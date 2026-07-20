@@ -262,8 +262,7 @@ workspace_result_t<void> append_target(arch_decode_result_t& output,
 
 bool is_load_multiple(arm_insn instruction) noexcept {
     return instruction == ARM_INS_LDM || instruction == ARM_INS_LDMDA ||
-           instruction == ARM_INS_LDMDB || instruction == ARM_INS_LDMIA ||
-           instruction == ARM_INS_LDMIB;
+           instruction == ARM_INS_LDMDB || instruction == ARM_INS_LDMIB;
 }
 
 bool is_exception_return(arm_insn instruction) noexcept {

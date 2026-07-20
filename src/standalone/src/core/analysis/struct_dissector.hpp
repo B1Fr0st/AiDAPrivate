@@ -24,6 +24,7 @@
 #include <limits>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -1024,6 +1025,62 @@ inline bool set_field_comment(int struct_idx, int field_idx, const std::string& 
 	return true;
 }
 
+inline bool remove_field(int struct_idx, int field_idx);
+
+inline bool move_field(int struct_idx, int field_idx, int destination_idx) {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (!valid_index(struct_idx, g_state.structs.size()))
+		return false;
+	auto& definition = g_state.structs[static_cast<std::size_t>(struct_idx)];
+	if (!valid_index(field_idx, definition.fields.size()) ||
+		!valid_index(destination_idx, definition.fields.size()))
+		return false;
+	if (field_idx == destination_idx)
+		return true;
+	struct_def_t candidate = definition;
+	const auto remap = [field_idx, destination_idx](int index) {
+		if (index < 0)
+			return index;
+		if (index == field_idx)
+			return destination_idx;
+		if (field_idx < destination_idx && index > field_idx && index <= destination_idx)
+			return index - 1;
+		if (destination_idx < field_idx && index >= destination_idx && index < field_idx)
+			return index + 1;
+		return index;
+	};
+	auto moving = std::move(candidate.fields[static_cast<std::size_t>(field_idx)]);
+	candidate.fields.erase(candidate.fields.begin() + field_idx);
+	candidate.fields.insert(candidate.fields.begin() + destination_idx, std::move(moving));
+	for (auto& field : candidate.fields) {
+		field.parent_idx = remap(field.parent_idx);
+		for (auto& child : field.children)
+			child = remap(child);
+	}
+	const auto validation = validate_structure_locked(candidate);
+	if (!validation.valid())
+		return false;
+	candidate.total_size = validation.computed_size;
+	candidate.layout_revision = definition.layout_revision + 1;
+	definition = std::move(candidate);
+	++g_state.schema_revision;
+	return true;
+}
+
+inline int insert_field(int struct_idx, int destination_idx, const field_def_t& field) {
+	const int appended = add_field(struct_idx, field);
+	if (appended < 0)
+		return -1;
+	if (destination_idx < 0)
+		destination_idx = 0;
+	if (destination_idx >= appended)
+		return appended;
+	if (move_field(struct_idx, appended, destination_idx))
+		return destination_idx;
+	static_cast<void>(remove_field(struct_idx, appended));
+	return -1;
+}
+
 inline bool remove_structure(int struct_idx, std::string& error) {
 	std::lock_guard<std::mutex> lock(g_state.mtx);
 	if (!valid_index(struct_idx, g_state.structs.size())) {
@@ -1197,7 +1254,8 @@ inline bool set_structure_kind(int struct_idx, structure_kind_t kind) {
 	});
 }
 
-inline bool upsert_enum(const enum_def_t& source) {
+inline bool upsert_enum_checked(const enum_def_t& source,
+	const std::optional<std::uint64_t>& expected_schema_revision) {
 	if (source.name.empty() || source.name.size() > 256 || source.values.size() > 65536 ||
 		static_cast<int>(source.underlying_type) < static_cast<int>(field_type_t::int8) ||
 		static_cast<int>(source.underlying_type) > static_cast<int>(field_type_t::uint64))
@@ -1207,9 +1265,20 @@ inline bool upsert_enum(const enum_def_t& source) {
 		if (value.name.empty() || value.name.size() > 256 || !names.insert(value.name).second)
 			return false;
 	std::lock_guard<std::mutex> lock(g_state.mtx);
-	auto found = std::find_if(g_state.enums.begin(), g_state.enums.end(), [&](const enum_def_t& item) {
-		return item.name == source.name;
-	});
+	if (expected_schema_revision && g_state.schema_revision != *expected_schema_revision)
+		return false;
+	auto found = source.stable_id == 0
+		? std::find_if(g_state.enums.begin(), g_state.enums.end(), [&](const enum_def_t& item) {
+			return item.name == source.name;
+		})
+		: std::find_if(g_state.enums.begin(), g_state.enums.end(), [&](const enum_def_t& item) {
+			return item.stable_id == source.stable_id;
+		});
+	if (std::any_of(g_state.enums.begin(), g_state.enums.end(), [&](const enum_def_t& item) {
+		return item.name == source.name && item.stable_id != source.stable_id &&
+			(found == g_state.enums.end() || item.stable_id != found->stable_id);
+	}))
+		return false;
 	if (found != g_state.enums.end() && found->underlying_type != source.underlying_type &&
 		std::any_of(g_state.structs.begin(), g_state.structs.end(), [&](const struct_def_t& definition) {
 			return std::any_of(definition.fields.begin(), definition.fields.end(), [&](const field_def_t& field) {
@@ -1230,21 +1299,90 @@ inline bool upsert_enum(const enum_def_t& source) {
 				});
 		})))
 		return false;
-	if (found == g_state.enums.end()) {
-		if (g_state.enums.size() >= 4096)
-			return false;
-		g_state.enums.push_back(std::move(candidate));
-	} else {
-		*found = std::move(candidate);
-	}
-	const auto published = std::find_if(g_state.enums.begin(), g_state.enums.end(),
-		[&](const enum_def_t& item) { return item.name == source.name; });
-	const std::uint64_t published_id = published->stable_id;
-	for (auto& definition : g_state.structs)
-		if (std::any_of(definition.fields.begin(), definition.fields.end(), [&](const field_def_t& field) {
-			return field.enum_id == published_id;
-		}))
+	if (found == g_state.enums.end() && g_state.enums.size() >= 4096)
+		return false;
+	const std::uint64_t published_id = candidate.stable_id;
+	const std::string published_name = candidate.name;
+	auto updated_enums = g_state.enums;
+	if (found == g_state.enums.end())
+		updated_enums.push_back(std::move(candidate));
+	else
+		updated_enums[static_cast<std::size_t>(std::distance(g_state.enums.begin(), found))] =
+			std::move(candidate);
+	auto updated_structs = g_state.structs;
+	for (auto& definition : updated_structs) {
+		bool changed = false;
+		for (auto& field : definition.fields) {
+			if (field.enum_id != published_id)
+				continue;
+			field.referenced_type_name = published_name;
+			changed = true;
+		}
+		if (changed)
 			++definition.layout_revision;
+	}
+	g_state.enums.swap(updated_enums);
+	g_state.structs.swap(updated_structs);
+	++g_state.schema_revision;
+	return true;
+}
+
+inline bool upsert_enum(const enum_def_t& source) {
+	return upsert_enum_checked(source, std::nullopt);
+}
+
+inline bool upsert_enum_exact(const enum_def_t& source,
+	std::uint64_t expected_schema_revision) {
+	return upsert_enum_checked(source, expected_schema_revision);
+}
+
+inline bool delete_enum_exact(std::uint64_t stable_id, const std::string& expected_name,
+	std::uint64_t expected_schema_revision) {
+	if (stable_id == 0 || expected_name.empty())
+		return false;
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (g_state.schema_revision != expected_schema_revision)
+		return false;
+	const auto found = std::find_if(g_state.enums.begin(), g_state.enums.end(),
+		[&](const enum_def_t& item) {
+			return item.stable_id == stable_id && item.name == expected_name;
+		});
+	if (found == g_state.enums.end())
+		return false;
+	if (std::any_of(g_state.structs.begin(), g_state.structs.end(),
+		[stable_id](const struct_def_t& definition) {
+			return std::any_of(definition.fields.begin(), definition.fields.end(),
+				[stable_id](const field_def_t& field) { return field.enum_id == stable_id; });
+		}))
+		return false;
+	g_state.enums.erase(found);
+	++g_state.schema_revision;
+	return true;
+}
+
+inline bool rename_enum(std::uint64_t stable_id, const std::string& name) {
+	if (stable_id == 0 || name.empty() || name.size() > 256)
+		return false;
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (std::any_of(g_state.enums.begin(), g_state.enums.end(),
+		[&](const enum_def_t& item) { return item.name == name && item.stable_id != stable_id; }))
+		return false;
+	auto found = std::find_if(g_state.enums.begin(), g_state.enums.end(),
+		[stable_id](const enum_def_t& item) { return item.stable_id == stable_id; });
+	if (found == g_state.enums.end())
+		return false;
+	found->name = name;
+	for (auto& definition : g_state.structs) {
+		bool changed = false;
+		for (auto& field : definition.fields) {
+			if (field.enum_id != stable_id)
+				continue;
+			field.referenced_type_name = name;
+			changed = true;
+		}
+		if (changed)
+			++definition.layout_revision;
+	}
 	++g_state.schema_revision;
 	return true;
 }

@@ -1,5 +1,6 @@
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/studio_semantics.hpp"
 #else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -23,6 +24,7 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/design_system.hpp"
+#include "../../ui/empty_state.hpp"
 #include "../../ui/application_ui_runtime.hpp"
 #include "../../infra/event_bus.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
@@ -47,6 +49,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 namespace aida {
@@ -54,6 +57,28 @@ namespace burp {
 namespace sitemap {
 
 namespace {
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string semantic_artifact_id(
+    std::string_view kind, const network_view::artifact_identity_t& identity)
+{
+    const std::string retained = identity.id + ":" +
+        std::to_string(identity.timestamp) + ":" +
+        std::to_string(identity.revision) + ":" +
+        std::to_string(identity.content_hash) + ":" +
+        std::to_string(identity.content_size);
+    return aida::preview::semantics::stable_id(
+        "aida.network", std::string(kind) + "-" +
+            aida::preview::semantics::entity_token(retained));
+}
+
+std::string semantic_site_node_id(std::string retained)
+{
+    return aida::preview::semantics::stable_id(
+        "aida.network", "site-map-node-" +
+            aida::preview::semantics::entity_token(retained));
+}
+#endif
 
 struct host_key_t
 {
@@ -565,6 +590,15 @@ void render_tree_node(state_t& st, const std::shared_ptr<path_node_t>& node, con
         }
 
         ImGui::InvisibleButton("##tree_row", ImVec2(win_w, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        if (ImGui::IsItemVisible()) {
+			const std::string retained = (tls ? "https:" : "http:") + host + ":" +
+				std::to_string(port) + ":" + label_full;
+            aida::preview::semantics::register_last_item(
+                semantic_site_node_id(retained), "network-site-map-node", false, false,
+                "aida.dock-window.view.network.site-map");
+        }
+#endif
         const bool item_clicked = ImGui::IsItemClicked();
         const bool item_right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
 
@@ -717,6 +751,15 @@ void render_tree(state_t& st, float width, float height, float alpha)
         dl->AddText(ImVec2(cs.x + 20.f, cs.y + text_oy), host_col, header_buf);
 
         ImGui::InvisibleButton("##sitemap_host_row", ImVec2(win_w, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        if (ImGui::IsItemVisible()) {
+			const std::string retained = (h.tls ? "https:" : "http:") + h.host + ":" +
+				std::to_string(h.port);
+            aida::preview::semantics::register_last_item(
+                semantic_site_node_id(retained), "network-site-map-node", false, false,
+                "aida.dock-window.view.network.site-map");
+        }
+#endif
         if (ImGui::IsItemClicked()) {
             if (expanded) st.expanded_paths.erase(ek);
             else          st.expanded_paths.insert(ek);
@@ -831,6 +874,17 @@ void render_request_block(const exchange_observed_t& e, float alpha)
             }
             ImGui::InputTextMultiline("##req_raw", raw.data(), raw.size() + 1,
                                        ImVec2(-1.f, -1.f), ImGuiInputTextFlags_ReadOnly);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            network_view::artifact_identity_t identity;
+            std::string reason;
+            static_cast<void>(network_view::make_sitemap_artifact(
+                e.id, network_view::artifact_kind_t::sitemap_request, identity, reason));
+            if (identity.valid() && ImGui::IsItemVisible())
+                aida::preview::semantics::register_last_item(
+                    semantic_artifact_id("request", identity),
+                    "network-request-editor", false, false,
+                    semantic_artifact_id("exchange", identity));
+#endif
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Headers")) {
@@ -851,6 +905,17 @@ void render_request_block(const exchange_observed_t& e, float alpha)
                                  std::min<size_t>(e.req_body.size(), 65536));
                 ImGui::InputTextMultiline("##req_body", body.data(), body.size() + 1,
                                            ImVec2(-1.f, -1.f), ImGuiInputTextFlags_ReadOnly);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                network_view::artifact_identity_t identity;
+                std::string reason;
+                static_cast<void>(network_view::make_sitemap_artifact(
+                    e.id, network_view::artifact_kind_t::sitemap_request, identity, reason));
+                if (identity.valid() && ImGui::IsItemVisible())
+                    aida::preview::semantics::register_last_item(
+                        semantic_artifact_id("request", identity),
+                        "network-request-editor", false, false,
+                        semantic_artifact_id("exchange", identity));
+#endif
             }
             ImGui::EndTabItem();
         }
@@ -878,6 +943,21 @@ void render_response_block(const exchange_observed_t& e, float alpha)
             }
             ImGui::InputTextMultiline("##resp_raw", raw.data(), raw.size() + 1,
                                        ImVec2(-1.f, -1.f), ImGuiInputTextFlags_ReadOnly);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            network_view::artifact_identity_t identity;
+            network_view::artifact_identity_t request_identity;
+            std::string reason;
+            static_cast<void>(network_view::make_sitemap_artifact(
+                e.id, network_view::artifact_kind_t::sitemap_response, identity, reason));
+            static_cast<void>(network_view::make_sitemap_artifact(
+                e.id, network_view::artifact_kind_t::sitemap_request,
+                request_identity, reason));
+            if (identity.valid() && ImGui::IsItemVisible())
+                aida::preview::semantics::register_last_item(
+                    semantic_artifact_id("response", identity),
+                    "network-response-editor", false, false,
+                    semantic_artifact_id("exchange", request_identity));
+#endif
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Headers")) {
@@ -898,6 +978,21 @@ void render_response_block(const exchange_observed_t& e, float alpha)
                                  std::min<size_t>(e.resp_body.size(), 65536));
                 ImGui::InputTextMultiline("##resp_body", body.data(), body.size() + 1,
                                            ImVec2(-1.f, -1.f), ImGuiInputTextFlags_ReadOnly);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                network_view::artifact_identity_t identity;
+                network_view::artifact_identity_t request_identity;
+                std::string reason;
+                static_cast<void>(network_view::make_sitemap_artifact(
+                    e.id, network_view::artifact_kind_t::sitemap_response, identity, reason));
+                static_cast<void>(network_view::make_sitemap_artifact(
+                    e.id, network_view::artifact_kind_t::sitemap_request,
+                    request_identity, reason));
+                if (identity.valid() && ImGui::IsItemVisible())
+                    aida::preview::semantics::register_last_item(
+                        semantic_artifact_id("response", identity),
+                        "network-response-editor", false, false,
+                        semantic_artifact_id("exchange", request_identity));
+#endif
             }
             ImGui::EndTabItem();
         }
@@ -1020,6 +1115,18 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
 
         ImGui::PushID(static_cast<int>(e.id));
         ImGui::InvisibleButton("##sm_row", ImVec2(width, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        network_view::artifact_identity_t semantic_request;
+        std::string semantic_reason;
+        static_cast<void>(network_view::make_sitemap_artifact(
+            e.id, network_view::artifact_kind_t::sitemap_request,
+            semantic_request, semantic_reason));
+        if (semantic_request.valid() && ImGui::IsItemVisible())
+            aida::preview::semantics::register_last_item(
+                semantic_artifact_id("exchange", semantic_request),
+                "network-exchange-row", false, false,
+                "aida.dock-window.view.network.site-map");
+#endif
         if (ImGui::IsItemClicked()) st.selected_exchange_id.store(e.id);
         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
             st.selected_exchange_id.store(e.id);
@@ -1143,7 +1250,10 @@ void render(float pos_x, float pos_y, float width, float height,
     auto& st = s();
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
-    ImGui::BeginChild("##burp_sitemap_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
+    ImGui::BeginChild("##burp_sitemap_root", ImVec2(width, height), false,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::SetScrollY(0.f);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 org = ImGui::GetWindowPos();
@@ -1161,7 +1271,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 aida::ui::with_alpha(th.text_dim, alpha), tot);
 
     const float content_y = pos_y + 34.f;
-    const float content_h = height - 38.f;
+    const float content_h = std::max(1.f, height - 38.f);
     if (total == 0) {
         ImGui::SetCursorPos(ImVec2(pos_x + 2.f, content_y));
         const float empty_width = std::max(1.f, width - 4.f);
@@ -1174,16 +1284,17 @@ void render(float pos_x, float pos_y, float width, float height,
             st.tree_filter, sizeof(st.tree_filter));
         ImGui::PopID();
         ImGui::Spacing();
-        const float empty_height = std::max(1.f, ImGui::GetContentRegionAvail().y);
-        aida::ui::design::state_presentation_t empty;
-        empty.stable_id = "view.network.site_map.empty";
-        empty.state = aida::ui::design::view_state_t::empty;
+        const ImVec2 empty_pos = ImGui::GetCursorScreenPos();
+        const ImVec2 empty_size(
+            std::max(1.f, ImGui::GetContentRegionAvail().x),
+            std::max(1.f, ImGui::GetContentRegionAvail().y));
+        aida::ui::empty_state::config_t empty;
+        empty.glyph = aida::ui::empty_state::glyph_t::network;
         empty.title = "No captured traffic";
-        empty.message = "Requests from Proxy, Repeater, Scanner, and API tools are organized here by host and path.";
-        empty.hint = "Start the proxy or send a request to populate the site map.";
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
-        aida::ui::design::render_state(empty, ImVec2(state_width, empty_height));
-        ImGui::PopStyleVar();
+        empty.body = "Requests from Proxy, Repeater, Scanner, and API tools are organized here by host and path.";
+        empty.footer = "Start the proxy or send a request to populate the site map.";
+        empty.max_width = std::min(360.f, empty_size.x);
+        aida::ui::empty_state::render_panel(empty_pos, empty_size, empty, alpha);
         aida::ui::application_ui::render_retained_entity_context_menu(
             "network.site_map.path");
         aida::ui::application_ui::render_retained_entity_context_menu(

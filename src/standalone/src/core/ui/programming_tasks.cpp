@@ -1537,36 +1537,55 @@ void render_output_controls() {
     }
     ImGui::EndDisabled();
     if (!compact) ImGui::SameLine();
-    const std::string run_reason = run_unavailable_reason();
-    ImGui::BeginDisabled(!run_reason.empty());
+	const int output_tab = static_cast<int>(bottom_tab_t::output);
+	const auto run_action = application_ui::present_output_action(
+		output_tab, "programming.task.run");
+	ImGui::BeginDisabled(!run_action.enabled);
     if (ImGui::SmallButton("Run..."))
-        static_cast<void>(application_ui::execute_output_action(static_cast<int>(bottom_tab_t::output),
+		static_cast<void>(application_ui::execute_output_action(output_tab,
             "programming.task.run", action_invocation_source_t::toolbar));
     ImGui::EndDisabled();
-    if (!run_reason.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("%s", run_reason.c_str());
+	design::tooltip_for_last_item(
+		run_action.enabled ? run_action.description.c_str() : run_action.disabled_reason.c_str(),
+		run_action.shortcut.empty() ? nullptr : run_action.shortcut.c_str());
     ImGui::SameLine();
+	const auto configure_action = application_ui::present_output_action(
+		output_tab, "programming.task.configure");
+	ImGui::BeginDisabled(!configure_action.enabled);
     if (ImGui::SmallButton("Configure..."))
-        static_cast<void>(application_ui::execute_output_action(static_cast<int>(bottom_tab_t::output),
+		static_cast<void>(application_ui::execute_output_action(output_tab,
             "programming.task.configure", action_invocation_source_t::toolbar));
+	ImGui::EndDisabled();
+	design::tooltip_for_last_item(configure_action.enabled
+		? configure_action.description.c_str() : configure_action.disabled_reason.c_str(),
+		configure_action.shortcut.empty() ? nullptr : configure_action.shortcut.c_str());
     if (has_active_run()) {
         ImGui::SameLine();
-        const std::string cancel_reason = cancel_unavailable_reason();
-        ImGui::BeginDisabled(!cancel_reason.empty());
+		const auto cancel_action = application_ui::present_output_action(
+			output_tab, "programming.task.cancel");
+		ImGui::BeginDisabled(!cancel_action.enabled);
         if (ImGui::SmallButton("Cancel"))
-            static_cast<void>(application_ui::execute_output_action(static_cast<int>(bottom_tab_t::output),
+			static_cast<void>(application_ui::execute_output_action(output_tab,
                 "programming.task.cancel", action_invocation_source_t::toolbar));
         ImGui::EndDisabled();
-        if (!cancel_reason.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("%s", cancel_reason.c_str());
+		design::tooltip_for_last_item(cancel_action.enabled
+			? cancel_action.description.c_str() : cancel_action.disabled_reason.c_str(),
+			cancel_action.shortcut.empty() ? nullptr : cancel_action.shortcut.c_str());
     }
     const std::size_t problems = problem_count();
     if (problems != 0) {
         ImGui::SameLine();
         const std::string label = "Problems (" + std::to_string(problems) + ")";
+		const auto problems_action = application_ui::present_output_action(
+			output_tab, "programming.show_problems");
+		ImGui::BeginDisabled(!problems_action.enabled);
         if (ImGui::SmallButton(label.c_str()))
-            static_cast<void>(application_ui::execute_output_action(static_cast<int>(bottom_tab_t::output),
+			static_cast<void>(application_ui::execute_output_action(output_tab,
                 "programming.show_problems", action_invocation_source_t::toolbar));
+		ImGui::EndDisabled();
+		design::tooltip_for_last_item(problems_action.enabled
+			? problems_action.description.c_str() : problems_action.disabled_reason.c_str(),
+			problems_action.shortcut.empty() ? nullptr : problems_action.shortcut.c_str());
     }
     if (!compact) ImGui::SameLine();
     const char* channel_preview = store.selected_channel.empty() ? "All Output" : store.selected_channel.c_str();
@@ -1588,6 +1607,64 @@ void render_output_controls() {
         ImGui::TextDisabled("Loading configurations...");
     }
     ImGui::PopID();
+}
+
+void render_automation_scripts() {
+    ensure_initialized();
+    ImGui::TextUnformatted("Automation Scripts");
+    ImGui::Separator();
+    render_output_controls();
+    ImGui::Spacing();
+    const auto snapshot = task_center::snapshot();
+    if (!snapshot) {
+        ImGui::TextDisabled("Task state is loading...");
+        return;
+    }
+    std::vector<const task_center::task_snapshot_t*> tasks;
+    for (const auto& task : snapshot->tasks)
+        if (task.source == "programming.config")
+            tasks.push_back(&task);
+    if (tasks.empty()) {
+        ImGui::TextDisabled("No automation script runs in this session");
+        return;
+    }
+    if (ImGui::BeginTable("##automation_script_runs", 4,
+        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+        ImGui::GetContentRegionAvail())) {
+        ImGui::TableSetupColumn("Script", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 120.f);
+        ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, 90.f);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(tasks.size()));
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                const auto& task = *tasks[static_cast<std::size_t>(row)];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(task.label.c_str());
+                const char* state_label = "Queued";
+                switch (task.state) {
+                case task_center::task_state_t::running: state_label = "Running"; break;
+                case task_center::task_state_t::cancellation_requested: state_label = "Cancelling"; break;
+                case task_center::task_state_t::completed: state_label = "Completed"; break;
+                case task_center::task_state_t::partial: state_label = "Partial"; break;
+                case task_center::task_state_t::cancelled: state_label = "Cancelled"; break;
+                case task_center::task_state_t::failed: state_label = "Failed"; break;
+                case task_center::task_state_t::timed_out: state_label = "Timed out"; break;
+                case task_center::task_state_t::interrupted: state_label = "Interrupted"; break;
+                case task_center::task_state_t::queued: break;
+                }
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(state_label);
+                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(task.stage.c_str());
+                ImGui::TableSetColumnIndex(3);
+                if (task.progress >= 0.f) ImGui::Text("%.0f%%", task.progress * 100.f);
+                else ImGui::TextDisabled("indeterminate");
+            }
+        }
+        ImGui::EndTable();
+    }
 }
 
 void render_modals() {

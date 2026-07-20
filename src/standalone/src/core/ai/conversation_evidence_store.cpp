@@ -103,7 +103,8 @@ bool bounded(std::string_view value, std::size_t maximum, bool empty = true) noe
 std::uint64_t fnv1a(std::string_view value) noexcept
 {
     std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char byte : value) {
+    for (const char raw_byte : value) {
+        const auto byte = static_cast<unsigned char>(raw_byte);
         hash ^= byte;
         hash *= 1099511628211ULL;
     }

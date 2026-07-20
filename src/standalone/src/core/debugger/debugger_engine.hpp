@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -31,6 +33,14 @@ enum class bp_state_t : int {
 	one_shot,
 };
 
+enum class breakpoint_install_state_t : int {
+	requested = 0,
+	installing,
+	installed,
+	removing,
+	error,
+};
+
 struct breakpoint_t {
 	uint64_t    address = 0;
 	bp_type_t   type = bp_type_t::software;
@@ -45,6 +55,9 @@ struct breakpoint_t {
 	bool        is_internal = false;
 	bool        auto_continue = false;
 	bool        byte_written = false;
+	breakpoint_install_state_t install_state = breakpoint_install_state_t::installed;
+	bool        readback_verified = false;
+	std::string install_detail;
 	std::string definition_module;
 	uint64_t    definition_module_offset = 0;
 	uint32_t    definition_module_size = 0;
@@ -55,6 +68,8 @@ struct breakpoint_t {
 	std::string source_file;
 	uint32_t    source_line = 0;
 	uint32_t    source_location_ordinal = 0;
+	uint64_t    mutation_identity = 0;
+	uint64_t    mutation_generation = 0;
 };
 
 struct internal_bp_t {
@@ -137,6 +152,56 @@ struct expression_evaluation_t {
 	std::string rendered_value;
 	std::string type;
 	std::string error;
+};
+
+inline constexpr std::size_t k_max_watch_count = 4096;
+inline constexpr std::size_t k_max_watch_expression_bytes = 96;
+
+struct watch_refresh_target_t {
+	std::string expression;
+	std::string persistent_expression;
+	std::string definition_module;
+	uint64_t definition_module_offset = 0;
+	uint32_t definition_module_size = 0;
+	bool persistent_definition = false;
+	bool definition_resolved = true;
+	std::string unresolved_error;
+};
+
+struct watch_refresh_batch_t {
+	uint64_t generation = 0;
+	std::size_t cardinality = 0;
+	std::vector<watch_refresh_target_t> targets;
+	std::string error;
+
+	bool valid() const noexcept {
+		return error.empty() && cardinality == targets.size();
+	}
+};
+
+using watch_refresh_batch_ptr = std::shared_ptr<const watch_refresh_batch_t>;
+
+struct watch_refresh_evaluation_batch_t {
+	watch_refresh_batch_ptr source;
+	std::vector<expression_evaluation_t> results;
+	std::string error;
+	bool cancelled = false;
+
+	bool valid() const noexcept {
+		return source && source->valid() && error.empty() && !cancelled &&
+			results.size() == source->targets.size();
+	}
+};
+
+using watch_refresh_cancel_fn_t = std::function<bool()>;
+
+enum class watch_refresh_publish_result_t : uint8_t {
+	published = 0,
+	invalid_batch,
+	stale_generation,
+	cardinality_mismatch,
+	identity_mismatch,
+	result_mismatch
 };
 
 
@@ -305,7 +370,7 @@ bool remove_source_breakpoint(const std::string& definition_id,
 bool discard_source_breakpoints_for_target_change(uint32_t previous_pid,
 	uint32_t current_pid);
 bool toggle_breakpoint(int index);
-void clear_all_breakpoints();
+bool clear_all_breakpoints();
 bool set_breakpoint_condition(int index, const std::string& condition);
 bool set_breakpoint_log(int index, const std::string& log_text, bool auto_continue);
 
@@ -377,7 +442,14 @@ int  add_watch(const std::string& expression);
 bool remove_watch(int index);
 void refresh_watches();
 expression_evaluation_t evaluate_expression(const std::string& expression);
+watch_refresh_batch_ptr capture_watch_refresh_batch();
+watch_refresh_evaluation_batch_t evaluate_watch_refresh_batch(
+	watch_refresh_batch_ptr batch,
+	watch_refresh_cancel_fn_t cancel_requested = {});
+watch_refresh_publish_result_t publish_watch_refresh_batch(
+	const watch_refresh_evaluation_batch_t& batch);
 bool publish_watch_evaluation(int index, const std::string& expected_expression,
+	uint64_t expected_watches_generation,
 	const expression_evaluation_t& evaluation);
 
 

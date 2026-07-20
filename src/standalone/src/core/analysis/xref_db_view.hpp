@@ -5,6 +5,9 @@
 #include "../ui/theme.hpp"
 #include "../ui/analysis_context_menu.hpp"
 #include "../ui/application_view_registry.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 #include "imgui/imgui.h"
 
 #include <algorithm>
@@ -326,8 +329,26 @@ inline void render(float, float, float width, float height,
                 std::lock_guard<std::mutex> lock(state->mutex);
                 selected = state->selected_runtime == result.runtime;
             }
-            if (ImGui::Selectable(result.label.c_str(), selected,
-                    ImGuiSelectableFlags_AllowDoubleClick)) {
+            const bool activated = ImGui::Selectable(result.label.c_str(), selected,
+                ImGuiSelectableFlags_AllowDoubleClick);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const std::string result_identity =
+                std::to_string(static_cast<unsigned>(result.result.source.space)) + ":" +
+                std::to_string(result.result.source.value) + ":" +
+                std::to_string(static_cast<unsigned>(result.result.source.architecture)) + ":" +
+                std::to_string(static_cast<unsigned>(result.result.source.mode)) + ":" +
+                std::to_string(static_cast<unsigned>(result.result.target.space)) + ":" +
+                std::to_string(result.result.target.value) + ":" +
+                std::to_string(static_cast<unsigned>(result.result.target.architecture)) + ":" +
+                std::to_string(static_cast<unsigned>(result.result.target.mode)) + ":" +
+                std::to_string(static_cast<unsigned>(result.result.kind));
+            const std::string result_semantic = aida::preview::semantics::stable_id(
+                "aida.xref-row", aida::preview::semantics::entity_token(result_identity));
+            static_cast<void>(aida::preview::semantics::register_last_item(result_semantic,
+                "xref-row", false, false,
+                "aida.dock-window.view.analysis.references"));
+#endif
+            if (activated) {
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
                     state->selected_runtime = result.runtime;

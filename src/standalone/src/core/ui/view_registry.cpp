@@ -32,6 +32,8 @@ view_operation_result_t view_registry_t::validate_descriptor(
         return {view_operation_status_t::invalid_descriptor, "View internal name is invalid"};
     if (!valid_minimum_size(descriptor.minimum_size))
         return {view_operation_status_t::invalid_descriptor, "View minimum size is invalid"};
+    if (descriptor.persistence_version == 0 || descriptor.preset_introduced_revision == 0)
+        return {view_operation_status_t::invalid_descriptor, "View persistence metadata is invalid"};
     if (descriptor.render_ownership == view_render_ownership_t::registry_window &&
         !descriptor.render)
         return {view_operation_status_t::invalid_descriptor, "View has no renderer"};
@@ -50,6 +52,13 @@ view_operation_result_t view_registry_t::validate_descriptor(
             return {view_operation_status_t::invalid_descriptor,
                     "View action binding is duplicated"};
     }
+    std::set<stable_view_id_t> aliases;
+    for (const auto& alias : descriptor.persistence_aliases) {
+        if (!is_valid_stable_id(alias.value()) || alias == descriptor.id)
+            return {view_operation_status_t::invalid_descriptor, "View persistence alias is invalid"};
+        if (!aliases.insert(alias).second)
+            return {view_operation_status_t::invalid_descriptor, "View persistence alias is duplicated"};
+    }
     return {};
 }
 
@@ -63,17 +72,36 @@ view_operation_result_t view_registry_t::register_view(view_descriptor_t descrip
         if (entry.second.internal_name == descriptor.internal_name)
             return {view_operation_status_t::already_registered,
                     "View internal name is already registered"};
+        if (std::find(entry.second.persistence_aliases.begin(),
+                      entry.second.persistence_aliases.end(), descriptor.id) !=
+                entry.second.persistence_aliases.end() ||
+            std::find(descriptor.persistence_aliases.begin(), descriptor.persistence_aliases.end(),
+                      entry.first) != descriptor.persistence_aliases.end())
+            return {view_operation_status_t::already_registered,
+                    "View ID conflicts with a persistence alias"};
+        for (const auto& alias : descriptor.persistence_aliases)
+            if (std::find(entry.second.persistence_aliases.begin(),
+                          entry.second.persistence_aliases.end(), alias) !=
+                    entry.second.persistence_aliases.end())
+                return {view_operation_status_t::already_registered,
+                        "View persistence alias is already registered"};
     }
 
     const auto id = descriptor.id;
     const bool default_open = descriptor.default_open;
     const auto inserted = descriptors_.emplace(id, std::move(descriptor));
-    if (default_open) {
-        const view_instance_id_t instance{id, {}};
-        auto& state = ensure_instance(inserted.first->second, instance, {});
-        state.open = true;
+    try {
+        if (default_open) {
+            const view_instance_id_t instance{id, {}};
+            auto& state = ensure_instance(inserted.first->second, instance, {});
+            state.open = true;
+        }
+    } catch (...) {
+        descriptors_.erase(inserted.first);
+        throw;
     }
     ++revision_;
+    ++visibility_revision_;
     return {};
 }
 
@@ -134,9 +162,9 @@ view_instance_state_t& view_registry_t::ensure_instance(
     auto found = instances_.find(id);
     if (found != instances_.end()) {
         if (!display_name.empty() && display_name != found->second.display_name) {
+            std::string window_name = compose_window_name(descriptor, id, display_name);
             found->second.display_name = std::move(display_name);
-            found->second.window_name = compose_window_name(
-                descriptor, id, found->second.display_name);
+            found->second.window_name = std::move(window_name);
         }
         return found->second;
     }
@@ -176,18 +204,29 @@ view_operation_result_t view_registry_t::open(const view_instance_id_t& id,
     if (!capability.visible || !capability.enabled)
         return {view_operation_status_t::unavailable, capability.disabled_reason};
 
+    try {
+        if (descriptor->activate)
+            descriptor->activate(id);
+    } catch (const std::exception& exception) {
+        return {view_operation_status_t::unavailable, exception.what()};
+    } catch (...) {
+        return {view_operation_status_t::unavailable,
+            "View activation failed with an unknown error"};
+    }
+
     const auto* existing = find_instance(id);
-    const bool changed = !existing || !existing->open ||
+    const bool visibility_changed = !existing || !existing->open;
+    const bool changed = visibility_changed ||
         (!display_name.empty() && display_name != existing->display_name);
     auto& state = ensure_instance(*descriptor, id, std::move(display_name));
     state.open = true;
     closed_history_.erase(
         std::remove(closed_history_.begin(), closed_history_.end(), id),
         closed_history_.end());
-    if (descriptor->activate)
-        descriptor->activate(id);
     if (changed)
         ++revision_;
+    if (visibility_changed)
+        ++visibility_revision_;
     return {};
 }
 
@@ -239,24 +278,36 @@ view_operation_result_t view_registry_t::close(const view_instance_id_t& id) {
     if (!descriptor->closeable)
         return {view_operation_status_t::not_closeable, "View cannot be closed"};
 
+    std::vector<view_instance_id_t> next_closed_history;
+    try {
+        next_closed_history = closed_history_;
+        next_closed_history.erase(
+            std::remove(next_closed_history.begin(), next_closed_history.end(), id),
+            next_closed_history.end());
+        next_closed_history.push_back(id);
+        constexpr std::size_t k_closed_history_capacity = 64;
+        if (next_closed_history.size() > k_closed_history_capacity)
+            next_closed_history.erase(next_closed_history.begin(),
+                next_closed_history.begin() +
+                    static_cast<std::ptrdiff_t>(next_closed_history.size() -
+                        k_closed_history_capacity));
+        if (descriptor->deactivate)
+            descriptor->deactivate(id);
+    } catch (const std::exception& exception) {
+        return {view_operation_status_t::unavailable, exception.what()};
+    } catch (...) {
+        return {view_operation_status_t::unavailable,
+            "View deactivation failed with an unknown error"};
+    }
+
     state->open = false;
     state->focused = false;
     state->focus_request_generation = state->consumed_focus_generation;
     if (focused_instance_ && *focused_instance_ == id)
         focused_instance_.reset();
-    if (descriptor->deactivate)
-        descriptor->deactivate(id);
-    closed_history_.erase(
-        std::remove(closed_history_.begin(), closed_history_.end(), id),
-        closed_history_.end());
-    closed_history_.push_back(id);
-    constexpr std::size_t k_closed_history_capacity = 64;
-    if (closed_history_.size() > k_closed_history_capacity)
-        closed_history_.erase(closed_history_.begin(),
-            closed_history_.begin() +
-                static_cast<std::ptrdiff_t>(closed_history_.size() -
-                    k_closed_history_capacity));
+    closed_history_.swap(next_closed_history);
     ++revision_;
+    ++visibility_revision_;
     return {};
 }
 

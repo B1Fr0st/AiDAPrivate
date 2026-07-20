@@ -12,6 +12,7 @@
 #include "../workbench/workbench_shell_integration.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/disasm_preview_adapter.hpp"
+#include "../../preview/studio_semantics.hpp"
 #endif
 
 #include "imgui/imgui.h"
@@ -462,7 +463,7 @@ std::uint64_t context_generation(
         (generation << 6u) + (generation >> 2u));
 }
 
-void open_line_context_menu(
+auto make_line_context_menu(
     const disasm_view::workspace_context_t& context,
     const aida::workbench::pseudocode_document::pseudocode_line_view_t& line,
     std::optional<std::uint64_t> source_address,
@@ -470,8 +471,8 @@ void open_line_context_menu(
     const std::shared_ptr<state_t>& state,
     int selected_line,
     std::uint32_t selected_token_begin,
-    std::uint32_t selected_token_end,
-    aida::ui::context_menu_open_origin_t origin)
+    std::uint32_t selected_token_end)
+    -> aida::ui::analysis_context_menu::context_t
 {
     using namespace aida::ui::analysis_context_menu;
     using aida::ui::action_handler_result_t;
@@ -592,7 +593,24 @@ void open_line_context_menu(
     menu.actions["analysis.modify.retype"].capability =
         capability_state_t::unavailable(
             "Use Types > Apply Type until canonical type-entry validation is available here");
-    open(std::move(menu), origin);
+    return menu;
+}
+
+void open_line_context_menu(
+    const disasm_view::workspace_context_t& context,
+    const aida::workbench::pseudocode_document::pseudocode_line_view_t& line,
+    std::optional<std::uint64_t> source_address,
+    std::string token_text,
+    const std::shared_ptr<state_t>& state,
+    int selected_line,
+    std::uint32_t selected_token_begin,
+    std::uint32_t selected_token_end,
+    aida::ui::context_menu_open_origin_t origin)
+{
+    aida::ui::analysis_context_menu::open(
+        make_line_context_menu(context, line, source_address,
+            std::move(token_text), state, selected_line,
+            selected_token_begin, selected_token_end), origin);
 }
 
 void persist_line_selection(
@@ -1352,8 +1370,9 @@ void render(float, float, float width, float height,
         ImGuiListClipper clipper;
         clipper.Begin(line_count, row_height);
         std::optional<std::uint64_t> selected_source_address;
-        std::string selected_line_text;
         std::string selected_token_text;
+        std::optional<aida::ui::analysis_context_menu::context_t>
+            selected_shortcut_context;
         while (clipper.Step()) {
             auto first = static_cast<std::uint32_t>(clipper.DisplayStart);
             const auto end = static_cast<std::uint32_t>(clipper.DisplayEnd);
@@ -1376,6 +1395,15 @@ void render(float, float, float width, float height,
                         gutter_width + 18.0f + text_width);
                     ImGui::InvisibleButton("##pseudocode_line",
                         ImVec2(row_width, row_height));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    const std::string line_identity = active_tab.entity_locator + ":" +
+                        std::to_string(line.line_number);
+                    const std::string line_semantic = aida::preview::semantics::stable_id(
+                        "aida.pseudocode-line",
+                        aida::preview::semantics::entity_token(line_identity));
+                    static_cast<void>(aida::preview::semantics::register_last_item(line_semantic,
+                        "pseudocode-line"));
+#endif
                     const bool hovered = ImGui::IsItemHovered();
                     const bool left_clicked = ImGui::IsItemClicked(
                         ImGuiMouseButton_Left);
@@ -1479,7 +1507,6 @@ void render(float, float, float width, float height,
                             *workbench.pseudocode_document,
                             token_for_position(page, selected_token_begin),
                             line, page);
-                        selected_line_text = line.text;
                         if (selected_token_end > selected_token_begin &&
                             selected_token_begin >= line.text_begin &&
                             selected_token_end <= line.text_end) {
@@ -1487,6 +1514,10 @@ void render(float, float, float width, float height,
                                 selected_token_begin - line.text_begin,
                                 selected_token_end - selected_token_begin);
                         }
+                        selected_shortcut_context = make_line_context_menu(
+                            context, line, selected_source_address,
+                            selected_token_text, state, line_index,
+                            selected_token_begin, selected_token_end);
                     }
                     if (hovered_token && hovered && source_address) {
                         ImGui::SetTooltip("%s\nMapped address  0x%s\nEnter: disassembly   Space: graph",
@@ -1563,10 +1594,11 @@ void render(float, float, float width, float height,
             ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         if (code_focused && selected_source_address) {
             const auto& io = ImGui::GetIO();
-			if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
-				ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
-                ImGui::SetClipboardText((selected_token_text.empty()
-                    ? selected_line_text : selected_token_text).c_str());
+			if (io.KeyCtrl && selected_shortcut_context &&
+                (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+				 ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
+                aida::ui::analysis_context_menu::execute_shortcut(
+                    std::move(*selected_shortcut_context), "analysis.copy.text");
         }
     }
     aida::ui::analysis_context_menu::render();

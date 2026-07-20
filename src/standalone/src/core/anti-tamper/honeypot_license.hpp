@@ -62,7 +62,7 @@ namespace anti_tamper::honeypot {
         uint8_t  patched;
         uint8_t  _pad[3];
     };
-    static_assert(sizeof(decoy_license_meta_t) == 80, "decoy_license_meta_t layout");
+    static_assert(sizeof(decoy_license_meta_t) == 88, "decoy_license_meta_t layout");
 
     inline decoy_license_meta_t g_decoy_metas[5] = {};
 
@@ -78,6 +78,7 @@ namespace anti_tamper::honeypot {
     constexpr uint32_t HONEYPOT_BUGCHECK_STRING_ACCESS = 0xA1DA0001u;
     constexpr uint32_t HONEYPOT_BUGCHECK_CANARY_PATCH   = 0xA1DA0002u;
     constexpr uint32_t HONEYPOT_CHECK_INTERVAL_MS       = 30000;
+    constexpr unsigned int HONEYPOT_FAST_FAIL_KEY_DERIVATION = 0xA1DA0A11u;
 
     __forceinline uint32_t crc32_ieee(const uint8_t* data, size_t len)
     {
@@ -87,7 +88,7 @@ namespace anti_tamper::honeypot {
             crc ^= data[i];
             for (int j = 0; j < 8; ++j)
             {
-                uint32_t mask = -(crc & 1u);
+                uint32_t mask = 0u - (crc & 1u);
                 crc = (crc >> 1) ^ (0xEDB88320u & mask);
             }
         }
@@ -151,7 +152,7 @@ namespace anti_tamper::honeypot {
     __forceinline canary_status_t check_canary(uint32_t decoy_id,
         const volatile uint8_t* canary, size_t len)
     {
-        if (decoy_id >= 5 || len < 52) return CANARY_CORRUPTION;
+        if (decoy_id >= 5 || len < 52) return canary_status_t::CANARY_CORRUPTION;
 
         uint8_t buf[52];
         memcpy(buf, (const void*)canary, 52);
@@ -161,12 +162,12 @@ namespace anti_tamper::honeypot {
         uint32_t computed_crc = crc32_ieee(buf, 48);
 
         if (computed_crc != stored_crc)
-            return CANARY_CORRUPTION;
+            return canary_status_t::CANARY_CORRUPTION;
 
         if (memcmp(buf, g_decoy_metas[decoy_id].orig_canary, 48) != 0)
-            return CANARY_PATCHED;
+            return canary_status_t::CANARY_PATCHED;
 
-        return CANARY_INTACT;
+        return canary_status_t::CANARY_INTACT;
     }
 
     __forceinline void refresh_canary_from_backup(uint32_t decoy_id)
@@ -176,9 +177,9 @@ namespace anti_tamper::honeypot {
         uint8_t nonce_buf[16] = {};
         uint32_t id = decoy_id;
         if (!key_pipeline::derive("aida.honeypot.canary.nonce",
-            &id, sizeof(id), nonce_buf, 16))
+            reinterpret_cast<const uint8_t*>(&id), sizeof(id), nonce_buf, 16))
         {
-            __fastfail(0xA1DA0HP1u);
+            __fastfail(HONEYPOT_FAST_FAIL_KEY_DERIVATION);
         }
 
         volatile uint8_t* canary = s_canary_table[decoy_id];
@@ -233,7 +234,7 @@ namespace anti_tamper::honeypot {
         _snprintf_s(patch_bytes, sizeof(patch_bytes), _TRUNCATE,
             "computed_crc=0x%08X stored_crc=0x%08X", computed, stored);
 
-        patch_type_t ptype = (status == CANARY_PATCHED)
+        patch_type_t ptype = (status == canary_status_t::CANARY_PATCHED)
             ? patch_type_t::CRC_VALID_PATCH
             : patch_type_t::CRC_INVALID_CORRUPTION;
 
@@ -263,7 +264,9 @@ namespace anti_tamper::honeypot {
             httplib::Client cli(host);
             cli.set_connection_timeout(3);
             cli.set_read_timeout(3);
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
             cli.enable_server_certificate_verification(true);
+#endif
 
             nlohmann::json body;
             body["hwid"] = webhook::get_computer_name();
@@ -288,7 +291,7 @@ namespace anti_tamper::honeypot {
     {
         if (decoy_id >= 5) return;
         g_decoy_metas[decoy_id].patched = 1;
-        report_patch(decoy_id, CANARY_PATCHED);
+        report_patch(decoy_id, canary_status_t::CANARY_PATCHED);
         trigger_immediate_bsod(HONEYPOT_BUGCHECK_CANARY_PATCH, decoy_id);
     }
 
@@ -303,7 +306,7 @@ namespace anti_tamper::honeypot {
                 reinterpret_cast<const volatile uint8_t*>(meta.canary_addr),
                 meta.canary_len);
 
-            if (status == CANARY_CORRUPTION)
+            if (status == canary_status_t::CANARY_CORRUPTION)
             {
                 auto& rt = state::get();
                 rt.decoy_honeypot_count.fetch_add(1, std::memory_order_relaxed);
@@ -313,7 +316,7 @@ namespace anti_tamper::honeypot {
                 continue;
             }
 
-            if (status == CANARY_PATCHED)
+            if (status == canary_status_t::CANARY_PATCHED)
             {
                 on_canary_patched(i);
             }
@@ -432,7 +435,7 @@ inline volatile const char* g_license_honeypot_strings[] = {
         anti_tamper::decoy::work::touch_real_globals();
 
         HINTERNET hInet = WinHttpOpen(L"AiDAStandalone/4.0",
-            WINHTTP_ACCESSYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
+            WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
             WINHTTP_NO_PROXY_BYPASS, 0);
         if (hInet)
         {
@@ -748,6 +751,63 @@ inline volatile const char* g_license_honeypot_strings[] = {
     inline uint32_t g_honeypot_guard_page_count = 0;
     inline PVOID g_honeypot_veh_handle = nullptr;
 
+    __declspec(noinline) static DWORD post_honeypot_access_winhttp_seh(
+        const char* body, DWORD body_size)
+    {
+        HINTERNET h_session = nullptr;
+        HINTERNET h_connect = nullptr;
+        HINTERNET h_request = nullptr;
+        DWORD observed_seh_code = ERROR_SUCCESS;
+
+        __try
+        {
+            h_session = WinHttpOpen(L"AiDAStandalone/4.0",
+                WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS, 0);
+            if (h_session)
+            {
+                DWORD timeout = 3000;
+                WinHttpSetTimeouts(h_session, timeout, timeout, timeout, timeout);
+
+                const wchar_t* host = L"aidapro.net";
+                INTERNET_PORT port = INTERNET_DEFAULT_HTTPS_PORT;
+                DWORD flags = WINHTTP_FLAG_SECURE;
+
+#ifdef AIDA_LOCAL_LICENSE_SERVER
+                host = L"localhost";
+                port = 3001;
+                flags = 0;
+#endif
+                h_connect = WinHttpConnect(h_session, host, port, 0);
+                if (h_connect)
+                {
+                    h_request = WinHttpOpenRequest(h_connect, L"POST",
+                        L"/api/honeypot/honeypot-access", nullptr,
+                        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+                    if (h_request)
+                    {
+                        wchar_t headers[] = L"Content-Type: application/json\r\n";
+                        if (WinHttpSendRequest(h_request, headers,
+                            static_cast<DWORD>(_countof(headers) - 1),
+                            const_cast<char*>(body), body_size, body_size, 0))
+                        {
+                            WinHttpReceiveResponse(h_request, nullptr);
+                        }
+                    }
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            observed_seh_code = GetExceptionCode();
+        }
+
+        if (h_request) WinHttpCloseHandle(h_request);
+        if (h_connect) WinHttpCloseHandle(h_connect);
+        if (h_session) WinHttpCloseHandle(h_session);
+        return observed_seh_code;
+    }
+
     __forceinline void report_honeypot_access(uint64_t accessed_addr, uint64_t rip, uint32_t pid)
     {
         char log_buf[160];
@@ -758,58 +818,22 @@ inline volatile const char* g_license_honeypot_strings[] = {
             pid);
         webhook::write_log("honeypot", log_buf);
 
-        __try {
-            nlohmann::json body;
-            body["accessed_addr"] = static_cast<unsigned long long>(accessed_addr);
-            body["rip"] = static_cast<unsigned long long>(rip);
-            body["pid"] = pid;
-            body["hwid"] = webhook::get_computer_name();
-            body["license_key"] = standalone_license::get_session_token();
-            body["watermark"] = "aida_standalone";
-            body["bug_code"] = static_cast<uint32_t>(HONEYPOT_BUGCHECK_STRING_ACCESS);
-            std::string body_str = body.dump();
-
-            HINTERNET hSession = WinHttpOpen(L"AiDAStandalone/4.0",
-                WINHTTP_ACCESSYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
-                WINHTTP_NO_PROXY_BYPASS, 0);
-            if (hSession)
-            {
-                DWORD timeout = 3000;
-                WinHttpSetTimeouts(hSession, timeout, timeout, timeout, timeout);
-
-                const wchar_t* whost = L"aidapro.net";
-                INTERNET_PORT wport = INTERNET_DEFAULT_HTTPS_PORT;
-                DWORD wflags = WINHTTP_FLAG_SECURE;
-
-#ifdef AIDA_LOCAL_LICENSE_SERVER
-                whost = L"localhost";
-                wport = 3001;
-                wflags = 0;
-#endif
-                const wchar_t* wpath = L"/api/honeypot/honeypot-access";
-
-                HINTERNET hConnect = WinHttpConnect(hSession, whost, wport, 0);
-                if (hConnect)
-                {
-                    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
-                        wpath, nullptr, WINHTTP_NO_REFERER,
-                        WINHTTP_DEFAULT_ACCEPT_TYPES, wflags);
-                    if (hRequest)
-                    {
-                        std::wstring hdrs = L"Content-Type: application/json\r\n";
-                        WinHttpSendRequest(hRequest,
-                            hdrs.c_str(), static_cast<DWORD>(hdrs.size()),
-                            const_cast<char*>(body_str.c_str()),
-                            static_cast<DWORD>(body_str.size()),
-                            static_cast<DWORD>(body_str.size()), 0);
-                        WinHttpReceiveResponse(hRequest, nullptr);
-                        WinHttpCloseHandle(hRequest);
-                    }
-                    WinHttpCloseHandle(hConnect);
-                }
-                WinHttpCloseHandle(hSession);
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        nlohmann::json body;
+        body["accessed_addr"] = static_cast<unsigned long long>(accessed_addr);
+        body["rip"] = static_cast<unsigned long long>(rip);
+        body["pid"] = pid;
+        body["hwid"] = webhook::get_computer_name();
+        body["license_key"] = standalone_license::get_session_token();
+        body["watermark"] = "aida_standalone";
+        body["bug_code"] = static_cast<uint32_t>(HONEYPOT_BUGCHECK_STRING_ACCESS);
+        std::string body_str = body.dump();
+        const DWORD observed_seh_code = post_honeypot_access_winhttp_seh(
+            body_str.data(), static_cast<DWORD>(body_str.size()));
+        if (observed_seh_code != ERROR_SUCCESS)
+        {
+            webhook::write_log_critical_fmt("honeypot",
+                "honeypot_access_post_seh code=0x%08X", observed_seh_code);
+        }
     }
 
     __declspec(noinline) static LONG WINAPI honeypot_guard_page_handler(EXCEPTION_POINTERS* ep)
@@ -978,6 +1002,24 @@ inline volatile const char* g_license_honeypot_strings[] = {
         webhook::write_log("honeypot", log_buf);
     }
 
+    __declspec(noinline) static DWORD register_canary_seh(
+        volatile uint8_t* canary, size_t size, BOOL* registered)
+    {
+        if (registered) *registered = FALSE;
+        DWORD observed_seh_code = ERROR_SUCCESS;
+        __try
+        {
+            const bool ok = driver_bridge::canary_register(
+                static_cast<void*>(const_cast<uint8_t*>(canary)), size);
+            if (registered) *registered = ok ? TRUE : FALSE;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            observed_seh_code = GetExceptionCode();
+        }
+        return observed_seh_code;
+    }
+
     inline void initialize()
     {
         anchor_honeypot_graph();
@@ -999,9 +1041,9 @@ inline volatile const char* g_license_honeypot_strings[] = {
             uint8_t nonce_buf[16] = {};
             uint32_t id = i;
             if (!key_pipeline::derive("aida.honeypot.canary.nonce",
-                &id, sizeof(id), nonce_buf, 16))
+                reinterpret_cast<const uint8_t*>(&id), sizeof(id), nonce_buf, 16))
             {
-                __fastfail(0xA1DA0HP1u);
+                __fastfail(HONEYPOT_FAST_FAIL_KEY_DERIVATION);
             }
 
             volatile uint8_t* canary = s_canary_table[i];
@@ -1034,12 +1076,15 @@ inline volatile const char* g_license_honeypot_strings[] = {
             SecureZeroMemory(nonce_buf, sizeof(nonce_buf));
             SecureZeroMemory(raw, sizeof(raw));
 
-            __try {
-                driver_bridge::canary_register(
-                    const_cast<void*>(reinterpret_cast<const void*>(canary)), 52);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                webhook::write_log("honeypot",
-                    ("canary_register_seh_exception decoy_id=" + std::to_string(i)).c_str());
+            BOOL registered = FALSE;
+            const DWORD observed_seh_code = register_canary_seh(canary, 52, &registered);
+            if (observed_seh_code != ERROR_SUCCESS)
+            {
+                char register_log[128];
+                _snprintf_s(register_log, sizeof(register_log), _TRUNCATE,
+                    "canary_register_seh_exception decoy_id=%u code=0x%08X",
+                    i, observed_seh_code);
+                webhook::write_log("honeypot", register_log);
             }
         }
 

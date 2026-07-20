@@ -440,7 +440,7 @@ validation_failure_t validate_address_collection(const json& value, std::string_
 validation_failure_t validate_thread_ids(const json& value, std::string_view path,
                                           const debugger_handler_limits_t& limits) {
     return scalar_or_array(value, path, limits.max_threads,
-        [&limits](const json& item, std::string item_path) {
+        [&limits](const json& item, std::string item_path) -> validation_failure_t {
             const auto v = unsigned_integer(item);
             if (!v || *v == 0) {
                 return invalid_value(std::move(item_path), "valid_thread_id_required", item);

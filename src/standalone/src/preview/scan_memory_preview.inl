@@ -76,9 +76,33 @@ inline std::string format_value(const std::vector<std::uint8_t>& bytes, value_ty
 	return buffer;
 }
 
+inline std::uint64_t observe_target_binding(std::uint32_t pid)
+{
+	const std::uint32_t previous = g_state.observed_target_pid.exchange(pid, std::memory_order_acq_rel);
+	g_state.observed_target_creation_time_100ns.store(pid == 0 ? 0 : 1,
+		std::memory_order_release);
+	if (previous != pid)
+		return g_state.target_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+	return g_state.target_epoch.load(std::memory_order_acquire);
+}
+
+inline bool target_binding_current(std::uint32_t pid, std::uint64_t epoch)
+{
+	return pid != 0 && g_state.observed_target_pid.load(std::memory_order_acquire) == pid &&
+		g_state.target_epoch.load(std::memory_order_acquire) == epoch;
+}
+
+inline bool validate_target_binding(std::uint32_t pid, std::uint64_t epoch,
+	std::uint64_t process_creation_time_100ns)
+{
+	return process_creation_time_100ns == 1 && target_binding_current(pid, epoch);
+}
+
 inline bool first_scan(const scan_config_t& config)
 {
 	g_state.config = config;
+	g_state.scan_target_pid = 6420;
+	g_state.scan_target_epoch = observe_target_binding(g_state.scan_target_pid);
 	g_state.scanning.store(true);
 	g_state.scan_progress.store(.25f);
 	std::vector<scan_result_t> results;
@@ -208,3 +232,44 @@ inline void initialize() {}
 inline void shutdown() {}
 inline bool start_pointer_scan(std::uint64_t, int, int, std::uint64_t = 0, std::uint64_t = 0) { return true; }
 inline void cancel_pointer_scan() {}
+
+inline void configure_preview_fixture(aida::preview::fixture_state_t state, std::size_t cardinality)
+{
+	if (state == aida::preview::fixture_state_t::empty ||
+		state == aida::preview::fixture_state_t::disconnected) {
+		reset_scan();
+		g_state.scan_target_pid = 0;
+		g_state.scanning.store(false, std::memory_order_release);
+		return;
+	}
+	scan_config_t config;
+	config.value_type = value_type_t::int32_val;
+	config.value_text = "1337";
+	first_scan(config);
+	const std::size_t bounded = (std::min<std::size_t>)(cardinality, 10000U);
+	if (bounded > g_state.results.size()) {
+		std::lock_guard<std::mutex> lock(g_state.results_mutex);
+		const auto value = parse_value("1337", value_type_t::int32_val, false);
+		g_state.results.reserve(bounded);
+		for (std::size_t index = g_state.results.size(); index < bounded; ++index) {
+			scan_result_t result;
+			result.address = 0x00007FF7A5000000ULL + static_cast<std::uint64_t>(index) * 0x10ULL;
+			result.current_value = value;
+			result.previous_value = value;
+			result.module_name = "sample.exe";
+			result.module_offset = result.address - 0x00007FF7A4C00000ULL;
+			g_state.results.push_back(std::move(result));
+		}
+		g_state.total_found = g_state.results.size();
+	}
+	if (state == aida::preview::fixture_state_t::loading) {
+		g_state.scanning.store(true, std::memory_order_release);
+		g_state.scan_progress.store(0.42f, std::memory_order_release);
+	} else if (state == aida::preview::fixture_state_t::cancellation_requested) {
+		g_state.scanning.store(true, std::memory_order_release);
+		g_state.scan_progress.store(0.68f, std::memory_order_release);
+	} else {
+		g_state.scanning.store(false, std::memory_order_release);
+		g_state.scan_progress.store(1.0f, std::memory_order_release);
+	}
+}

@@ -4,6 +4,7 @@ if(NOT WIN32)
     message(FATAL_ERROR "AiDA C03 package integration is Windows-only")
 endif()
 if(NOT COMMAND aida_c03_require_path_sha256 OR
+   NOT COMMAND aida_c03_require_path_identity OR
    NOT COMMAND aida_c03_reject_forbidden_target_links)
     message(FATAL_ERROR "AiDA C03 package integration requires aida_c03_dependencies.cmake")
 endif()
@@ -154,6 +155,22 @@ function(_aida_c03_package_require_runtime_file path output_name)
         message(FATAL_ERROR "AiDA C03 managed runtime file is a source, package, symbol, or build artifact: ${path}")
     endif()
     set(${output_name} "${_aida_c03_name}" PARENT_SCOPE)
+endfunction()
+
+function(_aida_c03_package_require_framework_assembly path expected_path expected_size expected_sha256 expected_name descriptor output_name)
+    if(NOT IS_ABSOLUTE "${path}" OR NOT IS_ABSOLUTE "${expected_path}")
+        message(FATAL_ERROR "AiDA C03 ${descriptor} source path is not absolute")
+    endif()
+    file(REAL_PATH "${path}" _aida_c03_actual_path)
+    file(REAL_PATH "${expected_path}" _aida_c03_expected_path)
+    string(TOLOWER "${_aida_c03_actual_path}" _aida_c03_actual_path)
+    string(TOLOWER "${_aida_c03_expected_path}" _aida_c03_expected_path)
+    if(NOT _aida_c03_actual_path STREQUAL _aida_c03_expected_path)
+        message(FATAL_ERROR "AiDA C03 ${descriptor} is not the pinned app-local framework artifact")
+    endif()
+    _aida_c03_package_require_filename("${path}" "${expected_name}" "${descriptor}")
+    aida_c03_require_path_identity("${path}" "${expected_size}" "${expected_sha256}" "${descriptor}")
+    set(${output_name} "${expected_name}" PARENT_SCOPE)
 endfunction()
 
 function(_aida_c03_package_require_distinct_paths left right descriptor)
@@ -337,10 +354,11 @@ function(aida_c03_register_native_worker_package)
 endfunction()
 
 function(aida_c03_register_managed_worker_package)
-    cmake_parse_arguments(PARSE_ARGV 0 _aida_c03 "" "APPLICATION_TARGET;BUILD_TARGET;WORKER_EXECUTABLE;PROVIDER_BINARY" "RUNTIME_FILES;DEPENDS")
+    cmake_parse_arguments(PARSE_ARGV 0 _aida_c03 "" "APPLICATION_TARGET;BUILD_TARGET;WORKER_EXECUTABLE;PROVIDER_BINARY" "APPLICATION_FILES;FRAMEWORK_ASSEMBLIES;DEPENDS")
     if(_aida_c03_UNPARSED_ARGUMENTS OR _aida_c03_KEYWORDS_MISSING_VALUES OR
        NOT _aida_c03_APPLICATION_TARGET OR NOT _aida_c03_BUILD_TARGET OR
-       NOT _aida_c03_WORKER_EXECUTABLE OR NOT _aida_c03_PROVIDER_BINARY)
+       NOT _aida_c03_WORKER_EXECUTABLE OR NOT _aida_c03_PROVIDER_BINARY OR
+       NOT _aida_c03_APPLICATION_FILES OR NOT _aida_c03_FRAMEWORK_ASSEMBLIES)
         message(FATAL_ERROR "AiDA C03 managed worker package arguments are incomplete or malformed")
     endif()
     _aida_c03_package_require_target("${_aida_c03_APPLICATION_TARGET}" "managed worker application")
@@ -354,15 +372,27 @@ function(aida_c03_register_managed_worker_package)
     _aida_c03_package_require_distinct_paths("${_aida_c03_WORKER_EXECUTABLE}" "${_aida_c03_PROVIDER_BINARY}" "managed worker/provider")
     _aida_c03_package_require_python(_aida_c03_python)
     _aida_c03_package_find_powershell(_aida_c03_powershell)
-    set(_aida_c03_expected_runtime_names
+    set(_aida_c03_expected_application_names
         "AiDA_ManagedDecompilerWorker.dll"
         "AiDA_ManagedDecompilerWorker.deps.json"
-        "AiDA_ManagedDecompilerWorker.runtimeconfig.json"
+        "AiDA_ManagedDecompilerWorker.runtimeconfig.json")
+    set(_aida_c03_expected_framework_names
         "System.Collections.Immutable.dll"
         "System.Reflection.Metadata.dll")
-    list(LENGTH _aida_c03_RUNTIME_FILES _aida_c03_application_file_count)
-    if(NOT _aida_c03_application_file_count EQUAL 5)
-        message(FATAL_ERROR "AiDA C03 managed application publication must contain the exact five non-apphost runtime files")
+    set(_aida_c03_expected_framework_paths
+        "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE}"
+        "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE}")
+    set(_aida_c03_expected_framework_sizes
+        "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SIZE}"
+        "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SIZE}")
+    set(_aida_c03_expected_framework_hashes
+        "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SHA256}"
+        "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SHA256}")
+    list(LENGTH _aida_c03_APPLICATION_FILES _aida_c03_application_file_count)
+    list(LENGTH _aida_c03_FRAMEWORK_ASSEMBLIES _aida_c03_framework_assembly_count)
+    if(NOT _aida_c03_application_file_count EQUAL 3 OR
+       NOT _aida_c03_framework_assembly_count EQUAL 2)
+        message(FATAL_ERROR "AiDA C03 managed application requires the exact three-file framework-dependent publication and two pinned framework assemblies")
     endif()
     set(_aida_c03_runtime_commands)
     set(_aida_c03_runtime_outputs)
@@ -371,10 +401,10 @@ function(aida_c03_register_managed_worker_package)
         "ICSharpCode.Decompiler.dll"
         "AiDA_ManagedDecompilerWorker.manifest.bin"
         "AiDA_ManagedDecompilerWorker.manifest.sha256")
-    set(_aida_c03_application_index 0)
-    foreach(_aida_c03_runtime_file IN LISTS _aida_c03_RUNTIME_FILES)
+    foreach(_aida_c03_application_index RANGE 0 2)
+        list(GET _aida_c03_APPLICATION_FILES ${_aida_c03_application_index} _aida_c03_runtime_file)
+        list(GET _aida_c03_expected_application_names ${_aida_c03_application_index} _aida_c03_expected_runtime_name)
         _aida_c03_package_require_runtime_file("${_aida_c03_runtime_file}" _aida_c03_runtime_name)
-        list(GET _aida_c03_expected_runtime_names ${_aida_c03_application_index} _aida_c03_expected_runtime_name)
         if(NOT _aida_c03_runtime_name STREQUAL _aida_c03_expected_runtime_name)
             message(FATAL_ERROR "AiDA C03 managed application publication is incomplete or reordered: ${_aida_c03_runtime_name}")
         endif()
@@ -393,7 +423,30 @@ function(aida_c03_register_managed_worker_package)
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "${_aida_c03_runtime_file}"
                 "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/${_aida_c03_runtime_name}")
-        math(EXPR _aida_c03_application_index "${_aida_c03_application_index} + 1")
+    endforeach()
+    foreach(_aida_c03_framework_index RANGE 0 1)
+        list(GET _aida_c03_FRAMEWORK_ASSEMBLIES ${_aida_c03_framework_index} _aida_c03_runtime_file)
+        list(GET _aida_c03_expected_framework_paths ${_aida_c03_framework_index} _aida_c03_expected_framework_path)
+        list(GET _aida_c03_expected_framework_sizes ${_aida_c03_framework_index} _aida_c03_expected_framework_size)
+        list(GET _aida_c03_expected_framework_hashes ${_aida_c03_framework_index} _aida_c03_expected_framework_hash)
+        list(GET _aida_c03_expected_framework_names ${_aida_c03_framework_index} _aida_c03_expected_runtime_name)
+        _aida_c03_package_require_framework_assembly(
+            "${_aida_c03_runtime_file}"
+            "${_aida_c03_expected_framework_path}"
+            "${_aida_c03_expected_framework_size}"
+            "${_aida_c03_expected_framework_hash}"
+            "${_aida_c03_expected_runtime_name}"
+            "managed ${_aida_c03_expected_runtime_name} framework source"
+            _aida_c03_runtime_name)
+        if(_aida_c03_runtime_name IN_LIST _aida_c03_runtime_names)
+            message(FATAL_ERROR "AiDA C03 managed runtime destination is duplicated: ${_aida_c03_runtime_name}")
+        endif()
+        list(APPEND _aida_c03_runtime_names "${_aida_c03_runtime_name}")
+        list(APPEND _aida_c03_runtime_outputs "deps/${_aida_c03_runtime_name}")
+        list(APPEND _aida_c03_runtime_commands
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${_aida_c03_runtime_file}"
+                "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/${_aida_c03_runtime_name}")
     endforeach()
     file(GLOB _aida_c03_framework_runtime_files CONFIGURE_DEPENDS LIST_DIRECTORIES false
         "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/shared/Microsoft.NETCore.App/${AIDA_C03_MANAGED_RUNTIME_VERSION}/*")
@@ -501,14 +554,287 @@ function(aida_c03_register_managed_worker_package)
         FOLDER "Packaging/C03"
         AIDA_C03_PACKAGE_ROLE "managed-cli-decompiler-worker-manifest-v3"
         AIDA_C03_PACKAGE_OUTPUTS "${_aida_c03_outputs}"
-        AIDA_C03_OFFLINE_RESTORE "locked-mode;local-source-only;no-machine-install"
+        AIDA_C03_OFFLINE_RESTORE "locked-mode;local-source-only;net10.0-only;no-rid-package-restore;no-machine-install"
+        AIDA_C03_APPHOST_SOURCE "${AIDA_C03_MANAGED_APPHOST_SOURCE}"
+        AIDA_C03_APPHOST_SOURCE_SHA256 "${AIDA_C03_MANAGED_APPHOST_SOURCE_SHA256}"
+        AIDA_C03_MANAGED_APPLICATION_PUBLICATION "framework-dependent;exact-three-publish-files;exact-two-framework-sourced-dependencies"
+        AIDA_C03_FRAMEWORK_DEPENDENCY_SOURCES "System.Collections.Immutable.dll=${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SHA256};System.Reflection.Metadata.dll=${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SHA256}"
         AIDA_C03_APP_LOCAL_RUNTIME "Microsoft.NETCore.App-${AIDA_C03_MANAGED_RUNTIME_VERSION};${AIDA_C03_MANAGED_RUNTIME_TFM};win-x64;exact-193-file-inventory"
         AIDA_C03_CUSTOMER_SDK_SHIPMENT "forbidden"
-        AIDA_C03_FINAL_BYTE_ORDERING "offline-build;finalizers;copy-application;protect;direct-protector-verify;offline-wintrust-receipts;materialize-app-local-runtime;verify-runtime;manifest-v3;verify;appcontainer-acl;acl-receipt;verify-acl")
+        AIDA_C03_FINAL_BYTE_ORDERING "offline-build;finalizers;copy-framework-dependent-application;copy-pinned-framework-dependencies;protect;direct-protector-verify;offline-wintrust-receipts;materialize-app-local-runtime;verify-runtime;manifest-v3;verify;appcontainer-acl;acl-receipt;verify-acl")
     add_dependencies("${_aida_c03_APPLICATION_TARGET}" ${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET})
     set_property(TARGET "${_aida_c03_APPLICATION_TARGET}" PROPERTY
         AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET "${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET}")
     set(AIDA_C03_MANAGED_WORKER_PACKAGE_OUTPUTS "${_aida_c03_outputs}" PARENT_SCOPE)
+endfunction()
+
+function(aida_c03_register_safe_headless_worker_runtime)
+    cmake_parse_arguments(PARSE_ARGV 0 _aida_c03 ""
+        "TARGET;RUNTIME_ROOT;SPEC_TARGET;GENERATOR_TARGET;APPROVED_INPUT_ROOT;NATIVE_WORKER_TARGET;MANAGED_BUILD_TARGET;MANAGED_WORKER_EXECUTABLE;MANAGED_PROVIDER_BINARY"
+        "SPEC_FILES;MANAGED_APPLICATION_FILES;MANAGED_FRAMEWORK_ASSEMBLIES")
+    if(_aida_c03_UNPARSED_ARGUMENTS OR _aida_c03_KEYWORDS_MISSING_VALUES OR
+       NOT _aida_c03_TARGET OR NOT _aida_c03_RUNTIME_ROOT OR
+       NOT _aida_c03_SPEC_TARGET OR NOT _aida_c03_GENERATOR_TARGET OR
+       NOT _aida_c03_APPROVED_INPUT_ROOT OR NOT _aida_c03_NATIVE_WORKER_TARGET OR
+       NOT _aida_c03_MANAGED_BUILD_TARGET OR NOT _aida_c03_MANAGED_WORKER_EXECUTABLE OR
+       NOT _aida_c03_MANAGED_PROVIDER_BINARY OR NOT _aida_c03_SPEC_FILES OR
+       NOT _aida_c03_MANAGED_APPLICATION_FILES OR NOT _aida_c03_MANAGED_FRAMEWORK_ASSEMBLIES)
+        message(FATAL_ERROR "AiDA C03 safe-headless worker runtime arguments are incomplete or malformed")
+    endif()
+    if(TARGET "${_aida_c03_TARGET}" OR
+       NOT _aida_c03_TARGET MATCHES "^aida_c03_[a-z0-9_]+$")
+        message(FATAL_ERROR "AiDA C03 safe-headless worker runtime target is invalid or duplicated")
+    endif()
+    if(NOT IS_ABSOLUTE "${_aida_c03_RUNTIME_ROOT}" OR
+       _aida_c03_RUNTIME_ROOT MATCHES "(^|[/\\\\])\\.\\.([/\\\\]|$)")
+        message(FATAL_ERROR "AiDA C03 safe-headless worker runtime root is invalid")
+    endif()
+    set(_aida_c03_forbidden_safe_headless_targets
+        AiDAStandalone
+        aida_camoufox_reverse_mcp_exe
+        aida_c03_signing_authority_blocker
+        aida_c03_distribution_manifest
+        aida_c03_standalone_security_receipts
+        "${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET}"
+        "${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET}"
+        "${AIDA_C03_ANALYSIS_PYTHON_WORKER_PACKAGE_TARGET}"
+        "${AIDA_C03_CUSTOMER_NOTICE_PACKAGE_TARGET}")
+    foreach(_aida_c03_required_target IN ITEMS
+            "${_aida_c03_SPEC_TARGET}"
+            "${_aida_c03_GENERATOR_TARGET}"
+            "${_aida_c03_NATIVE_WORKER_TARGET}"
+            "${_aida_c03_MANAGED_BUILD_TARGET}")
+        if(_aida_c03_required_target IN_LIST _aida_c03_forbidden_safe_headless_targets OR
+           _aida_c03_required_target MATCHES "(^|_)camoufox(_|$)" OR
+           _aida_c03_required_target MATCHES "(^|_)(signing|distribution|customer)(_.*)?$")
+            message(FATAL_ERROR "AiDA C03 safe-headless worker runtime cannot depend on production packaging target: ${_aida_c03_required_target}")
+        endif()
+        _aida_c03_package_require_target(
+            "${_aida_c03_required_target}"
+            "safe-headless worker runtime dependency")
+    endforeach()
+    if(NOT IS_ABSOLUTE "${_aida_c03_APPROVED_INPUT_ROOT}" OR
+       _aida_c03_APPROVED_INPUT_ROOT MATCHES "(^|[/\\\\])\\.\\.([/\\\\]|$)")
+        message(FATAL_ERROR "AiDA C03 safe-headless Ghidra input root is invalid")
+    endif()
+    _aida_c03_package_require_filename(
+        "${_aida_c03_MANAGED_WORKER_EXECUTABLE}"
+        "AiDA_ManagedDecompilerWorker.exe"
+        "safe-headless managed worker")
+    _aida_c03_package_require_filename(
+        "${_aida_c03_MANAGED_PROVIDER_BINARY}"
+        "ICSharpCode.Decompiler.dll"
+        "safe-headless managed provider")
+    _aida_c03_package_require_distinct_paths(
+        "${_aida_c03_MANAGED_WORKER_EXECUTABLE}"
+        "${_aida_c03_MANAGED_PROVIDER_BINARY}"
+        "safe-headless managed worker/provider")
+    _aida_c03_package_require_python(_aida_c03_python)
+
+    list(LENGTH _aida_c03_SPEC_FILES _aida_c03_spec_count)
+    if(NOT _aida_c03_spec_count EQUAL AIDA_C03_GHIDRA_SPEC_FILE_COUNT)
+        message(FATAL_ERROR "AiDA C03 safe-headless Ghidra runtime must receive the exact 51-file inventory")
+    endif()
+    file(READ "${AIDA_C03_GHIDRA_SPEC_SOURCE_SPEC}" _aida_c03_ghidra_source_json)
+    set(_aida_c03_seen_spec_names)
+    set(_aida_c03_spec_input_arguments)
+    math(EXPR _aida_c03_spec_last "${_aida_c03_spec_count} - 1")
+    foreach(_aida_c03_index RANGE 0 ${_aida_c03_spec_last})
+        list(GET _aida_c03_SPEC_FILES ${_aida_c03_index} _aida_c03_spec_file)
+        get_filename_component(_aida_c03_spec_name "${_aida_c03_spec_file}" NAME)
+        string(JSON _aida_c03_expected_name GET
+            "${_aida_c03_ghidra_source_json}" specifications ${_aida_c03_index} name)
+        if(NOT _aida_c03_spec_name STREQUAL _aida_c03_expected_name OR
+           _aida_c03_spec_name IN_LIST _aida_c03_seen_spec_names)
+            message(FATAL_ERROR "AiDA C03 safe-headless Ghidra input is missing, reordered, or duplicated: ${_aida_c03_spec_name}")
+        endif()
+        list(APPEND _aida_c03_seen_spec_names "${_aida_c03_spec_name}")
+        list(APPEND _aida_c03_spec_input_arguments --input "${_aida_c03_spec_file}")
+    endforeach()
+
+    set(_aida_c03_expected_application_names
+        "AiDA_ManagedDecompilerWorker.dll"
+        "AiDA_ManagedDecompilerWorker.deps.json"
+        "AiDA_ManagedDecompilerWorker.runtimeconfig.json")
+    set(_aida_c03_expected_framework_names
+        "System.Collections.Immutable.dll"
+        "System.Reflection.Metadata.dll")
+    set(_aida_c03_expected_framework_paths
+        "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE}"
+        "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE}")
+    set(_aida_c03_expected_framework_sizes
+        "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SIZE}"
+        "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SIZE}")
+    set(_aida_c03_expected_framework_hashes
+        "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SHA256}"
+        "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SHA256}")
+    list(LENGTH _aida_c03_MANAGED_APPLICATION_FILES _aida_c03_application_file_count)
+    list(LENGTH _aida_c03_MANAGED_FRAMEWORK_ASSEMBLIES _aida_c03_framework_assembly_count)
+    if(NOT _aida_c03_application_file_count EQUAL 3 OR
+       NOT _aida_c03_framework_assembly_count EQUAL 2)
+        message(FATAL_ERROR "AiDA C03 safe-headless managed runtime requires the exact three-file framework-dependent publication and two pinned framework assemblies")
+    endif()
+    set(_aida_c03_runtime_copy_commands)
+    set(_aida_c03_runtime_names)
+    foreach(_aida_c03_index RANGE 0 2)
+        list(GET _aida_c03_MANAGED_APPLICATION_FILES ${_aida_c03_index} _aida_c03_runtime_file)
+        list(GET _aida_c03_expected_application_names ${_aida_c03_index} _aida_c03_expected_runtime_name)
+        _aida_c03_package_require_runtime_file(
+            "${_aida_c03_runtime_file}" _aida_c03_runtime_name)
+        if(NOT _aida_c03_runtime_name STREQUAL _aida_c03_expected_runtime_name OR
+           _aida_c03_runtime_name IN_LIST _aida_c03_runtime_names)
+            message(FATAL_ERROR "AiDA C03 safe-headless managed publication is incomplete, reordered, or duplicated: ${_aida_c03_runtime_name}")
+        endif()
+        list(APPEND _aida_c03_runtime_names "${_aida_c03_runtime_name}")
+        list(APPEND _aida_c03_runtime_copy_commands
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${_aida_c03_runtime_file}"
+                "${_aida_c03_RUNTIME_ROOT}/deps/${_aida_c03_runtime_name}")
+    endforeach()
+    foreach(_aida_c03_index RANGE 0 1)
+        list(GET _aida_c03_MANAGED_FRAMEWORK_ASSEMBLIES ${_aida_c03_index} _aida_c03_runtime_file)
+        list(GET _aida_c03_expected_framework_paths ${_aida_c03_index} _aida_c03_expected_framework_path)
+        list(GET _aida_c03_expected_framework_sizes ${_aida_c03_index} _aida_c03_expected_framework_size)
+        list(GET _aida_c03_expected_framework_hashes ${_aida_c03_index} _aida_c03_expected_framework_hash)
+        list(GET _aida_c03_expected_framework_names ${_aida_c03_index} _aida_c03_expected_runtime_name)
+        _aida_c03_package_require_framework_assembly(
+            "${_aida_c03_runtime_file}"
+            "${_aida_c03_expected_framework_path}"
+            "${_aida_c03_expected_framework_size}"
+            "${_aida_c03_expected_framework_hash}"
+            "${_aida_c03_expected_runtime_name}"
+            "safe-headless ${_aida_c03_expected_runtime_name} framework source"
+            _aida_c03_runtime_name)
+        if(_aida_c03_runtime_name IN_LIST _aida_c03_runtime_names)
+            message(FATAL_ERROR "AiDA C03 safe-headless managed runtime destination is duplicated: ${_aida_c03_runtime_name}")
+        endif()
+        list(APPEND _aida_c03_runtime_names "${_aida_c03_runtime_name}")
+        list(APPEND _aida_c03_runtime_copy_commands
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${_aida_c03_runtime_file}"
+                "${_aida_c03_RUNTIME_ROOT}/deps/${_aida_c03_runtime_name}")
+    endforeach()
+
+    file(GLOB _aida_c03_framework_runtime_files CONFIGURE_DEPENDS LIST_DIRECTORIES false
+        "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/shared/Microsoft.NETCore.App/${AIDA_C03_MANAGED_RUNTIME_VERSION}/*")
+    list(LENGTH _aida_c03_framework_runtime_files _aida_c03_framework_runtime_count)
+    if(NOT _aida_c03_framework_runtime_count EQUAL 189)
+        message(FATAL_ERROR "AiDA C03 safe-headless app-local Microsoft.NETCore.App 10.0.9 inventory is incomplete")
+    endif()
+    set(_aida_c03_managed_runtime_sources
+        "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/dotnet.exe"
+        "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/LICENSE.txt"
+        "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/ThirdPartyNotices.txt"
+        "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/host/fxr/${AIDA_C03_MANAGED_RUNTIME_VERSION}/hostfxr.dll"
+        ${_aida_c03_framework_runtime_files})
+    list(LENGTH _aida_c03_managed_runtime_sources _aida_c03_managed_runtime_source_count)
+    if(NOT _aida_c03_managed_runtime_source_count EQUAL AIDA_C03_MANAGED_RUNTIME_SOURCE_FILE_COUNT)
+        message(FATAL_ERROR "AiDA C03 safe-headless app-local managed runtime source inventory is invalid")
+    endif()
+
+    add_custom_target(${_aida_c03_TARGET}
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_aida_c03_RUNTIME_ROOT}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${_aida_c03_RUNTIME_ROOT}/deps"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_GHIDRA_SPEC_MATERIALIZER}"
+            --repository-root "${AIDA_C03_DEPENDENCY_ROOT}"
+            --package-root "${_aida_c03_RUNTIME_ROOT}"
+            --contract "${AIDA_C03_GHIDRA_SPEC_SOURCE_SPEC}"
+            --approved-input-root "${_aida_c03_APPROVED_INPUT_ROOT}"
+            --approved-generator-root "$<TARGET_FILE_DIR:${_aida_c03_GENERATOR_TARGET}>"
+            --generator "$<TARGET_FILE:${_aida_c03_GENERATOR_TARGET}>"
+            ${_aida_c03_spec_input_arguments}
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_GHIDRA_SPEC_MATERIALIZER}"
+            --repository-root "${AIDA_C03_DEPENDENCY_ROOT}"
+            --package-root "${_aida_c03_RUNTIME_ROOT}"
+            --contract "${AIDA_C03_GHIDRA_SPEC_SOURCE_SPEC}"
+            --approved-input-root "${_aida_c03_APPROVED_INPUT_ROOT}"
+            --approved-generator-root "$<TARGET_FILE_DIR:${_aida_c03_GENERATOR_TARGET}>"
+            --generator "$<TARGET_FILE:${_aida_c03_GENERATOR_TARGET}>"
+            ${_aida_c03_spec_input_arguments}
+            --verify-only
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "$<TARGET_FILE:${_aida_c03_NATIVE_WORKER_TARGET}>"
+            "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_NativeDecompilerWorker.exe"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER}"
+            --contract "${AIDA_C03_NATIVE_WORKER_MANIFEST_CONTRACT}"
+            --package-root "${_aida_c03_RUNTIME_ROOT}"
+            --worker "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_NativeDecompilerWorker.exe"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER}"
+            --contract "${AIDA_C03_NATIVE_WORKER_MANIFEST_CONTRACT}"
+            --package-root "${_aida_c03_RUNTIME_ROOT}"
+            --worker "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_NativeDecompilerWorker.exe"
+            --verify-only
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${_aida_c03_MANAGED_WORKER_EXECUTABLE}"
+            "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_ManagedDecompilerWorker.exe"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${_aida_c03_MANAGED_PROVIDER_BINARY}"
+            "${_aida_c03_RUNTIME_ROOT}/deps/ICSharpCode.Decompiler.dll"
+        ${_aida_c03_runtime_copy_commands}
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}"
+            --repository-root "${AIDA_C03_DEPENDENCY_ROOT}"
+            --package-root "${_aida_c03_RUNTIME_ROOT}"
+            --contract "${AIDA_C03_MANAGED_RUNTIME_SOURCE_SPEC}"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}"
+            --repository-root "${AIDA_C03_DEPENDENCY_ROOT}"
+            --package-root "${_aida_c03_RUNTIME_ROOT}"
+            --contract "${AIDA_C03_MANAGED_RUNTIME_SOURCE_SPEC}"
+            --verify-only
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER}"
+            --contract "${AIDA_C03_MANAGED_WORKER_MANIFEST_CONTRACT}"
+            --package-root "${_aida_c03_RUNTIME_ROOT}"
+            --worker "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_ManagedDecompilerWorker.exe"
+            --provider "${_aida_c03_RUNTIME_ROOT}/deps/ICSharpCode.Decompiler.dll"
+            --runtime-manifest "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_ManagedRuntime.manifest.json"
+            --runtime-manifest-digest "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_ManagedRuntime.manifest.sha256"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER}"
+            --contract "${AIDA_C03_MANAGED_WORKER_MANIFEST_CONTRACT}"
+            --package-root "${_aida_c03_RUNTIME_ROOT}"
+            --worker "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_ManagedDecompilerWorker.exe"
+            --provider "${_aida_c03_RUNTIME_ROOT}/deps/ICSharpCode.Decompiler.dll"
+            --runtime-manifest "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_ManagedRuntime.manifest.json"
+            --runtime-manifest-digest "${_aida_c03_RUNTIME_ROOT}/deps/AiDA_ManagedRuntime.manifest.sha256"
+            --verify-only
+        DEPENDS
+            "${_aida_c03_SPEC_TARGET}"
+            "${_aida_c03_GENERATOR_TARGET}"
+            "${_aida_c03_NATIVE_WORKER_TARGET}"
+            "${_aida_c03_MANAGED_BUILD_TARGET}"
+            ${_aida_c03_SPEC_FILES}
+            "${AIDA_C03_GHIDRA_SPEC_SOURCE_SPEC}"
+            "${AIDA_C03_GHIDRA_SPEC_SOURCE_SCHEMA}"
+            "${AIDA_C03_GHIDRA_SPEC_MANIFEST_SCHEMA}"
+            "${AIDA_C03_GHIDRA_SPEC_MATERIALIZER}"
+            "${AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER}"
+            "${AIDA_C03_NATIVE_WORKER_MANIFEST_CONTRACT}"
+            "${AIDA_C03_NATIVE_WORKER_MANIFEST_SCHEMA}"
+            "${AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER}"
+            "${AIDA_C03_MANAGED_WORKER_MANIFEST_CONTRACT}"
+            "${AIDA_C03_MANAGED_WORKER_MANIFEST_SCHEMA}"
+            "${AIDA_C03_MANAGED_WORKER_PACKAGES_LOCK}"
+            "${AIDA_C03_MANAGED_RUNTIME_SOURCE_SPEC}"
+            "${AIDA_C03_MANAGED_RUNTIME_SOURCE_SCHEMA}"
+            "${AIDA_C03_MANAGED_RUNTIME_MANIFEST_SCHEMA}"
+            "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}"
+            ${_aida_c03_managed_runtime_sources}
+        COMMAND_EXPAND_LISTS
+        VERBATIM)
+    set_target_properties(${_aida_c03_TARGET} PROPERTIES
+        FOLDER "Tests/C03/SafeHeadless/Runtime"
+        AIDA_C03_PACKAGE_ROLE "safe-headless-worker-runtime-v1"
+        AIDA_C03_SAFE_HEADLESS TRUE
+        AIDA_C03_DEVELOPER_ONLY TRUE
+        AIDA_C03_CUSTOMER_PAYLOAD_FORBIDDEN TRUE
+        AIDA_C03_APPLICATION_DEPENDENCY_FORBIDDEN TRUE
+        AIDA_C03_SIGNING_DEPENDENCY_FORBIDDEN TRUE
+        AIDA_C03_CAMOUFOX_DEPENDENCY_FORBIDDEN TRUE
+        AIDA_C03_NETWORK_FETCH "forbidden"
+        AIDA_C03_OFFLINE_RESTORE "locked-mode;local-source-only;net10.0-only;no-rid-package-restore;no-machine-install"
+        AIDA_C03_APPHOST_SOURCE "${AIDA_C03_MANAGED_APPHOST_SOURCE}"
+        AIDA_C03_APPHOST_SOURCE_SHA256 "${AIDA_C03_MANAGED_APPHOST_SOURCE_SHA256}"
+        AIDA_C03_MANAGED_APPLICATION_PUBLICATION "framework-dependent;exact-three-publish-files;exact-two-framework-sourced-dependencies"
+        AIDA_C03_FRAMEWORK_DEPENDENCY_SOURCES "System.Collections.Immutable.dll=${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SHA256};System.Reflection.Metadata.dll=${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SHA256}"
+        AIDA_C03_RUNTIME_ROOT "${_aida_c03_RUNTIME_ROOT}")
 endfunction()
 
 function(aida_c03_register_analysis_python_worker_package)

@@ -3,7 +3,9 @@
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 #include "re_hubs_preview_adapter.hpp"
+#include "preview_fixture_controls.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -195,6 +197,44 @@ inline void ensure_preview_fixture() {
 		static_cast<unsigned long long>(g_state.current.base_address));
 	std::snprintf(g_state.name_input, sizeof(g_state.name_input), "%s", g_state.current.name.c_str());
 	std::snprintf(g_state.size_input, sizeof(g_state.size_input), "%d", g_state.current.total_size);
+}
+
+inline void configure_preview_fixture(aida::preview::fixture_state_t state,
+	std::size_t cardinality) {
+	std::lock_guard<std::mutex> lock(g_state.mutex);
+	if (state == aida::preview::fixture_state_t::empty ||
+		state == aida::preview::fixture_state_t::disconnected) {
+		g_state.current = {};
+		g_state.active = false;
+		publish_current_locked();
+		return;
+	}
+	g_state.current = preview_structure(0x0000000140005000ULL, 0x80,
+		"RuntimeImageContext");
+	const std::size_t bounded = (std::min<std::size_t>)(cardinality, 4096U);
+	if (bounded > g_state.current.fields.size()) {
+		g_state.current.fields.reserve(bounded);
+		for (std::size_t index = g_state.current.fields.size(); index < bounded; ++index) {
+			struct_field_t field;
+			field.offset = static_cast<std::uint64_t>(index * 8U);
+			field.size = 8;
+			field.type = field_type_t::uint64;
+			field.name = "field_" + std::to_string(index);
+			field.comment = "Deterministic recovered field";
+			field.type_confidence = 80.0f + static_cast<float>(index % 20U);
+			field.value_history.push(g_state.current.base_address + field.offset);
+			g_state.current.fields.push_back(std::move(field));
+		}
+		g_state.current.total_size = static_cast<int>(bounded * 8U);
+	}
+	g_state.active = true;
+	g_state.monitoring.store(state == aida::preview::fixture_state_t::loading,
+		std::memory_order_release);
+	g_state.cancel.store(state == aida::preview::fixture_state_t::cancellation_requested,
+		std::memory_order_release);
+	g_state.progress.store(state == aida::preview::fixture_state_t::loading ? 0.46f : 1.0f,
+		std::memory_order_release);
+	publish_current_locked();
 }
 
 inline void reconstruct_from_snapshot(uint64_t base, int size, const std::string& name) {

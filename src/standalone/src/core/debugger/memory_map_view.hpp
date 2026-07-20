@@ -31,6 +31,7 @@
 #include "../ui/design_system.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/debugger_preview_runtime.hpp"
+#include "../../preview/studio_semantics.hpp"
 #endif
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/executor.hpp"
@@ -60,11 +61,18 @@
 
 namespace memory_map_view {
 
-struct stat_counter_t {
-	float displayed = 0.f;
-	float velocity  = 0.f;
-	float target    = 0.f;
-};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline std::string studio_memory_region_id(const char* entity,
+	const debugger_engine::memory_region_t& region) {
+	const std::string identity = std::to_string(driver_bridge::attached_pid()) + ":" +
+		std::to_string(region.base) + ":" + std::to_string(region.size) + ":" +
+		region.module_name;
+	std::string source(entity);
+	source.push_back('-');
+	source.append(aida::preview::semantics::entity_token(identity));
+	return aida::preview::semantics::stable_id("aida.memory", source);
+}
+#endif
 
 struct hero_segment_t {
 	uint64_t base = 0;
@@ -103,10 +111,6 @@ struct ui_state_t {
 	int                                        change_protect_choice = 0;
 	uint32_t                                   change_protect_old = 0;
 	debugger_interaction::context_t            change_protect_context;
-	stat_counter_t                             stat_regions;
-	stat_counter_t                             stat_committed;
-	stat_counter_t                             stat_rwx;
-	stat_counter_t                             stat_attached;
 	int                                        hovered_segment = -1;
 	int                                        selected_segment = -1;
 	float                                      hero_scroll_target = 0.f;
@@ -331,21 +335,8 @@ inline bool match_filter(const debugger_engine::memory_region_t& r, const char* 
 	return false;
 }
 
-inline void tween_counter(stat_counter_t& c, float target, float dt)
+inline void format_counter(char* buf, size_t bufsz, float value, bool is_size)
 {
-	c.target = target;
-	c.displayed = aida::motion::critically_damped_step(c.displayed, c.target,
-		c.velocity, 0.20f, dt);
-}
-
-inline void format_counter(char* buf, size_t bufsz, float value, bool is_size, bool is_pid)
-{
-	if (is_pid) {
-		int v = static_cast<int>(value + 0.5f);
-		if (v <= 0) std::snprintf(buf, bufsz, "—");
-		else        std::snprintf(buf, bufsz, "%d", v);
-		return;
-	}
 	if (!is_size) {
 		std::snprintf(buf, bufsz, "%d", static_cast<int>(value + 0.5f));
 		return;
@@ -462,10 +453,30 @@ inline void render_hero_map(ImDrawList* dl, float x, float y, float w, float h,
 
 	dl->PushClipRect(ImVec2(strip_x0, strip_y0), ImVec2(strip_x1, strip_y1), true);
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	int last_semantic_slot = -1;
+	const int semantic_slot_count = (std::max)(1,
+		(std::min)(2048, static_cast<int>(std::ceil(strip_w))));
+#endif
 	for (size_t i = 0; i < segs.size(); ++i) {
 		auto& s = segs[i];
 		ImU32 col = detail::segment_color(s.protect, s.state, t, alpha);
 		float seg_w = s.width < 1.f ? 1.f : s.width;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const auto& region = regions[static_cast<std::size_t>(s.region_index)];
+		const std::string segment_id = studio_memory_region_id(
+			"map-segment", region);
+		const int semantic_slot = (std::clamp)(static_cast<int>(
+			((s.start_x - strip_x0) / (std::max)(strip_w, 1.f)) *
+			static_cast<float>(semantic_slot_count)), 0, semantic_slot_count - 1);
+		if (semantic_slot != last_semantic_slot) {
+			last_semantic_slot = semantic_slot;
+			aida::preview::semantics::register_region(segment_id, "memory-map-segment",
+				ImGui::GetID(segment_id.c_str()), ImVec2(s.start_x, strip_y0 + 1.f),
+				ImVec2(s.start_x + seg_w, strip_y1 - 1.f), true, false,
+				"aida.dock-window.view.debug.memory-map");
+		}
+#endif
 		dl->AddRectFilled(ImVec2(s.start_x, strip_y0 + 1.f),
 		                  ImVec2(s.start_x + seg_w, strip_y1 - 1.f),
 		                  col);
@@ -514,10 +525,21 @@ inline void render_hero_map(ImDrawList* dl, float x, float y, float w, float h,
 
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
-	int ticks = 6;
 	uint64_t low_va = segs.empty() ? 0 : segs.front().base;
 	uint64_t high_va = segs.empty() ? 0
 		: segs.back().base + segs.back().size;
+	const float fs_tick = aida::ui::components::detail::ui_fs() * 0.85f;
+	char low_tick[20];
+	char high_tick[20];
+	std::snprintf(low_tick, sizeof(low_tick), "%012" PRIX64, low_va);
+	std::snprintf(high_tick, sizeof(high_tick), "%012" PRIX64, high_va);
+	const float tick_label_width = (std::max)(
+		code_font->CalcTextSizeA(fs_tick, FLT_MAX, 0.f, low_tick).x,
+		code_font->CalcTextSizeA(fs_tick, FLT_MAX, 0.f, high_tick).x);
+	const float minimum_tick_stride = tick_label_width + 20.f;
+	const int tick_capacity = 1 + static_cast<int>(strip_w /
+		(std::max)(minimum_tick_stride, 1.f));
+	const int ticks = w < 640.f ? 2 : (std::clamp)(tick_capacity, 2, 6);
 	for (int ti = 0; ti < ticks; ++ti) {
 		float frac = static_cast<float>(ti) / static_cast<float>(ticks - 1);
 		float tx = strip_x0 + frac * strip_w;
@@ -526,7 +548,6 @@ inline void render_hero_map(ImDrawList* dl, float x, float y, float w, float h,
 		uint64_t va = low_va + static_cast<uint64_t>(static_cast<double>(high_va - low_va) * frac);
 		char buf[20];
 		std::snprintf(buf, sizeof(buf), "%012" PRIX64, va);
-		const float fs_tick = aida::ui::components::detail::ui_fs() * 0.85f;
 		ImVec2 sz = code_font->CalcTextSizeA(fs_tick, FLT_MAX, 0.f, buf);
 		float tlx = tx - sz.x * 0.5f;
 		if (tlx < strip_x0) tlx = strip_x0;
@@ -600,10 +621,12 @@ inline void render_stat_pod(ImDrawList* dl, float x, float y, float w, float h,
 	if (!val_font) val_font = ImGui::GetFont();
 
 	const float fs_pod_base = aida::ui::components::detail::ui_fs();
+	dl->PushClipRect(ImVec2(x + 4.f, y), ImVec2(x + w - 4.f, y + h), true);
 	dl->AddText(lab_font, fs_pod_base * 0.88f, ImVec2(x + 12.f, y + 6.f),
 	            aida::ui::with_alpha(t.text_dim, alpha), label);
 	dl->AddText(val_font, fs_pod_base * 1.18f, ImVec2(x + 12.f, y + 28.f),
 	            aida::ui::with_alpha(t.text_primary, alpha), value);
+	dl->PopClipRect();
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
@@ -633,15 +656,27 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height),
 	                  aida::ui::with_alpha(t.bg_base, alpha));
 
-	float toolbar_h = 48.f;
-	float hero_h    = 240.f;
-	float strip_h   = 70.f;
-	float col_header_h = 30.f;
+	const float toolbar_h = 48.f;
+	const float col_header_h = 30.f;
+	const float stats_gap = 6.f;
+	const bool narrow_stats = width < 360.f;
+	const int stats_columns = narrow_stats ? 2 : 4;
+	const int stats_rows = narrow_stats ? 2 : 1;
+	const float stat_pod_h = narrow_stats ? 58.f : 70.f;
+	const float stats_h = stat_pod_h * static_cast<float>(stats_rows) +
+		stats_gap * static_cast<float>(stats_rows - 1);
 
-	float toolbar_y = pos_y + 8.f;
-	float hero_y    = toolbar_y + toolbar_h + 8.f;
-	float strip_y   = hero_y + hero_h + 10.f;
-	float table_y   = strip_y + strip_h + 6.f;
+	const float toolbar_y = pos_y + 8.f;
+	const float hero_y = toolbar_y + toolbar_h + 8.f;
+	const float minimum_table_body_h = 96.f;
+	const bool show_hero = height >= toolbar_h + stats_h + col_header_h +
+		minimum_table_body_h + 96.f;
+	const float desired_hero_h = narrow_stats
+		? (std::clamp)(height * 0.28f, 120.f, 180.f)
+		: (std::clamp)(height * 0.36f, 160.f, 240.f);
+	const float hero_h = show_hero ? desired_hero_h : 0.f;
+	const float strip_y = show_hero ? hero_y + hero_h + 10.f : hero_y;
+	const float table_y = strip_y + stats_h + 6.f;
 
 	{
 		float tbx = pos_x + 12.f;
@@ -662,19 +697,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		else
 			std::snprintf(sub, sizeof(sub), "Not attached");
 		ImVec2 hs = h2->CalcTextSizeA(fs_mm_title, FLT_MAX, 0.f, "Memory Map");
-		dl->AddText(cf, fs_mm_sub,
-			ImVec2(tbx + hs.x + 12.f, toolbar_y + (toolbar_h - fs_mm_sub) * 0.5f + 2.f),
-			aida::ui::with_alpha(t.text_dim, alpha), sub);
+		const bool show_process_subtitle = width >= 560.f;
+		if (show_process_subtitle) {
+			dl->AddText(cf, fs_mm_sub,
+				ImVec2(tbx + hs.x + 12.f, toolbar_y + (toolbar_h - fs_mm_sub) * 0.5f + 2.f),
+				aida::ui::with_alpha(t.text_dim, alpha), sub);
+		}
 
 		float btn_w = 120.f;
 		float min_filter_w = 100.f;
-		float reserved_left = (hs.x + 12.f) + 200.f;
+		float reserved_left = hs.x + 24.f + (show_process_subtitle ? 200.f : 0.f);
 		float available_right = width - reserved_left - 24.f;
-		bool collapse_refresh = (available_right < (btn_w + min_filter_w + 12.f));
+		bool collapse_refresh = available_right < btn_w + min_filter_w + 12.f;
 		float effective_btn_w = collapse_refresh ? 64.f : btn_w;
-		float fw = std::max(min_filter_w,
-			std::min(260.f, available_right - effective_btn_w - 12.f));
-		if (fw < min_filter_w) fw = min_filter_w;
+		const bool show_filter = available_right >= effective_btn_w + min_filter_w + 12.f;
+		float fw = show_filter
+			? (std::max)(min_filter_w,
+				(std::min)(260.f, available_right - effective_btn_w - 12.f))
+			: 0.f;
 
 		ImGui::SetCursorScreenPos(ImVec2(pos_x + width - effective_btn_w - 12.f, toolbar_y + 4.f));
 		bool refreshing = g_ui.refreshing.load();
@@ -691,11 +731,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (clicked && !refreshing)
 			refresh();
 
-		float fx = pos_x + width - effective_btn_w - fw - 24.f;
-		ImGui::SetCursorScreenPos(ImVec2(fx, toolbar_y + 6.f));
-		aida::ui::components::input_text("##memmap_filter", g_ui.filter_buf,
-			sizeof(g_ui.filter_buf), "Filter modules or info...",
-			false, ImVec2(fw, 28.f));
+		if (show_filter) {
+			float fx = pos_x + width - effective_btn_w - fw - 24.f;
+			ImGui::SetCursorScreenPos(ImVec2(fx, toolbar_y + 6.f));
+			aida::ui::components::input_text("##memmap_filter", g_ui.filter_buf,
+				sizeof(g_ui.filter_buf), fw < 180.f ? "Filter..." : "Filter modules or info...",
+				false, ImVec2(fw, 28.f));
+		}
 
 		static bool s_mm_logged_collapse = false;
 		if (collapse_refresh && !s_mm_logged_collapse) {
@@ -743,8 +785,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 	const auto& filtered_indices = g_ui.visible_region_indices;
 
-	render_hero_map(dl, pos_x + 12.f, hero_y, width - 24.f, hero_h,
-		alpha, snapshot, filtered_indices);
+	if (show_hero) {
+		render_hero_map(dl, pos_x + 12.f, hero_y, width - 24.f, hero_h,
+			alpha, snapshot, filtered_indices);
+	}
 
 	{
 		size_t n_regions = snapshot.size();
@@ -752,38 +796,35 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		const int rwx_count = g_ui.visible_rwx_count;
 		uint32_t pid = driver_bridge::attached_pid();
 
-		detail::tween_counter(g_ui.stat_regions,    static_cast<float>(n_regions), dt);
-		detail::tween_counter(g_ui.stat_committed,  static_cast<float>(total_size), dt);
-		detail::tween_counter(g_ui.stat_rwx,        static_cast<float>(rwx_count), dt);
-		detail::tween_counter(g_ui.stat_attached,   static_cast<float>(pid), dt);
-
-		float pod_w = (width - 24.f - 6.f * 3.f) / 4.f;
-		float px = pos_x + 12.f;
+		const float pod_w = (width - 24.f - stats_gap *
+			static_cast<float>(stats_columns - 1)) / static_cast<float>(stats_columns);
+		const auto pod_position = [&](int index) {
+			const int column = index % stats_columns;
+			const int row = index / stats_columns;
+			return ImVec2(
+				pos_x + 12.f + static_cast<float>(column) * (pod_w + stats_gap),
+				strip_y + static_cast<float>(row) * (stat_pod_h + stats_gap));
+		};
 
 		char buf[32];
-		detail::format_counter(buf, sizeof(buf), g_ui.stat_regions.displayed, false, false);
-		render_stat_pod(dl, px, strip_y, pod_w, strip_h, "REGIONS", buf,
+		detail::format_counter(buf, sizeof(buf), static_cast<float>(n_regions), false);
+		const ImVec2 regions_pos = pod_position(0);
+		render_stat_pod(dl, regions_pos.x, regions_pos.y, pod_w, stat_pod_h, "REGIONS", buf,
 			t.accent_u32, alpha);
-		px += pod_w + 6.f;
 
-		detail::format_counter(buf, sizeof(buf), g_ui.stat_committed.displayed, true, false);
-		render_stat_pod(dl, px, strip_y, pod_w, strip_h, "COMMITTED", buf,
+		detail::format_counter(buf, sizeof(buf), static_cast<float>(total_size), true);
+		const ImVec2 committed_pos = pod_position(1);
+		render_stat_pod(dl, committed_pos.x, committed_pos.y, pod_w, stat_pod_h, "COMMITTED", buf,
 			t.info, alpha);
-		px += pod_w + 6.f;
 
-		detail::format_counter(buf, sizeof(buf), g_ui.stat_rwx.displayed, false, false);
-		render_stat_pod(dl, px, strip_y, pod_w, strip_h, "RWX",
+		detail::format_counter(buf, sizeof(buf), static_cast<float>(rwx_count), false);
+		const ImVec2 rwx_pos = pod_position(2);
+		render_stat_pod(dl, rwx_pos.x, rwx_pos.y, pod_w, stat_pod_h, "RWX",
 			buf, rwx_count > 0 ? t.error : t.success, alpha);
-		px += pod_w + 6.f;
 
-		detail::format_counter(buf, sizeof(buf), g_ui.stat_attached.displayed, false, true);
-		std::string val = buf;
-		if (pid != 0) {
-			char pidbuf[24];
-			std::snprintf(pidbuf, sizeof(pidbuf), "PID %s", buf);
-			val = pidbuf;
-		}
-		render_stat_pod(dl, px, strip_y, pod_w, strip_h, "ATTACHED", val.c_str(),
+		const std::string val = pid != 0 ? "PID " + std::to_string(pid) : "—";
+		const ImVec2 attached_pos = pod_position(3);
+		render_stat_pod(dl, attached_pos.x, attached_pos.y, pod_w, stat_pod_h, "ATTACHED", val.c_str(),
 			pid != 0 ? t.success : t.text_dim, alpha);
 	}
 
@@ -803,11 +844,33 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		            ImVec2(pos_x + width, table_y + col_header_h - 0.5f),
 		            aida::ui::with_alpha(t.border_subtle, alpha));
 
-		const char* labels[] = { "ADDRESS", "SIZE", "PROTECT", "STATE", "TYPE", "MODULE", "INFO" };
-		float fracs[] = { 0.18f, 0.10f, 0.15f, 0.11f, 0.10f, 0.16f, 0.20f };
+		const bool compact_columns = width < 520.f;
+		const bool medium_columns = !compact_columns && width < 760.f;
+		const char* labels[7]{};
+		float fracs[7]{};
+		int column_count = 0;
+		if (compact_columns) {
+			labels[0] = "ADDRESS"; labels[1] = "PROTECT"; labels[2] = "MODULE";
+			fracs[0] = 0.46f; fracs[1] = 0.22f; fracs[2] = 0.32f;
+			column_count = 3;
+		} else if (medium_columns) {
+			labels[0] = "ADDRESS"; labels[1] = "SIZE"; labels[2] = "PROTECT";
+			labels[3] = "MODULE"; labels[4] = "INFO";
+			fracs[0] = 0.30f; fracs[1] = 0.12f; fracs[2] = 0.17f;
+			fracs[3] = 0.18f; fracs[4] = 0.23f;
+			column_count = 5;
+		} else {
+			const char* wide_labels[] = { "ADDRESS", "SIZE", "PROTECT", "STATE", "TYPE", "MODULE", "INFO" };
+			const float wide_fracs[] = { 0.18f, 0.10f, 0.15f, 0.11f, 0.10f, 0.16f, 0.20f };
+			for (int index = 0; index < 7; ++index) {
+				labels[index] = wide_labels[index];
+				fracs[index] = wide_fracs[index];
+			}
+			column_count = 7;
+		}
 		const float fs_col_label = aida::ui::components::detail::ui_fs() * 0.88f;
 		float lx = pos_x + 12.f;
-		for (int i = 0; i < 7; ++i) {
+		for (int i = 0; i < column_count; ++i) {
 			dl->AddText(cf, fs_col_label,
 				ImVec2(lx, table_y + (col_header_h - fs_col_label) * 0.5f),
 				aida::ui::with_alpha(t.text_dim, alpha), labels[i]);
@@ -871,11 +934,34 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (first_visible < 0) first_visible = 0;
 	int visible_count = static_cast<int>(list_h / row_h) + 2;
 
-	float fracs[] = { 0.18f, 0.10f, 0.15f, 0.11f, 0.10f, 0.16f, 0.20f };
+	const bool compact_columns = width < 520.f;
+	const bool medium_columns = !compact_columns && width < 760.f;
+	float fracs[7]{};
+	int column_count = 0;
+	int size_column = -1;
+	int protect_column = -1;
+	int state_column = -1;
+	int type_column = -1;
+	int module_column = -1;
+	int info_column = -1;
+	if (compact_columns) {
+		fracs[0] = 0.46f; fracs[1] = 0.22f; fracs[2] = 0.32f;
+		column_count = 3; protect_column = 1; module_column = 2;
+	} else if (medium_columns) {
+		fracs[0] = 0.30f; fracs[1] = 0.12f; fracs[2] = 0.17f;
+		fracs[3] = 0.18f; fracs[4] = 0.23f;
+		column_count = 5; size_column = 1; protect_column = 2;
+		module_column = 3; info_column = 4;
+	} else {
+		const float wide_fracs[] = { 0.18f, 0.10f, 0.15f, 0.11f, 0.10f, 0.16f, 0.20f };
+		for (int index = 0; index < 7; ++index) fracs[index] = wide_fracs[index];
+		column_count = 7; size_column = 1; protect_column = 2;
+		state_column = 3; type_column = 4; module_column = 5; info_column = 6;
+	}
 	float col_x[7];
 	{
 		float lx = pos_x + 12.f;
-		for (int i = 0; i < 7; ++i) { col_x[i] = lx; lx += width * fracs[i]; }
+		for (int i = 0; i < column_count; ++i) { col_x[i] = lx; lx += width * fracs[i]; }
 	}
 
 	for (int vi = 0; vi < visible_count; ++vi) {
@@ -886,6 +972,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		auto& r = snapshot[static_cast<size_t>(idx)];
 		float ry = list_y + static_cast<float>(row_pos) * row_h - g_ui.scroll_y;
 		if (ry + row_h < list_y || ry > list_y + list_h) continue;
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string region_semantic_id = studio_memory_region_id("region", r);
+		aida::preview::semantics::register_region(region_semantic_id,
+			"memory-region-row", ImGui::GetID(region_semantic_id.c_str()),
+			ImVec2(pos_x, ry), ImVec2(pos_x + width, ry + row_h), false, false,
+			"aida.dock-window.view.debug.memory-map");
+#endif
 
 		bool sel = (g_ui.selected == idx);
 		bool hov = ImGui::IsMouseHoveringRect(ImVec2(pos_x, ry),
@@ -917,9 +1011,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		dl->AddText(code_font, fs_mm_row, ImVec2(col_x[0], ry + 6.f),
 		            aida::ui::with_alpha(t.text_address, alpha * row_a), buf);
 
-		std::string sz_str = detail::format_size(r.size);
-		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[1], ry + 6.f),
-		            aida::ui::with_alpha(t.text_secondary, alpha * row_a), sz_str.c_str());
+		if (size_column >= 0) {
+			std::string sz_str = detail::format_size(r.size);
+			dl->AddText(body_font, fs_mm_row, ImVec2(col_x[size_column], ry + 6.f),
+				aida::ui::with_alpha(t.text_secondary, alpha * row_a), sz_str.c_str());
+		}
 
 		std::string prot_str = debugger_engine::format_protect(r.protect);
 		ImU32 prot_col = detail::protect_token(r.protect, t);
@@ -927,7 +1023,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImVec2 ps = body_font->CalcTextSizeA(fs_mm_chip, FLT_MAX, 0.f, prot_str.c_str());
 			float bw = ps.x + 14.f;
 			float bh = 20.f;
-			float bx = col_x[2];
+			float bx = col_x[protect_column];
 			float by = ry + (row_h - bh) * 0.5f;
 			dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
 			                  aida::ui::with_alpha(prot_col, alpha * row_a * 0.22f),
@@ -940,21 +1036,27 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(prot_col, alpha * row_a), prot_str.c_str());
 		}
 
-		std::string state_str = detail::format_state(r.state);
-		ImU32 state_col = detail::state_color(r.state, t);
-		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[3], ry + 6.f),
-		            aida::ui::with_alpha(state_col, alpha * row_a), state_str.c_str());
+		if (state_column >= 0) {
+			std::string state_str = detail::format_state(r.state);
+			ImU32 state_col = detail::state_color(r.state, t);
+			dl->AddText(body_font, fs_mm_row, ImVec2(col_x[state_column], ry + 6.f),
+				aida::ui::with_alpha(state_col, alpha * row_a), state_str.c_str());
+		}
 
-		std::string type_str = detail::format_type(r.type);
-		ImU32 type_col = detail::type_color(r.type, t);
-		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[4], ry + 6.f),
-		            aida::ui::with_alpha(type_col, alpha * row_a), type_str.c_str());
+		if (type_column >= 0) {
+			std::string type_str = detail::format_type(r.type);
+			ImU32 type_col = detail::type_color(r.type, t);
+			dl->AddText(body_font, fs_mm_row, ImVec2(col_x[type_column], ry + 6.f),
+				aida::ui::with_alpha(type_col, alpha * row_a), type_str.c_str());
+		}
 
-		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[5], ry + 6.f),
+		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[module_column], ry + 6.f),
 		            aida::ui::with_alpha(t.text_secondary, alpha * row_a),
 		            r.module_name.c_str());
-		dl->AddText(body_font, fs_mm_row, ImVec2(col_x[6], ry + 6.f),
-		            aida::ui::with_alpha(t.text_dim, alpha * row_a), r.info.c_str());
+		if (info_column >= 0) {
+			dl->AddText(body_font, fs_mm_row, ImVec2(col_x[info_column], ry + 6.f),
+				aida::ui::with_alpha(t.text_dim, alpha * row_a), r.info.c_str());
+		}
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			g_ui.selected = idx;

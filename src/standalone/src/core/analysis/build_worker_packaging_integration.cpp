@@ -705,7 +705,7 @@ build_worker_result_t<std::string> sha256_text(std::string_view text) {
             error(build_worker_error_code_t::hash_failed, {}, "BCryptCreateHash:text", 0,
                   static_cast<std::uint32_t>(status)));
     if (!text.empty()) {
-        const auto* data = reinterpret_cast<PUCHAR>(const_cast<char*>(text.data()));
+        auto* data = reinterpret_cast<PUCHAR>(const_cast<char*>(text.data()));
         if (text.size() > static_cast<std::size_t>((std::numeric_limits<ULONG>::max)()))
             return build_worker_result_t<std::string>::failure(
                 error(build_worker_error_code_t::file_too_large, {}, "SHA-256 text"));
@@ -2612,12 +2612,12 @@ build_worker_packaging_integration_t::verify_distribution_package(
         !json_string_array(link_document["denylist"], link_denylist, 4) ||
         link_denylist != std::vector<std::string>({"lief", "lmdb", "unicorn", "remill"}) ||
         !json_scalar(link_document, "manifest_root_count", manifest_root_count) ||
-        manifest_root_count != 57 ||
+        manifest_root_count != 56 ||
         !json_scalar(link_document, "direct_root_count", direct_root_count) ||
         direct_root_count != 15 ||
         !json_scalar(link_document, "strict_root_count", strict_root_count) ||
         !json_string_array(link_document["strict_roots"], link_roots, 4096) ||
-        strict_root_count != link_roots.size() || strict_root_count < 78 ||
+        strict_root_count != link_roots.size() || strict_root_count < 77 ||
         !json_string_array(link_document["strict_targets"], link_targets, 65536) ||
         !json_string_array(link_document["strict_edges"], link_edges, 65536) ||
         !json_scalar(link_document, "integration_host", link_integration_host) ||

@@ -11,6 +11,7 @@
 
 #include "sequencer_view.hpp"
 #include "sequencer.hpp"
+#include "../human_request_editor.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_services.hpp"
 #else
@@ -22,6 +23,7 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/components.hpp"
+#include "../../ui/design_system.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_executor.hpp"
 #else
@@ -34,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 #include <utility>
@@ -62,6 +65,14 @@ struct view_state_t
 
     uint64_t selected_id   = 0;
     std::vector<aida::burp::sequencer::collection_status_t> cached;
+    std::uint64_t cached_generation = 0;
+    aida::burp::sequencer::capacity_snapshot_t capacity;
+    std::shared_ptr<const std::string> start_error = std::make_shared<const std::string>();
+    bool delete_review_requested = false;
+    std::uint64_t reviewed_delete_id = 0;
+    std::uint64_t reviewed_delete_started_ms = 0;
+    std::uint64_t reviewed_delete_instance_revision = 0;
+    std::string reviewed_delete_name;
 
     aida::burp::sequencer::analysis_result_t last_analysis{};
     bool                                     analysis_valid = false;
@@ -72,6 +83,26 @@ struct view_state_t
 };
 
 static view_state_t g_view_state;
+
+static void publish_view_error(std::string error)
+{
+    std::atomic_store_explicit(&g_view_state.start_error,
+        std::make_shared<const std::string>(std::move(error)), std::memory_order_release);
+}
+
+static bool submit_view_task(aida::infra::executor::submission_t submission, const char* action)
+{
+    try {
+        const auto result = aida::infra::executor::submit(std::move(submission));
+        if (result.submitted) return true;
+        publish_view_error(std::string(action) + " was rejected by the executor");
+    } catch (const std::exception& exception) {
+        publish_view_error(std::string(action) + " failed: " + exception.what());
+    } catch (...) {
+        publish_view_error(std::string(action) + " failed with an unknown exception");
+    }
+    return false;
+}
 
 static void start_pressed()
 {
@@ -98,9 +129,17 @@ static void start_pressed()
     submission.priority = 3;
     submission.body = [cfg = std::move(cfg)]() {
         const std::uint64_t id = aida::burp::sequencer::start_collection(cfg);
-        if (id != 0) g_view_state.started_id.store(id, std::memory_order_release);
+        if (id != 0) {
+            g_view_state.started_id.store(id, std::memory_order_release);
+            std::atomic_store_explicit(&g_view_state.start_error,
+                std::make_shared<const std::string>(), std::memory_order_release);
+        } else {
+            std::atomic_store_explicit(&g_view_state.start_error,
+                std::make_shared<const std::string>(aida::burp::sequencer::last_error()),
+                std::memory_order_release);
+        }
     };
-    static_cast<void>(aida::infra::executor::submit(std::move(submission)));
+    static_cast<void>(submit_view_task(std::move(submission), "Start collection"));
 }
 
 }
@@ -142,6 +181,22 @@ void render(float pos_x, float pos_y, float width, float height,
     const auto& th = aida::ui::resolved();
     const std::uint64_t started_id = g_view_state.started_id.exchange(0, std::memory_order_acq_rel);
     if (started_id != 0) g_view_state.selected_id = started_id;
+    const std::uint64_t registry_generation = aida::burp::sequencer::registry_generation();
+    if (g_view_state.cached_generation != registry_generation) {
+        auto snapshot = aida::burp::sequencer::snapshot_collections();
+        g_view_state.cached_generation = snapshot.generation;
+        g_view_state.capacity = snapshot.capacity;
+        g_view_state.cached = std::move(snapshot.collections);
+        if (g_view_state.selected_id != 0) {
+            const auto selected = std::find_if(g_view_state.cached.begin(), g_view_state.cached.end(),
+                [&](const auto& collection) { return collection.id == g_view_state.selected_id; });
+            if (selected == g_view_state.cached.end()) {
+                g_view_state.selected_id = 0;
+                g_view_state.analysis_valid = false;
+                g_view_state.analysis_for_id = 0;
+            }
+        }
+    }
     const auto analysis = std::atomic_load_explicit(&g_view_state.analysis_publication,
         std::memory_order_acquire);
     if (analysis->first != 0 && analysis->first != g_view_state.analysis_for_id) {
@@ -223,14 +278,29 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::PopItemWidth();
 
     ImGui::Checkbox("Use raw request", &g_view_state.use_raw_request);
+    static network_view::human_request_editor::fixed_state_t request_editor;
+    network_view::human_request_editor::render_result_t request_editor_result;
     if (g_view_state.use_raw_request) {
-        ImGui::InputTextMultiline("##s_raw", g_view_state.raw_request, sizeof(g_view_state.raw_request),
-            ImVec2(cfg_w - 24.f, 120.f));
+        network_view::human_request_editor::render_config_t request_config;
+        request_config.stable_id = "sequencer-raw-request";
+        request_config.size = ImVec2(cfg_w - 24.f, 120.f);
+        request_config.max_bytes = sizeof(g_view_state.raw_request) - 1;
+        request_editor_result = network_view::human_request_editor::render_fixed(
+            request_editor, "sequencer.raw-request", g_view_state.raw_request,
+            request_config);
     }
 
+    const bool collection_capacity_full =
+        g_view_state.capacity.collection_count >= g_view_state.capacity.collection_limit;
+    const bool sample_capacity_full =
+        g_view_state.capacity.retained_sample_bytes >= g_view_state.capacity.retained_sample_limit;
+    const bool request_unready = g_view_state.use_raw_request &&
+        (!request_editor_result.valid || request_editor_result.has_unapplied_pretty);
+    ImGui::BeginDisabled(collection_capacity_full || sample_capacity_full || request_unready);
     if (aida::ui::button("Start", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
         start_pressed();
     }
+    ImGui::EndDisabled();
     ImGui::SameLine();
     if (g_view_state.selected_id != 0) {
         if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
@@ -243,7 +313,7 @@ void render(float pos_x, float pos_y, float width, float height,
             submission.domain = aida::infra::executor::domain_t::external_tool;
             submission.priority = 3;
             submission.body = [id]() { aida::burp::sequencer::stop_collection(id); };
-            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
+            static_cast<void>(submit_view_task(std::move(submission), "Stop collection"));
         }
         ImGui::SameLine();
         if (aida::ui::button("Analyze", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
@@ -262,29 +332,41 @@ void render(float pos_x, float pos_y, float width, float height,
                 std::atomic_store_explicit(&g_view_state.analysis_publication,
                     std::move(publication), std::memory_order_release);
             };
-            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
+            static_cast<void>(submit_view_task(std::move(submission), "Analyze collection"));
         }
         ImGui::SameLine();
         if (aida::ui::button("Delete", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-            ::diag::log_tagged_fmt("sequencer_v", "delete_collection id=%llu", static_cast<unsigned long long>(g_view_state.selected_id));
-            const std::uint64_t id = g_view_state.selected_id;
-            aida::infra::executor::submission_t submission;
-            submission.owner_subsystem = "burp.sequencer_view";
-            submission.label = "sequencer.delete_collection";
-            submission.thread_class = "bounded_task";
-            submission.domain = aida::infra::executor::domain_t::external_tool;
-            submission.priority = 3;
-            submission.body = [id]() { aida::burp::sequencer::delete_collection(id); };
-            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
-            g_view_state.selected_id = 0;
-            g_view_state.analysis_valid = false;
+            const auto selected = std::find_if(g_view_state.cached.begin(), g_view_state.cached.end(),
+                [&](const auto& collection) { return collection.id == g_view_state.selected_id; });
+            if (selected == g_view_state.cached.end()) {
+                publish_view_error("The selected collection changed; select it again before deletion");
+            } else {
+                g_view_state.reviewed_delete_id = selected->id;
+                g_view_state.reviewed_delete_started_ms = selected->started_ms;
+                g_view_state.reviewed_delete_instance_revision = selected->instance_revision;
+                g_view_state.reviewed_delete_name = selected->name.empty() ? selected->url : selected->name;
+                g_view_state.delete_review_requested = true;
+            }
         }
     }
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
-        "Collections");
+        "Collections  %zu / %zu    Retained %.1f / %.1f MiB",
+        g_view_state.capacity.collection_count, g_view_state.capacity.collection_limit,
+        static_cast<double>(g_view_state.capacity.retained_sample_bytes) / (1024.0 * 1024.0),
+        static_cast<double>(g_view_state.capacity.retained_sample_limit) / (1024.0 * 1024.0));
+    const auto start_error = std::atomic_load_explicit(&g_view_state.start_error,
+        std::memory_order_acquire);
+    if (collection_capacity_full || sample_capacity_full || (start_error && !start_error->empty())) {
+        const std::string message = collection_capacity_full
+            ? "Collection capacity reached. Delete a retained collection before starting another."
+            : sample_capacity_full
+                ? "Retained sample capacity reached. Delete a collection before starting another."
+                : *start_error;
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.error, alpha)),
+            "%s", message.c_str());
+    }
 
-    g_view_state.cached = aida::burp::sequencer::list_collections();
     if (ImGui::BeginTable("##s_clist", 4,
         ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY)) {
         ImGui::TableSetupColumn("ID",       ImGuiTableColumnFlags_WidthFixed, 50.f);
@@ -292,7 +374,11 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, 100.f);
         ImGui::TableSetupColumn("State",    ImGuiTableColumnFlags_WidthFixed, 70.f);
         ImGui::TableHeadersRow();
-        for (const auto& c : g_view_state.cached) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(g_view_state.cached.size()));
+        while (clipper.Step())
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const auto& c = g_view_state.cached[static_cast<std::size_t>(row)];
             ImGui::TableNextRow();
             bool sel = (c.id == g_view_state.selected_id);
             ImGui::TableSetColumnIndex(0);
@@ -445,6 +531,54 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     ImGui::EndChild();
+
+    if (g_view_state.delete_review_requested) {
+        aida::ui::design::open_dialog("network.sequencer.delete", "Delete Sequencer Collection");
+        g_view_state.delete_review_requested = false;
+    }
+    if (aida::ui::design::begin_dialog("network.sequencer.delete", "Delete Sequencer Collection",
+            ImVec2(560.f, 310.f), ImVec2(430.f, 250.f))) {
+        const auto current = aida::burp::sequencer::status(g_view_state.reviewed_delete_id);
+        const bool exact = current.id == g_view_state.reviewed_delete_id &&
+            current.started_ms == g_view_state.reviewed_delete_started_ms &&
+            (current.name.empty() ? current.url : current.name) == g_view_state.reviewed_delete_name &&
+            current.instance_revision == g_view_state.reviewed_delete_instance_revision;
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Delete Collection");
+        if (aida::ui::design::begin_dialog_body("sequencer_delete_body", footer)) {
+            ImGui::TextWrapped("Delete Sequencer collection '%s' (ID %llu)?",
+                g_view_state.reviewed_delete_name.c_str(),
+                static_cast<unsigned long long>(g_view_state.reviewed_delete_id));
+            ImGui::TextDisabled("Scope: retained collection configuration and every captured token in this collection.");
+            ImGui::TextDisabled("Effect: active collection work is stopped and retained samples are permanently removed.");
+            ImGui::TextDisabled("This operation cannot be undone after confirmation.");
+            if (!exact)
+                ImGui::TextWrapped("The collection or registry changed after review. Cancel and select it again.");
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "sequencer_delete_footer", "Delete Collection", exact, true, "Cancel", true, false);
+        if (result.confirmed) {
+            const std::uint64_t id = g_view_state.reviewed_delete_id;
+            const std::uint64_t started_ms = g_view_state.reviewed_delete_started_ms;
+            const std::uint64_t instance_revision = g_view_state.reviewed_delete_instance_revision;
+            aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.sequencer_view";
+            submission.label = "sequencer.delete_collection_exact";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [id, started_ms, instance_revision]() {
+                if (!aida::burp::sequencer::delete_collection_exact(id, started_ms, instance_revision))
+                    publish_view_error(aida::burp::sequencer::last_error());
+            };
+            if (submit_view_task(std::move(submission), "Delete collection")) {
+                g_view_state.analysis_valid = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        if (result.cancelled) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 
     ImGui::EndChild();
 }

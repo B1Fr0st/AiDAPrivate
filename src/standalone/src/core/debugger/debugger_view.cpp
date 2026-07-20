@@ -1,5 +1,6 @@
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/debugger_preview_runtime.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -86,19 +87,251 @@
 #include <cstdlib>
 #include <cmath>
 #include <exception>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace debugger_view {
+
+void open_debugger_entity_actions(const debugger_interaction::context_t& context,
+	aida::ui::context_menu_open_origin_t origin);
 
 namespace {
 
 std::atomic<bool> g_execution_command_pending{false};
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 std::atomic<bool> g_target_mutation_pending{false};
+#endif
+
+constexpr std::size_t k_maximum_debugger_multi_selection = 4096;
+std::array<int, static_cast<std::size_t>(debugger_interaction::kind_t::bookmark) + 1U>
+	g_debugger_selection_anchors = [] {
+		std::array<int, static_cast<std::size_t>(debugger_interaction::kind_t::bookmark) + 1U> value{};
+		value.fill(-1);
+		return value;
+	}();
+
+bool debugger_context_identity_equal(const debugger_interaction::context_t& left,
+	const debugger_interaction::context_t& right) noexcept {
+	return left.kind == right.kind && left.target_pid == right.target_pid &&
+		left.process_creation_time_100ns == right.process_creation_time_100ns &&
+		left.stop_generation == right.stop_generation && left.address == right.address &&
+		left.value == right.value && left.extent == right.extent &&
+		left.thread_id == right.thread_id && left.index == right.index &&
+		left.primary_text == right.primary_text && left.secondary_text == right.secondary_text;
+}
+
+std::vector<debugger_interaction::context_t> debugger_action_contexts(
+	const debugger_interaction::context_t& focused) {
+	auto contexts = debugger_interaction::selected_set();
+	const bool compatible = !contexts.empty() &&
+		contexts.front().kind == focused.kind &&
+		contexts.front().target_pid == focused.target_pid &&
+		contexts.front().process_creation_time_100ns == focused.process_creation_time_100ns &&
+		contexts.front().stop_generation == focused.stop_generation;
+	if (!compatible)
+		contexts.assign(1, focused);
+	else if (std::none_of(contexts.begin(), contexts.end(), [&](const auto& item) {
+		return debugger_context_identity_equal(item, focused);
+	}))
+		contexts.assign(1, focused);
+	return contexts;
+}
+
+std::uint64_t debugger_action_set_hash(
+	const std::vector<debugger_interaction::context_t>& contexts) noexcept {
+	std::uint64_t hash = 1469598103934665603ULL;
+	const auto mix = [&](std::uint64_t value) {
+		hash ^= value;
+		hash *= 1099511628211ULL;
+	};
+	for (const auto& context : contexts) {
+		mix(static_cast<std::uint64_t>(context.kind));
+		mix(context.target_pid);
+		mix(context.process_creation_time_100ns);
+		mix(context.stop_generation);
+		mix(context.address);
+		mix(context.value);
+		mix(context.extent);
+		mix(context.thread_id);
+		mix(static_cast<std::uint64_t>(context.index));
+		for (const unsigned char ch : context.primary_text) mix(ch);
+		for (const unsigned char ch : context.secondary_text) mix(ch);
+	}
+	return hash;
+}
+
+std::string debugger_action_entity_id(
+	const debugger_interaction::context_t& focused,
+	const std::vector<debugger_interaction::context_t>& contexts) {
+	return std::to_string(static_cast<int>(focused.kind)) + ":" +
+		std::to_string(focused.address) + ":" + std::to_string(focused.index) + ":" +
+		std::to_string(contexts.size()) + ":" +
+		std::to_string(debugger_action_set_hash(contexts));
+}
+
+template <typename Factory>
+void select_debugger_row(debugger_interaction::context_t context, int row_count,
+	Factory&& factory, bool open_popup) {
+	const auto slot = static_cast<std::size_t>(context.kind);
+	if (context.kind == debugger_interaction::kind_t::none ||
+		slot >= g_debugger_selection_anchors.size())
+		return;
+	auto existing = debugger_interaction::selected_set();
+	const bool compatible = !existing.empty() &&
+		existing.front().kind == context.kind &&
+		existing.front().target_pid == context.target_pid &&
+		existing.front().process_creation_time_100ns == context.process_creation_time_100ns &&
+		existing.front().stop_generation == context.stop_generation;
+	if (!compatible) {
+		existing.clear();
+		g_debugger_selection_anchors[slot] = -1;
+	}
+	if (open_popup) {
+		if (std::none_of(existing.begin(), existing.end(), [&](const auto& item) {
+			return debugger_context_identity_equal(item, context);
+		}))
+			existing.assign(1, context);
+		debugger_interaction::select_set(std::move(existing), context);
+		open_debugger_entity_actions(debugger_interaction::selected(),
+			aida::ui::context_menu_open_origin_t::pointer);
+		return;
+	}
+	const ImGuiIO& io = ImGui::GetIO();
+	if (io.KeyShift && g_debugger_selection_anchors[slot] >= 0 && row_count > 0) {
+		const int anchor = (std::clamp)(g_debugger_selection_anchors[slot], 0, row_count - 1);
+		const int focus = (std::clamp)(context.index, 0, row_count - 1);
+		const int direction = focus >= anchor ? 1 : -1;
+		const std::size_t requested = static_cast<std::size_t>(
+			focus >= anchor ? focus - anchor + 1 : anchor - focus + 1);
+		const std::size_t retained = (std::min)(requested, k_maximum_debugger_multi_selection);
+		std::vector<debugger_interaction::context_t> range;
+		range.reserve(retained);
+		int row = focus - direction * static_cast<int>(retained - 1U);
+		for (std::size_t count = 0; count < retained; ++count, row += direction)
+			range.push_back(factory(row));
+		if (requested > retained)
+			toast_notification::push("Debugger range selection is limited to 4,096 rows.",
+				toast_notification::toast_type_t::warning);
+		debugger_interaction::select_set(std::move(range), context);
+		return;
+	}
+	if (io.KeyCtrl) {
+		g_debugger_selection_anchors[slot] = context.index;
+		const auto found = std::find_if(existing.begin(), existing.end(), [&](const auto& item) {
+			return debugger_context_identity_equal(item, context);
+		});
+		if (found == existing.end()) {
+			if (existing.size() >= k_maximum_debugger_multi_selection) {
+				toast_notification::push("Debugger multi-selection is limited to 4,096 rows.",
+					toast_notification::toast_type_t::warning);
+				return;
+			}
+			existing.push_back(context);
+		} else {
+			existing.erase(found);
+		}
+		if (existing.empty()) {
+			debugger_interaction::clear();
+			g_debugger_selection_anchors[slot] = -1;
+		} else {
+			const auto focused = std::any_of(existing.begin(), existing.end(), [&](const auto& item) {
+				return debugger_context_identity_equal(item, context);
+			}) ? context : existing.back();
+			debugger_interaction::select_set(std::move(existing), focused);
+		}
+		return;
+	}
+	g_debugger_selection_anchors[slot] = context.index;
+	debugger_interaction::select(std::move(context));
+}
+
+bool debugger_row_selected(const debugger_interaction::context_t& context,
+	bool scalar_fallback) {
+	const auto& selected = debugger_interaction::selected_set();
+	if (selected.empty() || selected.front().kind != context.kind ||
+		selected.front().target_pid != context.target_pid ||
+		selected.front().process_creation_time_100ns != context.process_creation_time_100ns ||
+		selected.front().stop_generation != context.stop_generation)
+		return scalar_fallback;
+	return debugger_interaction::selected_in_set(context);
+}
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string studio_debug_token_id(const char* entity, const std::string& identity) {
+	std::string source(entity);
+	source.push_back('-');
+	source.append(aida::preview::semantics::entity_token(identity));
+	return aida::preview::semantics::stable_id("aida.debug", source);
+}
+
+std::string studio_debug_entity_id(const char* entity,
+	const debugger_interaction::context_t& context) {
+	std::string identity = std::to_string(context.target_pid) + ":" +
+		std::to_string(static_cast<unsigned>(context.kind)) + ":";
+	switch (context.kind) {
+	case debugger_interaction::kind_t::register_value:
+	case debugger_interaction::kind_t::watch:
+		identity.append(context.primary_text);
+		break;
+	case debugger_interaction::kind_t::thread:
+		identity.append(std::to_string(context.thread_id));
+		break;
+	case debugger_interaction::kind_t::stack_frame:
+	case debugger_interaction::kind_t::trace_record:
+		identity.append(std::to_string(context.address)).append(":").append(
+			std::to_string(context.index));
+		break;
+	case debugger_interaction::kind_t::breakpoint:
+		identity.append(std::to_string(context.address)).append(":").append(
+			std::to_string(context.extent)).append(":").append(
+			std::to_string(context.index));
+		break;
+	case debugger_interaction::kind_t::handle:
+		identity.append(std::to_string(context.value));
+		break;
+	default:
+		identity.append(std::to_string(context.address));
+		break;
+	}
+	return studio_debug_token_id(entity, identity);
+}
+
+const char* studio_debug_parent_id(const char* entity) noexcept {
+	const std::string_view value(entity ? entity : "");
+	if (value == "instruction" || value == "register" || value == "stack")
+		return "aida.dock-window.view.debug.cpu";
+	if (value == "breakpoint") return "aida.dock-window.view.debug.breakpoints";
+	if (value == "callstack") return "aida.dock-window.view.debug.call-stack";
+	if (value == "thread") return "aida.dock-window.view.debug.threads";
+	if (value == "watch") return "aida.dock-window.view.debug.watches";
+	if (value == "trace") return "aida.dock-window.view.debug.trace";
+	if (value == "string") return "aida.dock-window.view.debug.strings";
+	if (value == "bookmark") return "aida.dock-window.view.debug.bookmarks";
+	if (value == "handle") return "aida.dock-window.view.debug.handles";
+	if (value == "patch") return "aida.dock-window.view.debug.patches";
+	return "";
+}
+
+void register_studio_debug_entity(const char* entity, const char* semantic_type,
+	const debugger_interaction::context_t& context, bool disabled = false) {
+	aida::preview::semantics::register_last_item(
+		studio_debug_entity_id(entity, context), semantic_type, false, disabled,
+		studio_debug_parent_id(entity));
+}
+
+std::string studio_debug_execution_id(const char* action_id) {
+	std::string action(action_id ? action_id : "action");
+	constexpr const char prefix[] = "debugger.";
+	if (action.rfind(prefix, 0) == 0)
+		action.erase(0, sizeof(prefix) - 1);
+	return aida::preview::semantics::stable_id("aida.debug", "execution-" + action);
+}
 #endif
 
 struct code_cave_result_t {
@@ -372,8 +605,6 @@ static constexpr float TAB_HEIGHT      = aida::ui::metrics::tab::primary_h;
 static constexpr float ROW_HEIGHT      = aida::ui::metrics::table::row_h;
 static constexpr float HEADER_H        = aida::ui::metrics::table::header_h;
 static constexpr float TOOLBAR_H       = aida::ui::metrics::toolbar::height;
-static constexpr float TOOLBAR_BTN_W   = 38.f;
-static constexpr float TOOLBAR_BTN_GAP = aida::ui::metrics::spacing::xs;
 static constexpr int   TOOLBAR_BTN_COUNT = 8;
 
 namespace {
@@ -987,7 +1218,16 @@ bool execute_patch_panel_command(patch_panel_command_t command, std::string* err
 
 namespace {
 
-inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
+inline float run_toolbar_height() {
+	const auto metrics = aida::ui::design::metrics();
+	return (std::max)(TOOLBAR_H,
+		metrics.control_height + (std::max)(metrics.spacing_sm,
+			aida::ui::scale_px(8.f, metrics.scale)));
+}
+
+inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float width, float alpha) {
+	if (width <= 0.f)
+		return;
 	const auto& t = aida::ui::resolved();
 	auto& ui = g_ui;
 
@@ -1019,6 +1259,10 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
 			tooltips[static_cast<std::size_t>(i)].append("\n");
 			tooltips[static_cast<std::size_t>(i)].append(presentation.disabled_reason);
 		}
+		if (command_pending) {
+			tooltips[static_cast<std::size_t>(i)].append(
+				"\nAnother debugger execution command is pending.");
+		}
 		btns[i] = {tooltips[static_cast<std::size_t>(i)].c_str(), i,
 			presentation.enabled && !command_pending, i == 0};
 	}
@@ -1027,34 +1271,97 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
 			button.enabled = false;
 	}
 
-	float total_w = static_cast<float>(TOOLBAR_BTN_COUNT) * TOOLBAR_BTN_W
-	              + static_cast<float>(TOOLBAR_BTN_COUNT - 1) * TOOLBAR_BTN_GAP
-	              + 16.f;
-	float pad_y = (TOOLBAR_H - 28.f) * 0.5f;
-	float bx = ox + 12.f;
+	const auto metrics = aida::ui::design::metrics();
+	const float scale = metrics.scale;
+	const float toolbar_height = run_toolbar_height();
+	const float margin = (std::max)(metrics.spacing_sm, aida::ui::scale_px(8.f, scale));
+	const float button_width = aida::ui::scale_px(38.f, scale);
+	const float button_height = metrics.control_height;
+	const float button_gap = metrics.spacing_xs;
+	const float overflow_width = (std::max)(aida::ui::scale_px(48.f, scale),
+		ImGui::CalcTextSize("More").x + metrics.spacing_lg * 2.f);
+	float pad_y = (toolbar_height - button_height) * 0.5f;
+	float bx = ox + margin;
 	float by = oy + pad_y;
 
-	ImVec2 a = ImVec2(bx - 6.f, by - 4.f);
-	ImVec2 b = ImVec2(bx + total_w - 8.f, by + 28.f + 4.f);
-	draw_glass_card(dl, a, b, 10.f, alpha);
-
-	ImFont* font = aida::ui::fonts::body();
-	if (!font) font = ImGui::GetFont();
+	ImFont* status_font = aida::ui::fonts::caption();
+	if (!status_font) status_font = ImGui::GetFont();
+	const float status_font_size = aida::ui::fonts::size_or(status_font, 13.5f);
+	const char* status_label = "IDLE";
+	aida::ui::pill_kind_t status_kind = aida::ui::pill_kind_t::neutral;
+	if (running) {
+		status_label = "RUNNING";
+		status_kind = aida::ui::pill_kind_t::success;
+	} else if (paused) {
+		status_label = "PAUSED";
+		status_kind = aida::ui::pill_kind_t::warning;
+	} else if (status == debugger_engine::dbg_status_t::terminated) {
+		status_label = "STOPPED";
+		status_kind = aida::ui::pill_kind_t::error;
+	}
+	const ImVec2 status_size = status_font->CalcTextSizeA(
+		status_font_size, FLT_MAX, 0.f, status_label);
+	const float status_height = (std::max)(aida::ui::scale_px(16.f, scale),
+		status_font_size + aida::ui::scale_px(2.f, scale));
+	const float status_width = status_size.x + aida::ui::scale_px(22.f, scale);
+	const bool show_status = width >= aida::ui::scale_px(260.f, scale);
+	const float usable_width = (std::max)(1.f, width - margin * 2.f);
+	const float status_reserve = show_status
+		? status_width + button_gap : 0.f;
+	const float action_budget = (std::max)(1.f, usable_width - status_reserve);
+	const float all_actions_width =
+		static_cast<float>(TOOLBAR_BTN_COUNT) * button_width +
+		static_cast<float>(TOOLBAR_BTN_COUNT - 1) * button_gap;
+	const bool has_overflow = all_actions_width > action_budget;
+	const float effective_overflow_width = has_overflow
+		? (std::min)(overflow_width, action_budget) : 0.f;
+	int direct_count = TOOLBAR_BTN_COUNT;
+	if (has_overflow) {
+		const float direct_budget = (std::max)(0.f,
+			action_budget - effective_overflow_width - button_gap);
+		direct_count = 0;
+		float used = 0.f;
+		while (direct_count < TOOLBAR_BTN_COUNT) {
+			const float candidate = used + (direct_count > 0 ? button_gap : 0.f) +
+				button_width;
+			if (candidate > direct_budget)
+				break;
+			used = candidate;
+			++direct_count;
+		}
+	}
+	const float direct_width = direct_count > 0
+		? static_cast<float>(direct_count) * button_width +
+			static_cast<float>(direct_count - 1) * button_gap
+		: 0.f;
+	const float action_strip_width = direct_width +
+		(has_overflow ? (direct_count > 0 ? button_gap : 0.f) +
+			effective_overflow_width : 0.f);
+	const float card_pad = aida::ui::scale_px(4.f, scale);
+	draw_glass_card(dl, ImVec2(bx - card_pad, by - card_pad),
+		ImVec2(bx + action_strip_width + card_pad, by + button_height + card_pad),
+		aida::ui::scale_px(10.f, scale), alpha);
 
 	float dt = aida::ui::clock::dt();
 	float pulse = running ? aida::ui::clock::pulse(1.5f, 0.f, 1.f) : 0.f;
 
-	for (int i = 0; i < TOOLBAR_BTN_COUNT; ++i) {
+	for (int i = 0; i < direct_count; ++i) {
 		const auto& btn = btns[i];
-		float btn_x = bx + static_cast<float>(i) * (TOOLBAR_BTN_W + TOOLBAR_BTN_GAP);
+		float btn_x = bx + static_cast<float>(i) * (button_width + button_gap);
 		float btn_y = by;
 		ImVec2 ba(btn_x, btn_y);
-		ImVec2 bb(btn_x + TOOLBAR_BTN_W, btn_y + 28.f);
+		ImVec2 bb(btn_x + button_width, btn_y + button_height);
 
 		ImGui::SetCursorScreenPos(ba);
 		ImGui::PushID(i);
-		ImGui::InvisibleButton("##tbn", ImVec2(TOOLBAR_BTN_W, 28.f));
-		bool hovered = ImGui::IsItemHovered() && btn.enabled;
+		ImGui::InvisibleButton("##tbn", ImVec2(button_width, button_height));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			studio_debug_execution_id(action_ids[i]), "debugger-execution-action",
+			false, !btn.enabled, "aida.dock-window.view.debug.cpu");
+#endif
+		const bool item_hovered = ImGui::IsItemHovered();
+		bool hovered = item_hovered && btn.enabled;
 		bool clicked = ImGui::IsItemClicked() && btn.enabled;
 		bool held    = ImGui::IsItemActive()  && btn.enabled;
 		ImGui::PopID();
@@ -1062,12 +1369,14 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
 		float h_v = ui.toolbar.hover[i].tick(hovered, dt, aida::motion::spring::balanced);
 		float p_v = ui.toolbar.press[i].tick(held, dt);
 
-		float scale = 1.f - (1.f - 0.95f) * p_v;
-		float lift  = h_v * 1.0f - p_v * 1.2f;
-		float bw_h = TOOLBAR_BTN_W * 0.5f;
-		float bh_h = 14.f;
-		ImVec2 ca(btn_x + bw_h - bw_h * scale, btn_y + bh_h - bh_h * scale - lift);
-		ImVec2 cb(btn_x + bw_h + bw_h * scale, btn_y + bh_h + bh_h * scale - lift);
+		float press_scale = 1.f - (1.f - 0.95f) * p_v;
+		float lift  = (h_v * 1.0f - p_v * 1.2f) * scale;
+		float bw_h = button_width * 0.5f;
+		float bh_h = button_height * 0.5f;
+		ImVec2 ca(btn_x + bw_h - bw_h * press_scale,
+			btn_y + bh_h - bh_h * press_scale - lift);
+		ImVec2 cb(btn_x + bw_h + bw_h * press_scale,
+			btn_y + bh_h + bh_h * press_scale - lift);
 
 		float btn_alpha = btn.enabled ? alpha : alpha * 0.42f;
 
@@ -1087,33 +1396,33 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
 			if (running) {
 				float pa = pulse * 0.55f * btn_alpha;
 				for (int g = 0; g < 4; ++g) {
-					float spread = 1.5f + static_cast<float>(g) * 1.4f;
+					float spread = aida::ui::scale_px(
+						1.5f + static_cast<float>(g) * 1.4f, scale);
 					dl->AddRect(ImVec2(ca.x - spread, ca.y - spread),
 					            ImVec2(cb.x + spread, cb.y + spread),
 					            with_a(t.accent_glow, pa * (1.f - static_cast<float>(g) / 4.f)),
-					            8.f + spread, 0, 1.f);
+					            aida::ui::scale_px(8.f, scale) + spread, 0,
+							(std::max)(1.f, scale));
 				}
 			}
 		} else {
 			ImU32 fill = aida::ui::mix(t.panel_header, t.accent_dim, h_v * 0.45f);
 			border = aida::ui::mix(t.border_subtle, t.accent_dim, h_v * 0.65f);
 			icon_col = aida::ui::mix(t.text_secondary, t.text_primary, h_v);
-			dl->AddRectFilled(ca, cb, with_a(fill, btn_alpha), 8.f);
+			dl->AddRectFilled(ca, cb, with_a(fill, btn_alpha),
+				aida::ui::scale_px(8.f, scale));
 		}
 
 		dl->AddRect(ca, cb, with_a(border, btn_alpha * (0.6f + h_v * 0.4f)),
-		            8.f, 0, 1.f);
+		            aida::ui::scale_px(8.f, scale), 0, (std::max)(1.f, scale));
 
 		ImVec2 ic = ImVec2((ca.x + cb.x) * 0.5f, (ca.y + cb.y) * 0.5f);
-		float ir = 9.f * scale;
-		float thickness = 1.6f;
+		float ir = aida::ui::scale_px(9.f, scale) * press_scale;
+		float thickness = aida::ui::scale_px(1.6f, scale);
 		draw_icon(dl, ic, ir, btn.icon_id, icon_col, thickness);
 
-		if (hovered) {
-			char tip[96];
-			std::snprintf(tip, sizeof(tip), "%s", btn.tooltip);
-			ImGui::SetTooltip("%s", tip);
-		}
+		if (item_hovered)
+			ImGui::SetTooltip("%s", btn.tooltip);
 
 		if (clicked) {
 			static_cast<void>(aida::ui::application_ui::execute_action(action_ids[i],
@@ -1121,40 +1430,52 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
 		}
 	}
 
-	{
-		const char* status_label = "IDLE";
-		aida::ui::pill_kind_t kind = aida::ui::pill_kind_t::neutral;
-		if (running) {
-			status_label = "RUNNING";
-			kind = aida::ui::pill_kind_t::success;
-		} else if (paused) {
-			status_label = "PAUSED";
-			kind = aida::ui::pill_kind_t::warning;
-		} else if (status == debugger_engine::dbg_status_t::terminated) {
-			status_label = "STOPPED";
-			kind = aida::ui::pill_kind_t::error;
+	if (has_overflow) {
+		const float overflow_x = bx + direct_width +
+			(direct_count > 0 ? button_gap : 0.f);
+		ImGui::SetCursorScreenPos(ImVec2(overflow_x, by));
+		std::array<aida::ui::design::action_t, TOOLBAR_BTN_COUNT> overflow_actions{};
+		std::size_t overflow_count = 0;
+		for (int i = direct_count; i < TOOLBAR_BTN_COUNT; ++i) {
+			const auto& presentation = presentations[static_cast<std::size_t>(i)];
+			overflow_actions[overflow_count++] = {
+				action_ids[i], presentation.label.c_str(), presentation.label.c_str(),
+				btns[i].tooltip,
+				presentation.shortcut.empty() ? nullptr : presentation.shortcut.c_str(),
+				nullptr, aida::ui::button_kind_t::secondary,
+				btns[i].enabled, false, true
+			};
 		}
-		ImFont* sf = aida::ui::fonts::caption();
-		if (!sf) sf = ImGui::GetFont();
-		const float sf_size = aida::ui::fonts::size_or(sf, 13.5f);
-		ImVec2 sl_sz = sf->CalcTextSizeA(sf_size, FLT_MAX, 0.f, status_label);
-		float sx = bx + total_w + 6.f;
-		float sy = by + (28.f - 16.f) * 0.5f;
+		const auto overflow_action = aida::ui::design::render_toolbar(
+			"debugger.execution.overflow", overflow_actions.data(), overflow_count,
+			effective_overflow_width);
+		if (overflow_action.invoked && overflow_action.id)
+			static_cast<void>(aida::ui::application_ui::execute_action(
+				overflow_action.id, aida::ui::action_invocation_source_t::toolbar));
+	}
+
+	if (show_status) {
+		float sx = ox + width - margin - status_width;
+		float sy = by + (button_height - status_height) * 0.5f;
 		ImU32 col;
-		switch (kind) {
+		switch (status_kind) {
 			case aida::ui::pill_kind_t::success: col = t.success; break;
 			case aida::ui::pill_kind_t::warning: col = t.warning; break;
 			case aida::ui::pill_kind_t::error:   col = t.error;   break;
 			default:                             col = t.text_secondary; break;
 		}
-		dl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + sl_sz.x + 22.f, sy + 16.f),
-		                  with_a(col, alpha * 0.18f), 8.f);
-		dl->AddRect(ImVec2(sx, sy), ImVec2(sx + sl_sz.x + 22.f, sy + 16.f),
-		            with_a(col, alpha * 0.55f), 8.f, 0, 1.f);
+		dl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + status_width, sy + status_height),
+		                  with_a(col, alpha * 0.18f), status_height * 0.5f);
+		dl->AddRect(ImVec2(sx, sy), ImVec2(sx + status_width, sy + status_height),
+		            with_a(col, alpha * 0.55f), status_height * 0.5f, 0,
+				(std::max)(1.f, scale));
 		float dpulse = aida::ui::clock::pulse(1.6f, 0.55f, 1.f);
-		dl->AddCircleFilled(ImVec2(sx + 8.f, sy + 8.f), 3.f,
+		dl->AddCircleFilled(ImVec2(sx + aida::ui::scale_px(8.f, scale),
+			sy + status_height * 0.5f), aida::ui::scale_px(3.f, scale),
 		                    with_a(col, alpha * dpulse), 14);
-		dl->AddText(sf, sf_size, ImVec2(sx + 14.f, sy + (16.f - sf_size) * 0.5f),
+		dl->AddText(status_font, status_font_size,
+			ImVec2(sx + aida::ui::scale_px(14.f, scale),
+				sy + (status_height - status_font_size) * 0.5f),
 		            with_a(col, alpha), status_label);
 	}
 }
@@ -1260,6 +1581,14 @@ bool queue_debugger_mutation(const char* label, const char* action,
 			} catch (...) {
 				result->detail = "The debugger mutation failed with an unknown exception.";
 			}
+		}
+		if (result->verified && context.target_pid != 0 &&
+			(driver_bridge::attached_pid() != context.target_pid ||
+			 debugger_interaction::current_stop_generation() != context.stop_generation)) {
+			result->ok = false;
+			result->verified = false;
+			result->detail =
+				"The mutation completed, but its target or stop generation changed before publication; the stale result was rejected.";
 		}
 		const bool posted = post_debugger_ui([context, result, advance_generation]() {
 			if (result->verified && advance_generation)
@@ -1391,11 +1720,15 @@ const char* debugger_action_id(const char* label) {
 }
 
 static aida::ui::application_ui::retained_entity_context_t
-build_debugger_entity_actions(const debugger_interaction::context_t& context) {
+build_debugger_entity_actions(const debugger_interaction::context_t& context,
+	bool include_selected_set = true) {
 	aida::ui::application_ui::retained_entity_context_t retained;
+	const auto action_contexts = include_selected_set
+		? debugger_action_contexts(context)
+		: std::vector<debugger_interaction::context_t>{context};
+	const bool multiple = action_contexts.size() > 1;
 	retained.owner_id = "debugger.entity";
-	retained.entity_id = std::to_string(static_cast<int>(context.kind)) + ":" +
-		std::to_string(context.address) + ":" + std::to_string(context.index);
+	retained.entity_id = debugger_action_entity_id(context, action_contexts);
 	retained.entity_generation = context.stop_generation;
 	const char* owner_view = "view.debug.cpu";
 	switch (context.kind) {
@@ -1413,12 +1746,14 @@ build_debugger_entity_actions(const debugger_interaction::context_t& context) {
 		default: break;
 	}
 	retained.active_view = aida::ui::stable_view_id_t(owner_view);
-	retained.validate_identity = [context]() {
-		const auto retention = context_item_retention(context);
-		if (retention == context_retention_t::busy)
-			return aida::ui::capability_state_t::unavailable("Debugger state is updating; retry when the refresh completes.");
-		if (retention != context_retention_t::current || !debugger_interaction::is_current(context))
-			return aida::ui::capability_state_t::unavailable("The selected debugger entity or stop generation changed.");
+	retained.validate_identity = [action_contexts]() {
+		for (const auto& item : action_contexts) {
+			const auto retention = context_item_retention(item);
+			if (retention == context_retention_t::busy)
+				return aida::ui::capability_state_t::unavailable("Debugger state is updating; retry when the refresh completes.");
+			if (retention != context_retention_t::current || !debugger_interaction::is_current(item))
+				return aida::ui::capability_state_t::unavailable("The selected debugger entity or stop generation changed.");
+		}
 		return aida::ui::capability_state_t::available();
 	};
 	auto add = [&](const char* id, bool enabled, const char* reason) {
@@ -1427,12 +1762,22 @@ build_debugger_entity_actions(const debugger_interaction::context_t& context) {
 			[]() { return aida::ui::action_handler_result_t::completed(); }});
 	};
 	auto add_capability = [&](const char* id, debugger_interaction::capability_t requested) {
+		if (multiple) {
+			add(id, false, "This action requires exactly one debugger row.");
+			return;
+		}
 		const auto evaluated = debugger_interaction::evaluate(requested, context);
 		add(id, evaluated.enabled, evaluated.disabled_reason ? evaluated.disabled_reason : "The debugger action is unavailable.");
 	};
-	add("debugger.entity.copy_address", context.address != 0 || context.value != 0,
+	const bool any_address = std::any_of(action_contexts.begin(), action_contexts.end(),
+		[](const auto& item) { return item.address != 0 || item.value != 0; });
+	const bool any_primary = std::any_of(action_contexts.begin(), action_contexts.end(),
+		[](const auto& item) { return !item.primary_text.empty(); });
+	const bool any_secondary = std::any_of(action_contexts.begin(), action_contexts.end(),
+		[](const auto& item) { return !item.secondary_text.empty(); });
+	add("debugger.entity.copy_address", any_address,
 		"The selected item has no resolved address.");
-	if (!context.primary_text.empty()) add("debugger.entity.copy_primary", true, "");
+	if (any_primary) add("debugger.entity.copy_primary", true, "");
 	add_capability("debugger.entity.open_disassembly", debugger_interaction::capability_t::follow_disassembly);
 	add_capability("debugger.entity.open_hex", debugger_interaction::capability_t::follow_memory);
 	switch (context.kind) {
@@ -1440,15 +1785,18 @@ build_debugger_entity_actions(const debugger_interaction::context_t& context) {
 			add_capability("debugger.instruction.run_to", debugger_interaction::capability_t::run_to_address);
 			add_capability("debugger.instruction.toggle_breakpoint", debugger_interaction::capability_t::toggle_breakpoint);
 			add_capability("debugger.instruction.set_rip", debugger_interaction::capability_t::set_instruction_pointer);
-			if (context.value != 0) add("debugger.instruction.follow_branch", true, "");
+			if (context.value != 0) add("debugger.instruction.follow_branch", !multiple,
+				"Following a branch requires exactly one debugger row.");
 			break;
 		case debugger_interaction::kind_t::register_value:
-			add("debugger.register.copy_decimal", true, "");
+			add("debugger.register.copy_decimal", !multiple,
+				"Decimal copy requires exactly one debugger row.");
 			add_capability("debugger.register.edit", debugger_interaction::capability_t::edit_register);
 			add_capability("debugger.register.zero", debugger_interaction::capability_t::edit_register);
 			break;
 		case debugger_interaction::kind_t::stack_slot:
-			add("debugger.stack.copy_qword", true, ""); break;
+			add("debugger.stack.copy_qword", !multiple,
+				"Qword copy requires exactly one debugger row."); break;
 		case debugger_interaction::kind_t::breakpoint:
 			add_capability("debugger.breakpoint.toggle_enabled", debugger_interaction::capability_t::toggle_breakpoint);
 			add_capability("debugger.breakpoint.edit", debugger_interaction::capability_t::edit_breakpoint);
@@ -1470,12 +1818,14 @@ build_debugger_entity_actions(const debugger_interaction::context_t& context) {
 		case debugger_interaction::kind_t::module:
 			add_capability("debugger.module.unload", debugger_interaction::capability_t::unload_module); break;
 		case debugger_interaction::kind_t::watch:
-			if (!context.secondary_text.empty()) add("debugger.entity.copy_secondary", true, "");
-			add("debugger.watch.remove", true, ""); break;
+			if (any_secondary) add("debugger.entity.copy_secondary", true, "");
+			add("debugger.watch.remove", !multiple,
+				"Removing a watch requires exactly one debugger row."); break;
 		case debugger_interaction::kind_t::string_value:
-			if (!context.secondary_text.empty()) add("debugger.entity.copy_secondary", true, ""); break;
+			if (any_secondary) add("debugger.entity.copy_secondary", true, ""); break;
 		case debugger_interaction::kind_t::bookmark:
-			add("debugger.bookmark.remove", true, ""); break;
+			add("debugger.bookmark.remove", !multiple,
+				"Removing a bookmark requires exactly one debugger row."); break;
 		default: break;
 	}
 	const char* evidence_kind = "debugger_entity";
@@ -1510,6 +1860,7 @@ build_debugger_entity_actions(const debugger_interaction::context_t& context) {
 	evidence.display_label = context.primary_text.empty() ? evidence_kind : context.primary_text;
 	evidence.excerpt = "PID: " + std::to_string(context.target_pid) +
 		"\nStop generation: " + std::to_string(context.stop_generation) +
+		"\nSelected rows: " + std::to_string(action_contexts.size()) +
 		"\nThread: " + std::to_string(context.thread_id) +
 		"\nAddress: " + address_text + "\nValue: " + value_text +
 		"\nExtent: " + std::to_string(context.extent) +
@@ -1519,13 +1870,30 @@ build_debugger_entity_actions(const debugger_interaction::context_t& context) {
 	evidence.revision = context.stop_generation;
 	evidence.generation = context.stop_generation;
 	evidence.sensitive = true;
-	evidence.return_to_source = [context, owner_view](std::string& reason) {
-		if (context_item_retention(context) != context_retention_t::current ||
-			!debugger_interaction::is_current(context)) {
-			reason = "The debugger target or stop generation changed; capture the entity again.";
-			return false;
+	const std::size_t evidence_rows = (std::min)(action_contexts.size(), std::size_t{256});
+	for (std::size_t index = 0; index < evidence_rows; ++index) {
+		const auto& item = action_contexts[index];
+		char item_address[24]{};
+		char item_value[24]{};
+		std::snprintf(item_address, sizeof(item_address), "0x%016llX",
+			static_cast<unsigned long long>(item.address));
+		std::snprintf(item_value, sizeof(item_value), "0x%016llX",
+			static_cast<unsigned long long>(item.value));
+		evidence.excerpt += "\n[" + std::to_string(index + 1) + "] Address: " +
+			item_address + " Value: " + item_value + " Primary: " + item.primary_text;
+	}
+	if (evidence_rows < action_contexts.size())
+		evidence.excerpt += "\n... " + std::to_string(action_contexts.size() - evidence_rows) +
+			" additional selected rows omitted from the excerpt.";
+	evidence.return_to_source = [context, action_contexts, owner_view](std::string& reason) {
+		for (const auto& item : action_contexts) {
+			if (context_item_retention(item) != context_retention_t::current ||
+				!debugger_interaction::is_current(item)) {
+				reason = "The debugger target or stop generation changed; capture the entity again.";
+				return false;
+			}
 		}
-		debugger_interaction::select(context);
+		debugger_interaction::select_set(action_contexts, context);
 		const auto opened = aida::ui::application_views::open_or_focus(
 			aida::ui::stable_view_id_t(owner_view));
 		if (!opened.ok()) {
@@ -1896,8 +2264,8 @@ void render_selected_context_menu(sub_tab_t pane) {
 			? aida::ui::context_menu_open_origin_t::menu_key
 			: aida::ui::context_menu_open_origin_t::shift_f10);
 	aida::ui::application_ui::render_retained_entity_context_menu("debugger.entity");
-	const std::string entity_id = std::to_string(static_cast<int>(context.kind)) + ":" +
-		std::to_string(context.address) + ":" + std::to_string(context.index);
+	const auto action_contexts = debugger_action_contexts(context);
+	const std::string entity_id = debugger_action_entity_id(context, action_contexts);
 	g_consumed_debugger_action = aida::ui::application_ui::consume_retained_entity_action(
 		"debugger.entity", entity_id.c_str());
 	if (selected_here && !g_consumed_debugger_action.empty()) {
@@ -1906,10 +2274,41 @@ void render_selected_context_menu(sub_tab_t pane) {
 			(context.kind == debugger_interaction::kind_t::register_value ||
 			 context.kind == debugger_interaction::kind_t::stack_slot)
 				? context.value : context.address;
-		if (g_consumed_debugger_action == "debugger.entity.copy_address")
-			copy_addr_to_clipboard(context.address != 0 ? context.address : context.value);
-		if (g_consumed_debugger_action == "debugger.entity.copy_primary")
-			copy_to_clipboard(context.primary_text.c_str());
+		if (g_consumed_debugger_action == "debugger.entity.copy_address") {
+			if (action_contexts.size() == 1)
+				copy_addr_to_clipboard(context.address != 0 ? context.address : context.value);
+			else {
+				std::ostringstream values;
+				values << std::uppercase << std::hex << std::setfill('0');
+				bool first = true;
+				for (const auto& item : action_contexts) {
+					const uint64_t value = item.address != 0 ? item.address : item.value;
+					if (value == 0) continue;
+					if (!first) values << '\n';
+					values << "0x" << std::setw(16) << value;
+					first = false;
+				}
+				copy_to_clipboard(values.str().c_str());
+			}
+		}
+		if (g_consumed_debugger_action == "debugger.entity.copy_primary") {
+			std::string values;
+			for (const auto& item : action_contexts) {
+				if (item.primary_text.empty()) continue;
+				if (!values.empty()) values.push_back('\n');
+				values.append(item.primary_text);
+			}
+			copy_to_clipboard(values.c_str());
+		}
+		if (g_consumed_debugger_action == "debugger.entity.copy_secondary") {
+			std::string values;
+			for (const auto& item : action_contexts) {
+				if (item.secondary_text.empty()) continue;
+				if (!values.empty()) values.push_back('\n');
+				values.append(item.secondary_text);
+			}
+			copy_to_clipboard(values.c_str());
+		}
 		if (context_menu_item("Open in Disassembly", nullptr,
 			debugger_interaction::capability_t::follow_disassembly, context) && navigation_address != 0)
 			jump_to_disasm(navigation_address);
@@ -2135,16 +2534,10 @@ void render_selected_context_menu(sub_tab_t pane) {
 			case debugger_interaction::kind_t::module:
 				break;
 			case debugger_interaction::kind_t::watch:
-				if (g_consumed_debugger_action == "debugger.entity.copy_secondary")
-					copy_to_clipboard(context.secondary_text.c_str());
 				if (g_consumed_debugger_action == "debugger.watch.remove")
 					request_context_mutation(pending_context_mutation_t::remove_watch, context);
 				break;
 			case debugger_interaction::kind_t::string_value:
-				if (!context.secondary_text.empty()) {
-					if (g_consumed_debugger_action == "debugger.entity.copy_secondary")
-						copy_to_clipboard(context.secondary_text.c_str());
-				}
 				break;
 			case debugger_interaction::kind_t::bookmark:
 				if (g_consumed_debugger_action == "debugger.bookmark.remove")
@@ -2745,11 +3138,29 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 	while (clipper.Step()) {
 		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
 			const auto& dr = rows[static_cast<size_t>(i)];
+			const auto row_context = debugger_interaction::capture(
+				debugger_interaction::kind_t::instruction, dr.addr,
+				dr.ins.branch_target, i, 0, static_cast<std::uint64_t>(dr.len),
+				dr.ins.mnem, dr.ins.ops);
+			const auto context_for_row = [&](int row) {
+				const auto& item = rows[static_cast<std::size_t>(row)];
+				return debugger_interaction::capture(
+					debugger_interaction::kind_t::instruction, item.addr,
+					item.ins.branch_target, row, 0,
+					static_cast<std::uint64_t>(item.len), item.ins.mnem, item.ins.ops);
+			};
 			float ry = content_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
 
 			ImGui::SetCursorScreenPos(ImVec2(x + 4.f, ry));
 			ImGui::PushID(i + 0xD0000);
 			ImGui::InvisibleButton("##cpu_disasm_row", ImVec2(child_w - 8.f, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("instruction", "debugger-instruction-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::instruction, dr.addr,
+					dr.ins.branch_target, i, 0, static_cast<std::uint64_t>(dr.len),
+					dr.ins.mnem, dr.ins.ops));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
@@ -2757,7 +3168,7 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 			ImGui::PopID();
 
 			bool is_rip = (dr.addr == rip);
-			bool is_sel = (ui.cpu_disasm_selected == i);
+			bool is_sel = debugger_row_selected(row_context, ui.cpu_disasm_selected == i);
 
 			if (is_rip) {
 				dl->AddRectFilled(ImVec2(x + 2.f, ry), ImVec2(x + child_w - 2.f, ry + row_h),
@@ -2811,10 +3222,8 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 
 			if (clicked) {
 				ui.cpu_disasm_selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::instruction, dr.addr,
-					dr.ins.branch_target, i, 0, static_cast<uint64_t>(dr.len),
-					dr.ins.mnem, dr.ins.ops), false);
+				select_debugger_row(row_context, static_cast<int>(rows.size()),
+					context_for_row, false);
 			}
 			if (dclicked && dr.ins.branch_target != 0) {
 				diag::log_tagged_fmt("cpu_view",
@@ -2823,10 +3232,8 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 				jump_to_disasm(dr.ins.branch_target);
 			}
 			if (rclicked) {
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::instruction, dr.addr,
-					dr.ins.branch_target, i, 0, static_cast<uint64_t>(dr.len),
-					dr.ins.mnem, dr.ins.ops), true);
+				select_debugger_row(row_context, static_cast<int>(rows.size()),
+					context_for_row, true);
 				diag::log_tagged_fmt("cpu_view",
 					"disasm_rclick addr=0x%llx target=0x%llx",
 					static_cast<unsigned long long>(dr.addr),
@@ -3082,6 +3489,13 @@ static void render_source_debug(ImDrawList* dl, float x, float y, float w, float
 								"Opened the source breakpoint location");
 						}
 					}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::semantics::register_last_item(
+						studio_debug_token_id("source",
+							definition.id),
+						"debugger-source-row", false, false,
+						"aida.dock-window.view.debug.source");
+#endif
 					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
 						ui.source_definition_selected = i;
 						open_source_actions(definition,
@@ -3251,10 +3665,25 @@ static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, flo
 			size_t qoff = static_cast<size_t>(i) * 8u;
 			if (qoff + 8 <= buf.size())
 				std::memcpy(&qval, buf.data() + qoff, sizeof(uint64_t));
+			const auto context_for_row = [&](int row) {
+				const std::size_t offset = static_cast<std::size_t>(row) * 8U;
+				std::uint64_t value = 0;
+				if (offset + 8U <= buf.size())
+					std::memcpy(&value, buf.data() + offset, sizeof(value));
+				return debugger_interaction::capture(
+					debugger_interaction::kind_t::stack_slot,
+					rsp + static_cast<std::uint64_t>(row) * 8ULL, value, row);
+			};
+			const auto row_context = context_for_row(i);
 
 			ImGui::SetCursorScreenPos(ImVec2(x + 4.f, ry));
 			ImGui::PushID(i + 0xC0000);
 			ImGui::InvisibleButton("##cpu_stack_row", ImVec2(child_w - 8.f, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("stack", "debugger-stack-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::stack_slot, qaddr, qval, i));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
@@ -3262,7 +3691,7 @@ static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, flo
 			ImGui::PopID();
 
 			bool is_top = (i == 0);
-			bool is_sel = (ui.cpu_stack_selected == i);
+			bool is_sel = debugger_row_selected(row_context, ui.cpu_stack_selected == i);
 			if (is_top) {
 				dl->AddRectFilled(ImVec2(x + 2.f, ry), ImVec2(x + 4.f, ry + row_h),
 					with_a(t.accent_u32, alpha));
@@ -3301,8 +3730,8 @@ static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, flo
 
 			if (clicked) {
 				ui.cpu_stack_selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::stack_slot, qaddr, qval, i), false);
+				select_debugger_row(row_context, static_cast<int>(qword_count),
+					context_for_row, false);
 			}
 			if (dclicked && cpu_view_detail::is_likely_pointer(qval)) {
 				diag::log_tagged_fmt("cpu_view",
@@ -3312,8 +3741,8 @@ static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, flo
 				jump_to_hex(qval, 256);
 			}
 			if (rclicked) {
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::stack_slot, qaddr, qval, i), true);
+				select_debugger_row(row_context, static_cast<int>(qword_count),
+					context_for_row, true);
 				diag::log_tagged_fmt("cpu_view",
 					"stack_rclick qaddr=0x%llx qval=0x%llx",
 					static_cast<unsigned long long>(qaddr),
@@ -3496,22 +3925,33 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 			ImGui::SetCursorScreenPos(ImVec2(left_x + 4.f, ry));
 			ImGui::PushID(i + 0xF0000);
 			ImGui::InvisibleButton("##cpu_row", ImVec2(left_w - 8.f, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("register", "debugger-register-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::register_value, 0, r.value, i,
+					0, 0, r.name));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
 			bool rclicked = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
 			ImGui::PopID();
 
-			bool sel = (ui.cpu_panel.selected == i);
+			const auto context_for_row = [&](int row) {
+				const auto& item = rows[static_cast<size_t>(row)];
+				return debugger_interaction::capture(
+					debugger_interaction::kind_t::register_value, 0, item.value, row,
+					0, 0, item.name);
+			};
+			const auto row_context = context_for_row(i);
+			bool sel = debugger_row_selected(row_context, ui.cpu_panel.selected == i);
 			float flash = (i < 32) ? ui.cpu_reg_flash[i] : 0.f;
 			draw_cpu_reg_row(dl, left_x + 2.f, ry, left_w - 4.f, row_h,
 				i, r, flash, sel, hov, a);
 
 			if (clicked) {
 				ui.cpu_panel.selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::register_value, 0, r.value, i,
-					0, 0, r.name), false);
+				select_debugger_row(row_context, rows_n, context_for_row, false);
 				diag::log_tagged_fmt("cpu_view",
 					"reg_click name=%s value=0x%llx",
 					r.name, static_cast<unsigned long long>(r.value));
@@ -3523,9 +3963,7 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 					r.name, static_cast<unsigned long long>(r.value));
 			}
 			if (rclicked && r.editable) {
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::register_value, 0, r.value, i,
-					0, 0, r.name), true);
+				select_debugger_row(row_context, rows_n, context_for_row, true);
 				diag::log_tagged_fmt("cpu_view",
 					"reg_rclick name=%s value=0x%llx",
 					r.name, static_cast<unsigned long long>(r.value));
@@ -4017,27 +4455,53 @@ static void render_seh_overlay(ImDrawList* dl, float ox, float oy, float w, floa
 }
 
 
-static void render_breakpoint_actions(float ox, float oy, float w) {
+static float render_breakpoint_actions(float ox, float oy, float w) {
 	auto& ui = g_ui;
+	const auto metrics = aida::ui::design::metrics();
+	const float pad = (std::max)(6.f, metrics.spacing_sm);
+	const float gap = (std::max)(4.f, metrics.spacing_xs);
+	const float control_height = (std::max)(28.f, metrics.control_height);
+	const bool stacked = w < aida::ui::scale_px(680.f, metrics.scale);
+	const float bar_h = stacked
+		? pad + control_height + gap + control_height + pad
+		: (std::max)(40.f, control_height + pad * 2.f);
+	const float input_w = stacked
+		? (std::max)(1.f, w - pad * 2.f)
+		: (std::clamp)(w * 0.42f, aida::ui::scale_px(170.f, metrics.scale),
+			(std::max)(aida::ui::scale_px(170.f, metrics.scale),
+				w - aida::ui::scale_px(290.f, metrics.scale)));
+	const float actions_x = stacked ? ox + pad : ox + pad + input_w + gap;
+	const float actions_y = stacked ? oy + pad + control_height + gap : oy + pad;
+	const float actions_w = stacked
+		? (std::max)(1.f, w - pad * 2.f)
+		: (std::max)(1.f, w - (actions_x - ox) - pad);
 
-	float bar_h = 40.f;
-	float pad = 8.f;
-	float input_w = w * 0.42f;
-	float btn_gap = 6.f;
-
-	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + 2.f));
+	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + pad));
 	ImGui::PushID("##bp_actions");
 
 	ImGui::SetNextItemWidth(input_w);
 	aida::ui::input_text("##bp_addr", ui.add_bp_addr_buf, sizeof(ui.add_bp_addr_buf),
 		"0x... breakpoint address",
-		false, ImVec2(input_w, bar_h - 8.f));
+		false, ImVec2(input_w, control_height));
 
-	ImGui::SameLine(0.f, btn_gap);
-
-	bool add_clicked = aida::ui::button("Add SW BP", aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (add_clicked) {
+	const aida::ui::design::action_t actions[] = {
+		{"debugger.breakpoint_add_software", "Add Software Breakpoint", "Add SW",
+			"Add a software breakpoint at the entered hexadecimal address", nullptr, nullptr,
+			aida::ui::button_kind_t::primary, true, true, true},
+		{"debugger.breakpoint_add_hardware", "Add Hardware Execute Breakpoint", "Add HW",
+			"Add a hardware execute breakpoint at the entered hexadecimal address", nullptr, nullptr,
+			aida::ui::button_kind_t::secondary, true, false, true},
+		{"debugger.breakpoint_clear_all", "Clear All Breakpoints", "Clear",
+			"Review removal of every breakpoint definition", nullptr,
+			"Removes every breakpoint definition after reviewed execution.",
+			aida::ui::button_kind_t::destructive, true, false, true}
+	};
+	ImGui::SetCursorScreenPos(ImVec2(actions_x, actions_y));
+	const auto action = aida::ui::design::render_toolbar(
+		"debugger.breakpoints.actions", actions, std::size(actions), actions_w);
+	const std::string_view invoked = action.invoked && action.id
+		? std::string_view(action.id) : std::string_view();
+	if (invoked == "debugger.breakpoint_add_software") {
 		uint64_t addr = parse_hex_address(ui.add_bp_addr_buf);
 		diag::log_tagged_critical_fmt("bp",
 			"bp_add_sw_request raw='%s' parsed_addr=0x%llx",
@@ -4062,12 +4526,7 @@ static void render_breakpoint_actions(float ox, float oy, float w) {
 				toast_notification::toast_type_t::warning);
 		}
 	}
-	ImGui::SameLine(0.f, btn_gap);
-
-	bool add_hw_clicked = aida::ui::button("Add HW Exec",
-		aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (add_hw_clicked) {
+	if (invoked == "debugger.breakpoint_add_hardware") {
 		uint64_t addr = parse_hex_address(ui.add_bp_addr_buf);
 		diag::log_tagged_critical_fmt("bp",
 			"bp_add_hw_request raw='%s' parsed_addr=0x%llx",
@@ -4092,24 +4551,24 @@ static void render_breakpoint_actions(float ox, float oy, float w) {
 				toast_notification::toast_type_t::warning);
 		}
 	}
-	ImGui::SameLine(0.f, btn_gap);
-
-	bool clear_clicked = aida::ui::button("Clear All",
-		aida::ui::button_kind_t::destructive,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (clear_clicked) {
+	if (invoked == "debugger.breakpoint_clear_all") {
 		const auto context = debugger_interaction::capture(
 			debugger_interaction::kind_t::breakpoint);
 		static_cast<void>(queue_debugger_mutation("Clear all breakpoints",
 			"debugger.breakpoint_clear_all", context, []() {
 				mutation_result_t result;
-				debugger_engine::clear_all_breakpoints();
-				result.ok = result.verified = debugger_engine::snapshot_breakpoints().empty();
+				const bool cleared = debugger_engine::clear_all_breakpoints();
+				result.ok = result.verified = cleared &&
+					debugger_engine::snapshot_breakpoints().empty();
+				if (!result.ok)
+					result.detail = "Clear all breakpoints did not verify: " +
+						debugger_engine::last_error();
 				return result;
 			}));
 	}
 
 	ImGui::PopID();
+	return bar_h;
 }
 
 static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
@@ -4126,14 +4585,23 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		}
 	}
 
-	float bar_h = 40.f;
-	render_breakpoint_actions(ox, oy, w);
+	const float bar_h = render_breakpoint_actions(ox, oy, w);
+	const bool compact_rows = w < 760.f;
+	const float breakpoint_row_height = compact_rows
+		? (std::max)(40.f, ROW_HEIGHT + 14.f) : ROW_HEIGHT;
 
 	float table_y = oy + bar_h;
-	{
+	if (compact_rows) {
 		ui_anim::table_col_t cols[] = {
-			{"#", 26.f}, {"State", 70.f}, {"Address", 170.f},
-			{"Type", 110.f}, {"Hits", 70.f}, {"Name", 180.f}, {"Actions", 0.f}
+			{"Breakpoint", (std::max)(1.f, w - 70.f)}, {"Actions", 0.f}
+		};
+		draw_table_header(dl, ox, table_y, w, cols, 2, a);
+	} else {
+		const float breakpoint_name_width = (std::max)(60.f, w - 700.f);
+		ui_anim::table_col_t cols[] = {
+			{"#", 32.f}, {"State", 90.f}, {"Address", 170.f},
+			{"Type", 120.f}, {"Hits", 70.f}, {"Name", breakpoint_name_width},
+			{"Actions", 0.f}
 		};
 		draw_table_header(dl, ox, table_y, w, cols, 7, a);
 	}
@@ -4143,7 +4611,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		st.breakpoints_generation, "breakpoints");
 	int total_n = static_cast<int>(snapshot.size());
 	float content_y = table_y + HEADER_H;
-	float visible_h = h - bar_h - HEADER_H;
+	float visible_h = (std::max)(1.f, h - bar_h - HEADER_H);
 
 	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
 	ImGui::PushID("##bp_list");
@@ -4158,25 +4626,40 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 	const float code_font_size = aida::ui::fonts::size_or(code_font, 14.5f);
 
 	ImGuiListClipper clipper;
-	clipper.Begin(total_n, ROW_HEIGHT);
+	clipper.Begin(total_n, breakpoint_row_height);
 	while (clipper.Step()) {
 		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-			ImGui::SetCursorScreenPos(ImVec2(ox, content_y + static_cast<float>(i) * ROW_HEIGHT
+			auto& bp = snapshot[static_cast<size_t>(i)];
+			ImGui::SetCursorScreenPos(ImVec2(ox,
+				content_y + static_cast<float>(i) * breakpoint_row_height
 				- ImGui::GetScrollY()));
 			ImVec2 row_min = ImGui::GetCursorScreenPos();
 			ImGui::PushID(i);
-			ImGui::InvisibleButton("##br", ImVec2(w - 18.f - 220.f, ROW_HEIGHT));
+			ImGui::InvisibleButton("##br", ImVec2((std::max)(1.f,
+				w - (compact_rows ? 68.f : 238.f)), breakpoint_row_height));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("breakpoint", "debugger-breakpoint-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::breakpoint, bp.address, 0, i, 0,
+					static_cast<std::uint64_t>(bp.size), bp.name, bp.condition));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
 			ImGui::PopID();
 
 			float ry = row_min.y;
-			auto& bp = snapshot[static_cast<size_t>(i)];
-			bool sel = (ui.bp_panel.selected == i);
 			const auto breakpoint_context = debugger_interaction::capture(
 				debugger_interaction::kind_t::breakpoint, bp.address, 0, i, 0,
 				static_cast<uint64_t>(bp.size), bp.name, bp.condition);
+			const auto context_for_row = [&](int row) {
+				const auto& item = snapshot[static_cast<size_t>(row)];
+				return debugger_interaction::capture(
+					debugger_interaction::kind_t::breakpoint, item.address, 0, row, 0,
+					static_cast<uint64_t>(item.size), item.name, item.condition);
+			};
+			bool sel = debugger_row_selected(breakpoint_context,
+				ui.bp_panel.selected == i);
 			const auto breakpoint_edit_gate = debugger_interaction::evaluate(
 				debugger_interaction::capability_t::edit_breakpoint, breakpoint_context);
 			const auto breakpoint_toggle_gate = debugger_interaction::evaluate(
@@ -4184,8 +4667,83 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 			const auto breakpoint_remove_gate = debugger_interaction::evaluate(
 				debugger_interaction::capability_t::remove_breakpoint, breakpoint_context);
 
-			draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, 1.f, a);
+			draw_row_bg(dl, ox, ry, w, breakpoint_row_height, sel, hov, i, 1.f, a);
 
+			bool compact_more_clicked = false;
+			if (compact_rows) {
+				char address_label[192];
+				if (bp.persistent_definition && !bp.definition_module.empty())
+					std::snprintf(address_label, sizeof(address_label), "%s+0x%" PRIX64,
+						bp.definition_module.c_str(), bp.definition_module_offset);
+				else
+					std::snprintf(address_label, sizeof(address_label), "%016" PRIX64,
+						bp.address);
+				const bool enabled = bp.state == debugger_engine::bp_state_t::enabled;
+				const bool unresolved = bp.persistent_definition && !bp.definition_resolved;
+				const bool install_error = bp.install_state ==
+					debugger_engine::breakpoint_install_state_t::error;
+				const bool install_pending = bp.install_state ==
+					debugger_engine::breakpoint_install_state_t::requested ||
+					bp.install_state == debugger_engine::breakpoint_install_state_t::installing ||
+					bp.install_state == debugger_engine::breakpoint_install_state_t::removing;
+				const char* state_label = install_error ? "ERROR" :
+					(install_pending ? "PENDING" : (unresolved ? "STALE" : (enabled ? "ON" : "OFF")));
+				static const char* compact_type_names[] = {
+					"SW", "HW EXEC", "HW WRITE", "HW READ", "MEM"
+				};
+				int type_index = static_cast<int>(bp.type);
+				if (type_index < 0 || type_index >= 5)
+					type_index = 0;
+				const ImU32 state_color = install_error ? t.error :
+					(install_pending ? t.warning : (unresolved ? t.warning :
+					(enabled ? t.success : t.text_secondary)));
+				const float action_pad = (std::min)(8.f, (std::max)(0.f, w * 0.08f));
+				const float action_width = (std::max)(1.f,
+					(std::min)(54.f, w - action_pad * 2.f));
+				const float action_x = ox + (std::max)(0.f,
+					w - action_pad - action_width);
+				dl->PushClipRect(ImVec2(ox, ry),
+					ImVec2((std::max)(ox + 1.f, action_x - 4.f),
+						ry + breakpoint_row_height), true);
+				dl->AddCircleFilled(ImVec2(ox + 14.f, ry + 11.f), 3.f,
+					with_a(state_color, a), 12);
+				dl->AddText(code_font, code_font_size, ImVec2(ox + 26.f, ry + 3.f),
+					with_a(t.text_address, a), address_label);
+				std::string detail_line = state_label;
+				detail_line.append("  ").append(compact_type_names[type_index]);
+				detail_line.append("  Hits ").append(std::to_string(bp.hit_count));
+				if (!bp.name.empty())
+					detail_line.append("  ").append(bp.name);
+				else if (unresolved && !bp.definition_status.empty())
+					detail_line.append("  ").append(bp.definition_status);
+				dl->AddText(body_font, body_font_size, ImVec2(ox + 26.f, ry + 21.f),
+					with_a(unresolved ? t.warning : t.text_secondary, a),
+					detail_line.c_str());
+				dl->PopClipRect();
+				ImGui::SetCursorScreenPos(ImVec2(action_x,
+					ry + (breakpoint_row_height - 22.f) * 0.5f));
+				ImGui::PushID(i + 0xC3000);
+				compact_more_clicked = aida::ui::button(
+					action_width < 42.f ? "..." : "More",
+					aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+					ImVec2(action_width, 22.f));
+				ImGui::PopID();
+				if (ImGui::IsItemHovered())
+					ImGui::SetTooltip("Open breakpoint actions");
+				if (hov && (bp.persistent_definition || !bp.install_detail.empty())) {
+					ImGui::BeginTooltip();
+					if (bp.persistent_definition) {
+						ImGui::Text("Persistent definition: %s+0x%" PRIX64,
+							bp.definition_module.c_str(), bp.definition_module_offset);
+						ImGui::TextWrapped("%s", bp.definition_status.empty()
+							? "Module-relative definition" : bp.definition_status.c_str());
+					}
+					if (!bp.install_detail.empty())
+						ImGui::TextWrapped("%s%s", bp.install_detail.c_str(),
+							bp.readback_verified ? " (verified)" : "");
+					ImGui::EndTooltip();
+				}
+			} else {
 			char ibuf[8];
 			std::snprintf(ibuf, sizeof(ibuf), "%d", i);
 			dl->AddText(body_font, body_font_size, ImVec2(ox + 8.f, ry + 5.f),
@@ -4193,15 +4751,24 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 
 			bool enabled = (bp.state == debugger_engine::bp_state_t::enabled);
 			const bool unresolved = bp.persistent_definition && !bp.definition_resolved;
-			ImU32 dot_col = unresolved ? t.warning : (enabled ? t.success : t.error);
+			const bool install_error = bp.install_state ==
+				debugger_engine::breakpoint_install_state_t::error;
+			const bool install_pending = bp.install_state ==
+				debugger_engine::breakpoint_install_state_t::requested ||
+				bp.install_state == debugger_engine::breakpoint_install_state_t::installing ||
+				bp.install_state == debugger_engine::breakpoint_install_state_t::removing;
+			ImU32 dot_col = install_error ? t.error :
+				(install_pending ? t.warning : (unresolved ? t.warning : (enabled ? t.success : t.error)));
 			float dot_pulse = enabled ? aida::ui::clock::pulse(1.4f, 0.55f, 1.f) : 0.55f;
 			dl->AddCircleFilled(ImVec2(ox + 40.f, ry + ROW_HEIGHT * 0.5f), 5.f,
 			                    with_a(dot_col, a * 0.20f), 16);
 			dl->AddCircleFilled(ImVec2(ox + 40.f, ry + ROW_HEIGHT * 0.5f), 3.f,
 			                    with_a(dot_col, a * dot_pulse), 16);
 
-			const char* state_str = unresolved ? "STALE" : (enabled ? "ON" : "OFF");
-			ImU32 pcol = unresolved ? t.warning : (enabled ? t.info : t.text_secondary);
+			const char* state_str = install_error ? "ERROR" :
+				(install_pending ? "PENDING" : (unresolved ? "STALE" : (enabled ? "ON" : "OFF")));
+			ImU32 pcol = install_error ? t.error :
+				(install_pending ? t.warning : (unresolved ? t.warning : (enabled ? t.info : t.text_secondary)));
 			ImVec2 sts = body_font->CalcTextSizeA(body_font_size, FLT_MAX, 0.f, state_str);
 			float pw = sts.x + 14.f;
 			float ph = 16.f;
@@ -4222,8 +4789,9 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 					bp.definition_module.c_str(), bp.definition_module_offset);
 			else
 				std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, bp.address);
+			const ImVec4 address_clip(ox + 126.f, ry, ox + 296.f, ry + ROW_HEIGHT);
 			dl->AddText(code_font, code_font_size, ImVec2(ox + 130.f, ry + 5.f),
-			            with_a(t.text_address, a), abuf);
+			            with_a(t.text_address, a), abuf, nullptr, 0.f, &address_clip);
 
 			static const char* type_names[] = {"SW", "HW_EXEC", "HW_WRITE", "HW_READ", "MEM"};
 			int ti = static_cast<int>(bp.type);
@@ -4253,12 +4821,16 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 			dl->AddText(code_font, code_font_size, ImVec2(ox + 420.f, ry + 5.f),
 			            with_a(t.text_secondary, a), hits_buf);
 
+			const float name_right = (std::max)(ox + 491.f, ox + w - 222.f);
+			dl->PushClipRect(ImVec2(ox + 486.f, ry),
+				ImVec2(name_right, ry + ROW_HEIGHT), true);
 			if (!bp.name.empty())
 				dl->AddText(body_font, body_font_size, ImVec2(ox + 490.f, ry + 5.f),
 				            with_a(t.text_primary, a), bp.name.c_str());
 			else if (unresolved)
 				dl->AddText(body_font, body_font_size, ImVec2(ox + 490.f, ry + 5.f),
 					with_a(t.warning, a), bp.definition_status.c_str());
+			dl->PopClipRect();
 			if (hov && bp.persistent_definition) {
 				ImGui::BeginTooltip();
 				ImGui::Text("Persistent definition: %s+0x%" PRIX64,
@@ -4333,12 +4905,17 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 				if (ui.bp_panel.selected == i)
 					ui.bp_panel.selected = -1;
 			}
+			}
+			if (compact_more_clicked) {
+				ui.bp_panel.selected = i;
+				select_debugger_row(breakpoint_context, total_n, context_for_row, false);
+				open_debugger_entity_actions(breakpoint_context,
+					aida::ui::context_menu_open_origin_t::pointer);
+			}
 
 			if (clicked) {
 				ui.bp_panel.selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::breakpoint, bp.address, 0, i,
-					0, static_cast<uint64_t>(bp.size), bp.name, bp.condition), false);
+				select_debugger_row(breakpoint_context, total_n, context_for_row, false);
 			}
 			if (dclicked && breakpoint_toggle_gate.enabled) {
 				static_cast<void>(queue_debugger_mutation("Toggle breakpoint state",
@@ -4351,9 +4928,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 					}));
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::breakpoint, bp.address, 0, i,
-					0, static_cast<uint64_t>(bp.size), bp.name, bp.condition), true);
+				select_debugger_row(breakpoint_context, total_n, context_for_row, true);
 		}
 	}
 	clipper.End();
@@ -4609,12 +5184,28 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 			ImGui::SetCursorScreenPos(ImVec2(card_x, cy));
 			ImGui::PushID(i);
 			ImGui::InvisibleButton("##cs_card", ImVec2(card_w, card_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("callstack", "debugger-callstack-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::stack_frame, f.address,
+					f.return_addr, i, 0, f.module_size, f.function_name,
+					f.module_name));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool dclicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && hov;
 			ImGui::PopID();
 
-			bool sel = (ui.callstack_panel.selected == i);
+			const auto context_for_row = [&](int row) {
+				const auto& item = snapshot[static_cast<size_t>(row)];
+				return debugger_interaction::capture(
+					debugger_interaction::kind_t::stack_frame, item.address,
+					item.return_addr, row, 0, item.module_size, item.function_name,
+					item.module_name);
+			};
+			const auto row_context = context_for_row(i);
+			bool sel = debugger_row_selected(row_context,
+				ui.callstack_panel.selected == i);
 			ImVec2 ca(card_x, cy);
 			ImVec2 cb(card_x + card_w, cy + card_h);
 
@@ -4682,10 +5273,7 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 
 			if (clicked) {
 				ui.callstack_panel.selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::stack_frame, f.address,
-					f.return_addr, i, 0, f.module_size, f.function_name,
-					f.module_name), false);
+				select_debugger_row(row_context, total_n, context_for_row, false);
 			}
 			if (dclicked) {
 				diag::log_tagged_fmt("dbg_view", "callstack double-click: jump to frame addr=0x%llX module='%s'",
@@ -4693,10 +5281,7 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 				jump_to_disasm(f.address);
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::stack_frame, f.address,
-					f.return_addr, i, 0, f.module_size, f.function_name,
-					f.module_name), true);
+				select_debugger_row(row_context, total_n, context_for_row, true);
 		}
 	}
 	clipper.End();
@@ -4775,18 +5360,29 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 	while (clipper.Step()) {
 		for (int ti = clipper.DisplayStart; ti < clipper.DisplayEnd; ++ti) {
 			float ry = content_y + static_cast<float>(ti) * row_h - ImGui::GetScrollY();
+			auto& th = threads[static_cast<size_t>(ti)];
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(ti);
 			ImGui::InvisibleButton("##th_row", ImVec2(w - 18.f - 280.f, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("thread", "debugger-thread-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::thread, th.rip, 0, ti, th.tid));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			ImGui::PopID();
 
-			auto& th = threads[static_cast<size_t>(ti)];
-			bool sel = (ui.threads_panel.selected == ti);
 			const auto thread_context = debugger_interaction::capture(
 				debugger_interaction::kind_t::thread, th.rip, 0, ti, th.tid);
+			const auto context_for_row = [&](int row) {
+				const auto& item = threads[static_cast<size_t>(row)];
+				return debugger_interaction::capture(
+					debugger_interaction::kind_t::thread, item.rip, 0, row, item.tid);
+			};
+			bool sel = debugger_row_selected(thread_context,
+				ui.threads_panel.selected == ti);
 			const auto suspend_gate = debugger_interaction::evaluate(
 				debugger_interaction::capability_t::suspend_thread, thread_context);
 			const auto resume_gate = debugger_interaction::evaluate(
@@ -4928,12 +5524,10 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			if (clicked) {
 				ui.threads_panel.selected = ti;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::thread, th.rip, 0, ti, th.tid), false);
+				select_debugger_row(thread_context, total_n, context_for_row, false);
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::thread, th.rip, 0, ti, th.tid), true);
+				select_debugger_row(thread_context, total_n, context_for_row, true);
 			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && th.rip != 0)
 				jump_to_disasm(th.rip);
 		}
@@ -5018,49 +5612,90 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 		}
 	}
 
+	const auto toolbar_metrics = aida::ui::design::metrics();
+	const float toolbar_pad = (std::max)(6.f, toolbar_metrics.spacing_sm);
+	const float toolbar_gap = (std::max)(4.f, toolbar_metrics.spacing_xs);
+	const float control_height = (std::max)(28.f, toolbar_metrics.control_height);
+	const bool stacked_toolbar = w < aida::ui::scale_px(600.f, toolbar_metrics.scale);
+	const float bar_h = stacked_toolbar
+		? toolbar_pad + control_height + toolbar_gap + control_height + toolbar_pad
+		: (std::max)(40.f, control_height + toolbar_pad * 2.f);
+
 	if (driver_bridge::attached_pid() == 0) {
-		float bar_h_local = 40.f;
-		float cw = std::min(w - 40.f, 620.f);
-		if (cw < 220.f) cw = std::max(220.f, w - 20.f);
+		float cw = (std::max)(1.f, (std::min)(w - 20.f, 620.f));
 		float cx = ox + (w - cw) * 0.5f;
-		float cy = oy + bar_h_local + (h - bar_h_local) * 0.5f - 26.f;
+		float cy = oy + bar_h + (h - bar_h) * 0.5f - 26.f;
 		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
 			"Attach to a process to evaluate register/memory watch expressions live.",
 			ui_anim::callout_kind_t::info, t.accent.x, t.accent.y, t.accent.z, a);
 	}
 
-	float bar_h = 40.f;
-	float input_w = w * 0.55f;
-	float btn_gap = 6.f;
-	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
+	const float input_w = stacked_toolbar
+		? (std::max)(1.f, w - toolbar_pad * 2.f)
+		: (std::clamp)(w * 0.55f, aida::ui::scale_px(170.f, toolbar_metrics.scale),
+			(std::max)(aida::ui::scale_px(170.f, toolbar_metrics.scale),
+				w - aida::ui::scale_px(210.f, toolbar_metrics.scale)));
+	const float actions_x = stacked_toolbar
+		? ox + toolbar_pad : ox + toolbar_pad + input_w + toolbar_gap;
+	const float actions_y = stacked_toolbar
+		? oy + toolbar_pad + control_height + toolbar_gap : oy + toolbar_pad;
+	const float actions_w = stacked_toolbar
+		? (std::max)(1.f, w - toolbar_pad * 2.f)
+		: (std::max)(1.f, w - (actions_x - ox) - toolbar_pad);
+	ImGui::SetCursorScreenPos(ImVec2(ox + toolbar_pad, oy + toolbar_pad));
 	ImGui::PushID("##w_actions");
 	aida::ui::input_text("##w_expr", ui.add_watch_buf, sizeof(ui.add_watch_buf),
 		"watch: RAX, [RBX+0x10], or 0x...",
-		false, ImVec2(input_w, bar_h - 8.f));
-	ImGui::SameLine(0.f, btn_gap);
-	bool add_clicked = aida::ui::button("Add Watch", aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (add_clicked && ui.add_watch_buf[0]) {
+		false, ImVec2(input_w, control_height));
+	const auto refresh_presentation = aida::ui::application_ui::present_action(
+		"debugger.watch.refresh_all");
+	std::string refresh_tooltip = refresh_presentation.description;
+	if (!refresh_presentation.enabled && !refresh_presentation.disabled_reason.empty()) {
+		refresh_tooltip.append("\n");
+		refresh_tooltip.append(refresh_presentation.disabled_reason);
+	}
+	const bool can_add = ui.add_watch_buf[0] != '\0';
+	const aida::ui::design::action_t actions[] = {
+		{"debugger.watch.add", "Add Watch", "Add", can_add
+			? "Add the entered register or memory expression"
+			: "Enter a register or memory expression before adding a watch",
+			nullptr, nullptr, aida::ui::button_kind_t::primary, can_add, true, true},
+		{"debugger.watch.refresh_all", "Refresh All Watches", "Refresh",
+			refresh_tooltip.c_str(), refresh_presentation.shortcut.c_str(), nullptr,
+			aida::ui::button_kind_t::secondary, refresh_presentation.enabled, false, true}
+	};
+	ImGui::SetCursorScreenPos(ImVec2(actions_x, actions_y));
+	const auto action = aida::ui::design::render_toolbar(
+		"debugger.watches.actions", actions, std::size(actions), actions_w);
+	const std::string_view invoked = action.invoked && action.id
+		? std::string_view(action.id) : std::string_view();
+	if (invoked == "debugger.watch.add") {
 		int idx = debugger_engine::add_watch(ui.add_watch_buf);
 		diag::log_tagged_critical_fmt("watches",
 			"watch_add expr='%s' idx=%d",
 			ui.add_watch_buf, idx);
 		ui.add_watch_buf[0] = '\0';
 	}
-	ImGui::SameLine(0.f, btn_gap);
-	bool refresh_clicked = aida::ui::button("Refresh", aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (refresh_clicked) {
+	if (invoked == "debugger.watch.refresh_all") {
 		diag::log_tagged_fmt("watches", "watch_refresh_all_request");
-		debugger_engine::refresh_watches();
+		static_cast<void>(aida::ui::application_ui::execute_action(
+			"debugger.watch.refresh_all",
+			aida::ui::action_invocation_source_t::toolbar));
 	}
 	ImGui::PopID();
 
+	const bool compact_rows = w < 700.f;
 	float table_y = oy + bar_h;
-	{
+	if (compact_rows) {
+		ui_anim::table_col_t cols[] = {
+			{"Watch", (std::max)(1.f, w - 70.f)}, {"Actions", 0.f}
+		};
+		draw_table_header(dl, ox, table_y, w, cols, 2, a);
+	} else {
+		const float value_column_width = (std::max)(100.f, w - 484.f);
 		ui_anim::table_col_t cols[] = {
 			{"Expression", 220.f}, {"Resolved Address", 180.f},
-			{"Value", 220.f}, {"Actions", 0.f}
+			{"Value", value_column_width}, {"Actions", 0.f}
 		};
 		draw_table_header(dl, ox, table_y, w, cols, 4, a);
 	}
@@ -5070,7 +5705,7 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 		st.watches_generation, "watches");
 	int total_n = static_cast<int>(snapshot.size());
 	float content_y = table_y + HEADER_H;
-	float visible_h = h - bar_h - HEADER_H;
+	float visible_h = (std::max)(1.f, h - bar_h - HEADER_H);
 
 	auto regs = debugger_engine::cached_registers();
 
@@ -5086,30 +5721,24 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
 	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
-	float row_h = ROW_HEIGHT + 4.f;
+	float row_h = compact_rows ? (std::max)(42.f, ROW_HEIGHT + 16.f) : ROW_HEIGHT + 4.f;
 	ImGuiListClipper clipper;
 	clipper.Begin(total_n, row_h);
 	while (clipper.Step()) {
 		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
 			float ry = content_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
 			auto& w_entry = snapshot[static_cast<size_t>(i)];
-			bool sel = (ui.watch_panel.selected == i);
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(i);
-			ImGui::InvisibleButton("##w_row", ImVec2(w - 18.f - 90.f, row_h));
+			ImGui::InvisibleButton("##w_row", ImVec2((std::max)(1.f,
+				w - (compact_rows ? 68.f : 108.f)), row_h));
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			ImGui::PopID();
 
-			draw_row_bg(dl, ox, ry, w, row_h, sel, hov, i, 1.f, a);
-
 			const std::string& display_expression = w_entry.persistent_expression.empty()
 				? w_entry.expression : w_entry.persistent_expression;
-			dl->AddText(body_font, body_font_size, ImVec2(ox + 10.f, ry + 7.f),
-			            with_a(w_entry.definition_resolved ? t.text_primary : t.warning, a),
-				display_expression.c_str());
-
 			bool deref = false;
 			bool ok = false;
 			uint64_t resolved = w_entry.definition_resolved
@@ -5121,54 +5750,106 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 			} else {
 				std::snprintf(addr_buf, sizeof(addr_buf), "?");
 			}
-			dl->AddText(code_font, code_font_size, ImVec2(ox + 230.f, ry + 7.f),
-			            with_a(t.text_address, a), addr_buf);
-
 			ImU32 vcol = w_entry.valid ? t.success : t.error;
 			const char* value_text = w_entry.valid
 				? w_entry.value.c_str()
 				: (w_entry.error.empty() ? "<error>" : w_entry.error.c_str());
-			dl->AddText(code_font, code_font_size, ImVec2(ox + 410.f, ry + 7.f),
-			            with_a(vcol, a), value_text);
-			if (hov && w_entry.persistent_definition && !w_entry.definition_module.empty()) {
-				ImGui::BeginTooltip();
-				ImGui::Text("Persistent definition: %s+0x%" PRIX64,
-					w_entry.definition_module.c_str(), w_entry.definition_module_offset);
-				if (!w_entry.definition_resolved)
-					ImGui::TextWrapped("%s", w_entry.error.c_str());
-				ImGui::EndTooltip();
-			}
-
-			float btn_x = ox + w - 84.f;
-			float btn_w = 64.f;
+			const auto watch_context = debugger_interaction::capture(
+				debugger_interaction::kind_t::watch, ok ? resolved : 0, 0, i,
+				0, 0, display_expression, value_text);
+			const auto context_for_row = [&](int row) {
+				const auto& item = snapshot[static_cast<size_t>(row)];
+				bool item_deref = false;
+				bool item_ok = false;
+				const uint64_t item_address = item.definition_resolved
+					? evaluate_watch_expression(item.expression, regs, item_deref, item_ok) : 0;
+				const std::string& item_expression = item.persistent_expression.empty()
+					? item.expression : item.persistent_expression;
+				const char* item_value = item.valid ? item.value.c_str()
+					: (item.error.empty() ? "<error>" : item.error.c_str());
+				return debugger_interaction::capture(debugger_interaction::kind_t::watch,
+					item_ok ? item_address : 0, 0, row, 0, 0, item_expression, item_value);
+			};
+			const bool sel = debugger_row_selected(watch_context,
+				ui.watch_panel.selected == i);
+			draw_row_bg(dl, ox, ry, w, row_h, sel, hov, i, 1.f, a);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("watch", "debugger-watch-row", watch_context);
+#endif
+			const float action_pad = compact_rows
+				? (std::min)(8.f, (std::max)(0.f, w * 0.08f)) : 20.f;
+			float btn_w = compact_rows
+				? (std::max)(1.f, (std::min)(54.f, w - action_pad * 2.f)) : 64.f;
+			float btn_x = ox + (std::max)(0.f, w - btn_w - action_pad);
 			float btn_h = 22.f;
 			float btn_y = ry + (row_h - btn_h) * 0.5f;
+			const float text_right = (std::max)(ox + 1.f, btn_x - 4.f);
+			dl->PushClipRect(ImVec2(ox, ry), ImVec2(text_right, ry + row_h), true);
+			if (compact_rows) {
+				dl->AddText(body_font, body_font_size, ImVec2(ox + 10.f, ry + 3.f),
+					with_a(w_entry.definition_resolved ? t.text_primary : t.warning, a),
+					display_expression.c_str());
+				dl->AddText(code_font, code_font_size, ImVec2(ox + 10.f, ry + 22.f),
+					with_a(t.text_address, a), addr_buf);
+				const float value_x = (std::max)(ox + 118.f,
+					ox + (text_right - ox) * 0.52f);
+				dl->AddText(code_font, code_font_size, ImVec2(value_x, ry + 22.f),
+					with_a(vcol, a), value_text);
+			} else {
+				const ImVec4 expression_clip(ox, ry, ox + 226.f, ry + row_h);
+				const ImVec4 address_clip(ox + 226.f, ry, ox + 406.f, ry + row_h);
+				const ImVec4 value_clip(ox + 406.f, ry, text_right, ry + row_h);
+				dl->AddText(body_font, body_font_size, ImVec2(ox + 10.f, ry + 7.f),
+					with_a(w_entry.definition_resolved ? t.text_primary : t.warning, a),
+					display_expression.c_str(), nullptr, 0.f, &expression_clip);
+				dl->AddText(code_font, code_font_size, ImVec2(ox + 230.f, ry + 7.f),
+					with_a(t.text_address, a), addr_buf, nullptr, 0.f, &address_clip);
+				dl->AddText(code_font, code_font_size, ImVec2(ox + 410.f, ry + 7.f),
+					with_a(vcol, a), value_text, nullptr, 0.f, &value_clip);
+			}
+			dl->PopClipRect();
+			if (hov) {
+				ImGui::BeginTooltip();
+				ImGui::TextUnformatted(display_expression.c_str());
+				ImGui::Text("Resolved: %s", addr_buf);
+				ImGui::TextWrapped("Value: %s", value_text);
+				if (w_entry.persistent_definition && !w_entry.definition_module.empty()) {
+					ImGui::Separator();
+					ImGui::Text("Persistent definition: %s+0x%" PRIX64,
+						w_entry.definition_module.c_str(), w_entry.definition_module_offset);
+					if (!w_entry.definition_resolved)
+						ImGui::TextWrapped("%s", w_entry.error.c_str());
+				}
+				ImGui::EndTooltip();
+			}
 			ImGui::SetCursorScreenPos(ImVec2(btn_x, btn_y));
 			ImGui::PushID(i + 0x40000);
-			bool rm = aida::ui::button("Remove", aida::ui::button_kind_t::destructive,
+			bool action_clicked = aida::ui::button(
+				compact_rows ? (btn_w < 42.f ? "..." : "More") : "Remove",
+				compact_rows ? aida::ui::button_kind_t::secondary : aida::ui::button_kind_t::destructive,
 				aida::ui::size_t_::sm, ImVec2(btn_w, btn_h));
 			ImGui::PopID();
-			if (rm) {
+			if (action_clicked && compact_rows) {
+				ui.watch_panel.selected = i;
+				select_debugger_row(watch_context, total_n, context_for_row, false);
+				open_debugger_entity_actions(watch_context,
+					aida::ui::context_menu_open_origin_t::pointer);
+			} else if (action_clicked) {
 				diag::log_tagged_fmt("watches",
 					"watch_remove_review idx=%d expr='%s'",
 					i, w_entry.expression.c_str());
 				request_context_mutation(pending_context_mutation_t::remove_watch,
-					debugger_interaction::capture(debugger_interaction::kind_t::watch,
-						ok ? resolved : 0, 0, i, 0, 0, display_expression, value_text));
+					watch_context);
 			}
 
 			if (clicked) {
 				ui.watch_panel.selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::watch, ok ? resolved : 0, 0, i,
-					0, 0, display_expression, value_text), false);
+				select_debugger_row(watch_context, total_n, context_for_row, false);
 			}
 			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ok && resolved != 0)
 				jump_to_hex(resolved, 256);
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::watch, ok ? resolved : 0, 0, i,
-					0, 0, display_expression, value_text), true);
+				select_debugger_row(watch_context, total_n, context_for_row, true);
 		}
 	}
 	clipper.End();
@@ -5496,11 +6177,24 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
 			float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ImGui::GetScrollY();
 			const auto& tr = trace_snapshot[filtered_indices[static_cast<std::size_t>(i)]];
-			bool sel = (ui.trace_panel.selected == i);
+			const auto context_for_row = [&](int row) {
+				const auto& item = trace_snapshot[filtered_indices[static_cast<size_t>(row)]];
+				return debugger_interaction::capture(
+					debugger_interaction::kind_t::trace_record, item.address, 0,
+					row, 0, 0, item.disasm_text);
+			};
+			const auto row_context = context_for_row(i);
+			bool sel = debugger_row_selected(row_context, ui.trace_panel.selected == i);
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(i);
 			ImGui::InvisibleButton("##tr_row", ImVec2(w - 18.f, ROW_HEIGHT));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("trace", "debugger-trace-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::trace_record, tr.address, 0,
+					i, 0, 0, tr.disasm_text));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			ImGui::PopID();
@@ -5520,16 +6214,12 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 			if (clicked) {
 				ui.trace_panel.selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::trace_record, tr.address, 0, i,
-					0, 0, tr.disasm_text), false);
+				select_debugger_row(row_context, total_n, context_for_row, false);
 			}
 			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
 				jump_to_disasm(tr.address);
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::trace_record, tr.address, 0, i,
-					0, 0, tr.disasm_text), true);
+				select_debugger_row(row_context, total_n, context_for_row, true);
 		}
 	}
 	clipper.End();
@@ -5660,11 +6350,24 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
 			float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ImGui::GetScrollY();
 			const auto& sr = strings_snapshot[filtered_indices[static_cast<std::size_t>(i)]];
-			bool sel = (ui.strings_panel.selected == i);
+			const auto context_for_row = [&](int row) {
+				const auto& item = strings_snapshot[filtered_indices[static_cast<size_t>(row)]];
+				return debugger_interaction::capture(
+					debugger_interaction::kind_t::string_value, item.address, 0, row,
+					0, item.value.size(), item.value, item.module_name);
+			};
+			const auto row_context = context_for_row(i);
+			bool sel = debugger_row_selected(row_context, ui.strings_panel.selected == i);
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(i);
 			ImGui::InvisibleButton("##s_row", ImVec2(w - 18.f, ROW_HEIGHT));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("string", "debugger-string-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::string_value, sr.address, 0, i,
+					0, sr.value.size(), sr.value, sr.module_name));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			ImGui::PopID();
@@ -5689,18 +6392,14 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			if (clicked) {
 				ui.strings_panel.selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::string_value, sr.address, 0, i,
-					0, sr.value.size(), sr.value, sr.module_name), false);
+				select_debugger_row(row_context, total_n, context_for_row, false);
 			}
 			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 				diag::log_tagged_fmt("dbg_view", "strings double-click: jump to hex addr=0x%llX value='%.32s'", (unsigned long long)sr.address, sr.value.c_str());
 				jump_to_hex(sr.address, 256);
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::string_value, sr.address, 0, i,
-					0, sr.value.size(), sr.value, sr.module_name), true);
+				select_debugger_row(row_context, total_n, context_for_row, true);
 		}
 	}
 	clipper.End();
@@ -5846,7 +6545,16 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
 			float ry = content_y + static_cast<float>(i) * row_h - ImGui::GetScrollY();
 			uint64_t addr = snapshot[static_cast<size_t>(i)];
-			bool sel = (ui.bookmark_panel.selected == i);
+			const auto context_for_row = [&](int row) {
+				const uint64_t item_address = snapshot[static_cast<size_t>(row)];
+				const auto label_it = labels_snapshot.find(item_address);
+				return debugger_interaction::capture(debugger_interaction::kind_t::bookmark,
+					item_address, 0, row, 0, 0,
+					label_it != labels_snapshot.end() ? label_it->second : std::string());
+			};
+			const auto row_context = context_for_row(i);
+			bool sel = debugger_row_selected(row_context,
+				ui.bookmark_panel.selected == i);
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(i);
@@ -5870,6 +6578,12 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 				dl->AddText(body_font, body_font_size, ImVec2(ox + 246.f, ry + 7.f),
 				            with_a(t.text_primary, a), it->second.c_str());
 			const std::string bookmark_label = it != labels_snapshot.end() ? it->second : std::string();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("bookmark", "debugger-bookmark-row",
+				debugger_interaction::capture(
+					debugger_interaction::kind_t::bookmark, addr, 0, i,
+					0, 0, bookmark_label));
+#endif
 
 			float btn_x = ox + w - 84.f;
 			float btn_w = 64.f;
@@ -5891,18 +6605,14 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 
 			if (clicked) {
 				ui.bookmark_panel.selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::bookmark, addr, 0, i,
-					0, 0, bookmark_label), false);
+				select_debugger_row(row_context, total_n, context_for_row, false);
 			}
 			if (dclicked) {
 				diag::log_tagged_fmt("dbg_view", "bookmark double-click: jump to addr=0x%llX", (unsigned long long)addr);
 				jump_to_disasm(addr);
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::bookmark, addr, 0, i,
-					0, 0, bookmark_label), true);
+				select_debugger_row(row_context, total_n, context_for_row, true);
 		}
 	}
 	clipper.End();
@@ -6025,11 +6735,23 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		for (int hi = clipper.DisplayStart; hi < clipper.DisplayEnd; ++hi) {
 			float ry = content_y + static_cast<float>(hi) * ROW_HEIGHT - ImGui::GetScrollY();
 			auto& he = snapshot[static_cast<size_t>(hi)];
-			bool sel = (ui.handle_panel.selected == hi);
+			const auto context_for_row = [&](int row) {
+				const auto& item = snapshot[static_cast<size_t>(row)];
+				return debugger_interaction::capture(debugger_interaction::kind_t::handle,
+					0, item.handle, row, 0, 0, item.name, item.type_name);
+			};
+			const auto row_context = context_for_row(hi);
+			bool sel = debugger_row_selected(row_context,
+				ui.handle_panel.selected == hi);
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(hi);
 			ImGui::InvisibleButton("##h_row", ImVec2(w - 18.f - 90.f, ROW_HEIGHT));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_studio_debug_entity("handle", "debugger-handle-row",
+				debugger_interaction::capture(debugger_interaction::kind_t::handle,
+					0, he.handle, hi, 0, 0, he.name, he.type_name));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			ImGui::PopID();
@@ -6090,14 +6812,10 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			if (clicked) {
 				ui.handle_panel.selected = hi;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::handle, 0, he.handle, hi, 0, 0,
-					he.name, he.type_name), false);
+				select_debugger_row(row_context, total_n, context_for_row, false);
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::handle, 0, he.handle, hi, 0, 0,
-					he.name, he.type_name), true);
+				select_debugger_row(row_context, total_n, context_for_row, true);
 		}
 	}
 	clipper.End();
@@ -6456,11 +7174,10 @@ static void render_code_cave_dialog() {
 		debugger_interaction::current_stop_generation() == snapshot.target_stop_generation &&
 		debugger_engine::g_state.status.load(std::memory_order_acquire) ==
 			debugger_engine::dbg_status_t::paused;
-	const auto dialog_metrics = aida::ui::design::metrics();
-	const float body_height = (std::max)(120.f,
-		ImGui::GetContentRegionAvail().y - dialog_metrics.dialog_footer_height);
-	ImGui::BeginChild("##code_cave_body", ImVec2(0.f, body_height), false,
-		ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    const auto dialog_metrics = aida::ui::design::metrics();
+    const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+        "Stage Patch Review", "Close");
+    aida::ui::design::begin_dialog_body("code_cave_body", footer_height);
 	ImGui::TextWrapped("Discover bounded 00/CC filler runs in loaded modules. Every result retains the exact process and debugger stop generation that produced it.");
 	ImGui::SetNextItemWidth((std::min)(aida::ui::scale_px(360.f, dialog_metrics.scale),
 		ImGui::GetContentRegionAvail().x));
@@ -6524,7 +7241,7 @@ static void render_code_cave_dialog() {
 			}
 		ImGui::EndTable();
 	}
-	ImGui::EndChild();
+    aida::ui::design::end_dialog_body();
 	const bool has_selection = g_code_cave_search.selected >= 0 &&
 		g_code_cave_search.selected < static_cast<int>(snapshot.results.size());
 	const auto footer = aida::ui::design::dialog_footer("code_cave_footer",
@@ -6593,8 +7310,11 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 		}
 	}
 
-	float bar_h = 40.f;
-	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
+	const auto toolbar_metrics = aida::ui::design::metrics();
+	const float toolbar_pad = (std::max)(6.f, toolbar_metrics.spacing_sm);
+	const float bar_h = (std::max)(40.f,
+		toolbar_metrics.control_height + toolbar_pad * 2.f);
+	ImGui::SetCursorScreenPos(ImVec2(ox + toolbar_pad, oy + toolbar_pad));
 	const bool selected_available = ui.patches_panel.selected >= 0 &&
 		ui.patches_panel.selected < static_cast<int>(patch_rows.size());
 	static aida::ui::application_ui::retained_entity_context_t selected_patch_context;
@@ -6619,7 +7339,7 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 					static_cast<std::uint64_t>(selected_patch.patched_size),
 					selected_patch.description);
 			selected_patch_context =
-				build_debugger_entity_actions(selected_patch_debugger_context);
+				build_debugger_entity_actions(selected_patch_debugger_context, false);
 			selected_patch_context_generation = snapshot_generation;
 			selected_patch_stop_generation = stop_generation;
 			selected_patch_target_pid = target_pid;
@@ -6677,7 +7397,7 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	};
 	const auto patch_action = aida::ui::design::render_toolbar(
 		"debugger.patches.actions", patch_actions, std::size(patch_actions),
-		(std::max)(1.f, w - 16.f));
+		(std::max)(1.f, w - toolbar_pad * 2.f));
 	const std::string_view invoked = patch_action.invoked && patch_action.id
 		? std::string_view(patch_action.id) : std::string_view();
 	if (!invoked.empty()) {
@@ -6693,18 +7413,28 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 				aida::ui::action_invocation_source_t::toolbar);
 		static_cast<void>(result);
 	}
+	const bool compact_rows = w < 820.f;
+	const float patch_row_height = compact_rows
+		? (std::max)(42.f, ROW_HEIGHT + 16.f) : ROW_HEIGHT;
 	float table_y = oy + bar_h;
-	{
+	if (compact_rows) {
 		ui_anim::table_col_t cols[] = {
-			{"#", 26.f}, {"Address", 170.f}, {"Original", 200.f},
-			{"Patched", 200.f}, {"Description", 220.f}, {"Active", 70.f}
+			{"Patch", (std::max)(1.f, w - 66.f)}, {"State", 0.f}
+		};
+		draw_table_header(dl, ox, table_y, w, cols, 2, a);
+	} else {
+		const float description_column_width = (std::max)(170.f, w - 650.f);
+		ui_anim::table_col_t cols[] = {
+			{"#", 26.f}, {"Address", 164.f}, {"Original", 200.f},
+			{"Patched", 200.f}, {"Description", description_column_width},
+			{"Active", 0.f}
 		};
 		draw_table_header(dl, ox, table_y, w, cols, 6, a);
 	}
 
 	int total_n = static_cast<int>(patch_rows.size());
 	float content_y = table_y + HEADER_H;
-	float visible_h = h - bar_h - HEADER_H;
+	float visible_h = (std::max)(1.f, h - bar_h - HEADER_H);
 
 	ImGui::SetCursorScreenPos(ImVec2(ox, content_y));
 	ImGui::PushID("##p_list");
@@ -6719,59 +7449,115 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	ImGuiListClipper clipper;
-	clipper.Begin(total_n, ROW_HEIGHT);
+	clipper.Begin(total_n, patch_row_height);
 	while (clipper.Step()) {
 		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-			float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ImGui::GetScrollY();
+			float ry = content_y + static_cast<float>(i) * patch_row_height - ImGui::GetScrollY();
 			const auto& p = patch_rows[static_cast<size_t>(i)];
-			bool sel = (ui.patches_panel.selected == i);
+			const auto context_for_row = [&](int row) {
+				const auto& item = patch_rows[static_cast<size_t>(row)];
+				return debugger_interaction::capture(debugger_interaction::kind_t::patch,
+					item.address, snapshot_generation, row, 0,
+					static_cast<uint64_t>(item.patched_size), item.description);
+			};
+			const auto row_context = context_for_row(i);
+			bool sel = debugger_row_selected(row_context,
+				ui.patches_panel.selected == i);
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
 			ImGui::PushID(i);
-			ImGui::InvisibleButton("##p_row", ImVec2(w - 80.f, ROW_HEIGHT));
+			ImGui::InvisibleButton("##p_row", ImVec2((std::max)(1.f, w - 62.f),
+				patch_row_height));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const auto patch_semantic_context = debugger_interaction::capture(
+				debugger_interaction::kind_t::patch, p.address, snapshot_generation,
+				i, 0, static_cast<std::uint64_t>(p.patched_size), p.description);
+			const std::string patch_semantic_id = studio_debug_entity_id(
+				"patch", patch_semantic_context);
+			aida::preview::semantics::register_last_item(
+				patch_semantic_id, "debugger-patch-row", false, false,
+				"aida.dock-window.view.debug.patches");
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			ImGui::PopID();
-			draw_row_bg(dl, ox, ry, w, ROW_HEIGHT, sel, hov, i, 1.f, a);
+			draw_row_bg(dl, ox, ry, w, patch_row_height, sel, hov, i, 1.f, a);
 
 			char ibuf[8], abuf[20];
 			std::snprintf(ibuf, sizeof(ibuf), "%d", i);
 			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, p.address);
-			dl->AddText(body_font, body_font_size, ImVec2(ox + 8.f, ry + 5.f),
-			            with_a(t.text_dim, a), ibuf);
-			dl->AddText(code_font, code_font_size, ImVec2(ox + 36.f, ry + 5.f),
-			            with_a(t.text_address, a), abuf);
-
-			ImVec2 osz = code_font->CalcTextSizeA(code_font_size, FLT_MAX, 0.f, p.original.c_str());
-			float bx = ox + 200.f;
-			float by = ry + 3.f;
-			dl->AddRectFilled(ImVec2(bx - 4.f, by),
-			                  ImVec2(bx + osz.x + 8.f, by + 16.f),
-			                  with_a(t.text_dim, a * 0.18f), 4.f);
-			dl->AddText(code_font, code_font_size, ImVec2(bx, ry + 5.f),
-			            with_a(t.text_secondary, a), p.original.c_str());
-
-			ImVec2 psz = code_font->CalcTextSizeA(code_font_size, FLT_MAX, 0.f, p.patched.c_str());
-			float bx2 = ox + 400.f;
 			ImU32 pc = p.active ? t.success : t.warning;
-			dl->AddRectFilled(ImVec2(bx2 - 4.f, by),
-			                  ImVec2(bx2 + psz.x + 8.f, by + 16.f),
-			                  with_a(pc, a * 0.20f), 4.f);
-			dl->AddText(code_font, code_font_size, ImVec2(bx2, ry + 5.f),
-			            with_a(pc, a), p.patched.c_str());
-
-			dl->AddText(body_font, body_font_size, ImVec2(ox + 600.f, ry + 5.f),
-			            with_a(t.text_primary, a), p.description.c_str());
-
 			bool active_state = p.active;
 			float track_w = 28.f;
 			float track_h = 14.f;
 			float tx = ox + w - track_w - 16.f;
-			float ty = ry + (ROW_HEIGHT - track_h) * 0.5f;
+			float ty = ry + (patch_row_height - track_h) * 0.5f;
+			const float text_right = (std::max)(ox + 1.f, tx - 8.f);
+			if (compact_rows) {
+				const ImVec4 top_clip(ox, ry, text_right, ry + patch_row_height * 0.5f);
+				dl->AddText(body_font, body_font_size, ImVec2(ox + 8.f, ry + 3.f),
+					with_a(t.text_dim, a), ibuf, nullptr, 0.f, &top_clip);
+				dl->AddText(code_font, code_font_size, ImVec2(ox + 34.f, ry + 3.f),
+					with_a(t.text_address, a), abuf, nullptr, 0.f, &top_clip);
+				const float bytes_x = ox + 34.f;
+				const float bytes_width = (std::max)(1.f, text_right - bytes_x);
+				const float midpoint = bytes_x + bytes_width * 0.5f;
+				const ImVec4 original_clip(bytes_x, ry + 20.f,
+					(std::max)(bytes_x + 1.f, midpoint - 10.f), ry + patch_row_height);
+				const ImVec4 patched_clip(midpoint + 10.f, ry + 20.f,
+					text_right, ry + patch_row_height);
+				const ImVec4 transition_clip(midpoint - 6.f, ry + 20.f,
+					midpoint + 8.f, ry + patch_row_height);
+				dl->AddText(code_font, code_font_size, ImVec2(bytes_x, ry + 22.f),
+					with_a(t.text_secondary, a), p.original.c_str(), nullptr, 0.f,
+					&original_clip);
+				dl->AddText(body_font, body_font_size, ImVec2(midpoint - 5.f, ry + 22.f),
+					with_a(t.text_dim, a), ">", nullptr, 0.f, &transition_clip);
+				dl->AddText(code_font, code_font_size, ImVec2(midpoint + 10.f, ry + 22.f),
+					with_a(pc, a), p.patched.c_str(), nullptr, 0.f, &patched_clip);
+			} else {
+				dl->AddText(body_font, body_font_size, ImVec2(ox + 8.f, ry + 5.f),
+					with_a(t.text_dim, a), ibuf);
+				dl->AddText(code_font, code_font_size, ImVec2(ox + 36.f, ry + 5.f),
+					with_a(t.text_address, a), abuf);
+				const ImVec4 original_clip(ox + 196.f, ry, ox + 396.f,
+					ry + patch_row_height);
+				dl->PushClipRect(ImVec2(original_clip.x, original_clip.y),
+					ImVec2(original_clip.z, original_clip.w), true);
+				ImVec2 osz = code_font->CalcTextSizeA(
+					code_font_size, FLT_MAX, 0.f, p.original.c_str());
+				float bx = ox + 200.f;
+				float by = ry + 3.f;
+				dl->AddRectFilled(ImVec2(bx - 4.f, by),
+					ImVec2(bx + osz.x + 8.f, by + 16.f),
+					with_a(t.text_dim, a * 0.18f), 4.f);
+				dl->AddText(code_font, code_font_size, ImVec2(bx, ry + 5.f),
+					with_a(t.text_secondary, a), p.original.c_str());
+				dl->PopClipRect();
+				const ImVec4 patched_clip(ox + 396.f, ry, ox + 596.f,
+					ry + patch_row_height);
+				dl->PushClipRect(ImVec2(patched_clip.x, patched_clip.y),
+					ImVec2(patched_clip.z, patched_clip.w), true);
+				ImVec2 psz = code_font->CalcTextSizeA(
+					code_font_size, FLT_MAX, 0.f, p.patched.c_str());
+				float bx2 = ox + 400.f;
+				dl->AddRectFilled(ImVec2(bx2 - 4.f, by),
+					ImVec2(bx2 + psz.x + 8.f, by + 16.f),
+					with_a(pc, a * 0.20f), 4.f);
+				dl->AddText(code_font, code_font_size, ImVec2(bx2, ry + 5.f),
+					with_a(pc, a), p.patched.c_str());
+				dl->PopClipRect();
+				const ImVec4 description_clip(ox + 596.f, ry,
+					text_right, ry + patch_row_height);
+				dl->AddText(body_font, body_font_size, ImVec2(ox + 600.f, ry + 5.f),
+					with_a(t.text_primary, a), p.description.c_str(), nullptr, 0.f,
+					&description_clip);
+			}
 			ImGui::SetCursorScreenPos(ImVec2(tx, ty));
 			ImGui::PushID(i + 0x70000);
 			ImGui::InvisibleButton("##patch_tog", ImVec2(track_w, track_h));
 			bool tog_clicked = ImGui::IsItemClicked();
+			bool tog_hovered = ImGui::IsItemHovered();
 			ImGui::PopID();
 			ImU32 track_col = aida::ui::mix(t.panel_header, t.accent_u32, active_state ? 1.f : 0.f);
 			dl->AddRectFilled(ImVec2(tx, ty), ImVec2(tx + track_w, ty + track_h),
@@ -6781,6 +7567,18 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 			float knob_y = (ty + ty + track_h) * 0.5f;
 			dl->AddCircleFilled(ImVec2(knob_x, knob_y), knob_r,
 			                    with_a(IM_COL32(255, 255, 255, 240), a), 16);
+			if (tog_hovered)
+				ImGui::SetTooltip("%s this patch after explicit review and byte readback",
+					active_state ? "Revert" : "Apply");
+			if (hov) {
+				ImGui::BeginTooltip();
+				ImGui::Text("Address: 0x%016" PRIX64, p.address);
+				ImGui::TextWrapped("%s", p.description.c_str());
+				ImGui::Separator();
+				ImGui::TextWrapped("Original: %s", p.original.c_str());
+				ImGui::TextWrapped("Patched: %s", p.patched.c_str());
+				ImGui::EndTooltip();
+			}
 			if (tog_clicked) {
 				diag::log_tagged_critical_fmt("patches",
 					"patch_toggle_review idx=%d addr=0x%llx new_active=%d desc='%s'",
@@ -6798,9 +7596,7 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			if (clicked) {
 				ui.patches_panel.selected = i;
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::patch, p.address, snapshot_generation, i, 0,
-					static_cast<uint64_t>(p.patched_size), p.description), false);
+				select_debugger_row(row_context, total_n, context_for_row, false);
 				memory_interaction::runtime_t runtime;
 				runtime.driver_loaded = driver_bridge::is_loaded();
 				runtime.live_attached = driver_bridge::attached_pid() != 0;
@@ -6812,9 +7608,7 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
 				jump_to_disasm(p.address);
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::patch, p.address, snapshot_generation, i, 0,
-					static_cast<uint64_t>(p.patched_size), p.description), true);
+				select_debugger_row(row_context, total_n, context_for_row, true);
 				memory_interaction::runtime_t runtime;
 				runtime.driver_loaded = driver_bridge::is_loaded();
 				runtime.live_attached = driver_bridge::attached_pid() != 0;
@@ -7127,8 +7921,8 @@ void render(float pos_x, float pos_y, float width, float height,
 		ui.active_tab != sub_tab_t::source;
 	float panel_offset = 0.f;
 	if (tab_uses_toolbar) {
-		draw_run_toolbar(dl, ox, toolbar_y, alpha);
-		panel_offset = TOOLBAR_H + aida::ui::metrics::spacing::sm;
+		draw_run_toolbar(dl, ox, toolbar_y, inner_width, alpha);
+		panel_offset = run_toolbar_height() + aida::ui::metrics::spacing::sm;
 	}
 
 	float panel_y = content_y + panel_offset;
@@ -7257,11 +8051,11 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 			pane != sub_tab_t::memory_map && pane != sub_tab_t::modules &&
 			pane != sub_tab_t::seh_chain && pane != sub_tab_t::cfg &&
 			pane != sub_tab_t::source;
-		const float controls_h = has_controls ? TOOLBAR_H : 0.f;
+		const float controls_h = has_controls ? run_toolbar_height() : 0.f;
 		const float gap = has_controls ? aida::ui::metrics::spacing::xs : 0.f;
 		const float body_h = std::max(1.f, size.y - status_h - controls_h - gap);
 		if (has_controls)
-			draw_run_toolbar(dl, origin.x, origin.y, alpha);
+			draw_run_toolbar(dl, origin.x, origin.y, size.x, alpha);
 		const float body_y = origin.y + controls_h + gap;
 
 		ImGui::PushClipRect(ImVec2(origin.x, body_y),
@@ -7350,11 +8144,9 @@ void render_global_dialogs() {
 			ImVec2(620.f, 420.f), ImVec2(420.f, 300.f)))
 		return;
 
-	const auto dialog_metrics = aida::ui::design::metrics();
-	const float body_height = (std::max)(120.f,
-		ImGui::GetContentRegionAvail().y - dialog_metrics.dialog_footer_height);
-	ImGui::BeginChild("##patch_stage_body", ImVec2(0.f, body_height), false,
-		ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+        "Stage Inactive", "Cancel");
+    aida::ui::design::begin_dialog_body("patch_stage_body", footer_height);
 	ImGui::TextUnformatted("Review a patch definition");
 	ImGui::TextDisabled("This stages an inactive definition. It does not write target memory.");
 	ImGui::Separator();
@@ -7399,7 +8191,7 @@ void render_global_dialogs() {
 			ui.patch_stage_expected_stop_generation);
 	if (!target_ready)
 		ImGui::TextDisabled("The reviewed live target or debugger stop is unavailable; cancel and capture a new patch review.");
-	ImGui::EndChild();
+    aida::ui::design::end_dialog_body();
 
 	const auto footer = aida::ui::design::dialog_footer("debugger_patch_stage_footer",
 		"Stage Inactive", valid && target_ready, false, "Cancel");
@@ -7485,8 +8277,8 @@ void render_execution_controls(float pos_x, float pos_y, float width, float heig
 	if (visible) {
 		const ImVec2 origin = ImGui::GetWindowPos();
 		const ImVec2 size = ImGui::GetWindowSize();
-		draw_run_toolbar(ImGui::GetWindowDrawList(), origin.x, origin.y, alpha);
-		if (size.y >= TOOLBAR_H + aida::ui::metrics::status_bar::height)
+		draw_run_toolbar(ImGui::GetWindowDrawList(), origin.x, origin.y, size.x, alpha);
+		if (size.y >= run_toolbar_height() + aida::ui::metrics::status_bar::height)
 			render_debugger_status_bar(ImVec2(0.f, size.y - aida::ui::metrics::status_bar::height),
 				size.x, status, driver_bridge::attached_pid(), driver_bridge::attached_pid() != 0);
 	}
@@ -7519,22 +8311,35 @@ void render_global_target_dialog() {
 			CloseHandle(reinterpret_cast<HANDLE>(result.thread_handle));
 			result.thread_handle = 0;
 		}
-		if (!sandbox_dir.empty())
-			spawn_target_dialog::detail::last_sandbox_dir() = sandbox_dir;
+		std::string error;
 		if (!ok) {
-			const std::string& error = debugger_engine::last_error();
-			toast_notification::push("Launch failed: " +
-				(error.empty() ? std::string("(no detail)") : error),
-				toast_notification::toast_type_t::error);
-		} else if (options.isolation == run_target::isolation_t::windows_sandbox) {
-			toast_notification::push("Launched interactive malware lab VM.",
-				toast_notification::toast_type_t::success);
-		} else {
-			char message[160];
-			std::snprintf(message, sizeof(message), "Host launch started PID %u (iso=%d)",
-				static_cast<unsigned>(new_pid), static_cast<int>(options.isolation));
-			toast_notification::push(message, toast_notification::toast_type_t::success);
+			error = debugger_engine::last_error();
+			if (error.empty())
+				error = "(no detail)";
 		}
+		const auto isolation = options.isolation;
+		const bool posted = post_debugger_ui(
+			[sandbox_dir, ok, error = std::move(error), new_pid, isolation] {
+				if (!sandbox_dir.empty())
+					spawn_target_dialog::detail::last_sandbox_dir() = sandbox_dir;
+				if (!ok) {
+					toast_notification::push("Launch failed: " + error,
+						toast_notification::toast_type_t::error);
+				} else if (isolation == run_target::isolation_t::windows_sandbox) {
+					toast_notification::push("Launched interactive malware lab VM.",
+						toast_notification::toast_type_t::success);
+				} else {
+					char message[160];
+					std::snprintf(message, sizeof(message),
+						"Host launch started PID %u (iso=%d)",
+						static_cast<unsigned>(new_pid), static_cast<int>(isolation));
+					toast_notification::push(message,
+						toast_notification::toast_type_t::success);
+				}
+			}, "spawn_attach_completion");
+		if (!posted)
+			throw std::runtime_error(
+				"Debugger launch completion could not be published to the UI thread");
 	};
 	const auto submitted = aida::infra::executor::submit(std::move(submission));
 	if (!submitted.submitted)

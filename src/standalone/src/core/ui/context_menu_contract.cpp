@@ -64,6 +64,13 @@ context_menu_registration_result_t context_menu_catalog_t::validate(
                 !is_valid_display_label(item.description_override))
                 return {context_menu_status_t::invalid_descriptor,
                         "Context menu action description is invalid"};
+            if (!item.shortcut_action.empty()) {
+                const auto* shortcut_action = actions.find(item.shortcut_action);
+                if (!shortcut_action ||
+                    !any(shortcut_action->surfaces & action_surface_t::shortcut))
+                    return {context_menu_status_t::invalid_descriptor,
+                            "Context menu shortcut action is not registered for shortcuts"};
+            }
             if (!action_ids.insert(item.action).second)
                 return {context_menu_status_t::invalid_descriptor,
                         "Context menu action is duplicated"};
@@ -139,9 +146,7 @@ context_menu_presentation_t context_menu_presenter_t::compose(
             if (!action)
                 continue;
             const auto state = actions_.evaluate(item.action, context);
-            if (!state.capability.visible ||
-                (!state.capability.enabled &&
-                 item.visibility == context_menu_visibility_t::hide_when_unavailable))
+            if (!state.capability.visible)
                 continue;
 
             context_menu_presented_action_t presented;
@@ -155,7 +160,9 @@ context_menu_presentation_t context_menu_presenter_t::compose(
                 : item.icon_override;
             presented.shortcut_hint = !item.shortcut_override.empty()
                 ? item.shortcut_override
-                : shortcuts_ ? shortcuts_->effective_hint(item.action, context)
+                : shortcuts_ ? shortcuts_->effective_hint(
+                    item.shortcut_action.empty() ? item.action : item.shortcut_action,
+                    context)
                              : std::string{};
             presented.disabled_reason = state.capability.disabled_reason;
             presented.consequence_summary = state.consequence_summary;
@@ -165,7 +172,6 @@ context_menu_presentation_t context_menu_presenter_t::compose(
             presented.enabled = state.capability.enabled;
             presented.undoable = action->undoable;
             presented.reviewable = action->reviewable;
-            presented.close_menu_on_execute = item.close_menu_on_execute;
             presented_section.actions.push_back(std::move(presented));
         }
         std::sort(presented_section.actions.begin(), presented_section.actions.end(),

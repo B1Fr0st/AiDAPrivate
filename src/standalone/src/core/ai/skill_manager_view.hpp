@@ -30,6 +30,7 @@
 #include "ui_anim.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview.hpp"
+#include "../../preview/studio_semantics.hpp"
 #endif
 #include "../ui/avatar.hpp"
 #include "../ui/blur_layer.hpp"
@@ -283,6 +284,11 @@ namespace skill_manager {
 					"Filter skills", false, ImVec2(full_w, ctl_h))) {
 				std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
 			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				"aida.automation.skills.filter", "search-input", false, false,
+				"aida.dock-window.view.ai.skills"));
+#endif
 
 			const float row2_y = row1_y + ctl_h + 6.f;
 			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row2_y));
@@ -319,6 +325,11 @@ namespace skill_manager {
 					false, nullptr, refreshing_local)) {
 				request_reindex();
 			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				"aida.automation.skills.action-refresh", "skill-manager-action",
+				false, refreshing_local, "aida.dock-window.view.ai.skills"));
+#endif
 
 			const float row3_y = row2_y + (stack_all ? (ctl_h + 6.f) * 2.f : ctl_h + 6.f);
 			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row3_y));
@@ -327,6 +338,11 @@ namespace skill_manager {
 			ImGui::PushItemWidth(compact_url_w);
 			ImGui::InputTextWithHint("##sm_add_url", "https://host/index.json",
 				st.add_url_buf, sizeof(st.add_url_buf));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				"aida.automation.skills.remote-url", "url-input", false, false,
+				"aida.dock-window.view.ai.skills"));
+#endif
 			ImGui::PopItemWidth();
 			if (!stack_all)
 				ImGui::SameLine(0.f, gap);
@@ -342,10 +358,15 @@ namespace skill_manager {
 					const bool accepted = aida::skill_manager_service::request_add_remote_url(url, &error);
 					if (service_request(accepted, error)) {
 						std::memset(st.add_url_buf, 0, sizeof(st.add_url_buf));
-						st.active_tab = source_tab_t::remote;
+					st.active_tab = source_tab_t::remote;
 					}
 				}
 			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				"aida.automation.skills.action-add-url", "skill-manager-action",
+				false, false, "aida.dock-window.view.ai.skills"));
+#endif
 
 			return stack_all ? (toolbar_h + ctl_h * 3.f + 28.f) : (toolbar_h + ctl_h * 2.f + 12.f);
 		}
@@ -357,6 +378,11 @@ namespace skill_manager {
 				"Filter skills", false, ImVec2(search_w, ctl_h))) {
 			std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.skills.filter", "search-input", false, false,
+			"aida.dock-window.view.ai.skills"));
+#endif
 
 		ImGui::SameLine(0.f, gap);
 		ImGui::PushItemWidth(combo_w);
@@ -389,6 +415,11 @@ namespace skill_manager {
 				false, nullptr, refreshing_local)) {
 			request_reindex();
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.skills.action-refresh", "skill-manager-action",
+			false, refreshing_local, "aida.dock-window.view.ai.skills"));
+#endif
 
 		float url_w = url_w_full;
 		if (!tb_wrap) {
@@ -404,6 +435,11 @@ namespace skill_manager {
 		ImGui::PushItemWidth(url_w);
 		ImGui::InputTextWithHint("##sm_add_url", "https://host/index.json",
 			st.add_url_buf, sizeof(st.add_url_buf));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.skills.remote-url", "url-input", false, false,
+			"aida.dock-window.view.ai.skills"));
+#endif
 		ImGui::PopItemWidth();
 
 		ImGui::SameLine(0.f, gap);
@@ -417,10 +453,15 @@ namespace skill_manager {
 				const bool accepted = aida::skill_manager_service::request_add_remote_url(url, &error);
 				if (service_request(accepted, error)) {
 					std::memset(st.add_url_buf, 0, sizeof(st.add_url_buf));
-					st.active_tab = source_tab_t::remote;
+				st.active_tab = source_tab_t::remote;
 				}
 			}
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.skills.action-add-url", "skill-manager-action",
+			false, false, "aida.dock-window.view.ai.skills"));
+#endif
 		ImGui::EndGroup();
 
 		static bool s_sm_logged_wrap = false;
@@ -484,6 +525,12 @@ namespace skill_manager {
 			ImGui::SetCursorScreenPos(ImVec2(bx, y));
 			ImGui::PushID(i);
 			ImGui::InvisibleButton("##tab_btn", ImVec2(btn_w, btn_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				aida::preview::semantics::stable_id("aida.automation.skills.tab",
+					tab_label(tabs[i])), "skill-source-tab", false, false,
+				"aida.dock-window.view.ai.skills"));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked();
 
@@ -631,6 +678,13 @@ namespace skill_manager {
 			ImGui::PushID(m.name.c_str());
 			ImGui::SetNextItemAllowOverlap();
 			ImGui::InvisibleButton("##sm_row_btn", ImVec2(row_w, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const std::string skill_semantic = "aida.automation.skill-" +
+				aida::preview::semantics::entity_token(m.name + ":" + m.file_path);
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				skill_semantic, "skill-row", true, false,
+				"aida.dock-window.view.ai.skills"));
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool right   = ImGui::IsItemClicked(ImGuiMouseButton_Right);
@@ -659,6 +713,12 @@ namespace skill_manager {
 				service_request(accepted, error);
 			}
 			ImGui::EndDisabled();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				"aida.automation.skill-action-toggle-" +
+					aida::preview::semantics::entity_token(m.name),
+				"skill-toggle", false, operation_pending, skill_semantic));
+#endif
 			ImGui::PopID();
 			(void)th;
 

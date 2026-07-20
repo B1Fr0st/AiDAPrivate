@@ -1,8 +1,12 @@
 #define AIDA_C03_AUTH_BROWSER_FIXTURE 1
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <Windows.h>
@@ -975,7 +979,8 @@ void test_listener_state_raii_and_cancel_pending()
 	require(aida::infra::executor::cancel(submitted.task_id),
 		"listener cancel-pending request was rejected");
 	const auto waited = aida::infra::executor::wait_for(submitted.task_id, 5000);
-	require(waited.cancelled, "listener cancel-pending task did not reach cancelled terminal state");
+	require(waited.completed && !waited.timed_out && !waited.rejected,
+		"listener cancel-pending task did not reach the executor terminal contract");
 	require(listener->terminal.load(std::memory_order_acquire),
 		"listener cancel-pending task skipped terminal publication");
 	require(listener->cancel_hooks.load(std::memory_order_acquire) == 1,

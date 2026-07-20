@@ -5,6 +5,7 @@
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
 #include "editor_preview_adapter.hpp"
+#include "debugger_preview_runtime.hpp"
 #include "../core/ui/clock.hpp"
 #include "../core/ui/application_view_registry.hpp"
 #include <algorithm>
@@ -29,7 +30,81 @@ namespace aida::preview
 		std::string active_process_name;
 		shell_controls_t fixture_controls;
 
-		const char* legacy_preview_view_id(int value) noexcept
+		bool stable_id_has_prefix(std::string_view value, std::string_view prefix) noexcept
+		{
+			return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+		}
+
+		bool legacy_domain_contains(center_view_t domain, std::string_view id) noexcept
+		{
+			switch (domain) {
+				case center_view_t::analysis_hub:
+					return stable_id_has_prefix(id, "view.analysis.");
+				case center_view_t::debugger_view:
+					return stable_id_has_prefix(id, "view.debug.");
+				case center_view_t::network_view:
+					return stable_id_has_prefix(id, "view.network.");
+				case center_view_t::scan_hub:
+					return stable_id_has_prefix(id, "view.memory.");
+				case center_view_t::types_hub:
+					return stable_id_has_prefix(id, "view.types.");
+				case center_view_t::workbench:
+					return id == "document.disassembly" || id == "document.hex" ||
+						id == "document.pseudocode" || id == "document.graph" ||
+						id == "document.image" || id == "view.navigator" ||
+						id == "view.inspector";
+				default:
+					return false;
+			}
+		}
+
+		const char* legacy_domain_default(center_view_t domain) noexcept
+		{
+			switch (domain) {
+				case center_view_t::analysis_hub: return "view.analysis.functions";
+				case center_view_t::debugger_view: return "view.debug.cpu";
+				case center_view_t::network_view: return "view.network.proxy";
+				case center_view_t::scan_hub: return "view.memory.value_scan";
+				case center_view_t::types_hub: return "view.types.struct_recon";
+				case center_view_t::workbench: return "document.disassembly";
+				default: return nullptr;
+			}
+		}
+
+		std::string retained_legacy_domain_view(center_view_t domain)
+		{
+			aida::ui::application_views::initialize();
+			auto& registry = aida::ui::application_views::registry();
+			if (const auto focused = registry.focused_instance(); focused &&
+				legacy_domain_contains(domain, focused->view.value()) &&
+				registry.find_descriptor(focused->view))
+				return focused->view.value();
+
+			std::string retained;
+			std::uint64_t retained_focus_sequence = 0;
+			bool retained_open = false;
+			registry.for_each_instance(
+				[&](const aida::ui::view_descriptor_t& descriptor,
+					const aida::ui::view_instance_state_t& instance) {
+					if (!legacy_domain_contains(domain, descriptor.id.value()))
+						return;
+					const bool better_focus = instance.last_focus_sequence > retained_focus_sequence;
+					const bool better_open = instance.last_focus_sequence == retained_focus_sequence &&
+						instance.open && !retained_open;
+					const bool deterministic_first = retained.empty();
+					if (!better_focus && !better_open && !deterministic_first)
+						return;
+					retained = descriptor.id.value();
+					retained_focus_sequence = instance.last_focus_sequence;
+					retained_open = instance.open;
+				}, false);
+			if (!retained.empty())
+				return retained;
+			const char* fallback = legacy_domain_default(domain);
+			return fallback ? std::string(fallback) : std::string{};
+		}
+
+		std::string legacy_preview_view_id(int value)
 		{
 			switch (static_cast<center_view_t>(value)) {
 				case center_view_t::code_editor: return "document.code";
@@ -37,9 +112,14 @@ namespace aida::preview
 				case center_view_t::hex_view: return "document.hex";
 				case center_view_t::welcome: return "view.start_center";
 				case center_view_t::settings_view: return "view.settings";
-				case center_view_t::network_view: return "view.network.connections";
+				case center_view_t::network_view:
+				case center_view_t::debugger_view:
+				case center_view_t::scan_hub:
+				case center_view_t::types_hub:
+				case center_view_t::analysis_hub:
+				case center_view_t::workbench:
+					return retained_legacy_domain_view(static_cast<center_view_t>(value));
 				case center_view_t::memory_scanner: return "view.memory.value_scan";
-				case center_view_t::debugger_view: return "view.debug.cpu";
 				case center_view_t::pseudocode: return "document.pseudocode";
 				case center_view_t::struct_recon: return "view.types.struct_recon";
 				case center_view_t::crypto_scanner: return "view.memory.crypto";
@@ -54,18 +134,14 @@ namespace aida::preview
 				case center_view_t::taint_view: return "view.analysis.taint";
 				case center_view_t::deobfuscation_view: return "view.analysis.deobfuscation";
 				case center_view_t::stealth_view: return "view.analysis.protection";
-				case center_view_t::scan_hub: return "view.memory.value_scan";
-				case center_view_t::types_hub: return "view.types.structures";
-				case center_view_t::analysis_hub: return "view.analysis.symbolic";
 				case center_view_t::binary_map: return "view.analysis.binary_map";
 				case center_view_t::graph_view: return "document.graph";
 				case center_view_t::image_view: return "document.image";
-				case center_view_t::test_lab: return nullptr;
-				case center_view_t::workbench: return "document.disassembly";
+				case center_view_t::test_lab: return {};
 				case center_view_t::functions_panel: return "view.analysis.functions";
 				case center_view_t::xref_database: return "view.analysis.references";
 			}
-			return nullptr;
+			return {};
 		}
 
 		const std::vector<process_fixture_t> process_rows = {
@@ -204,7 +280,7 @@ namespace aida::preview
 		conversations::current_id = "fixture-analysis";
 
 		output_log::push(bottom_tab_t::output, "[analysis] Loaded sample.exe (x64, 7 sections)");
-		output_log::push(bottom_tab_t::output, "[analysis] 1,284 functions indexed");
+		output_log::push(bottom_tab_t::output, "[analysis] 64 functions indexed");
 		output_log::push(bottom_tab_t::mcp_log, "[mcp] ImGui Studio preview connected");
 		output_log::push(bottom_tab_t::driver_log, "[driver] Runtime access disabled in UI preview");
 		output_log::push(bottom_tab_t::sandbox_log, "[sandbox] Deterministic fixture active");
@@ -260,10 +336,9 @@ namespace aida::preview
 		if (source.center_view >= 0) {
 			if (source.center_view > static_cast<int>(center_view_t::xref_database))
 				return false;
-			const char* legacy = legacy_preview_view_id(source.center_view);
-			if (!legacy)
-				return source.center_view == static_cast<int>(center_view_t::welcome);
-			candidate = legacy;
+			candidate = legacy_preview_view_id(source.center_view);
+			if (candidate.empty())
+				return false;
 		} else {
 			const auto terminator = std::find(source.requested_view_id.begin(),
 				source.requested_view_id.end(), '\0');
@@ -418,6 +493,13 @@ namespace aida::preview
 		record(shell_action_t::detach_process, active_process_name);
 		active_pid = 0;
 		active_process_name.clear();
+	}
+
+	void configure_debugger_fixture(fixture_state_t state, std::size_t cardinality)
+	{
+		debugger::apply_fixture_state(state, cardinality);
+		debugger_engine::preview_last_error() = state == fixture_state_t::error
+			? "The debug target terminated while reading thread context" : std::string{};
 	}
 }
 

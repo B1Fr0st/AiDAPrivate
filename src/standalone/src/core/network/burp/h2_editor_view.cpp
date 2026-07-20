@@ -1,5 +1,6 @@
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/studio_semantics.hpp"
 #else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -43,6 +44,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <utility>
 
@@ -202,6 +204,21 @@ static network_view::artifact_identity_t artifact_identity(const ui_state_t& sta
     return identity;
 }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+static std::string semantic_artifact_id(
+    std::string_view kind, const network_view::artifact_identity_t& identity)
+{
+    const std::string retained = identity.id + ":" +
+        std::to_string(identity.timestamp) + ":" +
+        std::to_string(identity.revision) + ":" +
+        std::to_string(identity.content_hash) + ":" +
+        std::to_string(identity.content_size);
+    return aida::preview::semantics::stable_id(
+        "aida.network", std::string(kind) + "-" +
+            aida::preview::semantics::entity_token(retained));
+}
+#endif
+
 }
 
 bool resolve_retained_artifact(uint64_t exchange_id, uint64_t generation, bool response,
@@ -346,11 +363,33 @@ void render(float pos_x, float pos_y, float width, float height,
                            "Body");
         ImGui::InputTextMultiline("##h2_body", st.body, sizeof(st.body),
                                   ImVec2(left_w - 24.f, 100.f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        {
+            std::lock_guard<std::mutex> lk(st.resp_mtx);
+            const auto identity = artifact_identity(st, false);
+            if (identity.valid() && ImGui::IsItemVisible())
+                aida::preview::semantics::register_last_item(
+                    semantic_artifact_id("request", identity),
+                    "network-request-editor", false, false,
+                    "aida.dock-window.view.network.h2-editor");
+        }
+#endif
     } else {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                            "Hex frames (length(3) type(1) flags(1) Rbit+stream(4) payload):");
         ImGui::InputTextMultiline("##h2_raw_hex", st.raw_frames_hex, sizeof(st.raw_frames_hex),
                                   ImVec2(left_w - 24.f, 280.f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        {
+            std::lock_guard<std::mutex> lk(st.resp_mtx);
+            const auto identity = artifact_identity(st, false);
+            if (identity.valid() && ImGui::IsItemVisible())
+                aida::preview::semantics::register_last_item(
+                    semantic_artifact_id("request", identity),
+                    "network-request-editor", false, false,
+                    "aida.dock-window.view.network.h2-editor");
+        }
+#endif
     }
 
     ImGui::Separator();
@@ -532,7 +571,18 @@ void render(float pos_x, float pos_y, float width, float height,
         response_identity = artifact_identity(st, true);
     }
     if (request_identity.valid()) {
-        if (aida::ui::button("Exchange actions", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
+        const bool open_actions = aida::ui::button(
+            "Exchange actions", aida::ui::button_kind_t::secondary,
+            aida::ui::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const std::string artifact_id =
+            semantic_artifact_id("request", request_identity);
+        if (ImGui::IsItemVisible())
+            aida::preview::semantics::register_last_item(
+                artifact_id + ".action.open", "network-artifact-action",
+                false, false, artifact_id);
+#endif
+        if (open_actions)
             network_view::open_exchange_context(request_identity, response_identity,
                 network_view::exchange_context_origin_t::pointer);
         const bool menu_key_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
@@ -597,6 +647,18 @@ void render(float pos_x, float pos_y, float width, float height,
     }
 
     ImGui::EndChild();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (request_identity.valid() && ImGui::IsItemVisible()) {
+        const std::string artifact_id =
+            semantic_artifact_id("request", request_identity);
+        const std::string response_id = response_identity.valid()
+            ? semantic_artifact_id("response", response_identity)
+            : artifact_id + ".response";
+        aida::preview::semantics::register_last_item(
+            response_id, "network-response-editor", false,
+            !response_identity.valid(), artifact_id);
+    }
+#endif
     ImGui::PopStyleColor();
 
     ImGui::EndChild();

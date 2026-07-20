@@ -1,13 +1,16 @@
 #include "aida_function_db.hpp"
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 #include "../zydis_disasm.hpp"
 #include "../../analysis/symbol_store.hpp"
 #include "standalone_driver.hpp"
+#endif
 
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
@@ -170,6 +173,25 @@ bool name_is_noreturn_default(const std::string& name)
 
 }
 
+#if defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
+
+void populate_from_pe(function_db_t&, const DisasmFile&, const pe_parser::pe_info_t*)
+{
+	throw std::logic_error("isolated native decompiler cannot access application PE state");
+}
+
+void populate_from_driver(function_db_t&, uint64_t)
+{
+	throw std::logic_error("isolated native decompiler cannot access the live driver");
+}
+
+void populate_from_symbol_store(function_db_t&)
+{
+	throw std::logic_error("isolated native decompiler cannot access application symbol state");
+}
+
+#else
+
 void populate_from_pe(function_db_t& db,
                       const DisasmFile& file,
                       const pe_parser::pe_info_t* pe_info)
@@ -309,6 +331,9 @@ void populate_from_symbol_store(function_db_t& db)
 	}
 }
 
+#endif
+
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 namespace {
 
 uint64_t workspace_load_base(
@@ -498,6 +523,8 @@ void populate_from_workspace(
 	populate_default_noreturn(db);
 }
 
+#endif
+
 void populate_default_noreturn(function_db_t& db)
 {
 	for (auto& s : db.symbols) {
@@ -508,6 +535,7 @@ void populate_default_noreturn(function_db_t& db)
 
 }
 
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 namespace aida::analysis::ghidra_adapter {
 
 namespace {
@@ -1033,3 +1061,5 @@ const ghidra_type_record_t* ghidra_function_database_t::find_type(entity_id_t id
 }
 
 }
+
+#endif

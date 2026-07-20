@@ -1,5 +1,6 @@
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/studio_semantics.hpp"
 #else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -69,6 +70,19 @@ bool same_filter(const logger::log_filter_t& lhs, const logger::log_filter_t& rh
         lhs.time_from_ms == rhs.time_from_ms && lhs.time_to_ms == rhs.time_to_ms &&
         lhs.mime_type == rhs.mime_type;
 }
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string semantic_exchange_id(const network_view::artifact_identity_t& identity) {
+    const std::string retained = identity.id + ":" +
+        std::to_string(identity.timestamp) + ":" +
+        std::to_string(identity.revision) + ":" +
+        std::to_string(identity.content_hash) + ":" +
+        std::to_string(identity.content_size);
+    return aida::preview::semantics::stable_id(
+        "aida.network", "exchange-" +
+            aida::preview::semantics::entity_token(retained));
+}
+#endif
 
 }
 
@@ -245,6 +259,18 @@ void render(float pos_x, float pos_y, float width, float height,
                     if (ImGui::Selectable("##logger_row", selected,
                             ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
                         s_state.selected_row = row_index;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    network_view::artifact_identity_t semantic_request;
+                    std::string semantic_reason;
+                    static_cast<void>(network_view::make_sitemap_artifact(
+                        r.exchange_id, network_view::artifact_kind_t::sitemap_request,
+                        semantic_request, semantic_reason));
+                    if (semantic_request.valid() && ImGui::IsItemVisible())
+                        aida::preview::semantics::register_last_item(
+                            semantic_exchange_id(semantic_request),
+                            "network-exchange-row", false, false,
+                            "aida.dock-window.view.network.logger");
+#endif
                     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                         s_state.selected_row = row_index;
                         open_row_context(r, network_view::exchange_context_origin_t::pointer);

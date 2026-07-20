@@ -972,7 +972,7 @@ void verify_manifest_registration(const std::string_view cmake_manifest,
                                   const std::string_view package_integration)
 {
 	require_exact_count(cmake_manifest,
-		"aida_c03_register_manifest_entry(", 57,
+		"aida_c03_register_manifest_entry(", 56,
 		"safe-headless manifest entry inventory");
 	require_exact_count(cmake_manifest,
 		"aida_c03_register_direct_test(", 15,

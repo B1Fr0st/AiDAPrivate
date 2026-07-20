@@ -739,8 +739,25 @@ overlay_operation_t journal_comment(
 void verify_journal_storage_identity(
     const std::shared_ptr<analysis_workspace_t>& workspace)
 {
-    const auto checked = workspace->database()->with_reader(
-        [](sqlite3* database) -> workspace_result_t<void> {
+    sqlite3* reader_handle = nullptr;
+    const auto open_status = sqlite3_open_v2(
+        workspace->database()->path().c_str(), &reader_handle,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI, nullptr);
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> reader(
+        reader_handle, sqlite3_close);
+    require(open_status == SQLITE_OK && static_cast<bool>(reader),
+            "unable to open managed overlay journal for inspection");
+    require(sqlite3_extended_result_codes(reader.get(), 1) == SQLITE_OK,
+            "unable to enable managed overlay journal extended result codes");
+    require(sqlite3_busy_timeout(
+                reader.get(),
+                static_cast<int>((std::min<std::uint32_t>)(
+                    workspace->database()->options().busy_timeout_ms, 60000U))) ==
+                SQLITE_OK,
+            "unable to configure managed overlay journal read timeout");
+    execute(reader.get(),
+            "PRAGMA foreign_keys=ON;PRAGMA trusted_schema=OFF;PRAGMA query_only=ON;BEGIN");
+    const auto checked = [](sqlite3* database) -> workspace_result_t<void> {
             sqlite3_stmt* statement = nullptr;
             const char* operation_sql =
                 "SELECT target_discriminator,address_space,address_value,address_arch,address_mode,length(managed_workspace_id),length(managed_provider_hash),managed_provider_size,length(managed_artifact_hash),managed_generation,length(managed_entity_hash),length(managed_entity_key),after_json FROM overlay_operations ORDER BY transaction_id DESC,operation_index DESC LIMIT 1";
@@ -823,7 +840,8 @@ void verify_journal_storage_identity(
                         "managed_overlay_identity_harness"));
             }
             return workspace_result_t<void>::success();
-        });
+        }(reader.get());
+    execute(reader.get(), checked ? "COMMIT" : "ROLLBACK");
     require(static_cast<bool>(checked),
             checked ? std::string{}
                     : checked.error().stable_code() + ":" +

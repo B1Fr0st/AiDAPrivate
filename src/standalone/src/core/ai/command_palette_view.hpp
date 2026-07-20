@@ -250,12 +250,13 @@ namespace command_palette {
 			if (!cmd.application_action_id.empty()) {
 				const auto result = ui::application_ui::execute_action(
 					cmd.application_action_id.c_str(), ui::action_invocation_source_t::command_palette);
-				if (!result.executed()) {
-					toast_notification::push(
-						result.message.empty() ? "The action could not be completed" : result.message,
-						toast_notification::toast_type_t::error, 6.0f);
+				if (result.status == ui::action_execution_status_t::confirmation_required ||
+					result.status == ui::action_execution_status_t::review_required) {
+					begin_close();
 					return;
 				}
+				if (!result.executed())
+					return;
 				begin_close();
 				return;
 			}
@@ -365,13 +366,15 @@ namespace command_palette {
 		                        bool show_kbd_chips)
 		{
 			const auto& t = ui::resolved();
+			const ImGuiViewport* viewport = ImGui::GetMainViewport();
+			const float dpi = viewport && viewport->DpiScale > 0.f ? viewport->DpiScale : 1.f;
 
-			const float lift_y = (1.f - entrance_t) * 6.f;
+			const float lift_y = (1.f - entrance_t) * 6.f * dpi;
 			ImVec2 a(ra.x, ra.y + lift_y);
 			ImVec2 b(rb.x, rb.y + lift_y);
 
-			const float inner_pad = 12.f;
-			const float row_radius = 10.f;
+			const float inner_pad = 12.f * dpi;
+			const float row_radius = 5.f * dpi;
 
 			const float alpha = entrance_t * close_alpha;
 
@@ -392,24 +395,25 @@ namespace command_palette {
 			if (is_selected) {
 				ImU32 border_top = ui::with_alpha(t.accent_grad_top, 0.95f * alpha);
 				ImU32 border_bot = ui::with_alpha(t.accent_grad_bot, 0.85f * alpha);
-				dl->AddRect(a, b, border_top, row_radius, 0, 1.5f);
-				dl->AddRect(ImVec2(a.x + 0.5f, a.y + 0.5f), ImVec2(b.x - 0.5f, b.y - 0.5f),
-					border_bot, row_radius, 0, 0.6f);
+				dl->AddRect(a, b, border_top, row_radius, 0, 1.5f * dpi);
+				dl->AddRect(ImVec2(a.x + 0.5f * dpi, a.y + 0.5f * dpi),
+					ImVec2(b.x - 0.5f * dpi, b.y - 0.5f * dpi),
+					border_bot, row_radius, 0, 0.6f * dpi);
 				ui::blur::render_inner_glow(dl, a, b, row_radius,
 					ui::with_alpha(t.accent_glow, alpha), 3);
 			}
 
-			const float icon_size = 22.f;
+			const float icon_size = 22.f * dpi;
 			ImVec2 icon_center(a.x + inner_pad + icon_size * 0.5f, (a.y + b.y) * 0.5f);
 			ImU32 icon_col = source_color(t, c.source);
 			draw_source_icon(dl, icon_center, icon_size, c, icon_col, alpha);
 
 			ImFont* name_font = ui::fonts::body_em();
 			ImFont* desc_font = ui::fonts::body();
-			const float name_fs = 14.f;
-			const float desc_fs = 13.f;
+			const float name_fs = ui::fonts::size_or(name_font, 14.f * dpi);
+			const float desc_fs = ui::fonts::size_or(desc_font, 13.f * dpi);
 
-			const float text_x = a.x + inner_pad + icon_size + 12.f;
+			const float text_x = a.x + inner_pad + icon_size + 12.f * dpi;
 
 			ImU32 name_col = ui::with_alpha(
 				!c.enabled ? t.text_dim : is_selected ? t.text_primary : ui::mix(t.text_primary, t.text_secondary, 0.25f),
@@ -424,12 +428,13 @@ namespace command_palette {
 				name_col, display_name.c_str());
 
 			float right_reserve = 0.f;
-			if (is_selected && show_kbd_chips) right_reserve = c.shortcut.empty() ? 150.f : 230.f;
+			if (is_selected && show_kbd_chips)
+				right_reserve = (c.shortcut.empty() ? 150.f : 230.f) * dpi;
 
 			if (!c.description.empty()) {
-				const float desc_x = text_x + name_sz.x + 14.f;
+				const float desc_x = text_x + name_sz.x + 14.f * dpi;
 				const float max_desc_w = (b.x - inner_pad - right_reserve) - desc_x;
-				if (max_desc_w > 60.f) {
+				if (max_desc_w > 60.f * dpi) {
 					std::string desc = c.description;
 					ImVec2 dts = desc_font->CalcTextSizeA(desc_fs, FLT_MAX, 0.f, desc.c_str());
 					if (dts.x > max_desc_w) {
@@ -444,7 +449,7 @@ namespace command_palette {
 
 			if (is_selected && show_kbd_chips) {
 				ImFont* sf = ui::fonts::caption();
-				const float kfs = 13.f;
+				const float kfs = ui::fonts::size_or(sf, 13.f * dpi);
 				const struct { const char* lbl; const char* key; } chips[] = {
 					{ "run",     "Enter" },
 					{ "preview", "Tab" },
@@ -453,29 +458,32 @@ namespace command_palette {
 				for (const auto& chip : chips) {
 					ImVec2 lts = sf->CalcTextSizeA(kfs, FLT_MAX, 0.f, chip.lbl);
 					ImVec2 kts = sf->CalcTextSizeA(kfs, FLT_MAX, 0.f, chip.key);
-					float kw = kts.x + 10.f;
-					float total = kw + 4.f + lts.x;
-					float chip_y = (a.y + b.y) * 0.5f - 8.f;
-					ImVec2 ka(right_x - lts.x - 4.f - kw, chip_y);
-					ImVec2 kb(ka.x + kw, chip_y + 16.f);
+					float kw = kts.x + 10.f * dpi;
+					float total = kw + 4.f * dpi + lts.x;
+					float chip_y = (a.y + b.y) * 0.5f - 8.f * dpi;
+					ImVec2 ka(right_x - lts.x - 4.f * dpi - kw, chip_y);
+					ImVec2 kb(ka.x + kw, chip_y + 16.f * dpi);
 					dl->AddRectFilled(ka, kb,
-						ui::with_alpha(t.panel_header, 0.95f * alpha), 4.f);
+						ui::with_alpha(t.panel_header, 0.95f * alpha), 4.f * dpi);
 					dl->AddRect(ka, kb,
-						ui::with_alpha(t.border_subtle, 0.95f * alpha), 4.f, 0, 1.f);
-					dl->AddText(sf, kfs, ImVec2(ka.x + 5.f, ka.y + (16.f - kfs) * 0.5f),
+						ui::with_alpha(t.border_subtle, 0.95f * alpha), 4.f * dpi, 0, dpi);
+					dl->AddText(sf, kfs, ImVec2(ka.x + 5.f * dpi,
+						ka.y + (16.f * dpi - kfs) * 0.5f),
 						ui::with_alpha(t.text_secondary, alpha), chip.key);
-					dl->AddText(sf, kfs, ImVec2(kb.x + 4.f, ka.y + (16.f - kfs) * 0.5f),
+					dl->AddText(sf, kfs, ImVec2(kb.x + 4.f * dpi,
+						ka.y + (16.f * dpi - kfs) * 0.5f),
 						ui::with_alpha(t.text_dim, alpha), chip.lbl);
-					right_x -= total + 8.f;
+					right_x -= total + 8.f * dpi;
 				}
 				if (!c.shortcut.empty()) {
 					ImVec2 kts = sf->CalcTextSizeA(kfs, FLT_MAX, 0.f, c.shortcut.c_str());
-					float kw = kts.x + 10.f;
-					ImVec2 ka(right_x - kw, (a.y + b.y) * 0.5f - 8.f);
-					ImVec2 kb(ka.x + kw, ka.y + 16.f);
-					dl->AddRectFilled(ka, kb, ui::with_alpha(t.panel_header, 0.95f * alpha), 4.f);
-					dl->AddRect(ka, kb, ui::with_alpha(t.border_subtle, 0.95f * alpha), 4.f, 0, 1.f);
-					dl->AddText(sf, kfs, ImVec2(ka.x + 5.f, ka.y + (16.f - kfs) * 0.5f),
+					float kw = kts.x + 10.f * dpi;
+					ImVec2 ka(right_x - kw, (a.y + b.y) * 0.5f - 8.f * dpi);
+					ImVec2 kb(ka.x + kw, ka.y + 16.f * dpi);
+					dl->AddRectFilled(ka, kb, ui::with_alpha(t.panel_header, 0.95f * alpha), 4.f * dpi);
+					dl->AddRect(ka, kb, ui::with_alpha(t.border_subtle, 0.95f * alpha), 4.f * dpi, 0, dpi);
+					dl->AddText(sf, kfs, ImVec2(ka.x + 5.f * dpi,
+						ka.y + (16.f * dpi - kfs) * 0.5f),
 						ui::with_alpha(t.text_secondary, alpha), c.shortcut.c_str());
 				}
 			}
@@ -486,17 +494,19 @@ namespace command_palette {
 		                                    const char* label, float close_alpha)
 		{
 			const auto& t = ui::resolved();
+			const ImGuiViewport* viewport = ImGui::GetMainViewport();
+			const float dpi = viewport && viewport->DpiScale > 0.f ? viewport->DpiScale : 1.f;
 			ImFont* font = ui::fonts::caption();
-			const float fs = 13.f;
+			const float fs = ui::fonts::size_or(font, 13.f * dpi);
 			ImU32 line_col = ui::with_alpha(t.border_subtle, 0.85f * close_alpha);
 			float text_y = (a.y + b.y) * 0.5f - fs * 0.5f;
-			dl->AddText(font, fs, ImVec2(a.x + 4.f, text_y),
+			dl->AddText(font, fs, ImVec2(a.x + 4.f * dpi, text_y),
 				ui::with_alpha(t.text_dim, close_alpha), label);
 			ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0.f, label);
-			float line_x = a.x + 4.f + ts.x + 10.f;
+			float line_x = a.x + 4.f * dpi + ts.x + 10.f * dpi;
 			dl->AddLine(ImVec2(line_x, (a.y + b.y) * 0.5f),
-			             ImVec2(b.x - 4.f, (a.y + b.y) * 0.5f),
-			             line_col, 1.f);
+			             ImVec2(b.x - 4.f * dpi, (a.y + b.y) * 0.5f),
+			             line_col, dpi);
 		}
 
 
@@ -831,14 +841,19 @@ namespace command_palette {
 		const float close_alpha = 1.f - close_t;
 
 		ImGuiIO& io = ImGui::GetIO();
-		ImVec2 vp = io.DisplaySize;
-		ImDrawList* fdl = ImGui::GetForegroundDrawList();
+		ImGuiViewport* viewport = ImGui::GetMainViewport();
+		const ImVec2 work_pos = viewport ? viewport->WorkPos : ImVec2(0.f, 0.f);
+		const ImVec2 work_size = viewport ? viewport->WorkSize : io.DisplaySize;
+		const float dpi = viewport && viewport->DpiScale > 0.f ? viewport->DpiScale : 1.f;
+		ImDrawList* fdl = ImGui::GetForegroundDrawList(viewport);
+		const float outer_margin = (std::min)(12.f * dpi,
+			(std::min)(work_size.x, work_size.y) * 0.08f);
+		const float palette_w = (std::max)(1.f,
+			(std::min)(720.f * dpi, work_size.x - outer_margin * 2.f));
+		const float palette_h = (std::max)(1.f,
+			(std::min)(540.f * dpi, work_size.y - outer_margin * 2.f));
 
-		const float palette_w = 720.f;
-		const float palette_h = 540.f;
-
-		const float overshoot_extra = 0.40f * std::max(0.f, open_t - 1.f);
-		const float scale_open  = 0.95f + 0.05f * std::min(1.f, open_t) + overshoot_extra;
+		const float scale_open  = 0.97f + 0.03f * (std::clamp)(open_t, 0.f, 1.f);
 		const float scale_close = is_closing() ? (1.f - 0.03f * close_t) : 1.f;
 		float scale = scale_open;
 		if (is_closing()) scale = scale_close;
@@ -848,12 +863,12 @@ namespace command_palette {
 
 		const float draw_w = palette_w * scale;
 		const float draw_h = palette_h * scale;
-		const float palette_x = (vp.x - draw_w) * 0.5f;
-		const float palette_y = (vp.y - draw_h) * 0.5f + y_offset;
+		const float palette_x = work_pos.x + (work_size.x - draw_w) * 0.5f;
+		const float palette_y = work_pos.y + (work_size.y - draw_h) * 0.5f + y_offset * dpi;
 
 		const ImVec2 card_a(palette_x, palette_y);
 		const ImVec2 card_b(palette_x + draw_w, palette_y + draw_h);
-		const float card_radius = 16.f;
+		const float card_radius = 8.f * dpi;
 
 		render_card_chrome(fdl, card_a, card_b, card_radius, open_t, close_t);
 
@@ -887,11 +902,15 @@ namespace command_palette {
 			return;
 		}
 
-		const float input_h = 60.f;
-		const float footer_h = 38.f;
-		const float side_pad = 18.f;
+		const float logical_width = draw_w / dpi;
+		const float logical_height = draw_h / dpi;
+		const bool compact_layout = logical_width < 650.f || logical_height < 400.f;
+		const float input_h = (compact_layout ? 48.f : 60.f) * dpi;
+		const float footer_h = (compact_layout ? 30.f : 38.f) * dpi;
+		const float side_pad = (compact_layout ? 10.f : 18.f) * dpi;
 
-		const bool wide_enough_for_preview = draw_w >= 600.f;
+		const bool wide_enough_for_preview = logical_width >= 680.f &&
+			logical_height >= 420.f && dpi <= 1.01f;
 		const bool show_preview = preview_visible() && hit_count > 0 && wide_enough_for_preview;
 
 		const float list_w = show_preview ? (draw_w - side_pad * 3.f) * 0.58f : (draw_w - side_pad * 2.f);
@@ -902,25 +921,25 @@ namespace command_palette {
 		ImVec2 input_b(card_b.x - side_pad, input_a.y + input_h);
 		{
 			ImU32 fill = ui::with_alpha(th.bg_elevated, 0.85f * close_alpha);
-			fdl->AddRectFilled(input_a, input_b, fill, 12.f);
+			fdl->AddRectFilled(input_a, input_b, fill, 6.f * dpi);
 
 			ImU32 border = ui::with_alpha(th.border_focus,
 				(0.55f + 0.45f * ui::clock::pulse(1.5f, 0.f, 1.f)) * close_alpha * open_t);
-			fdl->AddRect(input_a, input_b, border, 12.f, 0, 1.4f);
+			fdl->AddRect(input_a, input_b, border, 6.f * dpi, 0, 1.4f * dpi);
 
 			ImU32 wash = ui::with_alpha(th.glass_tint, 0.35f * close_alpha);
-			fdl->AddRectFilled(input_a, input_b, wash, 12.f);
+			fdl->AddRectFilled(input_a, input_b, wash, 6.f * dpi);
 		}
 
-		const float chip_size = 22.f;
-		ImVec2 chip_center(input_a.x + 18.f + chip_size * 0.5f,
+		const float chip_size = 22.f * dpi;
+		ImVec2 chip_center(input_a.x + 18.f * dpi + chip_size * 0.5f,
 		                   (input_a.y + input_b.y) * 0.5f);
 		draw_search_chip(fdl, chip_center, chip_size,
 			ui::with_alpha(th.text_secondary, 0.92f * close_alpha));
 
-		const float input_text_left = input_a.x + 18.f + chip_size + 14.f;
-		const float input_text_right = input_b.x - 18.f;
-		const float input_text_w = input_text_right - input_text_left;
+		const float input_text_left = input_a.x + 18.f * dpi + chip_size + 14.f * dpi;
+		const float input_text_right = input_b.x - 18.f * dpi;
+		const float input_text_w = (std::max)(1.f, input_text_right - input_text_left);
 
 		ImGui::PushFont(ui::fonts::lg());
 		const float font_h = ImGui::GetFontSize();
@@ -945,7 +964,7 @@ namespace command_palette {
 			ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		aida::preview::semantics::register_last_item(
-			"aida.palette.search", "command-palette-input");
+			"aida.palette.search", "command-palette-input", true);
 #endif
 
 		if (globals::ui::command_palette_buf[0] == '\0') {
@@ -989,9 +1008,10 @@ namespace command_palette {
 			execute_selection(hits[static_cast<std::size_t>(selected_index())]);
 		}
 
-		const float list_top = input_b.y + 14.f;
-		const float list_bottom = card_b.y - footer_h - 14.f;
-		const float list_height = list_bottom - list_top;
+		const float list_top = input_b.y + 10.f * dpi;
+		const float list_bottom = (std::max)(list_top + dpi,
+			card_b.y - footer_h - 10.f * dpi);
+		const float list_height = (std::max)(dpi, list_bottom - list_top);
 
 		ImVec2 list_a(card_a.x + side_pad, list_top);
 		ImVec2 list_b(list_a.x + list_w, list_bottom);
@@ -999,8 +1019,8 @@ namespace command_palette {
 		ImVec2 preview_a(list_b.x + side_pad, list_top);
 		ImVec2 preview_b(card_b.x - side_pad, list_bottom);
 
-		const float row_h = 40.f;
-		const float row_gap = 4.f;
+		const float row_h = (compact_layout ? 34.f : 40.f) * dpi;
+		const float row_gap = 4.f * dpi;
 
 		std::vector<bool> show_header_for(hits.size(), false);
 		bool any_two_categories = false;
@@ -1027,7 +1047,7 @@ namespace command_palette {
 
 		float y_cursor = 0.f;
 		const float xfade_t = filter_xfade().eased();
-		const float xfade_dx = (1.f - xfade_t) * 24.f;
+		const float xfade_dx = (1.f - xfade_t) * 24.f * dpi;
 		const float new_alpha = xfade_t;
 
 		ImVec2 win_pos = ImGui::GetCursorScreenPos();
@@ -1040,9 +1060,9 @@ namespace command_palette {
 
 			if (show_header) {
 				ImVec2 ha(win_pos.x, win_pos.y + y_cursor);
-				ImVec2 hb(win_pos.x + win_avail.x, ha.y + 22.f);
+				ImVec2 hb(win_pos.x + win_avail.x, ha.y + 22.f * dpi);
 				render_category_header(wdl, ha, hb, category_label(classify(c)), close_alpha);
-				y_cursor += 26.f;
+				y_cursor += 26.f * dpi;
 			}
 
 			ImVec2 ra(win_pos.x + xfade_dx, win_pos.y + y_cursor);
@@ -1058,7 +1078,7 @@ namespace command_palette {
 				const std::string semantic_id = aida::preview::semantics::stable_id(
 					"aida.palette.action", c.application_action_id);
 				aida::preview::semantics::register_last_item(
-					semantic_id, "command-palette-action");
+					semantic_id, "command-palette-action", true);
 			}
 			#endif
 			ImGui::PopID();
@@ -1094,7 +1114,7 @@ namespace command_palette {
 			for (int i = 0; i <= selected_index(); ++i) {
 				category_t cat = classify(hits[static_cast<std::size_t>(i)]);
 				if (show_headers && cat != prev) {
-					if (i != 0) target_y += 26.f;
+					if (i != 0) target_y += 26.f * dpi;
 					else target_y += 0.f;
 					prev = cat;
 				}
@@ -1110,10 +1130,12 @@ namespace command_palette {
 		if (hit_count == 0) {
 			ImFont* font = ui::fonts::body();
 			const char* msg = "No matches. Try shorter input or check skills, agents, and MCP servers.";
-			ImVec2 tsz = font->CalcTextSizeA(13.f, FLT_MAX, list_w - 40.f, msg);
+			const float empty_font_size = ui::fonts::size_or(font, 13.f * dpi);
+			ImVec2 tsz = font->CalcTextSizeA(empty_font_size, FLT_MAX,
+				(std::max)(1.f, list_w - 40.f * dpi), msg);
 			ImVec2 origin(list_a.x + (list_w - tsz.x) * 0.5f,
 			              list_a.y + (list_height - tsz.y) * 0.5f);
-			fdl->AddText(font, 13.f, origin,
+			fdl->AddText(font, empty_font_size, origin,
 				ui::with_alpha(th.text_dim, close_alpha), msg);
 		}
 
@@ -1146,17 +1168,17 @@ namespace command_palette {
 
 		{
 			ImVec2 fa(card_a.x + side_pad, card_b.y - footer_h);
-			ImVec2 fb(card_b.x - side_pad, card_b.y - 12.f);
+			ImVec2 fb(card_b.x - side_pad, card_b.y - 8.f * dpi);
 
 			ImU32 sep = ui::with_alpha(th.border_subtle, 0.95f * close_alpha);
-			fdl->AddLine(ImVec2(card_a.x + side_pad, fa.y - 2.f),
-			              ImVec2(card_b.x - side_pad, fa.y - 2.f), sep, 1.f);
+			fdl->AddLine(ImVec2(card_a.x + side_pad, fa.y - 2.f * dpi),
+			              ImVec2(card_b.x - side_pad, fa.y - 2.f * dpi), sep, dpi);
 
 			char count_buf[64];
 			std::snprintf(count_buf, sizeof(count_buf), "%d match%s",
 				hit_count, hit_count == 1 ? "" : "es");
 			ImFont* font = ui::fonts::caption();
-			const float fs = 13.f;
+			const float fs = ui::fonts::size_or(font, 13.f * dpi);
 			fdl->AddText(font, fs,
 				ImVec2(fa.x, fa.y + (footer_h - fs) * 0.5f),
 				ui::with_alpha(th.text_dim, close_alpha), count_buf);
@@ -1170,24 +1192,25 @@ namespace command_palette {
 				{ "Up/Down", "navigate" },
 			};
 			ImFont* sf = ui::fonts::caption();
-			float spacing = 14.f;
-			for (const auto& p : pairs) {
-				ImVec2 lts = sf->CalcTextSizeA(11.f, FLT_MAX, 0.f, p.lbl);
-				ImVec2 kts = sf->CalcTextSizeA(11.f, FLT_MAX, 0.f, p.key);
-				float kw = kts.x + 12.f;
-				float total = lts.x + 6.f + kw;
+			float spacing = 14.f * dpi;
+			if (!compact_layout) for (const auto& p : pairs) {
+				const float hint_font_size = ui::fonts::size_or(sf, 11.f * dpi);
+				ImVec2 lts = sf->CalcTextSizeA(hint_font_size, FLT_MAX, 0.f, p.lbl);
+				ImVec2 kts = sf->CalcTextSizeA(hint_font_size, FLT_MAX, 0.f, p.key);
+				float kw = kts.x + 12.f * dpi;
+				float total = lts.x + 6.f * dpi + kw;
 				right_x -= total;
-				ImVec2 kbox_a(right_x, fa.y + (footer_h - 18.f) * 0.5f);
-				ImVec2 kbox_b(kbox_a.x + kw, kbox_a.y + 18.f);
+				ImVec2 kbox_a(right_x, fa.y + (footer_h - 18.f * dpi) * 0.5f);
+				ImVec2 kbox_b(kbox_a.x + kw, kbox_a.y + 18.f * dpi);
 				fdl->AddRectFilled(kbox_a, kbox_b,
-					ui::with_alpha(th.panel_header, 0.95f * close_alpha), 4.f);
+					ui::with_alpha(th.panel_header, 0.95f * close_alpha), 4.f * dpi);
 				fdl->AddRect(kbox_a, kbox_b,
-					ui::with_alpha(th.border_subtle, 0.95f * close_alpha), 4.f, 0, 1.f);
-				fdl->AddText(sf, 13.f,
-					ImVec2(kbox_a.x + 6.f, kbox_a.y + (18.f - 11.f) * 0.5f),
+					ui::with_alpha(th.border_subtle, 0.95f * close_alpha), 4.f * dpi, 0, dpi);
+				fdl->AddText(sf, hint_font_size,
+					ImVec2(kbox_a.x + 6.f * dpi, kbox_a.y + (18.f * dpi - hint_font_size) * 0.5f),
 					ui::with_alpha(th.text_secondary, close_alpha), p.key);
-				fdl->AddText(sf, 13.f,
-					ImVec2(kbox_b.x + 6.f, kbox_a.y + (18.f - 11.f) * 0.5f),
+				fdl->AddText(sf, hint_font_size,
+					ImVec2(kbox_b.x + 6.f * dpi, kbox_a.y + (18.f * dpi - hint_font_size) * 0.5f),
 					ui::with_alpha(th.text_dim, close_alpha), p.lbl);
 				right_x -= spacing;
 			}

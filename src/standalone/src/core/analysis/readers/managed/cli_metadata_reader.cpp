@@ -532,8 +532,12 @@ private:
         cli_byte_reader_t reader{tables_raw_.data(), tables_raw_.size(), 0};
         std::uint32_t reserved = 0;
         if (!reader.u32(reserved, "cli.tables")) return false;
-        if (!reader.u8(result_.table_counts.tables_major, "cli.tables")) return false;
-        if (!reader.u8(result_.table_counts.tables_minor, "cli.tables")) return false;
+        std::uint8_t tables_major = 0;
+        std::uint8_t tables_minor = 0;
+        if (!reader.u8(tables_major, "cli.tables")) return false;
+        if (!reader.u8(tables_minor, "cli.tables")) return false;
+        result_.table_counts.tables_major = tables_major;
+        result_.table_counts.tables_minor = tables_minor;
         if (!reader.u8(result_.table_counts.heap_sizes, "cli.tables")) return false;
         std::uint8_t reserved_byte = 0;
         if (!reader.u8(reserved_byte, "cli.tables")) return false;
@@ -572,8 +576,7 @@ private:
         return true;
     }
 
-    bool read_blob_index(cli_byte_reader_t& reader, std::vector<std::uint8_t>& value, const char* phase) {
-        std::uint32_t index = 0;
+    bool read_blob_heap_index(cli_byte_reader_t& reader, std::uint32_t& index, const char* phase) {
         if (heaps_.large_blob) {
             if (!reader.u32(index, phase)) return false;
         } else {
@@ -581,6 +584,12 @@ private:
             if (!reader.u16(short_index, phase)) return false;
             index = short_index;
         }
+        return true;
+    }
+
+    bool read_blob_index(cli_byte_reader_t& reader, std::vector<std::uint8_t>& value, const char* phase) {
+        std::uint32_t index = 0;
+        if (!read_blob_heap_index(reader, index, phase)) return false;
         value = read_blob_heap(blob_heap_, index);
         return true;
     }
@@ -908,10 +917,18 @@ private:
                                       row_size, 0};
             cli_assembly_row_t assembly;
             if (!reader.u32(assembly.hash_alg_id, "cli.assembly")) return false;
-            if (!reader.u16(assembly.major_version, "cli.assembly")) return false;
-            if (!reader.u16(assembly.minor_version, "cli.assembly")) return false;
-            if (!reader.u16(assembly.build_number, "cli.assembly")) return false;
-            if (!reader.u16(assembly.revision_number, "cli.assembly")) return false;
+            std::uint16_t major_version = 0;
+            std::uint16_t minor_version = 0;
+            std::uint16_t build_number = 0;
+            std::uint16_t revision_number = 0;
+            if (!reader.u16(major_version, "cli.assembly")) return false;
+            if (!reader.u16(minor_version, "cli.assembly")) return false;
+            if (!reader.u16(build_number, "cli.assembly")) return false;
+            if (!reader.u16(revision_number, "cli.assembly")) return false;
+            assembly.major_version = major_version;
+            assembly.minor_version = minor_version;
+            assembly.build_number = build_number;
+            assembly.revision_number = revision_number;
             if (!reader.u32(assembly.flags, "cli.assembly")) return false;
             if (!read_blob_index(reader, assembly.public_key_blob, "cli.assembly")) return false;
             if (!read_string_index(reader, assembly.name, "cli.assembly")) return false;
@@ -935,7 +952,7 @@ private:
             if (!read_blob_index(reader, asm_ref.public_key_or_token_blob, "cli.assembly_ref")) return false;
             if (!read_string_index(reader, asm_ref.name, "cli.assembly_ref")) return false;
             if (!read_string_index(reader, asm_ref.culture, "cli.assembly_ref")) return false;
-            if (!read_blob_index(reader, asm_ref.hash_value_index, "cli.assembly_ref")) return false;
+            if (!read_blob_heap_index(reader, asm_ref.hash_value_index, "cli.assembly_ref")) return false;
             result_.assembly_refs.push_back(std::move(asm_ref));
         }
         return true;
@@ -1058,20 +1075,20 @@ private:
                 const auto flags_size = read_u16_le(data_.data() + file_offset);
                 body.is_fat = true;
                 body.max_stack = read_u16_le(data_.data() + file_offset + 2);
-                body.code_size = read_u32_le(data_.data() + file_offset + 4);
+                const auto code_size = read_u32_le(data_.data() + file_offset + 4);
                 body.local_token = read_u32_le(data_.data() + file_offset + 8);
                 body.offset = file_offset + 12;
-                body.size = 12 + body.code_size;
-                if (!span_within(body.offset, body.code_size, data_.size()))
+                body.size = 12ULL + code_size;
+                if (!span_within(body.offset, code_size, data_.size()))
                     continue;
                 body.code_bytes.assign(data_.data() + body.offset,
-                                       data_.data() + body.offset + body.code_size);
+                                       data_.data() + body.offset + code_size);
                 if (body.local_token != 0) {
                     const auto local_blob_index = body.local_token & 0x00FFFFFFu;
                     body.local_signature_blob = read_blob_heap(blob_heap_, local_blob_index);
                 }
-                if ((flags_size & cli_method_head_more_sects) != 0 && body.code_size > 0) {
-                    const auto aligned_code_end = (body.offset + body.code_size + 3u) & ~3u;
+                if ((flags_size & cli_method_head_more_sects) != 0 && code_size > 0) {
+                    const auto aligned_code_end = (body.offset + code_size + 3u) & ~3u;
                     if (span_within(aligned_code_end, 4, data_.size())) {
                         if (!parse_exception_sections(aligned_code_end, body))
                             return false;
@@ -1153,8 +1170,6 @@ private:
                             clause.catch_type_name = td.type_namespace.empty()
                                 ? td.type_name : td.type_namespace + "." + td.type_name;
                         }
-                    } else if (clause.flags == 0x01u) {
-                        clause.filter_offset = clause.class_token_or_filter_offset;
                     }
                     clause.is_finally = clause.flags == 0x02u;
                     body.exception_clauses.push_back(std::move(clause));
@@ -1459,9 +1474,10 @@ build_cli_artifact(const cli_metadata_t& metadata,
         field.is_static = fd.is_static;
         field.is_literal = fd.is_literal;
         field.is_init_only = fd.is_init_only;
-        for (const auto& td : metadata.type_defs) {
-            const auto next_field_index = (&td - &metadata.type_defs[0] + 1 < metadata.type_defs.size())
-                ? (&td + 1)->field_list_index
+        for (std::size_t type_index = 0; type_index < metadata.type_defs.size(); ++type_index) {
+            const auto& td = metadata.type_defs[type_index];
+            const auto next_field_index = (type_index + 1 < metadata.type_defs.size())
+                ? metadata.type_defs[type_index + 1].field_list_index
                 : static_cast<std::uint32_t>(metadata.fields.size() + 1);
             if (row + 1 >= td.field_list_index && row + 1 < next_field_index) {
                 field.declaring_type_name = td.type_namespace.empty()
@@ -1524,7 +1540,8 @@ build_cli_artifact(const cli_metadata_t& metadata,
             region.is_finally = clause.is_finally;
             region.is_filter = clause.is_filter;
             region.is_catch_all = clause.is_catch_all;
-            region.filter_offset = clause.filter_offset;
+            if (clause.is_filter)
+                region.filter_offset = clause.class_token_or_filter_offset;
             artifact.exception_regions.push_back(std::move(region));
         }
     }

@@ -1,7 +1,9 @@
 #include "workspace_fixture_builder.hpp"
 
 #include "../../src/core/analysis/workspace/patched_export.hpp"
+#include "../../src/core/workbench/workbench_model.h"
 
+#include <algorithm>
 #include <future>
 #include <chrono>
 #include <condition_variable>
@@ -96,6 +98,127 @@ address_t address_at(const std::shared_ptr<analysis_workspace_t>& workspace,
     value.architecture = workspace->identity().architecture();
     value.mode = workspace->image()->architecture_mode();
     return value;
+}
+
+void exercise_view_navigation_contract(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    std::size_t index,
+    const address_t& source,
+    const address_t& destination)
+{
+    namespace workbench = aida::workbench;
+
+    const workbench::workspace_id_t workbench_id{static_cast<std::uint64_t>(index) + 1U};
+    workbench::document_identity_t identity;
+    identity.workspace = workbench_id;
+    identity.kind = workbench::document_kind_t::disassembly;
+    identity.object_id = 1;
+    identity.variant_id = static_cast<std::uint64_t>(index) + 1U;
+    identity.provider_key = workspace->identity().binary_id().to_hex();
+    identity.has_address = true;
+    identity.address = source.value;
+
+    workbench::document_persistence_dto_t document;
+    document.id = {1};
+    document.identity = identity;
+    document.title = "workspace-" + std::to_string(index);
+    document.local_state.selection.kind = workbench::selection_kind_t::address;
+    document.local_state.selection.has_address = true;
+    document.local_state.selection.address = source.value;
+    document.local_state.cursor.has_position = true;
+    document.local_state.cursor.position = source.value;
+
+    workbench::view_persistence_dto_t view;
+    view.id = {1};
+    view.workspace = workbench_id;
+    view.document = document.id;
+    view.focused = true;
+
+    workbench::workbench_persistence_dto_t initial_state;
+    initial_state.workspace = workbench_id;
+    initial_state.revision = {1};
+    initial_state.documents = {document};
+    initial_state.active_document = document.id;
+    initial_state.views = {view};
+    initial_state.history.workspace = workbench_id;
+
+    workbench::workbench_model_t model;
+    workbench::workbench_snapshot_ptr_t initial_snapshot;
+    if (!model.create_workspace(initial_state, initial_snapshot).ok() || !initial_snapshot)
+        throw fixture_error_t("workspace-local workbench navigation model did not initialize");
+
+    workbench::workbench_document_bridge_t bridge(workbench_id);
+    workbench::document_descriptor_t descriptor;
+    descriptor.identity = identity;
+    descriptor.title = document.title;
+    descriptor.can_open = true;
+    if (!bridge.publish(std::move(descriptor)).ok())
+        throw fixture_error_t("workspace-local workbench navigation bridge did not publish");
+    const workbench::workbench_services_t services{&bridge, &bridge};
+
+    workbench::workbench_command_t navigate;
+    navigate.kind = workbench::workbench_command_kind_t::navigate;
+    navigate.workspace = workbench_id;
+    navigate.expected_revision = initial_snapshot->revision();
+    navigate.navigation.workspace = workbench_id;
+    navigate.navigation.target.document = identity;
+    navigate.navigation.target.selection.kind = workbench::selection_kind_t::address;
+    navigate.navigation.target.selection.has_address = true;
+    navigate.navigation.target.selection.address = destination.value;
+    navigate.navigation.target.cursor.has_position = true;
+    navigate.navigation.target.cursor.position = destination.value;
+    navigate.navigation.origin = workbench::navigation_origin_t::user;
+    const auto navigated = model.execute(navigate, services);
+    if (!navigated.error.ok() || !navigated.changed || !navigated.snapshot ||
+        navigated.snapshot->persistence().history.back.size() != 1 ||
+        !navigated.snapshot->persistence().history.forward.empty())
+        throw fixture_error_t("workspace-local workbench navigation did not publish history");
+
+    workbench::workbench_command_t back;
+    back.kind = workbench::workbench_command_kind_t::history_back;
+    back.workspace = workbench_id;
+    back.expected_revision = navigated.snapshot->revision();
+    const auto backed = model.execute(back, services);
+    if (!backed.error.ok() || !backed.changed || !backed.snapshot ||
+        !backed.snapshot->persistence().history.back.empty() ||
+        backed.snapshot->persistence().history.forward.size() != 1)
+        throw fixture_error_t("workspace-local workbench back navigation did not restore source state");
+    const auto& backed_persisted = backed.snapshot->persistence();
+    const auto backed_active = std::find_if(
+        backed_persisted.documents.begin(), backed_persisted.documents.end(),
+        [&](const workbench::document_persistence_dto_t& candidate) {
+            return candidate.id == backed_persisted.active_document;
+        });
+    if (backed_active == backed_persisted.documents.end() ||
+        backed_active->local_state.selection.kind != workbench::selection_kind_t::address ||
+        !backed_active->local_state.selection.has_address ||
+        backed_active->local_state.selection.address != source.value ||
+        !backed_active->local_state.cursor.has_position ||
+        backed_active->local_state.cursor.position != source.value)
+        throw fixture_error_t("workspace-local workbench back navigation restored mismatched state");
+
+    workbench::workbench_command_t forward;
+    forward.kind = workbench::workbench_command_kind_t::history_forward;
+    forward.workspace = workbench_id;
+    forward.expected_revision = backed.snapshot->revision();
+    const auto forwarded = model.execute(forward, services);
+    if (!forwarded.error.ok() || !forwarded.changed || !forwarded.snapshot ||
+        forwarded.snapshot->persistence().history.back.size() != 1 ||
+        !forwarded.snapshot->persistence().history.forward.empty())
+        throw fixture_error_t("workspace-local workbench forward navigation did not restore target state");
+
+    const auto& persisted = forwarded.snapshot->persistence();
+    const auto active = std::find_if(persisted.documents.begin(), persisted.documents.end(),
+        [&](const workbench::document_persistence_dto_t& candidate) {
+            return candidate.id == persisted.active_document;
+        });
+    if (active == persisted.documents.end() ||
+        active->local_state.selection.kind != workbench::selection_kind_t::address ||
+        !active->local_state.selection.has_address ||
+        active->local_state.selection.address != destination.value ||
+        !active->local_state.cursor.has_position ||
+        active->local_state.cursor.position != destination.value)
+        throw fixture_error_t("workspace-local workbench forward navigation restored mismatched state");
 }
 
 struct workspace_probe_t {
@@ -198,10 +321,10 @@ workspace_probe_t exercise_workspace(const std::shared_ptr<analysis_workspace_t>
     }
 
     const auto selection = address_at(workspace, 0x1000 + index);
+    exercise_view_navigation_contract(workspace, index, address_at(workspace, 0x1008 + index), selection);
+    const auto view_revision = workspace->view_state().revision;
     auto view_update = workspace->update_view_state([&](workspace_view_state_t& state) {
         state.selection = selection;
-        state.navigation_back = {address_at(workspace, 0x1000), selection};
-        state.navigation_forward = {address_at(workspace, 0x1005 + index)};
         state.bookmarks = {selection};
     });
     if (!view_update)
@@ -210,8 +333,8 @@ workspace_probe_t exercise_workspace(const std::shared_ptr<analysis_workspace_t>
     const auto overlay_snapshot = overlay->snapshot();
     const auto decompiler_snapshot = decompiler->snapshot();
     const auto history = decompiler->history();
-    if (!view.selection || *view.selection != selection || view.navigation_back.size() != 2 ||
-        view.navigation_forward.size() != 1 || view.bookmarks.size() != 1 ||
+    if (!view.selection || *view.selection != selection || view.bookmarks.size() != 1 ||
+        view.bookmarks.front() != selection || view.revision != view_revision + 1 ||
         overlay_snapshot.items.size() != 6 || decompiler_snapshot.memory_cache_entries == 0 ||
         history.empty() || history.back().function_id != snapshot->functions.front().id)
         throw fixture_error_t("workspace-local overlay/cache/history/view state was not published");

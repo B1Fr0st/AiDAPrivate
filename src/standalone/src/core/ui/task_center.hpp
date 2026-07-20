@@ -81,6 +81,8 @@ struct status_summary_t {
     std::uint32_t running = 0;
     std::uint32_t cancellation_requested = 0;
     std::uint32_t failures = 0;
+    std::uint32_t interrupted = 0;
+    std::uint32_t partial = 0;
     std::uint32_t unacknowledged_diagnostics = 0;
     std::uint64_t oldest_active_ms = 0;
     std::uint64_t generation = 0;

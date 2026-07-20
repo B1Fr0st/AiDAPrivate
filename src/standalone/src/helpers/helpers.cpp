@@ -22,6 +22,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <string>
 #include <cstring>
 #include <cstdint>
@@ -29,6 +30,7 @@
 #include <functional>
 #include <thread>
 #include <chrono>
+#include <cctype>
 #include <exception>
 #include <utility>
 #include <nlohmann/json.hpp>
@@ -98,7 +100,6 @@
 #endif
 #include "ui_anim.hpp"
 #include "agent_picker_view.hpp"
-#include "mcp_marketplace_view.hpp"
 #include "initial_analysis.hpp"
 #include "initial_analysis_view.hpp"
 #include "loading_binary_overlay.hpp"
@@ -108,6 +109,7 @@
 #include "../core/ui/workspace_layout.hpp"
 #include "../core/ui/application_ui_runtime.hpp"
 #include "../core/ui/application_view_registry.hpp"
+#include "../core/ui/task_center.hpp"
 #include "../core/settings/settings_persistence_service.hpp"
 #include "../core/settings/theme_transfer_service.hpp"
 #include "../core/ai/conversation_evidence_store.hpp"
@@ -144,6 +146,470 @@ namespace {
 		return aida::infra::executor::submit(std::move(sub));
 	}
 
+	struct process_attach_request_t final {
+		std::uint64_t generation = 0;
+		std::uint64_t selection_epoch = 0;
+		std::uint32_t pid = 0;
+		std::string process_name;
+		std::string process_path;
+		std::string window_title;
+	};
+
+	struct process_attach_result_t final {
+		process_attach_request_t request;
+		bool attached = false;
+		bool cancelled = false;
+		bool cancellation_after_commit = false;
+		bool module_available = false;
+		std::string session_id;
+		std::string detail;
+		std::string module_name;
+		std::uint64_t module_base = 0;
+		std::uint64_t module_size = 0;
+	};
+
+	struct process_attach_operation_t final {
+		process_attach_request_t request;
+		std::string task_id;
+		std::shared_ptr<aida::analysis::cancellation_source_t> cancellation;
+		std::function<bool()> selection_is_current;
+		std::function<void()> close_dialog;
+		std::atomic<bool> commit_reached{false};
+		std::atomic<bool> cancellation_after_commit{false};
+		std::atomic<bool> terminal{false};
+	};
+
+	std::mutex g_process_attach_operation_mutex;
+	std::shared_ptr<process_attach_operation_t> g_process_attach_operation;
+	std::atomic<std::uint64_t> g_process_attach_generation{0};
+
+	bool process_attach_active()
+	{
+		std::lock_guard<std::mutex> lock(g_process_attach_operation_mutex);
+		return g_process_attach_operation &&
+			!g_process_attach_operation->terminal.load(std::memory_order_acquire);
+	}
+
+	void clear_process_attach_operation(
+		const std::shared_ptr<process_attach_operation_t>& operation)
+	{
+		std::lock_guard<std::mutex> lock(g_process_attach_operation_mutex);
+		if (g_process_attach_operation == operation)
+			g_process_attach_operation.reset();
+	}
+
+	void raise_process_attach_diagnostic(
+		const std::shared_ptr<process_attach_operation_t>& operation,
+		aida::ui::task_center::diagnostic_severity_t severity,
+		std::string summary,
+		std::string details)
+	{
+		aida::ui::task_center::diagnostic_registration_t diagnostic;
+		diagnostic.id = operation->task_id + ".diagnostic";
+		diagnostic.task_id = operation->task_id;
+		diagnostic.owner = "Process Attach";
+		diagnostic.target = "PID " + std::to_string(operation->request.pid);
+		diagnostic.summary = std::move(summary);
+		diagnostic.details = std::move(details);
+		diagnostic.severity = severity;
+		diagnostic.callbacks.focus = [] {
+			static_cast<void>(aida::ui_thread::post([] {
+				static_cast<void>(aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.diagnostics")));
+			}, "process_attach", "focus_diagnostic", "task_center_callback"));
+		};
+		static_cast<void>(aida::ui::task_center::raise_diagnostic(std::move(diagnostic)));
+	}
+
+	void complete_process_attach_on_ui(
+		const std::shared_ptr<process_attach_operation_t>& operation,
+		const std::shared_ptr<const process_attach_result_t>& result)
+	{
+		if (!aida::ui_thread::require_owner(
+			"process_attach", "publish_completion", "executor_completion")) {
+			if (!operation->terminal.exchange(true, std::memory_order_acq_rel)) {
+				const auto terminal_state = result->cancelled
+					? aida::ui::task_center::task_state_t::cancelled
+					: result->attached
+						? aida::ui::task_center::task_state_t::partial
+						: aida::ui::task_center::task_state_t::failed;
+				static_cast<void>(aida::ui::task_center::update_task(
+					operation->task_id, terminal_state, 1.0f,
+					"UI ownership fence rejected completion",
+					result->attached
+						? "The attach committed, but its UI completion was rejected"
+						: result->cancelled
+							? "The attach was cancelled and rolled back"
+							: "The attach failed before its UI completion was rejected"));
+			}
+			clear_process_attach_operation(operation);
+			return;
+		}
+
+		const std::uint64_t current_generation =
+			g_process_attach_generation.load(std::memory_order_acquire);
+		bool operation_is_current = false;
+		{
+			std::lock_guard<std::mutex> lock(g_process_attach_operation_mutex);
+			operation_is_current = g_process_attach_operation == operation;
+		}
+		const bool generation_is_current = result->request.generation != 0 &&
+			result->request.generation == current_generation &&
+			result->request.generation == operation->request.generation;
+		const bool selection_is_current = operation->selection_is_current &&
+			operation->selection_is_current();
+
+		const bool session_target_is_current = !result->attached ||
+			analysis_session::active_live_session_matches(
+				result->request.pid, result->session_id);
+
+		if (operation->terminal.exchange(true, std::memory_order_acq_rel)) {
+			clear_process_attach_operation(operation);
+			return;
+		}
+
+		if (result->cancelled) {
+			output_log::push(bottom_tab_t::output,
+				"[Driver] Attach to PID " + std::to_string(result->request.pid) +
+				" was cancelled and rolled back.\n");
+			static_cast<void>(aida::ui::task_center::update_task(
+				operation->task_id,
+				aida::ui::task_center::task_state_t::cancelled,
+				1.0f,
+				"Cancelled and rolled back",
+				"No reviewed attach transaction was committed"));
+		} else if (!result->attached) {
+			const std::string detail = result->detail.empty()
+				? "Attach failed without diagnostic detail" : result->detail;
+			output_log::push(bottom_tab_t::output,
+				"[Driver] Failed to attach to PID " + std::to_string(result->request.pid) +
+				": " + detail + "\n");
+			static_cast<void>(aida::ui::task_center::update_task(
+				operation->task_id,
+				aida::ui::task_center::task_state_t::failed,
+				1.0f,
+				"Attach failed",
+				detail,
+				operation->task_id + ".diagnostic"));
+			raise_process_attach_diagnostic(operation,
+				aida::ui::task_center::diagnostic_severity_t::error,
+				"Process attach failed", detail);
+		} else if (result->cancellation_after_commit ||
+			operation->cancellation_after_commit.load(std::memory_order_acquire)) {
+			output_log::push(bottom_tab_t::output,
+				"[Driver] Attach to PID " + std::to_string(result->request.pid) +
+				" committed before cancellation was requested.\n");
+			static_cast<void>(aida::ui::task_center::update_task(
+				operation->task_id,
+				aida::ui::task_center::task_state_t::completed,
+				1.0f,
+				"Attach committed before cancellation request",
+				"The active session was retained because the transaction had crossed its commit boundary"));
+		} else if (!operation_is_current || !generation_is_current ||
+			!selection_is_current || !session_target_is_current) {
+			std::string reason;
+			if (!operation_is_current) reason = "operation ownership changed";
+			else if (!generation_is_current) reason = "request generation changed";
+			else if (!selection_is_current) reason = "reviewed process selection changed";
+			else reason = "active session target changed";
+			output_log::push(bottom_tab_t::output,
+				"[Driver] Attached to PID " + std::to_string(result->request.pid) +
+				", but discarded stale UI completion: " + reason + ".\n");
+			static_cast<void>(aida::ui::task_center::update_task(
+				operation->task_id,
+				aida::ui::task_center::task_state_t::partial,
+				1.0f,
+				"Attach committed; stale UI completion discarded",
+				reason));
+		} else {
+			if (!result->module_available) {
+				output_log::push(bottom_tab_t::output,
+					"[Driver] Attached to PID " + std::to_string(result->request.pid) +
+					" but could not enumerate modules.\n");
+			}
+			static_cast<void>(aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("document.disassembly")));
+			static_cast<void>(aida::ui::task_center::update_task(
+				operation->task_id,
+				aida::ui::task_center::task_state_t::completed,
+				1.0f,
+				result->module_available
+					? "Attached; workspace module resolved"
+					: "Attached; module list unavailable",
+				"PID " + std::to_string(result->request.pid) + " is the active session target"));
+		}
+
+		if (operation->close_dialog)
+			operation->close_dialog();
+		clear_process_attach_operation(operation);
+	}
+
+	void run_process_attach(
+		const std::shared_ptr<process_attach_operation_t>& operation)
+	{
+		diag::log_tagged_critical_fmt("attach",
+			"worker_enter generation=%llu selection_epoch=%llu pid=%u name=%s path=%s",
+			static_cast<unsigned long long>(operation->request.generation),
+			static_cast<unsigned long long>(operation->request.selection_epoch),
+			operation->request.pid, operation->request.process_name.c_str(),
+			operation->request.process_path.c_str());
+		driver_bridge::debug_log("ATTACH: attempting pid=%u name=%s\n",
+			operation->request.pid, operation->request.process_name.c_str());
+		static_cast<void>(aida::ui::task_center::update_task(
+			operation->task_id,
+			aida::ui::task_center::task_state_t::running,
+			0.05f,
+			"Validating reviewed process identity"));
+
+		auto result = std::make_shared<process_attach_result_t>();
+		result->request = operation->request;
+		try {
+			std::string session_error;
+			result->attached = analysis_session::open_attach_session(
+				operation->request.pid, &session_error, operation->cancellation->token());
+			result->detail = std::move(session_error);
+			result->cancelled = !result->attached &&
+				operation->cancellation->token().stop_requested();
+			diag::log_tagged_critical_fmt("attach",
+				"session_transaction generation=%llu pid=%u attached=%d cancelled=%d detail=%s",
+				static_cast<unsigned long long>(operation->request.generation),
+				operation->request.pid, result->attached ? 1 : 0,
+				result->cancelled ? 1 : 0, result->detail.c_str());
+			if (result->attached) {
+				operation->commit_reached.store(true, std::memory_order_release);
+				if (operation->cancellation->token().stop_requested())
+					operation->cancellation_after_commit.store(true, std::memory_order_release);
+				std::size_t session_index = 0;
+				if (analysis_session::find_session_by_pid(operation->request.pid, &session_index))
+					result->session_id = analysis_session::summarize_session_at(session_index).id;
+				static_cast<void>(aida::ui::task_center::update_task(
+					operation->task_id,
+					aida::ui::task_center::task_state_t::running,
+					0.78f,
+					"Attach committed; resolving target module"));
+				auto modules = driver_bridge::enumerate_modules();
+				diag::log_tagged_critical_fmt("attach",
+					"module_snapshot generation=%llu pid=%u count=%llu",
+					static_cast<unsigned long long>(operation->request.generation),
+					operation->request.pid,
+					static_cast<unsigned long long>(modules.size()));
+				if (!modules.empty()) {
+					std::string reviewed_name = operation->request.process_name;
+					for (char& character : reviewed_name)
+						character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+					const auto* target_module = &modules.front();
+					for (const auto& module : modules) {
+						std::string module_name = module.name;
+						for (char& character : module_name)
+							character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+						if (module_name == reviewed_name) {
+							target_module = &module;
+							break;
+						}
+					}
+					result->module_available = true;
+					result->module_name = target_module->name;
+					result->module_base = target_module->base;
+					result->module_size = target_module->size == 0
+						? 0x100000 : target_module->size;
+					driver_bridge::debug_log(
+						"ATTACH: workspace snapshot pid=%u base=0x%llX size=0x%llX mod=%s\n",
+						operation->request.pid,
+						static_cast<unsigned long long>(result->module_base),
+						static_cast<unsigned long long>(result->module_size),
+						result->module_name.c_str());
+				}
+			}
+		} catch (const std::exception& exception) {
+			if (!result->attached)
+				result->detail = exception.what();
+			diag::log_tagged_critical_fmt("attach",
+				"worker_exception pid=%u detail=%s",
+				operation->request.pid, exception.what());
+		} catch (...) {
+			if (!result->attached)
+				result->detail = "Unknown exception during process attach";
+			diag::log_tagged_critical_fmt("attach",
+				"worker_exception pid=%u detail=unknown", operation->request.pid);
+		}
+
+		static_cast<void>(aida::ui::task_center::update_task(
+			operation->task_id,
+			result->cancelled
+				? aida::ui::task_center::task_state_t::cancellation_requested
+				: aida::ui::task_center::task_state_t::running,
+			0.95f,
+			result->cancelled
+				? "Rollback complete; publishing cancellation"
+				: "Publishing immutable attach completion"));
+		result->cancellation_after_commit =
+			operation->cancellation_after_commit.load(std::memory_order_acquire);
+		const std::shared_ptr<const process_attach_result_t> immutable_result = result;
+		const bool posted = aida::ui_thread::post(
+			[operation, immutable_result] {
+				complete_process_attach_on_ui(operation, immutable_result);
+			}, "process_attach", "publish_completion", "executor_completion");
+		if (posted)
+			return;
+		diag::log_tagged_critical_fmt("attach",
+			"ui_dispatch_failed generation=%llu pid=%u attached=%d cancelled=%d",
+			static_cast<unsigned long long>(operation->request.generation),
+			operation->request.pid, result->attached ? 1 : 0,
+			result->cancelled ? 1 : 0);
+
+		if (!operation->terminal.exchange(true, std::memory_order_acq_rel)) {
+			if (result->cancelled) {
+				static_cast<void>(aida::ui::task_center::update_task(
+					operation->task_id,
+					aida::ui::task_center::task_state_t::cancelled,
+					1.0f,
+					"Cancelled and rolled back; UI dispatch unavailable",
+					"No reviewed attach transaction was committed"));
+			} else if (result->attached) {
+				static_cast<void>(aida::ui::task_center::update_task(
+					operation->task_id,
+					aida::ui::task_center::task_state_t::partial,
+					1.0f,
+					"Attach committed; UI dispatch failed",
+					"The active session is valid, but its UI completion could not be delivered"));
+				raise_process_attach_diagnostic(operation,
+					aida::ui::task_center::diagnostic_severity_t::warning,
+					"Attach UI completion was not delivered",
+					"The process attach committed before the UI dispatcher rejected publication");
+			} else {
+				const std::string detail = result->detail.empty()
+					? "Attach failed and UI completion dispatch was unavailable" : result->detail;
+				static_cast<void>(aida::ui::task_center::update_task(
+					operation->task_id,
+					aida::ui::task_center::task_state_t::failed,
+					1.0f,
+					"Attach failed; UI dispatch unavailable",
+					detail,
+					operation->task_id + ".diagnostic"));
+				raise_process_attach_diagnostic(operation,
+					aida::ui::task_center::diagnostic_severity_t::error,
+					"Process attach failed", detail);
+			}
+		}
+		clear_process_attach_operation(operation);
+	}
+
+	bool begin_process_attach(
+		process_attach_request_t request,
+		std::function<bool()> selection_is_current,
+		std::function<void()> close_dialog,
+		std::string& error)
+	{
+		auto operation = std::make_shared<process_attach_operation_t>();
+		{
+			std::lock_guard<std::mutex> lock(g_process_attach_operation_mutex);
+			if (g_process_attach_operation &&
+				!g_process_attach_operation->terminal.load(std::memory_order_acquire)) {
+				error = "A process attach transaction is already active";
+				return false;
+			}
+			request.generation = g_process_attach_generation.fetch_add(
+				1, std::memory_order_acq_rel) + 1;
+			operation->request = std::move(request);
+			operation->task_id = "process.attach." +
+				std::to_string(operation->request.pid) + "." +
+				std::to_string(operation->request.generation);
+			operation->cancellation =
+				std::make_shared<aida::analysis::cancellation_source_t>();
+			operation->selection_is_current = std::move(selection_is_current);
+			operation->close_dialog = std::move(close_dialog);
+			g_process_attach_operation = operation;
+		}
+
+		aida::ui::task_center::task_registration_t registration;
+		registration.id = operation->task_id;
+		registration.source = "process_attach_dialog";
+		registration.owner = "Process Attach";
+		registration.owner_view = "document.disassembly";
+		registration.owner_action = "session.attach_process";
+		registration.target = "PID " + std::to_string(operation->request.pid);
+		const std::string reviewed_label = !operation->request.process_name.empty()
+			? operation->request.process_name
+			: !operation->request.window_title.empty()
+				? operation->request.window_title : registration.target;
+		registration.label = "Attach to " + reviewed_label;
+		registration.stage = "Reviewed request queued";
+		registration.affected_entity = operation->request.process_path.empty()
+			? registration.target : operation->request.process_path;
+		registration.progress = 0.0f;
+		registration.cancellation_is_safe = true;
+		registration.callbacks.cancel = [weak = std::weak_ptr<process_attach_operation_t>(operation)] {
+			const auto current = weak.lock();
+			if (!current || current->terminal.load(std::memory_order_acquire))
+				return false;
+			if (current->commit_reached.load(std::memory_order_acquire))
+				current->cancellation_after_commit.store(true, std::memory_order_release);
+			else
+				current->cancellation->request_cancel();
+			return true;
+		};
+		registration.callbacks.focus = [] {
+			static_cast<void>(aida::ui_thread::post([] {
+				static_cast<void>(aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.background_tasks")));
+			}, "process_attach", "focus_task", "task_center_callback"));
+		};
+		if (!aida::ui::task_center::register_task(std::move(registration))) {
+			error = "The Task Center rejected process attach ownership";
+			operation->terminal.store(true, std::memory_order_release);
+			clear_process_attach_operation(operation);
+			return false;
+		}
+
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "process_attach";
+		submission.label = "process_attach.transaction";
+		submission.thread_class = "driver_session_transaction";
+		submission.domain = aida::infra::executor::domain_t::feature_worker;
+		submission.priority = 2;
+		submission.target_pid = operation->request.pid;
+		submission.generation = operation->request.generation;
+		submission.ui_access_policy = "immutable_snapshots_only";
+		submission.failure_policy = "typed_diagnostic";
+		submission.shutdown_policy = "cancel";
+		submission.cancel_hook = [weak = std::weak_ptr<process_attach_operation_t>(operation)] {
+			if (const auto current = weak.lock())
+				current->cancellation->request_cancel();
+		};
+		submission.body = [operation] { run_process_attach(operation); };
+		const auto submitted = aida::infra::executor::submit(std::move(submission));
+		if (submitted.submitted)
+			return true;
+
+		error = submitted.reject_reason.empty()
+			? "The process attach executor rejected dispatch" : submitted.reject_reason;
+		operation->terminal.store(true, std::memory_order_release);
+		static_cast<void>(aida::ui::task_center::update_task(
+			operation->task_id,
+			aida::ui::task_center::task_state_t::failed,
+			1.0f,
+			"Dispatch rejected before execution",
+			error,
+			operation->task_id + ".diagnostic"));
+		raise_process_attach_diagnostic(operation,
+			aida::ui::task_center::diagnostic_severity_t::error,
+			"Process attach dispatch was rejected", error);
+		clear_process_attach_operation(operation);
+		return false;
+	}
+
+	bool request_active_process_attach_cancel()
+	{
+		std::shared_ptr<process_attach_operation_t> operation;
+		{
+			std::lock_guard<std::mutex> lock(g_process_attach_operation_mutex);
+			operation = g_process_attach_operation;
+		}
+		if (!operation || operation->terminal.load(std::memory_order_acquire))
+			return false;
+		return aida::ui::task_center::request_cancel(operation->task_id);
+	}
+
 #endif
 
 	void g_sa_settings_request_save()
@@ -170,6 +636,8 @@ namespace {
 		char save_name[65]{};
 		char rename_name[65]{};
 		std::string selected_name;
+		std::uint64_t selected_generation = 0;
+		bool selection_requires_reselection = false;
 		std::string status;
 		workspace_review_t review = workspace_review_t::none;
 	};
@@ -256,27 +724,110 @@ namespace {
 		dialog.focus_save_name = true;
 	}
 
-	void open_workspace_manager_dialog(std::string_view selected = {})
+	void open_workspace_manager_dialog(std::string_view selected = {},
+		std::uint64_t selected_generation = 0)
 	{
 		auto& dialog = workspace_dialog_state();
 		dialog.manager_open = true;
 		dialog.save_as_open = false;
 		dialog.review = workspace_review_t::none;
 		dialog.status.clear();
+		dialog.selected_name.clear();
+		dialog.selected_generation = 0;
+		dialog.selection_requires_reselection = false;
 		if (!selected.empty()) {
 			dialog.selected_name.assign(selected);
+			dialog.selected_generation = selected_generation;
 			copy_workspace_name(dialog.rename_name, selected);
 		}
 	}
 
-	void load_workspace_from_menu(std::string_view name)
+	aida::ui::capability_state_t named_workspace_load_capability(
+		const aida::ui::workspace_layout::user_workspace_descriptor_t& retained)
 	{
-		const auto result = aida::ui::workspace_layout::load_user_layout(name);
-		if (workspace_request_succeeded(result))
+		if (!aida::ui::workspace_layout::user_layout_catalog_ready())
+			return aida::ui::capability_state_t::unavailable(
+				"The saved workspace catalog is still loading");
+		const auto catalog = aida::ui::workspace_layout::user_layout_catalog();
+		const auto current = catalog ? std::find_if(catalog->begin(), catalog->end(),
+			[&retained](const auto& item) {
+				return item.name == retained.name &&
+					item.generation == retained.generation;
+			}) : std::vector<aida::ui::workspace_layout::user_workspace_descriptor_t>::const_iterator{};
+		if (!catalog || current == catalog->end())
+			return aida::ui::capability_state_t::unavailable(
+				"This saved workspace changed after it was presented; reopen the catalog");
+		if (current->active)
+			return aida::ui::capability_state_t::unavailable(
+				"This saved workspace is already active");
+		if (aida::ui::workspace_layout::operation_pending()) {
+			const std::string status = aida::ui::workspace_layout::operation_status();
+			return aida::ui::capability_state_t::unavailable(status.empty()
+				? "Another workspace transaction is already running" : status);
+		}
+		return aida::ui::capability_state_t::available();
+	}
+
+	aida::ui::application_ui::retained_entity_context_t named_workspace_load_context(
+		aida::ui::workspace_layout::user_workspace_descriptor_t retained)
+	{
+		aida::ui::application_ui::retained_entity_context_t context;
+		context.owner_id = "workspace.saved";
+		context.entity_id = retained.name;
+		context.entity_generation = retained.generation;
+		context.validate_identity = [retained] {
+			return named_workspace_load_capability(retained);
+		};
+		aida::ui::application_ui::retained_entity_action_t action;
+		action.action_id = "workspace.load_named";
+		action.capability = named_workspace_load_capability(retained);
+		action.invoke = [retained] {
+			const auto capability = named_workspace_load_capability(retained);
+			if (!capability.enabled)
+				return aida::ui::action_handler_result_t::failed(
+					capability.disabled_reason);
+			const auto result = aida::ui::workspace_layout::load_user_layout_exact(
+				retained.name, retained.generation);
+			std::string detail = workspace_request_message(result, "Load workspace");
+			if (result == aida::ui::workspace_layout::workspace_request_result_t::unavailable &&
+				aida::ui::workspace_layout::user_layout_catalog_ready()) {
+				const auto catalog = aida::ui::workspace_layout::user_layout_catalog();
+				const bool exact_identity_exists = catalog && std::any_of(
+					catalog->begin(), catalog->end(), [&retained](const auto& item) {
+						return item.name == retained.name &&
+							item.generation == retained.generation;
+					});
+				if (!exact_identity_exists)
+					detail = "The selected saved workspace changed after it was presented. Reopen the catalog and select its current generation.";
+			}
+			return workspace_request_succeeded(result)
+				? aida::ui::action_handler_result_t::completed(detail)
+				: aida::ui::action_handler_result_t::failed(detail);
+		};
+		context.actions.push_back(std::move(action));
+		return context;
+	}
+
+	aida::ui::action_execution_result_t execute_named_workspace_load(
+		const aida::ui::workspace_layout::user_workspace_descriptor_t& retained,
+		aida::ui::action_invocation_source_t source)
+	{
+		auto context = named_workspace_load_context(retained);
+		return aida::ui::application_ui::execute_retained_entity_action(
+			"workspace.load_named", source, context);
+	}
+
+	void load_workspace_from_menu(
+		const aida::ui::workspace_layout::user_workspace_descriptor_t& retained)
+	{
+		const auto result = execute_named_workspace_load(retained,
+			aida::ui::action_invocation_source_t::application_menu);
+		if (result.executed())
 			return;
-		open_workspace_manager_dialog(name);
-		workspace_dialog_state().status = workspace_request_message(result,
-			"Load workspace");
+		open_workspace_manager_dialog(retained.name, retained.generation);
+		workspace_dialog_state().status = result.message.empty()
+			? "The selected saved workspace could not be loaded."
+			: result.message;
 	}
 
 	void open_workspace_reset_all_review()
@@ -288,22 +839,34 @@ namespace {
 	void render_workspace_dialogs()
 	{
 		auto& dialog = workspace_dialog_state();
-		const ImVec2 display = ImGui::GetIO().DisplaySize;
-		const auto place_window = [display](float desired_width, float desired_height) {
-			const float width = (std::min)(desired_width, (std::max)(120.0f, display.x - 24.0f));
-			const float height = (std::min)(desired_height, (std::max)(100.0f, display.y - 24.0f));
-			ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
-			ImGui::SetNextWindowPos(ImVec2((std::max)(12.0f, (display.x - width) * 0.5f),
-				(std::max)(12.0f, (display.y - height) * 0.5f)), ImGuiCond_Always);
+		const auto place_window = [](float desired_width, float desired_height,
+				float minimum_width, float minimum_height) {
+			ImGuiViewport* viewport = ImGui::GetMainViewport();
+			const ImVec2 work = viewport ? viewport->WorkSize : ImGui::GetIO().DisplaySize;
+			const ImVec2 origin = viewport ? viewport->WorkPos : ImVec2(0.0f, 0.0f);
+			const float scale = aida::ui::design::metrics().scale;
+			const float margin = aida::ui::scale_px(24.0f, scale);
+			const ImVec2 available((std::max)(1.0f, work.x - margin * 2.0f),
+				(std::max)(1.0f, work.y - margin * 2.0f));
+			const ImVec2 minimum(
+				(std::min)(aida::ui::scale_px(minimum_width, scale), available.x),
+				(std::min)(aida::ui::scale_px(minimum_height, scale), available.y));
+			const ImVec2 desired(
+				(std::clamp)(aida::ui::scale_px(desired_width, scale), minimum.x, available.x),
+				(std::clamp)(aida::ui::scale_px(desired_height, scale), minimum.y, available.y));
+			ImGui::SetNextWindowPos(ImVec2(origin.x + work.x * 0.5f,
+				origin.y + work.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+			ImGui::SetNextWindowSize(desired, ImGuiCond_Appearing);
+			ImGui::SetNextWindowSizeConstraints(minimum, available);
 		};
-		ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
-			ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+		ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
 #if defined(IMGUI_HAS_DOCK)
 		flags |= ImGuiWindowFlags_NoDocking;
 #endif
 
 		if (dialog.save_as_open) {
-			place_window(500.0f, dialog.review == workspace_review_t::overwrite ? 260.0f : 220.0f);
+			place_window(500.0f, dialog.review == workspace_review_t::overwrite ? 300.0f : 260.0f,
+				380.0f, 220.0f);
 			if (ImGui::Begin("Save Workspace As##workspace.save-as.dialog",
 					&dialog.save_as_open, flags)) {
 				const auto identity = aida::ui::workspace_layout::active_identity();
@@ -385,25 +948,41 @@ namespace {
 		}
 
 		if (dialog.manager_open) {
-			place_window(760.0f, 500.0f);
+			place_window(760.0f, 500.0f, 520.0f, 360.0f);
 			if (ImGui::Begin("Saved Workspaces##workspace.manager.dialog",
 					&dialog.manager_open, flags)) {
 				const bool catalog_ready = aida::ui::workspace_layout::user_layout_catalog_ready();
 				const auto catalog = aida::ui::workspace_layout::user_layout_catalog();
 				const auto active = aida::ui::workspace_layout::active_identity();
-				if (!dialog.selected_name.empty() && (!catalog ||
-					std::none_of(catalog->begin(), catalog->end(), [&dialog](const auto& item) {
-						return item.name == dialog.selected_name;
-					}))) {
-					dialog.selected_name.clear();
-					dialog.review = dialog.review == workspace_review_t::reset_all
-						? dialog.review : workspace_review_t::none;
+				if (catalog_ready && !dialog.selected_name.empty()) {
+					const auto retained = catalog ? std::find_if(catalog->begin(), catalog->end(),
+						[&dialog](const auto& item) {
+							return item.name == dialog.selected_name;
+						}) : std::vector<aida::ui::workspace_layout::user_workspace_descriptor_t>::const_iterator{};
+					const bool missing = !catalog || retained == catalog->end();
+					const bool replaced = !missing && (dialog.selected_generation == 0 ||
+						retained->generation != dialog.selected_generation);
+					if (missing || replaced) {
+						if (dialog.review != workspace_review_t::reset_all)
+							dialog.status = missing
+								? "The selected saved workspace no longer exists. Select another workspace."
+								: "The selected saved workspace changed after selection. Select its current generation explicitly.";
+						dialog.selected_name.clear();
+						dialog.selected_generation = 0;
+						dialog.selection_requires_reselection = true;
+						dialog.review = dialog.review == workspace_review_t::reset_all
+							? dialog.review : workspace_review_t::none;
+					}
 				}
-				if (dialog.selected_name.empty() && catalog && !catalog->empty()) {
+				if (dialog.selected_name.empty() && !dialog.selection_requires_reselection &&
+					catalog_ready && catalog && !catalog->empty()) {
 					const auto selected = std::find_if(catalog->begin(), catalog->end(),
 						[](const auto& item) { return item.active; });
-					dialog.selected_name = selected == catalog->end()
-						? catalog->front().name : selected->name;
+					const auto& initial = selected == catalog->end()
+						? catalog->front() : *selected;
+					dialog.selected_name = initial.name;
+					dialog.selected_generation = initial.generation;
+					copy_workspace_name(dialog.rename_name, initial.name);
 				}
 				ImGui::TextUnformatted("Saved Workspaces");
 				if (active.kind == aida::ui::workspace_layout::workspace_identity_kind_t::user)
@@ -426,18 +1005,22 @@ namespace {
 						ImGui::PushID(item.name.c_str());
 						std::string label = item.name;
 						if (item.active) label.append("  [Active]");
-						const bool selected = dialog.selected_name == item.name;
+						const bool selected = dialog.selected_name == item.name &&
+							dialog.selected_generation == item.generation;
 						if (ImGui::Selectable((label + "##workspace.saved-row").c_str(), selected,
 							ImGuiSelectableFlags_AllowDoubleClick)) {
 							dialog.selected_name = item.name;
+							dialog.selected_generation = item.generation;
+							dialog.selection_requires_reselection = false;
 							copy_workspace_name(dialog.rename_name, item.name);
 							dialog.review = workspace_review_t::none;
 							dialog.status.clear();
 							if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !item.active &&
 								!aida::ui::workspace_layout::operation_pending()) {
-								const auto result = aida::ui::workspace_layout::load_user_layout(item.name);
-								dialog.status = workspace_request_message(result, "Load workspace");
-								if (workspace_request_succeeded(result)) dialog.manager_open = false;
+								const auto result = execute_named_workspace_load(item,
+									aida::ui::action_invocation_source_t::toolbar);
+								dialog.status = result.message;
+								if (result.executed()) dialog.manager_open = false;
 							}
 						}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -454,7 +1037,10 @@ namespace {
 				ImGui::SameLine();
 				ImGui::BeginChild("##workspace.manager.details", ImVec2(0.0f, -44.0f), true);
 				const auto selected = catalog ? std::find_if(catalog->begin(), catalog->end(),
-					[&dialog](const auto& item) { return item.name == dialog.selected_name; }) :
+					[&dialog](const auto& item) {
+						return item.name == dialog.selected_name &&
+							item.generation == dialog.selected_generation;
+					}) :
 					std::vector<aida::ui::workspace_layout::user_workspace_descriptor_t>::const_iterator{};
 				if (!catalog || selected == catalog->end()) {
 					ImGui::TextWrapped("Select a saved workspace to load, rename or delete it.");
@@ -465,14 +1051,19 @@ namespace {
 						static_cast<unsigned long long>(selected->generation));
 					ImGui::Spacing();
 					const bool pending = aida::ui::workspace_layout::operation_pending();
-					ImGui::BeginDisabled(pending || selected->active);
+					const auto load_capability = named_workspace_load_capability(*selected);
+					ImGui::BeginDisabled(!load_capability.enabled);
 					if (ImGui::Button("Load##workspace.manager.load", ImVec2(96.0f, 0.0f))) {
-						const auto result = aida::ui::workspace_layout::load_user_layout(selected->name);
-						dialog.status = workspace_request_message(result, "Load workspace");
-						if (workspace_request_succeeded(result)) dialog.manager_open = false;
+						const auto result = execute_named_workspace_load(*selected,
+							aida::ui::action_invocation_source_t::toolbar);
+						dialog.status = result.message;
+						if (result.executed()) dialog.manager_open = false;
 					}
 					register_workspace_semantic("aida.workspace.manager.load", "workspace-load",
-						pending || selected->active);
+						!load_capability.enabled);
+					if (!load_capability.enabled && ImGui::IsItemHovered(
+							ImGuiHoveredFlags_AllowWhenDisabled))
+						ImGui::SetTooltip("%s", load_capability.disabled_reason.c_str());
 					ImGui::EndDisabled();
 					ImGui::SameLine();
 					if (ImGui::Button("Save As Copy##workspace.manager.save-copy")) {
@@ -505,8 +1096,11 @@ namespace {
 						const auto result = aida::ui::workspace_layout::rename_user_layout(
 							old_name, dialog.rename_name);
 						dialog.status = workspace_request_message(result, "Rename workspace");
-						if (workspace_request_succeeded(result))
-							dialog.selected_name.assign(dialog.rename_name);
+						if (workspace_request_succeeded(result)) {
+							dialog.selected_name.clear();
+							dialog.selected_generation = 0;
+							dialog.selection_requires_reselection = true;
+						}
 					}
 					register_workspace_semantic("aida.workspace.manager.rename",
 						"workspace-rename", pending || dialog.rename_name[0] == '\0' ||
@@ -532,6 +1126,8 @@ namespace {
 							dialog.status = workspace_request_message(result, "Delete workspace");
 							if (workspace_request_succeeded(result)) {
 								dialog.selected_name.clear();
+								dialog.selected_generation = 0;
+								dialog.selection_requires_reselection = true;
 								dialog.review = workspace_review_t::none;
 							}
 						}
@@ -1181,7 +1777,6 @@ namespace ui_input_gate
 			|| globals::ui::shortcuts_dialog_open
 			|| workspace_dialog_state().save_as_open
 			|| workspace_dialog_state().manager_open
-			|| aida::mcp_marketplace_view::is_open()
 			|| aida::agent_picker::is_open()
 			|| menu_bar::any_open;
 	}
@@ -4796,10 +5391,12 @@ void helpers::render_title()
 			}
 
 
+			static bool theme_editor_popup_requested = false;
+			if (custom_themes::editor_open && !theme_editor_popup_requested) {
+				aida::ui::design::open_dialog("theme_editor", "Theme Editor");
+				theme_editor_popup_requested = true;
+			}
 			if (custom_themes::editor_open) {
-				float ew = 380.f, eh = 520.f;
-				ImGui::SetNextWindowPos(ImVec2((ww - ew) * 0.5f, (globals::ui::window_h - eh) * 0.5f), ImGuiCond_Appearing);
-				ImGui::SetNextWindowSize(ImVec2(ew, eh));
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.f, 12.f));
 				ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
@@ -4810,12 +5407,13 @@ void helpers::render_title()
 				ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(th_te.panel_header));
 				ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(th_te.text_primary));
 
-				if (ImGui::Begin("##theme_editor", &custom_themes::editor_open,
-					ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-					ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse))
+				bool theme_editor_stay_open = custom_themes::editor_open;
+				if (aida::ui::design::begin_dialog_exact("Theme Editor###theme_editor",
+					ImVec2(420.f, 620.f), ImVec2(360.f, 420.f), &theme_editor_stay_open,
+					ImGuiWindowFlags_NoCollapse))
 				{
 					auto& ed = custom_themes::editing_copy;
-					float iw2 = ew - 28.f;
+					float iw2 = (std::max)(120.f, ImGui::GetContentRegionAvail().x);
 
 					ImGui::TextColored(aida::ui::resolved().accent,
 						custom_themes::editing_idx < 0 ? "Create Theme" : "Edit Theme");
@@ -4825,6 +5423,8 @@ void helpers::render_title()
 					static char name_buf[128] = {};
 					static bool name_init = false;
 					static int name_editing_idx = -2;
+					static int delete_review_index = -1;
+					static std::string delete_review_name;
 					if (!name_init || name_editing_idx != custom_themes::editing_idx ||
 						ed.name != name_buf) {
 						snprintf(name_buf, sizeof(name_buf), "%s", ed.name.c_str());
@@ -4957,6 +5557,10 @@ void helpers::render_title()
 							}
 						}
 					}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::semantics::register_last_item(
+						"aida.theme.editor.save", "theme-save");
+#endif
 					ImGui::SameLine();
 
 
@@ -4987,6 +5591,10 @@ void helpers::render_title()
 								custom_theme_ui_error() = "The theme export request failed validation or scheduling.";
 						}
 					}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::semantics::register_last_item(
+						"aida.theme.editor.export", "theme-export");
+#endif
 					ImGui::SameLine();
 
 
@@ -4997,7 +5605,52 @@ void helpers::render_title()
 							aida::ui::components::button_kind_t::destructive,
 							aida::ui::components::size_t_::md,
 							ImVec2(btn_w2, 26.f))) {
-							int idx = custom_themes::editing_idx;
+							delete_review_index = custom_themes::editing_idx;
+							delete_review_name = custom_themes::list[
+								static_cast<std::size_t>(delete_review_index)].name;
+							aida::ui::design::open_dialog("theme_delete_confirm", "Delete Theme");
+						}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						aida::preview::semantics::register_last_item(
+							"aida.theme.editor.delete", "theme-delete-review");
+#endif
+						ImGui::SameLine();
+					}
+
+					if (aida::ui::components::button("Cancel",
+						aida::ui::components::button_kind_t::secondary,
+						aida::ui::components::size_t_::md,
+						ImVec2(btn_w2, 26.f))) {
+						custom_themes::editor_open = false;
+						name_init = false;
+					}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::semantics::register_last_item(
+						"aida.theme.editor.cancel", "dialog-cancel");
+#endif
+
+					if (aida::ui::design::begin_dialog("theme_delete_confirm", "Delete Theme",
+							ImVec2(460.f, 270.f), ImVec2(340.f, 230.f))) {
+						const bool target_current = delete_review_index >= 0 &&
+							static_cast<std::size_t>(delete_review_index) < custom_themes::list.size() &&
+							custom_themes::list[static_cast<std::size_t>(delete_review_index)].name == delete_review_name;
+						const std::string delete_prerequisite = target_current
+							? "The reviewed catalog entry is unchanged."
+							: "The reviewed theme changed or no longer exists. Cancel and select it again.";
+						aida::ui::design::confirmation_t confirmation;
+						confirmation.verb = "Delete custom theme";
+						confirmation.target = delete_review_name.c_str();
+						confirmation.scope = "The persisted custom-theme catalog";
+						confirmation.effect = "The theme is removed. If active, the custom-theme selection is cleared.";
+						confirmation.reversibility = "Re-import or recreate the theme to restore it.";
+						confirmation.prerequisite = delete_prerequisite.c_str();
+						confirmation.confirm_label = "Delete";
+						confirmation.destructive = true;
+						confirmation.confirm_enabled = target_current;
+						const auto result = aida::ui::design::confirmation_dialog(
+							"theme_delete_confirm", confirmation);
+						if (result.confirmed && target_current) {
+							const int idx = delete_review_index;
 							const int previous_active = custom_themes::active_custom;
 							CustomThemeData removed = custom_themes::list[static_cast<std::size_t>(idx)];
 							custom_themes::list.erase(custom_themes::list.begin() + idx);
@@ -5015,21 +5668,26 @@ void helpers::render_title()
 								custom_theme_ui_error().clear();
 								name_init = false;
 							}
+							delete_review_index = -1;
+							delete_review_name.clear();
+							ImGui::CloseCurrentPopup();
+						} else if (result.cancelled) {
+							delete_review_index = -1;
+							delete_review_name.clear();
+							ImGui::CloseCurrentPopup();
 						}
-						ImGui::SameLine();
-					}
-
-					if (aida::ui::components::button("Cancel",
-						aida::ui::components::button_kind_t::secondary,
-						aida::ui::components::size_t_::md,
-						ImVec2(btn_w2, 26.f))) {
-						custom_themes::editor_open = false;
-						name_init = false;
+						ImGui::EndPopup();
 					}
 				}
-				ImGui::End();
+				ImGui::EndPopup();
 				ImGui::PopStyleColor(4);
 				ImGui::PopStyleVar(4);
+				if (!theme_editor_stay_open) {
+					custom_themes::editor_open = false;
+					theme_editor_popup_requested = false;
+				}
+			} else {
+				theme_editor_popup_requested = false;
 			}
 		}
 
@@ -5117,7 +5775,7 @@ void helpers::render_title()
 		int keyboard_menu_request = -1;
 		int compact_section_request = -1;
 		const ImGuiIO& menu_io = ImGui::GetIO();
-		if (menu_io.KeyAlt) {
+		if (menu_io.KeyAlt && !menu_io.KeyCtrl && !menu_io.KeyShift && !menu_io.KeySuper) {
 			if (ImGui::IsKeyPressed(ImGuiKey_F, false)) keyboard_menu_request = 0;
 			else if (ImGui::IsKeyPressed(ImGuiKey_E, false)) keyboard_menu_request = 1;
 			else if (ImGui::IsKeyPressed(ImGuiKey_V, false)) keyboard_menu_request = 2;
@@ -5350,17 +6008,34 @@ void helpers::render_title()
 					};
 
 					auto action_menu_item = [&](const char* action_id,
-						const char* shortcut_fallback = "",
+						const char* = "",
 						const char* label_override = nullptr) -> bool {
 						auto presentation = aida::ui::application_ui::present_action(action_id);
 						if (!presentation.visible)
 							return false;
 						const char* label = label_override && *label_override
 							? label_override : presentation.label.c_str();
-						const char* shortcut = !presentation.shortcut.empty()
-							? presentation.shortcut.c_str() : shortcut_fallback;
+						const char* shortcut = presentation.shortcut.empty()
+							? nullptr : presentation.shortcut.c_str();
 						const bool selected = menu_item(label, shortcut,
 							presentation.enabled, action_id);
+						if (!presentation.enabled &&
+							ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+							!presentation.disabled_reason.empty())
+							ImGui::SetTooltip("%s", presentation.disabled_reason.c_str());
+						if (selected)
+							static_cast<void>(aida::ui::application_ui::execute_action(
+								action_id, aida::ui::action_invocation_source_t::application_menu));
+						return selected;
+					};
+
+					auto review_action_menu_item = [&](const char* action_id) -> bool {
+						auto presentation =
+							aida::ui::application_ui::present_editor_review_action(action_id);
+						if (!presentation.visible)
+							return false;
+						const bool selected = menu_item(presentation.label.c_str(),
+							presentation.shortcut.c_str(), presentation.enabled, action_id);
 						if (!presentation.enabled &&
 							ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
 							!presentation.disabled_reason.empty())
@@ -5374,7 +6049,33 @@ void helpers::render_title()
 					auto begin_native_menu = [&](const char* label) -> bool {
 						ImGui::SetNextWindowSizeConstraints(
 							ImVec2(0.f, 0.f), ImVec2(FLT_MAX, popup_max_height));
-						return ImGui::BeginMenu(label);
+						ImFont* submenu_font = aida::ui::fonts::lg();
+						if (!submenu_font) submenu_font = aida::ui::fonts::body();
+						if (!submenu_font) submenu_font = ImGui::GetFont();
+						const float submenu_label_size =
+							aida::ui::fonts::size_or(submenu_font, metrics.menu_font);
+						const float submenu_label_pad =
+							aida::ui::scale_px(16.f, metrics.scale);
+						const float submenu_arrow_pad =
+							aida::ui::scale_px(14.f, metrics.scale);
+						ImDrawList* owner_draw = ImGui::GetWindowDrawList();
+						std::string submenu_id = "##submenu_";
+						submenu_id += label ? label : "menu";
+						const bool opened = ImGui::BeginMenu(submenu_id.c_str());
+						const ImVec2 item_min = ImGui::GetItemRectMin();
+						const ImVec2 item_max = ImGui::GetItemRectMax();
+						const float text_y = item_min.y +
+							(item_max.y - item_min.y - submenu_label_size) * 0.5f;
+						const ImVec4 text_clip(
+							item_min.x + submenu_label_pad, item_min.y,
+							(std::max)(item_min.x + submenu_label_pad,
+								item_max.x - submenu_arrow_pad), item_max.y);
+						owner_draw->AddText(
+							submenu_font, submenu_label_size,
+							ImVec2(item_min.x + submenu_label_pad, text_y),
+							aida::ui::resolved().text_primary,
+							label ? label : "", nullptr, 0.f, &text_clip);
+						return opened;
 					};
 
 					auto begin_semantic_menu = [&](const char* label,
@@ -5608,6 +6309,15 @@ void helpers::render_title()
 							network_view::operational_command_t::intercept_toggle);
 						action_menu_item("network.intercept.toggle_enabled", "",
 							intercept_state.checked ? "Disable Intercept" : "Enable Intercept");
+						if (begin_semantic_menu("Held Requests", "network.held-requests")) {
+							action_menu_item("network.intercept.forward_selected");
+							action_menu_item("network.intercept.drop_selected");
+							action_menu_item("network.intercept.forward_modified");
+							menu_sep();
+							action_menu_item("network.intercept.forward_all");
+							action_menu_item("network.intercept.drop_all");
+							ImGui::EndMenu();
+						}
 						if (begin_semantic_menu("Traffic Policy and Trust", "network.traffic-policy-trust")) {
 							action_menu_item("network.proxy.history.clear");
 							action_menu_item("network.proxy.ca_trust_repair");
@@ -5681,6 +6391,7 @@ void helpers::render_title()
 						action_menu_item("debugger.restart", "Ctrl+Shift+F5");
 						action_menu_item("debugger.detach", "Ctrl+F2");
 						action_menu_item("debugger.stop", "Shift+F5");
+						action_menu_item("debugger.watch.refresh_all", "Ctrl+R");
 						menu_sep();
 						if (begin_semantic_menu("Debugger Views", "debugger.views")) {
 							render_debugger_view_groups();
@@ -5916,22 +6627,23 @@ void helpers::render_title()
 							"workspace-saved-menu");
 						if (saved_workspaces_open) {
 							const auto catalog = aida::ui::workspace_layout::user_layout_catalog();
-							const bool pending = aida::ui::workspace_layout::operation_pending();
 							if (!catalog || catalog->empty())
 								ImGui::MenuItem("No saved workspaces", nullptr, false, false);
 							else {
 								for (const auto& item : *catalog) {
 									const char* detail = item.active ? "Active" :
 										workspace_preset_display_name(item.base_preset);
-									const bool enabled = !pending && !item.active;
+									auto retained = named_workspace_load_context(item);
+									const auto presentation =
+										aida::ui::application_ui::present_retained_entity_action(
+											"workspace.load_named", retained);
+									const bool enabled = presentation.enabled;
 									if (ImGui::MenuItem(item.name.c_str(), detail, false, enabled))
-										load_workspace_from_menu(item.name);
+										load_workspace_from_menu(item);
 									if (!enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-										const std::string status = aida::ui::workspace_layout::operation_status();
-										ImGui::SetTooltip("%s", item.active
-											? "This saved workspace is already active."
-											: status.empty() ? "Another workspace transaction is already running."
-												: status.c_str());
+										ImGui::SetTooltip("%s", presentation.disabled_reason.empty()
+											? "The retained workspace action is unavailable."
+											: presentation.disabled_reason.c_str());
 									}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 									register_workspace_semantic(aida::preview::semantics::stable_id(
@@ -5980,6 +6692,16 @@ void helpers::render_title()
 							action_menu_item("programming.language.format");
 							action_menu_item("programming.language.code_actions");
 							action_menu_item("programming.language.cancel_query");
+							ImGui::EndMenu();
+						}
+						if (begin_native_menu("Code Review")) {
+							review_action_menu_item("editor.ai.previous_pending_hunk");
+							review_action_menu_item("editor.ai.next_pending_hunk");
+							review_action_menu_item("editor.ai.accept_current_hunk");
+							review_action_menu_item("editor.ai.reject_current_hunk");
+							menu_sep();
+							review_action_menu_item("editor.ai.accept_all");
+							review_action_menu_item("editor.ai.reject_all");
 							ImGui::EndMenu();
 						}
 						render_view_category(aida::ui::view_category_t::programming);
@@ -6068,22 +6790,23 @@ void helpers::render_title()
 								"workspace-saved-menu");
 							if (saved_workspaces_open) {
 								const auto catalog = aida::ui::workspace_layout::user_layout_catalog();
-								const bool pending = aida::ui::workspace_layout::operation_pending();
 								if (!catalog || catalog->empty())
 									ImGui::MenuItem("No saved workspaces", nullptr, false, false);
 								else {
 									for (const auto& item : *catalog) {
 										const char* detail = item.active ? "Active" :
 											workspace_preset_display_name(item.base_preset);
-										const bool enabled = !pending && !item.active;
+										auto retained = named_workspace_load_context(item);
+										const auto presentation =
+											aida::ui::application_ui::present_retained_entity_action(
+												"workspace.load_named", retained);
+										const bool enabled = presentation.enabled;
 										if (ImGui::MenuItem(item.name.c_str(), detail, false, enabled))
-											load_workspace_from_menu(item.name);
+											load_workspace_from_menu(item);
 										if (!enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-											const std::string status = aida::ui::workspace_layout::operation_status();
-											ImGui::SetTooltip("%s", item.active
-												? "This saved workspace is already active."
-												: status.empty() ? "Another workspace transaction is already running."
-													: status.c_str());
+											ImGui::SetTooltip("%s", presentation.disabled_reason.empty()
+												? "The retained workspace action is unavailable."
+												: presentation.disabled_reason.c_str());
 										}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 										register_workspace_semantic(aida::preview::semantics::stable_id(
@@ -6129,6 +6852,16 @@ void helpers::render_title()
 								action_menu_item("programming.language.format");
 								action_menu_item("programming.language.code_actions");
 								action_menu_item("programming.language.cancel_query");
+								ImGui::EndMenu();
+							}
+							if (begin_native_menu("Code Review")) {
+								review_action_menu_item("editor.ai.previous_pending_hunk");
+								review_action_menu_item("editor.ai.next_pending_hunk");
+								review_action_menu_item("editor.ai.accept_current_hunk");
+								review_action_menu_item("editor.ai.reject_current_hunk");
+								menu_sep();
+								review_action_menu_item("editor.ai.accept_all");
+								review_action_menu_item("editor.ai.reject_all");
 								ImGui::EndMenu();
 							}
 							render_view_category(aida::ui::view_category_t::programming);
@@ -6190,137 +6923,116 @@ void helpers::render_title()
 			file_tabs::resolve_pending_close_after_save();
 		else if (!file_tabs::pending_close_all_document_ids.empty())
 			file_tabs::advance_close_all();
+		file_tabs::poll_exit_review();
 		bool popup_active = (file_tabs::pending_close_idx >= 0);
 
 
-		float target = popup_active ? 1.f : 0.f;
-		float speed = popup_active ? 12.f : 8.f;
-		file_tabs::close_confirm_anim += (target - file_tabs::close_confirm_anim) *
-			std::min(speed * dt, 1.f);
-		if (!popup_active && file_tabs::close_confirm_anim < 0.01f)
-			file_tabs::close_confirm_anim = 0.f;
-		file_tabs::show_close_confirm = false;
-
-		float anim = file_tabs::close_confirm_anim;
-		if (anim > 0.01f) {
-			ImDrawList* fdl = ImGui::GetForegroundDrawList();
-			ImVec2 display = ImGui::GetIO().DisplaySize;
-
-
-			fdl->AddRectFilled(ImVec2(0, 0), display,
-					IM_COL32(0, 0, 0, static_cast<int>(120.f * anim)));
-
-
-			float pw = 420.f, ph = file_tabs::close_confirm_error.empty() ? 150.f : 174.f;
-			float scale = 0.92f + 0.08f * anim;
-			float sw = pw * scale, sh = ph * scale;
-			float px = display.x * 0.5f - sw * 0.5f;
-			float py = display.y * 0.5f - sh * 0.5f - 20.f * (1.f - anim);
-			float popup_alpha = anim;
-
-
-			for (int s = 0; s < 4; ++s) {
-				float off = 4.f + static_cast<float>(s) * 3.f;
-				fdl->AddRectFilled(
-					ImVec2(px + off, py + off),
-					ImVec2(px + sw + off, py + sh + off),
-					IM_COL32(0, 0, 0, static_cast<int>(30.f * popup_alpha * static_cast<float>(4 - s) / 4.f)), 12.f);
+		static std::uint64_t reviewed_close_document = 0;
+		static bool close_dialog_requested = false;
+		if (popup_active) {
+			const int ci = file_tabs::pending_close_idx;
+			const std::uint64_t current_document = file_tabs::is_valid_tab_index(ci)
+				? file_tabs::tabs[file_tabs::tab_index(ci)].document_id : 0;
+			if (!close_dialog_requested || current_document != reviewed_close_document) {
+				reviewed_close_document = current_document;
+				aida::ui::design::open_dialog("editor_dirty_close", "Unsaved Changes");
+				close_dialog_requested = true;
 			}
-
-
-			float ax3 = globals::ui::accent.x;
-			float ay3 = globals::ui::accent.y;
-			float az3 = globals::ui::accent.z;
-			fdl->AddRectFilled(ImVec2(px, py), ImVec2(px + sw, py + sh),
-				aida::ui::with_alpha(shell_theme.bg_elevated, 0.96f * popup_alpha), 12.f);
-			fdl->AddRect(ImVec2(px, py), ImVec2(px + sw, py + sh),
-				aida::ui::with_alpha(shell_theme.border_strong, popup_alpha), 12.f);
-
-
-			fdl->AddRectFilled(ImVec2(px + 1.f, py + 1.f), ImVec2(px + sw - 1.f, py + 3.f),
-				IM_COL32(static_cast<int>(ax3 * 255.f), static_cast<int>(ay3 * 255.f), static_cast<int>(az3 * 255.f),
-				         static_cast<int>(180.f * popup_alpha)), 2.f);
-
-
-			int ci = file_tabs::pending_close_idx;
-			std::string fname = (ci >= 0 && static_cast<std::size_t>(ci) < file_tabs::tabs.size())
-				? file_tabs::tabs[static_cast<std::size_t>(ci)].filename : "this file";
-
-			std::string title = "Unsaved Changes";
-			ImVec2 tts = ImGui::CalcTextSize(title.c_str());
-			fdl->AddText(ImVec2(px + sw * 0.5f - tts.x * 0.5f, py + 18.f),
-				aida::ui::with_alpha(shell_theme.text_primary, popup_alpha), title.c_str());
-
-			std::string msg = "Do you want to save '" + fname + "'?";
-			ImVec2 mts = ImGui::CalcTextSize(msg.c_str());
-			fdl->AddText(ImVec2(px + sw * 0.5f - mts.x * 0.5f, py + 46.f),
-				aida::ui::with_alpha(shell_theme.text_secondary, popup_alpha), msg.c_str());
-			if (!file_tabs::close_confirm_error.empty()) {
-				const std::string detail = file_tabs::close_confirm_error;
-				const ImVec2 detail_size = ImGui::CalcTextSize(detail.c_str());
-				fdl->AddText(ImVec2(px + sw * 0.5f - detail_size.x * 0.5f, py + 67.f),
-					aida::ui::with_alpha(shell_theme.error, popup_alpha), detail.c_str());
-			}
-
-
-			const float content_offset = file_tabs::close_confirm_error.empty() ? 0.f : 24.f;
-			fdl->AddLine(ImVec2(px + 20.f, py + 76.f + content_offset), ImVec2(px + sw - 20.f, py + 76.f + content_offset),
-				aida::ui::with_alpha(shell_theme.border_subtle, popup_alpha));
-
-
-			ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
-
-			struct btn_t { const char* label; float w; ImU32 bg; ImU32 bg_hov; };
-			btn_t buttons[] = {
-				{"Save",        90.f,
-				 IM_COL32((int)(ax3*180), (int)(ay3*180), (int)(az3*180), (int)(60 * popup_alpha)),
-				 IM_COL32((int)(ax3*220), (int)(ay3*220), (int)(az3*220), (int)(100 * popup_alpha))},
-				{"Don't Save",  100.f,
-				 aida::ui::with_alpha(shell_theme.error, 0.16f * popup_alpha),
-				 aida::ui::with_alpha(shell_theme.error, 0.32f * popup_alpha)},
-				{"Cancel",      90.f,
-				 aida::ui::with_alpha(shell_theme.panel_header, 0.85f * popup_alpha),
-				 aida::ui::with_alpha(shell_theme.border_strong, popup_alpha)},
-			};
-
-			float btn_h = 34.f;
-			float total_btn_w = buttons[0].w + buttons[1].w + buttons[2].w + 16.f;
-			float bx = px + sw * 0.5f - total_btn_w * 0.5f;
-			float by = py + 90.f + content_offset;
-
-			ImVec2 mpos = ImGui::GetIO().MousePos;
-			bool clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-			int action = -1;
-
-			for (int bi = 0; bi < 3; bi++) {
-				float bx0 = bx, by0 = by;
-				float bx1 = bx + buttons[bi].w, by1 = by + btn_h;
-				bool hov = (mpos.x >= bx0 && mpos.x <= bx1 && mpos.y >= by0 && mpos.y <= by1);
-
-				if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-
-				ImU32 bg = hov ? buttons[bi].bg_hov : buttons[bi].bg;
-				fdl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), bg, 8.f);
-
-				if (hov) {
-					fdl->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1),
-						aida::ui::with_alpha(shell_theme.border_strong, popup_alpha), 8.f);
+		}
+		if (popup_active && aida::ui::design::begin_dialog("editor_dirty_close", "Unsaved Changes",
+				ImVec2(560.f, 390.f), ImVec2(400.f, 280.f))) {
+			const int ci = file_tabs::pending_close_idx;
+			const bool target_current = file_tabs::is_valid_tab_index(ci) &&
+				file_tabs::tabs[file_tabs::tab_index(ci)].document_id == reviewed_close_document;
+			const std::string fname = target_current
+				? file_tabs::tabs[file_tabs::tab_index(ci)].filename : "the reviewed document";
+			const bool stack_close_actions = ImGui::GetContentRegionAvail().x < 320.f;
+			const float footer_height = stack_close_actions
+				? 126.f : aida::ui::design::dialog_footer_reserve_height("Cancel", "") + 8.f;
+			aida::ui::design::begin_dialog_body("editor_dirty_close_body", footer_height);
+			ImGui::TextWrapped("Save changes to '%s' before closing?", fname.c_str());
+			if (!file_tabs::close_confirm_error.empty())
+				aida::ui::components::inline_notice("save_error", "Save failed",
+					file_tabs::close_confirm_error.c_str(), aida::ui::components::status_kind_t::error);
+			if (!target_current)
+				aida::ui::components::inline_notice("stale_target", "Document changed",
+					"The reviewed document is no longer current. Cancel and review the active close request.",
+					aida::ui::components::status_kind_t::warning);
+			if (!file_tabs::pending_close_all_document_ids.empty()) {
+				ImGui::SeparatorText("Close queue");
+				std::unordered_map<std::uint64_t, std::string> document_names;
+				document_names.reserve(file_tabs::tabs.size());
+				for (const auto& tab : file_tabs::tabs) {
+					if (tab.document_id != 0)
+						document_names.emplace(tab.document_id, tab.filename);
 				}
-
-				ImVec2 bts = ImGui::CalcTextSize(buttons[bi].label);
-				float tx = bx0 + (buttons[bi].w - bts.x) * 0.5f;
-				float ty = by0 + (btn_h - bts.y) * 0.5f;
-				fdl->AddText(ImVec2(tx, ty),
-					aida::ui::with_alpha(shell_theme.text_primary, (hov ? 1.f : 0.8f) * popup_alpha),
-					buttons[bi].label);
-
-				if (hov && clicked) action = bi;
-				bx = bx1 + 8.f;
+				ImGuiListClipper queue_clipper;
+				queue_clipper.Begin(static_cast<int>(file_tabs::pending_close_all_document_ids.size()));
+				while (queue_clipper.Step()) {
+					for (int queue_index = queue_clipper.DisplayStart;
+						 queue_index < queue_clipper.DisplayEnd; ++queue_index) {
+						const std::uint64_t document_id = file_tabs::pending_close_all_document_ids[
+							static_cast<std::size_t>(queue_index)];
+						const auto found = document_names.find(document_id);
+						const std::string document_name = found != document_names.end() && !found->second.empty()
+							? found->second : "Document " + std::to_string(document_id);
+						const std::string document_token = std::to_string(document_id);
+						ImGui::PushID(document_token.c_str());
+						ImGui::BulletText("%s", document_name.c_str());
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						aida::preview::semantics::register_last_item(
+							aida::preview::semantics::stable_id(
+								"aida.editor.dirty-close.document", document_token),
+							"dirty-document");
+#endif
+						ImGui::PopID();
+					}
+				}
+				queue_clipper.End();
 			}
+			aida::ui::design::end_dialog_body();
+			ImGui::Separator();
+			const float action_width = stack_close_actions
+				? ImGui::GetContentRegionAvail().x
+				: (std::max)(92.f,
+					(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.f) / 3.f);
+			int action = -1;
+			if (aida::ui::components::button("Save", aida::ui::components::button_kind_t::primary,
+					aida::ui::components::size_t_::md, ImVec2(action_width, 34.f), !target_current))
+				action = 0;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.editor.dirty-close.save", "dialog-action", false, !target_current);
+#endif
+			if (!stack_close_actions)
+				ImGui::SameLine();
+			if (aida::ui::components::button("Don't Save", aida::ui::components::button_kind_t::destructive,
+					aida::ui::components::size_t_::md, ImVec2(action_width, 34.f), !target_current))
+				action = 1;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.editor.dirty-close.discard", "dialog-action", false, !target_current);
+#endif
+			if (!stack_close_actions)
+				ImGui::SameLine();
+			if (aida::ui::components::button("Cancel", aida::ui::components::button_kind_t::secondary,
+					aida::ui::components::size_t_::md, ImVec2(action_width, 34.f)) ||
+				ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+				action = 2;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.editor.dirty-close.cancel", "dialog-action");
+#endif
+			if (target_current && !ImGui::GetIO().WantTextInput &&
+				(ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+				 ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
+				action = 0;
 
 			if (action == 0) {
 				const std::uint64_t closing_document = file_tabs::is_valid_tab_index(ci)
 					? file_tabs::tabs[file_tabs::tab_index(ci)].document_id : 0;
+				const std::uint64_t closing_revision = file_tabs::is_valid_tab_index(ci)
+					? file_tabs::tabs[file_tabs::tab_index(ci)].revision : 0;
 				file_tabs::save_result_t saved{false, "The document is no longer open."};
 				if (file_tabs::is_valid_tab_index(ci))
 					saved = file_tabs::tabs[file_tabs::tab_index(ci)].filepath.empty()
@@ -6332,6 +7044,9 @@ void helpers::render_title()
 					if (file_tabs::is_valid_tab_index(ci) &&
 						file_tabs::tabs[file_tabs::tab_index(ci)].save_in_progress) {
 						file_tabs::pending_close_after_save_document_id = closing_document;
+					} else if (file_tabs::exit_review_requested) {
+						file_tabs::resolve_exit_review_document(closing_document,
+							closing_revision, false);
 					} else {
 						file_tabs::close_tab(ci);
 						file_tabs::finish_close_all_document(closing_document);
@@ -6343,21 +7058,38 @@ void helpers::render_title()
 			} else if (action == 1) {
 				const std::uint64_t closing_document = file_tabs::is_valid_tab_index(ci)
 					? file_tabs::tabs[file_tabs::tab_index(ci)].document_id : 0;
-				file_tabs::close_tab(ci, true);
+				const std::uint64_t closing_revision = file_tabs::is_valid_tab_index(ci)
+					? file_tabs::tabs[file_tabs::tab_index(ci)].revision : 0;
+				if (!file_tabs::exit_review_requested)
+					file_tabs::close_tab(ci, true);
 				file_tabs::pending_close_idx = -1;
 				file_tabs::close_confirm_error.clear();
-				file_tabs::finish_close_all_document(closing_document);
-				file_tabs::advance_close_all();
+				if (file_tabs::exit_review_requested)
+					file_tabs::resolve_exit_review_document(closing_document,
+						closing_revision, true);
+				else {
+					file_tabs::finish_close_all_document(closing_document);
+					file_tabs::advance_close_all();
+				}
 			} else if (action == 2) {
 				file_tabs::pending_close_idx = -1;
 				file_tabs::close_confirm_error.clear();
 				file_tabs::cancel_close_all();
 			}
-
-
-			if (popup_active && clicked && action == -1) {
-
+			if (action >= 0 && action != 0) {
+				close_dialog_requested = false;
+				reviewed_close_document = 0;
+				ImGui::CloseCurrentPopup();
+			} else if (action == 0 && file_tabs::pending_close_idx < 0) {
+				close_dialog_requested = false;
+				reviewed_close_document = 0;
+				ImGui::CloseCurrentPopup();
 			}
+			ImGui::EndPopup();
+		} else if (!popup_active) {
+			close_dialog_requested = false;
+			reviewed_close_document = 0;
+			file_tabs::show_close_confirm = false;
 		}
 	}
 
@@ -6438,6 +7170,9 @@ void helpers::render_title()
 	static std::atomic<bool> pa_refresh_ready{false};
 	static uint64_t pa_refresh_epoch = 0;
 	static uint64_t pa_applied_epoch = 0;
+	const bool pa_attach_inflight = process_attach_active();
+#else
+	const bool pa_attach_inflight = false;
 #endif
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	static std::uint64_t preview_process_revision = 0;
@@ -6481,13 +7216,24 @@ void helpers::render_title()
 		const auto& th_pa = aida::ui::resolved();
 		float ax_pa = globals::ui::accent.x, ay_pa = globals::ui::accent.y, az_pa = globals::ui::accent.z;
 
-		ImVec2 vp = ImGui::GetIO().DisplaySize;
-
-
-		float pw = 620.f, ph = 490.f;
+		ImGuiViewport* pa_viewport = ImGui::GetMainViewport();
+		const ImVec2 pa_work_pos = pa_viewport ? pa_viewport->WorkPos : ImVec2(0.f, 0.f);
+		const ImVec2 pa_work_size = pa_viewport ? pa_viewport->WorkSize : ImGui::GetIO().DisplaySize;
+		const float pa_dpi = pa_viewport && pa_viewport->DpiScale > 0.f ? pa_viewport->DpiScale : 1.f;
+		float pw = (std::min)(620.f * pa_dpi, (std::max)(1.f, pa_work_size.x - 32.f * pa_dpi));
+		float ph = (std::min)(490.f * pa_dpi, (std::max)(1.f, pa_work_size.y - 32.f * pa_dpi));
 		float pa_scale = 0.96f + 0.04f * pa_anim;
 		float sw = pw * pa_scale, sh = ph * pa_scale;
-		float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
+		float px = pa_work_pos.x + (pa_work_size.x - sw) * 0.5f;
+		float py = pa_work_pos.y + (pa_work_size.y - sh) * 0.5f;
+
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !pa_closing) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			if (pa_attach_inflight)
+				static_cast<void>(request_active_process_attach_cancel());
+#endif
+			pa_closing = true;
+		}
 
 
 		if (ImGui::GetFrameCount() > pa_open_frame + 1 && !pa_closing &&
@@ -6549,7 +7295,13 @@ void helpers::render_title()
 				ImU32 x_col = aida::ui::with_alpha(x_hov ? th_pa.error : th_pa.text_secondary, pa_anim);
 				dl->AddLine({xc - 4, yc - 4}, {xc + 4, yc + 4}, x_col, 1.5f);
 				dl->AddLine({xc + 4, yc - 4}, {xc - 4, yc + 4}, x_col, 1.5f);
-				if (x_hov && ImGui::IsMouseClicked(0) && !pa_closing && ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) pa_closing = true;
+				if (x_hov && ImGui::IsMouseClicked(0) && !pa_closing && ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					if (pa_attach_inflight)
+						static_cast<void>(request_active_process_attach_cancel());
+#endif
+					pa_closing = true;
+				}
 			}
 
 
@@ -6567,25 +7319,41 @@ void helpers::render_title()
 				ImGui::SetNextItemWidth(-1);
 				ImGui::InputTextWithHint("##pa_filter", "Search processes...",
 					globals::ui::process_filter_buf, sizeof(globals::ui::process_filter_buf));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					"aida.process.attach.search", "process-search", true);
+#endif
 				ImGui::PopStyleColor(3);
 				ImGui::PopStyleVar(2);
 				ImGui::Spacing();
 
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				if (pa_refresh_ready.exchange(false, std::memory_order_acq_rel)) {
+				if (!pa_attach_inflight &&
+					pa_refresh_ready.exchange(false, std::memory_order_acq_rel)) {
 					std::lock_guard<std::mutex> lock(pa_proc_pending_mtx);
 					if (pa_pending_epoch > pa_applied_epoch) {
+						const std::uint32_t selected_pid = pa_selected >= 0 &&
+							pa_selected < static_cast<int>(pa_proc_list.size())
+							? pa_proc_list[static_cast<std::size_t>(pa_selected)].pid : 0;
 						pa_proc_list = std::move(pa_pending_proc_list);
 						pa_applied_epoch = pa_pending_epoch;
-						if (pa_selected >= static_cast<int>(pa_proc_list.size()))
-							pa_selected = -1;
+						pa_selected = -1;
+						if (selected_pid != 0) {
+							for (int index = 0; index < static_cast<int>(pa_proc_list.size()); ++index) {
+								if (pa_proc_list[static_cast<std::size_t>(index)].pid == selected_pid) {
+									pa_selected = index;
+									break;
+								}
+							}
+						}
 					}
 					pa_refresh_inflight.store(false, std::memory_order_release);
 				}
 
 				pa_refresh_timer -= ImGui::GetIO().DeltaTime;
-				if ((pa_refresh_timer <= 0.f || pa_proc_list.empty()) &&
+				if (!pa_attach_inflight &&
+					(pa_refresh_timer <= 0.f || pa_proc_list.empty()) &&
 					!pa_refresh_inflight.exchange(true, std::memory_order_acq_rel)) {
 					const uint64_t epoch = ++pa_refresh_epoch;
 					const auto submit_result = submit_helpers_executor_task(
@@ -6618,7 +7386,34 @@ void helpers::render_title()
 
 
 				std::string filt(globals::ui::process_filter_buf);
-				for (auto& c : filt) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+				for (auto& c : filt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+				static std::string pa_cached_filter;
+				static std::uint64_t pa_cached_filter_epoch = (std::numeric_limits<std::uint64_t>::max)();
+				static std::vector<int> pa_filtered_indices;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const std::uint64_t pa_filter_epoch = preview_process_revision;
+#else
+				const std::uint64_t pa_filter_epoch = pa_applied_epoch;
+#endif
+				if (pa_cached_filter != filt || pa_cached_filter_epoch != pa_filter_epoch) {
+					pa_cached_filter = filt;
+					pa_cached_filter_epoch = pa_filter_epoch;
+					pa_filtered_indices.clear();
+					pa_filtered_indices.reserve(pa_proc_list.size());
+					for (int i = 0; i < static_cast<int>(pa_proc_list.size()); ++i) {
+						const auto& process = pa_proc_list[static_cast<std::size_t>(i)];
+						bool matches = filt.empty();
+						if (!matches) {
+							std::string searchable = process.name + "\n" + process.window_title + "\n" +
+								process.path + "\n" + std::to_string(process.pid);
+							for (auto& character : searchable)
+								character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+							matches = searchable.find(filt) != std::string::npos;
+						}
+						if (matches)
+							pa_filtered_indices.push_back(i);
+					}
+				}
 
 
 				float list_h = ws.y - hdr_h - 108.f;
@@ -6646,34 +7441,33 @@ void helpers::render_title()
 					ImGui::TableSetupColumn("Window Title", ImGuiTableColumnFlags_WidthStretch);
 					ImGui::TableHeadersRow();
 
-					for (int i = 0; i < static_cast<int>(pa_proc_list.size()); i++) {
+					ImGuiListClipper process_clipper;
+					process_clipper.Begin(static_cast<int>(pa_filtered_indices.size()), 25.f);
+					while (process_clipper.Step()) {
+					for (int visible_index = process_clipper.DisplayStart;
+						 visible_index < process_clipper.DisplayEnd; ++visible_index) {
+						const int i = pa_filtered_indices[static_cast<std::size_t>(visible_index)];
 						auto& p = pa_proc_list[static_cast<std::size_t>(i)];
-						if (!filt.empty()) {
-							std::string nl = p.name;
-							for (auto& c2 : nl) c2 = static_cast<char>(tolower(static_cast<unsigned char>(c2)));
-							std::string ps = std::to_string(p.pid);
-							std::string tl = p.window_title;
-							for (auto& c2 : tl) c2 = static_cast<char>(tolower(static_cast<unsigned char>(c2)));
-							std::string pl = p.path;
-							for (auto& c2 : pl) c2 = static_cast<char>(tolower(static_cast<unsigned char>(c2)));
-							if (nl.find(filt) == std::string::npos &&
-								ps.find(filt) == std::string::npos &&
-								tl.find(filt) == std::string::npos &&
-								pl.find(filt) == std::string::npos)
-								continue;
-						}
 
 						ImGui::TableNextRow();
 						ImGui::TableSetColumnIndex(0);
 						ImGui::PushID(i);
 
 						bool sel = (pa_selected == i);
-						if (ImGui::Selectable("##ps", sel,
+						const bool row_clicked = ImGui::Selectable("##ps", sel,
 							ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
-							ImVec2(0, 20))) {
+							ImVec2(0, 20));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						aida::preview::semantics::register_last_item(
+							aida::preview::semantics::stable_id(
+								"aida.process.attach.row", std::to_string(p.pid)),
+							"process-row", false, pa_attach_inflight);
+#endif
+						if (!pa_attach_inflight && row_clicked) {
 							pa_selected = i;
 						}
-						if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+						if (!pa_attach_inflight && ImGui::IsItemHovered() &&
+							ImGui::IsMouseDoubleClicked(0)) {
 							pa_selected = i;
 							do_attach = true;
 						}
@@ -6697,6 +7491,8 @@ void helpers::render_title()
 						}
 						ImGui::PopID();
 					}
+					}
+					process_clipper.End();
 					ImGui::EndTable();
 				}
 				ImGui::PopStyleVar(2);
@@ -6705,7 +7501,8 @@ void helpers::render_title()
 				ImGui::Spacing();
 
 
-				bool can_attach = pa_selected >= 0 && pa_selected < static_cast<int>(pa_proc_list.size());
+				bool can_attach = !pa_attach_inflight && pa_selected >= 0 &&
+					pa_selected < static_cast<int>(pa_proc_list.size());
 				float btn_w = 100.f, btn_h = 30.f;
 				float total_btn_w = btn_w * 2.f + 12.f;
 				ImGui::SetCursorPosX((ImGui::GetWindowWidth() - total_btn_w) * 0.5f);
@@ -6717,14 +7514,26 @@ void helpers::render_title()
 					!can_attach) && can_attach) {
 					do_attach = true;
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					"aida.process.attach.confirm", "process-attach", false, !can_attach);
+#endif
 
 				ImGui::SameLine(0, 12.f);
 				if (aida::ui::components::button("Cancel",
 					aida::ui::components::button_kind_t::secondary,
 					aida::ui::components::size_t_::md,
 					ImVec2(btn_w, btn_h))) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					if (pa_attach_inflight)
+						static_cast<void>(request_active_process_attach_cancel());
+#endif
 					pa_closing = true;
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					"aida.process.attach.cancel", "dialog-cancel");
+#endif
 
 
 				if (do_attach && can_attach) {
@@ -6733,62 +7542,33 @@ void helpers::render_title()
 						pa_proc_list[static_cast<std::size_t>(pa_selected)]);
 					pa_closing = true;
 #else
-				  diag::log_tagged_critical("attach", "handler_entered tid=render");
-				  try {
-					auto& p = pa_proc_list[static_cast<std::size_t>(pa_selected)];
-					diag::log_tagged_critical_fmt("attach", "phase=pre_driver_attach pid=%u name=%s", p.pid, p.name.c_str());
-					driver_bridge::debug_log("ATTACH: attempting pid=%u name=%s\n", p.pid, p.name.c_str());
-					std::string sess_err;
-					bool attach_ok = analysis_session::open_attach_session(p.pid, &sess_err);
-					diag::log_tagged_critical_fmt("attach", "phase=post_driver_attach pid=%u ok=%d", p.pid, attach_ok ? 1 : 0);
-					if (!attach_ok) {
-						driver_bridge::debug_log("ATTACH: FAILED for pid=%u err=%s\n", p.pid, sess_err.c_str());
+					const std::size_t reviewed_index = static_cast<std::size_t>(pa_selected);
+					const auto reviewed_process = pa_proc_list[reviewed_index];
+					const std::uint64_t reviewed_epoch = pa_applied_epoch;
+					process_attach_request_t request;
+					request.selection_epoch = reviewed_epoch;
+					request.pid = reviewed_process.pid;
+					request.process_name = reviewed_process.name;
+					request.process_path = reviewed_process.path;
+					request.window_title = reviewed_process.window_title;
+					std::string dispatch_error;
+					const bool queued = begin_process_attach(
+						std::move(request),
+						[reviewed_index, reviewed_epoch, reviewed_pid = reviewed_process.pid] {
+							return !pa_closing && pa_applied_epoch == reviewed_epoch &&
+								pa_selected == static_cast<int>(reviewed_index) &&
+								reviewed_index < pa_proc_list.size() &&
+								pa_proc_list[reviewed_index].pid == reviewed_pid;
+						},
+						[] { pa_closing = true; },
+						dispatch_error);
+					if (!queued) {
 						output_log::push(bottom_tab_t::output,
-							"[Driver] Failed to attach to PID " + std::to_string(p.pid) + ": " +
-							sess_err + "\n");
-						pa_closing = true;
-					} else {
-						driver_bridge::debug_log("ATTACH: SUCCESS pid=%u, enumerating modules...\n", p.pid);
-						diag::log_tagged_critical("attach", "phase=pre_enumerate_modules");
-						auto modules = driver_bridge::enumerate_modules();
-						diag::log_tagged_critical_fmt("attach", "phase=post_enumerate_modules count=%llu", (unsigned long long)modules.size());
-						driver_bridge::debug_log("ATTACH: enumerate_modules returned %llu modules\n", (unsigned long long)modules.size());
-						if (!modules.empty()) {
-							const auto* target_mod = &modules[0];
-							for (const auto& m : modules) {
-								std::string mn = m.name;
-								for (auto& c : mn) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-								std::string pn = p.name;
-								for (auto& c : pn) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-								if (mn == pn) { target_mod = &m; break; }
-							}
-							uint64_t mod_size = target_mod->size;
-							if (mod_size == 0) mod_size = 0x100000;
-							driver_bridge::debug_log("ATTACH: workspace snapshot pid=%u base=0x%llX size=0x%llX mod=%s\n",
-								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
-							diag::log_tagged_critical_fmt("attach", "phase=workspace_snapshot_ready pid=%u base=0x%llX size=0x%llX mod=%s",
-								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
-							static_cast<void>(aida::ui::application_views::open_or_focus(
-								aida::ui::stable_view_id_t("document.disassembly")));
-							diag::log_tagged_critical("attach", "phase=post_focus_disassembly");
-						} else {
-							output_log::push(bottom_tab_t::output,
-								"[Driver] Attached to PID " + std::to_string(p.pid) + " but could not enumerate modules.\n");
-						}
-						pa_closing = true;
+							"[Driver] Attach request was not queued: " + dispatch_error + "\n");
+						diag::log_tagged_critical_fmt("attach",
+							"dispatch_rejected pid=%u detail=%s",
+							reviewed_process.pid, dispatch_error.c_str());
 					}
-				  } catch (const std::exception& e) {
-					char dbg[512];
-					snprintf(dbg, sizeof(dbg), "AiDA Standalone: EXCEPTION in attach handler: %s\n", e.what());
-					OutputDebugStringA(dbg);
-					diag::log_tagged_critical_fmt("attach", "EXCEPTION std=%s", e.what());
-					pa_closing = true;
-				  } catch (...) {
-					OutputDebugStringA("AiDA Standalone: UNKNOWN EXCEPTION in attach handler\n");
-					diag::log_tagged_critical("attach", "EXCEPTION unknown");
-					pa_closing = true;
-				  }
-				  diag::log_tagged_critical("attach", "handler_exit");
 #endif
 				}
 			}
@@ -6807,6 +7587,8 @@ void helpers::render_title()
 	static int ds_open_frame = -1;
 	static float ds_anim = 0.f;
 	static bool ds_closing = false;
+	static std::uint32_t ds_detach_review_pid = 0;
+	static std::string ds_detach_review_name;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	static std::uint64_t preview_driver_revision = 0;
 	if (preview_driver_revision != aida::preview::controls().revision) {
@@ -6837,12 +7619,16 @@ void helpers::render_title()
 	if (globals::ui::driver_status_open || ds_anim > 0.005f) {
 		if (ds_open_frame < 0) ds_open_frame = ImGui::GetFrameCount();
 
-		ImVec2 vp = ImGui::GetIO().DisplaySize;
-
-		float pw = 500.f, ph = 380.f;
+		ImGuiViewport* ds_viewport = ImGui::GetMainViewport();
+		const ImVec2 ds_work_pos = ds_viewport ? ds_viewport->WorkPos : ImVec2(0.f, 0.f);
+		const ImVec2 ds_work_size = ds_viewport ? ds_viewport->WorkSize : ImGui::GetIO().DisplaySize;
+		const float ds_dpi = ds_viewport && ds_viewport->DpiScale > 0.f ? ds_viewport->DpiScale : 1.f;
+		float pw = (std::min)(500.f * ds_dpi, (std::max)(1.f, ds_work_size.x - 32.f * ds_dpi));
+		float ph = (std::min)(380.f * ds_dpi, (std::max)(1.f, ds_work_size.y - 32.f * ds_dpi));
 		float ds_scale = 0.96f + 0.04f * ds_anim;
 		float sw = pw * ds_scale, sh = ph * ds_scale;
-		float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
+		float px = ds_work_pos.x + (ds_work_size.x - sw) * 0.5f;
+		float py = ds_work_pos.y + (ds_work_size.y - sh) * 0.5f;
 
 		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !ds_closing)
 			ds_closing = true;
@@ -6874,6 +7660,10 @@ void helpers::render_title()
 #endif
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(is_attached ? th_ds.success : th_ds.text_secondary),
 				is_attached ? "Status: Attached" : "Status: Detached");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.driver.status.summary", "driver-status");
+#endif
 
 			if (is_attached) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -7050,11 +7840,18 @@ void helpers::render_title()
 					aida::ui::components::size_t_::md,
 					ImVec2(btn_w, 26.f))) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-					aida::preview::detach_process();
+					ds_detach_review_pid = aida::preview::attached_pid();
+					ds_detach_review_name = aida::preview::attached_process_name();
 #else
-					driver_bridge::detach();
+					ds_detach_review_pid = driver_bridge::attached_pid();
+					ds_detach_review_name = driver_bridge::attached_process_name();
 #endif
+					aida::ui::design::open_dialog("driver_detach_confirm", "Detach Process");
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					"aida.driver.status.detach", "driver-detach-review");
+#endif
 				ImGui::SameLine();
 			}
 			if (aida::ui::components::button("Close",
@@ -7062,6 +7859,53 @@ void helpers::render_title()
 				aida::ui::components::size_t_::md,
 				ImVec2(btn_w, 26.f))) {
 				ds_closing = true;
+			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.driver.status.close", "dialog-close");
+#endif
+
+			if (aida::ui::design::begin_dialog("driver_detach_confirm", "Detach Process",
+					ImVec2(460.f, 250.f), ImVec2(340.f, 220.f))) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const std::uint32_t current_pid = aida::preview::attached_pid();
+#else
+				const std::uint32_t current_pid = driver_bridge::attached_pid();
+#endif
+				const bool target_current = ds_detach_review_pid != 0 && current_pid == ds_detach_review_pid;
+				const std::string detach_target =
+					(ds_detach_review_name.empty() ? "Process" : ds_detach_review_name) +
+					" (PID " + std::to_string(ds_detach_review_pid) + ")";
+				const std::string detach_prerequisite = target_current
+					? "The reviewed PID is still the active target."
+					: "The reviewed target is no longer active. Cancel and review the current target.";
+				aida::ui::design::confirmation_t confirmation;
+				confirmation.verb = "Detach the active driver-backed session";
+				confirmation.target = detach_target.c_str();
+				confirmation.scope = "Debugger, live-memory, and target-specific inspection state";
+				confirmation.effect = "The target process remains running, but live target state becomes unavailable.";
+				confirmation.reversibility = "Attach again to create a new live session.";
+				confirmation.prerequisite = detach_prerequisite.c_str();
+				confirmation.confirm_label = "Detach";
+				confirmation.destructive = true;
+				confirmation.confirm_enabled = target_current;
+				const auto result = aida::ui::design::confirmation_dialog(
+					"driver_detach_confirm", confirmation);
+				if (result.confirmed && target_current) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::detach_process();
+#else
+					driver_bridge::detach();
+#endif
+					ds_detach_review_pid = 0;
+					ds_detach_review_name.clear();
+					ImGui::CloseCurrentPopup();
+				} else if (result.cancelled) {
+					ds_detach_review_pid = 0;
+					ds_detach_review_name.clear();
+					ImGui::CloseCurrentPopup();
+				}
+				ImGui::EndPopup();
 			}
 		}
 		ImGui::End();
@@ -7130,13 +7974,16 @@ void helpers::render_title()
 	if (globals::ui::shortcuts_dialog_open || kb_anim > 0.005f) {
 		if (kb_open_frame < 0) kb_open_frame = ImGui::GetFrameCount();
 
-		ImVec2 vp = ImGui::GetIO().DisplaySize;
-
-		float pw = (std::min)(760.f, (std::max)(480.f, vp.x - 40.f));
-		float ph = (std::min)(620.f, (std::max)(420.f, vp.y - 40.f));
+		ImGuiViewport* kb_viewport = ImGui::GetMainViewport();
+		const ImVec2 kb_work_pos = kb_viewport ? kb_viewport->WorkPos : ImVec2(0.f, 0.f);
+		const ImVec2 kb_work_size = kb_viewport ? kb_viewport->WorkSize : ImGui::GetIO().DisplaySize;
+		const float kb_dpi = kb_viewport && kb_viewport->DpiScale > 0.f ? kb_viewport->DpiScale : 1.f;
+		float pw = (std::min)(760.f * kb_dpi, (std::max)(1.f, kb_work_size.x - 32.f * kb_dpi));
+		float ph = (std::min)(620.f * kb_dpi, (std::max)(1.f, kb_work_size.y - 32.f * kb_dpi));
 		float kb_scale = 0.96f + 0.04f * kb_anim;
 		float sw = pw * kb_scale, sh = ph * kb_scale;
-		float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
+		float px = kb_work_pos.x + (kb_work_size.x - sw) * 0.5f;
+		float py = kb_work_pos.y + (kb_work_size.y - sh) * 0.5f;
 
 		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !kb_closing) {
 			if (!kb_edit_binding.empty()) {
@@ -7516,6 +8363,10 @@ void helpers::render_title()
 				ImVec2(96.f, 26.f))) {
 				kb_closing = true;
 			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.shortcuts.close", "dialog-close");
+#endif
 		}
 		ImGui::End();
 		ImGui::PopStyleVar(2);
@@ -7543,59 +8394,51 @@ void helpers::render_title()
 	render_tool_approval_dialog();
 
 	g_render_section = "popups_chat_select_text";
-	if (chat_select_popup::open) {
-		ImGuiIO& io_cs = ImGui::GetIO();
-		ImVec2 vp_cs = io_cs.DisplaySize;
-		float pw_cs = std::min(820.f, vp_cs.x - 80.f);
-		float ph_cs = std::min(640.f, vp_cs.y - 80.f);
-		ImGui::SetNextWindowSize(ImVec2(pw_cs, ph_cs), ImGuiCond_Appearing);
-		ImGui::SetNextWindowPos(ImVec2((vp_cs.x - pw_cs) * 0.5f, (vp_cs.y - ph_cs) * 0.5f),
-			ImGuiCond_Appearing);
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.f);
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.f, 14.f));
-		const auto& th_cs = aida::ui::resolved();
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(th_cs.bg_elevated, 0.98f));
-		ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(th_cs.border_strong, 1.f));
-		ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(th_cs.panel_bg, 1.f));
-		bool stay_open = true;
-		ImGuiWindowFlags chat_select_window_flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
-#if defined(IMGUI_HAS_DOCK)
-		chat_select_window_flags |= ImGuiWindowFlags_NoDocking;
-#endif
-		if (ImGui::Begin("Select & Copy Text##aida_chat_select_popup", &stay_open,
-				chat_select_window_flags)) {
+	static bool chat_select_dialog_requested = false;
+	static std::string chat_select_buffer_source;
+	static std::vector<char> chat_select_buffer;
+	if (chat_select_popup::open && !chat_select_dialog_requested) {
+		aida::ui::design::open_dialog("chat_select_text", "Select & Copy Text");
+		chat_select_dialog_requested = true;
+	}
+	if (chat_select_popup::open && aida::ui::design::begin_dialog(
+			"chat_select_text", "Select & Copy Text", ImVec2(820.f, 640.f), ImVec2(420.f, 300.f))) {
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height("Copy All", "Close");
+		aida::ui::design::begin_dialog_body("chat_select_text_body", footer_height);
+		{
 			ImGui::TextWrapped("Drag to select. Ctrl+C to copy. Ctrl+A selects all.");
 			ImGui::Separator();
-			float avail_y = ImGui::GetContentRegionAvail().y - 44.f;
-			if (avail_y < 80.f) avail_y = 80.f;
-			static std::vector<char> sel_buf;
-			if (sel_buf.size() < chat_select_popup::text.size() + 1) {
-				sel_buf.assign(chat_select_popup::text.size() + 64, 0);
-				std::memcpy(sel_buf.data(), chat_select_popup::text.data(), chat_select_popup::text.size());
-				sel_buf[chat_select_popup::text.size()] = '\0';
+			if (chat_select_buffer_source != chat_select_popup::text) {
+				chat_select_buffer_source = chat_select_popup::text;
+				chat_select_buffer.assign(chat_select_buffer_source.size() + 1, 0);
+				std::memcpy(chat_select_buffer.data(), chat_select_buffer_source.data(),
+					chat_select_buffer_source.size());
 			}
+			const float avail_y = (std::max)(80.f, ImGui::GetContentRegionAvail().y);
 			ImGui::InputTextMultiline("##chat_select_buf",
-				sel_buf.data(), sel_buf.size(),
+				chat_select_buffer.data(), chat_select_buffer.size(),
 				ImVec2(-1.f, avail_y),
 				ImGuiInputTextFlags_ReadOnly);
-			ImGui::Spacing();
-			if (ImGui::Button("Copy All", ImVec2(120.f, 30.f))) {
-				ImGui::SetClipboardText(chat_select_popup::text.c_str());
-				toast_notification::push("Message copied to clipboard",
-					toast_notification::toast_type_t::info, 2.5f);
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("Close", ImVec2(120.f, 30.f))) {
-				stay_open = false;
-			}
 		}
-		ImGui::End();
-		ImGui::PopStyleColor(3);
-		ImGui::PopStyleVar(2);
-		if (!stay_open) {
+		aida::ui::design::end_dialog_body();
+		const auto result = aida::ui::design::dialog_footer(
+			"chat_select_text_footer", "Copy All", !chat_select_popup::text.empty(), false,
+			"Close", true, true);
+		if (result.confirmed) {
+			ImGui::SetClipboardText(chat_select_popup::text.c_str());
+			toast_notification::push("Message copied to clipboard",
+				toast_notification::toast_type_t::info, 2.5f);
+		} else if (result.cancelled) {
 			chat_select_popup::open = false;
 			chat_select_popup::text.clear();
+			chat_select_dialog_requested = false;
+			chat_select_buffer_source.clear();
+			chat_select_buffer.clear();
+			ImGui::CloseCurrentPopup();
 		}
+		ImGui::EndPopup();
+	} else if (!chat_select_popup::open) {
+		chat_select_dialog_requested = false;
 	}
 
 	aida::ui::application_ui::process_global_shortcuts();

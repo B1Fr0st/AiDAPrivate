@@ -60,12 +60,13 @@ enum class intercept_command_t : std::uint8_t {
     forward_selected,
     drop_selected,
     forward_all,
-    drop_all
+    drop_all,
+    forward_modified
 };
 
 struct intercept_command_capability_t {
     bool enabled = false;
-    const char* disabled_reason = nullptr;
+    std::string disabled_reason;
 };
 
 intercept_command_capability_t intercept_command_capability(intercept_command_t command);
@@ -211,7 +212,8 @@ enum class artifact_kind_t : std::uint8_t {
     http2_response,
     intruder_response,
     scanner_request,
-    scanner_response
+    scanner_response,
+    intercept_request
 };
 
 enum class exchange_context_origin_t : std::uint8_t {
@@ -449,7 +451,6 @@ struct state_t {
     int                           off_max_requests = 32;
     bool                          off_scope_only = true;
     std::atomic<bool>             off_running{false};
-    std::atomic<bool>             off_cancel_requested{false};
     std::atomic<uint64_t>         off_run_id{0};
     std::atomic<uint64_t>         off_active_fuzz_job_id{0};
     std::mutex                    off_mutex;
@@ -546,7 +547,8 @@ bool assign_artifact_to_agent(const artifact_identity_t& identity, std::string& 
 bool make_sitemap_artifact(std::uint64_t exchange_id, artifact_kind_t kind,
                            artifact_identity_t& identity, std::string& unavailable_reason);
 void open_exchange_context(artifact_identity_t primary, artifact_identity_t related,
-                           exchange_context_origin_t origin);
+                           exchange_context_origin_t origin,
+                           bool include_intercept_actions = false);
 void render_exchange_context();
 
 }

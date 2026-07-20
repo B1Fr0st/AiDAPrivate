@@ -236,6 +236,75 @@ inline uint32_t apply_vm_nested_tags()
     return applied;
 }
 
+__declspec(noinline) inline bool initialize_vm_state_seh(
+    virtualizer::detail::vm_state_t* vm, uint64_t seed)
+{
+    bool initialized = false;
+    __try
+    {
+        virtualizer::detail::init_vm(*vm, seed);
+        initialized = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        initialized = false;
+    }
+    return initialized;
+}
+
+__declspec(noinline) inline bool execute_vm_program_seh(
+    virtualizer::detail::vm_state_t* vm,
+    const uint8_t* bytecode,
+    uint32_t bytecode_size,
+    uint32_t rva,
+    uint64_t* out_result)
+{
+    bool executed = false;
+    __try
+    {
+        *out_result = virtualizer::detail::vm_execute_with_rva(
+            *vm, bytecode, bytecode_size, rva, state::g_vm_master_key);
+        executed = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        executed = false;
+    }
+    return executed;
+}
+
+__declspec(noinline) inline bool destroy_vm_state_seh(
+    virtualizer::detail::vm_state_t* vm)
+{
+    bool destroyed = false;
+    __try
+    {
+        virtualizer::detail::destroy_vm(*vm);
+        destroyed = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        destroyed = false;
+    }
+    return destroyed;
+}
+
+inline bool execute_entangled_vm(
+    const uint8_t* bytecode,
+    uint32_t bytecode_size,
+    uint32_t rva,
+    uint64_t& out_result)
+{
+    virtualizer::detail::vm_state_t vm{};
+    const uint64_t seed = __rdtsc() ^ rva ^ GetCurrentProcessId();
+    const bool initialized = initialize_vm_state_seh(&vm, seed);
+    bool executed = false;
+    if (initialized)
+        executed = execute_vm_program_seh(&vm, bytecode, bytecode_size, rva, &out_result);
+    const bool destroyed = destroy_vm_state_seh(&vm);
+    return initialized && executed && destroyed;
+}
+
 inline uint32_t apply_anti_emulation_nested()
 {
     auto& rt = state::get();
@@ -311,39 +380,21 @@ inline uint32_t apply_anti_emulation_nested()
             bool exec_a_ok = false;
             bool exec_b_ok = false;
 
-            __try
-            {
-                virtualizer::detail::vm_state_t vm_a;
-                uint64_t seed_a = __rdtsc() ^ 0x7A1DA1Au ^ GetCurrentProcessId();
-                virtualizer::detail::init_vm(vm_a, seed_a);
-                exec_a_result = virtualizer::detail::vm_execute_with_rva(
-                    vm_a, entangled.first.data(),
-                    static_cast<uint32_t>(entangled.first.size()),
-                    entangled_rva_a, state::g_vm_master_key);
-                virtualizer::detail::destroy_vm(vm_a);
-                exec_a_ok = true;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
+            exec_a_ok = execute_entangled_vm(
+                entangled.first.data(),
+                static_cast<uint32_t>(entangled.first.size()),
+                entangled_rva_a,
+                exec_a_result);
+            if (!exec_a_ok)
                 webhook::write_log("init", "anti_emu_entangled_exec_a_exception");
-            }
 
-            __try
-            {
-                virtualizer::detail::vm_state_t vm_b;
-                uint64_t seed_b = __rdtsc() ^ 0x7A1DA1Bu ^ GetCurrentProcessId();
-                virtualizer::detail::init_vm(vm_b, seed_b);
-                exec_b_result = virtualizer::detail::vm_execute_with_rva(
-                    vm_b, entangled.second.data(),
-                    static_cast<uint32_t>(entangled.second.size()),
-                    entangled_rva_b, state::g_vm_master_key);
-                virtualizer::detail::destroy_vm(vm_b);
-                exec_b_ok = true;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
+            exec_b_ok = execute_entangled_vm(
+                entangled.second.data(),
+                static_cast<uint32_t>(entangled.second.size()),
+                entangled_rva_b,
+                exec_b_result);
+            if (!exec_b_ok)
                 webhook::write_log("init", "anti_emu_entangled_exec_b_exception");
-            }
 
             char entangled_log[256];
             _snprintf_s(entangled_log, sizeof(entangled_log), _TRUNCATE,
@@ -1508,6 +1559,39 @@ inline bool check_dma_preflight()
     return false;
 }
 
+__declspec(noinline) inline bool verify_veh_chain_seh()
+{
+    bool verified = false;
+    __try
+    {
+        verified = anti_hook::veh_chain::verify_chain();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        verified = false;
+    }
+    return verified;
+}
+
+__declspec(noinline) inline bool initialize_honeypot_seh(DWORD* out_exception_code)
+{
+    bool initialized = false;
+    if (out_exception_code)
+        *out_exception_code = 0;
+    __try
+    {
+        honeypot::initialize();
+        initialized = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (out_exception_code)
+            *out_exception_code = GetExceptionCode();
+        initialized = false;
+    }
+    return initialized;
+}
+
 inline bool initialize()
 {
     webhook::write_log("init", "initialize_ENTRY before state::get");
@@ -2126,15 +2210,7 @@ inline bool initialize()
     }
 
     {
-        bool veh_chain_ok = false;
-        __try
-        {
-            veh_chain_ok = anti_hook::veh_chain::verify_chain();
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            veh_chain_ok = false;
-        }
+        const bool veh_chain_ok = verify_veh_chain_seh();
         webhook::write_log("init", veh_chain_ok
             ? "veh_chain_passive_monitor_ready"
             : "veh_chain_passive_monitor_failed");
@@ -2442,13 +2518,13 @@ inline bool initialize()
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(honeypot_tick));
-        __try {
-            honeypot::initialize();
+        DWORD honeypot_exception_code = 0;
+        if (initialize_honeypot_seh(&honeypot_exception_code)) {
             webhook::write_log("init", "honeypot_initialize_ok");
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        } else {
             webhook::write_log_critical_fmt("init",
                 "honeypot_initialize_seh_exception code=0x%08X",
-                GetExceptionCode());
+                honeypot_exception_code);
             diag::log_tagged_critical("init", "honeypot_initialize_failed_critical_continue");
         }
         webhook::write_log_critical_fmt("init",
@@ -3707,6 +3783,25 @@ inline bool finalize_after_activation()
     return true;
 }
 
+__declspec(noinline) inline bool periodic_canary_check_seh(DWORD* out_exception_code)
+{
+    bool completed = false;
+    if (out_exception_code)
+        *out_exception_code = 0;
+    __try
+    {
+        honeypot::periodic_canary_check();
+        completed = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (out_exception_code)
+            *out_exception_code = GetExceptionCode();
+        completed = false;
+    }
+    return completed;
+}
+
 inline bool guard()
 {
     static bool s_first_guard = true;
@@ -4528,12 +4623,11 @@ inline bool guard()
     {
         if ((rt.verify_counter & 0xF) == 0)
         {
-            __try {
-                honeypot::periodic_canary_check();
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            DWORD periodic_canary_exception_code = 0;
+            if (!periodic_canary_check_seh(&periodic_canary_exception_code)) {
                 webhook::write_log_critical_fmt("guard",
                     "honeypot_periodic_canary_check_seh code=0x%08X",
-                    GetExceptionCode());
+                    periodic_canary_exception_code);
             }
         }
         CFF_GOTO(guard_cff, 11);

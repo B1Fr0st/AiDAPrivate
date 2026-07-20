@@ -1,5 +1,9 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <Windows.h>
 #include <bcrypt.h>
 
@@ -95,7 +99,8 @@ std::string encode_identity_component(std::string_view value) {
     constexpr char digits[] = "0123456789ABCDEF";
     std::string result;
     result.reserve(value.size());
-    for (const unsigned char byte : value) {
+    for (const char raw_byte : value) {
+        const auto byte = static_cast<unsigned char>(raw_byte);
         if (byte == '%' || byte == '#') {
             result.push_back('%');
             result.push_back(digits[byte >> 4U]);

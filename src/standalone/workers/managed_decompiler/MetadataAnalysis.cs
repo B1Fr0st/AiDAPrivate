@@ -273,7 +273,7 @@ internal static class MetadataAnalysis
                 unknowns.Add(new WorkerUnknown("unsupported_instruction", $"il.unsupported.{instruction.Opcode:x4}", instruction.Offset, instruction.MetadataToken, 40, "provider_semantics"));
         }
 
-        if (instructions.Count > request.Budget.MaxProviderIrNodes)
+        if (checked((ulong)instructions.Count) > request.Budget.MaxProviderIrNodes)
             throw new ResourceLimitException(ResourceLimitKind.ProviderIrNodes);
 
         var typeGraph = BuildTypeGraph(typeNames, request.TypeGraphRevision);
@@ -408,6 +408,8 @@ internal static class MetadataAnalysis
             return new List<WorkerIrBlock>();
 
         var body = peReader.GetMethodBody(rva);
+        var ilBytes = body.GetILBytes() ?? throw new BadImageFormatException("method body has no IL byte stream");
+        var ilLength = ilBytes.Length;
         var starts = new HashSet<int> { instructions[0].Offset };
         var instructionOffsets = instructions.Select(instruction => instruction.Offset).ToHashSet();
         foreach (var instruction in instructions)
@@ -419,7 +421,7 @@ internal static class MetadataAnalysis
                     throw new BadImageFormatException("branch target does not start an IL instruction");
                 starts.Add(target);
             }
-            if (TerminatesBlock(instruction.Opcode) && instruction.NextOffset < body.GetILBytes().Length)
+            if (TerminatesBlock(instruction.Opcode) && instruction.NextOffset < ilLength)
                 starts.Add(instruction.NextOffset);
         }
 
@@ -443,7 +445,7 @@ internal static class MetadataAnalysis
         for (var index = 0; index < orderedStarts.Length; index++)
         {
             var start = orderedStarts[index];
-            var end = index + 1 < orderedStarts.Length ? orderedStarts[index + 1] : body.GetILBytes().Length;
+            var end = index + 1 < orderedStarts.Length ? orderedStarts[index + 1] : ilLength;
             var bodyInstructions = instructions.Where(instruction => instruction.Offset >= start && instruction.Offset < end).ToList();
             if (bodyInstructions.Count == 0)
                 throw new BadImageFormatException("basic block has no IL instructions");
@@ -457,9 +459,9 @@ internal static class MetadataAnalysis
             var terminal = block.Instructions[^1];
             foreach (var target in terminal.BranchTargets)
                 block.Successors.Add(blockByOffset[target]);
-            if ((IsConditionalBranch(terminal.Opcode) || terminal.Opcode == 0x0045) && terminal.NextOffset < body.GetILBytes().Length)
+            if ((IsConditionalBranch(terminal.Opcode) || terminal.Opcode == 0x0045) && terminal.NextOffset < ilLength)
                 block.Successors.Add(BlockForOffset(blocks, terminal.NextOffset));
-            else if (!TerminatesControlFlow(terminal.Opcode) && terminal.NextOffset < body.GetILBytes().Length)
+            else if (!TerminatesControlFlow(terminal.Opcode) && terminal.NextOffset < ilLength)
                 block.Successors.Add(BlockForOffset(blocks, terminal.NextOffset));
         }
 
@@ -549,7 +551,7 @@ internal static class MetadataAnalysis
         if (rva == 0)
             return Array.Empty<IlInstruction>();
         var body = peReader.GetMethodBody(rva);
-        var bytes = body.GetILBytes();
+        var bytes = body.GetILBytes() ?? throw new BadImageFormatException("method body has no IL byte stream");
         var result = new List<IlInstruction>();
         var offset = 0;
         while (offset < bytes.Length)
@@ -568,7 +570,7 @@ internal static class MetadataAnalysis
     }
 
     private static string ReadOperand(
-        ImmutableArray<byte> bytes,
+        ReadOnlySpan<byte> bytes,
         ref int offset,
         int instructionOffset,
         IlOperandKind kind,
@@ -638,21 +640,21 @@ internal static class MetadataAnalysis
         }
     }
 
-    private static byte ReadByte(ImmutableArray<byte> bytes, ref int offset)
+    private static byte ReadByte(ReadOnlySpan<byte> bytes, ref int offset)
     {
         if ((uint)offset >= (uint)bytes.Length)
             throw new BadImageFormatException("truncated IL instruction");
         return bytes[offset++];
     }
 
-    private static ushort ReadUInt16(ImmutableArray<byte> bytes, ref int offset)
+    private static ushort ReadUInt16(ReadOnlySpan<byte> bytes, ref int offset)
     {
         var first = ReadByte(bytes, ref offset);
         var second = ReadByte(bytes, ref offset);
         return (ushort)(first | (second << 8));
     }
 
-    private static int ReadInt32(ImmutableArray<byte> bytes, ref int offset)
+    private static int ReadInt32(ReadOnlySpan<byte> bytes, ref int offset)
     {
         var first = ReadByte(bytes, ref offset);
         var second = ReadByte(bytes, ref offset);
@@ -661,7 +663,7 @@ internal static class MetadataAnalysis
         return first | (second << 8) | (third << 16) | (fourth << 24);
     }
 
-    private static long ReadInt64(ImmutableArray<byte> bytes, ref int offset)
+    private static long ReadInt64(ReadOnlySpan<byte> bytes, ref int offset)
     {
         var low = unchecked((uint)ReadInt32(bytes, ref offset));
         var high = ReadInt32(bytes, ref offset);
@@ -715,8 +717,10 @@ internal static class MetadataAnalysis
         >= 0x0046 and <= 0x0050 or 0x009a or 0x00a3 => "ldelem",
         >= 0x0051 and <= 0x005d => "stind",
         >= 0x005e and <= 0x0066 => "binary",
-        >= 0x0067 and <= 0x0076 or 0x008c or 0x0079 => "cast",
+        >= 0x0067 and <= 0x006e or 0x0074 or 0x0075 or 0x0076 or 0x0079 or 0x008c => "cast",
         0x006f => "callvirt",
+        0x0070 => "cpobj",
+        0x0071 => "ldobj",
         0x0072 => "ldstr",
         0x0073 => "newobj",
         >= 0x007b and <= 0x0080 => "field",
@@ -745,7 +749,7 @@ internal static class MetadataAnalysis
         0x0025 => "copy",
         0x0065 or 0x0066 => "unary",
         >= 0x0058 and <= 0x0064 => "binary",
-        >= 0x0067 and <= 0x0076 or 0x0074 or 0x0075 or 0x0079 or 0x008c or 0x00a5 => "cast",
+        >= 0x0067 and <= 0x006e or 0x0074 or 0x0075 or 0x0076 or 0x0079 or 0x008c or 0x00a5 => "cast",
         >= 0x0046 and <= 0x0050 or 0x009a or 0x00a3 => "array_load",
         >= 0x009b and <= 0x00a4 => "array_store",
         >= 0x007b and <= 0x007c or 0x007e or 0x007f => "field_load",

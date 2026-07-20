@@ -4102,13 +4102,27 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         [](const json&) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: entry");
             const std::size_t before_count = breakpoint_count();
-            debugger_engine::clear_all_breakpoints();
-            diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: all breakpoints cleared");
+            const bool cleared = debugger_engine::clear_all_breakpoints();
+            const std::size_t after_count = breakpoint_count();
             json result;
             add_debugger_action_context(result, "dbg_clear_all_breakpoints");
-            result["success"] = true;
+            result["success"] = cleared && after_count == 0;
             result["breakpoint_count_before"] = before_count;
-            result["breakpoint_count_after"] = breakpoint_count();
+            result["breakpoint_count_after"] = after_count;
+            result["engine_verified"] = cleared;
+            if (!cleared || after_count != 0) {
+                const std::string detail = debugger_engine::last_error().empty()
+                    ? OBFSTR("Breakpoint restoration or removal did not verify completely.")
+                    : debugger_engine::last_error();
+                result["diagnostic"] = detail;
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_clear_all_breakpoints: failed before=%zu after=%zu engine_verified=%d detail='%s'",
+                    before_count, after_count, static_cast<int>(cleared), detail.c_str());
+                return tool_result_t::error(
+                    OBFSTR("Failed to clear every breakpoint without leaving target state uncertain."),
+                    "debugger_breakpoint_clear_failed", result);
+            }
+            diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: all breakpoints cleared");
             return tool_result_t::ok(OBFSTR("All breakpoints cleared."), result);
         }, false});
 

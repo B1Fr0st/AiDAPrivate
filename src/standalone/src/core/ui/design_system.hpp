@@ -306,7 +306,8 @@ bool begin_dialog_body(const char* stable_id, float footer_reserve_height);
 void end_dialog_body();
 dialog_result_t dialog_footer(const char* stable_id, const char* confirm_label,
     bool confirm_enabled, bool destructive, const char* cancel_label = "Cancel",
-    bool cancel_enabled = true);
+    bool cancel_enabled = true, bool confirm_on_enter = true);
+void render_confirmation_content(const confirmation_t& confirmation);
 dialog_result_t confirmation_dialog(const char* stable_id, const confirmation_t& confirmation);
 bool tiny_view_required(ImVec2 available, ImVec2 logical_minimum);
 ImVec2 minimum_logical_size(view_size_class_t size_class);

@@ -980,8 +980,9 @@ namespace taint_poison {
         uint64_t master_key, uint64_t tag)
     {
         volatile uint64_t v = master_key ^ tag;
+        const uint64_t snapshot = v;
         bool r = decoy_rsa_verify_stub(
-            reinterpret_cast<const uint8_t*>(&v), sizeof(v), tag);
+            reinterpret_cast<const uint8_t*>(&snapshot), sizeof(snapshot), tag);
         (void)r;
         write_discard(192, v);
         g_decoy_sink_taint ^= v;
@@ -991,8 +992,9 @@ namespace taint_poison {
         uint64_t hmac_input, uint64_t tag)
     {
         volatile uint64_t v = hmac_input ^ tag;
+        const uint64_t snapshot = v;
         uint64_t r = decoy_validate_signature(
-            reinterpret_cast<const uint8_t*>(&v), sizeof(v), tag);
+            reinterpret_cast<const uint8_t*>(&snapshot), sizeof(snapshot), tag);
         write_discard(224, r);
         g_decoy_sink_taint ^= r;
     }
@@ -1028,10 +1030,11 @@ namespace taint_poison {
         uint64_t response, uint64_t tag)
     {
         volatile uint64_t v = response ^ tag;
+        const uint64_t snapshot = v;
         bool r = decoy_ed25519_verify(
-            reinterpret_cast<const uint8_t*>(&v),
+            reinterpret_cast<const uint8_t*>(&snapshot),
             reinterpret_cast<const uint8_t*>(&tag),
-            sizeof(v));
+            sizeof(snapshot));
         (void)r;
         write_discard(248, v);
         g_decoy_sink_taint ^= v;

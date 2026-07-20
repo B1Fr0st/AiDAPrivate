@@ -99,11 +99,13 @@ void configure_shell_callbacks(shell_callbacks_t callbacks);
 void begin_frame();
 void render_action_confirmation();
 void process_global_shortcuts();
-void set_editor_focus(bool focused, bool text_input_active);
+void set_editor_focus(bool focused, bool text_input_active,
+                      bool review_mode = false);
 void process_editor_shortcuts();
 void set_shortcut_capture_active(bool active) noexcept;
 
 action_presentation_t present_action(const char* action_id);
+action_presentation_t present_editor_review_action(const char* action_id);
 action_presentation_t present_retained_entity_action(
     const char* action_id, const retained_entity_context_t& context);
 capability_state_t action_capability(const char* action_id);
@@ -121,6 +123,7 @@ action_execution_result_t execute_action(const char* action_id,
                                          action_invocation_source_t source);
 action_execution_result_t execute_editor_hunk_action(int hunk_index,
     const char* action_id, action_invocation_source_t source);
+action_presentation_t present_editor_tab_action(int tab_index, const char* action_id);
 action_execution_result_t execute_editor_tab_action(int tab_index,
     const char* action_id, action_invocation_source_t source);
 action_execution_result_t execute_retained_entity_action(
@@ -129,6 +132,10 @@ action_execution_result_t execute_retained_entity_action(
 void publish_action_execution_failure(const char* action_id,
     const action_execution_result_t& result,
     action_invocation_source_t source) noexcept;
+void finalize_action_execution(const char* action_id,
+    const action_execution_result_t& result,
+    action_invocation_source_t source,
+    const interaction_context_t& context);
 
 void open_editor_context_menu(context_menu_open_origin_t origin);
 void render_editor_context_menu();
@@ -160,6 +167,7 @@ void open_view_surface_context_menu(const view_instance_id_t& instance,
                                     context_menu_open_origin_t origin);
 void render_view_surface_context_menu(const view_instance_id_t& instance);
 
+action_presentation_t present_output_action(int tab, const char* action_id);
 action_execution_result_t execute_output_action(int tab, const char* action_id,
                                                 action_invocation_source_t source);
 void open_output_context_menu(int tab, context_menu_open_origin_t origin);

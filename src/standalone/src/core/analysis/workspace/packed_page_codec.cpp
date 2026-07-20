@@ -1202,10 +1202,10 @@ std::string fixed_width_address_t::hex() const {
 
 std::optional<fixed_width_address_t> fixed_width_address_t::from_hex(
     const std::string& text) noexcept {
-    if (text.size() != bytes.size() * 2)
-        return std::nullopt;
     fixed_width_address_t result;
-    for (std::size_t index = 0; index < bytes.size(); ++index) {
+    if (text.size() != result.bytes.size() * 2)
+        return std::nullopt;
+    for (std::size_t index = 0; index < result.bytes.size(); ++index) {
         auto hex_val = [](char c) -> std::optional<std::uint8_t> {
             if (c >= '0' && c <= '9') return static_cast<std::uint8_t>(c - '0');
             if (c >= 'a' && c <= 'f') return static_cast<std::uint8_t>(c - 'a' + 10);

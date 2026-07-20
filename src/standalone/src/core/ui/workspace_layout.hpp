@@ -57,6 +57,7 @@ struct workspace_preset_descriptor_t {
     std::string_view stable_id;
     std::string_view display_name;
     std::string_view description;
+    std::uint32_t revision = 1;
 };
 
 enum class workspace_identity_kind_t {
@@ -101,8 +102,10 @@ workspace_request_result_t dock_window(std::string_view window_name, dock_role_t
 workspace_request_result_t split_window(std::string_view window_name,
     std::string_view anchor_window_name, dock_split_direction_t direction) noexcept;
 void persist_if_requested() noexcept;
+void settle_pending_operation_for_shutdown() noexcept;
 void shutdown() noexcept;
 const workspace_preset_descriptor_t* presets(std::size_t& count) noexcept;
+std::uint32_t preset_revision(workspace_preset_t preset) noexcept;
 workspace_preset_t active_preset() noexcept;
 std::string_view active_preset_name() noexcept;
 workspace_identity_t active_identity() noexcept;
@@ -119,6 +122,8 @@ workspace_request_result_t switch_to(workspace_preset_t preset) noexcept;
 workspace_request_result_t save_user_layout(std::string_view name, bool overwrite = false) noexcept;
 workspace_request_result_t save_active_user_layout() noexcept;
 workspace_request_result_t load_user_layout(std::string_view name) noexcept;
+workspace_request_result_t load_user_layout_exact(std::string_view name,
+                                                  std::uint64_t expected_generation) noexcept;
 workspace_request_result_t rename_user_layout(std::string_view current_name,
                                               std::string_view new_name) noexcept;
 workspace_request_result_t delete_user_layout(std::string_view name) noexcept;

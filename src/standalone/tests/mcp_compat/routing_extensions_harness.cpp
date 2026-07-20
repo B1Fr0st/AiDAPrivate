@@ -19,6 +19,7 @@ namespace {
 
 using namespace aida::standalone::mcp::compat;
 using namespace aida::standalone::mcp::compat::handlers;
+namespace protocol = aida::standalone::mcp::protocol;
 using protocol::cancellation_token_t;
 using protocol::json;
 

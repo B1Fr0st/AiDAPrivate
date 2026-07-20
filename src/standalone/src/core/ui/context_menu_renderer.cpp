@@ -37,6 +37,13 @@ context_menu_render_result_t render_context_menu_popup(
         ImGui::EndPopup();
         return result;
     }
+    if (presentation.sections.empty()) {
+        ImGui::BeginDisabled();
+        ImGui::MenuItem("No actions available for this selection");
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
+        return result;
+    }
 
     bool first_section = true;
     for (const auto& section : presentation.sections) {
@@ -80,10 +87,8 @@ context_menu_render_result_t render_context_menu_popup(
             result.execution = presenter.execute(request, action.action, invocation);
             result.action = action.action;
             result.executed = result.execution.executed();
-            application_ui::publish_action_execution_failure(action.action.c_str(),
-                result.execution, action_invocation_source_t::context_menu);
-            if (!action.close_menu_on_execute)
-                ImGui::OpenPopup(popup_id);
+            application_ui::finalize_action_execution(action.action.c_str(),
+                result.execution, action_invocation_source_t::context_menu, context);
         }
     }
 

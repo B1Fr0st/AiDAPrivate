@@ -5,6 +5,7 @@
 #include "../core/settings/standalone_settings.hpp"
 #include "../helpers/globals.h"
 #include "command_registry_preview.inl"
+#include "preview_fixture_controls.hpp"
 
 #include <limits>
 
@@ -61,6 +62,43 @@ void seed_preview_chat()
     g_chat_scroll_to_bottom = true;
 }
 
+}
+
+namespace aida::preview {
+void configure_chat_fixture(fixture_state_t state, std::size_t cardinality)
+{
+    static_cast<void>(cardinality);
+    g_chat_messages.clear();
+    g_ai_thinking_active = false;
+    s_preview_busy.store(false, std::memory_order_release);
+    s_preview_cancel.store(false, std::memory_order_release);
+    if (state == fixture_state_t::empty)
+        return;
+    if (state == fixture_state_t::normal || state == fixture_state_t::recovery) {
+        seed_preview_chat();
+        return;
+    }
+    ChatMessage message;
+    message.timestamp = 1784048500;
+    if (state == fixture_state_t::loading ||
+        state == fixture_state_t::cancellation_requested) {
+        message.text = state == fixture_state_t::loading
+            ? "Analyzing the selected function and gathering cross-references..."
+            : "Cancellation requested. Waiting for the current tool boundary...";
+        message.has_thinking = true;
+        message.thinking_text = message.text;
+        g_ai_thinking_active = true;
+        s_preview_busy.store(true, std::memory_order_release);
+        s_preview_cancel.store(state == fixture_state_t::cancellation_requested,
+            std::memory_order_release);
+    } else {
+        message.text = state == fixture_state_t::disconnected
+            ? "AI provider disconnected. Reconnect a configured provider to continue."
+            : "The analysis request failed after the provider rejected the retained context.";
+    }
+    g_chat_messages.push_back(std::move(message));
+    g_chat_scroll_to_bottom = true;
+}
 }
 
 namespace aida::agent {
@@ -199,6 +237,42 @@ bool from_json(const nlohmann::json& object, agent_info_t& out)
     out.color = object.value("color", std::string("#458BE8"));
     out.native = false;
     return true;
+}
+
+namespace task {
+
+namespace {
+std::string s_preview_task_error;
+}
+
+bool execute(const std::string& agent_name,
+             const std::string& prompt_text,
+             int max_steps,
+             const std::string& parent_session_id,
+             std::string& out_result,
+             std::atomic<bool>* cancel_flag)
+{
+    if (cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire)) {
+        s_preview_task_error = "Agent task cancelled before execution";
+        out_result.clear();
+        return false;
+    }
+    if (get(agent_name) == nullptr || prompt_text.empty() || max_steps <= 0) {
+        s_preview_task_error = "Agent task request is invalid";
+        out_result.clear();
+        return false;
+    }
+    s_preview_task_error.clear();
+    out_result = "Studio parity receipt: agent '" + agent_name +
+        "' accepted evidence for session '" + parent_session_id + "'";
+    return true;
+}
+
+const std::string& last_error()
+{
+    return s_preview_task_error;
+}
+
 }
 
 }

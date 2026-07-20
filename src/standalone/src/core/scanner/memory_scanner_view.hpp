@@ -87,6 +87,7 @@ struct ui_state_t {
 	char   value_buf2[64] = {};
 
 	bool   auto_refresh = false;
+	bool   prefer_static_source = false;
 	float  refresh_timer = 0.f;
 	float  refresh_interval = 0.5f;
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <memory>
@@ -9,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <atomic>
+#include <vector>
 
 #include "imgui.h"
 #include "aob_generator.hpp"
@@ -91,6 +93,8 @@ struct state_t {
 	aob_generator::export_format_t last_export_format = aob_generator::export_format_t::json;
 	std::string last_export_path;
 	bool last_catalog_save = true;
+	std::uint64_t render_catalog_generation = 0;
+	std::vector<aob_generator::signature_t> render_catalog;
 };
 
 inline state_t g_state;
@@ -1343,18 +1347,44 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		"Saved Signatures");
 	ry += 22.f;
 
-	std::vector<aob_generator::signature_t> saved_copy;
-	{
+	const std::uint64_t catalog_generation =
+		gen.catalog_generation.load(std::memory_order_acquire);
+	bool catalog_refreshed = false;
+	if (st.render_catalog_generation != catalog_generation) {
 		std::lock_guard<std::mutex> lk(gen.mutex);
-		saved_copy = gen.saved_signatures;
+		const std::uint64_t locked_generation =
+			gen.catalog_generation.load(std::memory_order_relaxed);
+		if (st.render_catalog_generation != locked_generation) {
+			st.render_catalog = gen.saved_signatures;
+			st.render_catalog_generation = locked_generation;
+			catalog_refreshed = true;
+		}
+	}
+	const auto& saved_copy = st.render_catalog;
+	if (catalog_refreshed && st.selected_saved >= 0) {
+		const auto selected = std::find_if(saved_copy.begin(), saved_copy.end(),
+			[&](const auto& signature) {
+				return signature.address == st.context_address &&
+					signature.name == st.context_name;
+			});
+		st.selected_saved = selected == saved_copy.end() ? -1 :
+			static_cast<int>(std::distance(saved_copy.begin(), selected));
+	}
+	if (st.selected_saved < 0 || static_cast<std::size_t>(st.selected_saved) >= saved_copy.size()) {
+		st.selected_saved = -1;
+		st.context_address = 0;
+		st.context_name.clear();
 	}
 
 	float saved_h = oy + h - ry - 12.f;
 	float row_h = 28.f;
 	float content_h = static_cast<float>(saved_copy.size()) * row_h;
+	const float max_saved_scroll = (std::max)(0.f, content_h - saved_h);
+	st.target_scroll_y = (std::clamp)(st.target_scroll_y, 0.f, max_saved_scroll);
+	st.scroll_y = (std::clamp)(st.scroll_y, 0.f, max_saved_scroll);
 
 	float dt = aida::ui::clock::dt();
-	ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, std::max(0.f, content_h - saved_h), row_h);
+	ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, max_saved_scroll, row_h);
 	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 12.f, dt);
 
 	bool ctx_saved_open = false;
@@ -1365,7 +1395,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	static float saved_anim_time = 0.f;
 	saved_anim_time += dt;
 
-	for (std::size_t i = 0; i < saved_copy.size(); ++i) {
+	const std::size_t first_visible = saved_copy.empty() ? 0 :
+		(static_cast<std::size_t>((std::max)(0.f, st.scroll_y) / row_h));
+	const std::size_t visible_capacity = saved_h > 0.f
+		? static_cast<std::size_t>(std::ceil(saved_h / row_h)) + 2U : 0U;
+	const std::size_t visible_end = (std::min)(saved_copy.size(),
+		first_visible + visible_capacity);
+	for (std::size_t i = first_visible; i < visible_end; ++i) {
 		float row_y = ry + static_cast<float>(i) * row_h - st.scroll_y;
 		if (row_y + row_h < ry || row_y > oy + h) continue;
 

@@ -80,6 +80,8 @@ struct white_box_table_masked_t {
     uint8_t  mb_xor_keys_s2[9][16][32];
 };
 
+inline const white_box_table_t& get_tables();
+
 #include "wbaes_generated_tables.hpp"
 
 namespace detail_wb {

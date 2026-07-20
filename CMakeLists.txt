@@ -1335,7 +1335,7 @@ if(WIN32)
     option(BUILD_DRIVER_TEST "Build WhosWho driver test application" ON)
 
     if(BUILD_DRIVER_TEST)
-        add_executable(DriverTest
+        add_executable(DriverTest EXCLUDE_FROM_ALL
             driver/test_driver.cpp
             driver/comm.cpp
             driver/syscall.asm
@@ -1735,6 +1735,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/network/burp/passive_scanner.cpp"
             "${STANDALONE_ROOT}/core/network/burp/payload_library.cpp"
             "${STANDALONE_ROOT}/core/network/burp/project.cpp"
+            "${STANDALONE_ROOT}/core/network/burp/project_view.cpp"
             "${STANDALONE_ROOT}/core/network/burp/recon_view.cpp"
             "${STANDALONE_ROOT}/core/network/burp/report_generator.cpp"
             "${STANDALONE_ROOT}/core/network/burp/report_view.cpp"

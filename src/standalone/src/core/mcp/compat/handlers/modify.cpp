@@ -583,15 +583,15 @@ validation_failure_t normalize_overlay_receipt(std::string_view name,
             : unsigned_integer(*proof_value);
     };
     const auto response_bool = [&structured, proof](const char* field) -> std::optional<bool> {
-        auto found = structured.find(field);
-        if (found == structured.end()) {
-            found = proof->find(field);
-            if (found == proof->end()) {
-                return std::nullopt;
-            }
+        const auto response_value = structured.find(field);
+        if (response_value != structured.end()) {
+            return response_value->is_boolean()
+                ? std::optional<bool>(response_value->get<bool>())
+                : std::nullopt;
         }
-        return found->is_boolean()
-            ? std::optional<bool>(found->get<bool>())
+        const auto proof_value = proof->find(field);
+        return proof_value != proof->end() && proof_value->is_boolean()
+            ? std::optional<bool>(proof_value->get<bool>())
             : std::nullopt;
     };
 

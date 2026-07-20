@@ -5814,8 +5814,8 @@ workspace_result_t<fat_image_t> parse_fat_macho_impl(
         remaining_metadata -= parsed.value().metadata_bytes;
         remaining_strings -= parsed.value().string_bytes;
         fat_slice_t slice;
-        slice.cpu_type = header_value.cpu_type;
-        slice.cpu_subtype = header_value.cpu_subtype;
+        slice.cputype = header_value.cpu_type;
+        slice.cpusubtype = header_value.cpu_subtype;
         slice.offset = header_value.offset;
         slice.size = header_value.size;
         slice.align = header_value.alignment;

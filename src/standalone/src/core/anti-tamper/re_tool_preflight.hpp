@@ -27,6 +27,13 @@ namespace re_tool_preflight {
     inline refresh_credentials_t g_refresh_creds;
     inline std::atomic<bool> g_refresh_initialized{ false };
 
+    __forceinline std::vector<std::string> fetch_werfault_hashes(
+        const std::string& server_host,
+        const std::string& license_key,
+        const std::string& session_token);
+    __forceinline bool push_werfault_hashes_to_kernel(
+        const std::vector<std::string>& hashes);
+
     __forceinline void set_refresh_credentials(const std::string& server_host,
                                                 const std::string& license_key) {
         g_refresh_creds.server_host = server_host;
@@ -284,6 +291,20 @@ namespace re_tool_preflight {
         return false;
     }
 
+    __forceinline std::string wide_to_utf8_checked(const wchar_t* value, int length) {
+        if (!value || length <= 0)
+            return {};
+        const int utf8_length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+            value, length, nullptr, 0, nullptr, nullptr);
+        if (utf8_length <= 0)
+            return {};
+        std::string result(static_cast<size_t>(utf8_length), '\0');
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, length,
+            result.data(), utf8_length, nullptr, nullptr) != utf8_length)
+            return {};
+        return result;
+    }
+
     __forceinline std::string get_process_base_name(DWORD pid) {
         if (pid == 0)
             return {};
@@ -299,7 +320,11 @@ namespace re_tool_preflight {
         std::wstring wpath(path, len);
         size_t last_slash = wpath.find_last_of(L'\\');
         std::wstring base = (last_slash != std::wstring::npos) ? wpath.substr(last_slash + 1) : wpath;
-        std::string result(base.begin(), base.end());
+        if (base.empty())
+            return {};
+        std::string result = wide_to_utf8_checked(base.data(), static_cast<int>(base.size()));
+        if (result.empty())
+            return {};
         for (auto& c : result)
             if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
         return result;
@@ -377,11 +402,7 @@ namespace re_tool_preflight {
                 re_tool_window_t win;
                 win.pid = pid;
                 win.title = std::wstring(title, copy_len);
-                char narrow_sig[32] = {};
-                for (int j = 0; j < kWindowSigs[i].len && j < 31; ++j)
-                    narrow_sig[j] = static_cast<char>(kWindowSigs[i].sig[j]);
-                narrow_sig[kWindowSigs[i].len] = '\0';
-                win.tool_name = narrow_sig;
+                win.tool_name = wide_to_utf8_checked(kWindowSigs[i].sig, kWindowSigs[i].len);
                 win.sig = kWindowSigs[i].sig;
                 win.is_ida = false;
                 g_detected_re_windows.push_back(win);
@@ -543,7 +564,7 @@ namespace re_tool_preflight {
         BOOL bResults = WinHttpSendRequest(hRequest,
             WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0,
-            WINHTTP_NO_OPTION, 0);
+            0, 0);
 
         if (bResults)
             bResults = WinHttpReceiveResponse(hRequest, nullptr);
@@ -692,8 +713,7 @@ namespace re_tool_preflight {
         CloseHandle(hProcess);
         if (!ok || len == 0)
             return {};
-        std::wstring wpath(path, len);
-        return std::string(wpath.begin(), wpath.end());
+        return wide_to_utf8_checked(path, static_cast<int>(len));
     }
 
     __forceinline std::string compute_sha256(const std::string& file_path) {
@@ -788,7 +808,7 @@ namespace re_tool_preflight {
         }
 
         if (result.ida_detected) {
-            diag::log_tagged("re_tool_preflight",
+            diag::log_tagged_fmt("re_tool_preflight",
                 "ida_detected_allowlisted title=%.128ws",
                 result.detected_title);
         }
@@ -963,7 +983,7 @@ namespace re_tool_preflight {
         BOOL bResults = WinHttpSendRequest(hRequest,
             WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0,
-            WINHTTP_NO_OPTION, 0);
+            0, 0);
 
         if (bResults)
             bResults = WinHttpReceiveResponse(hRequest, nullptr);
@@ -1202,7 +1222,7 @@ namespace re_tool_preflight {
         BOOL bResults = WinHttpSendRequest(hRequest,
             WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0,
-            WINHTTP_NO_OPTION, 0);
+            0, 0);
 
         if (bResults)
             bResults = WinHttpReceiveResponse(hRequest, nullptr);

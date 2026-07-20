@@ -631,13 +631,13 @@ parse_multidex_metadata(const byte_provider_t& provider,
         }
         std::uint64_t image_string_bytes = 0;
         for (const auto& string : entry.image.strings) {
-            if (exceeds(image_string_bytes, string.utf8.size(),
+            if (exceeds(image_string_bytes, string.value.size(),
                         limits.max_string_bytes))
                 return workspace_result_t<multidex_metadata_t>::failure(
                     dex_managed_error(workspace_error_code_t::limit_exceeded,
                         "multidex string bytes exceed the reader limit",
                         "dex.multidex"));
-            image_string_bytes += string.utf8.size();
+            image_string_bytes += string.value.size();
         }
         if (exceeds(total_types, entry.image.types.size(), limits.max_types) ||
             exceeds(total_methods, entry.image.methods.size(), limits.max_methods) ||
@@ -733,12 +733,12 @@ build_dex_artifact(const dex_metadata_t& metadata,
             return workspace_result_t<managed_artifact_t>::failure(
                 dex_managed_stop_error(cancel,
                     "DEX artifact building cancelled", "dex.build"));
-        if (string.utf8.size() >
+        if (string.value.size() >
             limits.max_string_bytes - artifact.total_string_bytes)
             return workspace_result_t<managed_artifact_t>::failure(
                 dex_managed_error(workspace_error_code_t::limit_exceeded,
                     "DEX cumulative string bytes exceed limit", "dex.build"));
-        artifact.total_string_bytes += string.utf8.size();
+        artifact.total_string_bytes += string.value.size();
     }
 
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(metadata.image.classes.size()); ++i) {
@@ -805,7 +805,6 @@ build_dex_artifact(const dex_metadata_t& metadata,
                 method.code_offset = encoded.code->instructions_offset;
                 method.code_size = static_cast<std::uint64_t>(encoded.code->instruction_count) * 2u;
                 method.max_stack = 0;
-                method.max_locals = encoded.code->registers_size;
             }
             artifact.methods.push_back(std::move(method));
         }
@@ -836,7 +835,6 @@ build_dex_artifact(const dex_metadata_t& metadata,
                 method.code_offset = encoded.code->instructions_offset;
                 method.code_size = static_cast<std::uint64_t>(encoded.code->instruction_count) * 2u;
                 method.max_stack = 0;
-                method.max_locals = encoded.code->registers_size;
             }
             artifact.methods.push_back(std::move(method));
         }

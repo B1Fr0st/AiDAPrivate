@@ -1,18 +1,24 @@
 #ifdef _MSC_VER
 #pragma warning(push)
-#pragma warning(disable: 4005 4244 4267 4146 4996 4458 4457 4100 4127 4389)
+#pragma warning(disable: 4005 4099 4244 4267 4146 4996 4458 4457 4100 4127 4389)
 #endif
 
 #include "aida_load_image.hpp"
 #include "translate.hh"
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 #include "../zydis_disasm.hpp"
+#endif
 
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 
 #include "../ghidra_decompiler.hpp"
@@ -21,6 +27,8 @@
 #include <limits>
 #include <new>
 #include <utility>
+
+#include "aida_ghidra_preamble.hpp"
 
 namespace aida_ghidra {
 
@@ -46,8 +54,13 @@ load_image_t::load_image_t(const uint8_t* buffer,
 	  image_size_(buffer_size),
 	  addr_space_manager_(nullptr)
 {
+#if defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
+	if (file_fallback != nullptr)
+		throw ghidra::LowlevelError("isolated native decompiler cannot access application image state");
+#endif
 }
 
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 load_image_t::load_image_t(
     std::shared_ptr<const aida::analysis::byte_provider_t> provider,
     std::shared_ptr<const aida::analysis::pe_image_t> image,
@@ -72,6 +85,7 @@ load_image_t::load_image_t(
 			return left.provider_offset < right.provider_offset;
 		});
 }
+#endif
 
 void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra::Address& addr)
 {
@@ -85,6 +99,7 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 	std::memset(ptr, 0, static_cast<size_t>(size));
 
 	uint64_t offset = addr.getOffset();
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 	if (provider_) {
 		auto read_and_patch = [&](uint64_t provider_offset, ghidra::uint1* destination,
 			size_t amount) {
@@ -172,6 +187,7 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 		}
 		return;
 	}
+#endif
 
 	if (buffer_ && buffer_size_ > 0) {
 		if (offset >= buffer_base_ && offset < buffer_base_ + buffer_size_) {
@@ -187,6 +203,7 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 				return;
 			}
 
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 			if (file_ && file_->loaded) {
 				size_t remaining = static_cast<size_t>(size) - to_copy;
 				std::vector<uint8_t> tail;
@@ -195,6 +212,7 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 					std::memcpy(ptr + to_copy, tail.data(), copy_n);
 				}
 			}
+#endif
 			ghidra_decompiler::g_state.last_loadfill_tick_ms.store(
 				static_cast<uint64_t>(::GetTickCount64()),
 				std::memory_order_release);
@@ -218,6 +236,7 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 		}
 	}
 
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 	if (file_ && file_->loaded) {
 		std::vector<uint8_t> tmp;
 		if (static_analysis::read_bytes_from_pe(*file_, offset, static_cast<size_t>(size), tmp) && !tmp.empty()) {
@@ -225,6 +244,7 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 			std::memcpy(ptr, tmp.data(), copy_n);
 		}
 	}
+#endif
 
 	ghidra_decompiler::g_state.last_loadfill_tick_ms.store(
 		static_cast<uint64_t>(::GetTickCount64()),
@@ -233,6 +253,9 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 
 void load_image_t::getReadonly(ghidra::RangeList& list) const
 {
+#if defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
+	(void)list;
+#endif
 	if (cancel_flag_ && cancel_flag_->load(std::memory_order_acquire))
 		throw ghidra::LowlevelError("decompile cancelled");
 	if (cancel_check_ && cancel_check_())
@@ -244,6 +267,7 @@ void load_image_t::getReadonly(ghidra::RangeList& list) const
 	if (!code_space)
 		return;
 
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 	if (image_) {
 		for (const auto& section : image_->sections()) {
 			if (section.virtual_size == 0 || section.writable)
@@ -269,6 +293,7 @@ void load_image_t::getReadonly(ghidra::RangeList& list) const
 		if (end > start)
 			list.insertRange(code_space, start, end - 1);
 	}
+#endif
 }
 
 std::string load_image_t::getArchType() const
@@ -282,6 +307,8 @@ void load_image_t::adjustVma(long )
 }
 
 }
+
+#if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 
 namespace aida::analysis::ghidra_adapter {
 
@@ -767,3 +794,5 @@ workspace_result_t<std::uint64_t> ghidra_load_image_t::provider_offset_for_addre
 }
 
 }
+
+#endif

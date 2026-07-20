@@ -156,6 +156,9 @@ struct action_result_t {
 
 struct editor_proposal_snapshot_t {
     std::string id;
+    std::string audit_id;
+    std::string task_id;
+    std::string diagnostic_id;
     message_identity_t source;
     std::string target_document_id;
     std::uint64_t target_document_numeric_id = 0;
@@ -164,6 +167,9 @@ struct editor_proposal_snapshot_t {
     std::uint64_t generation = 0;
     std::uint64_t reviewed_generation = 0;
     std::uint64_t reviewed_content_hash = 0;
+    std::uint64_t proposed_content_hash = 0;
+    std::uint64_t result_revision = 0;
+    std::uint64_t result_content_hash = 0;
     int reviewed_pending_hunks = 0;
     bool pending = false;
     bool applying = false;
@@ -199,6 +205,9 @@ enum class reverse_engineering_proposal_state_t : std::uint8_t {
 
 struct reverse_engineering_proposal_snapshot_t {
     std::string id;
+    std::string audit_id;
+    std::string task_id;
+    std::string diagnostic_id;
     message_identity_t source;
     reverse_engineering_proposal_kind_t kind = reverse_engineering_proposal_kind_t::none;
     std::string kind_label;
@@ -216,6 +225,8 @@ struct reverse_engineering_proposal_snapshot_t {
     std::uint64_t expected_generation = 0;
     std::uint64_t expected_revision = 0;
     std::uint64_t expected_overlay_revision = 0;
+    std::uint64_t result_revision = 0;
+    std::uint64_t result_hash = 0;
     std::uint64_t operation_id = 0;
     reverse_engineering_proposal_state_t state =
         reverse_engineering_proposal_state_t::none;
@@ -223,6 +234,7 @@ struct reverse_engineering_proposal_snapshot_t {
     bool applying = false;
     bool review_staged = false;
     bool applied = false;
+    bool partial = false;
     bool rejected = false;
     bool stale = false;
     bool terminal_readback = false;
@@ -291,5 +303,7 @@ editor_proposal_snapshot_t editor_proposal_snapshot();
 action_result_t stage_reverse_engineering_proposal(const message_identity_t& source);
 std::shared_ptr<const reverse_engineering_proposal_snapshot_t>
 reverse_engineering_proposal_snapshot();
+void restore_proposal_reviews_for_session(const std::string& session_id);
+void prepare_proposal_reviews_for_shutdown();
 
 }

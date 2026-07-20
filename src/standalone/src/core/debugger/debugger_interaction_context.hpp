@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace debugger_interaction {
 
@@ -49,6 +50,7 @@ enum class capability_t : std::uint8_t {
 struct context_t {
 	kind_t kind = kind_t::none;
 	std::uint32_t target_pid = 0;
+	std::uint64_t process_creation_time_100ns = 0;
 	std::uint64_t stop_generation = 0;
 	std::uint64_t address = 0;
 	std::uint64_t value = 0;
@@ -74,7 +76,10 @@ context_t capture(kind_t kind, std::uint64_t address = 0,
 	std::uint64_t extent = 0, std::string primary_text = {},
 	std::string secondary_text = {});
 void select(context_t context);
+void select_set(std::vector<context_t> contexts, context_t focused);
 const context_t& selected();
+const std::vector<context_t>& selected_set();
+bool selected_in_set(const context_t& context);
 void clear();
 bool is_current(const context_t& context);
 capability_result_t evaluate(capability_t capability, const context_t& context);

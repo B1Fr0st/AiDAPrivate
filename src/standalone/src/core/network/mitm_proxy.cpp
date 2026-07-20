@@ -2381,6 +2381,8 @@ static void handle_plain_connection(SOCKET client_sock, const std::string& clien
             publish_exchange_event(exchange);
             std::lock_guard<std::mutex> lock(state.history_mutex);
             state.history.push_back(std::make_shared<http_exchange>(std::move(exchange)));
+            while (state.history.size() > config.max_history)
+                state.history.pop_front();
             state.active_connections.fetch_sub(1);
             close_socket(client_sock);
             return;

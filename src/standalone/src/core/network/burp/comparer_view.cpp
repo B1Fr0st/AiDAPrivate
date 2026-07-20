@@ -33,7 +33,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <functional>
+#include <atomic>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -60,12 +63,32 @@ struct view_state_t
     bool                                            cached_valid = false;
     int                                             cached_mode_idx = -1;
     uint64_t                                        cached_ids[2] = {0, 0};
+    std::atomic<std::uint64_t>                      diff_generation{0};
+    std::atomic<bool>                               diff_pending{false};
+    uint64_t                                        requested_ids[2] = {0, 0};
+    int                                             requested_mode_idx = -1;
+    std::string                                     diff_error;
 
     float                                           sync_scroll_y = 0.f;
 };
 
 static view_state_t g_view_state;
 static uint64_t g_pending_remove_slot = 0;
+
+struct diff_publication_t {
+    std::uint64_t generation = 0;
+    std::uint64_t slot_a = 0;
+    std::uint64_t slot_b = 0;
+    int mode_idx = -1;
+    bool succeeded = false;
+    std::string error;
+    std::vector<aida::burp::comparer::diff_block_t> blocks;
+    aida::burp::comparer::diff_stats_t stats;
+    aida::burp::comparer::slot_t a;
+    aida::burp::comparer::slot_t b;
+};
+
+static std::shared_ptr<const diff_publication_t> g_diff_publication;
 
 static aida::burp::comparer::diff_mode_t mode_from_index(int idx)
 {
@@ -90,23 +113,84 @@ static void ensure_diff()
         g_view_state.cached_mode_idx == g_view_state.mode_idx) {
         return;
     }
-    aida::burp::comparer::slot_t a;
-    aida::burp::comparer::slot_t b;
-    if (!aida::burp::comparer::get_slot(g_view_state.selected_a, a) ||
-        !aida::burp::comparer::get_slot(g_view_state.selected_b, b)) {
-        g_view_state.cached_valid = false;
+    const auto published = std::atomic_load_explicit(&g_diff_publication,
+        std::memory_order_acquire);
+    if (published && published->slot_a == g_view_state.selected_a &&
+        published->slot_b == g_view_state.selected_b &&
+        published->mode_idx == g_view_state.mode_idx) {
+        g_view_state.diff_error = published->error;
+        if (!published->succeeded) {
+            g_view_state.cached_valid = false;
+            return;
+        }
+        g_view_state.cached_blocks = published->blocks;
+        g_view_state.cached_stats = published->stats;
+        g_view_state.cached_a = published->a;
+        g_view_state.cached_b = published->b;
+        g_view_state.cached_valid = true;
+        g_view_state.cached_ids[0] = published->slot_a;
+        g_view_state.cached_ids[1] = published->slot_b;
+        g_view_state.cached_mode_idx = published->mode_idx;
+        g_view_state.diff_error.clear();
         return;
     }
-    g_view_state.cached_blocks = aida::burp::comparer::compute_diff_with_stats(
-        g_view_state.selected_a, g_view_state.selected_b,
-        mode_from_index(g_view_state.mode_idx),
-        g_view_state.cached_stats);
-    g_view_state.cached_a = std::move(a);
-    g_view_state.cached_b = std::move(b);
-    g_view_state.cached_valid = true;
-    g_view_state.cached_ids[0] = g_view_state.selected_a;
-    g_view_state.cached_ids[1] = g_view_state.selected_b;
-    g_view_state.cached_mode_idx = g_view_state.mode_idx;
+    if (g_view_state.diff_pending.load(std::memory_order_acquire) &&
+        g_view_state.requested_ids[0] == g_view_state.selected_a &&
+        g_view_state.requested_ids[1] == g_view_state.selected_b &&
+        g_view_state.requested_mode_idx == g_view_state.mode_idx) return;
+    const std::uint64_t slot_a = g_view_state.selected_a;
+    const std::uint64_t slot_b = g_view_state.selected_b;
+    const int mode_idx = g_view_state.mode_idx;
+    const std::uint64_t generation = g_view_state.diff_generation.fetch_add(
+        1, std::memory_order_acq_rel) + 1;
+    g_view_state.requested_ids[0] = slot_a;
+    g_view_state.requested_ids[1] = slot_b;
+    g_view_state.requested_mode_idx = mode_idx;
+    g_view_state.diff_pending.store(true, std::memory_order_release);
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "burp.comparer";
+    submission.label = "comparer.compute_diff";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.ui_access_policy = "immutable_snapshots_only";
+    submission.failure_policy = "typed_diagnostic";
+    submission.body = [slot_a, slot_b, mode_idx, generation] {
+        auto next = std::make_shared<diff_publication_t>();
+        next->generation = generation;
+        next->slot_a = slot_a;
+        next->slot_b = slot_b;
+        next->mode_idx = mode_idx;
+        try {
+            if (!aida::burp::comparer::get_slot(slot_a, next->a))
+                next->error = "Comparer input A is no longer available.";
+            else if (!aida::burp::comparer::get_slot(slot_b, next->b))
+                next->error = "Comparer input B is no longer available.";
+            else {
+                next->blocks = aida::burp::comparer::compute_diff_with_stats(
+                    slot_a, slot_b, mode_from_index(mode_idx), next->stats);
+                constexpr std::size_t maximum_published_bytes = 32U * 1024U;
+                if (next->a.data.size() > maximum_published_bytes)
+                    next->a.data.resize(maximum_published_bytes);
+                if (next->b.data.size() > maximum_published_bytes)
+                    next->b.data.resize(maximum_published_bytes);
+                next->succeeded = true;
+            }
+        } catch (const std::exception& exception) {
+            next->error = exception.what();
+        } catch (...) {
+            next->error = "Comparer diff failed with an unknown exception.";
+        }
+        if (g_view_state.diff_generation.load(std::memory_order_acquire) == generation)
+            std::atomic_store_explicit(&g_diff_publication,
+                std::shared_ptr<const diff_publication_t>(std::move(next)),
+                std::memory_order_release);
+        if (g_view_state.diff_generation.load(std::memory_order_acquire) == generation)
+            g_view_state.diff_pending.store(false, std::memory_order_release);
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted)
+        g_view_state.diff_pending.store(false, std::memory_order_release);
 }
 
 static ImU32 block_color(const aida::ui::theme_t& th, aida::burp::comparer::diff_block_t::kind_t k, float alpha)
@@ -139,8 +223,21 @@ static void render_pane(const char* id, const std::vector<uint8_t>& data,
             if (text[i] == '\n') line_starts.push_back(i + 1);
         }
 
-        float max_text_x = 0.f;
-        for (size_t li = 0; li < line_starts.size(); ++li) {
+        std::size_t maximum_line_bytes = 0;
+        for (std::size_t line = 0; line < line_starts.size(); ++line) {
+            const std::size_t begin = line_starts[line];
+            const std::size_t end = line + 1U < line_starts.size()
+                ? line_starts[line + 1U] : text.size();
+            maximum_line_bytes = (std::max)(maximum_line_bytes, end - begin);
+        }
+        float max_text_x = (std::max)(ImGui::GetContentRegionAvail().x,
+            static_cast<float>(maximum_line_bytes) * ImGui::CalcTextSize("M").x);
+        ImGuiListClipper line_clipper;
+        line_clipper.Begin(static_cast<int>(line_starts.size()), line_h);
+        while (line_clipper.Step()) {
+        for (int visible_line = line_clipper.DisplayStart;
+             visible_line < line_clipper.DisplayEnd; ++visible_line) {
+            const size_t li = static_cast<size_t>(visible_line);
             size_t ls = line_starts[li];
             size_t le = (li + 1 < line_starts.size()) ? line_starts[li + 1] : text.size();
             size_t inv_end = le;
@@ -180,7 +277,8 @@ static void render_pane(const char* id, const std::vector<uint8_t>& data,
             dl->AddText(ImVec2(text_x, ly),
                 aida::ui::with_alpha(th.text_primary, alpha), line_view.c_str());
         }
-        ImGui::Dummy(ImVec2(gutter + max_text_x + 16.f, static_cast<float>(line_starts.size()) * line_h));
+        }
+        ImGui::Dummy(ImVec2(gutter + max_text_x + 16.f, 0.f));
     }
     if (is_a) {
         if (ImGui::IsWindowHovered() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -439,6 +537,18 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::BeginChild("##cmp_sel", ImVec2(width, sel_h), false, ImGuiWindowFlags_NoBackground);
 
     auto slots = aida::burp::comparer::list_slots();
+    const auto slot_exists = [&slots](std::uint64_t id) {
+        return id == 0 || std::any_of(slots.begin(), slots.end(),
+            [id](const auto& slot) { return slot.id == id; });
+    };
+    if (!slot_exists(g_view_state.selected_a) || !slot_exists(g_view_state.selected_b)) {
+        if (!slot_exists(g_view_state.selected_a)) g_view_state.selected_a = 0;
+        if (!slot_exists(g_view_state.selected_b)) g_view_state.selected_b = 0;
+        g_view_state.cached_valid = false;
+        g_view_state.diff_error = "A selected comparer input was removed; select an available slot.";
+        g_view_state.diff_generation.fetch_add(1, std::memory_order_acq_rel);
+        g_view_state.diff_pending.store(false, std::memory_order_release);
+    }
 
     auto draw_combo = [&](const char* lbl, uint64_t* sel) {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
@@ -513,6 +623,10 @@ void render(float pos_x, float pos_y, float width, float height,
             st.equal_runs, st.insert_runs, st.delete_runs, st.replace_runs,
             st.bytes_equal, st.bytes_inserted, st.bytes_deleted, st.bytes_replaced,
             st.truncated ? "  (truncated)" : "");
+    } else if (!g_view_state.diff_error.empty()) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+            aida::ui::with_alpha(th.error, alpha)), "%s",
+            g_view_state.diff_error.c_str());
     } else {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
             "Select two slots above to compute the diff.");

@@ -13,6 +13,9 @@
 #include <cstring>
 #include <cctype>
 #include <algorithm>
+#include <charconv>
+#include <iterator>
+#include <limits>
 
 #include <sqlite3.h>
 
@@ -33,6 +36,7 @@ std::mutex   g_error_mutex;
 std::string  g_last_error;
 std::atomic<sqlite3*> g_db{ nullptr };
 std::mutex   g_init_mutex;
+std::recursive_mutex g_store_mutex;
 std::atomic<bool> g_initialized{ false };
 
 
@@ -421,6 +425,27 @@ int64_t column_int64_or_zero(sqlite3_stmt* stmt, int col)
 }
 
 
+std::uint64_t column_uint64_text_or_zero(sqlite3_stmt* stmt, int col)
+{
+    const std::string text = column_text_or_empty(stmt, col);
+    if (text.empty()) return 0;
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()
+        ? value : 0;
+}
+
+bool uint64_text_column_valid(sqlite3_stmt* stmt, int col)
+{
+    if (sqlite3_column_type(stmt, col) != SQLITE_TEXT) return false;
+    const std::string text = column_text_or_empty(stmt, col);
+    if (text.empty() || text.size() > 20U) return false;
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+}
+
+
 nlohmann::json column_json_or_empty(sqlite3_stmt* stmt, int col)
 {
     if (sqlite3_column_type(stmt, col) == SQLITE_NULL) return nlohmann::json();
@@ -642,6 +667,31 @@ bool column_exists(sqlite3* db, const char* table, const char* column)
     return found;
 }
 
+bool proposal_audit_parent_is_dedicated(sqlite3* db)
+{
+    sqlite3_stmt* statement = nullptr;
+    if (sqlite3_prepare_v2(db, "PRAGMA foreign_key_list(proposal_audits)",
+            -1, &statement, nullptr) != SQLITE_OK)
+        return false;
+    bool exact = false;
+    int result = SQLITE_ROW;
+    while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
+        const std::string table = column_text_or_empty(statement, 2);
+        const std::string from = column_text_or_empty(statement, 3);
+        const std::string to = column_text_or_empty(statement, 4);
+        if (from == "session_id") {
+            if (exact || table != "proposal_audit_sessions" ||
+                to != "session_id") {
+                sqlite3_finalize(statement);
+                return false;
+            }
+            exact = true;
+        }
+    }
+    sqlite3_finalize(statement);
+    return result == SQLITE_DONE && exact;
+}
+
 
 bool ensure_schema(sqlite3* db)
 {
@@ -708,6 +758,91 @@ bool ensure_schema(sqlite3* db)
             return false;
     }
 
+    if (!exec_simple(db, "BEGIN IMMEDIATE")) return false;
+    const char* proposal_schema =
+        "CREATE TABLE IF NOT EXISTS proposal_audit_sessions ("
+        "session_id TEXT PRIMARY KEY,"
+        "created INTEGER NOT NULL,"
+        "updated INTEGER NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS proposal_audits ("
+        "audit_id TEXT PRIMARY KEY,"
+        "proposal_id TEXT NOT NULL,"
+        "family TEXT NOT NULL,"
+        "kind TEXT NOT NULL,"
+        "session_id TEXT NOT NULL,"
+        "source_index TEXT NOT NULL,"
+        "source_timestamp INTEGER NOT NULL,"
+        "source_fingerprint TEXT NOT NULL,"
+        "target_id TEXT NOT NULL,"
+        "target_view_id TEXT NOT NULL,"
+        "target_generation TEXT NOT NULL,"
+        "source_revision TEXT NOT NULL,"
+        "target_overlay_revision TEXT NOT NULL,"
+        "before_hash TEXT NOT NULL,"
+        "after_hash TEXT NOT NULL,"
+        "result_hash TEXT NOT NULL,"
+        "result_revision TEXT NOT NULL,"
+        "provenance TEXT NOT NULL,"
+        "detail TEXT NOT NULL,"
+        "lifecycle_state TEXT NOT NULL,"
+        "outcome TEXT NOT NULL,"
+        "task_id TEXT NOT NULL,"
+        "diagnostic_id TEXT NOT NULL,"
+        "undo_revert_identity TEXT NOT NULL,"
+        "created INTEGER NOT NULL,"
+        "updated INTEGER NOT NULL,"
+        "revalidation_required INTEGER NOT NULL DEFAULT 0,"
+        "FOREIGN KEY(session_id) REFERENCES proposal_audit_sessions(session_id) ON DELETE CASCADE"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_audits_session_updated "
+        "ON proposal_audits(session_id, updated DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_audits_revalidation "
+        "ON proposal_audits(session_id, revalidation_required, updated DESC);"
+        "CREATE TABLE IF NOT EXISTS proposal_audit_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "audit_id TEXT NOT NULL,"
+        "outcome TEXT NOT NULL,"
+        "lifecycle_state TEXT NOT NULL,"
+        "detail TEXT NOT NULL,"
+        "event_time INTEGER NOT NULL,"
+        "task_id TEXT NOT NULL,"
+        "diagnostic_id TEXT NOT NULL,"
+        "result_revision TEXT NOT NULL,"
+        "result_hash TEXT NOT NULL,"
+        "undo_revert_identity TEXT NOT NULL,"
+        "FOREIGN KEY(audit_id) REFERENCES proposal_audits(audit_id) ON DELETE CASCADE"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_audit_events_audit "
+        "ON proposal_audit_events(audit_id, id DESC);"
+        "CREATE TABLE IF NOT EXISTS proposal_audit_hunks ("
+        "audit_id TEXT NOT NULL,"
+        "hunk_index INTEGER NOT NULL,"
+        "old_start INTEGER NOT NULL,"
+        "old_count INTEGER NOT NULL,"
+        "new_start INTEGER NOT NULL,"
+        "new_count INTEGER NOT NULL,"
+        "decision TEXT NOT NULL,"
+        "before_hash TEXT NOT NULL,"
+        "after_hash TEXT NOT NULL,"
+        "PRIMARY KEY(audit_id, hunk_index),"
+        "FOREIGN KEY(audit_id) REFERENCES proposal_audits(audit_id) ON DELETE CASCADE"
+        ");"
+        "UPDATE schema_meta SET value='3' WHERE key='version' AND CAST(value AS INTEGER)<3;";
+    if (!exec_simple(db, proposal_schema)) {
+        exec_simple(db, "ROLLBACK");
+        return false;
+    }
+    if (!proposal_audit_parent_is_dedicated(db)) {
+        set_last_error("proposal_audit_parent_schema_mismatch");
+        exec_simple(db, "ROLLBACK");
+        return false;
+    }
+    if (!exec_simple(db, "COMMIT")) {
+        exec_simple(db, "ROLLBACK");
+        return false;
+    }
+
     return true;
 }
 
@@ -716,6 +851,206 @@ sqlite3* db_handle()
 {
     return g_db.load(std::memory_order_acquire);
 }
+
+
+bool proposal_field_valid(const std::string& value, std::size_t maximum,
+                          bool required = false)
+{
+    return value.size() <= maximum && (!required || !value.empty());
+}
+
+bool session_identity_valid(const std::string& value)
+{
+    return !value.empty() && value.size() <= 128U &&
+        std::all_of(value.begin(), value.end(), [](unsigned char character) {
+            return std::isalnum(character) != 0 || character == '-' ||
+                character == '_';
+        });
+}
+
+bool ensure_proposal_audit_session_locked(sqlite3* db,
+                                          const std::string& session_id,
+                                          std::int64_t timestamp)
+{
+    if (!db || !session_identity_valid(session_id) || timestamp <= 0) {
+        set_last_error("invalid_session_identity");
+        return false;
+    }
+    sqlite3_stmt* statement = nullptr;
+    const int prepared = sqlite3_prepare_v2(db,
+        "INSERT INTO proposal_audit_sessions(session_id,created,updated) "
+        "VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
+        "updated=excluded.updated",
+        -1, &statement, nullptr);
+    if (prepared != SQLITE_OK) {
+        set_last_error_sqlite(db, "ensure_proposal_audit_session_prepare");
+        return false;
+    }
+    const bool bound = bind_text(statement, 1, session_id) &&
+        bind_int64(statement, 2, timestamp) &&
+        bind_int64(statement, 3, timestamp);
+    const int stepped = bound ? sqlite3_step(statement) : SQLITE_ERROR;
+    sqlite3_finalize(statement);
+    if (!bound || stepped != SQLITE_DONE) {
+        set_last_error_sqlite(db, "ensure_proposal_audit_session_step");
+        return false;
+    }
+    statement = nullptr;
+    const int selected = sqlite3_prepare_v2(db,
+        "SELECT session_id FROM proposal_audit_sessions WHERE session_id=? LIMIT 1",
+        -1, &statement, nullptr);
+    if (selected != SQLITE_OK || !bind_text(statement, 1, session_id)) {
+        if (statement) sqlite3_finalize(statement);
+        set_last_error_sqlite(db,
+            "ensure_proposal_audit_session_verify_prepare");
+        return false;
+    }
+    const bool exact = sqlite3_step(statement) == SQLITE_ROW &&
+        column_text_or_empty(statement, 0) == session_id;
+    sqlite3_finalize(statement);
+    if (!exact) {
+        set_last_error("ensure_proposal_audit_session_verify_failed");
+        return false;
+    }
+    return true;
+}
+
+bool proposal_audit_session_exists_locked(sqlite3* db,
+                                          const std::string& session_id)
+{
+    sqlite3_stmt* statement = nullptr;
+    if (sqlite3_prepare_v2(db,
+            "SELECT session_id FROM proposal_audit_sessions WHERE session_id=? LIMIT 1",
+            -1, &statement, nullptr) != SQLITE_OK ||
+        !bind_text(statement, 1, session_id)) {
+        if (statement) sqlite3_finalize(statement);
+        set_last_error_sqlite(db, "proposal_audit_session_lookup");
+        return false;
+    }
+    const bool exact = sqlite3_step(statement) == SQLITE_ROW &&
+        column_text_or_empty(statement, 0) == session_id;
+    sqlite3_finalize(statement);
+    return exact;
+}
+
+bool proposal_hash_valid(const std::string& value, bool required)
+{
+    if (value.empty()) return !required;
+    return value.size() == 16U && std::all_of(value.begin(), value.end(),
+        [](unsigned char character) { return std::isxdigit(character) != 0; }) &&
+        std::any_of(value.begin(), value.end(),
+            [](char character) { return character != '0'; });
+}
+
+
+bool proposal_audit_valid(const proposal_audit_record_t& record)
+{
+    constexpr std::int32_t maximum_hunk_coordinate = 16 * 1024 * 1024;
+    if (!proposal_field_valid(record.audit_id, 192, true) ||
+        !proposal_field_valid(record.proposal_id, 192, true) ||
+        !proposal_field_valid(record.family, 32, true) ||
+        !proposal_field_valid(record.kind, 64, true) ||
+        !proposal_field_valid(record.session_id, 128, true) ||
+        !proposal_field_valid(record.target_id, 512, true) ||
+        !proposal_field_valid(record.target_view_id, 128) ||
+        !proposal_hash_valid(record.before_hash, true) ||
+        !proposal_hash_valid(record.after_hash, true) ||
+        !proposal_hash_valid(record.result_hash, false) ||
+        !proposal_field_valid(record.provenance, 512, true) ||
+        !proposal_field_valid(record.detail, 4096, true) ||
+        !proposal_field_valid(record.lifecycle_state, 64, true) ||
+        !proposal_field_valid(record.outcome, 32, true) ||
+        !proposal_field_valid(record.task_id, 192, true) ||
+        !proposal_field_valid(record.diagnostic_id, 192) ||
+        !proposal_field_valid(record.undo_revert_identity, 512) ||
+        record.hunks.size() > 512)
+        return false;
+    if (record.family != "editor" && record.family != "reverse_engineering")
+        return false;
+    const bool kind_valid = record.family == "editor"
+        ? record.kind == "full_content_diff"
+        : record.kind == "analysis.rename" || record.kind == "analysis.comment" ||
+            record.kind == "analysis.type" || record.kind == "patch.static" ||
+            record.kind == "patch.live" || record.kind == "network.request_edit" ||
+            record.kind == "network.replay_stage";
+    if (!kind_valid) return false;
+    static constexpr const char* lifecycle_states[] = {
+        "validating", "pending_review", "reviewed", "applying", "rejected",
+        "stale", "failure", "applied_partial", "applied", "review_staged",
+        "partial"
+    };
+    if (std::none_of(std::begin(lifecycle_states), std::end(lifecycle_states),
+            [&](const char* value) { return record.lifecycle_state == value; }))
+        return false;
+    static constexpr const char* outcomes[] = {
+        "stage", "review", "apply", "reject", "stale", "partial",
+        "rollback", "failure"
+    };
+    if (std::none_of(std::begin(outcomes), std::end(outcomes),
+            [&](const char* value) { return record.outcome == value; }))
+        return false;
+    for (std::size_t index = 0; index < record.hunks.size(); ++index) {
+        const auto& hunk = record.hunks[index];
+        const bool decision_valid = hunk.decision == "pending" ||
+            hunk.decision == "accepted" || hunk.decision == "rejected";
+        const bool coordinates_valid = hunk.old_start >= 0 && hunk.old_count >= 0 &&
+            hunk.new_start >= 0 && hunk.new_count >= 0 &&
+            hunk.old_start <= maximum_hunk_coordinate &&
+            hunk.old_count <= maximum_hunk_coordinate &&
+            hunk.new_start <= maximum_hunk_coordinate &&
+            hunk.new_count <= maximum_hunk_coordinate &&
+            static_cast<std::int64_t>(hunk.old_start) + hunk.old_count <=
+                maximum_hunk_coordinate &&
+            static_cast<std::int64_t>(hunk.new_start) + hunk.new_count <=
+                maximum_hunk_coordinate;
+        if (hunk.index != index || !decision_valid || !coordinates_valid ||
+            !proposal_hash_valid(hunk.before_hash, true) ||
+            !proposal_hash_valid(hunk.after_hash, true))
+            return false;
+    }
+    return true;
+}
+
+
+void hydrate_proposal_audit(sqlite3_stmt* stmt, proposal_audit_record_t& record)
+{
+    record = {};
+    record.audit_id = column_text_or_empty(stmt, 0);
+    record.proposal_id = column_text_or_empty(stmt, 1);
+    record.family = column_text_or_empty(stmt, 2);
+    record.kind = column_text_or_empty(stmt, 3);
+    record.session_id = column_text_or_empty(stmt, 4);
+    record.source_index = column_uint64_text_or_zero(stmt, 5);
+    record.source_timestamp = column_int64_or_zero(stmt, 6);
+    record.source_fingerprint = column_uint64_text_or_zero(stmt, 7);
+    record.target_id = column_text_or_empty(stmt, 8);
+    record.target_view_id = column_text_or_empty(stmt, 9);
+    record.target_generation = column_uint64_text_or_zero(stmt, 10);
+    record.source_revision = column_uint64_text_or_zero(stmt, 11);
+    record.target_overlay_revision = column_uint64_text_or_zero(stmt, 12);
+    record.before_hash = column_text_or_empty(stmt, 13);
+    record.after_hash = column_text_or_empty(stmt, 14);
+    record.result_hash = column_text_or_empty(stmt, 15);
+    record.result_revision = column_uint64_text_or_zero(stmt, 16);
+    record.provenance = column_text_or_empty(stmt, 17);
+    record.detail = column_text_or_empty(stmt, 18);
+    record.lifecycle_state = column_text_or_empty(stmt, 19);
+    record.outcome = column_text_or_empty(stmt, 20);
+    record.task_id = column_text_or_empty(stmt, 21);
+    record.diagnostic_id = column_text_or_empty(stmt, 22);
+    record.undo_revert_identity = column_text_or_empty(stmt, 23);
+    record.created_unix = column_int64_or_zero(stmt, 24);
+    record.updated_unix = column_int64_or_zero(stmt, 25);
+    record.revalidation_required = column_int64_or_zero(stmt, 26) != 0;
+}
+
+
+constexpr const char* kSelectProposalAuditFields =
+    "audit_id,proposal_id,family,kind,session_id,source_index,source_timestamp,"
+    "source_fingerprint,target_id,target_view_id,target_generation,source_revision,"
+    "target_overlay_revision,before_hash,after_hash,result_hash,result_revision,"
+    "provenance,detail,lifecycle_state,outcome,task_id,diagnostic_id,"
+    "undo_revert_identity,created,updated,revalidation_required";
 
 
 bool list_with_filter(const std::string& filter_clause,
@@ -763,6 +1098,7 @@ bool list_with_filter(const std::string& filter_clause,
 
 bool initialize()
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     diag::log_tagged("session", "initialize enter");
     if (g_initialized.load(std::memory_order_acquire)) {
         diag::log_tagged("session", "initialize already_initialized");
@@ -779,14 +1115,24 @@ bool initialize()
 
     sqlite3* db = nullptr;
     const auto wide_path = db_path.wstring();
-    int needed = WideCharToMultiByte(CP_UTF8, 0, wide_path.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string utf8;
-    if (needed > 1) {
-        utf8.resize(static_cast<size_t>(needed - 1));
-        WideCharToMultiByte(CP_UTF8, 0, wide_path.c_str(), -1, utf8.data(), needed, nullptr, nullptr);
+    if (wide_path.empty() ||
+        wide_path.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        set_last_error("invalid_database_path");
+        return false;
     }
-    else {
-        utf8 = db_path.string();
+    const int wide_length = static_cast<int>(wide_path.size());
+    const int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        wide_path.data(), wide_length, nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) {
+        set_last_error("database_path_utf8_size_failed");
+        return false;
+    }
+    std::string utf8(static_cast<std::size_t>(needed), '\0');
+    const int converted = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        wide_path.data(), wide_length, utf8.data(), needed, nullptr, nullptr);
+    if (converted != needed) {
+        set_last_error("database_path_utf8_conversion_failed");
+        return false;
     }
     int rc = sqlite3_open_v2(
         utf8.c_str(),
@@ -819,6 +1165,7 @@ bool initialize()
 
 bool shutdown()
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     diag::log_tagged("session", "shutdown enter");
     std::lock_guard<std::mutex> lk(g_init_mutex);
     sqlite3* db = g_db.exchange(nullptr, std::memory_order_acq_rel);
@@ -843,6 +1190,7 @@ bool create(session_info_t& out_info,
             const std::string& binary_path,
             const std::string& parent_id)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     diag::log_tagged_fmt("session", "create enter project='%s' binary='%s' parent='%s'",
         project_id.c_str(), binary_path.c_str(), parent_id.c_str());
     sqlite3* db = db_handle();
@@ -894,6 +1242,7 @@ bool create(session_info_t& out_info,
 
 bool get(const std::string& session_id, session_info_t& out)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -927,6 +1276,7 @@ bool get(const std::string& session_id, session_info_t& out)
 
 bool update(const session_info_t& info)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -985,6 +1335,7 @@ bool update(const session_info_t& info)
 
 bool list(const std::string& binary_path_filter, std::vector<session_info_t>& out)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     if (binary_path_filter.empty()) return list_all(out);
     return list_with_filter("binary_path = ?", binary_path_filter, out);
 }
@@ -992,12 +1343,14 @@ bool list(const std::string& binary_path_filter, std::vector<session_info_t>& ou
 
 bool list_all(std::vector<session_info_t>& out)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     return list_with_filter(std::string(), std::string(), out);
 }
 
 
 bool list_children(const std::string& parent_id, std::vector<session_info_t>& out)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     return list_with_filter("parent_id = ?", parent_id, out);
 }
 
@@ -1006,6 +1359,7 @@ bool fork(const std::string& session_id,
           const std::string& fork_at_message_id,
           session_info_t& out_new)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     diag::log_tagged_fmt("session", "fork enter session='%s' fork_at='%s'",
         session_id.c_str(), fork_at_message_id.c_str());
     sqlite3* db = db_handle();
@@ -1204,6 +1558,7 @@ bool fork(const std::string& session_id,
 
 bool set_archived(const std::string& session_id, int64_t archived_unix)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -1240,6 +1595,7 @@ bool set_archived(const std::string& session_id, int64_t archived_unix)
 
 bool set_compacting(const std::string& session_id, int64_t compacting_unix)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -1285,6 +1641,7 @@ bool set_compacting(const std::string& session_id, int64_t compacting_unix)
 
 bool remove(const std::string& session_id)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     diag::log_tagged_fmt("session", "remove enter session='%s'", session_id.c_str());
     sqlite3* db = db_handle();
     if (!db) {
@@ -1381,6 +1738,7 @@ bool remove(const std::string& session_id)
 
 bool set_title(const std::string& session_id, const std::string& title)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     diag::log_tagged_fmt("session", "set_title session='%s' title='%s'",
         session_id.c_str(), title.c_str());
     sqlite3* db = db_handle();
@@ -1419,6 +1777,7 @@ bool set_title(const std::string& session_id, const std::string& title)
 
 bool append_message(const message_t& message)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     diag::log_tagged_fmt("session", "append_message enter msg_id='%s' session='%s' role=%s parts=%zu",
         message.id.c_str(), message.session_id.c_str(),
         role_to_string(message.role).c_str(), message.parts.size());
@@ -1492,6 +1851,7 @@ bool list_messages(const std::string& session_id,
                    std::vector<message_t>& out,
                    int limit)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -1566,6 +1926,7 @@ bool list_messages(const std::string& session_id,
 
 bool update_message(const message_t& message)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -1640,6 +2001,7 @@ bool update_message(const message_t& message)
 
 bool remove_message(const std::string& session_id, const std::string& message_id)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -1705,6 +2067,7 @@ bool remove_message(const std::string& session_id, const std::string& message_id
 
 double session_cost(const std::string& session_id)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     session_info_t info;
     if (!get(session_id, info)) return 0.0;
     return info.total_cost_usd;
@@ -1713,6 +2076,7 @@ double session_cost(const std::string& session_id)
 
 usage_tokens_t session_tokens(const std::string& session_id)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     usage_tokens_t agg;
     sqlite3* db = db_handle();
     if (!db) {
@@ -1752,6 +2116,7 @@ usage_tokens_t session_tokens(const std::string& session_id)
 
 bool get_session_todos(const std::string& session_id, std::string& out)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     out.clear();
     sqlite3* db = db_handle();
     if (!db) {
@@ -1791,6 +2156,7 @@ bool get_session_todos(const std::string& session_id, std::string& out)
 
 bool set_session_todos(const std::string& session_id, const std::string& todos_text)
 {
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
     sqlite3* db = db_handle();
     if (!db) {
         set_last_error("not_initialized");
@@ -1831,6 +2197,449 @@ bool set_session_todos(const std::string& session_id, const std::string& todos_t
         aida::events::publish(aida::events::event_session_updated, evt);
     }
 
+    return true;
+}
+
+
+bool upsert_proposal_audit(proposal_audit_record_t record)
+{
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
+    sqlite3* db = db_handle();
+    if (!db) {
+        set_last_error("not_initialized");
+        return false;
+    }
+    if (!proposal_audit_valid(record)) {
+        set_last_error("invalid_proposal_audit_record");
+        return false;
+    }
+    const std::int64_t current_time = now_unix_ms();
+    if (record.created_unix <= 0) record.created_unix = current_time;
+    record.updated_unix = current_time;
+    if (!exec_simple(db, "BEGIN IMMEDIATE")) return false;
+    auto rollback = [&] { static_cast<void>(exec_simple(db, "ROLLBACK")); };
+    if (!ensure_proposal_audit_session_locked(
+            db, record.session_id, current_time)) {
+        rollback();
+        return false;
+    }
+
+    const char* upsert_sql =
+        "INSERT INTO proposal_audits("
+        "audit_id,proposal_id,family,kind,session_id,source_index,source_timestamp,"
+        "source_fingerprint,target_id,target_view_id,target_generation,source_revision,"
+        "target_overlay_revision,before_hash,after_hash,result_hash,result_revision,"
+        "provenance,detail,lifecycle_state,outcome,task_id,diagnostic_id,"
+        "undo_revert_identity,created,updated,revalidation_required)"
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(audit_id) DO UPDATE SET "
+        "proposal_id=excluded.proposal_id,family=excluded.family,kind=excluded.kind,"
+        "session_id=excluded.session_id,source_index=excluded.source_index,"
+        "source_timestamp=excluded.source_timestamp,"
+        "source_fingerprint=excluded.source_fingerprint,target_id=excluded.target_id,"
+        "target_view_id=excluded.target_view_id,"
+        "target_generation=excluded.target_generation,source_revision=excluded.source_revision,"
+        "target_overlay_revision=excluded.target_overlay_revision,"
+        "before_hash=excluded.before_hash,after_hash=excluded.after_hash,"
+        "result_hash=excluded.result_hash,result_revision=excluded.result_revision,"
+        "provenance=excluded.provenance,detail=excluded.detail,"
+        "lifecycle_state=excluded.lifecycle_state,outcome=excluded.outcome,"
+        "task_id=excluded.task_id,diagnostic_id=excluded.diagnostic_id,"
+        "undo_revert_identity=excluded.undo_revert_identity,updated=excluded.updated,"
+        "revalidation_required=excluded.revalidation_required";
+    sqlite3_stmt* upsert = nullptr;
+    int rc = sqlite3_prepare_v2(db, upsert_sql, -1, &upsert, nullptr);
+    if (rc != SQLITE_OK) {
+        set_last_error_sqlite(db, "proposal_audit_upsert_prepare");
+        rollback();
+        return false;
+    }
+    bool ok =
+        bind_text(upsert, 1, record.audit_id) &&
+        bind_text(upsert, 2, record.proposal_id) &&
+        bind_text(upsert, 3, record.family) &&
+        bind_text(upsert, 4, record.kind) &&
+        bind_text(upsert, 5, record.session_id) &&
+        bind_text(upsert, 6, std::to_string(record.source_index)) &&
+        bind_int64(upsert, 7, record.source_timestamp) &&
+        bind_text(upsert, 8, std::to_string(record.source_fingerprint)) &&
+        bind_text(upsert, 9, record.target_id) &&
+        bind_text(upsert, 10, record.target_view_id) &&
+        bind_text(upsert, 11, std::to_string(record.target_generation)) &&
+        bind_text(upsert, 12, std::to_string(record.source_revision)) &&
+        bind_text(upsert, 13, std::to_string(record.target_overlay_revision)) &&
+        bind_text(upsert, 14, record.before_hash) &&
+        bind_text(upsert, 15, record.after_hash) &&
+        bind_text(upsert, 16, record.result_hash) &&
+        bind_text(upsert, 17, std::to_string(record.result_revision)) &&
+        bind_text(upsert, 18, record.provenance) &&
+        bind_text(upsert, 19, record.detail) &&
+        bind_text(upsert, 20, record.lifecycle_state) &&
+        bind_text(upsert, 21, record.outcome) &&
+        bind_text(upsert, 22, record.task_id) &&
+        bind_text(upsert, 23, record.diagnostic_id) &&
+        bind_text(upsert, 24, record.undo_revert_identity) &&
+        bind_int64(upsert, 25, record.created_unix) &&
+        bind_int64(upsert, 26, record.updated_unix) &&
+        bind_int(upsert, 27, record.revalidation_required ? 1 : 0);
+    if (ok) rc = sqlite3_step(upsert);
+    sqlite3_finalize(upsert);
+    if (!ok || rc != SQLITE_DONE) {
+        set_last_error_sqlite(db, "proposal_audit_upsert_step");
+        rollback();
+        return false;
+    }
+
+    sqlite3_stmt* delete_hunks = nullptr;
+    rc = sqlite3_prepare_v2(db,
+        "DELETE FROM proposal_audit_hunks WHERE audit_id=?", -1,
+        &delete_hunks, nullptr);
+    if (rc != SQLITE_OK || !bind_text(delete_hunks, 1, record.audit_id) ||
+        sqlite3_step(delete_hunks) != SQLITE_DONE) {
+        if (delete_hunks) sqlite3_finalize(delete_hunks);
+        set_last_error_sqlite(db, "proposal_audit_hunks_delete");
+        rollback();
+        return false;
+    }
+    sqlite3_finalize(delete_hunks);
+
+    if (!record.hunks.empty()) {
+        const char* hunk_sql =
+            "INSERT INTO proposal_audit_hunks(audit_id,hunk_index,old_start,old_count,"
+            "new_start,new_count,decision,before_hash,after_hash) VALUES(?,?,?,?,?,?,?,?,?)";
+        sqlite3_stmt* hunk_stmt = nullptr;
+        rc = sqlite3_prepare_v2(db, hunk_sql, -1, &hunk_stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            set_last_error_sqlite(db, "proposal_audit_hunks_prepare");
+            rollback();
+            return false;
+        }
+        for (const auto& hunk : record.hunks) {
+            sqlite3_reset(hunk_stmt);
+            sqlite3_clear_bindings(hunk_stmt);
+            ok = bind_text(hunk_stmt, 1, record.audit_id) &&
+                bind_int64(hunk_stmt, 2, hunk.index) &&
+                bind_int64(hunk_stmt, 3, hunk.old_start) &&
+                bind_int64(hunk_stmt, 4, hunk.old_count) &&
+                bind_int64(hunk_stmt, 5, hunk.new_start) &&
+                bind_int64(hunk_stmt, 6, hunk.new_count) &&
+                bind_text(hunk_stmt, 7, hunk.decision) &&
+                bind_text(hunk_stmt, 8, hunk.before_hash) &&
+                bind_text(hunk_stmt, 9, hunk.after_hash);
+            if (!ok || sqlite3_step(hunk_stmt) != SQLITE_DONE) {
+                sqlite3_finalize(hunk_stmt);
+                set_last_error_sqlite(db, "proposal_audit_hunks_step");
+                rollback();
+                return false;
+            }
+        }
+        sqlite3_finalize(hunk_stmt);
+    }
+
+    const char* event_sql =
+        "INSERT INTO proposal_audit_events(audit_id,outcome,lifecycle_state,detail,"
+        "event_time,task_id,diagnostic_id,result_revision,result_hash,"
+        "undo_revert_identity) VALUES(?,?,?,?,?,?,?,?,?,?)";
+    sqlite3_stmt* event_stmt = nullptr;
+    rc = sqlite3_prepare_v2(db, event_sql, -1, &event_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        set_last_error_sqlite(db, "proposal_audit_event_prepare");
+        rollback();
+        return false;
+    }
+    ok = bind_text(event_stmt, 1, record.audit_id) &&
+        bind_text(event_stmt, 2, record.outcome) &&
+        bind_text(event_stmt, 3, record.lifecycle_state) &&
+        bind_text(event_stmt, 4, record.detail) &&
+        bind_int64(event_stmt, 5, record.updated_unix) &&
+        bind_text(event_stmt, 6, record.task_id) &&
+        bind_text(event_stmt, 7, record.diagnostic_id) &&
+        bind_text(event_stmt, 8, std::to_string(record.result_revision)) &&
+        bind_text(event_stmt, 9, record.result_hash) &&
+        bind_text(event_stmt, 10, record.undo_revert_identity);
+    if (ok) rc = sqlite3_step(event_stmt);
+    sqlite3_finalize(event_stmt);
+    if (!ok || rc != SQLITE_DONE) {
+        set_last_error_sqlite(db, "proposal_audit_event_step");
+        rollback();
+        return false;
+    }
+
+    sqlite3_stmt* prune_events = nullptr;
+    rc = sqlite3_prepare_v2(db,
+        "DELETE FROM proposal_audit_events WHERE audit_id=? AND id NOT IN "
+        "(SELECT id FROM proposal_audit_events WHERE audit_id=? ORDER BY id DESC LIMIT 64)",
+        -1, &prune_events, nullptr);
+    if (rc != SQLITE_OK || !bind_text(prune_events, 1, record.audit_id) ||
+        !bind_text(prune_events, 2, record.audit_id) ||
+        sqlite3_step(prune_events) != SQLITE_DONE) {
+        if (prune_events) sqlite3_finalize(prune_events);
+        set_last_error_sqlite(db, "proposal_audit_events_prune");
+        rollback();
+        return false;
+    }
+    sqlite3_finalize(prune_events);
+
+    sqlite3_stmt* prune_session = nullptr;
+    rc = sqlite3_prepare_v2(db,
+        "DELETE FROM proposal_audits WHERE session_id=? AND audit_id NOT IN "
+        "(SELECT audit_id FROM proposal_audits WHERE session_id=? "
+        "ORDER BY updated DESC LIMIT 512)", -1, &prune_session, nullptr);
+    if (rc != SQLITE_OK || !bind_text(prune_session, 1, record.session_id) ||
+        !bind_text(prune_session, 2, record.session_id) ||
+        sqlite3_step(prune_session) != SQLITE_DONE) {
+        if (prune_session) sqlite3_finalize(prune_session);
+        set_last_error_sqlite(db, "proposal_audit_session_prune");
+        rollback();
+        return false;
+    }
+    sqlite3_finalize(prune_session);
+    if (!exec_simple(db,
+        "DELETE FROM proposal_audits WHERE audit_id NOT IN "
+        "(SELECT audit_id FROM proposal_audits ORDER BY updated DESC LIMIT 4096)")) {
+        rollback();
+        return false;
+    }
+    if (!exec_simple(db,
+        "DELETE FROM proposal_audit_sessions WHERE session_id NOT IN "
+        "(SELECT DISTINCT session_id FROM proposal_audits)")) {
+        rollback();
+        return false;
+    }
+    if (!exec_simple(db, "COMMIT")) {
+        rollback();
+        return false;
+    }
+    return true;
+}
+
+
+bool restore_proposal_audits(const std::string& session_id,
+                             std::vector<proposal_audit_record_t>& out,
+                             std::size_t limit)
+{
+    std::lock_guard<std::recursive_mutex> store_lock(g_store_mutex);
+    out.clear();
+    sqlite3* db = db_handle();
+    if (!db) {
+        set_last_error("not_initialized");
+        return false;
+    }
+    if (session_id.empty() || session_id.size() > 128) {
+        set_last_error("invalid_session_id");
+        return false;
+    }
+    limit = (std::max)(std::size_t{1}, (std::min)(limit, std::size_t{64}));
+    if (!exec_simple(db, "BEGIN IMMEDIATE")) return false;
+    auto rollback = [&] {
+        static_cast<void>(exec_simple(db, "ROLLBACK"));
+        out.clear();
+    };
+    const std::string sql = std::string("SELECT ") + kSelectProposalAuditFields +
+        " FROM proposal_audits WHERE session_id=? AND (revalidation_required=1 OR "
+        "lifecycle_state IN ('validating','pending_review','reviewed','applying')) "
+        "ORDER BY updated DESC LIMIT ?";
+    sqlite3_stmt* select = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &select, nullptr);
+    if (rc != SQLITE_OK || !bind_text(select, 1, session_id) ||
+        !bind_int64(select, 2, static_cast<std::int64_t>(limit))) {
+        if (select) sqlite3_finalize(select);
+        set_last_error_sqlite(db, "proposal_audit_restore_prepare");
+        rollback();
+        return false;
+    }
+    while ((rc = sqlite3_step(select)) == SQLITE_ROW) {
+        static constexpr int uint64_text_columns[] = {5, 7, 10, 11, 12, 16};
+        if (std::any_of(std::begin(uint64_text_columns),
+                std::end(uint64_text_columns),
+                [&](int column) { return !uint64_text_column_valid(select, column); }) ||
+            sqlite3_column_type(select, 6) != SQLITE_INTEGER ||
+            sqlite3_column_type(select, 24) != SQLITE_INTEGER ||
+            sqlite3_column_type(select, 25) != SQLITE_INTEGER ||
+            sqlite3_column_type(select, 26) != SQLITE_INTEGER) {
+            sqlite3_finalize(select);
+            set_last_error("invalid_persisted_proposal_audit_type");
+            rollback();
+            return false;
+        }
+        proposal_audit_record_t record;
+        hydrate_proposal_audit(select, record);
+        if (!proposal_audit_valid(record)) {
+            sqlite3_finalize(select);
+            set_last_error("invalid_persisted_proposal_audit");
+            rollback();
+            return false;
+        }
+        out.push_back(std::move(record));
+    }
+    sqlite3_finalize(select);
+    if (rc != SQLITE_DONE) {
+        set_last_error_sqlite(db, "proposal_audit_restore_select");
+        rollback();
+        return false;
+    }
+    if (!out.empty() &&
+        !proposal_audit_session_exists_locked(db, session_id)) {
+        set_last_error("proposal_audit_parent_identity_missing");
+        rollback();
+        return false;
+    }
+
+    sqlite3_stmt* hunk_select = nullptr;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT hunk_index,old_start,old_count,new_start,new_count,decision,"
+        "before_hash,after_hash FROM proposal_audit_hunks WHERE audit_id=? "
+        "ORDER BY hunk_index", -1, &hunk_select, nullptr);
+    if (rc != SQLITE_OK) {
+        set_last_error_sqlite(db, "proposal_audit_restore_hunks_prepare");
+        rollback();
+        return false;
+    }
+    for (auto& record : out) {
+        sqlite3_reset(hunk_select);
+        sqlite3_clear_bindings(hunk_select);
+        if (!bind_text(hunk_select, 1, record.audit_id)) {
+            sqlite3_finalize(hunk_select);
+            set_last_error("proposal_audit_restore_hunks_bind");
+            rollback();
+            return false;
+        }
+        while ((rc = sqlite3_step(hunk_select)) == SQLITE_ROW) {
+            if (record.hunks.size() >= 512U) {
+                sqlite3_finalize(hunk_select);
+                set_last_error("persisted_proposal_hunk_limit_exceeded");
+                rollback();
+                return false;
+            }
+            if (sqlite3_column_type(hunk_select, 0) != SQLITE_INTEGER ||
+                sqlite3_column_type(hunk_select, 1) != SQLITE_INTEGER ||
+                sqlite3_column_type(hunk_select, 2) != SQLITE_INTEGER ||
+                sqlite3_column_type(hunk_select, 3) != SQLITE_INTEGER ||
+                sqlite3_column_type(hunk_select, 4) != SQLITE_INTEGER) {
+                sqlite3_finalize(hunk_select);
+                set_last_error("invalid_persisted_proposal_hunk_type");
+                rollback();
+                return false;
+            }
+            const std::int64_t raw_index = column_int64_or_zero(hunk_select, 0);
+            const std::int64_t raw_old_start = column_int64_or_zero(hunk_select, 1);
+            const std::int64_t raw_old_count = column_int64_or_zero(hunk_select, 2);
+            const std::int64_t raw_new_start = column_int64_or_zero(hunk_select, 3);
+            const std::int64_t raw_new_count = column_int64_or_zero(hunk_select, 4);
+            constexpr std::int64_t maximum_hunk_coordinate = 16 * 1024 * 1024;
+            if (raw_index < 0 ||
+                raw_index > (std::numeric_limits<std::uint32_t>::max)() ||
+                raw_old_start < 0 || raw_old_start > maximum_hunk_coordinate ||
+                raw_old_count < 0 || raw_old_count > maximum_hunk_coordinate ||
+                raw_new_start < 0 || raw_new_start > maximum_hunk_coordinate ||
+                raw_new_count < 0 || raw_new_count > maximum_hunk_coordinate ||
+                raw_old_start + raw_old_count > maximum_hunk_coordinate ||
+                raw_new_start + raw_new_count > maximum_hunk_coordinate) {
+                sqlite3_finalize(hunk_select);
+                set_last_error("invalid_persisted_proposal_hunk_range");
+                rollback();
+                return false;
+            }
+            proposal_audit_hunk_t hunk;
+            hunk.index = static_cast<std::uint32_t>(raw_index);
+            hunk.old_start = static_cast<std::int32_t>(raw_old_start);
+            hunk.old_count = static_cast<std::int32_t>(raw_old_count);
+            hunk.new_start = static_cast<std::int32_t>(raw_new_start);
+            hunk.new_count = static_cast<std::int32_t>(raw_new_count);
+            hunk.decision = column_text_or_empty(hunk_select, 5);
+            hunk.before_hash = column_text_or_empty(hunk_select, 6);
+            hunk.after_hash = column_text_or_empty(hunk_select, 7);
+            record.hunks.push_back(std::move(hunk));
+        }
+        if (rc != SQLITE_DONE) {
+            sqlite3_finalize(hunk_select);
+            set_last_error_sqlite(db, "proposal_audit_restore_hunks_select");
+            rollback();
+            return false;
+        }
+        if (!proposal_audit_valid(record)) {
+            sqlite3_finalize(hunk_select);
+            set_last_error("invalid_persisted_proposal_hunks");
+            rollback();
+            return false;
+        }
+    }
+    sqlite3_finalize(hunk_select);
+
+    sqlite3_stmt* mark_stale = nullptr;
+    rc = sqlite3_prepare_v2(db,
+        "UPDATE proposal_audits SET lifecycle_state='stale',outcome='stale',"
+        "detail=?,updated=?,revalidation_required=1 WHERE audit_id=? AND "
+        "lifecycle_state<>'stale'", -1, &mark_stale, nullptr);
+    if (rc != SQLITE_OK) {
+        set_last_error_sqlite(db, "proposal_audit_restore_update_prepare");
+        rollback();
+        return false;
+    }
+    const std::int64_t restored_time = now_unix_ms();
+    for (auto& record : out) {
+        if (record.lifecycle_state == "stale") continue;
+        record.lifecycle_state = "stale";
+        record.outcome = "stale";
+        record.detail = "Restored proposal review requires explicit target revalidation; no proposal was automatically applied.";
+        record.updated_unix = restored_time;
+        record.revalidation_required = true;
+        sqlite3_reset(mark_stale);
+        sqlite3_clear_bindings(mark_stale);
+        if (!bind_text(mark_stale, 1, record.detail) ||
+            !bind_int64(mark_stale, 2, record.updated_unix) ||
+            !bind_text(mark_stale, 3, record.audit_id) ||
+            sqlite3_step(mark_stale) != SQLITE_DONE) {
+            sqlite3_finalize(mark_stale);
+            set_last_error_sqlite(db, "proposal_audit_restore_update");
+            rollback();
+            return false;
+        }
+        sqlite3_stmt* event = nullptr;
+        rc = sqlite3_prepare_v2(db,
+            "INSERT INTO proposal_audit_events(audit_id,outcome,lifecycle_state,detail,"
+            "event_time,task_id,diagnostic_id,result_revision,result_hash,"
+            "undo_revert_identity) VALUES(?,'stale','stale',?,?,?,?,?,?,?)",
+            -1, &event, nullptr);
+        const bool event_ok = rc == SQLITE_OK &&
+            bind_text(event, 1, record.audit_id) &&
+            bind_text(event, 2, record.detail) &&
+            bind_int64(event, 3, record.updated_unix) &&
+            bind_text(event, 4, record.task_id) &&
+            bind_text(event, 5, record.diagnostic_id) &&
+            bind_text(event, 6, std::to_string(record.result_revision)) &&
+            bind_text(event, 7, record.result_hash) &&
+            bind_text(event, 8, record.undo_revert_identity) &&
+            sqlite3_step(event) == SQLITE_DONE;
+        if (event) sqlite3_finalize(event);
+        if (!event_ok) {
+            set_last_error_sqlite(db, "proposal_audit_restore_event");
+            sqlite3_finalize(mark_stale);
+            rollback();
+            return false;
+        }
+        sqlite3_stmt* prune = nullptr;
+        rc = sqlite3_prepare_v2(db,
+            "DELETE FROM proposal_audit_events WHERE audit_id=? AND id NOT IN "
+            "(SELECT id FROM proposal_audit_events WHERE audit_id=? "
+            "ORDER BY id DESC LIMIT 64)", -1, &prune, nullptr);
+        const bool prune_ok = rc == SQLITE_OK &&
+            bind_text(prune, 1, record.audit_id) &&
+            bind_text(prune, 2, record.audit_id) &&
+            sqlite3_step(prune) == SQLITE_DONE;
+        if (prune) sqlite3_finalize(prune);
+        if (!prune_ok) {
+            set_last_error_sqlite(db, "proposal_audit_restore_event_prune");
+            sqlite3_finalize(mark_stale);
+            rollback();
+            return false;
+        }
+    }
+    sqlite3_finalize(mark_stale);
+    if (!exec_simple(db, "COMMIT")) {
+        rollback();
+        return false;
+    }
     return true;
 }
 

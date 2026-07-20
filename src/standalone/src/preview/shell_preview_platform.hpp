@@ -12,20 +12,59 @@
 #include <string_view>
 #include <vector>
 
+#if !defined(_MINWINDEF_)
 using BOOL = int;
+#if defined(_WIN32)
+using DWORD = unsigned long;
+#else
 using DWORD = std::uint32_t;
+#endif
+#endif
+
+#if !defined(_WINNT_)
 using ULONGLONG = unsigned long long;
 using LONGLONG = long long;
+#endif
+
+#if !defined(_WINDEF_)
+#if defined(_WIN32) && defined(STRICT)
+struct HWND__;
+using HWND = HWND__*;
+#else
 using HWND = void*;
+#endif
+#endif
+
+#if !defined(_BASETSD_H_)
 using UINT_PTR = std::uintptr_t;
+#endif
 
+#if !defined(TRUE)
 inline constexpr BOOL TRUE = 1;
-inline constexpr BOOL FALSE = 0;
-inline constexpr DWORD ERROR_SUCCESS = 0;
-inline constexpr std::size_t MAX_PATH = 260;
-inline constexpr std::size_t _TRUNCATE = static_cast<std::size_t>(-1);
-inline constexpr std::uint16_t IMAGE_FILE_MACHINE_AMD64 = 0x8664;
+#endif
 
+#if !defined(FALSE)
+inline constexpr BOOL FALSE = 0;
+#endif
+
+#if !defined(ERROR_SUCCESS)
+inline constexpr DWORD ERROR_SUCCESS = 0;
+#endif
+
+#if !defined(MAX_PATH)
+inline constexpr std::size_t MAX_PATH = 260;
+#endif
+
+#if !defined(IMAGE_FILE_MACHINE_AMD64)
+inline constexpr std::uint16_t IMAGE_FILE_MACHINE_AMD64 = 0x8664;
+#endif
+
+#if defined(_WIN32)
+#if !defined(_ERRHANDLING_H_)
+extern "C" __declspec(dllimport) DWORD __stdcall GetLastError();
+extern "C" __declspec(dllimport) void __stdcall SetLastError(DWORD value);
+#endif
+#else
 inline DWORD& preview_last_error_storage()
 {
 	static DWORD value = ERROR_SUCCESS;
@@ -41,6 +80,12 @@ inline void SetLastError(DWORD value)
 {
 	preview_last_error_storage() = value;
 }
+#endif
+
+#if !defined(_MSC_VER)
+#if !defined(_TRUNCATE)
+inline constexpr std::size_t _TRUNCATE = static_cast<std::size_t>(-1);
+#endif
 
 inline int _snprintf_s(char* buffer, std::size_t size, std::size_t, const char* format, ...)
 {
@@ -82,6 +127,7 @@ inline int strncpy_s(char (&destination)[N], const char* source, std::size_t cou
 {
 	return strncpy_s(destination, N, source, count);
 }
+#endif
 
 namespace diag
 {

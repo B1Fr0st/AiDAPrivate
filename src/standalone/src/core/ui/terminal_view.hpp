@@ -2,8 +2,12 @@
 
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include "../infra/win_thread.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -491,6 +495,26 @@ inline void writer_thread_func(TerminalSession* s)
 #endif
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline void close_native_handle(HANDLE& handle) noexcept
+{
+    if (handle == INVALID_HANDLE_VALUE || handle == nullptr)
+        return;
+    const HANDLE owned = handle;
+    handle = INVALID_HANDLE_VALUE;
+    CloseHandle(owned);
+}
+
+inline void close_native_pseudoconsole(HPCON& pseudoconsole) noexcept
+{
+    if (pseudoconsole == INVALID_HANDLE_VALUE || pseudoconsole == nullptr)
+        return;
+    const HPCON owned = pseudoconsole;
+    pseudoconsole = INVALID_HANDLE_VALUE;
+    ClosePseudoConsole(owned);
+}
+#endif
+
 
 inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
                            const wchar_t* cwd = nullptr)
@@ -543,9 +567,10 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
         return false;
     }
     if (!CreatePipe(&hPipeOutRead, &hPipeOutWrite, nullptr, 0)) {
-        CloseHandle(hPipeInRead);
-        CloseHandle(hPipeInWrite);
-        s.start_error = "CreatePipe for terminal output failed (" + std::to_string(GetLastError()) + ")";
+        const DWORD error = GetLastError();
+        close_native_handle(hPipeInRead);
+        close_native_handle(hPipeInWrite);
+        s.start_error = "CreatePipe for terminal output failed (" + std::to_string(error) + ")";
         return false;
     }
 
@@ -556,17 +581,17 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
 
     HRESULT hr = CreatePseudoConsole(size, hPipeInRead, hPipeOutWrite, 0, &s.hPC);
     if (FAILED(hr)) {
-        CloseHandle(hPipeInRead);
-        CloseHandle(hPipeInWrite);
-        CloseHandle(hPipeOutRead);
-        CloseHandle(hPipeOutWrite);
+        close_native_handle(hPipeInRead);
+        close_native_handle(hPipeInWrite);
+        close_native_handle(hPipeOutRead);
+        close_native_handle(hPipeOutWrite);
         s.start_error = "CreatePseudoConsole failed (" + std::to_string(static_cast<unsigned long>(hr)) + ")";
         return false;
     }
 
 
-    CloseHandle(hPipeInRead);
-    CloseHandle(hPipeOutWrite);
+    close_native_handle(hPipeInRead);
+    close_native_handle(hPipeOutWrite);
 
     s.hPipeIn  = hPipeOutRead;
     s.hPipeOut = hPipeInWrite;
@@ -577,21 +602,21 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
     std::vector<BYTE> attr_buf(attr_size);
     auto attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
     if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
-        ClosePseudoConsole(s.hPC);
-        s.hPC = INVALID_HANDLE_VALUE;
-        CloseHandle(s.hPipeIn);
-        CloseHandle(s.hPipeOut);
-        s.start_error = "InitializeProcThreadAttributeList failed (" + std::to_string(GetLastError()) + ")";
+        const DWORD error = GetLastError();
+        close_native_pseudoconsole(s.hPC);
+        close_native_handle(s.hPipeIn);
+        close_native_handle(s.hPipeOut);
+        s.start_error = "InitializeProcThreadAttributeList failed (" + std::to_string(error) + ")";
         return false;
     }
     if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                                    s.hPC, sizeof(HPCON), nullptr, nullptr)) {
+        const DWORD error = GetLastError();
         DeleteProcThreadAttributeList(attr_list);
-        ClosePseudoConsole(s.hPC);
-        s.hPC = INVALID_HANDLE_VALUE;
-        CloseHandle(s.hPipeIn);
-        CloseHandle(s.hPipeOut);
-        s.start_error = "UpdateProcThreadAttribute failed (" + std::to_string(GetLastError()) + ")";
+        close_native_pseudoconsole(s.hPC);
+        close_native_handle(s.hPipeIn);
+        close_native_handle(s.hPipeOut);
+        s.start_error = "UpdateProcThreadAttribute failed (" + std::to_string(error) + ")";
         return false;
     }
 
@@ -604,13 +629,13 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
 
     s.hJob = CreateJobObjectW(nullptr, nullptr);
     if (s.hJob == INVALID_HANDLE_VALUE || s.hJob == nullptr) {
+        const DWORD error = GetLastError();
         s.hJob = INVALID_HANDLE_VALUE;
         DeleteProcThreadAttributeList(attr_list);
-        ClosePseudoConsole(s.hPC);
-        s.hPC = INVALID_HANDLE_VALUE;
-        CloseHandle(s.hPipeIn);
-        CloseHandle(s.hPipeOut);
-        s.start_error = "CreateJobObject failed (" + std::to_string(GetLastError()) + ")";
+        close_native_pseudoconsole(s.hPC);
+        close_native_handle(s.hPipeIn);
+        close_native_handle(s.hPipeOut);
+        s.start_error = "CreateJobObject failed (" + std::to_string(error) + ")";
         return false;
     }
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
@@ -618,13 +643,11 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
     if (!SetInformationJobObject(s.hJob, JobObjectExtendedLimitInformation,
             &limits, sizeof(limits))) {
         const DWORD error = GetLastError();
-        CloseHandle(s.hJob);
-        s.hJob = INVALID_HANDLE_VALUE;
+        close_native_handle(s.hJob);
         DeleteProcThreadAttributeList(attr_list);
-        ClosePseudoConsole(s.hPC);
-        s.hPC = INVALID_HANDLE_VALUE;
-        CloseHandle(s.hPipeIn);
-        CloseHandle(s.hPipeOut);
+        close_native_pseudoconsole(s.hPC);
+        close_native_handle(s.hPipeIn);
+        close_native_handle(s.hPipeOut);
         s.start_error = "SetInformationJobObject failed (" + std::to_string(error) + ")";
         return false;
     }
@@ -638,12 +661,10 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
 
     if (!created) {
         const DWORD error = GetLastError();
-        ClosePseudoConsole(s.hPC);
-        s.hPC = INVALID_HANDLE_VALUE;
-        CloseHandle(s.hPipeIn);
-        CloseHandle(s.hPipeOut);
-        CloseHandle(s.hJob);
-        s.hJob = INVALID_HANDLE_VALUE;
+        close_native_pseudoconsole(s.hPC);
+        close_native_handle(s.hPipeIn);
+        close_native_handle(s.hPipeOut);
+        close_native_handle(s.hJob);
         s.start_error = "CreateProcessW failed (" + std::to_string(error) + ")";
         return false;
     }
@@ -651,28 +672,24 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
     if (!AssignProcessToJobObject(s.hJob, pi.hProcess)) {
         const DWORD error = GetLastError();
         TerminateProcess(pi.hProcess, error);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        ClosePseudoConsole(s.hPC);
-        s.hPC = INVALID_HANDLE_VALUE;
-        CloseHandle(s.hPipeIn);
-        CloseHandle(s.hPipeOut);
-        CloseHandle(s.hJob);
-        s.hJob = INVALID_HANDLE_VALUE;
+        close_native_handle(pi.hThread);
+        close_native_handle(pi.hProcess);
+        close_native_pseudoconsole(s.hPC);
+        close_native_handle(s.hPipeIn);
+        close_native_handle(s.hPipeOut);
+        close_native_handle(s.hJob);
         s.start_error = "AssignProcessToJobObject failed (" + std::to_string(error) + ")";
         return false;
     }
     if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
         const DWORD error = GetLastError();
         TerminateJobObject(s.hJob, error);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        ClosePseudoConsole(s.hPC);
-        s.hPC = INVALID_HANDLE_VALUE;
-        CloseHandle(s.hPipeIn);
-        CloseHandle(s.hPipeOut);
-        CloseHandle(s.hJob);
-        s.hJob = INVALID_HANDLE_VALUE;
+        close_native_handle(pi.hThread);
+        close_native_handle(pi.hProcess);
+        close_native_pseudoconsole(s.hPC);
+        close_native_handle(s.hPipeIn);
+        close_native_handle(s.hPipeOut);
+        close_native_handle(s.hJob);
         s.start_error = "ResumeThread failed (" + std::to_string(error) + ")";
         return false;
     }
@@ -694,31 +711,15 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
         s.stop_reader.store(true, std::memory_order_release);
         s.reader_done.store(true, std::memory_order_release);
         s.alive.store(false, std::memory_order_release);
-        if (s.hPC != INVALID_HANDLE_VALUE) {
-            ClosePseudoConsole(s.hPC);
-            s.hPC = INVALID_HANDLE_VALUE;
-        }
-        if (s.hPipeIn != INVALID_HANDLE_VALUE) {
-            CloseHandle(s.hPipeIn);
-            s.hPipeIn = INVALID_HANDLE_VALUE;
-        }
-        if (s.hPipeOut != INVALID_HANDLE_VALUE) {
-            CloseHandle(s.hPipeOut);
-            s.hPipeOut = INVALID_HANDLE_VALUE;
-        }
+        close_native_pseudoconsole(s.hPC);
+        close_native_handle(s.hPipeIn);
+        close_native_handle(s.hPipeOut);
         if (s.hProcess != INVALID_HANDLE_VALUE) {
             TerminateProcess(s.hProcess, 1);
-            CloseHandle(s.hProcess);
-            s.hProcess = INVALID_HANDLE_VALUE;
         }
-        if (s.hThread != INVALID_HANDLE_VALUE) {
-            CloseHandle(s.hThread);
-            s.hThread = INVALID_HANDLE_VALUE;
-        }
-        if (s.hJob != INVALID_HANDLE_VALUE) {
-            CloseHandle(s.hJob);
-            s.hJob = INVALID_HANDLE_VALUE;
-        }
+        close_native_handle(s.hProcess);
+        close_native_handle(s.hThread);
+        close_native_handle(s.hJob);
         return false;
     }
 
@@ -900,14 +901,8 @@ inline void resize_pty(TerminalSession& s, int cols, int rows)
 inline void release_session_process_handles(TerminalSession& s)
 {
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    if (s.hProcess != INVALID_HANDLE_VALUE) {
-        CloseHandle(s.hProcess);
-        s.hProcess = INVALID_HANDLE_VALUE;
-    }
-    if (s.hThread != INVALID_HANDLE_VALUE) {
-        CloseHandle(s.hThread);
-        s.hThread = INVALID_HANDLE_VALUE;
-    }
+    close_native_handle(s.hProcess);
+    close_native_handle(s.hThread);
 #else
     (void)s;
 #endif
@@ -958,7 +953,7 @@ inline bool destroy_session(TerminalSession& s)
             HANDLE hThread = OpenThread(THREAD_TERMINATE, FALSE, static_cast<DWORD>(reader_tid));
             if (hThread) {
                 CancelSynchronousIo(hThread);
-                CloseHandle(hThread);
+                close_native_handle(hThread);
             }
         }
     }
@@ -968,28 +963,18 @@ inline bool destroy_session(TerminalSession& s)
             HANDLE hThread = OpenThread(THREAD_TERMINATE, FALSE, static_cast<DWORD>(writer_tid));
             if (hThread) {
                 CancelSynchronousIo(hThread);
-                CloseHandle(hThread);
+                close_native_handle(hThread);
             }
         }
     }
     s.input_cv.notify_all();
 
-    if (s.hPipeOut != INVALID_HANDLE_VALUE) {
-        CloseHandle(s.hPipeOut);
-        s.hPipeOut = INVALID_HANDLE_VALUE;
-    }
-    if (s.hPipeIn != INVALID_HANDLE_VALUE) {
-        CloseHandle(s.hPipeIn);
-        s.hPipeIn = INVALID_HANDLE_VALUE;
-    }
-    if (s.hPC != INVALID_HANDLE_VALUE) {
-        ClosePseudoConsole(s.hPC);
-        s.hPC = INVALID_HANDLE_VALUE;
-    }
+    close_native_handle(s.hPipeOut);
+    close_native_handle(s.hPipeIn);
+    close_native_pseudoconsole(s.hPC);
     if (s.hJob != INVALID_HANDLE_VALUE) {
         TerminateJobObject(s.hJob, 0);
-        CloseHandle(s.hJob);
-        s.hJob = INVALID_HANDLE_VALUE;
+        close_native_handle(s.hJob);
     } else if (s.hProcess != INVALID_HANDLE_VALUE) {
         TerminateProcess(s.hProcess, 0);
     }
@@ -1364,9 +1349,15 @@ struct TerminalManager
 
     bool restart_terminal(int idx)
     {
-        if (idx < 0 || idx >= static_cast<int>(sessions.size()))
+        if (idx < 0 || idx >= static_cast<int>(sessions.size())) {
+            last_error = "The terminal session selected for restart no longer exists";
             return false;
+        }
         auto* prior = sessions[static_cast<std::size_t>(idx)];
+        if (!prior) {
+            last_error = "The terminal session selected for restart is unavailable";
+            return false;
+        }
         auto* replacement = new TerminalSession();
         replacement->id = prior->id;
         replacement->title = prior->title;
@@ -1374,15 +1365,15 @@ struct TerminalManager
         replacement->profile_label = prior->profile_label;
         const std::wstring command = prior->command;
         const std::wstring cwd = prior->cwd;
-        retire_or_delete(prior);
-        sessions[static_cast<std::size_t>(idx)] = replacement;
         if (!create_session(*replacement, command.c_str(), cwd.empty() ? nullptr : cwd.c_str())) {
             last_error = replacement->start_error.empty()
                 ? "The terminal session could not be restarted" : replacement->start_error;
+            delete replacement;
             return false;
         }
+        sessions[static_cast<std::size_t>(idx)] = replacement;
+        retire_or_delete(prior);
         last_error.clear();
-        active_tab = idx;
         return true;
     }
 

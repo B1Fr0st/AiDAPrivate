@@ -66,8 +66,13 @@ struct document_metadata_snapshot_t {
     bool dirty = false;
     int caret_line = 0;
     int caret_column = 0;
+    int selection_anchor_line = 0;
+    int selection_anchor_column = 0;
+    bool selection_active = false;
     float scroll_x = 0.f;
     float scroll_y = 0.f;
+    std::vector<int> folded_lines;
+    std::string language_override;
     bool proposal_pending = false;
     bool read_only = false;
 };
@@ -84,6 +89,15 @@ struct document_pane_render_context_t {
     std::string_view filename;
     std::string_view filepath;
     bool dirty = false;
+    int caret_line = 0;
+    int caret_column = 0;
+    int selection_anchor_line = 0;
+    int selection_anchor_column = 0;
+    bool selection_active = false;
+    float scroll_x = 0.f;
+    float scroll_y = 0.f;
+    const std::vector<int>* folded_lines = nullptr;
+    std::string_view language_override;
     bool read_only = false;
     std::string_view read_only_reason;
     float alpha = 1.f;
@@ -169,6 +183,7 @@ enum class diff_hunk_state_t : int {
 
 
 struct diff_hunk_t {
+    std::uint64_t     stable_id   = 0;
     int               old_start   = 0;
     int               old_count   = 0;
     int               new_start   = 0;
@@ -185,6 +200,7 @@ struct pending_diff_t {
     std::uint64_t            document_id = 0;
     std::uint64_t            base_revision = 0;
     std::uint64_t            base_content_hash = 0;
+    std::uint64_t            proposal_id = 0;
     std::string              origin;
     std::vector<std::string> old_lines;
     std::vector<std::string> new_lines;
@@ -199,6 +215,18 @@ struct pending_diff_t {
     }
 };
 
+struct review_hunk_identity_t {
+    std::uint64_t document_id = 0;
+    std::uint64_t proposal_id = 0;
+    std::uint64_t base_revision = 0;
+    std::uint64_t stable_hunk_id = 0;
+
+    bool valid() const noexcept {
+        return document_id != 0 && proposal_id != 0 &&
+            base_revision != 0 && stable_hunk_id != 0;
+    }
+};
+
 
 void init();
 
@@ -207,7 +235,11 @@ bool load_document(std::uint64_t document_id, std::uint64_t revision,
                    std::string_view filepath, bool dirty,
                    int caret_line = 0, int caret_column = 0,
                    float scroll_x = 0.f, float scroll_y = 0.f,
-                   bool replace_existing = false);
+                   bool replace_existing = false,
+                   int selection_anchor_line = 0, int selection_anchor_column = 0,
+                   bool selection_active = false,
+                   const std::vector<int>& folded_lines = {},
+                   std::string_view language_override = {});
 
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -256,6 +288,10 @@ bool set_document_scroll(std::uint64_t document_id, float x, float y);
 
 document_metadata_snapshot_t document_metadata(std::uint64_t document_id);
 
+bool set_document_language_override(std::uint64_t document_id, std::string_view language);
+
+bool toggle_document_fold(std::uint64_t document_id, int line);
+
 document_payload_snapshot_t document_payload(std::uint64_t document_id,
                                              std::uint64_t expected_revision = 0);
 
@@ -270,6 +306,11 @@ bool request_streamed_document(std::uint64_t document_id, std::uint64_t revision
                                std::string_view filename, std::string_view filepath,
                                std::uint64_t byte_length);
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+bool configure_preview_stream_state(std::uint64_t document_id, bool loading,
+                                    bool cancellation_requested,
+                                    std::string_view error);
+#endif
 
 void trigger_undo();
 void trigger_redo();
@@ -313,6 +354,21 @@ bool has_pending_diff();
 const pending_diff_t& pending_diff();
 
 int  pending_hunk_count();
+
+bool has_pending_review_hunks();
+
+review_hunk_identity_t review_hunk_identity(int index);
+
+review_hunk_identity_t selected_review_hunk_identity();
+
+int resolve_review_hunk(const review_hunk_identity_t& identity,
+                        bool require_pending = true);
+
+bool select_review_hunk(int index, bool request_focus = true);
+
+bool select_next_pending_hunk();
+
+bool select_previous_pending_hunk();
 
 bool accept_hunk(int index);
 

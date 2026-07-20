@@ -462,10 +462,11 @@ namespace enforcement_detail {
         try {
             std::string host = get_payload_host();
             httplib::Client cli(host);
+            if (!cli.is_valid())
+                return;
             cli.set_address_family(AF_INET);
             cli.set_connection_timeout(5);
             cli.set_read_timeout(5);
-            cli.enable_server_certificate_verification(true);
 
             nlohmann::json body;
             body["session_token"] = standalone_license::get_session_token();
@@ -747,25 +748,26 @@ namespace enforcement_detail {
         try {
             std::string host = get_payload_host();
             httplib::Client cli(host);
-            cli.set_address_family(AF_INET);
-            cli.set_connection_timeout(3);
-            cli.set_read_timeout(3);
-            cli.enable_server_certificate_verification(true);
+            if (cli.is_valid()) {
+                cli.set_address_family(AF_INET);
+                cli.set_connection_timeout(3);
+                cli.set_read_timeout(3);
 
-            nlohmann::json body;
-            body["session_token"] = standalone_license::get_session_token();
-            body["detection_type"] = detection_type;
-            body["reason_id_hex"] = ([reason_id]() {
-                char tmp[20];
-                _snprintf_s(tmp, sizeof(tmp), _TRUNCATE,
-                    "0x%016llX", static_cast<unsigned long long>(reason_id));
-                return std::string(tmp);
-            })();
-            body["tier"] = 2;
-            body["tsc"] = __rdtsc();
+                nlohmann::json body;
+                body["session_token"] = standalone_license::get_session_token();
+                body["detection_type"] = detection_type;
+                body["reason_id_hex"] = ([reason_id]() {
+                    char tmp[20];
+                    _snprintf_s(tmp, sizeof(tmp), _TRUNCATE,
+                        "0x%016llX", static_cast<unsigned long long>(reason_id));
+                    return std::string(tmp);
+                })();
+                body["tier"] = 2;
+                body["tsc"] = __rdtsc();
 
-            std::string body_str = body.dump();
-            cli.Post(OBFSTR("/api/sentinel/dma-report").c_str(), body_str, "application/json");
+                std::string body_str = body.dump();
+                cli.Post(OBFSTR("/api/sentinel/dma-report").c_str(), body_str, "application/json");
+            }
         } catch (...) {}
 
         diag::log_tagged_critical("dma_defense", "trigger_dma_bsod_dmct_sent_kernel_will_bsod");

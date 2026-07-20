@@ -24,7 +24,7 @@
   "contract_generation": {
     "generator": {
       "path": "tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py",
-      "sha256": "5B334BC8B951F0FBE3FA121E5EE0C9EC15CDDC12F00ADBD5CDB65F35812149A0"
+      "sha256": "E59FBBDD91BF028CE20D99DB747BB2B6D379E8DB07BAE2E6E714178DF1F4D285"
     },
     "reproduction_policy": "pinned_zip_data_only_byte_exact_offline",
     "artifacts": [
@@ -35,19 +35,19 @@
       "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp"
     ],
     "descriptor_artifact_sha256": {
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "D5F458C90435E24ACF12AD0279D8987410A96698F66DE9820445E8FA00654BF7",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "29E99FDDD813A18A84A1A736B47A1DBFEC95313A1692C1B906F9111537EB0E8A",
       "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json": "A2495751CCC29407E8F7A1E4FEF6C1813DCA81B8D78431D60E4BCEDC3F31210C",
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "BDA8DE668975D4233802A83FDD8877263EDE1EEB618798C0FCC8AED9ED5BC969"
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "A7D25BBE02F8C7BC59F3203C6DAA08FFC4A943321445901FC06C9AC91FDE025C"
     }
   },
   "current_surface_reproduction": {
     "generator": {
       "path": "src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1",
-      "sha256": "66E888C875CD42B91A87F4082B570934325225A6D6B8E83AB2151242EBBA9671"
+      "sha256": "1D34581A149A6D65DC79F76A7200436AF9A283FC10004EF290CDE5BD1563A39A"
     },
     "verifier": {
       "path": "tools/c03_authority/verify_authority_surface_ledger.py",
-      "sha256": "0CB2803831B221C810C6063921A68C45FAF6F293356AB2C20FD4AE89CC50812F"
+      "sha256": "F759D85BD976D31C6B51203630D5E96B2EA3021FE78E59D668CDE158FB8E425C"
     },
     "baseline": {
       "path": "src/standalone/tests/analysis_workspace/standalone_surface_baseline.json",

@@ -8,21 +8,11 @@
 #include "application_ui_runtime.hpp"
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include "../../preview/workspace_preview_fixture.hpp"
+#include "../../preview/shell_preview_platform.hpp"
 #else
-#include "../disasm/zydis_disasm.hpp"
-#endif
-#include "../../helpers/globals.h"
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #endif
 #include <string>
-
-extern HWND g_hwnd;
-
-namespace analysis_session {
-bool open_session(const std::string& path);
-}
 
 namespace aida::ui::no_target_overlay {
 
@@ -62,17 +52,26 @@ namespace aida::ui::no_target_overlay {
 			ImVec2(region_pos.x + region_size.x, region_pos.y + region_size.y),
 			aida::ui::with_alpha(t.bg_base, alpha * 0.95f));
 
-		const auto open_action = aida::ui::application_ui::present_action("file.open");
+		const auto open_action = aida::ui::application_ui::present_action("tools.load_binary");
+		const auto attach_action = aida::ui::application_ui::present_action("tools.attach_process");
+		const auto run_action = aida::ui::application_ui::present_action("debugger.launch");
 		const aida::ui::design::action_t actions[] = {
-			{"open_file", "Open File...", "Open", "Open a binary for static analysis",
+			{"open_file", open_action.label.c_str(), "Open",
+				open_action.enabled ? open_action.description.c_str() : open_action.disabled_reason.c_str(),
 				open_action.shortcut.empty() ? nullptr : open_action.shortcut.c_str(),
-				open_action.disabled_reason.empty() ? nullptr : open_action.disabled_reason.c_str(),
+				nullptr,
 				aida::ui::components::button_kind_t::primary,
 				open_action.enabled, true, open_action.visible},
-			{"attach_process", "Attach...", "Attach", "Attach to a running process", nullptr, nullptr,
-				aida::ui::components::button_kind_t::secondary, true, false, true},
-			{"run_target", "Run...", "Run", "Launch a binary under AiDA", nullptr, nullptr,
-				aida::ui::components::button_kind_t::secondary, true, false, true}
+			{"attach_process", attach_action.label.c_str(), "Attach",
+				attach_action.enabled ? attach_action.description.c_str() : attach_action.disabled_reason.c_str(),
+				attach_action.shortcut.empty() ? nullptr : attach_action.shortcut.c_str(), nullptr,
+				aida::ui::components::button_kind_t::secondary,
+				attach_action.enabled, false, attach_action.visible},
+			{"run_target", run_action.label.c_str(), "Run",
+				run_action.enabled ? run_action.description.c_str() : run_action.disabled_reason.c_str(),
+				run_action.shortcut.empty() ? nullptr : run_action.shortcut.c_str(), nullptr,
+				aida::ui::components::button_kind_t::secondary,
+				run_action.enabled, false, run_action.visible}
 		};
 		aida::ui::design::state_presentation_t state;
 		state.stable_id = state_id_for_glyph(glyph);
@@ -92,28 +91,19 @@ namespace aida::ui::no_target_overlay {
 
 	inline void dispatch_default_action(action_t action) {
 		if (action == action_t::open_file) {
-			diag::log_tagged_critical("file_dialog", "no_target_overlay.open_clicked invoking_open_file_dialog");
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::string fpath = aida::preview::workspace_preview_fixture().source_path;
-#else
-			std::string fpath = disasm::open_file_dialog(g_hwnd);
-#endif
-			if (!fpath.empty()) {
-				diag::log_tagged_critical_fmt("file_dialog",
-					"no_target_overlay.open ok path=%s", fpath.c_str());
-				analysis_session::open_session(fpath);
-			} else {
-				diag::log_tagged_critical("file_dialog", "no_target_overlay.open cancelled_or_empty");
-			}
+			diag::log_tagged_critical("file_dialog", "no_target_overlay.open_binary_clicked");
+			static_cast<void>(aida::ui::application_ui::execute_action(
+				"tools.load_binary", aida::ui::action_invocation_source_t::toolbar));
 		}
 		if (action == action_t::attach_process) {
 			diag::log_tagged_critical("file_dialog", "no_target_overlay.attach_clicked");
-			globals::ui::process_attach_open = true;
+			static_cast<void>(aida::ui::application_ui::execute_action(
+				"tools.attach_process", aida::ui::action_invocation_source_t::toolbar));
 		}
 		if (action == action_t::run_target) {
 			diag::log_tagged_critical("file_dialog", "no_target_overlay.run_clicked");
-			aida::ui::application_ui::execute_action("debugger.launch",
-				aida::ui::action_invocation_source_t::toolbar);
+			static_cast<void>(aida::ui::application_ui::execute_action(
+				"debugger.launch", aida::ui::action_invocation_source_t::toolbar));
 		}
 	}
 

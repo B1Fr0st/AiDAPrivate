@@ -3,14 +3,21 @@
 
 #include "memory_scanner.hpp"
 #include "standalone_driver.hpp"
+#include "../runtime/standalone_driver_identity.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#include "../settings/standalone_settings.hpp"
+#include "../settings/settings_persistence_service.hpp"
 #include "scanner_task_center.hpp"
+#include "../analysis/workspace/byte_provider.hpp"
+#include "../analysis/workspace/pe_image.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -21,6 +28,283 @@
 #include <type_traits>
 
 namespace memory_scanner {
+
+namespace {
+
+using live_target_identity_t = driver_bridge::identity::live_target_identity_t;
+
+bool same_target_identity(const live_target_identity_t& lhs, const live_target_identity_t& rhs) {
+	return lhs.process.pid == rhs.process.pid &&
+		lhs.process.creation_time_100ns == rhs.process.creation_time_100ns &&
+		lhs.process.normalized_process_path == rhs.process.normalized_process_path &&
+		lhs.module.base == rhs.module.base && lhs.module.size == rhs.module.size &&
+		lhs.module.normalized_name == rhs.module.normalized_name &&
+		lhs.module.normalized_path == rhs.module.normalized_path;
+}
+
+bool capture_attached_identity(live_target_identity_t& identity, const char* operation) {
+	const std::uint32_t pid = driver_bridge::is_loaded() ? driver_bridge::attached_pid() : 0;
+	std::string error;
+	if (pid != 0 && driver_bridge::identity::capture_live_target_identity(pid, 0, identity, &error)) {
+		const auto validation = driver_bridge::identity::validate_attached_target_identity(identity);
+		if (validation.matches) return true;
+		error = std::string(driver_bridge::identity::staleness_code(validation.staleness)) +
+			": " + validation.detail;
+	}
+	diag::log_tagged_fmt("mem_scanner", "%s refused target_identity error='%s' pid=%u",
+		operation, error.c_str(), pid);
+	identity = {};
+	return false;
+}
+
+std::uint64_t observe_target_identity(const live_target_identity_t& identity) {
+	auto& st = g_state;
+	std::lock_guard<std::mutex> lock(st.target_binding_mutex);
+	const std::uint32_t previous_pid = st.observed_target_pid.load(std::memory_order_relaxed);
+	const std::uint64_t previous_creation =
+		st.observed_target_creation_time_100ns.load(std::memory_order_relaxed);
+	if (previous_pid != identity.process.pid ||
+		previous_creation != identity.process.creation_time_100ns) {
+		st.observed_target_pid.store(identity.process.pid, std::memory_order_release);
+		st.observed_target_creation_time_100ns.store(
+			identity.process.creation_time_100ns, std::memory_order_release);
+		return st.target_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+	}
+	return st.target_epoch.load(std::memory_order_acquire);
+}
+
+bool validate_attached_identity(const live_target_identity_t& identity, const char* operation) {
+	const auto validation = driver_bridge::identity::validate_attached_target_identity(identity);
+	if (validation.matches) return true;
+	diag::log_tagged_fmt("mem_scanner",
+		"%s refused stale_target code=%s detail='%s' expected_pid=%u current_pid=%u",
+		operation, driver_bridge::identity::staleness_code(validation.staleness),
+		validation.detail.c_str(), identity.process.pid,
+		driver_bridge::is_loaded() ? driver_bridge::attached_pid() : 0);
+	return false;
+}
+
+}
+
+uint64_t observe_target_binding(uint32_t pid) {
+	auto& st = g_state;
+	std::lock_guard<std::mutex> lock(st.target_binding_mutex);
+	if (st.observed_target_pid.load(std::memory_order_relaxed) != pid) {
+		st.observed_target_pid.store(pid, std::memory_order_release);
+		st.observed_target_creation_time_100ns.store(0, std::memory_order_release);
+		return st.target_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+	}
+	return st.target_epoch.load(std::memory_order_acquire);
+}
+
+bool target_binding_current(uint32_t pid, uint64_t epoch) {
+	const uint32_t current_pid = driver_bridge::is_loaded() ? driver_bridge::attached_pid() : 0;
+	return pid != 0 && current_pid == pid &&
+		g_state.observed_target_pid.load(std::memory_order_acquire) == pid &&
+		g_state.target_epoch.load(std::memory_order_acquire) == epoch;
+}
+
+bool validate_target_binding(uint32_t pid, uint64_t epoch,
+	uint64_t process_creation_time_100ns) {
+	if (pid == 0 || epoch == 0 || process_creation_time_100ns == 0 ||
+		!target_binding_current(pid, epoch) ||
+		g_state.observed_target_creation_time_100ns.load(std::memory_order_acquire) !=
+			process_creation_time_100ns)
+		return false;
+	live_target_identity_t identity;
+	return capture_attached_identity(identity, "validate_target_binding") &&
+		identity.process.pid == pid &&
+		identity.process.creation_time_100ns == process_creation_time_100ns &&
+		target_binding_current(pid, epoch);
+}
+
+static std::string scanner_target_key(const live_target_identity_t& identity) {
+	if (identity.process.normalized_process_path.empty() ||
+		identity.module.normalized_name.empty() || identity.module.size == 0) return {};
+	return std::to_string(identity.process.normalized_process_path.size()) + ":" +
+		identity.process.normalized_process_path + ":" +
+		std::to_string(identity.module.normalized_path.size()) + ":" +
+		identity.module.normalized_path + ":" + identity.module.normalized_name + ":" +
+		std::to_string(identity.module.size);
+}
+
+static std::string legacy_scanner_target_key(const live_target_identity_t& identity) {
+	if (identity.module.normalized_name.empty() || identity.module.size == 0) return {};
+	return identity.module.normalized_name + ":" + std::to_string(identity.module.size);
+}
+
+static void persist_scanner_state() {
+	live_target_identity_t target_identity;
+	const bool identity_valid = capture_attached_identity(target_identity, "persist_scanner_state");
+	const std::uint32_t target_pid = identity_valid ? target_identity.process.pid : 0;
+	const std::uint64_t target_epoch = identity_valid ? observe_target_identity(target_identity) :
+		observe_target_binding(0);
+	const auto modules = identity_valid ? driver_bridge::enumerate_modules() :
+		std::vector<driver_bridge::module_info_t>{};
+	nlohmann::json root{{"schema", 2}, {"targets", nlohmann::json::object()}};
+	{
+		std::lock_guard<std::recursive_mutex> lock(sa_settings_detail::io_mutex());
+		if (!g_sa_settings.memory_scanner_state_json.empty()) {
+			auto parsed = nlohmann::json::parse(g_sa_settings.memory_scanner_state_json, nullptr, false);
+			if (parsed.is_object() && (parsed.value("schema", 0) == 1 ||
+				parsed.value("schema", 0) == 2) && parsed.contains("targets") &&
+				parsed["targets"].is_object())
+				root = std::move(parsed);
+		}
+		root["schema"] = 2;
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_state.results_mutex);
+		root["config"] = {
+			{"value_type", static_cast<int>(g_state.config.value_type)},
+			{"scan_mode", static_cast<int>(g_state.config.scan_mode)},
+			{"value", g_state.config.value_text.substr(0, 4096)},
+			{"value2", g_state.config.value_text2.substr(0, 4096)},
+			{"hex", g_state.config.hex_input},
+			{"signed", g_state.config.is_signed},
+			{"alignment", g_state.config.alignment},
+			{"writable_only", g_state.config.writable_only},
+			{"exclude_executable", g_state.config.executable_exclude}
+		};
+	}
+	const std::string target_key = identity_valid ? scanner_target_key(target_identity) : std::string{};
+	if (!target_key.empty()) {
+		nlohmann::json entries = nlohmann::json::array();
+		{
+			std::lock_guard<std::mutex> lock(g_state.address_mutex);
+			for (const auto& entry : g_state.address_list) {
+				if (entry.target_pid != target_pid || entry.target_epoch != target_epoch ||
+					!same_target_identity(entry.target_identity, target_identity))
+					continue;
+				for (const auto& module : modules) {
+					const std::uint64_t end = module.base + static_cast<std::uint64_t>(module.size);
+					if (module.size == 0 || end < module.base || entry.address < module.base || entry.address >= end)
+						continue;
+					entries.push_back({{"module", module.name.substr(0, 1024)},
+						{"module_size", module.size}, {"offset", std::to_string(entry.address - module.base)},
+						{"description", entry.description.substr(0, 1024)},
+						{"value_type", static_cast<int>(entry.value_type)},
+						{"process_creation_time_100ns", std::to_string(
+							entry.target_identity.process.creation_time_100ns)},
+						{"process_path", entry.target_identity.process.normalized_process_path.substr(0, 4096)},
+						{"identity_module_base", std::to_string(entry.target_identity.module.base)},
+						{"identity_module_size", std::to_string(entry.target_identity.module.size)},
+						{"identity_module_name", entry.target_identity.module.normalized_name.substr(0, 1024)},
+						{"identity_module_path", entry.target_identity.module.normalized_path.substr(0, 4096)}});
+					break;
+				}
+				if (entries.size() >= 4096) break;
+			}
+		}
+		if (validate_attached_identity(target_identity, "persist_scanner_state_publish"))
+			root["targets"][target_key] = {{"addresses", std::move(entries)}};
+	}
+	const std::string payload = root.dump();
+	{
+		std::lock_guard<std::recursive_mutex> lock(sa_settings_detail::io_mutex());
+		if (g_sa_settings.memory_scanner_state_json == payload) return;
+		g_sa_settings.memory_scanner_state_json = payload;
+	}
+	static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
+}
+
+static void restore_scanner_state_for_current_target() {
+	const std::uint32_t pid = driver_bridge::is_loaded() ? driver_bridge::attached_pid() : 0;
+	live_target_identity_t target_identity;
+	const bool identity_valid = pid != 0 &&
+		capture_attached_identity(target_identity, "restore_scanner_state");
+	const std::uint64_t creation_time = identity_valid ?
+		target_identity.process.creation_time_100ns : 0;
+	if (g_state.persisted_loaded_pid.load(std::memory_order_acquire) == pid &&
+		g_state.persisted_loaded_creation_time_100ns.load(std::memory_order_acquire) == creation_time &&
+		((pid != 0 && identity_valid) ||
+			g_state.persisted_config_loaded.load(std::memory_order_acquire))) return;
+	const std::uint64_t target_epoch = identity_valid ? observe_target_identity(target_identity) :
+		observe_target_binding(pid);
+	const auto modules = identity_valid ? driver_bridge::enumerate_modules() :
+		std::vector<driver_bridge::module_info_t>{};
+	const std::string target_key = identity_valid ? scanner_target_key(target_identity) : std::string{};
+	nlohmann::json root;
+	{
+		std::lock_guard<std::recursive_mutex> lock(sa_settings_detail::io_mutex());
+		root = nlohmann::json::parse(g_sa_settings.memory_scanner_state_json, nullptr, false);
+	}
+	if (!root.is_object() || (root.value("schema", 0) != 1 && root.value("schema", 0) != 2)) {
+		g_state.persisted_loaded_pid.store(pid, std::memory_order_release);
+		g_state.persisted_loaded_creation_time_100ns.store(creation_time, std::memory_order_release);
+		return;
+	}
+	if (root.contains("config") && root["config"].is_object()) {
+		const auto& config = root["config"];
+		const int value_type = config.value("value_type", static_cast<int>(value_type_t::int32_val));
+		const int scan_mode = config.value("scan_mode", static_cast<int>(scan_mode_t::exact));
+		if (value_type >= 0 && value_type < static_cast<int>(value_type_t::COUNT) &&
+			scan_mode >= 0 && scan_mode < static_cast<int>(scan_mode_t::COUNT)) {
+			std::lock_guard<std::mutex> lock(g_state.results_mutex);
+			g_state.config.value_type = static_cast<value_type_t>(value_type);
+			g_state.config.scan_mode = static_cast<scan_mode_t>(scan_mode);
+			g_state.config.value_text = config.value("value", std::string{}).substr(0, 4096);
+			g_state.config.value_text2 = config.value("value2", std::string{}).substr(0, 4096);
+			g_state.config.hex_input = config.value("hex", false);
+			g_state.config.is_signed = config.value("signed", true);
+			g_state.config.alignment = (std::max<std::size_t>)(1, (std::min<std::size_t>)(
+				4096, config.value("alignment", static_cast<std::size_t>(4))));
+			g_state.config.writable_only = config.value("writable_only", true);
+			g_state.config.executable_exclude = config.value("exclude_executable", true);
+			g_state.persisted_config_loaded.store(true, std::memory_order_release);
+		}
+	}
+	std::vector<address_entry_t> restored;
+	const std::string legacy_target_key = identity_valid ?
+		legacy_scanner_target_key(target_identity) : std::string{};
+	const nlohmann::json* persisted_target = nullptr;
+	if (!target_key.empty() && root.contains("targets") && root["targets"].is_object()) {
+		if (root["targets"].contains(target_key))
+			persisted_target = &root["targets"][target_key];
+		else if (!legacy_target_key.empty() && root["targets"].contains(legacy_target_key))
+			persisted_target = &root["targets"][legacy_target_key];
+	}
+	if (persisted_target && persisted_target->is_object() &&
+		persisted_target->contains("addresses")) {
+		const auto& addresses = (*persisted_target)["addresses"];
+		if (addresses.is_array()) for (const auto& item : addresses) {
+			if (restored.size() >= 4096 || !item.is_object()) break;
+			const std::string module_name = item.value("module", std::string{});
+			const std::uint32_t module_size = item.value("module_size", 0u);
+			const std::string offset_text = item.value("offset", std::string{});
+			char* end = nullptr;
+			errno = 0;
+			const auto offset = std::strtoull(offset_text.c_str(), &end, 10);
+			const int value_type = item.value("value_type", -1);
+			if (errno != 0 || !end || *end != '\0' || value_type < 0 ||
+				value_type >= static_cast<int>(value_type_t::COUNT)) continue;
+			const driver_bridge::module_info_t* match = nullptr;
+			for (const auto& module : modules) {
+				if (module.name != module_name || module.size != module_size) continue;
+				if (match) { match = nullptr; break; }
+				match = &module;
+			}
+			if (!match || offset >= match->size || match->base >
+				(std::numeric_limits<std::uint64_t>::max)() - offset) continue;
+			address_entry_t entry;
+			entry.address = match->base + offset;
+			entry.description = item.value("description", std::string{}).substr(0, 1024);
+			entry.value_type = static_cast<value_type_t>(value_type);
+			entry.target_pid = pid;
+			entry.target_epoch = target_epoch;
+			entry.target_identity = target_identity;
+			restored.push_back(std::move(entry));
+		}
+	}
+	if (identity_valid && !validate_attached_identity(target_identity,
+		"restore_scanner_state_publish")) restored.clear();
+	{
+		std::lock_guard<std::mutex> lock(g_state.address_mutex);
+		g_state.address_list = std::move(restored);
+	}
+	g_state.persisted_loaded_pid.store(pid, std::memory_order_release);
+	g_state.persisted_loaded_creation_time_100ns.store(creation_time, std::memory_order_release);
+}
 
 
 std::vector<uint8_t> parse_value(const std::string& text, value_type_t type, bool hex) {
@@ -265,6 +549,21 @@ static void annotate_modules(std::vector<scan_result_t>& results) {
 static void first_scan_thread(scan_config_t config) {
 	auto& st = g_state;
 	st.scan_progress.store(0.f);
+	uint32_t target_pid = 0;
+	uint64_t target_epoch = 0;
+	live_target_identity_t target_identity;
+	{
+		std::lock_guard<std::mutex> lock(st.results_mutex);
+		target_pid = st.scan_target_pid;
+		target_epoch = st.scan_target_epoch;
+		target_identity = st.scan_target_identity;
+	}
+	if (!target_binding_current(target_pid, target_epoch) ||
+		!validate_attached_identity(target_identity, "first_scan_thread_start")) {
+		st.scanning.store(false, std::memory_order_release);
+		st.scan_progress.store(1.f, std::memory_order_release);
+		return;
+	}
 
 	auto t_start = std::chrono::steady_clock::now();
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
@@ -378,6 +677,11 @@ static void first_scan_thread(scan_config_t config) {
 	std::atomic<size_t> bytes_done{0};
 
 	auto scan_region = [&](const driver_bridge::memory_region_t& region) {
+		if (!st.scanning.load(std::memory_order_acquire) ||
+			!target_binding_current(target_pid, target_epoch)) {
+			st.scanning.store(false, std::memory_order_release);
+			return;
+		}
 		std::vector<uint8_t> buf;
 		if (!driver_bridge::read_memory(region.base, static_cast<size_t>(region.size), buf)) {
 			size_t failures = read_failures.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -565,6 +869,12 @@ static void first_scan_thread(scan_config_t config) {
 
 	annotate_modules(all_results);
 
+	if (!target_binding_current(target_pid, target_epoch) ||
+		!validate_attached_identity(target_identity, "first_scan_publish")) {
+		st.scan_progress.store(1.f, std::memory_order_release);
+		st.scanning.store(false, std::memory_order_release);
+		return;
+	}
 	{
 		std::lock_guard<std::mutex> lk(st.results_mutex);
 		st.results = std::move(all_results);
@@ -597,11 +907,23 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 	std::vector<scan_result_t> prev;
 	value_type_t vtype;
 	bool hex_input;
+	uint32_t target_pid = 0;
+	uint64_t target_epoch = 0;
+	live_target_identity_t target_identity;
 	{
 		std::lock_guard<std::mutex> lk(st.results_mutex);
 		prev = st.results;
 		vtype = st.config.value_type;
 		hex_input = st.config.hex_input;
+		target_pid = st.scan_target_pid;
+		target_epoch = st.scan_target_epoch;
+		target_identity = st.scan_target_identity;
+	}
+	if (!target_binding_current(target_pid, target_epoch) ||
+		!validate_attached_identity(target_identity, "next_scan_thread_start")) {
+		st.scanning.store(false, std::memory_order_release);
+		st.scan_progress.store(1.f, std::memory_order_release);
+		return;
 	}
 
 	diag::log_tagged_fmt("mem_scanner", "next_scan_thread enter mode=%s prev_count=%zu val='%s' val2='%s' vtype=%s",
@@ -667,7 +989,10 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 	new_results.reserve(prev.size());
 
 	for (size_t i = 0; i < prev.size(); ++i) {
-		if (!st.scanning.load()) break;
+		if (!st.scanning.load() || !target_binding_current(target_pid, target_epoch)) {
+			st.scanning.store(false, std::memory_order_release);
+			break;
+		}
 
 		auto& pr = prev[i];
 		std::vector<uint8_t> cur_bytes;
@@ -782,11 +1107,18 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 	}
 
 	size_t hits = new_results.size();
+	const bool publish_current = target_binding_current(target_pid, target_epoch) &&
+		validate_attached_identity(target_identity, "next_scan_publish");
 	{
 		std::lock_guard<std::mutex> lk(st.results_mutex);
-		st.total_found = hits;
-		st.results = std::move(new_results);
-		st.scan_count++;
+		if (publish_current) {
+			st.total_found = hits;
+			st.results = std::move(new_results);
+			st.scan_count++;
+		} else if (!st.scan_history.empty()) {
+			st.scan_history.pop_back();
+			hits = st.results.size();
+		}
 	}
 
 	auto t_end = std::chrono::steady_clock::now();
@@ -828,7 +1160,14 @@ static bool wait_scan_worker_ready(const char* op) {
 static void freeze_loop() {
 	auto& st = g_state;
 	diag::log_tagged("mem_scanner", "freeze_loop start");
-	std::vector<std::pair<uint64_t, std::vector<uint8_t>>> snapshot;
+	struct frozen_write_t {
+		uint64_t address = 0;
+		std::vector<uint8_t> bytes;
+		uint32_t pid = 0;
+		uint64_t epoch = 0;
+		live_target_identity_t identity;
+	};
+	std::vector<frozen_write_t> snapshot;
 	uint64_t last_logged_count = static_cast<uint64_t>(-1);
 	auto last_log_time = std::chrono::steady_clock::now();
 	while (st.freeze_active.load()) {
@@ -837,7 +1176,8 @@ static void freeze_loop() {
 			std::lock_guard<std::mutex> lk(st.address_mutex);
 			for (auto& entry : st.address_list) {
 				if (entry.frozen && !entry.freeze_value.empty())
-					snapshot.emplace_back(entry.address, entry.freeze_value);
+					snapshot.push_back({entry.address, entry.freeze_value,
+						entry.target_pid, entry.target_epoch, entry.target_identity});
 			}
 		}
 		auto now = std::chrono::steady_clock::now();
@@ -852,7 +1192,30 @@ static void freeze_loop() {
 		}
 		for (auto& p : snapshot) {
 			if (!st.freeze_active.load()) break;
-			driver_bridge::write_memory(p.first, p.second);
+			if (!target_binding_current(p.pid, p.epoch) ||
+				!validate_attached_identity(p.identity, "freeze_write")) {
+				std::lock_guard<std::mutex> lk(st.address_mutex);
+				for (auto& entry : st.address_list)
+					if (entry.address == p.address && entry.target_pid == p.pid &&
+						entry.target_epoch == p.epoch &&
+						same_target_identity(entry.target_identity, p.identity))
+						entry.frozen = false;
+				continue;
+			}
+			std::vector<uint8_t> before;
+			if (!driver_bridge::read_memory(p.address, p.bytes.size(), before) ||
+				before.size() != p.bytes.size() ||
+				!driver_bridge::write_memory(p.address, p.bytes))
+				continue;
+			std::vector<uint8_t> readback;
+			if (!target_binding_current(p.pid, p.epoch) ||
+				!validate_attached_identity(p.identity, "freeze_readback") ||
+				!driver_bridge::read_memory(p.address, p.bytes.size(), readback) ||
+				readback != p.bytes) {
+				if (target_binding_current(p.pid, p.epoch) &&
+					validate_attached_identity(p.identity, "freeze_rollback"))
+					static_cast<void>(driver_bridge::write_memory(p.address, before));
+			}
 		}
 		if (!snapshot.empty()) Sleep(10);
 		else Sleep(100);
@@ -959,6 +1322,21 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	auto& st = g_state;
 	st.pointer_progress.store(0.f);
 	auto t_start = std::chrono::steady_clock::now();
+	uint32_t target_pid = 0;
+	uint64_t target_epoch = 0;
+	live_target_identity_t target_identity;
+	{
+		std::lock_guard<std::mutex> lock(st.pointer_mutex);
+		target_pid = st.pointer_target_pid;
+		target_epoch = st.pointer_target_epoch;
+		target_identity = st.pointer_target_identity;
+	}
+	if (!target_binding_current(target_pid, target_epoch) ||
+		!validate_attached_identity(target_identity, "pointer_scan_thread_start")) {
+		st.pointer_progress.store(1.f, std::memory_order_release);
+		st.pointer_scanning.store(false, std::memory_order_release);
+		return;
+	}
 
 	auto modules = driver_bridge::enumerate_modules();
 	auto regions = driver_bridge::enumerate_memory_regions(4096);
@@ -1296,9 +1674,11 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 		results.resize(MAX_RESULTS);
 
 	size_t final_count = results.size();
+	const bool publish_current = target_binding_current(target_pid, target_epoch) &&
+		validate_attached_identity(target_identity, "pointer_scan_publish");
 	{
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);
-		st.pointer_results = std::move(results);
+		if (publish_current) st.pointer_results = std::move(results);
 	}
 
 	auto t_end = std::chrono::steady_clock::now();
@@ -1334,6 +1714,7 @@ void initialize() {
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);
 		st.pointer_results.clear();
 	}
+	restore_scanner_state_for_current_target();
 	if (st.freeze_active.load(std::memory_order_acquire) &&
 		!st.freeze_thread_done.load(std::memory_order_acquire)) {
 		diag::log_tagged("mem_scanner", "initialize freeze_loop_already_running");
@@ -1383,6 +1764,7 @@ void initialize() {
 
 void shutdown() {
 	diag::log_tagged("mem_scanner", "shutdown enter");
+	persist_scanner_state();
 	auto& st = g_state;
 	st.scanning.store(false);
 	st.pointer_scanning.store(false);
@@ -1400,6 +1782,7 @@ void shutdown() {
 
 bool first_scan(const scan_config_t& config) {
 	auto& st = g_state;
+	restore_scanner_state_for_current_target();
 	if (st.scanning.load()) {
 		diag::log_tagged("mem_scanner", "first_scan refused already_scanning");
 		return false;
@@ -1409,6 +1792,10 @@ bool first_scan(const scan_config_t& config) {
 			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
 		return false;
 	}
+	const uint32_t target_pid = driver_bridge::attached_pid();
+	live_target_identity_t target_identity;
+	if (!capture_attached_identity(target_identity, "first_scan")) return false;
+	const uint64_t target_epoch = observe_target_identity(target_identity);
 	diag::log_tagged_fmt("mem_scanner", "first_scan start type=%s mode=%s val='%s' val2='%s' hex=%d",
 		value_type_name(config.value_type), scan_mode_name(config.scan_mode),
 		config.value_text.c_str(), config.value_text2.c_str(),
@@ -1422,7 +1809,14 @@ bool first_scan(const scan_config_t& config) {
 		st.has_initial_scan = false;
 		st.scan_count = 0;
 		st.config = config;
+		st.scan_target_pid = target_pid;
+		st.scan_target_epoch = target_epoch;
+		st.scan_target_identity = target_identity;
+		st.scan_static_binary = false;
+		st.scan_workspace_id.clear();
+		st.scan_workspace_generation = 0;
 	}
+	persist_scanner_state();
 
 	if (!wait_scan_worker_ready("first_scan"))
 		return false;
@@ -1499,6 +1893,158 @@ bool first_scan(const scan_config_t& config) {
 	return true;
 }
 
+bool first_static_scan(const scan_config_t& config,
+	std::shared_ptr<const aida::analysis::byte_provider_t> provider,
+	std::shared_ptr<const aida::analysis::pe_image_t> image,
+	std::string workspace_id, uint64_t workspace_generation) {
+	auto& st = g_state;
+	if (!provider || !image || workspace_id.empty() || st.scanning.load(std::memory_order_acquire) ||
+		!wait_scan_worker_ready("first_static_scan"))
+		return false;
+	const auto target = parse_value(config.value_text, config.value_type, config.hex_input);
+	const auto target2 = parse_value(config.value_text2, config.value_type, config.hex_input);
+	std::size_t value_size = value_type_size(config.value_type);
+	if (config.value_type == value_type_t::string_ascii ||
+		config.value_type == value_type_t::string_utf16 ||
+		config.value_type == value_type_t::byte_array)
+		value_size = target.size();
+	if (config.scan_mode != scan_mode_t::unknown_initial &&
+		(value_size == 0 || target.size() < value_size))
+		return false;
+	if (config.scan_mode == scan_mode_t::value_between && target2.size() < value_size)
+		return false;
+	if (config.scan_mode == scan_mode_t::unknown_initial && value_size == 0)
+		value_size = config.value_type == value_type_t::string_utf16 ? 2 : 1;
+	{
+		std::lock_guard<std::mutex> lock(st.results_mutex);
+		st.results.clear();
+		st.scan_history.clear();
+		st.total_found = 0;
+		st.has_initial_scan = false;
+		st.scan_count = 0;
+		st.config = config;
+		st.scan_target_pid = 0;
+		st.scan_target_epoch = 0;
+		st.scan_target_identity = {};
+		st.scan_static_binary = true;
+		st.scan_workspace_id = workspace_id;
+		st.scan_workspace_generation = workspace_generation;
+	}
+	persist_scanner_state();
+	st.scanning.store(true, std::memory_order_release);
+	st.scan_progress.store(0.0f, std::memory_order_release);
+	st.scan_thread_done.store(false, std::memory_order_release);
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "scanner";
+	submission.label = "scanner.static_binary_value_scan";
+	submission.thread_class = "scanner_scan";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 3;
+	submission.body = [config, provider = std::move(provider), image = std::move(image),
+		target, target2, value_size, workspace_id = std::move(workspace_id), workspace_generation]() {
+		auto finish = [] {
+			g_state.scan_progress.store(1.0f, std::memory_order_release);
+			g_state.scanning.store(false, std::memory_order_release);
+			g_state.scan_thread_done.store(true, std::memory_order_release);
+		};
+		try {
+		std::vector<scan_result_t> results;
+		std::uint64_t total_bytes = 0;
+		for (const auto& section : image->sections())
+			if (section.raw_size != 0 && (!config.writable_only || section.writable) &&
+				(!config.executable_exclude || !section.executable)) total_bytes += section.raw_size;
+		std::uint64_t completed = 0;
+		const std::size_t alignment = (std::max<std::size_t>)(1,
+			(config.value_type == value_type_t::string_ascii ||
+			 config.value_type == value_type_t::string_utf16 ||
+			 config.value_type == value_type_t::byte_array) ? 1 : config.alignment);
+		for (const auto& section : image->sections()) {
+			if (!g_state.scanning.load(std::memory_order_acquire)) break;
+			if (section.raw_size == 0 || (config.writable_only && !section.writable) ||
+				(config.executable_exclude && section.executable)) continue;
+			auto bytes_result = provider->read_vector(section.raw_offset, section.raw_size,
+				section.raw_size);
+			if (!bytes_result) { completed += section.raw_size; continue; }
+			const auto& bytes = bytes_result.value();
+			const std::size_t end = value_size != 0 && bytes.size() >= value_size
+				? bytes.size() - value_size + 1 : 0;
+			for (std::size_t offset = 0; offset < end && results.size() < 5000000;
+				offset += alignment) {
+				if ((offset & 0xFFFF) == 0 && !g_state.scanning.load(std::memory_order_acquire)) break;
+				bool match = config.scan_mode == scan_mode_t::unknown_initial;
+				if (config.scan_mode == scan_mode_t::exact)
+					match = compare_exact(bytes.data() + offset, target.data(), value_size);
+				else if (config.scan_mode == scan_mode_t::bigger_than) {
+					switch (config.value_type) {
+					case value_type_t::byte_val: match = compare_bigger<std::uint8_t>(bytes.data()+offset, target.data()); break;
+					case value_type_t::int16_val: match = compare_bigger<std::int16_t>(bytes.data()+offset, target.data()); break;
+					case value_type_t::int32_val: match = compare_bigger<std::int32_t>(bytes.data()+offset, target.data()); break;
+					case value_type_t::int64_val: match = compare_bigger<std::int64_t>(bytes.data()+offset, target.data()); break;
+					case value_type_t::float_val: match = compare_bigger<float>(bytes.data()+offset, target.data()); break;
+					case value_type_t::double_val: match = compare_bigger<double>(bytes.data()+offset, target.data()); break;
+					default: break;
+					}
+				} else if (config.scan_mode == scan_mode_t::smaller_than) {
+					switch (config.value_type) {
+					case value_type_t::byte_val: match = compare_smaller<std::uint8_t>(bytes.data()+offset, target.data()); break;
+					case value_type_t::int16_val: match = compare_smaller<std::int16_t>(bytes.data()+offset, target.data()); break;
+					case value_type_t::int32_val: match = compare_smaller<std::int32_t>(bytes.data()+offset, target.data()); break;
+					case value_type_t::int64_val: match = compare_smaller<std::int64_t>(bytes.data()+offset, target.data()); break;
+					case value_type_t::float_val: match = compare_smaller<float>(bytes.data()+offset, target.data()); break;
+					case value_type_t::double_val: match = compare_smaller<double>(bytes.data()+offset, target.data()); break;
+					default: break;
+					}
+				} else if (config.scan_mode == scan_mode_t::value_between) {
+					switch (config.value_type) {
+					case value_type_t::byte_val: match = compare_between<std::uint8_t>(bytes.data()+offset, target.data(), target2.data()); break;
+					case value_type_t::int16_val: match = compare_between<std::int16_t>(bytes.data()+offset, target.data(), target2.data()); break;
+					case value_type_t::int32_val: match = compare_between<std::int32_t>(bytes.data()+offset, target.data(), target2.data()); break;
+					case value_type_t::int64_val: match = compare_between<std::int64_t>(bytes.data()+offset, target.data(), target2.data()); break;
+					case value_type_t::float_val: match = compare_between<float>(bytes.data()+offset, target.data(), target2.data()); break;
+					case value_type_t::double_val: match = compare_between<double>(bytes.data()+offset, target.data(), target2.data()); break;
+					default: break;
+					}
+				}
+				const std::uint64_t section_base = image->image_base() + section.virtual_address;
+				if (section_base < image->image_base() || section_base >
+					(std::numeric_limits<std::uint64_t>::max)() - offset) continue;
+				const std::uint64_t address = section_base + offset;
+				if (config.range_base != 0 && config.range_size != 0 &&
+					(address < config.range_base || address - config.range_base >= config.range_size)) continue;
+				if (match) results.push_back({address,
+					std::vector<std::uint8_t>(bytes.begin() + offset, bytes.begin() + offset + value_size),
+					{}, section.name, static_cast<std::uint64_t>(section.virtual_address) + offset});
+			}
+			completed += section.raw_size;
+			if (total_bytes != 0) g_state.scan_progress.store(
+				static_cast<float>(completed) / static_cast<float>(total_bytes), std::memory_order_release);
+		}
+		{
+			std::lock_guard<std::mutex> lock(g_state.results_mutex);
+			if (g_state.scan_static_binary && g_state.scan_workspace_id == workspace_id &&
+				g_state.scan_workspace_generation == workspace_generation) {
+				g_state.total_found = results.size();
+				g_state.results = std::move(results);
+				g_state.has_initial_scan = true;
+				g_state.scan_count = 1;
+			}
+		}
+		} catch (const std::exception& ex) {
+			diag::log_tagged_fmt("mem_scanner", "static_scan worker exception err='%s'", ex.what());
+		} catch (...) {
+			diag::log_tagged("mem_scanner", "static_scan worker exception err='<unknown>'");
+		}
+		finish();
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		st.scanning.store(false, std::memory_order_release);
+		st.scan_thread_done.store(true, std::memory_order_release);
+		return false;
+	}
+	return true;
+}
+
 bool next_scan(scan_mode_t mode, const std::string& value_text, const std::string& value_text2) {
 	auto& st = g_state;
 	if (st.scanning.load()) {
@@ -1512,6 +2058,23 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
 		diag::log_tagged_fmt("mem_scanner", "next_scan refused not_attached driver_loaded=%d pid=%u",
 			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
+		return false;
+	}
+	live_target_identity_t target_identity;
+	uint32_t target_pid = 0;
+	uint64_t target_epoch = 0;
+	{
+		std::lock_guard<std::mutex> lock(st.results_mutex);
+		target_pid = st.scan_target_pid;
+		target_epoch = st.scan_target_epoch;
+		target_identity = st.scan_target_identity;
+	}
+	if (!target_binding_current(target_pid, target_epoch) ||
+		!validate_attached_identity(target_identity, "next_scan")) {
+		diag::log_tagged_fmt("mem_scanner",
+			"next_scan refused stale_target expected_pid=%u expected_epoch=%llu current_pid=%u",
+			target_pid, static_cast<unsigned long long>(target_epoch),
+			driver_bridge::attached_pid());
 		return false;
 	}
 	diag::log_tagged_fmt("mem_scanner", "next_scan start mode=%s val='%s' val2='%s'",
@@ -1612,6 +2175,8 @@ void undo_scan() {
 		return;
 	}
 	std::lock_guard<std::mutex> lk(st.results_mutex);
+	if (!st.scan_static_binary && (!target_binding_current(st.scan_target_pid, st.scan_target_epoch) ||
+		!validate_attached_identity(st.scan_target_identity, "undo_scan"))) return;
 	if (st.scan_history.empty()) {
 		diag::log_tagged("mem_scanner", "undo_scan refused history_empty");
 		return;
@@ -1647,51 +2212,76 @@ void reset_scan() {
 	st.total_found = 0;
 	st.has_initial_scan = false;
 	st.scan_count = 0;
+	st.scan_static_binary = false;
+	st.scan_target_pid = 0;
+	st.scan_target_epoch = 0;
+	st.scan_target_identity = {};
+	st.scan_workspace_id.clear();
+	st.scan_workspace_generation = 0;
 	st.scan_progress.store(1.f, std::memory_order_release);
 	diag::log_tagged_fmt("mem_scanner", "reset_scan cleared=%zu", had);
 }
 
 void add_address(uint64_t address, const std::string& description, value_type_t type) {
 	auto& st = g_state;
-	std::lock_guard<std::mutex> lk(st.address_mutex);
-	for (const auto& e : st.address_list) {
-		if (e.address == address) {
-			diag::log_tagged_fmt("mem_scanner", "add_address skipped_duplicate addr=0x%llX",
-				static_cast<unsigned long long>(address));
-			return;
+	restore_scanner_state_for_current_target();
+	live_target_identity_t target_identity;
+	if (!capture_attached_identity(target_identity, "add_address")) return;
+	const std::uint64_t target_epoch = observe_target_identity(target_identity);
+	{
+		std::lock_guard<std::mutex> lk(st.address_mutex);
+		for (const auto& e : st.address_list) {
+			if (e.address == address && same_target_identity(e.target_identity, target_identity)) {
+				diag::log_tagged_fmt("mem_scanner", "add_address skipped_duplicate addr=0x%llX",
+					static_cast<unsigned long long>(address));
+				return;
+			}
 		}
+		address_entry_t entry;
+		entry.address = address;
+		entry.description = description;
+		entry.value_type = type;
+		entry.target_pid = target_identity.process.pid;
+		entry.target_epoch = target_epoch;
+		entry.target_identity = target_identity;
+		st.address_list.push_back(std::move(entry));
+		diag::log_tagged_fmt("mem_scanner", "add_address addr=0x%llX type=%s desc='%s' total=%zu",
+			static_cast<unsigned long long>(address), value_type_name(type),
+			description.c_str(), st.address_list.size());
 	}
-	address_entry_t entry;
-	entry.address = address;
-	entry.description = description;
-	entry.value_type = type;
-	st.address_list.push_back(std::move(entry));
-	diag::log_tagged_fmt("mem_scanner", "add_address addr=0x%llX type=%s desc='%s' total=%zu",
-		static_cast<unsigned long long>(address), value_type_name(type),
-		description.c_str(), st.address_list.size());
+	persist_scanner_state();
 }
 
 void remove_address(size_t index) {
 	auto& st = g_state;
-	std::lock_guard<std::mutex> lk(st.address_mutex);
-	if (index < st.address_list.size()) {
-		uint64_t addr = st.address_list[index].address;
-		st.address_list.erase(st.address_list.begin() + static_cast<ptrdiff_t>(index));
-		diag::log_tagged_fmt("mem_scanner", "remove_address index=%zu addr=0x%llX remaining=%zu",
-			index, static_cast<unsigned long long>(addr), st.address_list.size());
-	} else {
-		diag::log_tagged_fmt("mem_scanner", "remove_address out_of_range index=%zu size=%zu",
-			index, st.address_list.size());
+	bool removed = false;
+	{
+		std::lock_guard<std::mutex> lk(st.address_mutex);
+		if (index < st.address_list.size()) {
+			uint64_t addr = st.address_list[index].address;
+			st.address_list.erase(st.address_list.begin() + static_cast<ptrdiff_t>(index));
+			diag::log_tagged_fmt("mem_scanner", "remove_address index=%zu addr=0x%llX remaining=%zu",
+				index, static_cast<unsigned long long>(addr), st.address_list.size());
+			removed = true;
+		} else {
+			diag::log_tagged_fmt("mem_scanner", "remove_address out_of_range index=%zu size=%zu",
+				index, st.address_list.size());
+		}
 	}
+	if (removed) persist_scanner_state();
 }
 
 void freeze_address(size_t index, bool enable) {
 	auto& st = g_state;
+	live_target_identity_t target_identity;
+	const bool identity_valid = capture_attached_identity(target_identity, "freeze_address");
+	const uint64_t epoch = identity_valid ? observe_target_identity(target_identity) : 0;
 	std::lock_guard<std::mutex> lk(st.address_mutex);
 	if (index < st.address_list.size()) {
 		auto& e = st.address_list[index];
-		e.frozen = enable;
-		if (enable && !e.last_value.empty())
+		e.frozen = enable && identity_valid && e.target_pid == target_identity.process.pid &&
+			e.target_epoch == epoch && same_target_identity(e.target_identity, target_identity);
+		if (e.frozen && !e.last_value.empty())
 			e.freeze_value = e.last_value;
 		diag::log_tagged_fmt("mem_scanner", "freeze_address addr=0x%llX enable=%d has_value=%d",
 			static_cast<unsigned long long>(e.address), static_cast<int>(enable),
@@ -1703,24 +2293,63 @@ void freeze_address(size_t index, bool enable) {
 }
 
 void write_value(uint64_t address, value_type_t type, const std::string& value_text, bool hex) {
+	live_target_identity_t target_identity;
+	if (!capture_attached_identity(target_identity, "write_value")) {
+		diag::log_tagged_fmt("mem_scanner", "write_value refused_not_attached addr=0x%llX",
+			static_cast<unsigned long long>(address));
+		return;
+	}
+	const uint32_t pid = target_identity.process.pid;
+	const uint64_t epoch = observe_target_identity(target_identity);
+	{
+		std::lock_guard<std::mutex> lock(g_state.address_mutex);
+		const auto entry = std::find_if(g_state.address_list.begin(), g_state.address_list.end(),
+			[address, type](const address_entry_t& item) {
+				return item.address == address && item.value_type == type;
+			});
+		if (entry != g_state.address_list.end() &&
+			(entry->target_pid != pid || entry->target_epoch != epoch ||
+				!same_target_identity(entry->target_identity, target_identity))) {
+			diag::log_tagged_fmt("mem_scanner", "write_value refused_stale_target addr=0x%llX entry_pid=%u current_pid=%u",
+				static_cast<unsigned long long>(address), entry->target_pid, pid);
+			return;
+		}
+	}
 	auto bytes = parse_value(value_text, type, hex);
 	if (bytes.empty()) {
 		diag::log_tagged_fmt("mem_scanner", "write_value parse_failed addr=0x%llX text='%s' hex=%d",
 			static_cast<unsigned long long>(address), value_text.c_str(), static_cast<int>(hex));
 		return;
 	}
-	bool ok = driver_bridge::write_memory(address, bytes);
+	std::vector<std::uint8_t> previous;
+	const bool read_ok = driver_bridge::read_memory(address, bytes.size(), previous) &&
+		previous.size() == bytes.size();
+	bool ok = target_binding_current(pid, epoch) &&
+		validate_attached_identity(target_identity, "write_value_commit") &&
+		driver_bridge::write_memory(address, bytes);
+	std::vector<std::uint8_t> readback;
+	ok = ok && target_binding_current(pid, epoch) &&
+		validate_attached_identity(target_identity, "write_value_readback") &&
+		driver_bridge::read_memory(address, bytes.size(), readback) && readback == bytes;
+	if (!ok && read_ok && target_binding_current(pid, epoch) &&
+		validate_attached_identity(target_identity, "write_value_rollback"))
+		static_cast<void>(driver_bridge::write_memory(address, previous));
 	diag::log_tagged_fmt("mem_scanner", "write_value addr=0x%llX size=%zu type=%s ok=%d",
 		static_cast<unsigned long long>(address), bytes.size(),
 		value_type_name(type), static_cast<int>(ok));
 }
 
 std::string read_value_string(uint64_t address, value_type_t type) {
+	live_target_identity_t target_identity;
+	if (!capture_attached_identity(target_identity, "read_value_string")) return "<stale target>";
+	const uint64_t target_epoch = observe_target_identity(target_identity);
 	size_t sz = value_type_size(type);
 	if (type == value_type_t::string_ascii || type == value_type_t::string_utf16)
 		sz = 256;
 	std::vector<uint8_t> buf;
-	if (!driver_bridge::read_memory(address, sz, buf)) return "<read error>";
+	if (!target_binding_current(target_identity.process.pid, target_epoch) ||
+		!driver_bridge::read_memory(address, sz, buf) ||
+		!validate_attached_identity(target_identity, "read_value_string_publish")) return "<read error>";
 	if (type == value_type_t::string_ascii) {
 		auto it = std::find(buf.begin(), buf.end(), 0);
 		if (it != buf.end()) buf.erase(it, buf.end());
@@ -1730,6 +2359,10 @@ std::string read_value_string(uint64_t address, value_type_t type) {
 
 void refresh_address_list() {
 	auto& st = g_state;
+	restore_scanner_state_for_current_target();
+	live_target_identity_t target_identity;
+	if (!capture_attached_identity(target_identity, "refresh_address_list")) return;
+	const uint64_t target_epoch = observe_target_identity(target_identity);
 	std::vector<address_entry_t> snapshot;
 	{
 		std::lock_guard<std::mutex> lk(st.address_mutex);
@@ -1739,10 +2372,17 @@ void refresh_address_list() {
 		uint64_t address = 0;
 		value_type_t value_type = value_type_t::int32_val;
 		std::vector<uint8_t> value;
+		uint32_t target_pid = 0;
+		uint64_t target_epoch = 0;
+		live_target_identity_t target_identity;
 	};
 	std::vector<refreshed_value_t> refreshed;
 	refreshed.reserve(snapshot.size());
 	for (const auto& entry : snapshot) {
+		if (!target_binding_current(entry.target_pid, entry.target_epoch) ||
+			entry.target_epoch != target_epoch ||
+			!same_target_identity(entry.target_identity, target_identity))
+			continue;
 		size_t sz = value_type_size(entry.value_type);
 		if (entry.value_type == value_type_t::string_ascii ||
 			entry.value_type == value_type_t::string_utf16) sz = 256;
@@ -1752,14 +2392,18 @@ void refresh_address_list() {
 				auto it = std::find(buf.begin(), buf.end(), 0);
 				if (it != buf.end()) buf.erase(it, buf.end());
 			}
-			refreshed.push_back({entry.address, entry.value_type, std::move(buf)});
+			refreshed.push_back({entry.address, entry.value_type, std::move(buf),
+				entry.target_pid, entry.target_epoch, entry.target_identity});
 		}
 	}
+	if (!validate_attached_identity(target_identity, "refresh_address_list_publish")) return;
 	std::lock_guard<std::mutex> lk(st.address_mutex);
 	for (auto& update : refreshed) {
-		auto current = std::find_if(st.address_list.begin(), st.address_list.end(),
+			auto current = std::find_if(st.address_list.begin(), st.address_list.end(),
 			[&](const address_entry_t& entry) {
-				return entry.address == update.address && entry.value_type == update.value_type;
+				return entry.address == update.address && entry.value_type == update.value_type &&
+					entry.target_pid == update.target_pid && entry.target_epoch == update.target_epoch &&
+					same_target_identity(entry.target_identity, update.target_identity);
 			});
 		if (current != st.address_list.end())
 			current->last_value = std::move(update.value);
@@ -1777,6 +2421,9 @@ bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, 
 			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
 		return false;
 	}
+	live_target_identity_t target_identity;
+	if (!capture_attached_identity(target_identity, "start_pointer_scan")) return false;
+	const uint64_t target_epoch = observe_target_identity(target_identity);
 	diag::log_tagged_fmt("pointer_scan", "start_pointer_scan target=0x%llX depth=%d offset=0x%X scan_range=0x%llX+0x%llX",
 		static_cast<unsigned long long>(target_address), max_depth, max_offset,
 		static_cast<unsigned long long>(scan_base),
@@ -1785,6 +2432,9 @@ bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, 
 	{
 		std::lock_guard<std::mutex> lk(st.pointer_mutex);
 		st.pointer_results.clear();
+		st.pointer_target_pid = target_identity.process.pid;
+		st.pointer_target_epoch = target_epoch;
+		st.pointer_target_identity = target_identity;
 	}
 	while (!st.pointer_thread_done.load(std::memory_order_acquire))
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));

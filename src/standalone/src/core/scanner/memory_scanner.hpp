@@ -10,9 +10,20 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "../runtime/standalone_driver_identity.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/preview_fixture_controls.hpp"
+#endif
+
+namespace aida::analysis {
+class byte_provider_t;
+class pe_image_t;
+}
 
 namespace memory_scanner {
 
@@ -88,6 +99,9 @@ struct address_entry_t {
 	bool        frozen = false;
 	std::vector<uint8_t> freeze_value;
 	std::vector<uint8_t> last_value;
+	uint32_t    target_pid = 0;
+	uint64_t    target_epoch = 0;
+	driver_bridge::identity::live_target_identity_t target_identity;
 };
 
 struct pointer_result_t {
@@ -136,8 +150,25 @@ struct state_t {
 	std::atomic<bool>              pointer_scanning{false};
 	std::atomic<float>             pointer_progress{0.f};
 	std::atomic<bool>              pointer_thread_done{true};
+	uint32_t                       pointer_target_pid = 0;
+	uint64_t                       pointer_target_epoch = 0;
+	driver_bridge::identity::live_target_identity_t pointer_target_identity;
 
 	std::vector<std::vector<scan_result_t>> scan_history;
+
+	std::mutex                         target_binding_mutex;
+	std::atomic<uint32_t>              observed_target_pid{0};
+	std::atomic<uint64_t>              observed_target_creation_time_100ns{0};
+	std::atomic<uint64_t>              target_epoch{1};
+	uint32_t                           scan_target_pid = 0;
+	uint64_t                           scan_target_epoch = 0;
+	driver_bridge::identity::live_target_identity_t scan_target_identity;
+	bool                               scan_static_binary = false;
+	std::string                        scan_workspace_id;
+	uint64_t                           scan_workspace_generation = 0;
+	std::atomic<uint32_t>              persisted_loaded_pid{0};
+	std::atomic<uint64_t>              persisted_loaded_creation_time_100ns{0};
+	std::atomic<bool>                  persisted_config_loaded{false};
 };
 
 inline state_t g_state;
@@ -149,6 +180,10 @@ void initialize();
 void shutdown();
 
 bool first_scan(const scan_config_t& config);
+bool first_static_scan(const scan_config_t& config,
+	std::shared_ptr<const aida::analysis::byte_provider_t> provider,
+	std::shared_ptr<const aida::analysis::pe_image_t> image,
+	std::string workspace_id, uint64_t workspace_generation);
 bool next_scan(scan_mode_t mode, const std::string& value_text, const std::string& value_text2 = "");
 bool cancel_scan();
 void undo_scan();
@@ -160,6 +195,10 @@ void freeze_address(size_t index, bool enable);
 void write_value(uint64_t address, value_type_t type, const std::string& value_text, bool hex = false);
 std::string read_value_string(uint64_t address, value_type_t type);
 void refresh_address_list();
+uint64_t observe_target_binding(uint32_t pid);
+bool target_binding_current(uint32_t pid, uint64_t epoch);
+bool validate_target_binding(uint32_t pid, uint64_t epoch,
+	uint64_t process_creation_time_100ns);
 
 bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, uint64_t scan_base = 0, uint64_t scan_size = 0);
 void cancel_pointer_scan();

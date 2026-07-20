@@ -752,10 +752,13 @@ void render_source_debug_console()
     const auto tasks = task_center::snapshot();
     const bool target_available = source && !source->target_key.empty();
     const bool current_location = source && source->current.valid;
+    const auto focus_action = application_ui::present_action(
+        "view.focus.view.programming.source_debug_console");
     const design::header_t header{"programming.source_debug.header",
         "Source Debug Console", "Programming / Debug",
         target_available ? source->target_key.c_str() : "No debug target",
-        "Ctrl+Shift+D", source && !source->error.empty()
+        focus_action.shortcut.empty() ? nullptr : focus_action.shortcut.c_str(),
+        source && !source->error.empty()
             ? design::semantic_t::error
             : source && source->operation_pending
                 ? design::semantic_t::warning
@@ -780,9 +783,7 @@ void render_source_debug_console()
     ImGui::SameLine();
     action_button("programming.show_problems", "Problems");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Output"))
-        static_cast<void>(application_views::open_or_focus(
-            stable_view_id_t("view.output")));
+    action_button("view.focus.view.output", "Output");
 
     if (!source) {
         design::state_presentation_t unavailable;

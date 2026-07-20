@@ -914,6 +914,7 @@ void begin_frame()
 		rt.definitions = {std::move(definition)};
 		rt.target_key = "preview-debugger-fixture";
 		rt.target_pid = debugger_engine::g_state.target_pid;
+		rt.stop_generation = debugger_interaction::current_stop_generation();
 		current_location_t current;
 		current.valid = true;
 		current.file_path = "C:/AiDA/Preview/sample.cpp";
@@ -930,6 +931,16 @@ void begin_frame()
 			{29, "}", false}};
 		rebuild_publication_locked(rt);
 		publish_current(rt, std::move(current));
+	} else {
+		const std::uint32_t target_pid = debugger_engine::g_state.target_pid;
+		const std::uint64_t stop_generation =
+			debugger_interaction::current_stop_generation();
+		std::lock_guard<std::mutex> lock(rt.operation_mutex);
+		if (rt.target_pid != target_pid || rt.stop_generation != stop_generation) {
+			rt.target_pid = target_pid;
+			rt.stop_generation = stop_generation;
+			rebuild_publication_locked(rt);
+		}
 	}
 #else
 	context_t context;

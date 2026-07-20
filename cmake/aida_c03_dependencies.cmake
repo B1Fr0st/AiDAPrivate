@@ -4,13 +4,12 @@ if(NOT WIN32)
     message(FATAL_ERROR "AiDA C03 dependencies are Windows-only")
 endif()
 
-set(AIDA_C03_DEPENDENCY_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
-cmake_path(NORMAL_PATH AIDA_C03_DEPENDENCY_ROOT)
+cmake_path(GET CMAKE_CURRENT_LIST_DIR PARENT_PATH AIDA_C03_DEPENDENCY_ROOT)
 set(AIDA_C03_NOTICE_LEDGER "${AIDA_C03_DEPENDENCY_ROOT}/licenses/c03/THIRD_PARTY_NOTICES.md")
 set(AIDA_C03_WORKER_MANIFEST_SCHEMA "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_worker_manifest.schema.json")
 set(AIDA_C03_WORKER_MANIFEST_SCHEMA_SHA256 "8c9bd6e9a2f5003af5bf55fd2e75fb7b60fbf8294e7f1613beca6242924e7f6a")
 set(AIDA_C03_WORKER_MANIFEST_LOCK "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_worker_manifest.lock.json")
-set(AIDA_C03_WORKER_MANIFEST_LOCK_SHA256 "7d7995b62bbaa3b6e5a24942cadd8c44e97a91fa1d9d3067a0e3a2856b3cac05")
+set(AIDA_C03_WORKER_MANIFEST_LOCK_SHA256 "f5cc81820b1b61a53adb6cc49bfa2037d081a48e3f24905c0592475c527219af")
 set(AIDA_C03_NATIVE_WORKER_MANIFEST_SCHEMA "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_native_worker_manifest.schema.json")
 set(AIDA_C03_NATIVE_WORKER_MANIFEST_SCHEMA_SHA256 "32ed5de9fde31039518946d6c28f7681675398466959daa2eb100e5d16746655")
 set(AIDA_C03_NATIVE_WORKER_MANIFEST_CONTRACT "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_native_worker_manifest.json")
@@ -19,17 +18,17 @@ set(AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER "${AIDA_C03_DEPENDENCY_ROOT}/pa
 set(AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER_SHA256 "ce731ce2459c61e8a88b32f9dacec1313d6e9ea8f60690ed37452ec606b0f58c")
 set(AIDA_C03_MANAGED_WORKER_ROOT "${AIDA_C03_DEPENDENCY_ROOT}/src/standalone/workers/managed_decompiler")
 set(AIDA_C03_MANAGED_WORKER_PROJECT "${AIDA_C03_MANAGED_WORKER_ROOT}/ManagedDecompilerWorker.csproj")
-set(AIDA_C03_MANAGED_WORKER_PROJECT_SHA256 "6cd5f5aac485fd4df184fefefd991c34b6260b05686f2b0ac68c9cfd01bbd58f")
+set(AIDA_C03_MANAGED_WORKER_PROJECT_SHA256 "f7992aa2e7b25db9b470c02c02993487c9e3ef2931d4334c8e87f43584dd26b4")
 set(AIDA_C03_MANAGED_WORKER_PACKAGES_LOCK "${AIDA_C03_MANAGED_WORKER_ROOT}/packages.lock.json")
-set(AIDA_C03_MANAGED_WORKER_PACKAGES_LOCK_SHA256 "1d9aa159e4abd4135519f5f4f3b62d71883aedd57426a66def82cde9f6d42a2b")
+set(AIDA_C03_MANAGED_WORKER_PACKAGES_LOCK_SHA256 "dd128ba62401441e4541ba352be13a6cd100d1b7ece51c80ce0025ccbb2c1b54")
 set(AIDA_C03_MANAGED_WORKER_NUGET_CONFIG "${AIDA_C03_MANAGED_WORKER_ROOT}/NuGet.Config")
-set(AIDA_C03_MANAGED_WORKER_NUGET_CONFIG_SHA256 "7ed721d172b6e0b6993d1000ae81c09fce12741614fa8b001cd2b99b79c0053c")
+set(AIDA_C03_MANAGED_WORKER_NUGET_CONFIG_SHA256 "b1d2ede9a75cfdb8db9a59cde826c8506470818be9a63952d30d624f225f9c09")
 set(AIDA_C03_MANAGED_WORKER_MANIFEST_SCHEMA "${AIDA_C03_MANAGED_WORKER_ROOT}/worker_manifest.schema.json")
 set(AIDA_C03_MANAGED_WORKER_MANIFEST_SCHEMA_SHA256 "fbc0fbac75c5af1219963aee9f624b600175dd1fb621353eeb3be3df9ccd994f")
 set(AIDA_C03_MANAGED_WORKER_MANIFEST_CONTRACT "${AIDA_C03_MANAGED_WORKER_ROOT}/worker_manifest.json")
 set(AIDA_C03_MANAGED_WORKER_MANIFEST_CONTRACT_SHA256 "3a1d2d5643b0204871f636d93a5c869dfe71667f03dc75f32f6fd83f646a193d")
 set(AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER "${AIDA_C03_MANAGED_WORKER_ROOT}/materialize_manifest.py")
-set(AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER_SHA256 "81f9c0c82da5d945f2f5cbca834211c85fc11985901ec3f2152a326aa78b9991")
+set(AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER_SHA256 "5689c68cd750fe0681f0074ebdfbb9c5da6e5cce9727af443e017c1c8085e061")
 set(AIDA_C03_WORKER_RUNTIME_ROOT "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_worker_runtime")
 set(AIDA_C03_MANAGED_RUNTIME_SOURCE_SPEC "${AIDA_C03_WORKER_RUNTIME_ROOT}/managed_runtime_source_spec.json")
 set(AIDA_C03_MANAGED_RUNTIME_SOURCE_SPEC_SHA256 "2ee04cc5ed3c0fdbe1dac2f59ff2ac0e0fd5b4595c042aadb9abfbbd8153c4de")
@@ -38,7 +37,7 @@ set(AIDA_C03_MANAGED_RUNTIME_SOURCE_SCHEMA_SHA256 "d66d6182c59356274183c669328bf
 set(AIDA_C03_MANAGED_RUNTIME_MANIFEST_SCHEMA "${AIDA_C03_WORKER_RUNTIME_ROOT}/managed_runtime_manifest.schema.json")
 set(AIDA_C03_MANAGED_RUNTIME_MANIFEST_SCHEMA_SHA256 "6edabaa290de6f5717a2dd01bad787c49577f4103cb029f4ef88a49804759ac6")
 set(AIDA_C03_MANAGED_RUNTIME_MATERIALIZER "${AIDA_C03_WORKER_RUNTIME_ROOT}/materialize_managed_runtime.py")
-set(AIDA_C03_MANAGED_RUNTIME_MATERIALIZER_SHA256 "b7294b49d3a3f1d43936b57a91b540c37ec98ffc778dcca980c469c5cd5ee25d")
+set(AIDA_C03_MANAGED_RUNTIME_MATERIALIZER_SHA256 "a6adf0dc656c5e42f1a96e37ed7372524ffc0f361e215c7c12c083edaaf279d6")
 set(AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT "${AIDA_C03_DEPENDENCY_ROOT}/.deps/dotnet-sdk-10.0.301-win-x64")
 set(AIDA_C03_MANAGED_RUNTIME_VERSION "10.0.9")
 set(AIDA_C03_MANAGED_RUNTIME_TFM "net10.0")
@@ -60,7 +59,7 @@ set(AIDA_C03_WORKER_RUNTIME_ACL_MATERIALIZER_SHA256 "241edea4b518ad455f6cacf6862
 set(AIDA_C03_WORKER_RUNTIME_ACL_SCHEMA "${AIDA_C03_WORKER_RUNTIME_ROOT}/worker_runtime_acl_receipt.schema.json")
 set(AIDA_C03_WORKER_RUNTIME_ACL_SCHEMA_SHA256 "e766379539f18fa3ce2ce43e9e4c7353fe9af768dd6d0efe65a059151d602131")
 set(AIDA_C03_DISTRIBUTION_MANIFEST_SPEC "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_distribution_manifest_spec.json")
-set(AIDA_C03_DISTRIBUTION_MANIFEST_SPEC_SHA256 "864227d0c0249d1b64434840ef6a8563b3772c8c950fb22a041f1b94031cde77")
+set(AIDA_C03_DISTRIBUTION_MANIFEST_SPEC_SHA256 "3421ec44ee57ea1ccebbcb05b081105ed88c4039890e7088a64c4cb7c0b7ef7a")
 set(AIDA_C03_DISTRIBUTION_MANIFEST_SPEC_SCHEMA "${AIDA_C03_WORKER_RUNTIME_ROOT}/distribution_manifest_spec.schema.json")
 set(AIDA_C03_DISTRIBUTION_MANIFEST_SPEC_SCHEMA_SHA256 "9f2649e41ef59d4a74c4c06dfa840aa846e6cf6ca461f05f05c23576b951cf7a")
 set(AIDA_C03_DISTRIBUTION_BLOCKER_SCRIPT "${AIDA_C03_WORKER_RUNTIME_ROOT}/fail_distribution.cmake")
@@ -69,16 +68,25 @@ set(AIDA_C03_ANALYSIS_PYTHON_WORKER_ROOT "${AIDA_C03_DEPENDENCY_ROOT}/src/standa
 set(AIDA_C03_ANALYSIS_PYTHON_WORKER_SOURCE "${AIDA_C03_ANALYSIS_PYTHON_WORKER_ROOT}/analysis_python_worker.py")
 set(AIDA_C03_ANALYSIS_PYTHON_WORKER_SOURCE_SHA256 "493d52e9401adaa060a4f5d1435ea38dfd3ee9f0519325ea04ce651a73c83024")
 set(AIDA_C03_ANALYSIS_PYTHON_WORKER_STAGER "${AIDA_C03_ANALYSIS_PYTHON_WORKER_ROOT}/build_frozen_worker.ps1")
-set(AIDA_C03_ANALYSIS_PYTHON_WORKER_STAGER_SHA256 "39d608ea74f5a9352828fd8d4a6078f558006019991b9b77d19838d152f16232")
+set(AIDA_C03_ANALYSIS_PYTHON_WORKER_STAGER_SHA256 "c6e6539f268920298ae94730dd03cd5ed8ebeea88990dcd1ee41b4bbc6415d26")
 set(AIDA_C03_ANALYSIS_PYTHON_WORKER_ARTIFACT "${AIDA_C03_DEPENDENCY_ROOT}/.deps/AiDA_AnalysisPythonWorker/AiDA_AnalysisPythonWorker.exe")
 set(AIDA_C03_DISTRIBUTION_MANIFEST_SCHEMA "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_distribution_manifest.schema.json")
 set(AIDA_C03_DISTRIBUTION_MANIFEST_SCHEMA_SHA256 "0140f8582f8a2292a0364bfe60e3a2c6ef05f876a617e19fd026f3e9f4f7b2ab")
 set(AIDA_C03_DISTRIBUTION_MANIFEST_MATERIALIZER "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_distribution_manifest.ps1")
-set(AIDA_C03_DISTRIBUTION_MANIFEST_MATERIALIZER_SHA256 "0ce5b8176f47ff3764cf230dd8a11d73c467e7d234898122aa7d6ff1d67fdde4")
+set(AIDA_C03_DISTRIBUTION_MANIFEST_MATERIALIZER_SHA256 "313bbec4121b5bff44d46e7507af5bb8a2d369a0c5de8a0cb3a9a6997502f5c3")
 set(AIDA_C03_CAMOUFOX_REVERSE_MCP_BUILD_LOCK "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_camoufox_reverse_mcp_build.lock.json")
 set(AIDA_C03_CAMOUFOX_REVERSE_MCP_BUILD_LOCK_SHA256 "ae513d4afe67806293a7fde3c9fee1b1ecaa9eda4865e9fb08193bd2150f30b5")
 set(AIDA_C03_DOTNET_EXECUTABLE "${AIDA_C03_DEPENDENCY_ROOT}/.deps/dotnet-sdk-10.0.301-win-x64/dotnet.exe")
 set(AIDA_C03_DOTNET_EXECUTABLE_SHA256 "a5ccdc3a41d5e5c6014ff64509aed176db39f4f14caffff3dd1997f8907e94d7")
+set(AIDA_C03_MANAGED_APPHOST_SOURCE "${AIDA_C03_DEPENDENCY_ROOT}/.deps/dotnet-sdk-10.0.301-win-x64/packs/Microsoft.NETCore.App.Host.win-x64/10.0.9/runtimes/win-x64/native/apphost.exe")
+set(AIDA_C03_MANAGED_APPHOST_SOURCE_SIZE 160768)
+set(AIDA_C03_MANAGED_APPHOST_SOURCE_SHA256 "11f1beca62b1b2bb583b2ca6ea1fb4402f1c1aa553fc8d7b6b919ae559018b83")
+set(AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/shared/Microsoft.NETCore.App/10.0.9/System.Collections.Immutable.dll")
+set(AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SIZE 948048)
+set(AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SHA256 "f1bf4d036baf22580ced0afcd1512d1582e9990edad9ad50e83a0a5870330a29")
+set(AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/shared/Microsoft.NETCore.App/10.0.9/System.Reflection.Metadata.dll")
+set(AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SIZE 1144656)
+set(AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SHA256 "03bcaa6abdec4bb0194689e41fb9c8bd07e4eb098421bba60d19d2134691a265")
 set(AIDA_C03_OFFLINE_NUGET_ROOT "${AIDA_C03_DEPENDENCY_ROOT}/.deps/nuget-offline")
 set(AIDA_C03_CAMOUFOX_EXECUTABLE "${AIDA_C03_DEPENDENCY_ROOT}/camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe")
 set(AIDA_C03_CAMOUFOX_EXECUTABLE_SHA256 "768937fa6a6df581d0cdc88ecffe1cf651ffebe1ad1d5667a5f75100e96acfe0")
@@ -283,7 +291,7 @@ aida_c03_configure_signing_authority()
 function(aida_c03_require_locked_source_tree)
     set(_aida_c03_inputs
         "src/standalone/workers/native_decompiler/fake_native_decompiler_worker.cpp|15972|4323a48219411fb872594dc96e6b884039c8e8cf20c2954424a765818d6c2dc4"
-        "src/standalone/workers/native_decompiler/ghidra_native_provider.cpp|13893|3b1cc79f48466147e8264ed64e1ecdf00e831cae715177fc311c4c034f4d3df7"
+        "src/standalone/workers/native_decompiler/ghidra_native_provider.cpp|13968|468a3c8bdfd53dafd9d20a467e1014e13b8029471121cc6a77224ac3d1b475b7"
         "src/standalone/workers/native_decompiler/ghidra_native_provider.hpp|487|524fb2f51e2e208610fa28768b6fa6b7a4b2ebd8824070ac518dff1d06b6ce55"
         "src/standalone/workers/native_decompiler/native_decompiler_worker.cpp|2825|0a39212f62ce22df7caa28e62dbaadb2adaaf6b6394690ea4e2129ab3242de1f"
         "src/standalone/workers/native_decompiler/native_worker_protocol.hpp|18353|2ebc3f2326285c4db0c4fd0d93b3314902fcc9336aba78837e544e24dc343f43"
@@ -293,18 +301,18 @@ function(aida_c03_require_locked_source_tree)
         "src/standalone/tests/c03/decompiler_quality_schema.cpp|115001|8dcc6359d1f7dd9bad36be742614c6b6b508c0055338be22af4700737c8e7e27"
         "src/standalone/tests/c03/decompiler_quality_schema.hpp|1266|97bc268ab39854317d24321bddce743c3c5b16340a9b9257b4422342db7b874c"
         "src/standalone/tests/c03/fixtures/decompiler_provider_results.schema.json|10352|2639cf30efba36143c8b7778264b714e7d3f50c09b3f68ae00d5786433c8427d"
-        "src/standalone/tests/c03/decompiler_quality_scorer.cpp|59613|b974931254c1263157061137f20243f84ed1a3f7ade1c09f038e0c12d56861a8"
+        "src/standalone/tests/c03/decompiler_quality_scorer.cpp|59912|6c5fdaafb2ea80985911e8d1e11a085c351dda2eaed3d589254c38a923a8dddd"
         "src/standalone/tests/c03/decompiler_quality_scorer.hpp|1480|9db0b310ca88f0a43c886819f3b4542834f621dcee6af7e498a8f50252fea28c"
-        "src/standalone/tests/c03/decompiler_quality_scorer_harness.cpp|24838|3e97c751aa6db0e434263d2f74f37e8237206b42ddcc19a4f3f904d14da2147b"
+        "src/standalone/tests/c03/decompiler_quality_scorer_harness.cpp|24897|d72d6bfa2e0381a4065e36bf5d9800981c2931610da9275da394c78d7db53648"
         "src/standalone/tests/c03/decompiler_quality_scorer_harness.hpp|644|f116aa31bbe209d973c4d045f46f68f1a127ec424ec81279bc3d527153dbdf65"
         "cmake/c03_safe_headless/decompiler_quality_pipeline_main.cpp|5501|2cd9b2aa17aa25cabb0c2f9bb4d1705957174826613aa69e9d05f3072bb41b66"
         "src/standalone/workers/managed_decompiler/AssemblyInfo.cs|98|69ebe8ec7e9a518093d43e9e6909724562fa55ae8083a71701e55411f1a4ef76"
         "src/standalone/workers/managed_decompiler/AuthenticatedTransport.cs|15277|f7fffeab2540b2458326efcb68096313701f2b95087e2978c1bf80a3971b8437"
-        "src/standalone/workers/managed_decompiler/ManagedDecompilerWorker.csproj|1281|6cd5f5aac485fd4df184fefefd991c34b6260b05686f2b0ac68c9cfd01bbd58f"
-        "src/standalone/workers/managed_decompiler/materialize_manifest.py|23779|81f9c0c82da5d945f2f5cbca834211c85fc11985901ec3f2152a326aa78b9991"
-        "src/standalone/workers/managed_decompiler/MetadataAnalysis.cs|44876|e080c2505290a867c6c9416581e4fe4bb53e4449ed690617bafcdb41e6ae9817"
-        "src/standalone/workers/managed_decompiler/NuGet.Config|297|7ed721d172b6e0b6993d1000ae81c09fce12741614fa8b001cd2b99b79c0053c"
-        "src/standalone/workers/managed_decompiler/packages.lock.json|1043|1d9aa159e4abd4135519f5f4f3b62d71883aedd57426a66def82cde9f6d42a2b"
+        "src/standalone/workers/managed_decompiler/ManagedDecompilerWorker.csproj|2314|f7992aa2e7b25db9b470c02c02993487c9e3ef2931d4334c8e87f43584dd26b4"
+        "src/standalone/workers/managed_decompiler/materialize_manifest.py|24064|5689c68cd750fe0681f0074ebdfbb9c5da6e5cce9727af443e017c1c8085e061"
+        "src/standalone/workers/managed_decompiler/MetadataAnalysis.cs|45140|2680d1302872a13b76bc8c19dc914b00e96a38760cc6c2d3fe5ec69614459b99"
+        "src/standalone/workers/managed_decompiler/NuGet.Config|976|b1d2ede9a75cfdb8db9a59cde826c8506470818be9a63952d30d624f225f9c09"
+        "src/standalone/workers/managed_decompiler/packages.lock.json|1043|dd128ba62401441e4541ba352be13a6cd100d1b7ece51c80ce0025ccbb2c1b54"
         "src/standalone/workers/managed_decompiler/Program.cs|9701|cd1eadecd5a5436e57ffefa2dd1592b7cfbdc2d66b002dfbb74042b28d37446c"
         "src/standalone/workers/managed_decompiler/Protocol.cs|6319|e2907928f3c218c21c774a3753f98072a7dc8176a13044fc7a0568f643d711d6"
         "src/standalone/workers/managed_decompiler/ResourceBudgetGuard.cs|5609|b9b715c3a524f0c830ef94599ba7de7597bf2aa6bad8928581ec6de5f4ba35bd"
@@ -312,7 +320,7 @@ function(aida_c03_require_locked_source_tree)
         "src/standalone/workers/managed_decompiler/worker_manifest.json|2429|3a1d2d5643b0204871f636d93a5c869dfe71667f03dc75f32f6fd83f646a193d"
         "src/standalone/workers/managed_decompiler/worker_manifest.schema.json|5361|fbc0fbac75c5af1219963aee9f624b600175dd1fb621353eeb3be3df9ccd994f"
         "src/standalone/workers/analysis_python/analysis_python_worker.py|9572|493d52e9401adaa060a4f5d1435ea38dfd3ee9f0519325ea04ce651a73c83024"
-        "src/standalone/workers/analysis_python/build_frozen_worker.ps1|25982|39d608ea74f5a9352828fd8d4a6078f558006019991b9b77d19838d152f16232"
+        "src/standalone/workers/analysis_python/build_frozen_worker.ps1|27710|c6e6539f268920298ae94730dd03cd5ed8ebeea88990dcd1ee41b4bbc6415d26"
         "src/standalone/workers/analysis_python/fake_analysis_python_worker.cpp|9858|309fa6f7f38949ba60e0c5e9ae7953eb544cac4f95b664802761e4289a48079f"
         "src/standalone/workers/analysis_python/python_worker_protocol.hpp|17993|97216bc6b188075324cda563a50bd64bc020208eb305f4a638889249763f5c0c")
     foreach(_aida_c03_input IN LISTS _aida_c03_inputs)
@@ -377,6 +385,9 @@ function(aida_c03_verify_dependency_inventory)
     aida_c03_require_json_contract("${AIDA_C03_MANAGED_RUNTIME_SOURCE_SCHEMA}" "${AIDA_C03_MANAGED_RUNTIME_SOURCE_SCHEMA_SHA256}" "C03 managed runtime source schema" _aida_c03_managed_runtime_source_schema)
     aida_c03_require_json_contract("${AIDA_C03_MANAGED_RUNTIME_MANIFEST_SCHEMA}" "${AIDA_C03_MANAGED_RUNTIME_MANIFEST_SCHEMA_SHA256}" "C03 managed runtime manifest schema" _aida_c03_managed_runtime_manifest_schema)
     aida_c03_require_path_sha256("${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}" "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER_SHA256}" "C03 managed runtime materializer")
+    aida_c03_require_path_identity("${AIDA_C03_MANAGED_APPHOST_SOURCE}" "${AIDA_C03_MANAGED_APPHOST_SOURCE_SIZE}" "${AIDA_C03_MANAGED_APPHOST_SOURCE_SHA256}" "C03 managed win-x64 apphost source")
+    aida_c03_require_path_identity("${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE}" "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SIZE}" "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE_SHA256}" "C03 managed System.Collections.Immutable framework source")
+    aida_c03_require_path_identity("${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE}" "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SIZE}" "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE_SHA256}" "C03 managed System.Reflection.Metadata framework source")
     aida_c03_require_json_contract("${AIDA_C03_GHIDRA_SPEC_SOURCE_SPEC}" "${AIDA_C03_GHIDRA_SPEC_SOURCE_SPEC_SHA256}" "C03 Ghidra specification source contract" _aida_c03_ghidra_spec_source)
     aida_c03_require_json_contract("${AIDA_C03_GHIDRA_SPEC_SOURCE_SCHEMA}" "${AIDA_C03_GHIDRA_SPEC_SOURCE_SCHEMA_SHA256}" "C03 Ghidra specification source schema" _aida_c03_ghidra_spec_source_schema)
     aida_c03_require_json_contract("${AIDA_C03_GHIDRA_SPEC_MANIFEST_SCHEMA}" "${AIDA_C03_GHIDRA_SPEC_MANIFEST_SCHEMA_SHA256}" "C03 Ghidra specification manifest schema" _aida_c03_ghidra_spec_manifest_schema)
@@ -544,10 +555,16 @@ function(aida_c03_verify_dependency_inventory)
        NOT _aida_c03_managed_count EQUAL 3)
         message(FATAL_ERROR "AiDA C03 offline managed package graph is invalid")
     endif()
+    string(JSON _aida_c03_managed_lock_target_count LENGTH "${_aida_c03_managed_packages}" dependencies)
+    string(JSON _aida_c03_managed_lock_target MEMBER "${_aida_c03_managed_packages}" dependencies 0)
+    if(NOT _aida_c03_managed_lock_target_count EQUAL 1 OR
+       NOT _aida_c03_managed_lock_target STREQUAL "net10.0")
+        message(FATAL_ERROR "AiDA C03 managed package lock contains a RID restore graph")
+    endif()
     set(_aida_c03_managed_expected
-        "ICSharpCode.Decompiler|10.1.0.8386|.deps/nuget-offline/ICSharpCode.Decompiler.10.1.0.8386.nupkg|a6fb2e9be86c1b73e54231e20640d4d566c52f21cba9ad99c3e9100d67e8f5af"
-        "System.Collections.Immutable|9.0.0|.deps/nuget-offline/System.Collections.Immutable.9.0.0.nupkg|fbaab954c7a87396e6e1616ca15ea705703d755e696bf3b8c96fa039d8bcc9a7"
-        "System.Reflection.Metadata|9.0.0|.deps/nuget-offline/System.Reflection.Metadata.9.0.0.nupkg|6af1166dc0a1ed7829b127ac9d1dff4a0c568bfe82e4ec6347cf497ff49f4634")
+        "ICSharpCode.Decompiler|10.1.0.8386|.deps/nuget-offline/ICSharpCode.Decompiler.10.1.0.8386.nupkg|a6fb2e9be86c1b73e54231e20640d4d566c52f21cba9ad99c3e9100d67e8f5af|vq3sH7MW+GqT6N5V4kbhfdN4zotq7+QKOBzRjgNRgUX3D46QDNGpHgbO6lS4A/JEs203lZOrEVc/eiQMPONMsw=="
+        "System.Collections.Immutable|9.0.0|.deps/nuget-offline/System.Collections.Immutable.9.0.0.nupkg|fbaab954c7a87396e6e1616ca15ea705703d755e696bf3b8c96fa039d8bcc9a7|QhkXUl2gNrQtvPmtBTQHb0YsUrDiDQ2QS09YbtTTiSjGcf7NBqtYbrG/BE06zcBPCKEwQGzIv13IVdXNOSub2w=="
+        "System.Reflection.Metadata|9.0.0|.deps/nuget-offline/System.Reflection.Metadata.9.0.0.nupkg|6af1166dc0a1ed7829b127ac9d1dff4a0c568bfe82e4ec6347cf497ff49f4634|ANiqLu3DxW9kol/hMmTWbt3414t9ftdIuiIU7j80okq2YzAueo120M442xk1kDJWtmZTqWQn7wHDvMRipVOEOQ==")
     set(_aida_c03_managed_archives)
     foreach(_aida_c03_index RANGE 0 2)
         list(GET _aida_c03_managed_expected ${_aida_c03_index} _aida_c03_expected_record)
@@ -556,23 +573,33 @@ function(aida_c03_verify_dependency_inventory)
         string(JSON _aida_c03_package_version GET "${_aida_c03_authority}" offline_managed_restore packages ${_aida_c03_index} version)
         string(JSON _aida_c03_package_path GET "${_aida_c03_authority}" offline_managed_restore packages ${_aida_c03_index} path)
         string(JSON _aida_c03_package_sha256 GET "${_aida_c03_authority}" offline_managed_restore packages ${_aida_c03_index} sha256)
+        string(JSON _aida_c03_package_content_hash GET "${_aida_c03_managed_packages}" dependencies net10.0 "${_aida_c03_package_id}" contentHash)
         list(GET _aida_c03_expected_fields 0 _aida_c03_expected_id)
         list(GET _aida_c03_expected_fields 1 _aida_c03_expected_version)
         list(GET _aida_c03_expected_fields 2 _aida_c03_expected_path)
         list(GET _aida_c03_expected_fields 3 _aida_c03_expected_sha256)
+        list(GET _aida_c03_expected_fields 4 _aida_c03_expected_content_hash)
         if(NOT _aida_c03_package_id STREQUAL _aida_c03_expected_id OR
            NOT _aida_c03_package_version STREQUAL _aida_c03_expected_version OR
            NOT _aida_c03_package_path STREQUAL _aida_c03_expected_path OR
-           NOT _aida_c03_package_sha256 STREQUAL _aida_c03_expected_sha256)
+           NOT _aida_c03_package_sha256 STREQUAL _aida_c03_expected_sha256 OR
+           NOT _aida_c03_package_content_hash STREQUAL _aida_c03_expected_content_hash)
             message(FATAL_ERROR "AiDA C03 offline managed package identity is invalid")
         endif()
         list(APPEND _aida_c03_managed_archives "${AIDA_C03_DEPENDENCY_ROOT}/${_aida_c03_package_path}")
     endforeach()
     file(READ "${AIDA_C03_MANAGED_WORKER_NUGET_CONFIG}" _aida_c03_nuget_config)
     string(TOLOWER "${_aida_c03_nuget_config}" _aida_c03_nuget_config_lower)
+    set(_aida_c03_nuget_repository_identity "https://api.nuget.org/v3/index.json")
+    set(_aida_c03_nuget_repository_certificate "1f4b311d9acc115c8dc8018b5a49e00fce6da8e2855f9f014ca6f34570bc482d")
+    string(REPLACE "${_aida_c03_nuget_repository_identity}" ""
+        _aida_c03_nuget_network_source_scan "${_aida_c03_nuget_config_lower}")
     if(NOT _aida_c03_nuget_config_lower MATCHES "<clear[ ]*/>" OR
        NOT _aida_c03_nuget_config_lower MATCHES "\\.deps\\\\nuget-offline" OR
-       _aida_c03_nuget_config_lower MATCHES "(https?|ftp|git|ssh|file)://")
+       NOT _aida_c03_nuget_config_lower MATCHES "signaturevalidationmode[^>]+value=\"require\"" OR
+       NOT _aida_c03_nuget_config_lower MATCHES "serviceindex=\"${_aida_c03_nuget_repository_identity}\"" OR
+       NOT _aida_c03_nuget_config_lower MATCHES "fingerprint=\"${_aida_c03_nuget_repository_certificate}\"" OR
+       _aida_c03_nuget_network_source_scan MATCHES "(https?|ftp|git|ssh|file)://")
         message(FATAL_ERROR "AiDA C03 managed worker NuGet configuration is not strictly offline")
     endif()
     string(JSON _aida_c03_native_schema_version GET "${_aida_c03_native}" schema_version)
@@ -830,17 +857,23 @@ function(aida_c03_reject_forbidden_target_links)
                 continue()
             endif()
             foreach(_aida_c03_link IN LISTS _aida_c03_links)
+                set(_aida_c03_exempt_link FALSE)
                 string(TOLOWER "${_aida_c03_link}" _aida_c03_normalized_link)
                 foreach(_aida_c03_forbidden IN LISTS AIDA_C03_PRODUCTION_LINK_DENY_TOKENS)
                     if(_aida_c03_normalized_link MATCHES "(^|[^a-z0-9])${_aida_c03_forbidden}([^a-z0-9]|$)")
                         set(_aida_c03_edge
                             "${_aida_c03_target}|${_aida_c03_property}|${_aida_c03_link}")
-                        if(NOT _aida_c03_edge STREQUAL
+                        if(_aida_c03_edge STREQUAL
                            "AiDAStandalone|LINK_LIBRARIES|unicorn")
+                            set(_aida_c03_exempt_link TRUE)
+                        else()
                             message(FATAL_ERROR "AiDA C03 target links a forbidden dependency: ${_aida_c03_target} -> ${_aida_c03_link}")
                         endif()
                     endif()
                 endforeach()
+                if(_aida_c03_exempt_link)
+                    continue()
+                endif()
                 if(TARGET "${_aida_c03_link}")
                     list(APPEND _aida_c03_queue "${_aida_c03_link}")
                 else()
@@ -878,9 +911,9 @@ function(aida_c03_emit_production_link_graph_evidence output_path integration_ho
     endif()
     list(LENGTH _aida_c03_MANIFEST_ROOTS _aida_c03_manifest_root_count)
     list(LENGTH _aida_c03_DIRECT_ROOTS _aida_c03_direct_root_count)
-    if(NOT _aida_c03_manifest_root_count EQUAL 57 OR
+    if(NOT _aida_c03_manifest_root_count EQUAL 56 OR
        NOT _aida_c03_direct_root_count EQUAL 15)
-        message(FATAL_ERROR "AiDA C03 production link evidence requires exactly 57 manifest and 15 direct roots")
+        message(FATAL_ERROR "AiDA C03 production link evidence requires exactly 56 manifest and 15 direct roots")
     endif()
     set(_aida_c03_strict_roots
         ${_aida_c03_MANIFEST_ROOTS}

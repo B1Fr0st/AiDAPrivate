@@ -3,6 +3,7 @@
 #include "../workbench/workbench_shell_integration.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/struct_recon_preview_runtime.hpp"
+#include "../../preview/studio_semantics.hpp"
 #include "../../preview/ui_task_executor.hpp"
 #else
 #include "struct_recon_engine.hpp"
@@ -45,6 +46,20 @@
 
 namespace struct_recon_view {
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+static std::string studio_recon_field_id(
+	const struct_recon::reconstructed_struct_t& structure,
+	const struct_recon::struct_field_t& field) {
+	const auto workspace = disasm_view::capture_selected_workspace();
+	const std::string workspace_id = workspace.workspace
+		? workspace.workspace->identity().binary_id().to_hex() : std::string("none");
+	const std::string identity = workspace_id + ":" +
+		std::to_string(structure.base_address) + ":" + std::to_string(field.offset);
+	return aida::preview::semantics::stable_id("aida.types",
+		"recon-field-" + aida::preview::semantics::entity_token(identity));
+}
+#endif
+
 struct field_anim_t {
 	float heat_v = 0.f;
 	aida::ui::flash_t change_flash;
@@ -63,7 +78,6 @@ struct local_state_t {
 	int   selected_field = -1;
 	int   editing_field = -1;
 	char  edit_value_buf[128] = {};
-	float row_anim_time = 0.f;
 	std::unordered_map<int, field_anim_t> field_anims;
 	aida::ui::transition_t vtable_expand;
 	bool  vtable_expanded = true;
@@ -305,7 +319,6 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	const auto& th = aida::ui::resolved();
 	const float dt = aida::ui::clock::dt();
-	st.row_anim_time += dt;
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + width, oy + height),
 		aida::ui::with_alpha(th.bg_base, alpha));
@@ -798,8 +811,6 @@ void render(float pos_x, float pos_y, float width, float height,
 	if (last_vis > static_cast<int>(current_copy.fields.size()))
 		last_vis = static_cast<int>(current_copy.fields.size());
 
-	const float per_item_delay = 0.008f;
-	const float total_stagger_cap = 0.240f;
 	int context_request = -1;
 	bool pointer_context_request = false;
 	for (int i = first_vis; i < last_vis; ++i) {
@@ -809,11 +820,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		const auto& field = current_copy.fields[static_cast<size_t>(i)];
 		auto& fa = fanim(i);
 
-		float entrance_delay = std::min(static_cast<float>(i) * per_item_delay, total_stagger_cap);
-		float entrance_t = (st.row_anim_time - entrance_delay) / 0.32f;
-		if (entrance_t < 0.f) entrance_t = 0.f;
-		if (entrance_t > 1.f) entrance_t = 1.f;
-		float entrance = aida::motion::ease::out_cubic(entrance_t);
+		const float entrance = 1.f;
 
 		ImVec2 rmin(ox, ry);
 		ImVec2 rmax(ox + main_w, ry + row_h);
@@ -821,6 +828,12 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SetCursorScreenPos(rmin);
 		ImGui::PushID(i);
 		ImGui::InvisibleButton("##struct_recon_field", ImVec2(main_w, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			studio_recon_field_id(current_copy, field),
+			"reconstruction-field-row", false, false,
+			"aida.dock-window.view.types.struct-recon");
+#endif
 		const bool hovered = ImGui::IsItemHovered();
 		const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 		const bool right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);

@@ -119,7 +119,9 @@ build_jvm_entity_identity(const managed_artifact_t& artifact, std::uint32_t meth
         identity.method_name = method.method_name;
         identity.method_descriptor = method.method_signature;
         identity.method_index = method_index;
-        identity.code_offset = method.code_offset;
+        identity.code_offset = method.code_offset <= std::numeric_limits<std::uint32_t>::max()
+            ? static_cast<std::uint32_t>(method.code_offset)
+            : 0;
     }
     return identity;
 }
@@ -135,7 +137,9 @@ build_dalvik_entity_identity(const managed_artifact_t& artifact, std::uint32_t m
         identity.method_name = method.method_name;
         identity.prototype = method.method_signature;
         identity.method_id = method.method_index;
-        identity.code_item_offset = method.code_offset;
+        identity.code_item_offset = method.code_offset <= std::numeric_limits<std::uint32_t>::max()
+            ? static_cast<std::uint32_t>(method.code_offset)
+            : 0;
     }
     return identity;
 }

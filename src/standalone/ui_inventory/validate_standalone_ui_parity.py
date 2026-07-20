@@ -35,6 +35,7 @@ MINIMUM_KIND_COUNTS = {
     "state": 7,
     "shortcut": 12,
 }
+EXPECTED_DIALOG_COUNT = 74
 REQUIRED_IDS = {
     "document.code", "document.disassembly", "document.hex", "document.pseudocode",
     "document.graph", "document.diff", "view.project_explorer", "view.workspace_search",
@@ -60,10 +61,97 @@ DEBUG_IDS = {
 }
 FORBIDDEN_PATH_PARTS = ("testlab", "plugin_plans", "/plugin/", "/server/", "/driver/")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]+$")
+REGISTRY_SOURCE = ROOT / "src" / "standalone" / "src" / "core" / "ui" / "application_view_registry.cpp"
+DYNAMIC_VIEW_SOURCES = {
+    "view.background_tasks": (
+        ROOT / "src" / "standalone" / "src" / "core" / "ui" / "task_center.cpp",
+        "tasks.render = render_tasks_view",
+    ),
+    "view.diagnostics": (
+        ROOT / "src" / "standalone" / "src" / "core" / "ui" / "task_center.cpp",
+        "diagnostics.render = render_diagnostics_view",
+    ),
+}
 
 
 def fail(errors: list[str], message: str) -> None:
     errors.append(message)
+
+
+def validate_registry_coverage(target_ids: set[str], errors: list[str]) -> None:
+    try:
+        source = REGISTRY_SOURCE.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        fail(errors, f"canonical view registry unreadable: {exc}")
+        return
+    catalog_start = source.find("constexpr catalog_entry_t k_catalog[]")
+    catalog_end = source.find("#undef AIDA_VIEW", catalog_start)
+    if catalog_start < 0 or catalog_end < 0:
+        fail(errors, "canonical view registry catalog boundary is missing")
+        return
+    catalog = source[catalog_start:catalog_end]
+    entries: dict[str, tuple[str, str, str]] = {}
+    for line in catalog.splitlines():
+        macro_match = re.search(
+            r'\b(AIDA_VIEW|AIDA_DEBUG_VIEW|AIDA_NETWORK_VIEW)\(\s*"([a-z0-9._-]+)"',
+            line,
+        )
+        if not macro_match:
+            continue
+        macro, view_id = macro_match.groups()
+        if view_id in entries:
+            fail(errors, f"duplicate canonical registry view {view_id}")
+            continue
+        category = ""
+        subview = ""
+        if macro == "AIDA_VIEW":
+            route_match = re.search(
+                r'AIDA_VIEW\(\s*"[^"]+"\s*,\s*"[^"]*"\s*,\s*([a-z_]+)\s*,\s*'
+                r'[a-z_]+\s*,\s*[a-z_]+\s*,\s*([a-z_]+)\s*,',
+                line,
+            )
+            if not route_match:
+                fail(errors, f"canonical registry entry is not statically parseable: {view_id}")
+                continue
+            category, subview = route_match.groups()
+        entries[view_id] = (macro, category, subview)
+    if not entries:
+        fail(errors, "canonical view registry catalog contains no parsed views")
+        return
+
+    generic_routes = {
+        ("analysis", "analysis"): "analysis_hub_view::render_subview",
+        ("memory", "scan"): "scan_hub_view::render_subview",
+        ("types", "types"): "types_hub_view::render_subview",
+        ("debugger", "debugger"): "debugger_view::render_pane",
+        ("network", "network"): "network_view::render_pane",
+    }
+    for view_id, (macro, category, subview) in sorted(entries.items()):
+        if view_id not in target_ids:
+            fail(errors, f"canonical registry view lacks inventory target coverage: {view_id}")
+        if macro == "AIDA_DEBUG_VIEW":
+            category, subview = "debugger", "debugger"
+        elif macro == "AIDA_NETWORK_VIEW":
+            category, subview = "network", "network"
+        generic_symbol = generic_routes.get((category, subview))
+        if generic_symbol:
+            if generic_symbol not in source:
+                fail(errors, f"canonical registry route missing for {view_id}: {generic_symbol}")
+            continue
+        dispatch = f'std::strcmp(entry.id, "{view_id}")'
+        if dispatch not in source:
+            fail(errors, f"canonical registry view has no render dispatch: {view_id}")
+
+    for view_id, (owner, render_binding) in DYNAMIC_VIEW_SOURCES.items():
+        if view_id not in target_ids:
+            fail(errors, f"dynamic registry view lacks inventory target coverage: {view_id}")
+        try:
+            owner_source = owner.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            fail(errors, f"dynamic registry owner unreadable for {view_id}: {exc}")
+            continue
+        if f'stable_view_id_t("{view_id}")' not in owner_source or render_binding not in owner_source:
+            fail(errors, f"dynamic registry view has no exact render binding: {view_id}")
 
 
 def main() -> int:
@@ -177,6 +265,8 @@ def main() -> int:
     for kind, minimum in MINIMUM_KIND_COUNTS.items():
         if counts[kind] < minimum:
             fail(errors, f"kind {kind} has {counts[kind]}, expected at least {minimum}")
+    if counts["dialog"] != EXPECTED_DIALOG_COUNT:
+        fail(errors, f"kind dialog has {counts['dialog']}, expected exactly {EXPECTED_DIALOG_COUNT}")
     missing_ids = REQUIRED_IDS - stable_ids
     if missing_ids:
         fail(errors, f"missing required IDs: {','.join(sorted(missing_ids))}")
@@ -186,6 +276,21 @@ def main() -> int:
     missing_debug = {f"view.debug.{name}" for name in DEBUG_IDS} - stable_ids
     if missing_debug:
         fail(errors, f"missing debugger views: {','.join(sorted(missing_debug))}")
+
+    validate_registry_coverage(target_ids, errors)
+
+    standalone_source = ROOT / "src" / "standalone" / "src"
+    shared_modal_owner = standalone_source / "core" / "ui" / "design_system.cpp"
+    for suffix in ("*.cpp", "*.hpp"):
+        for source in standalone_source.rglob(suffix):
+            if source == shared_modal_owner:
+                continue
+            try:
+                text = source.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                text = source.read_text(encoding="utf-8", errors="replace")
+            if "BeginPopupModal(" in text:
+                fail(errors, f"raw BeginPopupModal outside shared owner: {source.relative_to(ROOT)}")
 
     if errors:
         for error in errors:

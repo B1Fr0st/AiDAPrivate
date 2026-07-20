@@ -19,4 +19,7 @@
     <RestoreDisableParallel>true</RestoreDisableParallel>
     <RestoreIgnoreFailedSources>false</RestoreIgnoreFailedSources>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="harness\**\*.cs" />
+  </ItemGroup>
 </Project>

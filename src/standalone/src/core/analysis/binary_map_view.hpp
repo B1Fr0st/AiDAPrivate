@@ -19,6 +19,7 @@
 #include "binary_map_preview_runtime.hpp"
 #else
 #include "standalone_driver.hpp"
+#include "../runtime/standalone_driver_identity.hpp"
 #endif
 #include "event_bus.hpp"
 #include "toast_notification.hpp"
@@ -108,6 +109,19 @@ namespace binary_map_view {
 		bool        is_noaccess = false;
 	};
 
+	struct live_target_binding_t {
+		aida::analysis::process_identity_t process;
+		std::optional<aida::analysis::module_identity_t> module;
+		std::uint64_t workspace_generation = 0;
+		std::uint64_t refresh_serial = 0;
+
+		bool valid() const noexcept {
+			return process.pid != 0 && process.creation_time_100ns != 0 && module &&
+				module->base != 0 && module->size != 0 && workspace_generation != 0 &&
+				refresh_serial != 0;
+		}
+	};
+
 	struct live_snapshot_t {
 		std::vector<live_region_t>                regions;
 		std::vector<driver_bridge::module_info_t> modules;
@@ -120,6 +134,7 @@ namespace binary_map_view {
 		std::string                               process_name;
 		int64_t                                   generated_unix = 0;
 		uint64_t                                  enum_elapsed_ms = 0;
+		live_target_binding_t                     target_binding;
 	};
 
 	struct view_state_t
@@ -189,9 +204,10 @@ namespace binary_map_view {
 		uint64_t                                change_protect_size = 0;
 		int                                     change_protect_choice = 0;
 		uint32_t                                change_protect_old = 0;
+		live_target_binding_t                   change_protect_binding;
 		std::weak_ptr<aida::analysis::analysis_workspace_t> workspace;
 		std::string                             binary_id;
-		std::uint64_t                           workspace_generation = 0;
+		std::atomic<std::uint64_t>              workspace_generation{0};
 	};
 
 	inline std::mutex& workspace_states_mutex()
@@ -217,7 +233,12 @@ namespace binary_map_view {
 			state = std::make_shared<view_state_t>();
 			state->workspace = context.workspace;
 			state->binary_id = key;
-			state->workspace_generation = context.workspace->generation();
+			state->workspace_generation.store(context.workspace->generation(),
+				std::memory_order_release);
+		}
+		else {
+			state->workspace_generation.store(context.workspace->generation(),
+				std::memory_order_release);
 		}
 		return state;
 	}
@@ -262,9 +283,82 @@ namespace binary_map_view {
 			return index >= 0 && static_cast<std::size_t>(index) < count;
 		}
 
+		inline live_target_binding_t capture_workspace_binding(
+			const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+			std::uint64_t generation, std::uint64_t refresh_serial)
+		{
+			live_target_binding_t binding;
+			if (!workspace) return binding;
+			if (const auto process = workspace->identity().process()) binding.process = *process;
+			binding.module = workspace->identity().module();
+			binding.workspace_generation = generation;
+			binding.refresh_serial = refresh_serial;
+			return binding;
+		}
+
+		inline bool binding_matches_workspace(const live_target_binding_t& binding,
+			const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+		{
+			return binding.valid() && workspace && !workspace->closing() && !workspace->closed() &&
+				workspace->generation() == binding.workspace_generation &&
+				workspace->identity().process() &&
+				*workspace->identity().process() == binding.process &&
+				workspace->identity().module() == binding.module;
+		}
+
 		inline std::string export_live_snapshot_json(const live_snapshot_t& snap);
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		inline driver_bridge::identity::live_target_identity_t driver_identity(
+			const live_target_binding_t& binding)
+		{
+			driver_bridge::identity::live_target_identity_t identity;
+			identity.process.pid = binding.process.pid;
+			identity.process.creation_time_100ns = binding.process.creation_time_100ns;
+			identity.process.normalized_process_path = binding.process.normalized_process_path;
+			if (binding.module) {
+				identity.module.base = binding.module->base;
+				identity.module.size = binding.module->size;
+				identity.module.normalized_name = binding.module->normalized_name;
+				identity.module.normalized_path = binding.module->normalized_path;
+			}
+			return identity;
+		}
+
+		inline bool validate_live_binding(const live_target_binding_t& binding,
+			const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+			std::string& error)
+		{
+			if (!binding_matches_workspace(binding, workspace)) {
+				error = "The Binary Map workspace generation or immutable target identity changed";
+				return false;
+			}
+			const auto validation = driver_bridge::identity::validate_live_target_identity(
+				driver_identity(binding));
+			if (validation.matches) return true;
+			error = std::string(driver_bridge::identity::staleness_code(validation.staleness)) +
+				": " + validation.detail;
+			return false;
+		}
+
+		inline void raise_uncertain_mutation_diagnostic(const std::string& task_id,
+			const std::string& target, const std::string& details)
+		{
+			aida::ui::task_center::diagnostic_registration_t diagnostic;
+			diagnostic.id = "diagnostic." + task_id + ".uncertain";
+			diagnostic.task_id = task_id;
+			diagnostic.owner = "Binary Map";
+			diagnostic.target = target;
+			diagnostic.summary = "Live protection state is uncertain";
+			diagnostic.details = details;
+			diagnostic.severity = aida::ui::task_center::diagnostic_severity_t::security;
+			diagnostic.callbacks.focus = [] {
+				static_cast<void>(aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.analysis.binary_map")));
+			};
+			static_cast<void>(aida::ui::task_center::raise_diagnostic(std::move(diagnostic)));
+		}
+
 		inline bool atomic_write_exact(const std::string& destination,
 			const void* data, std::size_t size, std::string& error)
 		{
@@ -330,6 +424,116 @@ namespace binary_map_view {
 			}
 			if (!succeeded)
 				DeleteFileW(temporary.c_str());
+			return succeeded;
+		}
+
+		inline bool stream_live_region_atomic(const std::string& destination,
+			const live_target_binding_t& binding,
+			const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+			std::uint64_t base, std::uint64_t size,
+			const std::shared_ptr<std::atomic<bool>>& cancellation,
+			const std::string& task_id, bool& cancelled, std::string& error)
+		{
+			cancelled = false;
+			const std::filesystem::path final_path = std::filesystem::u8path(destination);
+			static std::atomic<std::uint64_t> sequence{1};
+			const std::filesystem::path temporary(final_path.wstring() + L".tmp." +
+				std::to_wstring(GetCurrentProcessId()) + L"." +
+				std::to_wstring(GetCurrentThreadId()) + L"." +
+				std::to_wstring(sequence.fetch_add(1, std::memory_order_relaxed)));
+			HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+				CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH, nullptr);
+			if (file == INVALID_HANDLE_VALUE) {
+				error = "Creating the dump temporary file failed with Win32 error " +
+					std::to_string(GetLastError());
+				return false;
+			}
+			bool succeeded = true;
+			std::uint64_t offset = 0;
+			constexpr std::size_t chunk_capacity = 1U * 1024U * 1024U;
+			std::vector<std::uint8_t> bytes;
+			bytes.reserve(chunk_capacity);
+			while (offset < size) {
+				if (cancellation->load(std::memory_order_acquire)) {
+					cancelled = true;
+					error = "Region dump cancelled";
+					succeeded = false;
+					break;
+				}
+				std::string identity_error;
+				if (!validate_live_binding(binding, workspace, identity_error)) {
+					error = "The live target changed before a dump read: " + identity_error;
+					succeeded = false;
+					break;
+				}
+				const std::size_t chunk = static_cast<std::size_t>((std::min<std::uint64_t>)(
+					size - offset, chunk_capacity));
+				bytes.clear();
+				if (!driver_bridge::read_memory_for(binding.process.pid, base + offset,
+					chunk, bytes) || bytes.size() != chunk) {
+					error = "The driver returned a short or failed live-region read at offset " +
+						std::to_string(offset);
+					succeeded = false;
+					break;
+				}
+				if (!validate_live_binding(binding, workspace, identity_error)) {
+					error = "The live target changed after a dump read: " + identity_error;
+					succeeded = false;
+					break;
+				}
+				DWORD written = 0;
+				if (!WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()),
+					&written, nullptr) || static_cast<std::size_t>(written) != bytes.size()) {
+					error = "Writing the dump temporary file failed with Win32 error " +
+						std::to_string(GetLastError());
+					succeeded = false;
+					break;
+				}
+				offset += written;
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::running,
+					static_cast<float>(static_cast<double>(offset) / static_cast<double>(size)),
+					"Reading and writing bounded live-memory chunks"));
+			}
+			if (succeeded && cancellation->load(std::memory_order_acquire)) {
+				cancelled = true;
+				error = "Region dump cancelled before commit";
+				succeeded = false;
+			}
+			std::string final_identity_error;
+			if (succeeded && !validate_live_binding(binding, workspace, final_identity_error)) {
+				error = "The live target changed before dump commit: " + final_identity_error;
+				succeeded = false;
+			}
+			if (succeeded && !FlushFileBuffers(file)) {
+				error = "Flushing the dump temporary file failed with Win32 error " +
+					std::to_string(GetLastError());
+				succeeded = false;
+			}
+			if (succeeded && cancellation->load(std::memory_order_acquire)) {
+				cancelled = true;
+				error = "Region dump cancelled before atomic replacement";
+				succeeded = false;
+			}
+			LARGE_INTEGER observed_size{};
+			if (succeeded && (!GetFileSizeEx(file, &observed_size) ||
+				observed_size.QuadPart < 0 ||
+				static_cast<std::uint64_t>(observed_size.QuadPart) != size)) {
+				error = "The dump temporary file size did not match the selected region";
+				succeeded = false;
+			}
+			if (!CloseHandle(file) && succeeded) {
+				error = "Closing the dump temporary file failed with Win32 error " +
+					std::to_string(GetLastError());
+				succeeded = false;
+			}
+			if (succeeded && !MoveFileExW(temporary.c_str(), final_path.c_str(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+				error = "Replacing the dump destination failed with Win32 error " +
+					std::to_string(GetLastError());
+				succeeded = false;
+			}
+			if (!succeeded) DeleteFileW(temporary.c_str());
 			return succeeded;
 		}
 
@@ -441,9 +645,11 @@ namespace binary_map_view {
 
 		inline bool queue_protection_change(const std::shared_ptr<view_state_t>& state,
 			const disasm_view::workspace_context_t& context,
-			std::uint64_t address, std::uint64_t size, std::uint32_t new_protect)
+			const live_target_binding_t& target_binding, std::uint64_t address,
+			std::uint64_t size, std::uint32_t expected_protect, std::uint32_t new_protect)
 		{
 			if (!state || !context || !context.workspace->identity().process() ||
+				!binding_matches_workspace(target_binding, context.workspace) ||
 				address == 0 || size == 0 ||
 				address > (std::numeric_limits<std::uint64_t>::max)() - size)
 				return false;
@@ -460,6 +666,7 @@ namespace binary_map_view {
 			std::snprintf(target, sizeof(target), "PID %u 0x%llX-0x%llX",
 				static_cast<unsigned>(pid), static_cast<unsigned long long>(address),
 				static_cast<unsigned long long>(address + size));
+			const std::string target_text(target);
 			aida::ui::task_center::task_registration_t registration;
 			registration.id = task_id;
 			registration.source = "analysis.binary_map";
@@ -470,6 +677,7 @@ namespace binary_map_view {
 			registration.label = "Change live memory protection";
 			registration.stage = "Queued after reviewed confirmation";
 			registration.affected_entity = target;
+			registration.security_critical = true;
 			registration.callbacks.focus = [] {
 				static_cast<void>(aida::ui::application_views::open_or_focus(
 					aida::ui::stable_view_id_t("view.analysis.binary_map")));
@@ -492,8 +700,8 @@ namespace binary_map_view {
 			submission.ui_access_policy = "immutable_snapshots_only";
 			submission.failure_policy = "typed_diagnostic";
 			submission.shutdown_policy = "drain";
-			submission.body = [state, context, task_id, pid, generation,
-				address, size, new_protect] {
+			submission.body = [state, context, target_binding, task_id, target_text, pid,
+				address, size, expected_protect, new_protect] {
 				struct pending_guard_t {
 					std::shared_ptr<view_state_t> state;
 					~pending_guard_t() {
@@ -502,13 +710,33 @@ namespace binary_map_view {
 				} pending_guard{state};
 				static_cast<void>(pending_guard);
 				try {
-					const auto process = context.workspace->identity().process();
-					if (context.workspace->generation() != generation || !process ||
-						process->pid != pid) {
+					std::string identity_error;
+					if (!validate_live_binding(target_binding, context.workspace, identity_error)) {
 						static_cast<void>(aida::ui::task_center::update_task(task_id,
 							aida::ui::task_center::task_state_t::failed, 1.0f,
 							"Target identity changed before mutation",
-							"The reviewed PID or workspace generation is no longer current",
+							identity_error,
+							"diagnostic." + task_id));
+						return;
+					}
+					auto observed_protection = [&](std::uint32_t& value) {
+						const auto regions = driver_bridge::enumerate_memory_regions_for(pid, 8192);
+						if (!validate_live_binding(target_binding, context.workspace, identity_error))
+							return false;
+						for (const auto& region : regions) {
+							if (address >= region.base && address - region.base < region.size) {
+								value = region.protect;
+								return true;
+							}
+						}
+						return false;
+					};
+					std::uint32_t preflight_protect = 0;
+					if (!observed_protection(preflight_protect) || preflight_protect != expected_protect) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Protection changed before mutation",
+							"The selected region no longer has the protection value reviewed in the dialog",
 							"diagnostic." + task_id));
 						return;
 					}
@@ -525,20 +753,42 @@ namespace binary_map_view {
 							"diagnostic." + task_id));
 						return;
 					}
-					bool verified = false;
-					const auto regions = driver_bridge::enumerate_memory_regions_for(pid, 8192);
-					for (const auto& region : regions) {
-						if (address >= region.base && address - region.base < region.size) {
-							verified = region.protect == new_protect;
-							break;
-						}
-					}
-					state->live_refresh_requested.store(true, std::memory_order_release);
-					if (!verified) {
+					if (!validate_live_binding(target_binding, context.workspace, identity_error)) {
+						raise_uncertain_mutation_diagnostic(task_id, target_text,
+							"The target identity changed after the driver accepted the mutation: " +
+							identity_error);
 						static_cast<void>(aida::ui::task_center::update_task(task_id,
 							aida::ui::task_center::task_state_t::failed, 1.0f,
-							"Protection readback did not match",
-							"The mutation returned success but the post-operation region snapshot did not confirm the requested protection",
+							"Protection state is uncertain", identity_error,
+							"diagnostic." + task_id + ".uncertain"));
+						return;
+					}
+					std::uint32_t observed = 0;
+					const bool verified = old_protect == expected_protect &&
+						observed_protection(observed) && observed == new_protect;
+					state->live_refresh_requested.store(true, std::memory_order_release);
+					if (!verified) {
+						bool restored = false;
+						std::string rollback_error;
+						if (old_protect != 0 &&
+							validate_live_binding(target_binding, context.workspace, rollback_error)) {
+							std::uint32_t ignored = 0;
+							if (driver_bridge::protect_memory_for(pid, address, size,
+								old_protect, &ignored) &&
+								validate_live_binding(target_binding, context.workspace, rollback_error)) {
+								std::uint32_t rolled_back = 0;
+								restored = observed_protection(rolled_back) && rolled_back == old_protect;
+							}
+						}
+						const std::string failure = restored
+							? "The requested protection was not confirmed; the original protection was restored and verified"
+							: "The requested protection was not confirmed and restoration could not be verified";
+						if (!restored)
+							raise_uncertain_mutation_diagnostic(task_id, target_text, failure +
+								(rollback_error.empty() ? std::string() : ": " + rollback_error));
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Protection readback did not match", failure,
 							"diagnostic." + task_id));
 						return;
 					}
@@ -571,6 +821,17 @@ namespace binary_map_view {
 				return false;
 			}
 			return true;
+		}
+#endif
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		inline bool validate_live_binding(const live_target_binding_t& binding,
+			const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+			std::string& error)
+		{
+			if (binding_matches_workspace(binding, workspace)) return true;
+			error = "The deterministic preview target identity or workspace generation changed";
+			return false;
 		}
 #endif
 
@@ -774,7 +1035,10 @@ namespace binary_map_view {
 			return driver_bridge::is_loaded()
 				&& workspace
 				&& workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot
-				&& process && process->pid != 0
+				&& process && process->pid != 0 && process->creation_time_100ns != 0
+				&& workspace->identity().module() &&
+					workspace->identity().module()->base != 0 &&
+					workspace->identity().module()->size != 0
 				&& driver_bridge::can_read_memory();
 		}
 
@@ -1028,8 +1292,21 @@ namespace binary_map_view {
 			const std::uint64_t request_generation = workspace->generation();
 			const std::uint64_t refresh_serial = s.live_refresh_serial.fetch_add(1,
 				std::memory_order_acq_rel) + 1;
+			const live_target_binding_t target_binding = capture_workspace_binding(
+				workspace, request_generation, refresh_serial);
+			if (!target_binding.valid()) {
+				s.live_refreshing.store(false, std::memory_order_release);
+				std::atomic_store_explicit(&s.live,
+					std::shared_ptr<const live_snapshot_t>(std::make_shared<live_snapshot_t>()),
+					std::memory_order_release);
+				s.live_selected_base.store(0, std::memory_order_release);
+				std::lock_guard<std::mutex> lock(s.mutex);
+				s.live_last_error = "The live workspace has no complete process-creation and module identity.";
+				return;
+			}
 			const std::string task_id = "binary_map.live_refresh." + s.binary_id + "." +
 				std::to_string(refresh_serial);
+			const auto cancellation = std::make_shared<std::atomic<bool>>(false);
 			aida::ui::task_center::task_registration_t registration;
 			registration.id = task_id;
 			registration.source = "binary_map";
@@ -1040,6 +1317,11 @@ namespace binary_map_view {
 			registration.label = "Enumerate live Binary Map";
 			registration.stage = "Queued target enumeration";
 			registration.affected_entity = workspace->identity().bin_name();
+			registration.cancellation_is_safe = true;
+			registration.callbacks.cancel = [cancellation] {
+				cancellation->store(true, std::memory_order_release);
+				return true;
+			};
 			if (!aida::ui::task_center::register_task(std::move(registration))) {
 				s.live_refreshing.store(false, std::memory_order_release);
 				std::lock_guard<std::mutex> lock(s.mutex);
@@ -1055,7 +1337,11 @@ namespace binary_map_view {
 			sub.priority = 3;
 			sub.target_pid = process->pid;
 			sub.generation = request_generation;
-			sub.body = [state, workspace, pid = process->pid, request_generation, task_id]() {
+			sub.cancel_hook = [cancellation] {
+				cancellation->store(true, std::memory_order_release);
+			};
+			sub.body = [state, workspace, pid = process->pid, request_generation,
+				target_binding, cancellation, task_id]() {
 				auto& s = *state;
 				struct refresh_guard_t {
 					std::shared_ptr<view_state_t> state;
@@ -1068,11 +1354,40 @@ namespace binary_map_view {
 					aida::ui::task_center::task_state_t::running, 0.05f,
 					"Enumerating target regions, modules, and threads"));
 				try {
-				const auto start_clock = std::chrono::steady_clock::now();
+					const auto start_clock = std::chrono::steady_clock::now();
+					auto require_identity = [&](const char* boundary) {
+						if (cancellation->load(std::memory_order_acquire)) {
+							static_cast<void>(aida::ui::task_center::update_task(task_id,
+								aida::ui::task_center::task_state_t::cancelled, 1.0f,
+								"Live refresh cancelled", boundary));
+							return false;
+						}
+						std::string identity_error;
+						if (validate_live_binding(target_binding, workspace, identity_error)) return true;
+						const std::string detail = std::string("The live target changed ") + boundary +
+							": " + identity_error;
+						{
+							std::lock_guard<std::mutex> lock(s.mutex);
+							s.live_last_error = detail;
+						}
+						std::atomic_store_explicit(&s.live,
+							std::shared_ptr<const live_snapshot_t>(std::make_shared<live_snapshot_t>()),
+							std::memory_order_release);
+						s.live_selected_base.store(0, std::memory_order_release);
+						s.live_hover_index.store(-1, std::memory_order_release);
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::cancelled, 1.0f,
+							"Discarded stale live map", detail));
+						return false;
+					};
+					if (!require_identity("before region enumeration")) return;
 
-				auto regions_raw = driver_bridge::enumerate_memory_regions_for(pid, 8192);
-				auto modules     = driver_bridge::enumerate_modules_for(pid);
-				auto threads     = driver_bridge::enumerate_threads_for(pid);
+					auto regions_raw = driver_bridge::enumerate_memory_regions_for(pid, 8192);
+					if (!require_identity("after region enumeration")) return;
+					auto modules     = driver_bridge::enumerate_modules_for(pid);
+					if (!require_identity("after module enumeration")) return;
+					auto threads     = driver_bridge::enumerate_threads_for(pid);
+					if (!require_identity("after thread enumeration")) return;
 				if (regions_raw.empty()) {
 					const std::string error = "The target returned no readable memory-region enumeration.";
 					{
@@ -1088,16 +1403,18 @@ namespace binary_map_view {
 
 				driver_bridge::peb_info_t peb{};
 				uint64_t process_heap = 0;
-				if (driver_bridge::read_peb_for(pid, peb)) {
-					process_heap = peb.process_heap;
-				}
+					if (driver_bridge::read_peb_for(pid, peb)) {
+						process_heap = peb.process_heap;
+					}
+					if (!require_identity("after PEB read")) return;
 
 				live_snapshot_t snap;
 				snap.modules = std::move(modules);
 				snap.threads = std::move(threads);
 				snap.process_heap = process_heap;
 				snap.pid = pid;
-				snap.process_name = proc_name;
+					snap.process_name = proc_name;
+					snap.target_binding = target_binding;
 				snap.regions.reserve(regions_raw.size());
 
 				uint64_t total_committed = 0;
@@ -1105,6 +1422,12 @@ namespace binary_map_view {
 				uint32_t rwx = 0;
 
 				for (const auto& src : regions_raw) {
+					if (cancellation->load(std::memory_order_acquire)) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::cancelled, 1.0f,
+							"Live refresh cancelled", "Cancelled while classifying regions"));
+						return;
+					}
 					live_region_t r;
 					r.base = src.base;
 					r.size = src.size;
@@ -1164,22 +1487,21 @@ namespace binary_map_view {
 					std::chrono::duration_cast<std::chrono::milliseconds>(
 						end_clock - start_clock).count());
 
-				const auto current_process = workspace->identity().process();
-				if (workspace->generation() != request_generation ||
-					!current_process || current_process->pid != pid) {
+				const bool superseded = s.live_refresh_serial.load(std::memory_order_acquire) !=
+					target_binding.refresh_serial;
+				if (superseded || !require_identity("before publication")) {
 					s.live_refresh_requested.store(true, std::memory_order_release);
-					{
-						std::lock_guard<std::mutex> lock(s.mutex);
-						s.live_last_error = "The target or workspace changed during live enumeration.";
+					if (superseded) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::cancelled, 1.0f,
+							"Discarded superseded live map", "A newer live refresh owns publication"));
 					}
-					static_cast<void>(aida::ui::task_center::update_task(task_id,
-						aida::ui::task_center::task_state_t::cancelled, 1.0f,
-						"Discarded stale live map", "Target PID or workspace generation changed"));
 					diag::log_tagged_fmt("binary_map",
-						"live_refresh STALE pid=%u request_generation=%llu current_generation=%llu",
+						"live_refresh STALE pid=%u request_generation=%llu current_generation=%llu serial=%llu",
 						static_cast<unsigned>(pid),
 						static_cast<unsigned long long>(request_generation),
-						static_cast<unsigned long long>(workspace->generation()));
+						static_cast<unsigned long long>(workspace->generation()),
+						static_cast<unsigned long long>(target_binding.refresh_serial));
 					return;
 				}
 				auto published = std::make_shared<const live_snapshot_t>(std::move(snap));
@@ -1360,7 +1682,8 @@ namespace binary_map_view {
 			else binary_map::unpin_function(workspace, va);
 		}
 
-		inline void jump_to_hex(view_state_t& state, uint64_t va, std::size_t size)
+		inline void jump_to_hex(view_state_t& state, uint64_t va, std::size_t size,
+			std::optional<live_target_binding_t> live_binding = std::nullopt)
 		{
 			if (va == 0) {
 				diag::log_tagged_fmt("binary_map",
@@ -1375,6 +1698,15 @@ namespace binary_map_view {
 			if (!context) return;
 			const bool live_ok = context.workspace->target_kind() ==
 				aida::analysis::target_kind_t::live_snapshot;
+			if (live_ok) {
+				std::string identity_error;
+				if (!live_binding || !validate_live_binding(*live_binding,
+					context.workspace, identity_error)) {
+					toast_notification::push("The selected live address belongs to a stale target",
+						toast_notification::toast_type_t::error, 4.0f);
+					return;
+				}
+			}
 			bool used_static = false;
 			bool ok = false;
 			if (live_ok) {
@@ -1413,10 +1745,11 @@ namespace binary_map_view {
 		}
 
 		inline bool dump_region_to_disk(view_state_t& state, uint64_t base, uint64_t size,
-			const std::string& kind_label)
+			const std::string& kind_label,
+			std::optional<live_target_binding_t> live_binding = std::nullopt)
 		{
-			if (size == 0) {
-				toast_notification::push("Region has zero size",
+			if (size == 0 || base > (std::numeric_limits<std::uint64_t>::max)() - size) {
+				toast_notification::push("Region range is empty or invalid",
 					toast_notification::toast_type_t::error, 2.5f);
 				return false;
 			}
@@ -1428,6 +1761,7 @@ namespace binary_map_view {
 			}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			(void)state;
+			(void)live_binding;
 			char receipt[192];
 			std::snprintf(receipt, sizeof(receipt), "Dump %s 0x%016llX (%llu bytes)",
 				kind_label.empty() ? "region" : kind_label.c_str(),
@@ -1468,10 +1802,19 @@ namespace binary_map_view {
 			}
 			const auto context = disasm_view::capture_workspace(state.workspace.lock());
 			if (!context) return false;
+			const bool live_dump = context.workspace->target_kind() ==
+				aida::analysis::target_kind_t::live_snapshot;
+			if (live_dump && (!live_binding ||
+				!binding_matches_workspace(*live_binding, context.workspace))) {
+				toast_notification::push("The selected live region belongs to a stale target",
+					toast_notification::toast_type_t::error, 4.0f);
+				return false;
+			}
 			const std::string output_path = path_buf;
 			static std::atomic<std::uint64_t> dump_sequence{1};
 			const std::string task_id = "analysis.binary_map.dump." +
 				std::to_string(dump_sequence.fetch_add(1, std::memory_order_relaxed));
+			const auto cancellation = std::make_shared<std::atomic<bool>>(false);
 
 			diag::log_tagged_critical_fmt("binary_map",
 				"dump_region START base=0x%llX size=%llu path='%s'",
@@ -1494,6 +1837,13 @@ namespace binary_map_view {
 					aida::ui::stable_view_id_t("view.analysis.binary_map")));
 			};
 			registration.callbacks.open_log = registration.callbacks.focus;
+			registration.cancellation_is_safe = live_dump;
+			if (live_dump) {
+				registration.callbacks.cancel = [cancellation] {
+					cancellation->store(true, std::memory_order_release);
+					return true;
+				};
+			}
 			if (!aida::ui::task_center::register_task(std::move(registration))) {
 				toast_notification::push("Task Center rejected the region dump",
 					toast_notification::toast_type_t::error, 3.0f);
@@ -1514,44 +1864,78 @@ namespace binary_map_view {
 			submission.ui_access_policy = "immutable_snapshots_only";
 			submission.failure_policy = "typed_diagnostic";
 			submission.shutdown_policy = "drain";
-			submission.body = [context, base, size, output_path, task_id]() {
+			submission.cancel_hook = [cancellation] {
+				cancellation->store(true, std::memory_order_release);
+			};
+			submission.body = [context, live_binding, cancellation, base, size,
+				output_path, task_id]() {
 				try {
 					static_cast<void>(aida::ui::task_center::update_task(task_id,
 						aida::ui::task_center::task_state_t::running, -1.0f,
 						"Reading exact bytes from the captured target identity"));
-					std::vector<uint8_t> buffer;
 					if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot &&
-						context.workspace->identity().process()) {
-						driver_bridge::read_memory_for(context.workspace->identity().process()->pid,
-							base, static_cast<std::size_t>(size), buffer);
+						live_binding) {
+						std::string identity_error;
+						if (!validate_live_binding(*live_binding, context.workspace, identity_error)) {
+							static_cast<void>(aida::ui::task_center::update_task(task_id,
+								aida::ui::task_center::task_state_t::failed, 1.0f,
+								"Stale live target refused", identity_error,
+								"diagnostic." + task_id));
+							return;
+						}
+						bool cancelled = false;
+						std::string error;
+						if (!stream_live_region_atomic(output_path, *live_binding,
+							context.workspace, base, size, cancellation, task_id,
+							cancelled, error)) {
+							static_cast<void>(aida::ui::task_center::update_task(task_id,
+								cancelled ? aida::ui::task_center::task_state_t::cancelled
+									: aida::ui::task_center::task_state_t::failed,
+								1.0f, cancelled ? "Region dump cancelled" : "Live region dump failed",
+								error, cancelled ? std::string() : "diagnostic." + task_id));
+							return;
+						}
+						diag::log_tagged_critical_fmt("binary_map",
+							"dump_region DONE bytes=%llu path='%s'",
+							static_cast<unsigned long long>(size), output_path.c_str());
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::completed, 1.0f,
+							"Finished", "Region dumped atomically to " + output_path));
+						return;
 					} else if (const auto address = disasm_view::typed_address(context, base)) {
+						std::vector<uint8_t> buffer;
 						auto bytes = disasm_view::read_bytes(context, *address,
 							static_cast<std::size_t>(size));
 						if (bytes) buffer = std::move(bytes.value());
-					}
-					if (buffer.size() != static_cast<std::size_t>(size)) {
+						if (buffer.size() != static_cast<std::size_t>(size)) {
+							static_cast<void>(aida::ui::task_center::update_task(task_id,
+								aida::ui::task_center::task_state_t::failed, 1.0f,
+								"Exact target read failed",
+								"Requested " + std::to_string(size) + " bytes but received " +
+								std::to_string(buffer.size()), "diagnostic." + task_id));
+							return;
+						}
 						static_cast<void>(aida::ui::task_center::update_task(task_id,
-							aida::ui::task_center::task_state_t::failed, 1.0f,
-							"Exact target read failed",
-							"Requested " + std::to_string(size) + " bytes but received " +
-							std::to_string(buffer.size()), "diagnostic." + task_id));
+							aida::ui::task_center::task_state_t::running, -1.0f,
+							"Writing a same-directory temporary file"));
+						std::string error;
+						if (!atomic_write_exact(output_path, buffer.data(), buffer.size(), error)) {
+							static_cast<void>(aida::ui::task_center::update_task(task_id,
+								aida::ui::task_center::task_state_t::failed, 1.0f,
+								"Atomic region dump failed", error, "diagnostic." + task_id));
+							return;
+						}
+						diag::log_tagged_critical_fmt("binary_map",
+							"dump_region DONE bytes=%zu path='%s'", buffer.size(), output_path.c_str());
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::completed, 1.0f,
+							"Finished", "Region dumped atomically to " + output_path));
 						return;
 					}
 					static_cast<void>(aida::ui::task_center::update_task(task_id,
-						aida::ui::task_center::task_state_t::running, -1.0f,
-						"Writing a same-directory temporary file"));
-					std::string error;
-					if (!atomic_write_exact(output_path, buffer.data(), buffer.size(), error)) {
-						static_cast<void>(aida::ui::task_center::update_task(task_id,
-							aida::ui::task_center::task_state_t::failed, 1.0f,
-							"Atomic region dump failed", error, "diagnostic." + task_id));
-						return;
-					}
-					diag::log_tagged_critical_fmt("binary_map",
-						"dump_region DONE bytes=%zu path='%s'", buffer.size(), output_path.c_str());
-					static_cast<void>(aida::ui::task_center::update_task(task_id,
-						aida::ui::task_center::task_state_t::completed, 1.0f,
-						"Finished", "Region dumped atomically to " + output_path));
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Exact target read failed", "The selected address is not readable in this workspace",
+						"diagnostic." + task_id));
 				} catch (const std::exception& exception) {
 					static_cast<void>(aida::ui::task_center::update_task(task_id,
 						aida::ui::task_center::task_state_t::failed, 1.0f,
@@ -1648,16 +2032,25 @@ namespace binary_map_view {
 		inline std::string export_live_snapshot_json(const live_snapshot_t& snap)
 		{
 			std::string out;
-			char hdr[256];
+			char hdr[512];
 			std::snprintf(hdr, sizeof(hdr),
 				"{\"pid\":%u,\"process\":\"%s\",\"committed\":%llu,\"reserved\":%llu,"
-				"\"rwx_count\":%u,\"region_count\":%zu,\"regions\":[",
+				"\"rwx_count\":%u,\"region_count\":%zu,\"process_creation_time_100ns\":%llu,"
+				"\"module_base\":%llu,\"module_size\":%llu,\"workspace_generation\":%llu,"
+				"\"refresh_serial\":%llu,\"regions\":[",
 				static_cast<unsigned>(snap.pid),
 				snap.process_name.c_str(),
 				static_cast<unsigned long long>(snap.total_committed),
 				static_cast<unsigned long long>(snap.total_reserved),
 				static_cast<unsigned>(snap.rwx_count),
-				snap.regions.size());
+				snap.regions.size(),
+				static_cast<unsigned long long>(snap.target_binding.process.creation_time_100ns),
+				static_cast<unsigned long long>(snap.target_binding.module
+					? snap.target_binding.module->base : 0),
+				static_cast<unsigned long long>(snap.target_binding.module
+					? snap.target_binding.module->size : 0),
+				static_cast<unsigned long long>(snap.target_binding.workspace_generation),
+				static_cast<unsigned long long>(snap.target_binding.refresh_serial));
 			out = hdr;
 			for (std::size_t i = 0; i < snap.regions.size(); ++i) {
 				if (i) out += ",";
@@ -2032,12 +2425,13 @@ namespace binary_map_view {
 					aida::ui::application_ui::retained_entity_context_t retained;
 					retained.owner_id = "analysis.binary_map.heat_function";
 					retained.entity_id = std::to_string(fn.va) + ":" + fn.name;
-					retained.entity_generation = vs.workspace_generation;
+					retained.entity_generation = vs.workspace_generation.load(std::memory_order_acquire);
 					retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 					const uint64_t va = fn.va;
-					const uint64_t generation = vs.workspace_generation;
+					const uint64_t generation = vs.workspace_generation.load(std::memory_order_acquire);
 					retained.validate_identity = [&vs, va, generation] {
-						return vs.workspace_generation == generation && vs.selected_va.load() == va
+						return vs.workspace_generation.load(std::memory_order_acquire) == generation &&
+							vs.selected_va.load() == va
 							? aida::ui::capability_state_t::available()
 							: aida::ui::capability_state_t::unavailable(
 								"The Binary Map workspace or selected function changed");
@@ -3286,13 +3680,16 @@ namespace binary_map_view {
 				aida::ui::application_ui::retained_entity_context_t retained;
 				retained.owner_id = "analysis.binary_map.region";
 				retained.entity_id = std::to_string(r.base) + ":" + std::to_string(r.size);
-				retained.entity_generation = s.workspace_generation;
+				retained.entity_generation = s.workspace_generation.load(std::memory_order_acquire);
 				retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 				const auto retained_live = live_snapshot;
 				const auto region = r;
 				retained.validate_identity = [&s, retained_live, region] {
 					const auto current_live = std::atomic_load_explicit(&s.live, std::memory_order_acquire);
-					return current_live == retained_live && s.live_selected_base.load() == region.base
+					return current_live == retained_live && s.live_selected_base.load() == region.base &&
+						detail::binding_matches_workspace(retained_live->target_binding, s.workspace.lock()) &&
+						s.workspace_generation.load(std::memory_order_acquire) ==
+							retained_live->target_binding.workspace_generation
 						? aida::ui::capability_state_t::available()
 						: aida::ui::capability_state_t::unavailable(
 							"The live memory-map publication or selected region changed");
@@ -3303,24 +3700,26 @@ namespace binary_map_view {
 					return aida::ui::action_handler_result_t::completed();
 				});
 			detail::add_retained_action(retained, "analysis.binary_map.region.open_hex",
-				true, "", [&s, region] {
-					detail::jump_to_hex(s, region.base, detail::hex_request_size(region.size));
+				true, "", [&s, retained_live, region] {
+					detail::jump_to_hex(s, region.base, detail::hex_request_size(region.size),
+						retained_live->target_binding);
 					return aida::ui::action_handler_result_t::completed();
 				});
 			detail::add_retained_action(retained, "analysis.binary_map.region.dump",
-				region.size != 0, "The retained region is empty", [&s, region] {
+				region.size != 0, "The retained region is empty", [&s, retained_live, region] {
 					detail::dump_region_to_disk(s, region.base, region.size,
-						detail::region_kind_label(region));
+						detail::region_kind_label(region), retained_live->target_binding);
 					return aida::ui::action_handler_result_t::completed();
 				});
 			detail::add_retained_action(retained, "analysis.binary_map.region.change_protection",
 				region.size != 0 && !s.change_protect_pending.load(std::memory_order_acquire),
 				s.change_protect_pending.load(std::memory_order_acquire)
 					? "Another reviewed protection change is running" : "The retained region is empty",
-				[&s, region] {
+				[&s, retained_live, region] {
 					s.change_protect_addr = region.base;
 					s.change_protect_size = region.size;
 					s.change_protect_old = region.protect;
+					s.change_protect_binding = retained_live->target_binding;
 					s.change_protect_choice = 0;
 					s.change_protect_open = true;
 					s.change_protect_popup_requested = true;
@@ -3450,13 +3849,16 @@ namespace binary_map_view {
 						aida::ui::application_ui::retained_entity_context_t retained;
 						retained.owner_id = "analysis.binary_map.module";
 						retained.entity_id = std::to_string(m.base) + ":" + m.name;
-						retained.entity_generation = s.workspace_generation;
+						retained.entity_generation = s.workspace_generation.load(std::memory_order_acquire);
 						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 						const auto module = m;
 						const auto retained_live = live_snapshot;
 						retained.validate_identity = [&s, module, retained_live] {
 							return std::atomic_load_explicit(&s.live, std::memory_order_acquire) == retained_live &&
-								s.live_selected_base.load() == module.base
+								s.live_selected_base.load() == module.base &&
+								detail::binding_matches_workspace(retained_live->target_binding, s.workspace.lock()) &&
+								s.workspace_generation.load(std::memory_order_acquire) ==
+									retained_live->target_binding.workspace_generation
 								? aida::ui::capability_state_t::available()
 								: aida::ui::capability_state_t::unavailable(
 									"The live module publication or selection changed");
@@ -3467,8 +3869,9 @@ namespace binary_map_view {
 								return aida::ui::action_handler_result_t::completed();
 							});
 						detail::add_retained_action(retained, "analysis.binary_map.module.open_hex",
-							true, "", [&s, module] {
-								detail::jump_to_hex(s, module.base, 0x400);
+							true, "", [&s, retained_live, module] {
+								detail::jump_to_hex(s, module.base, 0x400,
+									retained_live->target_binding);
 								return aida::ui::action_handler_result_t::completed();
 							});
 						detail::add_retained_action(retained, "analysis.binary_map.module.copy_name",
@@ -3595,7 +3998,7 @@ namespace binary_map_view {
 						aida::ui::application_ui::retained_entity_context_t retained;
 						retained.owner_id = "analysis.binary_map.section";
 						retained.entity_id = std::to_string(sec.va) + ":" + sec.name;
-						retained.entity_generation = s.workspace_generation;
+						retained.entity_generation = s.workspace_generation.load(std::memory_order_acquire);
 						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 						const auto section = sec;
 						const auto retained_map = map_snapshot;
@@ -3768,7 +4171,7 @@ namespace binary_map_view {
 						aida::ui::application_ui::retained_entity_context_t retained;
 						retained.owner_id = "analysis.binary_map.function";
 						retained.entity_id = std::to_string(fn.va) + ":" + fn.name;
-						retained.entity_generation = s.workspace_generation;
+						retained.entity_generation = s.workspace_generation.load(std::memory_order_acquire);
 						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 						const auto function = fn;
 						const auto retained_map = map_snapshot;
@@ -3897,7 +4300,7 @@ namespace binary_map_view {
 						aida::ui::application_ui::retained_entity_context_t retained;
 						retained.owner_id = "analysis.binary_map.global";
 						retained.entity_id = global_id + ":" + gl.name;
-						retained.entity_generation = s.workspace_generation;
+						retained.entity_generation = s.workspace_generation.load(std::memory_order_acquire);
 						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 						const auto global = gl;
 						const auto retained_map = map_snapshot;
@@ -4035,7 +4438,7 @@ namespace binary_map_view {
 						aida::ui::application_ui::retained_entity_context_t retained;
 						retained.owner_id = "analysis.binary_map.import_dll";
 						retained.entity_id = import_dll_id;
-						retained.entity_generation = s.workspace_generation;
+						retained.entity_generation = s.workspace_generation.load(std::memory_order_acquire);
 						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 						const auto retained_map = map_snapshot;
 						retained.validate_identity = [&s, import_dll_id, retained_map] {
@@ -4105,7 +4508,7 @@ namespace binary_map_view {
 								aida::ui::application_ui::retained_entity_context_t retained;
 								retained.owner_id = "analysis.binary_map.import_function";
 								retained.entity_id = import_function_id;
-								retained.entity_generation = s.workspace_generation;
+								retained.entity_generation = s.workspace_generation.load(std::memory_order_acquire);
 								retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 								const auto retained_map = map_snapshot;
 								retained.validate_identity = [&s, import_function_id, retained_map] {
@@ -4182,7 +4585,7 @@ namespace binary_map_view {
 						aida::ui::application_ui::retained_entity_context_t retained;
 						retained.owner_id = "analysis.binary_map.export";
 						retained.entity_id = export_id;
-						retained.entity_generation = s.workspace_generation;
+						retained.entity_generation = s.workspace_generation.load(std::memory_order_acquire);
 						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
 						const auto retained_map = map_snapshot;
 						retained.validate_identity = [&s, export_id, retained_map] {
@@ -4297,12 +4700,22 @@ namespace binary_map_view {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 				std::uint32_t old_protect = 0;
 				const auto process = context.workspace->identity().process();
-				queued = process && driver_bridge::protect_memory_for(process->pid,
+				const auto current_live = std::atomic_load_explicit(&s.live, std::memory_order_acquire);
+				const bool reviewed_region_current = current_live && std::any_of(
+					current_live->regions.begin(), current_live->regions.end(), [&](const auto& region) {
+						return region.base == s.change_protect_addr &&
+							region.size == s.change_protect_size &&
+							region.protect == s.change_protect_old;
+					});
+				queued = process && reviewed_region_current && detail::binding_matches_workspace(
+					s.change_protect_binding, context.workspace) &&
+					driver_bridge::protect_memory_for(process->pid,
 					s.change_protect_addr, s.change_protect_size, new_protect, &old_protect);
 				if (queued) s.live_refresh_requested.store(true, std::memory_order_release);
 #else
 				queued = detail::queue_protection_change(state_handle, context,
-					s.change_protect_addr, s.change_protect_size, new_protect);
+					s.change_protect_binding, s.change_protect_addr,
+					s.change_protect_size, s.change_protect_old, new_protect);
 #endif
 				if (!queued)
 					toast_notification::push("The reviewed protection change could not be queued; see Task Center",

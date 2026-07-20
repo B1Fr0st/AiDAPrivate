@@ -19,10 +19,12 @@
 #include "../ui/task_center.hpp"
 #include "../ui/application_view_registry.hpp"
 #include "../ui/application_ui_runtime.hpp"
+#include "../ui/workspace_layout.hpp"
 #include "../ui/chat_render.hpp"
 #include "../ui/toast_notification.hpp"
 #include "../helpers/globals.h"
 #include "../../preview/shell_preview_platform.hpp"
+#include "../../preview/studio_semantics.hpp"
 
 #else
 
@@ -74,6 +76,7 @@
 #include "../ui/fonts.hpp"
 #include "../ui/task_center.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/workspace_layout.hpp"
 #include "../ui/chat_render.hpp"
 #include "../../helpers/win32_dialog.hpp"
 #include "../ui/toast_notification.hpp"
@@ -110,6 +113,7 @@
 #endif
 
 #include "../infra/executor.hpp"
+#include "../session/session_store.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
 #include "../settings/settings_persistence_service.hpp"
 #include "../settings/theme_transfer_service.hpp"
@@ -127,6 +131,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -137,6 +142,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 extern HWND g_hwnd;
@@ -231,7 +237,15 @@ bool submit_chat_task(const char* label,
         registration.owner_action = label ? label : "ai_chat.task";
         registration.label = label ? label : "AI Chat task";
         registration.stage = "Queued";
-        registration.cancellation_is_safe = false;
+        const bool agentic_request = label != nullptr &&
+            std::strcmp(label, "chat.agentic_request") == 0;
+        registration.cancellation_is_safe = agentic_request;
+        if (agentic_request) {
+            registration.callbacks.cancel = [] {
+                chat_request_cancel();
+                return true;
+            };
+        }
         registration.callbacks.focus = [] {
             (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.ai_chat"));
         };
@@ -2924,6 +2938,7 @@ void shutdown_standalone_chat()
     shutdown_phase_done("ui_services_shutdown", ui_start);
 
     ULONGLONG session_start = shutdown_phase_begin("session_shutdown");
+    aida::automation_ui::prepare_proposal_reviews_for_shutdown();
     (void)aida::session::shutdown();
     shutdown_phase_done("session_shutdown", session_start);
 
@@ -2935,6 +2950,7 @@ void shutdown_standalone_chat()
     log_shutdown_queue_snapshot("queue_drain_before");
     aida::infra::executor::shutdown();
     log_shutdown_queue_snapshot("queue_drain_after_executor");
+    aida::ui::workspace_layout::settle_pending_operation_for_shutdown();
     const bool queues_quiescent = shutdown_queues_quiescent("queue_drain_after_executor");
     shutdown_phase_done("queue_drain", queue_start);
 
@@ -3329,7 +3345,10 @@ std::atomic<bool>* chat_cancel_flag()
 void chat_bind_session(const std::string& session_id)
 {
     diag::log_tagged_fmt("chat", "chat_bind_session id='%s'", session_id.c_str());
+    const bool changed = get_chat_session_id_locked() != session_id;
     set_chat_session_id_locked(session_id);
+    if (changed)
+        aida::automation_ui::restore_proposal_reviews_for_session(session_id);
 }
 
 
@@ -3353,44 +3372,6 @@ std::string start_new_conversation()
     return {};
 }
 
-#endif
-
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-namespace {
-
-bool submit_chat_task(const char* label,
-                      aida::infra::executor::domain_t domain,
-                      const char* thread_class,
-                      int priority,
-                      std::function<void()> body)
-{
-    aida::infra::executor::submission_t submission;
-    submission.owner_subsystem = "ai_chat";
-    submission.label = label;
-    submission.thread_class = thread_class;
-    submission.domain = domain;
-    submission.priority = priority;
-    submission.body = std::move(body);
-    const auto submitted = aida::infra::executor::submit(std::move(submission));
-    if (submitted.submitted && submitted.task_id != 0) {
-        aida::ui::task_center::task_registration_t registration;
-        registration.owner = "automation";
-        registration.owner_view = "view.ai_chat";
-        registration.owner_action = label ? label : "ai_chat.task";
-        registration.label = label ? label : "AI Chat task";
-        registration.stage = "Queued";
-        registration.cancellation_is_safe = false;
-        registration.callbacks.focus = [] {
-            (void)aida::ui::application_views::open_or_focus(
-                aida::ui::stable_view_id_t("view.ai_chat"));
-        };
-        (void)aida::ui::task_center::register_executor_job(
-            submitted.task_id, std::move(registration));
-    }
-    return submitted.submitted;
-}
-
-}
 #endif
 
 namespace aida::automation_ui {
@@ -3418,6 +3399,12 @@ std::shared_ptr<const evidence_session_publication_t> s_evidence_session_publica
 std::optional<aida::conversation_store::request_t> s_deferred_evidence_save;
 std::mutex s_editor_proposal_mutex;
 editor_proposal_snapshot_t s_editor_proposal;
+std::atomic<std::uint64_t> s_editor_proposal_operation{1};
+std::mutex s_editor_proposal_hunks_mutex;
+std::string s_editor_proposal_hunks_audit_id;
+std::vector<aida::session::proposal_audit_hunk_t> s_editor_proposal_hunks;
+std::atomic<std::uint64_t> s_proposal_restore_operation{1};
+std::atomic<bool> s_proposal_restore_pending{false};
 std::mutex s_reverse_engineering_proposal_mutex;
 reverse_engineering_proposal_snapshot_t s_reverse_engineering_proposal;
 std::atomic<std::uint64_t> s_reverse_engineering_proposal_operation{1};
@@ -3474,6 +3461,327 @@ std::uint64_t hash_append(std::uint64_t hash, std::string_view text)
         hash *= 1099511628211ULL;
     }
     return hash;
+}
+
+std::string bounded_metadata_string(std::string value, std::size_t limit);
+
+std::uint64_t exact_content_hash(std::string_view text)
+{
+    std::uint64_t hash = hash_append(14695981039346656037ULL, text);
+    hash ^= static_cast<std::uint64_t>(text.size());
+    hash *= 1099511628211ULL;
+    return hash == 0 ? 1 : hash;
+}
+
+std::string hash_text(std::uint64_t hash)
+{
+    char value[17]{};
+    std::snprintf(value, sizeof(value), "%016llX",
+        static_cast<unsigned long long>(hash));
+    return value;
+}
+
+std::string stable_proposal_id(std::string_view family,
+                               const message_identity_t& source,
+                               std::uint64_t operation)
+{
+    std::uint64_t identity_hash = hash_append(14695981039346656037ULL,
+        source.session_id);
+    identity_hash ^= source.fingerprint;
+    identity_hash *= 1099511628211ULL;
+    identity_hash ^= static_cast<std::uint64_t>(source.timestamp);
+    identity_hash *= 1099511628211ULL;
+    identity_hash ^= static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    identity_hash *= 1099511628211ULL;
+    identity_hash ^= operation;
+    identity_hash *= 1099511628211ULL;
+    return "proposal." + std::string(family) + "." + hash_text(identity_hash) +
+        "." + std::to_string(operation);
+}
+
+std::string proposal_task_id(const std::string& audit_id)
+{
+    return "task." + audit_id;
+}
+
+bool persist_proposal_audit(aida::session::proposal_audit_record_t record,
+                            std::string& reason)
+{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static_cast<void>(record);
+    reason.clear();
+    return true;
+#else
+    if (aida::session::upsert_proposal_audit(std::move(record))) {
+        reason.clear();
+        return true;
+    }
+    reason = aida::session::last_error();
+    if (reason.empty()) reason = "The proposal audit transaction failed.";
+    return false;
+#endif
+}
+
+std::string hunk_decision(code_editor_widget::diff_hunk_state_t state)
+{
+    if (state == code_editor_widget::diff_hunk_state_t::accepted) return "accepted";
+    if (state == code_editor_widget::diff_hunk_state_t::rejected) return "rejected";
+    return "pending";
+}
+
+std::vector<aida::session::proposal_audit_hunk_t> editor_hunk_audit_snapshot()
+{
+    std::vector<aida::session::proposal_audit_hunk_t> result;
+    if (!code_editor_widget::has_pending_diff()) return result;
+    const auto diff = code_editor_widget::pending_diff();
+    if (diff.hunks.size() > 512U) return {};
+    result.reserve(diff.hunks.size());
+    for (std::size_t index = 0; index < diff.hunks.size(); ++index) {
+        const auto& source = diff.hunks[index];
+        std::uint64_t before_hash = 14695981039346656037ULL;
+        std::uint64_t after_hash = 14695981039346656037ULL;
+        std::uint64_t before_size = 0;
+        std::uint64_t after_size = 0;
+        auto append_framed = [](std::uint64_t& hash, std::uint64_t& size,
+                                std::string_view value) {
+            hash = hash_append(hash, value);
+            size += static_cast<std::uint64_t>(value.size());
+        };
+        for (const auto& line : source.lines) {
+            const std::string positions = std::to_string(line.old_line) + ":" +
+                std::to_string(line.new_line) + ":";
+            if (line.kind != code_editor_widget::diff_line_kind_t::added) {
+                append_framed(before_hash, before_size, positions);
+                append_framed(before_hash, before_size, line.text);
+                append_framed(before_hash, before_size, "\n");
+            }
+            if (line.kind != code_editor_widget::diff_line_kind_t::removed) {
+                append_framed(after_hash, after_size, positions);
+                append_framed(after_hash, after_size, line.text);
+                append_framed(after_hash, after_size, "\n");
+            }
+        }
+        before_hash ^= before_size;
+        before_hash *= 1099511628211ULL;
+        after_hash ^= after_size;
+        after_hash *= 1099511628211ULL;
+        if (before_hash == 0) before_hash = 1;
+        if (after_hash == 0) after_hash = 1;
+        aida::session::proposal_audit_hunk_t hunk;
+        hunk.index = static_cast<std::uint32_t>(index);
+        hunk.old_start = source.old_start;
+        hunk.old_count = source.old_count;
+        hunk.new_start = source.new_start;
+        hunk.new_count = source.new_count;
+        hunk.decision = hunk_decision(source.state);
+        hunk.before_hash = hash_text(before_hash);
+        hunk.after_hash = hash_text(after_hash);
+        result.push_back(std::move(hunk));
+    }
+    return result;
+}
+
+std::vector<aida::session::proposal_audit_hunk_t> editor_proposal_hunks(
+    const editor_proposal_snapshot_t& proposal)
+{
+    const bool live_identity = !proposal.stale &&
+        proposal.target_document_numeric_id != 0 &&
+        code_editor_widget::active_document_id() == proposal.target_document_numeric_id &&
+        code_editor_widget::document_revision() == proposal.base_document_revision &&
+        code_editor_widget::document_content_fingerprint() == proposal.base_content_hash;
+    if (live_identity) {
+        auto live = editor_hunk_audit_snapshot();
+        if (!live.empty()) {
+            std::lock_guard<std::mutex> lock(s_editor_proposal_hunks_mutex);
+            s_editor_proposal_hunks_audit_id = proposal.audit_id;
+            s_editor_proposal_hunks = live;
+            return live;
+        }
+    }
+    std::lock_guard<std::mutex> lock(s_editor_proposal_hunks_mutex);
+    return s_editor_proposal_hunks_audit_id == proposal.audit_id
+        ? s_editor_proposal_hunks
+        : std::vector<aida::session::proposal_audit_hunk_t>{};
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+void retain_editor_proposal_hunks(
+    const std::string& audit_id,
+    const std::vector<aida::session::proposal_audit_hunk_t>& hunks)
+{
+    std::lock_guard<std::mutex> lock(s_editor_proposal_hunks_mutex);
+    s_editor_proposal_hunks_audit_id = audit_id;
+    s_editor_proposal_hunks = hunks;
+}
+#endif
+
+aida::session::proposal_audit_record_t editor_audit_record(
+    const editor_proposal_snapshot_t& proposal, std::string lifecycle_state,
+    std::string outcome, std::string detail)
+{
+    aida::session::proposal_audit_record_t record;
+    record.audit_id = proposal.audit_id;
+    record.proposal_id = proposal.id;
+    record.family = "editor";
+    record.kind = "full_content_diff";
+    record.session_id = proposal.source.session_id;
+    record.source_index = proposal.source.index;
+    record.source_timestamp = proposal.source.timestamp;
+    record.source_fingerprint = proposal.source.fingerprint;
+    record.target_id = proposal.target_document_id;
+    record.target_view_id = "document.code";
+    record.target_generation = proposal.generation;
+    record.source_revision = proposal.base_document_revision;
+    record.before_hash = hash_text(proposal.base_content_hash);
+    record.after_hash = hash_text(proposal.proposed_content_hash);
+    record.result_hash = proposal.result_content_hash == 0
+        ? std::string{} : hash_text(proposal.result_content_hash);
+    record.result_revision = proposal.result_revision;
+    record.provenance = "chat:" + proposal.source.session_id + ":" +
+        std::to_string(proposal.source.fingerprint);
+    record.detail = bounded_metadata_string(std::move(detail), 4096U);
+    record.lifecycle_state = std::move(lifecycle_state);
+    record.outcome = std::move(outcome);
+    record.task_id = proposal.task_id;
+    record.diagnostic_id = proposal.diagnostic_id;
+    if (proposal.result_revision != 0)
+        record.undo_revert_identity = "editor.undo:" +
+            std::to_string(proposal.target_document_numeric_id) + ":" +
+            std::to_string(proposal.result_revision);
+    record.revalidation_required = record.outcome == "stale" ||
+        (record.outcome == "failure" && proposal.pending);
+    record.hunks = editor_proposal_hunks(proposal);
+    return record;
+}
+
+aida::session::proposal_audit_record_t reverse_audit_record(
+    const reverse_engineering_proposal_snapshot_t& proposal,
+    std::string lifecycle_state, std::string outcome, std::string detail)
+{
+    aida::session::proposal_audit_record_t record;
+    record.audit_id = proposal.audit_id;
+    record.proposal_id = proposal.id;
+    record.family = "reverse_engineering";
+    switch (proposal.kind) {
+    case reverse_engineering_proposal_kind_t::analysis_rename:
+        record.kind = "analysis.rename";
+        break;
+    case reverse_engineering_proposal_kind_t::analysis_comment:
+        record.kind = "analysis.comment";
+        break;
+    case reverse_engineering_proposal_kind_t::analysis_type:
+        record.kind = "analysis.type";
+        break;
+    case reverse_engineering_proposal_kind_t::static_patch:
+        record.kind = "patch.static";
+        break;
+    case reverse_engineering_proposal_kind_t::live_patch:
+        record.kind = "patch.live";
+        break;
+    case reverse_engineering_proposal_kind_t::network_request_edit:
+        record.kind = "network.request_edit";
+        break;
+    case reverse_engineering_proposal_kind_t::network_replay_staging:
+        record.kind = "network.replay_stage";
+        break;
+    default:
+        record.kind = "unknown";
+        break;
+    }
+    record.session_id = proposal.source.session_id;
+    record.source_index = proposal.source.index;
+    record.source_timestamp = proposal.source.timestamp;
+    record.source_fingerprint = proposal.source.fingerprint;
+    record.target_id = proposal.target_id.empty() ? "unresolved" : proposal.target_id;
+    record.target_view_id = proposal.target_view_id;
+    record.target_generation = proposal.expected_generation;
+    record.source_revision = proposal.expected_revision;
+    record.target_overlay_revision = proposal.expected_overlay_revision;
+    record.before_hash = hash_text(exact_content_hash(proposal.before_value));
+    record.after_hash = hash_text(exact_content_hash(proposal.after_value));
+    record.result_hash = proposal.result_hash == 0
+        ? std::string{} : hash_text(proposal.result_hash);
+    record.result_revision = proposal.result_revision;
+    record.provenance = bounded_metadata_string(proposal.provenance, 512U);
+    record.detail = bounded_metadata_string(std::move(detail), 4096U);
+    record.lifecycle_state = std::move(lifecycle_state);
+    record.outcome = std::move(outcome);
+    record.task_id = proposal.task_id;
+    record.diagnostic_id = proposal.diagnostic_id;
+    record.undo_revert_identity = proposal.rollback_action_id;
+    record.revalidation_required = record.outcome == "stale" ||
+        (record.outcome == "failure" && proposal.pending);
+    return record;
+}
+
+bool register_proposal_task(const std::string& task_id,
+                            const std::string& session_id,
+                            const std::string& target,
+                            const std::string& label)
+{
+    aida::ui::task_center::task_registration_t registration;
+    registration.id = task_id;
+    registration.source = "ai_proposal";
+    registration.owner = "ai_proposal";
+    registration.owner_view = "view.ai.evidence";
+    registration.owner_action = "ai.proposal.review";
+    registration.session = session_id;
+    registration.target = target;
+    registration.label = label;
+    registration.stage = "Queued for validation";
+    registration.affected_entity = target;
+    registration.callbacks.focus = [] {
+        static_cast<void>(aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.ai.evidence")));
+    };
+    return aida::ui::task_center::register_task(std::move(registration));
+}
+
+void update_proposal_task(const std::string& task_id,
+                          aida::ui::task_center::task_state_t state,
+                          float progress, std::string stage,
+                          std::string detail, std::string diagnostic_id = {})
+{
+    if (task_id.empty()) return;
+    static_cast<void>(aida::ui::task_center::update_task(task_id, state, progress,
+        std::move(stage), bounded_metadata_string(std::move(detail), 4096U),
+        std::move(diagnostic_id)));
+}
+
+void raise_proposal_diagnostic(const std::string& diagnostic_id,
+                               const std::string& task_id,
+                               const std::string& target,
+                               std::string summary, std::string detail)
+{
+    if (diagnostic_id.empty()) return;
+    aida::ui::task_center::diagnostic_registration_t diagnostic;
+    diagnostic.id = diagnostic_id;
+    diagnostic.task_id = task_id;
+    diagnostic.owner = "ai_proposal";
+    diagnostic.target = target;
+    diagnostic.summary = bounded_metadata_string(std::move(summary), 512U);
+    diagnostic.details = bounded_metadata_string(std::move(detail), 4096U);
+    diagnostic.severity = aida::ui::task_center::diagnostic_severity_t::error;
+    diagnostic.callbacks.focus = [] {
+        static_cast<void>(aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.ai.evidence")));
+    };
+    static_cast<void>(aida::ui::task_center::raise_diagnostic(
+        std::move(diagnostic)));
+}
+
+bool submit_proposal_job(const char* label, std::function<void()> body)
+{
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "ai_proposal";
+    submission.label = label;
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::general;
+    submission.priority = 2;
+    submission.body = std::move(body);
+    return aida::infra::executor::submit(std::move(submission)).submitted;
 }
 
 std::string bounded_metadata_string(std::string value, std::size_t limit)
@@ -3864,6 +4172,7 @@ bool parse_network_kind(std::string_view value, network_view::artifact_kind_t& k
 {
     using kind_t = network_view::artifact_kind_t;
     if (value == "request") kind = kind_t::request;
+    else if (value == "intercept_request") kind = kind_t::intercept_request;
     else if (value == "exchange") kind = kind_t::exchange;
     else if (value == "sitemap_request") kind = kind_t::sitemap_request;
     else if (value == "api_request") kind = kind_t::api_request;
@@ -3958,9 +4267,16 @@ bool open_message_context(const message_identity_t& identity, context_open_origi
 action_result_t stage_editor_proposal(const message_identity_t& source,
                                       const std::string& proposed_content)
 {
+    if (s_proposal_restore_pending.load(std::memory_order_acquire))
+        return failed("Wait for the bounded proposal-review restore to finish before staging another proposal.");
     std::string reason;
     if (!resolve_message(source, reason)) return failed(std::move(reason));
     if (proposed_content.empty()) return failed("The proposed editor content is empty.");
+    {
+        std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+        if (s_editor_proposal.pending || s_editor_proposal.applying)
+            return failed("Review, apply, or reject the currently pending editor proposal first.");
+    }
     const std::uint64_t document_id = code_editor_widget::active_document_id();
     const std::uint64_t base_revision = code_editor_widget::document_revision();
     const std::uint64_t base_hash = code_editor_widget::document_content_fingerprint();
@@ -3973,17 +4289,54 @@ action_result_t stage_editor_proposal(const message_identity_t& source,
         code_editor_widget::cancel_agent_edit();
         return failed(code_editor_widget::last_error());
     }
-    std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
-    s_editor_proposal = editor_proposal_snapshot_t{};
-    s_editor_proposal.id = "proposal.editor." + std::to_string(source.fingerprint);
-    s_editor_proposal.source = source;
-    s_editor_proposal.target_document_id = "document.code:" + std::to_string(document_id);
-    s_editor_proposal.target_document_numeric_id = document_id;
-    s_editor_proposal.base_document_revision = base_revision;
-    s_editor_proposal.base_content_hash = base_hash;
-    s_editor_proposal.generation = source.fingerprint;
-    s_editor_proposal.pending = true;
-    s_editor_proposal.detail = "Review every editor hunk before applying.";
+    const int hunk_count = code_editor_widget::pending_hunk_count();
+    if (hunk_count <= 0 || hunk_count > 512) {
+        code_editor_widget::cancel_agent_edit();
+        return failed(hunk_count <= 0
+            ? "The proposed editor content does not produce a reviewable change."
+            : "The proposal exceeds the bounded 512-hunk review limit.");
+    }
+    const std::uint64_t operation =
+        s_editor_proposal_operation.fetch_add(1, std::memory_order_acq_rel);
+    editor_proposal_snapshot_t proposal;
+    proposal.id = stable_proposal_id("editor", source, operation);
+    proposal.audit_id = proposal.id;
+    proposal.task_id = proposal_task_id(proposal.audit_id);
+    proposal.source = source;
+    proposal.target_document_id = "document.code:" + std::to_string(document_id);
+    proposal.target_document_numeric_id = document_id;
+    proposal.base_document_revision = base_revision;
+    proposal.base_content_hash = base_hash;
+    proposal.proposed_content_hash = exact_content_hash(proposed_content);
+    proposal.generation = operation;
+    proposal.pending = true;
+    proposal.detail = "Review every editor hunk before applying.";
+    if (!register_proposal_task(proposal.task_id, source.session_id,
+            proposal.target_document_id, "Review AI editor proposal")) {
+        code_editor_widget::cancel_agent_edit();
+        return failed("Task Center rejected the proposal-specific editor review task.");
+    }
+    std::string persistence_error;
+    if (!persist_proposal_audit(editor_audit_record(proposal, "pending_review",
+            "stage", proposal.detail), persistence_error)) {
+        code_editor_widget::cancel_agent_edit();
+        const std::string diagnostic_id = "diagnostic." + proposal.audit_id;
+        update_proposal_task(proposal.task_id,
+            aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Audit persistence failed", persistence_error, diagnostic_id);
+        raise_proposal_diagnostic(diagnostic_id, proposal.task_id,
+            proposal.target_document_id, "AI editor proposal audit was not durable",
+            persistence_error);
+        return failed("The editor proposal was not staged because its audit record could not be committed: " +
+            persistence_error);
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+        s_editor_proposal = proposal;
+    }
+    update_proposal_task(proposal.task_id,
+        aida::ui::task_center::task_state_t::running, 0.35f,
+        "Awaiting per-hunk review", proposal.detail);
     action_result_t result = completed("Editor proposal staged for per-hunk review.");
     result.target_view_id = "document.code";
     return result;
@@ -3991,13 +4344,38 @@ action_result_t stage_editor_proposal(const message_identity_t& source,
 
 editor_proposal_snapshot_t editor_proposal_snapshot()
 {
-    std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
-    editor_proposal_snapshot_t result = s_editor_proposal;
-    if (result.pending && (code_editor_widget::active_document_id() != result.target_document_numeric_id ||
-            code_editor_widget::document_revision() != result.base_document_revision ||
-            code_editor_widget::document_content_fingerprint() != result.base_content_hash)) {
-        result.stale = true;
-        result.detail = "The target code document identity, revision, or content hash changed after staging; reject or regenerate the proposal.";
+    editor_proposal_snapshot_t result;
+    bool became_stale = false;
+    {
+        std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+        if (s_editor_proposal.pending && !s_editor_proposal.stale &&
+            (code_editor_widget::active_document_id() !=
+                    s_editor_proposal.target_document_numeric_id ||
+             code_editor_widget::document_revision() !=
+                    s_editor_proposal.base_document_revision ||
+             code_editor_widget::document_content_fingerprint() !=
+                    s_editor_proposal.base_content_hash)) {
+            s_editor_proposal.stale = true;
+            s_editor_proposal.detail = "The target code document identity, revision, or content hash changed after staging; explicit revalidation is required.";
+            became_stale = true;
+        }
+        result = s_editor_proposal;
+    }
+    if (became_stale) {
+        std::string persistence_error;
+        const bool persisted = persist_proposal_audit(editor_audit_record(result,
+            "stale", "stale", result.detail), persistence_error);
+        const std::string diagnostic_id = persisted ? std::string{} :
+            "diagnostic." + result.audit_id + ".stale";
+        update_proposal_task(result.task_id, persisted
+                ? aida::ui::task_center::task_state_t::interrupted
+                : aida::ui::task_center::task_state_t::failed,
+            1.0f, persisted ? "Revalidation required" : "Audit persistence failed",
+            persisted ? result.detail : persistence_error, diagnostic_id);
+        if (!persisted)
+            raise_proposal_diagnostic(diagnostic_id, result.task_id,
+                result.target_document_id, "Stale editor proposal audit was not durable",
+                persistence_error);
     }
     return result;
 }
@@ -4020,11 +4398,18 @@ action_result_t validate_reverse_engineering_proposal(
 
     reverse_engineering_proposal_snapshot_t proposal;
     reverse_engineering_proposal_binding_t binding;
-    proposal.id = "proposal.re." + std::to_string(source.fingerprint);
+    {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.operation_id != operation_id)
+            return failed("The proposal validation was superseded before target resolution.");
+        proposal.id = s_reverse_engineering_proposal.id;
+        proposal.audit_id = s_reverse_engineering_proposal.audit_id;
+        proposal.task_id = s_reverse_engineering_proposal.task_id;
+    }
     proposal.source = source;
     proposal.kind = kind;
     proposal.kind_label = proposal_kind_label(kind);
-    proposal.generation = source.fingerprint;
+    proposal.generation = operation_id;
     proposal.operation_id = operation_id;
     proposal.state = reverse_engineering_proposal_state_t::valid;
     proposal.provenance = bounded_proposal_text(document, "provenance", 512U, reason, true);
@@ -4204,21 +4589,62 @@ action_result_t validate_reverse_engineering_proposal(
         proposal.reversibility = "Close the staged Repeater tab to discard it; captured history and the original artifact are not modified.";
     }
 
+    std::string persistence_error;
     {
         std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
         if (s_reverse_engineering_proposal.operation_id != operation_id)
             return failed("The proposal validation was superseded before publication.");
-        s_reverse_engineering_proposal = std::move(proposal);
+        if (!persist_proposal_audit(reverse_audit_record(proposal,
+                "pending_review", "review", proposal.detail), persistence_error))
+            return failed("The validated proposal was not published because its audit transaction failed: " +
+                persistence_error);
+        s_reverse_engineering_proposal = proposal;
         s_reverse_engineering_proposal_binding = std::move(binding);
         publish_reverse_engineering_proposal_locked();
     }
+    update_proposal_task(proposal.task_id,
+        aida::ui::task_center::task_state_t::running, 0.4f,
+        "Awaiting exact before/after review", proposal.detail);
     action_result_t result = completed("Reverse-engineering proposal staged for exact before/after review.");
     result.target_view_id = "view.ai.evidence";
     return result;
 }
 
+void fail_reverse_engineering_proposal(std::uint64_t operation_id,
+                                       std::string detail,
+                                       std::string summary)
+{
+    reverse_engineering_proposal_snapshot_t proposal;
+    {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.operation_id != operation_id) return;
+        s_reverse_engineering_proposal.pending = true;
+        s_reverse_engineering_proposal.applying = false;
+        s_reverse_engineering_proposal.state =
+            reverse_engineering_proposal_state_t::error;
+        s_reverse_engineering_proposal.stale = true;
+        s_reverse_engineering_proposal.diagnostic_id =
+            "diagnostic." + s_reverse_engineering_proposal.audit_id + ".failure";
+        s_reverse_engineering_proposal.disabled_reason = detail;
+        s_reverse_engineering_proposal.detail = detail;
+        proposal = s_reverse_engineering_proposal;
+        publish_reverse_engineering_proposal_locked();
+    }
+    std::string persistence_error;
+    if (!persist_proposal_audit(reverse_audit_record(proposal, "failure",
+            "failure", detail), persistence_error))
+        detail += " Audit persistence also failed: " + persistence_error;
+    update_proposal_task(proposal.task_id,
+        aida::ui::task_center::task_state_t::failed, 1.0f,
+        "Proposal failed", detail, proposal.diagnostic_id);
+    raise_proposal_diagnostic(proposal.diagnostic_id, proposal.task_id,
+        proposal.target_id, std::move(summary), std::move(detail));
+}
+
 action_result_t stage_reverse_engineering_proposal(const message_identity_t& source)
 {
+    if (s_proposal_restore_pending.load(std::memory_order_acquire))
+        return failed("Wait for the bounded proposal-review restore to finish before staging another proposal.");
     std::string reason;
     const ChatMessage* message = resolve_message(source, reason);
     if (!message) return failed(std::move(reason));
@@ -4247,19 +4673,24 @@ action_result_t stage_reverse_engineering_proposal(const message_identity_t& sou
     if (analysis_kind) workspace = disasm_view::capture_selected_workspace();
     const std::uint64_t operation_id =
         s_reverse_engineering_proposal_operation.fetch_add(1, std::memory_order_acq_rel);
+    reverse_engineering_proposal_snapshot_t queued_proposal;
     {
         std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
         if (s_reverse_engineering_proposal.pending)
             return failed("Review, apply, or reject the currently pending reverse-engineering proposal first.");
         s_reverse_engineering_proposal = {};
-        s_reverse_engineering_proposal.id = "proposal.re." +
-            std::to_string(source.fingerprint);
+        s_reverse_engineering_proposal.id =
+            stable_proposal_id("reverse", source, operation_id);
+        s_reverse_engineering_proposal.audit_id =
+            s_reverse_engineering_proposal.id;
+        s_reverse_engineering_proposal.task_id =
+            proposal_task_id(s_reverse_engineering_proposal.audit_id);
         s_reverse_engineering_proposal.source = source;
         s_reverse_engineering_proposal.kind = kind;
         s_reverse_engineering_proposal.kind_label = proposal_kind_label(kind);
         s_reverse_engineering_proposal.provenance = provenance;
         s_reverse_engineering_proposal.rationale = rationale;
-        s_reverse_engineering_proposal.generation = source.fingerprint;
+        s_reverse_engineering_proposal.generation = operation_id;
         s_reverse_engineering_proposal.operation_id = operation_id;
         s_reverse_engineering_proposal.state =
             reverse_engineering_proposal_state_t::queued;
@@ -4267,49 +4698,90 @@ action_result_t stage_reverse_engineering_proposal(const message_identity_t& sou
         s_reverse_engineering_proposal.detail =
             "Proposal validation is queued on the bounded AI review executor.";
         s_reverse_engineering_proposal_binding = {};
+        queued_proposal = s_reverse_engineering_proposal;
         publish_reverse_engineering_proposal_locked();
     }
-    const bool submitted = submit_chat_task(
-        "ai.proposal.validate", aida::infra::executor::domain_t::general,
-        "bounded_task", 2,
-        [source, document, workspace = std::move(workspace), operation_id]() mutable {
-            {
-                std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
-                if (s_reverse_engineering_proposal.operation_id != operation_id ||
-                    !s_reverse_engineering_proposal.pending)
-                    return;
-                s_reverse_engineering_proposal.state =
-                    reverse_engineering_proposal_state_t::running;
-                s_reverse_engineering_proposal.detail =
-                    "Validating proposal identity, exact before value, and retained target.";
-                publish_reverse_engineering_proposal_locked();
-            }
-            const auto validation = validate_reverse_engineering_proposal(
-                source, document, std::move(workspace), operation_id);
-            if (validation.succeeded) return;
-            std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
-            if (s_reverse_engineering_proposal.operation_id != operation_id)
-                return;
-            s_reverse_engineering_proposal.pending = true;
-            s_reverse_engineering_proposal.state =
-                reverse_engineering_proposal_state_t::error;
-            s_reverse_engineering_proposal.stale = true;
-            s_reverse_engineering_proposal.disabled_reason = validation.detail;
-            s_reverse_engineering_proposal.detail = validation.detail;
-            publish_reverse_engineering_proposal_locked();
-        });
-    if (!submitted) {
+    if (!register_proposal_task(queued_proposal.task_id, source.session_id,
+            "unresolved:" + queued_proposal.kind_label,
+            "Review AI reverse-engineering proposal")) {
         std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
         if (s_reverse_engineering_proposal.operation_id == operation_id) {
+            s_reverse_engineering_proposal.pending = false;
             s_reverse_engineering_proposal.state =
                 reverse_engineering_proposal_state_t::error;
             s_reverse_engineering_proposal.stale = true;
-            s_reverse_engineering_proposal.disabled_reason =
-                "The bounded AI proposal validator rejected the task.";
             s_reverse_engineering_proposal.detail =
-                s_reverse_engineering_proposal.disabled_reason;
+                "Task Center rejected the proposal-specific review task.";
+            s_reverse_engineering_proposal.disabled_reason =
+                s_reverse_engineering_proposal.detail;
             publish_reverse_engineering_proposal_locked();
         }
+        return failed("Task Center rejected the proposal-specific reverse-engineering review task.");
+    }
+    std::string persistence_error;
+    if (!persist_proposal_audit(reverse_audit_record(queued_proposal,
+            "validating", "stage", queued_proposal.detail), persistence_error)) {
+        const std::string diagnostic_id =
+            "diagnostic." + queued_proposal.audit_id + ".persistence";
+        update_proposal_task(queued_proposal.task_id,
+            aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Audit persistence failed", persistence_error, diagnostic_id);
+        raise_proposal_diagnostic(diagnostic_id, queued_proposal.task_id,
+            queued_proposal.target_id,
+            "Reverse-engineering proposal audit was not durable", persistence_error);
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.operation_id == operation_id) {
+            s_reverse_engineering_proposal.pending = false;
+            s_reverse_engineering_proposal.state =
+                reverse_engineering_proposal_state_t::error;
+            s_reverse_engineering_proposal.stale = true;
+            s_reverse_engineering_proposal.detail = persistence_error;
+            s_reverse_engineering_proposal.disabled_reason = persistence_error;
+            s_reverse_engineering_proposal.diagnostic_id = diagnostic_id;
+            publish_reverse_engineering_proposal_locked();
+        }
+        return failed("The proposal was not staged because its audit transaction failed: " +
+            persistence_error);
+    }
+    const bool submitted = submit_proposal_job(
+        "ai.proposal.validate",
+        [source, document, workspace = std::move(workspace), operation_id]() mutable {
+            try {
+                reverse_engineering_proposal_snapshot_t running;
+                {
+                    std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+                    if (s_reverse_engineering_proposal.operation_id != operation_id ||
+                        !s_reverse_engineering_proposal.pending)
+                        return;
+                    s_reverse_engineering_proposal.state =
+                        reverse_engineering_proposal_state_t::running;
+                    s_reverse_engineering_proposal.detail =
+                        "Validating proposal identity, exact before value, and retained target.";
+                    running = s_reverse_engineering_proposal;
+                    publish_reverse_engineering_proposal_locked();
+                }
+                update_proposal_task(running.task_id,
+                    aida::ui::task_center::task_state_t::running, 0.15f,
+                    "Validating target identity and revision", running.detail);
+                const auto validation = validate_reverse_engineering_proposal(
+                    source, document, std::move(workspace), operation_id);
+                if (validation.succeeded) return;
+                fail_reverse_engineering_proposal(operation_id, validation.detail,
+                    "AI proposal validation failed");
+            } catch (const std::exception& exception) {
+                fail_reverse_engineering_proposal(operation_id,
+                    std::string("Proposal validation raised an exception: ") + exception.what(),
+                    "AI proposal validation failed");
+            } catch (...) {
+                fail_reverse_engineering_proposal(operation_id,
+                    "Proposal validation raised an unknown exception.",
+                    "AI proposal validation failed");
+            }
+        });
+    if (!submitted) {
+        fail_reverse_engineering_proposal(operation_id,
+            "The bounded AI proposal validator rejected the task.",
+            "AI proposal validation dispatch failed");
         return failed("The bounded AI proposal validator rejected the task.");
     }
     action_result_t result = completed("Proposal validation queued.");
@@ -4324,49 +4796,506 @@ reverse_engineering_proposal_snapshot()
         std::memory_order_acquire);
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::uint64_t parse_audit_hash(const std::string& text)
+{
+    if (text.empty() || text.size() > 16U) return 0;
+    std::uint64_t value = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
+        value, 16);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size()
+        ? value : 0;
+}
+
+void install_restored_proposal_reviews(
+    const std::string& session_id, std::uint64_t operation,
+    std::vector<aida::session::proposal_audit_record_t> records)
+{
+    if (s_proposal_restore_operation.load(std::memory_order_acquire) != operation ||
+        get_chat_session_id_locked() != session_id)
+        return;
+    s_proposal_restore_pending.store(false, std::memory_order_release);
+    bool restored_editor = false;
+    bool restored_reverse = false;
+    for (const auto& record : records) {
+        if (record.family == "editor" && !restored_editor) {
+            editor_proposal_snapshot_t restored;
+            restored.id = record.proposal_id;
+            restored.audit_id = record.audit_id;
+            restored.task_id = record.task_id;
+            restored.diagnostic_id = record.diagnostic_id;
+            restored.source.session_id = record.session_id;
+            restored.source.index = static_cast<std::size_t>(record.source_index);
+            restored.source.timestamp = record.source_timestamp;
+            restored.source.fingerprint = record.source_fingerprint;
+            restored.target_document_id = record.target_id;
+            const std::string prefix = "document.code:";
+            if (record.target_id.rfind(prefix, 0) == 0) {
+                const std::string numeric = record.target_id.substr(prefix.size());
+                static_cast<void>(std::from_chars(numeric.data(),
+                    numeric.data() + numeric.size(),
+                    restored.target_document_numeric_id));
+            }
+            restored.base_document_revision = record.source_revision;
+            restored.base_content_hash = parse_audit_hash(record.before_hash);
+            restored.proposed_content_hash = parse_audit_hash(record.after_hash);
+            restored.generation = record.target_generation;
+            restored.pending = true;
+            restored.stale = true;
+            restored.detail = record.detail;
+            bool installed = false;
+            {
+                std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+                if (!s_editor_proposal.pending && !s_editor_proposal.applying) {
+                    s_editor_proposal = restored;
+                    installed = true;
+                }
+            }
+            if (installed) {
+                retain_editor_proposal_hunks(restored.audit_id, record.hunks);
+                static_cast<void>(register_proposal_task(restored.task_id,
+                    record.session_id, record.target_id,
+                    "Restored AI editor proposal"));
+                update_proposal_task(restored.task_id,
+                    aida::ui::task_center::task_state_t::interrupted, 1.0f,
+                    "Revalidation required", restored.detail);
+            }
+            restored_editor = true;
+        } else if (record.family == "reverse_engineering" && !restored_reverse) {
+            reverse_engineering_proposal_snapshot_t restored;
+            restored.id = record.proposal_id;
+            restored.audit_id = record.audit_id;
+            restored.task_id = record.task_id;
+            restored.diagnostic_id = record.diagnostic_id;
+            restored.source.session_id = record.session_id;
+            restored.source.index = static_cast<std::size_t>(record.source_index);
+            restored.source.timestamp = record.source_timestamp;
+            restored.source.fingerprint = record.source_fingerprint;
+            restored.kind = proposal_kind(record.kind);
+            restored.kind_label = proposal_kind_label(restored.kind);
+            restored.target_id = record.target_id;
+            restored.target_label = record.target_id;
+            restored.target_view_id = record.target_view_id;
+            restored.expected_generation = record.target_generation;
+            restored.expected_revision = record.source_revision;
+            restored.expected_overlay_revision = record.target_overlay_revision;
+            restored.before_value = "Restored before hash: " + record.before_hash;
+            restored.after_value = "Restored after hash: " + record.after_hash;
+            restored.provenance = record.provenance;
+            restored.rationale = record.detail;
+            restored.rollback_action_id = record.undo_revert_identity;
+            restored.generation = record.target_generation;
+            restored.operation_id =
+                s_reverse_engineering_proposal_operation.fetch_add(
+                    1, std::memory_order_acq_rel);
+            restored.state = reverse_engineering_proposal_state_t::stale;
+            restored.pending = true;
+            restored.stale = true;
+            restored.disabled_reason = record.detail;
+            restored.detail = record.detail;
+            bool installed = false;
+            {
+                std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+                if (!s_reverse_engineering_proposal.pending &&
+                    !s_reverse_engineering_proposal.applying) {
+                    s_reverse_engineering_proposal = restored;
+                    s_reverse_engineering_proposal_binding = {};
+                    publish_reverse_engineering_proposal_locked();
+                    installed = true;
+                }
+            }
+            if (installed) {
+                static_cast<void>(register_proposal_task(restored.task_id,
+                    record.session_id, record.target_id,
+                    "Restored AI reverse-engineering proposal"));
+                update_proposal_task(restored.task_id,
+                    aida::ui::task_center::task_state_t::interrupted, 1.0f,
+                    "Revalidation required", restored.detail,
+                    restored.diagnostic_id);
+            }
+            restored_reverse = true;
+        }
+        if (restored_editor && restored_reverse) break;
+    }
+}
+#endif
+
+void restore_proposal_reviews_for_session(const std::string& session_id)
+{
+    const std::uint64_t previous_operation =
+        s_proposal_restore_operation.fetch_add(1, std::memory_order_acq_rel);
+    const std::uint64_t operation = previous_operation + 1U;
+    if (s_proposal_restore_pending.exchange(false,
+            std::memory_order_acq_rel)) {
+        update_proposal_task("task.proposal.restore." +
+                std::to_string(previous_operation),
+            aida::ui::task_center::task_state_t::interrupted, 1.0f,
+            "Restore superseded by another conversation",
+            "A newer conversation identity superseded this restore.");
+    }
+    editor_proposal_snapshot_t displaced_editor;
+    bool editor_displaced = false;
+    {
+        std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+        if ((s_editor_proposal.pending || s_editor_proposal.applying) &&
+            !s_editor_proposal.source.session_id.empty() &&
+            s_editor_proposal.source.session_id != session_id) {
+            s_editor_proposal.pending = true;
+            s_editor_proposal.applying = false;
+            s_editor_proposal.stale = true;
+            s_editor_proposal.detail =
+                "The conversation changed before proposal completion; explicit revalidation is required after restore.";
+            displaced_editor = s_editor_proposal;
+            s_editor_proposal = {};
+            editor_displaced = true;
+        }
+    }
+    if (editor_displaced) {
+        std::string persistence_error;
+        const bool persisted = persist_proposal_audit(editor_audit_record(
+            displaced_editor, "stale", "stale", displaced_editor.detail),
+            persistence_error);
+        update_proposal_task(displaced_editor.task_id, persisted
+                ? aida::ui::task_center::task_state_t::interrupted
+                : aida::ui::task_center::task_state_t::failed,
+            1.0f, persisted ? "Conversation changed" :
+                "Session-switch audit persistence failed",
+            persisted ? displaced_editor.detail : persistence_error);
+        code_editor_widget::cancel_agent_edit();
+    }
+    reverse_engineering_proposal_snapshot_t displaced_reverse;
+    bool reverse_displaced = false;
+    {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if ((s_reverse_engineering_proposal.pending ||
+                s_reverse_engineering_proposal.applying) &&
+            !s_reverse_engineering_proposal.source.session_id.empty() &&
+            s_reverse_engineering_proposal.source.session_id != session_id) {
+            s_reverse_engineering_proposal.operation_id =
+                s_reverse_engineering_proposal_operation.fetch_add(
+                    1, std::memory_order_acq_rel);
+            s_reverse_engineering_proposal.applying = false;
+            s_reverse_engineering_proposal.stale = true;
+            s_reverse_engineering_proposal.state =
+                reverse_engineering_proposal_state_t::stale;
+            s_reverse_engineering_proposal.detail =
+                "The conversation changed before proposal completion; explicit target revalidation is required after restore.";
+            s_reverse_engineering_proposal.disabled_reason =
+                s_reverse_engineering_proposal.detail;
+            displaced_reverse = s_reverse_engineering_proposal;
+            s_reverse_engineering_proposal = {};
+            s_reverse_engineering_proposal_binding = {};
+            publish_reverse_engineering_proposal_locked();
+            reverse_displaced = true;
+        }
+    }
+    if (reverse_displaced) {
+        std::string persistence_error;
+        const bool persisted = persist_proposal_audit(reverse_audit_record(
+            displaced_reverse, "stale", "stale", displaced_reverse.detail),
+            persistence_error);
+        update_proposal_task(displaced_reverse.task_id, persisted
+                ? aida::ui::task_center::task_state_t::interrupted
+                : aida::ui::task_center::task_state_t::failed,
+            1.0f, persisted ? "Conversation changed" :
+                "Session-switch audit persistence failed",
+            persisted ? displaced_reverse.detail : persistence_error);
+    }
+    if (session_id.empty()) return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static_cast<void>(session_id);
+    static_cast<void>(operation);
+#else
+    const std::string restore_task_id = "task.proposal.restore." +
+        std::to_string(operation);
+    if (!register_proposal_task(restore_task_id, session_id, session_id,
+            "Restore AI proposal reviews")) {
+        const std::string diagnostic_id = "diagnostic.proposal.restore." +
+            std::to_string(operation);
+        raise_proposal_diagnostic(diagnostic_id, {}, session_id,
+            "AI proposal review restore could not start",
+            "Task Center rejected restore ownership before executor submission.");
+        return;
+    }
+    s_proposal_restore_pending.store(true, std::memory_order_release);
+    update_proposal_task(restore_task_id,
+        aida::ui::task_center::task_state_t::running, 0.1f,
+        "Restoring durable proposal audit state",
+        "Reading only bounded stale/revalidation-required proposal records; no proposal can be applied automatically.");
+    const bool submitted = submit_proposal_job("ai.proposal.restore",
+        [session_id, operation, restore_task_id] {
+            std::vector<aida::session::proposal_audit_record_t> records;
+            const bool restored = aida::session::restore_proposal_audits(
+                session_id, records, 16U);
+            std::string error = restored ? std::string{} : aida::session::last_error();
+            aida::ui_thread::post_options_t options;
+            options.subsystem = "ai_proposal";
+            options.label = "proposal.restore_completion";
+            options.phase = "restore";
+            options.owner = "ai_proposal";
+            options.priority = aida::ui_thread::priority_t::high;
+            const auto posted = aida::ui_thread::post(
+                [session_id, operation, restore_task_id, restored,
+                 error = std::move(error),
+                 records = std::move(records)]() mutable {
+                    if (s_proposal_restore_operation.load(
+                            std::memory_order_acquire) != operation ||
+                        get_chat_session_id_locked() != session_id) {
+                        update_proposal_task(restore_task_id,
+                            aida::ui::task_center::task_state_t::interrupted,
+                            1.0f, "Restore superseded by another conversation",
+                            "A newer conversation identity superseded this restore before UI publication.");
+                        return;
+                    }
+                    if (!restored) {
+                        s_proposal_restore_pending.store(false,
+                            std::memory_order_release);
+                        const std::string diagnostic_id =
+                            "diagnostic.proposal.restore." +
+                            std::to_string(operation);
+                        raise_proposal_diagnostic(diagnostic_id, {}, session_id,
+                            "AI proposal review restore failed", error);
+                        update_proposal_task(restore_task_id,
+                            aida::ui::task_center::task_state_t::failed, 1.0f,
+                            "Proposal review restore failed", error,
+                            diagnostic_id);
+                        diag::log_tagged_fmt("chat",
+                            "proposal_audit_restore_failed session='%.128s' error='%.512s'",
+                            session_id.c_str(), error.c_str());
+                        return;
+                    }
+                    install_restored_proposal_reviews(session_id, operation,
+                        std::move(records));
+                    update_proposal_task(restore_task_id,
+                        aida::ui::task_center::task_state_t::completed, 1.0f,
+                        "Proposal review restore complete",
+                        "Durable proposal records were restored as stale and require explicit target revalidation.");
+                }, std::move(options));
+            if (posted != aida::ui_thread::enqueue_result_t::accepted) {
+                const bool current = s_proposal_restore_operation.load(
+                    std::memory_order_acquire) == operation;
+                if (current)
+                    s_proposal_restore_pending.store(false,
+                        std::memory_order_release);
+                update_proposal_task(restore_task_id, current
+                        ? aida::ui::task_center::task_state_t::failed
+                        : aida::ui::task_center::task_state_t::interrupted,
+                    1.0f, current ? "Restore completion dispatch failed" :
+                        "Restore superseded by another conversation",
+                    current ? "The bounded UI dispatcher rejected the proposal restore completion."
+                        : "A newer conversation identity superseded this restore.");
+                diag::log_tagged_fmt("chat",
+                    "proposal_audit_restore_dispatch_failed session='%.128s'",
+                    session_id.c_str());
+            }
+        });
+    if (!submitted) {
+        s_proposal_restore_pending.store(false, std::memory_order_release);
+        const std::string diagnostic_id = "diagnostic.proposal.restore." +
+            std::to_string(operation);
+        raise_proposal_diagnostic(diagnostic_id, {}, session_id,
+            "AI proposal review restore could not start",
+            "The bounded proposal restore executor rejected the request.");
+        update_proposal_task(restore_task_id,
+            aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Proposal restore dispatch failed",
+            "The bounded proposal restore executor rejected the request.",
+            diagnostic_id);
+    }
+#endif
+}
+
+void prepare_proposal_reviews_for_shutdown()
+{
+    const std::uint64_t restore_operation =
+        s_proposal_restore_operation.fetch_add(1, std::memory_order_acq_rel);
+    if (s_proposal_restore_pending.exchange(false,
+            std::memory_order_acq_rel)) {
+        update_proposal_task("task.proposal.restore." +
+                std::to_string(restore_operation),
+            aida::ui::task_center::task_state_t::interrupted, 1.0f,
+            "Restore interrupted by shutdown",
+            "The IDE shut down before proposal restore publication.");
+    }
+    editor_proposal_snapshot_t editor;
+    bool editor_active = false;
+    {
+        std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+        if (s_editor_proposal.pending || s_editor_proposal.applying) {
+            s_editor_proposal.applying = false;
+            s_editor_proposal.stale = true;
+            s_editor_proposal.detail =
+                "The IDE closed before proposal completion; explicit revalidation is required after restore.";
+            editor = s_editor_proposal;
+            editor_active = true;
+        }
+    }
+    if (editor_active) {
+        std::string persistence_error;
+        const bool persisted = persist_proposal_audit(editor_audit_record(editor,
+            "stale", "stale", editor.detail), persistence_error);
+        update_proposal_task(editor.task_id, persisted
+                ? aida::ui::task_center::task_state_t::interrupted
+                : aida::ui::task_center::task_state_t::failed,
+            1.0f, persisted ? "Interrupted by shutdown" :
+                "Shutdown audit persistence failed",
+            persisted ? editor.detail : persistence_error);
+    }
+
+    reverse_engineering_proposal_snapshot_t reverse;
+    bool reverse_active = false;
+    {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.pending ||
+            s_reverse_engineering_proposal.applying) {
+            s_reverse_engineering_proposal.operation_id =
+                s_reverse_engineering_proposal_operation.fetch_add(
+                    1, std::memory_order_acq_rel);
+            s_reverse_engineering_proposal.applying = false;
+            s_reverse_engineering_proposal.stale = true;
+            s_reverse_engineering_proposal.state =
+                reverse_engineering_proposal_state_t::stale;
+            s_reverse_engineering_proposal.detail =
+                "The IDE closed before proposal completion; explicit target revalidation is required after restore.";
+            s_reverse_engineering_proposal.disabled_reason =
+                s_reverse_engineering_proposal.detail;
+            reverse = s_reverse_engineering_proposal;
+            s_reverse_engineering_proposal_binding = {};
+            publish_reverse_engineering_proposal_locked();
+            reverse_active = true;
+        }
+    }
+    if (reverse_active) {
+        std::string persistence_error;
+        const bool persisted = persist_proposal_audit(reverse_audit_record(reverse,
+            "stale", "stale", reverse.detail), persistence_error);
+        update_proposal_task(reverse.task_id, persisted
+                ? aida::ui::task_center::task_state_t::interrupted
+                : aida::ui::task_center::task_state_t::failed,
+            1.0f, persisted ? "Interrupted by shutdown" :
+                "Shutdown audit persistence failed",
+            persisted ? reverse.detail : persistence_error);
+    }
+}
+
 void finish_reverse_engineering_proposal(std::uint64_t operation_id,
                                          bool succeeded,
                                          std::string detail,
-                                         bool terminal_readback)
+                                         bool terminal_readback,
+                                         std::string failure_outcome = "failure",
+                                         std::uint64_t result_revision = 0,
+                                         std::uint64_t result_hash = 0,
+                                         std::string result_identity = {},
+                                         bool mutation_committed = false)
 {
-    std::string diagnostic_target;
-    std::string diagnostic_detail;
+    reverse_engineering_proposal_snapshot_t proposal;
     {
         std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
         if (s_reverse_engineering_proposal.operation_id != operation_id) return;
         s_reverse_engineering_proposal.applying = false;
-        s_reverse_engineering_proposal.pending = !succeeded;
+        s_reverse_engineering_proposal.pending = !succeeded && !mutation_committed;
         s_reverse_engineering_proposal.review_staged = succeeded && !terminal_readback;
         s_reverse_engineering_proposal.applied = succeeded && terminal_readback;
+        s_reverse_engineering_proposal.partial = mutation_committed;
         s_reverse_engineering_proposal.terminal_readback =
             succeeded && terminal_readback;
         s_reverse_engineering_proposal.stale = !succeeded;
-        s_reverse_engineering_proposal.state = succeeded
-            ? terminal_readback
-                ? reverse_engineering_proposal_state_t::applied
-                : reverse_engineering_proposal_state_t::staged_review
-            : reverse_engineering_proposal_state_t::stale;
+        s_reverse_engineering_proposal.state = succeeded ? terminal_readback
+            ? reverse_engineering_proposal_state_t::applied
+            : reverse_engineering_proposal_state_t::staged_review
+            : failure_outcome == "stale"
+            ? reverse_engineering_proposal_state_t::stale
+            : reverse_engineering_proposal_state_t::error;
         s_reverse_engineering_proposal.disabled_reason = succeeded
             ? std::string{} : detail;
         s_reverse_engineering_proposal.detail = std::move(detail);
-        diagnostic_target = s_reverse_engineering_proposal.target_id;
-        diagnostic_detail = s_reverse_engineering_proposal.detail;
+        if (succeeded || mutation_committed) {
+            s_reverse_engineering_proposal.result_revision = result_revision != 0
+                ? result_revision
+                : (terminal_readback || mutation_committed) &&
+                        s_reverse_engineering_proposal.expected_overlay_revision !=
+                            (std::numeric_limits<std::uint64_t>::max)()
+                ? s_reverse_engineering_proposal.expected_overlay_revision + 1U
+                : s_reverse_engineering_proposal.expected_revision;
+            s_reverse_engineering_proposal.result_hash = result_hash != 0
+                ? result_hash
+                : exact_content_hash(s_reverse_engineering_proposal.after_value);
+            if (!result_identity.empty())
+                s_reverse_engineering_proposal.rollback_action_id =
+                    std::move(result_identity);
+            else if (!s_reverse_engineering_proposal.rollback_action_id.empty())
+                s_reverse_engineering_proposal.rollback_action_id += ":" +
+                    s_reverse_engineering_proposal.target_id + ":" +
+                    std::to_string(
+                        s_reverse_engineering_proposal.result_revision);
+            if (mutation_committed)
+                s_reverse_engineering_proposal.detail +=
+                    " Rollback identity: " +
+                    s_reverse_engineering_proposal.rollback_action_id + ".";
+        } else {
+            s_reverse_engineering_proposal.diagnostic_id =
+                "diagnostic." + s_reverse_engineering_proposal.audit_id + "." +
+                failure_outcome;
+        }
+        proposal = s_reverse_engineering_proposal;
         publish_reverse_engineering_proposal_locked();
     }
-    if (!succeeded) {
-        aida::ui::task_center::diagnostic_registration_t diagnostic;
-        diagnostic.id = "diagnostic.ai.proposal." + std::to_string(operation_id);
-        diagnostic.owner = "ai_proposal";
-        diagnostic.target = std::move(diagnostic_target);
-        diagnostic.summary = "Reviewed AI proposal did not reach its authoritative review surface";
-        diagnostic.details = std::move(diagnostic_detail);
-        diagnostic.severity = aida::ui::task_center::diagnostic_severity_t::error;
-        diagnostic.callbacks.focus = [] {
-            static_cast<void>(aida::ui::application_views::open_or_focus(
-                aida::ui::stable_view_id_t("view.ai.evidence")));
-        };
-        static_cast<void>(aida::ui::task_center::raise_diagnostic(
-            std::move(diagnostic)));
+    if (!succeeded && mutation_committed) {
+        proposal.diagnostic_id = "diagnostic." + proposal.audit_id + ".partial";
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.operation_id == operation_id) {
+            s_reverse_engineering_proposal.diagnostic_id = proposal.diagnostic_id;
+            publish_reverse_engineering_proposal_locked();
+        }
+    }
+    const std::string lifecycle = succeeded
+        ? terminal_readback ? "applied" : "review_staged"
+        : mutation_committed ? "partial"
+        : failure_outcome == "stale" ? "stale" : "failure";
+    const std::string outcome = succeeded
+        ? terminal_readback ? "apply" : "partial"
+        : mutation_committed ? "partial"
+        : failure_outcome == "stale" ? "stale" : "failure";
+    std::string persistence_error;
+    const bool persisted = persist_proposal_audit(reverse_audit_record(proposal,
+        lifecycle, outcome, proposal.detail), persistence_error);
+    if (!persisted) {
+        const std::string diagnostic_id =
+            "diagnostic." + proposal.audit_id + ".persistence";
+        const std::string combined = proposal.detail +
+            " Audit persistence failed: " + persistence_error;
+        update_proposal_task(proposal.task_id,
+            succeeded || mutation_committed
+                ? aida::ui::task_center::task_state_t::partial
+                : aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Authoritative result was not durably audited", combined, diagnostic_id);
+        raise_proposal_diagnostic(diagnostic_id, proposal.task_id, proposal.target_id,
+            "AI proposal result audit was not durable", combined);
+        return;
+    }
+    if (succeeded) {
+        update_proposal_task(proposal.task_id, terminal_readback
+                ? aida::ui::task_center::task_state_t::completed
+                : aida::ui::task_center::task_state_t::partial,
+            1.0f, terminal_readback ? "Applied and verified" :
+                "Staged for authoritative downstream review", proposal.detail);
+    } else {
+        update_proposal_task(proposal.task_id, mutation_committed
+                ? aida::ui::task_center::task_state_t::partial
+                : failure_outcome == "stale"
+                ? aida::ui::task_center::task_state_t::interrupted
+                : aida::ui::task_center::task_state_t::failed,
+            1.0f, mutation_committed ? "Committed; terminal verification failed" :
+                failure_outcome == "stale" ? "Revalidation required" :
+                "Proposal failed", proposal.detail, proposal.diagnostic_id);
+        raise_proposal_diagnostic(proposal.diagnostic_id, proposal.task_id,
+            proposal.target_id,
+            mutation_committed
+                ? "AI proposal committed but terminal verification failed"
+                : failure_outcome == "stale"
+                ? "Reviewed AI proposal became stale before dispatch"
+                : "Reviewed AI proposal did not reach authoritative completion",
+            proposal.detail);
     }
 }
 
@@ -4453,6 +5382,7 @@ action_result_t queue_reverse_engineering_proposal_apply(
     const reverse_engineering_proposal_snapshot_t& proposal)
 {
     reverse_engineering_proposal_binding_t binding;
+    reverse_engineering_proposal_snapshot_t applying_proposal;
     const std::uint64_t operation_id =
         s_reverse_engineering_proposal_operation.fetch_add(1, std::memory_order_acq_rel);
     {
@@ -4469,17 +5399,53 @@ action_result_t queue_reverse_engineering_proposal_apply(
             reverse_engineering_proposal_state_t::applying;
         s_reverse_engineering_proposal.detail =
             "Apply-time identity and before-value revalidation is queued.";
+        applying_proposal = s_reverse_engineering_proposal;
         publish_reverse_engineering_proposal_locked();
     }
-    const bool submitted = submit_chat_task(
-        "ai.proposal.apply", aida::infra::executor::domain_t::general,
-        "bounded_task", 2,
+    std::string persistence_error;
+    if (!persist_proposal_audit(reverse_audit_record(applying_proposal,
+            "reviewed", "review", "The human confirmed the exact proposal scope and consequence."),
+            persistence_error) ||
+        !persist_proposal_audit(reverse_audit_record(applying_proposal,
+            "applying", "apply", applying_proposal.detail), persistence_error)) {
+        {
+            std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+            if (s_reverse_engineering_proposal.operation_id == operation_id) {
+                s_reverse_engineering_proposal.applying = false;
+                s_reverse_engineering_proposal.stale = true;
+                s_reverse_engineering_proposal.state =
+                    reverse_engineering_proposal_state_t::error;
+                s_reverse_engineering_proposal.diagnostic_id =
+                    "diagnostic." + applying_proposal.audit_id + ".persistence";
+                s_reverse_engineering_proposal.disabled_reason = persistence_error;
+                s_reverse_engineering_proposal.detail = persistence_error;
+                applying_proposal = s_reverse_engineering_proposal;
+                publish_reverse_engineering_proposal_locked();
+            }
+        }
+        update_proposal_task(applying_proposal.task_id,
+            aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Apply audit persistence failed", persistence_error,
+            applying_proposal.diagnostic_id);
+        raise_proposal_diagnostic(applying_proposal.diagnostic_id,
+            applying_proposal.task_id, applying_proposal.target_id,
+            "AI proposal apply was blocked by audit persistence",
+            persistence_error);
+        return failed("Apply was blocked because the proposal audit transaction failed: " +
+            persistence_error);
+    }
+    update_proposal_task(applying_proposal.task_id,
+        aida::ui::task_center::task_state_t::running, 0.65f,
+        "Revalidating before authoritative dispatch", applying_proposal.detail);
+    const bool submitted = submit_proposal_job(
+        "ai.proposal.apply",
         [proposal, binding = std::move(binding), operation_id]() mutable {
+          try {
             std::string reason;
             if (!revalidate_reverse_engineering_proposal(proposal, binding, reason)) {
                 finish_reverse_engineering_proposal(operation_id, false,
                     reason.empty() ? "Apply-time proposal revalidation failed." :
-                        std::move(reason), false);
+                        std::move(reason), false, "stale");
                 return;
             }
             if (proposal.kind == reverse_engineering_proposal_kind_t::analysis_rename ||
@@ -4537,12 +5503,14 @@ action_result_t queue_reverse_engineering_proposal_apply(
                     }
                     if (succeeded && !verified && error.empty())
                         error = "The authoritative analysis overlay committed, but its exact generation-fenced terminal readback did not match the proposal.";
-                    finish_reverse_engineering_proposal(operation_id, succeeded,
+                    finish_reverse_engineering_proposal(operation_id,
+                        succeeded && verified,
                         verified
                             ? "The authoritative analysis overlay committed and its proposal-specific completion matched."
                             : error.empty()
                             ? "The authoritative analysis overlay rejected the proposal mutation."
-                            : std::move(error), verified);
+                            : std::move(error), verified, "failure", 0, 0, {},
+                        succeeded && !verified);
                 };
                 bool accepted = false;
                 if (proposal.kind == reverse_engineering_proposal_kind_t::analysis_rename)
@@ -4579,42 +5547,75 @@ action_result_t queue_reverse_engineering_proposal_apply(
             };
             const auto posted = aida::ui_thread::post(
                 [proposal, binding = std::move(binding), operation_id]() mutable {
-                    bool accepted = false;
-                    std::string dispatch_reason;
-                    if (proposal.kind == reverse_engineering_proposal_kind_t::static_patch) {
-                        accepted = disasm_view::open_exact_static_patch_review(
-                            binding.workspace, binding.address, binding.before_bytes,
-                            binding.after_bytes, proposal.provenance,
-                            proposal.expected_generation, proposal.expected_revision,
-                            proposal.expected_overlay_revision, &dispatch_reason);
-                    } else if (proposal.kind ==
-                            reverse_engineering_proposal_kind_t::live_patch) {
-                        accepted = debugger_view::stage_exact_patch_review(
-                            binding.address.value, binding.before_bytes,
-                            binding.after_bytes, binding.target_pid,
-                            "AI proposal " + proposal.id + " from " +
-                                proposal.provenance, &dispatch_reason);
-                    } else {
-                        accepted = network_view::stage_validated_reviewed_request(
-                            binding.network_source, binding.network_after,
-                            proposal.provenance, binding.network_staged,
-                            dispatch_reason);
+                    try {
+                        bool accepted = false;
+                        std::string dispatch_reason;
+                        if (proposal.kind == reverse_engineering_proposal_kind_t::static_patch) {
+                            accepted = disasm_view::open_exact_static_patch_review(
+                                binding.workspace, binding.address, binding.before_bytes,
+                                binding.after_bytes, proposal.provenance,
+                                proposal.expected_generation, proposal.expected_revision,
+                                proposal.expected_overlay_revision, &dispatch_reason);
+                        } else if (proposal.kind ==
+                                reverse_engineering_proposal_kind_t::live_patch) {
+                            accepted = debugger_view::stage_exact_patch_review(
+                                binding.address.value, binding.before_bytes,
+                                binding.after_bytes, binding.target_pid,
+                                "AI proposal " + proposal.id + " from " +
+                                    proposal.provenance, &dispatch_reason);
+                        } else {
+                            accepted = network_view::stage_validated_reviewed_request(
+                                binding.network_source, binding.network_after,
+                                proposal.provenance, binding.network_staged,
+                                dispatch_reason);
+                        }
+                        const std::uint64_t staged_revision = accepted &&
+                                (proposal.kind == reverse_engineering_proposal_kind_t::network_request_edit ||
+                                 proposal.kind == reverse_engineering_proposal_kind_t::network_replay_staging)
+                            ? binding.network_staged.revision : 0;
+                        const std::uint64_t staged_hash = accepted &&
+                                (proposal.kind == reverse_engineering_proposal_kind_t::network_request_edit ||
+                                 proposal.kind == reverse_engineering_proposal_kind_t::network_replay_staging)
+                            ? binding.network_staged.content_hash
+                            : exact_content_hash(proposal.after_value);
+                        const std::string staged_identity = accepted &&
+                                !binding.network_staged.id.empty()
+                            ? "network.repeater.close:" + binding.network_staged.id
+                            : proposal.rollback_action_id + ":" + proposal.id;
+                        finish_reverse_engineering_proposal(operation_id, accepted,
+                            accepted
+                                ? proposal.kind == reverse_engineering_proposal_kind_t::static_patch
+                                    ? "Exact static bytes were staged in the generation-fenced Static Patch Review; the overlay is unchanged until its second confirmation."
+                                    : proposal.kind == reverse_engineering_proposal_kind_t::live_patch
+                                    ? "Exact live bytes were revalidated off the UI thread and staged in debugger Patch Review; target memory is unchanged."
+                                    : "The canonical retained endpoint and strict HTTP/1 draft were staged in Repeater; no request was sent."
+                                : dispatch_reason.empty()
+                                    ? "The authoritative review surface rejected the proposal."
+                                    : std::move(dispatch_reason), false, "failure",
+                            staged_revision, staged_hash, staged_identity);
+                    } catch (const std::exception& exception) {
+                        finish_reverse_engineering_proposal(operation_id, false,
+                            std::string("The UI review-surface dispatch raised an exception: ") +
+                                exception.what(), false, "failure");
+                    } catch (...) {
+                        finish_reverse_engineering_proposal(operation_id, false,
+                            "The UI review-surface dispatch raised an unknown exception.",
+                            false, "failure");
                     }
-                    finish_reverse_engineering_proposal(operation_id, accepted,
-                        accepted
-                            ? proposal.kind == reverse_engineering_proposal_kind_t::static_patch
-                                ? "Exact static bytes were staged in the generation-fenced Static Patch Review; the overlay is unchanged until its second confirmation."
-                                : proposal.kind == reverse_engineering_proposal_kind_t::live_patch
-                                ? "Exact live bytes were revalidated off the UI thread and staged in debugger Patch Review; target memory is unchanged."
-                                : "The canonical retained endpoint and strict HTTP/1 draft were staged in Repeater; no request was sent."
-                            : dispatch_reason.empty()
-                                ? "The authoritative review surface rejected the proposal."
-                                : std::move(dispatch_reason), false);
                 }, std::move(options));
             if (posted != aida::ui_thread::enqueue_result_t::accepted)
                 finish_reverse_engineering_proposal(operation_id, false,
                     "The UI review-surface handoff was rejected by the bounded dispatcher.",
-                    false);
+                    false, "failure");
+          } catch (const std::exception& exception) {
+              finish_reverse_engineering_proposal(operation_id, false,
+                  std::string("Apply-time proposal dispatch raised an exception: ") +
+                      exception.what(), false, "failure");
+          } catch (...) {
+              finish_reverse_engineering_proposal(operation_id, false,
+                  "Apply-time proposal dispatch raised an unknown exception.",
+                  false, "failure");
+          }
         });
     if (!submitted) {
         finish_reverse_engineering_proposal(operation_id, false,
@@ -4627,9 +5628,109 @@ action_result_t queue_reverse_engineering_proposal_apply(
     return result;
 }
 
+action_result_t reject_editor_proposal(
+    const editor_proposal_snapshot_t& proposal)
+{
+    if (!proposal.pending)
+        return failed("The staged editor proposal is no longer pending.");
+    if (proposal.applying)
+        return failed("The editor proposal is already committing its reviewed hunks.");
+    bool changed_before_reject = false;
+    {
+        std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+        if (!s_editor_proposal.pending ||
+            s_editor_proposal.generation != proposal.generation)
+            changed_before_reject = true;
+    }
+    if (changed_before_reject) {
+        editor_proposal_snapshot_t interrupted = proposal;
+        interrupted.applying = false;
+        interrupted.stale = true;
+        interrupted.diagnostic_id =
+            "diagnostic." + proposal.audit_id + ".reject_generation";
+        interrupted.detail =
+            "The editor proposal ownership changed before rejection could be committed; no editor mutation occurred.";
+        std::string persistence_error;
+        const bool persisted = persist_proposal_audit(editor_audit_record(
+            interrupted, "stale", "stale", interrupted.detail), persistence_error);
+        update_proposal_task(proposal.task_id, persisted
+                ? aida::ui::task_center::task_state_t::interrupted
+                : aida::ui::task_center::task_state_t::failed,
+            1.0f, persisted ? "Proposal ownership changed before reject" :
+                "Reject interruption audit failed",
+            persisted ? interrupted.detail : persistence_error,
+            interrupted.diagnostic_id);
+        raise_proposal_diagnostic(interrupted.diagnostic_id, proposal.task_id,
+            proposal.target_document_id,
+            "AI editor proposal ownership changed before reject",
+            interrupted.detail + (persisted ? std::string{} :
+                " Audit persistence failed: " + persistence_error));
+        return failed(interrupted.detail);
+    }
+    std::string persistence_error;
+    if (!persist_proposal_audit(editor_audit_record(proposal, "rejected",
+            "reject", "The proposal was rejected without changing the document."),
+            persistence_error)) {
+        const std::string diagnostic_id =
+            "diagnostic." + proposal.audit_id + ".reject_persistence";
+        {
+            std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+            if (s_editor_proposal.generation == proposal.generation) {
+                s_editor_proposal.stale = true;
+                s_editor_proposal.diagnostic_id = diagnostic_id;
+                s_editor_proposal.detail = persistence_error;
+            }
+        }
+        update_proposal_task(proposal.task_id,
+            aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Reject audit persistence failed", persistence_error, diagnostic_id);
+        raise_proposal_diagnostic(diagnostic_id, proposal.task_id,
+            proposal.target_document_id,
+            "AI editor rejection was blocked by audit persistence",
+            persistence_error);
+        return failed("Reject was blocked because the proposal audit transaction failed: " +
+            persistence_error);
+    }
+    bool ownership_changed = false;
+    {
+        std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+        if (!s_editor_proposal.pending ||
+            s_editor_proposal.generation != proposal.generation)
+            ownership_changed = true;
+        else {
+            s_editor_proposal.pending = false;
+            s_editor_proposal.rejected = true;
+            s_editor_proposal.detail =
+                "The proposal was rejected without changing the document.";
+        }
+    }
+    if (ownership_changed) {
+        update_proposal_task(proposal.task_id,
+            aida::ui::task_center::task_state_t::cancelled, 1.0f,
+            "Rejected after proposal ownership changed",
+            "The durable rejection completed without interacting with the newer editor proposal.");
+        return completed(
+            "Editor proposal rejected durably without interacting with the newer proposal.");
+    }
+    code_editor_widget::cancel_agent_edit();
+    update_proposal_task(proposal.task_id,
+        aida::ui::task_center::task_state_t::cancelled, 1.0f,
+        "Rejected by reviewer",
+        "The proposal was rejected without changing the document.");
+    return completed("Editor proposal rejected without writes.");
+}
+
 action_capability_t message_action_capability(const message_identity_t& identity, message_action_t action)
 {
     action_capability_t result;
+    if (s_proposal_restore_pending.load(std::memory_order_acquire) &&
+        (action == message_action_t::review_change ||
+         action == message_action_t::apply_change ||
+         action == message_action_t::reject_change)) {
+        result.disabled_reason =
+            "Wait for the bounded proposal-review restore to finish.";
+        return result;
+    }
     if (action == message_action_t::reject_change) {
         const auto reverse_proposal_publication = reverse_engineering_proposal_snapshot();
         const auto& reverse_proposal = *reverse_proposal_publication;
@@ -4639,6 +5740,15 @@ action_capability_t message_action_capability(const message_identity_t& identity
             result.enabled = !reverse_proposal.applying;
             result.disabled_reason = result.enabled ? std::string{} :
                 "The proposal operation is already committing its reviewed handoff.";
+            return result;
+        }
+        const auto editor_proposal = editor_proposal_snapshot();
+        if (editor_proposal.pending &&
+            editor_proposal.source.session_id == identity.session_id &&
+            editor_proposal.source.fingerprint == identity.fingerprint) {
+            result.enabled = !editor_proposal.applying;
+            result.disabled_reason = result.enabled ? std::string{} :
+                "The editor proposal is already committing its reviewed hunks.";
             return result;
         }
     }
@@ -4726,6 +5836,10 @@ action_capability_t message_action_capability(const message_identity_t& identity
                 if (reverse_proposal.stale ||
                     reverse_proposal.state == reverse_engineering_proposal_state_t::error ||
                     reverse_proposal.state == reverse_engineering_proposal_state_t::stale) {
+                    if (action == message_action_t::review_change) {
+                        result.enabled = true;
+                        break;
+                    }
                     result.disabled_reason = reverse_proposal.disabled_reason.empty()
                         ? reverse_proposal.detail : reverse_proposal.disabled_reason;
                     break;
@@ -4746,12 +5860,23 @@ action_capability_t message_action_capability(const message_identity_t& identity
                 editor_proposal.source.fingerprint == identity.fingerprint;
             if (editor_linked) {
                 if (editor_proposal.stale) {
+                    if (action == message_action_t::review_change) {
+                        result.enabled = true;
+                        break;
+                    }
                     result.disabled_reason = editor_proposal.detail;
                     break;
                 }
                 if (action == message_action_t::apply_change &&
                     code_editor_widget::pending_hunk_count() == 0) {
                     result.disabled_reason = "The staged change has no pending editor hunks to apply.";
+                    break;
+                }
+                if (action == message_action_t::apply_change &&
+                    (!code_editor_widget::has_pending_diff() ||
+                     !code_editor_widget::pending_diff().fully_resolved())) {
+                    result.disabled_reason =
+                        "Accept or reject every editor hunk before applying the resolved diff.";
                     break;
                 }
                 result.enabled = true;
@@ -4789,25 +5914,92 @@ action_result_t execute_message_action(const message_identity_t& identity, messa
         if (reverse_proposal.pending &&
             reverse_proposal.source.session_id == identity.session_id &&
             reverse_proposal.source.fingerprint == identity.fingerprint) {
-            std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
-            if (s_reverse_engineering_proposal.operation_id !=
-                reverse_proposal.operation_id)
+            bool generation_changed = false;
+            bool applying = false;
+            {
+                std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+                generation_changed = s_reverse_engineering_proposal.operation_id !=
+                    reverse_proposal.operation_id;
+                applying = s_reverse_engineering_proposal.applying;
+            }
+            if (generation_changed) {
+                update_proposal_task(reverse_proposal.task_id,
+                    aida::ui::task_center::task_state_t::interrupted, 1.0f,
+                    "Proposal ownership changed before reject",
+                    "The proposal generation changed before rejection; no mutation was dispatched.");
                 return failed("The proposal generation changed; review the current proposal.");
-            if (s_reverse_engineering_proposal.applying)
+            }
+            if (applying)
                 return failed("The proposal is already committing its reviewed handoff.");
-            s_reverse_engineering_proposal.pending = false;
-            s_reverse_engineering_proposal.rejected = true;
-            s_reverse_engineering_proposal.state =
-                reverse_engineering_proposal_state_t::rejected;
-            s_reverse_engineering_proposal.operation_id =
-                s_reverse_engineering_proposal_operation.fetch_add(
-                    1, std::memory_order_acq_rel);
-            s_reverse_engineering_proposal.detail =
-                "The reverse-engineering proposal was rejected without dispatching a mutation.";
-            publish_reverse_engineering_proposal_locked();
+            std::string persistence_error;
+            if (!persist_proposal_audit(reverse_audit_record(reverse_proposal,
+                    "rejected", "reject",
+                    "The reverse-engineering proposal was rejected without dispatching a mutation."),
+                    persistence_error)) {
+                const std::string diagnostic_id =
+                    "diagnostic." + reverse_proposal.audit_id + ".reject_persistence";
+                {
+                    std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+                    if (s_reverse_engineering_proposal.operation_id ==
+                            reverse_proposal.operation_id) {
+                        s_reverse_engineering_proposal.stale = true;
+                        s_reverse_engineering_proposal.state =
+                            reverse_engineering_proposal_state_t::error;
+                        s_reverse_engineering_proposal.diagnostic_id = diagnostic_id;
+                        s_reverse_engineering_proposal.disabled_reason = persistence_error;
+                        s_reverse_engineering_proposal.detail = persistence_error;
+                        publish_reverse_engineering_proposal_locked();
+                    }
+                }
+                update_proposal_task(reverse_proposal.task_id,
+                    aida::ui::task_center::task_state_t::failed, 1.0f,
+                    "Reject audit persistence failed", persistence_error,
+                    diagnostic_id);
+                raise_proposal_diagnostic(diagnostic_id, reverse_proposal.task_id,
+                    reverse_proposal.target_id,
+                    "AI proposal rejection was blocked by audit persistence",
+                    persistence_error);
+                return failed("Reject was blocked because the proposal audit transaction failed: " +
+                    persistence_error);
+            }
+            bool ownership_changed = false;
+            {
+                std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+                ownership_changed = s_reverse_engineering_proposal.operation_id !=
+                    reverse_proposal.operation_id;
+                if (!ownership_changed) {
+                    s_reverse_engineering_proposal.pending = false;
+                    s_reverse_engineering_proposal.rejected = true;
+                    s_reverse_engineering_proposal.state =
+                        reverse_engineering_proposal_state_t::rejected;
+                    s_reverse_engineering_proposal.operation_id =
+                        s_reverse_engineering_proposal_operation.fetch_add(
+                            1, std::memory_order_acq_rel);
+                    s_reverse_engineering_proposal.detail =
+                        "The reverse-engineering proposal was rejected without dispatching a mutation.";
+                    publish_reverse_engineering_proposal_locked();
+                }
+            }
+            if (ownership_changed) {
+                update_proposal_task(reverse_proposal.task_id,
+                    aida::ui::task_center::task_state_t::cancelled, 1.0f,
+                    "Rejected after proposal ownership changed",
+                    "The durable rejection completed without interacting with the newer proposal.");
+                return completed(
+                    "Reverse-engineering proposal rejected durably without interacting with the newer proposal.");
+            }
+            update_proposal_task(reverse_proposal.task_id,
+                aida::ui::task_center::task_state_t::cancelled, 1.0f,
+                "Rejected by reviewer",
+                "The proposal was rejected without dispatching a mutation.");
             return completed(
                 "Reverse-engineering proposal rejected without writes or network activity.");
         }
+        const auto editor_proposal = editor_proposal_snapshot();
+        if (editor_proposal.pending &&
+            editor_proposal.source.session_id == identity.session_id &&
+            editor_proposal.source.fingerprint == identity.fingerprint)
+            return reject_editor_proposal(editor_proposal);
     }
     std::string reason;
     const ChatMessage* message = resolve_message(identity, reason);
@@ -4929,49 +6121,200 @@ action_result_t execute_message_action(const message_identity_t& identity, messa
                 code_editor_widget::document_content_fingerprint() != proposal.base_content_hash)
                 return failed("The code document changed after review began; apply is blocked until the proposal is regenerated.");
             const int pending_hunks = code_editor_widget::pending_hunk_count();
+            const auto pending_diff = code_editor_widget::pending_diff();
             if (proposal.reviewed_generation != proposal.generation ||
                 proposal.reviewed_content_hash != proposal.base_content_hash ||
-                proposal.reviewed_pending_hunks != pending_hunks || pending_hunks <= 0)
+                proposal.reviewed_pending_hunks != pending_hunks || pending_hunks <= 0 ||
+                !pending_diff.active || !pending_diff.fully_resolved())
                 return failed("Review and confirm the exact target revision, content hash, and pending hunks before applying.");
+            std::string persistence_error;
+            if (!persist_proposal_audit(editor_audit_record(proposal, "reviewed",
+                    "review", "The human confirmed the exact per-hunk decisions and target revision."),
+                    persistence_error) ||
+                !persist_proposal_audit(editor_audit_record(proposal, "applying",
+                    "apply", "Applying the resolved per-hunk decisions through the code editor backend."),
+                    persistence_error)) {
+                const std::string diagnostic_id =
+                    "diagnostic." + proposal.audit_id + ".persistence";
+                {
+                    std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+                    if (s_editor_proposal.generation == proposal.generation) {
+                        s_editor_proposal.stale = true;
+                        s_editor_proposal.detail = persistence_error;
+                    }
+                }
+                update_proposal_task(proposal.task_id,
+                    aida::ui::task_center::task_state_t::failed, 1.0f,
+                    "Apply audit persistence failed", persistence_error, diagnostic_id);
+                raise_proposal_diagnostic(diagnostic_id, proposal.task_id,
+                    proposal.target_document_id,
+                    "AI editor apply was blocked by audit persistence",
+                    persistence_error);
+                return failed("Apply was blocked because the editor proposal audit transaction failed: " +
+                    persistence_error);
+            }
+            int accepted_hunks = 0;
+            int rejected_hunks = 0;
+            for (const auto& hunk : pending_diff.hunks) {
+                if (hunk.state == code_editor_widget::diff_hunk_state_t::accepted)
+                    ++accepted_hunks;
+                else if (hunk.state == code_editor_widget::diff_hunk_state_t::rejected)
+                    ++rejected_hunks;
+            }
+            bool generation_changed_before_commit = false;
             {
                 std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
-                if (!s_editor_proposal.pending || s_editor_proposal.generation != proposal.generation)
-                    return failed("The proposal generation changed; review the current proposal.");
-                s_editor_proposal.applying = true;
-                s_editor_proposal.detail = "Applying " + std::to_string(pending_hunks) +
-                    " reviewed editor hunks to document " +
-                    std::to_string(proposal.target_document_numeric_id) + ".";
+                generation_changed_before_commit = !s_editor_proposal.pending ||
+                    s_editor_proposal.generation != proposal.generation;
+                if (!generation_changed_before_commit) {
+                    s_editor_proposal.applying = true;
+                    s_editor_proposal.detail = "Applying " + std::to_string(pending_hunks) +
+                        " reviewed editor hunks to document " +
+                        std::to_string(proposal.target_document_numeric_id) + ".";
+                }
             }
-            code_editor_widget::accept_all();
+            if (generation_changed_before_commit) {
+                editor_proposal_snapshot_t interrupted = proposal;
+                interrupted.applying = false;
+                interrupted.stale = true;
+                interrupted.diagnostic_id =
+                    "diagnostic." + proposal.audit_id + ".generation";
+                interrupted.detail =
+                    "The editor proposal ownership changed after apply was audited but before any editor mutation; no hunks were committed.";
+                std::string terminal_persistence;
+                const bool persisted = persist_proposal_audit(editor_audit_record(
+                    interrupted, "stale", "stale", interrupted.detail),
+                    terminal_persistence);
+                update_proposal_task(proposal.task_id, persisted
+                        ? aida::ui::task_center::task_state_t::interrupted
+                        : aida::ui::task_center::task_state_t::failed,
+                    1.0f, persisted ? "Proposal ownership changed before commit" :
+                        "Proposal interruption audit failed",
+                    persisted ? interrupted.detail : terminal_persistence,
+                    interrupted.diagnostic_id);
+                raise_proposal_diagnostic(interrupted.diagnostic_id,
+                    proposal.task_id, proposal.target_document_id,
+                    "AI editor proposal ownership changed before commit",
+                    interrupted.detail + (persisted ? std::string{} :
+                        " Audit persistence failed: " + terminal_persistence));
+                return failed(interrupted.detail);
+            }
+            update_proposal_task(proposal.task_id,
+                aida::ui::task_center::task_state_t::running, 0.75f,
+                "Applying resolved editor hunks",
+                std::to_string(accepted_hunks) + " accepted; " +
+                    std::to_string(rejected_hunks) + " rejected");
             if (!code_editor_widget::commit_resolved_diff()) {
-                std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
-                s_editor_proposal.applying = false;
-                s_editor_proposal.detail = "The code editor rejected the resolved diff; no completion was recorded.";
-                return failed(s_editor_proposal.detail);
+                editor_proposal_snapshot_t failed_proposal = proposal;
+                failed_proposal.applying = false;
+                failed_proposal.stale = true;
+                failed_proposal.diagnostic_id =
+                    "diagnostic." + proposal.audit_id + ".apply";
+                failed_proposal.detail =
+                    "The code editor rejected the resolved diff; no completion was recorded.";
+                {
+                    std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+                    if (s_editor_proposal.generation == proposal.generation) {
+                        s_editor_proposal.applying = false;
+                        s_editor_proposal.stale = true;
+                        s_editor_proposal.diagnostic_id = failed_proposal.diagnostic_id;
+                        s_editor_proposal.detail = failed_proposal.detail;
+                        failed_proposal = s_editor_proposal;
+                    } else {
+                        failed_proposal.detail +=
+                            " Proposal ownership also changed before failure publication.";
+                    }
+                }
+                std::string failure_persistence;
+                static_cast<void>(persist_proposal_audit(editor_audit_record(
+                    failed_proposal, "failure", "failure", failed_proposal.detail),
+                    failure_persistence));
+                const std::string diagnostic_id = failed_proposal.diagnostic_id;
+                update_proposal_task(proposal.task_id,
+                    aida::ui::task_center::task_state_t::failed, 1.0f,
+                    "Editor apply failed", failed_proposal.detail, diagnostic_id);
+                raise_proposal_diagnostic(diagnostic_id, proposal.task_id,
+                    proposal.target_document_id, "AI editor proposal apply failed",
+                    failed_proposal.detail + (failure_persistence.empty()
+                        ? std::string{} : " Audit persistence also failed: " +
+                            failure_persistence));
+                return failed(failed_proposal.detail);
             }
+            editor_proposal_snapshot_t applied_proposal = proposal;
+            applied_proposal.pending = false;
+            applied_proposal.applying = false;
+            applied_proposal.applied = true;
+            applied_proposal.result_revision =
+                code_editor_widget::document_revision();
+            applied_proposal.result_content_hash =
+                code_editor_widget::document_content_fingerprint();
+            applied_proposal.detail = rejected_hunks == 0
+                ? "All reviewed hunks were applied through the code editor backend."
+                : std::to_string(accepted_hunks) +
+                    " reviewed hunks were applied and " +
+                    std::to_string(rejected_hunks) + " were retained unchanged.";
+            bool generation_changed_after_commit = false;
             {
                 std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
-                if (s_editor_proposal.generation != proposal.generation)
-                    return failed("The proposal generation changed during apply; inspect the editor and diagnostics.");
-                s_editor_proposal.pending = false;
-                s_editor_proposal.applying = false;
-                s_editor_proposal.applied = true;
-                s_editor_proposal.detail = "All reviewed hunks were applied through the code editor backend.";
+                generation_changed_after_commit =
+                    s_editor_proposal.generation != proposal.generation;
+                if (!generation_changed_after_commit) {
+                    s_editor_proposal = applied_proposal;
+                    applied_proposal = s_editor_proposal;
+                }
             }
-            return completed("All reviewed editor hunks applied.");
+            if (generation_changed_after_commit) {
+                applied_proposal.diagnostic_id =
+                    "diagnostic." + proposal.audit_id + ".committed_generation";
+                applied_proposal.detail +=
+                    " The authoritative editor commit succeeded, but proposal ownership changed before terminal publication; use the exact editor undo identity from the audit record if rollback is required.";
+                std::string committed_persistence;
+                const bool persisted = persist_proposal_audit(editor_audit_record(
+                    applied_proposal, "partial", "partial", applied_proposal.detail),
+                    committed_persistence);
+                update_proposal_task(proposal.task_id,
+                    aida::ui::task_center::task_state_t::partial,
+                    1.0f, persisted ? "Committed; proposal ownership changed" :
+                        "Committed result audit failed",
+                    persisted ? applied_proposal.detail : committed_persistence,
+                    applied_proposal.diagnostic_id);
+                raise_proposal_diagnostic(applied_proposal.diagnostic_id,
+                    proposal.task_id, proposal.target_document_id,
+                    "AI editor commit completed after proposal ownership changed",
+                    applied_proposal.detail + (persisted ? std::string{} :
+                        " Audit persistence failed: " + committed_persistence));
+                return failed(applied_proposal.detail);
+            }
+            const bool partial = rejected_hunks != 0;
+            std::string terminal_persistence;
+            if (!persist_proposal_audit(editor_audit_record(applied_proposal,
+                    partial ? "applied_partial" : "applied",
+                    partial ? "partial" : "apply", applied_proposal.detail),
+                    terminal_persistence)) {
+                const std::string diagnostic_id =
+                    "diagnostic." + proposal.audit_id + ".result_persistence";
+                update_proposal_task(proposal.task_id,
+                    aida::ui::task_center::task_state_t::partial, 1.0f,
+                    "Applied result was not durably audited", terminal_persistence,
+                    diagnostic_id);
+                raise_proposal_diagnostic(diagnostic_id, proposal.task_id,
+                    proposal.target_document_id,
+                    "Applied AI editor result audit failed",
+                    applied_proposal.detail + " Audit persistence failed: " +
+                        terminal_persistence);
+                return failed(applied_proposal.detail +
+                    " The authoritative edit succeeded, but its audit transaction failed: " +
+                    terminal_persistence);
+            }
+            update_proposal_task(proposal.task_id, partial
+                    ? aida::ui::task_center::task_state_t::partial
+                    : aida::ui::task_center::task_state_t::completed,
+                1.0f, partial ? "Partially applied by hunk decision" :
+                    "Applied and revision-verified", applied_proposal.detail);
+            return completed(applied_proposal.detail);
         }
         case message_action_t::reject_change: {
-            const auto proposal = editor_proposal_snapshot();
-            if (!proposal.pending || proposal.source.fingerprint != identity.fingerprint)
-                return failed("The staged proposal is no longer linked to this message.");
-            code_editor_widget::cancel_agent_edit();
-            std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
-            if (s_editor_proposal.generation != proposal.generation)
-                return failed("The proposal generation changed; review the current proposal.");
-            s_editor_proposal.pending = false;
-            s_editor_proposal.rejected = true;
-            s_editor_proposal.detail = "The proposal was rejected without changing the document.";
-            return completed("Editor proposal rejected without writes.");
+            return failed("The staged proposal is no longer linked to this message.");
         }
     }
     return failed("The action has no executable provider.");
@@ -5212,6 +6555,10 @@ static bool queue_evidence(const std::string& evidence_id, bool agent, std::stri
 {
     evidence_envelope_t envelope;
     if (!evidence_payload(evidence_id, envelope, reason)) return false;
+    if (envelope.sensitive) {
+        reason = "Sensitive evidence is blocked from AI transfer. Return to the source and create an explicitly redacted evidence envelope.";
+        return false;
+    }
     std::ostringstream payload;
     payload << "[Evidence " << envelope.id << "]\nSource: " << envelope.source_view_id
             << " / " << envelope.entity_id << "\nRevision: " << envelope.revision
@@ -5233,7 +6580,122 @@ bool queue_evidence_for_chat(const std::string& evidence_id, std::string& reason
 
 bool queue_evidence_for_agent(const std::string& evidence_id, std::string& reason)
 {
-    return queue_evidence(evidence_id, true, reason);
+    evidence_envelope_t envelope;
+    if (!evidence_payload(evidence_id, envelope, reason)) return false;
+    if (envelope.sensitive) {
+        reason = "Sensitive evidence is blocked from agent transfer. Return to the source and create an explicitly redacted evidence envelope.";
+        return false;
+    }
+    const std::string agent_name = aida::agent::active_agent_name();
+    if (agent_name.empty() || aida::agent::get(agent_name) == nullptr) {
+        reason = "Select an available agent before assigning evidence.";
+        return false;
+    }
+    std::ostringstream prompt;
+    prompt << "Review the assigned AiDA evidence without assuming ambient selection.\n"
+           << "Evidence ID: " << envelope.id << "\n"
+           << "Source view: " << envelope.source_view_id << "\n"
+           << "Entity: " << envelope.entity_id << "\n"
+           << "Revision: " << envelope.revision << "\n"
+           << "Generation: " << envelope.generation << "\n"
+           << "Snapshot hash: 0x" << std::hex << envelope.snapshot_hash << "\n"
+           << "Content hash: 0x" << envelope.content_hash << std::dec << "\n\n"
+           << envelope.excerpt;
+    if (envelope.truncated)
+        prompt << "\n[The evidence excerpt is bounded. Return to the retained source before making any mutation.]";
+    const std::string parent_session = envelope.session_id.empty()
+        ? chat_active_session() : envelope.session_id;
+    const std::string task_id = "automation.evidence.agent." +
+        std::to_string(s_evidence_sequence.fetch_add(1, std::memory_order_acq_rel));
+    const auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "automation.evidence";
+    submission.label = "evidence.assign_agent";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.ui_access_policy = "immutable_snapshots_only";
+    submission.failure_policy = "typed_diagnostic";
+    submission.cancel_hook = [cancelled] {
+        cancelled->store(true, std::memory_order_release);
+    };
+    submission.body = [agent_name, parent_session, assigned = prompt.str(),
+                       task_id, cancelled] {
+        std::string result;
+        const bool completed = aida::agent::task::execute(
+            agent_name, assigned, 0, parent_session, result, cancelled.get());
+        const bool was_cancelled = cancelled->load(std::memory_order_acquire);
+        std::string detail = completed ? result : aida::agent::task::last_error();
+        if (detail.size() > 512U) detail.resize(512U);
+        if (!completed && !was_cancelled)
+            diag::log_tagged_fmt("chat", "evidence_agent_assignment_failed agent=%.96s error=%.256s",
+                agent_name.c_str(), detail.c_str());
+        const bool posted = aida::ui_thread::post(
+            [task_id, completed, was_cancelled, detail = std::move(detail)]() mutable {
+                const auto state = was_cancelled
+                    ? aida::ui::task_center::task_state_t::cancelled
+                    : completed ? aida::ui::task_center::task_state_t::completed
+                                : aida::ui::task_center::task_state_t::failed;
+                const std::string diagnostic = completed || was_cancelled
+                    ? std::string{} : "automation.evidence.agent.failure." + task_id;
+                static_cast<void>(aida::ui::task_center::update_task(task_id, state, 1.0f,
+                    was_cancelled ? "Cancelled" : completed ? "Completed" : "Failed",
+                    detail.empty() ? (was_cancelled ? "Agent assignment cancelled" :
+                        completed ? "Agent assignment completed" : "Agent assignment failed")
+                        : std::move(detail), diagnostic));
+                if (!completed && !was_cancelled) {
+                    aida::ui::task_center::diagnostic_registration_t registration;
+                    registration.id = diagnostic;
+                    registration.task_id = task_id;
+                    registration.owner = "automation.evidence";
+                    registration.summary = "Agent evidence assignment failed";
+                    registration.details = "The selected agent did not complete the retained evidence assignment.";
+                    registration.callbacks.focus = [] {
+                        static_cast<void>(aida::ui::application_views::open_or_focus(
+                            aida::ui::stable_view_id_t("view.ai.agents")));
+                    };
+                    static_cast<void>(aida::ui::task_center::raise_diagnostic(
+                        std::move(registration)));
+                }
+            }, "automation_evidence", "agent_assignment_result", "worker_result");
+        if (!posted)
+            diag::log_tagged_fmt("chat",
+                "evidence_agent_assignment_result_dispatch_failed task=%.128s",
+                task_id.c_str());
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        reason = submitted.reject_reason.empty()
+            ? "The agent evidence assignment executor rejected the request."
+            : submitted.reject_reason;
+        return false;
+    }
+    aida::ui::task_center::task_registration_t registration;
+    registration.id = task_id;
+    registration.source = "automation.evidence";
+    registration.owner = "automation.evidence";
+    registration.owner_view = "view.ai.agents";
+    registration.owner_action = "evidence.assign_agent";
+    registration.session = parent_session;
+    registration.target = envelope.id;
+    registration.label = "Assign evidence to " + agent_name;
+    registration.stage = "Queued for agent review";
+    registration.cancellation_is_safe = true;
+    registration.callbacks.focus = [] {
+        static_cast<void>(aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.ai.agents")));
+    };
+    if (!aida::ui::task_center::try_register_executor_job(submitted.task_id,
+            std::move(registration))) {
+        cancelled->store(true, std::memory_order_release);
+        static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+        reason = "Task Center rejected the agent evidence assignment.";
+        return false;
+    }
+    (void)aida::ui::application_views::open_or_focus(
+        aida::ui::stable_view_id_t("view.ai.agents"));
+    reason.clear();
+    return true;
 }
 
 bool navigate_to_evidence_source(const std::string& evidence_id, std::string& reason)
@@ -5353,13 +6815,13 @@ void render_chat_view(float width, float height)
             history_can_dock ? "Show or hide conversation history beside the chat" :
                 "Open conversation history in a compact popup",
             nullptr, nullptr, aida::ui::components::button_kind_t::secondary, true, false, true},
+        {"chat.evidence", "Evidence", "Evidence", "Review evidence attached to AI workflows", nullptr, nullptr,
+            aida::ui::components::button_kind_t::secondary, true, false, true},
         {"chat.providers", "Providers", "Providers", "Open AI provider and model configuration", nullptr, nullptr,
             aida::ui::components::button_kind_t::secondary, true, false, true},
         {"chat.agents", "Agents", "Agents", "Open the agent manager", nullptr, nullptr,
             aida::ui::components::button_kind_t::secondary, true, false, true},
         {"chat.skills", "Skills", "Skills", "Open the installed skills manager", nullptr, nullptr,
-            aida::ui::components::button_kind_t::secondary, true, false, true},
-        {"chat.evidence", "Evidence", "Evidence", "Review evidence attached to AI workflows", nullptr, nullptr,
             aida::ui::components::button_kind_t::secondary, true, false, true},
         {"chat.mcp-log", "MCP Log", "MCP", "Open the complete MCP request and tool activity log", nullptr, nullptr,
             aida::ui::components::button_kind_t::secondary, true, false, true},
@@ -5392,6 +6854,29 @@ void render_chat_view(float width, float height)
         open_view("view.settings");
     }
 
+    const float selector_gap = scaled(6.f);
+    const float selector_width = chat_model_pill_width() + chat_agent_pill_width() +
+        chat_skills_pill_width() + chat_mcp_pill_width() + selector_gap * 3.f;
+    const bool selector_scroll = selector_width > toolbar_width;
+    const float selector_height = scaled(22.f) + scaled(4.f) +
+        (selector_scroll ? ImGui::GetStyle().ScrollbarSize : 0.f);
+    ImGui::BeginChild("##registry_chat_context_selectors",
+        ImVec2(toolbar_width, selector_height), false,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_HorizontalScrollbar);
+    const ImVec2 selector_origin = ImGui::GetCursorScreenPos();
+    float selector_x = selector_origin.x;
+    chat_render_model_pill(selector_x, selector_origin.y, 1.f);
+    selector_x += chat_model_pill_width() + selector_gap;
+    chat_render_agent_pill(selector_x, selector_origin.y, 1.f);
+    selector_x += chat_agent_pill_width() + selector_gap;
+    chat_render_skills_pill(selector_x, selector_origin.y, 1.f, g_chat_buf,
+        sizeof(g_chat_buf));
+    selector_x += chat_skills_pill_width() + selector_gap;
+    chat_render_mcp_pill(selector_x, selector_origin.y, 1.f);
+    ImGui::SetCursorScreenPos(selector_origin);
+    ImGui::Dummy(ImVec2(selector_width, scaled(22.f)));
+    ImGui::EndChild();
+
     ImGui::Separator();
     const std::string persistence_detail = !conversations::persistence_error.empty()
         ? conversations::persistence_error : conversation_persistence.error;
@@ -5410,6 +6895,7 @@ void render_chat_view(float width, float height)
     }
     const float body_width = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
     const float body_height = (std::max)(1.f, ImGui::GetContentRegionAvail().y);
+    const ImVec2 body_origin = ImGui::GetCursorScreenPos();
     const bool busy = is_ai_busy();
     const float composer_editor_height = (std::max)(chat_metrics.control_height,
         ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().FramePadding.y * 2.f +
@@ -5424,7 +6910,8 @@ void render_chat_view(float width, float height)
     const float minimum_message_height = scaled(48.f);
     const float minimum_body_height = composer_area_height + minimum_message_height;
     const bool tiny_height = body_height < minimum_body_height;
-    const bool tiny_width = body_width < scaled(96.f);
+    const float minimum_chat_width = scaled(180.f);
+    const bool tiny_width = body_width < minimum_chat_width;
     const float content_height = tiny_height || tiny_width ? 0.f :
         (std::max)(1.f, body_height - composer_area_height - chat_metrics.spacing_sm);
     const bool history_visible = conversations::browser_open && history_can_dock && !tiny_height && !tiny_width;
@@ -5433,6 +6920,11 @@ void render_chat_view(float width, float height)
         ImGui::SetNextItemWidth(-1.f);
         ImGui::InputTextWithHint("##registry_chat_history_filter", "Filter conversations...",
             history_filter, sizeof(history_filter));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        static_cast<void>(aida::preview::semantics::register_last_item(
+            "aida.ai.chat.history-filter", "search-input", false,
+            conversation_store_blocked, "aida.dock-window.view.ai-chat"));
+#endif
         std::string filter = history_filter;
         std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char value) {
             return static_cast<char>(std::tolower(value));
@@ -5480,6 +6972,13 @@ void render_chat_view(float width, float height)
                     ImGuiSelectableFlags_AllowDoubleClick,
                     ImVec2(0.f, history_row_height));
             ImGui::EndDisabled();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const std::string conversation_semantic = "aida.ai.chat.conversation-" +
+                aida::preview::semantics::entity_token(conversation.id);
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                conversation_semantic, "conversation-row", false,
+                conversation_store_blocked, "aida.dock-window.view.ai-chat"));
+#endif
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
                 history_keyboard_conversation_id = conversation.id;
             if (opened && !selected && !conversation_store_blocked) {
@@ -5700,7 +7199,7 @@ void render_chat_view(float width, float height)
         tiny.stable_id = "view.ai-chat.tiny";
         tiny.state = aida::ui::design::view_state_t::tiny;
         tiny.title = "AI Chat needs more room";
-        tiny.message = tiny_width ? "Widen this dock to at least 96 logical pixels." :
+        tiny.message = tiny_width ? "Widen this dock to at least 180 logical pixels." :
             "Increase this dock until the message list and compact composer fit.";
         tiny.hint = "The action overflow remains available while the dock is compact.";
         (void)aida::ui::design::render_state(tiny, ImVec2(body_width, body_height));
@@ -5849,10 +7348,48 @@ void render_chat_view(float width, float height)
     for (std::size_t index = window.first; index < window.last && index < g_chat_messages.size(); ++index) {
         auto& message = g_chat_messages[index];
         ImGui::PushID(static_cast<int>(index));
-        const ImVec2 start = ImGui::GetCursorScreenPos();
-        const float available_width = (std::max)(120.f, ImGui::GetContentRegionAvail().x - 10.f);
+        const auto& chat_theme = aida::ui::resolved();
+        const float card_padding = scaled(10.f);
+        const float card_spacing = scaled(7.f);
+        const ImVec2 card_start = ImGui::GetCursorScreenPos();
+        const float card_width = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
+        const float available_width = (std::max)(1.f, card_width - card_padding * 2.f);
+        ImDrawList* message_draw = ImGui::GetWindowDrawList();
+        ImDrawListSplitter message_splitter;
+        message_splitter.Split(message_draw, 2);
+        message_splitter.SetCurrentChannel(message_draw, 1);
+        ImGui::SetCursorScreenPos(ImVec2(card_start.x + card_padding,
+            card_start.y + card_padding));
+        const char* role_label = message.is_user ? "YOU" :
+            !message.tool_name.empty() ? "TOOL" : "AIDA";
+        const char* role_detail = !message.tool_name.empty() ? message.tool_name.c_str() :
+            !message.model_id.empty() ? message.model_id.c_str() :
+            message.is_user ? "Workspace request" : "Workspace assistant";
+        const ImU32 role_color = message.is_user ? chat_theme.accent_hover :
+            !message.tool_name.empty() ? chat_theme.warning : chat_theme.accent_u32;
+        const ImVec2 role_text_size = ImGui::CalcTextSize(role_label);
+        const float role_height = (std::max)(scaled(20.f), role_text_size.y + scaled(6.f));
+        const float role_width = role_text_size.x + scaled(12.f);
+        const ImVec2 role_min = ImGui::GetCursorScreenPos();
+        const ImVec2 role_max(role_min.x + role_width, role_min.y + role_height);
+        message_draw->AddRectFilled(role_min, role_max,
+            aida::ui::with_alpha(role_color, 0.18f), role_height * 0.5f);
+        message_draw->AddRect(role_min, role_max,
+            aida::ui::with_alpha(role_color, 0.58f), role_height * 0.5f);
+        message_draw->AddText(ImVec2(role_min.x + scaled(6.f),
+            role_min.y + (role_height - role_text_size.y) * 0.5f),
+            role_color, role_label);
+        const ImVec4 role_detail_clip(
+            role_max.x + chat_metrics.spacing_sm, role_min.y,
+            card_start.x + card_width - card_padding, role_max.y);
+        message_draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+            ImVec2(role_max.x + chat_metrics.spacing_sm,
+                role_min.y + (role_height - ImGui::GetFontSize()) * 0.5f),
+            chat_theme.text_dim, role_detail, nullptr, 0.f, &role_detail_clip);
+        ImGui::Dummy(ImVec2(available_width, role_height));
+        ImGui::Dummy(ImVec2(0.f, chat_metrics.spacing_sm));
         if (message.is_user && chat_edit::active && chat_edit::msg_idx == static_cast<int>(index)) {
-            ImGui::TextDisabled("EDITING USER MESSAGE");
+            ImGui::TextDisabled("Editing message");
             ImGui::SetNextItemWidth(-1.f);
             ImGui::InputTextMultiline("##registry_chat_edit", chat_edit::buf, sizeof(chat_edit::buf),
                 ImVec2(-1.f, 84.f), ImGuiInputTextFlags_CtrlEnterForNewLine);
@@ -5882,20 +7419,12 @@ void render_chat_view(float width, float height)
                 chat_edit::msg_idx = -1;
             }
         } else if (message.is_user) {
-            ImGui::TextDisabled("YOU");
             ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::resolved().text_primary);
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + available_width);
             ImGui::TextUnformatted(message.text.c_str());
             ImGui::PopTextWrapPos();
             ImGui::PopStyleColor();
         } else {
-            if (!message.tool_name.empty()) {
-                ImGui::TextDisabled("TOOL  %s", message.tool_name.c_str());
-            } else if (!message.model_id.empty()) {
-                ImGui::TextDisabled("ASSISTANT  %s", message.model_id.c_str());
-            } else {
-                ImGui::TextDisabled("ASSISTANT");
-            }
             if (message.has_thinking && !message.thinking_text.empty() &&
                 ImGui::TreeNode("Reasoning")) {
                 ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + available_width - 18.f);
@@ -5908,6 +7437,7 @@ void render_chat_view(float width, float height)
                 response_origin, available_width, message.text, 1.f,
                 globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z,
                 static_cast<int>(index), ImGui::GetIO().DeltaTime, !message.streaming);
+            ImGui::SetCursorScreenPos(response_origin);
             ImGui::Dummy(ImVec2(available_width, (std::max)(rich.height, ImGui::GetTextLineHeightWithSpacing())));
             if (rich.action == chat_render::action_t::retry) {
                 (void)execute_message_action(message_identity(index), message_action_t::retry_from_here);
@@ -5920,15 +7450,48 @@ void render_chat_view(float width, float height)
                 (void)execute_message_action(message_identity(index), message_action_t::copy_text);
             }
         }
-        const ImVec2 end = ImGui::GetCursorScreenPos();
-        const ImVec2 hit_max(start.x + available_width,
-            (std::max)(end.y, start.y + ImGui::GetTextLineHeightWithSpacing()));
-        const bool hovered = ImGui::IsMouseHoveringRect(start, hit_max, true);
+        const ImVec2 content_end = ImGui::GetCursorScreenPos();
+        const float card_bottom = (std::max)(
+            content_end.y + card_padding,
+            card_start.y + role_height + card_padding * 2.f + ImGui::GetTextLineHeightWithSpacing());
+        const ImVec2 hit_max(card_start.x + card_width, card_bottom);
+        message_splitter.SetCurrentChannel(message_draw, 0);
+        const ImU32 card_fill = message.is_user
+            ? aida::ui::mix(chat_theme.bg_elevated, chat_theme.accent_dim, 0.14f)
+            : !message.tool_name.empty()
+            ? aida::ui::mix(chat_theme.bg_elevated, chat_theme.warning, 0.07f)
+            : chat_theme.bg_elevated;
+        message_draw->AddRectFilled(card_start, hit_max,
+            aida::ui::with_alpha(card_fill, 0.94f), scaled(6.f));
+        message_draw->AddRect(card_start, hit_max,
+            message.is_user
+                ? aida::ui::with_alpha(chat_theme.accent_dim, 0.56f)
+                : chat_theme.border_subtle,
+            scaled(6.f));
+        message_draw->AddRectFilled(card_start,
+            ImVec2(card_start.x + scaled(2.f), hit_max.y),
+            aida::ui::with_alpha(role_color, 0.78f), scaled(6.f),
+            ImDrawFlags_RoundCornersLeft);
+        message_splitter.Merge(message_draw);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const message_identity_t semantic_identity = message_identity(index);
+        const std::string message_semantic = "aida.ai.chat.message-" +
+            aida::preview::semantics::entity_token(semantic_identity.session_id + ":" +
+                std::to_string(semantic_identity.index) + ":" +
+                std::to_string(semantic_identity.timestamp));
+        static_cast<void>(aida::preview::semantics::register_region(
+            message_semantic, "chat-message", ImGui::GetID(message_semantic.c_str()),
+            card_start, hit_max, false, false, "aida.dock-window.view.ai-chat"));
+#endif
+        const bool hovered = ImGui::IsMouseHoveringRect(card_start, hit_max, true);
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
             keyboard_identity = message_identity(index);
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
             open_message_menu(index, context_open_origin_t::pointer);
-        ImGui::Separator();
+        const float trailing_item_height = (std::max)(0.f,
+            hit_max.y + card_spacing - content_end.y - ImGui::GetStyle().ItemSpacing.y);
+        ImGui::SetCursorScreenPos(ImVec2(card_start.x + card_padding, content_end.y));
+        ImGui::Dummy(ImVec2(available_width, trailing_item_height));
         ImGui::PopID();
         if (message_deleted) break;
     }
@@ -6035,6 +7598,10 @@ void render_chat_view(float width, float height)
             confirmation.destructive = true;
             confirmation.confirm_enabled = capability.enabled && !reverse_proposal.stale &&
                 !reverse_proposal.applying;
+            const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+                confirmation.confirm_label);
+            aida::ui::design::begin_dialog_body(
+                "chat.proposal.apply.reverse.body", footer_height);
             ImGui::TextDisabled("BEFORE");
             ImGui::BeginChild("##proposal_before", ImVec2(-1.f, 52.f), true,
                 ImGuiWindowFlags_HorizontalScrollbar);
@@ -6045,8 +7612,11 @@ void render_chat_view(float width, float height)
                 ImGuiWindowFlags_HorizontalScrollbar);
             ImGui::TextUnformatted(reverse_proposal.after_value.c_str());
             ImGui::EndChild();
-            const auto result = aida::ui::design::confirmation_dialog(
-                "chat.proposal.apply.confirmation", confirmation);
+            aida::ui::design::render_confirmation_content(confirmation);
+            aida::ui::design::end_dialog_body();
+            const auto result = aida::ui::design::dialog_footer(
+                "chat.proposal.apply.confirmation", confirmation.confirm_label,
+                confirmation.confirm_enabled, confirmation.destructive);
             if (result.confirmed && confirmation.confirm_enabled) {
                 auto applied = execute_message_action(
                     pending_apply_identity, message_action_t::apply_change);
@@ -6063,25 +7633,31 @@ void render_chat_view(float width, float height)
         } else {
         const auto proposal = editor_proposal_snapshot();
         const int pending_hunks = code_editor_widget::pending_hunk_count();
+        const bool hunks_resolved = code_editor_widget::has_pending_diff() &&
+            code_editor_widget::pending_diff().fully_resolved();
         std::ostringstream hash_stream;
         hash_stream << "0x" << std::hex << std::uppercase << proposal.base_content_hash;
         const std::string target = proposal.target_document_numeric_id != 0
             ? "code document " + std::to_string(proposal.target_document_numeric_id)
             : std::string("the staged code document");
         const std::string scope = std::to_string((std::max)(pending_hunks, 0)) +
-            " pending hunks; base revision " + std::to_string(proposal.base_document_revision) +
+            " reviewed hunks; base revision " + std::to_string(proposal.base_document_revision) +
             "; base hash " + hash_stream.str();
         aida::ui::design::confirmation_t confirmation;
         confirmation.verb = "Apply";
         confirmation.target = target.c_str();
         confirmation.scope = scope.c_str();
-        confirmation.effect = "Applies every pending reviewed hunk to the in-memory editor buffer; it does not save the file to disk.";
+        confirmation.effect = "Applies accepted hunks to the in-memory editor buffer and leaves rejected hunks unchanged; it does not save the file to disk.";
         confirmation.reversibility = "Use the code editor Undo command before saving to reverse the applied buffer change.";
-        confirmation.prerequisite = capability.enabled ? nullptr : capability.disabled_reason.c_str();
+        const std::string hunk_prerequisite = hunks_resolved
+            ? capability.disabled_reason
+            : "Accept or reject every hunk before applying the resolved diff.";
+        confirmation.prerequisite = capability.enabled && hunks_resolved
+            ? nullptr : hunk_prerequisite.c_str();
         confirmation.confirm_label = "Apply Reviewed Hunks";
         confirmation.destructive = true;
         confirmation.confirm_enabled = capability.enabled && pending_hunks > 0 &&
-            proposal.pending && !proposal.stale;
+            proposal.pending && !proposal.stale && hunks_resolved;
         const auto result = aida::ui::design::confirmation_dialog(
             "chat.proposal.apply.confirmation", confirmation);
         if (result.confirmed && confirmation.confirm_enabled) {
@@ -6096,7 +7672,8 @@ void render_chat_view(float width, float height)
                         code_editor_widget::document_revision() &&
                     s_editor_proposal.base_content_hash ==
                         code_editor_widget::document_content_fingerprint() &&
-                    pending_hunks == code_editor_widget::pending_hunk_count()) {
+                    pending_hunks == code_editor_widget::pending_hunk_count() &&
+                    code_editor_widget::pending_diff().fully_resolved()) {
                     s_editor_proposal.reviewed_generation = proposal.generation;
                     s_editor_proposal.reviewed_content_hash = proposal.base_content_hash;
                     s_editor_proposal.reviewed_pending_hunks = pending_hunks;
@@ -6123,14 +7700,48 @@ void render_chat_view(float width, float height)
         ImGui::EndPopup();
     }
 
+    ImGui::SetCursorScreenPos(ImVec2(body_origin.x,
+        body_origin.y + content_height + chat_metrics.spacing_sm));
     const float input_width = stacked_composer ? body_width :
         (std::max)(1.f, body_width - composer_button_width - chat_metrics.spacing_sm);
+    const auto& composer_theme = aida::ui::resolved();
+    const ImVec2 composer_origin = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(composer_origin.x, composer_origin.y - chat_metrics.spacing_xs),
+        ImVec2(composer_origin.x + body_width,
+            composer_origin.y - chat_metrics.spacing_xs),
+        composer_theme.border_subtle);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, scaled(5.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,
+        ImGui::ColorConvertU32ToFloat4(composer_theme.bg_elevated));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+        ImGui::ColorConvertU32ToFloat4(composer_theme.panel_header));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+        ImGui::ColorConvertU32ToFloat4(composer_theme.panel_header));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImGui::ColorConvertU32ToFloat4(composer_theme.border_subtle));
     ImGui::SetNextItemWidth(input_width);
     ImGui::BeginDisabled(conversation_store_blocked);
     const bool enter = ImGui::InputTextMultiline("##registry_chat_input", g_chat_buf, sizeof(g_chat_buf),
         ImVec2(input_width, composer_editor_height),
         ImGuiInputTextFlags_CtrlEnterForNewLine | ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::EndDisabled();
+    const bool composer_active = ImGui::IsItemActive();
+    if (g_chat_buf[0] == '\0' && !composer_active) {
+        const ImVec2 input_min = ImGui::GetItemRectMin();
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2(input_min.x + ImGui::GetStyle().FramePadding.x,
+                input_min.y + ImGui::GetStyle().FramePadding.y),
+            composer_theme.text_dim, "Ask AiDA about the active workspace...");
+    }
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static_cast<void>(aida::preview::semantics::register_last_item(
+        "aida.ai.chat.composer", "chat-composer", false,
+        conversation_store_blocked, "aida.dock-window.view.ai-chat"));
+#endif
     if (stacked_composer) ImGui::Dummy(ImVec2(0.f, chat_metrics.spacing_xs));
     else {
         ImGui::SameLine(0.f, chat_metrics.spacing_sm);
@@ -6138,6 +7749,16 @@ void render_chat_view(float width, float height)
             (std::max)(0.f, (composer_editor_height - composer_button_height) * 0.5f));
     }
     bool submit = false;
+    const ImU32 primary_fill = busy
+        ? aida::ui::mix(composer_theme.panel_header, composer_theme.warning, 0.24f)
+        : composer_theme.accent_dim;
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, scaled(5.f));
+    ImGui::PushStyleColor(ImGuiCol_Button,
+        ImGui::ColorConvertU32ToFloat4(primary_fill));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+        ImGui::ColorConvertU32ToFloat4(composer_theme.accent_hover));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+        ImGui::ColorConvertU32ToFloat4(composer_theme.accent_u32));
     if (conversation_store_blocked) {
         ImGui::BeginDisabled();
         ImGui::Button(conversation_store_pending
@@ -6146,6 +7767,11 @@ void render_chat_view(float width, float height)
             ImVec2(stacked_composer ? body_width : composer_button_width,
                 composer_button_height));
         ImGui::EndDisabled();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        static_cast<void>(aida::preview::semantics::register_last_item(
+            "aida.ai.chat.action-storage-blocked", "chat-primary-action", false,
+            true, "aida.dock-window.view.ai-chat"));
+#endif
         aida::ui::design::tooltip_for_last_item(conversation_store_pending
             ? "Wait for the conversation transaction to finish"
             : "Use Retry above to reconcile the retained conversation transaction");
@@ -6154,6 +7780,11 @@ void render_chat_view(float width, float height)
                 ImVec2(stacked_composer ? body_width : composer_button_width,
                 composer_button_height)))
             chat_request_cancel();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        static_cast<void>(aida::preview::semantics::register_last_item(
+            "aida.ai.chat.action-cancel", "chat-primary-action", false,
+            false, "aida.dock-window.view.ai-chat"));
+#endif
         aida::ui::design::tooltip_for_last_item("Cancel the active AI operation");
     } else {
         const bool has_text = std::any_of(g_chat_buf, g_chat_buf + std::strlen(g_chat_buf), [](unsigned char value) {
@@ -6162,12 +7793,19 @@ void render_chat_view(float width, float height)
         ImGui::BeginDisabled(!has_text);
         submit = ImGui::Button("Send###registry_chat_primary_action",
             ImVec2(stacked_composer ? body_width : composer_button_width,
-            composer_button_height));
+                composer_button_height));
         ImGui::EndDisabled();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        static_cast<void>(aida::preview::semantics::register_last_item(
+            "aida.ai.chat.action-send", "chat-primary-action", false,
+            !has_text, "aida.dock-window.view.ai-chat"));
+#endif
         aida::ui::design::tooltip_for_last_item(has_text ? "Send this message" :
             "Type a message to enable Send", "Enter");
         submit = (submit || enter) && has_text;
     }
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
     const bool compact_status = body_width < scaled(280.f);
     if (conversation_store_pending) ImGui::TextDisabled("Conversation transaction in progress");
     else if (conversation_persistence.failed) ImGui::TextDisabled("Conversation persistence requires retry");
@@ -6213,15 +7851,27 @@ void render_evidence_view(float width, float height)
         (proposal.pending || proposal.applying || proposal.review_staged || proposal.applied ||
          proposal.rejected || proposal.stale)) {
         proposal_height = (std::min)(height, 278.f);
+        const ImVec2 proposal_minimum = ImGui::GetCursorScreenPos();
         ImGui::BeginChild("##reverse_engineering_proposal_review",
             ImVec2(width, proposal_height), true,
             ImGuiWindowFlags_HorizontalScrollbar);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const std::string proposal_semantic = "aida.ai.evidence.proposal-" +
+            aida::preview::semantics::entity_token(proposal.id);
+        static_cast<void>(aida::preview::semantics::register_region(
+            proposal_semantic, "ai-proposal-review",
+            ImGui::GetID(proposal_semantic.c_str()), proposal_minimum,
+            ImVec2(proposal_minimum.x + width, proposal_minimum.y + proposal_height),
+            false, false, "aida.dock-window.view.ai.evidence"));
+#endif
         ImGui::TextUnformatted("AI CHANGE REVIEW");
         ImGui::SameLine();
         if (proposal.state == reverse_engineering_proposal_state_t::queued)
             ImGui::TextDisabled("QUEUED");
         else if (proposal.state == reverse_engineering_proposal_state_t::running)
             ImGui::TextDisabled("VALIDATING");
+        else if (proposal.partial)
+            ImGui::TextDisabled("PARTIAL / ROLLBACK AVAILABLE");
         else if (proposal.state == reverse_engineering_proposal_state_t::error)
             ImGui::TextDisabled("ERROR");
         else if (proposal.applying) ImGui::TextDisabled("APPLYING");
@@ -6254,6 +7904,13 @@ void render_evidence_view(float width, float height)
             ImGui::BeginDisabled(!capability.enabled);
             if (ImGui::Button("Apply Reviewed Change")) apply_requested = true;
             ImGui::EndDisabled();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                "aida.ai.evidence.action-apply-" +
+                    aida::preview::semantics::entity_token(proposal.id),
+                "ai-proposal-action", false, !capability.enabled,
+                proposal_semantic));
+#endif
             if (!capability.enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("%s", capability.disabled_reason.c_str());
             ImGui::SameLine();
@@ -6262,6 +7919,12 @@ void render_evidence_view(float width, float height)
                     proposal.source, message_action_t::reject_change);
                 feedback = rejected.detail;
             }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                "aida.ai.evidence.action-reject-" +
+                    aida::preview::semantics::entity_token(proposal.id),
+                "ai-proposal-action", false, false, proposal_semantic));
+#endif
         }
         if (!proposal.detail.empty()) ImGui::TextWrapped("%s", proposal.detail.c_str());
         if (!feedback.empty()) ImGui::TextWrapped("%s", feedback.c_str());
@@ -6410,6 +8073,13 @@ void render_evidence_view(float width, float height)
                     (void)navigate_to_evidence_source(item.id, reason);
                 }
             }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const std::string evidence_semantic = "aida.ai.evidence.item-" +
+                aida::preview::semantics::entity_token(item.id);
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                evidence_semantic, "evidence-row", false, false,
+                "aida.dock-window.view.ai.evidence"));
+#endif
             const bool menu_key_context = selected &&
                 ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
                 ImGui::IsKeyPressed(ImGuiKey_Menu, false);
@@ -6546,33 +8216,16 @@ void render_tool_approval_dialog()
         }
 
         aida::ui::design::end_dialog_body();
-        ImGui::Separator();
-        const float gap = ImGui::GetStyle().ItemSpacing.x;
-        const float available = ImGui::GetContentRegionAvail().x;
-        const float button_width = (std::min)(140.0f,
-            (std::max)(96.0f, (available - gap) * 0.5f));
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-            (std::max)(0.0f, available - button_width * 2.0f - gap));
-        const bool allow = aida::ui::components::button("Allow",
-            aida::ui::components::button_kind_t::primary,
-            aida::ui::components::size_t_::md,
-            ImVec2(button_width, 0.0f));
+        const auto footer = aida::ui::design::dialog_footer(
+            "tool_approval_footer", "Allow", true, false, "Deny", true, false);
 
-        ImGui::SameLine(0.0f, gap);
-        const bool deny = aida::ui::components::button("Deny",
-            aida::ui::components::button_kind_t::destructive,
-            aida::ui::components::size_t_::md,
-            ImVec2(button_width, 0.0f)) ||
-            ImGui::IsKeyPressed(ImGuiKey_Escape, false);
-        ImGui::SetItemDefaultFocus();
-
-        if (allow) {
+        if (footer.confirmed) {
             std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
             s_tool_approval.approved = true;
             s_tool_approval.answered = true;
             s_tool_approval.cv.notify_one();
             ImGui::CloseCurrentPopup();
-        } else if (deny) {
+        } else if (footer.cancelled) {
             std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
             s_tool_approval.approved = false;
             s_tool_approval.answered = true;
@@ -6790,11 +8443,14 @@ void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha)
     ImVec2 pmin(anchor_x, anchor_y);
     ImVec2 pmax(anchor_x + pill_w, anchor_y + pill_h);
 
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImGui::SetCursorPos(ImVec2(pmin.x - wp.x, pmin.y - wp.y));
+    ImGui::SetCursorScreenPos(pmin);
     ImGui::SetNextItemAllowOverlap();
     ImGui::PushID("##chat_agent_pill_root");
     ImGui::InvisibleButton("##aida_agent_pill", ImVec2(pill_w, pill_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static_cast<void>(aida::preview::semantics::register_last_item(
+        "aida.ai.chat.selector.agent", "chat-agent-selector"));
+#endif
     bool hov = ImGui::IsItemHovered();
     bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     anim.hover += ((hov ? 1.f : 0.f) - anim.hover) * std::min(12.f * dt, 1.f);
@@ -6963,11 +8619,14 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
     ImVec2 pmin(anchor_x, anchor_y);
     ImVec2 pmax(anchor_x + pill_w, anchor_y + pill_h);
 
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImGui::SetCursorPos(ImVec2(pmin.x - wp.x, pmin.y - wp.y));
+    ImGui::SetCursorScreenPos(pmin);
     ImGui::SetNextItemAllowOverlap();
     ImGui::PushID("##chat_model_pill_root");
     ImGui::InvisibleButton("##chat_model_pill", ImVec2(pill_w, pill_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static_cast<void>(aida::preview::semantics::register_last_item(
+        "aida.ai.chat.selector.model", "chat-model-selector"));
+#endif
     bool hov = ImGui::IsItemHovered();
     bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     anim.hover += ((hov ? 1.f : 0.f) - anim.hover) * std::min(12.f * dt, 1.f);
@@ -7461,11 +9120,14 @@ void chat_render_skills_pill(float anchor_x, float anchor_y, float alpha, char* 
     ImVec2 pmin(anchor_x, anchor_y);
     ImVec2 pmax(anchor_x + pill_w, anchor_y + pill_h);
 
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImGui::SetCursorPos(ImVec2(pmin.x - wp.x, pmin.y - wp.y));
+    ImGui::SetCursorScreenPos(pmin);
     ImGui::SetNextItemAllowOverlap();
     ImGui::PushID("##chat_skills_pill_root");
     ImGui::InvisibleButton("##chat_skills_pill", ImVec2(pill_w, pill_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static_cast<void>(aida::preview::semantics::register_last_item(
+        "aida.ai.chat.selector.skills", "chat-skills-selector"));
+#endif
     bool hov = ImGui::IsItemHovered();
     bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     anim.hover += ((hov ? 1.f : 0.f) - anim.hover) * std::min(12.f * dt, 1.f);
@@ -7714,11 +9376,14 @@ void chat_render_mcp_pill(float anchor_x, float anchor_y, float alpha)
     ImVec2 pmin(anchor_x, anchor_y);
     ImVec2 pmax(anchor_x + pill_w, anchor_y + pill_h);
 
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImGui::SetCursorPos(ImVec2(pmin.x - wp.x, pmin.y - wp.y));
+    ImGui::SetCursorScreenPos(pmin);
     ImGui::SetNextItemAllowOverlap();
     ImGui::PushID("##chat_mcp_pill_root");
     ImGui::InvisibleButton("##chat_mcp_pill", ImVec2(pill_w, pill_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static_cast<void>(aida::preview::semantics::register_last_item(
+        "aida.ai.chat.selector.mcp", "chat-mcp-selector"));
+#endif
     bool hov = ImGui::IsItemHovered();
     bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     anim.hover += ((hov ? 1.f : 0.f) - anim.hover) * std::min(12.f * dt, 1.f);

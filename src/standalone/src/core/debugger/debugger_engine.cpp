@@ -68,6 +68,32 @@ void set_last_error(const std::string& msg) {
 	last_error_ref() = msg;
 }
 
+std::mutex& breakpoint_mutation_mutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+std::atomic<std::uint64_t>& next_breakpoint_mutation_identity() {
+	static std::atomic<std::uint64_t> identity{1};
+	return identity;
+}
+
+std::uint64_t allocate_breakpoint_mutation_identity() {
+	auto identity = next_breakpoint_mutation_identity().fetch_add(1,
+		std::memory_order_acq_rel);
+	if (identity != 0)
+		return identity;
+	return next_breakpoint_mutation_identity().fetch_add(1,
+		std::memory_order_acq_rel);
+}
+
+auto find_breakpoint_identity(state_t& state, std::uint64_t identity) {
+	return std::find_if(state.breakpoints.begin(), state.breakpoints.end(),
+		[identity](const breakpoint_t& breakpoint) {
+			return breakpoint.mutation_identity == identity;
+		});
+}
+
 constexpr uint64_t ctx_mask_rax = 1ULL << 0;
 constexpr uint64_t ctx_mask_rbx = 1ULL << 1;
 constexpr uint64_t ctx_mask_rcx = 1ULL << 2;
@@ -1182,6 +1208,40 @@ expression_eval::context_t build_eval_context(const register_set_t& regs) {
 	return ctx;
 }
 
+const char* watch_expression_validation_error(const std::string& expression) {
+	if (expression.empty())
+		return "empty expression";
+	if (expression.size() > k_max_watch_expression_bytes)
+		return "expression exceeds the 96-byte debugger limit";
+	if (expression.find('\n') != std::string::npos ||
+		expression.find('\r') != std::string::npos)
+		return "expression must be a single line";
+	return nullptr;
+}
+
+expression_evaluation_t evaluate_expression_with_context(
+		const std::string& expression, const expression_eval::context_t& context) {
+	expression_evaluation_t result;
+	if (const char* validation = watch_expression_validation_error(expression)) {
+		result.error = validation;
+		return result;
+	}
+	const auto evaluated = expression_eval::evaluate(expression, context);
+	if (!evaluated.ok) {
+		result.error = evaluated.error.empty()
+			? "the debugger expression evaluator rejected the expression"
+			: evaluated.error;
+		return result;
+	}
+	char rendered[20]{};
+	std::snprintf(rendered, sizeof(rendered), "0x%016" PRIX64, evaluated.value);
+	result.succeeded = true;
+	result.value = evaluated.value;
+	result.rendered_value = rendered;
+	result.type = "uint64";
+	return result;
+}
+
 void push_log_message_locked(state_t& st, const std::string& msg) {
 	std::lock_guard<std::mutex> lk(st.log_mutex);
 	if (st.log_messages.size() >= st.log_messages_max) {
@@ -1531,6 +1591,11 @@ static int add_breakpoint_impl(uint64_t address, bp_type_t type,
 	uint32_t source_line, uint32_t source_location_ordinal) {
 	auto& st = g_state;
 	sync_attached_state();
+	std::unique_lock<std::mutex> mutation_lock(breakpoint_mutation_mutex());
+	const std::uint32_t operation_pid = driver_bridge::attached_pid();
+	const auto target_current = [operation_pid] {
+		return driver_bridge::attached_pid() == operation_pid;
+	};
 
 	int len_bits = 0;
 	bool is_hw = (type == bp_type_t::hardware_execute ||
@@ -1548,7 +1613,7 @@ static int add_breakpoint_impl(uint64_t address, bp_type_t type,
 		}
 	}
 
-	std::lock_guard<std::mutex> lk(st.bp_mutex);
+	std::unique_lock<std::mutex> lk(st.bp_mutex);
 
 
 	for (auto& bp : st.breakpoints) {
@@ -1558,94 +1623,133 @@ static int add_breakpoint_impl(uint64_t address, bp_type_t type,
 		}
 	}
 
-	breakpoint_t bp;
-	bp.address = address;
-	bp.type = type;
-	bp.state = bp_state_t::enabled;
-	bp.name = name;
-	bp.condition = condition;
-	bp.size = is_hw ? size : 1;
-	bp.source_definition_id = source_definition_id;
-	bp.source_file = source_file;
-	bp.source_line = source_line;
-	bp.source_location_ordinal = source_location_ordinal;
+	breakpoint_t requested;
+	requested.address = address;
+	requested.type = type;
+	requested.state = bp_state_t::enabled;
+	requested.name = name;
+	requested.condition = condition;
+	requested.size = is_hw ? size : 1;
+	requested.source_definition_id = source_definition_id;
+	requested.source_file = source_file;
+	requested.source_line = source_line;
+	requested.source_location_ordinal = source_location_ordinal;
+	requested.install_state = breakpoint_install_state_t::installing;
+	requested.install_detail = "Installation requested";
+	requested.mutation_identity = allocate_breakpoint_mutation_identity();
+	requested.mutation_generation = 1;
+	st.breakpoints.push_back(std::move(requested));
+	breakpoint_t bp = st.breakpoints.back();
+	if (is_hw) {
+		bool used[4] = {};
+		for (const auto& existing : st.breakpoints) {
+			if (existing.mutation_identity == bp.mutation_identity)
+				continue;
+			if (existing.hw_slot >= 0 && existing.hw_slot < 4 &&
+				existing.state != bp_state_t::disabled)
+				used[existing.hw_slot] = true;
+		}
+		for (int slot = 0; slot < 4; ++slot)
+			if (!used[slot]) {
+				bp.hw_slot = slot;
+				st.breakpoints.back().hw_slot = slot;
+				break;
+			}
+	}
+	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+	const auto fail_install = [&](const char* detail) {
+		set_last_error(detail);
+		std::lock_guard<std::mutex> publish_lock(st.bp_mutex);
+		const auto row = find_breakpoint_identity(st, bp.mutation_identity);
+		if (row != st.breakpoints.end() &&
+			row->mutation_generation == bp.mutation_generation) {
+			row->install_state = breakpoint_install_state_t::error;
+			row->readback_verified = false;
+			row->install_detail = detail;
+			row->state = (bp.byte_written || bp.readback_verified || bp.hw_slot >= 0)
+				? bp_state_t::enabled : bp_state_t::disabled;
+			row->byte_written = bp.byte_written;
+			row->original_byte = bp.original_byte;
+			row->hw_slot = bp.hw_slot;
+			st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+		}
+		return -1;
+	};
+	if (is_hw && bp.hw_slot < 0) {
+		lk.unlock();
+		return fail_install("add_breakpoint: no free hardware slot (4 max)");
+	}
+	lk.unlock();
+	if (!target_current())
+		return fail_install("add_breakpoint: target changed before installation began");
 
 
 	if (type == bp_type_t::software) {
 		std::vector<uint8_t> orig;
 		if (!driver_bridge::read_memory(address, 1, orig) || orig.empty()) {
-			set_last_error("add_breakpoint: read_memory failed");
 			diag::log_tagged_fmt("bp",
 				"add_breakpoint_read_FAILED addr=0x%llx",
 				static_cast<unsigned long long>(address));
-			return -1;
+			return fail_install("add_breakpoint: read_memory failed");
 		}
 
 		if (orig[0] == 0xCC) {
 			bool recovered = false;
-			for (const auto& ibp : st.internal_breakpoints) {
-				if (ibp.address == address && ibp.active) {
-					bp.original_byte = ibp.original_byte;
-					bp.byte_written = true;
-					recovered = true;
-					diag::log_tagged_fmt("bp",
-						"add_breakpoint_reuse_internal_byte addr=0x%llx orig=0x%02X",
-						static_cast<unsigned long long>(address),
-						static_cast<unsigned>(ibp.original_byte));
-					break;
+			{
+				std::lock_guard<std::mutex> internal_lock(st.bp_mutex);
+				for (const auto& ibp : st.internal_breakpoints) {
+					if (ibp.address == address && ibp.active) {
+						bp.original_byte = ibp.original_byte;
+						bp.byte_written = true;
+						bp.readback_verified = true;
+						recovered = true;
+						diag::log_tagged_fmt("bp",
+							"add_breakpoint_reuse_internal_byte addr=0x%llx orig=0x%02X",
+							static_cast<unsigned long long>(address),
+							static_cast<unsigned>(ibp.original_byte));
+						break;
+					}
 				}
 			}
 			if (!recovered) {
-				set_last_error("add_breakpoint: byte already 0xCC and no recoverable original");
 				diag::log_tagged_fmt("bp",
 					"add_breakpoint_already_cc addr=0x%llx",
 					static_cast<unsigned long long>(address));
-				return -1;
+				return fail_install("add_breakpoint: byte already 0xCC and no recoverable original");
 			}
 		} else {
 			bp.original_byte = orig[0];
 
 			std::vector<uint8_t> cc{0xCC};
 			if (!driver_bridge::write_memory(address, cc)) {
-				set_last_error("add_breakpoint: write_memory failed");
 				diag::log_tagged_fmt("bp",
 					"add_breakpoint_write_FAILED addr=0x%llx",
 					static_cast<unsigned long long>(address));
-				return -1;
+				return fail_install("add_breakpoint: write_memory failed");
 			}
+			bp.byte_written = true;
 
 			std::vector<uint8_t> verify;
 			if (!driver_bridge::read_memory(address, 1, verify) || verify.empty() || verify[0] != 0xCC) {
 				std::vector<uint8_t> restore{bp.original_byte};
-				driver_bridge::write_memory(address, restore);
-				set_last_error("add_breakpoint: write verification failed");
+				std::vector<uint8_t> restored;
+				if (driver_bridge::write_memory(address, restore) &&
+					driver_bridge::read_memory(address, 1, restored) && !restored.empty() &&
+					restored[0] == bp.original_byte)
+					bp.byte_written = false;
 				diag::log_tagged_fmt("bp",
 					"add_breakpoint_verify_FAILED addr=0x%llx",
 					static_cast<unsigned long long>(address));
-				return -1;
+				return fail_install("add_breakpoint: write verification failed");
 			}
-			bp.byte_written = true;
+			bp.readback_verified = true;
 		}
 	}
 
 
 	if (type == bp_type_t::hardware_execute || type == bp_type_t::hardware_write ||
 		type == bp_type_t::hardware_read) {
-		int slot = -1;
-		bool used[4] = {};
-		for (auto& existing : st.breakpoints) {
-			if (existing.hw_slot >= 0 && existing.hw_slot < 4 &&
-				existing.state != bp_state_t::disabled)
-				used[existing.hw_slot] = true;
-		}
-		for (int i = 0; i < 4; ++i) {
-			if (!used[i]) { slot = i; break; }
-		}
-		if (slot == -1) {
-			set_last_error("add_breakpoint: no free hardware slot (4 max)");
-			return -1;
-		}
-		bp.hw_slot = slot;
+		const int slot = bp.hw_slot;
 
 		int hw_type = 0;
 		if (type == bp_type_t::hardware_execute)    hw_type = 0;
@@ -1664,28 +1768,67 @@ static int add_breakpoint_impl(uint64_t address, bp_type_t type,
 			}
 		}
 		if (!any_applied && st.target_pid != 0) {
-			set_last_error("add_breakpoint: failed to program any thread's DRx");
-			return -1;
+			bp.hw_slot = -1;
+			return fail_install("add_breakpoint: failed to program any thread's DRx");
 		}
 		if (any_failed) {
 			diag::log_tagged_fmt("bp",
 				"add_breakpoint_partial_drx addr=0x%llx slot=%d",
 				static_cast<unsigned long long>(address),
 				slot);
+			bool rollback_failed = false;
+			if (st.target_pid != 0) {
+				auto threads = hardware_breakpoint_threads(st, "add_breakpoint_rollback");
+				for (const auto& thread : threads)
+					if (!driver_bridge::clear_hardware_breakpoint(thread.tid, slot))
+						rollback_failed = true;
+			}
+			if (!rollback_failed) bp.hw_slot = -1;
+			return fail_install(rollback_failed
+				? "add_breakpoint: DRx programming was incomplete and rollback did not clear every thread"
+				: "add_breakpoint: DRx programming was incomplete and was rolled back");
+		}
+		bp.readback_verified = st.target_pid == 0 || any_applied;
+	}
+	if (!target_current())
+		return fail_install("add_breakpoint: target changed before verified publication");
+
+	bool stale_publication = false;
+	int published_index = -1;
+	{
+		std::lock_guard<std::mutex> publish_lock(st.bp_mutex);
+		const auto row = find_breakpoint_identity(st, bp.mutation_identity);
+		if (row == st.breakpoints.end() ||
+			row->mutation_generation != bp.mutation_generation)
+			stale_publication = true;
+		else {
+			bp.install_state = breakpoint_install_state_t::installed;
+			bp.install_detail = bp.readback_verified ? "Installation verified" : "Definition installed";
+			published_index = static_cast<int>(std::distance(st.breakpoints.begin(), row));
+			*row = bp;
+			st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 		}
 	}
-
-	int new_index = static_cast<int>(st.breakpoints.size());
-	st.breakpoints.push_back(std::move(bp));
-	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+	if (stale_publication) {
+		set_last_error("add_breakpoint: staged row changed before verified publication");
+		if (bp.type == bp_type_t::software && bp.byte_written)
+			static_cast<void>(driver_bridge::write_memory(bp.address,
+				std::vector<std::uint8_t>{bp.original_byte}));
+		if (is_hw && bp.hw_slot >= 0 && st.target_pid != 0)
+			for (const auto& thread : hardware_breakpoint_threads(st,
+				"add_breakpoint_stale_rollback"))
+				static_cast<void>(driver_bridge::clear_hardware_breakpoint(
+					thread.tid, bp.hw_slot));
+		return -1;
+	}
 	diag::log_tagged_fmt("bp",
 		"add_breakpoint_ok addr=0x%llx type=%d size=%d idx=%d hwbp=%d",
 		static_cast<unsigned long long>(address),
 		static_cast<int>(type),
 		is_hw ? size : 1,
-		new_index,
+		published_index,
 		is_hw ? 1 : 0);
-	return new_index;
+	return published_index;
 }
 
 int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
@@ -1704,19 +1847,58 @@ int add_source_breakpoint(uint64_t address, const std::string& definition_id,
 		file_path, line, location_ordinal);
 }
 
-static bool remove_breakpoint_locked(state_t& st, int index) {
-	if (index < 0 || index >= static_cast<int>(st.breakpoints.size()))
+static bool remove_breakpoint_serialized(state_t& st, int index) {
+	const std::uint32_t operation_pid = driver_bridge::attached_pid();
+	const auto target_current = [operation_pid] {
+		return driver_bridge::attached_pid() == operation_pid;
+	};
+	breakpoint_t bp;
+	{
+		std::lock_guard<std::mutex> lock(st.bp_mutex);
+		if (index < 0 || index >= static_cast<int>(st.breakpoints.size()))
+			return false;
+		auto& row = st.breakpoints[static_cast<size_t>(index)];
+		if (row.install_state == breakpoint_install_state_t::installing ||
+			row.install_state == breakpoint_install_state_t::removing) {
+			set_last_error("remove_breakpoint: breakpoint mutation is already pending");
+			return false;
+		}
+		if (row.mutation_identity == 0)
+			row.mutation_identity = allocate_breakpoint_mutation_identity();
+		++row.mutation_generation;
+		row.install_state = breakpoint_install_state_t::removing;
+		row.install_detail = "Removal requested";
+		row.readback_verified = false;
+		bp = row;
+		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+	}
+	const auto fail = [&](const char* detail) {
+		set_last_error(detail);
+		std::lock_guard<std::mutex> lock(st.bp_mutex);
+		const auto row = find_breakpoint_identity(st, bp.mutation_identity);
+		if (row != st.breakpoints.end() && row->mutation_generation == bp.mutation_generation) {
+			row->install_state = breakpoint_install_state_t::error;
+			row->install_detail = detail;
+			row->readback_verified = false;
+			row->byte_written = bp.byte_written;
+			st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+		}
 		return false;
-
-	auto& bp = st.breakpoints[static_cast<size_t>(index)];
+	};
+	if (!target_current())
+		return fail("remove_breakpoint: target changed before removal began");
 
 	if (bp.type == bp_type_t::software && bp.byte_written) {
 		std::vector<uint8_t> restore{bp.original_byte};
-		if (!driver_bridge::write_memory(bp.address, restore)) {
-			set_last_error("remove_breakpoint: write_memory failed restoring byte");
-			return false;
+		if (!driver_bridge::write_memory(bp.address, restore))
+			return fail("remove_breakpoint: write_memory failed restoring byte");
+		std::vector<std::uint8_t> readback;
+		if (!driver_bridge::read_memory(bp.address, 1, readback) || readback.empty() ||
+			readback[0] != bp.original_byte) {
+			return fail("remove_breakpoint: restore verification failed");
 		}
 		bp.byte_written = false;
+		bp.readback_verified = true;
 	}
 
 	if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.target_pid != 0) {
@@ -1736,26 +1918,39 @@ static bool remove_breakpoint_locked(state_t& st, int index) {
 			diag::log_tagged_fmt("bp",
 				"remove_breakpoint_partial_clear idx=%d slot=%d threads=%zu",
 				index, bp.hw_slot, threads.size());
+			return fail("remove_breakpoint: one or more hardware breakpoint slots could not be cleared");
+		}
+		bp.readback_verified = true;
+	}
+	if (!target_current())
+		return fail("remove_breakpoint: target changed before verified publication");
+
+	bool stale_publication = false;
+	{
+		std::lock_guard<std::mutex> lock(st.bp_mutex);
+		const auto row = find_breakpoint_identity(st, bp.mutation_identity);
+		if (row == st.breakpoints.end() || row->mutation_generation != bp.mutation_generation)
+			stale_publication = true;
+		else {
+			st.breakpoints.erase(row);
+			st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 		}
 	}
-
-	uint64_t removed_addr = bp.address;
-	int       removed_type = static_cast<int>(bp.type);
-	st.breakpoints.erase(st.breakpoints.begin() + index);
-	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+	if (stale_publication)
+		return fail("remove_breakpoint: staged row changed before verified publication");
 	diag::log_tagged_fmt("bp",
 		"remove_breakpoint_ok idx=%d addr=0x%llx type=%d",
 		index,
-		static_cast<unsigned long long>(removed_addr),
-		removed_type);
+		static_cast<unsigned long long>(bp.address),
+		static_cast<int>(bp.type));
 	return true;
 }
 
 bool remove_breakpoint(int index) {
 	auto& st = g_state;
 	sync_attached_state();
-	std::lock_guard<std::mutex> lk(st.bp_mutex);
-	return remove_breakpoint_locked(st, index);
+	std::unique_lock<std::mutex> mutation_lock(breakpoint_mutation_mutex());
+	return remove_breakpoint_serialized(st, index);
 }
 
 bool remove_source_breakpoint(const std::string& definition_id,
@@ -1763,14 +1958,20 @@ bool remove_source_breakpoint(const std::string& definition_id,
 	if (definition_id.empty()) return false;
 	auto& st = g_state;
 	sync_attached_state();
-	std::lock_guard<std::mutex> lk(st.bp_mutex);
-	for (size_t index = 0; index < st.breakpoints.size(); ++index) {
-		const auto& breakpoint = st.breakpoints[index];
-		if (breakpoint.source_definition_id == definition_id &&
-			breakpoint.source_location_ordinal == location_ordinal)
-			return remove_breakpoint_locked(st, static_cast<int>(index));
+	std::unique_lock<std::mutex> mutation_lock(breakpoint_mutation_mutex());
+	int index = -1;
+	{
+		std::lock_guard<std::mutex> lock(st.bp_mutex);
+		for (size_t candidate = 0; candidate < st.breakpoints.size(); ++candidate) {
+			const auto& breakpoint = st.breakpoints[candidate];
+			if (breakpoint.source_definition_id == definition_id &&
+				breakpoint.source_location_ordinal == location_ordinal) {
+				index = static_cast<int>(candidate);
+				break;
+			}
+		}
 	}
-	return true;
+	return index < 0 || remove_breakpoint_serialized(st, index);
 }
 
 bool discard_source_breakpoints_for_target_change(uint32_t previous_pid,
@@ -1800,28 +2001,101 @@ bool toggle_breakpoint(int index) {
 	auto& st = g_state;
 	diag::log_tagged_fmt("dbg_engine", "toggle_breakpoint: index=%d", index);
 	sync_attached_state();
-	std::lock_guard<std::mutex> lk(st.bp_mutex);
+	std::unique_lock<std::mutex> mutation_lock(breakpoint_mutation_mutex());
+	const std::uint32_t operation_pid = driver_bridge::attached_pid();
+	const auto target_current = [operation_pid] {
+		return driver_bridge::attached_pid() == operation_pid;
+	};
+	std::unique_lock<std::mutex> lk(st.bp_mutex);
 	if (index < 0 || index >= static_cast<int>(st.breakpoints.size())) {
 		diag::log_tagged_fmt("dbg_engine", "toggle_breakpoint: index=%d out of range (size=%zu)", index, st.breakpoints.size());
 		return false;
 	}
-	auto& bp = st.breakpoints[static_cast<size_t>(index)];
-
+	auto& row = st.breakpoints[static_cast<size_t>(index)];
+	if (row.install_state == breakpoint_install_state_t::installing ||
+		row.install_state == breakpoint_install_state_t::removing) {
+		set_last_error("toggle_breakpoint: breakpoint mutation is already pending");
+		return false;
+	}
+	if (row.mutation_identity == 0)
+		row.mutation_identity = allocate_breakpoint_mutation_identity();
+	++row.mutation_generation;
+	breakpoint_t bp = row;
 	bool will_enable = (bp.state == bp_state_t::disabled);
+	row.install_state = breakpoint_install_state_t::installing;
+	row.install_detail = will_enable ? "Enable requested" : "Disable requested";
+	row.readback_verified = false;
+	if (will_enable && (bp.type == bp_type_t::hardware_execute ||
+		bp.type == bp_type_t::hardware_write || bp.type == bp_type_t::hardware_read)) {
+		bool used[4] = {};
+		for (const auto& existing : st.breakpoints) {
+			if (existing.mutation_identity == bp.mutation_identity)
+				continue;
+			if (existing.hw_slot >= 0 && existing.hw_slot < 4 &&
+				existing.state != bp_state_t::disabled)
+				used[existing.hw_slot] = true;
+		}
+		if (bp.hw_slot < 0 || bp.hw_slot >= 4 || used[bp.hw_slot]) {
+			bp.hw_slot = -1;
+			for (int slot = 0; slot < 4; ++slot)
+				if (!used[slot]) { bp.hw_slot = slot; break; }
+		}
+		row.hw_slot = bp.hw_slot;
+	}
+	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+	lk.unlock();
+	const auto fail_toggle = [&](const char* detail) {
+		set_last_error(detail);
+		std::lock_guard<std::mutex> publish_lock(st.bp_mutex);
+		const auto published = find_breakpoint_identity(st, bp.mutation_identity);
+		if (published != st.breakpoints.end() &&
+			published->mutation_generation == bp.mutation_generation) {
+			published->install_state = breakpoint_install_state_t::error;
+			published->install_detail = detail;
+			published->readback_verified = false;
+			published->byte_written = bp.byte_written;
+			published->original_byte = bp.original_byte;
+			published->hw_slot = bp.hw_slot;
+			published->state = bp.state;
+			st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+		}
+		return false;
+	};
+	if (!target_current())
+		return fail_toggle("toggle_breakpoint: target changed before mutation began");
 
 	if (bp.type == bp_type_t::software) {
 		if (will_enable && !bp.byte_written) {
 			std::vector<uint8_t> orig;
-			if (driver_bridge::read_memory(bp.address, 1, orig) && !orig.empty()) {
-				bp.original_byte = orig[0];
-				std::vector<uint8_t> cc{0xCC};
-				if (driver_bridge::write_memory(bp.address, cc))
-					bp.byte_written = true;
+			if (!driver_bridge::read_memory(bp.address, 1, orig) || orig.empty())
+				return fail_toggle("toggle_breakpoint: failed to read the original software byte");
+			bp.original_byte = orig[0];
+			std::vector<uint8_t> cc{0xCC};
+			if (!driver_bridge::write_memory(bp.address, cc))
+				return fail_toggle("toggle_breakpoint: failed to write the software breakpoint");
+			bp.byte_written = true;
+			std::vector<uint8_t> verify;
+			if (!driver_bridge::read_memory(bp.address, 1, verify) || verify.empty() || verify[0] != 0xCC) {
+				std::vector<uint8_t> restore{bp.original_byte};
+				std::vector<uint8_t> restored;
+				if (driver_bridge::write_memory(bp.address, restore) &&
+					driver_bridge::read_memory(bp.address, 1, restored) && !restored.empty() &&
+					restored[0] == bp.original_byte)
+					bp.byte_written = false;
+				if (bp.byte_written) bp.state = bp_state_t::enabled;
+				return fail_toggle("toggle_breakpoint: software breakpoint verification failed");
 			}
+			bp.readback_verified = true;
 		} else if (!will_enable && bp.byte_written) {
 			std::vector<uint8_t> restore{bp.original_byte};
-			if (driver_bridge::write_memory(bp.address, restore))
-				bp.byte_written = false;
+			if (!driver_bridge::write_memory(bp.address, restore))
+				return fail_toggle("toggle_breakpoint: failed to restore the software byte");
+			std::vector<uint8_t> verify;
+			if (!driver_bridge::read_memory(bp.address, 1, verify) || verify.empty() ||
+				verify[0] != bp.original_byte)
+				return fail_toggle("toggle_breakpoint: restored software byte did not verify");
+			bp.byte_written = false;
+			bp.readback_verified = true;
 		}
 	}
 
@@ -1830,31 +2104,19 @@ bool toggle_breakpoint(int index) {
 		if (!will_enable) {
 			if (bp.hw_slot >= 0 && bp.hw_slot < 4 && st.target_pid != 0) {
 				auto threads = hardware_breakpoint_threads(st, "toggle_breakpoint_off");
+				bool failed = false;
 				for (const auto& t : threads) {
-					driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot);
+					if (!driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot)) failed = true;
 				}
+				if (failed)
+					return fail_toggle("toggle_breakpoint: failed to clear every hardware slot");
+				bp.readback_verified = true;
 			}
 		} else {
-			int slot = -1;
-			bool used[4] = {};
-			for (auto& existing : st.breakpoints) {
-				if (&existing == &bp) continue;
-				if (existing.hw_slot >= 0 && existing.hw_slot < 4 &&
-					existing.state != bp_state_t::disabled)
-					used[existing.hw_slot] = true;
-			}
-			if (bp.hw_slot >= 0 && bp.hw_slot < 4 && !used[bp.hw_slot])
-				slot = bp.hw_slot;
-			else {
-				for (int i = 0; i < 4; ++i) {
-					if (!used[i]) { slot = i; break; }
-				}
-			}
+			const int slot = bp.hw_slot;
 			if (slot == -1) {
-				set_last_error("toggle_breakpoint: no free hardware slot");
-				return false;
+				return fail_toggle("toggle_breakpoint: no free hardware slot");
 			}
-			bp.hw_slot = slot;
 
 			int hw_type = 0;
 			if (bp.type == bp_type_t::hardware_execute)    hw_type = 0;
@@ -1872,59 +2134,96 @@ bool toggle_breakpoint(int index) {
 
 			if (st.target_pid != 0) {
 				auto threads = hardware_breakpoint_threads(st, "toggle_breakpoint_on");
+				bool applied = false;
+				bool failed = false;
 				for (const auto& t : threads) {
-					driver_bridge::set_hardware_breakpoint(t.tid, slot, bp.address, hw_type, len_bits);
+					if (driver_bridge::set_hardware_breakpoint(t.tid, slot, bp.address, hw_type, len_bits)) applied = true;
+					else failed = true;
 				}
+				if (!applied || failed) {
+					bool rollback_failed = false;
+					for (const auto& thread : threads)
+						if (!driver_bridge::clear_hardware_breakpoint(thread.tid, slot))
+							rollback_failed = true;
+					if (rollback_failed) bp.state = bp_state_t::enabled;
+					return fail_toggle(rollback_failed
+						? "toggle_breakpoint: hardware slot programming and rollback were incomplete"
+						: "toggle_breakpoint: hardware slot programming was incomplete");
+				}
+				bp.readback_verified = true;
 			}
 		}
 	}
+	if (!target_current())
+		return fail_toggle("toggle_breakpoint: target changed before verified publication");
 
 	bp.state = will_enable ? bp_state_t::enabled : bp_state_t::disabled;
-	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+	bp.install_state = breakpoint_install_state_t::installed;
+	bp.install_detail = bp.readback_verified ? "Mutation verified" : "Definition updated";
+	bool stale_publication = false;
+	{
+		std::lock_guard<std::mutex> publish_lock(st.bp_mutex);
+		const auto published = find_breakpoint_identity(st, bp.mutation_identity);
+		if (published == st.breakpoints.end() ||
+			published->mutation_generation != bp.mutation_generation)
+			stale_publication = true;
+		else {
+			*published = bp;
+			st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+		}
+	}
+	if (stale_publication)
+		return fail_toggle("toggle_breakpoint: staged row changed before verified publication");
 	diag::log_tagged_fmt("dbg_engine", "toggle_breakpoint: index=%d addr=0x%llX now=%s", index, (unsigned long long)bp.address, will_enable ? "enabled" : "disabled");
 	return true;
 }
 
-void clear_all_breakpoints() {
+bool clear_all_breakpoints() {
 	auto& st = g_state;
 	diag::log_tagged_fmt("dbg_engine", "clear_all_breakpoints: entry");
 	sync_attached_state();
-
-	bool has_hw = false;
-	for (const auto& bp : st.breakpoints) {
-		if (bp.hw_slot >= 0 && bp.hw_slot < 4) { has_hw = true; break; }
-	}
-
-	std::vector<driver_bridge::thread_info_t> threads;
-	if (has_hw && st.target_pid != 0)
-		threads = hardware_breakpoint_threads(st, "clear_all_breakpoints");
-
-	std::lock_guard<std::mutex> lk(st.bp_mutex);
-
-	for (auto& bp : st.breakpoints) {
-		if (bp.type == bp_type_t::software && bp.byte_written) {
-			std::vector<uint8_t> restore{bp.original_byte};
-			driver_bridge::write_memory(bp.address, restore);
-			bp.byte_written = false;
+	std::unique_lock<std::mutex> mutation_lock(breakpoint_mutation_mutex());
+	bool complete = true;
+	for (;;) {
+		int index = -1;
+		{
+			std::lock_guard<std::mutex> lock(st.bp_mutex);
+			if (!st.breakpoints.empty())
+				index = 0;
 		}
-		if (bp.hw_slot >= 0 && bp.hw_slot < 4) {
-			for (const auto& t : threads) {
-				if (t.owner_pid != st.target_pid) continue;
-				driver_bridge::clear_hardware_breakpoint(t.tid, bp.hw_slot);
-			}
+		if (index < 0)
+			break;
+		if (!remove_breakpoint_serialized(st, index)) {
+			complete = false;
+			break;
 		}
 	}
-	st.breakpoints.clear();
-	for (auto& ibp : st.internal_breakpoints) {
-		if (ibp.active) {
-			std::vector<uint8_t> restore{ibp.original_byte};
-			driver_bridge::write_memory(ibp.address, restore);
-			ibp.active = false;
+	std::vector<internal_bp_t> internal;
+	{
+		std::lock_guard<std::mutex> lock(st.bp_mutex);
+		internal = st.internal_breakpoints;
+	}
+	for (const auto& breakpoint : internal) {
+		if (!breakpoint.active)
+			continue;
+		const std::vector<std::uint8_t> restore{breakpoint.original_byte};
+		std::vector<std::uint8_t> readback;
+		if (!driver_bridge::write_memory(breakpoint.address, restore) ||
+			!driver_bridge::read_memory(breakpoint.address, 1, readback) ||
+			readback.empty() || readback[0] != breakpoint.original_byte) {
+			complete = false;
+			set_last_error("clear_all_breakpoints: internal breakpoint restoration did not verify");
+			break;
 		}
 	}
-	st.internal_breakpoints.clear();
-	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
-	diag::log_tagged_fmt("dbg_engine", "clear_all_breakpoints: done");
+	if (complete) {
+		std::lock_guard<std::mutex> lock(st.bp_mutex);
+		st.internal_breakpoints.clear();
+		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
+	}
+	diag::log_tagged_fmt("dbg_engine", "clear_all_breakpoints: done complete=%d",
+		static_cast<int>(complete));
+	return complete;
 }
 
 
@@ -2370,6 +2669,7 @@ bool step_into() {
 		std::lock_guard<std::mutex> lk(st.bp_mutex);
 		for (size_t i = 0; i < st.breakpoints.size(); ++i) {
 			auto& bp = st.breakpoints[i];
+			if (bp.install_state != breakpoint_install_state_t::installed) continue;
 			if (bp.type != bp_type_t::software) continue;
 			if (bp.state == bp_state_t::disabled) continue;
 			if (bp.is_internal) continue;
@@ -3657,7 +3957,16 @@ std::vector<memory_region_t> get_memory_map() {
 int add_watch(const std::string& expression) {
 	auto& st = g_state;
 	diag::log_tagged_fmt("dbg_engine", "add_watch: expr='%s'", expression.c_str());
+	if (const char* validation = watch_expression_validation_error(expression)) {
+		diag::log_tagged_fmt("dbg_engine", "add_watch: rejected reason='%s'", validation);
+		return -1;
+	}
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
+	if (st.watches.size() >= k_max_watch_count) {
+		diag::log_tagged_fmt("dbg_engine", "add_watch: rejected maximum=%zu",
+			k_max_watch_count);
+		return -1;
+	}
 	watch_entry_t w;
 	w.expression = expression;
 	w.persistent_expression = expression;
@@ -3683,37 +3992,161 @@ bool remove_watch(int index) {
 }
 
 expression_evaluation_t evaluate_expression(const std::string& expression) {
-	expression_evaluation_t result;
-	if (expression.empty()) {
-		result.error = "empty expression";
-		return result;
-	}
-	if (expression.size() > 96) {
-		result.error = "expression exceeds the 96-byte debugger limit";
+	if (const char* validation = watch_expression_validation_error(expression)) {
+		expression_evaluation_t result;
+		result.error = validation;
 		return result;
 	}
 	const auto regs = get_registers();
 	expression_eval::context_t context = build_eval_context(regs);
-	const auto evaluated = expression_eval::evaluate(expression, context);
-	if (!evaluated.ok) {
-		result.error = evaluated.error.empty()
-			? "the debugger expression evaluator rejected the expression"
-			: evaluated.error;
-		return result;
+	return evaluate_expression_with_context(expression, context);
+}
+
+watch_refresh_batch_ptr capture_watch_refresh_batch() {
+	auto batch = std::make_shared<watch_refresh_batch_t>();
+	auto& state = g_state;
+	std::lock_guard<std::mutex> lock(state.watch_mutex);
+	batch->generation = state.watches_generation.load(std::memory_order_acquire);
+	batch->cardinality = state.watches.size();
+	if (batch->cardinality > k_max_watch_count) {
+		batch->error = "watch collection exceeds the 4096-entry refresh limit";
+		return batch;
 	}
-	char rendered[20]{};
-	std::snprintf(rendered, sizeof(rendered), "0x%016" PRIX64, evaluated.value);
-	result.succeeded = true;
-	result.value = evaluated.value;
-	result.rendered_value = rendered;
-	result.type = "uint64";
-	return result;
+	batch->targets.reserve(batch->cardinality);
+	for (const auto& watch : state.watches) {
+		watch_refresh_target_t target;
+		target.expression = watch.expression;
+		target.persistent_expression = watch.persistent_expression;
+		target.definition_module = watch.definition_module;
+		target.definition_module_offset = watch.definition_module_offset;
+		target.definition_module_size = watch.definition_module_size;
+		target.persistent_definition = watch.persistent_definition;
+		target.definition_resolved = watch.definition_resolved;
+		if (watch.persistent_definition && !watch.definition_resolved)
+			target.unresolved_error = watch.error.empty()
+				? "Persisted watch binding is unresolved" : watch.error;
+		batch->targets.push_back(std::move(target));
+	}
+	return batch;
+}
+
+watch_refresh_evaluation_batch_t evaluate_watch_refresh_batch(
+		watch_refresh_batch_ptr batch,
+		watch_refresh_cancel_fn_t cancel_requested) {
+	watch_refresh_evaluation_batch_t evaluated;
+	evaluated.source = std::move(batch);
+	if (!evaluated.source) {
+		evaluated.error = "watch refresh capture is unavailable";
+		return evaluated;
+	}
+	if (!evaluated.source->valid()) {
+		evaluated.error = evaluated.source->error.empty()
+			? "watch refresh capture is invalid" : evaluated.source->error;
+		return evaluated;
+	}
+	if (cancel_requested && cancel_requested()) {
+		evaluated.cancelled = true;
+		return evaluated;
+	}
+	evaluated.results.resize(evaluated.source->targets.size());
+	bool requires_context = false;
+	for (const auto& target : evaluated.source->targets) {
+		if (!(target.persistent_definition && !target.definition_resolved) &&
+			watch_expression_validation_error(target.expression) == nullptr) {
+			requires_context = true;
+			break;
+		}
+	}
+	expression_eval::context_t context;
+	if (requires_context) {
+		if (cancel_requested && cancel_requested()) {
+			evaluated.cancelled = true;
+			return evaluated;
+		}
+		const auto registers = get_registers();
+		context = build_eval_context(registers);
+	}
+	for (std::size_t index = 0; index < evaluated.source->targets.size(); ++index) {
+		if (cancel_requested && cancel_requested()) {
+			evaluated.cancelled = true;
+			return evaluated;
+		}
+		const auto& target = evaluated.source->targets[index];
+		auto& result = evaluated.results[index];
+		if (target.persistent_definition && !target.definition_resolved) {
+			result.error = target.unresolved_error.empty()
+				? "Persisted watch binding is unresolved" : target.unresolved_error;
+			continue;
+		}
+		if (const char* validation = watch_expression_validation_error(target.expression)) {
+			result.error = validation;
+			continue;
+		}
+		result = evaluate_expression_with_context(target.expression, context);
+	}
+	return evaluated;
+}
+
+watch_refresh_publish_result_t publish_watch_refresh_batch(
+		const watch_refresh_evaluation_batch_t& batch) {
+	if (!batch.source || !batch.source->valid())
+		return watch_refresh_publish_result_t::invalid_batch;
+	if (batch.cancelled || !batch.error.empty() ||
+		batch.results.size() != batch.source->targets.size())
+		return watch_refresh_publish_result_t::result_mismatch;
+	std::vector<watch_entry_t> updated;
+	updated.reserve(batch.source->targets.size());
+	for (std::size_t index = 0; index < batch.source->targets.size(); ++index) {
+		const auto& target = batch.source->targets[index];
+		const auto& result = batch.results[index];
+		watch_entry_t watch;
+		watch.expression = target.expression;
+		watch.value = result.succeeded ? result.rendered_value : std::string{};
+		watch.type = result.succeeded ? result.type : std::string{};
+		watch.error = result.succeeded ? std::string{} : result.error;
+		watch.valid = result.succeeded;
+		watch.persistent_expression = target.persistent_expression;
+		watch.definition_module = target.definition_module;
+		watch.definition_module_offset = target.definition_module_offset;
+		watch.definition_module_size = target.definition_module_size;
+		watch.persistent_definition = target.persistent_definition;
+		watch.definition_resolved = target.definition_resolved;
+		updated.push_back(std::move(watch));
+	}
+	auto& state = g_state;
+	std::lock_guard<std::mutex> lock(state.watch_mutex);
+	if (state.watches_generation.load(std::memory_order_acquire) !=
+			batch.source->generation)
+		return watch_refresh_publish_result_t::stale_generation;
+	if (state.watches.size() != batch.source->cardinality ||
+		state.watches.size() != batch.source->targets.size())
+		return watch_refresh_publish_result_t::cardinality_mismatch;
+	for (std::size_t index = 0; index < state.watches.size(); ++index) {
+		const auto& watch = state.watches[index];
+		const auto& target = batch.source->targets[index];
+		if (watch.expression != target.expression ||
+			watch.persistent_expression != target.persistent_expression ||
+			watch.definition_module != target.definition_module ||
+			watch.definition_module_offset != target.definition_module_offset ||
+			watch.definition_module_size != target.definition_module_size ||
+			watch.persistent_definition != target.persistent_definition ||
+			watch.definition_resolved != target.definition_resolved)
+			return watch_refresh_publish_result_t::identity_mismatch;
+	}
+	state.watches.swap(updated);
+	if (!state.watches.empty())
+		state.watches_generation.fetch_add(1, std::memory_order_release);
+	return watch_refresh_publish_result_t::published;
 }
 
 bool publish_watch_evaluation(int index, const std::string& expected_expression,
+		uint64_t expected_watches_generation,
 		const expression_evaluation_t& evaluation) {
 	auto& state = g_state;
 	std::lock_guard<std::mutex> lock(state.watch_mutex);
+	if (state.watches_generation.load(std::memory_order_acquire) !=
+			expected_watches_generation)
+		return false;
 	if (index < 0 || index >= static_cast<int>(state.watches.size()))
 		return false;
 	auto& watch = state.watches[static_cast<std::size_t>(index)];
@@ -3730,46 +4163,14 @@ bool publish_watch_evaluation(int index, const std::string& expected_expression,
 }
 
 void refresh_watches() {
-	auto& st = g_state;
-	diag::log_tagged_fmt("dbg_engine", "refresh_watches: entry watch_count=%zu", st.watches.size());
-	auto regs = get_registers();
-	expression_eval::context_t ctx = build_eval_context(regs);
-	std::lock_guard<std::mutex> lk(st.watch_mutex);
-
-	for (auto& w : st.watches) {
-		if (w.persistent_definition && !w.definition_resolved) {
-			w.value.clear();
-			w.type.clear();
-			w.valid = false;
-			if (w.error.empty())
-				w.error = "Persisted watch binding is unresolved";
-			continue;
-		}
-		if (w.expression.empty()) {
-			w.value.clear();
-			w.type.clear();
-			w.error = "empty expression";
-			w.valid = false;
-			continue;
-		}
-
-		auto er = expression_eval::evaluate(w.expression, ctx);
-		if (!er.ok) {
-			w.value.clear();
-			w.type.clear();
-			w.error = er.error;
-			w.valid = false;
-			continue;
-		}
-
-		char hex[20];
-		snprintf(hex, sizeof(hex), "0x%016" PRIX64, er.value);
-		w.value = hex;
-		w.type = "uint64";
-		w.error.clear();
-		w.valid = true;
-	}
-	st.watches_generation.fetch_add(1, std::memory_order_release);
+	const auto captured = capture_watch_refresh_batch();
+	auto evaluated = evaluate_watch_refresh_batch(captured);
+	const auto published = publish_watch_refresh_batch(evaluated);
+	diag::log_tagged_fmt("dbg_engine",
+		"refresh_watches_compat generation=%llu count=%zu publish=%u error='%s'",
+		static_cast<unsigned long long>(captured ? captured->generation : 0),
+		captured ? captured->cardinality : 0,
+		static_cast<unsigned>(published), evaluated.error.c_str());
 }
 
 
@@ -4295,6 +4696,7 @@ bp_hit_action_t handle_breakpoint_hit(uint64_t address) {
 			for (size_t i = 0; i < st.breakpoints.size(); ++i) {
 				auto& bp = st.breakpoints[i];
 				if (bp.address != pa_addr) continue;
+				if (bp.install_state != breakpoint_install_state_t::installed) continue;
 				has_bp = true;
 				bp_index = static_cast<int>(i);
 				bp_address_matched = pa_addr;
@@ -4959,14 +5361,14 @@ void restore_breakpoints_and_watches(std::vector<breakpoint_t> bps,
 	{
 		std::lock_guard<std::mutex> lk(st.bp_mutex);
 		st.breakpoints = std::move(bps);
-		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
-		int max_id = 0;
-		for (const auto& b : st.breakpoints) {
-			(void)b;
+		for (auto& breakpoint : st.breakpoints) {
+			if (breakpoint.mutation_identity == 0)
+				breakpoint.mutation_identity = allocate_breakpoint_mutation_identity();
+			breakpoint.mutation_generation = 0;
 		}
+		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 		if (st.next_bp_id <= static_cast<int>(st.breakpoints.size()))
 			st.next_bp_id = static_cast<int>(st.breakpoints.size()) + 1;
-		(void)max_id;
 	}
 	{
 		std::lock_guard<std::mutex> lk(st.watch_mutex);

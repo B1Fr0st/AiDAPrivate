@@ -180,7 +180,20 @@ acquire_static_workspace(const std::string& path,
         std::move(result));
 }
 
-bool open_attach_session(std::uint32_t pid, std::string* out_err) {
+bool open_attach_session(
+    std::uint32_t pid,
+    std::string* out_err,
+    const aida::analysis::cancellation_token_t& cancel) {
+    if (cancel.stop_requested()) {
+        const std::string error = cancel.deadline_exceeded()
+            ? "deadline_exceeded" : "cancelled";
+        if (out_err)
+            *out_err = error;
+        auto& value = state();
+        std::lock_guard lock(value.mutex);
+        value.error = error;
+        return false;
+    }
     const std::string error = pid == 0
         ? "A process identifier is required"
         : "Live process attachment is unavailable in the UI-only preview";
@@ -189,6 +202,35 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err) {
     auto& value = state();
     std::lock_guard lock(value.mutex);
     value.error = error;
+    return false;
+}
+
+bool reattach_session_exact(
+    const std::string& session_id,
+    std::uint32_t expected_pid,
+    std::uint64_t expected_process_creation_time_100ns,
+    std::string* out_err,
+    const aida::analysis::cancellation_token_t& cancel) {
+    if (cancel.stop_requested()) {
+        const std::string error = cancel.deadline_exceeded()
+            ? "deadline_exceeded" : "cancelled";
+        if (out_err) *out_err = error;
+        return false;
+    }
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    const auto found = std::find_if(value.sessions.begin(), value.sessions.end(),
+        [&](const std::shared_ptr<analysis_session_t>& session) {
+            return session && session->id == session_id;
+        });
+    const std::string error = found == value.sessions.end()
+        ? "session_not_found"
+        : ((*found)->attached_pid != expected_pid || expected_pid == 0 ||
+            expected_process_creation_time_100ns == 0)
+            ? "TARGET_STALE: retained process identity does not match the session"
+            : "Live process reattachment is unavailable in the UI-only preview";
+    value.error = error;
+    if (out_err) *out_err = error;
     return false;
 }
 
@@ -386,6 +428,18 @@ bool find_session_by_id(const std::string& session_id, std::size_t* out_idx) {
     return false;
 }
 
+bool active_live_session_matches(std::uint32_t pid, const std::string& session_id) {
+    if (pid == 0 || session_id.empty())
+        return false;
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    if (value.active >= value.sessions.size())
+        return false;
+    const auto& session = value.sessions[value.active];
+    return session && session->attached_pid == pid && session->id == session_id &&
+        session->load_state == session_load_state_t::ready && session->workspace;
+}
+
 void prune_lru(std::size_t max_keep) {
     auto& value = state();
     std::lock_guard lock(value.mutex);
@@ -434,7 +488,9 @@ session_summary_t summarize_session_at(std::size_t index) {
 
 #else
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include <algorithm>
@@ -2581,9 +2637,26 @@ bool open_session(const std::string& path)
     return true;
 }
 
-bool open_attach_session(std::uint32_t pid, std::string* out_err)
+bool open_attach_session(
+    std::uint32_t pid,
+    std::string* out_err,
+    const aida::analysis::cancellation_token_t& cancel)
 {
     std::lock_guard<std::recursive_mutex> activation_lock(state().activation_mutex);
+    const auto publish_cancellation = [&]() {
+        if (!cancel.stop_requested())
+            return false;
+        const std::string error = cancel.deadline_exceeded()
+            ? "deadline_exceeded" : "cancelled";
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        if (out_err) *out_err = error;
+        return true;
+    };
+    if (publish_cancellation())
+        return false;
     if (pid == 0 || pid == GetCurrentProcessId()) {
         const std::string error = pid == GetCurrentProcessId()
             ? "SELF_TARGET_REFUSED"
@@ -2607,6 +2680,8 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         std::string existing_error;
         if (!existing_session_id.empty() && validate_live_session_binding(
                 existing_session_id, workspace, nullptr, existing_error)) {
+            if (publish_cancellation())
+                return false;
             const bool activated = activate_session_transaction(existing, out_err);
             if (!activated && out_err && out_err->empty()) *out_err = last_error();
             return activated;
@@ -2620,6 +2695,8 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
             if (out_err) *out_err = error;
             return false;
         }
+        if (publish_cancellation())
+            return false;
     }
 
     driver_bridge::identity::live_target_identity_t source_identity;
@@ -2633,6 +2710,8 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         if (out_err) *out_err = identity_error;
         return false;
     }
+    if (publish_cancellation())
+        return false;
     {
         std::lock_guard<std::mutex> lock(state().mutex);
         if (state().sessions.size() >= kMaxSessions) {
@@ -2667,6 +2746,10 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         }
         rollback_driver_activation(pid, previous_pid, attached_by_transaction, &source_identity);
     };
+    if (publish_cancellation()) {
+        rollback_attach();
+        return false;
+    }
     bool is_64_bit = true;
     if (!inspect_live_pe(pid, source_identity.module.base, is_64_bit)) {
         const std::string error = "MALFORMED_PE: live module header is invalid";
@@ -2675,6 +2758,10 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
             std::lock_guard<std::mutex> lock(state().mutex);
             state().last_error = error;
         }
+        rollback_attach();
+        return false;
+    }
+    if (publish_cancellation()) {
         rollback_attach();
         return false;
     }
@@ -2717,6 +2804,10 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         return false;
     }
     auto workspace = opened.take_value();
+    if (publish_cancellation()) {
+        rollback_attach(workspace);
+        return false;
+    }
     std::shared_ptr<workspace_database_t> database;
     auto services = install_workspace_services(workspace, database);
     if (!services) {
@@ -2729,6 +2820,10 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         rollback_attach(workspace);
         return false;
     }
+    if (publish_cancellation()) {
+        rollback_attach(workspace);
+        return false;
+    }
     live_session_binding_t binding;
     std::string binding_error;
     if (!make_live_session_binding(source_identity, workspace, binding, binding_error)) {
@@ -2737,6 +2832,10 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
             state().last_error = binding_error;
         }
         if (out_err) *out_err = binding_error;
+        rollback_attach(workspace);
+        return false;
+    }
+    if (publish_cancellation()) {
         rollback_attach(workspace);
         return false;
     }
@@ -2760,6 +2859,10 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
             state().last_error = error;
         }
         if (out_err) *out_err = error;
+        rollback_attach(workspace);
+        return false;
+    }
+    if (publish_cancellation()) {
         rollback_attach(workspace);
         return false;
     }
@@ -2812,6 +2915,17 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         rollback_attach(workspace);
         return false;
     }
+    if (publish_cancellation()) {
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            const auto iterator = std::find(state().sessions.begin(), state().sessions.end(), session);
+            if (iterator != state().sessions.end())
+                state().sessions.erase(iterator);
+            state().live_bindings.erase(session->id);
+        }
+        rollback_attach(workspace);
+        return false;
+    }
     std::string activation_error;
     if (!activate_session_transaction(session_index, &activation_error)) {
         {
@@ -2840,6 +2954,84 @@ bool open_attach_session(std::uint32_t pid, std::string* out_err)
         static_cast<unsigned long long>(binding.capture_time_100ns),
         static_cast<unsigned long long>(binding.capture_size), binding.capture_hash.c_str(),
         stealth ? 1 : 0);
+    return true;
+}
+
+bool reattach_session_exact(
+    const std::string& session_id,
+    std::uint32_t expected_pid,
+    std::uint64_t expected_process_creation_time_100ns,
+    std::string* out_err,
+    const aida::analysis::cancellation_token_t& cancel)
+{
+    std::lock_guard<std::recursive_mutex> activation_lock(state().activation_mutex);
+    const auto fail = [&](std::string error) {
+        {
+            std::lock_guard<std::mutex> lock(state().mutex);
+            state().last_error = error;
+        }
+        if (out_err) *out_err = std::move(error);
+        return false;
+    };
+    if (cancel.stop_requested())
+        return fail(cancel.deadline_exceeded() ? "deadline_exceeded" : "cancelled");
+    if (session_id.empty() || expected_pid == 0 ||
+        expected_process_creation_time_100ns == 0)
+        return fail("TARGET_STALE: retained live-session identity is incomplete");
+
+    std::size_t session_index = static_cast<std::size_t>(-1);
+    std::shared_ptr<analysis_session_t> session;
+    live_session_binding_t binding;
+    bool binding_found = false;
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        for (std::size_t index = 0; index < state().sessions.size(); ++index) {
+            if (!state().sessions[index] || state().sessions[index]->id != session_id)
+                continue;
+            session_index = index;
+            session = state().sessions[index];
+            break;
+        }
+        if (session) {
+            const auto binding_it = state().live_bindings.find(session_id);
+            if (binding_it != state().live_bindings.end()) {
+                binding = binding_it->second;
+                binding_found = true;
+            }
+        }
+    }
+    if (!session)
+        return fail("session_not_found");
+    if (!binding_found)
+        return fail("TARGET_STALE: retained live-session identity binding is missing");
+    if (session->attached_pid != expected_pid || !session->workspace ||
+        binding.source_identity.process.pid != expected_pid ||
+        binding.source_identity.process.creation_time_100ns !=
+            expected_process_creation_time_100ns)
+        return fail("TARGET_STALE: retained process identity does not match the session");
+
+    std::string validation_error;
+    live_session_binding_t validated_binding;
+    if (!validate_live_session_binding(session_id, session->workspace,
+            &validated_binding, validation_error))
+        return fail(validation_error.empty()
+            ? "TARGET_STALE: retained process identity validation failed"
+            : std::move(validation_error));
+    if (validated_binding.source_identity.process.pid != expected_pid ||
+        validated_binding.source_identity.process.creation_time_100ns !=
+            expected_process_creation_time_100ns)
+        return fail("TARGET_STALE: live process identity changed before reattach");
+    if (cancel.stop_requested())
+        return fail(cancel.deadline_exceeded() ? "deadline_exceeded" : "cancelled");
+
+    std::string activation_error;
+    if (!activate_session_transaction(session_index, &activation_error))
+        return fail(activation_error.empty() ? "session_reattach_failed" : activation_error);
+    {
+        std::lock_guard<std::mutex> lock(state().mutex);
+        state().last_error.clear();
+    }
+    if (out_err) out_err->clear();
     return true;
 }
 
@@ -3254,6 +3446,21 @@ bool find_session_by_id(const std::string& session_id, size_t* out_idx)
         return true;
     }
     return false;
+}
+
+bool active_live_session_matches(std::uint32_t pid, const std::string& session_id)
+{
+    if (pid == 0 || session_id.empty()) return false;
+    std::lock_guard<std::mutex> lock(state().mutex);
+    if (state().active_idx < 0 ||
+        static_cast<size_t>(state().active_idx) >= state().sessions.size())
+        return false;
+    const auto& session = state().sessions[static_cast<size_t>(state().active_idx)];
+    if (!session || session->attached_pid != pid || session->id != session_id ||
+        session->load_state != session_load_state_t::ready || !session->workspace)
+        return false;
+    const auto process_identity = session->workspace->identity().process();
+    return process_identity && process_identity->pid == pid;
 }
 
 void prune_lru(size_t max_keep)

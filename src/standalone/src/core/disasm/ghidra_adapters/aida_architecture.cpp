@@ -1,12 +1,14 @@
 #ifdef _MSC_VER
 #pragma warning(push)
-#pragma warning(disable: 4005 4244 4267 4146 4996 4458 4457 4100 4127 4389)
+#pragma warning(disable: 4005 4099 4244 4267 4146 4996 4458 4457 4100 4127 4389)
 #endif
 
 #include "aida_architecture.hpp"
 #include "aida_load_image.hpp"
 #include "aida_scope.hpp"
 #include "aida_comment_database.hpp"
+
+#include "aida_ghidra_preamble.hpp"
 
 #include "funcdata.hh"
 #include "coreaction.hh"

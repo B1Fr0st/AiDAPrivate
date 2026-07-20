@@ -1,5 +1,6 @@
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/studio_semantics.hpp"
 #else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -12,6 +13,7 @@
 
 #include "scanner_view.hpp"
 #include "../network_view.hpp"
+#include "../human_request_editor.hpp"
 #include "burp_ui_operation.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_routed.hpp"
@@ -26,6 +28,8 @@
 #include "../../ui/components.hpp"
 #include "../../ui/design_system.hpp"
 #include "../../ui/responsive.hpp"
+#include "../../ui/task_center.hpp"
+#include "../../ui/application_view_registry.hpp"
 #include "../../scanner/scanner_async_io.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_services.hpp"
@@ -35,12 +39,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace aida {
@@ -54,6 +61,12 @@ struct view_state_t
     char            new_url[1024] = {};
     char            new_raw[65536] = {};
     bool            new_open = false;
+    bool            new_dialog_requested = false;
+    bool            new_close_requested = false;
+    std::uint64_t   new_dialog_generation = 0;
+    std::uint64_t   new_close_dialog_generation = 0;
+    bool            audit_submission_pending = false;
+    bool            restore_scanner_focus = false;
     bool            scope_only = true;
     bool            follow_redirects = false;
     int             timeout_ms = 15000;
@@ -68,6 +81,7 @@ struct view_state_t
     char            filter_host[128] = {};
     char            filter_type[128] = {};
     char            status_msg[256] = {};
+    aida::ui::design::form_state_t new_audit_form;
     std::atomic<bool> initialized{false};
     std::atomic<bool> initialization_requested{false};
     bool            initialization_attempted = false;
@@ -79,8 +93,70 @@ struct view_state_t
     aida::burp::ui_operation::state_t operation;
     std::uint64_t observed_operation_generation = 0;
     std::atomic<std::uint64_t> started_audit_id{0};
+    std::atomic<std::uint64_t> started_audit_dialog_generation{0};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reviewed_issue_identity;
+    std::unordered_set<std::uint64_t> task_center_audits;
+    std::unordered_set<std::uint64_t> terminal_audits;
 };
+
+constexpr std::size_t max_new_audit_url_bytes = 1023;
+constexpr std::size_t max_new_audit_request_bytes = 65535;
+
+bool valid_audit_url(std::string_view url)
+{
+    const std::size_t scheme_end = url.find("://");
+    if (scheme_end == std::string_view::npos)
+        return false;
+    std::string scheme(url.substr(0, scheme_end));
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    if (scheme != "http" && scheme != "https")
+        return false;
+    const std::size_t host_begin = scheme_end + 3;
+    if (host_begin >= url.size())
+        return false;
+    const std::size_t host_end = url.find_first_of("/:?#", host_begin);
+    return (host_end == std::string_view::npos ? url.size() : host_end) > host_begin;
+}
+
+void validate_new_audit(view_state_t& state, std::size_t enabled_module_count)
+{
+    state.new_audit_form.clear();
+    const std::string_view url(state.new_url);
+    const std::string_view raw(state.new_raw);
+    if (url.empty())
+        state.new_audit_form.reject("scanner-new-url", "Enter the exact HTTP or HTTPS target URL.");
+    else if (!valid_audit_url(url))
+        state.new_audit_form.reject("scanner-new-url", "Use an absolute HTTP or HTTPS URL with a host.");
+    if (raw.empty())
+        state.new_audit_form.reject("scanner-new-request", "Enter the HTTP/1.1 request to audit.");
+    else {
+        const std::size_t line_end = raw.find_first_of("\r\n");
+        const std::string_view request_line = raw.substr(0, line_end);
+        const std::size_t first_space = request_line.find(' ');
+        const std::size_t second_space = first_space == std::string_view::npos
+            ? std::string_view::npos : request_line.find(' ', first_space + 1);
+        if (first_space == 0 || first_space == std::string_view::npos ||
+            second_space == std::string_view::npos || second_space == first_space + 1 ||
+            second_space + 1 >= request_line.size())
+            state.new_audit_form.reject("scanner-new-request",
+                "The first line must contain method, request target, and HTTP version.");
+        else if (raw.find("\r\n\r\n") == std::string_view::npos)
+            state.new_audit_form.reject("scanner-new-request",
+                "Terminate the HTTP header block with an empty CRLF line.");
+    }
+    if (state.timeout_ms < 100 || state.timeout_ms > 300000)
+        state.new_audit_form.reject("scanner-new-timeout", "Use a timeout from 100 to 300000 ms.");
+    if (state.max_concurrent < 1 || state.max_concurrent > 64)
+        state.new_audit_form.reject("scanner-new-concurrency", "Use 1 to 64 parallel requests.");
+    if (state.throttle_ms < 0 || state.throttle_ms > 60000)
+        state.new_audit_form.reject("scanner-new-throttle", "Use a throttle from 0 to 60000 ms.");
+    if (state.per_module_cap < 1 || state.per_module_cap > 100000)
+        state.new_audit_form.reject("scanner-new-module-cap", "Use a per-module cap from 1 to 100000.");
+    if (enabled_module_count == 0)
+        state.new_audit_form.reject("scanner-new-modules", "Enable at least one Scanner module.");
+}
 
 view_state_t& vs()
 {
@@ -230,8 +306,8 @@ void submit_reviewed_issue_clear(std::vector<std::pair<std::uint64_t, std::uint6
     static_cast<void>(vs().operation.submit(std::move(request)));
 }
 
-void submit_audit(std::vector<std::uint8_t> raw, std::string url,
-    active_scanner::audit_config_t config)
+bool submit_audit(std::vector<std::uint8_t> raw, std::string url,
+    active_scanner::audit_config_t config, std::uint64_t dialog_generation)
 {
     aida::burp::ui_operation::request_t request;
     request.owner = "burp.scanner";
@@ -241,17 +317,20 @@ void submit_audit(std::vector<std::uint8_t> raw, std::string url,
     request.target = url;
     request.affected_entity = url;
     request.execute = [raw = std::move(raw), url = std::move(url),
-                       config = std::move(config)]() mutable {
+                       config = std::move(config), dialog_generation]() mutable {
         aida::burp::ui_operation::result_t result;
         const std::uint64_t id = active_scanner::enqueue_target(raw, url, config);
         result.success = id != 0;
         result.message = result.success ? "Scanner audit started."
                                         : active_scanner::last_error();
-        if (id != 0)
+        if (id != 0) {
+            vs().started_audit_dialog_generation.store(dialog_generation,
+                std::memory_order_release);
             vs().started_audit_id.store(id, std::memory_order_release);
+        }
         return result;
     };
-    static_cast<void>(vs().operation.submit(std::move(request)));
+    return vs().operation.submit(std::move(request));
 }
 
 void submit_passive_toggle(bool reviewed, bool desired)
@@ -329,6 +408,31 @@ ImU32 conf_color(confidence_t c, float a)
     return identity;
 }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string semantic_identity_id(
+    std::string_view kind, const ::network_view::artifact_identity_t& identity)
+{
+    const std::string retained = identity.id + ":" +
+        std::to_string(identity.timestamp) + ":" +
+        std::to_string(identity.revision) + ":" +
+        std::to_string(identity.content_hash) + ":" +
+        std::to_string(identity.content_size);
+    return aida::preview::semantics::stable_id(
+        "aida.network", std::string(kind) + "-" +
+            aida::preview::semantics::entity_token(retained));
+}
+
+std::string semantic_finding_id(const issue_t& issue)
+{
+    const std::string retained = std::to_string(issue.id) + ":" +
+        std::to_string(issue.seen_ms) + ":" + issue.type_key + ":" +
+        issue.host + ":" + issue.path + ":" + issue.name;
+    return aida::preview::semantics::stable_id(
+        "aida.network", "scanner-finding-" +
+            aida::preview::semantics::entity_token(retained));
+}
+#endif
+
 void render_evidence_artifact(const issue_t& issue, std::size_t evidence_index,
     bool response, float alpha)
 {
@@ -357,6 +461,15 @@ void render_evidence_artifact(const issue_t& issue, std::size_t evidence_index,
         ::network_view::open_exchange_context(primary, related, origin);
     }
     ImGui::EndChild();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const auto identity = evidence_identity(issue, evidence_index, response);
+    const std::string finding_id = semantic_finding_id(issue);
+    if (ImGui::IsItemVisible())
+        aida::preview::semantics::register_last_item(
+            semantic_identity_id(response ? "response" : "request", identity),
+            response ? "network-response-editor" : "network-request-editor",
+            false, false, finding_id);
+#endif
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Right-click, Menu, or Shift+F10 for request/response actions");
     ImGui::PopID();
@@ -375,6 +488,69 @@ void render_audits_pane(float w, float h, float alpha)
     ImGui::Spacing();
 
     auto audits = active_scanner::list_audits();
+    std::unordered_set<std::uint64_t> visible_audits;
+    visible_audits.reserve(audits.size());
+    for (const auto& audit : audits) {
+        visible_audits.insert(audit.id);
+        const std::string task_id = "network.scanner.audit." + std::to_string(audit.id);
+        const float audit_progress = audit.total_probes == 0
+            ? -1.0f : (std::min)(1.0f, static_cast<float>(audit.completed_probes) /
+                static_cast<float>(audit.total_probes));
+        if (audit.running && s.task_center_audits.insert(audit.id).second) {
+            aida::ui::task_center::task_registration_t registration;
+            registration.id = task_id;
+            registration.owner = "network.scanner";
+            registration.owner_view = "view.network.scanner";
+            registration.owner_action = "network.scanner.cancel_audit";
+            registration.label = "Scanner audit: " + audit.host;
+            registration.stage = "Running active audit";
+            registration.cancellation_is_safe = true;
+            registration.callbacks.cancel = [id = audit.id] {
+                return active_scanner::cancel_audit(id);
+            };
+            registration.callbacks.focus = [] {
+                (void)aida::ui::application_views::open_or_focus(
+                    aida::ui::stable_view_id_t("view.network.scanner"));
+            };
+            if (!aida::ui::task_center::register_task(std::move(registration)))
+                s.task_center_audits.erase(audit.id);
+            else
+                static_cast<void>(aida::ui::task_center::update_task(task_id,
+                    aida::ui::task_center::task_state_t::running, audit_progress,
+                    "Running active audit"));
+        } else if (audit.running && s.task_center_audits.count(audit.id) != 0U) {
+            static_cast<void>(aida::ui::task_center::update_task(task_id,
+                aida::ui::task_center::task_state_t::running, audit_progress,
+                "Running active audit"));
+        } else if (!audit.running && s.task_center_audits.count(audit.id) != 0U &&
+                   s.terminal_audits.insert(audit.id).second) {
+            const bool transport_failed = !audit.cancelled &&
+                audit.responses_received == 0 && audit.transport_failures != 0;
+            static_cast<void>(aida::ui::task_center::update_task(task_id,
+                audit.cancelled ? aida::ui::task_center::task_state_t::cancelled
+                                : transport_failed
+                                ? aida::ui::task_center::task_state_t::failed
+                                : aida::ui::task_center::task_state_t::completed,
+                1.0f, audit.cancelled ? "Cancelled" : transport_failed
+                    ? "Transport failed" : "Completed",
+                transport_failed ? audit.last_transport_error : std::string{}));
+            s.task_center_audits.erase(audit.id);
+        }
+    }
+    for (auto it = s.task_center_audits.begin(); it != s.task_center_audits.end();) {
+        if (visible_audits.count(*it) != 0U) {
+            ++it;
+            continue;
+        }
+        const std::string task_id = "network.scanner.audit." + std::to_string(*it);
+        static_cast<void>(aida::ui::task_center::update_task(task_id,
+            aida::ui::task_center::task_state_t::interrupted, 1.0f,
+            "Audit no longer exists in the scanner registry"));
+        it = s.task_center_audits.erase(it);
+    }
+    constexpr std::size_t maximum_terminal_audits = 4096U;
+    while (s.terminal_audits.size() > maximum_terminal_audits)
+        s.terminal_audits.erase(s.terminal_audits.begin());
     const bool compact_rows = w < 400.f;
     const float line_h = ImGui::GetTextLineHeight();
     const float primary_y = 4.f;
@@ -552,7 +728,9 @@ void render_issues_pane(float w, float h, float alpha)
 
     const float content_top = ImGui::GetCursorPosY();
     const float remaining_h = std::max(1.f, h - content_top);
-    const float list_h = std::max(72.f, remaining_h * 0.55f);
+    const float split_gap = std::min(8.f, std::max(0.f, remaining_h - 2.f));
+    const float usable_h = std::max(2.f, remaining_h - split_gap);
+    const float list_h = std::max(1.f, usable_h * 0.55f);
 
     ImGui::BeginChild("##burp_issue_list", ImVec2(std::max(1.f, w - 4.f), list_h),
         false, ImGuiWindowFlags_NoBackground);
@@ -615,6 +793,15 @@ void render_issues_pane(float w, float h, float alpha)
         float abs_ry = ImGui::GetCursorScreenPos().y;
         bool hovered = ImGui::IsMouseHoveringRect(
             ImVec2(lo.x, abs_ry), ImVec2(lo.x + table_w, abs_ry + row_h), false);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        ImGui::PushID(row);
+        const ImGuiID finding_row_id = ImGui::GetID("##scanner_finding_row");
+        ImGui::PopID();
+        aida::preview::semantics::register_region(
+            semantic_finding_id(it), "network-scanner-finding", finding_row_id,
+            ImVec2(lo.x, abs_ry), ImVec2(lo.x + table_w, abs_ry + row_h), false, false,
+            "aida.dock-window.view.network.scanner");
+#endif
         bool selected = (s.selected_issue_id == it.id);
         if (selected) {
             dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + table_w, abs_ry + row_h),
@@ -662,9 +849,10 @@ void render_issues_pane(float w, float h, float alpha)
     ImGui::Dummy(ImVec2(0.f, 0.f));
     ImGui::EndChild();
 
-    ImGui::Spacing();
+    if (split_gap > 0.f)
+        ImGui::Dummy(ImVec2(0.f, split_gap));
 
-    const float detail_h = std::max(80.f, remaining_h - list_h - 16.f);
+    const float detail_h = std::max(1.f, usable_h - list_h);
     ImGui::BeginChild("##burp_issue_detail", ImVec2(std::max(1.f, w - 4.f), detail_h),
         false, ImGuiWindowFlags_NoBackground);
     const auto selected_it = std::find_if(issues->begin(), issues->end(),
@@ -736,114 +924,199 @@ void render_new_audit_dialog(float alpha)
 {
     auto& s = vs();
     const auto& th = aida::ui::resolved();
-    if (!s.new_open) return;
-
-    ImGui::SetNextWindowSize(ImVec2(620.f, 540.f), ImGuiCond_Once);
-    if (ImGui::Begin("New Audit##burp_new", &s.new_open,
-                     ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Target URL");
-        aida::ui::input_text("##na_url", s.new_url, sizeof(s.new_url),
-                              "https://example.com/path?id=1", false, ImVec2(580.f, 28.f));
-        ImGui::Spacing();
-
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Raw Request (HTTP/1.1 textual)");
-        ImGui::InputTextMultiline("##na_raw", s.new_raw, sizeof(s.new_raw),
-                                  ImVec2(580.f, 220.f));
-
-        ImGui::Spacing();
-        aida::ui::toggle_switch("##na_scope", &s.scope_only);
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Scope only");
-        ImGui::SameLine();
-        aida::ui::toggle_switch("##na_redir", &s.follow_redirects);
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Follow redirects");
-        ImGui::Spacing();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Timeout(ms):");
-        ImGui::SameLine();
-        aida::ui::input_int("##na_to", &s.timeout_ms, ImVec2(120.f, 28.f));
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Max parallel:");
-        ImGui::SameLine();
-        aida::ui::input_int("##na_par", &s.max_concurrent, ImVec2(80.f, 28.f));
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Throttle:");
-        ImGui::SameLine();
-        aida::ui::input_int("##na_th", &s.throttle_ms, ImVec2(80.f, 28.f));
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Per-module cap:");
-        ImGui::SameLine();
-        aida::ui::input_int("##na_cap", &s.per_module_cap, ImVec2(80.f, 28.f));
-
-        ImGui::Spacing();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Enabled modules:");
-        auto modules = scanner::all_modules();
-        ImGui::BeginChild("##na_mods", ImVec2(580.f, 100.f), true, ImGuiWindowFlags_NoBackground);
-        for (auto& m : modules) {
-            bool en = s.module_disabled.find(m.id) == s.module_disabled.end();
-            ImGui::PushID(m.id.c_str());
-            if (ImGui::Checkbox(m.name.c_str(), &en)) {
-                if (en) s.module_disabled.erase(m.id);
-                else    s.module_disabled.insert(m.id);
-            }
-            ImGui::PopID();
-            ImGui::SameLine(220.f);
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                               "[%s] %s", m.category.c_str(), m.id.c_str());
-        }
-        ImGui::EndChild();
-
-        ImGui::Spacing();
-        ImGui::BeginDisabled(s.operation.pending());
-        if (aida::ui::button("Start Audit", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-            std::string url = s.new_url;
-            std::string raw = s.new_raw;
-            if (url.empty() || raw.empty()) {
-                _snprintf_s(s.status_msg, sizeof(s.status_msg), _TRUNCATE,
-                            "Provide URL and raw request.");
-            } else {
-                std::vector<uint8_t> raw_bytes(raw.begin(), raw.end());
-                if (raw_bytes.size() < 4 ||
-                    !(raw_bytes[raw_bytes.size() - 4] == '\r' && raw_bytes[raw_bytes.size() - 3] == '\n' &&
-                      raw_bytes[raw_bytes.size() - 2] == '\r' && raw_bytes[raw_bytes.size() - 1] == '\n')) {
-                    raw_bytes.push_back('\r'); raw_bytes.push_back('\n');
-                    raw_bytes.push_back('\r'); raw_bytes.push_back('\n');
-                }
-                active_scanner::audit_config_t cfg;
-                cfg.scope_only = s.scope_only;
-                cfg.follow_redirects = s.follow_redirects;
-                cfg.timeout_ms = s.timeout_ms;
-                cfg.max_concurrent_requests = static_cast<size_t>(std::max(1, s.max_concurrent));
-                cfg.request_throttle_ms = static_cast<size_t>(std::max(0, s.throttle_ms));
-                cfg.per_module_request_cap = static_cast<size_t>(std::max(1, s.per_module_cap));
-                for (auto& m : modules) {
-                    if (s.module_disabled.find(m.id) == s.module_disabled.end())
-                        cfg.enabled_modules.push_back(m.id);
-                }
-                submit_audit(std::move(raw_bytes), std::move(url), std::move(cfg));
-            }
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            s.new_open = false;
-        }
-        if (s.status_msg[0]) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                               "%s", s.status_msg);
-        }
+    if (s.new_dialog_requested) {
+        aida::ui::design::open_dialog("dialog.network_scanner_new", "New Scanner Audit");
+        s.new_dialog_requested = false;
     }
-    ImGui::End();
+    if (!s.new_open)
+        return;
+
+    auto modules = scanner::all_modules();
+    const std::size_t enabled_module_count = static_cast<std::size_t>(std::count_if(
+        modules.begin(), modules.end(), [&s](const auto& module) {
+            return s.module_disabled.find(module.id) == s.module_disabled.end();
+        }));
+    validate_new_audit(s, enabled_module_count);
+    if (aida::ui::design::begin_dialog("dialog.network_scanner_new",
+        "New Scanner Audit", ImVec2(680.f, 720.f), ImVec2(420.f, 360.f))) {
+        static network_view::human_request_editor::fixed_state_t request_editor;
+        network_view::human_request_editor::render_result_t request_editor_result;
+        const bool pending = s.audit_submission_pending;
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Start Audit");
+        if (aida::ui::design::begin_dialog_body("network-scanner-new-body", footer)) {
+            ImGui::BeginDisabled(pending);
+            aida::ui::design::form_input_text("scanner-new-url", "Target URL", s.new_url,
+                sizeof(s.new_url), s.new_audit_form, "https://example.com/path?id=1");
+            aida::ui::design::text(aida::ui::design::text_role_t::secondary,
+                "Raw Request (HTTP/1.1 textual)");
+            if (s.new_audit_form.consume_focus_request("scanner-new-request"))
+                ImGui::SetKeyboardFocusHere();
+            network_view::human_request_editor::render_config_t request_config;
+            request_config.stable_id = "scanner-new-request";
+            request_config.size = ImVec2(-FLT_MIN,
+                (std::max)(140.f, ImGui::GetContentRegionAvail().y * 0.34f));
+            request_config.max_bytes = sizeof(s.new_raw) - 1;
+            request_config.editable = !pending;
+            request_editor_result = network_view::human_request_editor::render_fixed(
+                request_editor,
+                "scanner.new-request." + std::to_string(s.new_dialog_generation),
+                s.new_raw, request_config);
+            aida::ui::design::inline_validation("scanner-new-request", s.new_audit_form);
+
+            ImGui::Spacing();
+            ImGui::PushID("scanner-new-options");
+            aida::ui::toggle_switch("##scope", &s.scope_only);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                "aida.form-field.scanner-new-scope", "form-field"));
+#endif
+            ImGui::SameLine();
+            ImGui::TextUnformatted("Scope only");
+            ImGui::SameLine(0.f, aida::ui::design::metrics().spacing_lg);
+            aida::ui::toggle_switch("##redirects", &s.follow_redirects);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                "aida.form-field.scanner-new-redirects", "form-field"));
+#endif
+            ImGui::SameLine();
+            ImGui::TextUnformatted("Follow redirects");
+            ImGui::PopID();
+
+            if (ImGui::BeginTable("##scanner-new-limits", 2,
+                ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
+                ImGui::TableNextColumn();
+                aida::ui::design::form_input_int("scanner-new-timeout", "Timeout (ms)",
+                    s.timeout_ms, s.new_audit_form, 1000);
+                ImGui::TableNextColumn();
+                aida::ui::design::form_input_int("scanner-new-concurrency", "Max parallel",
+                    s.max_concurrent, s.new_audit_form);
+                ImGui::TableNextColumn();
+                aida::ui::design::form_input_int("scanner-new-throttle", "Throttle (ms)",
+                    s.throttle_ms, s.new_audit_form, 10);
+                ImGui::TableNextColumn();
+                aida::ui::design::form_input_int("scanner-new-module-cap", "Per-module cap",
+                    s.per_module_cap, s.new_audit_form);
+                ImGui::EndTable();
+            }
+
+            aida::ui::design::text(aida::ui::design::text_role_t::secondary,
+                "Enabled modules");
+            if (ImGui::BeginChild("##scanner-new-modules", ImVec2(0.f, 132.f),
+                ImGuiChildFlags_Borders, ImGuiWindowFlags_NoSavedSettings)) {
+                const float row_height = ImGui::GetTextLineHeightWithSpacing();
+                aida::ui::design::render_clipped_rows(modules.size(), row_height,
+                    [&s, &modules, alpha, &th](std::size_t index) {
+                        const auto& module = modules[index];
+                        bool enabled = s.module_disabled.find(module.id) == s.module_disabled.end();
+                        ImGui::PushID(module.id.c_str());
+                        if (ImGui::Checkbox(module.name.c_str(), &enabled)) {
+                            if (enabled)
+                                s.module_disabled.erase(module.id);
+                            else
+                                s.module_disabled.insert(module.id);
+                        }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                        static_cast<void>(aida::preview::semantics::register_last_item(
+                            aida::preview::semantics::stable_id(
+                                "aida.form-field.scanner-new-module", module.id), "form-field"));
+#endif
+                        ImGui::SameLine((std::min)(220.f, ImGui::GetContentRegionAvail().x * 0.48f));
+                        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+                            aida::ui::with_alpha(th.text_dim, alpha)), "[%s] %s",
+                            module.category.c_str(), module.id.c_str());
+                        ImGui::PopID();
+                    });
+            }
+            ImGui::EndChild();
+            aida::ui::design::inline_validation("scanner-new-modules", s.new_audit_form);
+            ImGui::EndDisabled();
+
+            aida::ui::design::form_summary("scanner-new-summary", s.new_audit_form);
+            if (pending)
+                aida::ui::components::inline_notice("scanner-new-pending", "Starting audit",
+                    "The reviewed target and request are queued in Task Center.",
+                    aida::ui::components::status_kind_t::accent);
+            else if (!s.initialized.load(std::memory_order_acquire))
+                aida::ui::components::inline_notice("scanner-new-unavailable",
+                    s.operation.pending() ? "Scanner is loading" : "Scanner unavailable",
+                    s.operation.pending() ? "Initialization is running in Task Center."
+                                          : "Retry Scanner initialization before starting an audit.",
+                    s.operation.pending() ? aida::ui::components::status_kind_t::accent
+                                          : aida::ui::components::status_kind_t::error);
+            else if (s.status_msg[0])
+                aida::ui::components::inline_notice("scanner-new-status", "Scanner",
+                    s.status_msg, aida::ui::components::status_kind_t::warning);
+        }
+        aida::ui::design::end_dialog_body();
+
+        if (s.new_close_requested &&
+            s.new_close_dialog_generation == s.new_dialog_generation) {
+            s.new_close_requested = false;
+            s.new_close_dialog_generation = 0;
+            s.new_open = false;
+            s.restore_scanner_focus = true;
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            ImGui::SetWindowFocus();
+            s.restore_scanner_focus = false;
+            return;
+        }
+        if (s.new_close_requested) {
+            s.new_close_requested = false;
+            s.new_close_dialog_generation = 0;
+        }
+
+        const std::size_t current_enabled_module_count = static_cast<std::size_t>(
+            std::count_if(modules.begin(), modules.end(), [&s](const auto& module) {
+                return s.module_disabled.find(module.id) == s.module_disabled.end();
+            }));
+        validate_new_audit(s, current_enabled_module_count);
+        const bool can_submit = s.new_audit_form.valid() && !pending &&
+            !s.operation.pending() && s.initialized.load(std::memory_order_acquire) &&
+            request_editor_result.valid && !request_editor_result.has_unapplied_pretty;
+        const auto result = aida::ui::design::dialog_footer("network-scanner-new-footer",
+            "Start Audit", can_submit, false, "Cancel", !pending, can_submit);
+        if (!s.new_audit_form.valid() && !pending && !ImGui::GetIO().WantTextInput &&
+            (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+             ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
+            s.new_audit_form.request_first_invalid_focus();
+        if (result.confirmed) {
+            std::string url(s.new_url);
+            std::string raw(s.new_raw);
+            std::vector<std::uint8_t> raw_bytes(raw.begin(), raw.end());
+            active_scanner::audit_config_t config;
+            config.scope_only = s.scope_only;
+            config.follow_redirects = s.follow_redirects;
+            config.timeout_ms = s.timeout_ms;
+            config.max_concurrent_requests = static_cast<std::size_t>(s.max_concurrent);
+            config.request_throttle_ms = static_cast<std::size_t>(s.throttle_ms);
+            config.per_module_request_cap = static_cast<std::size_t>(s.per_module_cap);
+            config.max_concurrent_explicit = true;
+            config.request_throttle_explicit = true;
+            for (const auto& module : modules) {
+                if (s.module_disabled.find(module.id) == s.module_disabled.end())
+                    config.enabled_modules.push_back(module.id);
+            }
+            s.status_msg[0] = '\0';
+            s.audit_submission_pending = submit_audit(
+                std::move(raw_bytes), std::move(url), std::move(config),
+                s.new_dialog_generation);
+            if (!s.audit_submission_pending) {
+                _snprintf_s(s.status_msg, sizeof(s.status_msg), _TRUNCATE,
+                    "Task Center rejected the audit request; review the active operation and retry.");
+            }
+        }
+        if (result.cancelled && !s.audit_submission_pending) {
+            s.new_open = false;
+            s.restore_scanner_focus = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (s.restore_scanner_focus) {
+        ImGui::SetWindowFocus();
+        s.restore_scanner_focus = false;
+    }
 }
 
 }
@@ -875,11 +1148,22 @@ void shutdown()
 bool open_new_audit_with(const std::string& url, const std::string& raw_request)
 {
     auto& s = vs();
-    _snprintf_s(s.new_url, sizeof(s.new_url), _TRUNCATE, "%s", url.c_str());
-    size_t copy_len = std::min(raw_request.size(), sizeof(s.new_raw) - 1);
-    std::memcpy(s.new_raw, raw_request.data(), copy_len);
-    s.new_raw[copy_len] = '\0';
+    if (s.new_open || url.size() > max_new_audit_url_bytes ||
+        raw_request.size() > max_new_audit_request_bytes ||
+        url.find('\0') != std::string::npos || raw_request.find('\0') != std::string::npos)
+        return false;
+    std::memcpy(s.new_url, url.data(), url.size());
+    s.new_url[url.size()] = '\0';
+    std::memcpy(s.new_raw, raw_request.data(), raw_request.size());
+    s.new_raw[raw_request.size()] = '\0';
+    s.status_msg[0] = '\0';
+    ++s.new_dialog_generation;
+    if (s.new_dialog_generation == 0)
+        ++s.new_dialog_generation;
+    s.new_close_requested = false;
+    s.new_close_dialog_generation = 0;
     s.new_open = true;
+    s.new_dialog_requested = true;
     return true;
 }
 
@@ -943,25 +1227,49 @@ void render(float pos_x, float pos_y, float width, float height,
         if (operation_completion->result.success) {
             const std::uint64_t audit_id = vs().started_audit_id.exchange(0,
                 std::memory_order_acq_rel);
+            const std::uint64_t dialog_generation =
+                vs().started_audit_dialog_generation.exchange(0,
+                    std::memory_order_acq_rel);
             if (audit_id != 0) {
                 vs().selected_audit_id = audit_id;
-                vs().new_open = false;
+                if (vs().new_open && dialog_generation == vs().new_dialog_generation) {
+                    vs().new_close_requested = true;
+                    vs().new_close_dialog_generation = dialog_generation;
+                }
             }
             vs().issues_filter_signature.clear();
             if (operation_completion->result.message.find("cleared") != std::string::npos)
                 vs().selected_issue_id = 0;
         }
+        if (vs().audit_submission_pending)
+            vs().audit_submission_pending = false;
         _snprintf_s(vs().status_msg, sizeof(vs().status_msg), _TRUNCATE,
             "%s", operation_completion->result.message.c_str());
     }
     const auto& th = aida::ui::resolved();
+    const float density_scale = std::max(1.f, ImGui::GetFontSize() / 16.f);
+    const bool compact_toolbar = width < 760.f * density_scale;
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
-    ImGui::BeginChild("##burp_scanner_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
+    ImGui::BeginChild("##burp_scanner_root", ImVec2(width, height), false,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::SetScrollY(0.f);
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                        "Scanner");
+    continue_toolbar_line(toolbar_button_width("New Audit"));
+    if (aida::ui::button("New Audit", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+        ++vs().new_dialog_generation;
+        if (vs().new_dialog_generation == 0)
+            ++vs().new_dialog_generation;
+        vs().new_close_requested = false;
+        vs().new_close_dialog_generation = 0;
+        vs().new_open = true;
+        vs().new_dialog_requested = true;
+        vs().status_msg[0] = '\0';
+    }
     if (!vs().initialized.load(std::memory_order_acquire) && operation_completion &&
         !operation_completion->result.success && !vs().operation.pending()) {
         continue_toolbar_line(toolbar_button_width("Retry initialization"));
@@ -969,11 +1277,8 @@ void render(float pos_x, float pos_y, float width, float height,
             aida::ui::size_t_::sm))
             submit_initialization();
     }
-    continue_toolbar_line(toolbar_button_width("New Audit"));
-    if (aida::ui::button("New Audit", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-        vs().new_open = true;
-    }
-    continue_toolbar_line(toolbar_button_width("Export Issues"));
+    if (!compact_toolbar)
+        continue_toolbar_line(toolbar_button_width("Export Issues"));
     ImGui::BeginDisabled(vs().operation.pending() ||
         !vs().initialized.load(std::memory_order_acquire));
     if (aida::ui::button("Export Issues", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
@@ -994,7 +1299,8 @@ void render(float pos_x, float pos_y, float width, float height,
     }
     ImGui::EndDisabled();
     const float passive_width = 42.f + 6.f + ImGui::CalcTextSize("Passive").x;
-    continue_toolbar_line(passive_width);
+    if (!compact_toolbar)
+        continue_toolbar_line(passive_width);
     const bool passive_before = passive_scanner::is_enabled();
     bool passive = passive_before;
     ImGui::BeginDisabled(vs().operation.pending());
@@ -1024,32 +1330,41 @@ void render(float pos_x, float pos_y, float width, float height,
 
     const float panes_y = ImGui::GetCursorPosY() + 6.f;
     const float panes_h = std::max(1.f, height - panes_y);
-    const float density_scale = std::max(1.f, ImGui::GetFontSize() / 16.f);
     const float pane_gap = std::max(8.f, ImGui::GetStyle().ItemSpacing.x);
     const bool stack_panes = width < 760.f * density_scale;
     const float pane_w = std::max(1.f, width);
-    const float left_w = stack_panes
-        ? pane_w : std::max(1.f, width * 0.36f - pane_gap);
-    const float right_w = stack_panes
-        ? pane_w : std::max(1.f, width - left_w - pane_gap * 2.f);
-    const float left_h = stack_panes
-        ? std::min(240.f * density_scale,
-            std::max(160.f * density_scale, panes_h * 0.32f)) : panes_h;
-    const float right_h = stack_panes
-        ? std::max(220.f * density_scale, panes_h - left_h - pane_gap) : panes_h;
-
     ImGui::SetCursorPos(ImVec2(0.f, panes_y));
-    ImGui::BeginChild("##burp_left", ImVec2(left_w, left_h), false, ImGuiWindowFlags_NoBackground);
-    render_audits_pane(left_w, left_h, alpha);
-    ImGui::EndChild();
+    if (stack_panes) {
+        ImGui::BeginChild("##burp_compact_panes", ImVec2(pane_w, panes_h), false,
+            ImGuiWindowFlags_NoBackground);
+        if (ImGui::BeginTabBar("##burp_scanner_compact_tabs")) {
+            if (ImGui::BeginTabItem("Audits")) {
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                render_audits_pane(std::max(1.f, avail.x), std::max(1.f, avail.y), alpha);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Issues")) {
+                const ImVec2 avail = ImGui::GetContentRegionAvail();
+                render_issues_pane(std::max(1.f, avail.x), std::max(1.f, avail.y), alpha);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::EndChild();
+    } else {
+        const float left_w = std::max(1.f, width * 0.36f - pane_gap);
+        const float right_w = std::max(1.f, width - left_w - pane_gap * 2.f);
+        ImGui::BeginChild("##burp_left", ImVec2(left_w, panes_h), false,
+            ImGuiWindowFlags_NoBackground);
+        render_audits_pane(left_w, panes_h, alpha);
+        ImGui::EndChild();
 
-    const ImVec2 right_pos = stack_panes
-        ? ImVec2(0.f, panes_y + left_h + pane_gap)
-        : ImVec2(left_w + pane_gap, panes_y);
-    ImGui::SetCursorPos(right_pos);
-    ImGui::BeginChild("##burp_right", ImVec2(right_w, right_h), false, ImGuiWindowFlags_NoBackground);
-    render_issues_pane(right_w, right_h, alpha);
-    ImGui::EndChild();
+        ImGui::SetCursorPos(ImVec2(left_w + pane_gap, panes_y));
+        ImGui::BeginChild("##burp_right", ImVec2(right_w, panes_h), false,
+            ImGuiWindowFlags_NoBackground);
+        render_issues_pane(right_w, panes_h, alpha);
+        ImGui::EndChild();
+    }
 
     if (aida::ui::design::begin_dialog_exact("Review Scanner issue clearing",
         ImVec2(540.f, 300.f), ImVec2(420.f, 240.f))) {

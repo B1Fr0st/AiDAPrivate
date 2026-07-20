@@ -13,6 +13,9 @@
 #include "../ui/empty_state.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/theme.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 #include "imgui/imgui.h"
 
 #include <algorithm>
@@ -53,6 +56,14 @@ inline std::string row_identity(const row_t& row) {
         std::to_string(row.address) + ":" + row.name + ":" + row.context + ":" +
         row.detail;
 }
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline std::string semantic_row_identity(const row_t& row) {
+    return row.has_address
+        ? std::string("address:") + std::to_string(row.address)
+        : std::string("entity:") + row.name + ":" + row.context;
+}
+#endif
 
 struct state_t {
     bool projected = false;
@@ -429,9 +440,9 @@ inline void open_related_view(const row_t& row,
     aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(stable_id));
 }
 
-inline void open_context(const row_t& row,
+inline aida::ui::analysis_context_menu::context_t make_context(
+                         const row_t& row,
                          const disasm_view::workspace_context_t& context,
-                         aida::ui::context_menu_open_origin_t origin,
                          std::function<aida::ui::capability_state_t()> validate_identity) {
     using namespace aida::ui::analysis_context_menu;
     using aida::ui::action_handler_result_t;
@@ -511,7 +522,15 @@ inline void open_context(const row_t& row,
         ImGui::SetClipboardText(value.c_str());
         return action_handler_result_t::completed();
     };
-    open(std::move(menu), origin);
+    return menu;
+}
+
+inline void open_context(const row_t& row,
+                         const disasm_view::workspace_context_t& context,
+                         aida::ui::context_menu_open_origin_t origin,
+                         std::function<aida::ui::capability_state_t()> validate_identity) {
+    aida::ui::analysis_context_menu::open(
+        make_context(row, context, std::move(validate_identity)), origin);
 }
 
 inline void render(domain_t domain) {
@@ -638,6 +657,15 @@ inline void render(domain_t domain) {
                 const bool activated = ImGui::Selectable("##row", selected,
                     ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick,
                     ImVec2(0.0f, 20.0f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string row_semantic = aida::preview::semantics::stable_id(
+                    aida::preview::semantics::stable_id("aida.analysis-row", info.stable_id),
+                    aida::preview::semantics::entity_token(semantic_row_identity(row)));
+				const std::string parent_semantic = aida::preview::semantics::stable_id(
+					"aida.dock-window", info.stable_id);
+                static_cast<void>(aida::preview::semantics::register_last_item(row_semantic,
+                    "analysis-entity-row", false, false, parent_semantic));
+#endif
                 if (activated) {
                     select_row(row, *state, source, context);
                     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
@@ -692,8 +720,8 @@ inline void render(domain_t domain) {
             select_row(state->rows[source], *state, source, context);
             state->page = static_cast<std::size_t>(position) / state->page_size;
         }
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
-            ImGui::SetClipboardText(selected->name.c_str());
+        selected = state->selected_source < state->rows.size()
+            ? &state->rows[state->selected_source] : nullptr;
     }
     aida::ui::context_menu_open_origin_t keyboard_origin{};
     const bool request_keyboard_context = selected && accepts_shortcuts &&
@@ -708,6 +736,11 @@ inline void render(domain_t domain) {
             : aida::ui::capability_state_t::unavailable(
                 "The selected analysis-list entity changed");
     };
+    if (selected && accepts_shortcuts && ImGui::GetIO().KeyCtrl &&
+        (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
+        aida::ui::analysis_context_menu::execute_shortcut(
+            make_context(*selected, context, selection_validator), "analysis.copy.name");
     if (request_pointer_context)
         open_context(context_row, context,
             aida::ui::context_menu_open_origin_t::pointer, selection_validator);

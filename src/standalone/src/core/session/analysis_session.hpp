@@ -118,7 +118,16 @@ aida::analysis::workspace_result_t<static_workspace_acquisition_t>
 acquire_static_workspace(
     const std::string& path,
     const aida::analysis::cancellation_token_t& cancel = {});
-bool open_attach_session(std::uint32_t pid, std::string* out_err);
+bool open_attach_session(
+    std::uint32_t pid,
+    std::string* out_err,
+    const aida::analysis::cancellation_token_t& cancel = {});
+bool reattach_session_exact(
+    const std::string& session_id,
+    std::uint32_t expected_pid,
+    std::uint64_t expected_process_creation_time_100ns,
+    std::string* out_err,
+    const aida::analysis::cancellation_token_t& cancel = {});
 bool switch_session(size_t idx);
 bool close_session(size_t idx);
 bool cancel_session(size_t idx);
@@ -150,6 +159,7 @@ aida::analysis::workspace_result_t<void> cancel_pdb(
 bool find_session_by_path(const std::string& path, size_t* out_idx);
 bool find_session_by_pid(std::uint32_t pid, size_t* out_idx);
 bool find_session_by_id(const std::string& session_id, size_t* out_idx);
+bool active_live_session_matches(std::uint32_t pid, const std::string& session_id);
 void prune_lru(size_t max_keep);
 const char* last_error();
 bool has_active_target();

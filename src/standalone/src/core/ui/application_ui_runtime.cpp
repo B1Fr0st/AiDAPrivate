@@ -16,6 +16,12 @@
 #include "../editor/programming_language_service.hpp"
 #include "../debugger/source_debug_service.hpp"
 #include "../debugger/debugger_engine.hpp"
+#include "../debugger/debugger_interaction_context.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/debugger_preview_runtime.hpp"
+#else
+#include "../runtime/standalone_driver.hpp"
+#endif
 #include "../infra/executor.hpp"
 #include "../session/analysis_session.hpp"
 #include "../settings/standalone_settings.hpp"
@@ -42,14 +48,18 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -87,9 +97,11 @@ constexpr const char* k_output_context_type = "context.output.view";
 constexpr const char* k_view_surface_context_type = "context.view.surface";
 constexpr const char* k_retained_entity_context_type = "context.retained.entity";
 constexpr const char* k_editor_scope = "scope.editor.text";
+constexpr const char* k_editor_review_scope = "scope.editor.review";
 constexpr const char* k_analysis_scope = "scope.analysis";
 constexpr const char* k_debugger_scope = "scope.debugger";
 constexpr const char* k_disassembly_scope = "scope.document.disassembly";
+constexpr const char* k_output_scope = "scope.output";
 constexpr const char* k_terminal_scope = "scope.terminal";
 constexpr const char* k_network_intercept_scope = "scope.view.network.intercept";
 constexpr const char* k_memory_scan_scope = "scope.view.memory.value_scan";
@@ -171,6 +183,8 @@ struct pending_action_confirmation_t {
     std::string description;
     std::string consequence;
     action_invocation_source_t source = action_invocation_source_t::command_palette;
+    interaction_context_t context;
+    retained_entity_runtime_context_t retained_context;
 };
 
 struct runtime_t {
@@ -213,7 +227,9 @@ struct runtime_t {
     bool initialized = false;
     bool editor_focused = false;
     bool editor_text_input = false;
-    int editor_hunk_index = -1;
+    bool editor_review_mode = false;
+    code_editor_widget::review_hunk_identity_t editor_hunk_target;
+    bool editor_hunk_target_explicit = false;
     bool shortcut_capture_active = false;
     std::string retained_entity_executed_owner;
     std::string retained_entity_executed_id;
@@ -248,10 +264,19 @@ capability_state_t editor_selection() {
         : capability_state_t::unavailable("Select text first");
 }
 
+capability_state_t licensed_save_capability() {
+	const auto gate = file_tabs::verify_licensed_save_gate();
+	return gate.succeeded ? capability_state_t::available()
+		: capability_state_t::unavailable(gate.detail);
+}
+
 capability_state_t editor_savable() {
     const auto editor = code_editor_widget::document_state();
     if (!editor.active)
         return capability_state_t::unavailable("Open or create a text document first");
+	const auto license_gate = licensed_save_capability();
+	if (!license_gate.enabled)
+		return license_gate;
     if (file_tabs::is_valid_tab_index(file_tabs::active_tab)) {
         const auto& tab = file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)];
 		if (tab.save_in_progress)
@@ -265,6 +290,116 @@ capability_state_t editor_savable() {
     return editor.filepath.empty()
         ? capability_state_t::unavailable("Use Save As to choose a path first")
         : capability_state_t::available();
+}
+
+enum class focused_edit_operation_t : std::uint8_t {
+	undo,
+	redo,
+	cut,
+	copy,
+	paste,
+	delete_selection,
+	select_all,
+	find,
+	replace,
+	go_to
+};
+
+bool focused_code_editor(const interaction_context_t& context) {
+	return context.active_view == stable_view_id_t("document.code") ||
+		runtime().editor_focused;
+}
+
+std::string focused_provider_action(focused_edit_operation_t operation,
+	const interaction_context_t& context) {
+	const std::string& view = context.active_view.value();
+	if (view == "view.terminal") {
+		if (operation == focused_edit_operation_t::paste) return "terminal.paste";
+		if (operation == focused_edit_operation_t::find) return "terminal.search";
+		return {};
+	}
+	const auto* descriptor = application_views::registry().find_descriptor(
+		context.active_view);
+	if (descriptor && descriptor->category == view_category_t::output) {
+		if (operation == focused_edit_operation_t::copy) return "output.copy_all";
+		if (operation == focused_edit_operation_t::select_all) return "output.select_all";
+		if (operation == focused_edit_operation_t::find) return "output.filter";
+		return {};
+	}
+	if (descriptor && (descriptor->category == view_category_t::analysis ||
+		descriptor->category == view_category_t::document)) {
+		if (operation == focused_edit_operation_t::undo) return "analysis.overlay.undo";
+		if (operation == focused_edit_operation_t::redo) return "analysis.overlay.redo";
+		if (operation == focused_edit_operation_t::go_to) return "analysis.navigate.goto";
+	}
+	return {};
+}
+
+capability_state_t focused_edit_capability(focused_edit_operation_t operation,
+	const interaction_context_t& context) {
+	if (focused_code_editor(context)) {
+		switch (operation) {
+			case focused_edit_operation_t::undo:
+				return code_editor_widget::can_undo() ? capability_state_t::available()
+					: capability_state_t::unavailable("Nothing to undo in the focused code editor");
+			case focused_edit_operation_t::redo:
+				return code_editor_widget::can_redo() ? capability_state_t::available()
+					: capability_state_t::unavailable("Nothing to redo in the focused code editor");
+			case focused_edit_operation_t::cut:
+			case focused_edit_operation_t::copy:
+				return editor_selection();
+			case focused_edit_operation_t::paste:
+				return code_editor_widget::can_paste() ? capability_state_t::available()
+					: capability_state_t::unavailable("The clipboard does not contain text");
+			default:
+				return editor_active();
+		}
+	}
+	if (ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput)
+		return capability_state_t::unavailable(
+			"The focused text input owns this edit command");
+	const std::string provider_action = focused_provider_action(operation, context);
+	if (provider_action.empty())
+		return capability_state_t::unavailable(
+			"The focused view does not provide this edit command");
+	return runtime().actions.evaluate(action_id(provider_action.c_str()), context).capability;
+}
+
+action_handler_result_t execute_focused_edit(focused_edit_operation_t operation,
+	const action_invocation_t& invocation) {
+	if (focused_code_editor(invocation.context)) {
+		switch (operation) {
+			case focused_edit_operation_t::undo: code_editor_widget::trigger_undo(); break;
+			case focused_edit_operation_t::redo: code_editor_widget::trigger_redo(); break;
+			case focused_edit_operation_t::cut: code_editor_widget::trigger_cut(); break;
+			case focused_edit_operation_t::copy: code_editor_widget::trigger_copy(); break;
+			case focused_edit_operation_t::paste: code_editor_widget::trigger_paste(); break;
+			case focused_edit_operation_t::delete_selection: code_editor_widget::trigger_delete(); break;
+			case focused_edit_operation_t::select_all: code_editor_widget::trigger_select_all(); break;
+			case focused_edit_operation_t::find: code_editor_widget::open_find(); break;
+			case focused_edit_operation_t::replace: code_editor_widget::open_replace(); break;
+			case focused_edit_operation_t::go_to: code_editor_widget::open_goto_line(); break;
+		}
+		return action_handler_result_t::completed();
+	}
+	if (ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput)
+		return action_handler_result_t::failed(
+			"The focused text input owns this edit command");
+	const std::string provider_action = focused_provider_action(operation,
+		invocation.context);
+	if (provider_action.empty())
+		return action_handler_result_t::failed(
+			"The focused view does not provide this edit command");
+	action_invocation_t routed{invocation.context};
+	routed.source = invocation.source;
+	routed.invocation_id = invocation.invocation_id;
+	routed.review_completed = invocation.review_completed;
+	routed.confirmation_granted = invocation.confirmation_granted;
+	const auto result = runtime().actions.execute(
+		action_id(provider_action.c_str()), routed);
+	return result.executed() ? action_handler_result_t::completed()
+		: action_handler_result_t::failed(result.message.empty()
+			? "The focused provider rejected the edit command" : result.message);
 }
 
 capability_state_t language_capability(
@@ -379,7 +514,10 @@ void register_action(runtime_t& rt,
     descriptor.capability = std::move(capability);
     descriptor.checked = std::move(checked);
     descriptor.undoable = undoable;
-    rt.actions.register_action(std::move(descriptor));
+    const auto registered = rt.actions.register_action(std::move(descriptor));
+    if (!registered.ok())
+        throw std::logic_error(std::string("Action registration failed for '") +
+            id + "': " + registered.detail);
 }
 
 void register_action_with_consequence(runtime_t& rt,
@@ -411,7 +549,10 @@ void register_action_with_consequence(runtime_t& rt,
     descriptor.consequence.target_summary = std::move(target_summary);
     descriptor.prepare_confirmation = std::move(prepare_confirmation);
     descriptor.cancel_confirmation = std::move(cancel_confirmation);
-    rt.actions.register_action(std::move(descriptor));
+    const auto registered = rt.actions.register_action(std::move(descriptor));
+    if (!registered.ok())
+        throw std::logic_error(std::string("Action registration failed for '") +
+            id + "': " + registered.detail);
 }
 
 const retained_entity_action_t* retained_entity_action(
@@ -782,6 +923,15 @@ bool persist_shortcut_overrides(runtime_t& rt, const shortcut_resolver_t& rollba
     return true;
 }
 
+void register_binding(runtime_t& rt, shortcut_binding_t binding) {
+    const std::string id = binding.id.value();
+    const auto registered = rt.shortcuts.register_binding(
+        std::move(binding), rt.actions);
+    if (!registered.ok())
+        throw std::logic_error(std::string("Shortcut registration failed for '") +
+            id + "': " + registered.detail);
+}
+
 void register_shortcut(runtime_t& rt,
                        const char* binding_id,
                        const char* action,
@@ -796,7 +946,22 @@ void register_shortcut(runtime_t& rt,
     binding.scope_kind = focus_scope_kind_t::text_editor;
     binding.text_input_policy = shortcut_text_input_policy_t::allow;
     binding.allow_repeat = repeat;
-    rt.shortcuts.register_binding(std::move(binding), rt.actions);
+    register_binding(rt, std::move(binding));
+}
+
+void register_review_shortcut(runtime_t& rt,
+                              const char* binding_id,
+                              const char* action,
+                              ImGuiKeyChord chord,
+                              const char* display) {
+    shortcut_binding_t binding;
+    binding.id = stable_action_binding_id_t(binding_id);
+    binding.action = action_id(action);
+    binding.sequence = {{chord}, display};
+    binding.scope = stable_scope_id_t(k_editor_review_scope);
+    binding.scope_kind = focus_scope_kind_t::text_editor;
+    binding.text_input_policy = shortcut_text_input_policy_t::allow;
+    register_binding(rt, std::move(binding));
 }
 
 void register_global_shortcut(runtime_t& rt,
@@ -810,7 +975,7 @@ void register_global_shortcut(runtime_t& rt,
     binding.sequence = {{chord}, display};
     binding.scope_kind = focus_scope_kind_t::global;
     binding.text_input_policy = shortcut_text_input_policy_t::suppress;
-    rt.shortcuts.register_binding(std::move(binding), rt.actions);
+    register_binding(rt, std::move(binding));
 }
 
 void register_global_chord(runtime_t& rt,
@@ -825,7 +990,7 @@ void register_global_chord(runtime_t& rt,
     binding.sequence = {{first, second}, display};
     binding.scope_kind = focus_scope_kind_t::global;
     binding.text_input_policy = shortcut_text_input_policy_t::suppress;
-    rt.shortcuts.register_binding(std::move(binding), rt.actions);
+    register_binding(rt, std::move(binding));
 }
 
 void register_domain_shortcut(runtime_t& rt,
@@ -843,7 +1008,7 @@ void register_domain_shortcut(runtime_t& rt,
     binding.scope_kind = focus_scope_kind_t::domain;
     binding.text_input_policy = shortcut_text_input_policy_t::suppress;
     binding.priority = priority;
-    rt.shortcuts.register_binding(std::move(binding), rt.actions);
+    register_binding(rt, std::move(binding));
 }
 
 void register_document_shortcut(runtime_t& rt,
@@ -861,7 +1026,7 @@ void register_document_shortcut(runtime_t& rt,
     binding.scope_kind = focus_scope_kind_t::document;
     binding.text_input_policy = shortcut_text_input_policy_t::suppress;
     binding.priority = priority;
-    rt.shortcuts.register_binding(std::move(binding), rt.actions);
+    register_binding(rt, std::move(binding));
 }
 
 void register_widget_shortcut(runtime_t& rt,
@@ -879,7 +1044,7 @@ void register_widget_shortcut(runtime_t& rt,
     binding.scope_kind = focus_scope_kind_t::widget;
     binding.text_input_policy = shortcut_text_input_policy_t::suppress;
     binding.priority = priority;
-    rt.shortcuts.register_binding(std::move(binding), rt.actions);
+    register_binding(rt, std::move(binding));
 }
 
 void register_menu(runtime_t& rt,
@@ -890,7 +1055,10 @@ void register_menu(runtime_t& rt,
     descriptor.id = stable_menu_id_t(id);
     descriptor.accepted_contexts.push_back(context_type(accepted_context));
     descriptor.sections = std::move(sections);
-    rt.menus.register_menu(std::move(descriptor), rt.actions);
+    const auto registered = rt.menus.register_menu(std::move(descriptor), rt.actions);
+    if (!registered.ok())
+        throw std::logic_error(std::string("Context-menu registration failed for '") +
+            id + "': " + registered.detail);
 }
 
 context_menu_action_t menu_action(const char* id, int order) {
@@ -902,13 +1070,12 @@ context_menu_action_t menu_action(const char* id, int order) {
 
 context_menu_action_t retained_menu_action(const char* id, int order) {
     auto result = menu_action(id, order);
-	result.visibility = context_menu_visibility_t::show_disabled;
 	const std::string_view action(id);
 	if (action == "debugger.entity.copy_address" || action == "memory.entity.copy_address" ||
 		action == "hex.copy_byte")
 		result.shortcut_override = "Ctrl+C";
 	else if (action == "debugger.instruction.toggle_breakpoint")
-		result.shortcut_override = "F9";
+		result.shortcut_action = action_id("debugger.toggle_breakpoint_at_rip");
 	else if (action == "debugger.breakpoint.delete" || action == "debugger.source.remove" ||
 		action == "memory.address.remove")
 		result.shortcut_override = "Delete";
@@ -920,7 +1087,8 @@ context_menu_action_t retained_menu_action(const char* id, int order) {
 
 context_menu_action_t analysis_context_menu_action(
     const char* id, int order, const char* shortcut = nullptr,
-    const char* label = nullptr, const char* description = nullptr) {
+    const char* label = nullptr, const char* description = nullptr,
+    const char* shortcut_action = nullptr) {
     auto result = retained_menu_action(id, order);
     if (shortcut)
         result.shortcut_override = shortcut;
@@ -928,6 +1096,8 @@ context_menu_action_t analysis_context_menu_action(
         result.label_override = label;
     if (description)
         result.description_override = description;
+    if (shortcut_action)
+        result.shortcut_action = action_id(shortcut_action);
     return result;
 }
 
@@ -1108,12 +1278,48 @@ std::atomic<std::uint64_t>& debugger_expression_generation() {
     return generation;
 }
 
+struct debugger_task_registration_gate_t {
+    enum class state_t : std::uint8_t {
+        pending,
+        registered,
+        rejected,
+        timed_out
+    };
+
+    bool await_registration() {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!ready.wait_for(lock, std::chrono::seconds(5), [this] {
+                return state != state_t::pending;
+            })) {
+            state = state_t::timed_out;
+            return false;
+        }
+        return state == state_t::registered;
+    }
+
+    bool release(bool accepted) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const bool worker_timed_out = state == state_t::timed_out;
+        if (state == state_t::pending)
+            state = accepted ? state_t::registered : state_t::rejected;
+        ready.notify_all();
+        return worker_timed_out;
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    state_t state = state_t::pending;
+};
+
 bool expression_fence_matches(const source_debug_service::snapshot_ptr& snapshot,
         std::uint32_t pid, std::uint64_t publication_generation,
         std::uint64_t stop_generation, const std::string& target_key) {
     return snapshot && snapshot->target_pid == pid && snapshot->target_key == target_key &&
         snapshot->generation == publication_generation &&
         snapshot->stop_generation == stop_generation &&
+        driver_bridge::attached_pid() == pid &&
+        debugger_engine::g_state.target_pid == pid &&
+        debugger_interaction::current_stop_generation() == stop_generation &&
         debugger_engine::g_state.status.load(std::memory_order_acquire) ==
             debugger_engine::dbg_status_t::paused;
 }
@@ -1139,10 +1345,15 @@ action_handler_result_t schedule_debugger_expression_evaluation(
     const std::uint32_t pid = retained->target_pid;
     const std::uint64_t publication_generation = retained->generation;
     const std::uint64_t stop_generation = retained->stop_generation;
+    const std::uint64_t watches_generation = persistent_watch_index >= 0
+        ? debugger_engine::g_state.watches_generation.load(std::memory_order_acquire)
+        : 0;
     const std::string target_key = retained->target_key;
     const std::string task_id = "source.debug.expression." +
         std::to_string(request_generation);
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    auto registration_gate =
+        std::make_shared<debugger_task_registration_gate_t>();
     aida::infra::executor::submission_t submission;
     submission.owner_subsystem = "source_debug";
     submission.label = persistent_watch_index >= 0
@@ -1156,27 +1367,43 @@ action_handler_result_t schedule_debugger_expression_evaluation(
         cancelled->store(true, std::memory_order_release);
     };
     submission.body = [expression, persistent_watch_index, pid,
-        publication_generation, stop_generation, target_key, task_id,
-        cancelled]() mutable {
+        publication_generation, stop_generation, watches_generation,
+        target_key, task_id, cancelled, registration_gate]() mutable {
+        if (!registration_gate->await_registration())
+            return;
         debugger_engine::expression_evaluation_t evaluation;
         std::string fence_error;
-        const auto before = source_debug_service::snapshot();
-        if (!expression_fence_matches(before, pid, publication_generation,
-                stop_generation, target_key))
-            fence_error = "Debugger target or stop generation changed before evaluation began";
-        else if (cancelled->load(std::memory_order_acquire))
-            fence_error = "Debugger expression evaluation was cancelled";
-        else
-            evaluation = debugger_engine::evaluate_expression(expression);
+        try {
+            const auto before = source_debug_service::snapshot();
+            if (!expression_fence_matches(before, pid, publication_generation,
+                    stop_generation, target_key))
+                fence_error = "Debugger target or stop generation changed before evaluation began";
+            else if (cancelled->load(std::memory_order_acquire))
+                fence_error = "Debugger expression evaluation was cancelled";
+            else
+                evaluation = debugger_engine::evaluate_expression(expression);
+        } catch (const std::exception& exception) {
+            evaluation.error = std::string("Debugger expression evaluation raised an exception: ") +
+                exception.what();
+        } catch (...) {
+            evaluation.error = "Debugger expression evaluation raised an unknown exception";
+        }
         const auto after = source_debug_service::snapshot();
         if (fence_error.empty() && !expression_fence_matches(after, pid,
                 publication_generation, stop_generation, target_key))
             fence_error = "Debugger target or stop generation changed during evaluation; the stale result was discarded";
         if (fence_error.empty() && cancelled->load(std::memory_order_acquire))
             fence_error = "Debugger expression evaluation was cancelled; the result was discarded";
-        const bool posted = aida::ui_thread::post(
-            [expression = std::move(expression), persistent_watch_index, pid,
-             publication_generation, stop_generation, target_key = std::move(target_key),
+        if (fence_error.empty() && !evaluation.succeeded && evaluation.error.empty())
+            evaluation.error = "The debugger expression evaluator returned no result";
+        bool posted = false;
+        std::string dispatch_error =
+            "The debugger expression result could not return to the UI owner";
+        try {
+            posted = aida::ui_thread::post(
+            [expression, persistent_watch_index, pid,
+             publication_generation, stop_generation, watches_generation,
+             target_key,
              task_id, evaluation = std::move(evaluation),
              fence_error = std::move(fence_error)]() mutable {
                 const auto current = source_debug_service::snapshot();
@@ -1184,14 +1411,28 @@ action_handler_result_t schedule_debugger_expression_evaluation(
                         publication_generation, stop_generation, target_key))
                     fence_error = "Debugger target or stop generation changed before result publication; the stale result was discarded";
                 if (!fence_error.empty()) {
+                    bool watch_updated = true;
+                    if (persistent_watch_index >= 0) {
+                        debugger_engine::expression_evaluation_t failure;
+                        failure.error = fence_error;
+                        watch_updated = debugger_engine::publish_watch_evaluation(
+                            persistent_watch_index, expression, watches_generation,
+                            failure);
+                    }
                     static_cast<void>(task_center::update_task(task_id,
-                        task_center::task_state_t::cancelled, 1.0f,
-                        "Result discarded by debugger generation fence", fence_error));
+                        watch_updated ? task_center::task_state_t::cancelled
+                                      : task_center::task_state_t::partial,
+                        1.0f, watch_updated
+                            ? "Result discarded by debugger generation fence"
+                            : "Watch changed while the result was discarded",
+                        watch_updated ? fence_error
+                            : "No stale result or error was applied to another watch"));
                     return;
                 }
                 if (persistent_watch_index >= 0 &&
                     !debugger_engine::publish_watch_evaluation(
-                        persistent_watch_index, expression, evaluation)) {
+                        persistent_watch_index, expression, watches_generation,
+                        evaluation)) {
                     static_cast<void>(task_center::update_task(task_id,
                         task_center::task_state_t::partial, 1.0f,
                         "Watch changed before result publication",
@@ -1224,18 +1465,30 @@ action_handler_result_t schedule_debugger_expression_evaluation(
                         std::move(diagnostic)));
                 }
             }, "source_debug", "expression_evaluation_result", "worker_result");
+        } catch (const std::exception& exception) {
+            dispatch_error = std::string("Result publication raised an exception: ") +
+                exception.what();
+        } catch (...) {
+            dispatch_error = "Result publication raised an unknown exception";
+        }
         if (!posted) {
+            if (persistent_watch_index >= 0) {
+                debugger_engine::expression_evaluation_t failure;
+                failure.error = dispatch_error;
+                static_cast<void>(debugger_engine::publish_watch_evaluation(
+                    persistent_watch_index, expression, watches_generation,
+                    failure));
+            }
             static_cast<void>(task_center::update_task(task_id,
                 task_center::task_state_t::failed, 1.0f,
-                "Result publication failed",
-                "The debugger expression result could not return to the UI owner"));
+                "Result publication failed", dispatch_error));
             task_center::diagnostic_registration_t diagnostic;
             diagnostic.id = "diagnostic.source_debug.expression.dispatch." + task_id;
             diagnostic.task_id = task_id;
             diagnostic.owner = "Source Debugger";
             diagnostic.target = "PID " + std::to_string(pid);
             diagnostic.summary = "Debugger expression result publication failed";
-            diagnostic.details = "The worker completed, but its result could not return to the UI owner";
+            diagnostic.details = dispatch_error;
             diagnostic.severity = task_center::diagnostic_severity_t::error;
             diagnostic.callbacks.focus = [] {
                 static_cast<void>(application_views::open_or_focus(
@@ -1244,43 +1497,452 @@ action_handler_result_t schedule_debugger_expression_evaluation(
             static_cast<void>(task_center::raise_diagnostic(std::move(diagnostic)));
         }
     };
-    const auto submitted = aida::infra::executor::submit(std::move(submission));
-    if (!submitted.submitted)
+    aida::infra::executor::submit_result_t submitted;
+    try {
+        submitted = aida::infra::executor::submit(std::move(submission));
+    } catch (const std::exception& exception) {
+        static_cast<void>(registration_gate->release(false));
+        return action_handler_result_t::failed(
+            std::string("Debugger expression scheduling raised an exception: ") +
+            exception.what());
+    } catch (...) {
+        static_cast<void>(registration_gate->release(false));
+        return action_handler_result_t::failed(
+            "Debugger expression scheduling raised an unknown exception");
+    }
+    if (!submitted.submitted) {
+        static_cast<void>(registration_gate->release(false));
         return action_handler_result_t::failed(
             "Debugger expression evaluation scheduling failed: " +
             submitted.reject_reason);
-    task_center::task_registration_t registration;
-    registration.id = task_id;
-    registration.owner = "source_debug";
-    registration.owner_view = persistent_watch_index >= 0
-        ? "view.debug.watches" : "view.programming.source_debug_console";
-    registration.owner_action = owner_action ? owner_action : "debug.selection.evaluate";
-    registration.target = "PID " + std::to_string(pid);
-    registration.label = label ? label : "Evaluate debugger expression";
-    registration.stage = "Queued against stop generation " +
-        std::to_string(stop_generation);
-    registration.affected_entity = expression;
-    registration.cancellation_is_safe = true;
-    registration.callbacks.cancel = [cancelled, task = submitted.task_id] {
-        cancelled->store(true, std::memory_order_release);
-        return aida::infra::executor::cancel(task);
-    };
-    registration.callbacks.focus = [persistent = persistent_watch_index >= 0] {
-        static_cast<void>(application_views::open_or_focus(stable_view_id_t(
-            persistent ? "view.debug.watches"
-                       : "view.programming.source_debug_console")));
-    };
-    if (!task_center::try_register_executor_job(
-            submitted.task_id, std::move(registration))) {
+    }
+    bool registered = false;
+    std::string registration_error =
+        "Task Center rejected debugger expression evaluation ownership";
+    try {
+        task_center::task_registration_t registration;
+        registration.id = task_id;
+        registration.owner = "source_debug";
+        registration.owner_view = persistent_watch_index >= 0
+            ? "view.debug.watches" : "view.programming.source_debug_console";
+        registration.owner_action = owner_action ? owner_action : "debug.selection.evaluate";
+        registration.target = "PID " + std::to_string(pid);
+        registration.label = label ? label : "Evaluate debugger expression";
+        registration.stage = "Queued against stop generation " +
+            std::to_string(stop_generation);
+        registration.affected_entity = expression;
+        registration.cancellation_is_safe = true;
+        registration.callbacks.cancel = [cancelled, task = submitted.task_id] {
+            cancelled->store(true, std::memory_order_release);
+            return aida::infra::executor::cancel(task);
+        };
+        registration.callbacks.focus = [persistent = persistent_watch_index >= 0] {
+            static_cast<void>(application_views::open_or_focus(stable_view_id_t(
+                persistent ? "view.debug.watches"
+                           : "view.programming.source_debug_console")));
+        };
+        registered = task_center::try_register_executor_job(
+            submitted.task_id, std::move(registration));
+    } catch (const std::exception& exception) {
+        registration_error = std::string(
+            "Task Center registration raised an exception: ") + exception.what();
+    } catch (...) {
+        registration_error = "Task Center registration raised an unknown exception";
+    }
+    const bool registration_timed_out = registration_gate->release(registered);
+    if (!registered) {
         cancelled->store(true, std::memory_order_release);
         static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+        return action_handler_result_t::failed(registration_error);
+    }
+    if (registration_timed_out) {
+        cancelled->store(true, std::memory_order_release);
+        static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+        static_cast<void>(task_center::update_task(task_id,
+            task_center::task_state_t::failed, 1.0f,
+            "Registration handshake timed out",
+            "The bounded worker ownership gate expired before Task Center registration completed"));
         return action_handler_result_t::failed(
-            "Task Center rejected debugger expression evaluation ownership");
+            "Debugger expression ownership registration exceeded the bounded worker gate");
     }
     return action_handler_result_t::completed(
         persistent_watch_index >= 0
             ? "Watch persisted; authoritative evaluation queued"
             : "One-shot debugger evaluation queued");
+}
+
+std::atomic<std::uint64_t>& debugger_watch_refresh_generation() {
+    static std::atomic<std::uint64_t> generation{0};
+    return generation;
+}
+
+bool debugger_watch_refresh_task_active() {
+    const auto current = task_center::snapshot();
+    if (!current)
+        return false;
+    return std::any_of(current->tasks.begin(), current->tasks.end(), [](const auto& task) {
+        if (task.owner_action != "debugger.watch.refresh_all")
+            return false;
+        return task.state == task_center::task_state_t::queued ||
+            task.state == task_center::task_state_t::running ||
+            task.state == task_center::task_state_t::cancellation_requested;
+    });
+}
+
+capability_state_t debugger_watch_refresh_capability() {
+    if (debugger_watch_refresh_task_active())
+        return capability_state_t::unavailable(
+            "A debugger watch refresh is already running");
+    if (debugger_engine::g_state.target_pid == 0)
+        return capability_state_t::unavailable(
+            "Attach the debugger to a process first");
+    if (debugger_engine::g_state.status.load(std::memory_order_acquire) !=
+            debugger_engine::dbg_status_t::paused)
+        return capability_state_t::unavailable(
+            "Pause the debugger before refreshing watches");
+    const auto source = source_debug_service::snapshot();
+    if (!source || source->target_pid != debugger_engine::g_state.target_pid ||
+        source->target_key.empty() ||
+        source->stop_generation != debugger_interaction::current_stop_generation())
+        return capability_state_t::unavailable(
+            "Wait for the debugger target and stop context to finish publishing");
+    std::unique_lock<std::mutex> lock(debugger_engine::g_state.watch_mutex,
+        std::try_to_lock);
+    if (!lock.owns_lock())
+        return capability_state_t::unavailable(
+            "Watch definitions are being updated");
+    if (debugger_engine::g_state.watches.empty())
+        return capability_state_t::unavailable(
+            "Add at least one watch expression first");
+    return capability_state_t::available();
+}
+
+const char* watch_refresh_publish_detail(
+        debugger_engine::watch_refresh_publish_result_t result) {
+    using result_t = debugger_engine::watch_refresh_publish_result_t;
+    switch (result) {
+    case result_t::published:
+        return "The exact watch generation was refreshed";
+    case result_t::stale_generation:
+        return "Watch definitions changed before publication; no stale result was applied";
+    case result_t::cardinality_mismatch:
+        return "The watch count changed before publication; no stale result was applied";
+    case result_t::identity_mismatch:
+        return "A watch definition changed before publication; no stale result was applied";
+    case result_t::invalid_batch:
+        return "The immutable watch refresh capture was invalid";
+    case result_t::result_mismatch:
+        return "The watch refresh evaluator returned an incomplete result set";
+    }
+    return "The watch refresh publication returned an unknown result";
+}
+
+action_handler_result_t schedule_debugger_watch_refresh() {
+    const auto capability = debugger_watch_refresh_capability();
+    if (!capability.enabled)
+        return action_handler_result_t::failed(capability.disabled_reason);
+    const auto source = source_debug_service::snapshot();
+    if (!source)
+        return action_handler_result_t::failed(
+            "The debugger stop context is unavailable");
+    debugger_engine::watch_refresh_batch_ptr captured;
+    try {
+        captured = debugger_engine::capture_watch_refresh_batch();
+    } catch (const std::exception& exception) {
+        return action_handler_result_t::failed(
+            std::string("Watch capture raised an exception: ") + exception.what());
+    } catch (...) {
+        return action_handler_result_t::failed(
+            "Watch capture raised an unknown exception");
+    }
+    if (!captured || !captured->valid())
+        return action_handler_result_t::failed(captured && !captured->error.empty()
+            ? captured->error : "The immutable watch capture is invalid");
+    if (captured->targets.empty())
+        return action_handler_result_t::failed(
+            "Add at least one watch expression first");
+
+    const std::uint64_t request_generation =
+        debugger_watch_refresh_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::uint32_t pid = source->target_pid;
+    const std::uint64_t publication_generation = source->generation;
+    const std::uint64_t stop_generation = source->stop_generation;
+    const std::string target_key = source->target_key;
+    const std::string task_id = "debugger.watch.refresh." +
+        std::to_string(request_generation);
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    auto registration_gate = std::make_shared<debugger_task_registration_gate_t>();
+
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "debugger";
+    submission.label = "debugger.watch.refresh_all";
+    submission.thread_class = "target_read";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.target_pid = pid;
+    submission.generation = request_generation;
+    submission.cancel_hook = [cancelled] {
+        cancelled->store(true, std::memory_order_release);
+    };
+    submission.body = [captured, pid, publication_generation, stop_generation,
+        target_key, task_id, cancelled, registration_gate]() mutable {
+        if (!registration_gate->await_registration())
+            return;
+        static_cast<void>(task_center::update_task(task_id,
+            task_center::task_state_t::running, 0.1f,
+            "Evaluating immutable watch generation " +
+                std::to_string(captured->generation)));
+
+        debugger_engine::watch_refresh_evaluation_batch_t evaluated;
+        std::string fence_error;
+        try {
+            const auto before = source_debug_service::snapshot();
+            if (!expression_fence_matches(before, pid, publication_generation,
+                    stop_generation, target_key))
+                fence_error = "Debugger target or stop generation changed before watch evaluation began";
+            else if (cancelled->load(std::memory_order_acquire))
+                fence_error = "Debugger watch refresh was cancelled before evaluation began";
+            else
+                evaluated = debugger_engine::evaluate_watch_refresh_batch(captured,
+                    [cancelled] {
+                        return cancelled->load(std::memory_order_acquire);
+                    });
+        } catch (const std::exception& exception) {
+            evaluated.source = captured;
+            evaluated.error = std::string("Watch evaluation raised an exception: ") +
+                exception.what();
+        } catch (...) {
+            evaluated.source = captured;
+            evaluated.error = "Watch evaluation raised an unknown exception";
+        }
+
+        const auto after = source_debug_service::snapshot();
+        if (fence_error.empty() && !expression_fence_matches(after, pid,
+                publication_generation, stop_generation, target_key))
+            fence_error = "Debugger target or stop generation changed during watch evaluation";
+        if (fence_error.empty() && cancelled->load(std::memory_order_acquire))
+            fence_error = "Debugger watch refresh was cancelled after evaluation";
+
+        bool posted = false;
+        std::string dispatch_error =
+            "The watch refresh result could not return to the UI owner";
+        try {
+            posted = aida::ui_thread::post(
+                [pid, publication_generation, stop_generation, target_key,
+                 task_id, cancelled, evaluated = std::move(evaluated),
+                 fence_error = std::move(fence_error)]() mutable {
+                    const auto current = source_debug_service::snapshot();
+                    if (fence_error.empty() && !expression_fence_matches(current, pid,
+                            publication_generation, stop_generation, target_key))
+                        fence_error = "Debugger target or stop generation changed before watch publication";
+                    if (fence_error.empty() && cancelled->load(std::memory_order_acquire))
+                        fence_error = "Debugger watch refresh was cancelled before publication";
+                    if (!fence_error.empty()) {
+                        static_cast<void>(task_center::update_task(task_id,
+                            task_center::task_state_t::cancelled, 1.0f,
+                            "Watch refresh discarded by the debugger generation fence",
+                            fence_error));
+                        return;
+                    }
+                    if (!evaluated.valid()) {
+                        const std::string detail = evaluated.error.empty()
+                            ? "The watch evaluator returned an invalid result batch"
+                            : evaluated.error;
+                        const std::string diagnostic_id =
+                            "diagnostic.debugger.watch.refresh." + task_id;
+                        static_cast<void>(task_center::update_task(task_id,
+                            task_center::task_state_t::failed, 1.0f,
+                            "Watch evaluation failed", detail, diagnostic_id));
+                        task_center::diagnostic_registration_t diagnostic;
+                        diagnostic.id = diagnostic_id;
+                        diagnostic.task_id = task_id;
+                        diagnostic.owner = "Debugger Watches";
+                        diagnostic.target = "PID " + std::to_string(pid);
+                        diagnostic.summary = "Debugger watch refresh failed";
+                        diagnostic.details = detail;
+                        diagnostic.severity = task_center::diagnostic_severity_t::error;
+                        diagnostic.callbacks.focus = [] {
+                            static_cast<void>(application_views::open_or_focus(
+                                stable_view_id_t("view.debug.watches")));
+                        };
+                        static_cast<void>(task_center::raise_diagnostic(
+                            std::move(diagnostic)));
+                        return;
+                    }
+
+                    auto published =
+                        debugger_engine::watch_refresh_publish_result_t::invalid_batch;
+                    std::string publication_exception;
+                    try {
+                        published = debugger_engine::publish_watch_refresh_batch(evaluated);
+                    } catch (const std::exception& exception) {
+                        publication_exception =
+                            std::string("Watch publication raised an exception: ") +
+                            exception.what();
+                    } catch (...) {
+                        publication_exception =
+                            "Watch publication raised an unknown exception";
+                    }
+                    if (!publication_exception.empty()) {
+                        const std::string diagnostic_id =
+                            "diagnostic.debugger.watch.publish." + task_id;
+                        static_cast<void>(task_center::update_task(task_id,
+                            task_center::task_state_t::failed, 1.0f,
+                            "Watch publication failed", publication_exception,
+                            diagnostic_id));
+                        task_center::diagnostic_registration_t diagnostic;
+                        diagnostic.id = diagnostic_id;
+                        diagnostic.task_id = task_id;
+                        diagnostic.owner = "Debugger Watches";
+                        diagnostic.target = "PID " + std::to_string(pid);
+                        diagnostic.summary = "Debugger watch publication failed";
+                        diagnostic.details = publication_exception;
+                        diagnostic.severity = task_center::diagnostic_severity_t::error;
+                        diagnostic.callbacks.focus = [] {
+                            static_cast<void>(application_views::open_or_focus(
+                                stable_view_id_t("view.debug.watches")));
+                        };
+                        static_cast<void>(task_center::raise_diagnostic(
+                            std::move(diagnostic)));
+                        return;
+                    }
+                    const char* detail = watch_refresh_publish_detail(published);
+                    if (published == debugger_engine::watch_refresh_publish_result_t::published) {
+                        static_cast<void>(task_center::update_task(task_id,
+                            task_center::task_state_t::completed, 1.0f,
+                            "Refreshed " + std::to_string(evaluated.results.size()) +
+                                " watch expression(s)", detail));
+                        return;
+                    }
+                    const bool stale =
+                        published == debugger_engine::watch_refresh_publish_result_t::stale_generation ||
+                        published == debugger_engine::watch_refresh_publish_result_t::cardinality_mismatch ||
+                        published == debugger_engine::watch_refresh_publish_result_t::identity_mismatch;
+                    if (stale) {
+                        static_cast<void>(task_center::update_task(task_id,
+                            task_center::task_state_t::partial, 1.0f,
+                            "Watch definitions changed during refresh", detail));
+                        return;
+                    }
+                    const std::string diagnostic_id =
+                        "diagnostic.debugger.watch.publish." + task_id;
+                    static_cast<void>(task_center::update_task(task_id,
+                        task_center::task_state_t::failed, 1.0f,
+                        "Watch publication failed", detail, diagnostic_id));
+                    task_center::diagnostic_registration_t diagnostic;
+                    diagnostic.id = diagnostic_id;
+                    diagnostic.task_id = task_id;
+                    diagnostic.owner = "Debugger Watches";
+                    diagnostic.target = "PID " + std::to_string(pid);
+                    diagnostic.summary = "Debugger watch publication failed";
+                    diagnostic.details = detail;
+                    diagnostic.severity = task_center::diagnostic_severity_t::error;
+                    diagnostic.callbacks.focus = [] {
+                        static_cast<void>(application_views::open_or_focus(
+                            stable_view_id_t("view.debug.watches")));
+                    };
+                    static_cast<void>(task_center::raise_diagnostic(
+                        std::move(diagnostic)));
+                }, "debugger", "watch_refresh_result", "worker_result");
+        } catch (const std::exception& exception) {
+            dispatch_error = std::string("Watch result publication raised an exception: ") +
+                exception.what();
+        } catch (...) {
+            dispatch_error = "Watch result publication raised an unknown exception";
+        }
+        if (!posted) {
+            const std::string diagnostic_id =
+                "diagnostic.debugger.watch.dispatch." + task_id;
+            static_cast<void>(task_center::update_task(task_id,
+                task_center::task_state_t::failed, 1.0f,
+                "Watch result dispatch failed", dispatch_error, diagnostic_id));
+            task_center::diagnostic_registration_t diagnostic;
+            diagnostic.id = diagnostic_id;
+            diagnostic.task_id = task_id;
+            diagnostic.owner = "Debugger Watches";
+            diagnostic.target = "PID " + std::to_string(pid);
+            diagnostic.summary = "Debugger watch result dispatch failed";
+            diagnostic.details = dispatch_error;
+            diagnostic.severity = task_center::diagnostic_severity_t::error;
+            diagnostic.callbacks.focus = [] {
+                static_cast<void>(application_views::open_or_focus(
+                    stable_view_id_t("view.debug.watches")));
+            };
+            static_cast<void>(task_center::raise_diagnostic(std::move(diagnostic)));
+        }
+    };
+
+    aida::infra::executor::submit_result_t submitted;
+    try {
+        submitted = aida::infra::executor::submit(std::move(submission));
+    } catch (const std::exception& exception) {
+        static_cast<void>(registration_gate->release(false));
+        return action_handler_result_t::failed(
+            std::string("Watch refresh scheduling raised an exception: ") +
+            exception.what());
+    } catch (...) {
+        static_cast<void>(registration_gate->release(false));
+        return action_handler_result_t::failed(
+            "Watch refresh scheduling raised an unknown exception");
+    }
+    if (!submitted.submitted) {
+        static_cast<void>(registration_gate->release(false));
+        return action_handler_result_t::failed(
+            "Watch refresh scheduling failed: " + submitted.reject_reason);
+    }
+
+    bool registered = false;
+    std::string registration_error =
+        "Task Center rejected debugger watch refresh ownership";
+    try {
+        task_center::task_registration_t registration;
+        registration.id = task_id;
+        registration.owner = "debugger";
+        registration.owner_view = "view.debug.watches";
+        registration.owner_action = "debugger.watch.refresh_all";
+        registration.target = "PID " + std::to_string(pid);
+        registration.label = "Refresh debugger watches";
+        registration.stage = "Queued against stop generation " +
+            std::to_string(stop_generation);
+        registration.affected_entity = std::to_string(captured->cardinality) +
+            " watch expression(s)";
+        registration.cancellation_is_safe = true;
+        registration.callbacks.cancel = [cancelled, task = submitted.task_id] {
+            cancelled->store(true, std::memory_order_release);
+            return aida::infra::executor::cancel(task);
+        };
+        registration.callbacks.focus = [] {
+            static_cast<void>(application_views::open_or_focus(
+                stable_view_id_t("view.debug.watches")));
+        };
+        registered = task_center::try_register_executor_job(
+            submitted.task_id, std::move(registration));
+    } catch (const std::exception& exception) {
+        registration_error = std::string(
+            "Watch Task Center registration raised an exception: ") +
+            exception.what();
+    } catch (...) {
+        registration_error =
+            "Watch Task Center registration raised an unknown exception";
+    }
+    const bool registration_timed_out = registration_gate->release(registered);
+    if (!registered) {
+        cancelled->store(true, std::memory_order_release);
+        static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+        return action_handler_result_t::failed(registration_error);
+    }
+    if (registration_timed_out) {
+        cancelled->store(true, std::memory_order_release);
+        static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+        static_cast<void>(task_center::update_task(task_id,
+            task_center::task_state_t::failed, 1.0f,
+            "Registration handshake timed out",
+            "The bounded worker ownership gate expired before Task Center registration completed"));
+        return action_handler_result_t::failed(
+            "Debugger watch ownership registration exceeded the bounded worker gate");
+    }
+    return action_handler_result_t::completed(
+        "Authoritative debugger watch refresh queued");
 }
 
 std::optional<view_instance_id_t> code_group_instance(int tab_index) {
@@ -1521,20 +2183,23 @@ void initialize(runtime_t& rt) {
     const auto context_surfaces = action_surface_t::context_menu |
         action_surface_t::command_palette | action_surface_t::accessibility;
 
-    register_action(rt, "file.new", "New File", "Create an untitled code document", menu_surfaces,
+    register_action(rt, "file.new", "New File", "Create an untitled code document",
+        menu_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             file_tabs::open_or_focus("", "untitled", "");
             application_views::open_or_focus(stable_view_id_t("document.code"));
             return action_handler_result_t::completed();
         });
-    register_action(rt, "file.open", "Open File...", "Open a file", menu_surfaces,
+    register_action(rt, "file.open", "Open File...", "Open a file",
+        menu_surfaces | action_surface_t::toolbar,
         [&rt](const action_invocation_t&) {
             if (!rt.shell.open_file)
                 return action_handler_result_t::failed("Open-file provider is unavailable");
             rt.shell.open_file();
             return action_handler_result_t::completed();
         });
-    register_action(rt, "file.open_folder", "Open Folder...", "Open a folder in Explorer", menu_surfaces | action_surface_t::context_menu,
+    register_action(rt, "file.open_folder", "Open Folder...", "Open a folder in Explorer",
+        menu_surfaces | action_surface_t::toolbar | action_surface_t::context_menu,
         [&rt](const action_invocation_t&) {
             if (!rt.shell.open_folder)
                 return action_handler_result_t::failed("Open-folder provider is unavailable");
@@ -1551,7 +2216,8 @@ void initialize(runtime_t& rt) {
             return action_handler_result_t::completed();
         }, {}, false, {}, "category.file", "File");
     register_action(rt, "file.restore_previous_session", "Restore Previous Session",
-        "Open the most recent closed binary or analysis session", menu_surfaces,
+        "Open the most recent closed binary or analysis session",
+        menu_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             return explorer_views::request_restore_previous_session()
                 ? action_handler_result_t::completed()
@@ -1590,7 +2256,11 @@ void initialize(runtime_t& rt) {
                 return action_handler_result_t::failed("Save As provider is unavailable");
             rt.shell.save_as();
             return action_handler_result_t::completed();
-        }, [](const interaction_context_t&) { return editor_active(); });
+        }, [](const interaction_context_t&) {
+			const auto active = editor_active();
+			if (!active.enabled) return active;
+			return licensed_save_capability();
+		});
     register_action(rt, "file.save_all", "Save All", "Save every modified code document", all_surfaces,
         [](const action_invocation_t&) {
             file_tabs::snapshot_active_to_tab();
@@ -1611,6 +2281,9 @@ void initialize(runtime_t& rt) {
             }
             return action_handler_result_t::completed();
         }, [](const interaction_context_t&) {
+			const auto license_gate = licensed_save_capability();
+			if (!license_gate.enabled)
+				return license_gate;
             bool modified = false;
             for (const auto& tab : file_tabs::tabs) {
                 if (!tab.dirty)
@@ -1680,9 +2353,20 @@ void initialize(runtime_t& rt) {
         [&rt](const action_invocation_t&) {
             if (!rt.shell.exit_application)
                 return action_handler_result_t::failed("Application shutdown provider is unavailable");
-            rt.shell.exit_application();
-            return action_handler_result_t::completed();
-        });
+			const auto requested = file_tabs::request_exit_review();
+			return requested.succeeded ? action_handler_result_t::completed()
+				: action_handler_result_t::failed(requested.detail);
+        }, [&rt](const interaction_context_t&) {
+			if (!rt.shell.exit_application)
+				return capability_state_t::unavailable(
+					"Application shutdown provider is unavailable");
+			if (file_tabs::exit_review_requested)
+				return capability_state_t::available();
+			return file_tabs::close_review_in_progress()
+				? capability_state_t::unavailable(
+					"Finish the current document-close review first")
+				: capability_state_t::available();
+		});
 
     register_action(rt, "navigate.next_document_or_session", "Next Document or Session",
         "Activate the next code document in the focused editor, otherwise the next analysis session",
@@ -1698,7 +2382,7 @@ void initialize(runtime_t& rt) {
         false, {}, "category.navigate", "Navigate");
     register_action(rt, "programming.show_problems", "Problems and Diagnostics",
         "Open the canonical diagnostics surface for editor, task, analysis, and runtime failures",
-        menu_surfaces,
+        menu_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             const auto result = application_views::open_or_focus(
                 stable_view_id_t("view.diagnostics"));
@@ -1754,7 +2438,7 @@ void initialize(runtime_t& rt) {
         action_surface_t::shortcut | action_surface_t::accessibility;
     register_action(rt, "programming.index.rebuild", "Rebuild Workspace Text Index",
         "Cancel the previous generation and build one bounded immutable workspace text and C/C++ symbol index",
-        language_surfaces,
+        language_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             const auto result = aida::editor::language_service::rebuild_workspace_index();
             return result.accepted ? action_handler_result_t::completed()
@@ -1766,7 +2450,7 @@ void initialize(runtime_t& rt) {
         }, false, {}, "category.programming.language", "Programming / Language Services");
     register_action(rt, "programming.index.cancel", "Cancel Workspace Index",
         "Request cancellation of the active Workspace Text Index generation while preserving the previous immutable publication",
-        language_surfaces,
+        language_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             return aida::editor::language_service::cancel_workspace_index()
                 ? action_handler_result_t::completed()
@@ -1869,7 +2553,7 @@ void initialize(runtime_t& rt) {
         "view.programming.references");
     register_action(rt, "programming.language.cancel_query", "Cancel Language Query",
         "Cancel the active provider query without discarding its previous immutable result",
-        language_surfaces,
+        language_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             bool cancelled = false;
             for (std::size_t index = 0; index <= static_cast<std::size_t>(
@@ -1965,6 +2649,10 @@ void initialize(runtime_t& rt) {
         language_surfaces,
         [](const action_invocation_t&) {
             const std::string expression = code_editor_widget::selected_text(97);
+            const auto opened = application_views::open_or_focus(
+                stable_view_id_t("view.debug.watches"));
+            if (!opened.ok())
+                return action_handler_result_t::failed(opened.detail);
             const int index = debugger_engine::add_watch(expression);
             if (index < 0)
                 return action_handler_result_t::failed(
@@ -1975,10 +2663,6 @@ void initialize(runtime_t& rt) {
                 static_cast<void>(debugger_engine::remove_watch(index));
                 return scheduled;
             }
-            const auto opened = application_views::open_or_focus(
-                stable_view_id_t("view.debug.watches"));
-            if (!opened.ok())
-                return action_handler_result_t::failed(opened.detail);
             return scheduled;
         }, watch_capability, true, {}, "category.programming.debug",
         "Programming / Source Debugging");
@@ -1987,14 +2671,13 @@ void initialize(runtime_t& rt) {
         language_surfaces,
         [](const action_invocation_t&) {
             const std::string expression = code_editor_widget::selected_text(97);
-            const auto scheduled = schedule_debugger_expression_evaluation(
-                expression, -1, "debug.selection.evaluate", "Evaluate source selection");
-            if (!scheduled.success)
-                return scheduled;
             const auto opened = application_views::open_or_focus(
                 stable_view_id_t("view.programming.source_debug_console"));
-            return opened.ok() ? scheduled
-                : action_handler_result_t::failed(opened.detail);
+            if (!opened.ok())
+                return action_handler_result_t::failed(opened.detail);
+            const auto scheduled = schedule_debugger_expression_evaluation(
+                expression, -1, "debug.selection.evaluate", "Evaluate source selection");
+            return scheduled;
         }, watch_capability, false, {}, "category.programming.debug",
         "Programming / Source Debugging");
 
@@ -2015,41 +2698,38 @@ void initialize(runtime_t& rt) {
     register_ai_selection("editor.ai.generate_tests", "AI: Generate Tests for Selection",
         "Generate comprehensive tests for this source selection, covering success, boundary, failure, cancellation, and concurrency behavior where applicable.");
 
-    const auto pending_hunk_capability = [&rt](const interaction_context_t&) {
-        if (!code_editor_widget::has_pending_diff())
+    const auto pending_review_capability = [](const interaction_context_t&) {
+        if (!code_editor_widget::has_pending_review_hunks())
             return capability_state_t::unavailable("No reviewed AI diff is active");
-        const auto& diff = code_editor_widget::pending_diff();
-        int index = rt.editor_hunk_index;
-        if (index < 0) {
-            const auto found = std::find_if(diff.hunks.begin(), diff.hunks.end(),
-                [](const code_editor_widget::diff_hunk_t& hunk) {
-                    return hunk.state == code_editor_widget::diff_hunk_state_t::pending;
-                });
-            index = found == diff.hunks.end() ? -1
-                : static_cast<int>(std::distance(diff.hunks.begin(), found));
-        }
-        return index >= 0 && index < static_cast<int>(diff.hunks.size()) &&
-            diff.hunks[static_cast<std::size_t>(index)].state ==
-                code_editor_widget::diff_hunk_state_t::pending
+        return capability_state_t::available();
+    };
+    const auto retained_hunk_identity = [&rt] {
+        return rt.editor_hunk_target_explicit
+            ? rt.editor_hunk_target
+            : code_editor_widget::selected_review_hunk_identity();
+    };
+    const auto pending_hunk_capability = [retained_hunk_identity](
+            const interaction_context_t&) {
+        const auto identity = retained_hunk_identity();
+        if (!identity.valid())
+            return capability_state_t::unavailable(
+                "Select a pending AI review hunk first");
+        if (identity.document_id != code_editor_widget::active_document_id())
+            return capability_state_t::unavailable(
+                "The retained AI hunk belongs to another editor document");
+        return code_editor_widget::resolve_review_hunk(identity, true) >= 0
             ? capability_state_t::available()
-            : capability_state_t::unavailable("The selected AI hunk is already resolved");
+            : capability_state_t::unavailable(
+                "The retained AI hunk changed or was already resolved");
     };
     const auto register_hunk_action = [&](const char* id, const char* label, bool accept) {
         register_action(rt, id, label,
             accept ? "Accept the retained revision-bound AI hunk"
                    : "Reject the retained revision-bound AI hunk",
             language_surfaces,
-            [&rt, accept](const action_invocation_t&) {
-                const auto& diff = code_editor_widget::pending_diff();
-                int index = rt.editor_hunk_index;
-                if (index < 0) {
-                    const auto found = std::find_if(diff.hunks.begin(), diff.hunks.end(),
-                        [](const code_editor_widget::diff_hunk_t& hunk) {
-                            return hunk.state == code_editor_widget::diff_hunk_state_t::pending;
-                        });
-                    index = found == diff.hunks.end() ? -1
-                        : static_cast<int>(std::distance(diff.hunks.begin(), found));
-                }
+            [retained_hunk_identity, accept](const action_invocation_t&) {
+                const auto identity = retained_hunk_identity();
+                const int index = code_editor_widget::resolve_review_hunk(identity, true);
                 const bool changed = accept ? code_editor_widget::accept_hunk(index)
                                             : code_editor_widget::reject_hunk(index);
                 return changed ? action_handler_result_t::completed()
@@ -2060,14 +2740,62 @@ void initialize(runtime_t& rt) {
     };
     register_hunk_action("editor.ai.accept_hunk", "Accept AI Hunk", true);
     register_hunk_action("editor.ai.reject_hunk", "Reject AI Hunk", false);
+    register_action(rt, "editor.ai.previous_pending_hunk", "Previous Pending AI Hunk",
+        "Select, focus, and reveal the previous pending hunk in the exact active AI proposal, wrapping once at the beginning",
+        language_surfaces,
+        [](const action_invocation_t&) {
+            return code_editor_widget::select_previous_pending_hunk()
+                ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(
+                    "No pending AI review hunk could be selected");
+        }, pending_review_capability, false, {}, "category.programming.ai",
+        "Programming / AI Review");
+    register_action(rt, "editor.ai.next_pending_hunk", "Next Pending AI Hunk",
+        "Select, focus, and reveal the next pending hunk in the exact active AI proposal, wrapping once at the end",
+        language_surfaces,
+        [](const action_invocation_t&) {
+            return code_editor_widget::select_next_pending_hunk()
+                ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(
+                    "No pending AI review hunk could be selected");
+        }, pending_review_capability, false, {}, "category.programming.ai",
+        "Programming / AI Review");
+    const auto register_current_hunk_action = [&](const char* id,
+            const char* label, const char* description, const char* retained_action) {
+        register_action(rt, id, label, description,
+            language_surfaces,
+            [retained_action](const action_invocation_t& invocation) {
+                const auto identity = code_editor_widget::selected_review_hunk_identity();
+                const int index = code_editor_widget::resolve_review_hunk(identity, true);
+                if (index < 0)
+                    return action_handler_result_t::failed(
+                        "The selected AI hunk changed before the decision executed");
+                const auto result = execute_editor_hunk_action(
+                    index, retained_action, invocation.source);
+                return result.executed()
+                    ? action_handler_result_t::completed()
+                    : action_handler_result_t::failed(result.message.empty()
+                        ? "The selected AI hunk decision was not executed"
+                        : result.message);
+            }, pending_hunk_capability, true, {}, "category.programming.ai",
+            "Programming / AI Review");
+    };
+    register_current_hunk_action("editor.ai.accept_current_hunk",
+        "Accept Current AI Hunk",
+        "Accept the keyboard-selected hunk in the exact active AI proposal",
+        "editor.ai.accept_hunk");
+    register_current_hunk_action("editor.ai.reject_current_hunk",
+        "Reject Current AI Hunk",
+        "Reject the keyboard-selected hunk in the exact active AI proposal",
+        "editor.ai.reject_hunk");
     register_action(rt, "editor.ai.accept_all", "Accept All AI Hunks",
         "Accept every pending hunk in the active revision-bound AI proposal",
         language_surfaces,
         [](const action_invocation_t&) {
             code_editor_widget::accept_all();
             return action_handler_result_t::completed();
-        }, [pending_hunk_capability](const interaction_context_t& context) {
-            return pending_hunk_capability(context);
+        }, [pending_review_capability](const interaction_context_t& context) {
+            return pending_review_capability(context);
         }, true, {}, "category.programming.ai", "Programming / AI Review");
     register_action(rt, "editor.ai.reject_all", "Reject All AI Hunks",
         "Reject every pending hunk in the active revision-bound AI proposal",
@@ -2075,8 +2803,8 @@ void initialize(runtime_t& rt) {
         [](const action_invocation_t&) {
             code_editor_widget::reject_all();
             return action_handler_result_t::completed();
-        }, [pending_hunk_capability](const interaction_context_t& context) {
-            return pending_hunk_capability(context);
+        }, [pending_review_capability](const interaction_context_t& context) {
+            return pending_review_capability(context);
         }, true, {}, "category.programming.ai", "Programming / AI Review");
 
     auto source_breakpoint_capability = [](const interaction_context_t&) {
@@ -2107,7 +2835,7 @@ void initialize(runtime_t& rt) {
 		"category.programming.debug", "Programming / Source Debugging");
     register_action(rt, "debug.source.open_mixed", "Open Mixed Source / Assembly",
 		"Open the dockable source breakpoint, exact source excerpt and live assembly surface",
-		menu_surfaces | action_surface_t::context_menu,
+		menu_surfaces | action_surface_t::toolbar | action_surface_t::context_menu,
 		[](const action_invocation_t&) {
 			const auto opened = application_views::open_or_focus(
 				stable_view_id_t("view.debug.source"));
@@ -2117,7 +2845,7 @@ void initialize(runtime_t& rt) {
 		"Programming / Source Debugging");
     register_action(rt, "debug.source.rebind", "Rebind Source Breakpoints",
 		"Re-enumerate loaded modules and bind every persistent file:line definition against immutable PDB source records",
-		menu_surfaces | action_surface_t::context_menu,
+		menu_surfaces | action_surface_t::toolbar | action_surface_t::context_menu,
 		[](const action_invocation_t&) {
 			std::string error;
 			return source_debug_service::request_rebind(&error)
@@ -2605,41 +3333,55 @@ void initialize(runtime_t& rt) {
         }, true, {}, "category.types.reconstruction", "Types / Reconstruction");
 
     register_action(rt, "edit.undo", "Undo", "Undo the last editor change", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::trigger_undo(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { const bool active = code_editor_widget::document_state().active; return active && code_editor_widget::can_undo() ? capability_state_t::available() : capability_state_t::unavailable(active ? "Nothing to undo" : "Open or create a text document first"); }, true);
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::undo, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::undo, context); }, true);
     register_action(rt, "edit.redo", "Redo", "Redo the last undone editor change", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::trigger_redo(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { const bool active = code_editor_widget::document_state().active; return active && code_editor_widget::can_redo() ? capability_state_t::available() : capability_state_t::unavailable(active ? "Nothing to redo" : "Open or create a text document first"); }, true);
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::redo, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::redo, context); }, true);
     register_action(rt, "edit.cut", "Cut", "Cut the selected text", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::trigger_cut(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { return editor_selection(); }, true);
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::cut, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::cut, context); }, true);
     register_action(rt, "edit.copy", "Copy", "Copy the selected text", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::trigger_copy(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { return editor_selection(); });
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::copy, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::copy, context); });
     register_action(rt, "edit.paste", "Paste", "Paste text at the caret", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::trigger_paste(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) {
-            if (!code_editor_widget::document_state().active)
-                return capability_state_t::unavailable("Open or create a text document first");
-            return code_editor_widget::can_paste()
-                ? capability_state_t::available()
-                : capability_state_t::unavailable("The clipboard does not contain text");
-        }, true);
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::paste, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::paste, context); }, true);
     register_action(rt, "edit.delete", "Delete", "Delete the selection or the character at the caret", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::trigger_delete(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { return editor_active(); }, true);
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::delete_selection, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::delete_selection, context); }, true);
     register_action(rt, "edit.select_all", "Select All", "Select the entire document", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::trigger_select_all(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { return editor_active(); });
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::select_all, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::select_all, context); });
     register_action(rt, "edit.find", "Find", "Find text in the active document", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::open_find(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { return editor_active(); });
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::find, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::find, context); });
     register_action(rt, "edit.replace", "Replace", "Find and replace text in the active document", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::open_replace(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { return editor_active(); });
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::replace, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::replace, context); });
     register_action(rt, "edit.goto_line", "Go to Line...", "Navigate to a line in the active document", all_surfaces,
-        [](const action_invocation_t&) { code_editor_widget::open_goto_line(); return action_handler_result_t::completed(); },
-        [](const interaction_context_t&) { return editor_active(); });
+		[](const action_invocation_t& invocation) { return execute_focused_edit(
+			focused_edit_operation_t::go_to, invocation); },
+		[](const interaction_context_t& context) { return focused_edit_capability(
+			focused_edit_operation_t::go_to, context); });
     const auto document_action = [](code_editor_widget::document_action_t action) {
         return [action](const action_invocation_t&) {
             return code_editor_widget::request_document_action(action)
@@ -2788,72 +3530,58 @@ void initialize(runtime_t& rt) {
                 : capability_state_t::unavailable("No analysis decompiler context is available");
         }, false, {}, "category.analysis.navigate", "Analysis / Navigate");
 
-    auto register_view = [&](const char* id, const char* label, const char* target_view) {
+    application_views::initialize();
+    const auto canonical_view_capability = [](const stable_view_id_t& target,
+                                              const interaction_context_t& context) {
+        const auto* descriptor = application_views::registry().find_descriptor(target);
+        if (!descriptor)
+            return capability_state_t::unavailable("The view is no longer registered");
+        if (application_views::is_open(target) && !descriptor->closeable)
+            return capability_state_t::unavailable("This required view cannot be closed");
+        return application_views::registry().evaluate(target, context);
+    };
+    const auto canonical_view_check = [](const stable_view_id_t& target) {
+        return application_views::is_open(target)
+            ? action_check_state_t::checked : action_check_state_t::unchecked;
+    };
+    const auto toggle_canonical_view = [&rt](const stable_view_id_t& target,
+                                             const char* compatibility_action) {
+        const auto result = application_views::is_open(target)
+            ? application_views::close(target)
+            : application_views::open_or_focus(target);
+        if (!result.ok())
+            return action_handler_result_t::failed(result.detail);
+        if (rt.shell.persist_workspace)
+            rt.shell.persist_workspace();
+        if (compatibility_action && rt.shell.action_executed)
+            rt.shell.action_executed(compatibility_action);
+        return action_handler_result_t::completed();
+    };
+    auto register_view = [&](const char* id, const char* label, const char* target_view,
+                             action_surface_t surfaces = action_surface_t::shortcut) {
         register_action(rt, id, label, "Compatibility launcher for the canonical dockable IDE view",
-            action_surface_t::shortcut,
-            [&rt, id, target = stable_view_id_t(target_view)](const action_invocation_t&) {
-                const auto result = application_views::open_or_focus(target);
-                if (!result.ok())
-                    return action_handler_result_t::failed(result.detail);
-                if (rt.shell.action_executed)
-                    rt.shell.action_executed(id);
-                return action_handler_result_t::completed();
-            }, [target = stable_view_id_t(target_view)](const interaction_context_t& context) {
-                return application_views::registry().evaluate(target, context);
+            surfaces,
+            [toggle_canonical_view, id,
+             target = stable_view_id_t(target_view)](const action_invocation_t&) {
+                return toggle_canonical_view(target, id);
+            }, [canonical_view_capability,
+                target = stable_view_id_t(target_view)](const interaction_context_t& context) {
+                return canonical_view_capability(target, context);
+            }, false, [canonical_view_check,
+                       target = stable_view_id_t(target_view)](const interaction_context_t&) {
+                return canonical_view_check(target);
             });
     };
-    register_action(rt, "view.explorer", "Toggle Explorer", "Show or hide Project Explorer", menu_surfaces,
-        [&rt](const action_invocation_t&) {
-            const stable_view_id_t id("view.project_explorer");
-            const auto result = application_views::is_open(id)
-                ? application_views::close(id)
-                : application_views::open_or_focus(id);
-            if (!result.ok())
-                return action_handler_result_t::failed(result.detail);
-            if (rt.shell.persist_workspace) rt.shell.persist_workspace();
-            if (rt.shell.action_executed) rt.shell.action_executed("view.explorer");
-            return action_handler_result_t::completed();
-        });
-    register_action(rt, "view.chat", "Toggle Chat", "Show or hide Chat", menu_surfaces,
-        [&rt](const action_invocation_t&) {
-            const stable_view_id_t id("view.ai_chat");
-            const auto result = application_views::is_open(id)
-                ? application_views::close(id)
-                : application_views::open_or_focus(id);
-            if (!result.ok())
-                return action_handler_result_t::failed(result.detail);
-            if (rt.shell.persist_workspace)
-                rt.shell.persist_workspace();
-            if (rt.shell.action_executed)
-                rt.shell.action_executed("view.chat");
-            return action_handler_result_t::completed();
-        });
-    register_action(rt, "view.output", "Toggle Output", "Show or hide Output", menu_surfaces,
-        [&rt](const action_invocation_t&) {
-            const stable_view_id_t id("view.output");
-            const auto result = application_views::is_open(id)
-                ? application_views::close(id)
-                : application_views::open_or_focus(id);
-            if (!result.ok())
-                return action_handler_result_t::failed(result.detail);
-            if (rt.shell.persist_workspace) rt.shell.persist_workspace();
-            if (rt.shell.action_executed) rt.shell.action_executed("view.output");
-            return action_handler_result_t::completed();
-        });
+    register_view("view.explorer", "Toggle Explorer", "view.project_explorer", menu_surfaces);
+    register_view("view.chat", "Toggle Chat", "view.ai_chat", menu_surfaces);
+    register_view("view.output", "Toggle Output", "view.output", menu_surfaces);
     register_view("view.editor", "Editor", "document.code");
-    register_view("view.workbench", "Workbench", "document.disassembly");
     register_view("view.disassembly", "Disassembly", "document.disassembly");
     register_view("view.hex", "Hex", "document.hex");
     register_view("view.pseudocode", "Pseudocode", "document.pseudocode");
     register_view("view.graph", "Graph", "document.graph");
-    register_view("view.network", "Network", "view.network.connections");
-    register_view("view.debugger", "Debugger", "view.debug.cpu");
-    register_view("view.scan", "Scan", "view.memory.value_scan");
-    register_view("view.types", "Types", "view.types.structures");
-    register_view("view.analysis", "Analysis", "view.analysis.symbolic");
     register_view("view.binary_map", "Binary Map", "view.analysis.binary_map");
 
-    application_views::initialize();
     application_views::registry().for_each_descriptor([&](const view_descriptor_t& view) {
         const std::string stable_id = compose_view_action_id(view.id);
         const std::string label = std::string("Toggle ") + view.display_name;
@@ -2861,37 +3589,31 @@ void initialize(runtime_t& rt) {
         register_action(rt, stable_id.c_str(), label.c_str(), "Open, focus, or close this dockable IDE view",
             action_surface_t::application_menu | action_surface_t::command_palette |
                 action_surface_t::accessibility,
-            [id = view.id, &rt](const action_invocation_t&) {
-                const auto result = application_views::is_open(id)
-                    ? application_views::close(id)
-                    : application_views::open_or_focus(id);
-                if (!result.ok())
-                    return action_handler_result_t::failed(result.detail);
-                if (rt.shell.persist_workspace)
-                    rt.shell.persist_workspace();
-                return action_handler_result_t::completed();
+            [id = view.id, toggle_canonical_view](const action_invocation_t&) {
+                return toggle_canonical_view(id, nullptr);
             },
-            [id = view.id](const interaction_context_t& context) {
-                const auto* descriptor = application_views::registry().find_descriptor(id);
-                if (!descriptor)
-                    return capability_state_t::unavailable("The view is no longer registered");
-                if (application_views::is_open(id) && !descriptor->closeable)
-                    return capability_state_t::unavailable("This required view cannot be closed");
-                return application_views::registry().evaluate(id, context);
+            [id = view.id, canonical_view_capability](const interaction_context_t& context) {
+                return canonical_view_capability(id, context);
             }, false,
-            [id = view.id](const interaction_context_t&) {
-                return application_views::is_open(id)
-                    ? action_check_state_t::checked
-                    : action_check_state_t::unchecked;
+            [id = view.id, canonical_view_check](const interaction_context_t&) {
+                return canonical_view_check(id);
             }, view_category_id(view.category), category.c_str());
 
         std::string focus_id = "view.focus.";
         focus_id.append(view.id.value());
         const std::string focus_label = std::string("Focus ") + view.display_name;
+        action_surface_t focus_surfaces = action_surface_t::application_menu |
+            action_surface_t::command_palette | action_surface_t::accessibility;
+        if (view.id.value() == "view.recent" ||
+            view.id.value() == "view.background_tasks" ||
+            view.id.value() == "view.diagnostics" ||
+            view.id.value() == "view.output")
+            focus_surfaces = focus_surfaces | action_surface_t::toolbar;
+        if (view.id.value() == "view.programming.source_debug_console")
+            focus_surfaces = focus_surfaces | action_surface_t::shortcut;
         register_action(rt, focus_id.c_str(), focus_label.c_str(),
             "Open this IDE view if needed, then move keyboard focus to it",
-            action_surface_t::application_menu | action_surface_t::command_palette |
-                action_surface_t::accessibility,
+            focus_surfaces,
             [id = view.id](const action_invocation_t&) {
                 const auto result = application_views::open_or_focus(id);
                 return result.ok()
@@ -3037,6 +3759,28 @@ void initialize(runtime_t& rt) {
         }
         return capability_state_t::available();
     };
+    const auto activate_workspace = [](workspace_layout::workspace_preset_t preset) {
+        const auto switched = workspace_layout::switch_to(preset);
+        const auto result = workspace_result(switched, "Workspace switching failed");
+        if (switched != workspace_layout::workspace_request_result_t::completed &&
+            switched != workspace_layout::workspace_request_result_t::unchanged)
+            return result;
+        const char* primary_document = preset == workspace_layout::workspace_preset_t::analysis
+            ? "document.disassembly"
+            : preset == workspace_layout::workspace_preset_t::programming
+                ? "document.code" : nullptr;
+        if (!primary_document)
+            return result;
+        const auto opened = application_views::open_or_focus(
+            stable_view_id_t(primary_document));
+        return opened.ok() ? result : action_handler_result_t::failed(opened.detail);
+    };
+    const auto workspace_check = [](workspace_layout::workspace_preset_t preset) {
+        const auto identity = workspace_layout::active_identity();
+        return identity.kind == workspace_layout::workspace_identity_kind_t::built_in &&
+            identity.preset == preset
+            ? action_check_state_t::checked : action_check_state_t::unchecked;
+    };
     for (std::size_t index = 0; index < preset_count; ++index) {
         const auto preset = presets[index];
         if (preset.id == workspace_layout::workspace_preset_t::safe)
@@ -3048,33 +3792,41 @@ void initialize(runtime_t& rt) {
         const std::string description(preset.description);
         register_action(rt, id.c_str(), label.c_str(), description.c_str(),
             action_surface_t::application_menu | action_surface_t::command_palette |
-                action_surface_t::accessibility,
-            [preset](const action_invocation_t&) {
-                const auto switched = workspace_layout::switch_to(preset.id);
-                const auto result = workspace_result(switched, "Workspace switching failed");
-                if (switched == workspace_layout::workspace_request_result_t::completed ||
-                    switched == workspace_layout::workspace_request_result_t::unchanged) {
-                    const char* primary_document = preset.id == workspace_layout::workspace_preset_t::analysis
-                        ? "document.disassembly"
-                        : preset.id == workspace_layout::workspace_preset_t::programming
-                            ? "document.code" : nullptr;
-                    if (!primary_document)
-                        return result;
-                    const auto opened = application_views::open_or_focus(
-                        stable_view_id_t(primary_document));
-                    if (!opened.ok())
-                        return action_handler_result_t::failed(opened.detail);
-                }
-                return result;
+                action_surface_t::toolbar | action_surface_t::accessibility,
+            [preset, activate_workspace](const action_invocation_t&) {
+                return activate_workspace(preset.id);
             }, workspace_action_capability, false,
-            [preset](const interaction_context_t&) {
-                const auto identity = workspace_layout::active_identity();
-                return identity.kind == workspace_layout::workspace_identity_kind_t::built_in &&
-                    identity.preset == preset.id
-                    ? action_check_state_t::checked
-                    : action_check_state_t::unchecked;
+            [preset, workspace_check](const interaction_context_t&) {
+                return workspace_check(preset.id);
             }, "category.workspace", "Workspace");
     }
+    const auto register_workspace_alias = [&](const char* id, const char* label,
+                                               workspace_layout::workspace_preset_t preset) {
+        register_action(rt, id, label,
+            "Compatibility launcher for the canonical named IDE workspace",
+            action_surface_t::shortcut,
+            [&rt, id, preset, activate_workspace](const action_invocation_t&) {
+                const auto result = activate_workspace(preset);
+                if (result.success && rt.shell.action_executed)
+                    rt.shell.action_executed(id);
+                return result;
+            }, workspace_action_capability, false,
+            [preset, workspace_check](const interaction_context_t&) {
+                return workspace_check(preset);
+            }, "category.workspace", "Workspace");
+    };
+    register_workspace_alias("view.analysis", "Analysis",
+        workspace_layout::workspace_preset_t::analysis);
+    register_workspace_alias("view.workbench", "Workbench",
+        workspace_layout::workspace_preset_t::analysis);
+    register_workspace_alias("view.debugger", "Debugger",
+        workspace_layout::workspace_preset_t::debugging);
+    register_workspace_alias("view.network", "Network",
+        workspace_layout::workspace_preset_t::network);
+    register_workspace_alias("view.scan", "Scan",
+        workspace_layout::workspace_preset_t::memory);
+    register_workspace_alias("view.types", "Types",
+        workspace_layout::workspace_preset_t::types_structures);
 
     register_action(rt, "workspace.lock", "Lock / Unlock Layout", "Toggle dock placement editing while preserving close and reopen",
         action_surface_t::application_menu | action_surface_t::command_palette |
@@ -3186,9 +3938,17 @@ void initialize(runtime_t& rt) {
         action_surface_t::application_menu | action_surface_t::command_palette | action_surface_t::accessibility,
         [](const action_invocation_t&) {
             return workspace_result(workspace_layout::open_missing_views(), "Opening missing views failed");
-        }, workspace_action_capability, false, {}, "category.workspace", "Workspace");
+        }, [workspace_action_capability](const interaction_context_t& context) {
+            const auto base = workspace_action_capability(context);
+            if (!base.enabled)
+                return base;
+            return workspace_layout::layout_locked()
+                ? capability_state_t::unavailable("Unlock the layout before placing missing views")
+                : capability_state_t::available();
+        }, false, {}, "category.workspace", "Workspace");
     register_action(rt, "workspace.safe", "Activate Safe Layout", "Recover to the minimal known-good IDE layout",
-        action_surface_t::application_menu | action_surface_t::command_palette | action_surface_t::accessibility,
+        action_surface_t::application_menu | action_surface_t::toolbar |
+            action_surface_t::command_palette | action_surface_t::accessibility,
         [](const action_invocation_t&) {
             return workspace_result(workspace_layout::activate_safe_layout(), "Safe Layout recovery failed");
         }, workspace_action_capability, false, {}, "category.workspace", "Workspace");
@@ -3197,7 +3957,7 @@ void initialize(runtime_t& rt) {
         return callback ? capability_state_t::available() : capability_state_t::unavailable(reason);
     };
     register_action(rt, "tools.load_binary", "Load Binary...", "Open a binary and create an analysis session",
-        menu_surfaces, [&rt](const action_invocation_t&) {
+        menu_surfaces | action_surface_t::toolbar, [&rt](const action_invocation_t&) {
             if (!rt.shell.load_binary)
                 return action_handler_result_t::failed("Binary loader is unavailable");
             rt.shell.load_binary();
@@ -3206,7 +3966,7 @@ void initialize(runtime_t& rt) {
             return shell_capability(rt.shell.load_binary, "Binary loader is unavailable");
         }, false, {}, "category.tools", "Tools");
     register_action(rt, "tools.attach_process", "Attach to Process...", "Select and attach to a running process",
-        menu_surfaces, [&rt](const action_invocation_t&) {
+        menu_surfaces | action_surface_t::toolbar, [&rt](const action_invocation_t&) {
             if (!rt.shell.attach_process)
                 return action_handler_result_t::failed("Process attachment is unavailable");
             rt.shell.attach_process();
@@ -3218,7 +3978,7 @@ void initialize(runtime_t& rt) {
     const auto network_surfaces = action_surface_t::application_menu |
         action_surface_t::toolbar | action_surface_t::command_palette |
         action_surface_t::accessibility;
-    const auto register_network_operation = [&rt, network_surfaces](
+    const auto register_network_operation = [&rt](
         const char* id, const char* label, const char* description,
         network_view::operational_command_t command, action_effect_t effects,
         confirmation_requirement_t confirmation, const char* consequence) {
@@ -3372,7 +4132,8 @@ void initialize(runtime_t& rt) {
 	const auto register_debugger_action = [&rt](const char* id, const char* label,
 		const char* description, debugger_view::execution_command_t command) {
 		register_action(rt, id, label, description,
-			action_surface_t::application_menu | action_surface_t::command_palette |
+			action_surface_t::application_menu | action_surface_t::toolbar |
+				action_surface_t::command_palette |
 				action_surface_t::shortcut | action_surface_t::accessibility,
 			[command](const action_invocation_t&) {
 				std::string error;
@@ -3407,10 +4168,21 @@ void initialize(runtime_t& rt) {
 	register_debugger_action("debugger.toggle_breakpoint_at_rip", "Toggle Breakpoint at RIP",
 		"Add or remove a software breakpoint at the paused instruction pointer",
 		debugger_view::execution_command_t::toggle_breakpoint_at_instruction_pointer);
+	register_action(rt, "debugger.watch.refresh_all", "Refresh Watches",
+		"Evaluate the exact immutable watch generation off the UI thread and publish all results atomically",
+		action_surface_t::application_menu | action_surface_t::toolbar |
+			action_surface_t::command_palette | action_surface_t::shortcut |
+			action_surface_t::accessibility,
+		[](const action_invocation_t&) {
+			return schedule_debugger_watch_refresh();
+		}, [](const interaction_context_t&) {
+			return debugger_watch_refresh_capability();
+		}, false, {}, "category.debugger", "Debugger");
 	const auto register_patch_panel_action = [&rt](const char* id, const char* label,
 		const char* description, debugger_view::patch_panel_command_t command) {
 		register_action(rt, id, label, description,
-			action_surface_t::command_palette | action_surface_t::accessibility,
+			action_surface_t::toolbar | action_surface_t::command_palette |
+				action_surface_t::accessibility,
 			[command](const action_invocation_t&) {
 				std::string error;
 				return debugger_view::execute_patch_panel_command(command, &error)
@@ -3437,19 +4209,20 @@ void initialize(runtime_t& rt) {
 	const auto register_intercept_action = [&rt](const char* id, const char* label,
 		const char* description, network_view::intercept_command_t command) {
 		register_action(rt, id, label, description,
-			action_surface_t::toolbar | action_surface_t::command_palette |
-			action_surface_t::shortcut | action_surface_t::accessibility,
-			[command](const action_invocation_t&) {
+			action_surface_t::application_menu | action_surface_t::toolbar |
+			action_surface_t::command_palette | action_surface_t::shortcut |
+			action_surface_t::context_menu | action_surface_t::accessibility,
+			retained_or_handler(id, [command](const action_invocation_t&) {
 				std::string error;
 				return network_view::execute_intercept_command(command, &error)
 					? action_handler_result_t::completed()
 					: action_handler_result_t::failed(error);
-			}, [command](const interaction_context_t&) {
+			}), retained_or_capability(id, [command](const interaction_context_t&) {
 				const auto state = network_view::intercept_command_capability(command);
 				return state.enabled ? capability_state_t::available()
-					: capability_state_t::unavailable(state.disabled_reason
-						? state.disabled_reason : "Intercept command is unavailable");
-			}, false, {}, "category.network", "Network");
+					: capability_state_t::unavailable(state.disabled_reason.empty()
+						? "Intercept command is unavailable" : state.disabled_reason);
+			}), false, {}, "category.network", "Network");
 	};
 	register_intercept_action("network.intercept.forward_selected", "Forward Selected",
 		"Forward the exact selected held exchange",
@@ -3457,6 +4230,9 @@ void initialize(runtime_t& rt) {
 	register_intercept_action("network.intercept.drop_selected", "Drop Selected...",
 		"Review dropping the exact selected held exchange",
 		network_view::intercept_command_t::drop_selected);
+	register_intercept_action("network.intercept.forward_modified", "Forward Modified",
+		"Forward the exact selected held exchange with its reviewed bounded text draft",
+		network_view::intercept_command_t::forward_modified);
 	register_intercept_action("network.intercept.forward_all", "Forward All Held",
 		"Forward every exchange in the current immutable Intercept publication",
 		network_view::intercept_command_t::forward_all);
@@ -3464,7 +4240,7 @@ void initialize(runtime_t& rt) {
 		"Review dropping every exchange in the current immutable Intercept publication",
 		network_view::intercept_command_t::drop_all);
     register_action(rt, "tools.settings", "Settings", "Open AiDA settings",
-        menu_surfaces, [&rt](const action_invocation_t&) {
+        menu_surfaces | action_surface_t::toolbar, [&rt](const action_invocation_t&) {
             if (!rt.shell.open_settings)
                 return action_handler_result_t::failed("Settings are unavailable");
             rt.shell.open_settings();
@@ -3500,7 +4276,8 @@ void initialize(runtime_t& rt) {
             return shell_capability(rt.shell.open_settings, "Model settings are unavailable");
         }, false, {}, "category.ai", "AI");
     register_action(rt, "ai.agent_picker.toggle", "Choose Active Agent...",
-        "Open or close the active-agent picker", menu_surfaces,
+        "Open or close the active-agent picker",
+        menu_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             std::string error;
             return chat_toggle_agent_picker(error)
@@ -3582,7 +4359,8 @@ void initialize(runtime_t& rt) {
         }, [&rt](const interaction_context_t&) {
             return single_explorer_selection(rt.explorer);
         });
-    register_action(rt, "explorer.search", "Search Workspace", "Open workspace search", context_surfaces,
+    register_action(rt, "explorer.search", "Search Workspace", "Open workspace search",
+        context_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             const auto result = application_views::open_or_focus(stable_view_id_t("view.workspace_search"));
             return result.ok() ? action_handler_result_t::completed() : action_handler_result_t::failed(result.detail);
@@ -3598,8 +4376,16 @@ void initialize(runtime_t& rt) {
         }, [&rt](const interaction_context_t&) {
             return single_explorer_selection(rt.explorer);
         });
-    register_action(rt, "explorer.refresh", "Refresh", "Refresh Explorer", context_surfaces,
-        [](const action_invocation_t&) { file_browser::needs_refresh = true; return action_handler_result_t::completed(); });
+    register_action(rt, "explorer.refresh", "Refresh", "Refresh Explorer",
+        context_surfaces | action_surface_t::toolbar,
+        [](const action_invocation_t&) {
+            file_browser::needs_refresh = true;
+            return action_handler_result_t::completed();
+        }, [](const interaction_context_t&) {
+            return file_browser::roots.empty()
+                ? capability_state_t::unavailable("Open a workspace folder before refreshing Explorer")
+                : capability_state_t::available();
+        });
     const auto register_explorer_file_operation = [&rt](const char* id, const char* label,
             const char* description, explorer_views::file_operation_t operation,
             bool mutation) {
@@ -3804,22 +4590,24 @@ void initialize(runtime_t& rt) {
             ? capability_state_t::available()
             : capability_state_t::unavailable("This output view has no text");
     };
-    register_action(rt, "output.copy_all", "Copy All", "Copy the complete bounded output buffer", context_surfaces,
+    const auto output_surfaces = context_surfaces | action_surface_t::toolbar |
+        action_surface_t::shortcut;
+    register_action(rt, "output.copy_all", "Copy All", "Copy the complete bounded output buffer", output_surfaces,
         [output_tab](const action_invocation_t&) {
             const auto result = output_views::copy_all(output_tab());
             return result.succeeded ? action_handler_result_t::completed() : action_handler_result_t::failed(result.detail);
         }, output_capability);
-    register_action(rt, "output.clear", "Clear", "Clear this view without affecting its underlying service", context_surfaces,
+    register_action(rt, "output.clear", "Clear", "Clear this view without affecting its underlying service", output_surfaces,
         [output_tab](const action_invocation_t&) {
             const auto result = output_views::clear(output_tab());
             return result.succeeded ? action_handler_result_t::completed() : action_handler_result_t::failed(result.detail);
         }, output_capability);
-    register_action(rt, "output.select_all", "Select All", "Select all text in this output view", context_surfaces,
+    register_action(rt, "output.select_all", "Select All", "Select all text in this output view", output_surfaces,
         [output_tab](const action_invocation_t&) {
             const auto result = output_views::select_all(output_tab());
             return result.succeeded ? action_handler_result_t::completed() : action_handler_result_t::failed(result.detail);
         }, output_capability);
-    register_action(rt, "output.follow", "Follow Tail", "Toggle automatic following of new output", context_surfaces,
+    register_action(rt, "output.follow", "Follow Tail", "Toggle automatic following of new output", output_surfaces,
         [output_tab](const action_invocation_t&) {
             const auto result = output_views::toggle_follow(output_tab());
             return result.succeeded ? action_handler_result_t::completed() : action_handler_result_t::failed(result.detail);
@@ -3831,7 +4619,7 @@ void initialize(runtime_t& rt) {
             return output_views::follows_tail(output_tab())
                 ? action_check_state_t::checked : action_check_state_t::unchecked;
         });
-    register_action(rt, "output.filter", "Focus Filter", "Focus the output filter", context_surfaces,
+    register_action(rt, "output.filter", "Focus Filter", "Focus the output filter", output_surfaces,
         [output_tab](const action_invocation_t&) {
             const auto result = output_views::focus_filter(output_tab());
             return result.succeeded ? action_handler_result_t::completed() : action_handler_result_t::failed(result.detail);
@@ -3840,7 +4628,7 @@ void initialize(runtime_t& rt) {
                 ? capability_state_t::available()
                 : capability_state_t::unavailable("Interactive terminal output cannot be filtered safely");
         });
-    register_action(rt, "output.export", "Export...", "Export the complete bounded output buffer to a chosen file", context_surfaces,
+    register_action(rt, "output.export", "Export...", "Export the complete bounded output buffer to a chosen file", output_surfaces,
         [output_tab](const action_invocation_t&) {
             const auto result = output_views::export_all(output_tab());
             return result.succeeded ? action_handler_result_t::completed() : action_handler_result_t::failed(result.detail);
@@ -3863,7 +4651,7 @@ void initialize(runtime_t& rt) {
     };
     const auto register_terminal_operation = [&](const char* id, const char* name,
             const char* description, auto operation, auto capability) {
-        register_action(rt, id, name, description, context_surfaces,
+        register_action(rt, id, name, description, output_surfaces,
             [operation](const action_invocation_t&) {
                 const auto result = operation();
                 return result.succeeded ? action_handler_result_t::completed()
@@ -3911,9 +4699,10 @@ void initialize(runtime_t& rt) {
                     "The file changed on disk; resolve the editor conflict before saving")
                 : capability_state_t::available();
         });
+    const auto tab_toolbar_surfaces = context_surfaces | action_surface_t::toolbar;
     register_action(rt, "tab.compare_disk", "Compare with Disk",
         "Load the bounded current disk version asynchronously and open a revision-bound reviewed comparison",
-        context_surfaces,
+        tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             const auto result = file_tabs::compare_with_disk(rt.tab.index);
             return result.succeeded ? action_handler_result_t::completed()
@@ -3931,7 +4720,7 @@ void initialize(runtime_t& rt) {
                 : capability_state_t::available();
         });
     register_action(rt, "tab.load.cancel", "Cancel Load",
-        "Cancel the asynchronous bounded read for this editor document", context_surfaces,
+        "Cancel the asynchronous bounded read for this editor document", tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             if (!file_tabs::is_valid_tab_index(rt.tab.index))
                 return action_handler_result_t::failed("The tab is no longer open");
@@ -3945,7 +4734,7 @@ void initialize(runtime_t& rt) {
                 : capability_state_t::unavailable("This document is not loading");
         });
     register_action(rt, "tab.load.retry", "Retry Load",
-        "Retry the asynchronous bounded read for this editor document", context_surfaces,
+        "Retry the asynchronous bounded read for this editor document", tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             if (!file_tabs::is_valid_tab_index(rt.tab.index))
                 return action_handler_result_t::failed("The tab is no longer open");
@@ -3960,7 +4749,7 @@ void initialize(runtime_t& rt) {
                 : capability_state_t::unavailable("This document does not have a failed load to retry");
         });
     register_action(rt, "tab.recovery.retry_probe", "Retry Recovery Check",
-        "Retry the asynchronous verified recovery-journal probe", context_surfaces,
+        "Retry the asynchronous verified recovery-journal probe", tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             if (!file_tabs::is_valid_tab_index(rt.tab.index))
                 return action_handler_result_t::failed("The tab is no longer open");
@@ -3979,7 +4768,7 @@ void initialize(runtime_t& rt) {
                 : capability_state_t::unavailable("No failed recovery check is available to retry");
         });
     register_action(rt, "tab.external.reload", "Reload from Disk",
-        "Replace the unmodified editor buffer with the newer retained disk version", context_surfaces,
+        "Replace the unmodified editor buffer with the newer retained disk version", tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             return file_tabs::reload_external(rt.tab.index)
                 ? action_handler_result_t::completed()
@@ -3997,7 +4786,7 @@ void initialize(runtime_t& rt) {
         });
     register_action(rt, "tab.external.keep_editor", "Keep Editor Version",
         "Approve the retained editor version for the next explicit save over the newer disk version",
-        context_surfaces,
+        tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             return file_tabs::keep_editor_version(rt.tab.index)
                 ? action_handler_result_t::completed()
@@ -4028,7 +4817,7 @@ void initialize(runtime_t& rt) {
     };
     register_action(rt, "tab.recovery.recover", "Recover Unsaved Content",
         "Open the verified journal content as unsaved work without consuming the retained recovery point",
-        context_surfaces,
+        tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             const auto result = file_tabs::recover_from_journal(rt.tab.index);
             return result.succeeded ? action_handler_result_t::completed()
@@ -4038,7 +4827,7 @@ void initialize(runtime_t& rt) {
         });
     register_action(rt, "tab.recovery.compare", "Compare with Recovery",
         "Open a revision-bound comparison between the current document and the verified journal",
-        context_surfaces,
+        tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             const auto result = file_tabs::compare_with_journal(rt.tab.index);
             return result.succeeded ? action_handler_result_t::completed()
@@ -4048,7 +4837,7 @@ void initialize(runtime_t& rt) {
         });
     register_action(rt, "tab.recovery.discard", "Discard Recovery",
         "Permanently discard the current and last-good journals for this document after explicit acknowledgement",
-        context_surfaces,
+        tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             const auto result = file_tabs::request_recovery_discard(rt.tab.index);
             return result.succeeded ? action_handler_result_t::completed()
@@ -4056,7 +4845,7 @@ void initialize(runtime_t& rt) {
         }, [recovery_capability](const interaction_context_t&) {
             return recovery_capability(true);
         });
-    register_action(rt, "tab.close", "Close", "Close this editor tab", context_surfaces,
+    register_action(rt, "tab.close", "Close", "Close this editor tab", tab_toolbar_surfaces,
         [&rt](const action_invocation_t&) {
             if (file_tabs::close_review_in_progress())
                 return action_handler_result_t::failed(
@@ -4436,6 +5225,18 @@ void initialize(runtime_t& rt) {
     register_shortcut(rt, "binding.editor.language.outline",
         "programming.language.document_symbols",
         ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_O, "Ctrl+Shift+O");
+    register_review_shortcut(rt, "binding.editor.ai.previous_pending_hunk",
+        "editor.ai.previous_pending_hunk", ImGuiMod_Alt | ImGuiKey_LeftBracket,
+        "Alt+[");
+    register_review_shortcut(rt, "binding.editor.ai.next_pending_hunk",
+        "editor.ai.next_pending_hunk", ImGuiMod_Alt | ImGuiKey_RightBracket,
+        "Alt+]");
+    register_review_shortcut(rt, "binding.editor.ai.accept_current_hunk",
+        "editor.ai.accept_current_hunk",
+        ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_Enter, "Ctrl+Alt+Enter");
+    register_review_shortcut(rt, "binding.editor.ai.reject_current_hunk",
+        "editor.ai.reject_current_hunk",
+        ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_Backspace, "Ctrl+Alt+Backspace");
     register_global_shortcut(rt, "binding.global.new", "file.new", ImGuiMod_Ctrl | ImGuiKey_N, "Ctrl+N");
     register_global_shortcut(rt, "binding.global.open", "file.open", ImGuiMod_Ctrl | ImGuiKey_O, "Ctrl+O");
     register_global_shortcut(rt, "binding.global.open_folder", "file.open_folder", ImGuiMod_Ctrl | ImGuiKey_K, "Ctrl+K");
@@ -4446,6 +5247,9 @@ void initialize(runtime_t& rt) {
     register_global_shortcut(rt, "binding.global.output", "view.output", ImGuiMod_Ctrl | ImGuiKey_GraveAccent, "Ctrl+`");
     register_global_shortcut(rt, "binding.global.network", "view.network", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_N, "Ctrl+Shift+N");
     register_global_shortcut(rt, "binding.global.debugger", "view.debugger", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_D, "Ctrl+Shift+D");
+    register_global_shortcut(rt, "binding.global.source_debug_console",
+        "view.focus.view.programming.source_debug_console",
+        ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_D, "Ctrl+Alt+D");
     register_global_shortcut(rt, "binding.global.scan", "view.scan", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_M, "Ctrl+Shift+M");
 	register_widget_shortcut(rt, "binding.memory.first_scan", "memory.first_scan",
 		ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_F, "Ctrl+Alt+F", k_memory_scan_scope, 50);
@@ -4484,6 +5288,12 @@ void initialize(runtime_t& rt) {
         ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_C, "Ctrl+Alt+C");
     register_global_shortcut(rt, "binding.global.programming_task_configure", "programming.task.configure",
         ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_T, "Ctrl+Alt+T");
+    register_domain_shortcut(rt, "binding.output.copy_all", "output.copy_all",
+        ImGuiMod_Ctrl | ImGuiKey_C, "Ctrl+C", k_output_scope, 40);
+    register_domain_shortcut(rt, "binding.output.select_all", "output.select_all",
+        ImGuiMod_Ctrl | ImGuiKey_A, "Ctrl+A", k_output_scope, 40);
+    register_domain_shortcut(rt, "binding.output.filter", "output.filter",
+        ImGuiMod_Ctrl | ImGuiKey_F, "Ctrl+F", k_output_scope, 40);
     register_domain_shortcut(rt, "binding.terminal.new", "terminal.new",
         ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_GraveAccent, "Ctrl+Shift+`", k_terminal_scope, 40);
     register_domain_shortcut(rt, "binding.terminal.close", "terminal.close",
@@ -4562,12 +5372,17 @@ void initialize(runtime_t& rt) {
 	register_domain_shortcut(rt, "binding.debugger.restart", "debugger.restart", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_F5, "Ctrl+Shift+F5", k_debugger_scope, 30);
 	register_domain_shortcut(rt, "binding.debugger.detach", "debugger.detach", ImGuiMod_Ctrl | ImGuiKey_F2, "Ctrl+F2", k_debugger_scope, 30);
 	register_domain_shortcut(rt, "binding.debugger.toggle_breakpoint", "debugger.toggle_breakpoint_at_rip", ImGuiKey_F9, "F9", k_debugger_scope, 30);
+	register_widget_shortcut(rt, "binding.debugger.watch.refresh_all",
+		"debugger.watch.refresh_all", ImGuiMod_Ctrl | ImGuiKey_R,
+		"Ctrl+R", "scope.view.debug.watches", 50);
 	register_domain_shortcut(rt, "binding.editor.source_breakpoint",
 		"debug.source.toggle_breakpoint", ImGuiKey_F9, "F9", k_editor_scope, 50);
 	register_widget_shortcut(rt, "binding.network.intercept.forward_selected",
 		"network.intercept.forward_selected", ImGuiKey_F, "F", k_network_intercept_scope, 50);
 	register_widget_shortcut(rt, "binding.network.intercept.drop_selected",
 		"network.intercept.drop_selected", ImGuiKey_D, "D", k_network_intercept_scope, 50);
+	register_widget_shortcut(rt, "binding.network.intercept.forward_modified",
+		"network.intercept.forward_modified", ImGuiKey_M, "M", k_network_intercept_scope, 50);
 	register_widget_shortcut(rt, "binding.network.intercept.forward_all",
 		"network.intercept.forward_all", ImGuiMod_Shift | ImGuiKey_F,
 		"Shift+F", k_network_intercept_scope, 50);
@@ -4582,6 +5397,7 @@ void initialize(runtime_t& rt) {
         bool undoable = false;
     };
     static constexpr retained_action_definition_t retained_actions[] = {
+        {"workspace.load_named", "Load Saved Workspace", "Load the exact retained saved workspace generation", "Workspace"},
         {"task.focus_owner", "Focus Owner", "Focus the retained task owner", "Tasks"},
         {"task.open_log", "Open Log", "Open the retained task log", "Tasks"},
         {"task.retry", "Retry", "Retry the retained terminal task", "Tasks"},
@@ -4702,6 +5518,7 @@ void initialize(runtime_t& rt) {
         {"network.capture.send_repeater", "Send to Repeater", "Send a retained HTTP request to Repeater", "Network Capture"},
         {"network.capture.replay", "Replay Packet", "Replay a reviewed retained packet", "Network Capture"},
         {"network.exchange.repeater", "Open Request in Repeater", "Stage the retained request in Repeater", "Network Exchange"},
+        {"network.exchange.fuzzer", "Open Request in Fuzzer", "Stage the exact retained request in Fuzzer", "Network Exchange"},
         {"network.exchange.intruder", "Open Request in Intruder", "Stage the retained request in Intruder", "Network Exchange"},
         {"network.exchange.scanner", "Open Request in Scanner", "Stage the retained request in Scanner", "Network Exchange"},
         {"network.exchange.comparer", "Send Artifact to Comparer", "Send the retained exchange artifact to Comparer", "Network Exchange"},
@@ -4833,6 +5650,14 @@ void initialize(runtime_t& rt) {
         {"analysis.graph.reset", "Reset View", "Reset graph pan and zoom", "Analysis"},
         {"analysis.graph.select_block", "Select Entire Block", "Select all instructions in the graph block", "Analysis"},
         {"analysis.graph.clear_selection", "Clear Selection", "Clear the graph text selection", "Analysis"},
+		{"analysis.graph.navigate_source", "Go to Source Block", "Navigate to the published incoming source block", "Analysis"},
+		{"analysis.graph.navigate_target", "Go to Target", "Navigate to the selected instruction's direct target", "Analysis"},
+		{"analysis.graph.collapse_reachable", "Collapse Reachable Scope", "Hide blocks reachable from the selected block", "Analysis"},
+		{"analysis.graph.expand_reachable", "Expand Reachable Scope", "Restore blocks hidden below the selected block", "Analysis"},
+		{"analysis.graph.pin_node", "Pin Node Position", "Retain the selected node position across graph rebuilds", "Analysis"},
+		{"analysis.graph.unpin_node", "Unpin Node Position", "Return the selected node to automatic graph layout", "Analysis"},
+		{"analysis.graph.pin_layout", "Pin Layout", "Retain all current node positions across graph rebuilds", "Analysis"},
+		{"analysis.graph.unpin_layout", "Unpin Layout", "Return the graph to automatic layout", "Analysis"},
         {"analysis.view.va", "Virtual Address Format", "Display virtual addresses", "Analysis"},
         {"analysis.view.rva", "Relative Address Format", "Display image-relative addresses", "Analysis"},
         {"analysis.view.file_offset", "File Offset Format", "Display file offsets where available", "Analysis"},
@@ -4939,14 +5764,35 @@ void initialize(runtime_t& rt) {
 		{"types.dissector.field.choose_enum", "Choose Enum...", "Apply an enum definition to the retained field", "Types"},
         {"types.dissector.field.configure_bitfield", "Configure Bitfield...", "Configure the retained field bit layout", "Types"},
         {"types.dissector.field.set_alignment", "Set Alignment...", "Set alignment for the retained field", "Types"},
+		{"types.dissector.field.insert_before", "Insert Field Before...", "Insert a field before the retained field", "Types"},
+		{"types.dissector.field.insert_after", "Insert Field After...", "Insert a field after the retained field", "Types"},
+		{"types.dissector.field.move_up", "Move Field Up", "Move the retained field up", "Types"},
+		{"types.dissector.field.move_down", "Move Field Down", "Move the retained field down", "Types"},
         {"types.dissector.field.remove", "Remove Field...", "Review removing the retained field", "Types"}
     };
     const auto retained_surfaces = action_surface_t::context_menu |
         action_surface_t::accessibility;
     for (const auto& definition : retained_actions) {
         const std::string retained_id = definition.id;
+        const bool toolbar_retained = retained_id == "workspace.load_named" ||
+            retained_id == "debugger.patch.apply" ||
+            retained_id == "debugger.patch.remove" ||
+            retained_id == "network.exchange.repeater" ||
+            retained_id == "network.exchange.copy_url" ||
+            retained_id == "network.exchange.fuzzer";
+        const bool shortcut_retained = retained_id == "memory.address.remove" ||
+            retained_id == "debugger.source.remove";
+        auto definition_surfaces = retained_surfaces;
+        if (toolbar_retained)
+            definition_surfaces = definition_surfaces | action_surface_t::toolbar;
+        if (retained_id == "workspace.load_named")
+            definition_surfaces = definition_surfaces |
+                action_surface_t::application_menu;
+        if (shortcut_retained)
+            definition_surfaces = definition_surfaces |
+                action_surface_t::shortcut;
         register_action(rt, definition.id, definition.label, definition.description,
-            retained_surfaces,
+            definition_surfaces,
             [retained_id](const action_invocation_t& invocation) {
                 return invoke_retained_entity_action(invocation, retained_id);
             },
@@ -5030,10 +5876,12 @@ void initialize(runtime_t& rt) {
             analysis_context_menu_action("analysis.navigate.disassembly_side", 3),
             analysis_context_menu_action("analysis.navigate.hex", 4),
             analysis_context_menu_action("analysis.navigate.follow", 5),
-            analysis_context_menu_action("analysis.navigate.graph", 6, "Space", "Open in Graph",
-                "Open the selected function in graph representation"),
-            analysis_context_menu_action("analysis.navigate.pseudocode", 7, "F5", "Open in Pseudocode",
-                "Open or decompile the selected function as pseudocode"),
+            analysis_context_menu_action("analysis.navigate.graph", 6, nullptr, "Open in Graph",
+                "Open the selected function in graph representation",
+                "analysis.toggle_graph_text"),
+            analysis_context_menu_action("analysis.navigate.pseudocode", 7, nullptr,
+                "Open in Pseudocode", "Open or decompile the selected function as pseudocode",
+                "analysis.decompile_or_focus_pseudocode"),
             analysis_context_menu_action("analysis.navigate.functions", 8),
             analysis_context_menu_action("analysis.navigate.structures", 9),
             analysis_context_menu_action("analysis.navigate.types", 10)});
@@ -5114,16 +5962,26 @@ void initialize(runtime_t& rt) {
                 analysis_context_menu_action("analysis.select.metadata_all", 0)})});
     register_menu(rt, "menu.analysis.graph", k_retained_entity_context_type, {
         analysis_navigation,
+		analysis_context_menu_section("section.graph.navigate", "Graph Navigation",
+			context_menu_group_t::open_navigate, 1, {
+				analysis_context_menu_action("analysis.graph.navigate_source", 0),
+				analysis_context_menu_action("analysis.graph.navigate_target", 1, "Enter")}),
         analysis_context_menu_section("section.graph.canvas", "Graph",
-            context_menu_group_t::open_navigate, 1, {
+			context_menu_group_t::open_navigate, 2, {
                 analysis_context_menu_action("analysis.graph.fit", 0),
                 analysis_context_menu_action("analysis.graph.zoom_in", 1),
                 analysis_context_menu_action("analysis.graph.zoom_out", 2),
                 analysis_context_menu_action("analysis.graph.reset", 3),
                 analysis_context_menu_action("analysis.graph.select_block", 4),
-                analysis_context_menu_action("analysis.graph.clear_selection", 5)}),
+				analysis_context_menu_action("analysis.graph.clear_selection", 5),
+				analysis_context_menu_action("analysis.graph.collapse_reachable", 6),
+				analysis_context_menu_action("analysis.graph.expand_reachable", 7),
+				analysis_context_menu_action("analysis.graph.pin_node", 8),
+				analysis_context_menu_action("analysis.graph.unpin_node", 9),
+				analysis_context_menu_action("analysis.graph.pin_layout", 10),
+				analysis_context_menu_action("analysis.graph.unpin_layout", 11)}),
         analysis_context_menu_section("section.graph.copy", "Copy",
-            context_menu_group_t::copy_export, 2, {
+			context_menu_group_t::copy_export, 3, {
                 analysis_context_menu_action("analysis.copy.block", 0),
                 analysis_context_menu_action("analysis.copy.block_addressed", 1),
                 analysis_context_menu_action("analysis.copy.address", 2)}),
@@ -5185,14 +6043,31 @@ void initialize(runtime_t& rt) {
              menu_action("editor.ai.fix", 2),
              menu_action("editor.ai.generate_tests", 3),
              menu_action("editor.add_to_chat", 4),
-             menu_action("editor.ai.accept_hunk", 5),
-             menu_action("editor.ai.reject_hunk", 6),
-             menu_action("editor.ai.accept_all", 7),
-             menu_action("editor.ai.reject_all", 8)}),
+             menu_action("editor.ai.previous_pending_hunk", 5),
+             menu_action("editor.ai.next_pending_hunk", 6),
+             menu_action("editor.ai.accept_current_hunk", 7),
+             menu_action("editor.ai.reject_current_hunk", 8),
+             menu_action("editor.ai.accept_hunk", 9),
+             menu_action("editor.ai.reject_hunk", 10),
+             menu_action("editor.ai.accept_all", 11),
+             menu_action("editor.ai.reject_all", 12)}),
         menu_section("section.editor.file", context_menu_group_t::modify_run, 8,
             {menu_action("file.quick_open", 0), menu_action("file.save", 1),
              menu_action("file.save_as", 2), menu_action("file.save_all", 3),
              menu_action("file.close", 4), menu_action("file.close_all", 5)})
+    });
+    register_menu(rt, "menu.editor.review", k_editor_context_type, {
+        menu_section("section.editor.review.navigate", context_menu_group_t::open_navigate, 0,
+            {menu_action("editor.ai.previous_pending_hunk", 0),
+             menu_action("editor.ai.next_pending_hunk", 1)}),
+        menu_section("section.editor.review.current", context_menu_group_t::modify_run, 1,
+            {menu_action("editor.ai.accept_current_hunk", 0),
+             menu_action("editor.ai.reject_current_hunk", 1),
+             menu_action("editor.ai.accept_hunk", 2),
+             menu_action("editor.ai.reject_hunk", 3)}),
+        menu_section("section.editor.review.all", context_menu_group_t::modify_run, 2,
+            {menu_action("editor.ai.accept_all", 0),
+             menu_action("editor.ai.reject_all", 1)})
     });
     register_menu(rt, "menu.editor.tab", k_tab_context_type, {
         menu_section("section.tab.reopen", context_menu_group_t::open_navigate, 0,
@@ -5377,6 +6252,14 @@ void initialize(runtime_t& rt) {
 		"types.dissector.structure.save_catalog", 42));
 	analysis_types_modify.push_back(retained_menu_action(
 		"types.dissector.structure.load_catalog", 43));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.field.insert_before", 44));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.field.insert_after", 45));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.field.move_up", 46));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.field.move_down", 47));
     std::vector<context_menu_action_t> analysis_types_copy = {
 		retained_menu_action("types.dissector.structure.copy_name", 0),
 		retained_menu_action("types.dissector.structure.copy_declaration", 1),
@@ -5548,22 +6431,23 @@ void initialize(runtime_t& rt) {
             {retained_menu_action("network.capture.send_comparer", 0),
              retained_menu_action("network.capture.send_repeater", 1),
              retained_menu_action("network.exchange.repeater", 2),
-             retained_menu_action("network.exchange.intruder", 3),
-             retained_menu_action("network.exchange.scanner", 4),
-             retained_menu_action("network.exchange.comparer", 5),
-             retained_menu_action("network.exchange.decoder", 6),
-             retained_menu_action("network.exchange.sequencer", 7),
-             retained_menu_action("network.exchange.camoufox", 8),
-             retained_menu_action("ai.provider.open_details", 9),
-             retained_menu_action("ai.provider.test_model", 10),
-             retained_menu_action("ai.skill.open_file", 11),
-             retained_menu_action("mcp.marketplace.open_details", 12),
-             retained_menu_action("ai.chat.conversation.open", 13),
-             retained_menu_action("ai.chat.message.inspect_tool", 14),
-             retained_menu_action("ai.chat.message.review_change", 15),
-             retained_menu_action("ai.evidence.return_source", 16),
-             retained_menu_action("network.exchange.related_comparer", 17),
-             retained_menu_action("network.websocket.open_editor", 18)}),
+             retained_menu_action("network.exchange.fuzzer", 3),
+             retained_menu_action("network.exchange.intruder", 4),
+             retained_menu_action("network.exchange.scanner", 5),
+             retained_menu_action("network.exchange.comparer", 6),
+             retained_menu_action("network.exchange.decoder", 7),
+             retained_menu_action("network.exchange.sequencer", 8),
+             retained_menu_action("network.exchange.camoufox", 9),
+             retained_menu_action("ai.provider.open_details", 10),
+             retained_menu_action("ai.provider.test_model", 11),
+             retained_menu_action("ai.skill.open_file", 12),
+             retained_menu_action("mcp.marketplace.open_details", 13),
+             retained_menu_action("ai.chat.conversation.open", 14),
+             retained_menu_action("ai.chat.message.inspect_tool", 15),
+             retained_menu_action("ai.chat.message.review_change", 16),
+             retained_menu_action("ai.evidence.return_source", 17),
+             retained_menu_action("network.exchange.related_comparer", 18),
+             retained_menu_action("network.websocket.open_editor", 19)}),
         menu_section("section.retained.network_ai.modify", context_menu_group_t::modify_run, 6,
             {retained_menu_action("network.capture.filter_pid", 0),
              retained_menu_action("network.capture.filter_protocol", 1),
@@ -5598,7 +6482,10 @@ void initialize(runtime_t& rt) {
              retained_menu_action("network.proxy.clear_filter", 30),
              retained_menu_action("network.repeater.duplicate", 31),
              retained_menu_action("network.websocket.filter_host", 32),
-             retained_menu_action("network.websocket.toggle_follow", 33)}),
+             retained_menu_action("network.websocket.toggle_follow", 33),
+             retained_menu_action("network.intercept.forward_selected", 34),
+             retained_menu_action("network.intercept.drop_selected", 35),
+             retained_menu_action("network.intercept.forward_modified", 36)}),
         menu_section("section.retained.network_ai.copy", context_menu_group_t::copy_export, 7,
             {retained_menu_action("network.capture.copy_summary", 0),
              retained_menu_action("network.capture.copy_source", 1),
@@ -5671,7 +6558,8 @@ interaction_context_t editor_context(runtime_t& rt) {
     interaction_context_t context;
     context.active_view = stable_view_id_t("document.code");
     if (rt.editor_focused)
-        context.focus_path.push_back({stable_scope_id_t(k_editor_scope), focus_scope_kind_t::text_editor});
+        context.focus_path.push_back({stable_scope_id_t(rt.editor_review_mode
+            ? k_editor_review_scope : k_editor_scope), focus_scope_kind_t::text_editor});
     context.payload = typed_context_ref_t::from(context_type(k_editor_context_type), rt.editor);
     context.generation = rt.generation;
     context.text_input_active = rt.editor_text_input;
@@ -5702,6 +6590,8 @@ interaction_context_t active_context(runtime_t& rt) {
             context.focus_path.push_back({stable_scope_id_t(k_debugger_scope), focus_scope_kind_t::domain});
         else if (focused->view.value() == "view.terminal")
             context.focus_path.push_back({stable_scope_id_t(k_terminal_scope), focus_scope_kind_t::domain});
+        else if (descriptor && descriptor->category == view_category_t::output)
+            context.focus_path.push_back({stable_scope_id_t(k_output_scope), focus_scope_kind_t::domain});
         else if (descriptor && (descriptor->category == view_category_t::analysis ||
                  descriptor->category == view_category_t::document))
             context.focus_path.push_back({stable_scope_id_t(k_analysis_scope), focus_scope_kind_t::domain});
@@ -5718,7 +6608,8 @@ void cancel_action_confirmation(runtime_t& rt);
 
 bool queue_action_confirmation(runtime_t& rt, const char* id,
                                action_invocation_source_t source,
-                               const action_execution_result_t& result) {
+                               const action_execution_result_t& result,
+                               const interaction_context_t& context) {
     if (result.status != action_execution_status_t::confirmation_required &&
         result.status != action_execution_status_t::review_required)
         return false;
@@ -5735,6 +6626,14 @@ bool queue_action_confirmation(runtime_t& rt, const char* id,
     rt.pending_confirmation.description = descriptor->description;
     rt.pending_confirmation.consequence = result.consequence_summary;
     rt.pending_confirmation.source = source;
+    rt.pending_confirmation.context = context;
+    if (const auto* retained =
+            context.payload.get<retained_entity_runtime_context_t>()) {
+        rt.pending_confirmation.retained_context.retained = retained->context();
+        rt.pending_confirmation.context.payload = typed_context_ref_t::from(
+            context_type(k_retained_entity_context_type),
+            rt.pending_confirmation.retained_context);
+    }
     return true;
 }
 
@@ -5780,10 +6679,8 @@ bool execute_resolution(runtime_t& rt, const shortcut_resolution_t& resolution) 
     invocation.source = action_invocation_source_t::shortcut;
     invocation.invocation_id = rt.invocation++;
     const auto result = rt.actions.execute(resolution.action, invocation);
-    if (!queue_action_confirmation(rt, resolution.action.c_str(),
-            action_invocation_source_t::shortcut, result))
-        publish_action_execution_failure(resolution.action.c_str(), result,
-            action_invocation_source_t::shortcut);
+    finalize_action_execution(resolution.action.c_str(), result,
+        action_invocation_source_t::shortcut, invocation.context);
     return true;
 }
 
@@ -5801,8 +6698,10 @@ void begin_frame() {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     aida::infra::executor::drain_preview_frame();
 #endif
-    aida::editor::language_service::begin_frame();
+	aida::editor::language_service::begin_frame();
 	source_debug_service::begin_frame();
+	if (rt.shell.exit_application && file_tabs::consume_exit_review_ready())
+		rt.shell.exit_application();
     rt.consumed_strokes_this_frame.clear();
     rt.editor_focused = false;
     rt.editor_text_input = false;
@@ -5824,10 +6723,11 @@ void render_action_confirmation() {
     bool keep_open = true;
     if (design::begin_dialog_exact(popup_label, ImVec2(560.0f, 350.0f),
             ImVec2(420.0f, 280.0f), &keep_open)) {
-        rt.current = active_context(rt);
         const std::string pending_id = rt.pending_confirmation.action;
         const auto pending_source = rt.pending_confirmation.source;
-        const auto state = rt.actions.evaluate(action_id(pending_id.c_str()), rt.current);
+        const interaction_context_t pending_context = rt.pending_confirmation.context;
+        const auto state = rt.actions.evaluate(
+            action_id(pending_id.c_str()), pending_context);
         const auto* descriptor = rt.actions.find(action_id(pending_id.c_str()));
         const action_effect_t high_consequence_effects =
             action_effect_t::destructive | action_effect_t::security_sensitive |
@@ -5867,7 +6767,7 @@ void render_action_confirmation() {
             publish_action_execution_failure(pending_id.c_str(), unavailable,
                 pending_source);
         } else if (dialog_result.confirmed) {
-            action_invocation_t invocation{rt.current};
+            action_invocation_t invocation{pending_context};
             invocation.source = pending_source;
             invocation.invocation_id = rt.invocation++;
             invocation.review_completed = true;
@@ -5931,13 +6831,16 @@ void process_global_shortcuts() {
     execute_resolution(rt, rt.shortcuts.poll(now_ms(), rt.current, rt.actions));
 }
 
-void set_editor_focus(bool focused, bool text_input_active) {
+void set_editor_focus(bool focused, bool text_input_active, bool review_mode) {
     auto& rt = runtime();
     initialize(rt);
-    if (rt.editor_focused != focused || rt.editor_text_input != text_input_active)
+    const bool effective_review_mode = focused && review_mode;
+    if (rt.editor_focused != focused || rt.editor_text_input != text_input_active ||
+        rt.editor_review_mode != effective_review_mode)
         ++rt.generation;
     rt.editor_focused = focused;
     rt.editor_text_input = text_input_active;
+    rt.editor_review_mode = effective_review_mode;
     rt.editor.focused = focused;
     rt.current = editor_context(rt);
 }
@@ -5995,6 +6898,30 @@ action_presentation_t present_action(const char* id) {
     result.description = descriptor->description;
     result.category = descriptor->category.display_name;
     result.shortcut = rt.shortcuts.effective_hint(descriptor->id, rt.current);
+    result.disabled_reason = state.capability.disabled_reason;
+    result.visible = state.capability.visible;
+    result.enabled = state.capability.enabled;
+    return result;
+}
+
+action_presentation_t present_editor_review_action(const char* id) {
+    auto& rt = runtime();
+    initialize(rt);
+    auto context = editor_context(rt);
+    context.focus_path.clear();
+    context.focus_path.push_back({stable_scope_id_t(k_editor_review_scope),
+        focus_scope_kind_t::text_editor});
+    context.text_input_active = false;
+    action_presentation_t result;
+    const auto* descriptor = rt.actions.find(action_id(id));
+    if (!descriptor)
+        return result;
+    const auto state = rt.actions.evaluate(descriptor->id, context);
+    result.id = descriptor->id.value();
+    result.label = descriptor->label;
+    result.description = descriptor->description;
+    result.category = descriptor->category.display_name;
+    result.shortcut = rt.shortcuts.effective_hint(descriptor->id, context);
     result.disabled_reason = state.capability.disabled_reason;
     result.visible = state.capability.visible;
     result.enabled = state.capability.enabled;
@@ -6118,34 +7045,6 @@ std::vector<shortcut_presentation_t> list_shortcuts() {
         item.editable = default_binding != rt.default_shortcuts.end();
         result.push_back(std::move(item));
     });
-    const auto append_surface_shortcut = [&result](
-            const char* binding_id, const char* action_id_value,
-            const char* label, const char* category, const char* shortcut,
-            const char* scope, const capability_state_t& capability) {
-        shortcut_presentation_t item;
-        item.binding_id = binding_id;
-        item.action_id = action_id_value;
-        item.label = label;
-        item.category = category;
-        item.shortcut = shortcut;
-        item.default_shortcut = shortcut;
-        item.scope = scope;
-        item.disabled_reason = capability.disabled_reason;
-        item.enabled = capability.enabled;
-        item.binding_enabled = true;
-        item.editable = false;
-        result.push_back(std::move(item));
-    };
-    const auto analysis_selection = analysis_selection_capability();
-    append_surface_shortcut("binding.analysis.surface.copy", "analysis.copy.selection",
-        "Copy Selected Analysis Text", "Analysis / Copy", "Ctrl+C",
-        "Analysis Documents and Lists", analysis_selection);
-    append_surface_shortcut("binding.analysis.surface.context", "analysis.context.open",
-        "Open Analysis Context Menu", "Analysis / Navigate", "Menu / Shift+F10",
-        "Analysis Documents and Lists", analysis_selection);
-    append_surface_shortcut("binding.editor.surface.context", "editor.context.open",
-        "Open Code Editor Context Menu", "Programming", "Menu / Shift+F10",
-        "Code Editor", editor_active());
     std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
         if (lhs.category != rhs.category)
             return lhs.category < rhs.category;
@@ -6335,6 +7234,16 @@ void publish_action_execution_failure(const char* id,
     toast_notification::push(message, toast_notification::toast_type_t::error, 5.0f);
 }
 
+void finalize_action_execution(const char* id,
+    const action_execution_result_t& result,
+    action_invocation_source_t source,
+    const interaction_context_t& context) {
+    auto& rt = runtime();
+    initialize(rt);
+    if (!queue_action_confirmation(rt, id, source, result, context))
+        publish_action_execution_failure(id, result, source);
+}
+
 action_execution_result_t execute_action(const char* id, action_invocation_source_t source) {
     auto& rt = runtime();
     initialize(rt);
@@ -6343,8 +7252,7 @@ action_execution_result_t execute_action(const char* id, action_invocation_sourc
     invocation.source = source;
     invocation.invocation_id = rt.invocation++;
     auto result = rt.actions.execute(action_id(id), invocation);
-    if (!queue_action_confirmation(rt, id, source, result))
-        publish_action_execution_failure(id, result, source);
+    finalize_action_execution(id, result, source, invocation.context);
     return result;
 }
 
@@ -6352,14 +7260,45 @@ action_execution_result_t execute_editor_hunk_action(int hunk_index,
         const char* id, action_invocation_source_t source) {
     auto& rt = runtime();
     initialize(rt);
-    rt.editor_hunk_index = hunk_index;
+    rt.editor_hunk_target = code_editor_widget::review_hunk_identity(hunk_index);
+    rt.editor_hunk_target_explicit = true;
     rt.current = editor_context(rt);
     action_invocation_t invocation{rt.current};
     invocation.source = source;
     invocation.invocation_id = rt.invocation++;
     auto result = rt.actions.execute(action_id(id), invocation);
-    rt.editor_hunk_index = -1;
-    publish_action_execution_failure(id, result, source);
+    rt.editor_hunk_target = {};
+    rt.editor_hunk_target_explicit = false;
+    finalize_action_execution(id, result, source, invocation.context);
+    return result;
+}
+
+action_presentation_t present_editor_tab_action(int tab_index, const char* id) {
+    action_presentation_t result;
+    auto& rt = runtime();
+    initialize(rt);
+    if (!file_tabs::is_valid_tab_index(tab_index))
+        return result;
+    const auto previous_tab = rt.tab;
+    const auto& tab = file_tabs::tabs[file_tabs::tab_index(tab_index)];
+    rt.tab = {tab_index, tab.filepath, tab.filename};
+    interaction_context_t context;
+    context.active_view = stable_view_id_t("document.code");
+    context.payload = typed_context_ref_t::from(context_type(k_tab_context_type), rt.tab);
+    context.generation = rt.generation;
+    const auto* descriptor = rt.actions.find(action_id(id));
+    if (descriptor) {
+        const auto state = rt.actions.evaluate(descriptor->id, context);
+        result.id = descriptor->id.value();
+        result.label = descriptor->label;
+        result.description = descriptor->description;
+        result.category = descriptor->category.display_name;
+        result.shortcut = rt.shortcuts.effective_hint(descriptor->id, context);
+        result.disabled_reason = state.capability.disabled_reason;
+        result.visible = state.capability.visible;
+        result.enabled = state.capability.enabled;
+    }
+    rt.tab = previous_tab;
     return result;
 }
 
@@ -6385,7 +7324,7 @@ action_execution_result_t execute_editor_tab_action(int tab_index,
     invocation.source = source;
     invocation.invocation_id = rt.invocation++;
     auto result = rt.actions.execute(action_id(id), invocation);
-    publish_action_execution_failure(id, result, source);
+    finalize_action_execution(id, result, source, invocation.context);
     return result;
 }
 
@@ -6405,7 +7344,7 @@ action_execution_result_t execute_retained_entity_action(
     invocation.source = source;
     invocation.invocation_id = rt.invocation++;
     auto result = rt.actions.execute(action_id(id), invocation);
-    publish_action_execution_failure(id, result, source);
+    finalize_action_execution(id, result, source, invocation.context);
     return result;
 }
 
@@ -6414,7 +7353,9 @@ void open_editor_context_menu(context_menu_open_origin_t origin) {
     initialize(rt);
     ++rt.generation;
     rt.editor_popup_context = editor_context(rt);
-    rt.editor_popup_request = {stable_menu_id_t("menu.editor.text"), origin, rt.editor_popup_context.generation};
+    rt.editor_popup_request = {stable_menu_id_t(rt.editor_review_mode
+        ? "menu.editor.review" : "menu.editor.text"), origin,
+        rt.editor_popup_context.generation};
     ImGui::OpenPopup("##aida_editor_context");
 }
 
@@ -6648,6 +7589,41 @@ void render_view_surface_context_menu(const view_instance_id_t& instance) {
         rt.view_surface_popup_request, rt.view_surface_popup_context);
 }
 
+action_presentation_t present_output_action(int tab, const char* action) {
+    action_presentation_t result;
+    auto& rt = runtime();
+    initialize(rt);
+    if (tab < 0 || tab >= static_cast<int>(bottom_tab_t::COUNT))
+        return result;
+    const int previous_tab = rt.output.tab;
+    rt.output.tab = tab;
+    interaction_context_t context;
+    context.active_view = stable_view_id_t(tab == static_cast<int>(bottom_tab_t::terminal)
+        ? "view.terminal" : tab == static_cast<int>(bottom_tab_t::mcp_log)
+        ? "view.mcp_log" : tab == static_cast<int>(bottom_tab_t::driver_log)
+        ? "view.driver_log" : tab == static_cast<int>(bottom_tab_t::sandbox_log)
+        ? "view.sandbox_log" : "view.output");
+    context.focus_path.push_back({stable_scope_id_t(
+        tab == static_cast<int>(bottom_tab_t::terminal)
+            ? k_terminal_scope : k_output_scope), focus_scope_kind_t::domain});
+    context.payload = typed_context_ref_t::from(context_type(k_output_context_type), rt.output);
+    context.generation = rt.generation;
+    const auto* descriptor = rt.actions.find(action_id(action));
+    if (descriptor) {
+        const auto state = rt.actions.evaluate(descriptor->id, context);
+        result.id = descriptor->id.value();
+        result.label = descriptor->label;
+        result.description = descriptor->description;
+        result.category = descriptor->category.display_name;
+        result.shortcut = rt.shortcuts.effective_hint(descriptor->id, context);
+        result.disabled_reason = state.capability.disabled_reason;
+        result.visible = state.capability.visible;
+        result.enabled = state.capability.enabled;
+    }
+    rt.output.tab = previous_tab;
+    return result;
+}
+
 action_execution_result_t execute_output_action(int tab, const char* action,
                                                 action_invocation_source_t source) {
     auto& rt = runtime();
@@ -6667,13 +7643,16 @@ action_execution_result_t execute_output_action(int tab, const char* action,
         ? "view.mcp_log" : tab == static_cast<int>(bottom_tab_t::driver_log)
         ? "view.driver_log" : tab == static_cast<int>(bottom_tab_t::sandbox_log)
         ? "view.sandbox_log" : "view.output");
+    rt.current.focus_path.push_back({stable_scope_id_t(
+        tab == static_cast<int>(bottom_tab_t::terminal)
+            ? k_terminal_scope : k_output_scope), focus_scope_kind_t::domain});
     rt.current.payload = typed_context_ref_t::from(context_type(k_output_context_type), rt.output);
     rt.current.generation = ++rt.generation;
     action_invocation_t invocation{rt.current};
     invocation.source = source;
     invocation.invocation_id = rt.invocation++;
     auto result = rt.actions.execute(action_id(action), invocation);
-    publish_action_execution_failure(action, result, source);
+    finalize_action_execution(action, result, source, invocation.context);
     return result;
 }
 
@@ -6713,6 +7692,25 @@ void open_retained_entity_context_menu(retained_entity_context_t context,
     rt.retained_entity_popup_context = {};
     rt.retained_entity_popup_context.active_view =
         rt.retained_entity.retained.active_view;
+    if (!rt.retained_entity_popup_context.active_view.empty()) {
+        const auto* descriptor = application_views::registry().find_descriptor(
+            rt.retained_entity_popup_context.active_view);
+        if (descriptor && descriptor->category == view_category_t::document)
+            rt.retained_entity_popup_context.focus_path.push_back({stable_scope_id_t(
+                std::string("scope.") + rt.retained_entity_popup_context.active_view.value()),
+                focus_scope_kind_t::document});
+        else
+            rt.retained_entity_popup_context.focus_path.push_back({stable_scope_id_t(
+                std::string("scope.") + rt.retained_entity_popup_context.active_view.value()),
+                focus_scope_kind_t::widget});
+        if (descriptor && descriptor->category == view_category_t::debugger)
+            rt.retained_entity_popup_context.focus_path.push_back({
+                stable_scope_id_t(k_debugger_scope), focus_scope_kind_t::domain});
+        else if (descriptor && (descriptor->category == view_category_t::analysis ||
+                 descriptor->category == view_category_t::document))
+            rt.retained_entity_popup_context.focus_path.push_back({
+                stable_scope_id_t(k_analysis_scope), focus_scope_kind_t::domain});
+    }
     rt.retained_entity_popup_context.payload = typed_context_ref_t::from(
         context_type(k_retained_entity_context_type), rt.retained_entity);
     rt.retained_entity_popup_context.generation = ++rt.generation;

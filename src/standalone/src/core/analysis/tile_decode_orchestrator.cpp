@@ -2070,10 +2070,10 @@ tile_decode_orchestrator_t::run(
                 const auto source_by_index = operand_index_source_ids.find(target.operand_index);
                 if (source_by_id != operand_source_ids.end()) {
                     target_input.operand = packed_entity_reference_t::local(
-                        packed_entity_domain_t::operand_fact, source_by_id->second);
+                        packed_entity_domain_t::operand, source_by_id->second);
                 } else if (source_by_index != operand_index_source_ids.end()) {
                     target_input.operand = packed_entity_reference_t::local(
-                        packed_entity_domain_t::operand_fact, source_by_index->second);
+                        packed_entity_domain_t::operand, source_by_index->second);
                 }
                 entity_id_t target_expression_source_id = 0;
                 const auto by_expression_id =

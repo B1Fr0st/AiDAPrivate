@@ -7,6 +7,9 @@
 #include "toast_notification.hpp"
 #include "../ai/entity_evidence_handoff.hpp"
 #include "imgui/imgui.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -290,8 +293,12 @@ void publish_locked(state_t& store, std::uint64_t now) {
             ++next->status.running;
         else if (item.state == task_state_t::cancellation_requested)
             ++next->status.cancellation_requested;
-        if (failure_state(item.state))
+        if (item.state == task_state_t::failed || item.state == task_state_t::timed_out)
             ++next->status.failures;
+        else if (item.state == task_state_t::interrupted)
+            ++next->status.interrupted;
+        else if (item.state == task_state_t::partial)
+            ++next->status.partial;
         if (active_state(item.state))
             next->status.oldest_active_ms = (std::max)(next->status.oldest_active_ms, item.elapsed_ms);
     }
@@ -847,6 +854,8 @@ void register_views(view_registry_t& registry) {
     diagnostics.category = view_category_t::output;
     diagnostics.role = view_presentation_role_t::bottom_panel;
     diagnostics.minimum_size = {420.0f, 180.0f};
+    diagnostics.persistence_version = 2;
+    diagnostics.persistence_aliases.emplace_back("view.problems");
     diagnostics.render = render_diagnostics_view;
     registry.register_view(std::move(diagnostics));
 }
@@ -1140,6 +1149,16 @@ void render_tasks_view(const view_render_context_t&) {
         components::status_badge((std::to_string(current->status.failures) + " failed").c_str(),
             components::status_kind_t::error);
     }
+    if (current->status.interrupted) {
+        ImGui::SameLine(0.0f, metrics.spacing_sm);
+        components::status_badge((std::to_string(current->status.interrupted) + " interrupted").c_str(),
+            components::status_kind_t::warning);
+    }
+    if (current->status.partial) {
+        ImGui::SameLine(0.0f, metrics.spacing_sm);
+        components::status_badge((std::to_string(current->status.partial) + " partial").c_str(),
+            components::status_kind_t::warning);
+    }
     ImGui::Dummy(ImVec2(0.0f, metrics.spacing_xs));
 
     const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
@@ -1169,6 +1188,12 @@ void render_tasks_view(const view_render_context_t&) {
                 ImGui::Selectable("##task-row", selected,
                     ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
                     ImVec2(0.0f, ImGui::GetTextLineHeight()));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string task_semantic_id = "aida.task.row-" +
+                    aida::preview::semantics::entity_token(item.id);
+                static_cast<void>(aida::preview::semantics::register_last_item(
+                    task_semantic_id, "background-task-row"));
+#endif
                 if (ImGui::IsItemClicked()) s_selected_task_id = item.id;
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && item.focusable)
                     static_cast<void>(focus(item.id));
@@ -1209,15 +1234,39 @@ void render_tasks_view(const view_render_context_t&) {
                 if (item.state == task_state_t::cancellation_requested) {
                     ImGui::TextDisabled("Pending");
                 } else if (item.cancellable && active_state(item.state)) {
-                    if (components::button("Cancel", components::button_kind_t::destructive, components::size_t_::sm))
+                    const bool invoked = components::button("Cancel",
+                        components::button_kind_t::destructive, components::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    static_cast<void>(aida::preview::semantics::register_last_item(
+                        "aida.task.action-cancel-" +
+                            aida::preview::semantics::entity_token(item.id),
+                        "background-task-action", false, false, task_semantic_id));
+#endif
+                    if (invoked)
                         static_cast<void>(request_cancel(item.id));
                     design::tooltip_for_last_item("Request cancellation and wait for owner confirmation", nullptr,
                         "The task remains active until its owner reports a terminal state.");
                 } else if (item.focusable) {
-                    if (components::button("Focus", components::button_kind_t::ghost, components::size_t_::sm))
+                    const bool invoked = components::button("Focus",
+                        components::button_kind_t::ghost, components::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    static_cast<void>(aida::preview::semantics::register_last_item(
+                        "aida.task.action-focus-" +
+                            aida::preview::semantics::entity_token(item.id),
+                        "background-task-action", false, false, task_semantic_id));
+#endif
+                    if (invoked)
                         static_cast<void>(focus(item.id));
                 } else if (item.retryable && !active_state(item.state)) {
-                    if (components::button("Retry", components::button_kind_t::secondary, components::size_t_::sm))
+                    const bool invoked = components::button("Retry",
+                        components::button_kind_t::secondary, components::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    static_cast<void>(aida::preview::semantics::register_last_item(
+                        "aida.task.action-retry-" +
+                            aida::preview::semantics::entity_token(item.id),
+                        "background-task-action", false, false, task_semantic_id));
+#endif
+                    if (invoked)
                         static_cast<void>(retry(item.id));
                 } else ImGui::TextDisabled("-");
                 application_ui::render_retained_entity_context_menu(
@@ -1299,6 +1348,12 @@ void render_diagnostics_view(const view_render_context_t&) {
                 ImGui::Selectable("##diagnostic-row", selected,
                     ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
                     ImVec2(0.0f, ImGui::GetTextLineHeight()));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string diagnostic_semantic_id = "aida.diagnostic.row-" +
+                    aida::preview::semantics::entity_token(item.id);
+                static_cast<void>(aida::preview::semantics::register_last_item(
+                    diagnostic_semantic_id, "diagnostic-row"));
+#endif
                 if (ImGui::IsItemClicked()) s_selected_diagnostic_id = item.id;
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && item.focusable)
                     static_cast<void>(focus_diagnostic(item.id));
@@ -1337,6 +1392,10 @@ void render_diagnostics_view(const view_render_context_t&) {
         selected = &current->diagnostics.front();
     }
     if (selected) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const std::string selected_semantic_id = "aida.diagnostic.row-" +
+            aida::preview::semantics::entity_token(selected->id);
+#endif
         ImGui::BeginChild("##diagnostic-details", ImVec2(0.0f, 0.0f), true,
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysUseWindowPadding);
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(design::semantic_color(
@@ -1344,25 +1403,57 @@ void render_diagnostics_view(const view_render_context_t&) {
         if (!selected->details.empty()) ImGui::TextWrapped("%s", selected->details.c_str());
         ImGui::TextDisabled("%s", selected->id.c_str());
         if (selected->focusable) {
-            if (components::button("Focus Owner", components::button_kind_t::secondary, components::size_t_::sm))
+            const bool invoked = components::button("Focus Owner",
+                components::button_kind_t::secondary, components::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                "aida.diagnostic.action-focus-" +
+                    aida::preview::semantics::entity_token(selected->id),
+                "diagnostic-action", false, false, selected_semantic_id));
+#endif
+            if (invoked)
                 static_cast<void>(focus_diagnostic(selected->id));
         }
         if (selected->log_available) {
             if (ImGui::GetContentRegionAvail().x >= aida::ui::scale_px(96.0f, metrics.scale))
                 ImGui::SameLine();
-            if (components::button("Open Log", components::button_kind_t::ghost, components::size_t_::sm))
+            const bool invoked = components::button("Open Log",
+                components::button_kind_t::ghost, components::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                "aida.diagnostic.action-log-" +
+                    aida::preview::semantics::entity_token(selected->id),
+                "diagnostic-action", false, false, selected_semantic_id));
+#endif
+            if (invoked)
                 static_cast<void>(open_diagnostic_log(selected->id));
         }
         if (selected->retryable) {
             if (ImGui::GetContentRegionAvail().x >= aida::ui::scale_px(80.0f, metrics.scale))
                 ImGui::SameLine();
-            if (components::button("Retry", components::button_kind_t::secondary, components::size_t_::sm))
+            const bool invoked = components::button("Retry",
+                components::button_kind_t::secondary, components::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                "aida.diagnostic.action-retry-" +
+                    aida::preview::semantics::entity_token(selected->id),
+                "diagnostic-action", false, false, selected_semantic_id));
+#endif
+            if (invoked)
                 static_cast<void>(retry_diagnostic(selected->id));
         }
         if (!selected->acknowledged) {
             if (ImGui::GetContentRegionAvail().x >= aida::ui::scale_px(112.0f, metrics.scale))
                 ImGui::SameLine();
-            if (components::button("Acknowledge", components::button_kind_t::ghost, components::size_t_::sm))
+            const bool invoked = components::button("Acknowledge",
+                components::button_kind_t::ghost, components::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            static_cast<void>(aida::preview::semantics::register_last_item(
+                "aida.diagnostic.action-acknowledge-" +
+                    aida::preview::semantics::entity_token(selected->id),
+                "diagnostic-action", false, false, selected_semantic_id));
+#endif
+            if (invoked)
                 static_cast<void>(acknowledge_diagnostic(selected->id));
         }
         ImGui::EndChild();

@@ -8,6 +8,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -35,6 +36,9 @@
 #include "../ui/design_system.hpp"
 #include "../ui/application_ui_runtime.hpp"
 #include "../helpers/globals.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #endif
@@ -118,6 +122,17 @@ namespace agent_manager {
 			static manager_state_t s;
 			return s;
 		}
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		inline bool register_visible_last_item(std::string_view stable_id,
+			std::string_view semantic_type, bool disabled = false)
+		{
+			return ImGui::IsItemVisible() &&
+				aida::preview::semantics::register_last_item(stable_id,
+					semantic_type, false, disabled,
+					"aida.dock-window.view.ai.agents");
+		}
+#endif
 
 		inline std::string action_name(int action)
 		{
@@ -481,6 +496,11 @@ namespace agent_manager {
 			if (!aida::agent_manager_service::request_reload(&error))
 				toast_notification::push(error, toast_notification::toast_type_t::error, 5.f);
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(detail::register_visible_last_item(
+			"aida.automation.agents.action-reload", "agent-manager-action",
+			service && service->state == aida::agent_manager_service::operation_state_t::loading));
+#endif
 
 		const float gm_avail_w = (std::max)(1.f, panel_w - gm_pad * 2.f);
 		const float gm_avail_h = (std::max)(1.f, content_h - gm_header_h - gm_pad);
@@ -539,6 +559,10 @@ namespace agent_manager {
 						layout_metrics.control_height))) {
 				std::memcpy(st.left_filter, filter_local, sizeof(st.left_filter));
 			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			static_cast<void>(detail::register_visible_last_item(
+				"aida.automation.agents.filter", "search-input"));
+#endif
 		}
 		ImGui::Dummy(ImVec2(0.f, layout_metrics.spacing_xs));
 
@@ -575,6 +599,14 @@ namespace agent_manager {
 
 			ImGui::PushID(a.name.c_str());
 			ImGui::InvisibleButton("##row", ImVec2(row_w, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			if (ImGui::IsItemVisible()) {
+				const std::string agent_semantic = "aida.automation.agent-" +
+					aida::preview::semantics::entity_token(a.name);
+				static_cast<void>(detail::register_visible_last_item(
+					agent_semantic, "agent-row"));
+			}
+#endif
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked();
 			bool right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
@@ -1282,6 +1314,12 @@ namespace agent_manager {
 							? "Duplicate request was rejected" : error,
 							toast_notification::toast_type_t::error, 5.f);
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				static_cast<void>(detail::register_visible_last_item(
+					"aida.automation.agents.action-duplicate-" +
+						aida::preview::semantics::entity_token(st.selected_name),
+					"agent-manager-action", operation_pending));
+#endif
 			} else {
 				const float footer_avail = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
 				const float footer_gap = layout_metrics.spacing_sm;
@@ -1310,6 +1348,12 @@ namespace agent_manager {
 								toast_notification::toast_type_t::error, 5.f);
 					}
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				static_cast<void>(detail::register_visible_last_item(
+					"aida.automation.agents.action-save-" +
+						aida::preview::semantics::entity_token(st.selected_name),
+					"agent-manager-action", operation_pending));
+#endif
 				if (!footer_stack)
 					ImGui::SameLine(0.f, footer_gap);
 				if (aida::ui::button("Reset",
@@ -1320,6 +1364,12 @@ namespace agent_manager {
 					toast_notification::push("Reverted unsaved changes",
 						toast_notification::toast_type_t::info, 2.5f);
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				static_cast<void>(detail::register_visible_last_item(
+					"aida.automation.agents.action-reset-" +
+						aida::preview::semantics::entity_token(st.selected_name),
+					"agent-manager-action"));
+#endif
 				if (!footer_stack)
 					ImGui::SameLine(0.f, footer_gap);
 				if (aida::ui::button("Delete",
@@ -1331,6 +1381,12 @@ namespace agent_manager {
 						? service->catalog_generation : 0;
 					st.delete_dialog_requested = true;
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				static_cast<void>(detail::register_visible_last_item(
+					"aida.automation.agents.action-delete-" +
+						aida::preview::semantics::entity_token(st.selected_name),
+					"agent-manager-action", operation_pending));
+#endif
 			}
 			ImGui::EndChild();
 		}

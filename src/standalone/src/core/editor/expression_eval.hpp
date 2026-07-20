@@ -6,6 +6,7 @@
 #include <vector>
 #include <cctype>
 #include <cstring>
+#include <utility>
 
 namespace expression_eval {
 
@@ -15,6 +16,12 @@ struct eval_result_t {
 	bool     ok = false;
 	uint64_t value = 0;
 	std::string error;
+
+	eval_result_t() = default;
+	eval_result_t(bool succeeded, uint64_t result)
+		: ok(succeeded), value(result) {}
+	eval_result_t(bool succeeded, uint64_t result, std::string message)
+		: ok(succeeded), value(result), error(std::move(message)) {}
 };
 
 struct context_t {
@@ -64,6 +71,13 @@ struct token_t {
 	token_type_t type = token_type_t::end_of_input;
 	uint64_t     num_val = 0;
 	std::string  str_val;
+
+	token_t() = default;
+	token_t(token_type_t token_type) : type(token_type) {}
+	token_t(token_type_t token_type, uint64_t number)
+		: type(token_type), num_val(number) {}
+	token_t(token_type_t token_type, uint64_t number, std::string text)
+		: type(token_type), num_val(number), str_val(std::move(text)) {}
 };
 
 class lexer_t {

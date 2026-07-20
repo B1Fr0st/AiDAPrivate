@@ -1,6 +1,7 @@
 #include "network_view.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../preview/network_preview_adapter.hpp"
+#include "../../preview/studio_semantics.hpp"
 #endif
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../preview/network_preview_executor.hpp"
@@ -111,6 +112,11 @@
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
+#include "human_request_editor.hpp"
+
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../workbench/workbench_shell_integration.hpp"
+#endif
 
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../preview/network_preview_platform.hpp"
@@ -161,6 +167,33 @@ namespace network_open_dialog = win32_dialog;
 namespace network_view {
 
 using json = nlohmann::json;
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+static std::string semantic_artifact_id(std::string_view kind,
+                                        const artifact_identity_t& identity) {
+    std::string retained = identity.id;
+    retained.push_back(':');
+    retained.append(std::to_string(identity.timestamp));
+    retained.push_back(':');
+    retained.append(std::to_string(identity.revision));
+    retained.push_back(':');
+    retained.append(std::to_string(identity.content_hash));
+    retained.push_back(':');
+    retained.append(std::to_string(identity.content_size));
+    return aida::preview::semantics::stable_id(
+        "aida.network", std::string(kind) + "-" +
+            aida::preview::semantics::entity_token(retained));
+}
+
+static void register_network_last_item(const std::string& id,
+                                       std::string_view type,
+                                       std::string_view parent = {},
+                                       bool disabled = false) {
+    if (ImGui::IsItemVisible())
+        aida::preview::semantics::register_last_item(
+            id, type, false, disabled, parent);
+}
+#endif
 
 static aida::ui::pill_kind_t tcp_state_to_pill(uint8_t st) {
     switch (st) {
@@ -216,6 +249,7 @@ struct capture_context_t {
 
 enum class network_exchange_action_t : std::uint8_t {
     repeater,
+    fuzzer,
     intruder,
     scanner,
     comparer,
@@ -251,6 +285,12 @@ struct exchange_context_runtime_t {
     bool primary_current = false;
     std::string unavailable_reason;
 };
+
+struct intercept_runtime_snapshot_t;
+
+static bool execute_retained_exchange_toolbar_action(
+    const char* action_id, artifact_identity_t primary,
+    artifact_identity_t related, std::string& unavailable_reason);
 
 static capture_context_t s_capture_context;
 static std::atomic<std::uint64_t> s_repeater_artifact_sequence{1};
@@ -387,7 +427,8 @@ static artifact_identity_t exchange_artifact_identity(const mitm_proxy::http_exc
     identity.parent_id = "network.exchange." + std::to_string(exchange.id);
     const bool response = kind == artifact_kind_t::response;
     identity.id = identity.parent_id + (response ? ".response" : ".request");
-    identity.source_view_id = "view.network.proxy";
+    identity.source_view_id = kind == artifact_kind_t::intercept_request
+        ? "view.network.intercept" : "view.network.proxy";
     identity.label = std::string(response ? "Response #" : "Request #") + std::to_string(exchange.id);
     const auto& bytes = response ? exchange.raw_response : exchange.raw_request;
     identity.content_size = bytes.size();
@@ -421,6 +462,133 @@ static artifact_identity_t repeater_artifact_identity(const repeater_entry_t& en
         : retained_hash != 0 ? retained_hash : artifact_hash(std::string_view(text));
     return identity;
 }
+
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
+struct network_selection_publication_t {
+    std::weak_ptr<aida::analysis::analysis_workspace_t> workspace;
+    std::uint64_t workspace_generation = 0;
+    std::string entity_key;
+    std::string source_view_id;
+};
+
+static network_selection_publication_t s_network_selection_publication;
+
+static std::string network_selection_entity_key(const artifact_identity_t& identity) {
+    std::string key = "network.artifact|";
+    const auto append_component = [&](std::string_view value) {
+        key.append(std::to_string(value.size()));
+        key.push_back(':');
+        key.append(value);
+        key.push_back('|');
+    };
+    append_component(identity.source_view_id);
+    append_component(identity.id);
+    append_component(identity.session_id);
+    key.append(std::to_string(static_cast<unsigned>(identity.kind)));
+    key.push_back('|');
+    key.append(std::to_string(identity.source_id));
+    key.push_back('|');
+    key.append(std::to_string(identity.timestamp));
+    key.push_back('|');
+    key.append(std::to_string(identity.revision));
+    key.push_back('|');
+    key.append(std::to_string(identity.content_hash));
+    key.push_back('|');
+    key.append(std::to_string(identity.content_size));
+    key.push_back('|');
+    key.append(std::to_string(identity.target_port));
+    key.push_back('|');
+    key.push_back(identity.use_tls ? '1' : '0');
+    key.push_back('|');
+    key.push_back(identity.raw_protocol ? '1' : '0');
+    if (key.size() <= aida::workbench::k_max_document_key_bytes)
+        return key;
+    return "network.artifact.hash|" + std::to_string(artifact_hash(key));
+}
+
+static bool publish_workbench_network_selection(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    const aida::workbench::selection_context_t& selection) {
+    if (!workspace || workspace->closing() || workspace->closed())
+        return false;
+    aida::workbench::document_local_cursor_t cursor;
+    aida::workbench::workbench_shell_workspace_context_t output;
+    return static_cast<bool>(aida::workbench::workbench_shell_runtime_t::instance()
+        .publish_selection(workspace, selection, cursor,
+            aida::workbench::navigation_origin_t::user, output));
+}
+
+static bool current_workbench_selection_matches(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    std::string_view entity_key) {
+    if (!workspace || entity_key.empty())
+        return false;
+    aida::workbench::workbench_shell_workspace_context_t context;
+    if (!aida::workbench::workbench_shell_runtime_t::instance()
+            .workspace_context(workspace, context))
+        return false;
+    const auto focused = std::find_if(context.persistence.views.begin(),
+        context.persistence.views.end(), [](const auto& view) { return view.focused; });
+    if (focused == context.persistence.views.end())
+        return false;
+    const auto document = std::find_if(context.persistence.documents.begin(),
+        context.persistence.documents.end(), [&](const auto& candidate) {
+            return candidate.id == focused->document;
+        });
+    return document != context.persistence.documents.end() &&
+        document->local_state.selection.kind == aida::workbench::selection_kind_t::entity &&
+        document->local_state.selection.entity_key == entity_key;
+}
+
+static void clear_stale_network_selection(std::string_view source_view_id) {
+    if (s_network_selection_publication.source_view_id != source_view_id)
+        return;
+    auto workspace = s_network_selection_publication.workspace.lock();
+    if (workspace && !workspace->closing() && !workspace->closed() &&
+        current_workbench_selection_matches(
+            workspace, s_network_selection_publication.entity_key)) {
+        aida::workbench::selection_context_t empty;
+        static_cast<void>(publish_workbench_network_selection(workspace, empty));
+    }
+    s_network_selection_publication = {};
+}
+
+static void publish_network_selection(const artifact_identity_t& identity, bool force = false) {
+    if (!identity.valid() || identity.source_view_id.empty())
+        return;
+    auto workspace = analysis_session::active_workspace();
+    if (!workspace || workspace->closing() || workspace->closed())
+        return;
+    const auto generation = workspace->generation();
+    const std::string entity_key = network_selection_entity_key(identity);
+    auto previous_workspace = s_network_selection_publication.workspace.lock();
+    if (previous_workspace &&
+        (previous_workspace.get() != workspace.get() ||
+         s_network_selection_publication.workspace_generation != generation) &&
+        !previous_workspace->closing() && !previous_workspace->closed() &&
+        current_workbench_selection_matches(
+            previous_workspace, s_network_selection_publication.entity_key)) {
+        aida::workbench::selection_context_t empty;
+        static_cast<void>(publish_workbench_network_selection(previous_workspace, empty));
+    }
+    if (previous_workspace.get() == workspace.get() &&
+        s_network_selection_publication.workspace_generation == generation &&
+        s_network_selection_publication.entity_key == entity_key && !force)
+        return;
+    aida::workbench::selection_context_t selection;
+    selection.kind = aida::workbench::selection_kind_t::entity;
+    selection.entity_key = entity_key;
+    if (!publish_workbench_network_selection(workspace, selection))
+        return;
+    s_network_selection_publication.workspace = workspace;
+    s_network_selection_publication.workspace_generation = generation;
+    s_network_selection_publication.entity_key = entity_key;
+    s_network_selection_publication.source_view_id = identity.source_view_id;
+}
+#else
+static void clear_stale_network_selection(std::string_view) {}
+static void publish_network_selection(const artifact_identity_t&, bool = false) {}
+#endif
 
 struct repeater_artifact_publication_t {
     std::vector<std::shared_ptr<const artifact_snapshot_t>> requests;
@@ -2606,7 +2774,10 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     (void)ar; (void)ag; (void)ab;
     const auto& th = aida::ui::resolved();
     ImGui::SetCursorPos(ImVec2(x, y));
-    ImGui::BeginChild("##net_cap", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
+    ImGui::BeginChild("##net_cap", ImVec2(w, h), false,
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::SetScrollY(0.f);
 
     request_driver_available_snapshot();
     const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire) &&
@@ -2619,61 +2790,21 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     const size_t pkt_count = packet_snapshot ? packet_snapshot->size() : 0;
     float live_rate = capture_rate_tick(pkt_count);
 
-
-    {
-        ImDrawList* hdr_dl = ImGui::GetWindowDrawList();
-        ImVec2 dpos = ImGui::GetCursorScreenPos();
-        float bx = dpos.x;
-        float by = dpos.y + 4.f;
-        float bh = 24.f;
-
-        char live_buf[64];
-        if (cap_running) {
-            snprintf(live_buf, sizeof(live_buf), "LIVE  -  %.1f pkt/s", live_rate);
-        } else if (cap_start_pending || cap_stop_pending) {
-            snprintf(live_buf, sizeof(live_buf), "%s", cap_start_pending ? "STARTING" : "STOPPING");
-        } else {
-            snprintf(live_buf, sizeof(live_buf), "PAUSED");
-        }
-        float text_w = ImGui::CalcTextSize(live_buf).x;
-        float dot_d = 18.f;
-        float pad_x = 10.f;
-        float bw = dot_d + text_w + pad_x * 2.f + 4.f;
-
-        ImU32 fill_col = cap_running
-            ? aida::ui::with_alpha(th.error, 0.18f * alpha)
-            : aida::ui::with_alpha(th.text_dim, 0.18f * alpha);
-        ImU32 border_col = cap_running
-            ? aida::ui::with_alpha(th.error, 0.55f * alpha)
-            : aida::ui::with_alpha(th.text_dim, 0.55f * alpha);
-        hdr_dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), fill_col, bh * 0.5f);
-        hdr_dl->AddRect(ImVec2(bx, by), ImVec2(bx + bw, by + bh), border_col, bh * 0.5f, 0, 1.f);
-
-        if (cap_running) {
-            float pulse = aida::ui::clock::pulse(0.8f, 0.45f, 1.0f);
-            ImU32 dot_col = aida::ui::with_alpha(th.error, alpha);
-            ImU32 halo_col = aida::ui::with_alpha(th.error, alpha * 0.35f * pulse);
-            hdr_dl->AddCircleFilled(ImVec2(bx + pad_x + 5.f, by + bh * 0.5f), 6.f, halo_col, 18);
-            hdr_dl->AddCircleFilled(ImVec2(bx + pad_x + 5.f, by + bh * 0.5f), 4.f, dot_col, 16);
-        } else {
-            ImU32 dot_col = aida::ui::with_alpha(th.text_dim, alpha);
-            hdr_dl->AddCircleFilled(ImVec2(bx + pad_x + 5.f, by + bh * 0.5f), 4.f, dot_col, 16);
-        }
-        ImU32 text_col = cap_running
-            ? aida::ui::with_alpha(th.error, alpha)
-            : aida::ui::with_alpha(th.text_secondary, alpha);
-        hdr_dl->AddText(ImVec2(bx + pad_x + dot_d, by + (bh - ImGui::GetTextLineHeight()) * 0.5f),
-                        text_col, live_buf);
-
-        ImGui::Dummy(ImVec2(bw + 8.f, bh + 4.f));
-        ImGui::SameLine();
+    char live_buf[64];
+    if (cap_running) {
+        snprintf(live_buf, sizeof(live_buf), "LIVE  -  %.1f pkt/s", live_rate);
+    } else if (cap_start_pending || cap_stop_pending) {
+        snprintf(live_buf, sizeof(live_buf), "%s", cap_start_pending ? "STARTING" : "STOPPING");
+    } else {
+        snprintf(live_buf, sizeof(live_buf), "PAUSED");
     }
+    const float live_text_w = ImGui::CalcTextSize(live_buf).x;
+    const float live_dot_d = 18.f;
+    const float live_pad_x = 10.f;
+    const float live_badge_w = live_dot_d + live_text_w + live_pad_x * 2.f + 4.f;
 
     if (!driver_ok) ImGui::BeginDisabled();
-
-    if (cap_start_pending || cap_stop_pending)
-        ImGui::BeginDisabled();
-
+    if (cap_start_pending || cap_stop_pending) ImGui::BeginDisabled();
     if (!cap_running) {
         if (aida::ui::button("Start Capture", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
             diag::log_tagged_fmt("network", "start_capture_clicked filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d",
@@ -2687,25 +2818,60 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             invoke_global_network_action("network.capture.stop");
         }
     }
-
-    if (cap_start_pending || cap_stop_pending)
-        ImGui::EndDisabled();
-
+    if (cap_start_pending || cap_stop_pending) ImGui::EndDisabled();
     if (!driver_ok) ImGui::EndDisabled();
+
+    same_line_if_fits(live_badge_w, 8.f);
+    {
+        ImDrawList* hdr_dl = ImGui::GetWindowDrawList();
+        ImVec2 dpos = ImGui::GetCursorScreenPos();
+        float bx = dpos.x;
+        float by = dpos.y + 4.f;
+        float bh = 24.f;
+
+        ImU32 fill_col = cap_running
+            ? aida::ui::with_alpha(th.error, 0.18f * alpha)
+            : aida::ui::with_alpha(th.text_dim, 0.18f * alpha);
+        ImU32 border_col = cap_running
+            ? aida::ui::with_alpha(th.error, 0.55f * alpha)
+            : aida::ui::with_alpha(th.text_dim, 0.55f * alpha);
+        hdr_dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + live_badge_w, by + bh), fill_col, bh * 0.5f);
+        hdr_dl->AddRect(ImVec2(bx, by), ImVec2(bx + live_badge_w, by + bh), border_col, bh * 0.5f, 0, 1.f);
+
+        if (cap_running) {
+            float pulse = aida::ui::clock::pulse(0.8f, 0.45f, 1.0f);
+            ImU32 dot_col = aida::ui::with_alpha(th.error, alpha);
+            ImU32 halo_col = aida::ui::with_alpha(th.error, alpha * 0.35f * pulse);
+            hdr_dl->AddCircleFilled(ImVec2(bx + live_pad_x + 5.f, by + bh * 0.5f), 6.f, halo_col, 18);
+            hdr_dl->AddCircleFilled(ImVec2(bx + live_pad_x + 5.f, by + bh * 0.5f), 4.f, dot_col, 16);
+        } else {
+            ImU32 dot_col = aida::ui::with_alpha(th.text_dim, alpha);
+            hdr_dl->AddCircleFilled(ImVec2(bx + live_pad_x + 5.f, by + bh * 0.5f), 4.f, dot_col, 16);
+        }
+        ImU32 text_col = cap_running
+            ? aida::ui::with_alpha(th.error, alpha)
+            : aida::ui::with_alpha(th.text_secondary, alpha);
+        hdr_dl->AddText(ImVec2(bx + live_pad_x + live_dot_d, by + (bh - ImGui::GetTextLineHeight()) * 0.5f),
+                        text_col, live_buf);
+        ImGui::Dummy(ImVec2(live_badge_w, bh + 4.f));
+    }
 
     std::string capture_status = capture_control_status();
     if (!capture_status.empty()) {
-        ImGui::SameLine(0.f, 12.f);
+        same_line_if_fits(std::min(360.f, ImGui::CalcTextSize(capture_status.c_str()).x), 10.f);
         ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "%s", capture_status.c_str());
+        clipped_text(capture_status.c_str(), aida::ui::with_alpha(th.text_secondary, alpha),
+            ImGui::GetContentRegionAvail().x);
     }
 
-    ImGui::SameLine(0.f, 12.f);
+    ImGui::Spacing();
+    const ImVec4 secondary = ImGui::ColorConvertU32ToFloat4(
+        aida::ui::with_alpha(th.text_secondary, alpha));
+    const float field_gap = 6.f;
+    ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                       "PID:");
-    ImGui::SameLine();
+    ImGui::TextColored(secondary, "PID:");
+    ImGui::SameLine(0.f, field_gap);
     {
         int pid_v = static_cast<int>(state.cap_filter_pid);
         ImGui::SetNextItemWidth(80.f);
@@ -2714,11 +2880,13 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             state.cap_filter_pid = static_cast<uint32_t>(pid_v);
         }
     }
-    ImGui::SameLine(0.f, 8.f);
+    ImGui::EndGroup();
+
+    same_line_if_fits(ImGui::CalcTextSize("Port:").x + field_gap + 70.f, 10.f);
+    ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                       "Port:");
-    ImGui::SameLine();
+    ImGui::TextColored(secondary, "Port:");
+    ImGui::SameLine(0.f, field_gap);
     {
         int port_v = static_cast<int>(state.cap_filter_port);
         ImGui::SetNextItemWidth(70.f);
@@ -2728,11 +2896,13 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             state.cap_filter_port = static_cast<uint16_t>(port_v);
         }
     }
-    ImGui::SameLine(0.f, 8.f);
+    ImGui::EndGroup();
+
+    same_line_if_fits(ImGui::CalcTextSize("Proto:").x + field_gap + 80.f, 10.f);
+    ImGui::BeginGroup();
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                       "Proto:");
-    ImGui::SameLine();
+    ImGui::TextColored(secondary, "Proto:");
+    ImGui::SameLine(0.f, field_gap);
     {
         const char* cap_proto_items[] = { "All", "TCP", "UDP" };
         int cap_proto_idx = state.cap_filter_protocol == 6 ? 1 :
@@ -2743,8 +2913,9 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                                          cap_proto_idx == 2 ? 17 : 0;
         }
     }
+    ImGui::EndGroup();
 
-    ImGui::SameLine();
+    same_line_if_fits(64.f, 10.f);
     if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         std::lock_guard<std::mutex> lock(state.cap_mutex);
         size_t prev = state.captured_packets.size();
@@ -2754,47 +2925,47 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         diag::log_tagged_fmt("network", "capture_cleared prev_packet_count=%zu", prev);
     }
 
+    ImGui::Spacing();
     {
         char count_buf[32];
         snprintf(count_buf, sizeof(count_buf), "%zu packets", pkt_count);
         float count_w = ImGui::CalcTextSize(count_buf).x;
         float row_avail = ImGui::GetContentRegionAvail().x;
-        float right_pad = 12.f;
-        float gap = 14.f;
-        float reserved_right = count_w + right_pad + gap;
-        float input_min = 200.f;
-        float input_max = 640.f;
-        float input_w = row_avail - reserved_right;
-        if (input_w < input_min) input_w = input_min;
-        if (input_w > input_max) input_w = input_max;
-
-        ImGui::SameLine(0.f, gap);
+        const float gap = 10.f;
+        const bool count_on_row = row_avail >= count_w + gap + 140.f;
+        const float input_w = std::max(1.f, std::min(640.f,
+            count_on_row ? row_avail - count_w - gap : row_avail));
         aida::ui::input_text("##cap_filter", state.cap_filter_text, sizeof(state.cap_filter_text),
                               "Filter packets...", false, ImVec2(input_w, 28.f));
-
-        if (row_avail > input_w + reserved_right) {
-            ImGui::SameLine();
-            float row_x = ImGui::GetCursorPosX();
-            ImGui::SetCursorPosX(row_x + (row_avail - input_w - count_w - right_pad - gap));
+        if (count_on_row) {
+            ImGui::SameLine(0.f, gap);
             ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                               "%s", count_buf);
+        } else {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                                "%s", count_buf);
         }
     }
 
     ImGui::Spacing();
-
-
-    float split_y = h * state.detail_ratio;
-    float list_top = ImGui::GetCursorPosY();
-    float list_h = split_y - list_top;
-    if (list_h < 80.f) list_h = 80.f;
-    float detail_h = h - split_y - 30.f;
-
-
     capture_table_snapshot_t& cap_snapshot = snapshot_capture_table(state, state.cap_filter_text);
+    const float list_top = ImGui::GetCursorPosY();
+    const float remaining_h = std::max(1.f, h - list_top);
+    float list_h = remaining_h;
+    float detail_h = 0.f;
+    if (cap_snapshot.total_count > 0 && remaining_h > 96.f) {
+        const float separator_h = std::min(16.f, remaining_h * 0.10f);
+        const float usable_h = std::max(2.f, remaining_h - separator_h);
+        const float desired_list_h = h * state.detail_ratio - list_top;
+        const float min_list_h = std::min(80.f, usable_h * 0.42f);
+        const float min_detail_h = std::min(96.f, usable_h * 0.42f);
+        const float max_list_h = std::max(min_list_h, usable_h - min_detail_h);
+        list_h = std::clamp(desired_list_h, min_list_h, max_list_h);
+        detail_h = std::max(1.f, usable_h - list_h);
+    }
 
-    ImGui::BeginChild("##cap_list", ImVec2(w - 4.f, list_h), false,
+    ImGui::BeginChild("##cap_list", ImVec2(std::max(1.f, w - 4.f), list_h), false,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
 
     if (cap_snapshot.total_count == 0) {
@@ -2805,8 +2976,32 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         cfg.title = cap_running ? "Waiting for packets..." : "Capture not running";
         cfg.body  = cap_running
             ? "Packets will stream in here as they are observed by the kernel driver."
-            : "Press Start Capture above to begin recording network traffic.";
-        aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
+            : "Start driver-backed capture to begin recording network traffic.";
+        aida::ui::empty_state::action_t action;
+        action.id = cap_running ? "network.capture.stop" : "network.capture.start";
+        action.label = cap_running ? "Stop Capture" : "Start Capture";
+        action.kind = cap_running
+            ? aida::ui::components::button_kind_t::destructive
+            : aida::ui::components::button_kind_t::primary;
+        action.disabled = cap_start_pending || cap_stop_pending || !driver_ok;
+        if (cap_start_pending || cap_stop_pending)
+            action.tooltip = "Capture state is already changing.";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire))
+            action.tooltip = "The driver is unavailable.";
+        else if (!standalone_license::is_valid())
+            action.tooltip = "A valid license is required for driver-backed capture.";
+        cfg.actions.push_back(std::move(action));
+        const auto result = aida::ui::empty_state::render(
+            ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
+        if (result.action_id == "network.capture.start") {
+            diag::log_tagged_fmt("network", "start_capture_clicked filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d",
+                state.cap_filter_pid, state.cap_filter_port, state.cap_filter_protocol,
+                driver_ok ? 1 : 0);
+            invoke_global_network_action("network.capture.start");
+        } else if (result.action_id == "network.capture.stop") {
+            diag::log_tagged("network", "stop_capture_clicked");
+            invoke_global_network_action("network.capture.stop");
+        }
         ImGui::Dummy(ImVec2(0.f, 0.f));
         ImGui::EndChild();
         ImGui::Dummy(ImVec2(0.f, 0.f));
@@ -2892,6 +3087,21 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
                                                aida::ui::with_alpha(th.selection, r_alpha * 0.55f));
                     }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    if (packet_snapshot && row.packet_index >= 0 &&
+                        row.packet_index < static_cast<int>(packet_snapshot->size())) {
+                        const auto& packet = (*packet_snapshot)[static_cast<std::size_t>(row.packet_index)];
+                        artifact_identity_t identity;
+                        identity.id = "network.packet." + std::to_string(packet.timestamp) + "." +
+                            std::to_string(row.packet_index);
+                        identity.timestamp = packet.timestamp;
+                        identity.content_size = packet.payload.size();
+                        identity.content_hash = artifact_hash(packet.payload);
+                        register_network_last_item(
+                            semantic_artifact_id("packet", identity), "network-packet-row",
+                            "aida.dock-window.view.network.capture");
+                    }
+#endif
                     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                         s_capture_context.packet_index = row.packet_index;
                         s_capture_context.timestamp = row.timestamp;
@@ -3127,19 +3337,16 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
     ImGui::EndChild();
 
-
-    ImGui::Spacing();
-    {
+    if (detail_h > 30.f) {
+        ImGui::Spacing();
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 wp = ImGui::GetWindowPos();
         dl->AddLine(ImVec2(wp.x + 2.f, wp.y + ImGui::GetCursorPosY()),
                     ImVec2(wp.x + w - 2.f, wp.y + ImGui::GetCursorPosY()),
                     aida::ui::with_alpha(th.border_subtle, alpha));
-    }
-    ImGui::Spacing();
-
-    if (detail_h > 30.f) {
-        ImGui::BeginChild("##cap_detail", ImVec2(w - 4.f, detail_h), false, ImGuiWindowFlags_NoBackground);
+        ImGui::Spacing();
+        ImGui::BeginChild("##cap_detail", ImVec2(std::max(1.f, w - 4.f), detail_h), false,
+            ImGuiWindowFlags_NoBackground);
 
         const auto detail_packets = std::atomic_load_explicit(&state.capture_snapshot, std::memory_order_acquire);
         int selected_packet = state.cap_selected.load(std::memory_order_acquire);
@@ -3518,6 +3725,7 @@ static std::atomic<std::uint64_t> s_proxy_snapshot_requested_ms{0};
 static std::atomic<bool> s_proxy_operation_pending{false};
 static std::atomic<std::uint64_t> s_proxy_operation_serial{0};
 static std::size_t s_bypass_review_count = 0;
+static std::uint64_t s_proxy_selected_exchange_id = 0;
 
 static void request_proxy_runtime_snapshot(bool force = false) {
     const std::uint64_t now = network_now_ms();
@@ -4132,6 +4340,9 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     const auto& history = proxy_snapshot ? proxy_snapshot->history : empty_history;
 
     if (history.empty()) {
+        state.proxy_selected = -1;
+        s_proxy_selected_exchange_id = 0;
+        clear_stale_network_selection("view.network.proxy");
         ImVec2 list_org = ImGui::GetCursorScreenPos();
         aida::ui::empty_state::config_t cfg;
         cfg.glyph = aida::ui::empty_state::glyph_t::network;
@@ -4143,6 +4354,25 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         ImGui::Dummy(ImVec2(0.f, list_h));
         ImGui::EndChild();
         return;
+    }
+
+    if (s_proxy_selected_exchange_id != 0) {
+        const auto selected = std::find_if(history.begin(), history.end(), [](const auto& exchange) {
+            return exchange.id == s_proxy_selected_exchange_id;
+        });
+        if (selected == history.end()) {
+            state.proxy_selected = -1;
+            s_proxy_selected_exchange_id = 0;
+            clear_stale_network_selection("view.network.proxy");
+        } else {
+            state.proxy_selected = static_cast<int>(std::distance(history.begin(), selected));
+        }
+    } else if (state.proxy_selected >= 0 &&
+               state.proxy_selected < static_cast<int>(history.size())) {
+        s_proxy_selected_exchange_id =
+            history[static_cast<std::size_t>(state.proxy_selected)].id;
+    } else {
+        state.proxy_selected = -1;
     }
 
     const ImGuiTableFlags table_flags =
@@ -4212,9 +4442,24 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                                   ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
                                   ImVec2(0.f, 22.f))) {
                 state.proxy_selected = i;
+                s_proxy_selected_exchange_id = ex.id;
+                publish_network_selection(
+                    exchange_artifact_identity(ex, artifact_kind_t::request), true);
             }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const auto proxy_request_identity =
+                exchange_artifact_identity(ex, artifact_kind_t::request);
+            const std::string proxy_artifact_id =
+                semantic_artifact_id("exchange", proxy_request_identity);
+            register_network_last_item(
+                proxy_artifact_id, "network-exchange-row",
+                "aida.dock-window.view.network.proxy");
+#endif
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                 state.proxy_selected = i;
+                s_proxy_selected_exchange_id = ex.id;
+                publish_network_selection(
+                    exchange_artifact_identity(ex, artifact_kind_t::request), true);
                 open_exchange_context(
                     exchange_artifact_identity(ex, artifact_kind_t::request),
                     exchange_artifact_identity(ex, artifact_kind_t::response),
@@ -4301,6 +4546,19 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         ImGui::BeginChild("##proxy_detail", ImVec2(w - 4.f, detail_h), false, ImGuiWindowFlags_NoBackground);
 
         auto& ex = history[static_cast<size_t>(state.proxy_selected)];
+        publish_network_selection(exchange_artifact_identity(ex, artifact_kind_t::request));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const auto proxy_request_identity =
+            exchange_artifact_identity(ex, artifact_kind_t::request);
+        const auto proxy_response_identity =
+            exchange_artifact_identity(ex, artifact_kind_t::response);
+        const std::string proxy_artifact_id =
+            semantic_artifact_id("exchange", proxy_request_identity);
+        const std::string proxy_request_id =
+            semantic_artifact_id("request", proxy_request_identity);
+        const std::string proxy_response_id =
+            semantic_artifact_id("response", proxy_response_identity);
+#endif
         ImU32 method_col = ui_anim::http_method_color(ex.request.method.c_str(), alpha);
 
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(method_col), "%s", ex.request.method.c_str());
@@ -4317,26 +4575,34 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             format_bytes(ex.response_size).c_str());
         clipped_text(meta_buf, aida::ui::with_alpha(th.text_secondary, alpha), ImGui::GetContentRegionAvail().x);
 
-        if (aida::ui::button("Send to Repeater", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            auto rep = std::make_shared<repeater_entry_t>();
-            rep->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
-            rep->source_artifact_id = "network.exchange." + std::to_string(ex.id) + ".request";
-            rep->host = ex.target_host;
-            rep->port = ex.target_port;
-            rep->use_tls = ex.is_tls;
-            rep->raw_request = std::string(ex.raw_request.begin(), ex.raw_request.end());
-            rep->request_hash = artifact_hash(ex.raw_request);
-            diag::log_tagged_fmt("network", "proxy_send_to_repeater id=%llu host=%s:%u tls=%d size=%zu",
-                static_cast<unsigned long long>(ex.id), ex.target_host.c_str(), ex.target_port,
-                ex.is_tls ? 1 : 0, rep->raw_request.size());
-            state.repeater_entries.push_back(std::move(rep));
-            publish_repeater_request_artifacts(state);
-            state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
+        const bool send_to_repeater = aida::ui::button(
+            "Send to Repeater", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_network_last_item(
+            proxy_artifact_id + ".action.send-to-repeater", "network-artifact-action",
+            proxy_artifact_id);
+#endif
+        if (send_to_repeater) {
+            std::string unavailable;
+            static_cast<void>(execute_retained_exchange_toolbar_action(
+                "network.exchange.repeater",
+                exchange_artifact_identity(ex, artifact_kind_t::request),
+                exchange_artifact_identity(ex, artifact_kind_t::response), unavailable));
         }
         same_line_if_fits(96.f);
-        if (aida::ui::button("Copy URL", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-            std::string url = std::string(ex.is_tls ? "https://" : "http://") + ex.target_host + ex.request.uri;
-            ImGui::SetClipboardText(url.c_str());
+        const bool copy_proxy_url = aida::ui::button(
+            "Copy URL", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_network_last_item(
+            proxy_artifact_id + ".action.copy-url", "network-artifact-action",
+            proxy_artifact_id);
+#endif
+        if (copy_proxy_url) {
+            std::string unavailable;
+            static_cast<void>(execute_retained_exchange_toolbar_action(
+                "network.exchange.copy_url",
+                exchange_artifact_identity(ex, artifact_kind_t::request),
+                exchange_artifact_identity(ex, artifact_kind_t::response), unavailable));
         }
 
         ImGui::Spacing();
@@ -4360,15 +4626,31 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             float pane_w = (w - 16.f) * 0.5f;
             render_payload_box("##proxy_request_payload", "Request", req_meta, request_text,
                                ImVec2(pane_w, pane_h), th, alpha);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_network_last_item(
+                proxy_request_id, "network-request-editor", proxy_artifact_id);
+#endif
             ImGui::SameLine();
             render_payload_box("##proxy_response_payload", "Response", resp_meta, response_text,
                                ImVec2(pane_w, pane_h), th, alpha);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_network_last_item(
+                proxy_response_id, "network-response-editor", proxy_artifact_id);
+#endif
         } else {
             float each_h = std::max(72.f, (pane_h - 6.f) * 0.5f);
             render_payload_box("##proxy_request_payload", "Request", req_meta, request_text,
                                ImVec2(w - 8.f, each_h), th, alpha);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_network_last_item(
+                proxy_request_id, "network-request-editor", proxy_artifact_id);
+#endif
             render_payload_box("##proxy_response_payload", "Response", resp_meta, response_text,
                                ImVec2(w - 8.f, each_h), th, alpha);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_network_last_item(
+                proxy_response_id, "network-response-editor", proxy_artifact_id);
+#endif
         }
 
         ImGui::EndChild();
@@ -4907,7 +5189,24 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
 static void render_repeater(state_t& state, float x, float y, float w, float h,
                              float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
+    static std::unordered_map<std::uint64_t, human_request_editor::state_t> request_editors;
+    static std::unordered_map<std::uint64_t, artifact_kind_t> selected_artifact_kinds;
     const auto& th = aida::ui::resolved();
+    for (auto editor = request_editors.begin(); editor != request_editors.end();) {
+        const bool retained = std::any_of(state.repeater_entries.begin(),
+            state.repeater_entries.end(), [&](const auto& entry) {
+                return entry && entry->id == editor->first;
+            });
+        editor = retained ? std::next(editor) : request_editors.erase(editor);
+    }
+    for (auto selected = selected_artifact_kinds.begin();
+         selected != selected_artifact_kinds.end();) {
+        const bool retained = std::any_of(state.repeater_entries.begin(),
+            state.repeater_entries.end(), [&](const auto& entry) {
+                return entry && entry->id == selected->first;
+            });
+        selected = retained ? std::next(selected) : selected_artifact_kinds.erase(selected);
+    }
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_rep", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
@@ -4944,6 +5243,8 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
         state.repeater_entries.push_back(std::move(rep));
         publish_repeater_request_artifacts(state);
         state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
+        selected_artifact_kinds[state.repeater_entries.back()->id] =
+            artifact_kind_t::repeater_request;
     }
 
 
@@ -4957,11 +5258,27 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             aida::ui::button_kind_t kk = is_sel
                 ? aida::ui::button_kind_t::primary
                 : aida::ui::button_kind_t::secondary;
-            if (aida::ui::button(label, kk, aida::ui::size_t_::sm)) {
+            const bool select_repeater_entry =
+                aida::ui::button(label, kk, aida::ui::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const auto& semantic_entry = *state.repeater_entries[static_cast<std::size_t>(i)];
+            const auto semantic_identity = repeater_artifact_identity(
+                semantic_entry, artifact_kind_t::repeater_request);
+            register_network_last_item(
+                semantic_artifact_id("exchange", semantic_identity),
+                "network-exchange-row", "aida.dock-window.view.network.repeater");
+#endif
+            if (select_repeater_entry) {
                 if (state.repeater_selected != i)
                     diag::log_tagged_fmt("network", "repeater_tab_switched from=%d to=%d",
                         state.repeater_selected, i);
                 state.repeater_selected = i;
+                selected_artifact_kinds[
+                    state.repeater_entries[static_cast<std::size_t>(i)]->id] =
+                    artifact_kind_t::repeater_request;
+                publish_network_selection(repeater_artifact_identity(
+                    *state.repeater_entries[static_cast<std::size_t>(i)],
+                    artifact_kind_t::repeater_request), true);
             }
         }
 
@@ -4971,9 +5288,12 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             if (aida::ui::button("Close##rep_close", aida::ui::button_kind_t::ghost,
                                   aida::ui::size_t_::sm)) {
                 int idx = state.repeater_selected;
+                const auto removed_id = state.repeater_entries[static_cast<std::size_t>(idx)]->id;
                 diag::log_tagged_fmt("network", "repeater_entry_closed idx=%d", idx);
                 state.repeater_entries.erase(
                     state.repeater_entries.begin() + static_cast<ptrdiff_t>(idx));
+                request_editors.erase(removed_id);
+                selected_artifact_kinds.erase(removed_id);
                 publish_repeater_request_artifacts(state);
                 if (state.repeater_selected >= static_cast<int>(state.repeater_entries.size()))
                     state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
@@ -5016,37 +5336,78 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             ImGui::BeginChild("##rep_req", ImVec2(req_w, req_h), false, ImGuiWindowFlags_NoBackground);
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                                "Request");
-
-            static char req_buf[65536] = {};
-            static const repeater_entry_t* req_buf_owner = nullptr;
-            static bool req_buf_dirty = false;
-            if (req_buf_owner != &rep) {
-                size_t copy_n = rep.raw_request.size() < (sizeof(req_buf) - 1)
-                    ? rep.raw_request.size()
-                    : (sizeof(req_buf) - 1);
-                memcpy(req_buf, rep.raw_request.data(), copy_n);
-                req_buf[copy_n] = '\0';
-                req_buf_owner = &rep;
-                req_buf_dirty = false;
+            const auto request_identity = repeater_artifact_identity(
+                rep, artifact_kind_t::repeater_request);
+            const artifact_kind_t selected_kind = selected_artifact_kinds.count(rep.id) != 0
+                ? selected_artifact_kinds[rep.id] : artifact_kind_t::repeater_request;
+            const auto selected_identity = repeater_artifact_identity(rep, selected_kind);
+            if (selected_identity.valid())
+                publish_network_selection(selected_identity);
+            else if (request_identity.valid())
+                publish_network_selection(request_identity);
+            else
+                clear_stale_network_selection("view.network.repeater");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const std::string request_editor_parent =
+                semantic_artifact_id("exchange", request_identity);
+#endif
+            const std::string editor_identity = "repeater." + std::to_string(rep.id);
+            auto& request_editor = request_editors[rep.id];
+            human_request_editor::render_config_t editor_config;
+            editor_config.stable_id = "repeater-request";
+            editor_config.size = ImVec2(req_w - 4.f, std::max(72.f, req_h - 70.f));
+            editor_config.max_bytes = 1U << 18;
+            editor_config.editable = !rep.in_progress.load(std::memory_order_acquire);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            editor_config.semantic_parent_id = request_editor_parent.c_str();
+#endif
+            ImGui::BeginChild("##rep_request_editor_surface", editor_config.size, false,
+                ImGuiWindowFlags_NoBackground);
+            editor_config.size = ImGui::GetContentRegionAvail();
+            const auto editor_result = human_request_editor::render(
+                request_editor, editor_identity, rep.raw_request, editor_config);
+            const bool request_menu_key = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+            const bool request_shift_f10 = !request_menu_key &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+                ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+            ImGui::EndChild();
+            const bool request_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            const bool request_pointer_select = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+            if (request_pointer_select) {
+                selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
+                publish_network_selection(request_identity, true);
             }
-            if (ImGui::InputTextMultiline("##rep_req_edit", req_buf, sizeof(req_buf),
-                ImVec2(req_w - 4.f, std::max(72.f, req_h - 78.f)))) {
-                rep.raw_request = req_buf;
+            if (editor_result.authority_changed) {
+                selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
                 ++rep.request_revision;
                 rep.request_hash = artifact_hash(std::string_view(rep.raw_request));
                 rep.reviewed_draft = false;
                 rep.reviewed_source_hash = 0;
                 rep.review_provenance.clear();
-                req_buf_dirty = true;
                 publish_repeater_request_artifacts(state);
+                const auto changed_identity = repeater_artifact_identity(
+                    rep, artifact_kind_t::repeater_request);
+                if (changed_identity.valid())
+                    publish_network_selection(changed_identity, true);
+                else
+                    clear_stale_network_selection("view.network.repeater");
             }
-            const bool request_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-            const bool request_menu_key = ImGui::IsItemFocused() &&
-                ImGui::IsKeyPressed(ImGuiKey_Menu, false);
-            const bool request_shift_f10 = !request_menu_key && ImGui::IsItemFocused() &&
-                ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const auto repeater_request_identity = repeater_artifact_identity(
+                rep, artifact_kind_t::repeater_request);
+            const std::string repeater_artifact_id =
+                request_editor_parent;
+            const std::string repeater_request_id =
+                semantic_artifact_id("request", repeater_request_identity);
+            register_network_last_item(
+                repeater_request_id, "network-request-editor", repeater_artifact_id);
+#endif
             const bool request_context = request_pointer_context || request_menu_key || request_shift_f10;
             if (request_context) {
+                selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
+                publish_network_selection(repeater_artifact_identity(
+                    rep, artifact_kind_t::repeater_request), true);
                 const auto origin = request_pointer_context
                     ? exchange_context_origin_t::pointer
                     : request_menu_key
@@ -5058,11 +5419,21 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             }
 
             if (!rep.in_progress.load()) {
-                if (aida::ui::button("Send", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-                    if (req_buf_dirty) {
-                        rep.raw_request = req_buf;
-                        req_buf_dirty = false;
-                    }
+                const bool send_disabled = !editor_result.valid ||
+                    editor_result.has_unapplied_pretty;
+                const bool send_repeater_request = aida::ui::button(
+                    "Send", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+                    ImVec2(0.f, 0.f), send_disabled);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                register_network_last_item(
+                    repeater_artifact_id + ".action.send", "network-artifact-action",
+                    repeater_artifact_id);
+#endif
+                if (send_repeater_request) {
+                    selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
+                    publish_network_selection(repeater_artifact_identity(
+                        rep, artifact_kind_t::repeater_request), true);
+                    human_request_editor::mark_clean(request_editor);
                     rep.in_progress.store(true);
                     std::shared_ptr<repeater_entry_t> entry = rep_ptr;
                     diag::log_tagged_fmt("network", "repeater_send_clicked host=%s:%u tls=%d req_size=%zu",
@@ -5106,9 +5477,13 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                         entry->in_progress.store(false);
                     }
                 }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Sends the visible request to %s:%u over %s; this creates live network activity",
-                        rep.host.c_str(), static_cast<unsigned>(rep.port), rep.use_tls ? "TLS" : "plain TCP");
+                if (ImGui::IsItemHovered()) {
+                    if (send_disabled)
+                        ImGui::SetTooltip("Resolve the request editor error or apply/discard Pretty edits before sending raw bytes");
+                    else
+                        ImGui::SetTooltip("Sends the authoritative raw request to %s:%u over %s; this creates live network activity",
+                            rep.host.c_str(), static_cast<unsigned>(rep.port), rep.use_tls ? "TLS" : "plain TCP");
+                }
             } else {
                 aida::ui::pill_kind("Sending...", aida::ui::pill_kind_t::accent,
                                      aida::ui::size_t_::sm, true);
@@ -5140,6 +5515,14 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 rep.raw_response.size() + 1,
                 ImVec2(resp_w - 4.f, std::max(72.f, resp_h - 78.f)),
                 ImGuiInputTextFlags_ReadOnly);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const auto repeater_response_identity = repeater_artifact_identity(
+                rep, artifact_kind_t::repeater_response);
+            register_network_last_item(
+                semantic_artifact_id("response", repeater_response_identity),
+                "network-response-editor", repeater_artifact_id,
+                !repeater_response_identity.valid());
+#endif
             const bool response_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
             const bool response_menu_key = ImGui::IsItemFocused() &&
                 ImGui::IsKeyPressed(ImGuiKey_Menu, false);
@@ -5152,14 +5535,22 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                     : response_menu_key
                     ? exchange_context_origin_t::menu_key
                     : exchange_context_origin_t::shift_f10;
+                const auto response_identity = repeater_artifact_identity(
+                    rep, artifact_kind_t::repeater_response);
+                if (response_identity.valid())
+                    publish_network_selection(response_identity, true);
+                selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_response;
                 open_exchange_context(
-                    repeater_artifact_identity(rep, artifact_kind_t::repeater_response),
+                    response_identity,
                     repeater_artifact_identity(rep, artifact_kind_t::repeater_request), origin);
             }
 
             ImGui::EndChild();
+        } else {
+            clear_stale_network_selection("view.network.repeater");
         }
     } else {
+        clear_stale_network_selection("view.network.repeater");
         ImVec2 region_pos = ImGui::GetCursorScreenPos();
         ImVec2 region_size = ImVec2(w, h - ImGui::GetCursorPosY() - 8.f);
         aida::ui::empty_state::config_t cfg;
@@ -5174,9 +5565,34 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
 
 
 struct intercept_runtime_snapshot_t {
+    std::uint64_t generation = 0;
     bool running = false;
     bool enabled = false;
     std::vector<mitm_proxy::http_exchange> held;
+};
+
+struct intercept_target_identity_t {
+    std::uint64_t publication_generation = 0;
+    std::uint64_t exchange_id = 0;
+    std::uint64_t timestamp = 0;
+    std::uint64_t content_hash = 0;
+    std::size_t content_size = 0;
+
+    bool valid() const noexcept {
+        return publication_generation != 0 && exchange_id != 0 &&
+            content_hash != 0;
+    }
+};
+
+static constexpr std::size_t k_intercept_editor_capacity = 65536U;
+
+struct intercept_modified_draft_t {
+    intercept_target_identity_t source;
+    std::string raw_request;
+    std::uint64_t content_hash = 0;
+    bool loaded = false;
+    bool editable = false;
+    std::string unavailable_reason;
 };
 
 enum class intercept_operation_t {
@@ -5191,7 +5607,7 @@ enum class intercept_operation_t {
 struct intercept_drop_review_t {
     bool open = false;
     bool all = false;
-    std::uint64_t exchange_id = 0;
+    intercept_target_identity_t target;
     std::size_t reviewed_count = 0;
     std::shared_ptr<const intercept_runtime_snapshot_t> reviewed_publication;
 };
@@ -5199,13 +5615,118 @@ struct intercept_drop_review_t {
 static std::shared_ptr<const intercept_runtime_snapshot_t> s_intercept_runtime_snapshot;
 static std::atomic<bool> s_intercept_snapshot_pending{false};
 static std::atomic<std::uint64_t> s_intercept_snapshot_requested_ms{0};
+static std::atomic<std::uint64_t> s_intercept_snapshot_generation{0};
 static std::atomic<bool> s_intercept_operation_pending{false};
 static std::atomic<std::uint64_t> s_intercept_operation_serial{0};
 static intercept_drop_review_t s_intercept_drop_review;
 static std::uint64_t s_intercept_selected_exchange_id = 0;
+static intercept_modified_draft_t s_intercept_modified_draft;
+static human_request_editor::state_t s_intercept_request_editor;
+static human_request_editor::state_t s_intercept_original_editor;
+
+static intercept_target_identity_t intercept_target_identity(
+    const intercept_runtime_snapshot_t& publication,
+    const mitm_proxy::http_exchange& exchange) {
+    return {publication.generation, exchange.id, exchange.timestamp,
+        artifact_hash(exchange.raw_request), exchange.raw_request.size()};
+}
+
+static bool intercept_exchange_matches(const mitm_proxy::http_exchange& exchange,
+                                       const intercept_target_identity_t& target) {
+    return target.valid() && exchange.id == target.exchange_id &&
+        exchange.timestamp == target.timestamp &&
+        exchange.raw_request.size() == target.content_size &&
+        artifact_hash(exchange.raw_request) == target.content_hash;
+}
+
+static bool intercept_target_matches(const intercept_target_identity_t& lhs,
+                                     const intercept_target_identity_t& rhs,
+                                     bool include_generation) {
+    return lhs.exchange_id == rhs.exchange_id && lhs.timestamp == rhs.timestamp &&
+        lhs.content_hash == rhs.content_hash && lhs.content_size == rhs.content_size &&
+        (!include_generation || lhs.publication_generation == rhs.publication_generation);
+}
+
+static bool intercept_editor_compatible(const std::vector<std::uint8_t>& bytes,
+                                        std::string& unavailable_reason) {
+    if (bytes.empty()) {
+        unavailable_reason = "The retained request is empty and cannot be edited or forwarded.";
+        return false;
+    }
+    if (bytes.size() >= k_intercept_editor_capacity) {
+        unavailable_reason = "The retained request exceeds the 65535-byte reviewed editor limit; use a binary-safe external workflow.";
+        return false;
+    }
+    const char* cursor = reinterpret_cast<const char*>(bytes.data());
+    const char* const end = cursor + bytes.size();
+    while (cursor < end) {
+        unsigned int codepoint = 0;
+        const int consumed = ImTextCharFromUtf8(&codepoint, cursor, end);
+        if (consumed <= 0 || cursor + consumed > end ||
+            codepoint == IM_UNICODE_CODEPOINT_INVALID) {
+            unavailable_reason = "The retained request contains invalid UTF-8 or binary bytes that the text editor cannot represent safely.";
+            return false;
+        }
+        if ((codepoint < 0x20U && codepoint != '\r' && codepoint != '\n' && codepoint != '\t') ||
+            codepoint == 0x7FU) {
+            unavailable_reason = "The retained request contains binary control bytes that the text editor cannot represent safely.";
+            return false;
+        }
+        cursor += consumed;
+    }
+    unavailable_reason.clear();
+    return true;
+}
+
+static bool refresh_intercept_modified_draft(std::string& unavailable_reason) {
+    if (!s_intercept_modified_draft.loaded || !s_intercept_modified_draft.editable) {
+        unavailable_reason = s_intercept_modified_draft.unavailable_reason.empty()
+            ? "The selected request has no editable retained draft."
+            : s_intercept_modified_draft.unavailable_reason;
+        return false;
+    }
+    if (s_intercept_modified_draft.raw_request.size() >= k_intercept_editor_capacity) {
+        unavailable_reason = "The modified request exceeded its bounded editor capacity.";
+        s_intercept_modified_draft.unavailable_reason = unavailable_reason;
+        return false;
+    }
+    if (s_intercept_modified_draft.raw_request.empty()) {
+        unavailable_reason = "The modified request is empty and cannot be forwarded.";
+        s_intercept_modified_draft.unavailable_reason = unavailable_reason;
+        return false;
+    }
+    s_intercept_modified_draft.content_hash = artifact_hash(std::string_view(
+        s_intercept_modified_draft.raw_request));
+    s_intercept_modified_draft.unavailable_reason.clear();
+    unavailable_reason.clear();
+    return true;
+}
+
+static void retain_intercept_modified_draft(
+    const intercept_runtime_snapshot_t& publication,
+    const mitm_proxy::http_exchange& exchange) {
+    const auto target = intercept_target_identity(publication, exchange);
+    if (s_intercept_modified_draft.loaded &&
+        intercept_target_matches(s_intercept_modified_draft.source, target, false)) {
+        s_intercept_modified_draft.source.publication_generation = publication.generation;
+        return;
+    }
+    s_intercept_modified_draft = {};
+    s_intercept_modified_draft.loaded = true;
+    s_intercept_modified_draft.source = target;
+    s_intercept_modified_draft.editable = intercept_editor_compatible(
+        exchange.raw_request, s_intercept_modified_draft.unavailable_reason);
+    if (!s_intercept_modified_draft.editable)
+        return;
+    s_intercept_modified_draft.raw_request.assign(
+        exchange.raw_request.begin(), exchange.raw_request.end());
+    s_intercept_modified_draft.content_hash = artifact_hash(exchange.raw_request);
+}
 
 static void publish_intercept_runtime_snapshot() {
     auto snapshot = std::make_shared<intercept_runtime_snapshot_t>();
+    snapshot->generation = s_intercept_snapshot_generation.fetch_add(
+        1, std::memory_order_acq_rel) + 1;
     snapshot->running = mitm_proxy::is_running();
     snapshot->enabled = mitm_proxy::is_intercept_enabled();
     snapshot->held = mitm_proxy::get_held_exchanges();
@@ -5237,8 +5758,9 @@ static void request_intercept_runtime_snapshot(bool force = false) {
 }
 
 static bool request_intercept_operation(intercept_operation_t operation, bool enabled,
-                                        std::uint64_t exchange_id,
+                                        intercept_target_identity_t target,
                                         std::vector<std::uint8_t> modified_request,
+                                        std::uint64_t modified_content_hash,
                                         std::size_t reviewed_count,
                                         std::shared_ptr<const intercept_runtime_snapshot_t>
                                             reviewed_publication = {}) {
@@ -5246,15 +5768,16 @@ static bool request_intercept_operation(intercept_operation_t operation, bool en
     if (!s_intercept_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         return false;
     const std::uint64_t serial = s_intercept_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
-    const char* action = "network.intercept.forward";
+    const char* action = "network.intercept.forward_selected";
     const char* label = "Forward held exchange";
-    std::string target = exchange_id == 0 ? std::to_string(reviewed_count) + " held exchanges"
-                                          : "exchange " + std::to_string(exchange_id);
+    std::string target_summary = target.exchange_id == 0
+        ? std::to_string(reviewed_count) + " held exchanges"
+        : "exchange " + std::to_string(target.exchange_id);
     switch (operation) {
     case intercept_operation_t::set_enabled:
         action = "network.intercept.toggle_enabled";
         label = enabled ? "Enable request interception" : "Disable request interception";
-        target = enabled ? "interception enabled" : "interception disabled";
+        target_summary = enabled ? "interception enabled" : "interception disabled";
         break;
     case intercept_operation_t::forward_all:
         action = "network.intercept.forward_all";
@@ -5265,7 +5788,7 @@ static bool request_intercept_operation(intercept_operation_t operation, bool en
         label = "Drop all held exchanges";
         break;
     case intercept_operation_t::drop_one:
-        action = "network.intercept.drop";
+        action = "network.intercept.drop_selected";
         label = "Drop held exchange";
         break;
     case intercept_operation_t::forward_modified:
@@ -5275,58 +5798,119 @@ static bool request_intercept_operation(intercept_operation_t operation, bool en
     default:
         break;
     }
-    const std::string task_id = register_network_operation(action, label, "view.network.intercept", target);
+    const std::string task_id = register_network_operation(
+        action, label, "view.network.intercept", target_summary);
     const bool posted = post_network_task(
         "intercept_mutation", aida::infra::executor::domain_t::feature_worker, "bounded_task",
-        [serial, operation, enabled, exchange_id, modified_request = std::move(modified_request),
-         reviewed_count, reviewed_publication = std::move(reviewed_publication), task_id]() {
+        [serial, operation, enabled, target, modified_request = std::move(modified_request),
+         modified_content_hash, reviewed_count,
+         reviewed_publication = std::move(reviewed_publication), task_id]() {
             bool success = false;
             std::string error;
             try {
+                std::vector<mitm_proxy::http_exchange> live_held;
+                const auto validate_selected = [&]() -> const mitm_proxy::http_exchange* {
+                    if (!reviewed_publication || !target.valid() ||
+                        target.publication_generation != reviewed_publication->generation) {
+                        error = "The exact reviewed Intercept publication is unavailable";
+                        return nullptr;
+                    }
+                    const auto reviewed = std::find_if(reviewed_publication->held.begin(),
+                        reviewed_publication->held.end(), [&](const auto& exchange) {
+                            return intercept_exchange_matches(exchange, target);
+                        });
+                    if (reviewed == reviewed_publication->held.end()) {
+                        error = "The reviewed held exchange identity does not match its immutable publication";
+                        return nullptr;
+                    }
+                    live_held = mitm_proxy::get_held_exchanges();
+                    const auto live = std::find_if(live_held.begin(), live_held.end(),
+                        [&](const auto& exchange) {
+                            return intercept_exchange_matches(exchange, target);
+                        });
+                    if (live == live_held.end()) {
+                        error = "The held exchange changed after review; select and review it again";
+                        return nullptr;
+                    }
+                    return &*reviewed;
+                };
+                const auto validate_all = [&]() {
+                    if (!reviewed_publication || reviewed_publication->generation == 0 ||
+                        reviewed_count == 0 ||
+                        reviewed_count != reviewed_publication->held.size()) {
+                        error = "The exact reviewed Intercept publication is unavailable";
+                        return false;
+                    }
+                    live_held = mitm_proxy::get_held_exchanges();
+                    for (const auto& reviewed : reviewed_publication->held) {
+                        const auto reviewed_target = intercept_target_identity(
+                            *reviewed_publication, reviewed);
+                        const bool current = std::any_of(live_held.begin(), live_held.end(),
+                            [&](const auto& exchange) {
+                                return intercept_exchange_matches(exchange, reviewed_target);
+                            });
+                        if (!current) {
+                            error = "A held exchange changed after review; review the current publication again";
+                            return false;
+                        }
+                    }
+                    return true;
+                };
                 switch (operation) {
                 case intercept_operation_t::set_enabled:
                     mitm_proxy::set_intercept_enabled(enabled);
                     success = mitm_proxy::is_intercept_enabled() == enabled;
                     break;
                 case intercept_operation_t::forward_all:
-                    if (!reviewed_publication) {
-                        error = "The reviewed Intercept publication is unavailable";
-                        break;
-                    }
+                    if (!validate_all()) break;
                     for (const auto& exchange : reviewed_publication->held)
                         mitm_proxy::forward_exchange(exchange.id);
                     success = true;
                     break;
                 case intercept_operation_t::drop_all:
-                    if (!reviewed_publication) {
-                        error = "The reviewed Intercept publication is unavailable";
-                        break;
-                    }
+                    if (!validate_all()) break;
                     for (const auto& exchange : reviewed_publication->held)
                         mitm_proxy::drop_exchange(exchange.id);
                     success = true;
                     break;
                 case intercept_operation_t::forward_one:
-                    mitm_proxy::forward_exchange(exchange_id);
+                    if (!validate_selected()) break;
+                    mitm_proxy::forward_exchange(target.exchange_id);
                     success = true;
                     break;
                 case intercept_operation_t::drop_one:
-                    mitm_proxy::drop_exchange(exchange_id);
+                    if (!validate_selected()) break;
+                    mitm_proxy::drop_exchange(target.exchange_id);
                     success = true;
                     break;
-                case intercept_operation_t::forward_modified:
-                    if (modified_request.empty())
-                        mitm_proxy::forward_exchange(exchange_id);
-                    else
-                        mitm_proxy::forward_modified(exchange_id, modified_request);
+                case intercept_operation_t::forward_modified: {
+                    const auto* reviewed = validate_selected();
+                    if (!reviewed) break;
+                    if (modified_request.empty() ||
+                        modified_request.size() >= k_intercept_editor_capacity ||
+                        modified_content_hash == 0 ||
+                        artifact_hash(modified_request) != modified_content_hash) {
+                        error = "The modified request draft changed after review or exceeded its bounded size";
+                        break;
+                    }
+                    artifact_identity_t canonical_source;
+                    if (!validate_reviewed_request(
+                            exchange_artifact_identity(*reviewed,
+                                artifact_kind_t::intercept_request),
+                            modified_request, canonical_source, error))
+                        break;
+                    mitm_proxy::forward_modified(target.exchange_id, modified_request);
                     success = true;
                     break;
                 }
+                }
                 publish_intercept_runtime_snapshot();
                 const auto snapshot = std::atomic_load_explicit(&s_intercept_runtime_snapshot, std::memory_order_acquire);
-                if (success && exchange_id != 0 && snapshot) {
+                if (success && target.exchange_id != 0 && snapshot) {
                     success = std::none_of(snapshot->held.begin(), snapshot->held.end(),
-                        [exchange_id](const auto& exchange) { return exchange.id == exchange_id; });
+                        [target](const auto& exchange) {
+                            return exchange.id == target.exchange_id;
+                        });
                 } else if (success && reviewed_publication && snapshot &&
                     (operation == intercept_operation_t::forward_all ||
                      operation == intercept_operation_t::drop_all)) {
@@ -5341,7 +5925,7 @@ static bool request_intercept_operation(intercept_operation_t operation, bool en
                                 exchange.id);
                         });
                 }
-                if (!success)
+                if (!success && error.empty())
                     error = "The requested intercept state could not be verified";
             } catch (const std::exception& exception) {
                 error = exception.what();
@@ -5370,60 +5954,96 @@ static bool request_intercept_operation(intercept_operation_t operation, bool en
     return true;
 }
 
-intercept_command_capability_t intercept_command_capability(intercept_command_t command) {
-    const auto snapshot = std::atomic_load_explicit(
-        &s_intercept_runtime_snapshot, std::memory_order_acquire);
-    if (!snapshot)
+static bool selected_intercept_command(intercept_command_t command) {
+    return command == intercept_command_t::forward_selected ||
+        command == intercept_command_t::drop_selected ||
+        command == intercept_command_t::forward_modified;
+}
+
+static intercept_command_capability_t intercept_command_capability_for(
+    intercept_command_t command,
+    const std::shared_ptr<const intercept_runtime_snapshot_t>& publication,
+    const intercept_target_identity_t& target) {
+    if (!publication)
         return {false, "The immutable Intercept publication is still loading"};
-    if (!snapshot->running)
+    if (!publication->running)
         return {false, "Start the MITM proxy before using Intercept commands"};
     if (s_intercept_operation_pending.load(std::memory_order_acquire))
         return {false, "Wait for the current Intercept operation to finish"};
-    if (snapshot->held.empty())
+    if (publication->held.empty())
         return {false, "No held exchanges are available"};
-    if (command == intercept_command_t::forward_selected ||
-        command == intercept_command_t::drop_selected) {
-        if (s_intercept_selected_exchange_id == 0)
+    if (selected_intercept_command(command)) {
+        if (!target.valid())
             return {false, "Select a held exchange first"};
-        const bool selected_exists = std::any_of(snapshot->held.begin(), snapshot->held.end(),
+        const bool reviewed_exists = target.publication_generation == publication->generation &&
+            std::any_of(publication->held.begin(), publication->held.end(),
+            [&](const auto& exchange) {
+                return intercept_exchange_matches(exchange, target);
+            });
+        if (!reviewed_exists)
+            return {false, "The reviewed held exchange changed; select it again"};
+        const auto current = std::atomic_load_explicit(
+            &s_intercept_runtime_snapshot, std::memory_order_acquire);
+        const bool selected_current = current && current->running &&
+            std::any_of(current->held.begin(), current->held.end(),
+                [&](const auto& exchange) {
+                    return intercept_exchange_matches(exchange, target);
+                });
+        if (!selected_current)
+            return {false, "The selected held exchange changed; select it again"};
+        if (command == intercept_command_t::forward_modified) {
+            if (!s_intercept_modified_draft.loaded ||
+                !intercept_target_matches(
+                    s_intercept_modified_draft.source, target, false))
+                return {false, "The selected exchange has no retained modified draft"};
+            std::string draft_reason;
+            if (!refresh_intercept_modified_draft(draft_reason))
+                return {false, s_intercept_modified_draft.unavailable_reason.empty()
+                    ? "The retained modified draft is unavailable"
+                    : s_intercept_modified_draft.unavailable_reason};
+            if (s_intercept_request_editor.pretty_dirty)
+                return {false, "Apply or discard the pending Pretty edits before forwarding raw bytes"};
+            if (s_intercept_request_editor.oversized || s_intercept_request_editor.binary ||
+                !s_intercept_request_editor.error.empty())
+                return {false, s_intercept_request_editor.error.empty()
+                    ? "The retained modified request is not safely editable"
+                    : s_intercept_request_editor.error};
+        }
+    }
+    return {true, {}};
+}
+
+intercept_command_capability_t intercept_command_capability(intercept_command_t command) {
+    const auto publication = std::atomic_load_explicit(
+        &s_intercept_runtime_snapshot, std::memory_order_acquire);
+    intercept_target_identity_t target;
+    if (publication && selected_intercept_command(command)) {
+        const auto selected = std::find_if(publication->held.begin(), publication->held.end(),
             [](const auto& exchange) {
                 return exchange.id == s_intercept_selected_exchange_id;
             });
-        if (!selected_exists)
-            return {false, "The selected held exchange changed; select it again"};
+        if (selected != publication->held.end())
+            target = intercept_target_identity(*publication, *selected);
     }
-    return {true, nullptr};
+    return intercept_command_capability_for(command, publication, target);
 }
 
-bool execute_intercept_command(intercept_command_t command, std::string* error) {
-    const auto capability = intercept_command_capability(command);
+static bool execute_reviewed_intercept_command(
+    intercept_command_t command,
+    const std::shared_ptr<const intercept_runtime_snapshot_t>& publication,
+    const intercept_target_identity_t& target,
+    std::string* error) {
+    const auto capability = intercept_command_capability_for(command, publication, target);
     if (!capability.enabled) {
-        if (error) *error = capability.disabled_reason ? capability.disabled_reason :
-            "The Intercept command is unavailable";
+        if (error) *error = capability.disabled_reason.empty()
+            ? "The Intercept command is unavailable"
+            : capability.disabled_reason;
         return false;
-    }
-    const auto snapshot = std::atomic_load_explicit(
-        &s_intercept_runtime_snapshot, std::memory_order_acquire);
-    if (!snapshot) {
-        if (error) *error = "The immutable Intercept publication changed before execution";
-        return false;
-    }
-    std::uint64_t selected_id = 0;
-    if (command == intercept_command_t::forward_selected ||
-        command == intercept_command_t::drop_selected) {
-        selected_id = s_intercept_selected_exchange_id;
-        const bool selected_exists = selected_id != 0 &&
-            std::any_of(snapshot->held.begin(), snapshot->held.end(),
-                [selected_id](const auto& exchange) { return exchange.id == selected_id; });
-        if (!selected_exists) {
-            if (error) *error = "The selected held exchange changed before execution";
-            return false;
-        }
     }
     switch (command) {
     case intercept_command_t::forward_selected:
         if (!request_intercept_operation(intercept_operation_t::forward_one, false,
-                selected_id, {}, 1)) {
+                target, {}, 0, 1, publication)) {
             if (error) *error = "The Intercept executor rejected the selected forward operation";
             return false;
         }
@@ -5435,11 +6055,47 @@ bool execute_intercept_command(intercept_command_t command, std::string* error) 
                 ? "The Intercept review surface could not be opened" : opened.detail;
             return false;
         }
-        s_intercept_drop_review = {true, false, selected_id, 1, {}};
+        s_intercept_drop_review = {true, false, target, 1, publication};
         break;
+    case intercept_command_t::forward_modified: {
+        std::string draft_reason;
+        if (!refresh_intercept_modified_draft(draft_reason) ||
+            !intercept_target_matches(s_intercept_modified_draft.source, target, false)) {
+            if (error) *error = draft_reason.empty()
+                ? "The retained modified draft no longer matches the selected exchange"
+                : draft_reason;
+            return false;
+        }
+        const auto reviewed = std::find_if(publication->held.begin(), publication->held.end(),
+            [&](const auto& exchange) {
+                return intercept_exchange_matches(exchange, target);
+            });
+        if (reviewed == publication->held.end()) {
+            if (error) *error = "The selected exchange changed before modified forwarding";
+            return false;
+        }
+        std::vector<std::uint8_t> modified_request(
+            s_intercept_modified_draft.raw_request.begin(),
+            s_intercept_modified_draft.raw_request.end());
+        artifact_identity_t canonical_source;
+        if (!validate_reviewed_request(
+                exchange_artifact_identity(*reviewed, artifact_kind_t::intercept_request),
+                modified_request, canonical_source, draft_reason)) {
+            if (error) *error = draft_reason.empty()
+                ? "The modified request failed reviewed HTTP validation" : draft_reason;
+            return false;
+        }
+        if (!request_intercept_operation(intercept_operation_t::forward_modified, false,
+                target, std::move(modified_request),
+                s_intercept_modified_draft.content_hash, 1, publication)) {
+            if (error) *error = "The Intercept executor rejected the modified forward operation";
+            return false;
+        }
+        break;
+    }
     case intercept_command_t::forward_all:
         if (!request_intercept_operation(intercept_operation_t::forward_all, false,
-                0, {}, snapshot->held.size(), snapshot)) {
+                {}, {}, 0, publication->held.size(), publication)) {
             if (error) *error = "The Intercept executor rejected the forward-all operation";
             return false;
         }
@@ -5451,11 +6107,26 @@ bool execute_intercept_command(intercept_command_t command, std::string* error) 
                 ? "The Intercept review surface could not be opened" : opened.detail;
             return false;
         }
-        s_intercept_drop_review = {true, true, 0, snapshot->held.size(), snapshot};
+        s_intercept_drop_review = {true, true, {}, publication->held.size(), publication};
         break;
     }
     if (error) error->clear();
     return true;
+}
+
+bool execute_intercept_command(intercept_command_t command, std::string* error) {
+    const auto publication = std::atomic_load_explicit(
+        &s_intercept_runtime_snapshot, std::memory_order_acquire);
+    intercept_target_identity_t target;
+    if (publication && selected_intercept_command(command)) {
+        const auto selected = std::find_if(publication->held.begin(), publication->held.end(),
+            [](const auto& exchange) {
+                return exchange.id == s_intercept_selected_exchange_id;
+            });
+        if (selected != publication->held.end())
+            target = intercept_target_identity(*publication, *selected);
+    }
+    return execute_reviewed_intercept_command(command, publication, target, error);
 }
 
 static void render_intercept(state_t& state, float x, float y, float w, float h,
@@ -5471,6 +6142,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
     const bool running = intercept_snapshot && intercept_snapshot->running;
     const bool intercept_pending = s_intercept_operation_pending.load(std::memory_order_acquire);
     if (!running) {
+        clear_stale_network_selection("view.network.intercept");
         ImVec2 region = ImVec2(w, h);
         ImVec2 region_pos = ImGui::GetCursorScreenPos();
         aida::ui::empty_state::config_t cfg;
@@ -5541,6 +6213,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         if (selected == held.end()) {
             state.intercept_selected = -1;
             s_intercept_selected_exchange_id = 0;
+            clear_stale_network_selection("view.network.intercept");
         } else {
             state.intercept_selected = static_cast<int>(std::distance(held.begin(), selected));
         }
@@ -5549,6 +6222,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
             held[static_cast<std::size_t>(state.intercept_selected)].id;
     } else {
         state.intercept_selected = -1;
+        clear_stale_network_selection("view.network.intercept");
     }
     if (held_count > s_intercept_ui.prev_held_count) {
         s_intercept_ui.border_flash.trigger();
@@ -5575,18 +6249,22 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
                 ImGui::Text("Drop all %zu currently held exchanges?", s_intercept_drop_review.reviewed_count);
             else
                 ImGui::Text("Drop held exchange %llu?",
-                    static_cast<unsigned long long>(s_intercept_drop_review.exchange_id));
+                    static_cast<unsigned long long>(
+                        s_intercept_drop_review.target.exchange_id));
             ImGui::TextWrapped("Dropped exchanges are not forwarded to their upstream destination.");
         }
         aida::ui::design::end_dialog_body();
         const bool retained_target = s_intercept_drop_review.reviewed_publication &&
-            s_intercept_drop_review.reviewed_count != 0;
+            s_intercept_drop_review.reviewed_count != 0 &&
+            (s_intercept_drop_review.all ||
+                s_intercept_drop_review.target.valid());
         const auto result = aida::ui::design::dialog_footer(
             "intercept_drop_review_footer", "Confirm Drop", retained_target, true);
         if (result.confirmed) {
             const bool accepted = request_intercept_operation(
                 s_intercept_drop_review.all ? intercept_operation_t::drop_all : intercept_operation_t::drop_one,
-                false, s_intercept_drop_review.exchange_id, {}, s_intercept_drop_review.reviewed_count,
+                false, s_intercept_drop_review.target, {}, 0,
+                s_intercept_drop_review.reviewed_count,
                 s_intercept_drop_review.reviewed_publication);
             if (accepted) {
                 s_intercept_drop_review = {};
@@ -5675,10 +6353,35 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         }
 
         ImVec2 mouse = ImGui::GetMousePos();
-        if (mouse.x >= list_org.x && mouse.x < list_org.x + list_sz.x - 4.f &&
-            mouse.y >= abs_ry && mouse.y < abs_ry + row_h && ImGui::IsMouseClicked(0)) {
+        const bool row_hovered = mouse.x >= list_org.x &&
+            mouse.x < list_org.x + list_sz.x - 4.f &&
+            mouse.y >= abs_ry && mouse.y < abs_ry + row_h;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const auto intercept_identity = exchange_artifact_identity(
+            ex, artifact_kind_t::intercept_request);
+        const std::string intercept_artifact_id =
+            semantic_artifact_id("exchange", intercept_identity);
+        ImGui::PushID(i);
+        const ImGuiID intercept_row_id = ImGui::GetID("##intercept_exchange_row");
+        ImGui::PopID();
+        aida::preview::semantics::register_region(
+            intercept_artifact_id, "network-exchange-row", intercept_row_id,
+            ImVec2(list_org.x, abs_ry),
+            ImVec2(list_org.x + list_sz.x - 4.f, abs_ry + row_h), false, false,
+            "aida.dock-window.view.network.intercept");
+#endif
+        if (row_hovered && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+            ImGui::IsMouseClicked(ImGuiMouseButton_Right))) {
             state.intercept_selected = i;
             s_intercept_selected_exchange_id = ex.id;
+            publish_network_selection(
+                exchange_artifact_identity(ex, artifact_kind_t::intercept_request), true);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                retain_intercept_modified_draft(*intercept_snapshot, ex);
+                open_exchange_context(
+                    exchange_artifact_identity(ex, artifact_kind_t::intercept_request), {},
+                    exchange_context_origin_t::pointer, true);
+            }
         }
 
         ImU32 txt_col = aida::ui::with_alpha(is_sel ? th.text_primary : th.text_secondary, alpha);
@@ -5703,30 +6406,60 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         ImGui::SetCursorPosY(ry + row_h);
     }
     }
+    const bool intercept_menu_key = state.intercept_selected >= 0 &&
+        state.intercept_selected < static_cast<int>(held.size()) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+        ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+    const bool intercept_shift_f10 = !intercept_menu_key &&
+        state.intercept_selected >= 0 &&
+        state.intercept_selected < static_cast<int>(held.size()) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+        ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+    if (intercept_menu_key || intercept_shift_f10) {
+        const auto& selected = held[static_cast<std::size_t>(state.intercept_selected)];
+        publish_network_selection(
+            exchange_artifact_identity(selected, artifact_kind_t::intercept_request), true);
+        retain_intercept_modified_draft(*intercept_snapshot, selected);
+        open_exchange_context(
+            exchange_artifact_identity(selected, artifact_kind_t::intercept_request), {},
+            intercept_menu_key ? exchange_context_origin_t::menu_key
+                               : exchange_context_origin_t::shift_f10,
+            true);
+    }
     ImGui::EndChild();
     (void)dl_outer; (void)outer_pos;
 
 
     if (state.intercept_selected >= 0 && state.intercept_selected < static_cast<int>(held.size())) {
         auto& sel = held[static_cast<size_t>(state.intercept_selected)];
-        static char mod_buf[65536] = {};
-        static uint64_t mod_buf_loaded_id = 0;
-        if (mod_buf_loaded_id != sel.id) {
-            size_t copy_len = sel.raw_request.size() < (sizeof(mod_buf) - 1)
-                ? sel.raw_request.size()
-                : (sizeof(mod_buf) - 1);
-            memcpy(mod_buf, sel.raw_request.data(), copy_len);
-            mod_buf[copy_len] = '\0';
-            mod_buf_loaded_id = sel.id;
-        }
+        retain_intercept_modified_draft(*intercept_snapshot, sel);
+        publish_network_selection(
+            exchange_artifact_identity(sel, artifact_kind_t::intercept_request));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const auto intercept_identity = exchange_artifact_identity(
+            sel, artifact_kind_t::intercept_request);
+        const std::string intercept_artifact_id =
+            semantic_artifact_id("exchange", intercept_identity);
+        const std::string intercept_request_id =
+            semantic_artifact_id("request", intercept_identity);
+#endif
 
         ImGui::Spacing();
         const auto forward_selected_action = aida::ui::application_ui::present_action(
             "network.intercept.forward_selected");
         const auto drop_selected_action = aida::ui::application_ui::present_action(
             "network.intercept.drop_selected");
-        if (aida::ui::button("Forward", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
-                             ImVec2(0.f, 0.f), !forward_selected_action.enabled)) {
+        const auto forward_modified_action = aida::ui::application_ui::present_action(
+            "network.intercept.forward_modified");
+        const bool forward_intercept = aida::ui::button(
+            "Forward", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+            ImVec2(0.f, 0.f), !forward_selected_action.enabled);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_network_last_item(
+            intercept_artifact_id + ".action.forward", "network-artifact-action",
+            intercept_artifact_id, !forward_selected_action.enabled);
+#endif
+        if (forward_intercept) {
             diag::log_tagged_fmt("network", "intercept_forward_clicked id=%llu",
                 static_cast<unsigned long long>(sel.id));
             static_cast<void>(aida::ui::application_ui::execute_action(
@@ -5738,8 +6471,15 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
             aida::ui::kbd_chip(forward_selected_action.shortcut.c_str());
         }
         ImGui::SameLine();
-        if (aida::ui::button("Drop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm,
-                             ImVec2(0.f, 0.f), !drop_selected_action.enabled)) {
+        const bool drop_intercept = aida::ui::button(
+            "Drop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm,
+            ImVec2(0.f, 0.f), !drop_selected_action.enabled);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_network_last_item(
+            intercept_artifact_id + ".action.drop", "network-artifact-action",
+            intercept_artifact_id, !drop_selected_action.enabled);
+#endif
+        if (drop_intercept) {
             diag::log_tagged_fmt("network", "intercept_drop_clicked id=%llu",
                 static_cast<unsigned long long>(sel.id));
             static_cast<void>(aida::ui::application_ui::execute_action(
@@ -5751,50 +6491,53 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
             aida::ui::kbd_chip(drop_selected_action.shortcut.c_str());
         }
         ImGui::SameLine();
-        if (aida::ui::button("Forward Modified", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
-                             ImVec2(0.f, 0.f), intercept_pending)) {
-            size_t len = strlen(mod_buf);
-            if (len > 0) {
-                std::vector<uint8_t> mod_data(mod_buf, mod_buf + len);
-                diag::log_tagged_fmt("network", "intercept_forward_modified id=%llu new_size=%zu",
-                    static_cast<unsigned long long>(sel.id), len);
-                request_intercept_operation(intercept_operation_t::forward_modified, false, sel.id,
-                                            std::move(mod_data), 1);
-            } else {
-                diag::log_tagged_fmt("network", "intercept_forward_modified id=%llu empty_buf_fallback_forward",
-                    static_cast<unsigned long long>(sel.id));
-                request_intercept_operation(intercept_operation_t::forward_modified, false, sel.id, {}, 1);
-            }
+        const bool forward_modified_intercept = aida::ui::button(
+            "Forward Modified", aida::ui::button_kind_t::secondary,
+            aida::ui::size_t_::sm, ImVec2(0.f, 0.f), !forward_modified_action.enabled);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_network_last_item(
+            intercept_artifact_id + ".action.forward-modified",
+            "network-artifact-action", intercept_artifact_id,
+            !forward_modified_action.enabled);
+#endif
+        if (forward_modified_intercept) {
+            static_cast<void>(aida::ui::application_ui::execute_action(
+                "network.intercept.forward_modified",
+                aida::ui::action_invocation_source_t::toolbar));
+        }
+        if (!forward_modified_action.shortcut.empty()) {
+            ImGui::SameLine();
+            aida::ui::kbd_chip(forward_modified_action.shortcut.c_str());
         }
         ImGui::SameLine();
-        aida::ui::kbd_chip("M");
-        ImGui::SameLine();
-        if (aida::ui::button("Send to Repeater", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-            auto rep = std::make_shared<repeater_entry_t>();
-            rep->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
-            rep->source_artifact_id = "network.exchange." + std::to_string(sel.id) + ".request";
-            rep->host = sel.target_host;
-            rep->port = sel.target_port;
-            rep->use_tls = sel.is_tls;
-            rep->raw_request = std::string(sel.raw_request.begin(), sel.raw_request.end());
-            rep->request_hash = artifact_hash(sel.raw_request);
-            diag::log_tagged_fmt("network", "intercept_send_to_repeater id=%llu host=%s:%u size=%zu",
-                static_cast<unsigned long long>(sel.id), sel.target_host.c_str(), sel.target_port,
-                rep->raw_request.size());
-            state.repeater_entries.push_back(std::move(rep));
-            publish_repeater_request_artifacts(state);
-            state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
+        const bool send_intercept_to_repeater = aida::ui::button(
+            "Send to Repeater", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_network_last_item(
+            intercept_artifact_id + ".action.send-to-repeater",
+            "network-artifact-action", intercept_artifact_id);
+#endif
+        if (send_intercept_to_repeater) {
+            std::string unavailable;
+            static_cast<void>(execute_retained_exchange_toolbar_action(
+                "network.exchange.repeater",
+                exchange_artifact_identity(sel, artifact_kind_t::intercept_request), {},
+                unavailable));
         }
         ImGui::SameLine();
-        if (aida::ui::button("Send to Fuzzer", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-            state.fuzz_config.host = sel.target_host;
-            state.fuzz_config.port = sel.target_port;
-            state.fuzz_config.use_tls = sel.is_tls;
-            state.fuzz_config.base_request = std::string(sel.raw_request.begin(), sel.raw_request.end());
-            diag::log_tagged_fmt("network", "intercept_send_to_fuzzer id=%llu host=%s:%u size=%zu",
-                static_cast<unsigned long long>(sel.id), sel.target_host.c_str(), sel.target_port,
-                state.fuzz_config.base_request.size());
-            state.active_tab = sub_tab_t::fuzzer;
+        const bool send_intercept_to_fuzzer = aida::ui::button(
+            "Send to Fuzzer", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_network_last_item(
+            intercept_artifact_id + ".action.send-to-fuzzer",
+            "network-artifact-action", intercept_artifact_id);
+#endif
+        if (send_intercept_to_fuzzer) {
+            std::string unavailable;
+            static_cast<void>(execute_retained_exchange_toolbar_action(
+                "network.exchange.fuzzer",
+                exchange_artifact_identity(sel, artifact_kind_t::intercept_request), {},
+                unavailable));
         }
 
         ImGui::Spacing();
@@ -5816,13 +6559,49 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                            "%zu bytes", sel.raw_request.size());
 
-        static char int_orig_buf[65536] = {};
-        if (sel.raw_request.size() < sizeof(int_orig_buf)) {
-            memcpy(int_orig_buf, sel.raw_request.data(), sel.raw_request.size());
-            int_orig_buf[sel.raw_request.size()] = '\0';
+        const std::string original_editor_identity =
+            "intercept.original." + std::to_string(sel.id) + "." +
+            std::to_string(sel.timestamp) + "." +
+            std::to_string(artifact_hash(sel.raw_request));
+        static std::string original_raw;
+        if (s_intercept_original_editor.identity != original_editor_identity)
+            original_raw.assign(sel.raw_request.begin(), sel.raw_request.end());
+        human_request_editor::render_config_t original_config;
+        original_config.stable_id = "intercept-original-request";
+        original_config.size = ImVec2(pane_w - 4.f, std::max(72.f, pane_h - 50.f));
+        original_config.max_bytes = k_intercept_editor_capacity - 1;
+        original_config.editable = false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        original_config.semantic_parent_id = intercept_artifact_id.c_str();
+#endif
+        ImGui::BeginChild("##int_req_orig", original_config.size, true,
+            ImGuiWindowFlags_NoBackground);
+        original_config.size = ImGui::GetContentRegionAvail();
+        static_cast<void>(human_request_editor::render(
+            s_intercept_original_editor,
+            original_editor_identity,
+            original_raw, original_config));
+        const bool original_menu_key = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool original_shift_f10 = !original_menu_key &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+        ImGui::EndChild();
+        const bool original_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+        if (original_pointer_context || original_menu_key || original_shift_f10) {
+            publish_network_selection(
+                exchange_artifact_identity(sel, artifact_kind_t::intercept_request), true);
+            open_exchange_context(
+                exchange_artifact_identity(sel, artifact_kind_t::intercept_request), {},
+                original_pointer_context ? exchange_context_origin_t::pointer
+                    : original_menu_key ? exchange_context_origin_t::menu_key
+                                        : exchange_context_origin_t::shift_f10,
+                true);
         }
-        ImGui::InputTextMultiline("##int_req_orig", int_orig_buf, sizeof(int_orig_buf),
-            ImVec2(pane_w - 4.f, std::max(72.f, pane_h - 50.f)), ImGuiInputTextFlags_ReadOnly);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_network_last_item(
+            intercept_request_id, "network-request-editor", intercept_artifact_id);
+#endif
         ImGui::EndChild();
 
         if (stack_editors) {
@@ -5835,9 +6614,62 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                            "Modified Request");
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                           "Editable buffer");
-        ImGui::InputTextMultiline("##mod_buf", mod_buf, sizeof(mod_buf),
-            ImVec2(pane_w - 4.f, std::max(72.f, edit_pane_h - 50.f)));
+                           "%s", s_intercept_modified_draft.editable
+                               ? "Bounded reviewed text draft"
+                               : "Text editing unavailable for this retained request");
+        if (s_intercept_modified_draft.editable) {
+            human_request_editor::render_config_t modified_config;
+            modified_config.stable_id = "intercept-modified-request";
+            modified_config.size = ImVec2(pane_w - 4.f,
+                std::max(72.f, edit_pane_h - 50.f));
+            modified_config.max_bytes = k_intercept_editor_capacity - 1;
+            modified_config.editable = !intercept_pending;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            modified_config.semantic_parent_id = intercept_request_id.c_str();
+#endif
+            ImGui::BeginChild("##int_req_modified_editor", modified_config.size, false,
+                ImGuiWindowFlags_NoBackground);
+            modified_config.size = ImGui::GetContentRegionAvail();
+            const auto modified_result = human_request_editor::render(
+                s_intercept_request_editor,
+                "intercept.modified." + std::to_string(sel.id) + "." +
+                    std::to_string(sel.timestamp) + "." +
+                    std::to_string(artifact_hash(sel.raw_request)),
+                s_intercept_modified_draft.raw_request, modified_config);
+            const bool modified_menu_key = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+            const bool modified_shift_f10 = !modified_menu_key &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+                ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+            ImGui::EndChild();
+            const bool modified_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            if (modified_pointer_context || modified_menu_key || modified_shift_f10) {
+                publish_network_selection(
+                    exchange_artifact_identity(sel, artifact_kind_t::intercept_request), true);
+                open_exchange_context(
+                    exchange_artifact_identity(sel, artifact_kind_t::intercept_request), {},
+                    modified_pointer_context ? exchange_context_origin_t::pointer
+                        : modified_menu_key ? exchange_context_origin_t::menu_key
+                                            : exchange_context_origin_t::shift_f10,
+                    true);
+            }
+            if (modified_result.authority_changed) {
+                std::string draft_reason;
+                if (!refresh_intercept_modified_draft(draft_reason))
+                    s_intercept_modified_draft.unavailable_reason = std::move(draft_reason);
+            }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_network_last_item(
+                intercept_request_id + ".draft", "network-request-editor",
+                intercept_request_id);
+#endif
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                aida::ui::with_alpha(th.error, alpha)));
+            ImGui::TextWrapped("%s", s_intercept_modified_draft.unavailable_reason.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Dummy(ImVec2(pane_w - 4.f, std::max(32.f, edit_pane_h - 86.f)));
+        }
         ImGui::EndChild();
 
         ImGui::EndChild();
@@ -6170,7 +7002,7 @@ operational_command_capability_t operational_command_capability(
         break;
     case operational_command_t::intercept_toggle:
         request_intercept_runtime_snapshot();
-        if (g_state.intercept_operation_pending.load(std::memory_order_acquire))
+        if (s_intercept_operation_pending.load(std::memory_order_acquire))
             capability.disabled_reason = "An Intercept operation is already in progress";
         else if (!intercept) capability.disabled_reason = "Intercept state is still loading";
         else capability.enabled = true;
@@ -6385,8 +7217,9 @@ bool execute_operational_command(operational_command_t command, std::string* err
             if (error) *error = "Intercept state is no longer retained";
             return false;
         }
-        request_intercept_operation(intercept_operation_t::set_enabled, !intercept->enabled, 0, {}, 0);
-        return g_state.intercept_operation_pending.load(std::memory_order_acquire);
+        return request_intercept_operation(
+            intercept_operation_t::set_enabled, !intercept->enabled,
+            {}, {}, 0, 0);
     }
     case operational_command_t::keylog_launch:
         request_keylog_operation(keylog_operation_t::launch_and_watch,
@@ -7682,22 +8515,24 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                        "Mark injection points with $value$  (FUZZ also accepted)");
     ImGui::Spacing();
 
-    static char tmpl_buf[65536] = {};
-    if (cfg.base_request.size() < sizeof(tmpl_buf) && !state.fuzz_running.load()) {
-        memcpy(tmpl_buf, cfg.base_request.c_str(), cfg.base_request.size());
-        tmpl_buf[cfg.base_request.size()] = '\0';
-    }
-
     float tmpl_h = std::min(h * 0.22f, 180.f);
-    if (ImGui::InputTextMultiline("##fuzz_tmpl", tmpl_buf, sizeof(tmpl_buf),
-                                   ImVec2(w - 8.f, tmpl_h)))
-        cfg.base_request = tmpl_buf;
+    static human_request_editor::state_t request_editor;
+    human_request_editor::render_config_t request_config;
+    request_config.stable_id = "network-fuzzer-template";
+    request_config.size = ImVec2(w - 8.f, tmpl_h);
+    request_config.max_bytes = 65535;
+    request_config.editable = !state.fuzz_running.load(std::memory_order_acquire);
+    const auto request_editor_result = human_request_editor::render(
+        request_editor, "network.fuzzer.request-template", cfg.base_request,
+        request_config);
 
     ImGui::Spacing();
 
 
     if (!state.fuzz_running.load()) {
-        bool fuzz_can_start = !cfg.host.empty() && cfg.port > 0 && !cfg.base_request.empty();
+        bool fuzz_can_start = !cfg.host.empty() && cfg.port > 0 &&
+            !cfg.base_request.empty() && request_editor_result.valid &&
+            !request_editor_result.has_unapplied_pretty;
         if (aida::ui::button("Start Fuzzer", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
                               ImVec2(0.f, 0.f), !fuzz_can_start)) {
             {
@@ -8254,7 +9089,6 @@ static bool start_offensive_workflow(state_t& state, const offensive_workflow_t&
     }
     offensive_apply_base_payload(state, payload);
     const uint64_t run_id = state.off_run_id.fetch_add(1, std::memory_order_acq_rel) + 1;
-    state.off_cancel_requested.store(false, std::memory_order_release);
     state.off_running.store(true, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(state.off_mutex);
@@ -8266,32 +9100,20 @@ static bool start_offensive_workflow(state_t& state, const offensive_workflow_t&
         const offensive_workflow_t workflow_copy = offensive_workflow_at(workflow_index);
         offensive_run_result_t result;
         const uint64_t begin = static_cast<uint64_t>(GetTickCount64());
-        if (g_state.off_cancel_requested.load(std::memory_order_acquire)) {
+        try {
+            result = offensive_dispatch(workflow_copy, std::move(payload));
+        } catch (const std::exception& e) {
             result.success = false;
-            result.message = "Cancelled before dispatch";
-            result.code = "cancelled";
+            result.message = "Offensive workflow failed";
+            result.code = "exception";
+            result.data = json{{"exception_len", std::string(e.what()).size()}};
+        } catch (...) {
+            result.success = false;
+            result.message = "Offensive workflow failed";
+            result.code = "unknown_exception";
             result.data = json::object();
-        } else {
-            try {
-                result = offensive_dispatch(workflow_copy, std::move(payload));
-            } catch (const std::exception& e) {
-                result.success = false;
-                result.message = "Offensive workflow failed";
-                result.code = "exception";
-                result.data = json{{"exception_len", std::string(e.what()).size()}};
-            } catch (...) {
-                result.success = false;
-                result.message = "Offensive workflow failed";
-                result.code = "unknown_exception";
-                result.data = json::object();
-            }
         }
         const uint64_t elapsed_ms = static_cast<uint64_t>(GetTickCount64()) - begin;
-        if (g_state.off_cancel_requested.load(std::memory_order_acquire) && result.success) {
-            result.success = false;
-            result.message = "Cancelled";
-            result.code = "cancelled";
-        }
         json out;
         out["run_id"] = run_id;
         out["workflow"] = workflow_copy.label;
@@ -8313,7 +9135,6 @@ static bool start_offensive_workflow(state_t& state, const offensive_workflow_t&
             g_state.off_result = out.dump(2);
         }
         g_state.off_running.store(false, std::memory_order_release);
-        g_state.off_cancel_requested.store(false, std::memory_order_release);
     });
     if (!posted) {
         state.off_running.store(false, std::memory_order_release);
@@ -8441,15 +9262,27 @@ static void render_offensive(state_t& state, float x, float y, float w, float h,
         ImGui::SameLine(0.f, split_gap);
     ImGui::BeginChild("##off_raw_pane", ImVec2(pane_w, editor_h + 26.f), false, ImGuiWindowFlags_NoBackground);
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)), "Raw Request");
-    ImGui::InputTextMultiline("##off_raw", state.off_raw_request, sizeof(state.off_raw_request),
-                              ImVec2(pane_w - 4.f, editor_h), ImGuiInputTextFlags_AllowTabInput);
+    static human_request_editor::fixed_state_t request_editor;
+    human_request_editor::render_config_t request_config;
+    request_config.stable_id = "offensive-raw-request";
+    request_config.size = ImVec2(pane_w - 4.f, editor_h);
+    request_config.max_bytes = sizeof(state.off_raw_request) - 1;
+    request_config.editable = !state.off_running.load(std::memory_order_acquire);
+    request_config.allow_empty = true;
+    const auto request_editor_result = human_request_editor::render_fixed(
+        request_editor, "network.offensive.raw-request", state.off_raw_request,
+        request_config);
     ImGui::EndChild();
 
     ImGui::Spacing();
     const bool running = state.off_running.load(std::memory_order_acquire);
     const uint64_t fuzz_job = state.off_active_fuzz_job_id.load(std::memory_order_acquire);
     if (!running) {
-        if (aida::ui::button("Run", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+        const bool raw_request_present = state.off_raw_request[0] != '\0';
+        const bool run_disabled = raw_request_present &&
+            (!request_editor_result.valid || request_editor_result.has_unapplied_pretty);
+        if (aida::ui::button("Run", aida::ui::button_kind_t::primary,
+                aida::ui::size_t_::sm, ImVec2(0.f, 0.f), run_disabled)) {
             const offensive_workflow_t& run_wf = offensive_workflow_at(state.off_workflow);
             diag::log_tagged_fmt("network", "offensive_run_clicked workflow=%s scope_only=%d timeout_ms=%d max_payloads=%d max_requests=%d url_len=%zu raw_len=%zu",
                 run_wf.label, state.off_scope_only ? 1 : 0, state.off_timeout_ms, state.off_max_payloads, state.off_max_requests,
@@ -8470,13 +9303,12 @@ static void render_offensive(state_t& state, float x, float y, float w, float h,
     } else {
         aida::ui::pill_kind("Running", aida::ui::pill_kind_t::accent, aida::ui::size_t_::sm, true);
         ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            state.off_cancel_requested.store(true, std::memory_order_release);
-            if (fuzz_job != 0)
-                stop_offensive_fuzz_job(state);
-            std::lock_guard<std::mutex> lk(state.off_mutex);
-            state.off_status = "Cancellation requested";
-        }
+        ImGui::BeginDisabled();
+        static_cast<void>(aida::ui::button("Cancel", aida::ui::button_kind_t::destructive,
+            aida::ui::size_t_::sm));
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("This backend operation has no cooperative cancellation contract. It must finish before another workflow can start.");
     }
 
     std::string status;
@@ -8609,6 +9441,19 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
         ImVec2 mouse = ImGui::GetMousePos();
         const bool hovered = mouse.x >= ImGui::GetWindowPos().x && mouse.x < ImGui::GetWindowPos().x + w &&
             mouse.y >= abs_ry && mouse.y < abs_ry + row_h;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const auto websocket_identity = websocket_artifact_identity(fr);
+        const std::string websocket_artifact_id =
+            semantic_artifact_id("websocket-frame", websocket_identity);
+        ImGui::PushID(static_cast<int>(i));
+        const ImGuiID websocket_row_id = ImGui::GetID("##websocket_frame_row");
+        ImGui::PopID();
+        aida::preview::semantics::register_region(
+            websocket_artifact_id, "network-websocket-frame", websocket_row_id,
+            ImVec2(ImGui::GetWindowPos().x, abs_ry),
+            ImVec2(ImGui::GetWindowPos().x + w, abs_ry + row_h), false, false,
+            "aida.dock-window.view.network.websocket");
+#endif
         if (hovered && ImGui::IsMouseClicked(0))
             state.ws_selected = static_cast<int>(i);
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
@@ -10481,6 +11326,28 @@ bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& 
         snapshot.bytes = identity.kind == artifact_kind_t::response ? found->raw_response : found->raw_request;
         break;
     }
+    case artifact_kind_t::intercept_request: {
+        const auto publication = std::atomic_load_explicit(
+            &s_intercept_runtime_snapshot, std::memory_order_acquire);
+        if (!publication) {
+            unavailable_reason = "The immutable Intercept publication is still loading; select the held request again.";
+            return false;
+        }
+        const auto found = std::find_if(publication->held.begin(), publication->held.end(),
+            [&](const mitm_proxy::http_exchange& exchange) {
+                return exchange.id == identity.source_id &&
+                    exchange.timestamp == identity.timestamp;
+            });
+        if (found == publication->held.end()) {
+            unavailable_reason = "The held request is no longer retained; select a current Intercept row.";
+            return false;
+        }
+        snapshot.identity.target_host = found->target_host;
+        snapshot.identity.target_port = found->target_port;
+        snapshot.identity.use_tls = found->is_tls;
+        snapshot.bytes = found->raw_request;
+        break;
+    }
     case artifact_kind_t::packet: {
         const auto capture_snapshot = std::atomic_load_explicit(
             &g_state.capture_snapshot, std::memory_order_acquire);
@@ -10643,7 +11510,9 @@ bool send_artifact_to_repeater(const artifact_identity_t& identity, std::string&
         unavailable_reason = "HTTP/2 requests must remain in the HTTP/2 editor so frame and pseudo-header semantics are preserved.";
         return false;
     }
-    if (identity.kind != artifact_kind_t::request && identity.kind != artifact_kind_t::exchange &&
+    if (identity.kind != artifact_kind_t::request &&
+        identity.kind != artifact_kind_t::intercept_request &&
+        identity.kind != artifact_kind_t::exchange &&
         identity.kind != artifact_kind_t::repeater_request &&
         identity.kind != artifact_kind_t::sitemap_request &&
         identity.kind != artifact_kind_t::api_request &&
@@ -10973,6 +11842,7 @@ bool stage_validated_reviewed_request(const artifact_identity_t& source,
         return false;
     }
     if (source.kind != artifact_kind_t::request &&
+        source.kind != artifact_kind_t::intercept_request &&
         source.kind != artifact_kind_t::exchange &&
         source.kind != artifact_kind_t::repeater_request &&
         source.kind != artifact_kind_t::sitemap_request &&
@@ -11076,6 +11946,7 @@ namespace {
 
 const network_exchange_action_descriptor_t k_exchange_actions[] = {
     {network_exchange_action_t::repeater, "network.exchange.repeater"},
+    {network_exchange_action_t::fuzzer, "network.exchange.fuzzer"},
     {network_exchange_action_t::intruder, "network.exchange.intruder"},
     {network_exchange_action_t::scanner, "network.exchange.scanner"},
     {network_exchange_action_t::comparer, "network.exchange.comparer"},
@@ -11111,7 +11982,9 @@ bool response_kind(artifact_kind_t kind) {
 }
 
 bool request_kind(artifact_kind_t kind) {
-    return kind == artifact_kind_t::request || kind == artifact_kind_t::exchange ||
+    return kind == artifact_kind_t::request ||
+        kind == artifact_kind_t::intercept_request ||
+        kind == artifact_kind_t::exchange ||
         kind == artifact_kind_t::repeater_request ||
         kind == artifact_kind_t::sitemap_request ||
         kind == artifact_kind_t::api_request ||
@@ -11251,6 +12124,7 @@ std::string capability_reason(network_exchange_action_t action,
     const auto* response = response_identity(context);
     switch (action) {
     case network_exchange_action_t::repeater:
+    case network_exchange_action_t::fuzzer:
     case network_exchange_action_t::intruder:
     case network_exchange_action_t::scanner:
     case network_exchange_action_t::sequencer:
@@ -11304,6 +12178,7 @@ bool execute_exchange_action(network_exchange_action_t action,
     artifact_snapshot_t request_snapshot;
     artifact_snapshot_t response_snapshot;
     const bool needs_request = action == network_exchange_action_t::repeater ||
+        action == network_exchange_action_t::fuzzer ||
         action == network_exchange_action_t::intruder ||
         action == network_exchange_action_t::scanner ||
         action == network_exchange_action_t::sequencer ||
@@ -11328,6 +12203,27 @@ bool execute_exchange_action(network_exchange_action_t action,
     switch (action) {
     case network_exchange_action_t::repeater:
         return request && send_artifact_to_repeater(*request, reason);
+    case network_exchange_action_t::fuzzer:
+        if (!request) {
+            reason = "Fuzzer requires an exact retained HTTP/1 request artifact.";
+            return false;
+        }
+        if (!intercept_editor_compatible(request_snapshot.bytes, reason))
+            return false;
+        if (const auto opened = aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.network.fuzzer")); !opened.ok()) {
+            reason = opened.detail.empty()
+                ? "The reviewed request could not open Fuzzer." : opened.detail;
+            return false;
+        }
+        g_state.fuzz_config.host = request->target_host;
+        g_state.fuzz_config.port = request->target_port;
+        g_state.fuzz_config.use_tls = request->use_tls;
+        g_state.fuzz_config.base_request.assign(
+            request_snapshot.bytes.begin(), request_snapshot.bytes.end());
+        g_state.active_tab = sub_tab_t::fuzzer;
+        reason.clear();
+        return true;
     case network_exchange_action_t::comparer:
         return send_artifact_to_comparer(context.primary, reason);
     case network_exchange_action_t::intruder:
@@ -11403,8 +12299,82 @@ bool execute_exchange_action(network_exchange_action_t action,
 
 }
 
+static bool execute_retained_exchange_toolbar_action(
+    const char* requested_action_id, artifact_identity_t primary,
+    artifact_identity_t related, std::string& unavailable_reason) {
+    if (!requested_action_id || requested_action_id[0] == '\0') {
+        unavailable_reason = "The retained Network action identity is missing.";
+        return false;
+    }
+    const auto descriptor = std::find_if(std::begin(k_exchange_actions),
+        std::end(k_exchange_actions), [&](const auto& candidate) {
+            return std::strcmp(candidate.id, requested_action_id) == 0;
+        });
+    if (descriptor == std::end(k_exchange_actions)) {
+        unavailable_reason = "The retained Network action is not registered by the exchange provider.";
+        return false;
+    }
+    exchange_context_runtime_t retained;
+    retained.primary = std::move(primary);
+    retained.related = std::move(related);
+    artifact_snapshot_t snapshot;
+    retained.primary_current = resolve_artifact(
+        retained.primary, snapshot, retained.unavailable_reason);
+    if (!retained.primary_current) {
+        unavailable_reason = retained.unavailable_reason;
+        return false;
+    }
+    const std::string capability = capability_reason(descriptor->action, retained);
+    aida::ui::application_ui::retained_entity_context_t context;
+    context.owner_id = "network.exchange.artifact";
+    context.entity_id = retained.primary.id;
+    context.entity_generation = retained.primary.timestamp ^ retained.primary.revision ^
+        retained.primary.content_hash;
+    context.active_view = aida::ui::stable_view_id_t(
+        retained.primary.source_view_id.empty()
+            ? "view.network" : retained.primary.source_view_id);
+    const auto retained_identity = retained.primary;
+    const auto retained_related_identity = retained.related;
+    context.validate_identity = [retained_identity, retained_related_identity] {
+        artifact_snapshot_t live;
+        std::string reason;
+        if (!resolve_artifact(retained_identity, live, reason))
+            return aida::ui::capability_state_t::unavailable(reason.empty()
+                ? "The network artifact was replaced; select it again" : reason);
+        if (retained_related_identity.valid() &&
+            !resolve_artifact(retained_related_identity, live, reason))
+            return aida::ui::capability_state_t::unavailable(reason.empty()
+                ? "The related network artifact was replaced; select it again" : reason);
+        return aida::ui::capability_state_t::available();
+    };
+    aida::ui::application_ui::retained_entity_action_t action;
+    action.action_id = descriptor->id;
+    action.capability = capability.empty()
+        ? aida::ui::capability_state_t::available()
+        : aida::ui::capability_state_t::unavailable(capability);
+    const auto operation = descriptor->action;
+    action.invoke = [retained, operation] {
+        std::string reason;
+        return execute_exchange_action(operation, retained, reason)
+            ? aida::ui::action_handler_result_t::completed()
+            : aida::ui::action_handler_result_t::failed(reason.empty()
+                ? "The retained Network operation was rejected" : reason);
+    };
+    context.actions.push_back(std::move(action));
+    const auto result = aida::ui::application_ui::execute_retained_entity_action(
+        requested_action_id, aida::ui::action_invocation_source_t::toolbar, context);
+    if (!result.executed()) {
+        unavailable_reason = result.message.empty()
+            ? "The retained Network operation was rejected" : result.message;
+        return false;
+    }
+    unavailable_reason.clear();
+    return true;
+}
+
 void open_exchange_context(artifact_identity_t primary, artifact_identity_t related,
-                           exchange_context_origin_t origin) {
+                           exchange_context_origin_t origin,
+                           bool include_intercept_actions) {
     exchange_context_runtime_t retained;
     retained.primary = std::move(primary);
     retained.related = std::move(related);
@@ -11461,6 +12431,46 @@ void open_exchange_context(artifact_identity_t primary, artifact_identity_t rela
                     ? "The network operation was rejected" : reason);
         };
         context.actions.push_back(std::move(action));
+    }
+    if (include_intercept_actions &&
+        retained.primary.kind == artifact_kind_t::intercept_request) {
+        const auto publication = std::atomic_load_explicit(
+            &s_intercept_runtime_snapshot, std::memory_order_acquire);
+        intercept_target_identity_t target;
+        if (publication) {
+            const auto found = std::find_if(publication->held.begin(),
+                publication->held.end(), [&](const auto& exchange) {
+                    return exchange.id == retained.primary.source_id &&
+                        exchange.timestamp == retained.primary.timestamp &&
+                        exchange.raw_request.size() == retained.primary.content_size &&
+                        artifact_hash(exchange.raw_request) == retained.primary.content_hash;
+                });
+            if (found != publication->held.end())
+                target = intercept_target_identity(*publication, *found);
+        }
+        const auto append_intercept = [&](const char* id,
+                                          intercept_command_t command) {
+            const auto capability = intercept_command_capability_for(
+                command, publication, target);
+            append(id, capability.enabled,
+                capability.disabled_reason.empty()
+                    ? "The retained Intercept action is unavailable"
+                    : capability.disabled_reason.c_str(),
+                [command, publication, target] {
+                    std::string reason;
+                    return execute_reviewed_intercept_command(
+                            command, publication, target, &reason)
+                        ? aida::ui::action_handler_result_t::completed()
+                        : aida::ui::action_handler_result_t::failed(reason.empty()
+                            ? "The retained Intercept operation was rejected" : reason);
+                });
+        };
+        append_intercept("network.intercept.forward_selected",
+            intercept_command_t::forward_selected);
+        append_intercept("network.intercept.drop_selected",
+            intercept_command_t::drop_selected);
+        append_intercept("network.intercept.forward_modified",
+            intercept_command_t::forward_modified);
     }
     const auto* request = request_identity(retained);
     artifact_snapshot_t request_snapshot;

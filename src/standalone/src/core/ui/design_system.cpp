@@ -13,7 +13,9 @@
 #include <atomic>
 #include <cfloat>
 #include <cstdio>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -23,6 +25,9 @@ namespace {
 
 std::atomic<int> g_density{static_cast<int>(density_t::compact)};
 std::atomic<bool> g_reduced_motion{false};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::vector<std::string> g_property_semantic_scopes;
+#endif
 
 const char* safe(const char* value) {
     return value ? value : "";
@@ -447,8 +452,19 @@ search_result_t render_search(const char* stable_id, search_state_t& state, floa
     const float field_width = compact ? (std::max)(aida::ui::scale_px(72.f, m.scale), total_width) :
         (std::max)(aida::ui::scale_px(120.f, m.scale), total_width - controls_width);
     bool query_focused = false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const ImVec2 search_minimum = ImGui::GetCursorScreenPos();
+#endif
     result.query_changed = components::search_field("query", state.query, state.query_capacity,
         "Filter this view", field_width, &result.cleared, &query_focused);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string search_semantic = aida::preview::semantics::stable_id(
+        "aida.search", safe(stable_id));
+    static_cast<void>(aida::preview::semantics::register_region(search_semantic,
+        "search-input", ImGui::GetID("##query-semantic"), search_minimum,
+        ImVec2(search_minimum.x + field_width,
+            search_minimum.y + aida::ui::metrics::control::search_h)));
+#endif
     if (query_focused && ImGui::IsKeyPressed(ImGuiKey_Enter)) {
         if (ImGui::GetIO().KeyShift) result.previous_requested = state.match_count != 0;
         else result.next_requested = state.match_count != 0;
@@ -513,12 +529,25 @@ filter_result_t render_filter_chips(const char* stable_id, const filter_chip_t* 
             std::snprintf(label, sizeof(label), "%s", safe(filter.label));
         bool removed = false;
         components::chip(label, semantic_color(filter.semantic), filter.removable, &removed);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const std::string filter_semantic = aida::preview::semantics::stable_id(
+            aida::preview::semantics::stable_id("aida.filter", safe(stable_id)),
+            safe(filter.id));
+        static_cast<void>(aida::preview::semantics::register_last_item(filter_semantic,
+            "filter-chip"));
+#endif
         if (removed) result.removed_id = filter.id;
         ImGui::PopID();
     }
     if (allow_reset) {
         ImGui::SameLine(0.f, m.spacing_sm);
         result.reset_all = ImGui::SmallButton("Reset filters");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const std::string reset_semantic = aida::preview::semantics::stable_id(
+            aida::preview::semantics::stable_id("aida.filter", safe(stable_id)), "reset");
+        static_cast<void>(aida::preview::semantics::register_last_item(reset_semantic,
+            "filter-reset"));
+#endif
         tooltip_for_last_item("Remove every active filter in this view", nullptr, nullptr);
     }
     ImGui::PopID();
@@ -599,6 +628,12 @@ bool tree_node(const char* stable_id, const char* label, bool selected, ImGuiTre
     ImGui::PushID(safe(stable_id));
     if (selected) flags |= ImGuiTreeNodeFlags_Selected;
     const bool open = ImGui::TreeNodeEx("##node", flags | ImGuiTreeNodeFlags_SpanAvailWidth, "%s", safe(label));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string tree_semantic = aida::preview::semantics::stable_id(
+        "aida.tree", safe(stable_id));
+    static_cast<void>(aida::preview::semantics::register_last_item(tree_semantic,
+        "tree-node"));
+#endif
     draw_focus_ring_for_last_item();
     if (!open) ImGui::PopID();
     return open;
@@ -616,8 +651,20 @@ action_result_t render_state(const state_presentation_t& state, ImVec2 size) {
     const float width = size.x > 0.f ? size.x : ImGui::GetContentRegionAvail().x;
     const float height = size.y > 0.f ? size.y : (std::max)(aida::ui::scale_px(170.f, m.scale), ImGui::GetContentRegionAvail().y);
     ImGui::PushID(safe(state.stable_id));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const ImVec2 state_minimum = ImGui::GetCursorScreenPos();
+    const ImGuiID state_imgui_id = ImGui::GetID("##state");
+#endif
     ImGui::BeginChild("##state", ImVec2((std::max)(1.f, width), (std::max)(1.f, height)), true,
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysUseWindowPadding);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string state_semantic_id = aida::preview::semantics::stable_id(
+        "aida.state", safe(state.stable_id));
+    static_cast<void>(aida::preview::semantics::register_region(state_semantic_id,
+        "view-state", state_imgui_id, state_minimum,
+        ImVec2(state_minimum.x + (std::max)(1.f, width),
+            state_minimum.y + (std::max)(1.f, height)), true));
+#endif
     const float content_width = (std::min)(ImGui::GetContentRegionAvail().x, aida::ui::scale_px(620.f, m.scale));
     const float left = ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - content_width) * 0.5f;
     ImGui::SetCursorPosX(left);
@@ -689,6 +736,14 @@ bool begin_property_grid(const char* stable_id, float label_width) {
     const float width = label_width > 0.f ? label_width : metrics().property_label_width;
     if (!ImGui::BeginTable(safe(stable_id), 2,
         ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg)) return false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    std::string property_scope(safe(stable_id));
+    const std::string& parent_scope = aida::preview::semantics::active_parent_storage();
+    if (!parent_scope.empty())
+        property_scope.append(".").append(aida::preview::semantics::entity_token(parent_scope));
+    g_property_semantic_scopes.push_back(
+        aida::preview::semantics::stable_id("aida.property-grid", property_scope));
+#endif
     ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthFixed, width);
     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
     return true;
@@ -702,6 +757,15 @@ void property_value(const char* stable_id, const char* label, const char* value,
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::resolved().text_secondary), "%s", safe(label));
     ImGui::TableSetColumnIndex(1);
     ImGui::Selectable(safe(value), false, ImGuiSelectableFlags_AllowDoubleClick);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string property_semantic = aida::preview::semantics::stable_id(
+        g_property_semantic_scopes.empty()
+            ? std::string_view("aida.property")
+            : std::string_view(g_property_semantic_scopes.back()),
+        safe(stable_id));
+    static_cast<void>(aida::preview::semantics::register_last_item(property_semantic,
+        "property-row"));
+#endif
     if (ImGui::IsItemFocused() && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C))
         ImGui::SetClipboardText(safe(value));
     if (ImGui::BeginPopupContextItem("##value_context")) {
@@ -716,16 +780,36 @@ void property_value(const char* stable_id, const char* label, const char* value,
     ImGui::PopID();
 }
 
-void end_property_grid() { ImGui::EndTable(); }
+void end_property_grid() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (!g_property_semantic_scopes.empty())
+        g_property_semantic_scopes.pop_back();
+#endif
+    ImGui::EndTable();
+}
 
 inspector_control_result_t inspector_controls(const char* stable_id, bool& follow_selection,
     bool& pinned, const char* source, const char* revision) {
     inspector_control_result_t result;
     ImGui::PushID(safe(stable_id));
     result.follow_changed = ImGui::Checkbox("Follow Selection", &follow_selection);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string inspector_parent = aida::preview::semantics::stable_id(
+        "aida.inspector", safe(stable_id));
+    const std::string follow_semantic = aida::preview::semantics::stable_id(
+        inspector_parent, "follow-selection");
+    static_cast<void>(aida::preview::semantics::register_last_item(follow_semantic,
+        "inspector-control"));
+#endif
     tooltip_for_last_item("Update this inspector when the global selection changes", nullptr, nullptr);
     ImGui::SameLine(0.f, metrics().spacing_md);
     result.pin_changed = ImGui::Checkbox("Pin", &pinned);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string pin_semantic = aida::preview::semantics::stable_id(
+        inspector_parent, "pin");
+    static_cast<void>(aida::preview::semantics::register_last_item(pin_semantic,
+        "inspector-control"));
+#endif
     tooltip_for_last_item("Keep inspecting the current entity while global selection changes", nullptr, nullptr);
     if (pinned && follow_selection) {
         follow_selection = false;
@@ -825,6 +909,12 @@ bool form_input_text(const char* field_id, const char* label, char* buffer,
     const bool changed = hint && *hint
         ? ImGui::InputTextWithHint("##value", hint, buffer, buffer_size)
         : ImGui::InputText("##value", buffer, buffer_size);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string field_semantic = aida::preview::semantics::stable_id(
+        "aida.form-field", safe(field_id));
+    static_cast<void>(aida::preview::semantics::register_last_item(field_semantic,
+        "form-field"));
+#endif
     draw_focus_ring_for_last_item();
     inline_validation(field_id, form);
     ImGui::PopID();
@@ -838,6 +928,12 @@ bool form_input_int(const char* field_id, const char* label, int& value,
     if (form.consume_focus_request(field_id)) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(-FLT_MIN);
     const bool changed = ImGui::InputInt("##value", &value, step, step * 10);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string field_semantic = aida::preview::semantics::stable_id(
+        "aida.form-field", safe(field_id));
+    static_cast<void>(aida::preview::semantics::register_last_item(field_semantic,
+        "form-field"));
+#endif
     draw_focus_ring_for_last_item();
     inline_validation(field_id, form);
     ImGui::PopID();
@@ -846,12 +942,15 @@ bool form_input_int(const char* field_id, const char* label, int& value,
 
 bool begin_dialog_exact(const char* popup_label, ImVec2 desired_size,
     ImVec2 minimum_size, bool* open, ImGuiWindowFlags flags) {
-    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGuiViewport* viewport = ImGui::GetWindowViewport();
+    if (!viewport)
+        viewport = ImGui::GetMainViewport();
     const ImVec2 work = viewport ? viewport->WorkSize : ImGui::GetIO().DisplaySize;
     const ImVec2 work_position = viewport ? viewport->WorkPos : ImVec2(0.f, 0.f);
     const ImVec2 position(work_position.x + work.x * 0.5f,
         work_position.y + work.y * 0.5f);
-    const float scale = metrics().scale;
+    const float scale = viewport && viewport->DpiScale > 0.0f
+        ? viewport->DpiScale : metrics().scale;
     const float margin = aida::ui::scale_px(32.f, scale);
     const ImVec2 available((std::max)(1.f, work.x - margin * 2.f),
         (std::max)(1.f, work.y - margin * 2.f));
@@ -868,8 +967,39 @@ bool begin_dialog_exact(const char* popup_label, ImVec2 desired_size,
     ImGui::SetNextWindowPos(position, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(desired_size, ImGuiCond_Appearing);
     ImGui::SetNextWindowSizeConstraints(effective_minimum, available);
-    return ImGui::BeginPopupModal(safe(popup_label), open,
+    if (viewport)
+        ImGui::SetNextWindowViewport(viewport->ID);
+    const bool visible = ImGui::BeginPopupModal(safe(popup_label), open,
         flags | ImGuiWindowFlags_NoSavedSettings);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (visible) {
+        const std::string_view label = safe(popup_label);
+        const std::size_t hidden_separator = label.find("###");
+        const std::size_t id_separator = hidden_separator == std::string_view::npos
+            ? label.find("##") : std::string_view::npos;
+        const std::string_view identity = hidden_separator != std::string_view::npos
+            ? label.substr(hidden_separator + 3)
+            : id_separator != std::string_view::npos
+                ? label.substr(id_separator + 2) : label;
+        std::string dialog_identity(identity);
+        const std::string& parent_identity =
+            aida::preview::semantics::active_parent_storage();
+        if (!parent_identity.empty()) {
+            dialog_identity.push_back('.');
+            dialog_identity.append(
+                aida::preview::semantics::entity_token(parent_identity));
+        }
+        const std::string dialog_semantic = aida::preview::semantics::stable_id(
+            "aida.dialog", dialog_identity);
+        const ImVec2 dialog_minimum = ImGui::GetWindowPos();
+        const ImVec2 dialog_size = ImGui::GetWindowSize();
+        static_cast<void>(aida::preview::semantics::register_region(dialog_semantic,
+            "dialog", ImGui::GetID(dialog_semantic.c_str()), dialog_minimum,
+            ImVec2(dialog_minimum.x + dialog_size.x, dialog_minimum.y + dialog_size.y),
+            true));
+    }
+#endif
+    return visible;
 }
 
 bool begin_dialog(const char* popup_id, const char* title, ImVec2 desired_size, ImVec2 minimum_size) {
@@ -912,7 +1042,7 @@ void end_dialog_body() {
 
 dialog_result_t dialog_footer(const char* stable_id, const char* confirm_label,
     bool confirm_enabled, bool destructive, const char* cancel_label,
-    bool cancel_enabled) {
+    bool cancel_enabled, bool confirm_on_enter) {
     dialog_result_t result;
     const auto m = metrics();
     ImGui::PushID(safe(stable_id));
@@ -934,17 +1064,32 @@ dialog_result_t dialog_footer(const char* stable_id, const char* confirm_label,
         if (components::button(cancel_label, components::button_kind_t::secondary,
             components::size_t_::sm, ImVec2(cancel_width, m.control_height),
             !cancel_enabled)) result.cancelled = true;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const std::string cancel_semantic = aida::preview::semantics::stable_id(
+            aida::preview::semantics::stable_id("aida.dialog-action", safe(stable_id)),
+            "cancel");
+        static_cast<void>(aida::preview::semantics::register_last_item(cancel_semantic,
+            "dialog-action", false, !cancel_enabled));
+#endif
         draw_focus_ring_for_last_item();
-        if (cancel_enabled && (destructive || !confirm_enabled)) ImGui::SetItemDefaultFocus();
+        if (cancel_enabled && (destructive || !confirm_enabled || !confirm_on_enter))
+            ImGui::SetItemDefaultFocus();
         if (!stacked)
             ImGui::SameLine(0.f, m.spacing_sm);
     }
     const auto kind = destructive ? components::button_kind_t::destructive : components::button_kind_t::primary;
     if (components::button(safe(confirm_label), kind, components::size_t_::sm,
         ImVec2(confirm_width, m.control_height), !confirm_enabled)) result.confirmed = true;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string confirm_semantic = aida::preview::semantics::stable_id(
+        aida::preview::semantics::stable_id("aida.dialog-action", safe(stable_id)),
+        "confirm");
+    static_cast<void>(aida::preview::semantics::register_last_item(confirm_semantic,
+        "dialog-action", false, !confirm_enabled));
+#endif
     draw_focus_ring_for_last_item();
-    if (!destructive && confirm_enabled) ImGui::SetItemDefaultFocus();
-    if (!destructive && confirm_enabled &&
+    if (confirm_on_enter && !destructive && confirm_enabled) ImGui::SetItemDefaultFocus();
+    if (confirm_on_enter && !destructive && confirm_enabled &&
         (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
          ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) &&
         !ImGui::GetIO().WantTextInput) result.confirmed = true;
@@ -954,12 +1099,12 @@ dialog_result_t dialog_footer(const char* stable_id, const char* confirm_label,
     return result;
 }
 
-dialog_result_t confirmation_dialog(const char* stable_id, const confirmation_t& confirmation) {
-    dialog_result_t result;
+void render_confirmation_content(const confirmation_t& confirmation) {
     const auto& theme = aida::ui::resolved();
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
-        confirmation.destructive ? theme.error : theme.text_primary), "%s %s?",
-        safe(confirmation.verb), safe(confirmation.target));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+        confirmation.destructive ? theme.error : theme.text_primary));
+    ImGui::TextWrapped("%s %s?", safe(confirmation.verb), safe(confirmation.target));
+    ImGui::PopStyleColor();
     if (confirmation.scope && *confirmation.scope)
         components::property_row("scope", "Scope", confirmation.scope);
     if (confirmation.effect && *confirmation.effect)
@@ -970,10 +1115,19 @@ dialog_result_t confirmation_dialog(const char* stable_id, const confirmation_t&
     if (confirmation.prerequisite && *confirmation.prerequisite)
         components::inline_notice("prerequisite", "Required before continuing", confirmation.prerequisite,
             components::status_kind_t::warning);
-    result = dialog_footer(stable_id,
-        confirmation.confirm_label && *confirmation.confirm_label ? confirmation.confirm_label : confirmation.verb,
-        confirmation.confirm_enabled, confirmation.destructive);
-    return result;
+}
+
+dialog_result_t confirmation_dialog(const char* stable_id, const confirmation_t& confirmation) {
+    const char* confirm_label = confirmation.confirm_label && *confirmation.confirm_label
+        ? confirmation.confirm_label : confirmation.verb;
+    const float footer_height = dialog_footer_reserve_height(confirm_label);
+    std::string body_id = safe(stable_id);
+    body_id += ".body";
+    begin_dialog_body(body_id.c_str(), footer_height);
+    render_confirmation_content(confirmation);
+    end_dialog_body();
+    return dialog_footer(stable_id, confirm_label, confirmation.confirm_enabled,
+        confirmation.destructive);
 }
 
 bool tiny_view_required(ImVec2 available, ImVec2 logical_minimum) {

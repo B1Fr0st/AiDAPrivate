@@ -241,6 +241,31 @@ inline bool parse_ipv4(const std::string& input, std::array<std::uint8_t, 4>& by
     return true;
 }
 
+inline bool looks_like_noncanonical_ipv4_literal(const std::string& input) noexcept
+{
+    if (input.empty()) return false;
+    std::size_t cursor = 0;
+    while (cursor < input.size()) {
+        const std::size_t end = input.find('.', cursor);
+        const std::size_t stop = end == std::string::npos ? input.size() : end;
+        if (stop == cursor) return false;
+        std::size_t digit = cursor;
+        bool hexadecimal = false;
+        if (stop - cursor > 2 && input[cursor] == '0'
+            && (input[cursor + 1] == 'x' || input[cursor + 1] == 'X')) {
+            digit += 2;
+            hexadecimal = true;
+        }
+        for (; digit < stop; ++digit) {
+            const unsigned char ch = static_cast<unsigned char>(input[digit]);
+            if (hexadecimal ? hex_value(ch) < 0 : !ascii_digit(ch)) return false;
+        }
+        if (end == std::string::npos) return true;
+        cursor = end + 1;
+    }
+    return false;
+}
+
 inline std::string canonical_ipv4(const std::array<std::uint8_t, 4>& bytes)
 {
     return std::to_string(bytes[0]) + "." + std::to_string(bytes[1]) + "."
@@ -413,17 +438,16 @@ inline std::string remove_dot_segments(const std::string& path)
 {
     std::vector<std::string> segments;
     std::size_t cursor = 1;
-    bool trailing = path.size() > 1 && path.back() == '/';
+    const bool trailing = path.size() > 1 && (path.back() == '/'
+        || (path.size() >= 2 && path.compare(path.size() - 2, 2, "/.") == 0)
+        || (path.size() >= 3 && path.compare(path.size() - 3, 3, "/..") == 0));
     while (cursor <= path.size()) {
         const std::size_t end = path.find('/', cursor);
         const std::size_t stop = end == std::string::npos ? path.size() : end;
         const std::string segment = path.substr(cursor, stop - cursor);
         if (segment == "..") {
             if (!segments.empty()) segments.pop_back();
-            trailing = true;
-        } else if (segment == ".") {
-            trailing = true;
-        } else {
+        } else if (segment != ".") {
             segments.push_back(segment);
         }
         if (end == std::string::npos) break;
@@ -530,7 +554,7 @@ inline canonical_external_url_t canonicalize_url_impl(const std::string& input)
         std::array<std::uint8_t, 4> bytes{};
         if (parse_ipv4(raw_host, bytes)) {
             host = canonical_ipv4(bytes);
-        } else if (raw_host.find_first_not_of("0123456789.") == std::string::npos) {
+        } else if (looks_like_noncanonical_ipv4_literal(raw_host)) {
             result.reason = "url_ipv4_invalid";
             return result;
         } else if (!canonicalize_dns_host(raw_host, host)) {

@@ -12,6 +12,7 @@ struct operation_result_t {
 };
 
 void render_output_controls();
+void render_automation_scripts();
 void render_modals();
 bool output_line_visible(std::string_view line);
 std::string selected_output_channel();

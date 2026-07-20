@@ -1,5 +1,6 @@
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/studio_semantics.hpp"
 #else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -77,6 +78,20 @@ network_view::artifact_identity_t artifact_identity(uint64_t connection_id,
         " WebSocket editor frame #" + std::to_string(frame.id);
     return identity;
 }
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string semantic_frame_id(const network_view::artifact_identity_t& identity)
+{
+    const std::string retained = identity.id + ":" +
+        std::to_string(identity.timestamp) + ":" +
+        std::to_string(identity.revision) + ":" +
+        std::to_string(identity.content_hash) + ":" +
+        std::to_string(identity.content_size);
+    return aida::preview::semantics::stable_id(
+        "aida.network", "websocket-frame-" +
+            aida::preview::semantics::entity_token(retained));
+}
+#endif
 
 const char* g_scheme_items[] = { "ws", "wss" };
 const char* g_compose_modes[] = { "Text", "Binary hex", "Raw frame" };
@@ -368,6 +383,14 @@ void render(float pos_x, float pos_y, float width, float height,
                 ImGui::PushStyleColor(ImGuiCol_Text, col);
                 if (ImGui::Selectable(frame_label, selected)) s_state.selected_frame_id = f.id;
                 ImGui::PopStyleColor();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const auto semantic_identity = artifact_identity(cid, f);
+                if (ImGui::IsItemVisible())
+                    aida::preview::semantics::register_last_item(
+                        semantic_frame_id(semantic_identity),
+                        "network-websocket-frame", false, false,
+                        "aida.dock-window.view.network.ws-editor");
+#endif
                 const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
                 const bool menu_key_context = ImGui::IsItemFocused() &&
                     ImGui::IsKeyPressed(ImGuiKey_Menu, false);

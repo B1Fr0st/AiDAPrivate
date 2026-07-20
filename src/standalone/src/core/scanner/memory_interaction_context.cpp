@@ -1,16 +1,162 @@
 #include "memory_interaction_context.hpp"
+#include "memory_scanner.hpp"
+#include "../disasm/disasm_view.hpp"
+#include "../workbench/workbench_shell_integration.hpp"
 
 #include "imgui/imgui.h"
 
 #include <utility>
+#include <algorithm>
+#include <memory>
 #include <mutex>
+#include <string_view>
 
 namespace memory_interaction {
 namespace {
 
 std::mutex g_selection_mutex;
 context_t g_selected;
+std::vector<context_t> g_selected_set;
 std::uint64_t g_selection_generation = 0;
+std::weak_ptr<aida::analysis::analysis_workspace_t> g_published_workspace;
+std::string g_published_entity_key;
+std::uint64_t g_published_document_id = 0;
+
+constexpr std::size_t k_maximum_selected_contexts = 4096;
+
+bool same_identity(const context_t& left, const context_t& right) noexcept {
+	return left.kind == right.kind && left.source == right.source &&
+		left.target_pid == right.target_pid && left.target_epoch == right.target_epoch &&
+		left.process_creation_time_100ns == right.process_creation_time_100ns &&
+		left.scan_revision == right.scan_revision && left.workspace_id == right.workspace_id &&
+		left.workspace_generation == right.workspace_generation &&
+		left.address == right.address && left.extent == right.extent &&
+		left.index == right.index;
+}
+
+void mix_hash(std::uint64_t& hash, std::uint64_t value) noexcept {
+	for (unsigned shift = 0; shift < 64; shift += 8) {
+		hash ^= static_cast<std::uint8_t>(value >> shift);
+		hash *= 1099511628211ULL;
+	}
+}
+
+void mix_hash(std::uint64_t& hash, std::string_view value) noexcept {
+	for (const unsigned char byte : value) {
+		hash ^= byte;
+		hash *= 1099511628211ULL;
+	}
+}
+
+std::uint64_t context_hash(const context_t& context) noexcept {
+	std::uint64_t hash = 14695981039346656037ULL;
+	mix_hash(hash, static_cast<std::uint64_t>(context.kind));
+	mix_hash(hash, static_cast<std::uint64_t>(context.source));
+	mix_hash(hash, context.target_pid);
+	mix_hash(hash, context.target_epoch);
+	mix_hash(hash, context.process_creation_time_100ns);
+	mix_hash(hash, context.scan_revision);
+	mix_hash(hash, context.workspace_id);
+	mix_hash(hash, context.workspace_generation);
+	mix_hash(hash, context.address);
+	mix_hash(hash, context.extent);
+	mix_hash(hash, static_cast<std::uint64_t>(static_cast<std::int64_t>(context.index)));
+	return hash;
+}
+
+const aida::workbench::selection_context_t* focused_selection(
+	const aida::workbench::workbench_shell_workspace_context_t& context,
+	std::uint64_t* document_id = nullptr) noexcept {
+	const auto focused_view = std::find_if(context.persistence.views.begin(),
+		context.persistence.views.end(), [](const auto& view) { return view.focused; });
+	if (focused_view == context.persistence.views.end()) return nullptr;
+	const auto found = std::find_if(context.persistence.documents.begin(),
+		context.persistence.documents.end(), [&](const auto& document) {
+			return document.id == focused_view->document;
+		});
+	if (found == context.persistence.documents.end()) return nullptr;
+	if (document_id) *document_id = found->id.value;
+	return &found->local_state.selection;
+}
+
+void clear_published_selection_if_owned() {
+	auto workspace = g_published_workspace.lock();
+	if (!workspace || g_published_entity_key.empty() || g_published_document_id == 0) {
+		g_published_workspace.reset();
+		g_published_entity_key.clear();
+		g_published_document_id = 0;
+		return;
+	}
+	auto& shell = aida::workbench::workbench_shell_runtime_t::instance();
+	aida::workbench::workbench_shell_workspace_context_t current;
+	if (shell.workspace_context(workspace, current).ok()) {
+		std::uint64_t document_id = 0;
+		const auto* selection = focused_selection(current, &document_id);
+		if (selection && selection->kind == aida::workbench::selection_kind_t::entity &&
+			document_id == g_published_document_id &&
+			selection->entity_key == g_published_entity_key) {
+			aida::workbench::workbench_shell_workspace_context_t ignored;
+			static_cast<void>(shell.publish_selection(workspace, {}, {},
+				aida::workbench::navigation_origin_t::user, ignored));
+		}
+	}
+	g_published_workspace.reset();
+	g_published_entity_key.clear();
+	g_published_document_id = 0;
+}
+
+void publish_selection(const context_t& context,
+	const std::vector<context_t>& contexts) {
+	if (context.kind == kind_t::none || context.address == 0 || contexts.empty()) {
+		clear_published_selection_if_owned();
+		return;
+	}
+	const auto workspace_context = disasm_view::capture_selected_workspace();
+	if (!workspace_context.workspace || workspace_context.workspace->closing() ||
+		workspace_context.workspace->closed()) {
+		clear_published_selection_if_owned();
+		return;
+	}
+	const auto process = workspace_context.workspace->identity().process();
+	const bool workspace_matches = context.source == source_t::live_process
+		? process && process->pid == context.target_pid &&
+			process->creation_time_100ns == context.process_creation_time_100ns
+		: context.source == source_t::static_binary && !process &&
+			workspace_context.workspace->identity().binary_id().to_hex() == context.workspace_id &&
+			workspace_context.workspace->generation() == context.workspace_generation;
+	if (!workspace_matches) {
+		clear_published_selection_if_owned();
+		return;
+	}
+	const auto previous_workspace = g_published_workspace.lock();
+	if (previous_workspace && previous_workspace != workspace_context.workspace)
+		clear_published_selection_if_owned();
+	aida::workbench::selection_context_t selection;
+	selection.kind = aida::workbench::selection_kind_t::entity;
+	std::uint64_t set_hash = 14695981039346656037ULL;
+	for (const auto& selected : contexts) mix_hash(set_hash, context_hash(selected));
+	selection.entity_key = "memory.source." + std::to_string(static_cast<unsigned>(context.source)) +
+		".pid." + std::to_string(context.target_pid) + ".scan." +
+		std::to_string(context.scan_revision) + ".kind." +
+		std::to_string(static_cast<unsigned>(context.kind)) + ".address." +
+		std::to_string(context.address) + ".index." + std::to_string(context.index) +
+		".count." + std::to_string(contexts.size()) + ".set." + std::to_string(set_hash);
+	aida::workbench::document_local_cursor_t cursor;
+	cursor.has_position = true;
+	cursor.position = context.address;
+	aida::workbench::workbench_shell_workspace_context_t output;
+	if (aida::workbench::workbench_shell_runtime_t::instance().publish_selection(
+			workspace_context.workspace, selection, cursor,
+			aida::workbench::navigation_origin_t::user, output).ok()) {
+		g_published_workspace = workspace_context.workspace;
+		g_published_entity_key = std::move(selection.entity_key);
+		std::uint64_t document_id = 0;
+		static_cast<void>(focused_selection(output, &document_id));
+		g_published_document_id = document_id;
+	} else {
+		clear_published_selection_if_owned();
+	}
+}
 
 capability_result_t allowed() {
 	return {true, nullptr};
@@ -24,7 +170,13 @@ context_t capture_pointer_chain(const runtime_t& runtime, std::uint64_t address,
 	context.kind = kind_t::pointer_chain;
 	context.source = runtime.live_attached ? source_t::live_process : source_t::none;
 	context.target_pid = runtime.target_pid;
+	context.target_epoch = runtime.target_epoch;
+	context.process_creation_time_100ns = runtime.process_creation_time_100ns;
 	context.scan_revision = runtime.scan_revision;
+	context.workspace_id = context.source == source_t::static_binary
+		? runtime.scan_workspace_id : std::string{};
+	context.workspace_generation = context.source == source_t::static_binary
+		? runtime.scan_workspace_generation : 0;
 	context.address = address;
 	context.extent = extent;
 	context.index = index;
@@ -39,7 +191,13 @@ context_t capture_memory_range(const runtime_t& runtime, std::uint64_t address,
 	context.source = runtime.live_attached ? source_t::live_process :
 		(runtime.static_loaded ? source_t::static_binary : source_t::none);
 	context.target_pid = runtime.target_pid;
+	context.target_epoch = runtime.target_epoch;
+	context.process_creation_time_100ns = runtime.process_creation_time_100ns;
 	context.scan_revision = runtime.scan_revision;
+	context.workspace_id = context.source == source_t::static_binary
+		? runtime.scan_workspace_id : std::string{};
+	context.workspace_generation = context.source == source_t::static_binary
+		? runtime.scan_workspace_generation : 0;
 	context.address = address;
 	context.extent = extent;
 	context.index = index;
@@ -53,6 +211,8 @@ context_t capture_patch(const runtime_t& runtime, std::uint64_t address,
 	context.kind = kind_t::patch_record;
 	context.source = runtime.live_attached ? source_t::live_process : source_t::none;
 	context.target_pid = runtime.target_pid;
+	context.target_epoch = runtime.target_epoch;
+	context.process_creation_time_100ns = runtime.process_creation_time_100ns;
 	context.scan_revision = runtime.scan_revision;
 	context.address = address;
 	context.extent = extent;
@@ -62,9 +222,50 @@ context_t capture_patch(const runtime_t& runtime, std::uint64_t address,
 }
 
 void select(context_t context) {
-	std::lock_guard<std::mutex> lock(g_selection_mutex);
-	g_selected = std::move(context);
-	++g_selection_generation;
+	if (context.kind == kind_t::none) {
+		clear_selection();
+		return;
+	}
+	select_set({context}, context);
+}
+
+void select_set(std::vector<context_t> contexts, context_t focused) {
+	if (focused.kind == kind_t::none || contexts.empty()) {
+		clear_selection();
+		return;
+	}
+	contexts.erase(std::remove_if(contexts.begin(), contexts.end(), [&](const context_t& item) {
+		return item.kind != focused.kind || item.source != focused.source ||
+			item.target_pid != focused.target_pid || item.target_epoch != focused.target_epoch ||
+			item.process_creation_time_100ns != focused.process_creation_time_100ns ||
+			item.scan_revision != focused.scan_revision ||
+			item.workspace_id != focused.workspace_id ||
+			item.workspace_generation != focused.workspace_generation;
+	}), contexts.end());
+	std::sort(contexts.begin(), contexts.end(), [](const context_t& left, const context_t& right) {
+		if (left.index != right.index) return left.index < right.index;
+		return context_hash(left) < context_hash(right);
+	});
+	contexts.erase(std::unique(contexts.begin(), contexts.end(), same_identity), contexts.end());
+	if (contexts.size() > k_maximum_selected_contexts)
+		contexts.resize(k_maximum_selected_contexts);
+	if (std::none_of(contexts.begin(), contexts.end(), [&](const context_t& item) {
+		return same_identity(item, focused);
+	})) {
+		if (contexts.size() == k_maximum_selected_contexts) contexts.pop_back();
+		contexts.push_back(focused);
+	}
+	context_t published;
+	std::vector<context_t> published_set;
+	{
+		std::lock_guard<std::mutex> lock(g_selection_mutex);
+		g_selected = std::move(focused);
+		g_selected_set = std::move(contexts);
+		published = g_selected;
+		published_set = g_selected_set;
+		++g_selection_generation;
+	}
+	publish_selection(published, published_set);
 }
 
 context_t selected() {
@@ -72,8 +273,35 @@ context_t selected() {
 	return g_selected;
 }
 
+std::vector<context_t> selected_set() {
+	std::lock_guard<std::mutex> lock(g_selection_mutex);
+	return g_selected_set;
+}
+
+bool selected_in_set(const context_t& context) {
+	std::lock_guard<std::mutex> lock(g_selection_mutex);
+	return std::any_of(g_selected_set.begin(), g_selected_set.end(),
+		[&](const context_t& item) { return same_identity(item, context); });
+}
+
 void clear_selection() {
-	select({});
+	{
+		std::lock_guard<std::mutex> lock(g_selection_mutex);
+		g_selected = {};
+		g_selected_set.clear();
+		++g_selection_generation;
+	}
+	clear_published_selection_if_owned();
+}
+
+void synchronize_selection(const runtime_t& runtime) {
+	context_t current;
+	{
+		std::lock_guard<std::mutex> lock(g_selection_mutex);
+		current = g_selected;
+	}
+	if (current.kind != kind_t::none && !is_current(current, runtime))
+		clear_selection();
 }
 
 std::uint64_t selection_generation() {
@@ -108,10 +336,16 @@ context_t capture_result(const runtime_t& runtime, std::uint64_t address,
 	std::string module_offset) {
 	context_t context;
 	context.kind = kind_t::scan_result;
-	context.source = runtime.live_attached ? source_t::live_process :
-		(runtime.static_loaded ? source_t::static_binary : source_t::none);
-	context.target_pid = runtime.target_pid;
+	context.source = runtime.scan_static_binary ? source_t::static_binary :
+		(runtime.scan_target_pid != 0 ? source_t::live_process : source_t::none);
+	context.target_pid = runtime.scan_static_binary ? 0 : runtime.scan_target_pid;
+	context.target_epoch = runtime.scan_static_binary ? 0 : runtime.scan_target_epoch;
+	context.process_creation_time_100ns = runtime.scan_static_binary ? 0 :
+		runtime.scan_process_creation_time_100ns;
 	context.scan_revision = runtime.scan_revision;
+	context.workspace_id = runtime.scan_static_binary ? runtime.scan_workspace_id : std::string{};
+	context.workspace_generation = runtime.scan_static_binary
+		? runtime.scan_workspace_generation : 0;
 	context.address = address;
 	context.index = index;
 	context.value = std::move(value);
@@ -121,11 +355,15 @@ context_t capture_result(const runtime_t& runtime, std::uint64_t address,
 }
 
 context_t capture_address(const runtime_t& runtime, std::uint64_t address,
-	int index, bool frozen, std::string value) {
+	int index, bool frozen, std::string value, std::uint32_t target_pid,
+	std::uint64_t target_epoch, std::uint64_t process_creation_time_100ns) {
 	context_t context;
 	context.kind = kind_t::address_entry;
 	context.source = runtime.live_attached ? source_t::live_process : source_t::none;
-	context.target_pid = runtime.target_pid;
+	context.target_pid = target_pid != 0 ? target_pid : runtime.target_pid;
+	context.target_epoch = target_epoch != 0 ? target_epoch : runtime.target_epoch;
+	context.process_creation_time_100ns = process_creation_time_100ns != 0
+		? process_creation_time_100ns : runtime.process_creation_time_100ns;
 	context.scan_revision = runtime.scan_revision;
 	context.address = address;
 	context.index = index;
@@ -140,10 +378,22 @@ bool is_current(const context_t& context, const runtime_t& runtime) {
 	if (context.source == source_t::live_process)
 		return runtime.live_attached && context.target_pid != 0 &&
 			context.target_pid == runtime.target_pid &&
-			(context.kind != kind_t::scan_result ||
-				context.scan_revision == runtime.scan_revision);
+			context.target_epoch != 0 && context.target_epoch == runtime.target_epoch &&
+			context.process_creation_time_100ns != 0 &&
+			context.process_creation_time_100ns == runtime.process_creation_time_100ns &&
+			memory_scanner::validate_target_binding(context.target_pid,
+				context.target_epoch, context.process_creation_time_100ns) &&
+			(context.kind != kind_t::scan_result || (!runtime.scan_static_binary &&
+				context.target_pid == runtime.scan_target_pid &&
+				context.target_epoch == runtime.scan_target_epoch &&
+				context.process_creation_time_100ns ==
+					runtime.scan_process_creation_time_100ns &&
+				context.scan_revision == runtime.scan_revision));
 	if (context.source == source_t::static_binary)
-		return runtime.static_loaded && context.scan_revision == runtime.scan_revision;
+		return runtime.static_loaded && runtime.scan_static_binary &&
+			context.scan_revision == runtime.scan_revision &&
+			context.workspace_id == runtime.scan_workspace_id &&
+			context.workspace_generation == runtime.scan_workspace_generation;
 	return false;
 }
 

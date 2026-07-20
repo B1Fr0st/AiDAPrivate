@@ -49,27 +49,30 @@ inline uint64_t derive_key_material()
     return tsc ^ (tid << 32) ^ (pid << 16) ^ (mod & 0xFFFF);
 }
 
-inline void aes_gcm_encrypt_simple(
+inline bool aes_gcm_encrypt_simple(
     const uint8_t* plaintext, uint32_t pt_len,
     uint64_t key_material, uint8_t* iv,
     uint8_t* ciphertext, uint8_t* tag)
 {
+    if (!plaintext || pt_len == 0 || !iv || !ciphertext || !tag) return false;
+
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_KEY_HANDLE key = nullptr;
+    bool encrypted = false;
+    uint8_t key_bytes[32]{};
+    memcpy(key_bytes, &key_material, sizeof(key_material));
+    memcpy(key_bytes + 8, &key_material, sizeof(key_material));
+    memcpy(key_bytes + 16, iv, 8);
+    uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
+    memcpy(key_bytes + 24, &pid, sizeof(pid));
 
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) == 0) {
-        BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
-            reinterpret_cast<PUCHAR>(BCRYPT_CHAIN_MODE_GCM),
-            sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
-
-        uint8_t key_bytes[32]{};
-        memcpy(key_bytes, &key_material, sizeof(key_material));
-        memcpy(key_bytes + 8, &key_material, sizeof(key_material));
-        memcpy(key_bytes + 16, iv, 8);
-        uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
-        memcpy(key_bytes + 24, &pid, sizeof(pid));
-
-        if (BCryptGenerateSymmetricKey(alg, &key, key_bytes, sizeof(key_bytes), key_bytes, sizeof(key_bytes), 0) == 0) {
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) >= 0) {
+        wchar_t chaining_mode[] = BCRYPT_CHAIN_MODE_GCM;
+        if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR>(chaining_mode),
+            static_cast<ULONG>(sizeof(chaining_mode)), 0) >= 0 &&
+            BCryptGenerateSymmetricKey(alg, &key, nullptr, 0,
+                key_bytes, static_cast<ULONG>(sizeof(key_bytes)), 0) >= 0) {
             BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO auth_info{};
             BCRYPT_INIT_AUTH_MODE_INFO(auth_info);
             auth_info.pbNonce = iv;
@@ -78,40 +81,44 @@ inline void aes_gcm_encrypt_simple(
             auth_info.cbTag = 16;
 
             ULONG cipher_len = 0;
-            BCryptEncrypt(key,
+            const NTSTATUS status = BCryptEncrypt(key,
                 const_cast<PUCHAR>(plaintext), pt_len,
                 &auth_info, nullptr, 0,
                 ciphertext, pt_len, &cipher_len, 0);
-
-            BCryptDestroyKey(key);
+            encrypted = status >= 0 && cipher_len == pt_len;
         }
+        if (key) BCryptDestroyKey(key);
         BCryptCloseAlgorithmProvider(alg, 0);
     }
 
-    SecureZeroMemory(key, sizeof(key));
+    SecureZeroMemory(key_bytes, sizeof(key_bytes));
+    return encrypted;
 }
 
-inline void aes_gcm_decrypt_simple(
+inline bool aes_gcm_decrypt_simple(
     const uint8_t* ciphertext, uint32_t ct_len,
     uint64_t key_material, uint8_t* iv, uint8_t* tag,
     uint8_t* plaintext)
 {
+    if (!ciphertext || ct_len == 0 || !iv || !tag || !plaintext) return false;
+
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_KEY_HANDLE key = nullptr;
+    bool decrypted = false;
+    uint8_t key_bytes[32]{};
+    memcpy(key_bytes, &key_material, sizeof(key_material));
+    memcpy(key_bytes + 8, &key_material, sizeof(key_material));
+    memcpy(key_bytes + 16, iv, 8);
+    uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
+    memcpy(key_bytes + 24, &pid, sizeof(pid));
 
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) == 0) {
-        BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
-            reinterpret_cast<PUCHAR>(BCRYPT_CHAIN_MODE_GCM),
-            sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
-
-        uint8_t key_bytes[32]{};
-        memcpy(key_bytes, &key_material, sizeof(key_material));
-        memcpy(key_bytes + 8, &key_material, sizeof(key_material));
-        memcpy(key_bytes + 16, iv, 8);
-        uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
-        memcpy(key_bytes + 24, &pid, sizeof(pid));
-
-        if (BCryptGenerateSymmetricKey(alg, &key, key_bytes, sizeof(key_bytes), key_bytes, sizeof(key_bytes), 0) == 0) {
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0) >= 0) {
+        wchar_t chaining_mode[] = BCRYPT_CHAIN_MODE_GCM;
+        if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR>(chaining_mode),
+            static_cast<ULONG>(sizeof(chaining_mode)), 0) >= 0 &&
+            BCryptGenerateSymmetricKey(alg, &key, nullptr, 0,
+                key_bytes, static_cast<ULONG>(sizeof(key_bytes)), 0) >= 0) {
             BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO auth_info{};
             BCRYPT_INIT_AUTH_MODE_INFO(auth_info);
             auth_info.pbNonce = iv;
@@ -120,17 +127,18 @@ inline void aes_gcm_decrypt_simple(
             auth_info.cbTag = 16;
 
             ULONG plain_len = 0;
-            BCryptDecrypt(key,
+            const NTSTATUS status = BCryptDecrypt(key,
                 const_cast<PUCHAR>(ciphertext), ct_len,
                 &auth_info, nullptr, 0,
                 plaintext, ct_len, &plain_len, 0);
-
-            BCryptDestroyKey(key);
+            decrypted = status >= 0 && plain_len == ct_len;
         }
+        if (key) BCryptDestroyKey(key);
         BCryptCloseAlgorithmProvider(alg, 0);
     }
 
-    SecureZeroMemory(key, sizeof(key));
+    SecureZeroMemory(key_bytes, sizeof(key_bytes));
+    return decrypted;
 }
 
 inline uint32_t round_up_16(uint32_t v)
@@ -155,13 +163,21 @@ inline secure_heap_header_t* secure_alloc(uint32_t size)
     header->key_index = 0;
     header->key_material = derive_key_material();
 
-    BCryptGenRandom(nullptr, header->iv, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (BCryptGenRandom(nullptr, header->iv, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        SecureZeroMemory(header, total_size);
+        HeapFree(GetProcessHeap(), 0, header);
+        return nullptr;
+    }
 
     uint8_t* ciphertext = reinterpret_cast<uint8_t*>(header + 1);
     std::vector<uint8_t> plaintext(size, 0);
 
-    aes_gcm_encrypt_simple(plaintext.data(), size,
-        header->key_material, header->iv, ciphertext, header->tag);
+    if (!aes_gcm_encrypt_simple(plaintext.data(), size,
+        header->key_material, header->iv, ciphertext, header->tag)) {
+        SecureZeroMemory(header, total_size);
+        HeapFree(GetProcessHeap(), 0, header);
+        return nullptr;
+    }
 
     {
         std::lock_guard<std::mutex> lk(heap_mtx());
@@ -178,7 +194,7 @@ struct secure_accessor_t {
     bool modified;
 
     explicit secure_accessor_t(secure_heap_header_t* h)
-        : size(0), header(h), modified(false)
+        : buffer{}, size(0), header(h), modified(false)
     {
         if (!header || header->magic != SHEAP_MAGIC) {
             header = nullptr;
@@ -192,8 +208,12 @@ struct secure_accessor_t {
         }
 
         uint8_t* ciphertext = reinterpret_cast<uint8_t*>(header + 1);
-        aes_gcm_decrypt_simple(ciphertext, size,
-            header->key_material, header->iv, header->tag, buffer);
+        if (!aes_gcm_decrypt_simple(ciphertext, size,
+            header->key_material, header->iv, header->tag, buffer)) {
+            SecureZeroMemory(buffer, sizeof(buffer));
+            size = 0;
+            header = nullptr;
+        }
     }
 
     ~secure_accessor_t()
@@ -202,9 +222,13 @@ struct secure_accessor_t {
 
         if (modified) {
             uint8_t* ciphertext = reinterpret_cast<uint8_t*>(header + 1);
-            BCryptGenRandom(nullptr, header->iv, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-            aes_gcm_encrypt_simple(buffer, size,
-                header->key_material, header->iv, ciphertext, header->tag);
+            if (BCryptGenRandom(nullptr, header->iv, 12,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ||
+                !aes_gcm_encrypt_simple(buffer, size,
+                    header->key_material, header->iv, ciphertext, header->tag)) {
+                SecureZeroMemory(buffer, SHEAP_MAX_PLAINTEXT);
+                __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+            }
         }
 
         SecureZeroMemory(buffer, SHEAP_MAX_PLAINTEXT);
@@ -242,16 +266,19 @@ inline void secure_reencrypt_all()
         if (!header || header->magic != SHEAP_MAGIC) continue;
 
         secure_accessor_t acc(header);
-        if (!acc.header) continue;
+        if (!acc.header) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
 
         uint8_t* ciphertext = reinterpret_cast<uint8_t*>(header + 1);
         header->key_material = derive_key_material();
-        BCryptGenRandom(nullptr, header->iv, 12, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-        aes_gcm_encrypt_simple(
+        if (BCryptGenRandom(nullptr, header->iv, 12,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ||
+            !aes_gcm_encrypt_simple(
             reinterpret_cast<const uint8_t*>(acc.data()),
             acc.data_size(),
             header->key_material, header->iv,
-            ciphertext, header->tag);
+            ciphertext, header->tag)) {
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
     }
 }
 

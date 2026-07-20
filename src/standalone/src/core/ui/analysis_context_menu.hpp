@@ -34,6 +34,7 @@ struct context_t {
 };
 
 void open(context_t context, context_menu_open_origin_t origin);
+bool execute_shortcut(context_t context, const char* action_id);
 void render();
 bool keyboard_request(context_menu_open_origin_t& origin);
 

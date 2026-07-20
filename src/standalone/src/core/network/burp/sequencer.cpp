@@ -16,11 +16,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <regex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -33,6 +37,7 @@ namespace {
 struct collection_t
 {
     uint64_t                  id = 0;
+    uint64_t                  instance_revision = 0;
     collection_config_t       config;
     std::string               name;
     std::atomic<bool>         running{false};
@@ -41,6 +46,7 @@ struct collection_t
     std::atomic<size_t>       collected{0};
     std::mutex                samples_mtx;
     std::vector<std::string>  samples;
+    size_t                    sample_bytes = 0;
     std::mutex                err_mtx;
     std::string               error_message;
     uint64_t                  started_ms = 0;
@@ -51,14 +57,86 @@ struct collection_t
 
 struct registry_t
 {
+    std::mutex                                                mutation_mtx;
     std::mutex                                                mtx;
     std::atomic<uint64_t>                                     next_id{1};
+    std::atomic<uint64_t>                                     next_instance_revision{1};
+    std::atomic<uint64_t>                                     generation{1};
+    std::atomic<size_t>                                       retained_sample_bytes{0};
     std::unordered_map<uint64_t, std::shared_ptr<collection_t>> collections;
     std::mutex                                                err_mtx;
     std::string                                               last_err;
 };
 
 static registry_t g_reg;
+
+static bool reserve_sample_bytes(size_t bytes)
+{
+    size_t current = g_reg.retained_sample_bytes.load(std::memory_order_acquire);
+    while (bytes <= max_total_sample_bytes - (std::min)(current, max_total_sample_bytes)) {
+        if (g_reg.retained_sample_bytes.compare_exchange_weak(current, current + bytes,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return true;
+    }
+    return false;
+}
+
+static void release_sample_bytes(size_t bytes)
+{
+    if (bytes == 0) return;
+    const size_t previous = g_reg.retained_sample_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+    if (previous < bytes)
+        g_reg.retained_sample_bytes.store(0, std::memory_order_release);
+}
+
+static void publish_registry_change()
+{
+    g_reg.generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+struct in_flight_guard_t
+{
+    std::shared_ptr<collection_t> collection;
+    ~in_flight_guard_t()
+    {
+        if (collection) collection->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    }
+};
+
+struct sample_reservation_t
+{
+    size_t bytes = 0;
+    bool committed = false;
+    ~sample_reservation_t()
+    {
+        if (!committed) release_sample_bytes(bytes);
+    }
+};
+
+static collection_status_t collection_status(const std::shared_ptr<collection_t>& coll)
+{
+    collection_status_t status;
+    if (!coll) return status;
+    status.id = coll->id;
+    status.instance_revision = coll->instance_revision;
+    status.url = coll->config.url;
+    status.name = coll->name;
+    status.collected = coll->collected.load(std::memory_order_acquire);
+    status.target = coll->config.target_count;
+    status.running = coll->running.load(std::memory_order_acquire);
+    status.error = coll->error_flag.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(coll->err_mtx);
+        status.error_message = coll->error_message;
+    }
+    {
+        std::lock_guard<std::mutex> lock(coll->samples_mtx);
+        status.retained_sample_bytes = coll->sample_bytes;
+    }
+    status.started_ms = coll->started_ms;
+    status.last_sample_ms = coll->last_sample_ms.load(std::memory_order_acquire);
+    return status;
+}
 
 static void set_last_error(const std::string& msg)
 {
@@ -222,6 +300,7 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
         coll->error_flag.store(true);
         set_last_error("invalid_regex");
         coll->running.store(false);
+        publish_registry_change();
         ::diag::log_tagged_fmt("sequencer", "collection_failed id=%llu reason=invalid_regex",
             static_cast<unsigned long long>(coll->id));
         return;
@@ -239,6 +318,7 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
                 if (coll->error_message.empty()) coll->error_message = "too_many_failures";
             }
             coll->error_flag.store(true);
+            publish_registry_change();
             break;
         }
         if (total_attempts >= max_attempts) {
@@ -247,6 +327,7 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
                 if (coll->error_message.empty()) coll->error_message = "attempt_cap_reached";
             }
             coll->error_flag.store(true);
+            publish_registry_change();
             break;
         }
 
@@ -259,31 +340,74 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
             Sleep(static_cast<DWORD>(coll->config.throttle_ms));
         }
 
-        coll->in_flight.fetch_add(1);
         total_attempts++;
         collection_config_t cfg_snapshot = coll->config;
         std::shared_ptr<collection_t> coll_ref = coll;
         std::regex re_copy = re;
         auto sample_task = [coll_ref, cfg_snapshot, re_copy]() {
-            std::string token;
-            std::string err;
-            bool ok = perform_one_request(cfg_snapshot, re_copy, token, err);
-            if (ok && !token.empty()) {
-                std::lock_guard<std::mutex> lk(coll_ref->samples_mtx);
-                coll_ref->samples.push_back(token);
-                coll_ref->collected.store(coll_ref->samples.size());
-                coll_ref->last_sample_ms.store(now_ms());
-                coll_ref->consecutive_failures.store(0);
-            } else {
-                coll_ref->consecutive_failures.fetch_add(1);
-                if (!ok) {
-                    std::lock_guard<std::mutex> lk(coll_ref->err_mtx);
-                    if (coll_ref->error_message.empty()) coll_ref->error_message = err;
+            in_flight_guard_t in_flight{coll_ref};
+            auto fail_terminal = [&](std::string error) {
+                {
+                    std::lock_guard<std::mutex> lock(coll_ref->err_mtx);
+                    coll_ref->error_message = error;
                 }
-                if (!err.empty()) set_last_error(err);
+                coll_ref->error_flag.store(true, std::memory_order_release);
+                coll_ref->stop_request.store(true, std::memory_order_release);
+                coll_ref->running.store(false, std::memory_order_release);
+                set_last_error(error);
+                publish_registry_change();
+            };
+            try {
+                std::string token;
+                std::string err;
+                bool ok = perform_one_request(cfg_snapshot, re_copy, token, err);
+                if (ok && !token.empty()) {
+                    std::string capacity_error;
+                    if (token.size() > max_sample_bytes) {
+                        capacity_error = "sample_exceeds_64_kib_limit";
+                    } else {
+                        std::lock_guard<std::mutex> lk(coll_ref->samples_mtx);
+                        if (coll_ref->samples.size() < coll_ref->config.target_count) {
+                            if (token.size() > max_collection_sample_bytes -
+                                    (std::min)(coll_ref->sample_bytes, max_collection_sample_bytes)) {
+                                capacity_error = "collection_exceeds_64_mib_sample_limit";
+                            } else if (!reserve_sample_bytes(token.size())) {
+                                capacity_error = "sequencer_exceeds_512_mib_retained_sample_limit";
+                            } else {
+                                sample_reservation_t reservation{token.size(), false};
+                                coll_ref->sample_bytes += token.size();
+                                try {
+                                    coll_ref->samples.push_back(std::move(token));
+                                } catch (...) {
+                                    coll_ref->sample_bytes -= reservation.bytes;
+                                    throw;
+                                }
+                                reservation.committed = true;
+                                coll_ref->collected.store(coll_ref->samples.size(), std::memory_order_release);
+                                coll_ref->last_sample_ms.store(now_ms(), std::memory_order_release);
+                                coll_ref->consecutive_failures.store(0, std::memory_order_release);
+                                publish_registry_change();
+                            }
+                        }
+                    }
+                    if (!capacity_error.empty()) {
+                        fail_terminal(std::move(capacity_error));
+                    }
+                } else {
+                    coll_ref->consecutive_failures.fetch_add(1);
+                    if (!ok) {
+                        std::lock_guard<std::mutex> lk(coll_ref->err_mtx);
+                        if (coll_ref->error_message.empty()) coll_ref->error_message = err;
+                    }
+                    if (!err.empty()) set_last_error(err);
+                }
+            } catch (const std::exception& exception) {
+                fail_terminal(std::string("sample_task_exception: ") + exception.what());
+            } catch (...) {
+                fail_terminal("sample_task_exception: unknown exception");
             }
-            coll_ref->in_flight.fetch_sub(1);
         };
+        coll->in_flight.fetch_add(1, std::memory_order_acq_rel);
         bool posted = false;
         try {
             posted = [&]() {
@@ -309,6 +433,7 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
                 if (coll->error_message.empty()) coll->error_message = "sample_executor_post_failed";
             }
             coll->error_flag.store(true);
+            publish_registry_change();
             coll->in_flight.fetch_sub(1);
         }
     }
@@ -326,6 +451,7 @@ static void collection_worker(std::shared_ptr<collection_t> coll)
         if (!err.empty()) set_last_error(err);
     }
     coll->running.store(false);
+    publish_registry_change();
     ::diag::log_tagged_fmt("sequencer", "collection_done id=%llu collected=%zu target=%zu",
         static_cast<unsigned long long>(coll->id),
         coll->samples.size(), coll->config.target_count);
@@ -785,22 +911,43 @@ uint64_t start_collection(const collection_config_t& cfg)
         set_last_error("target_count_zero");
         return 0;
     }
+    if (cfg.target_count > max_target_samples) {
+        set_last_error("target_count_exceeds_250000_limit");
+        return 0;
+    }
+    if (cfg.concurrency == 0 || cfg.concurrency > max_collection_concurrency) {
+        set_last_error("concurrency_outside_1_to_64_limit");
+        return 0;
+    }
+    if (cfg.raw_request.size() > max_raw_request_bytes) {
+        set_last_error("raw_request_exceeds_1_mib_limit");
+        return 0;
+    }
+    if (cfg.extract_regex.size() > max_extract_regex_bytes) {
+        set_last_error("extract_regex_exceeds_4096_byte_limit");
+        return 0;
+    }
 
     auto coll = std::make_shared<collection_t>();
-    coll->id = g_reg.next_id.fetch_add(1);
     coll->config = cfg;
     coll->name = cfg.name.empty() ? cfg.url : cfg.name;
     coll->running.store(true);
     coll->started_ms = now_ms();
     {
+        std::lock_guard<std::mutex> mutation_lock(g_reg.mutation_mtx);
         std::lock_guard<std::mutex> lk(g_reg.mtx);
         const size_t pruned = prune_empty_failed_collections_locked(coll->started_ms, 30000);
         if (pruned > 0) {
-            ::diag::log_tagged_fmt("sequencer", "start_collection pruned_empty_failed=%zu new_id=%llu",
-                pruned,
-                static_cast<unsigned long long>(coll->id));
+            ::diag::log_tagged_fmt("sequencer", "start_collection pruned_empty_failed=%zu", pruned);
         }
+        if (g_reg.collections.size() >= max_collection_count) {
+            set_last_error("collection_capacity_128_reached_delete_a_collection");
+            return 0;
+        }
+        coll->id = g_reg.next_id.fetch_add(1, std::memory_order_acq_rel);
+        coll->instance_revision = g_reg.next_instance_revision.fetch_add(1, std::memory_order_acq_rel);
         g_reg.collections[coll->id] = coll;
+        publish_registry_change();
     }
 
     std::shared_ptr<collection_t> coll_ref = coll;
@@ -833,8 +980,13 @@ uint64_t start_collection(const collection_config_t& cfg)
             static_cast<unsigned long long>(coll->id),
             cfg.url.c_str());
         {
+            std::lock_guard<std::mutex> mutation_lock(g_reg.mutation_mtx);
             std::lock_guard<std::mutex> lk(g_reg.mtx);
-            g_reg.collections.erase(coll->id);
+            const auto found = g_reg.collections.find(coll->id);
+            if (found != g_reg.collections.end() && found->second == coll) {
+                g_reg.collections.erase(found);
+                publish_registry_change();
+            }
         }
         return 0;
     }
@@ -857,6 +1009,7 @@ bool stop_collection(uint64_t id)
     }
     coll->stop_request.store(true);
     coll->running.store(false);
+    publish_registry_change();
     ::diag::log_tagged_fmt("sequencer", "collection_stop_requested id=%llu", static_cast<unsigned long long>(id));
     return true;
 }
@@ -875,19 +1028,7 @@ collection_status_t status(uint64_t id)
         }
         coll = it->second;
     }
-    s.id = coll->id;
-    s.url = coll->config.url;
-    s.name = coll->name;
-    s.collected = coll->collected.load();
-    s.target = coll->config.target_count;
-    s.running = coll->running.load();
-    s.error = coll->error_flag.load();
-    {
-        std::lock_guard<std::mutex> lk(coll->err_mtx);
-        s.error_message = coll->error_message;
-    }
-    s.started_ms = coll->started_ms;
-    s.last_sample_ms = coll->last_sample_ms.load();
+    s = collection_status(coll);
     diag::log_tagged_fmt("sequencer", "status id=%llu collected=%zu target=%zu running=%d error=%d",
         static_cast<unsigned long long>(id), s.collected, s.target, (int)s.running, (int)s.error);
     return s;
@@ -952,22 +1093,39 @@ analysis_result_t analyze(uint64_t id, const analysis_config_t& config)
 
 std::vector<collection_status_t> list_collections()
 {
-    diag::log_tagged_fmt("sequencer", "list_collections entry");
-    std::vector<collection_status_t> out;
-    std::vector<uint64_t> ids;
+    return snapshot_collections().collections;
+}
+
+uint64_t registry_generation()
+{
+    return g_reg.generation.load(std::memory_order_acquire);
+}
+
+registry_snapshot_t snapshot_collections()
+{
+    registry_snapshot_t snapshot;
+    std::vector<std::shared_ptr<collection_t>> collections;
     {
-        std::lock_guard<std::mutex> lk(g_reg.mtx);
-        ids.reserve(g_reg.collections.size());
-        for (const auto& kv : g_reg.collections) ids.push_back(kv.first);
+        std::lock_guard<std::mutex> lock(g_reg.mtx);
+        collections.reserve(g_reg.collections.size());
+        for (const auto& entry : g_reg.collections)
+            collections.push_back(entry.second);
+        snapshot.generation = g_reg.generation.load(std::memory_order_relaxed);
+        snapshot.capacity.collection_count = collections.size();
+        snapshot.capacity.retained_sample_bytes =
+            g_reg.retained_sample_bytes.load(std::memory_order_acquire);
     }
-    out.reserve(ids.size());
-    for (uint64_t id : ids) out.push_back(status(id));
-    diag::log_tagged_fmt("sequencer", "list_collections result count=%zu", out.size());
-    return out;
+    snapshot.collections.reserve(collections.size());
+    for (const auto& collection : collections)
+        snapshot.collections.push_back(collection_status(collection));
+    std::sort(snapshot.collections.begin(), snapshot.collections.end(),
+        [](const auto& left, const auto& right) { return left.id < right.id; });
+    return snapshot;
 }
 
 bool delete_collection(uint64_t id)
 {
+    std::lock_guard<std::mutex> mutation_lock(g_reg.mutation_mtx);
     diag::log_tagged_fmt("sequencer", "delete_collection entry id=%llu", static_cast<unsigned long long>(id));
     std::shared_ptr<collection_t> coll;
     {
@@ -984,11 +1142,335 @@ bool delete_collection(uint64_t id)
     diag::log_tagged_fmt("sequencer", "delete_collection waiting_inflight id=%llu in_flight=%zu",
         static_cast<unsigned long long>(id), coll->in_flight.load());
     while (coll->in_flight.load() > 0) Sleep(5);
+    size_t released_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(coll->samples_mtx);
+        released_bytes = coll->sample_bytes;
+        coll->sample_bytes = 0;
+        coll->samples.clear();
+        coll->collected.store(0, std::memory_order_release);
+    }
     {
         std::lock_guard<std::mutex> lk(g_reg.mtx);
         g_reg.collections.erase(id);
+        release_sample_bytes(released_bytes);
+        publish_registry_change();
     }
     diag::log_tagged_fmt("sequencer", "delete_collection ok id=%llu", static_cast<unsigned long long>(id));
+    return true;
+}
+
+bool delete_collection_exact(uint64_t id, uint64_t started_ms, uint64_t instance_revision)
+{
+    std::lock_guard<std::mutex> mutation_lock(g_reg.mutation_mtx);
+    std::shared_ptr<collection_t> collection;
+    {
+        std::lock_guard<std::mutex> lock(g_reg.mtx);
+        const auto found = g_reg.collections.find(id);
+        if (found == g_reg.collections.end() || !found->second ||
+            found->second->started_ms != started_ms ||
+            found->second->instance_revision != instance_revision) {
+            set_last_error("collection_changed_after_delete_review");
+            return false;
+        }
+        collection = found->second;
+        collection->stop_request.store(true, std::memory_order_release);
+        collection->running.store(false, std::memory_order_release);
+    }
+    while (collection->in_flight.load(std::memory_order_acquire) != 0) Sleep(5);
+    size_t released_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_reg.mtx);
+        const auto found = g_reg.collections.find(id);
+        if (found == g_reg.collections.end() || found->second != collection ||
+            collection->started_ms != started_ms ||
+            collection->instance_revision != instance_revision) {
+            set_last_error("collection_changed_before_delete_commit");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> samples_lock(collection->samples_mtx);
+            released_bytes = collection->sample_bytes;
+            collection->sample_bytes = 0;
+            collection->samples.clear();
+            collection->collected.store(0, std::memory_order_release);
+        }
+        g_reg.collections.erase(found);
+        release_sample_bytes(released_bytes);
+        publish_registry_change();
+    }
+    return true;
+}
+
+nlohmann::json export_json()
+{
+    nlohmann::json root;
+    root["version"] = 1;
+    root["limits"] = {
+        {"collections", max_collection_count},
+        {"samples_per_collection", max_target_samples},
+        {"sample_bytes", max_sample_bytes},
+        {"collection_sample_bytes", max_collection_sample_bytes},
+        {"total_sample_bytes", max_total_sample_bytes}
+    };
+    nlohmann::json rows = nlohmann::json::array();
+    std::vector<std::shared_ptr<collection_t>> collections;
+    {
+        std::lock_guard<std::mutex> lock(g_reg.mtx);
+        collections.reserve(g_reg.collections.size());
+        for (const auto& entry : g_reg.collections)
+            collections.push_back(entry.second);
+    }
+    std::sort(collections.begin(), collections.end(), [](const auto& left, const auto& right) {
+        return left->id < right->id;
+    });
+    for (const auto& collection : collections) {
+        const collection_status_t status = collection_status(collection);
+        nlohmann::json row;
+        row["id"] = collection->id;
+        row["name"] = collection->name;
+        row["url"] = collection->config.url;
+        row["raw_request"] = collection->config.raw_request;
+        row["use_tls"] = collection->config.use_tls;
+        row["host"] = collection->config.host;
+        row["port"] = collection->config.port;
+        row["extract_regex"] = collection->config.extract_regex;
+        row["capture_group"] = collection->config.capture_group;
+        row["target_count"] = collection->config.target_count;
+        row["concurrency"] = collection->config.concurrency;
+        row["throttle_ms"] = collection->config.throttle_ms;
+        row["started_ms"] = collection->started_ms;
+        row["last_sample_ms"] = status.last_sample_ms;
+        row["running"] = status.running;
+        row["error"] = status.error;
+        row["error_message"] = status.error_message;
+        nlohmann::json samples_json = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lock(collection->samples_mtx);
+            for (const auto& sample : collection->samples) {
+                samples_json.push_back(std::vector<std::uint8_t>(sample.begin(), sample.end()));
+            }
+        }
+        row["samples"] = std::move(samples_json);
+        rows.push_back(std::move(row));
+    }
+    root["collections"] = std::move(rows);
+    return root;
+}
+
+bool import_json(const nlohmann::json& doc, bool replace_existing)
+{
+    struct staged_collection_t {
+        std::shared_ptr<collection_t> collection;
+    };
+    if (!doc.is_object() || doc.value("version", 0) != 1 ||
+        !doc.contains("collections") || !doc["collections"].is_array()) {
+        set_last_error("sequencer_import_invalid_schema");
+        return false;
+    }
+    const auto& rows = doc["collections"];
+    if (rows.size() > max_collection_count) {
+        set_last_error("sequencer_import_exceeds_128_collection_limit");
+        return false;
+    }
+    std::vector<staged_collection_t> staged;
+    staged.reserve(rows.size());
+    size_t total_bytes = 0;
+    std::unordered_set<uint64_t> imported_ids;
+    try {
+        for (const auto& row : rows) {
+            if (!row.is_object() || !row.contains("id") || !row["id"].is_number_unsigned() ||
+                !row.contains("samples") || !row["samples"].is_array()) {
+                set_last_error("sequencer_import_invalid_collection");
+                return false;
+            }
+            auto collection = std::make_shared<collection_t>();
+            collection->id = row["id"].get<uint64_t>();
+            collection->instance_revision =
+                g_reg.next_instance_revision.fetch_add(1, std::memory_order_acq_rel);
+            if (collection->id == 0 || collection->id == (std::numeric_limits<uint64_t>::max)() ||
+                !imported_ids.insert(collection->id).second) {
+                set_last_error("sequencer_import_duplicate_or_zero_collection_id");
+                return false;
+            }
+            collection->name = row.value("name", std::string());
+            collection->config.name = collection->name;
+            collection->config.url = row.value("url", std::string());
+            collection->config.use_tls = row.value("use_tls", true);
+            collection->config.host = row.value("host", std::string());
+            collection->config.port = row.value("port", static_cast<uint16_t>(443));
+            collection->config.extract_regex = row.value("extract_regex", std::string());
+            collection->config.capture_group = row.value("capture_group", 1);
+            collection->config.target_count = row.value("target_count", static_cast<size_t>(0));
+            collection->config.concurrency = row.value("concurrency", static_cast<size_t>(0));
+            collection->config.throttle_ms = row.value("throttle_ms", static_cast<size_t>(0));
+            if (row.contains("raw_request")) {
+                if (!row["raw_request"].is_array()) {
+                    set_last_error("sequencer_import_raw_request_not_byte_array");
+                    return false;
+                }
+                const auto bytes = row["raw_request"].get<std::vector<std::uint8_t>>();
+                collection->config.raw_request.assign(bytes.begin(), bytes.end());
+            }
+            if (collection->config.target_count == 0 ||
+                collection->config.target_count > max_target_samples ||
+                collection->config.concurrency == 0 ||
+                collection->config.concurrency > max_collection_concurrency ||
+                collection->config.raw_request.size() > max_raw_request_bytes ||
+                collection->config.extract_regex.empty() ||
+                collection->config.extract_regex.size() > max_extract_regex_bytes ||
+                (collection->config.url.empty() && collection->config.host.empty()) ||
+                row["samples"].size() > collection->config.target_count) {
+                set_last_error("sequencer_import_collection_exceeds_runtime_contract");
+                return false;
+            }
+            collection->samples.reserve(row["samples"].size());
+            for (const auto& encoded : row["samples"]) {
+                if (!encoded.is_array()) {
+                    set_last_error("sequencer_import_sample_not_byte_array");
+                    return false;
+                }
+                const auto bytes = encoded.get<std::vector<std::uint8_t>>();
+                if (bytes.empty() || bytes.size() > max_sample_bytes ||
+                    bytes.size() > max_collection_sample_bytes -
+                        (std::min)(collection->sample_bytes, max_collection_sample_bytes) ||
+                    bytes.size() > max_total_sample_bytes - (std::min)(total_bytes, max_total_sample_bytes)) {
+                    set_last_error("sequencer_import_sample_capacity_exceeded");
+                    return false;
+                }
+                collection->samples.emplace_back(bytes.begin(), bytes.end());
+                collection->sample_bytes += bytes.size();
+                total_bytes += bytes.size();
+            }
+            collection->collected.store(collection->samples.size(), std::memory_order_release);
+            collection->started_ms = row.value("started_ms", static_cast<uint64_t>(0));
+            collection->last_sample_ms.store(row.value("last_sample_ms", static_cast<uint64_t>(0)),
+                std::memory_order_release);
+            collection->error_flag.store(row.value("error", false), std::memory_order_release);
+            collection->error_message = row.value("error_message", std::string());
+            if (row.value("running", false)) {
+                collection->error_flag.store(true, std::memory_order_release);
+                collection->error_message =
+                    "restored_collection_was_running_and_requires_explicit_restart";
+            }
+            collection->running.store(false, std::memory_order_release);
+            collection->stop_request.store(true, std::memory_order_release);
+            staged.push_back({std::move(collection)});
+        }
+    } catch (...) {
+        set_last_error("sequencer_import_invalid_value");
+        return false;
+    }
+
+    if (replace_existing) {
+        std::unordered_map<uint64_t, std::shared_ptr<collection_t>> replacement;
+        uint64_t next_id = 1;
+        try {
+            replacement.reserve(staged.size());
+            for (const auto& item : staged) {
+                replacement.emplace(item.collection->id, item.collection);
+                next_id = (std::max)(next_id, item.collection->id + 1);
+            }
+        } catch (const std::exception& exception) {
+            set_last_error(std::string("sequencer_import_allocation_failed: ") + exception.what());
+            return false;
+        }
+        std::lock_guard<std::mutex> mutation_lock(g_reg.mutation_mtx);
+        std::vector<std::pair<uint64_t, std::shared_ptr<collection_t>>> existing;
+        try {
+            std::lock_guard<std::mutex> lock(g_reg.mtx);
+            existing.reserve(g_reg.collections.size());
+            for (const auto& entry : g_reg.collections) existing.push_back(entry);
+            for (const auto& entry : existing) {
+                entry.second->stop_request.store(true, std::memory_order_release);
+                entry.second->running.store(false, std::memory_order_release);
+            }
+        } catch (const std::exception& exception) {
+            set_last_error(std::string("sequencer_import_allocation_failed: ") + exception.what());
+            return false;
+        }
+        for (const auto& entry : existing) {
+            while (entry.second->in_flight.load(std::memory_order_acquire) != 0) Sleep(5);
+        }
+        bool exact = false;
+        {
+            std::lock_guard<std::mutex> lock(g_reg.mtx);
+            exact = g_reg.collections.size() == existing.size();
+            if (exact) {
+                for (const auto& entry : existing) {
+                    const auto found = g_reg.collections.find(entry.first);
+                    if (found == g_reg.collections.end() || found->second != entry.second) {
+                        exact = false;
+                        break;
+                    }
+                }
+            }
+            if (exact) {
+                g_reg.collections.swap(replacement);
+                g_reg.retained_sample_bytes.store(total_bytes, std::memory_order_release);
+                g_reg.next_id.store(next_id, std::memory_order_release);
+                publish_registry_change();
+            }
+        }
+        if (!exact) {
+            set_last_error("sequencer_import_existing_registry_changed_before_replace_commit");
+            return false;
+        }
+        return true;
+    }
+
+    std::lock_guard<std::mutex> mutation_lock(g_reg.mutation_mtx);
+    std::vector<uint64_t> inserted_ids;
+    try {
+        inserted_ids.reserve(staged.size());
+    } catch (const std::exception& exception) {
+        set_last_error(std::string("sequencer_import_allocation_failed: ") + exception.what());
+        return false;
+    }
+    if (!reserve_sample_bytes(total_bytes)) {
+        set_last_error("sequencer_import_exceeds_global_sample_capacity");
+        return false;
+    }
+    bool committed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_reg.mtx);
+        if (g_reg.collections.size() <= max_collection_count - staged.size()) {
+            bool conflict = false;
+            for (const auto& item : staged) {
+                if (g_reg.collections.find(item.collection->id) != g_reg.collections.end()) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (!conflict) {
+                try {
+                    uint64_t next_id = g_reg.next_id.load(std::memory_order_acquire);
+                    for (const auto& item : staged) {
+                        next_id = (std::max)(next_id, item.collection->id + 1);
+                        const auto inserted = g_reg.collections.emplace(
+                            item.collection->id, item.collection);
+                        if (!inserted.second) throw std::runtime_error("collection identity conflict");
+                        inserted_ids.push_back(item.collection->id);
+                    }
+                    g_reg.next_id.store(next_id, std::memory_order_release);
+                    publish_registry_change();
+                    committed = true;
+                } catch (const std::exception& exception) {
+                    for (const uint64_t id : inserted_ids) g_reg.collections.erase(id);
+                    set_last_error(std::string("sequencer_import_commit_failed: ") + exception.what());
+                } catch (...) {
+                    for (const uint64_t id : inserted_ids) g_reg.collections.erase(id);
+                    set_last_error("sequencer_import_commit_failed: unknown exception");
+                }
+            }
+        }
+    }
+    if (!committed) {
+        release_sample_bytes(total_bytes);
+        if (last_error().rfind("sequencer_import_commit_failed", 0) != 0)
+            set_last_error("sequencer_import_collection_capacity_or_identity_conflict");
+        return false;
+    }
     return true;
 }
 

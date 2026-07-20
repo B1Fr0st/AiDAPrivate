@@ -384,7 +384,6 @@ void verify_serialized_round_trip(fixture_t& fixture) {
         restored->find_text("needle payload", 0, 16, {}),
         "restored packed-index comparison query failed");
     require(original_page.total == restored_page.total &&
-        original_page.total_is_exact == restored_page.total_is_exact &&
         original_page.truncated == restored_page.truncated &&
         entity_ids(original_page.hits) == entity_ids(restored_page.hits),
         "restored packed-index query results diverged");

@@ -19,18 +19,19 @@
 #include "repeater.hpp"
 #include "scope.hpp"
 #include "session_handler.hpp"
+#include "sequencer.hpp"
 #include "site_map.hpp"
 
 #include "../../settings/standalone_compat.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <mutex>
-#include <sstream>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -64,6 +65,145 @@ uint64_t now_ms()
 {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+std::filesystem::path temporary_project_path(const std::filesystem::path& destination)
+{
+    static std::atomic<std::uint64_t> sequence{1};
+    std::filesystem::path temporary = destination;
+    temporary += L".tmp." + std::to_wstring(GetCurrentProcessId()) + L"." +
+        std::to_wstring(now_ms()) + L"." +
+        std::to_wstring(sequence.fetch_add(1, std::memory_order_acq_rel));
+    return temporary;
+}
+
+bool write_project_file(const std::filesystem::path& path, std::string_view data,
+                        std::string& error)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = "project.save: temporary create failed (Win32 " +
+            std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    std::size_t offset = 0;
+    while (offset < data.size()) {
+        const DWORD chunk = static_cast<DWORD>((std::min)(data.size() - offset,
+            std::size_t{1024U * 1024U}));
+        DWORD written = 0;
+        if (!WriteFile(file, data.data() + offset, chunk, &written, nullptr)) {
+            const DWORD write_error = GetLastError();
+            CloseHandle(file);
+            error = "project.save: write failed (Win32 " +
+                std::to_string(write_error) + ")";
+            return false;
+        }
+        if (written != chunk) {
+            CloseHandle(file);
+            error = "project.save: partial write (expected " +
+                std::to_string(chunk) + ", wrote " + std::to_string(written) + ")";
+            return false;
+        }
+        offset += written;
+    }
+    const BOOL flushed = FlushFileBuffers(file);
+    const DWORD flush_error = flushed ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(file);
+    if (!flushed) {
+        error = "project.save: durable flush failed (Win32 " +
+            std::to_string(flush_error) + ")";
+        return false;
+    }
+    return true;
+}
+
+bool replace_project_file(const std::filesystem::path& temporary,
+                          const std::filesystem::path& destination,
+                          std::string& error)
+{
+    const DWORD attributes = GetFileAttributesW(destination.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            error = "project.save: destination is a directory";
+            return false;
+        }
+        if (ReplaceFileW(destination.c_str(), temporary.c_str(), nullptr,
+                REPLACEFILE_WRITE_THROUGH, nullptr, nullptr))
+            return true;
+        const DWORD replace_error = GetLastError();
+        if (MoveFileExW(temporary.c_str(), destination.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return true;
+        error = "project.save: atomic replace failed (ReplaceFileW " +
+            std::to_string(replace_error) + ", MoveFileExW " +
+            std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    const DWORD attributes_error = GetLastError();
+    if (attributes_error != ERROR_FILE_NOT_FOUND && attributes_error != ERROR_PATH_NOT_FOUND) {
+        error = "project.save: destination query failed (Win32 " +
+            std::to_string(attributes_error) + ")";
+        return false;
+    }
+    if (MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH))
+        return true;
+    error = "project.save: atomic create failed (Win32 " +
+        std::to_string(GetLastError()) + ")";
+    return false;
+}
+
+bool read_project_file(const std::filesystem::path& path, std::string& raw,
+                       std::string& error)
+{
+    raw.clear();
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = "project.load: open failed (Win32 " +
+            std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size)) {
+        const DWORD size_error = GetLastError();
+        CloseHandle(file);
+        error = "project.load: size query failed (Win32 " +
+            std::to_string(size_error) + ")";
+        return false;
+    }
+    if (size.QuadPart < 0 || static_cast<unsigned long long>(size.QuadPart) >
+            static_cast<unsigned long long>(maximum_project_file_bytes)) {
+        CloseHandle(file);
+        error = "project.load: file exceeds the 64 MiB project retention limit";
+        return false;
+    }
+    raw.resize(static_cast<std::size_t>(size.QuadPart));
+    std::size_t offset = 0;
+    while (offset < raw.size()) {
+        const DWORD chunk = static_cast<DWORD>((std::min)(raw.size() - offset,
+            std::size_t{1024U * 1024U}));
+        DWORD read = 0;
+        if (!ReadFile(file, raw.data() + offset, chunk, &read, nullptr)) {
+            const DWORD read_error = GetLastError();
+            CloseHandle(file);
+            raw.clear();
+            error = "project.load: bounded read failed (Win32 " +
+                std::to_string(read_error) + ")";
+            return false;
+        }
+        if (read != chunk) {
+            CloseHandle(file);
+            raw.clear();
+            error = "project.load: file changed during read (expected " +
+                std::to_string(chunk) + ", read " + std::to_string(read) + ")";
+            return false;
+        }
+        offset += read;
+    }
+    CloseHandle(file);
+    return true;
 }
 
 std::string base64_encode(const std::vector<uint8_t>& data)
@@ -384,6 +524,7 @@ nlohmann::json export_json()
 
     root["crawl_audit"] = crawl_audit::export_json();
     root["collaborator"] = collaborator::export_json();
+    root["sequencer"] = sequencer::export_json();
     return root;
 }
 
@@ -415,6 +556,7 @@ bool import_json(const nlohmann::json& doc, bool replace_existing)
         ok = crawl_audit::import_json({{"version", 1}, {"pipelines", json::array()}}, true) && ok;
     }
     if (doc.contains("collaborator")) ok = collaborator::import_json(doc["collaborator"], replace_existing) && ok;
+    if (doc.contains("sequencer")) ok = sequencer::import_json(doc["sequencer"], replace_existing) && ok;
     if (!ok) set_err("project.import: one or more sections failed");
     return ok;
 }
@@ -425,37 +567,31 @@ bool save_to_file(const std::string& path)
         set_err("project.save: empty path");
         return false;
     }
-    std::filesystem::path fs_path(path);
+    const std::filesystem::path fs_path(path);
     std::error_code ec;
     if (!fs_path.parent_path().empty()) std::filesystem::create_directories(fs_path.parent_path(), ec);
     if (ec) {
         set_err("project.save: create parent failed: " + ec.message());
         return false;
     }
-    const std::string tmp = path + ".tmp";
     const std::string dump = export_json().dump(2);
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            set_err("project.save: open failed");
-            return false;
-        }
-        out.write(dump.data(), static_cast<std::streamsize>(dump.size()));
-        if (!out) {
-            set_err("project.save: write failed");
-            return false;
-        }
+    if (dump.size() > maximum_project_file_bytes) {
+        set_err("project.save: serialized project exceeds the 64 MiB project retention limit");
+        return false;
     }
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
-        std::filesystem::remove(path, ec);
-        ec.clear();
-        std::filesystem::rename(tmp, path, ec);
-        if (ec) {
-            set_err("project.save: replace failed: " + ec.message());
-            return false;
-        }
+    const std::filesystem::path temporary = temporary_project_path(fs_path);
+    std::string durable_error;
+    if (!write_project_file(temporary, dump, durable_error)) {
+        std::filesystem::remove(temporary, ec);
+        set_err(durable_error);
+        return false;
     }
+    if (!replace_project_file(temporary, fs_path, durable_error)) {
+        std::filesystem::remove(temporary, ec);
+        set_err(durable_error);
+        return false;
+    }
+    set_err(std::string{});
     diag::log_tagged_fmt("burp_project", "save ok path=%s bytes=%zu", path.c_str(), dump.size());
     return true;
 }
@@ -466,20 +602,19 @@ bool load_from_file(const std::string& path, bool replace_existing)
         set_err("project.load: empty path");
         return false;
     }
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        set_err("project.load: open failed");
+    std::string raw;
+    std::string read_error;
+    if (!read_project_file(std::filesystem::path(path), raw, read_error)) {
+        set_err(read_error);
         return false;
     }
-    std::stringstream ss;
-    ss << in.rdbuf();
-    const std::string raw = ss.str();
     json doc = json::parse(raw, nullptr, false);
     if (doc.is_discarded()) {
         set_err("project.load: parse failed");
         return false;
     }
     const bool ok = import_json(doc, replace_existing);
+    if (ok) set_err(std::string{});
     diag::log_tagged_fmt("burp_project", "load path=%s bytes=%zu ok=%d replace=%d", path.c_str(), raw.size(), ok ? 1 : 0, replace_existing ? 1 : 0);
     return ok;
 }

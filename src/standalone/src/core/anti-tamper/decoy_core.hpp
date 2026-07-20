@@ -35,7 +35,7 @@ namespace decoy_core {
             crc ^= data[i];
             for (int j = 0; j < 8; ++j)
             {
-                uint32_t mask = -(crc & 1u);
+                uint32_t mask = 0u - (crc & 1u);
                 crc = (crc >> 1) ^ (0xEDB88320u & mask);
             }
         }

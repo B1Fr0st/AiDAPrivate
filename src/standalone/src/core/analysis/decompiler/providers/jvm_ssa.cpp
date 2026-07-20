@@ -126,7 +126,6 @@ enum opcode_flags_t : std::uint16_t {
     flag_field = 1 << 5,
     flag_array = 1 << 6,
     flag_monitor = 1 << 7,
-    flag_jsr = 1 << 8,
     flag_reserved = 1 << 9,
     flag_cat2_result = 1 << 10,
     flag_dynamic_stack = 1 << 11,
@@ -316,8 +315,8 @@ static const opcode_info_t& opcode_info(std::uint8_t opcode)
         {"if_acmpeq",3,2,0,provider_ir_opcode_t::conditional_branch,hir_node_kind_t::conditional,flag_branch},
         {"if_acmpne",3,2,0,provider_ir_opcode_t::conditional_branch,hir_node_kind_t::conditional,flag_branch},
         {"goto",3,0,0,provider_ir_opcode_t::branch,hir_node_kind_t::branch,flag_branch|flag_terminator},
-        {"jsr",3,0,1,provider_ir_opcode_t::branch,hir_node_kind_t::branch,flag_jsr|flag_branch},
-        {"ret",2,0,0,provider_ir_opcode_t::branch,hir_node_kind_t::branch,flag_jsr|flag_terminator},
+        {"jsr",3,0,1,provider_ir_opcode_t::branch,hir_node_kind_t::branch,flag_branch},
+        {"ret",2,0,0,provider_ir_opcode_t::branch,hir_node_kind_t::branch,flag_terminator},
         {"tableswitch",0,1,0,provider_ir_opcode_t::switch_branch,hir_node_kind_t::switch_branch,flag_switch|flag_terminator},
         {"lookupswitch",0,1,0,provider_ir_opcode_t::switch_branch,hir_node_kind_t::switch_branch,flag_switch|flag_terminator},
         {"ireturn",1,1,0,provider_ir_opcode_t::return_value,hir_node_kind_t::return_value,flag_return|flag_terminator},
@@ -349,7 +348,7 @@ static const opcode_info_t& opcode_info(std::uint8_t opcode)
         {"ifnull",3,1,0,provider_ir_opcode_t::conditional_branch,hir_node_kind_t::conditional,flag_branch},
         {"ifnonnull",3,1,0,provider_ir_opcode_t::conditional_branch,hir_node_kind_t::conditional,flag_branch},
         {"goto_w",5,0,0,provider_ir_opcode_t::branch,hir_node_kind_t::branch,flag_branch|flag_terminator},
-        {"jsr_w",5,0,1,provider_ir_opcode_t::branch,hir_node_kind_t::branch,flag_jsr|flag_branch},
+        {"jsr_w",5,0,1,provider_ir_opcode_t::branch,hir_node_kind_t::branch,flag_branch},
         {"breakpoint",1,0,0,provider_ir_opcode_t::unknown,hir_node_kind_t::unknown,flag_reserved},
     };
     return table[opcode & 0xFF];
@@ -941,7 +940,6 @@ struct cfg_block_t {
     std::vector<std::uint64_t> exception_successor_ids;
     std::vector<std::uint64_t> exception_predecessor_ids;
     bool is_exception_handler = false;
-    bool is_jsr_target = false;
 };
 
 struct cfg_t {
@@ -1756,9 +1754,6 @@ private:
                 frame.stack.push_back({val.id, true});
         }
 
-        if (flags & flag_jsr) {
-            block.is_jsr_target = true;
-        }
     }
 
     void simulate_dynamic(std::size_t bi, const instruction_t& inst,

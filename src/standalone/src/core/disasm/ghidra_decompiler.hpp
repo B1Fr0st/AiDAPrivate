@@ -1,7 +1,11 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include "../infra/executor.hpp"
 
@@ -32,6 +36,11 @@
 #include "../analysis/decompiler/providers/ghidra_ir_adapter.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4005 4099 4244 4267 4146 4996 4458 4457 4100 4127 4389)
+#endif
+
 #include "ghidra_adapters/aida_ghidra_preamble.hpp"
 #include "ghidra_adapters/aida_architecture.hpp"
 #include "ghidra_adapters/aida_load_image.hpp"
@@ -41,10 +50,7 @@
 #include "ghidra_adapters/aida_print_c.hpp"
 #include "ghidra_adapters/aida_pcode_fixup.hpp"
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable: 4005 4244 4267 4146 4996 4458 4457 4100 4127 4389)
-#endif
+#include "ghidra_adapters/aida_ghidra_preamble.hpp"
 
 #include "libdecomp.hh"
 #include "sleigh_arch.hh"
@@ -118,6 +124,7 @@ struct ghidra_adapter_decompile_request_t {
 	std::shared_ptr<const aida::analysis::ghidra_adapter::ghidra_load_image_t> load_image;
 	std::shared_ptr<const aida::analysis::ghidra_adapter::ghidra_function_database_t> function_database;
 	aida::analysis::ghidra_adapter::ghidra_entity_address_key_t function;
+	std::optional<aida::analysis::decompiler_entity_key_t> typed_entity;
 	uint64_t type_revision = 0;
 	aida::analysis::cancellation_token_t cancellation;
 	std::atomic<bool>* engine_cancel = nullptr;
@@ -1533,7 +1540,7 @@ inline ghidra_result_t decompile_isolated_buffer(
 	}
 	if (!data || size == 0 || base_addr == 0 || entry_addr < base_addr ||
 		entry_addr - base_addr >= size || sleigh_id.empty() ||
-		!valid_decompile_result_limits(result_limits) ||
+		!detail::valid_decompile_result_limits(result_limits) ||
 		!aida::analysis::validate_decompiler_entity_key(typed_request.entity).valid()) {
 		result.is_error = true;
 		result.error_text = "isolated decompiler input violates the typed provider contract";
@@ -1597,7 +1604,7 @@ inline ghidra_result_t decompile_isolated_regions(
 	}
 	if (regions.empty() || image_size == 0 ||
 		entry_addr < image_base || entry_addr - image_base >= image_size ||
-		sleigh_id.empty() || !valid_decompile_result_limits(result_limits) ||
+		sleigh_id.empty() || !detail::valid_decompile_result_limits(result_limits) ||
 		!aida::analysis::validate_decompiler_entity_key(typed_request.entity).valid()) {
 		result.is_error = true;
 		result.error_text = "isolated region decompiler input violates the typed provider contract";

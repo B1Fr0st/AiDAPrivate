@@ -1590,12 +1590,12 @@ inline tm_key_slot_info_t tm_place_key_slots(pe_file::pe_image_t& pe,
     sec->data.resize(cursor + kTmWbAesTableSize, 0);
     {
         uint8_t zero_key[16] = {0};
-        wbaes_table_t* tbl = static_cast<wbaes_table_t*>(
-            HeapAlloc(GetProcessHeap(), 0, sizeof(wbaes_table_t)));
+        aes_detail::wbaes_table_t* tbl = static_cast<aes_detail::wbaes_table_t*>(
+            HeapAlloc(GetProcessHeap(), 0, sizeof(aes_detail::wbaes_table_t)));
         if (tbl) {
-            wbaes_generate_tables(zero_key, 0, *tbl);
+            aes_detail::wbaes_generate_tables(zero_key, 0, *tbl);
             std::memcpy(sec->data.data() + cursor, tbl, kTmWbAesTableSize);
-            SecureZeroMemory(tbl, sizeof(wbaes_table_t));
+            SecureZeroMemory(tbl, sizeof(aes_detail::wbaes_table_t));
             HeapFree(GetProcessHeap(), 0, tbl);
         }
         uint32_t magic = kTmKeySlotMagicWbAes;

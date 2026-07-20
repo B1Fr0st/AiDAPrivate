@@ -1,5 +1,3 @@
-#pragma once
-
 #ifdef LoadImage
 #undef LoadImage
 #endif

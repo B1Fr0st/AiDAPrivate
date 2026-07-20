@@ -9,9 +9,20 @@
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace aida {
 namespace burp {
 namespace sequencer {
+
+inline constexpr size_t max_collection_count = 128;
+inline constexpr size_t max_target_samples = 250000;
+inline constexpr size_t max_collection_concurrency = 64;
+inline constexpr size_t max_sample_bytes = 64ULL * 1024ULL;
+inline constexpr size_t max_collection_sample_bytes = 64ULL * 1024ULL * 1024ULL;
+inline constexpr size_t max_total_sample_bytes = 512ULL * 1024ULL * 1024ULL;
+inline constexpr size_t max_raw_request_bytes = 1ULL * 1024ULL * 1024ULL;
+inline constexpr size_t max_extract_regex_bytes = 4096;
 
 struct collection_config_t
 {
@@ -40,6 +51,23 @@ struct collection_status_t
     std::string error_message;
     uint64_t    started_ms = 0;
     uint64_t    last_sample_ms = 0;
+    uint64_t    instance_revision = 0;
+    size_t      retained_sample_bytes = 0;
+};
+
+struct capacity_snapshot_t
+{
+    size_t collection_count = 0;
+    size_t collection_limit = max_collection_count;
+    size_t retained_sample_bytes = 0;
+    size_t retained_sample_limit = max_total_sample_bytes;
+};
+
+struct registry_snapshot_t
+{
+    uint64_t generation = 0;
+    capacity_snapshot_t capacity;
+    std::vector<collection_status_t> collections;
 };
 
 struct analysis_config_t
@@ -105,7 +133,14 @@ std::vector<std::string>  samples(uint64_t id, size_t max_count = 0);
 analysis_result_t         analyze(uint64_t id);
 analysis_result_t         analyze(uint64_t id, const analysis_config_t& config);
 std::vector<collection_status_t> list_collections();
+registry_snapshot_t         snapshot_collections();
+uint64_t                    registry_generation();
 bool                      delete_collection(uint64_t id);
+bool                      delete_collection_exact(uint64_t id, uint64_t started_ms,
+                              uint64_t instance_revision);
+
+nlohmann::json            export_json();
+bool                      import_json(const nlohmann::json& doc, bool replace_existing);
 
 std::string               last_error();
 

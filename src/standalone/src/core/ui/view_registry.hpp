@@ -84,6 +84,9 @@ struct view_descriptor_t {
     view_presentation_role_t role = view_presentation_role_t::tool_window;
     view_render_ownership_t render_ownership = view_render_ownership_t::registry_window;
     view_minimum_size_t minimum_size;
+    std::uint32_t persistence_version = 1;
+    std::uint32_t preset_introduced_revision = 1;
+    std::vector<stable_view_id_t> persistence_aliases;
     std::vector<stable_action_id_t> action_bindings;
     view_capability_fn_t capability;
     view_render_fn_t render;
@@ -163,6 +166,7 @@ public:
     std::size_t descriptor_count() const noexcept { return descriptors_.size(); }
     std::size_t instance_count() const noexcept { return instances_.size(); }
     std::uint64_t revision() const noexcept { return revision_; }
+    std::uint64_t visibility_revision() const noexcept { return visibility_revision_; }
 
 private:
     static view_operation_result_t validate_descriptor(const view_descriptor_t& descriptor);
@@ -182,6 +186,7 @@ private:
     std::optional<view_instance_id_t> focused_instance_;
     std::uint64_t focus_sequence_ = 0;
     std::uint64_t revision_ = 0;
+    std::uint64_t visibility_revision_ = 0;
 };
 
 }

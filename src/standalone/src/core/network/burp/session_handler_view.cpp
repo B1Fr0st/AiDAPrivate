@@ -12,6 +12,7 @@
 
 #include "session_handler_view.hpp"
 #include "session_handler.hpp"
+#include "../human_request_editor.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -399,9 +400,15 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::SameLine();
         ImGui::InputInt("Port##sh_new_step_port", &st.new_step_port);
         ImGui::InputInt("Timeout(ms)##sh_new_step_timeout", &st.new_step_timeout_ms);
-        ImGui::InputTextMultiline("Raw HTTP/1.1 request##sh_new_step_req",
-            st.new_step_request, sizeof(st.new_step_request),
-            ImVec2(right_w - 4.f, 112.f), ImGuiInputTextFlags_AllowTabInput);
+        static network_view::human_request_editor::fixed_state_t request_editor;
+        network_view::human_request_editor::render_config_t request_config;
+        request_config.stable_id = "session-handler-new-step";
+        request_config.size = ImVec2(right_w - 4.f, 112.f);
+        request_config.max_bytes = sizeof(st.new_step_request) - 1;
+        const auto request_editor_result = network_view::human_request_editor::render_fixed(
+            request_editor,
+            "session-handler.new-step." + std::to_string(cur.id),
+            st.new_step_request, request_config);
 
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Extractor (optional)");
         ImGui::InputText("Name##sh_new_ext_name", st.new_extract_name, sizeof(st.new_extract_name));
@@ -409,7 +416,10 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::InputText("Regex##sh_new_ext_regex", st.new_extract_regex, sizeof(st.new_extract_regex));
         ImGui::InputInt("Group##sh_new_ext_group", &st.new_extract_group);
 
-        if (aida::ui::button("Add step", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+        const bool add_step_disabled = !request_editor_result.valid ||
+            request_editor_result.has_unapplied_pretty;
+        if (aida::ui::button("Add step", aida::ui::button_kind_t::primary,
+                aida::ui::size_t_::sm, ImVec2(0.f, 0.f), add_step_disabled)) {
             session_handler::macro_step_t step;
             step.label = st.new_step_label;
             step.host = st.new_step_host;

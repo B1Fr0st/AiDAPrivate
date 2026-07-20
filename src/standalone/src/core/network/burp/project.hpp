@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -9,6 +10,9 @@
 namespace aida {
 namespace burp {
 namespace project {
+
+inline constexpr std::size_t maximum_project_file_bytes =
+    64ULL * 1024ULL * 1024ULL;
 
 bool initialize();
 void shutdown();

@@ -13,6 +13,8 @@
 namespace aida::analysis::c03_test {
 namespace {
 
+using namespace ::aida::analysis::type_graph;
+
 void require(bool condition, const char* message)
 {
 	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);

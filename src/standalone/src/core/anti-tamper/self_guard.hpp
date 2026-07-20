@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <bcrypt.h>
 #include <psapi.h>
@@ -9,13 +11,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "webhook.hpp"
@@ -723,12 +728,13 @@ inline void update_blocklist(const std::vector<aida_blocklist_entry_t>& entries)
             validated.push_back(entry);
     }
     if (validated.empty() && !entries.empty()) {
-        webhook::write_log("self_guard", "blocklist_update_all_invalid_retaining_previous");
+        anti_tamper::webhook::write_log(
+            "self_guard", "blocklist_update_all_invalid_retaining_previous");
         return;
     }
     std::unique_lock<std::shared_mutex> lk(blocklist_mutex());
     blocklist() = std::move(validated);
-    webhook::write_log_critical_fmt("self_guard",
+    anti_tamper::webhook::write_log_critical_fmt("self_guard",
         "blocklist_updated entries=%zu epoch=%u",
         blocklist().size(),
         entries.empty() ? 0u : entries.front().rotation_epoch);
@@ -769,7 +775,6 @@ inline bool cache_get(const std::string& key, self_guard_result_t& out_result) {
                     uint64_t cached_ct = std::strtoull(
                         key.c_str() + second_colon + 1, nullptr, 10);
                     if (current_ct != 0 && cached_ct != 0 && current_ct != cached_ct) {
-                        wlk.unlock();
                         lk.unlock();
                         std::unique_lock<std::shared_mutex> wlk2(cache_mutex());
                         check_cache().erase(key);
@@ -812,28 +817,65 @@ inline void cache_put(const std::string& key, self_guard_result_t result) {
     check_cache()[key] = std::move(entry);
 }
 
+inline bool self_guard_hmac_sha256(const uint8_t* key, uint32_t key_len,
+    const uint8_t* data, uint32_t data_len, uint8_t out[32]) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
+            nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0) {
+        return false;
+    }
+    if (BCryptCreateHash(algorithm, &hash, nullptr, 0,
+            const_cast<PUCHAR>(key), key_len, 0) != 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+    const bool ok = BCryptHashData(hash, const_cast<PUCHAR>(data), data_len, 0) == 0
+        && BCryptFinishHash(hash, out, 32, 0) == 0;
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    return ok;
+}
+
 inline uint64_t resolve_rolling_key_self_guard(uint32_t rva) {
     uint64_t k0 = 0, k1 = 0;
     anti_tamper::integrity::get_session_keys(k0, k1);
-    uint8_t ikm[24];
+    uint8_t ikm[24]{};
     memcpy(ikm, &k0, 8);
     memcpy(ikm + 8, &k1, 8);
     uint64_t rva_u64 = static_cast<uint64_t>(rva);
     memcpy(ikm + 16, &rva_u64, 8);
-    uint8_t prk[32];
-    anti_tamper::virtualizer::detail::hmac_sha256(
-        anti_tamper::state::g_vm_master_key, 32, ikm, 24, prk);
+    uint8_t prk[32]{};
     static const uint8_t info[16] = {
         'a','i','d','a','_','s','e','l','f','g','u','a','r','d','_','k'
     };
-    uint8_t okm[16];
-    anti_tamper::virtualizer::detail::hkdf_expand_sha256(prk, info, 16, okm, 16);
+    uint8_t expand_input[17]{};
+    memcpy(expand_input, info, sizeof(info));
+    expand_input[sizeof(info)] = 1;
+    uint8_t okm[32]{};
+    const bool extract_ok = self_guard_hmac_sha256(
+        anti_tamper::state::g_vm_master_key, 32, ikm,
+        static_cast<uint32_t>(sizeof(ikm)), prk);
+    const bool expand_ok = extract_ok
+        && self_guard_hmac_sha256(prk, static_cast<uint32_t>(sizeof(prk)),
+            expand_input, static_cast<uint32_t>(sizeof(expand_input)), okm);
+    if (!expand_ok) {
+        SecureZeroMemory(prk, sizeof(prk));
+        SecureZeroMemory(okm, sizeof(okm));
+        SecureZeroMemory(ikm, sizeof(ikm));
+        SecureZeroMemory(expand_input, sizeof(expand_input));
+        anti_tamper::enforce_violation_id(
+            aida::reason_ids::reason_id_from_string("self_guard_key_derivation_failed"),
+            "self_guard_key_derivation_failed");
+        __fastfail(static_cast<unsigned int>(SELF_GUARD_BUGCHECK_CODE));
+    }
     uint64_t out_lo = 0, out_hi = 0;
     memcpy(&out_lo, okm, 8);
     memcpy(&out_hi, okm + 8, 8);
-    SecureZeroMemory(prk, 32);
-    SecureZeroMemory(okm, 16);
-    SecureZeroMemory(ikm, 24);
+    SecureZeroMemory(prk, sizeof(prk));
+    SecureZeroMemory(okm, sizeof(okm));
+    SecureZeroMemory(ikm, sizeof(ikm));
+    SecureZeroMemory(expand_input, sizeof(expand_input));
     return out_lo ^ _rotl64(out_hi, 23);
 }
 
@@ -849,7 +891,7 @@ inline uintptr_t descramble_pointer(uintptr_t scrambled, uint32_t rva) {
     return scrambled ^ key;
 }
 
-__declspec(noinline) self_guard_result_t check_pid_self_impl(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t check_pid_self_impl(const self_guard_context_t& ctx) {
     auto& sid = identity();
     if (ctx.target_pid == sid.self_pid)
         return self_guard_result_t::bsod_self_pid;
@@ -916,7 +958,7 @@ __declspec(noinline) self_guard_result_t check_pid_self_impl(const self_guard_co
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t check_address_self_impl(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t check_address_self_impl(const self_guard_context_t& ctx) {
     auto& sid = identity();
     if (!ctx.has_pid || !ctx.has_address)
         return self_guard_result_t::allow;
@@ -949,7 +991,7 @@ __declspec(noinline) self_guard_result_t check_address_self_impl(const self_guar
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t check_binary_self_impl(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t check_binary_self_impl(const self_guard_context_t& ctx) {
     if (ctx.target_binary_path.empty())
         return self_guard_result_t::allow;
     auto& sid = identity();
@@ -986,7 +1028,7 @@ __declspec(noinline) self_guard_result_t check_binary_self_impl(const self_guard
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t check_blocklist_impl(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t check_blocklist_impl(const self_guard_context_t& ctx) {
     std::string name;
     uint8_t hash[32] = {};
     bool hash_computed = false;
@@ -1025,7 +1067,7 @@ __declspec(noinline) self_guard_result_t check_blocklist_impl(const self_guard_c
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t decoy_guard_1(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t decoy_guard_1(const self_guard_context_t& ctx) {
     volatile uint32_t noise = 0;
     noise ^= static_cast<uint32_t>(__rdtsc());
     noise ^= ctx.target_pid;
@@ -1034,7 +1076,7 @@ __declspec(noinline) self_guard_result_t decoy_guard_1(const self_guard_context_
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t decoy_guard_2(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t decoy_guard_2(const self_guard_context_t& ctx) {
     volatile uint64_t noise = 0;
     noise ^= __rdtsc();
     noise ^= ctx.target_address;
@@ -1043,7 +1085,7 @@ __declspec(noinline) self_guard_result_t decoy_guard_2(const self_guard_context_
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t decoy_guard_3(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t decoy_guard_3(const self_guard_context_t& ctx) {
     volatile uint32_t noise = 0x55AA55AAu;
     noise ^= ctx.target_pid ^ static_cast<uint32_t>(ctx.target_address);
     noise ^= static_cast<uint32_t>(__rdtsc());
@@ -1051,7 +1093,7 @@ __declspec(noinline) self_guard_result_t decoy_guard_3(const self_guard_context_
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t decoy_guard_4(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t decoy_guard_4(const self_guard_context_t& ctx) {
     volatile uint64_t noise = 0xA1DA0001ULL;
     noise ^= static_cast<uint64_t>(ctx.target_pid) | (ctx.target_address << 16);
     noise ^= __rdtsc();
@@ -1059,7 +1101,7 @@ __declspec(noinline) self_guard_result_t decoy_guard_4(const self_guard_context_
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t decoy_guard_5(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t decoy_guard_5(const self_guard_context_t& ctx) {
     volatile uint32_t noise = 0xDEADBEEFu;
     for (int i = 0; i < 4; ++i) {
         noise ^= static_cast<uint32_t>(ctx.target_address >> (i * 8));
@@ -1069,7 +1111,7 @@ __declspec(noinline) self_guard_result_t decoy_guard_5(const self_guard_context_
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t decoy_guard_6(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t decoy_guard_6(const self_guard_context_t& ctx) {
     volatile uint64_t a = __rdtsc();
     volatile uint64_t b = a ^ ctx.target_address ^ ctx.target_pid;
     volatile uint64_t c = b ^ _rotl64(a, 13);
@@ -1077,7 +1119,7 @@ __declspec(noinline) self_guard_result_t decoy_guard_6(const self_guard_context_
     return self_guard_result_t::allow;
 }
 
-__declspec(noinline) self_guard_result_t self_guard_check_impl(const self_guard_context_t& ctx) {
+__declspec(noinline) inline self_guard_result_t self_guard_check_impl(const self_guard_context_t& ctx) {
     using check_fn_t = self_guard_result_t(*)(const self_guard_context_t&);
 
     if (ctx.has_pid) {
@@ -1187,6 +1229,20 @@ inline self_guard_result_t invoke_self_guard(const self_guard_context_t& ctx) {
     return fn(ctx);
 }
 
+__declspec(noinline) inline uint64_t self_guard_text_hash_seh(
+    const void* data, size_t len, bool& ok) {
+    ok = false;
+    uint64_t hash = 0;
+    __try {
+        hash = anti_tamper::integrity::hash_memory(data, len);
+        ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        hash = 0;
+        ok = false;
+    }
+    return hash;
+}
+
 inline void verify_self_guard_integrity() {
     auto& sid = identity();
     if (!sid.initialized) return;
@@ -1194,7 +1250,7 @@ inline void verify_self_guard_integrity() {
     if (rt.code_snap.text_base == 0 || rt.code_snap.text_size == 0) return;
 
     bool hash_ok = false;
-    uint64_t current_hash = anti_tamper::driver_crc_text_hash_seh(
+    uint64_t current_hash = self_guard_text_hash_seh(
         reinterpret_cast<const void*>(rt.code_snap.text_base),
         rt.code_snap.text_size,
         hash_ok);
@@ -1375,10 +1431,10 @@ inline void vm_protect_self_guard_functions() {
 }
 
 inline bool initialize() {
-    webhook::write_log("init", "self_guard_initialize_ENTRY");
+    anti_tamper::webhook::write_log("init", "self_guard_initialize_ENTRY");
     auto& sid = identity();
     if (sid.initialized) {
-        webhook::write_log("init", "self_guard_already_initialized");
+        anti_tamper::webhook::write_log("init", "self_guard_already_initialized");
         return true;
     }
 
@@ -1445,7 +1501,7 @@ inline bool initialize() {
     g_self_guard_code_size.store(4096, std::memory_order_release);
 
     sid.initialized = true;
-    webhook::write_log_critical_fmt("init",
+    anti_tamper::webhook::write_log_critical_fmt("init",
         "self_guard_initialize_OK pid=%lu module_base=0x%llX module_size=0x%llX "
         "text_base=0x%llX text_size=0x%X text_hash=0x%016llX module_ranges=%zu "
         "watermark_set=%d image_hash_set=%d",

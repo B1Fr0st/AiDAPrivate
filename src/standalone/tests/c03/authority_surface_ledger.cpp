@@ -2768,7 +2768,7 @@ void verify_authority_cmake_integration(const std::filesystem::path& root) {
             ++observed;
         return observed;
     };
-    require(count_in(cmake, "aida_c03_register_manifest_entry(") == 57U &&
+    require(count_in(cmake, "aida_c03_register_manifest_entry(") == 56U &&
                 count_in(cmake, "aida_c03_register_direct_test(") == 13U &&
                 count_in(cmake, "add_test(NAME") == 3U &&
                 count_in(cmake,

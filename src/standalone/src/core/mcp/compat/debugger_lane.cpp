@@ -159,7 +159,9 @@ adapter_result_t<adapter_response_t> debugger_lane_t::handle(
             deadline - current);
         const auto wait = (std::min)(limits_.lock_poll_interval,
                                      (std::max)(remaining, std::chrono::milliseconds(1)));
-        lane_lock.try_lock_for(wait);
+        if (lane_lock.try_lock_for(wait)) {
+            break;
+        }
     }
 
     if (cancellation.cancelled()) {

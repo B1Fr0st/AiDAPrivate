@@ -6,6 +6,7 @@
 #include "c03_compatibility_registration.hpp"
 #include "../ida_compat_mut.hpp"
 #include "../ida_compat_read.hpp"
+#include "../ida_compat_schemas.hpp"
 #include "../schema_validator.hpp"
 #include "debugger_lane.hpp"
 #include "effect_policy.hpp"
@@ -39,6 +40,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -56,6 +58,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -130,14 +133,66 @@ namespace mcp_standalone
     {
         namespace python_compat = aida::standalone::mcp::compat;
 
+        class workspace_call_cancel_bridge_t final
+        {
+        public:
+            workspace_call_cancel_bridge_t(
+                std::optional<std::chrono::steady_clock::time_point> deadline,
+                std::atomic<bool>* external)
+                : source_(deadline), external_(external)
+            {
+                if (external_) {
+                    worker_ = std::thread([this]() {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        while (!stopping_) {
+                            if (external_->load(std::memory_order_acquire)) {
+                                source_.request_cancel();
+                                break;
+                            }
+                            cv_.wait_for(lock, std::chrono::milliseconds(10), [this]() {
+                                return stopping_;
+                            });
+                        }
+                    });
+                }
+            }
+
+            ~workspace_call_cancel_bridge_t()
+            {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    stopping_ = true;
+                }
+                cv_.notify_all();
+                if (worker_.joinable())
+                    worker_.join();
+            }
+
+            workspace_call_cancel_bridge_t(const workspace_call_cancel_bridge_t&) = delete;
+            workspace_call_cancel_bridge_t& operator=(const workspace_call_cancel_bridge_t&) = delete;
+
+            aida::analysis::cancellation_token_t token() const noexcept
+            {
+                return source_.token();
+            }
+
+        private:
+            aida::analysis::cancellation_source_t source_;
+            std::atomic<bool>* external_ = nullptr;
+            std::mutex mutex_;
+            std::condition_variable cv_;
+            bool stopping_ = false;
+            std::thread worker_;
+        };
+
         std::optional<fs::path> standalone_package_root()
         {
             std::vector<wchar_t> path(32768U, L'\0');
             const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
             if (length == 0 || length >= path.size())
                 return std::nullopt;
-            path.resize(length);
-            const fs::path executable(path);
+            const fs::path executable(
+                std::wstring(path.data(), static_cast<std::size_t>(length)));
             if (executable.parent_path().empty())
                 return std::nullopt;
             return executable.parent_path();
@@ -1164,7 +1219,7 @@ namespace mcp_standalone
                     return found->second(arguments, context);
                 return tool_result_t::error(
                     "No production workspace adapter is registered for " + std::string(name) + ".",
-                    "MCP_BACKEND_UNAVAILABLE");
+                    std::string("MCP_BACKEND_UNAVAILABLE"));
             }
 
             static json scalar_or_array_items(const json& value)
@@ -1744,8 +1799,8 @@ namespace mcp_standalone
                             if (cancelled())
                                 return tool_result_t::error(
                                     "Decompile address annotation was interrupted.",
-                                    context.cancellation_requested()
-                                        ? "CANCELLED" : "DEADLINE_EXCEEDED");
+                                    std::string(context.cancellation_requested()
+                                        ? "CANCELLED" : "DEADLINE_EXCEEDED"));
                             const auto newline = code.find('\n', begin);
                             line_starts.push_back(begin);
                             line_ends.push_back(newline == std::string::npos
@@ -1774,8 +1829,8 @@ namespace mcp_standalone
                             if ((mapping_ordinal++ & 0x3FU) == 0U && cancelled())
                                 return tool_result_t::error(
                                     "Decompile address annotation was interrupted.",
-                                    context.cancellation_requested()
-                                        ? "CANCELLED" : "DEADLINE_EXCEEDED");
+                                    std::string(context.cancellation_requested()
+                                        ? "CANCELLED" : "DEADLINE_EXCEEDED"));
                             if (!mapping.is_object() ||
                                 !mapping.contains("address") ||
                                 !mapping["address"].is_string())
@@ -1814,8 +1869,8 @@ namespace mcp_standalone
                             if ((line & 0x3FU) == 0U && cancelled())
                                 return tool_result_t::error(
                                     "Decompile address annotation was interrupted.",
-                                    context.cancellation_requested()
-                                        ? "CANCELLED" : "DEADLINE_EXCEEDED");
+                                    std::string(context.cancellation_requested()
+                                        ? "CANCELLED" : "DEADLINE_EXCEEDED"));
                             const auto line_begin = line_starts[line];
                             const auto line_end = line_ends[line];
                             const auto available = maximum_code_bytes - marked.size();
@@ -1905,7 +1960,7 @@ namespace mcp_standalone
                     json output = json::array();
                     for (const auto& target : scalar_or_array_items(arguments.at("addrs"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const auto legacy = invoke_legacy(
                             "xrefs_to", json{{"address", target},
                                        {"limit", arguments.value("limit", 100U)}}, context);
@@ -1929,7 +1984,7 @@ namespace mcp_standalone
                     json output = json::array();
                     for (const auto& query : scalar_or_array_items(arguments.at("queries"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const auto legacy = invoke_legacy(
                             "xrefs_to_field", json{{"struct_name", query.at("struct")},
                                        {"field_name", query.at("field")}}, context);
@@ -1951,7 +2006,7 @@ namespace mcp_standalone
                     json output = json::array();
                     for (const auto& target : scalar_or_array_items(arguments.at("addrs"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const auto legacy = invoke_legacy(
                             "callees", json{{"address", target}}, context);
                         json item{{"addr", target.get<std::string>()}};
@@ -1982,7 +2037,7 @@ namespace mcp_standalone
                     json output = json::array();
                     for (const auto& query : scalar_or_array_items(arguments.at("queries"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const std::string target = query.value("addr", "*");
                         std::vector<json> functions;
                         std::string error;
@@ -2076,7 +2131,7 @@ namespace mcp_standalone
                     const auto snapshot = context.workspace->snapshot();
                     for (const auto& query : scalar_or_array_items(arguments.at("queries"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const std::string target = query.at("addr").get<std::string>();
                         const auto lookup = lookup_analysis_function(query.at("addr"), context);
                         const auto function = first_generated_function(lookup);
@@ -2271,11 +2326,11 @@ namespace mcp_standalone
                     const auto snapshot = context.workspace->snapshot();
                     if (!snapshot)
                         return tool_result_t::error(
-                            "Xref query requires an analysis snapshot.", "NO_SNAPSHOT");
+                            "Xref query requires an analysis snapshot.", std::string("NO_SNAPSHOT"));
                     json output = json::array();
                     for (const auto& query : scalar_or_array_items(arguments.at("queries"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const std::string target = query.at("addr").get<std::string>();
                         auto address = wave_c_address_value(query.at("addr"));
                         if (!address) {
@@ -2356,12 +2411,12 @@ namespace mcp_standalone
                         if (patterns.size() != 1)
                             return tool_result_t::error(
                                 "A find_bytes cursor requires exactly one pattern.",
-                                "INVALID_QUERY_CURSOR");
+                                std::string("INVALID_QUERY_CURSOR"));
                         cursor = &*found;
                     }
                     for (const auto& pattern_value : patterns) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const std::string pattern = pattern_value.get<std::string>();
                         const auto translated = wildcard_byte_pattern(pattern);
                         if (!translated) {
@@ -2376,7 +2431,7 @@ namespace mcp_standalone
                         if (!bytes || !mask)
                             return tool_result_t::error(
                                 "Byte pattern normalization failed.",
-                                "INVALID_BYTE_PATTERN");
+                                std::string("INVALID_BYTE_PATTERN"));
                         aida::analysis::byte_search_query_t query;
                         query.pattern = *bytes;
                         query.mask = *mask;
@@ -2406,7 +2461,7 @@ namespace mcp_standalone
                     const std::size_t maximum = arguments.value("max_blocks", std::size_t{1000});
                     for (const auto& target : scalar_or_array_items(arguments.at("addrs"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const auto legacy = invoke_legacy(
                             "basic_blocks", json{{"address", target}}, context);
                         json item{{"addr", target.get<std::string>()}};
@@ -2445,12 +2500,12 @@ namespace mcp_standalone
                         if (targets.size() != 1)
                             return tool_result_t::error(
                                 "A find cursor requires exactly one target.",
-                                "INVALID_QUERY_CURSOR");
+                                std::string("INVALID_QUERY_CURSOR"));
                         cursor = &*found;
                     }
                     for (const auto& target : targets) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const std::string route_semantics = json{
                             {"tool", "find"}, {"type", search_type},
                             {"target", target}}.dump();
@@ -2462,7 +2517,7 @@ namespace mcp_standalone
                                 return tool_result_t::error(
                                     address ? "Analysis snapshot is unavailable." :
                                         "Reference target is invalid.",
-                                    address ? "NO_SNAPSHOT" : "INVALID_REFERENCE_TARGET");
+                                    std::string(address ? "NO_SNAPSHOT" : "INVALID_REFERENCE_TARGET"));
                             }
                             std::unordered_set<std::uint64_t> sources;
                             for (const auto& xref : snapshot->xrefs) {
@@ -2474,7 +2529,7 @@ namespace mcp_standalone
                                 if (cursor)
                                     return tool_result_t::error(
                                         "Reference query cursor has no current source set.",
-                                        "INVALID_QUERY_CURSOR");
+                                        std::string("INVALID_QUERY_CURSOR"));
                             } else {
                                 const auto bounds = (std::minmax_element)(
                                     sources.begin(), sources.end());
@@ -2482,7 +2537,7 @@ namespace mcp_standalone
                                     (std::numeric_limits<std::uint64_t>::max)()) {
                                     return tool_result_t::error(
                                         "Reference sources cannot be represented as an address range.",
-                                        "INVALID_REFERENCE_TARGET");
+                                        std::string("INVALID_REFERENCE_TARGET"));
                                 }
                                 aida::analysis::address_search_query_t address_query;
                                 address_query.begin = {
@@ -2521,7 +2576,7 @@ namespace mcp_standalone
                                 if (!immediate)
                                     return tool_result_t::error(
                                         "Immediate search target is invalid.",
-                                        "INVALID_IMMEDIATE_TARGET");
+                                        std::string("INVALID_IMMEDIATE_TARGET"));
                                 aida::analysis::instruction_search_query_t instruction;
                                 instruction.filter.immediate = *immediate;
                                 query = std::move(instruction);
@@ -2552,11 +2607,11 @@ namespace mcp_standalone
                     const auto snapshot = context.workspace->snapshot();
                     if (!snapshot)
                         return tool_result_t::error(
-                            "Instruction query requires an analysis snapshot.", "NO_SNAPSHOT");
+                            "Instruction query requires an analysis snapshot.", std::string("NO_SNAPSHOT"));
                     json output = json::array();
                     for (const auto& query : scalar_or_array_items(arguments.at("queries"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const std::size_t offset = query.value("offset", std::size_t{0});
                         const std::size_t count = static_cast<std::size_t>(
                             query_count(query, 100, 5000));
@@ -2671,7 +2726,7 @@ namespace mcp_standalone
                     std::string header;
                     for (const auto& target : scalar_or_array_items(arguments.at("addrs"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const auto lookup = lookup_analysis_function(target, context);
                         const auto function = first_generated_function(lookup);
                         if (!function) {
@@ -2681,7 +2736,7 @@ namespace mcp_standalone
                                 if (format == "c_header")
                                     return tool_result_t::error(
                                         "C header export is unavailable for managed entity locators.",
-                                        "MANAGED_C_HEADER_UNSUPPORTED");
+                                        std::string("MANAGED_C_HEADER_UNSUPPORTED"));
                                 if (format == "json") {
                                     if (decompiled.success) {
                                         functions.push_back({
@@ -2785,7 +2840,7 @@ namespace mcp_standalone
                     const auto max_edges = arguments.value("max_edges", std::size_t{5000});
                     for (const auto& root : scalar_or_array_items(arguments.at("roots"))) {
                         if (cancelled())
-                            return tool_result_t::error("Analysis request cancelled.", "CANCELLED");
+                            return tool_result_t::error("Analysis request cancelled.", std::string("CANCELLED"));
                         const auto legacy = invoke_legacy(
                             "callgraph", json{{"address", root},
                                        {"depth", arguments.value("max_depth", 5U)},
@@ -2838,7 +2893,7 @@ namespace mcp_standalone
 
                 return tool_result_t::error(
                     "Analysis adapter is not registered for " + std::string(name) + ".",
-                    "MCP_BACKEND_UNAVAILABLE");
+                    std::string("MCP_BACKEND_UNAVAILABLE"));
             }
 
             static std::uint64_t query_count(
@@ -3093,7 +3148,7 @@ namespace mcp_standalone
                         for (const auto& hit : page.hits) {
                             if (context.cancellation_requested())
                                 return tool_result_t::error(
-                                    "Entity query was cancelled.", "CANCELLED");
+                                    "Entity query was cancelled.", std::string("CANCELLED"));
                             if (!filter.empty() && hit.text.find(filter) == std::string::npos)
                                 continue;
                             if (pattern) {
@@ -3218,7 +3273,7 @@ namespace mcp_standalone
                         (start && end && *end < *start)) {
                         return tool_result_t::error(
                             "Search text bounds are invalid.",
-                            "INVALID_SEARCH_RANGE");
+                            std::string("INVALID_SEARCH_RANGE"));
                     }
                     const bool code_only = arguments.value("code_only", true);
                     const std::string include_mode =
@@ -3265,7 +3320,7 @@ namespace mcp_standalone
                     return invoke_legacy("int_convert", arguments, context);
                 return tool_result_t::error(
                     "Core adapter is not registered for " + std::string(name) + ".",
-                    "MCP_BACKEND_UNAVAILABLE");
+                    std::string("MCP_BACKEND_UNAVAILABLE"));
             }
 
             struct assembly_register_t final {
@@ -3835,11 +3890,11 @@ namespace mcp_standalone
                 const auto memory = arguments.find("_aida_memory");
                 if (memory == arguments.end() || !memory->is_object())
                     return tool_result_t::error(
-                        "Memory adapter intent is missing.", "MCP_MEMORY_INTENT_INVALID");
+                        "Memory adapter intent is missing.", std::string("MCP_MEMORY_INTENT_INVALID"));
                 if (!live_snapshot_identity_current(context))
                     return tool_result_t::error(
                         "Live snapshot identity is stale or unavailable.",
-                        "LIVE_SNAPSHOT_IDENTITY_INVALID");
+                        std::string("LIVE_SNAPSHOT_IDENTITY_INVALID"));
                 const auto ranges = memory->find("ranges");
                 if (context.kind == aida::analysis::target_kind_t::live_snapshot) {
                     std::size_t requested = 0;
@@ -3856,7 +3911,7 @@ namespace mcp_standalone
                         live_routing.limits().maximum_snapshots_per_request) {
                         return tool_result_t::error(
                             "Live memory request exceeds the snapshot quota.",
-                            "LIVE_SNAPSHOT_BUDGET_EXCEEDED");
+                            std::string("LIVE_SNAPSHOT_BUDGET_EXCEEDED"));
                     }
                 }
                 json result = json::array();
@@ -3891,13 +3946,13 @@ namespace mcp_standalone
                     const auto queries = arguments.find("queries");
                     if (queries == arguments.end())
                         return tool_result_t::error(
-                            "Global value queries are missing.", "MCP_MEMORY_INTENT_INVALID");
+                            "Global value queries are missing.", std::string("MCP_MEMORY_INTENT_INVALID"));
                     const json values = queries->is_array()
                         ? *queries : json::array({*queries});
                     for (const auto& query : values) {
                         if (context.cancellation_requested())
                             return tool_result_t::error(
-                                "Memory request was cancelled.", "CANCELLED");
+                                "Memory request was cancelled.", std::string("CANCELLED"));
                         const std::string query_text = query.get<std::string>();
                         if (context.kind == aida::analysis::target_kind_t::live_snapshot) {
                             auto address = wave_c_address_value(query);
@@ -3961,11 +4016,11 @@ namespace mcp_standalone
                 } else {
                     if (ranges == memory->end() || !ranges->is_array())
                         return tool_result_t::error(
-                            "Memory ranges are missing.", "MCP_MEMORY_INTENT_INVALID");
+                            "Memory ranges are missing.", std::string("MCP_MEMORY_INTENT_INVALID"));
                     for (const auto& range : *ranges) {
                         if (context.cancellation_requested())
                             return tool_result_t::error(
-                                "Memory request was cancelled.", "CANCELLED");
+                                "Memory request was cancelled.", std::string("CANCELLED"));
                         const std::string address_text = range.at("addr").get<std::string>();
                         const auto address = range.at("address").get<std::uint64_t>();
                         const auto size = range.at("size").get<std::size_t>();
@@ -4040,11 +4095,11 @@ namespace mcp_standalone
                 if (!live_snapshot_identity_current(context))
                     return tool_result_t::error(
                         "Live snapshot identity changed during the memory request.",
-                        "LIVE_SNAPSHOT_IDENTITY_CHANGED");
+                        std::string("LIVE_SNAPSHOT_IDENTITY_CHANGED"));
                 if (context.kind == aida::analysis::target_kind_t::live_snapshot && !binding)
                     return tool_result_t::error(
                         "Live memory response has no resolved target binding.",
-                        "LIVE_SNAPSHOT_BINDING_MISSING");
+                        std::string("LIVE_SNAPSHOT_BINDING_MISSING"));
 
                 return tool_result_t::ok(json{
                     {"result", std::move(result)},
@@ -4062,23 +4117,23 @@ namespace mcp_standalone
                 if (context.kind == aida::analysis::target_kind_t::live_snapshot)
                     return tool_result_t::error(
                         "Static overlay mutation is denied for live targets.",
-                        "STATIC_OVERLAY_LIVE_TARGET_DENIED");
+                        std::string("STATIC_OVERLAY_LIVE_TARGET_DENIED"));
                 const auto memory = arguments.find("_aida_memory");
                 if (memory == arguments.end() || !memory->is_object())
                     return tool_result_t::error(
-                        "Memory overlay intent is missing.", "MCP_MEMORY_INTENT_INVALID");
+                        "Memory overlay intent is missing.", std::string("MCP_MEMORY_INTENT_INVALID"));
                 const auto operations = memory->find("operations");
                 if (operations == memory->end() || !operations->is_array() ||
                     operations->empty())
                     return tool_result_t::error(
-                        "Memory overlay operations are missing.", "MCP_MEMORY_INTENT_INVALID");
+                        "Memory overlay operations are missing.", std::string("MCP_MEMORY_INTENT_INVALID"));
 
                 json legacy_items = json::array();
                 json receipts = json::array();
                 for (const auto& operation : *operations) {
                     if (context.cancellation_requested())
                         return tool_result_t::error(
-                            "Memory overlay request was cancelled.", "CANCELLED");
+                            "Memory overlay request was cancelled.", std::string("CANCELLED"));
                     const auto address = operation.at("address").get<std::uint64_t>();
                     const auto size = operation.at("size").get<std::size_t>();
                     const auto before = read_snapshot_bytes(
@@ -4088,7 +4143,7 @@ namespace mcp_standalone
                     if (!before || !after || after->size() != size)
                         return tool_result_t::error(
                             "Memory overlay bytes could not be captured.",
-                            "MCP_MEMORY_SNAPSHOT_FAILED");
+                            std::string("MCP_MEMORY_SNAPSHOT_FAILED"));
                     if (name == "patch") {
                         legacy_items.push_back({
                             {"address", operation.at("addr")},
@@ -4118,7 +4173,7 @@ namespace mcp_standalone
                 if (name != "patch" && name != "put_int")
                     return tool_result_t::error(
                         "Memory overlay tool has no production handler.",
-                        "MCP_BACKEND_UNAVAILABLE");
+                        std::string("MCP_BACKEND_UNAVAILABLE"));
                 auto committed = name == "patch"
                     ? invoke_legacy("patch", legacy_arguments, context)
                     : invoke_legacy("put_int", legacy_arguments, context);
@@ -4132,13 +4187,13 @@ namespace mcp_standalone
                     !revision->is_number_unsigned())
                     return tool_result_t::error(
                         "Memory overlay receipt is incomplete.",
-                        "MCP_MEMORY_RECEIPT_INVALID");
+                        std::string("MCP_MEMORY_RECEIPT_INVALID"));
                 const auto transaction_value = transaction_id->get<std::uint64_t>();
                 const auto revision_after = revision->get<std::uint64_t>();
                 if (transaction_value == 0 || revision_after <= context.overlay_revision)
                     return tool_result_t::error(
                         "Memory overlay revision did not advance.",
-                        "MCP_MEMORY_RECEIPT_INVALID");
+                        std::string("MCP_MEMORY_RECEIPT_INVALID"));
 
                 committed.data["_aida_memory"]["transaction"] = {
                     {"transaction_id", std::to_string(transaction_value)},
@@ -4166,7 +4221,7 @@ namespace mcp_standalone
                 const auto memory = arguments.find("_aida_memory");
                 if (memory == arguments.end() || !memory->is_object())
                     return tool_result_t::error(
-                        "Memory adapter intent is missing.", "MCP_MEMORY_INTENT_INVALID");
+                        "Memory adapter intent is missing.", std::string("MCP_MEMORY_INTENT_INVALID"));
                 const std::string operation = memory->value("operation", std::string());
                 if (operation == "read")
                     return invoke_memory_read_backend(
@@ -4175,7 +4230,7 @@ namespace mcp_standalone
                     return invoke_memory_overlay_backend(
                         name, arguments, context, live_routing, cancellation);
                 return tool_result_t::error(
-                    "Memory adapter operation is invalid.", "MCP_MEMORY_INTENT_INVALID");
+                    "Memory adapter operation is invalid.", std::string("MCP_MEMORY_INTENT_INVALID"));
             }
 
             static std::optional<aida::analysis::address_t> generated_overlay_address(
@@ -4276,20 +4331,20 @@ namespace mcp_standalone
                 if (context.kind != aida::analysis::target_kind_t::static_file)
                     return tool_result_t::error(
                         "Generated modify tools require a static analysis workspace.",
-                        "MCP_LIVE_MUTATION_DENIED");
+                        std::string("MCP_LIVE_MUTATION_DENIED"));
                 const auto overlay = context.workspace->overlay();
                 if (!overlay)
                     return tool_result_t::error(
-                        "Reversible overlay journal is unavailable.", "NO_OVERLAY");
+                        "Reversible overlay journal is unavailable.", std::string("NO_OVERLAY"));
                 if (operations.empty())
                     return tool_result_t::error(
                         "Generated modify transaction contains no operations.",
-                        "MCP_EMPTY_MUTATION");
+                        std::string("MCP_EMPTY_MUTATION"));
                 const auto before = overlay->snapshot().revision;
                 if (before != context.overlay_revision)
                     return tool_result_t::error(
                         "Overlay generation changed before the generated mutation committed.",
-                        "MCP_STALE_OVERLAY");
+                        std::string("MCP_STALE_OVERLAY"));
                 aida::analysis::overlay_transaction_request_t transaction;
                 transaction.operations = std::move(operations);
                 transaction.dry_run = dry_run;
@@ -4302,7 +4357,7 @@ namespace mcp_standalone
                     if (now >= context.deadline_ms)
                         return tool_result_t::error(
                             "Generated modify transaction deadline expired.",
-                            "DEADLINE_EXCEEDED");
+                            std::string("DEADLINE_EXCEEDED"));
                     cancellation.set_deadline(
                         std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(context.deadline_ms - now));
@@ -4313,12 +4368,12 @@ namespace mcp_standalone
                         committed.error().message.empty()
                             ? "Generated modify transaction failed."
                             : committed.error().message,
-                        "MCP_OVERLAY_TRANSACTION_FAILED");
+                        std::string("MCP_OVERLAY_TRANSACTION_FAILED"));
                 const auto& receipt = committed.value();
                 if (receipt.operations.size() != transaction.operations.size())
                     return tool_result_t::error(
                         "Generated modify transaction returned an incomplete receipt.",
-                        "MCP_OVERLAY_RECEIPT_INVALID");
+                        std::string("MCP_OVERLAY_RECEIPT_INVALID"));
                 std::uint64_t transaction_id = receipt.transaction_id;
                 if (transaction_id == 0) {
                     transaction_id = next_receipt_id_.fetch_add(1, std::memory_order_relaxed);
@@ -4350,7 +4405,7 @@ namespace mcp_standalone
                 if (name == "add_bookmark") {
                     const auto address = generated_overlay_address(arguments.at("addr"), context);
                     if (!address)
-                        return tool_result_t::error("Bookmark address is invalid.", "INVALID_ADDRESS");
+                        return tool_result_t::error("Bookmark address is invalid.", std::string("INVALID_ADDRESS"));
                     const std::string prefix = arguments.value("prefix", "idaMCP: ");
                     const std::string title = prefix + arguments.at("name").get<std::string>();
                     aida::analysis::overlay_operation_t operation;
@@ -4370,7 +4425,7 @@ namespace mcp_standalone
                     const auto overlay = context.workspace->overlay();
                     if (!overlay)
                         return tool_result_t::error(
-                            "Reversible overlay journal is unavailable.", "NO_OVERLAY");
+                            "Reversible overlay journal is unavailable.", std::string("NO_OVERLAY"));
                     const auto snapshot = overlay->snapshot();
                     std::vector<aida::analysis::overlay_operation_t> operations;
                     json result = json::array();
@@ -4378,7 +4433,7 @@ namespace mcp_standalone
                     for (const auto& value : values) {
                         const auto address = generated_item_address(value, context);
                         if (!address)
-                            return tool_result_t::error("Comment address is invalid.", "INVALID_ADDRESS");
+                            return tool_result_t::error("Comment address is invalid.", std::string("INVALID_ADDRESS"));
                         const std::string comment = value.at("comment").get<std::string>();
                         aida::analysis::overlay_operation_t operation;
                         operation.kind = aida::analysis::overlay_operation_kind_t::comment_update;
@@ -4418,20 +4473,20 @@ namespace mcp_standalone
                         const auto address = generated_item_address(value, context);
                         if (!address)
                             return tool_result_t::error(
-                                "Definition address is invalid.", "INVALID_ADDRESS");
+                                "Definition address is invalid.", std::string("INVALID_ADDRESS"));
                         auto end = generated_item_end(value, context);
                         if (!end && name != "define_func") {
                             const auto size = value.value("size", std::uint64_t{1});
                             if (size == 0 || size >
                                 (std::numeric_limits<std::uint64_t>::max)() - address->value)
                                 return tool_result_t::error(
-                                    "Definition size is invalid.", "INVALID_RANGE");
+                                    "Definition size is invalid.", std::string("INVALID_RANGE"));
                             end = *address;
                             end->value += size;
                         }
                         if (end && end->value <= address->value)
                             return tool_result_t::error(
-                                "Definition range is not increasing.", "INVALID_RANGE");
+                                "Definition range is not increasing.", std::string("INVALID_RANGE"));
                         aida::analysis::overlay_operation_t operation;
                         operation.kind = name == "define_code"
                             ? aida::analysis::overlay_operation_kind_t::define_code
@@ -4468,7 +4523,7 @@ namespace mcp_standalone
                             value.at("type").get_ref<const std::string&>().empty())
                             return tool_result_t::error(
                                 "Data definition requires a valid address and type.",
-                                "INVALID_DATA_DEFINITION");
+                                std::string("INVALID_DATA_DEFINITION"));
                         aida::analysis::overlay_operation_t operation;
                         operation.kind = aida::analysis::overlay_operation_kind_t::define_data;
                         operation.address = *address;
@@ -4493,13 +4548,13 @@ namespace mcp_standalone
                     if (!image)
                         return tool_result_t::error(
                             "Assembly patching requires a normalized image.",
-                            "ANALYSIS_UNAVAILABLE");
+                            std::string("ANALYSIS_UNAVAILABLE"));
                     using architecture_t = aida::analysis::architecture_id_t;
                     if (image->architecture != architecture_t::x86 &&
                         image->architecture != architecture_t::x86_64)
                         return tool_result_t::error(
                             "Assembly patching supports x86 and x86-64 workspaces only.",
-                            "UNSUPPORTED_ARCHITECTURE");
+                            std::string("UNSUPPORTED_ARCHITECTURE"));
                     std::vector<aida::analysis::overlay_operation_t> operations;
                     json result = json::array();
                     operations.reserve(values.size());
@@ -4507,7 +4562,7 @@ namespace mcp_standalone
                         const auto address = generated_item_address(value, context);
                         if (!address)
                             return tool_result_t::error(
-                                "Assembly patch address is invalid.", "INVALID_ADDRESS");
+                                "Assembly patch address is invalid.", std::string("INVALID_ADDRESS"));
                         aida::analysis::overlay_operation_t operation;
                         operation.kind = aida::analysis::overlay_operation_kind_t::assembly_patch;
                         operation.address = *address;
@@ -4516,7 +4571,7 @@ namespace mcp_standalone
                             (std::numeric_limits<std::uint64_t>::max)() - image->image_base)
                             return tool_result_t::error(
                                 "Assembly patch address overflows the workspace image base.",
-                                "INVALID_ADDRESS");
+                                std::string("INVALID_ADDRESS"));
                         std::string assembly_error;
                         auto assembled = assemble_x86_overlay(
                             operation.assembly, image->image_base + address->value,
@@ -4527,7 +4582,7 @@ namespace mcp_standalone
                                 assembly_error.empty()
                                     ? "Assembly patch could not be encoded."
                                     : std::move(assembly_error),
-                                "ASSEMBLY_ENCODING_FAILED");
+                                std::string("ASSEMBLY_ENCODING_FAILED"));
                         operation.bytes = std::move(*assembled);
                         operations.push_back(std::move(operation));
                         result.push_back({{"addr", canonical_overlay_address(*address)}});
@@ -4553,7 +4608,7 @@ namespace mcp_standalone
                         const auto address = generated_item_address(value, context);
                         if (!address)
                             return tool_result_t::error(
-                                "Recompile address is invalid.", "INVALID_ADDRESS");
+                                "Recompile address is invalid.", std::string("INVALID_ADDRESS"));
                         aida::analysis::overlay_operation_t operation;
                         operation.kind = aida::analysis::overlay_operation_kind_t::reanalysis;
                         operation.address = *address;
@@ -4576,7 +4631,7 @@ namespace mcp_standalone
                         if (!address || kind.empty())
                             return tool_result_t::error(
                                 "Operand type requires a valid address and kind.",
-                                "INVALID_OPERAND_TYPE");
+                                std::string("INVALID_OPERAND_TYPE"));
                         const auto operand = value.value("op_n", std::uint64_t{0});
                         aida::analysis::overlay_operation_t operation;
                         operation.kind = aida::analysis::overlay_operation_kind_t::type_update;
@@ -4626,12 +4681,12 @@ namespace mcp_standalone
                     };
                     if (batch.contains("func") && !append_functions(batch.at("func")))
                         return tool_result_t::error(
-                            "Function rename address is invalid.", "INVALID_ADDRESS");
+                            "Function rename address is invalid.", std::string("INVALID_ADDRESS"));
                     if (batch.contains("data")) {
                         const auto snapshot = context.workspace->snapshot();
                         if (!snapshot)
                             return tool_result_t::error(
-                                "Data rename requires an analysis snapshot.", "NO_SNAPSHOT");
+                                "Data rename requires an analysis snapshot.", std::string("NO_SNAPSHOT"));
                         for (const auto& value : scalar_or_array_items(batch.at("data"))) {
                             const std::string old_name = value.at("old").get<std::string>();
                             const auto symbol = std::find_if(
@@ -4641,12 +4696,12 @@ namespace mcp_standalone
                                 });
                             if (symbol == snapshot->symbols.end())
                                 return tool_result_t::error(
-                                    "Data rename source symbol was not found.", "SYMBOL_NOT_FOUND");
+                                    "Data rename source symbol was not found.", std::string("SYMBOL_NOT_FOUND"));
                             const auto address = generated_overlay_address(
                                 hex_addr(symbol->address.value), context);
                             if (!address)
                                 return tool_result_t::error(
-                                    "Data rename address is invalid.", "INVALID_ADDRESS");
+                                    "Data rename address is invalid.", std::string("INVALID_ADDRESS"));
                             aida::analysis::overlay_operation_t operation;
                             operation.kind = aida::analysis::overlay_operation_kind_t::name;
                             operation.address = *address;
@@ -4707,12 +4762,12 @@ namespace mcp_standalone
                         !append_scoped(batch.at("local"), true))
                         return tool_result_t::error(
                             "Local rename source has no stable declared stack-slot identity.",
-                            "MCP_LOCAL_RENAME_UNRESOLVED");
+                            std::string("MCP_LOCAL_RENAME_UNRESOLVED"));
                     if (batch.contains("stack") &&
                         !append_scoped(batch.at("stack"), false))
                         return tool_result_t::error(
                             "Stack rename source has no stable declared slot identity.",
-                            "MCP_STACK_RENAME_UNRESOLVED");
+                            std::string("MCP_STACK_RENAME_UNRESOLVED"));
                     json output{
                         {"func", std::move(function_results)}, {"data", std::move(data_results)},
                         {"local", std::move(local_results)}, {"stack", std::move(stack_results)},
@@ -4731,7 +4786,7 @@ namespace mcp_standalone
 
                 return tool_result_t::error(
                     "Modify adapter is not registered for " + std::string(name) + ".",
-                    "MCP_BACKEND_UNAVAILABLE");
+                    std::string("MCP_BACKEND_UNAVAILABLE"));
             }
 
             wave_c_compat::adapter_result_t<wave_c_compat::adapter_response_t>
@@ -4914,7 +4969,7 @@ namespace mcp_standalone
                     response.diagnostic_code = "cancelled";
                     return response;
                 }
-                const auto entity = aida::analysis::workbench::
+                const auto entity = aida::workbench::
                     pseudocode_document::parse_pseudocode_entity_locator(
                         request.subject);
                 if (!entity || entity->address || !entity->token ||
@@ -5374,21 +5429,21 @@ namespace mcp_standalone
                 const auto database = context.workspace->database();
                 if (!database)
                     return tool_result_t::error(
-                        "Workspace persistence is unavailable.", "WORKSPACE_DATABASE_UNAVAILABLE");
+                        "Workspace persistence is unavailable.", std::string("WORKSPACE_DATABASE_UNAVAILABLE"));
                 auto ticket = database->checkpoint(false);
                 if (!ticket.accepted || !ticket.completion.valid())
                     return tool_result_t::error(
-                        "Workspace checkpoint was not accepted.", "WORKSPACE_CHECKPOINT_REJECTED");
+                        "Workspace checkpoint was not accepted.", std::string("WORKSPACE_CHECKPOINT_REJECTED"));
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::seconds(30);
                 if (ticket.completion.wait_until(deadline) != std::future_status::ready)
                     return tool_result_t::error(
                         "Workspace checkpoint exceeded its bounded deadline.",
-                        "WORKSPACE_CHECKPOINT_TIMEOUT");
+                        std::string("WORKSPACE_CHECKPOINT_TIMEOUT"));
                 const auto result = ticket.completion.get();
                 if (!result)
                     return tool_result_t::error(
-                        "Workspace checkpoint failed.", "WORKSPACE_CHECKPOINT_FAILED");
+                        "Workspace checkpoint failed.", std::string("WORKSPACE_CHECKPOINT_FAILED"));
                 return tool_result_t::ok(json{{"ok", true}, {"path", database->path()}});
             }
 

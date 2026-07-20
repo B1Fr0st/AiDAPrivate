@@ -1,5 +1,6 @@
 #pragma once
 
+#include "compact_ir.hpp"
 #include "workspace_types.hpp"
 
 #include <array>

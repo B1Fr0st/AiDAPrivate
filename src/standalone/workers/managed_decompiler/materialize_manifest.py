@@ -252,7 +252,12 @@ def validate_runtime_manifest(manifest_bytes, digest_bytes):
             direct_dependencies != {"deps/System.Collections.Immutable.dll", "deps/System.Reflection.Metadata.dll"}:
         fail("managed application role inventory is invalid")
     def canonical_hash(rows):
-        material = "\n".join("|".join((relative, str(size), sha256)) for relative, size, sha256 in sorted(rows))
+        def canonical_windows_path_order(row):
+            relative = row[0]
+            encoded = relative.encode("utf-8", errors="strict")
+            return relative.casefold().encode("utf-8", errors="strict"), encoded
+        material = "\n".join("|".join((relative, str(size), sha256))
+                             for relative, size, sha256 in sorted(rows, key=canonical_windows_path_order))
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
     runtime_size = sum(row[1] for row in runtime_rows)
     application_size = sum(row[1] for row in application_rows)

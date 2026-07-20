@@ -6,12 +6,14 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 
 #include "../../src/standalone/src/core/anti-tamper/wbaes.hpp"
+#include "../protector/transforms.hpp"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -158,6 +160,42 @@ bool generate_random_bytes(uint8_t* buf, size_t len) {
     return s == 0;
 }
 
+using runtime_table_t = anti_tamper::wbaes::white_box_table_t;
+using generated_table_t = protector::aes_detail::wbaes_table_t;
+
+static_assert(offsetof(runtime_table_t, t_boxes) == offsetof(generated_table_t, t_boxes));
+static_assert(offsetof(runtime_table_t, mb_tables) == offsetof(generated_table_t, mb_tables));
+static_assert(offsetof(runtime_table_t, ext_in) == offsetof(generated_table_t, ext_in));
+static_assert(offsetof(runtime_table_t, ext_out) == offsetof(generated_table_t, ext_out));
+static_assert(offsetof(runtime_table_t, table_id) == sizeof(generated_table_t));
+
+bool generate_runtime_tables(const uint8_t key[16], uint64_t entropy_seed,
+                             runtime_table_t& out) {
+    auto* generated = static_cast<generated_table_t*>(std::malloc(sizeof(generated_table_t)));
+    if (!generated) return false;
+
+    if (!protector::aes_detail::wbaes_generate_tables(key, entropy_seed, *generated)) {
+        SecureZeroMemory(generated, sizeof(generated_table_t));
+        std::free(generated);
+        return false;
+    }
+
+    SecureZeroMemory(&out, sizeof(out));
+    std::memcpy(out.t_boxes, generated->t_boxes, sizeof(out.t_boxes));
+    std::memcpy(out.mb_tables, generated->mb_tables, sizeof(out.mb_tables));
+    std::memcpy(out.ext_in, generated->ext_in, sizeof(out.ext_in));
+    std::memcpy(out.ext_out, generated->ext_out, sizeof(out.ext_out));
+
+    uint8_t metadata[48];
+    protector::aes_detail::wbaes_emit_random(key, entropy_seed, 0, metadata, sizeof(metadata));
+    std::memcpy(out.table_id, metadata + 32, sizeof(out.table_id));
+
+    SecureZeroMemory(metadata, sizeof(metadata));
+    SecureZeroMemory(generated, sizeof(generated_table_t));
+    std::free(generated);
+    return true;
+}
+
 bool memcontains(const uint8_t* haystack, size_t haystack_len,
                   const uint8_t* needle, size_t needle_len) {
     if (needle_len == 0 || haystack_len < needle_len) return false;
@@ -206,8 +244,8 @@ bool test_known_answer() {
         std::printf("KAT_ALLOC_FAILED\n");
         return false;
     }
-    if (!anti_tamper::wbaes::generate_tables(kat_key, 0xDEADBEEFCAFEBABEULL, *tbl)) {
-        std::printf("KAT_GENERATE_TABLES_FAILED: %s\n", anti_tamper::wbaes::last_error());
+    if (!generate_runtime_tables(kat_key, 0xDEADBEEFCAFEBABEULL, *tbl)) {
+        std::printf("KAT_GENERATE_TABLES_FAILED\n");
         std::free(tbl);
         return false;
     }
@@ -246,8 +284,8 @@ bool test_random_match() {
         return false;
     }
 
-    if (!anti_tamper::wbaes::generate_tables(key, entropy_seed, *tbl)) {
-        std::printf("RANDOM_GENERATE_TABLES_FAILED: %s\n", anti_tamper::wbaes::last_error());
+    if (!generate_runtime_tables(key, entropy_seed, *tbl)) {
+        std::printf("RANDOM_GENERATE_TABLES_FAILED\n");
         std::free(tbl);
         return false;
     }
@@ -325,8 +363,8 @@ bool test_ctr_round_trip() {
         return false;
     }
 
-    if (!anti_tamper::wbaes::generate_tables(key, seed, *tbl)) {
-        std::printf("CTR_GENERATE_TABLES_FAILED: %s\n", anti_tamper::wbaes::last_error());
+    if (!generate_runtime_tables(key, seed, *tbl)) {
+        std::printf("CTR_GENERATE_TABLES_FAILED\n");
         std::free(pt); std::free(ct); std::free(dec); std::free(ref_ct); std::free(tbl);
         return false;
     }
@@ -380,8 +418,8 @@ bool test_no_key_in_memory() {
     }
 
     uint64_t seed = 0xA1DAA1DAA1DAA1DAULL;
-    if (!anti_tamper::wbaes::generate_tables(key, seed, *tbl)) {
-        std::printf("LEAK_GENERATE_TABLES_FAILED: %s\n", anti_tamper::wbaes::last_error());
+    if (!generate_runtime_tables(key, seed, *tbl)) {
+        std::printf("LEAK_GENERATE_TABLES_FAILED\n");
         std::free(tbl);
         return false;
     }
@@ -423,12 +461,12 @@ bool test_deterministic_generation() {
         if (tbl_b) std::free(tbl_b);
         return false;
     }
-    if (!anti_tamper::wbaes::generate_tables(key, seed, *tbl_a)) {
+    if (!generate_runtime_tables(key, seed, *tbl_a)) {
         std::printf("DET_GENERATE_A_FAILED\n");
         std::free(tbl_a); std::free(tbl_b);
         return false;
     }
-    if (!anti_tamper::wbaes::generate_tables(key, seed, *tbl_b)) {
+    if (!generate_runtime_tables(key, seed, *tbl_b)) {
         std::printf("DET_GENERATE_B_FAILED\n");
         std::free(tbl_a); std::free(tbl_b);
         return false;

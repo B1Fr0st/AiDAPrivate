@@ -10,6 +10,8 @@
 
 #include <windows.h>
 
+#include "../../src/core/disasm/ghidra_adapters/aida_ghidra_preamble.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>

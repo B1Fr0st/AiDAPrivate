@@ -139,6 +139,8 @@ json status_to_json(const aida::burp::sequencer::collection_status_t& s)
     j["error_message"]  = s.error_message;
     j["started_ms"]     = static_cast<uint64_t>(s.started_ms);
     j["last_sample_ms"] = static_cast<uint64_t>(s.last_sample_ms);
+    j["instance_revision"] = s.instance_revision;
+    j["retained_sample_bytes"] = static_cast<uint64_t>(s.retained_sample_bytes);
     return j;
 }
 
@@ -304,13 +306,20 @@ tool_result_t handle_analyze(const json& p)
 tool_result_t handle_list(const json&)
 {
     diag::log_tagged_fmt("mcp_burp", "sequencer_list entry");
-    auto v = aida::burp::sequencer::list_collections();
+    auto snapshot = aida::burp::sequencer::snapshot_collections();
     json arr = json::array();
-    for (const auto& s : v) arr.push_back(status_to_json(s));
-    diag::log_tagged_fmt("mcp_burp", "sequencer_list ok count=%zu", v.size());
+    for (const auto& s : snapshot.collections) arr.push_back(status_to_json(s));
+    diag::log_tagged_fmt("mcp_burp", "sequencer_list ok count=%zu", snapshot.collections.size());
     json out;
     out["collections"] = std::move(arr);
-    return tool_result_t::ok("collections count=" + std::to_string(v.size()), out);
+    out["generation"] = snapshot.generation;
+    out["capacity"] = {
+        {"collection_count", snapshot.capacity.collection_count},
+        {"collection_limit", snapshot.capacity.collection_limit},
+        {"retained_sample_bytes", snapshot.capacity.retained_sample_bytes},
+        {"retained_sample_limit", snapshot.capacity.retained_sample_limit}
+    };
+    return tool_result_t::ok("collections count=" + std::to_string(snapshot.collections.size()), out);
 }
 
 tool_result_t handle_delete(const json& p)

@@ -1,6 +1,9 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <aclapi.h>
+#include <userenv.h>
 
 #include "python_worker_host.hpp"
 
@@ -640,7 +643,7 @@ bool launch_worker(const verified_worker_t& verified, const python_worker_limits
         return false;
     }
     std::array<HANDLE, 2> inherited_handles{child_read.get(), child_write.get()};
-    const std::uint64_t mitigation_policy = PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE |
+    std::uint64_t mitigation_policy = PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE |
         PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE |
         PROCESS_CREATION_MITIGATION_POLICY_HEAP_TERMINATE_ALWAYS_ON |
         PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON |

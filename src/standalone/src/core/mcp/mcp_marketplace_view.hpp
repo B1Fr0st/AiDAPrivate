@@ -32,6 +32,9 @@
 #include "../ui/theme.hpp"
 #include "../ui/transition.hpp"
 #include "../ui/application_ui_runtime.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 
 
 extern settings_sa_t g_sa_settings;
@@ -53,11 +56,8 @@ namespace aida::mcp_marketplace_view {
 	struct view_state_t
 	{
 		std::mutex mtx;
-		std::atomic<bool> open{false};
 		std::atomic<bool> initialized{false};
-
-		float open_anim = 0.f;
-		float open_velocity = 0.f;
+		std::atomic<bool> open{false};
 
 		char  search_buf[256] = {};
 		std::vector<::mcp_marketplace::package_info_t> last_results;
@@ -68,14 +68,11 @@ namespace aida::mcp_marketplace_view {
 		std::string selected_pkg;
 		std::string keyboard_selected_pkg;
 		bool detail_view_open = false;
-		float detail_anim = 0.f;
-		float detail_velocity = 0.f;
 
 		std::unordered_map<std::string, card_anim_t> card_anims;
 		std::deque<std::string> install_log;
 		std::string installing_pkg;
 		bool show_install_log = false;
-		float install_log_anim = 0.f;
 		::mcp_marketplace::package_info_t pending_install;
 		bool install_confirm_open = false;
 		bool install_confirm_armed = false;
@@ -93,32 +90,6 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
-	inline void open()
-	{
-		auto& s = state();
-		s.open.store(true);
-		s.open_anim = 0.f;
-		s.open_velocity = 0.f;
-		if (!s.first_search_done) {
-			s.first_search_done = true;
-			::mcp_marketplace::search_async("server", ::mcp_marketplace::registry_t::npm);
-		}
-	}
-
-
-	inline void close()
-	{
-		auto& s = state();
-		s.open.store(false);
-	}
-
-
-	inline bool is_open()
-	{
-		return state().open.load();
-	}
-
-
 	inline void initialize()
 	{
 		auto& s = state();
@@ -130,8 +101,8 @@ namespace aida::mcp_marketplace_view {
 	inline void shutdown()
 	{
 		auto& s = state();
+		s.open.store(false, std::memory_order_release);
 		s.initialized.store(false);
-		s.open.store(false);
 		s.card_anims.clear();
 		s.install_log.clear();
 	}
@@ -211,6 +182,21 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
+	inline bool is_open()
+	{
+		return state().open.load(std::memory_order_acquire);
+	}
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	inline std::string semantic_package_id(const ::mcp_marketplace::package_info_t& package)
+	{
+		return "aida.automation.mcp-package-" +
+			aida::preview::semantics::entity_token(
+				package.name + ":" + package_source_label(package));
+	}
+#endif
+
+
 	inline void request_install_confirmation(const ::mcp_marketplace::package_info_t& p)
 	{
 		auto& s = state();
@@ -248,18 +234,28 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
-	inline void render_hero_search(float ox, float oy, float w)
+	inline void render_hero_search(float ox, float oy, float available_width, bool stacked)
 	{
 		auto& s = state();
 		const auto& th = aida::ui::resolved();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		(void)dl;
+		const float input_width = stacked ? available_width :
+			(std::max)(80.f, available_width - 132.f);
+		const float button_width = stacked ? available_width : 120.f;
+		const float button_x = stacked ? ox : ox + input_width + 12.f;
+		const float button_y = stacked ? oy + 48.f : oy + 6.f;
 
 		ImGui::SetCursorScreenPos(ImVec2(ox, oy));
 		char local[256];
 		std::memcpy(local, s.search_buf, sizeof(local));
 		bool changed = aida::ui::input_text("##mp_search", local, sizeof(local),
-			"Search MCP servers...", false, ImVec2(w, 44.f));
+			"Search MCP servers...", false, ImVec2(input_width, 44.f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.mcp-marketplace.search", "search-input", false, false,
+			"aida.dock-window.view.ai.mcp-marketplace"));
+#endif
 		if (changed) {
 			std::memcpy(s.search_buf, local, sizeof(s.search_buf));
 		}
@@ -267,15 +263,21 @@ namespace aida::mcp_marketplace_view {
 			ImGui::IsKeyPressed(ImGuiKey_Enter, false);
 		if (committed) start_search();
 
-		ImGui::SetCursorScreenPos(ImVec2(ox + w + 12.f, oy + 6.f));
+		ImGui::SetCursorScreenPos(ImVec2(button_x, button_y));
 		bool searching = (s.last_search_state == ::mcp_marketplace::search_state_t::searching);
 		if (aida::ui::button(searching ? "Searching" : "Search",
 				aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::md,
-				ImVec2(120.f, 36.f),
+				ImVec2(button_width, 36.f),
 				false, nullptr, searching)) {
 			start_search();
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.mcp-marketplace.action-search",
+			"marketplace-action", false, searching,
+			"aida.dock-window.view.ai.mcp-marketplace"));
+#endif
 
 		(void)th;
 	}
@@ -302,6 +304,13 @@ namespace aida::mcp_marketplace_view {
 				s.selected_pkg = p.name;
 				s.detail_view_open = true;
 			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const std::string package_semantic = semantic_package_id(p);
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				"aida.automation.mcp-action-details-" +
+					aida::preview::semantics::entity_token(p.name),
+				"marketplace-package-action", false, false, package_semantic));
+#endif
 		} else {
 			if (aida::ui::button(installing ? "Installing" : "Review",
 					aida::ui::button_kind_t::primary,
@@ -312,6 +321,13 @@ namespace aida::mcp_marketplace_view {
 					request_install_confirmation(p);
 				}
 			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const std::string package_semantic = semantic_package_id(p);
+			static_cast<void>(aida::preview::semantics::register_last_item(
+				"aida.automation.mcp-action-review-" +
+					aida::preview::semantics::entity_token(p.name),
+				"marketplace-package-action", false, installing, package_semantic));
+#endif
 		}
 	}
 
@@ -389,6 +405,12 @@ namespace aida::mcp_marketplace_view {
 		ImGui::SetCursorScreenPos(ImVec2(ox, oy));
 		ImGui::SetNextItemAllowOverlap();
 		ImGui::InvisibleButton("##lr_hit", ImVec2(w, h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string package_semantic = semantic_package_id(p);
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			package_semantic, "marketplace-package-row", true, false,
+			"aida.dock-window.view.ai.mcp-marketplace"));
+#endif
 		bool hov = ImGui::IsItemHovered();
 		bool clicked = ImGui::IsItemClicked();
 		const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
@@ -575,6 +597,45 @@ namespace aida::mcp_marketplace_view {
 		ImGui::SetCursorScreenPos(ImVec2(ox, oy + h + 1.f));
 		ImGui::Dummy(ImVec2(w, 0.f));
 		ImGui::PopID();
+	}
+
+	inline void render_compact_detail(const ::mcp_marketplace::package_info_t& p,
+		float width, float height)
+	{
+		auto& s = state();
+		const auto& th = aida::ui::resolved();
+		ImGui::BeginChild("##mcp_marketplace_compact_detail", ImVec2(width, height), false,
+			ImGuiWindowFlags_AlwaysVerticalScrollbar);
+		if (aida::ui::button("Back", aida::ui::button_kind_t::secondary,
+				aida::ui::size_t_::sm)) {
+			s.detail_view_open = false;
+		}
+		ImGui::PushFont(aida::ui::fonts::body_strong());
+		ImGui::TextWrapped("%s", p.display_name.empty() ? p.name.c_str() : p.display_name.c_str());
+		ImGui::PopFont();
+		ImGui::TextDisabled("%s", p.name.c_str());
+		ImGui::Separator();
+		if (!p.description.empty())
+			ImGui::TextWrapped("%s", p.description.c_str());
+		ImGui::Spacing();
+		ImGui::TextDisabled("Registry");
+		ImGui::TextWrapped("%s", ::mcp_marketplace::registry_label(p.registry).c_str());
+		ImGui::TextDisabled("Source");
+		ImGui::TextWrapped("%s", package_source_label(p).c_str());
+		if (!p.version.empty()) {
+			ImGui::TextDisabled("Version");
+			ImGui::TextWrapped("%s", p.version.c_str());
+		}
+		ImGui::Spacing();
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.warning),
+			"Unverified third-party code");
+		ImGui::TextWrapped("Install stages this server disabled with auto-connect off until you review and enable it from MCP Servers.");
+		ImGui::Spacing();
+		const ImVec2 action = ImGui::GetCursorScreenPos();
+		render_install_button(p, action.x, action.y,
+			(std::max)(64.f, ImGui::GetContentRegionAvail().x));
+		ImGui::Dummy(ImVec2(0.f, 34.f));
+		ImGui::EndChild();
 	}
 
 
@@ -846,270 +907,23 @@ namespace aida::mcp_marketplace_view {
 	}
 
 
-	inline void render_modal_if_open()
-	{
-		auto& s = state();
-		const auto& th = aida::ui::resolved();
-		const float dt = aida::ui::clock::dt();
-
-		float target = s.open.load() ? 1.f : 0.f;
-		s.open_anim = aida::motion::spring_step(s.open_anim, target, s.open_velocity,
-			aida::motion::spring::balanced, dt);
-		if (s.open_anim < 0.f) s.open_anim = 0.f;
-		if (s.open_anim > 1.f) s.open_anim = 1.f;
-		if (target > 0.5f && s.open_anim > 0.985f) s.open_anim = 1.f;
-		if (target < 0.5f && s.open_anim < 0.015f) s.open_anim = 0.f;
-
-		if (s.open_anim <= 0.001f && target <= 0.f) return;
-
-		auto search_state_now = ::mcp_marketplace::get_search_state();
-		if (search_state_now == ::mcp_marketplace::search_state_t::done &&
-			s.last_search_state != ::mcp_marketplace::search_state_t::done) {
-			s.last_results = ::mcp_marketplace::get_search_results();
-		}
-		if (search_state_now == ::mcp_marketplace::search_state_t::error_state) {
-			std::string e = ::mcp_marketplace::get_search_error();
-			if (!e.empty() && e != s.last_search_error) {
-				s.last_search_error = e;
-				toast_notification::push("Search error: " + truncate_text(e, 120),
-					toast_notification::toast_type_t::error, 4.f);
-			}
-		}
-		s.last_search_state = search_state_now;
-
-		auto inst_state_now = ::mcp_marketplace::get_install_state();
-		if (inst_state_now == ::mcp_marketplace::install_state_t::done &&
-			!s.installing_pkg.empty()) {
-			toast_notification::push("Installed disabled: " + s.installing_pkg,
-				toast_notification::toast_type_t::info, 3.5f);
-			{
-				std::lock_guard<std::mutex> lk(s.mtx);
-				s.install_log.push_back("Done. Enable from MCP Servers.");
-			}
-			s.installing_pkg.clear();
-		} else if (inst_state_now == ::mcp_marketplace::install_state_t::error_state &&
-			!s.installing_pkg.empty()) {
-			std::string ie = ::mcp_marketplace::get_install_error();
-			toast_notification::push("Install failed: " + truncate_text(ie, 120),
-				toast_notification::toast_type_t::error, 5.f);
-			{
-				std::lock_guard<std::mutex> lk(s.mtx);
-				s.install_log.push_back("Error: " + ie);
-			}
-			s.installing_pkg.clear();
-		}
-
-		ImVec2 display = ImGui::GetIO().DisplaySize;
-		const float ease = aida::motion::ease::out_back(s.open_anim);
-		const float pw = std::min(1080.f, display.x * 0.85f);
-		const float ph = std::min(720.f, display.y * 0.85f);
-		const float scale = 0.94f + 0.06f * ease;
-		const float sw = pw * scale;
-		const float sh = ph * scale;
-		const float px = display.x * 0.5f - sw * 0.5f;
-		const float py = display.y * 0.5f - sh * 0.5f - 24.f * (1.f - ease);
-		const float alpha = s.open_anim;
-
-		ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-		ImGui::SetNextWindowSize(display, ImGuiCond_Always);
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
-		ImGuiWindowFlags blocker_flags =
-			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
-			ImGuiWindowFlags_NoScrollbar;
-#ifdef IMGUI_HAS_DOCK
-		blocker_flags |= ImGuiWindowFlags_NoDocking;
-#endif
-		if (ImGui::Begin("##mcp_market_blocker", nullptr, blocker_flags)) {
-			ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), display,
-				IM_COL32(0, 0, 0, static_cast<int>(140.f * alpha)));
-			ImGui::InvisibleButton("##mcp_block", display);
-			if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
-				close();
-		}
-		ImGui::End();
-		ImGui::PopStyleColor();
-		ImGui::PopStyleVar(2);
-
-		ImGui::SetNextWindowPos(ImVec2(px, py), ImGuiCond_Always);
-		ImGui::SetNextWindowSize(ImVec2(sw, sh), ImGuiCond_Always);
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
-		ImGui::SetNextWindowFocus();
-
-		bool win_open = true;
-		ImGuiWindowFlags marketplace_flags =
-			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-			ImGuiWindowFlags_NoSavedSettings;
-#ifdef IMGUI_HAS_DOCK
-		marketplace_flags |= ImGuiWindowFlags_NoDocking;
-#endif
-		if (ImGui::Begin("##aida_mcp_marketplace", &win_open, marketplace_flags)) {
-
-			ImDrawList* wdl = ImGui::GetWindowDrawList();
-
-			ImVec2 panel_a(px, py);
-			ImVec2 panel_b(px + sw, py + sh);
-
-			aida::ui::blur::layer_request_t br;
-			br.pos = panel_a;
-			br.size = ImVec2(sw, sh);
-			br.radius = 16.f;
-			br.strength = 0.95f;
-			br.alpha = alpha;
-			aida::ui::blur::schedule(br);
-
-			aida::ui::blur::render_drop_shadow(wdl, panel_a, panel_b, 16.f, 6, 0.45f * alpha,
-				ImVec2(0.f, 12.f));
-			aida::ui::blur::render_glass_fill(wdl, panel_a, panel_b, 16.f, alpha);
-			aida::ui::blur::render_glass_border(wdl, panel_a, panel_b, 16.f, alpha, 1.f);
-
-			ImU32 grad_top = aida::ui::with_alpha(th.accent_grad_top, alpha);
-			ImU32 grad_bot = aida::ui::with_alpha(th.accent_grad_bot, alpha);
-			wdl->AddRectFilledMultiColor(
-				ImVec2(panel_a.x + 1.f, panel_a.y + 1.f),
-				ImVec2(panel_b.x - 1.f, panel_a.y + 4.f),
-				grad_top, grad_top, grad_bot, grad_bot);
-
-			float pad = 22.f;
-			wdl->AddText(aida::ui::fonts::display(), 24.f,
-				ImVec2(panel_a.x + pad, panel_a.y + pad),
-				aida::ui::with_alpha(th.text_primary, alpha), "MCP Marketplace");
-			wdl->AddText(aida::ui::fonts::caption(), 14.f,
-				ImVec2(panel_a.x + pad, panel_a.y + pad + 32.f),
-				aida::ui::with_alpha(th.text_dim, alpha),
-				"Discover and install Model Context Protocol servers from npm.");
-
-			ImGui::SetCursorScreenPos(ImVec2(panel_b.x - pad - 36.f, panel_a.y + pad - 4.f));
-			if (aida::ui::button("X##close_mp",
-					aida::ui::button_kind_t::ghost,
-					aida::ui::size_t_::md,
-					ImVec2(36.f, 32.f))) {
-				close();
-			}
-
-			float search_y = panel_a.y + pad + 60.f;
-			float search_w = sw - pad * 2.f - 132.f;
-			render_hero_search(panel_a.x + pad, search_y, search_w);
-
-			// Thin separator below search.
-			float sep_y = search_y + 52.f;
-			wdl->AddLine(ImVec2(panel_a.x + pad, sep_y),
-				ImVec2(panel_b.x - pad, sep_y),
-				aida::ui::with_alpha(th.border_subtle, 0.4f * alpha), 1.f);
-
-			// Result count label.
-			float count_y = sep_y + 6.f;
-			if (!s.last_results.empty()) {
-				char count_buf[64];
-				std::snprintf(count_buf, sizeof(count_buf), "%zu server%s",
-					s.last_results.size(),
-					s.last_results.size() == 1 ? "" : "s");
-				wdl->AddText(aida::ui::fonts::caption(), 12.f,
-					ImVec2(panel_a.x + pad, count_y),
-					aida::ui::with_alpha(th.text_dim, 0.7f * alpha),
-					count_buf);
-			}
-
-			float content_y = count_y + 18.f;
-			float content_h = panel_b.y - content_y - pad;
-			float content_w = sw - pad * 2.f;
-
-			ImGui::SetCursorScreenPos(ImVec2(panel_a.x + pad, content_y));
-			ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
-			ImGui::BeginChild("##mp_content", ImVec2(content_w, content_h), false,
-				ImGuiWindowFlags_NoBackground);
-
-			const auto& filtered = s.last_results;
-
-			if (s.last_search_state == ::mcp_marketplace::search_state_t::searching &&
-				s.last_results.empty()) {
-				// Loading skeleton rows.
-				ImVec2 sp = ImGui::GetCursorScreenPos();
-				ImDrawList* sdl = ImGui::GetWindowDrawList();
-				for (int i = 0; i < 6; ++i) {
-					float row_h = 58.f;
-					ImVec2 ka(sp.x, sp.y + static_cast<float>(i) * (row_h + 1.f));
-					ImVec2 kb(sp.x + content_w, ka.y + row_h);
-					aida::ui::skeleton::render_card(sdl, ka, kb, 6.f, 1.5f);
-				}
-				ImGui::Dummy(ImVec2(content_w, 6 * 59.f));
-			} else if (filtered.empty()) {
-				ImVec2 region_pos = ImGui::GetCursorScreenPos();
-				ImVec2 region_size(content_w, content_h);
-				aida::ui::empty_state::config_t cfg;
-				cfg.glyph = aida::ui::empty_state::glyph_t::dots;
-				cfg.title = s.last_results.empty()
-					? std::string("Search for MCP servers")
-					: std::string("No matches");
-				cfg.body = s.last_results.empty()
-					? std::string("Type a query above to discover MCP servers from npm.")
-					: std::string("No servers found for this query.");
-				cfg.max_width = content_w * 0.7f;
-				aida::ui::empty_state::render(region_pos, region_size, cfg);
-			} else {
-				// Clean list view -- one row per server.
-				for (size_t i = 0; i < filtered.size(); ++i) {
-					ImVec2 cp = ImGui::GetCursorScreenPos();
-					render_list_row(cp.x, cp.y, content_w, filtered[i], dt);
-				}
-			}
-
-			ImGui::EndChild();
-			ImGui::PopStyleColor();
-
-			if (s.detail_view_open && !s.selected_pkg.empty()) {
-				const ::mcp_marketplace::package_info_t* pp = nullptr;
-				for (const auto& p : s.last_results) {
-					if (p.name == s.selected_pkg) { pp = &p; break; }
-				}
-				if (pp) {
-					float dt_target = 1.f;
-					s.detail_anim = aida::motion::spring_step(s.detail_anim, dt_target,
-						s.detail_velocity, aida::motion::spring::balanced, dt);
-					float drawer_w = std::min(420.f, sw * 0.42f);
-					float drawer_x = panel_b.x - drawer_w * s.detail_anim;
-					float drawer_y = panel_a.y;
-					float drawer_h = sh;
-					render_detail_drawer(drawer_x, drawer_y, drawer_w, drawer_h, *pp);
-				} else {
-					s.detail_view_open = false;
-					s.selected_pkg.clear();
-				}
-			} else {
-				s.detail_anim = aida::motion::spring_step(s.detail_anim, 0.f,
-					s.detail_velocity, aida::motion::spring::balanced, dt);
-			}
-
-			render_install_confirmation_modal();
-		}
-		ImGui::End();
-		ImGui::PopStyleColor();
-		ImGui::PopStyleVar(2);
-
-		if (s.open.load()) {
-			if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-				if (s.detail_view_open) s.detail_view_open = false;
-				else close();
-			}
-		}
-	}
-
-
 	inline void render(float panel_w, float panel_h)
 	{
 		auto& s = state();
+		s.open.store(true, std::memory_order_release);
 		const auto& th = aida::ui::resolved();
 		const float dt = aida::ui::clock::dt();
 		auto search_state_now = ::mcp_marketplace::get_search_state();
+		if (!s.first_search_done) {
+			s.first_search_done = true;
+			::mcp_marketplace::search_async("server", ::mcp_marketplace::registry_t::npm);
+		}
 		if (search_state_now == ::mcp_marketplace::search_state_t::done &&
-			s.last_search_state != ::mcp_marketplace::search_state_t::done)
+			s.last_search_state != ::mcp_marketplace::search_state_t::done) {
 			s.last_results = ::mcp_marketplace::get_search_results();
+			std::lock_guard<std::mutex> lock(s.mtx);
+			s.card_anims.clear();
+		}
 		if (search_state_now == ::mcp_marketplace::search_state_t::error_state) {
 			const std::string error = ::mcp_marketplace::get_search_error();
 			if (!error.empty() && error != s.last_search_error) {
@@ -1130,15 +944,45 @@ namespace aida::mcp_marketplace_view {
 			s.installing_pkg.clear();
 		}
 		const ImVec2 origin = ImGui::GetCursorScreenPos();
-		const float width = (std::max)(panel_w, 260.f);
-		const float height = (std::max)(panel_h, 180.f);
+		const float width = (std::max)(panel_w, 1.f);
+		const float height = (std::max)(panel_h, 1.f);
+		if (height < 180.f) {
+			aida::ui::design::state_presentation_t compact_state;
+			compact_state.stable_id = "mcp.marketplace.too_short";
+			compact_state.state = aida::ui::design::view_state_t::tiny;
+			compact_state.title = "Marketplace needs more height";
+			compact_state.message = "Increase this dock region to restore search, results, package review, and installation controls.";
+			compact_state.target = "MCP Marketplace";
+			compact_state.hint = "Drag the dock divider or use the title context menu to float or move this view.";
+			static_cast<void>(aida::ui::design::render_state(compact_state,
+				ImVec2(width, height)));
+			render_install_confirmation_modal();
+			return;
+		}
+		const bool compact = width < 360.f;
 		const float pad = width < 520.f ? 10.f : 18.f;
-		ImGui::GetWindowDrawList()->AddText(aida::ui::fonts::display(), 22.f, origin,
+		ImGui::GetWindowDrawList()->AddText(aida::ui::fonts::display(), compact ? 18.f : 22.f, origin,
 			th.text_primary, "MCP Marketplace");
 		ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + 34.f));
-		render_hero_search(origin.x, origin.y + 34.f, (std::max)(160.f, width - pad * 2.f - 120.f));
-		const float content_y = origin.y + 92.f;
-		const float content_h = (std::max)(80.f, height - 92.f);
+		render_hero_search(origin.x, origin.y + 34.f,
+			(std::max)(1.f, width - pad * 2.f), compact);
+		const float content_offset = compact ? 132.f : 92.f;
+		const float content_y = origin.y + content_offset;
+		const float content_h = (std::max)(1.f, height - content_offset);
+		if (compact && s.detail_view_open && !s.selected_pkg.empty()) {
+			const auto found = std::find_if(s.last_results.begin(), s.last_results.end(), [&](const auto& package) {
+				return package.name == s.selected_pkg;
+			});
+			ImGui::SetCursorScreenPos(ImVec2(origin.x, content_y));
+			if (found != s.last_results.end())
+				render_compact_detail(*found, width, content_h);
+			else {
+				s.detail_view_open = false;
+				s.selected_pkg.clear();
+			}
+			render_install_confirmation_modal();
+			return;
+		}
 		ImGui::SetCursorScreenPos(ImVec2(origin.x, content_y));
 		ImGui::BeginChild("##mcp_marketplace_docked_content", ImVec2(width, content_h), false,
 			ImGuiWindowFlags_NoBackground);
@@ -1153,7 +997,7 @@ namespace aida::mcp_marketplace_view {
 		} else {
 			for (const auto& package : s.last_results) {
 				const ImVec2 row = ImGui::GetCursorScreenPos();
-				render_list_row(row.x, row.y, (std::max)(180.f, ImGui::GetContentRegionAvail().x), package, dt);
+				render_list_row(row.x, row.y, (std::max)(1.f, ImGui::GetContentRegionAvail().x), package, dt);
 			}
 		}
 		ImGui::EndChild();

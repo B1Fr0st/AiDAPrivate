@@ -332,12 +332,12 @@ inline void hmac(const uint8_t* data, size_t len, uint8_t out[32])
     uint8_t key[32];
     wbaes::get_table_hash(key);
 
-    uint8_t key_block[kHmacBlockSize] = {0};
+    uint8_t key_block[detail_wbc::kHmacBlockSize] = {0};
     std::memcpy(key_block, key, 32);
 
-    uint8_t ipad_key[kHmacBlockSize];
-    uint8_t opad_key[kHmacBlockSize];
-    for (int i = 0; i < kHmacBlockSize; ++i)
+    uint8_t ipad_key[detail_wbc::kHmacBlockSize];
+    uint8_t opad_key[detail_wbc::kHmacBlockSize];
+    for (int i = 0; i < detail_wbc::kHmacBlockSize; ++i)
     {
         ipad_key[i] = static_cast<uint8_t>(
             key_block[i] ^ detail_wbc::kIpad);
@@ -346,17 +346,17 @@ inline void hmac(const uint8_t* data, size_t len, uint8_t out[32])
     }
 
     std::vector<uint8_t> inner_buf(
-        static_cast<size_t>(kHmacBlockSize) + len);
-    std::memcpy(inner_buf.data(), ipad_key, kHmacBlockSize);
+        static_cast<size_t>(detail_wbc::kHmacBlockSize) + len);
+    std::memcpy(inner_buf.data(), ipad_key, detail_wbc::kHmacBlockSize);
     if (len > 0 && data)
-        std::memcpy(inner_buf.data() + kHmacBlockSize, data, len);
+        std::memcpy(inner_buf.data() + detail_wbc::kHmacBlockSize, data, len);
 
     uint8_t inner_hash[32];
     blake3::hash(inner_buf.data(), inner_buf.size(), inner_hash);
 
-    uint8_t outer_buf[kHmacBlockSize + 32];
-    std::memcpy(outer_buf, opad_key, kHmacBlockSize);
-    std::memcpy(outer_buf + kHmacBlockSize, inner_hash, 32);
+    uint8_t outer_buf[detail_wbc::kHmacBlockSize + 32];
+    std::memcpy(outer_buf, opad_key, detail_wbc::kHmacBlockSize);
+    std::memcpy(outer_buf + detail_wbc::kHmacBlockSize, inner_hash, 32);
 
     blake3::hash(outer_buf, sizeof(outer_buf), out);
 

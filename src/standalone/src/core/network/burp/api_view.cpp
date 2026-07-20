@@ -1,5 +1,6 @@
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/studio_semantics.hpp"
 #else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -42,6 +43,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace aida {
@@ -87,6 +89,21 @@ network_view::artifact_identity_t artifact_identity(const retained_exchange_t& e
     identity.use_tls = exchange.use_tls;
     return identity;
 }
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string semantic_artifact_id(std::string_view kind,
+                                 const network_view::artifact_identity_t& identity)
+{
+    const std::string retained = identity.id + ":" +
+        std::to_string(identity.timestamp) + ":" +
+        std::to_string(identity.revision) + ":" +
+        std::to_string(identity.content_hash) + ":" +
+        std::to_string(identity.content_size);
+    return aida::preview::semantics::stable_id(
+        "aida.network", std::string(kind) + "-" +
+            aida::preview::semantics::entity_token(retained));
+}
+#endif
 
 retained_exchange_t retained_metadata(const retained_exchange_t& source)
 {
@@ -626,7 +643,17 @@ void render(float pos_x, float pos_y, float width, float height,
         if (has_retained) {
             const auto request_identity = artifact_identity(retained, false);
             const auto response_identity = artifact_identity(retained, true);
-            if (aida::ui::button("Actions", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
+            const bool open_actions = aida::ui::button(
+                "Actions", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const std::string artifact_id =
+                semantic_artifact_id("exchange", request_identity);
+            if (ImGui::IsItemVisible())
+                aida::preview::semantics::register_last_item(
+                    artifact_id + ".action.open", "network-artifact-action",
+                    false, false, "aida.dock-window.view.network.api");
+#endif
+            if (open_actions)
                 network_view::open_exchange_context(request_identity, response_identity,
                     network_view::exchange_context_origin_t::pointer);
         }
@@ -653,6 +680,21 @@ void render(float pos_x, float pos_y, float width, float height,
                                        retained_response.size() + 1,
                                        ImVec2(right_w - 16.f, content_h - 280.f),
                                        ImGuiInputTextFlags_ReadOnly);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            if (has_retained) {
+                const auto request_identity = artifact_identity(retained, false);
+                const auto response_identity = artifact_identity(retained, true);
+                const std::string artifact_id =
+                    semantic_artifact_id("exchange", request_identity);
+                const std::string editor_id = response_identity.valid()
+                    ? semantic_artifact_id("response", response_identity)
+                    : semantic_artifact_id("response", request_identity);
+                if (ImGui::IsItemVisible())
+                    aida::preview::semantics::register_last_item(
+                        editor_id, "network-response-editor", false,
+                        !response_identity.valid(), "aida.dock-window.view.network.api");
+            }
+#endif
             const bool response_pointer_context = has_retained &&
                 ImGui::IsItemClicked(ImGuiMouseButton_Right);
             const bool response_menu_key = has_retained && ImGui::IsItemFocused() &&

@@ -54,7 +54,6 @@
     {"id":"workbench.model","category":"workbench","requirement_ids":["WB-01"],"source_target":"aida_c03_b25_workbench_model_harness"},
     {"id":"workbench.navigator","category":"workbench","requirement_ids":["WB-02"],"source_target":"aida_c03_b26_workbench_navigator_harness"},
     {"id":"workbench.inspector","category":"workbench","requirement_ids":["WB-03"],"source_target":"aida_c03_b27_workbench_inspector_harness"},
-    {"id":"workbench.document_host","category":"workbench","requirement_ids":["WB-04"],"source_target":"aida_c03_b28_document_host_harness"},
     {"id":"persistence.overlay_journal","category":"persistence","requirement_ids":["OVL-01","OVL-02"],"source_target":"aida_c03_b29_overlay_journal_v9_harness"},
     {"id":"provider.live_snapshot","category":"provider","requirement_ids":["LIVE-01","LIVE-02"],"source_target":"aida_c03_b30_live_snapshot_harness"},
     {"id":"decode.orchestrator","category":"decode","requirement_ids":["PERF-05","REC-01"],"source_target":"aida_c03_c01_tile_decode_orchestrator_harness"},

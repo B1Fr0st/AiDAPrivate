@@ -1491,7 +1491,7 @@ void rename_registers(
     std::uint16_t ins_size,
     const std::vector<std::string>& param_descriptors,
     type_registry_t& type_reg,
-    std::map<std::pair<std::uint64_t, std::uint32_t>, dalvik_ssa_value_t>& block_values,
+    std::map<std::pair<std::uint64_t, std::uint64_t>, dalvik_ssa_value_t>& block_values,
     std::map<std::pair<std::uint64_t, std::uint32_t>, ssa_phi_t>& block_phi_map,
     std::vector<dalvik_ssa_variable_t>& variables,
     std::uint32_t& diagnostic_ordinal,
@@ -1515,7 +1515,10 @@ void rename_registers(
         ctx.register_versions[param_reg].push_back(1);
     }
 
-    for (std::uint32_t reg = 0; reg < registers_size - ins_size; ++reg) {
+    const auto local_register_count = registers_size >= ins_size
+        ? static_cast<std::uint32_t>(registers_size - ins_size)
+        : 0U;
+    for (std::uint32_t reg = 0; reg < local_register_count; ++reg) {
         if (ctx.current_version.find(reg) == ctx.current_version.end()) {
             dalvik_ssa_variable_t var;
             var.register_number = reg;
@@ -1766,19 +1769,19 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
 
     const auto& code_item = *capture.code_item;
     if (code_item.registers_size == 0) {
-        fail(decompiler_diagnostic_code_t::malformed_input, "dalvik_ssa.registers_size");
+        fail(decompiler_diagnostic_code_t::malformed_provider_ir, "dalvik_ssa.registers_size");
         return result;
     }
     if (code_item.ins_size > code_item.registers_size) {
-        fail(decompiler_diagnostic_code_t::malformed_input, "dalvik_ssa.ins_size");
+        fail(decompiler_diagnostic_code_t::malformed_provider_ir, "dalvik_ssa.ins_size");
         return result;
     }
     if (code_item.outs_size > code_item.registers_size) {
-        fail(decompiler_diagnostic_code_t::malformed_input, "dalvik_ssa.outs_size");
+        fail(decompiler_diagnostic_code_t::malformed_provider_ir, "dalvik_ssa.outs_size");
         return result;
     }
     if (code_item.instructions.empty()) {
-        fail(decompiler_diagnostic_code_t::malformed_input, "dalvik_ssa.empty_instructions");
+        fail(decompiler_diagnostic_code_t::malformed_provider_ir, "dalvik_ssa.empty_instructions");
         return result;
     }
     if (code_item.instructions.size() > k_max_values) {
@@ -1814,7 +1817,7 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
     }
     if (expected_ins != code_item.ins_size && !param_descriptors.empty()) {
         result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::warning,
-            decompiler_diagnostic_code_t::malformed_input, "dalvik_ssa.ins_size_mismatch", diagnostic_ordinal++));
+            decompiler_diagnostic_code_t::malformed_provider_ir, "dalvik_ssa.ins_size_mismatch", diagnostic_ordinal++));
     }
 
     const std::string return_desc = capture.prototype.empty()
@@ -1909,7 +1912,7 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
     ssa_context_t ctx;
     place_phi_nodes(blocks, df, reg_defs, ctx, code_item.registers_size);
 
-    std::map<std::pair<std::uint64_t, std::uint32_t>, dalvik_ssa_value_t> block_values;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, dalvik_ssa_value_t> block_values;
     std::map<std::pair<std::uint64_t, std::uint32_t>, ssa_phi_t> block_phi_map;
     std::vector<dalvik_ssa_variable_t> variables;
 

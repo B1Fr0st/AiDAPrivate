@@ -2,6 +2,7 @@
 #include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decompiler/providers/cli_provider.hpp"
+#include "../../src/core/analysis/workspace/workspace_identity.hpp"
 
 #include <nlohmann/json.hpp>
 

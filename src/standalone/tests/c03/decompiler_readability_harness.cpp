@@ -174,7 +174,8 @@ public:
         const std::uint64_t job_id) override
     {
         if (request.workspace_generation != generation_ || job_id == 0) {
-            return {aida::workbench::workbench_error_code_t::invalid_argument, job_id};
+            return {aida::workbench::workbench_error_code_t::revision_mismatch,
+                    request.workspace_generation};
         }
         job_id_ = job_id;
         active_ = true;

@@ -1,4 +1,5 @@
 #include "network_preview_adapter.hpp"
+#include "preview_fixture_controls.hpp"
 
 #include "../core/network/network_view.hpp"
 #include "../core/network/mitm_proxy.hpp"
@@ -15,10 +16,24 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <regex>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace aida::preview::network {
+namespace {
+network_view::state_t* s_current_state = nullptr;
+fixture_state_t s_pending_fixture = fixture_state_t::normal;
+std::size_t s_pending_cardinality = 0;
+bool s_pending_fixture_valid = false;
+}
+
+static void apply_fixture(network_view::state_t& state, fixture_state_t fixture,
+    std::size_t cardinality);
+
 namespace {
 
 std::string s_receipt;
@@ -273,37 +288,134 @@ namespace aida::burp::sequencer {
 namespace {
 
 uint64_t s_sequencer_next_id = 4;
+uint64_t s_sequencer_next_instance_revision = 4;
+uint64_t s_sequencer_generation = 1;
+std::mutex s_sequencer_mutex;
+std::string s_sequencer_error;
+std::unordered_map<uint64_t, collection_config_t> s_sequencer_configs;
+std::unordered_map<uint64_t, std::vector<std::string>> s_sequencer_samples;
 std::vector<collection_status_t> s_sequencer_collections = {
     { 1, "https://portal.aidapro.net/login", "Session token", 200, 200, false, false, {}, aida::preview::network::monotonic_ms() - 300000, aida::preview::network::monotonic_ms() - 220000 },
     { 2, "https://sandbox.aidapro.net/api/csrf", "CSRF token", 146, 200, true, false, {}, aida::preview::network::monotonic_ms() - 97000, aida::preview::network::monotonic_ms() - 300 },
     { 3, "https://portal.aidapro.net/api/nonce", "API nonce", 82, 100, false, true, "Target returned 429 after 82 samples", aida::preview::network::monotonic_ms() - 180000, aida::preview::network::monotonic_ms() - 151000 }
 };
 
+std::vector<std::string> generated_samples(uint64_t id, size_t count);
+
+void ensure_sequencer_identity() {
+    for (size_t index = 0; index < s_sequencer_collections.size(); ++index) {
+        auto& collection = s_sequencer_collections[index];
+        if (collection.instance_revision == 0) collection.instance_revision = index + 1;
+        if (s_sequencer_configs.find(collection.id) == s_sequencer_configs.end()) {
+            collection_config_t config;
+            config.url = collection.url;
+            config.name = collection.name;
+            config.target_count = collection.target;
+            config.extract_regex = "([A-Za-z0-9_]+)";
+            s_sequencer_configs.emplace(collection.id, std::move(config));
+        }
+        if (s_sequencer_samples.find(collection.id) == s_sequencer_samples.end()) {
+            auto retained = generated_samples(collection.id, collection.collected);
+            size_t retained_bytes = 0;
+            for (const auto& sample : retained) retained_bytes += sample.size();
+            collection.retained_sample_bytes = retained_bytes;
+            s_sequencer_samples.emplace(collection.id, std::move(retained));
+        }
+    }
+}
+
+size_t retained_bytes_locked() {
+    size_t bytes = 0;
+    for (const auto& entry : s_sequencer_samples)
+        for (const auto& sample : entry.second) bytes += sample.size();
+    return bytes;
+}
+
+std::vector<std::string> generated_samples(uint64_t id, size_t count) {
+    std::vector<std::string> values;
+    values.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+        values.push_back("tkn_" + std::to_string(id) + "_" + std::to_string(918273645ULL + i * 7919ULL));
+    return values;
+}
+
 }
 
 uint64_t start_collection(const collection_config_t& config) {
-    const uint64_t id = s_sequencer_next_id++;
-    s_sequencer_collections.push_back({ id, config.url, config.name, config.target_count, config.target_count, false, false, {},
-        aida::preview::network::monotonic_ms(), aida::preview::network::monotonic_ms() });
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
+    if (config.target_count == 0 || config.target_count > max_target_samples ||
+        config.concurrency == 0 || config.concurrency > max_collection_concurrency ||
+        config.raw_request.size() > max_raw_request_bytes || config.extract_regex.empty() ||
+        config.extract_regex.size() > max_extract_regex_bytes ||
+        (config.url.empty() && config.host.empty())) {
+        s_sequencer_error = "collection configuration exceeds the bounded Sequencer contract";
+        return 0;
+    }
+    if (s_sequencer_collections.size() >= max_collection_count) {
+        s_sequencer_error = "collection capacity 128 reached; delete a collection";
+        return 0;
+    }
+    const uint64_t id = s_sequencer_next_id;
+    const size_t retained_count = (std::min)(config.target_count, static_cast<size_t>(200));
+    auto retained = generated_samples(id, retained_count);
+    size_t retained_bytes = 0;
+    for (const auto& sample : retained) retained_bytes += sample.size();
+    if (retained_bytes_locked() > max_total_sample_bytes - retained_bytes) {
+        s_sequencer_error = "retained sample capacity reached; delete a collection";
+        return 0;
+    }
+    collection_status_t status;
+    status.id = id;
+    status.url = config.url;
+    status.name = config.name;
+    status.collected = retained_count;
+    status.target = config.target_count;
+    status.running = retained_count < config.target_count;
+    status.started_ms = aida::preview::network::monotonic_ms();
+    status.last_sample_ms = status.started_ms;
+    status.retained_sample_bytes = retained_bytes;
+    status.instance_revision = s_sequencer_next_instance_revision++;
+    s_sequencer_collections.push_back(status);
+    s_sequencer_configs[id] = config;
+    s_sequencer_samples[id] = std::move(retained);
+    ++s_sequencer_next_id;
+    ++s_sequencer_generation;
+    s_sequencer_error.clear();
     aida::preview::network::record_receipt("Sequencer collection", config.name.empty() ? config.url : config.name);
     return id;
 }
 
 bool stop_collection(uint64_t id) {
-    for (auto& collection : s_sequencer_collections) if (collection.id == id) { collection.running = false; return true; }
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
+    for (auto& collection : s_sequencer_collections) if (collection.id == id) {
+        collection.running = false;
+        ++s_sequencer_generation;
+        return true;
+    }
     return false;
 }
 
 collection_status_t status(uint64_t id) {
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
     for (const auto& collection : s_sequencer_collections) if (collection.id == id) return collection;
     return {};
 }
 
 std::vector<std::string> samples(uint64_t id, size_t max_count) {
-    std::vector<std::string> values;
-    const size_t count = max_count == 0 ? 32 : std::min<size_t>(max_count, 32);
-    for (size_t i = 0; i < count; ++i) values.push_back("tkn_" + std::to_string(id) + "_" + std::to_string(918273645ULL + i * 7919ULL));
-    return values;
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
+    const auto stored = s_sequencer_samples.find(id);
+    size_t available = 0;
+    for (const auto& collection : s_sequencer_collections)
+        if (collection.id == id) available = collection.collected;
+    const size_t take = max_count == 0 ? available : (std::min)(max_count, available);
+    if (stored == s_sequencer_samples.end()) return generated_samples(id, take);
+    const size_t stored_take = (std::min)(take, stored->second.size());
+    return std::vector<std::string>(stored->second.end() - static_cast<ptrdiff_t>(stored_take),
+        stored->second.end());
 }
 
 analysis_result_t analyze(uint64_t id) {
@@ -340,16 +452,229 @@ analysis_result_t analyze(uint64_t id) {
 }
 
 analysis_result_t analyze(uint64_t id, const analysis_config_t&) { return analyze(id); }
-std::vector<collection_status_t> list_collections() { return s_sequencer_collections; }
+std::vector<collection_status_t> list_collections() { return snapshot_collections().collections; }
+
+uint64_t registry_generation() {
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    return s_sequencer_generation;
+}
+
+registry_snapshot_t snapshot_collections() {
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
+    registry_snapshot_t snapshot;
+    snapshot.generation = s_sequencer_generation;
+    snapshot.collections = s_sequencer_collections;
+    snapshot.capacity.collection_count = snapshot.collections.size();
+    snapshot.capacity.retained_sample_bytes = retained_bytes_locked();
+    std::sort(snapshot.collections.begin(), snapshot.collections.end(),
+        [](const auto& left, const auto& right) { return left.id < right.id; });
+    return snapshot;
+}
 
 bool delete_collection(uint64_t id) {
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
     const auto old_size = s_sequencer_collections.size();
     s_sequencer_collections.erase(std::remove_if(s_sequencer_collections.begin(), s_sequencer_collections.end(),
         [id](const auto& collection) { return collection.id == id; }), s_sequencer_collections.end());
-    return old_size != s_sequencer_collections.size();
+    const bool removed = old_size != s_sequencer_collections.size();
+    if (removed) {
+        s_sequencer_configs.erase(id);
+        s_sequencer_samples.erase(id);
+        ++s_sequencer_generation;
+    }
+    return removed;
 }
 
-std::string last_error() { return {}; }
+bool delete_collection_exact(uint64_t id, uint64_t started_ms, uint64_t instance_revision) {
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
+    const auto found = std::find_if(s_sequencer_collections.begin(), s_sequencer_collections.end(),
+        [&](const auto& collection) {
+            return collection.id == id && collection.started_ms == started_ms &&
+                collection.instance_revision == instance_revision;
+        });
+    if (found == s_sequencer_collections.end()) {
+        s_sequencer_error = "collection changed after delete review";
+        return false;
+    }
+    s_sequencer_collections.erase(found);
+    s_sequencer_configs.erase(id);
+    s_sequencer_samples.erase(id);
+    ++s_sequencer_generation;
+    return true;
+}
+
+nlohmann::json export_json() {
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
+    nlohmann::json root;
+    root["version"] = 1;
+    root["limits"] = {
+        {"collections", max_collection_count},
+        {"samples_per_collection", max_target_samples},
+        {"sample_bytes", max_sample_bytes},
+        {"collection_sample_bytes", max_collection_sample_bytes},
+        {"total_sample_bytes", max_total_sample_bytes}
+    };
+    nlohmann::json rows = nlohmann::json::array();
+    auto collections = s_sequencer_collections;
+    std::sort(collections.begin(), collections.end(),
+        [](const auto& left, const auto& right) { return left.id < right.id; });
+    for (const auto& collection : collections) {
+        const auto config = s_sequencer_configs.find(collection.id);
+        const auto retained = s_sequencer_samples.find(collection.id);
+        if (config == s_sequencer_configs.end() || retained == s_sequencer_samples.end()) continue;
+        nlohmann::json samples_json = nlohmann::json::array();
+        for (const auto& sample : retained->second)
+            samples_json.push_back(std::vector<uint8_t>(sample.begin(), sample.end()));
+        rows.push_back({
+            {"id", collection.id}, {"name", collection.name}, {"url", config->second.url},
+            {"raw_request", config->second.raw_request}, {"use_tls", config->second.use_tls},
+            {"host", config->second.host}, {"port", config->second.port},
+            {"extract_regex", config->second.extract_regex},
+            {"capture_group", config->second.capture_group},
+            {"target_count", config->second.target_count},
+            {"concurrency", config->second.concurrency}, {"throttle_ms", config->second.throttle_ms},
+            {"started_ms", collection.started_ms}, {"last_sample_ms", collection.last_sample_ms},
+            {"running", collection.running}, {"error", collection.error},
+            {"error_message", collection.error_message}, {"samples", std::move(samples_json)}
+        });
+    }
+    root["collections"] = std::move(rows);
+    return root;
+}
+
+bool import_json(const nlohmann::json& document, bool replace_existing) {
+    struct staged_t {
+        collection_status_t status;
+        collection_config_t config;
+        std::vector<std::string> samples;
+    };
+    if (!document.is_object() || document.value("version", 0) != 1 ||
+        !document.contains("collections") || !document["collections"].is_array() ||
+        document["collections"].size() > max_collection_count) {
+        std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+        s_sequencer_error = "sequencer_import_invalid_schema_or_collection_capacity";
+        return false;
+    }
+    std::vector<staged_t> staged;
+    std::unordered_set<uint64_t> imported_ids;
+    size_t staged_bytes = 0;
+    try {
+        staged.reserve(document["collections"].size());
+        for (const auto& row : document["collections"]) {
+            if (!row.is_object() || !row.contains("id") || !row["id"].is_number_unsigned() ||
+                !row.contains("samples") || !row["samples"].is_array())
+                throw std::invalid_argument("sequencer_import_invalid_collection");
+            staged_t item;
+            item.status.id = row["id"].get<uint64_t>();
+            if (item.status.id == 0 || item.status.id == UINT64_MAX ||
+                !imported_ids.insert(item.status.id).second)
+                throw std::invalid_argument("sequencer_import_duplicate_or_zero_collection_id");
+            item.status.name = row.value("name", std::string());
+            item.status.url = row.value("url", std::string());
+            item.config.name = item.status.name;
+            item.config.url = item.status.url;
+            item.config.use_tls = row.value("use_tls", true);
+            item.config.host = row.value("host", std::string());
+            item.config.port = row.value("port", static_cast<uint16_t>(443));
+            item.config.extract_regex = row.value("extract_regex", std::string());
+            item.config.capture_group = row.value("capture_group", 1);
+            item.config.target_count = row.value("target_count", static_cast<size_t>(0));
+            item.config.concurrency = row.value("concurrency", static_cast<size_t>(0));
+            item.config.throttle_ms = row.value("throttle_ms", static_cast<size_t>(0));
+            if (!row.contains("raw_request") || !row["raw_request"].is_array())
+                throw std::invalid_argument("sequencer_import_raw_request_not_byte_array");
+            const auto request = row["raw_request"].get<std::vector<uint8_t>>();
+            item.config.raw_request.assign(request.begin(), request.end());
+            if (item.config.target_count == 0 || item.config.target_count > max_target_samples ||
+                item.config.concurrency == 0 || item.config.concurrency > max_collection_concurrency ||
+                item.config.raw_request.size() > max_raw_request_bytes ||
+                item.config.extract_regex.empty() || item.config.extract_regex.size() > max_extract_regex_bytes ||
+                (item.config.url.empty() && item.config.host.empty()) ||
+                row["samples"].size() > item.config.target_count)
+                throw std::invalid_argument("sequencer_import_collection_exceeds_runtime_contract");
+            size_t collection_bytes = 0;
+            item.samples.reserve(row["samples"].size());
+            for (const auto& encoded : row["samples"]) {
+                if (!encoded.is_array()) throw std::invalid_argument("sequencer_import_sample_not_byte_array");
+                const auto bytes = encoded.get<std::vector<uint8_t>>();
+                if (bytes.empty() || bytes.size() > max_sample_bytes ||
+                    collection_bytes > max_collection_sample_bytes - bytes.size() ||
+                    staged_bytes > max_total_sample_bytes - bytes.size())
+                    throw std::invalid_argument("sequencer_import_sample_capacity_exceeded");
+                item.samples.emplace_back(bytes.begin(), bytes.end());
+                collection_bytes += bytes.size();
+                staged_bytes += bytes.size();
+            }
+            item.status.collected = item.samples.size();
+            item.status.target = item.config.target_count;
+            item.status.started_ms = row.value("started_ms", static_cast<uint64_t>(0));
+            item.status.last_sample_ms = row.value("last_sample_ms", static_cast<uint64_t>(0));
+            item.status.error = row.value("error", false);
+            item.status.error_message = row.value("error_message", std::string());
+            if (row.value("running", false)) {
+                item.status.error = true;
+                item.status.error_message = "restored_collection_was_running_and_requires_explicit_restart";
+            }
+            item.status.running = false;
+            item.status.retained_sample_bytes = collection_bytes;
+            staged.push_back(std::move(item));
+        }
+    } catch (const std::exception& exception) {
+        std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+        s_sequencer_error = exception.what();
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    ensure_sequencer_identity();
+    try {
+        auto next_collections = replace_existing
+            ? std::vector<collection_status_t>() : s_sequencer_collections;
+        auto next_configs = replace_existing
+            ? std::unordered_map<uint64_t, collection_config_t>() : s_sequencer_configs;
+        auto next_samples = replace_existing
+            ? std::unordered_map<uint64_t, std::vector<std::string>>() : s_sequencer_samples;
+        const size_t existing_bytes = replace_existing ? 0 : retained_bytes_locked();
+        if (next_collections.size() > max_collection_count - staged.size() ||
+            existing_bytes > max_total_sample_bytes - staged_bytes) {
+            s_sequencer_error = "sequencer_import_collection_or_sample_capacity_exceeded";
+            return false;
+        }
+        uint64_t next_id = replace_existing ? 1 : s_sequencer_next_id;
+        uint64_t next_instance_revision = s_sequencer_next_instance_revision;
+        for (auto& item : staged) {
+            if (next_configs.find(item.status.id) != next_configs.end()) {
+                s_sequencer_error = "sequencer_import_collection_identity_conflict";
+                return false;
+            }
+            item.status.instance_revision = next_instance_revision++;
+            next_id = (std::max)(next_id, item.status.id + 1);
+            next_collections.push_back(item.status);
+            next_configs.emplace(item.status.id, std::move(item.config));
+            next_samples.emplace(item.status.id, std::move(item.samples));
+        }
+        s_sequencer_collections.swap(next_collections);
+        s_sequencer_configs.swap(next_configs);
+        s_sequencer_samples.swap(next_samples);
+        s_sequencer_next_id = next_id;
+        s_sequencer_next_instance_revision = next_instance_revision;
+    } catch (const std::exception& exception) {
+        s_sequencer_error = std::string("sequencer_import_commit_failed: ") + exception.what();
+        return false;
+    }
+    ++s_sequencer_generation;
+    s_sequencer_error.clear();
+    return true;
+}
+
+std::string last_error() {
+    std::lock_guard<std::mutex> lock(s_sequencer_mutex);
+    return s_sequencer_error;
+}
 
 }
 
@@ -919,6 +1244,18 @@ void clear_history() {
     aida::preview::network::record_receipt("Proxy history", "cleared");
 }
 
+bool clear_history_if_exact(const std::vector<uint64_t>& reviewed_ids) {
+    std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    if (g_state.history.size() != reviewed_ids.size()) return false;
+    for (size_t index = 0; index < g_state.history.size(); ++index) {
+        if (!g_state.history[index] || g_state.history[index]->id != reviewed_ids[index]) return false;
+    }
+    g_state.history.clear();
+    g_state.total_requests.store(0, std::memory_order_release);
+    aida::preview::network::record_receipt("Proxy history", "exact reviewed history cleared");
+    return true;
+}
+
 size_t history_count() {
     seed_proxy_history();
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
@@ -1100,6 +1437,7 @@ const std::string& receipt() {
 }
 
 void initialize(network_view::state_t& state) {
+    s_current_state = &state;
     state.active = true;
     state.active_tab = network_view::sub_tab_t::connections;
     state.prev_tab = state.active_tab;
@@ -1313,9 +1651,86 @@ void initialize(network_view::state_t& state) {
     std::fill(std::begin(state.tab_anim), std::end(state.tab_anim), 0.f);
     state.tab_anim[static_cast<int>(state.active_tab)] = 1.f;
     record_receipt("Network preview initialized", "36 authoritative routes mounted");
+    if (s_pending_fixture_valid)
+        apply_fixture(state, s_pending_fixture, s_pending_cardinality);
+}
+
+static void apply_fixture(network_view::state_t& state, fixture_state_t fixture,
+    std::size_t cardinality) {
+    if (fixture == fixture_state_t::empty || fixture == fixture_state_t::disconnected) {
+        state.active_tab = network_view::sub_tab_t::capture;
+        state.cap_running.store(false, std::memory_order_release);
+        state.cap_start_pending.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(state.conn_mutex);
+            state.connections.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.cap_mutex);
+            state.captured_packets.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.dns_mutex);
+            state.dns_entries.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.bw_mutex);
+            state.bw_entries.clear();
+        }
+        state.bw_monitoring = false;
+        state.intercept_enabled = false;
+        state.repeater_entries.clear();
+        mitm_proxy::stop();
+        return;
+    }
+    if (fixture == fixture_state_t::error) {
+        state.active_tab = network_view::sub_tab_t::pcap_export;
+        state.pcap_writing.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(state.pcap_error_mutex);
+            state.pcap_last_error = "Capture export failed because the retained destination is unavailable";
+        }
+        mitm_proxy::stop();
+        return;
+    }
+    state.active_tab = network_view::sub_tab_t::capture;
+    {
+        std::lock_guard<std::mutex> lock(state.pcap_error_mutex);
+        state.pcap_last_error.clear();
+    }
+    const std::size_t bounded = (std::min<std::size_t>)(cardinality, state.cap_max_packets);
+    {
+        std::lock_guard<std::mutex> lock(state.cap_mutex);
+        for (std::size_t index = state.captured_packets.size(); index < bounded; ++index) {
+            network_view::packet_entry_t row;
+            row.timestamp = 39130000ULL + static_cast<std::uint64_t>(index);
+            row.pid = index % 5U == 0U ? 12064U : 6420U;
+            row.protocol = 6;
+            row.direction = static_cast<std::uint8_t>(index % 2U);
+            row.src_port = static_cast<std::uint16_t>(50000U + index % 10000U);
+            row.dst_port = 443;
+            row.protocol_label = index % 7U == 0U ? "WebSocket" : "HTTP";
+            row.summary = "Deterministic capture row " + std::to_string(index + 1U);
+            state.captured_packets.push_back(std::move(row));
+        }
+    }
+    state.cap_running.store(fixture == fixture_state_t::loading,
+        std::memory_order_release);
+    state.cap_start_pending.store(fixture == fixture_state_t::cancellation_requested,
+        std::memory_order_release);
+}
+
+void configure_fixture(fixture_state_t fixture, std::size_t cardinality) {
+    s_pending_fixture = fixture;
+    s_pending_cardinality = (std::min<std::size_t>)(cardinality, 10000U);
+    s_pending_fixture_valid = true;
+    if (s_current_state)
+        initialize(*s_current_state);
 }
 
 void shutdown(network_view::state_t& state) {
+    if (s_current_state == &state)
+        s_current_state = nullptr;
     state.conn_polling.store(false, std::memory_order_release);
     state.cap_polling.store(false, std::memory_order_release);
     state.cap_running.store(false, std::memory_order_release);
@@ -1326,4 +1741,10 @@ void shutdown(network_view::state_t& state) {
     record_receipt("Network preview stopped", "state retained for inspection");
 }
 
+}
+
+namespace aida::preview {
+void configure_network_fixture(fixture_state_t fixture, std::size_t cardinality) {
+    network::configure_fixture(fixture, cardinality);
+}
 }

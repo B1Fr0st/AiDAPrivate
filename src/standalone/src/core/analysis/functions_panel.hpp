@@ -930,6 +930,9 @@ namespace functions_panel {
 
 			ImDrawList* cdl = ImGui::GetWindowDrawList();
 			const float row_h = (std::max)(24.f, fs_fp_base * 1.55f);
+			const ImVec2 compact_item_spacing = ImGui::GetStyle().ItemSpacing;
+			ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+				ImVec2(compact_item_spacing.x, 0.f));
 
 			ImGuiListClipper clipper;
 			clipper.Begin(row_view ? static_cast<int>(row_view->sorted_indices.size()) : 0,
@@ -945,11 +948,21 @@ namespace functions_panel {
 					ImGui::PushID(row_idx);
 
 					ImVec2 row_min = ImGui::GetCursorScreenPos();
-					ImVec2 row_max = ImVec2(row_min.x + content_size.x, row_min.y + row_h);
+					const float row_visible_h = (std::clamp)(
+						ImGui::GetWindowPos().y + ImGui::GetWindowHeight() - row_min.y,
+						0.f, row_h);
+					if (row_visible_h <= 0.f) {
+						ImGui::Dummy(ImVec2(0.f, row_h));
+						ImGui::PopID();
+						continue;
+					}
+					ImVec2 row_max = ImVec2(row_min.x + content_size.x, row_min.y + row_visible_h);
 
 					char btn_label[40];
 					std::snprintf(btn_label, sizeof(btn_label), "##fn_cb_%d", row_idx);
-					ImGui::InvisibleButton(btn_label, ImVec2(content_size.x, row_h));
+					ImGui::InvisibleButton(btn_label, ImVec2(content_size.x, row_visible_h));
+					if (row_visible_h < row_h)
+						ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h - row_visible_h);
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 					if (ImGui::IsItemVisible()) {
@@ -957,7 +970,8 @@ namespace functions_panel {
 							aida::preview::semantics::stable_id(
 								"aida.functions.row", "address-" + std::to_string(e.address));
 						aida::preview::semantics::register_last_item(
-							function_semantic_id, "analysis-function-row");
+							function_semantic_id, "analysis-function-row", false, false,
+							"aida.dock-window.view.analysis.functions");
 					}
 #endif
 
@@ -1047,6 +1061,7 @@ namespace functions_panel {
 				}
 			}
 			clipper.End();
+			ImGui::PopStyleVar();
 
 			ImGui::EndChild();
 		}
@@ -1130,7 +1145,8 @@ namespace functions_panel {
 							aida::preview::semantics::stable_id(
 								"aida.functions.row", "address-" + std::to_string(e.address));
 						aida::preview::semantics::register_last_item(
-							function_semantic_id, "analysis-function-row");
+							function_semantic_id, "analysis-function-row", false, false,
+							"aida.dock-window.view.analysis.functions");
 					}
 #endif
 
@@ -1290,8 +1306,49 @@ namespace functions_panel {
 				}
 			}
 			if (ImGui::GetIO().KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
-				ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
-				ImGui::SetClipboardText(selected_entry.name.c_str());
+				ImGui::IsKeyPressed(ImGuiKey_Insert, false))) {
+				const auto target = s.selected_addr;
+				std::string target_name;
+				if (row_view && row_view->entries) {
+					const auto selected = row_view->row_by_address.find(target);
+					if (selected != row_view->row_by_address.end() &&
+						selected->second < row_view->sorted_indices.size()) {
+						const int source = row_view->sorted_indices[selected->second];
+						if (source >= 0 && source < static_cast<int>(row_view->entries->size()))
+							target_name = (*row_view->entries)[static_cast<std::size_t>(source)].name;
+					}
+				}
+				auto workspace = render_workspace();
+				if (workspace && !target_name.empty()) {
+					using namespace aida::ui::analysis_context_menu;
+					using aida::ui::action_handler_result_t;
+					context_t menu;
+					menu.kind = menu_kind_t::function;
+					menu.entity_id = "function:" + std::to_string(target);
+					const auto generation = workspace->generation();
+					const auto revision = workspace->analysis_revision();
+					menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
+						(generation << 6u) + (generation >> 2u));
+					menu.live_generation = [workspace]() {
+						const auto current = workspace->generation();
+						const auto current_revision = workspace->analysis_revision();
+						return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
+							(current << 6u) + (current >> 2u));
+					};
+					menu.validate_identity = [&s, target]() {
+						std::lock_guard<std::mutex> lock(s.mtx);
+						return s.selected_addr == target
+							? aida::ui::capability_state_t::available()
+							: aida::ui::capability_state_t::unavailable(
+								"The selected function changed");
+					};
+					menu.actions["analysis.copy.name"].invoke = [value = std::move(target_name)]() {
+						ImGui::SetClipboardText(value.c_str());
+						return action_handler_result_t::completed();
+					};
+					execute_shortcut(std::move(menu), "analysis.copy.name");
+				}
+			}
 		}
 
 		aida::ui::context_menu_open_origin_t function_origin{};

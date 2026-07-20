@@ -3,6 +3,7 @@
 #include "scanner_task_center.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #include "standalone_driver.hpp"
 #include "../anti-tamper/webhook.hpp"
@@ -34,6 +35,7 @@
 #include "imgui/imgui_internal.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -43,12 +45,28 @@
 #include <cstring>
 #include <cinttypes>
 #include <initializer_list>
+#include <iomanip>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace memory_scanner_view {
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string studio_memory_entity_id(const char* entity,
+	const memory_interaction::context_t& context) {
+	const std::string identity = std::to_string(static_cast<unsigned>(context.source)) + ":" +
+		std::to_string(context.target_pid) + ":" + std::to_string(context.address) +
+		(context.address == 0 ? ":" + std::to_string(context.index) : std::string{});
+	std::string source(entity);
+	source.push_back('-');
+	source.append(aida::preview::semantics::entity_token(identity));
+	return aida::preview::semantics::stable_id("aida.memory", source);
+}
+#endif
 
 namespace {
 
@@ -61,6 +79,7 @@ constexpr float kAddrRowHeight       = 30.f;
 constexpr float kScrollbarTrackW     = 14.f;
 constexpr float kSplitterThickness   = 6.f;
 constexpr float kCalloutHeight       = 30.f;
+constexpr std::size_t kMaximumMemoryMultiSelection = 4096;
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 constexpr int   kRegionRefreshChunk  = 4096;
 #endif
@@ -337,15 +356,27 @@ memory_interaction::runtime_t runtime_snapshot_locked(std::size_t result_count) 
 	memory_interaction::runtime_t runtime;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	runtime.driver_loaded = true;
-	runtime.live_attached = true;
+	runtime.target_pid = memory_scanner::g_state.observed_target_pid.load(
+		std::memory_order_acquire);
+	runtime.live_attached = runtime.target_pid != 0;
 	runtime.static_loaded = true;
-	runtime.target_pid = 4242;
 #else
 	runtime.driver_loaded = driver_bridge::is_loaded();
 	runtime.target_pid = driver_bridge::attached_pid();
 	runtime.live_attached = runtime.driver_loaded && runtime.target_pid != 0;
 	runtime.static_loaded = function_index::detail::static_pe_active();
 #endif
+	runtime.target_epoch = memory_scanner::g_state.target_epoch.load(
+		std::memory_order_acquire);
+	runtime.process_creation_time_100ns = memory_scanner::g_state.
+		observed_target_creation_time_100ns.load(std::memory_order_acquire);
+	runtime.scan_static_binary = memory_scanner::g_state.scan_static_binary;
+	runtime.scan_target_pid = memory_scanner::g_state.scan_target_pid;
+	runtime.scan_target_epoch = memory_scanner::g_state.scan_target_epoch;
+	runtime.scan_process_creation_time_100ns = memory_scanner::g_state.
+		scan_target_identity.process.creation_time_100ns;
+	runtime.scan_workspace_id = memory_scanner::g_state.scan_workspace_id;
+	runtime.scan_workspace_generation = memory_scanner::g_state.scan_workspace_generation;
 	const std::uint64_t count_component = static_cast<std::uint64_t>(result_count);
 	runtime.scan_revision =
 		(static_cast<std::uint64_t>(static_cast<std::uint32_t>(memory_scanner::g_state.scan_count)) << 32U) ^
@@ -360,6 +391,79 @@ memory_interaction::runtime_t runtime_snapshot() {
 }
 
 std::string s_consumed_memory_action;
+
+bool memory_context_identity_equal(const memory_interaction::context_t& left,
+	const memory_interaction::context_t& right) noexcept {
+	return left.kind == right.kind && left.source == right.source &&
+		left.target_pid == right.target_pid && left.target_epoch == right.target_epoch &&
+		left.process_creation_time_100ns == right.process_creation_time_100ns &&
+		left.scan_revision == right.scan_revision && left.workspace_id == right.workspace_id &&
+		left.workspace_generation == right.workspace_generation &&
+		left.address == right.address && left.extent == right.extent && left.index == right.index;
+}
+
+std::vector<memory_interaction::context_t> memory_action_contexts(
+	const memory_interaction::context_t& focused) {
+	auto contexts = memory_interaction::selected_set();
+	const bool compatible = !contexts.empty() && contexts.front().kind == focused.kind &&
+		contexts.front().source == focused.source &&
+		contexts.front().target_pid == focused.target_pid &&
+		contexts.front().target_epoch == focused.target_epoch &&
+		contexts.front().process_creation_time_100ns == focused.process_creation_time_100ns &&
+		contexts.front().scan_revision == focused.scan_revision &&
+		contexts.front().workspace_id == focused.workspace_id &&
+		contexts.front().workspace_generation == focused.workspace_generation;
+	if (!compatible || std::none_of(contexts.begin(), contexts.end(), [&](const auto& item) {
+		return memory_context_identity_equal(item, focused);
+	}))
+		contexts.assign(1, focused);
+	return contexts;
+}
+
+std::uint64_t memory_action_set_hash(
+	const std::vector<memory_interaction::context_t>& contexts) noexcept {
+	std::uint64_t hash = 1469598103934665603ULL;
+	const auto mix = [&](std::uint64_t value) {
+		for (unsigned shift = 0; shift < 64; shift += 8) {
+			hash ^= static_cast<std::uint8_t>(value >> shift);
+			hash *= 1099511628211ULL;
+		}
+	};
+	for (const auto& context : contexts) {
+		mix(static_cast<std::uint64_t>(context.kind));
+		mix(static_cast<std::uint64_t>(context.source));
+		mix(context.target_pid);
+		mix(context.target_epoch);
+		mix(context.process_creation_time_100ns);
+		mix(context.scan_revision);
+		mix(context.workspace_generation);
+		mix(context.address);
+		mix(context.extent);
+		mix(static_cast<std::uint64_t>(static_cast<std::int64_t>(context.index)));
+		for (const unsigned char byte : context.workspace_id) mix(byte);
+	}
+	return hash;
+}
+
+std::string memory_action_entity_id(const memory_interaction::context_t& focused,
+	const std::vector<memory_interaction::context_t>& contexts) {
+	return std::to_string(focused.address) + ":" + std::to_string(focused.index) + ":" +
+		std::to_string(contexts.size()) + ":" + std::to_string(memory_action_set_hash(contexts));
+}
+
+bool memory_action_is_explicit_batch(memory_interaction::capability_t capability) noexcept {
+	switch (capability) {
+		case memory_interaction::capability_t::copy_address:
+		case memory_interaction::capability_t::copy_value:
+		case memory_interaction::capability_t::copy_previous_value:
+		case memory_interaction::capability_t::copy_module_offset:
+		case memory_interaction::capability_t::add_to_address_list:
+		case memory_interaction::capability_t::remove:
+			return true;
+		default:
+			return false;
+	}
+}
 
 const char* memory_action_id(const char* label) {
 	if (std::strcmp(label, "Add to address list") == 0) return "memory.result.add_address";
@@ -399,20 +503,24 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 	const memory_interaction::runtime_t& runtime,
 	std::initializer_list<std::pair<const char*, memory_interaction::capability_t>> actions) {
 	aida::ui::application_ui::retained_entity_context_t retained;
+	const auto action_contexts = memory_action_contexts(context);
+	const bool multiple = action_contexts.size() > 1;
 	retained.owner_id = owner;
-	retained.entity_id = std::to_string(context.address) + ":" + std::to_string(context.index);
+	retained.entity_id = memory_action_entity_id(context, action_contexts);
 	retained.entity_generation = context.scan_revision;
 	retained.active_view = aida::ui::stable_view_id_t("view.memory.value_scan");
 	const auto selected_workspace = disasm_view::capture_selected_workspace();
-	const auto workspace_generation = selected_workspace.workspace
-		? selected_workspace.workspace->generation() : 0;
-	const std::string static_workspace_id = selected_workspace.workspace
-		? selected_workspace.workspace->identity().binary_id().to_hex() : std::string{};
-	retained.validate_identity = [context, workspace_generation, static_workspace_id]() {
-		if (!memory_interaction::is_current(context, runtime_snapshot()))
-			return aida::ui::capability_state_t::unavailable(
-				"The target, scan publication, or selected memory entity changed.");
-		if (context.source == memory_interaction::source_t::static_binary) {
+	const auto workspace_generation = context.workspace_generation;
+	const std::string static_workspace_id = context.workspace_id;
+	retained.validate_identity = [action_contexts, workspace_generation, static_workspace_id]() {
+		const auto current_runtime = runtime_snapshot();
+		for (const auto& item : action_contexts) {
+			if (!memory_interaction::is_current(item, current_runtime))
+				return aida::ui::capability_state_t::unavailable(
+					"The target, scan publication, or selected memory entity changed.");
+		}
+		if (!action_contexts.empty() &&
+			action_contexts.front().source == memory_interaction::source_t::static_binary) {
 			const auto current_workspace = disasm_view::capture_selected_workspace();
 			if (!current_workspace.workspace ||
 				current_workspace.workspace->generation() != workspace_generation ||
@@ -423,11 +531,35 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 		return aida::ui::capability_state_t::available();
 	};
 	for (const auto& [id, capability] : actions) {
-		const auto evaluated = memory_interaction::evaluate(capability, context, runtime);
-		retained.actions.push_back({id, evaluated.enabled
-			? aida::ui::capability_state_t::available()
-			: aida::ui::capability_state_t::unavailable(
-				evaluated.disabled_reason ? evaluated.disabled_reason : "The memory action is unavailable."),
+		aida::ui::capability_state_t state;
+		if (multiple && !memory_action_is_explicit_batch(capability)) {
+			state = aida::ui::capability_state_t::unavailable(
+				"This action requires exactly one memory row.");
+		} else {
+			bool enabled = capability == memory_interaction::capability_t::copy_address ||
+				capability == memory_interaction::capability_t::copy_value ||
+				capability == memory_interaction::capability_t::copy_previous_value ||
+				capability == memory_interaction::capability_t::copy_module_offset ? false : true;
+			const char* reason = nullptr;
+			for (const auto& item : action_contexts) {
+				const auto evaluated = memory_interaction::evaluate(capability, item, runtime);
+				if (capability == memory_interaction::capability_t::copy_address ||
+					capability == memory_interaction::capability_t::copy_value ||
+					capability == memory_interaction::capability_t::copy_previous_value ||
+					capability == memory_interaction::capability_t::copy_module_offset) {
+					enabled = enabled || evaluated.enabled;
+					if (!reason && !evaluated.enabled) reason = evaluated.disabled_reason;
+				} else if (!evaluated.enabled) {
+					enabled = false;
+					reason = evaluated.disabled_reason;
+					break;
+				}
+			}
+			state = enabled ? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(
+					reason ? reason : "The memory action is unavailable.");
+		}
+		retained.actions.push_back({id, std::move(state),
 			[]() { return aida::ui::action_handler_result_t::completed(); }});
 	}
 	const char* source_kind = context.kind == memory_interaction::kind_t::scan_result
@@ -438,26 +570,44 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 		static_cast<unsigned long long>(context.address));
 	aida::automation_ui::entity_evidence::snapshot_t evidence;
 	evidence.workspace_id = context.source == memory_interaction::source_t::live_process
-		? "pid:" + std::to_string(context.target_pid) : static_workspace_id;
+		? "pid:" + std::to_string(context.target_pid) + ":created:" +
+			std::to_string(context.process_creation_time_100ns) : static_workspace_id;
 	evidence.source_view_id = "view.memory.value_scan";
 	evidence.source_kind = source_kind;
 	evidence.entity_id = retained.entity_id;
-	evidence.display_label = std::string(source_kind) + " " + address;
+	evidence.display_label = multiple ? std::to_string(action_contexts.size()) +
+		" selected memory rows" : std::string(source_kind) + " " + address;
 	evidence.excerpt = "Source: " + std::string(context.source == memory_interaction::source_t::live_process
 		? "live process" : "static binary") + "\nPID: " + std::to_string(context.target_pid) +
+		"\nProcess creation: " + std::to_string(context.process_creation_time_100ns) +
+		"\nTarget epoch: " + std::to_string(context.target_epoch) +
 		"\nScan revision: " + std::to_string(context.scan_revision) +
-		"\nAddress: " + address + "\nExtent: " + std::to_string(context.extent) +
-		"\nValue: " + context.value + "\nPrevious value: " + context.previous_value +
-		"\nModule offset: " + context.module_offset;
+		"\nSelected rows: " + std::to_string(action_contexts.size());
+	const std::size_t evidence_limit = (std::min<std::size_t>)(action_contexts.size(), 256U);
+	for (std::size_t index = 0; index < evidence_limit; ++index) {
+		const auto& item = action_contexts[index];
+		char item_address[24]{};
+		std::snprintf(item_address, sizeof(item_address), "0x%016llX",
+			static_cast<unsigned long long>(item.address));
+		evidence.excerpt += "\n[" + std::to_string(index + 1) + "] " + item_address +
+			" | " + item.value + " | previous=" + item.previous_value +
+			" | " + item.module_offset;
+	}
+	if (action_contexts.size() > evidence_limit)
+		evidence.excerpt += "\n... " + std::to_string(action_contexts.size() - evidence_limit) +
+			" additional selected rows retained by identity.";
 	evidence.address = context.address;
 	evidence.revision = context.scan_revision;
 	evidence.generation = context.scan_revision;
 	evidence.sensitive = context.source == memory_interaction::source_t::live_process;
-	evidence.return_to_source = [context, workspace_generation,
+	evidence.return_to_source = [context, action_contexts, workspace_generation,
 		static_workspace_id](std::string& reason) {
-		if (!memory_interaction::is_current(context, runtime_snapshot())) {
-			reason = "The target, scan publication, or retained memory entity changed; capture it again.";
-			return false;
+		const auto current_runtime = runtime_snapshot();
+		for (const auto& item : action_contexts) {
+			if (!memory_interaction::is_current(item, current_runtime)) {
+				reason = "The target, scan publication, or retained memory entity changed; capture it again.";
+				return false;
+			}
 		}
 		if (context.source == memory_interaction::source_t::static_binary) {
 			const auto current_workspace = disasm_view::capture_selected_workspace();
@@ -468,7 +618,7 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 				return false;
 			}
 		}
-		memory_interaction::select(context);
+		memory_interaction::select_set(action_contexts, context);
 		const auto opened = aida::ui::application_views::open_or_focus(
 			aida::ui::stable_view_id_t("view.memory.value_scan"));
 		if (!opened.ok()) {
@@ -669,6 +819,13 @@ void request_region_refresh() {
 void rebuild_sorted_indices(int total) {
 	auto& ui = g_ui;
 	auto& sc = memory_scanner::g_state;
+	if (sc.persisted_config_loaded.exchange(false, std::memory_order_acq_rel)) {
+		std::lock_guard<std::mutex> lock(sc.results_mutex);
+		std::strncpy(ui.value_buf, sc.config.value_text.c_str(), sizeof(ui.value_buf) - 1);
+		ui.value_buf[sizeof(ui.value_buf) - 1] = '\0';
+		std::strncpy(ui.value_buf2, sc.config.value_text2.c_str(), sizeof(ui.value_buf2) - 1);
+		ui.value_buf2[sizeof(ui.value_buf2) - 1] = '\0';
+	}
 	const int safe_total = std::max(total, 0);
 	if (ui.result_sort_field == result_sort_t::by_index) {
 		ui.sorted_result_indices.clear();
@@ -772,7 +929,167 @@ void invalidate_sort() {
 	g_ui.sorted_indices_dirty = true;
 }
 
-void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
+float render_compact_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
+	auto& sc = memory_scanner::g_state;
+	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
+	const float toolbar_h = 120.f;
+	const float pad = 10.f;
+	const float gap = 6.f;
+	const float usable = (std::max)(1.f, w - pad * 2.f);
+
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + toolbar_h),
+		aida::ui::with_alpha(t.panel_header, a));
+	dl->AddLine(ImVec2(ox, oy + toolbar_h), ImVec2(ox + w, oy + toolbar_h),
+		aida::ui::with_alpha(t.border_subtle, a), 1.f);
+
+	const float type_w = (std::clamp)(usable * 0.38f, 82.f, 108.f);
+	const float mode_w = (std::max)(80.f, usable - type_w - gap);
+	const float row1_y = oy + 7.f;
+
+	ImGui::SetCursorScreenPos(ImVec2(ox + pad, row1_y));
+	ImGui::SetNextItemWidth(type_w);
+	if (ImGui::BeginCombo("##compact_vtype", memory_scanner::value_type_name(sc.config.value_type))) {
+		for (int i = 0; i < static_cast<int>(memory_scanner::value_type_t::COUNT); ++i) {
+			const auto value_type = static_cast<memory_scanner::value_type_t>(i);
+			const bool selected = sc.config.value_type == value_type;
+			if (ImGui::Selectable(memory_scanner::value_type_name(value_type), selected)) {
+				sc.config.value_type = value_type;
+				invalidate_sort();
+				diag_logf("toolbar value_type_change to=%s",
+					memory_scanner::value_type_name(value_type));
+			}
+		}
+		ImGui::EndCombo();
+	}
+
+	ImGui::SetCursorScreenPos(ImVec2(ox + pad + type_w + gap, row1_y));
+	ImGui::SetNextItemWidth(mode_w);
+	if (ImGui::BeginCombo("##compact_smode", memory_scanner::scan_mode_name(sc.config.scan_mode))) {
+		for (int i = 0; i < static_cast<int>(memory_scanner::scan_mode_t::COUNT); ++i) {
+			const auto scan_mode = static_cast<memory_scanner::scan_mode_t>(i);
+			const bool selected = sc.config.scan_mode == scan_mode;
+			if (ImGui::Selectable(memory_scanner::scan_mode_name(scan_mode), selected)) {
+				sc.config.scan_mode = scan_mode;
+				diag_logf("toolbar scan_mode_change to=%s",
+					memory_scanner::scan_mode_name(scan_mode));
+			}
+		}
+		ImGui::EndCombo();
+	}
+
+	const bool needs_value = sc.config.scan_mode != memory_scanner::scan_mode_t::changed &&
+		sc.config.scan_mode != memory_scanner::scan_mode_t::unchanged &&
+		sc.config.scan_mode != memory_scanner::scan_mode_t::increased &&
+		sc.config.scan_mode != memory_scanner::scan_mode_t::decreased &&
+		sc.config.scan_mode != memory_scanner::scan_mode_t::unknown_initial;
+	const bool between = sc.config.scan_mode == memory_scanner::scan_mode_t::value_between;
+	const float hex_w = 48.f;
+	const float row2_y = oy + 42.f;
+	float value_x = ox + pad;
+	float value_width = usable - hex_w - gap;
+	if (needs_value) {
+		if (between) {
+			const float to_w = 18.f;
+			const float field_w = (std::max)(44.f,
+				(value_width - to_w - gap * 2.f) * 0.5f);
+			ImGui::SetCursorScreenPos(ImVec2(value_x, row2_y));
+			ImGui::SetNextItemWidth(field_w);
+			ImGui::InputTextWithHint("##compact_val", "min", ui.value_buf, sizeof(ui.value_buf));
+			ImGui::SetCursorScreenPos(ImVec2(value_x + field_w + gap, row2_y + 5.f));
+			ImGui::TextUnformatted("to");
+			ImGui::SetCursorScreenPos(ImVec2(value_x + field_w + gap + to_w + gap, row2_y));
+			ImGui::SetNextItemWidth(field_w);
+			ImGui::InputTextWithHint("##compact_val2", "max", ui.value_buf2, sizeof(ui.value_buf2));
+		} else {
+			ImGui::SetCursorScreenPos(ImVec2(value_x, row2_y));
+			ImGui::SetNextItemWidth(value_width);
+			ImGui::InputTextWithHint("##compact_val", "value", ui.value_buf, sizeof(ui.value_buf));
+		}
+	} else {
+		ImFont* body = aida::ui::fonts::body();
+		if (!body) body = ImGui::GetFont();
+		const float font_size = aida::ui::fonts::size_or(body, ImGui::GetFontSize());
+		dl->PushClipRect(ImVec2(value_x, row2_y),
+			ImVec2(value_x + value_width, row2_y + 28.f), true);
+		dl->AddText(body, font_size, ImVec2(value_x, row2_y + 5.f),
+			aida::ui::with_alpha(t.text_secondary, a), "Uses the previous scan values");
+		dl->PopClipRect();
+	}
+
+	ImGui::SetCursorScreenPos(ImVec2(ox + w - pad - hex_w, row2_y + 3.f));
+	bool hex_input = sc.config.hex_input;
+	if (ImGui::Checkbox("Hex", &hex_input)) {
+		sc.config.hex_input = hex_input;
+		diag_logf("toolbar hex_toggle now=%d", static_cast<int>(hex_input));
+	}
+
+	const bool scanning = sc.scanning.load(std::memory_order_acquire);
+	bool has_initial_scan = false;
+	std::size_t total_found = 0;
+	{
+		std::lock_guard<std::mutex> lock(sc.results_mutex);
+		has_initial_scan = sc.has_initial_scan;
+		total_found = sc.total_found;
+	}
+	const char* primary_action = scanning ? "memory.stop_scan" :
+		(has_initial_scan ? "memory.next_scan" : "memory.first_scan");
+	std::array<aida::ui::application_ui::action_presentation_t, 3> presentations{
+		aida::ui::application_ui::present_action(primary_action),
+		aida::ui::application_ui::present_action("memory.undo_scan"),
+		aida::ui::application_ui::present_action("memory.new_scan")
+	};
+	std::array<aida::ui::design::action_t, 3> actions{};
+	for (std::size_t index = 0; index < actions.size(); ++index) {
+		auto& action = actions[index];
+		const auto& presentation = presentations[index];
+		action.id = presentation.id.c_str();
+		action.label = presentation.label.c_str();
+		action.compact_label = index == 0
+			? (scanning ? "Stop" : (has_initial_scan ? "Next" : "First"))
+			: (index == 1 ? "Undo" : "New");
+		action.tooltip = presentation.enabled
+			? presentation.description.c_str() : presentation.disabled_reason.c_str();
+		action.shortcut = presentation.shortcut.empty() ? nullptr : presentation.shortcut.c_str();
+		action.kind = index == 0
+			? (scanning ? aida::ui::components::button_kind_t::destructive
+				: aida::ui::components::button_kind_t::primary)
+			: (index == 1 ? aida::ui::components::button_kind_t::secondary
+				: aida::ui::components::button_kind_t::ghost);
+		action.enabled = presentation.enabled;
+		action.primary = index == 0;
+		action.visible = presentation.visible;
+	}
+
+	char count_buf[64];
+	if (scanning) {
+		const int progress = static_cast<int>((std::clamp)(sc.scan_progress.load(), 0.f, 1.f) * 100.f);
+		std::snprintf(count_buf, sizeof(count_buf), "%zu / %d%%", total_found, progress);
+	} else {
+		std::snprintf(count_buf, sizeof(count_buf), "%zu found", total_found);
+	}
+	ImFont* count_font = aida::ui::fonts::caption();
+	if (!count_font) count_font = ImGui::GetFont();
+	const float count_fs = aida::ui::fonts::size_or(count_font, ImGui::GetFontSize());
+	const ImVec2 count_size = count_font->CalcTextSizeA(count_fs, FLT_MAX, 0.f, count_buf);
+	const float count_reserve = (std::min)(usable * 0.38f, count_size.x + gap);
+	const float action_width = (std::max)(1.f, usable - count_reserve - gap);
+	ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + 80.f));
+	const auto invoked = aida::ui::design::render_toolbar(
+		"memory-scan-compact", actions.data(), actions.size(), action_width);
+	if (invoked.invoked && invoked.id) {
+		static_cast<void>(aida::ui::application_ui::execute_action(
+			invoked.id, aida::ui::action_invocation_source_t::toolbar));
+	}
+	dl->AddText(count_font, count_fs,
+		ImVec2(ox + w - pad - count_size.x, oy + 86.f),
+		aida::ui::with_alpha(t.text_secondary, a), count_buf);
+	return toolbar_h;
+}
+
+float render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
+	if (w < 1120.f)
+		return render_compact_toolbar(dl, ox, oy, w, a);
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
@@ -1029,8 +1346,10 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		right_cx -= 12.f;
 	}
 
-	if (static_pe && !attached) {
-		const char* lbl = "Static source only";
+	if (static_pe) {
+		if (!attached) ui.prefer_static_source = true;
+		const bool static_selected = ui.prefer_static_source || !attached;
+		const char* lbl = static_selected ? "Static binary" : "Live process";
 		ImFont* body_fn = aida::ui::fonts::body();
 		const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
 		ImVec2 lsz = body_fn->CalcTextSizeA(body_fs, FLT_MAX, 0.f, lbl);
@@ -1040,17 +1359,27 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		float bh = lsz.y + pad_y * 2.f;
 		right_cx -= bw;
 		float by = oy + (kToolbarHeight - bh) * 0.5f;
+		ImGui::SetCursorScreenPos(ImVec2(right_cx, by));
+		ImGui::BeginDisabled(!attached || has_initial_scan || scanning);
+		ImGui::InvisibleButton("##memory_scan_source", ImVec2(bw, bh));
+		if (ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
+			!ui_input_gate::popup_blocks_background_input())
+			ui.prefer_static_source = !ui.prefer_static_source;
+		ImGui::EndDisabled();
 		dl->AddRectFilled(ImVec2(right_cx, by),
 			ImVec2(right_cx + bw, by + bh),
-			aida::ui::with_alpha(t.warning, 0.18f * a), bh * 0.5f);
+			aida::ui::with_alpha(static_selected ? t.warning : t.info, 0.18f * a), bh * 0.5f);
 		dl->AddRect(ImVec2(right_cx, by),
 			ImVec2(right_cx + bw, by + bh),
-			aida::ui::with_alpha(t.warning, 0.65f * a), bh * 0.5f, 0, 1.f);
+			aida::ui::with_alpha(static_selected ? t.warning : t.info, 0.65f * a), bh * 0.5f, 0, 1.f);
 		dl->AddText(body_fn, body_fs,
 			ImVec2(right_cx + pad_x, by + pad_y),
-			aida::ui::with_alpha(t.warning, a), lbl);
+			aida::ui::with_alpha(static_selected ? t.warning : t.info, a), lbl);
+		if (attached && !has_initial_scan && !scanning && ImGui::IsItemHovered())
+			ImGui::SetTooltip("Switch the next scan between the attached process and static PE image");
 		right_cx -= 12.f;
 	}
+	return kToolbarHeight;
 }
 
 void compute_result_columns(float ox, float w,
@@ -1061,6 +1390,41 @@ void compute_result_columns(float ox, float w,
 	const float pad = 12.f;
 	float right_reserve = include_scrollbar ? (kScrollbarTrackW + 12.f) : 12.f;
 	float avail = w - pad - right_reserve;
+	if (w < 360.f) {
+		const float address_w = (std::max)(96.f, avail * 0.62f);
+		const float value_w = (std::max)(1.f, avail - address_w);
+		const float widths[4] = {address_w, value_w, 0.f, 0.f};
+		const char* names[4] = {"Address", "Value", "", ""};
+		float cx = ox + pad;
+		for (std::size_t index = 0; index < 4U; ++index) {
+			cols[index].x0 = cx;
+			cols[index].x1 = cx + widths[index];
+			cols[index].inner_x0 = cx + (widths[index] > 0.f ? 4.f : 0.f);
+			cols[index].inner_x1 = cols[index].x1 - (widths[index] > 0.f ? 4.f : 0.f);
+			cols[index].title = names[index];
+			cx += widths[index];
+		}
+		content_w_total = cx - ox;
+		return;
+	}
+	if (w < 560.f) {
+		const float address_w = avail * 0.42f;
+		const float value_w = avail * 0.25f;
+		const float module_w = (std::max)(1.f, avail - address_w - value_w);
+		const float widths[4] = {address_w, value_w, 0.f, module_w};
+		const char* names[4] = {"Address", "Value", "", "Module"};
+		float cx = ox + pad;
+		for (std::size_t index = 0; index < 4U; ++index) {
+			cols[index].x0 = cx;
+			cols[index].x1 = cx + widths[index];
+			cols[index].inner_x0 = cx + (widths[index] > 0.f ? 5.f : 0.f);
+			cols[index].inner_x1 = cols[index].x1 - (widths[index] > 0.f ? 5.f : 0.f);
+			cols[index].title = names[index];
+			cx += widths[index];
+		}
+		content_w_total = cx - ox;
+		return;
+	}
 	float col_addr_w = std::min(180.f, std::max(140.f, avail * 0.20f));
 	float col_val_w  = std::min(170.f, std::max(110.f, avail * 0.18f));
 	float col_prev_w = std::min(170.f, std::max(110.f, avail * 0.18f));
@@ -1088,6 +1452,42 @@ void compute_addr_columns(float ox, float w,
 	const float pad = 12.f;
 	float right_reserve = include_scrollbar ? (kScrollbarTrackW + 12.f) : 12.f;
 	float avail = w - pad - right_reserve;
+	if (w < 360.f) {
+		const float active_w = 42.f;
+		const float address_w = (std::max)(92.f, avail * 0.54f);
+		const float description_w = (std::max)(1.f, avail - active_w - address_w);
+		const float widths[5] = {active_w, description_w, address_w, 0.f, 0.f};
+		const char* names[5] = {"On", "Name", "Address", "", ""};
+		float cx = ox + pad;
+		for (std::size_t index = 0; index < 5U; ++index) {
+			cols[index].x0 = cx;
+			cols[index].x1 = cx + widths[index];
+			cols[index].inner_x0 = cx + (widths[index] > 0.f ? 4.f : 0.f);
+			cols[index].inner_x1 = cols[index].x1 - (widths[index] > 0.f ? 4.f : 0.f);
+			cols[index].title = names[index];
+			cx += widths[index];
+		}
+		return;
+	}
+	if (w < 560.f) {
+		const float active_w = 48.f;
+		const float description_w = avail * 0.25f;
+		const float address_w = avail * 0.42f;
+		const float value_w = (std::max)(1.f,
+			avail - active_w - description_w - address_w);
+		const float widths[5] = {active_w, description_w, address_w, 0.f, value_w};
+		const char* names[5] = {"On", "Name", "Address", "", "Value"};
+		float cx = ox + pad;
+		for (std::size_t index = 0; index < 5U; ++index) {
+			cols[index].x0 = cx;
+			cols[index].x1 = cx + widths[index];
+			cols[index].inner_x0 = cx + (widths[index] > 0.f ? 5.f : 0.f);
+			cols[index].inner_x1 = cols[index].x1 - (widths[index] > 0.f ? 5.f : 0.f);
+			cols[index].title = names[index];
+			cx += widths[index];
+		}
+		return;
+	}
 	float col_freeze_w = 60.f;
 	float col_addr_w = std::min(180.f, std::max(140.f, avail * 0.18f));
 	float col_type_w = std::min(120.f, std::max(80.f, avail * 0.10f));
@@ -1154,21 +1554,112 @@ void update_results_diff_flash(int total, std::uint64_t revision) {
 void handle_multi_select(std::unordered_set<int>& set, int& anchor, int idx, int total) {
 	bool ctrl = ctrl_held();
 	bool shift = shift_held();
+	bool truncated = false;
 	if (shift && anchor >= 0 && anchor < total) {
 		int lo = std::min(anchor, idx);
 		int hi = std::max(anchor, idx);
 		if (!ctrl) set.clear();
-		for (int k = lo; k <= hi; ++k) set.insert(k);
+		for (int k = lo; k <= hi; ++k) {
+			if (set.count(k) != 0) continue;
+			if (set.size() >= kMaximumMemoryMultiSelection) {
+				truncated = true;
+				break;
+			}
+			set.insert(k);
+		}
+		if (set.count(idx) == 0) {
+			if (set.size() >= kMaximumMemoryMultiSelection) set.erase(set.begin());
+			set.insert(idx);
+			truncated = true;
+		}
 	} else if (ctrl) {
-		auto it = set.find(idx);
-		if (it == set.end()) set.insert(idx);
-		else set.erase(it);
 		anchor = idx;
+		auto it = set.find(idx);
+		if (it == set.end()) {
+			if (set.size() < kMaximumMemoryMultiSelection) set.insert(idx);
+			else truncated = true;
+		}
+		else set.erase(it);
 	} else {
 		set.clear();
 		set.insert(idx);
 		anchor = idx;
 	}
+	if (truncated)
+		toast_notification::push("Memory selection is limited to 4,096 rows.",
+			toast_notification::toast_type_t::warning, 4.f);
+}
+
+void select_result_rows(const memory_interaction::runtime_t& runtime,
+	const std::vector<region_cache_entry_t>& regions, int preferred_row) {
+	auto& state = memory_scanner::g_state;
+	auto& ui = g_ui;
+	std::vector<int> rows(ui.result_multi_sel.begin(), ui.result_multi_sel.end());
+	std::sort(rows.begin(), rows.end());
+	if (rows.size() > kMaximumMemoryMultiSelection)
+		rows.resize(kMaximumMemoryMultiSelection);
+	std::vector<memory_interaction::context_t> contexts;
+	contexts.reserve(rows.size());
+	memory_interaction::context_t focused;
+	{
+		std::lock_guard<std::mutex> lock(state.results_mutex);
+		for (const int row : rows) {
+			int source_index = row;
+			if (row >= 0 && row < static_cast<int>(ui.sorted_result_indices.size()))
+				source_index = ui.sorted_result_indices[static_cast<std::size_t>(row)];
+			if (source_index < 0 || source_index >= static_cast<int>(state.results.size())) continue;
+			const auto& result = state.results[static_cast<std::size_t>(source_index)];
+			auto context = memory_interaction::capture_result(runtime, result.address, source_index,
+				memory_scanner::format_value(result.current_value, state.config.value_type),
+				memory_scanner::format_value(result.previous_value, state.config.value_type),
+				compose_module_label(result, regions));
+			if (row == preferred_row) focused = context;
+			contexts.push_back(std::move(context));
+		}
+	}
+	if (contexts.empty()) {
+		ui.selected_result = -1;
+		memory_interaction::clear_selection();
+		return;
+	}
+	if (focused.kind == memory_interaction::kind_t::none) focused = contexts.back();
+	ui.selected_result = preferred_row >= 0 && ui.result_multi_sel.count(preferred_row) != 0
+		? preferred_row : rows.back();
+	memory_interaction::select_set(std::move(contexts), std::move(focused));
+}
+
+void select_address_rows(const memory_interaction::runtime_t& runtime, int preferred_row) {
+	auto& state = memory_scanner::g_state;
+	auto& ui = g_ui;
+	std::vector<int> rows(ui.address_multi_sel.begin(), ui.address_multi_sel.end());
+	std::sort(rows.begin(), rows.end());
+	if (rows.size() > kMaximumMemoryMultiSelection)
+		rows.resize(kMaximumMemoryMultiSelection);
+	std::vector<memory_interaction::context_t> contexts;
+	contexts.reserve(rows.size());
+	memory_interaction::context_t focused;
+	{
+		std::lock_guard<std::mutex> lock(state.address_mutex);
+		for (const int row : rows) {
+			if (row < 0 || row >= static_cast<int>(state.address_list.size())) continue;
+			const auto& entry = state.address_list[static_cast<std::size_t>(row)];
+			auto context = memory_interaction::capture_address(runtime, entry.address, row,
+				entry.frozen, memory_scanner::format_value(entry.last_value, entry.value_type),
+				entry.target_pid, entry.target_epoch,
+				entry.target_identity.process.creation_time_100ns);
+			if (row == preferred_row) focused = context;
+			contexts.push_back(std::move(context));
+		}
+	}
+	if (contexts.empty()) {
+		ui.selected_address = -1;
+		memory_interaction::clear_selection();
+		return;
+	}
+	if (focused.kind == memory_interaction::kind_t::none) focused = contexts.back();
+	ui.selected_address = preferred_row >= 0 && ui.address_multi_sel.count(preferred_row) != 0
+		? preferred_row : rows.back();
+	memory_interaction::select_set(std::move(contexts), std::move(focused));
 }
 
 void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
@@ -1199,6 +1690,8 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	const float hdr_fs = aida::ui::fonts::size_or(hdr_font, ImGui::GetFontSize());
 
 	for (std::size_t c = 0; c < 4U; ++c) {
+		if (!cols[c].title || cols[c].title[0] == '\0')
+			continue;
 		ImVec2 hmin(cols[c].x0, oy);
 		ImVec2 hmax(cols[c].x1, oy + kResultHeaderHeight);
 		bool hov = ImGui::IsMouseHoveringRect(hmin, hmax, false) &&
@@ -1206,6 +1699,13 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		ImGui::PushID(8000 + static_cast<int>(c));
 		ImGui::SetCursorScreenPos(hmin);
 		ImGui::InvisibleButton("##rh", ImVec2(hmax.x - hmin.x, hmax.y - hmin.y));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			aida::preview::semantics::stable_id("aida.memory",
+				std::string("result-header-") + cols[c].title),
+			"memory-scan-action", false, !sort_allowed,
+			"aida.dock-window.view.memory.value-scan");
+#endif
 		bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
 			!ui_input_gate::popup_blocks_background_input();
 		ImGui::PopID();
@@ -1373,9 +1873,6 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), true);
 
-	static float result_row_anim_time = 0.f;
-	result_row_anim_time += dt;
-
 	ImFont* code_fn = aida::ui::fonts::code();
 	const float code_fs = aida::ui::fonts::size_or(code_fn, ImGui::GetFontSize());
 	ImFont* body_fn = aida::ui::fonts::body();
@@ -1395,7 +1892,21 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		float ry = body_y + static_cast<float>(i) * kResultRowHeight - ui.result_sb.scroll_y;
 		if (ry + kResultRowHeight < body_y || ry > body_y + body_h) continue;
 
-		float row_entrance = ui_anim::render_row_entrance(i - first_row, result_row_anim_time, 0.012f);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const auto result_semantic_context = memory_interaction::capture_result(runtime,
+			r.address, src_index,
+			memory_scanner::format_value(r.current_value, sc.config.value_type),
+			memory_scanner::format_value(r.previous_value, sc.config.value_type),
+			compose_module_label(r, regions_snapshot));
+		const std::string result_semantic_id = studio_memory_entity_id(
+			"result", result_semantic_context);
+		aida::preview::semantics::register_region(result_semantic_id,
+			"memory-scan-result-row", ImGui::GetID(result_semantic_id.c_str()),
+			ImVec2(ox, ry), ImVec2(row_right_edge, ry + kResultRowHeight), false, false,
+			"aida.dock-window.view.memory.value-scan");
+#endif
+
+		const float row_entrance = 1.f;
 		bool sel = (ui.result_multi_sel.count(i) > 0) || (ui.selected_result == i);
 		bool hov = ImGui::IsMouseHoveringRect(
 			ImVec2(ox, ry), ImVec2(row_right_edge, ry + kResultRowHeight), false) &&
@@ -1428,8 +1939,10 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		}
 
 		char addr_buf[24];
-		snprintf(addr_buf, sizeof(addr_buf), "%016" PRIX64,
-			r.address);
+		if (w < 360.f)
+			snprintf(addr_buf, sizeof(addr_buf), "%" PRIX64, r.address);
+		else
+			snprintf(addr_buf, sizeof(addr_buf), "%016" PRIX64, r.address);
 		dl->PushClipRect(ImVec2(cols[kColResultAddr].inner_x0, ry),
 			ImVec2(cols[kColResultAddr].inner_x1, ry + kResultRowHeight), true);
 		dl->AddText(code_fn, code_fs,
@@ -1494,18 +2007,8 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	};
 
 	if (clicked_row >= 0) {
-		ui.selected_result = clicked_row;
 		handle_multi_select(ui.result_multi_sel, ui.last_result_anchor, clicked_row, total);
-		int source_index = clicked_row;
-		if (source_index < static_cast<int>(ui.sorted_result_indices.size()))
-			source_index = ui.sorted_result_indices[static_cast<std::size_t>(source_index)];
-		if (const auto result = capture_result(source_index)) {
-			memory_interaction::select(memory_interaction::capture_result(runtime,
-				result->address, source_index,
-				memory_scanner::format_value(result->current_value, sc.config.value_type),
-				memory_scanner::format_value(result->previous_value, sc.config.value_type),
-				compose_module_label(*result, regions_snapshot)));
-		}
+		select_result_rows(runtime, regions_snapshot, clicked_row);
 		diag_logf("results row_click idx=%d multi_count=%zu",
 			clicked_row, ui.result_multi_sel.size());
 	}
@@ -1533,12 +2036,13 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 				ui.result_multi_sel.insert(right_click_row);
 				ui.last_result_anchor = right_click_row;
 			}
-			ui.result_context = memory_interaction::capture_result(runtime, addr,
+				ui.result_context = memory_interaction::capture_result(runtime, addr,
 				src_index,
 				memory_scanner::format_value(result->current_value, sc.config.value_type),
 				memory_scanner::format_value(result->previous_value, sc.config.value_type),
 				compose_module_label(*result, regions_snapshot));
-			memory_interaction::select(ui.result_context);
+				select_result_rows(runtime, regions_snapshot, right_click_row);
+				ui.result_context = memory_interaction::selected();
 			s_result_context_origin.store(0);
 			s_open_result_ctx.store(true);
 			diag_logf("results right_click row=%d addr=0x%llX",
@@ -1557,6 +2061,8 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 				memory_scanner::format_value(result->current_value, sc.config.value_type),
 				memory_scanner::format_value(result->previous_value, sc.config.value_type),
 				compose_module_label(*result, regions_snapshot));
+			select_result_rows(runtime, regions_snapshot, ui.selected_result);
+			ui.result_context = memory_interaction::selected();
 			s_result_context_origin.store(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ? 1 : 2);
 			s_open_result_ctx.store(true);
 		}
@@ -1639,11 +2145,13 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
+	const bool compact_header = w < 460.f;
+	const float header_h = compact_header ? 64.f : kAddrHeaderHeight;
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + kAddrHeaderHeight),
+	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + header_h),
 		aida::ui::with_alpha(t.panel_header, a * 0.92f));
-	dl->AddLine(ImVec2(ox, oy + kAddrHeaderHeight),
-		ImVec2(ox + w, oy + kAddrHeaderHeight),
+	dl->AddLine(ImVec2(ox, oy + header_h),
+		ImVec2(ox + w, oy + header_h),
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
 	ImFont* h_font = aida::ui::fonts::body_em();
@@ -1670,11 +2178,28 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		(void)cts;
 	}
 
-	float right_x = ox + w - 12.f;
-
 	ImFont* btn_fn = aida::ui::fonts::body();
 	const float btn_fs = aida::ui::fonts::size_or(btn_fn, ImGui::GetFontSize());
-
+	if (compact_header) {
+		ImGui::SetCursorScreenPos(ImVec2(ox + 10.f, oy + 34.f));
+		if (aida::ui::components::button("Add Address",
+			aida::ui::components::button_kind_t::secondary,
+			aida::ui::components::size_t_::sm, ImVec2(100.f, 26.f))) {
+			s_pending_add_addr.store(0);
+			s_pending_add_vtype.store(static_cast<int>(sc.config.value_type));
+			s_open_add_dialog.store(true);
+			diag_log("address add_manual_button");
+		}
+		ImGui::SetCursorScreenPos(ImVec2(ox + 118.f, oy + 37.f));
+		bool auto_refresh = ui.auto_refresh;
+		if (ImGui::Checkbox("Auto", &auto_refresh)) {
+			ui.auto_refresh = auto_refresh;
+			diag_logf("address auto_refresh_toggle now=%d", static_cast<int>(ui.auto_refresh));
+		}
+		if (ImGui::IsItemHovered())
+			ImGui::SetTooltip("Automatically refresh retained address values");
+	} else {
+		float right_x = ox + w - 12.f;
 	{
 		const char* lbl = "Auto-refresh";
 		ImVec2 lsz = btn_fn->CalcTextSizeA(btn_fs, FLT_MAX, 0.f, lbl);
@@ -1745,13 +2270,14 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		ImGui::PopID();
 		right_x -= (bw + 8.f);
 	}
+	}
 
 	column_layout_t cols[5];
 	int addr_total = static_cast<int>(addr_count);
 	bool include_sb = addr_total > 0;
 	compute_addr_columns(ox, w, cols, include_sb);
 
-	float tbl_y0 = oy + kAddrHeaderHeight;
+	float tbl_y0 = oy + header_h;
 	dl->AddRectFilled(ImVec2(ox, tbl_y0),
 		ImVec2(ox + w, tbl_y0 + kAddrTableHeaderH),
 		aida::ui::with_alpha(t.bg_overlay, a * 0.40f));
@@ -1760,13 +2286,22 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	const float col_fs = aida::ui::fonts::size_or(col_fn, ImGui::GetFontSize());
 	for (std::size_t c = 0; c < 5U; ++c) {
 		if (!cols[c].title || cols[c].title[0] == '\0') continue;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string header_semantic_id = aida::preview::semantics::stable_id(
+			"aida.memory", std::string("address-header-") + cols[c].title);
+		aida::preview::semantics::register_region(header_semantic_id,
+			"memory-scan-action", ImGui::GetID(header_semantic_id.c_str()),
+			ImVec2(cols[c].x0, tbl_y0),
+			ImVec2(cols[c].x1, tbl_y0 + kAddrTableHeaderH), false, true,
+			"aida.dock-window.view.memory.value-scan");
+#endif
 		dl->AddText(col_fn, col_fs,
 			ImVec2(cols[c].inner_x0, tbl_y0 + (kAddrTableHeaderH - col_fs) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, a), cols[c].title);
 	}
 
 	float body_y = tbl_y0 + kAddrTableHeaderH;
-	float body_h = h - kAddrHeaderHeight - kAddrTableHeaderH;
+	float body_h = h - header_h - kAddrTableHeaderH;
 	if (body_h < 1.f) body_h = 1.f;
 	int visible_rows = static_cast<int>(body_h / kAddrRowHeight);
 	if (visible_rows < 1) visible_rows = 1;
@@ -1839,6 +2374,19 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		float ry = body_y + static_cast<float>(i) * kAddrRowHeight - ui.address_sb.scroll_y;
 		if (ry + kAddrRowHeight < body_y || ry > body_y + body_h) continue;
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const auto address_semantic_context = memory_interaction::capture_address(runtime,
+			e.address, i, e.frozen,
+			memory_scanner::format_value(e.last_value, e.value_type), e.target_pid,
+			e.target_epoch, e.target_identity.process.creation_time_100ns);
+		const std::string address_semantic_id = studio_memory_entity_id(
+			"address", address_semantic_context);
+		aida::preview::semantics::register_region(address_semantic_id,
+			"memory-address-row", ImGui::GetID(address_semantic_id.c_str()),
+			ImVec2(ox, ry), ImVec2(row_right_edge, ry + kAddrRowHeight), false, false,
+			"aida.dock-window.view.memory.value-scan");
+#endif
+
 		bool sel = (ui.address_multi_sel.count(i) > 0) || (ui.selected_address == i);
 		bool hov = ImGui::IsMouseHoveringRect(
 			ImVec2(ox, ry), ImVec2(row_right_edge, ry + kAddrRowHeight), false) &&
@@ -1869,6 +2417,11 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			ImGui::PushID(i * 11 + 3);
 			ImGui::SetCursorScreenPos(ImVec2(bx, by));
 			ImGui::InvisibleButton("##fz", ImVec2(box_w, box_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				aida::preview::semantics::stable_id(address_semantic_id, "freeze"),
+				"memory-scan-action", true, false, address_semantic_id);
+#endif
 			bool fz_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
 				!ui_input_gate::popup_blocks_background_input();
 			ImGui::PopID();
@@ -1877,7 +2430,8 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			if (fz_clicked) {
 				const auto context = memory_interaction::capture_address(runtime,
 					e.address, i, e.frozen,
-					memory_scanner::format_value(e.last_value, e.value_type));
+					memory_scanner::format_value(e.last_value, e.value_type), e.target_pid,
+					e.target_epoch, e.target_identity.process.creation_time_100ns);
 				const auto capability = memory_interaction::evaluate(
 					e.frozen ? memory_interaction::capability_t::unfreeze :
 						memory_interaction::capability_t::freeze,
@@ -1942,8 +2496,10 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 		{
 			char abuf[24];
-			snprintf(abuf, sizeof(abuf), "%016" PRIX64,
-				e.address);
+			if (w < 360.f)
+				snprintf(abuf, sizeof(abuf), "%" PRIX64, e.address);
+			else
+				snprintf(abuf, sizeof(abuf), "%016" PRIX64, e.address);
 			float maxw = cols[kColAddrAddress].inner_x1 - cols[kColAddrAddress].inner_x0;
 			dl->PushClipRect(
 				ImVec2(cols[kColAddrAddress].inner_x0, ry),
@@ -1988,11 +2544,8 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		bool in_freeze_col = (mx_now >= cols[kColAddrFreeze].x0 && mx_now < cols[kColAddrFreeze].x1);
 
 		if (hov && !in_freeze_col && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			ui.selected_address = i;
 			handle_multi_select(ui.address_multi_sel, ui.last_address_anchor, i, total);
-			memory_interaction::select(memory_interaction::capture_address(runtime,
-				e.address, i, e.frozen,
-				memory_scanner::format_value(e.last_value, e.value_type)));
+			select_address_rows(runtime, i);
 			diag_logf("address row_click idx=%d multi=%zu",
 				i, ui.address_multi_sel.size());
 		}
@@ -2005,7 +2558,8 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			} else if (mx >= cols[kColAddrValue].x0 && mx < cols[kColAddrValue].x1) {
 				const auto context = memory_interaction::capture_address(runtime,
 					e.address, i, e.frozen,
-					memory_scanner::format_value(e.last_value, e.value_type));
+					memory_scanner::format_value(e.last_value, e.value_type), e.target_pid,
+					e.target_epoch, e.target_identity.process.creation_time_100ns);
 				const auto capability = memory_interaction::evaluate(
 					memory_interaction::capability_t::change_value, context, runtime);
 				if (capability.enabled) {
@@ -2025,8 +2579,8 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			ctx_addr_request_row = i;
 			requested_context = memory_interaction::capture_address(runtime,
 				e.address, i, e.frozen,
-				memory_scanner::format_value(e.last_value, e.value_type));
-			memory_interaction::select(requested_context);
+				memory_scanner::format_value(e.last_value, e.value_type), e.target_pid,
+				e.target_epoch, e.target_identity.process.creation_time_100ns);
 			s_address_context_origin.store(0);
 			ui.selected_address = i;
 			if (ui.address_multi_sel.count(i) == 0) {
@@ -2034,6 +2588,8 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 				ui.address_multi_sel.insert(i);
 				ui.last_address_anchor = i;
 			}
+			select_address_rows(runtime, i);
+			requested_context = memory_interaction::selected();
 			diag_logf("address right_click idx=%d addr=0x%llX",
 				i, static_cast<unsigned long long>(e.address));
 		}
@@ -2062,7 +2618,11 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			ctx_addr_request_row = selected;
 			requested_context = memory_interaction::capture_address(runtime,
 				entry->address, selected, entry->frozen,
-				memory_scanner::format_value(entry->last_value, entry->value_type));
+				memory_scanner::format_value(entry->last_value, entry->value_type),
+				entry->target_pid, entry->target_epoch,
+				entry->target_identity.process.creation_time_100ns);
+			select_address_rows(runtime, selected);
+			requested_context = memory_interaction::selected();
 			s_address_context_origin.store(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ? 1 : 2);
 		}
 	}
@@ -2122,9 +2682,11 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	if (delete_idx >= 0) {
 		const auto current = capture_address_entry(delete_idx);
 		if (current && current->address == delete_address) {
-			auto context = memory_interaction::capture_address(runtime,
-				current->address, delete_idx, current->frozen,
-				memory_scanner::format_value(current->last_value, current->value_type));
+				auto context = memory_interaction::capture_address(runtime,
+					current->address, delete_idx, current->frozen,
+					memory_scanner::format_value(current->last_value, current->value_type),
+					current->target_pid, current->target_epoch,
+					current->target_identity.process.creation_time_100ns);
 			ui.address_context = context;
 			auto retained = make_memory_actions("memory.value_scan.address",
 				context, runtime, {{"memory.address.remove",
@@ -2155,6 +2717,11 @@ void render_splitter(ImDrawList* dl, float ox, float oy, float w, float a,
 	ImGui::PushID("##scanner_splitter");
 	ImGui::SetCursorScreenPos(a_min);
 	ImGui::InvisibleButton("##spl", ImVec2(a_max.x - a_min.x, a_max.y - a_min.y));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::semantics::register_last_item(
+		"aida.memory.splitter", "memory-scan-action", false, false,
+		"aida.dock-window.view.memory.value-scan");
+#endif
 	bool hov = ImGui::IsItemHovered();
 	bool act = ImGui::IsItemActive();
 	bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
@@ -2455,11 +3022,20 @@ void process_edit_value_dialog() {
 
 		uint64_t addr_v = 0;
 		memory_scanner::value_type_t vt = memory_scanner::value_type_t::int32_val;
+		std::uint32_t target_pid = 0;
+		std::uint64_t target_epoch = 0;
+		std::uint64_t process_creation_time_100ns = 0;
+		bool frozen = false;
 		{
 			std::lock_guard<std::mutex> lk(sc.address_mutex);
 			if (idx >= 0 && idx < static_cast<int>(sc.address_list.size())) {
-				addr_v = sc.address_list[static_cast<size_t>(idx)].address;
-				vt = sc.address_list[static_cast<size_t>(idx)].value_type;
+				const auto& entry = sc.address_list[static_cast<size_t>(idx)];
+				addr_v = entry.address;
+				vt = entry.value_type;
+				target_pid = entry.target_pid;
+				target_epoch = entry.target_epoch;
+				process_creation_time_100ns = entry.target_identity.process.creation_time_100ns;
+				frozen = entry.frozen;
 			}
 		}
 		char abuf[64];
@@ -2487,7 +3063,8 @@ void process_edit_value_dialog() {
 			std::string text(s_edit_value_buf);
 			const auto runtime = runtime_snapshot();
 			const auto context = memory_interaction::capture_address(runtime,
-				addr_v, idx, false, {});
+				addr_v, idx, frozen, {}, target_pid, target_epoch,
+				process_creation_time_100ns);
 			const auto capability = memory_interaction::evaluate(
 				memory_interaction::capability_t::change_value, context, runtime);
 			if (!capability.enabled) {
@@ -2873,15 +3450,19 @@ scan_command_state_t scan_command_capability(scan_command_t command) {
 	const bool scanning = state.scanning.load(std::memory_order_acquire);
 	bool has_initial_scan = false;
 	bool has_undo_history = false;
+	bool static_scan = false;
 	{
 		std::lock_guard<std::mutex> lock(state.results_mutex);
 		has_initial_scan = state.has_initial_scan;
 		has_undo_history = !state.scan_history.empty();
+		static_scan = state.scan_static_binary;
 	}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	const bool attached = true;
+	const bool static_binary = true;
 #else
 	const bool attached = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+	const bool static_binary = function_index::detail::static_pe_active();
 #endif
 	const auto requires_value = [](memory_scanner::scan_mode_t mode) {
 		return mode == memory_scanner::scan_mode_t::exact ||
@@ -2912,26 +3493,34 @@ scan_command_state_t scan_command_capability(scan_command_t command) {
 	};
 
 	switch (command) {
-	case scan_command_t::first_scan:
+	case scan_command_t::first_scan: {
 		if (scanning)
 			return {false, "A memory scan is already running"};
 		if (has_initial_scan)
 			return {false, "Start a New Scan before running another First Scan"};
-		if (!attached)
-			return {false, "Attach to a live process before starting a memory scan"};
+		if (g_ui.prefer_static_source && !static_binary)
+			return {false, "The selected static binary source is no longer available"};
+		if (!attached && !static_binary)
+			return {false, "Attach to a live process or open a static PE workspace before scanning"};
 		if (state.config.scan_mode == memory_scanner::scan_mode_t::changed ||
 			state.config.scan_mode == memory_scanner::scan_mode_t::unchanged ||
 			state.config.scan_mode == memory_scanner::scan_mode_t::increased ||
 			state.config.scan_mode == memory_scanner::scan_mode_t::decreased)
 			return {false, "Choose an initial comparison or Unknown Initial scan mode"};
 		return configured_value_capability();
+	}
 	case scan_command_t::next_scan:
 		if (scanning)
 			return {false, "Wait for the active memory scan to finish or stop it first"};
 		if (!has_initial_scan)
 			return {false, "Run First Scan before refining results"};
+		if (static_scan)
+			return {false, "Static binary scans are immutable; change the definition and run New Scan"};
 		if (!attached)
 			return {false, "The scanned live process is no longer attached"};
+		if (!memory_scanner::target_binding_current(
+				state.scan_target_pid, state.scan_target_epoch))
+			return {false, "The attached process changed; start a New Scan for this target"};
 		if (state.config.scan_mode == memory_scanner::scan_mode_t::unknown_initial)
 			return {false, "Choose a refinement scan mode before running Next Scan"};
 		return configured_value_capability();
@@ -2959,7 +3548,7 @@ scan_command_result_t execute_scan_command(scan_command_t command) {
 	auto& state = memory_scanner::g_state;
 	auto& ui = g_ui;
 	switch (command) {
-	case scan_command_t::first_scan:
+	case scan_command_t::first_scan: {
 		diag_logf("action first_scan val='%s' val2='%s' vtype=%s mode=%s",
 			ui.value_buf, ui.value_buf2,
 			memory_scanner::value_type_name(state.config.value_type),
@@ -2968,8 +3557,27 @@ scan_command_result_t execute_scan_command(scan_command_t command) {
 			"[scan_audit] memory_scanner first_scan invoked");
 		state.config.value_text = ui.value_buf;
 		state.config.value_text2 = ui.value_buf2;
-		if (!memory_scanner::first_scan(state.config))
-			return {false, "The memory scan engine rejected First Scan; the target or worker admission changed"};
+		bool started = false;
+		bool static_started = false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		started = memory_scanner::first_scan(state.config);
+#else
+		if (!ui.prefer_static_source && driver_bridge::is_loaded() &&
+			driver_bridge::attached_pid() != 0) {
+			started = memory_scanner::first_scan(state.config);
+		} else {
+			const auto workspace = disasm_view::capture_selected_workspace();
+			if (workspace.workspace && workspace.image) {
+				started = memory_scanner::first_static_scan(state.config,
+					workspace.workspace->provider_handle(), workspace.image,
+					workspace.workspace->identity().binary_id().to_hex(),
+					workspace.workspace->generation());
+				static_started = started;
+			}
+		}
+#endif
+		if (!started)
+			return {false, "The memory scan engine rejected First Scan; the live target or static workspace changed"};
 		ui.selected_result = -1;
 		ui.result_multi_sel.clear();
 		ui.last_result_anchor = -1;
@@ -2978,7 +3586,9 @@ scan_command_result_t execute_scan_command(scan_command_t command) {
 		ui.user_scrolled_up = false;
 		request_region_refresh();
 		invalidate_sort();
-		return {true, "Initial memory scan started"};
+		return {true, static_started ? "Static binary value scan started" :
+			"Initial live memory scan started"};
+	}
 	case scan_command_t::next_scan:
 		diag_logf("action next_scan mode=%s val='%s' val2='%s'",
 			memory_scanner::scan_mode_name(state.config.scan_mode),
@@ -3034,6 +3644,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		seeded = true;
 	}
 #endif
+	memory_interaction::synchronize_selection(runtime_snapshot());
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
 	ImGui::BeginChild("##scanner_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -3102,10 +3713,10 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	float callout_h = (!any_target) ? kCalloutHeight : 0.f;
 
-	render_toolbar(dl, ox, oy, w, a);
+	const float toolbar_h = render_toolbar(dl, ox, oy, w, a);
 
 	if (callout_h > 0.f) {
-		ui_anim::render_inline_callout(dl, ox + 12.f, oy + kToolbarHeight + 4.f,
+		ui_anim::render_inline_callout(dl, ox + 12.f, oy + toolbar_h + 4.f,
 			w - 24.f, 22.f,
 			static_pe_now
 				? "Static binary loaded. Value scans and watch mutations require a live process attach."
@@ -3113,12 +3724,12 @@ void render(float pos_x, float pos_y, float width, float height,
 			ui_anim::callout_kind_t::warn, 0.85f, 0.6f, 0.2f, a);
 	}
 
-	float remaining = h - kToolbarHeight - callout_h;
+	float remaining = h - toolbar_h - callout_h;
 	if (remaining < 100.f) remaining = 100.f;
 	float results_h = 0.f;
 	float address_h = 0.f;
 
-	float results_y = oy + kToolbarHeight + callout_h;
+	float results_y = oy + toolbar_h + callout_h;
 	float split_y = 0.f;
 
 	{
@@ -3152,6 +3763,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 void render_results(float pos_x, float pos_y, float width, float height,
 	float alpha, float, float, float) {
+	memory_interaction::synchronize_selection(runtime_snapshot());
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
 	ImGui::BeginChild("##memory_scan_results_pane", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -3165,6 +3777,7 @@ void render_results(float pos_x, float pos_y, float width, float height,
 
 void render_address_list(float pos_x, float pos_y, float width, float height,
 	float alpha, float, float, float) {
+	memory_interaction::synchronize_selection(runtime_snapshot());
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
 	ImGui::BeginChild("##memory_address_list_pane", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);

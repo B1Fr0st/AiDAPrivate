@@ -16,6 +16,7 @@ namespace {
 
 using namespace aida::standalone::mcp::compat;
 using namespace aida::standalone::mcp::compat::handlers;
+namespace protocol = aida::standalone::mcp::protocol;
 using protocol::cancellation_token_t;
 using protocol::json;
 
@@ -605,7 +606,7 @@ void fixture_set_type_and_batch_success(test_env_t& env, std::size_t& completed)
             json{{"addr", "0x14003000"}, {"ty", "USHORT"}},
             json{{"addr", "0x14004000"}, {"ty", "ULONG"}},
         })},
-    }}}));
+    }}});
     auto batch_result = adapters::type_apply_batch(*env.handlers, batch_args,
                                                      cancellation_token_t::create(), metadata);
     require_fixture(!batch_result.is_error(), "type_apply_batch", "batch_success", batch_result.text());

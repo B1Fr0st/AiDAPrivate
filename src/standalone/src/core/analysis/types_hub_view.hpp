@@ -25,6 +25,9 @@
 #include "../../helpers/win32_dialog.hpp"
 #endif
 #include "imgui/imgui.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -34,6 +37,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -53,6 +57,19 @@ extern HWND g_hwnd;
 #endif
 
 namespace types_hub_view {
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline std::string studio_type_entity_id(const char* entity,
+	const disasm_view::workspace_context_t& context, const std::string& entity_identity) {
+	const std::string workspace_id = context.workspace
+		? context.workspace->identity().binary_id().to_hex() : std::string("none");
+	const std::string identity = workspace_id + ":" + entity_identity;
+	std::string source(entity);
+	source.push_back('-');
+	source.append(aida::preview::semantics::entity_token(identity));
+	return aida::preview::semantics::stable_id("aida.types", source);
+}
+#endif
 
 enum class sub_tab_t : int {
     structs = 0,
@@ -801,6 +818,13 @@ inline void render_type_references(const disasm_view::workspace_context_t& conte
                     aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
                 }
             }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const std::string reference_semantic_id = studio_type_entity_id(
+				"reference", context, type_name + ":" +
+				std::to_string(reference.address.value));
+			aida::preview::semantics::register_last_item(
+				reference_semantic_id, "type-reference-row");
+#endif
         }
     }
     ImGui::EndChild();
@@ -1150,9 +1174,61 @@ inline void render_catalog_context_menu(const disasm_view::workspace_context_t& 
             ImGui::SetClipboardText(declaration.c_str());
             return aida::ui::action_handler_result_t::completed();
         });
-        add_action("types.catalog.edit_enum", false,
-            "The catalog has no mutable enum backend; create an overlay declaration instead",
-            [] { return aida::ui::action_handler_result_t::completed(); });
+        add_action("types.catalog.edit_enum", true, "", [definition, context] {
+            struct_dissector::enum_def_t editable;
+            bool existing = false;
+            {
+                auto& state = struct_dissector::g_state;
+                std::lock_guard<std::mutex> lock(state.mtx);
+                const auto found = std::find_if(state.enums.begin(), state.enums.end(),
+                    [&](const auto& item) { return item.name == definition.name; });
+                if (found != state.enums.end()) {
+                    editable = *found;
+                    existing = true;
+                }
+            }
+            if (!existing) {
+                editable.name = definition.name;
+                editable.underlying_type = struct_dissector::field_type_t::int64;
+                editable.values.reserve(definition.members.size());
+                for (const auto& member : definition.members)
+                    editable.values.push_back({member.name, member.value});
+                if (!struct_dissector::upsert_enum(editable))
+                    return aida::ui::action_handler_result_t::failed(
+                        "The enum could not be imported into the mutable catalog");
+                auto& state = struct_dissector::g_state;
+                std::lock_guard<std::mutex> lock(state.mtx);
+                const auto found = std::find_if(state.enums.begin(), state.enums.end(),
+                    [&](const auto& item) { return item.name == definition.name; });
+                if (found == state.enums.end())
+                    return aida::ui::action_handler_result_t::failed(
+                        "The imported enum was not published to the mutable catalog");
+                editable = *found;
+            }
+            struct_dissector_view::g_ui.selected_enum_id = editable.stable_id;
+            std::strncpy(struct_dissector_view::g_ui.enum_name_buf,
+                editable.name.c_str(), sizeof(struct_dissector_view::g_ui.enum_name_buf) - 1);
+            struct_dissector_view::g_ui.enum_name_buf[
+                sizeof(struct_dissector_view::g_ui.enum_name_buf) - 1] = '\0';
+            std::string values;
+            for (const auto& member : editable.values) {
+                if (!values.empty()) values.push_back('\n');
+                values += member.name + "=" + std::to_string(member.value);
+            }
+            std::strncpy(struct_dissector_view::g_ui.enum_values_buf, values.c_str(),
+                sizeof(struct_dissector_view::g_ui.enum_values_buf) - 1);
+            struct_dissector_view::g_ui.enum_values_buf[
+                sizeof(struct_dissector_view::g_ui.enum_values_buf) - 1] = '\0';
+            struct_dissector_view::g_ui.enum_underlying_type =
+                static_cast<int>(editable.underlying_type);
+            struct_dissector_view::g_ui.operation_error = false;
+            struct_dissector_view::g_ui.operation_status = existing
+                ? "Opened existing mutable enum unchanged; review replacements in Enum Manager"
+                : "Imported enum into the mutable catalog";
+            struct_dissector_view::g_ui.enum_popup_requested = true;
+            set_sub_tab(context, sub_tab_t::dissector);
+            return aida::ui::action_handler_result_t::completed();
+        });
     } else if (tab == sub_tab_t::functions) {
         const auto& entry = catalog.functions[index];
         const auto address = disasm_view::runtime_address(context, entry.address).value_or(entry.address.value);
@@ -1448,6 +1524,14 @@ inline void render(float, float, float width, float height,
                     publish_type_selection(context, active, entry.module,
                         entry.definition.name);
                 }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const std::string catalog_semantic_id = studio_type_entity_id(
+					"catalog", context,
+					std::to_string(static_cast<int>(active)) + ":" + entry.module + ":" +
+					entry.definition.name);
+				aida::preview::semantics::register_last_item(
+					catalog_semantic_id, "type-row");
+#endif
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     selected = row;
                     context_request_row = row;
@@ -1472,6 +1556,14 @@ inline void render(float, float, float width, float height,
                     publish_type_selection(context, active, entry.module,
                         entry.definition.name);
                 }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const std::string catalog_semantic_id = studio_type_entity_id(
+					"catalog", context,
+					std::to_string(static_cast<int>(active)) + ":" + entry.module + ":" +
+					entry.definition.name);
+				aida::preview::semantics::register_last_item(
+					catalog_semantic_id, "type-row");
+#endif
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     selected = row;
                     context_request_row = row;
@@ -1503,6 +1595,14 @@ inline void render(float, float, float width, float height,
                         aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
                     }
                 }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const std::string catalog_semantic_id = studio_type_entity_id(
+					"catalog", context,
+					std::to_string(static_cast<int>(active)) + ":" +
+					std::to_string(entry.address.value) + ":" + entry.name);
+				aida::preview::semantics::register_last_item(
+					catalog_semantic_id, "type-row");
+#endif
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     selected = row;
                     context_request_row = row;
@@ -1531,6 +1631,14 @@ inline void render(float, float, float width, float height,
                             ? std::optional<aida::analysis::address_t>(entry.address)
                             : std::nullopt);
                 }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const std::string catalog_semantic_id = studio_type_entity_id(
+					"catalog", context,
+					std::to_string(static_cast<int>(active)) + ":" + entry.name + ":" +
+					std::to_string(entry.address.value));
+				aida::preview::semantics::register_last_item(
+					catalog_semantic_id, "type-row");
+#endif
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     selected = row;
                     context_request_row = row;

@@ -868,6 +868,7 @@ struct job_t
 
     std::mutex                    results_mtx;
     std::deque<result_t>          results;
+    std::atomic<size_t>           discarded_results{0};
 
     std::mutex                    worker_mtx;
 
@@ -888,7 +889,19 @@ static registry_t& reg() { static registry_t r; return r; }
 
 static void store_result(job_t& job, result_t r)
 {
+    constexpr size_t maximum_retained_results = 32768;
     std::lock_guard<std::mutex> lk(job.results_mtx);
+    if (job.results.size() >= maximum_retained_results) {
+        job.results.pop_front();
+        const size_t discarded = job.discarded_results.fetch_add(1,
+            std::memory_order_acq_rel) + 1;
+        if (discarded == 1 || (discarded % 1024U) == 0U) {
+            diag::log_tagged_fmt("intruder",
+                "result_retention_backpressure job_id=%llu retained=%zu discarded=%zu",
+                static_cast<unsigned long long>(job.id), maximum_retained_results,
+                discarded);
+        }
+    }
     job.results.push_back(std::move(r));
 }
 

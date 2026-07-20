@@ -51,6 +51,14 @@ value_t require_value(workspace_result_t<value_t> result, const char* message) {
     return result.take_value();
 }
 
+void require_success(workspace_result_t<void> result, const char* message) {
+    const bool accepted = static_cast<bool>(result);
+    aida::analysis::c03_test::assertion_telemetry::record_assertion(
+        accepted, message, __FILE__, __LINE__);
+    if (!accepted)
+        throw std::runtime_error(std::string(message) + ": " + result.error().stable_code());
+}
+
 void require(bool condition, const char* message) {
 	aida::analysis::c03_test::assertion_telemetry::record_assertion(
 		condition, message, __FILE__, __LINE__);
@@ -247,8 +255,8 @@ void verify_zip_archive_kind_detection(const std::filesystem::path& root) {
                                       "lazy open classes.dex failed");
     require(dex_provider->size() == 8, "classes.dex provider size mismatch");
 
-    auto integrity = require_value(collection->verify_integrity(),
-                                    "integrity verification failed");
+    require_success(collection->verify_integrity(),
+                    "integrity verification failed");
     require(collection->integrity_verified(), "integrity flag not set");
 }
 

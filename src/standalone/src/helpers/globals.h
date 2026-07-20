@@ -1022,8 +1022,13 @@ struct OpenTab {
 	bool          external_overwrite_approved = false;
 	int           caret_line = 0;
 	int           caret_column = 0;
+	int           selection_anchor_line = 0;
+	int           selection_anchor_column = 0;
+	bool          selection_active = false;
 	float         scroll_x = 0.f;
 	float         scroll_y = 0.f;
+	std::vector<int> folded_lines;
+	std::string   language_override;
 	std::uint64_t revision = 1;
 	std::uint64_t content_hash = 0;
 	std::uint64_t base_fingerprint = 0;
@@ -1098,13 +1103,19 @@ namespace file_tabs {
 	inline std::string close_confirm_error;
 	inline std::deque<std::uint64_t> pending_close_all_document_ids;
 	inline std::uint64_t pending_close_after_save_document_id = 0;
+	inline bool exit_review_requested = false;
+	inline bool exit_review_ready = false;
+	inline bool exit_review_committed = false;
+	inline std::unordered_map<std::uint64_t, std::uint64_t> exit_review_snapshot_revisions;
+	inline std::unordered_map<std::uint64_t, std::uint64_t> exit_review_resolved_revisions;
+	inline std::unordered_map<std::uint64_t, std::uint64_t> exit_review_discard_revisions;
 	inline std::uint64_t pending_recovery_discard_document = 0;
 	inline float close_confirm_anim = 0.f;
 	inline int   close_confirm_hovered = -1;
 
 	inline bool close_review_in_progress() {
 		return pending_close_idx >= 0 || pending_close_after_save_document_id != 0 ||
-			!pending_close_all_document_ids.empty();
+			!pending_close_all_document_ids.empty() || exit_review_requested;
 	}
 
 	inline bool is_valid_tab_index(int idx) {
@@ -1114,6 +1125,8 @@ namespace file_tabs {
 	inline size_t tab_index(int idx) {
 		return static_cast<size_t>(idx);
 	}
+
+	inline int find_document(std::uint64_t document_id);
 
 	inline std::int64_t disk_write_version(const std::string& fpath) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -1310,8 +1323,13 @@ namespace file_tabs {
 		t.dirty = metadata.dirty;
 		t.caret_line = metadata.caret_line;
 		t.caret_column = metadata.caret_column;
+		t.selection_anchor_line = metadata.selection_anchor_line;
+		t.selection_anchor_column = metadata.selection_anchor_column;
+		t.selection_active = metadata.selection_active;
 		t.scroll_x = metadata.scroll_x;
 		t.scroll_y = metadata.scroll_y;
+		t.folded_lines = metadata.folded_lines;
+		t.language_override = metadata.language_override;
 		t.revision = metadata.revision;
 		t.proposal_pending = metadata.proposal_pending;
 		if (metadata.dirty) t.content_hash = 0;
@@ -1325,7 +1343,9 @@ namespace file_tabs {
 		if (t.buffer_loaded) {
 			static_cast<void>(code_editor_widget::load_document(t.document_id, t.revision,
 				t.buffer, t.filename, t.filepath, t.dirty, t.caret_line, t.caret_column,
-				t.scroll_x, t.scroll_y));
+				t.scroll_x, t.scroll_y, false, t.selection_anchor_line,
+				t.selection_anchor_column, t.selection_active, t.folded_lines,
+				t.language_override));
 			if (t.pending_caret_navigation) {
 				code_editor_widget::set_document_caret(t.document_id,
 					t.caret_line, t.caret_column);
@@ -1339,7 +1359,9 @@ namespace file_tabs {
 			t.dirty = false;
 			static_cast<void>(code_editor_widget::load_document(t.document_id, t.revision,
 				t.buffer, t.filename, t.filepath, false, t.caret_line, t.caret_column,
-				t.scroll_x, t.scroll_y));
+				t.scroll_x, t.scroll_y, false, t.selection_anchor_line,
+				t.selection_anchor_column, t.selection_active, t.folded_lines,
+				t.language_override));
 #else
 		if (t.load_in_progress)
 			return;
@@ -1712,6 +1734,21 @@ namespace file_tabs {
 		std::string detail;
 	};
 
+	inline save_result_t verify_licensed_save_gate() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		return {true, {}};
+#else
+		if (!standalone_license::is_valid())
+			return {false, "The licensed save gate is unavailable."};
+		const uint64_t token = standalone_license::inline_gate_check(
+			standalone_license::gate_editor_save);
+		return standalone_license::verify_gate_token(
+			standalone_license::gate_editor_save, token) >= 0.5
+			? save_result_t{true, {}}
+			: save_result_t{false, "The licensed save gate rejected the operation."};
+#endif
+	}
+
 	inline std::uint64_t content_fingerprint(std::string_view content) {
 		std::uint64_t hash = 14695981039346656037ULL;
 		for (const char character : content) {
@@ -1740,8 +1777,13 @@ namespace file_tabs {
 		record.dirty = tab.dirty;
 		record.caret_line = tab.caret_line;
 		record.caret_column = tab.caret_column;
+		record.selection_anchor_line = tab.selection_anchor_line;
+		record.selection_anchor_column = tab.selection_anchor_column;
+		record.selection_active = tab.selection_active;
 		record.scroll_x = tab.scroll_x;
 		record.scroll_y = tab.scroll_y;
+		record.folded_lines = tab.folded_lines;
+		record.language_override = tab.language_override;
 		record.text = tab.text_metadata;
 		return record;
 	}
@@ -2474,19 +2516,10 @@ namespace file_tabs {
 		return {true, {}};
 #else
 		const std::int64_t expected_disk_version = save_as ? 0 : t.disk_write_version;
-		if (!standalone_license::is_valid()) {
+		const auto save_gate = verify_licensed_save_gate();
+		if (!save_gate.succeeded) {
 			t.save_in_progress = false;
-			return {false, "The licensed save gate is unavailable."};
-		}
-		{
-			uint64_t gt = standalone_license::inline_gate_check(
-				standalone_license::gate_editor_save);
-			if (standalone_license::verify_gate_token(
-					standalone_license::gate_editor_save, gt) < 0.5)
-			{
-				t.save_in_progress = false;
-				return {false, "The licensed save gate rejected the operation."};
-			}
+			return save_gate;
 		}
 		auto dispatch_failed = std::make_shared<std::atomic<bool>>(false);
 		auto cancelled = std::make_shared<std::atomic<bool>>(false);
@@ -2679,7 +2712,9 @@ namespace file_tabs {
 		active_document_by_group[nt.group_id] = nt.document_id;
 		static_cast<void>(code_editor_widget::load_document(nt.document_id,
 			nt.revision, nt.buffer, nt.filename, nt.filepath, nt.dirty,
-			nt.caret_line, nt.caret_column, nt.scroll_x, nt.scroll_y, true));
+			nt.caret_line, nt.caret_column, nt.scroll_x, nt.scroll_y, true,
+			nt.selection_anchor_line, nt.selection_anchor_column, nt.selection_active,
+			nt.folded_lines, nt.language_override));
 	}
 
 	inline save_result_t restore_programming_session(const std::string& serialized,
@@ -2708,8 +2743,13 @@ namespace file_tabs {
 			tab.pinned = record.pinned;
 			tab.caret_line = record.caret_line;
 			tab.caret_column = record.caret_column;
+			tab.selection_anchor_line = record.selection_anchor_line;
+			tab.selection_anchor_column = record.selection_anchor_column;
+			tab.selection_active = record.selection_active;
 			tab.scroll_x = record.scroll_x;
 			tab.scroll_y = record.scroll_y;
+			tab.folded_lines = record.folded_lines;
+			tab.language_override = record.language_override;
 			tab.revision = record.revision;
 			tab.content_hash = record.content_hash;
 			tab.base_fingerprint = record.base_fingerprint;
@@ -2762,8 +2802,13 @@ namespace file_tabs {
 			tab.revision = metadata.revision;
 			tab.caret_line = metadata.caret_line;
 			tab.caret_column = metadata.caret_column;
+			tab.selection_anchor_line = metadata.selection_anchor_line;
+			tab.selection_anchor_column = metadata.selection_anchor_column;
+			tab.selection_active = metadata.selection_active;
 			tab.scroll_x = metadata.scroll_x;
 			tab.scroll_y = metadata.scroll_y;
+			tab.folded_lines = metadata.folded_lines;
+			tab.language_override = metadata.language_override;
 			tab.proposal_pending = metadata.proposal_pending;
 			if (metadata.dirty) tab.content_hash = 0;
 		}
@@ -3021,6 +3066,13 @@ namespace file_tabs {
 
 	inline void cancel_close_all() {
 		pending_close_all_document_ids.clear();
+		pending_close_after_save_document_id = 0;
+		exit_review_requested = false;
+		exit_review_ready = false;
+		exit_review_committed = false;
+		exit_review_snapshot_revisions.clear();
+		exit_review_resolved_revisions.clear();
+		exit_review_discard_revisions.clear();
 	}
 
 	inline void finish_close_all_document(std::uint64_t document_id) {
@@ -3040,11 +3092,12 @@ namespace file_tabs {
 				continue;
 			}
 			auto& tab = tabs[tab_index(index)];
-			if (tab.pinned) {
+			if (!exit_review_requested && tab.pinned) {
 				pending_close_all_document_ids.pop_front();
 				continue;
 			}
-			if (tab.save_in_progress)
+			if (tab.save_in_progress || (exit_review_requested &&
+				(tab.recovery_operation_pending || tab.recovery_checkpoint_pending)))
 				return;
 			const auto metadata = code_editor_widget::document_metadata(document_id);
 			if (metadata.found) {
@@ -3052,11 +3105,18 @@ namespace file_tabs {
 				tab.revision = metadata.revision;
 			}
 			if (tab.dirty) {
+				const auto resolved = exit_review_resolved_revisions.find(document_id);
+				if (exit_review_requested && resolved != exit_review_resolved_revisions.end() &&
+					resolved->second == tab.revision) {
+					pending_close_all_document_ids.pop_front();
+					continue;
+				}
 				pending_close_idx = index;
 				show_close_confirm = true;
 				return;
 			}
-			close_tab(index);
+			if (!exit_review_requested)
+				close_tab(index);
 			pending_close_all_document_ids.pop_front();
 		}
 	}
@@ -3096,7 +3156,7 @@ namespace file_tabs {
 			pending_close_idx = -1;
 			return;
 		}
-		if (tab.pinned) {
+		if (!exit_review_requested && tab.pinned) {
 			pending_close_after_save_document_id = 0;
 			pending_close_idx = -1;
 			close_confirm_error.clear();
@@ -3116,9 +3176,110 @@ namespace file_tabs {
 		pending_close_after_save_document_id = 0;
 		pending_close_idx = -1;
 		close_confirm_error.clear();
-		close_tab(index);
+		if (!exit_review_requested)
+			close_tab(index);
 		finish_close_all_document(document_id);
 		advance_close_all();
+	}
+
+	inline void resolve_exit_review_document(std::uint64_t document_id,
+		std::uint64_t revision, bool confirmed_discard) {
+		if (!exit_review_requested || document_id == 0 ||
+			exit_review_snapshot_revisions.find(document_id) ==
+				exit_review_snapshot_revisions.end())
+			return;
+		exit_review_resolved_revisions[document_id] = revision;
+		if (confirmed_discard)
+			exit_review_discard_revisions[document_id] = revision;
+		else
+			exit_review_discard_revisions.erase(document_id);
+		finish_close_all_document(document_id);
+		advance_close_all();
+	}
+
+	inline void poll_exit_review() {
+		if (!exit_review_requested || exit_review_committed)
+			return;
+		snapshot_active_to_tab();
+		bool operation_pending = pending_close_after_save_document_id != 0;
+		for (std::size_t index = 0; index < tabs.size(); ++index) {
+			auto& tab = tabs[index];
+			const auto metadata = code_editor_widget::document_metadata(tab.document_id);
+			if (metadata.found) {
+				tab.dirty = metadata.dirty;
+				tab.revision = metadata.revision;
+			}
+			operation_pending = operation_pending || tab.save_in_progress ||
+				tab.recovery_operation_pending || tab.recovery_checkpoint_pending;
+			if (!tab.dirty)
+				continue;
+			exit_review_snapshot_revisions.try_emplace(tab.document_id, tab.revision);
+			const auto resolved = exit_review_resolved_revisions.find(tab.document_id);
+			if (resolved != exit_review_resolved_revisions.end() &&
+				resolved->second == tab.revision)
+				continue;
+			if (std::find(pending_close_all_document_ids.begin(),
+					pending_close_all_document_ids.end(), tab.document_id) ==
+				pending_close_all_document_ids.end() &&
+				(!is_valid_tab_index(pending_close_idx) ||
+				 tabs[tab_index(pending_close_idx)].document_id != tab.document_id))
+				pending_close_all_document_ids.push_back(tab.document_id);
+		}
+		if (pending_close_idx < 0 && pending_close_after_save_document_id == 0)
+			advance_close_all();
+		exit_review_ready = !operation_pending && pending_close_idx < 0 &&
+			pending_close_after_save_document_id == 0 &&
+			pending_close_all_document_ids.empty();
+	}
+
+	inline save_result_t request_exit_review() {
+		if (exit_review_requested)
+			return {true, exit_review_committed
+				? "Application shutdown is already committed."
+				: "Application shutdown review is already in progress."};
+		if (pending_close_idx >= 0 || pending_close_after_save_document_id != 0 ||
+			!pending_close_all_document_ids.empty())
+			return {false, "Finish the current document-close review first."};
+		exit_review_requested = true;
+		exit_review_ready = false;
+		exit_review_committed = false;
+		exit_review_snapshot_revisions.clear();
+		exit_review_resolved_revisions.clear();
+		exit_review_discard_revisions.clear();
+		poll_exit_review();
+		return {true, {}};
+	}
+
+	inline bool consume_exit_review_ready() {
+		poll_exit_review();
+		if (!exit_review_requested || !exit_review_ready || exit_review_committed)
+			return false;
+		for (const auto& discarded : exit_review_discard_revisions) {
+			const int index = find_document_index(discarded.first);
+			if (!is_valid_tab_index(index))
+				continue;
+			const auto metadata = code_editor_widget::document_metadata(discarded.first);
+			if (!metadata.found || metadata.revision != discarded.second ||
+				!metadata.dirty) {
+				exit_review_ready = false;
+				exit_review_resolved_revisions.erase(discarded.first);
+				return false;
+			}
+		}
+		for (const auto& discarded : exit_review_discard_revisions) {
+			const int index = find_document_index(discarded.first);
+			if (!is_valid_tab_index(index))
+				continue;
+			auto& tab = tabs[tab_index(index)];
+			schedule_confirmed_recovery_cleanup(tab);
+			tab.dirty = false;
+			tab.recovery = {};
+			tab.recovery_error.clear();
+			code_editor_widget::mark_document_saved(tab.document_id, tab.revision,
+				tab.filename, tab.filepath);
+		}
+		exit_review_committed = true;
+		return true;
 	}
 
 	inline bool can_reopen_closed_document() {

@@ -1,8 +1,12 @@
 #pragma once
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <shlobj.h>
 #include <wincrypt.h>
@@ -434,6 +438,7 @@ struct settings_sa_t
     std::string ui_table_preferences_json;
     std::string ui_filter_preferences_json;
     std::string debugger_definitions_json;
+	std::string memory_scanner_state_json;
 
 
     bool        enable_reasoning    = false;
@@ -1422,6 +1427,7 @@ struct settings_sa_t
         str("ui_table_preferences_json", ui_table_preferences_json);
         str("ui_filter_preferences_json", ui_filter_preferences_json);
         str("debugger_definitions_json", debugger_definitions_json);
+		str("memory_scanner_state_json", memory_scanner_state_json);
         ui_density = ui_density == 1 ? 1 : 0;
         if (root.contains("editor_font_size") && root["editor_font_size"].is_number())
             editor_font_size = root["editor_font_size"].get<float>();
@@ -1722,6 +1728,7 @@ struct settings_sa_t
         root["ui_table_preferences_json"] = ui_table_preferences_json;
         root["ui_filter_preferences_json"] = ui_filter_preferences_json;
         root["debugger_definitions_json"] = debugger_definitions_json;
+		root["memory_scanner_state_json"] = memory_scanner_state_json;
 
         root["enable_reasoning"] = enable_reasoning;
         root["reasoning_budget"] = reasoning_budget;

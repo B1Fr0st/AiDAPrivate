@@ -9,8 +9,6 @@
 
 #include "../infra/executor.hpp"
 
-using DWORD = std::uint32_t;
-
 inline std::uint64_t GetTickCount64()
 {
 	using clock_t = std::chrono::steady_clock;
@@ -23,15 +21,6 @@ inline void* SecureZeroMemory(void* pointer, std::size_t size)
 	volatile unsigned char* cursor = static_cast<volatile unsigned char*>(pointer);
 	while (size-- != 0) *cursor++ = 0;
 	return pointer;
-}
-
-namespace diag {
-
-template <typename... Args>
-inline void log_tagged_fmt(const char*, const char*, Args&&...)
-{
-}
-
 }
 
 namespace aida::infra::win_thread {

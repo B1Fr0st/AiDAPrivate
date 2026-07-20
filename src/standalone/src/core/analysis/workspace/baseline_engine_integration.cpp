@@ -21,8 +21,7 @@ struct integration_state_t final {
     baseline_engine_integration_config_t config;
     std::atomic<std::uint64_t> active_job_id{0};
     std::atomic<bool> cancellation_active{false};
-    std::atomic<c03::publication_stage_t::underlying_t> current_stage{
-        static_cast<c03::publication_stage_t::underlying_t>(c03::publication_stage_t::none)};
+    std::atomic<c03::publication_stage_t> current_stage{c03::publication_stage_t::none};
     std::atomic<std::uint64_t> active_generation{0};
     std::atomic<std::uint64_t> active_analysis_revision{0};
     std::atomic<bool> resource_budget_exceeded{false};
@@ -78,7 +77,6 @@ resolve_target_contract_identity(const analysis_workspace_t& workspace) {
     auto ws_contract = resolve_workspace_contract_identity(workspace);
     if (!ws_contract)
         return workspace_result_t<c03::target_contract_identity_t>::failure(ws_contract.error());
-    c03::target_id_t target_id;
     auto target_result = c03::target_id_t::from_value(
         workspace.generation() + 1);
     if (!target_result)
@@ -86,7 +84,7 @@ resolve_target_contract_identity(const analysis_workspace_t& workspace) {
             make_workspace_error(workspace_error_code_t::integrity_failure,
                 "C03 target identity could not be derived",
                 "baseline_engine_integration"));
-    target_id = target_result.value();
+    const auto target_id = target_result.value();
     const auto kind = workspace.target_kind() == target_kind_t::static_file
         ? c03::analysis_target_kind_t::static_image
         : c03::analysis_target_kind_t::live_module;
@@ -274,7 +272,7 @@ struct baseline_engine_integration_t::impl_t {
             return workspace_result_t<void>::failure(std::move(error));
         }
         std::lock_guard<std::mutex> lock(state.snapshot_mutex);
-        state.cancellation_domain = domain.value();
+        state.cancellation_domain.emplace(std::move(domain).take_value());
         state.metrics_snapshot.cancellation_domain_activated++;
         return workspace_result_t<void>::success();
     }
@@ -415,8 +413,7 @@ baseline_engine_integration_t::start_baseline(
     impl_->state.active_analysis_revision.store(workspace_->analysis_revision(),
         std::memory_order_release);
     impl_->state.current_stage.store(
-        static_cast<c03::publication_stage_t::underlying_t>(
-            c03::publication_stage_t::metadata_ready),
+        c03::publication_stage_t::metadata_ready,
         std::memory_order_release);
     auto submitted = baseline_analysis_service_t::start(
         workspace_, config_.baseline_settings, deadline);
@@ -435,8 +432,7 @@ baseline_engine_integration_t::start_baseline(
         impl_->state.metrics_snapshot.graph_submissions++;
     }
     impl_->state.current_stage.store(
-        static_cast<c03::publication_stage_t::underlying_t>(
-            c03::publication_stage_t::baseline_ready),
+        c03::publication_stage_t::baseline_ready,
         std::memory_order_release);
     return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::success(
         submitted.value());
@@ -448,13 +444,12 @@ bool baseline_engine_integration_t::cancel_baseline() noexcept {
         return false;
     impl_->state.cancellation_active.store(true, std::memory_order_release);
     impl_->state.current_stage.store(
-        static_cast<c03::publication_stage_t::underlying_t>(
-            c03::publication_stage_t::retired),
+        c03::publication_stage_t::retired,
         std::memory_order_release);
     const auto cancelled = baseline_analysis_service_t::cancel(
         aida::infra::taskflow_runtime::job_handle_t{id});
     if (cancelled)
-        impl_->state.revoke_cancellation_domain();
+        impl_->revoke_cancellation_domain();
     return cancelled;
 }
 
@@ -511,8 +506,7 @@ baseline_engine_integration_t::snapshot() const noexcept {
         std::memory_order_acquire);
     result.resource_budget_exceeded = impl_->state.resource_budget_exceeded.load(
         std::memory_order_acquire);
-    result.current_stage = static_cast<c03::publication_stage_t>(
-        impl_->state.current_stage.load(std::memory_order_acquire));
+    result.current_stage = impl_->state.current_stage.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lock(impl_->state.snapshot_mutex);
         result.metrics = impl_->state.metrics_snapshot;
@@ -580,8 +574,7 @@ baseline_engine_integration_t::validate_publication_contract(
                 "immutable publication contract validation failed",
                 "baseline_engine_integration"));
     auto transition = c03::validate_publication_stage_transition(
-        static_cast<c03::publication_stage_t>(
-            impl_->state.current_stage.load(std::memory_order_acquire)),
+        impl_->state.current_stage.load(std::memory_order_acquire),
         stage);
     if (!transition)
         return workspace_result_t<c03::immutable_publication_contract_t>::failure(

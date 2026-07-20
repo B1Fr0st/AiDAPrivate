@@ -54,6 +54,7 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <cstring>
 #include <exception>
@@ -832,13 +833,27 @@ inline bool is_archive(const std::string& ext)
 
 namespace {
 
+struct hex_preview_operation_t {
+    std::mutex mutex;
+    std::condition_variable completion;
+    std::atomic<bool> terminal{false};
+    std::atomic<bool> cancellation{false};
+    std::shared_ptr<aida::analysis::cancellation_source_t> provider_cancellation;
+    std::optional<aida::analysis::workspace_admission_handle_t> admission;
+};
+
 struct hex_preview_state_t {
     std::mutex mutex;
     std::uint64_t serial = 0;
     bool loading = false;
+    bool cancellation_requested = false;
+    bool cancelled = false;
+    bool archive = false;
     std::string path;
     std::string error;
+    aida::infra::taskflow_runtime::job_handle_t task;
     std::optional<aida::analysis::workspace_admission_handle_t> admission;
+    std::shared_ptr<hex_preview_operation_t> operation;
 };
 
 hex_preview_state_t& hex_preview_state()
@@ -855,19 +870,104 @@ bool hex_preview_is_current(std::uint64_t serial)
 
 void complete_hex_preview_failure(std::uint64_t serial, std::string path, std::string error)
 {
-    if (!aida::ui_thread::post([serial, path = std::move(path), error = std::move(error)]() mutable {
+    auto publish = [serial, path = std::move(path), error = std::move(error)]() mutable {
         auto& preview = hex_preview_state();
         std::lock_guard<std::mutex> lock(preview.mutex);
         if (preview.serial != serial)
             return;
         preview.loading = false;
+        preview.cancellation_requested = false;
+        preview.cancelled = false;
         preview.path = std::move(path);
         preview.error = std::move(error);
+        preview.task = {};
         preview.admission.reset();
-    }, "file_browser", "hex_fallback", "failure")) {
+        preview.operation.reset();
+    };
+    if (!aida::ui_thread::post(publish, "file_browser", "hex_fallback", "failure")) {
+        publish();
         diag::log_tagged_fmt("file_browser", "hex_fallback_ui_post_failed serial=%llu",
             static_cast<unsigned long long>(serial));
     }
+}
+
+void complete_hex_preview_cancelled(std::uint64_t serial, std::string path)
+{
+    auto publish = [serial, path = std::move(path)]() mutable {
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        if (preview.serial != serial)
+            return;
+        preview.loading = false;
+        preview.cancellation_requested = false;
+        preview.cancelled = true;
+        preview.path = std::move(path);
+        preview.error.clear();
+        preview.task = {};
+        preview.admission.reset();
+        preview.operation.reset();
+    };
+    if (!aida::ui_thread::post(publish, "file_browser", "hex_fallback", "cancelled")) {
+        publish();
+        diag::log_tagged_fmt("file_browser", "hex_fallback_cancel_ui_post_failed serial=%llu",
+            static_cast<unsigned long long>(serial));
+    }
+}
+
+bool claim_hex_preview_terminal(const std::shared_ptr<hex_preview_operation_t>& operation)
+{
+    return operation && !operation->terminal.exchange(true, std::memory_order_acq_rel);
+}
+
+void finish_hex_preview_failure(const std::shared_ptr<hex_preview_operation_t>& operation,
+    std::uint64_t serial, const std::string& path, std::string error)
+{
+    if (!claim_hex_preview_terminal(operation))
+        return;
+    complete_hex_preview_failure(serial, path, std::move(error));
+    operation->completion.notify_all();
+}
+
+void cancel_hex_preview_operation(const std::shared_ptr<hex_preview_operation_t>& operation,
+    std::uint64_t serial, const std::string& path)
+{
+    if (!claim_hex_preview_terminal(operation))
+        return;
+    operation->cancellation.store(true, std::memory_order_release);
+    std::optional<aida::analysis::workspace_admission_handle_t> admission;
+    std::shared_ptr<aida::analysis::cancellation_source_t> provider_cancellation;
+    {
+        std::lock_guard<std::mutex> lock(operation->mutex);
+        admission = operation->admission;
+        provider_cancellation = operation->provider_cancellation;
+    }
+    if (provider_cancellation)
+        provider_cancellation->request_cancel();
+    if (admission)
+        aida::analysis::workspace_registry_t::cancel_admission(*admission);
+    complete_hex_preview_cancelled(serial, path);
+    operation->completion.notify_all();
+}
+
+void timeout_hex_preview_operation(const std::shared_ptr<hex_preview_operation_t>& operation,
+    std::uint64_t serial, const std::string& path)
+{
+    if (!claim_hex_preview_terminal(operation))
+        return;
+    std::optional<aida::analysis::workspace_admission_handle_t> admission;
+    std::shared_ptr<aida::analysis::cancellation_source_t> provider_cancellation;
+    {
+        std::lock_guard<std::mutex> lock(operation->mutex);
+        admission = operation->admission;
+        provider_cancellation = operation->provider_cancellation;
+    }
+    if (provider_cancellation)
+        provider_cancellation->request_cancel();
+    if (admission)
+        aida::analysis::workspace_registry_t::cancel_admission(*admission);
+    complete_hex_preview_failure(serial, path,
+        "TIMEOUT: provider admission did not complete within 60 seconds");
+    operation->completion.notify_all();
 }
 
 bool has_suffix(const std::string& value, const char* suffix)
@@ -944,9 +1044,13 @@ bool open_archive_member_provider(const std::shared_ptr<const aida::analysis::by
 }
 
 void complete_hex_preview_success(
+    const std::shared_ptr<hex_preview_operation_t>& operation,
     std::uint64_t serial, std::string path,
     aida::analysis::workspace_result_t<std::shared_ptr<aida::analysis::analysis_workspace_t>> result)
 {
+    if (!claim_hex_preview_terminal(operation))
+        return;
+    const std::string fallback_path = path;
     if (!aida::ui_thread::post([serial, path = std::move(path), result = std::move(result)]() mutable {
         auto& preview = hex_preview_state();
         {
@@ -959,8 +1063,12 @@ void complete_hex_preview_success(
             if (preview.serial != serial)
                 return;
             preview.loading = false;
+            preview.cancellation_requested = false;
+            preview.cancelled = false;
             preview.error = result.error().stable_code() + ": " + result.error().message;
+            preview.task = {};
             preview.admission.reset();
+            preview.operation.reset();
             return;
         }
         auto workspace = result.take_value();
@@ -971,7 +1079,11 @@ void complete_hex_preview_success(
         if (preview.serial != serial)
             return;
         preview.loading = false;
+        preview.cancellation_requested = false;
+        preview.cancelled = false;
+        preview.task = {};
         preview.admission.reset();
+        preview.operation.reset();
         if (!selected || !context) {
             preview.error = !selected ? selected.error().stable_code() + ": " + selected.error().message :
                 "TARGET_NOT_FOUND: admitted workspace context is unavailable";
@@ -985,26 +1097,46 @@ void complete_hex_preview_success(
         diag::log_tagged_fmt("file_browser", "hex_fallback_complete path=%s target=%s",
             path.c_str(), workspace->identity().binary_id().to_hex().c_str());
     }, "file_browser", "hex_fallback", "complete")) {
+        complete_hex_preview_failure(serial, fallback_path,
+            "SERVICE_CONFLICT: admitted workspace completion could not reach the UI owner");
         diag::log_tagged_fmt("file_browser", "hex_fallback_ui_post_failed serial=%llu",
             static_cast<unsigned long long>(serial));
     }
+    operation->completion.notify_all();
 }
 
 void async_hex_fallback(const std::string& path, bool archive)
 {
     std::optional<aida::analysis::workspace_admission_handle_t> previous;
+    aida::infra::taskflow_runtime::job_handle_t previous_task;
+    std::shared_ptr<hex_preview_operation_t> previous_operation;
+    const auto operation = std::make_shared<hex_preview_operation_t>();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    operation->provider_cancellation =
+        std::make_shared<aida::analysis::cancellation_source_t>(deadline);
     std::uint64_t serial = 0;
     {
         auto& preview = hex_preview_state();
         std::lock_guard<std::mutex> lock(preview.mutex);
         previous = std::move(preview.admission);
+        previous_task = preview.task;
+        previous_operation = std::move(preview.operation);
         serial = ++preview.serial;
         preview.loading = true;
+        preview.cancellation_requested = false;
+        preview.cancelled = false;
+        preview.archive = archive;
         preview.path = path;
         preview.error.clear();
+        preview.task = {};
+        preview.operation = operation;
     }
+    if (previous_task.valid())
+        static_cast<void>(aida::infra::taskflow_runtime::cancel(previous_task));
     if (previous)
         aida::analysis::workspace_registry_t::cancel_admission(*previous);
+    if (previous_operation)
+        cancel_hex_preview_operation(previous_operation, serial - 1, path);
     aida::infra::taskflow_runtime::task_descriptor_t task;
     task.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
     task.owner_subsystem = "file_browser";
@@ -1013,15 +1145,19 @@ void async_hex_fallback(const std::string& path, bool archive)
     task.ui_access_policy = "none";
     task.failure_policy = "structured_completion";
     task.shutdown_policy = "cancel_and_drain";
-    task.cancellable_body = [path, archive, serial](
+    task.deadline_ms = 65000;
+    task.cancel_hook = [operation, serial, path] {
+        cancel_hex_preview_operation(operation, serial, path);
+    };
+    task.cancellable_body = [path, archive, serial, operation, deadline](
         const aida::infra::taskflow_runtime::cancellation_token_t& cancel) {
-        if (cancel.requested.load(std::memory_order_acquire) || !hex_preview_is_current(serial))
+        if (cancel.requested.load(std::memory_order_acquire) || !hex_preview_is_current(serial)) {
+            cancel_hex_preview_operation(operation, serial, path);
             return;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-        aida::analysis::cancellation_source_t provider_cancel(deadline);
+        }
         auto mapped = aida::analysis::mapped_file_provider_t::open(path);
         if (!mapped) {
-            complete_hex_preview_failure(serial, path,
+            finish_hex_preview_failure(operation, serial, path,
                 mapped.error().stable_code() + ": " + mapped.error().message);
             return;
         }
@@ -1030,14 +1166,17 @@ void async_hex_fallback(const std::string& path, bool archive)
         if (archive) {
             std::string member_error;
             std::shared_ptr<const aida::analysis::byte_provider_t> member;
-            if (!open_archive_member_provider(provider, member, provider_cancel.token(), member_error)) {
-                complete_hex_preview_failure(serial, path, std::move(member_error));
+            if (!open_archive_member_provider(provider, member,
+                    operation->provider_cancellation->token(), member_error)) {
+                finish_hex_preview_failure(operation, serial, path, std::move(member_error));
                 return;
             }
             provider = std::move(member);
         }
-        if (cancel.requested.load(std::memory_order_acquire) || !hex_preview_is_current(serial))
+        if (cancel.requested.load(std::memory_order_acquire) || !hex_preview_is_current(serial)) {
+            cancel_hex_preview_operation(operation, serial, path);
             return;
+        }
         aida::analysis::baseline_analysis_settings_t settings;
         const std::string profile = "aida-pe-workspace-engine-1|" + settings.canonical_json();
         aida::analysis::open_provider_workspace_request_t request;
@@ -1048,21 +1187,44 @@ void async_hex_fallback(const std::string& path, bool archive)
         request.load_profile.assign(profile.begin(), profile.end());
         request.analysis_settings = settings;
         auto admitted = aida::analysis::workspace_registry().admit_verified_provider_async(
-            std::move(request), [serial, path](auto result) mutable {
-                complete_hex_preview_success(serial, path, std::move(result));
+            std::move(request), [operation, serial, path](auto result) mutable {
+                complete_hex_preview_success(operation, serial, path, std::move(result));
             }, deadline);
         if (!admitted) {
-            complete_hex_preview_failure(serial, path,
+            finish_hex_preview_failure(operation, serial, path,
                 admitted.error().stable_code() + ": " + admitted.error().message);
             return;
         }
-        auto& preview = hex_preview_state();
-        std::lock_guard<std::mutex> lock(preview.mutex);
-        if (preview.serial == serial)
-            preview.admission = admitted.take_value();
-        else {
-            auto handle = admitted.take_value();
-            aida::analysis::workspace_registry_t::cancel_admission(handle);
+        auto handle = admitted.take_value();
+        {
+            std::lock_guard<std::mutex> lock(operation->mutex);
+            operation->admission = handle;
+        }
+        {
+            auto& preview = hex_preview_state();
+            std::lock_guard<std::mutex> lock(preview.mutex);
+            if (preview.serial == serial && !operation->terminal.load(std::memory_order_acquire))
+                preview.admission = handle;
+        }
+        if (operation->terminal.load(std::memory_order_acquire)) {
+            if (operation->cancellation.load(std::memory_order_acquire))
+                aida::analysis::workspace_registry_t::cancel_admission(handle);
+            return;
+        }
+        std::unique_lock<std::mutex> lock(operation->mutex);
+        while (!operation->terminal.load(std::memory_order_acquire)) {
+            if (cancel.requested.load(std::memory_order_acquire) ||
+                !hex_preview_is_current(serial)) {
+                lock.unlock();
+                cancel_hex_preview_operation(operation, serial, path);
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                lock.unlock();
+                timeout_hex_preview_operation(operation, serial, path);
+                return;
+            }
+            operation->completion.wait_for(lock, std::chrono::milliseconds(50));
         }
     };
     const auto submitted = aida::infra::taskflow_runtime::submit(std::move(task));
@@ -1071,9 +1233,21 @@ void async_hex_fallback(const std::string& path, bool archive)
         std::lock_guard<std::mutex> lock(preview.mutex);
         if (preview.serial == serial) {
             preview.loading = false;
+            preview.cancellation_requested = false;
+            preview.cancelled = false;
             preview.error = "SERVICE_CONFLICT: provider admission task was rejected: " +
                 submitted.reject_reason;
+            preview.operation.reset();
         }
+        operation->terminal.store(true, std::memory_order_release);
+        operation->completion.notify_all();
+    } else {
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        if (preview.serial == serial && preview.loading)
+            preview.task = submitted.handle;
+        else
+            static_cast<void>(aida::infra::taskflow_runtime::cancel(submitted.handle));
     }
 }
 
@@ -1088,6 +1262,9 @@ struct hex_preview_state_t {
     std::mutex mutex;
     std::uint64_t serial = 0;
     bool loading = false;
+    bool cancellation_requested = false;
+    bool cancelled = false;
+    bool archive = false;
     std::string path;
     std::string error;
 };
@@ -1311,51 +1488,142 @@ inline std::string truncate_middle(const std::string& s, size_t max_len) {
 void render_hex_loading_indicator()
 {
     bool loading = false;
+    bool cancellation_requested = false;
+    bool cancelled = false;
+    bool archive = false;
     std::string preview_path;
     std::string preview_error;
     {
         auto& preview = hex_preview_state();
         std::lock_guard<std::mutex> lock(preview.mutex);
         loading = preview.loading;
+        cancellation_requested = preview.cancellation_requested;
+        cancelled = preview.cancelled;
+        archive = preview.archive;
         preview_path = preview.path;
         preview_error = preview.error;
     }
-    if (!loading && preview_error.empty()) return;
-    const auto& theme = aida::ui::resolved();
-    const ImVec2 viewport = ImGui::GetIO().DisplaySize;
-    ImDrawList* draw = ImGui::GetForegroundDrawList();
-    draw->AddRectFilled(ImVec2(0, 0), viewport,
-        IM_COL32(0, 0, 0, static_cast<int>(140)));
-    const ImVec2 size(380.f, loading ? 88.f : 116.f);
-    const ImVec2 minimum((viewport.x - size.x) * 0.5f, (viewport.y - size.y) * 0.5f);
-    const ImVec2 maximum(minimum.x + size.x, minimum.y + size.y);
-    draw->AddRectFilled(minimum, maximum,
-        aida::ui::with_alpha(theme.bg_elevated, 0.98f), 12.f);
-    draw->AddRect(minimum, maximum,
-        aida::ui::with_alpha(theme.border_strong, 1.f), 12.f, 0, 1.2f);
-    if (loading) {
-        ui_anim::render_spinner(draw, minimum.x + 32.f, minimum.y + 44.f, 14.f, 3.f,
-            aida::ui::with_alpha(theme.accent_u32, 1.f),
-            static_cast<float>(ImGui::GetTime()));
-    }
-    ImFont* body = aida::ui::fonts::body_strong();
-    draw->AddText(body, 15.f, ImVec2(minimum.x + 66.f, minimum.y + 20.f),
-        aida::ui::with_alpha(loading ? theme.text_primary : theme.error, 1.f),
-        loading ? "Loading hex preview..." : "Hex preview unavailable");
+    if (!loading && !cancelled && preview_error.empty()) return;
+
+    const char* popup = "Open as Hex###aida_hex_fallback_operation";
+    ImGui::OpenPopup(popup);
+    if (!aida::ui::design::begin_dialog_exact(popup, ImVec2(500.f, 300.f),
+            ImVec2(340.f, 230.f)))
+        return;
+
+    const bool terminal = !loading;
+    const char* primary_label = terminal ? "Retry" : "Cancel Operation";
+    const char* secondary_label = terminal ? "Dismiss" : nullptr;
+    const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+        primary_label, secondary_label);
+    aida::ui::design::begin_dialog_body("file.hex_fallback.body", footer_height);
+
+    aida::ui::design::state_presentation_t state;
+    state.stable_id = loading ? "file.hex_fallback.loading" :
+        (cancelled ? "file.hex_fallback.cancelled" : "file.hex_fallback.error");
+    state.state = loading ? aida::ui::design::view_state_t::loading :
+        (cancelled ? aida::ui::design::view_state_t::empty :
+            aida::ui::design::view_state_t::error);
+    state.title = loading ? (cancellation_requested ? "Cancelling file open" :
+        "Opening file as Hex") : (cancelled ? "File open cancelled" :
+            "Hex fallback unavailable");
+    state.message = loading ?
+        (cancellation_requested ?
+            "Cancellation was requested. The current provider admission is being stopped." :
+            "AiDA is validating and admitting a bounded read-only provider for this file.") :
+        (cancelled ? "No workspace state was changed." : preview_error.c_str());
+    state.target = preview_path.empty() ? "Selected file" : preview_path.c_str();
+    state.hint = terminal ?
+        "Retry the exact file or dismiss this result and continue using the IDE." :
+        "The operation is owned by Task Center and can be cancelled safely.";
+    static_cast<void>(aida::ui::design::render_state(state, ImVec2(0.f, 0.f)));
     if (!preview_path.empty()) {
         const auto slash = preview_path.find_last_of("\\/");
         const std::string filename = slash != std::string::npos
             ? preview_path.substr(slash + 1) : preview_path;
-        ImFont* caption = aida::ui::fonts::caption();
-        draw->AddText(caption, 12.f, ImVec2(minimum.x + 66.f, minimum.y + 46.f),
-            aida::ui::with_alpha(theme.text_dim, 1.f), filename.c_str());
+        ImGui::TextDisabled("%s", filename.c_str());
     }
-    if (!loading && !preview_error.empty()) {
-        const std::string message = truncate_middle(preview_error, 170);
-        ImFont* caption = aida::ui::fonts::caption();
-        draw->AddText(caption, 12.f, ImVec2(minimum.x + 22.f, minimum.y + 78.f),
-            aida::ui::with_alpha(theme.text_secondary, 1.f), message.c_str());
+    aida::ui::design::end_dialog_body();
+
+    const auto footer = aida::ui::design::dialog_footer(
+        "file.hex_fallback.actions", primary_label,
+        terminal || !cancellation_requested, false, secondary_label,
+        terminal || !cancellation_requested, terminal);
+    const bool cancel_requested = loading && (footer.confirmed || footer.cancelled);
+    const bool retry_requested = terminal && footer.confirmed;
+    const bool dismiss_requested = terminal && footer.cancelled;
+    ImGui::EndPopup();
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (cancel_requested) {
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        preview.loading = false;
+        preview.cancellation_requested = false;
+        preview.cancelled = true;
+        preview.error.clear();
+    } else if (retry_requested) {
+        open_path(preview_path);
+    } else if (dismiss_requested) {
+        auto& preview = hex_preview_state();
+        std::lock_guard<std::mutex> lock(preview.mutex);
+        ++preview.serial;
+        preview.loading = false;
+        preview.cancellation_requested = false;
+        preview.cancelled = false;
+        preview.path.clear();
+        preview.error.clear();
     }
+#else
+    if (cancel_requested) {
+        aida::infra::taskflow_runtime::job_handle_t task;
+        std::shared_ptr<hex_preview_operation_t> operation;
+        std::optional<aida::analysis::workspace_admission_handle_t> admission;
+        std::uint64_t serial = 0;
+        {
+            auto& preview = hex_preview_state();
+            std::lock_guard<std::mutex> lock(preview.mutex);
+            if (preview.loading && !preview.cancellation_requested) {
+                preview.cancellation_requested = true;
+                serial = preview.serial;
+                task = preview.task;
+                operation = preview.operation;
+                admission = preview.admission;
+            }
+        }
+        if (task.valid())
+            static_cast<void>(aida::infra::taskflow_runtime::cancel(task));
+        if (admission)
+            aida::analysis::workspace_registry_t::cancel_admission(*admission);
+        if (operation)
+            cancel_hex_preview_operation(operation, serial, preview_path);
+    } else if (retry_requested) {
+        async_hex_fallback(preview_path, archive);
+    } else if (dismiss_requested) {
+        aida::infra::taskflow_runtime::job_handle_t task;
+        std::optional<aida::analysis::workspace_admission_handle_t> admission;
+        {
+            auto& preview = hex_preview_state();
+            std::lock_guard<std::mutex> lock(preview.mutex);
+            ++preview.serial;
+            task = preview.task;
+            admission = preview.admission;
+            preview.loading = false;
+            preview.cancellation_requested = false;
+            preview.cancelled = false;
+            preview.archive = false;
+            preview.path.clear();
+            preview.error.clear();
+            preview.task = {};
+            preview.admission.reset();
+            preview.operation.reset();
+        }
+        if (task.valid())
+            static_cast<void>(aida::infra::taskflow_runtime::cancel(task));
+        if (admission)
+            aida::analysis::workspace_registry_t::cancel_admission(*admission);
+    }
+#endif
 }
 
 void request_open_confirmation(const std::string& path)

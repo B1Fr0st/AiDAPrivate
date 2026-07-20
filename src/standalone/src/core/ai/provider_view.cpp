@@ -48,6 +48,9 @@
 #include "../ui/theme.hpp"
 #include "../ui/transition.hpp"
 #include "../helpers/globals.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 
 namespace aida {
 namespace provider_view {
@@ -855,6 +858,13 @@ namespace {
 		ImGui::SetCursorScreenPos(ImVec2(ox, oy));
 		ImGui::SetNextItemAllowOverlap();
 		ImGui::InvisibleButton("##card_hit", ImVec2(card_w, card_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string provider_semantic = "aida.automation.provider-" +
+			aida::preview::semantics::entity_token(provider.id);
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			provider_semantic, "provider-row", true, false,
+			"aida.dock-window.view.ai.providers"));
+#endif
 		bool hov = ImGui::IsItemHovered();
 		bool clicked = ImGui::IsItemClicked();
 		bool right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
@@ -1300,6 +1310,12 @@ namespace {
 		aida::ui::input_text("##detail_base_url",
 			st.detail_base_url_buf, sizeof(st.detail_base_url_buf),
 			"https://api.host", false, ImVec2(pane_w - 28.f, 32.f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.provider-base-url-" +
+				aida::preview::semantics::entity_token(prov->id),
+			"url-input", false, false, "aida.dock-window.view.ai.providers"));
+#endif
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 100.f));
 		dl->AddText(aida::ui::fonts::body_em(), detail_fs * 0.96f,
@@ -1309,6 +1325,12 @@ namespace {
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 118.f));
 		ImGui::InputTextMultiline("##detail_headers", st.detail_headers_buf, sizeof(st.detail_headers_buf),
 			ImVec2(pane_w - 28.f, 100.f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.provider-headers-" +
+				aida::preview::semantics::entity_token(prov->id),
+			"json-editor", false, false, "aida.dock-window.view.ai.providers"));
+#endif
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 14.f, a.y + 230.f));
 		const bool detail_actions_stack = pane_w < 330.f;
@@ -1331,6 +1353,12 @@ namespace {
 					toast_notification::toast_type_t::info, 3.0f);
 			}
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.provider-action-save-" +
+				aida::preview::semantics::entity_token(prov->id),
+			"provider-action", false, false, "aida.dock-window.view.ai.providers"));
+#endif
 		if (!detail_actions_stack)
 			ImGui::SameLine(0.f, 8.f);
 		if (aida::ui::button("Reset", aida::ui::button_kind_t::secondary,
@@ -1342,10 +1370,22 @@ namespace {
 			toast_notification::push("Provider overrides cleared",
 				toast_notification::toast_type_t::info, 3.0f);
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.provider-action-reset-" +
+				aida::preview::semantics::entity_token(prov->id),
+			"provider-action", false, false, "aida.dock-window.view.ai.providers"));
+#endif
 		if (!detail_actions_stack)
 			ImGui::SameLine(0.f, 12.f);
 		aida::ui::toggle_switch("Show raw model.json", &st.show_raw_model_json,
 			aida::ui::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			"aida.automation.provider-action-raw-model-" +
+				aida::preview::semantics::entity_token(prov->id),
+			"provider-toggle", false, false, "aida.dock-window.view.ai.providers"));
+#endif
 
 		if (st.show_raw_model_json) {
 			const std::string mid = preferred_model_for(st.selected_detail_provider_id);
@@ -1454,6 +1494,11 @@ void render(float panel_w, float panel_h)
 		std::lock_guard<std::mutex> lk(st.mtx);
 		std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
 	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(aida::preview::semantics::register_last_item(
+		"aida.automation.providers.filter", "search-input", false, false,
+		"aida.dock-window.view.ai.providers"));
+#endif
 
 	const float btn_w = 220.f;
 	const float refresh_w = toolbar_stack ? (std::max)(140.f, root_w - pad * 2.f) : btn_w;
@@ -1468,6 +1513,11 @@ void render(float panel_w, float panel_h)
 		if (!refreshing)
 			start_refresh_thread();
 	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(aida::preview::semantics::register_last_item(
+		"aida.automation.providers.action-refresh", "provider-action", false,
+		refreshing, "aida.dock-window.view.ai.providers"));
+#endif
 
 	const auto& providers = aida::provider::catalog::list_providers();
 	const std::string filter = lower_copy(std::string(st.search_buf));
@@ -1574,7 +1624,13 @@ void render_chat_header_picker(float max_width)
 	const float w = (max_width <= 0.f) ? 360.f : std::min(max_width, 480.f);
 	ImGui::PushID("chat_header_picker");
 	ImGui::PushItemWidth(w);
-	if (ImGui::BeginCombo("##chat_model_picker", label.c_str())) {
+	const bool picker_open = ImGui::BeginCombo("##chat_model_picker", label.c_str());
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(aida::preview::semantics::register_last_item(
+		"aida.ai.chat.model-picker", "model-picker", false, false,
+		"aida.dock-window.view.ai-chat"));
+#endif
+	if (picker_open) {
 		const auto& providers = aida::provider::catalog::list_providers();
 		for (const auto& p : providers) {
 			if (p.model_ids.empty())
@@ -1601,6 +1657,12 @@ void render_chat_header_picker(float max_width)
 					evt.model_id = m->id;
 					aida::events::publish(aida::events::event_model_changed, evt);
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				static_cast<void>(aida::preview::semantics::register_last_item(
+					"aida.ai.chat.model-" +
+						aida::preview::semantics::entity_token(p.id + ":" + m->id),
+					"model-option", false, false, "aida.ai.chat.model-picker"));
+#endif
 				if (is_sel)
 					ImGui::SetItemDefaultFocus();
 			}

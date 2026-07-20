@@ -3,6 +3,7 @@
 #include "design_system.hpp"
 #include "explorer_views.hpp"
 #include "output_views.hpp"
+#include "programming_tasks.hpp"
 #include "programming_language_views.hpp"
 #include "task_center.hpp"
 #include "theme.hpp"
@@ -33,6 +34,7 @@
 #include "../editor/hex_view.hpp"
 #include "../editor/image_view.hpp"
 #include "../network/network_view.hpp"
+#include "../network/burp/project_view.hpp"
 #include "../scanner/scan_hub_view.hpp"
 #include "../session/analysis_session.hpp"
 #include "imgui/imgui.h"
@@ -41,6 +43,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -168,6 +171,7 @@ constexpr catalog_entry_t k_catalog[] = {
     AIDA_NETWORK_VIEW("view.network.jwt_lab", "JWT Lab", 24), AIDA_NETWORK_VIEW("view.network.match_replace", "Match and Replace", 25),
     AIDA_NETWORK_VIEW("view.network.session", "Session", 26),
     AIDA_VIEW("view.network.api", "API", network, tool_window, registry, network, 27, 520, 320, false, true, false),
+    AIDA_VIEW("view.network.project", "Burp Project", network, tool_window, registry, none, 0, 480, 260, false, true, false),
     AIDA_VIEW("view.network.ws_editor", "WebSocket Editor", network, tool_window, registry, network, 28, 520, 320, false, true, false),
     AIDA_VIEW("view.network.h2_editor", "HTTP/2 Editor", network, tool_window, registry, network, 29, 520, 320, false, true, false),
     AIDA_NETWORK_VIEW("view.network.logger", "Logger", 30), AIDA_NETWORK_VIEW("view.network.csp", "CSP", 31),
@@ -178,6 +182,7 @@ constexpr catalog_entry_t k_catalog[] = {
     AIDA_VIEW("view.ai.providers", "AI Providers", automation, tool_window, registry, none, 0, 460, 300, false, true, false),
     AIDA_VIEW("view.ai.mcp_marketplace", "MCP Marketplace", automation, tool_window, registry, none, 0, 600, 420, false, true, false),
     AIDA_VIEW("view.ai.evidence", "Evidence Review", automation, tool_window, registry, none, 0, 420, 280, false, true, false),
+    AIDA_VIEW("view.ai.scripts", "Automation Scripts", automation, tool_window, registry, none, 0, 520, 300, false, true, false),
     AIDA_VIEW("view.settings", "Settings", settings, tool_window, registry, none, 0, 520, 360, false, true, false)
 };
 
@@ -189,6 +194,9 @@ struct state_t {
     struct surface_state_t {
         bool pinned = false;
         bool reset_requested = false;
+        bool restore_open = false;
+        bool presentation_pending = false;
+        disasm_view::presentation_snapshot_t presentation;
     };
     view_registry_t registry;
     interaction_context_t context;
@@ -204,11 +212,26 @@ struct state_t {
     std::string observed_workspace_identity;
     std::map<stable_view_id_t, bool> workspace_visibility;
     std::set<stable_view_id_t> deferred_workspace_opens;
+    bool visibility_capture_valid = false;
+    std::uint64_t visibility_capture_registry_revision = 0;
+    workspace_layout::workspace_preset_t visibility_capture_preset =
+        workspace_layout::workspace_preset_t::analysis;
+    std::string visibility_capture_identity;
 };
 
 state_t& state() {
     static state_t value;
     return value;
+}
+
+stable_view_id_t canonical_view_id(const stable_view_id_t& id);
+const catalog_entry_t* find_catalog(const stable_view_id_t& id);
+
+bool is_disassembly_side_instance(const view_instance_id_t& id) noexcept {
+    if (id.view.value() != "document.disassembly")
+        return false;
+    const std::string& key = id.instance.value();
+    return key == "side.1" || key == "side.2" || key == "side.3";
 }
 
 void clear_surface_settings(ImGuiContext*, ImGuiSettingsHandler*) {
@@ -226,8 +249,12 @@ void* open_surface_settings(ImGuiContext*, ImGuiSettingsHandler*, const char* na
     const std::string instance = key.substr(separator + 1);
     if (!is_valid_stable_id(view) || (!instance.empty() && !is_valid_stable_instance_key(instance)))
         return nullptr;
-    const view_instance_id_t id{stable_view_id_t(view), stable_view_instance_key_t(instance)};
-    if (!state().registry.find_descriptor(id.view))
+    const view_instance_id_t id{canonical_view_id(stable_view_id_t(view)),
+        stable_view_instance_key_t(instance)};
+    if (!find_catalog(id.view))
+        return nullptr;
+    if (!id.instance.empty() && !is_disassembly_side_instance(id) &&
+        id.view.value() != "document.code")
         return nullptr;
     return &state().surfaces[id];
 }
@@ -238,16 +265,100 @@ void read_surface_setting(ImGuiContext*, ImGuiSettingsHandler*, void* entry, con
     int pinned = 0;
     if (std::sscanf(line, "Pinned=%d", &pinned) == 1)
         static_cast<state_t::surface_state_t*>(entry)->pinned = pinned != 0;
+    int open = 0;
+    if (std::sscanf(line, "Open=%d", &open) == 1)
+        static_cast<state_t::surface_state_t*>(entry)->restore_open = open != 0;
+    int format = 0;
+    int show_bytes = 0;
+    int section = -1;
+    int has_base = 0;
+    unsigned long long base = 0;
+    int has_selection = 0;
+    int space = 0;
+    unsigned long long address = 0;
+    int architecture = 0;
+    int mode = 0;
+    unsigned long long scroll_milli = 0;
+    if (std::sscanf(line,
+            "Presentation=%d,%d,%d,%d,%llu,%d,%d,%llu,%d,%d,%llu",
+            &format, &show_bytes, &section, &has_base, &base,
+            &has_selection, &space, &address, &architecture, &mode,
+            &scroll_milli) == 11 &&
+        format >= static_cast<int>(disasm_view::addr_format_t::va) &&
+        format <= static_cast<int>(disasm_view::addr_format_t::file_offset)) {
+        auto& surface = *static_cast<state_t::surface_state_t*>(entry);
+        surface.presentation.addr_format =
+            static_cast<disasm_view::addr_format_t>(format);
+        surface.presentation.show_bytes = show_bytes != 0;
+        surface.presentation.active_section = section;
+        surface.presentation.scroll_y = static_cast<float>(
+            (std::min)(scroll_milli, 1000000000000000ULL)) / 1000.0f;
+        surface.presentation.display_image_base = has_base != 0
+            ? std::optional<std::uint64_t>(static_cast<std::uint64_t>(base))
+            : std::nullopt;
+        if (has_selection != 0) {
+            aida::analysis::address_t selection;
+            selection.space = static_cast<aida::analysis::address_space_id_t>(space);
+            selection.value = static_cast<std::uint64_t>(address);
+            selection.architecture =
+                static_cast<aida::analysis::architecture_id_t>(architecture);
+            selection.mode = static_cast<aida::analysis::architecture_mode_t>(mode);
+            surface.presentation.selection = selection;
+        } else {
+            surface.presentation.selection.reset();
+        }
+        surface.presentation_pending = true;
+    }
 }
 
 void write_surface_settings(ImGuiContext*, ImGuiSettingsHandler*, ImGuiTextBuffer* output) {
     if (!output)
         return;
-    for (const auto& entry : state().surfaces) {
-        if (!entry.second.pinned)
+    std::set<view_instance_id_t> entries;
+    for (const auto& entry : state().surfaces)
+        if (entry.second.pinned)
+            entries.insert(entry.first);
+    state().registry.for_each_instance(
+        [&](const view_descriptor_t&, const view_instance_state_t& instance) {
+            if (instance.open && instance.id.view.value() == "document.disassembly" &&
+                !instance.id.instance.empty())
+                entries.insert(instance.id);
+        }, true);
+    for (const auto& id : entries) {
+        const auto surface = state().surfaces.find(id);
+        const bool pinned = surface != state().surfaces.end() && surface->second.pinned;
+        const bool open = state().registry.is_open(id);
+        if (!pinned && !open)
             continue;
-        output->appendf("[AiDAView][%s|%s]\nPinned=1\n\n",
-            entry.first.view.c_str(), entry.first.instance.c_str());
+        output->appendf("[AiDAView][%s|%s]\n",
+            id.view.c_str(), id.instance.c_str());
+        if (pinned)
+            output->append("Pinned=1\n");
+        if (open)
+            output->append("Open=1\n");
+        if (open && id.view.value() == "document.disassembly" &&
+            !id.instance.empty()) {
+            disasm_view::presentation_snapshot_t snapshot;
+            if (disasm_view::capture_selected_presentation(
+                    id.instance.value(), snapshot)) {
+                const auto selection = snapshot.selection.value_or(
+                    aida::analysis::address_t{});
+                const auto scroll_milli = static_cast<unsigned long long>(
+                    std::llround((std::clamp)(snapshot.scroll_y,
+                        0.0f, 1000000000000.0f) * 1000.0f));
+                output->appendf(
+                    "Presentation=%d,%d,%d,%d,%llu,%d,%d,%llu,%d,%d,%llu\n",
+                    static_cast<int>(snapshot.addr_format), snapshot.show_bytes ? 1 : 0,
+                    snapshot.active_section, snapshot.display_image_base ? 1 : 0,
+                    static_cast<unsigned long long>(
+                        snapshot.display_image_base.value_or(0)),
+                    snapshot.selection ? 1 : 0, static_cast<int>(selection.space),
+                    static_cast<unsigned long long>(selection.value),
+                    static_cast<int>(selection.architecture),
+                    static_cast<int>(selection.mode), scroll_milli);
+            }
+        }
+        output->append("\n");
     }
 }
 
@@ -277,13 +388,14 @@ const catalog_entry_t* find_catalog(const stable_view_id_t& id) {
 }
 
 stable_view_id_t canonical_view_id(const stable_view_id_t& id) {
-    if (id.value() == "view.problems")
-        return stable_view_id_t("view.diagnostics");
-    if (id.value() == "view.types.live_inspector")
-        return stable_view_id_t("view.types.dissector");
-    if (id.value() == "view.ai.mcp_activity")
-        return stable_view_id_t("view.mcp_log");
-    return id;
+    stable_view_id_t canonical = id;
+    state().registry.for_each_descriptor([&](const view_descriptor_t& descriptor) {
+        if (std::find(descriptor.persistence_aliases.begin(),
+                      descriptor.persistence_aliases.end(), id) !=
+            descriptor.persistence_aliases.end())
+            canonical = descriptor.id;
+    });
+    return canonical;
 }
 
 ImGuiID default_dock_node(const view_descriptor_t& descriptor) noexcept {
@@ -361,26 +473,43 @@ void restore_workspace_visibility(state_t& current,
     const nlohmann::json root = read_workspace_visibility_root();
     const std::string preset_key(identity);
     const nlohmann::json* persisted_views = nullptr;
+    const nlohmann::json* persisted_entry = nullptr;
+    std::uint32_t persisted_revision = 1;
     if (root.contains("presets") && root["presets"].is_object()) {
         const auto& presets = root["presets"];
         if (presets.contains(preset_key) && presets[preset_key].is_object() &&
-            presets[preset_key].contains("views") && presets[preset_key]["views"].is_object())
-            persisted_views = &presets[preset_key]["views"];
+            presets[preset_key].contains("views") && presets[preset_key]["views"].is_object()) {
+            persisted_entry = &presets[preset_key];
+            persisted_views = &(*persisted_entry)["views"];
+        }
         else if (identity.rfind("builtin:", 0) == 0) {
             const std::string legacy = workspace_preset_key(preset);
             if (presets.contains(legacy) && presets[legacy].is_object() &&
-                presets[legacy].contains("views") && presets[legacy]["views"].is_object())
-                persisted_views = &presets[legacy]["views"];
+                presets[legacy].contains("views") && presets[legacy]["views"].is_object()) {
+                persisted_entry = &presets[legacy];
+                persisted_views = &(*persisted_entry)["views"];
+            }
         }
+    }
+    if (persisted_entry && persisted_entry->contains("preset_revision") &&
+        (*persisted_entry)["preset_revision"].is_number_unsigned()) {
+        const auto value = (*persisted_entry)["preset_revision"].get<std::uint64_t>();
+        if (value > 0 && value <= (std::numeric_limits<std::uint32_t>::max)())
+            persisted_revision = static_cast<std::uint32_t>(value);
     }
     current.registry.for_each_descriptor([&](const view_descriptor_t& descriptor) {
         if (!workspace_manages_visibility(descriptor))
             return;
-        bool desired = workspace_layout::preset_default_opens_view(
-            preset, descriptor.id.value());
-        if (const auto persisted = persisted_workspace_visibility(
-                persisted_views, descriptor.id))
+        bool desired = persisted_views == nullptr &&
+            workspace_layout::preset_default_opens_view(preset, descriptor.id.value());
+        if (const auto persisted = persisted_workspace_visibility(persisted_views, descriptor.id)) {
             desired = *persisted;
+        } else if (persisted_views &&
+            descriptor.preset_introduced_revision > persisted_revision &&
+            descriptor.preset_introduced_revision <= workspace_layout::preset_revision(preset)) {
+            desired = workspace_layout::preset_default_opens_view(
+                preset, descriptor.id.value());
+        }
         current.workspace_visibility[descriptor.id] = desired;
         const view_instance_id_t instance{descriptor.id, {}};
         const bool open = current.registry.is_open(instance);
@@ -415,9 +544,14 @@ void retry_deferred_workspace_opens(state_t& current) {
 
 void capture_workspace_visibility(state_t& current,
     workspace_layout::workspace_preset_t preset, std::string_view identity) {
-    static_cast<void>(preset);
+    const std::uint64_t registry_revision = current.registry.visibility_revision();
+    if (current.visibility_capture_valid &&
+        current.visibility_capture_registry_revision == registry_revision &&
+        current.visibility_capture_preset == preset &&
+        current.visibility_capture_identity == identity)
+        return;
     nlohmann::json root = read_workspace_visibility_root();
-    root["version"] = 2;
+    root["version"] = 3;
     nlohmann::json views = nlohmann::json::object();
     current.registry.for_each_descriptor([&](const view_descriptor_t& descriptor) {
         if (!workspace_manages_visibility(descriptor))
@@ -435,13 +569,24 @@ void capture_workspace_visibility(state_t& current,
     const std::string preset_key(identity);
     if (!root.contains("presets") || !root["presets"].is_object())
         root["presets"] = nlohmann::json::object();
-    root["presets"][preset_key] = {{"views", std::move(views)}};
+    root["presets"][preset_key] = {
+        {"preset_revision", workspace_layout::preset_revision(preset)},
+        {"views", std::move(views)}};
     const std::string serialized = root.dump();
     if (serialized.size() > kMaximumWorkspaceVisibilityBytes)
         return;
-    if (serialized == g_sa_settings.workspace.view_visibility_json)
+    if (serialized == g_sa_settings.workspace.view_visibility_json) {
+        current.visibility_capture_valid = true;
+        current.visibility_capture_registry_revision = registry_revision;
+        current.visibility_capture_preset = preset;
+        current.visibility_capture_identity.assign(identity);
         return;
+    }
     g_sa_settings.workspace.view_visibility_json = serialized;
+    current.visibility_capture_valid = true;
+    current.visibility_capture_registry_revision = registry_revision;
+    current.visibility_capture_preset = preset;
+    current.visibility_capture_identity.assign(identity);
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 #endif
@@ -579,6 +724,30 @@ void close_code_group(const view_instance_id_t& instance) {
             file_tabs::close_tab(index);
 }
 
+view_operation_result_t prepare_code_group_close(const view_instance_id_t& instance) {
+    std::uint32_t group = 0;
+    if (!parse_code_group(instance.instance, group))
+        return {view_operation_status_t::invalid_instance,
+            "The editor group identity is invalid"};
+    for (const auto& tab : file_tabs::tabs) {
+        if (tab.group_id != group)
+            continue;
+        if (tab.pinned)
+            return {view_operation_status_t::unavailable,
+                "Unpin every document in this editor group before closing it"};
+        if (tab.dirty) {
+            const int index = file_tabs::find_document(tab.document_id);
+            if (index >= 0) {
+                file_tabs::pending_close_idx = index;
+                file_tabs::show_close_confirm = true;
+            }
+            return {view_operation_status_t::unavailable,
+                "Review the unsaved document before closing this editor group"};
+        }
+    }
+    return {};
+}
+
 void render_code_group(const view_render_context_t& context) {
     std::uint32_t group = 0;
     if (!parse_code_group(context.instance.instance, group)) {
@@ -682,6 +851,24 @@ void render_code_group(const view_render_context_t& context) {
     }
 
     auto& selected_tab = file_tabs::tabs[file_tabs::tab_index(selected)];
+    const auto render_tab_action = [selected](const char* action_id,
+            const char* label, bool small) {
+        const auto presentation = application_ui::present_editor_tab_action(
+            selected, action_id);
+        if (!presentation.visible)
+            return false;
+        ImGui::BeginDisabled(!presentation.enabled);
+        const bool clicked = small ? ImGui::SmallButton(label) : ImGui::Button(label);
+        ImGui::EndDisabled();
+        const char* detail = !presentation.enabled && !presentation.disabled_reason.empty()
+            ? presentation.disabled_reason.c_str() : presentation.description.c_str();
+        design::tooltip_for_last_item(detail,
+            presentation.shortcut.empty() ? nullptr : presentation.shortcut.c_str());
+        if (clicked)
+            static_cast<void>(application_ui::execute_editor_tab_action(selected,
+                action_id, action_invocation_source_t::toolbar));
+        return clicked;
+    };
     file_tabs::observe_document_load_dispatch_failure(selected);
     file_tabs::observe_document_save_dispatch_failure(selected);
     if (!selected_tab.buffer_loaded) {
@@ -690,21 +877,15 @@ void render_code_group(const view_render_context_t& context) {
         if (selected_tab.load_in_progress) {
             ImGui::TextDisabled("Loading %s asynchronously...", selected_tab.filename.c_str());
             ImGui::TextWrapped("The editor remains responsive while this bounded file read completes.");
-            if (ImGui::Button("Cancel Load"))
-                application_ui::execute_editor_tab_action(selected, "tab.load.cancel",
-                    action_invocation_source_t::toolbar);
+            render_tab_action("tab.load.cancel", "Cancel Load", false);
         } else {
             ImGui::TextUnformatted("Document could not be loaded");
             ImGui::TextWrapped("%s", selected_tab.load_error.empty()
                 ? "The file is unavailable or the load did not start."
                 : selected_tab.load_error.c_str());
-            if (ImGui::Button("Retry"))
-                application_ui::execute_editor_tab_action(selected, "tab.load.retry",
-                    action_invocation_source_t::toolbar);
+            render_tab_action("tab.load.retry", "Retry", false);
             ImGui::SameLine();
-            if (ImGui::Button("Close"))
-                application_ui::execute_editor_tab_action(selected, "tab.close",
-                    action_invocation_source_t::toolbar);
+            render_tab_action("tab.close", "Close", false);
         }
         ImGui::EndChild();
         return;
@@ -735,9 +916,8 @@ void render_code_group(const view_render_context_t& context) {
                 ImGuiWindowFlags_NoSavedSettings)) {
             ImGui::TextWrapped("Recovery storage: %s", selected_tab.recovery_error.c_str());
             ImGui::SameLine();
-            if (ImGui::SmallButton("Retry Recovery Check"))
-                application_ui::execute_editor_tab_action(selected,
-                    "tab.recovery.retry_probe", action_invocation_source_t::toolbar);
+            render_tab_action("tab.recovery.retry_probe",
+                "Retry Recovery Check", true);
         }
         ImGui::EndChild();
     }
@@ -753,23 +933,11 @@ void render_code_group(const view_render_context_t& context) {
                 selected_tab.recovery.metadata.text.encoding.c_str(),
                 selected_tab.recovery.metadata.text.bom.c_str(),
                 selected_tab.recovery.metadata.text.eol.c_str());
-            ImGui::BeginDisabled(selected_tab.recovery_operation_pending || selected_tab.dirty);
-            if (ImGui::SmallButton("Recover Unsaved Content"))
-                application_ui::execute_editor_tab_action(selected,
-                    "tab.recovery.recover", action_invocation_source_t::toolbar);
-            ImGui::EndDisabled();
-            if (selected_tab.dirty && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("Compare first or save the current editor changes; recovery will not overwrite newer unsaved work");
+            render_tab_action("tab.recovery.recover", "Recover Unsaved Content", true);
             ImGui::SameLine();
-            ImGui::BeginDisabled(selected_tab.recovery_operation_pending);
-            if (ImGui::SmallButton("Compare"))
-                application_ui::execute_editor_tab_action(selected,
-                    "tab.recovery.compare", action_invocation_source_t::toolbar);
+            render_tab_action("tab.recovery.compare", "Compare", true);
             ImGui::SameLine();
-            if (ImGui::SmallButton("Discard Recovery"))
-                application_ui::execute_editor_tab_action(selected,
-                    "tab.recovery.discard", action_invocation_source_t::toolbar);
-            ImGui::EndDisabled();
+            render_tab_action("tab.recovery.discard", "Discard Recovery", true);
             if (!selected_tab.recovery_error.empty()) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("%s", selected_tab.recovery_error.c_str());
@@ -832,35 +1000,23 @@ void render_code_group(const view_render_context_t& context) {
         if (ImGui::BeginChild("##aida_external_change", ImVec2(0.f, 48.f), true)) {
             ImGui::TextUnformatted("The file changed on disk. AiDA will not overwrite it without your decision.");
             ImGui::SameLine();
-            if (ImGui::SmallButton("Compare"))
-                application_ui::execute_editor_tab_action(selected,
-                    "tab.compare_disk", action_invocation_source_t::toolbar);
+            render_tab_action("tab.compare_disk", "Compare", true);
             ImGui::SameLine();
-            ImGui::BeginDisabled(selected_tab.dirty);
-            if (ImGui::SmallButton("Reload from Disk"))
-                application_ui::execute_editor_tab_action(selected,
-                    "tab.external.reload", action_invocation_source_t::toolbar);
+            render_tab_action("tab.external.reload", "Reload from Disk", true);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
             const std::string reload_semantic_id = aida::preview::semantics::stable_id(
                 "aida.editor.external", "reload-document-" + std::to_string(selected_tab.document_id));
             aida::preview::semantics::register_last_item(
                 reload_semantic_id, "editor-conflict-action");
 #endif
-            ImGui::EndDisabled();
-            if (selected_tab.dirty && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("Save your editor changes elsewhere or explicitly keep the editor version first");
             ImGui::SameLine();
-            if (ImGui::SmallButton("Keep Editor Version"))
-                application_ui::execute_editor_tab_action(selected,
-                    "tab.external.keep_editor", action_invocation_source_t::toolbar);
+            render_tab_action("tab.external.keep_editor", "Keep Editor Version", true);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
             const std::string keep_semantic_id = aida::preview::semantics::stable_id(
                 "aida.editor.external", "keep-document-" + std::to_string(selected_tab.document_id));
             aida::preview::semantics::register_last_item(
                 keep_semantic_id, "editor-conflict-action");
 #endif
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("The next Save may overwrite the newer disk version");
         }
         ImGui::EndChild();
         ImGui::PopStyleColor();
@@ -873,6 +1029,15 @@ void render_code_group(const view_render_context_t& context) {
     render_context.filename = selected_tab.filename;
     render_context.filepath = selected_tab.filepath;
     render_context.dirty = selected_tab.dirty;
+    render_context.caret_line = selected_tab.caret_line;
+    render_context.caret_column = selected_tab.caret_column;
+    render_context.selection_anchor_line = selected_tab.selection_anchor_line;
+    render_context.selection_anchor_column = selected_tab.selection_anchor_column;
+    render_context.selection_active = selected_tab.selection_active;
+    render_context.scroll_x = selected_tab.scroll_x;
+    render_context.scroll_y = selected_tab.scroll_y;
+    render_context.folded_lines = &selected_tab.folded_lines;
+    render_context.language_override = selected_tab.language_override;
     render_context.read_only = selected_tab.streamed_document ||
         selected_tab.buffer.size() >
             aida::editor::programming_documents::maximum_editable_document_bytes;
@@ -895,8 +1060,13 @@ void render_code_group(const view_render_context_t& context) {
         selected_tab.dirty = metadata.dirty;
         selected_tab.caret_line = metadata.caret_line;
         selected_tab.caret_column = metadata.caret_column;
+        selected_tab.selection_anchor_line = metadata.selection_anchor_line;
+        selected_tab.selection_anchor_column = metadata.selection_anchor_column;
+        selected_tab.selection_active = metadata.selection_active;
         selected_tab.scroll_x = metadata.scroll_x;
         selected_tab.scroll_y = metadata.scroll_y;
+        selected_tab.folded_lines = metadata.folded_lines;
+        selected_tab.language_override = metadata.language_override;
         selected_tab.proposal_pending = metadata.proposal_pending;
         if (metadata.dirty)
             selected_tab.content_hash = 0;
@@ -970,7 +1140,6 @@ void initialize() {
     auto& current = state();
     if (current.initialized)
         return;
-    current.initialized = true;
     current.context.generation = 1;
     for (const auto& entry : k_catalog) {
         view_descriptor_t descriptor;
@@ -983,6 +1152,13 @@ void initialize() {
             ? view_identity_policy_t::multi_instance
             : view_identity_policy_t::singleton;
         descriptor.minimum_size = {entry.minimum_width, entry.minimum_height};
+        if (std::strcmp(entry.id, "view.types.dissector") == 0) {
+            descriptor.persistence_version = 2;
+            descriptor.persistence_aliases.emplace_back("view.types.live_inspector");
+        } else if (std::strcmp(entry.id, "view.mcp_log") == 0) {
+            descriptor.persistence_version = 2;
+            descriptor.persistence_aliases.emplace_back("view.ai.mcp_activity");
+        }
         descriptor.default_open = entry.default_open;
         descriptor.closeable = entry.closeable;
         descriptor.render_ownership = entry.owner == catalog_owner_t::registry
@@ -1052,12 +1228,13 @@ void initialize() {
                 workbench_registry_views::render_diff();
             };
         else if (std::strcmp(entry.id, "document.disassembly") == 0)
-            descriptor.render = [](const view_render_context_t&) {
+            descriptor.render = [](const view_render_context_t& context) {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
                 disasm_view::render(0.f, 0.f, (std::max)(available.x, 1.f),
                     (std::max)(available.y, 1.f), 1.f, globals::ui::accent.x,
                     globals::ui::accent.y, globals::ui::accent.z,
-                    disasm_view::capture_selected_workspace(), ImGui::GetIO().DeltaTime);
+                    disasm_view::capture_selected_workspace(
+                        context.instance.instance.value()), ImGui::GetIO().DeltaTime);
             };
         else if (std::strcmp(entry.id, "document.hex") == 0)
             descriptor.render = [](const view_render_context_t&) {
@@ -1151,7 +1328,8 @@ void initialize() {
             descriptor.render = [tab = static_cast<analysis_hub_view::sub_tab_t>(
                 entry.subview_value)](const view_render_context_t&) {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
-                analysis_hub_view::render_subview(tab, 0.f, 0.f,
+                const ImVec2 cursor = ImGui::GetCursorPos();
+                analysis_hub_view::render_subview(tab, cursor.x, cursor.y,
                     (std::max)(available.x, 1.f), (std::max)(available.y, 1.f),
                     1.f, globals::ui::accent.x, globals::ui::accent.y,
                     globals::ui::accent.z, disasm_view::capture_selected_workspace());
@@ -1159,7 +1337,8 @@ void initialize() {
         else if (entry.category == view_category_t::memory && entry.subview == catalog_subview_t::scan)
             descriptor.render = [tab = static_cast<scan_hub_view::sub_tab_t>(entry.subview_value)](const view_render_context_t&) {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
-                scan_hub_view::render_subview(tab, 0.f, 0.f,
+                const ImVec2 cursor = ImGui::GetCursorPos();
+                scan_hub_view::render_subview(tab, cursor.x, cursor.y,
                     (std::max)(available.x, 1.f), (std::max)(available.y, 1.f), 1.f,
                     globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
             };
@@ -1173,32 +1352,41 @@ void initialize() {
         else if (std::strcmp(entry.id, "view.types.struct_recon") == 0)
             descriptor.render = [](const view_render_context_t&) {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
-                struct_recon_view::render(0.f, 0.f,
+                const ImVec2 cursor = ImGui::GetCursorPos();
+                struct_recon_view::render(cursor.x, cursor.y,
                     (std::max)(available.x, 1.f), (std::max)(available.y, 1.f), 1.f,
                     globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
             };
         else if (entry.category == view_category_t::debugger && entry.subview == catalog_subview_t::debugger)
             descriptor.render = [tab = static_cast<debugger_view::sub_tab_t>(entry.subview_value)](const view_render_context_t&) {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
+                const ImVec2 cursor = ImGui::GetCursorPos();
                 const float width = (std::max)(available.x, 1.f);
                 const float height = (std::max)(available.y, 1.f);
-                float content_y = 0.f;
+                float content_y = cursor.y;
                 if (tab == debugger_view::sub_tab_t::cpu) {
                     const float controls_height = (std::min)(72.f, height * 0.24f);
-                    debugger_view::render_execution_controls(0.f, 0.f, width, controls_height, 1.f,
+                    debugger_view::render_execution_controls(cursor.x, cursor.y, width, controls_height, 1.f,
                         globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
                     content_y = controls_height + 4.f;
+                    content_y += cursor.y;
                 }
-                debugger_view::render_pane(tab, 0.f, content_y, width,
-                    (std::max)(height - content_y, 1.f), 1.f,
+                const float consumed = content_y - cursor.y;
+                debugger_view::render_pane(tab, cursor.x, content_y, width,
+                    (std::max)(height - consumed, 1.f), 1.f,
                     globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
             };
         else if (entry.category == view_category_t::network && entry.subview == catalog_subview_t::network)
             descriptor.render = [tab = static_cast<network_view::sub_tab_t>(entry.subview_value)](const view_render_context_t&) {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
-                network_view::render_pane(tab, 0.f, 0.f,
+                const ImVec2 cursor = ImGui::GetCursorPos();
+                network_view::render_pane(tab, cursor.x, cursor.y,
                     (std::max)(available.x, 1.f), (std::max)(available.y, 1.f), 1.f,
                     globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
+            };
+        else if (std::strcmp(entry.id, "view.network.project") == 0)
+            descriptor.render = [](const view_render_context_t&) {
+                aida::burp::project_view::render();
             };
         else if (std::strcmp(entry.id, "view.ai.agents") == 0)
             descriptor.render = [](const view_render_context_t&) {
@@ -1226,6 +1414,10 @@ void initialize() {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
                 aida::automation_ui::render_evidence_view((std::max)(available.x, 1.f),
                     (std::max)(available.y, 1.f));
+            };
+        else if (std::strcmp(entry.id, "view.ai.scripts") == 0)
+            descriptor.render = [](const view_render_context_t&) {
+                programming_tasks::render_automation_scripts();
             };
         else if (std::strcmp(entry.id, "view.ai.mcp_marketplace") == 0)
             descriptor.render = [](const view_render_context_t&) {
@@ -1292,6 +1484,7 @@ void initialize() {
     }
     task_center::register_views(current.registry);
     install_surface_settings_handler();
+    current.initialized = true;
 }
 
 view_registry_t& registry() {
@@ -1346,6 +1539,7 @@ bool synchronize_workspace_visibility(
         current.observed_workspace_preset = preset;
         current.observed_workspace_identity = identity;
         restore_workspace_visibility(current, preset, identity);
+        current.visibility_capture_valid = false;
         if (preset == workspace_layout::workspace_preset_t::safe) {
             if (const auto* entry = find_catalog(stable_view_id_t("view.start_center")))
                 current.registry.open_or_focus(instance_for(*entry), current.context);
@@ -1362,6 +1556,19 @@ void begin_frame() noexcept {
         initialize();
         auto& current = state();
         ++current.context.generation;
+        for (auto& [id, surface] : current.surfaces) {
+            if (!is_disassembly_side_instance(id))
+                continue;
+            if (surface.restore_open && workspace_available() &&
+                !current.registry.is_open(id))
+                static_cast<void>(current.registry.open(id, current.context,
+                    "Disassembly: Side " + id.instance.value().substr(5)));
+            if (surface.restore_open && workspace_available() &&
+                surface.presentation_pending &&
+                disasm_view::restore_selected_presentation(
+                    id.instance.value(), surface.presentation))
+                surface.presentation_pending = false;
+        }
         file_tabs::poll_external_changes();
         synchronize_code_groups(current);
         task_center::refresh();
@@ -1398,7 +1605,7 @@ void reset_persisted_workspace_visibility(
             root["presets"].erase("builtin:" + workspace_preset_key(preset));
             root["presets"].erase(workspace_preset_key(preset));
         }
-        root["version"] = 2;
+        root["version"] = 3;
         const std::string serialized = root.dump();
         if (serialized.size() > kMaximumWorkspaceVisibilityBytes)
             return;
@@ -1406,8 +1613,9 @@ void reset_persisted_workspace_visibility(
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
         static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 #endif
-        if (workspace_layout::active_preset() == preset) {
+        if (all_presets || workspace_layout::active_preset() == preset) {
             auto& current = state();
+            current.visibility_capture_valid = false;
             current.workspace_preset_observed = false;
             current.observed_workspace_identity.clear();
             current.workspace_visibility.clear();
@@ -1423,6 +1631,7 @@ void clone_persisted_workspace_visibility(std::string_view source_identity,
         if (source_identity.empty() || target_identity.empty() || source_identity == target_identity)
             return;
         initialize();
+        state().visibility_capture_valid = false;
         nlohmann::json root = read_workspace_visibility_root();
         if (!root.contains("presets") || !root["presets"].is_object())
             root["presets"] = nlohmann::json::object();
@@ -1436,7 +1645,7 @@ void clone_persisted_workspace_visibility(std::string_view source_identity,
         if (!refreshed.contains(std::string(source_identity)))
             return;
         refreshed[std::string(target_identity)] = refreshed[std::string(source_identity)];
-        root["version"] = 2;
+        root["version"] = 3;
         const std::string serialized = root.dump();
         if (serialized.size() > kMaximumWorkspaceVisibilityBytes)
             return;
@@ -1445,6 +1654,7 @@ void clone_persisted_workspace_visibility(std::string_view source_identity,
         static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 #endif
         state().workspace_preset_observed = false;
+        state().visibility_capture_valid = false;
     } catch (...) {
     }
 }
@@ -1465,7 +1675,7 @@ void rename_persisted_workspace_visibility(std::string_view source_identity,
             return;
         entries[target] = std::move(entries[source]);
         entries.erase(source);
-        root["version"] = 2;
+        root["version"] = 3;
         const std::string serialized = root.dump();
         if (serialized.size() > kMaximumWorkspaceVisibilityBytes)
             return;
@@ -1474,6 +1684,7 @@ void rename_persisted_workspace_visibility(std::string_view source_identity,
         static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 #endif
         state().workspace_preset_observed = false;
+        state().visibility_capture_valid = false;
     } catch (...) {
     }
 }
@@ -1487,7 +1698,7 @@ void remove_persisted_workspace_visibility(std::string_view identity) noexcept {
         if (!root.contains("presets") || !root["presets"].is_object())
             return;
         root["presets"].erase(std::string(identity));
-        root["version"] = 2;
+        root["version"] = 3;
         const std::string serialized = root.dump();
         if (serialized.size() > kMaximumWorkspaceVisibilityBytes)
             return;
@@ -1496,6 +1707,150 @@ void remove_persisted_workspace_visibility(std::string_view identity) noexcept {
         static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 #endif
         state().workspace_preset_observed = false;
+        state().visibility_capture_valid = false;
+    } catch (...) {
+    }
+}
+
+std::string persistence_fingerprint() noexcept {
+    try {
+        initialize();
+        std::uint64_t hash = 14695981039346656037ULL;
+        const auto append = [&hash](std::string_view value) {
+            for (const char raw_byte : value) {
+                const auto byte = static_cast<unsigned char>(raw_byte);
+                hash ^= byte;
+                hash *= 1099511628211ULL;
+            }
+            hash ^= 0xFFU;
+            hash *= 1099511628211ULL;
+        };
+        state().registry.for_each_descriptor([&](const view_descriptor_t& descriptor) {
+            append(descriptor.id.value());
+            append(descriptor.internal_name);
+            append(std::to_string(descriptor.persistence_version));
+            append(std::to_string(descriptor.preset_introduced_revision));
+            append(std::to_string(static_cast<unsigned>(descriptor.category)));
+            append(std::to_string(static_cast<unsigned>(descriptor.identity_policy)));
+            append(std::to_string(static_cast<unsigned>(descriptor.role)));
+            for (const auto& alias : descriptor.persistence_aliases)
+                append(alias.value());
+        });
+        char encoded[17]{};
+        const int length = std::snprintf(encoded, sizeof(encoded), "%016llx",
+            static_cast<unsigned long long>(hash));
+        return length == 16 ? std::string(encoded, 16) : std::string{};
+    } catch (...) {
+        return {};
+    }
+}
+
+void migrate_persisted_window_settings() noexcept {
+    try {
+        initialize();
+        ImGuiContext* context = ImGui::GetCurrentContext();
+        if (!context)
+            return;
+        struct migration_t {
+            std::string name;
+            ImVec2ih pos;
+            ImVec2ih size;
+            ImVec2ih viewport_pos;
+            ImGuiID viewport_id = 0;
+            ImGuiID dock_id = 0;
+            ImGuiID class_id = 0;
+            short dock_order = -1;
+            bool collapsed = false;
+            bool is_child = false;
+        };
+        std::vector<migration_t> migrations;
+        std::vector<ImGuiID> migrated_old_ids;
+        std::vector<ImGuiID> removed_view_ids;
+        for (ImGuiWindowSettings* settings = context->SettingsWindows.begin(); settings;
+             settings = context->SettingsWindows.next_chunk(settings)) {
+            if (settings->WantDelete)
+                continue;
+            const std::string_view saved_name(settings->GetName());
+            const std::size_t hidden_separator = saved_name.find("###");
+            const std::string_view saved_identity = hidden_separator == std::string_view::npos
+                ? saved_name : saved_name.substr(hidden_separator + 3);
+            const std::string_view visible_prefix = hidden_separator == std::string_view::npos
+                ? std::string_view{} : saved_name.substr(0, hidden_separator);
+            bool migrated = false;
+            bool known = false;
+            state().registry.for_each_descriptor([&](const view_descriptor_t& descriptor) {
+                const std::string& current_prefix = descriptor.internal_name;
+                if (saved_identity == current_prefix ||
+                    (descriptor.identity_policy == view_identity_policy_t::multi_instance &&
+                     saved_identity.size() > current_prefix.size() &&
+                     saved_identity.compare(0, current_prefix.size(), current_prefix) == 0 &&
+                     saved_identity[current_prefix.size()] == '.'))
+                    known = true;
+                if (migrated || known)
+                    return;
+                for (const auto& alias : descriptor.persistence_aliases) {
+                    const std::string old_prefix = std::string("aida.") + alias.value();
+                    const bool exact = saved_identity == old_prefix;
+                    const bool instance = descriptor.identity_policy == view_identity_policy_t::multi_instance &&
+                        saved_identity.size() > old_prefix.size() &&
+                        saved_identity.compare(0, old_prefix.size(), old_prefix) == 0 &&
+                        saved_identity[old_prefix.size()] == '.';
+                    if (!exact && !instance)
+                        continue;
+                    migrated_old_ids.push_back(settings->ID);
+                    std::string new_name;
+                    if (ImGui::GetIO().ConfigDebugIniSettings && !visible_prefix.empty()) {
+                        new_name.assign(visible_prefix);
+                        new_name.append("###");
+                    } else {
+                        new_name.assign("###");
+                    }
+                    new_name.append(descriptor.internal_name);
+                    new_name.append(saved_identity.substr(old_prefix.size()));
+                    const ImGuiID new_id = ImHashStr(new_name.c_str());
+                    if (!ImGui::FindWindowSettingsByID(new_id)) {
+                        migrations.push_back({std::move(new_name), settings->Pos,
+                            settings->Size, settings->ViewportPos, settings->ViewportId,
+                            settings->DockId, settings->ClassId, settings->DockOrder,
+                            settings->Collapsed, settings->IsChild});
+                    }
+                    migrated = true;
+                    break;
+                }
+            });
+            if (!known && !migrated &&
+                (saved_identity.rfind("aida.view.", 0) == 0 ||
+                 saved_identity.rfind("aida.document.", 0) == 0))
+                removed_view_ids.push_back(settings->ID);
+        }
+        bool completed = true;
+        for (const auto& migration : migrations) {
+            ImGuiWindowSettings* settings = ImGui::CreateNewWindowSettings(migration.name.c_str());
+            if (!settings) {
+                completed = false;
+                continue;
+            }
+            settings->Pos = migration.pos;
+            settings->Size = migration.size;
+            settings->ViewportPos = migration.viewport_pos;
+            settings->ViewportId = migration.viewport_id;
+            settings->DockId = migration.dock_id;
+            settings->ClassId = migration.class_id;
+            settings->DockOrder = migration.dock_order;
+            settings->Collapsed = migration.collapsed;
+            settings->IsChild = migration.is_child;
+            settings->WantApply = true;
+        }
+        if (completed) {
+            for (const ImGuiID old_id : migrated_old_ids)
+                if (ImGuiWindowSettings* previous = ImGui::FindWindowSettingsByID(old_id))
+                    previous->WantDelete = true;
+            for (const ImGuiID removed_id : removed_view_ids)
+                if (ImGuiWindowSettings* removed = ImGui::FindWindowSettingsByID(removed_id))
+                    removed->WantDelete = true;
+        }
+        if (completed && (!migrated_old_ids.empty() || !removed_view_ids.empty()))
+            ImGui::GetIO().WantSaveIniSettings = true;
     } catch (...) {
     }
 }
@@ -1564,9 +1919,23 @@ view_operation_result_t close_instance(const view_instance_id_t& id) {
         return {view_operation_status_t::not_registered, "The target view is not registered"};
     if (state().surfaces[id].pinned)
         return {view_operation_status_t::unavailable, "Unpin this view before closing it"};
+    if (id.view.value() == "document.code") {
+        const auto prepared = prepare_code_group_close(id);
+        if (!prepared.ok())
+            return prepared;
+    }
     if (state().title_focused && *state().title_focused == id)
         state().title_focused.reset();
-    return state().registry.close(id);
+    const auto result = state().registry.close(id);
+    if (result.ok() && id.view.value() == "document.disassembly" &&
+        !id.instance.empty()) {
+        disasm_view::release_presentation(id.instance.value());
+        auto& surface = state().surfaces[id];
+        surface.restore_open = false;
+        surface.presentation_pending = false;
+        ImGui::GetIO().WantSaveIniSettings = true;
+    }
+    return result;
 }
 
 view_operation_result_t close_other_instances(const view_instance_id_t& keep) {
@@ -1581,7 +1950,14 @@ view_operation_result_t close_other_instances(const view_instance_id_t& keep) {
     if (targets.empty())
         return {view_operation_status_t::unavailable, "No other closeable unpinned view is open"};
     for (const auto& target : targets) {
-        const auto result = state().registry.close(target);
+        if (target.view.value() != "document.code")
+            continue;
+        const auto prepared = prepare_code_group_close(target);
+        if (!prepared.ok())
+            return prepared;
+    }
+    for (const auto& target : targets) {
+        const auto result = close_instance(target);
         if (!result.ok())
             return result;
     }
@@ -1603,16 +1979,56 @@ view_operation_result_t request_reset_state(const view_instance_id_t& id) {
     if (!state().registry.is_open(id))
         return {view_operation_status_t::not_open, "The target view is no longer open"};
     state().surfaces[id].reset_requested = true;
+    if (id.view.value() == "document.disassembly" && !id.instance.empty())
+        disasm_view::reset_presentation(id.instance.value());
     return {view_operation_status_t::completed, {}};
 }
 
 view_operation_result_t duplicate_instance(const view_instance_id_t& id) {
     initialize();
-    if (!can_duplicate(id))
+    if (id.view.value() != "document.disassembly")
         return {view_operation_status_t::unavailable,
             "This renderer does not declare independent duplicate state"};
+    if (!state().registry.is_open(id))
+        return {view_operation_status_t::not_open,
+            "The source Disassembly view is no longer open"};
+    if (!workspace_available())
+        return {view_operation_status_t::unavailable,
+            "Open and analyze a binary before creating a Disassembly side view"};
+    if (workspace_layout::layout_locked())
+        return {view_operation_status_t::unavailable,
+            "Unlock the workspace layout before opening Disassembly to the side"};
+    constexpr unsigned maximum_side_instances = 3;
+    for (unsigned index = 1; index <= maximum_side_instances; ++index) {
+        const std::string key = "side." + std::to_string(index);
+        const view_instance_id_t target{id.view,
+            stable_view_instance_key_t(key)};
+        if (state().registry.is_open(target))
+            continue;
+        disasm_view::clone_presentation(id.instance.value(), key);
+        const auto result = state().registry.open(target, state().context,
+            "Disassembly: Side " + std::to_string(index));
+        if (!result.ok()) {
+            disasm_view::release_presentation(key);
+            return result;
+        }
+        const auto split = workspace_layout::split_window(
+            state().registry.window_name(target), state().registry.window_name(id),
+            workspace_layout::dock_split_direction_t::right);
+        if (split != workspace_layout::workspace_request_result_t::completed &&
+            split != workspace_layout::workspace_request_result_t::unchanged) {
+            static_cast<void>(state().registry.close(target));
+            disasm_view::release_presentation(key);
+            return {view_operation_status_t::unavailable,
+                "The source Disassembly dock could not be split; realize the document and unlock the layout before retrying"};
+        }
+        state().surfaces[target].restore_open = true;
+        ImGui::GetIO().WantSaveIniSettings = true;
+        return {view_operation_status_t::completed,
+            "Opened independent Disassembly side view " + std::to_string(index)};
+    }
     return {view_operation_status_t::unavailable,
-        "No current registry renderer declares independent duplicate state"};
+        "The bounded limit of three Disassembly side views is already open"};
 }
 
 view_operation_result_t reopen_last_closed() {
@@ -1651,8 +2067,24 @@ bool is_pinned(const view_instance_id_t& id) noexcept {
     }
 }
 
-bool can_duplicate(const view_instance_id_t&) noexcept {
-    return false;
+bool can_duplicate(const view_instance_id_t& id) noexcept {
+    try {
+        initialize();
+        if (id.view.value() != "document.disassembly" ||
+            !state().registry.is_open(id) || !workspace_available() ||
+            workspace_layout::layout_locked())
+            return false;
+        unsigned open_side_instances = 0;
+        state().registry.for_each_instance(
+            [&](const view_descriptor_t&, const view_instance_state_t& instance) {
+                if (instance.open && instance.id.view == id.view &&
+                    !instance.id.instance.empty())
+                    ++open_side_instances;
+            }, true);
+        return open_side_instances < 3;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool can_reset_state(const view_instance_id_t& id) noexcept {
@@ -1671,6 +2103,17 @@ bool can_reopen_last_closed() noexcept {
     } catch (...) {
         return false;
     }
+}
+
+std::string focused_disassembly_presentation_key() noexcept {
+    try {
+        initialize();
+        const auto focused = state().registry.focused_instance();
+        if (focused && focused->view.value() == "document.disassembly")
+            return focused->instance.value();
+    } catch (...) {
+    }
+    return {};
 }
 
 void render_registry_owned_windows() noexcept {
@@ -1714,18 +2157,40 @@ void render_registry_owned_windows() noexcept {
             ImGui::SetNextWindowFocus();
         const bool pinned = is_pinned(id);
         bool open = true;
-        const ImGuiWindowFlags placement_flags = workspace_layout::layout_locked()
+        const ImGuiWindowFlags placement_flags =
+            (workspace_layout::layout_locked() || workspace_layout::operation_pending())
             ? static_cast<ImGuiWindowFlags>(ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize)
             : ImGuiWindowFlags_None;
         const bool content_visible = ImGui::Begin(window_name.c_str(),
             descriptor->closeable && !pinned ? &open : nullptr, placement_flags);
         ImGuiWindow* window = ImGui::GetCurrentWindow();
+        const bool owns_visible_content = !window->DockIsActive || window->DockTabIsVisible;
         const bool window_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         if (window_focused)
             focused = id;
         const ImRect context_rect = window->DockIsActive &&
                 window->DC.DockTabItemRect.GetWidth() > 0.0f
             ? window->DC.DockTabItemRect : window->TitleBarRect();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        std::string semantic_identity = id.view.value();
+        if (!id.instance.empty())
+            semantic_identity.append(".").append(
+                aida::preview::semantics::entity_token(id.instance.value()));
+        const std::string semantic_window = aida::preview::semantics::stable_id(
+            "aida.dock-window", semantic_identity);
+        const std::string semantic_tab = aida::preview::semantics::stable_id(
+            "aida.dock-tab", semantic_identity);
+        if (content_visible && owns_visible_content)
+            static_cast<void>(aida::preview::semantics::register_region(semantic_window,
+                "dock-window", window->ID, window->Pos,
+                ImVec2(window->Pos.x + window->Size.x, window->Pos.y + window->Size.y),
+                true));
+        const std::string_view semantic_tab_parent = content_visible && owns_visible_content
+            ? std::string_view(semantic_window) : std::string_view{};
+        static_cast<void>(aida::preview::semantics::register_region(semantic_tab,
+            "dock-tab", window->TabId != 0 ? window->TabId : window->ID,
+            context_rect.Min, context_rect.Max, true, false, semantic_tab_parent));
+#endif
         const bool title_hovered = ImGui::IsMouseHoveringRect(context_rect.Min, context_rect.Max);
         ImGuiContext* gui_context = ImGui::GetCurrentContext();
         const float title_tooltip_delay = (std::max)(ImGui::GetStyle().HoverDelayShort,
@@ -1769,16 +2234,27 @@ void render_registry_owned_windows() noexcept {
                 theme.accent_u32, 1.0f * scale);
         }
         auto surface = current.surfaces.find(id);
-        if (surface != current.surfaces.end() && surface->second.reset_requested && content_visible) {
+        if (surface != current.surfaces.end() && surface->second.reset_requested &&
+            content_visible && owns_visible_content) {
             window->StateStorage.Clear();
             ImGui::SetScrollX(0.0f);
             ImGui::SetScrollY(0.0f);
             surface->second.reset_requested = false;
         }
         if (content_visible) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            aida::preview::semantics::scoped_registration_t semantic_registration_scope(
+                owns_visible_content);
+            aida::preview::semantics::scoped_parent_t semantic_parent_scope(semantic_window);
+#endif
             current.context.active_view = id.view;
             current.context.active_view_instance = id.instance;
             const ImVec2 available = ImGui::GetContentRegionAvail();
+            const ImVec2 content_min = ImGui::GetCursorScreenPos();
+            const ImVec2 content_max(
+                content_min.x + (std::max)(available.x, 1.0f),
+                content_min.y + (std::max)(available.y, 1.0f));
+            ImGui::PushClipRect(content_min, content_max, true);
             const ImVec2 recovery_minimum(
                 (std::min)(descriptor->minimum_size.width, 168.0f),
                 (std::min)(descriptor->minimum_size.height, 96.0f));
@@ -1833,6 +2309,7 @@ void render_registry_owned_windows() noexcept {
             } else {
                 current.render_failures.erase(id);
             }
+            ImGui::PopClipRect();
         }
         application_ui::render_view_surface_context_menu(id);
         ImGui::End();

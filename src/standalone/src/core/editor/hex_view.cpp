@@ -3,6 +3,7 @@
 #include "../analysis/workspace/overlay_journal.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/hex_preview_adapter.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #include "../infra/taskflow_runtime.hpp"
 #include "standalone_driver.hpp"
@@ -22,6 +23,7 @@
 #include "imgui/imgui.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <cctype>
@@ -762,6 +764,31 @@ bool context_key_pressed() {
         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false));
 }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string_view byte_semantic_id(std::string_view binary_id, bool live_source,
+                                  std::uint64_t address, std::array<char, 43>& storage) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto append_hash = [&hash](std::string_view value) {
+        for (const char character : value) {
+            hash ^= static_cast<unsigned char>(character);
+            hash *= 1099511628211ULL;
+        }
+    };
+    append_hash(binary_id);
+    append_hash(live_source ? ":live:" : ":file:");
+    std::array<char, 21> encoded_address{};
+    const auto converted = std::to_chars(encoded_address.data(),
+        encoded_address.data() + encoded_address.size(), address);
+    if (converted.ec == std::errc())
+        append_hash(std::string_view(encoded_address.data(),
+            static_cast<std::size_t>(converted.ptr - encoded_address.data())));
+    const int length = std::snprintf(storage.data(), storage.size(),
+        "aida.hex-byte.e%016llx", static_cast<unsigned long long>(hash));
+    return length == 31 ? std::string_view(storage.data(), static_cast<std::size_t>(length))
+                        : std::string_view{};
+}
+#endif
+
 }
 
 void activate(const disasm_view::workspace_context_t& context) {
@@ -1300,39 +1327,47 @@ void render(float, float, float width, float height,
             std::snprintf(address, sizeof(address), "%016llX",
                 static_cast<unsigned long long>(display_address));
             ImGui::TextUnformatted(address);
-            std::string ascii;
-            ascii.reserve(16);
-            for (std::uint64_t column = 0; column < 16; ++column) {
-                const std::uint64_t offset = row_offset + column;
-                if (offset >= byte_count)
-                    break;
-                std::uint8_t value = 0;
-                bool patched = false;
-                {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    if (live_source) {
-                        if (offset >= state->live_bytes.size())
-                            continue;
-                        value = state->live_bytes[static_cast<std::size_t>(offset)];
-                    } else {
-                        const auto relative = offset - state->window_offset;
-                        if (relative >= state->window.size())
-                            continue;
-                        value = patched_byte(*state, offset,
-                            state->window[static_cast<std::size_t>(relative)], &patched);
+            std::array<std::uint8_t, 16> row_bytes{};
+            std::array<bool, 16> row_patched{};
+            const std::size_t row_byte_count = static_cast<std::size_t>((std::min)(
+                byte_count - row_offset, static_cast<std::uint64_t>(row_bytes.size())));
+            std::size_t copied_byte_count = 0;
+            std::int64_t selection_begin = -1;
+            std::int64_t selection_end = -1;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                selection_begin = state->ui.sel_start;
+                selection_end = state->ui.sel_end;
+                if ((state->source_kind == source_kind_t::live_memory) == live_source) {
+                    for (std::size_t column = 0; column < row_byte_count; ++column) {
+                        const std::uint64_t offset = row_offset + column;
+                        if (live_source) {
+                            if (offset >= state->live_bytes.size())
+                                break;
+                            row_bytes[column] = state->live_bytes[static_cast<std::size_t>(offset)];
+                        } else {
+                            if (offset < state->window_offset)
+                                break;
+                            const auto relative = offset - state->window_offset;
+                            if (relative >= state->window.size())
+                                break;
+                            row_bytes[column] = patched_byte(*state, offset,
+                                state->window[static_cast<std::size_t>(relative)],
+                                &row_patched[column]);
+                        }
+                        ++copied_byte_count;
                     }
                 }
+            }
+            char ascii[17]{};
+            for (std::size_t column = 0; column < copied_byte_count; ++column) {
+                const std::uint64_t offset = row_offset + column;
+                const std::uint8_t value = row_bytes[column];
+                const bool patched = row_patched[column];
                 ImGui::SameLine(170.0f + static_cast<float>(column) * 29.0f);
                 ImGui::PushID(static_cast<int>((offset ^ (offset >> 32)) & 0x7FFFFFFF));
                 char encoded[4]{};
                 std::snprintf(encoded, sizeof(encoded), "%02X", value);
-                std::int64_t selection_begin = -1;
-                std::int64_t selection_end = -1;
-                {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    selection_begin = state->ui.sel_start;
-                    selection_end = state->ui.sel_end;
-                }
                 const auto low = (std::min)(selection_begin, selection_end);
                 const auto high = (std::max)(selection_begin, selection_end);
                 const bool selected = selection_begin >= 0 &&
@@ -1340,14 +1375,26 @@ void render(float, float, float width, float height,
                     static_cast<std::int64_t>(offset) <= high;
                 if (patched)
                     ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(theme.warning, alpha));
-                if (ImGui::Selectable(encoded, selected,
-                        ImGuiSelectableFlags_AllowDoubleClick, ImVec2(27.0f, row_height))) {
+                const bool activated = ImGui::Selectable(encoded, selected,
+                    ImGuiSelectableFlags_AllowDoubleClick, ImVec2(27.0f, row_height));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                if (ImGui::IsItemVisible()) {
+                    std::array<char, 43> semantic_storage{};
+                    const auto semantic_id = byte_semantic_id(id, live_source,
+                        live_source ? live_base + offset : offset, semantic_storage);
+                    static_cast<void>(aida::preview::semantics::register_last_item(semantic_id,
+                        "hex-byte", true));
+                }
+#endif
+                if (activated) {
                     std::lock_guard<std::mutex> lock(state->mutex);
                     if (ImGui::GetIO().KeyShift && state->ui.sel_start >= 0)
                         state->ui.sel_end = static_cast<std::int64_t>(offset);
                     else
                         state->ui.sel_start = state->ui.sel_end =
                             static_cast<std::int64_t>(offset);
+                    selection_begin = state->ui.sel_start;
+                    selection_end = state->ui.sel_end;
                     if (!live_source && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                         if (auto translated = normalized_address_for_file_offset(context, offset)) {
                             disasm_view::goto_address(*translated, context);
@@ -1380,10 +1427,10 @@ void render(float, float, float width, float height,
                             : aida::ui::context_menu_open_origin_t::shift_f10;
                 }
                 ImGui::PopID();
-                ascii.push_back(value >= 0x20 && value <= 0x7E ? static_cast<char>(value) : '.');
+                ascii[column] = value >= 0x20 && value <= 0x7E ? static_cast<char>(value) : '.';
             }
             ImGui::SameLine(650.0f);
-            ImGui::TextUnformatted(ascii.c_str());
+            ImGui::TextUnformatted(ascii, ascii + copied_byte_count);
         }
     }
     if (open_hex_context) {

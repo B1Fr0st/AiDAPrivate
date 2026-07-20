@@ -6,7 +6,7 @@
         "type": "Direct",
         "requested": "[10.1.0.8386]",
         "resolved": "10.1.0.8386",
-        "contentHash": "qqv9CICyxyZPZFhA7v/ctpQ664EOVL1vcohzpF1lqBsODHZPao1BF1bePWEKcaAoCxCpjTRO8kDL5XDpV+7kzw==",
+        "contentHash": "vq3sH7MW+GqT6N5V4kbhfdN4zotq7+QKOBzRjgNRgUX3D46QDNGpHgbO6lS4A/JEs203lZOrEVc/eiQMPONMsw==",
         "dependencies": {
           "System.Collections.Immutable": "9.0.0",
           "System.Reflection.Metadata": "9.0.0"
@@ -16,13 +16,13 @@
         "type": "Direct",
         "requested": "[9.0.0]",
         "resolved": "9.0.0",
-        "contentHash": "z/Oo7nxWmZ0Y578vj8EUVrFJZ3DX6OMuUGlgeYgeeUZOFGT89XfaM8fDFMvJy6+mOIqW6ux5NdNzEnlTnQGJ7A=="
+        "contentHash": "QhkXUl2gNrQtvPmtBTQHb0YsUrDiDQ2QS09YbtTTiSjGcf7NBqtYbrG/BE06zcBPCKEwQGzIv13IVdXNOSub2w=="
       },
       "System.Reflection.Metadata": {
         "type": "Direct",
         "requested": "[9.0.0]",
         "resolved": "9.0.0",
-        "contentHash": "jz+Y2m/CpdPvdjCNRigiWJYKFusdkfJlxDx4V5cWX2TubAMaz5CZpODBD/P2+20SpWvmZG6J3UYjl+R2Yg7yFw==",
+        "contentHash": "ANiqLu3DxW9kol/hMmTWbt3414t9ftdIuiIU7j80okq2YzAueo120M442xk1kDJWtmZTqWQn7wHDvMRipVOEOQ==",
         "dependencies": {
           "System.Collections.Immutable": "9.0.0"
         }

@@ -33,6 +33,7 @@
 #include "ui_anim.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
@@ -133,6 +134,22 @@ inline std::string chain_identity_key(const pointer_scanner::pointer_chain_t& ch
 		static_cast<unsigned long long>(chain_identity_value(chain)));
 	return encoded;
 }
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline std::string studio_pointer_entity_id(const char* entity,
+	const pointer_scanner::pointer_chain_t& chain, int step = -1) {
+	const auto workspace = disasm_view::capture_selected_workspace();
+	const std::string workspace_id = workspace.workspace
+		? workspace.workspace->identity().binary_id().to_hex() : std::string("none");
+	const std::string identity = std::to_string(driver_bridge::attached_pid()) + ":" +
+		workspace_id + ":" +
+		chain_identity_key(chain) + ":" + std::to_string(step);
+	std::string source(entity);
+	source.push_back('-');
+	source.append(aida::preview::semantics::entity_token(identity));
+	return aida::preview::semantics::stable_id("aida.memory", source);
+}
+#endif
 
 inline std::uint64_t map_fingerprint() {
 	auto& state = pointer_scanner::g_state;
@@ -541,6 +558,10 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 	float gap_w = 56.f;
 
 	const size_t total_steps = chain.offsets.size() + 1;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const std::string chain_semantic_id = studio_pointer_entity_id(
+		"pointer-chain", chain);
+#endif
 
 	std::vector<float> box_w_arr;
 	box_w_arr.reserve(total_steps * 2);
@@ -600,6 +621,11 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		ImGui::PushID(chain_idx * 100 + 0);
 		ImGui::SetCursorScreenPos(ba);
 		ImGui::InvisibleButton("##step0", ImVec2(bw, box_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			studio_pointer_entity_id("pointer-step", chain, 0),
+			"pointer-chain-step", false, false, chain_semantic_id);
+#endif
 		bool clk = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 		bool hov = ImGui::IsItemHovered();
 		if (hov) hover_step = 0;
@@ -662,6 +688,11 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		ImGui::PushID(chain_idx * 100 + step_idx);
 		ImGui::SetCursorScreenPos(ba);
 		ImGui::InvisibleButton("##stepn", ImVec2(bw, box_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			studio_pointer_entity_id("pointer-step", chain, step_idx),
+			"pointer-chain-step", false, false, chain_semantic_id);
+#endif
 		bool clk = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 		bool hov = ImGui::IsItemHovered();
 		if (hov) hover_step = step_idx;
@@ -1116,6 +1147,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ry = body_y + static_cast<float>(visible_row) * row_h
 			- (st.scroll_y - static_cast<float>(start_row) * row_h);
 		if (ry + row_h < body_y || ry > body_y + body_h) continue;
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string chain_semantic_id = detail::studio_pointer_entity_id(
+			"pointer-chain", chain);
+		aida::preview::semantics::register_region(chain_semantic_id,
+			"pointer-chain-row", ImGui::GetID(chain_semantic_id.c_str()),
+			ImVec2(table_x, ry), ImVec2(table_x + table_w, ry + row_h), false, false,
+			"aida.dock-window.view.memory.pointers");
+#endif
 
 		bool hovered = (mp.x >= table_x && mp.x <= table_x + table_w &&
 		                mp.y >= ry && mp.y < ry + row_h);

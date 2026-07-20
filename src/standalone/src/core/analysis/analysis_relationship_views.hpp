@@ -4,6 +4,9 @@
 #include "../ui/empty_state.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/theme.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 #include "imgui/imgui.h"
 #include <Zydis/Zydis.h>
 
@@ -341,6 +344,17 @@ inline void render() {
                 const bool activated = ImGui::Selectable("##row", state->selected == source,
                     ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick,
                     ImVec2(0.0f, 20.0f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string row_identity = std::to_string(row.address) + ":" +
+                    std::to_string(row.register_id) + ":" +
+                    std::to_string(row.segment_relative);
+                const std::string row_semantic = aida::preview::semantics::stable_id(
+                    "aida.segment-register-row",
+                    aida::preview::semantics::entity_token(row_identity));
+                static_cast<void>(aida::preview::semantics::register_last_item(row_semantic,
+                    "relationship-row", false, false,
+                    "aida.dock-window.view.analysis.segment-registers"));
+#endif
                 if (activated) {
                     state->selected = source;
                     disasm_view::select_address(row.address, context);
@@ -395,8 +409,22 @@ inline void render() {
         if (delta != 0 || ImGui::IsKeyPressed(ImGuiKey_Home, false) ||
             ImGui::IsKeyPressed(ImGuiKey_End, false))
             disasm_view::select_address(row.address, context, false);
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
-            ImGui::SetClipboardText(address_text(row.address).c_str());
+        if (ImGui::GetIO().KeyCtrl &&
+            (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+             ImGui::IsKeyPressed(ImGuiKey_Insert, false))) {
+            const auto retained_row = action_row(row);
+            aida::ui::analysis_context_menu::execute_shortcut(
+                analysis_list_views::make_context(retained_row, context,
+                    [state, expected = state->selected,
+                     identity = analysis_list_views::row_identity(retained_row)] {
+                        return state->selected == expected && expected < state->rows.size() &&
+                            analysis_list_views::row_identity(action_row(state->rows[expected])) == identity
+                            ? aida::ui::capability_state_t::available()
+                            : aida::ui::capability_state_t::unavailable(
+                                "The selected segment-register entity changed");
+                    }),
+                "analysis.copy.address");
+        }
     }
     aida::ui::context_menu_open_origin_t keyboard_origin{};
     const bool keyboard_context = focused && state->selected < state->rows.size() &&
@@ -773,9 +801,9 @@ inline analysis_list_views::row_t action_row(const node_t& node) {
     return result;
 }
 
-inline void open_context(const node_t& node, state_t& state,
-                         const disasm_view::workspace_context_t& context,
-                         aida::ui::context_menu_open_origin_t origin) {
+inline aida::ui::analysis_context_menu::context_t make_context(
+                         const node_t& node, state_t& state,
+                         const disasm_view::workspace_context_t& context) {
     using namespace aida::ui::analysis_context_menu;
     using aida::ui::action_handler_result_t;
     context_t menu;
@@ -896,7 +924,14 @@ inline void open_context(const node_t& node, state_t& state,
         ImGui::SetClipboardText(value.c_str());
         return action_handler_result_t::completed();
     };
-    open(std::move(menu), origin);
+    return menu;
+}
+
+inline void open_context(const node_t& node, state_t& state,
+                         const disasm_view::workspace_context_t& context,
+                         aida::ui::context_menu_open_origin_t origin) {
+    aida::ui::analysis_context_menu::open(
+        make_context(node, state, context), origin);
 }
 
 inline void render() {
@@ -1030,6 +1065,15 @@ inline void render() {
                 const bool activated = ImGui::Selectable("##row", state->selected == source,
                     ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick,
                     ImVec2(0.0f, 20.0f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string node_identity = std::to_string(node.address);
+                const std::string node_semantic = aida::preview::semantics::stable_id(
+                    "aida.proximity-row",
+                    aida::preview::semantics::entity_token(node_identity));
+                static_cast<void>(aida::preview::semantics::register_last_item(node_semantic,
+                    "relationship-row", false, false,
+                    "aida.dock-window.view.analysis.proximity"));
+#endif
                 if (activated) {
                     state->selected = source;
                     disasm_view::select_address(node.address, context);
@@ -1085,8 +1129,11 @@ inline void render() {
         if (delta != 0 || ImGui::IsKeyPressed(ImGuiKey_Home, false) ||
             ImGui::IsKeyPressed(ImGuiKey_End, false))
             disasm_view::select_address(node.address, context, false);
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
-            ImGui::SetClipboardText(address_text(node.address).c_str());
+        if (ImGui::GetIO().KeyCtrl &&
+            (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+             ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
+            aida::ui::analysis_context_menu::execute_shortcut(
+                make_context(node, *state, context), "analysis.copy.address");
     }
     aida::ui::context_menu_open_origin_t keyboard_origin{};
     const bool keyboard_context = focused && state->selected < state->nodes.size() &&

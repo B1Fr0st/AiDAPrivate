@@ -49,6 +49,7 @@ struct subscription_handle_t { uint64_t id = 0; std::string type_name; bool vali
 #include "../ui/ui_thread_dispatcher.hpp"
 #else
 #include "../../preview/ui_task_executor.hpp"
+#include "../../preview/studio_semantics.hpp"
 #endif
 
 namespace module_view {
@@ -499,6 +500,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float refresh_y = pos_y + (header_h - refresh_h) * 0.5f;
 	ImVec2 btn_min(refresh_x, refresh_y);
 	ImVec2 btn_max(refresh_x + refresh_w, refresh_y + refresh_h);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(aida::preview::semantics::register_region(
+		"aida.debug.modules.action-refresh", "debugger-action",
+		ImGui::GetID("aida.debug.modules.action-refresh"), btn_min, btn_max,
+		false, g_ui.loading.load(std::memory_order_acquire),
+		"aida.dock-window.view.debug.modules"));
+#endif
 	bool btn_hover = ImGui::IsMouseHoveringRect(btn_min, btn_max, false);
 	ImU32 btn_top = btn_hover ? aida::ui::with_alpha(_t.accent_grad_top, alpha * 0.95f)
 	                          : aida::ui::with_alpha(_t.accent_dim, alpha * 0.55f);
@@ -525,6 +533,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PushItemWidth(140.f);
 	ImGui::PushID("##modlistfilter");
 	ImGui::InputText("##mlf", mod_list_filter, sizeof(mod_list_filter));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(aida::preview::semantics::register_last_item(
+		"aida.debug.modules.filter", "search-input", false, false,
+		"aida.dock-window.view.debug.modules"));
+#endif
 	ImGui::PopID();
 	ImGui::PopItemWidth();
 
@@ -610,6 +623,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ry = mod_list_y + static_cast<float>(idx) * row_h - g_ui.module_scroll_y;
 		if (ry + row_h < mod_list_y || ry > mod_list_y + mod_list_h) continue;
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string module_semantic = "aida.debug.module-" +
+			aida::preview::semantics::entity_token(std::to_string(m.base) + ":" +
+				m.name);
+		static_cast<void>(aida::preview::semantics::register_region(
+			module_semantic, "debugger-module-row",
+			ImGui::GetID(module_semantic.c_str()), ImVec2(pos_x, ry),
+			ImVec2(pos_x + left_w - 12.f, ry + row_h), false, false,
+			"aida.dock-window.view.debug.modules"));
+#endif
 		bool clicked = ui_anim::row_hover_select(dl, pos_x, ry, left_w - 12.f, row_h,
 												  idx, selected_filtered_idx, alpha, ar, ag, ab);
 		const bool hovered = ImGui::IsMouseHoveringRect(
@@ -684,6 +707,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float tw = tsz.x + 20.f;
 		ImVec2 tmin(tab_x, pos_y + 4.f);
 		ImVec2 tmax(tab_x + tw, pos_y + 26.f);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string tab_semantic = aida::preview::semantics::stable_id(
+			"aida.debug.modules.tab", sub_labels[i]);
+		static_cast<void>(aida::preview::semantics::register_region(
+			tab_semantic, "debugger-module-detail-tab",
+			ImGui::GetID(tab_semantic.c_str()), tmin, tmax, false, false,
+			"aida.dock-window.view.debug.modules"));
+#endif
 		bool tab_hover = ImGui::IsMouseHoveringRect(tmin, tmax, false);
 
 		if (tab_hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -720,6 +751,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PushItemWidth(200.f);
 	ImGui::PushID("##modfilter");
 	ImGui::InputText("##mf", g_ui.filter_buf, sizeof(g_ui.filter_buf));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(aida::preview::semantics::register_last_item(
+		"aida.debug.modules.detail-filter", "search-input", false, false,
+		"aida.dock-window.view.debug.modules"));
+#endif
 	ImGui::PopID();
 	ImGui::PopItemWidth();
 
@@ -771,6 +807,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float ry = det_list_y + static_cast<float>(idx) * row_h - g_ui.detail_scroll_y;
 			if (ry + row_h < det_list_y || ry > det_list_y + det_list_h) continue;
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const std::string export_semantic = "aida.debug.module-export-" +
+				aida::preview::semantics::entity_token(std::to_string(selected_base_snapshot) +
+					":" + std::to_string(exp.ordinal) + ":" + exp.name + ":" +
+					std::to_string(exp.address));
+			static_cast<void>(aida::preview::semantics::register_region(
+				export_semantic, "debugger-module-export-row",
+				ImGui::GetID(export_semantic.c_str()), ImVec2(right_x, ry),
+				ImVec2(right_x + right_w - 12.f, ry + row_h), false, false,
+				"aida.dock-window.view.debug.modules"));
+#endif
 			ui_anim::row_hover_select(dl, right_x, ry, right_w - 12.f, row_h,
 									  idx, g_ui.selected_detail, alpha, ar, ag, ab);
 
@@ -841,6 +888,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float ry = det_list_y + static_cast<float>(idx) * row_h - g_ui.detail_scroll_y;
 			if (ry + row_h < det_list_y || ry > det_list_y + det_list_h) continue;
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const std::string import_semantic = "aida.debug.module-import-" +
+				aida::preview::semantics::entity_token(std::to_string(selected_base_snapshot) +
+					":" + imp.module_name + ":" + imp.function_name + ":" +
+					std::to_string(imp.iat_address));
+			static_cast<void>(aida::preview::semantics::register_region(
+				import_semantic, "debugger-module-import-row",
+				ImGui::GetID(import_semantic.c_str()), ImVec2(right_x, ry),
+				ImVec2(right_x + right_w - 12.f, ry + row_h), false, false,
+				"aida.dock-window.view.debug.modules"));
+#endif
 			ui_anim::row_hover_select(dl, right_x, ry, right_w - 12.f, row_h,
 									  idx, g_ui.selected_detail, alpha, ar, ag, ab);
 

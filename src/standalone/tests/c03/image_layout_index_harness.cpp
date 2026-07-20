@@ -24,7 +24,6 @@ void require(bool condition, const char* message) {
     if (!condition)
         throw std::runtime_error(message);
 }
-}
 
 binary_id_t content_id(std::uint8_t seed) {
     binary_id_t result;

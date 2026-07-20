@@ -1823,6 +1823,31 @@ namespace detail {
     }
 }
 
+__declspec(noinline) inline void scan_kernel_exception_directory_seh(uint64_t module_base)
+{
+    __try {
+        const UINT8* mod_base = reinterpret_cast<const UINT8*>(module_base);
+        const DWORD e_lfanew = *reinterpret_cast<const DWORD*>(mod_base + 0x3C);
+        if (e_lfanew > 0 && e_lfanew < 0x100000) {
+            const auto* nt_hdrs = reinterpret_cast<const IMAGE_NT_HEADERS64*>(mod_base + e_lfanew);
+            if (nt_hdrs->Signature == IMAGE_NT_SIGNATURE &&
+                nt_hdrs->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                nt_hdrs->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
+                const auto& exc_dir = nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+                if (exc_dir.VirtualAddress != 0 && exc_dir.Size != 0) {
+                    uint64_t kernel_hit_rva = 0;
+                    driver_bridge::kernel_anti_debug_scan_text(
+                        module_base,
+                        exc_dir.VirtualAddress,
+                        exc_dir.Size,
+                        &kernel_hit_rva);
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
 inline void tick();
 
 inline void tick()
@@ -1842,28 +1867,8 @@ inline void tick()
         driver_bridge::kernel_anti_debug_clear_dr();
 
         auto& rt = state::get();
-        if (rt.code_snap.module_base != 0) {
-            __try {
-                const UINT8* mod_base = reinterpret_cast<const UINT8*>(rt.code_snap.module_base);
-                const DWORD e_lfanew = *reinterpret_cast<const DWORD*>(mod_base + 0x3C);
-                if (e_lfanew > 0 && e_lfanew < 0x100000) {
-                    const auto* nt_hdrs = reinterpret_cast<const IMAGE_NT_HEADERS64*>(mod_base + e_lfanew);
-                    if (nt_hdrs->Signature == IMAGE_NT_SIGNATURE &&
-                        nt_hdrs->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
-                        nt_hdrs->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
-                        const auto& exc_dir = nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-                        if (exc_dir.VirtualAddress != 0 && exc_dir.Size != 0) {
-                            uint64_t kernel_hit_rva = 0;
-                            driver_bridge::kernel_anti_debug_scan_text(
-                                rt.code_snap.module_base,
-                                exc_dir.VirtualAddress,
-                                exc_dir.Size,
-                                &kernel_hit_rva);
-                        }
-                    }
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
+        if (rt.code_snap.module_base != 0)
+            scan_kernel_exception_directory_seh(rt.code_snap.module_base);
     }
 
     static std::atomic<uint32_t> s_tick_num{0};

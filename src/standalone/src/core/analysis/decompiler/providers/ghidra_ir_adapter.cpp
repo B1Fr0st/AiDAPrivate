@@ -10,11 +10,18 @@
 #include <unordered_map>
 #include <utility>
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4099)
+#endif
 #include "funcdata.hh"
 #include "fspec.hh"
 #include "opcodes.hh"
 #include "type.hh"
 #include "variable.hh"
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 namespace aida::analysis::ghidra_ir_adapter {
 namespace {

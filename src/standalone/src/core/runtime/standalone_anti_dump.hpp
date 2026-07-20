@@ -1834,7 +1834,7 @@ namespace monitor
                     }
                 }
 
-                heap_encrypt::secure_reencrypt_all();
+                anti_tamper::heap_encrypt::secure_reencrypt_all();
 
                 detail::xor_key() = new_key;
 
@@ -1949,6 +1949,17 @@ __declspec(noinline) static bool sa_init_call_set_guard_pages_seh()
     return ok;
 }
 
+__declspec(noinline) static bool sa_init_call_erase_export_seh()
+{
+    bool ok = false;
+    __try { ok = pe_header::erase_export_directory(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::webhook::write_log_critical_fmt("anti_dump",
+            "sa_erase_export_SEH code=0x%08X", GetExceptionCode());
+    }
+    return ok;
+}
+
 
 inline bool initialize()
 {
@@ -2043,12 +2054,7 @@ inline bool initialize()
 
         anti_tamper::webhook::write_log_critical("anti_dump", "sa_erase_export_pre");
         {
-            bool export_ok = false;
-            __try { export_ok = pe_header::erase_export_directory(); }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                anti_tamper::webhook::write_log_critical_fmt("anti_dump",
-                    "sa_erase_export_SEH code=0x%08X", GetExceptionCode());
-            }
+            const bool export_ok = sa_init_call_erase_export_seh();
             anti_tamper::webhook::write_log_critical_fmt("anti_dump",
                 "erase_export_ok=%d", export_ok ? 1 : 0);
         }

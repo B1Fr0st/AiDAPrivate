@@ -57,7 +57,7 @@ void verify_compact_image(bool preheader) {
             image.payload_size == fixture.bytes.size() &&
             image.normalized.image_size == fixture.bytes.size(),
         "compact DEX split payload identity is invalid");
-    require(image.strings.size() == 4 && image.strings[0].utf8 == "LTest;" &&
+    require(image.strings.size() == 4 && image.strings[0].value == "LTest;" &&
             image.types.size() == 2 && image.methods.size() == 2 &&
             image.classes.size() == 1 &&
             image.classes[0].direct_methods.size() == 2,

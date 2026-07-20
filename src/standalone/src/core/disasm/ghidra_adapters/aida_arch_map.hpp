@@ -26,7 +26,10 @@ arch_descriptor_t detect_arch_default_x64();
 std::optional<arch_descriptor_t> detect_arch_from_workspace(
 	const aida::analysis::workspace_identity_t& identity);
 
-bool is_x86_family(const std::string& sleigh_id);
+inline bool is_x86_family(const std::string& sleigh_id)
+{
+	return sleigh_id.size() >= 3 && sleigh_id.compare(0, 3, "x86") == 0;
+}
 
 }
 

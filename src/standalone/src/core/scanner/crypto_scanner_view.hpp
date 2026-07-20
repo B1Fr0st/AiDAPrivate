@@ -1695,9 +1695,10 @@ inline void render(float, float, float width, float height,
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			const std::string semantic_id = aida::preview::semantics::stable_id(
 				"aida.memory.crypto-reference", std::to_string(address) + "-" +
-					std::to_string(index) + "-" + std::to_string(st.reference_generation));
+					std::to_string(index));
 			aida::preview::semantics::register_last_item(
-				semantic_id, "crypto-reference-row", false, !current);
+				semantic_id, "crypto-reference-row", false, !current,
+				"aida.dock-window.view.memory.crypto");
 #endif
 			if (selected) {
 				static_cast<void>(activate_reference(address));

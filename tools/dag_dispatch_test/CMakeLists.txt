@@ -25,6 +25,7 @@ target_include_directories(DAG_DISPATCH_TEST PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
     "${CMAKE_SOURCE_DIR}/src/shared"
     "${CMAKE_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/.deps/taskflow"
     "${CMAKE_BINARY_DIR}/generated"
 )
 

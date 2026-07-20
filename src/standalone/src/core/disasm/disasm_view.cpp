@@ -64,15 +64,19 @@
 namespace disasm_view {
 
 struct workspace_model_t {
-    explicit workspace_model_t(const aida::analysis::binary_id_t& id)
-        : automatic_comments(id), view(std::make_shared<state_t>()) {}
+    workspace_model_t(const aida::analysis::binary_id_t& id,
+                      const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
+        : automatic_comments(id), view(std::make_shared<state_t>()), owner(workspace) {}
 
     auto_comment_store::workspace_store_t automatic_comments;
     std::shared_ptr<state_t> view;
+    std::unordered_map<std::string, std::shared_ptr<state_t>> presentations;
+    std::weak_ptr<aida::analysis::analysis_workspace_t> owner;
     std::mutex mutation_mutex;
     std::mutex initialization_mutex;
     std::atomic<bool> initialized{false};
     std::atomic<std::uint32_t> format_generation{1};
+    std::atomic<std::uint64_t> presentation_selection_revision{0};
 };
 
 namespace {
@@ -84,9 +88,9 @@ std::mutex& model_registry_mutex() {
     return value;
 }
 
-std::unordered_map<binary_id_t, std::weak_ptr<workspace_model_t>, binary_id_hash_t>&
+std::unordered_map<binary_id_t, std::shared_ptr<workspace_model_t>, binary_id_hash_t>&
 model_registry() {
-    static std::unordered_map<binary_id_t, std::weak_ptr<workspace_model_t>, binary_id_hash_t> value;
+    static std::unordered_map<binary_id_t, std::shared_ptr<workspace_model_t>, binary_id_hash_t> value;
     return value;
 }
 
@@ -97,17 +101,16 @@ std::shared_ptr<workspace_model_t> model_for(const std::shared_ptr<analysis_work
     std::lock_guard<std::mutex> lock(model_registry_mutex());
     auto& registry = model_registry();
     for (auto it = registry.begin(); it != registry.end();) {
-        if (it->second.expired())
+        const auto owner = it->second ? it->second->owner.lock() : nullptr;
+        if (!owner || owner->closed())
             it = registry.erase(it);
         else
             ++it;
     }
     auto found = registry.find(id);
-    if (found != registry.end()) {
-        if (auto existing = found->second.lock())
-            return existing;
-    }
-    auto created = std::make_shared<workspace_model_t>(id);
+    if (found != registry.end())
+        return found->second;
+    auto created = std::make_shared<workspace_model_t>(id, workspace);
     registry[id] = created;
     return created;
 }
@@ -120,6 +123,30 @@ void initialize_model(const std::shared_ptr<analysis_workspace_t>& workspace,
     if (model->initialized.load(std::memory_order_acquire))
         return;
     model->initialized.store(true, std::memory_order_release);
+}
+
+std::shared_ptr<state_t> presentation_for(
+    const std::shared_ptr<workspace_model_t>& model, std::string_view key) {
+    if (!model || key.empty())
+        return model ? model->view : nullptr;
+    std::lock_guard<std::mutex> lock(model->initialization_mutex);
+    const std::string identity(key);
+    const auto found = model->presentations.find(identity);
+    if (found != model->presentations.end())
+        return found->second;
+    auto created = std::make_shared<state_t>();
+    model->presentations.emplace(identity, created);
+    return created;
+}
+
+std::shared_ptr<state_t> authoritative_state(const workspace_context_t& context) {
+    return context.model ? context.model->view : context.view;
+}
+
+workspace_context_t authoritative_context(const workspace_context_t& context) {
+    workspace_context_t result = context;
+    result.view = authoritative_state(context);
+    return result;
 }
 
 std::optional<std::uint64_t> checked_add(std::uint64_t left, std::uint64_t right) {
@@ -462,9 +489,10 @@ private:
     std::shared_ptr<state_t> state_;
 };
 
-void record_overlay_presentation_result(const workspace_context_t& context,
+void record_overlay_presentation_result(const workspace_context_t& source_context,
                                         bool published,
                                         std::string detail) {
+    const auto context = authoritative_context(source_context);
     if (!context.view || !context.workspace)
         return;
     const auto publication = context.workspace->analysis_publication();
@@ -481,7 +509,8 @@ void record_overlay_presentation_result(const workspace_context_t& context,
             : std::move(detail));
 }
 
-bool queue_overlay_presentation_retry(const workspace_context_t& context) {
+bool queue_overlay_presentation_retry(const workspace_context_t& source_context) {
+    const auto context = authoritative_context(source_context);
     if (!context || !context.workspace->overlay())
         return false;
     bool expected = false;
@@ -557,12 +586,13 @@ bool queue_overlay_presentation_retry(const workspace_context_t& context) {
 #endif
 }
 
-bool queue_overlay_transaction(const workspace_context_t& context,
+bool queue_overlay_transaction(const workspace_context_t& source_context,
                                std::vector<overlay_operation_t> operations,
                                std::optional<std::uint64_t> required_generation = {},
                                std::optional<std::uint64_t> required_analysis_revision = {},
                                std::optional<std::uint64_t> required_overlay_revision = {},
                                overlay_completion_t completion = {}) {
+    const auto context = authoritative_context(source_context);
     if (!context || context.workspace->closing() || context.workspace->closed() ||
         !context.workspace->overlay() || operations.empty())
         return false;
@@ -834,10 +864,11 @@ bool queue_overlay_operation(const workspace_context_t& context,
         std::move(completion));
 }
 
-bool queue_overlay_history(const workspace_context_t& context, bool redo,
+bool queue_overlay_history(const workspace_context_t& source_context, bool redo,
                            std::uint64_t expected_generation,
                            std::uint64_t expected_analysis_revision,
                            std::uint64_t expected_overlay_revision) {
+    const auto context = authoritative_context(source_context);
     if (!context || !context.workspace->overlay() ||
         context.workspace->generation() != expected_generation ||
         context.workspace->analysis_revision() != expected_analysis_revision ||
@@ -1264,7 +1295,8 @@ void queue_listing_export(const workspace_context_t& context) {
 }
 
 workspace_context_t capture_workspace(
-    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    std::string_view presentation_key) {
     workspace_context_t context;
     if (!workspace || workspace->closed())
         return context;
@@ -1273,30 +1305,31 @@ workspace_context_t capture_workspace(
     context.image = context.publication && context.publication->snapshot
         ? context.publication->snapshot->image : workspace->image();
     context.model = model_for(workspace);
-    context.view = context.model ? context.model->view : nullptr;
+    context.view = presentation_for(context.model, presentation_key);
     context.progress = workspace->progress();
     initialize_model(workspace, context.model);
     if (context.model && context.view && context.publication &&
         context.publication->overlay_revision != 0) {
+        const auto authority = authoritative_context(context);
         const auto presentation = context.publication->overlay_presentation;
         bool attempted = false;
         {
-            std::lock_guard<std::mutex> lock(context.view->mutex);
-            attempted = context.view->derived_publication_target_revision ==
+            std::lock_guard<std::mutex> lock(authority.view->mutex);
+            attempted = authority.view->derived_publication_target_revision ==
                 context.publication->overlay_revision;
         }
         if ((!presentation || presentation->overlay_revision !=
                 context.publication->overlay_revision) && !attempted &&
-            context.view->pending_mutations.load(std::memory_order_acquire) == 0) {
+            authority.view->pending_mutations.load(std::memory_order_acquire) == 0) {
             try {
                 std::unique_lock<std::mutex> mutation_lock(
                     context.model->mutation_mutex, std::try_to_lock);
                 if (mutation_lock.owns_lock()) {
                     std::string detail;
                     const bool published = reconcile_committed_overlay_state(
-                        context, detail);
+                        authority, detail);
                     record_overlay_presentation_result(
-                        context, published, std::move(detail));
+                        authority, published, std::move(detail));
                     if (published) {
                         const auto refreshed = workspace->analysis_publication();
                         if (refreshed &&
@@ -1314,7 +1347,7 @@ workspace_context_t capture_workspace(
                 }
             } catch (...) {
                 try {
-                    record_overlay_presentation_result(context, false,
+                    record_overlay_presentation_result(authority, false,
                         "Derived overlay publication recovery failed.");
                 } catch (...) {
                 }
@@ -1333,13 +1366,133 @@ workspace_context_t capture_workspace(
             context.view->cached_overlay_revision = context.publication->overlay_revision;
             context.model->format_generation.fetch_add(1, std::memory_order_acq_rel);
         }
-        context.view->selection = workspace->view_state().selection;
+        const auto workspace_view = workspace->view_state();
+        if (!context.view->selection_initialized ||
+            (presentation_key.empty() && workspace_view.revision != 0 &&
+             workspace_view.revision != context.model->presentation_selection_revision.load(
+                std::memory_order_acquire))) {
+            context.view->selection = workspace_view.selection;
+            context.view->selection_initialized = true;
+            if (presentation_key.empty())
+                context.model->presentation_selection_revision.store(
+                    workspace_view.revision, std::memory_order_release);
+        }
     }
     return context;
 }
 
+workspace_context_t capture_workspace(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    return capture_workspace(workspace, {});
+}
+
 workspace_context_t capture_selected_workspace() {
-    return capture_workspace(aida::analysis::workspace_registry().selected_for_ui());
+    return capture_workspace(
+        aida::analysis::workspace_registry().selected_for_ui(),
+        aida::ui::application_views::focused_disassembly_presentation_key());
+}
+
+workspace_context_t capture_selected_workspace(std::string_view presentation_key) {
+    return capture_workspace(
+        aida::analysis::workspace_registry().selected_for_ui(), presentation_key);
+}
+
+void reset_presentation(std::string_view presentation_key) {
+    if (presentation_key.empty())
+        return;
+    std::lock_guard<std::mutex> registry_lock(model_registry_mutex());
+    for (auto& [_, model] : model_registry()) {
+        if (model) {
+            std::lock_guard<std::mutex> model_lock(model->initialization_mutex);
+            model->presentations[std::string(presentation_key)] =
+                std::make_shared<state_t>();
+        }
+    }
+}
+
+void release_presentation(std::string_view presentation_key) {
+    if (presentation_key.empty())
+        return;
+    std::lock_guard<std::mutex> registry_lock(model_registry_mutex());
+    for (auto& [_, model] : model_registry()) {
+        if (model) {
+            std::lock_guard<std::mutex> model_lock(model->initialization_mutex);
+            model->presentations.erase(std::string(presentation_key));
+        }
+    }
+}
+
+void clone_presentation(std::string_view source_key, std::string_view target_key) {
+    if (target_key.empty() || source_key == target_key)
+        return;
+    std::lock_guard<std::mutex> registry_lock(model_registry_mutex());
+    for (auto& [_, model] : model_registry()) {
+        if (model) {
+            const auto source = presentation_for(model, source_key);
+            const auto target = presentation_for(model, target_key);
+            if (!source || !target)
+                continue;
+            std::scoped_lock state_lock(source->mutex, target->mutex);
+            target->addr_format = source->addr_format;
+            target->show_bytes = source->show_bytes;
+            target->display_image_base = source->display_image_base;
+            target->banner_selected_all = source->banner_selected_all;
+            target->banner_selected_line = source->banner_selected_line;
+            target->active_section = source->active_section;
+            target->selection = source->selection;
+            target->target_scroll_y = source->target_scroll_y;
+            target->scroll_restore_pending = true;
+            target->scroll_to_selection = false;
+            target->selection_initialized = source->selection_initialized;
+        }
+    }
+}
+
+bool capture_selected_presentation(std::string_view presentation_key,
+                                   presentation_snapshot_t& snapshot) {
+    const auto context = capture_selected_workspace(presentation_key);
+    if (!context.view)
+        return false;
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    snapshot.addr_format = context.view->addr_format;
+    snapshot.show_bytes = context.view->show_bytes;
+    snapshot.display_image_base = context.view->display_image_base;
+    snapshot.active_section = context.view->active_section;
+    snapshot.selection = context.view->selection;
+    snapshot.scroll_y = context.view->target_scroll_y;
+    return true;
+}
+
+bool restore_selected_presentation(std::string_view presentation_key,
+                                   const presentation_snapshot_t& snapshot) {
+    if (presentation_key.empty())
+        return false;
+    const auto context = capture_selected_workspace(presentation_key);
+    if (!context.view)
+        return false;
+    if (snapshot.active_section >= 0 && (!context.image ||
+        static_cast<std::size_t>(snapshot.active_section) >=
+            context.image->sections().size()))
+        return false;
+    if (snapshot.selection) {
+        if (snapshot.selection->architecture !=
+                context.workspace->identity().architecture() ||
+            (context.image && snapshot.selection->mode !=
+                context.image->architecture_mode()) ||
+            !runtime_address(context, *snapshot.selection))
+            return false;
+    }
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    context.view->addr_format = snapshot.addr_format;
+    context.view->show_bytes = snapshot.show_bytes;
+    context.view->display_image_base = snapshot.display_image_base;
+    context.view->active_section = snapshot.active_section;
+    context.view->selection = snapshot.selection;
+    context.view->selection_initialized = true;
+    context.view->target_scroll_y = (std::max)(snapshot.scroll_y, 0.0f);
+    context.view->scroll_restore_pending = true;
+    context.view->scroll_to_selection = false;
+    return true;
 }
 
 std::optional<aida::analysis::address_t> typed_address(
@@ -1644,6 +1797,7 @@ bool initialize_static_patch_review(const workspace_context_t& context,
                                     std::optional<std::uint64_t> required_analysis_revision,
                                     std::optional<std::uint64_t> required_overlay_revision,
                                     std::string* error) {
+    const auto authority = authoritative_context(context);
     const auto fail = [error](std::string message) {
         if (error) *error = std::move(message);
         return false;
@@ -1679,34 +1833,34 @@ bool initialize_static_patch_review(const workspace_context_t& context,
     if (mode == static_patch_mode_t::nop_fill)
         proposed.assign(static_cast<std::size_t>(extent), 0x90U);
     const std::string encoded = encode_patch_bytes(proposed);
-    if (encoded.size() >= context.view->static_patch_input.size())
+    if (encoded.size() >= authority.view->static_patch_input.size())
         return fail("The selected patch cannot be represented within the bounded review editor.");
     if (!fence_current())
         return fail("The patch review publication fence changed before the modal could be initialized.");
     {
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        context.view->static_patch_open = true;
-        context.view->static_patch_focus_input = focus_input;
-        context.view->static_patch_mode = mode;
-        context.view->static_patch_address = address;
-        context.view->static_patch_extent = extent;
-        context.view->static_patch_generation = generation;
-        context.view->static_patch_analysis_revision = analysis_revision;
-        context.view->static_patch_overlay_revision = overlay_revision;
-        context.view->static_patch_existing = existing_patch;
-        context.view->static_patch_existing_size = existing_patch_size;
-        context.view->static_patch_original = std::move(original);
-        context.view->static_patch_proposed = std::move(proposed);
-        context.view->static_patch_input.fill('\0');
-        std::memcpy(context.view->static_patch_input.data(), encoded.data(), encoded.size());
-        context.view->static_patch_description.fill('\0');
+        std::lock_guard<std::mutex> lock(authority.view->mutex);
+        authority.view->static_patch_open = true;
+        authority.view->static_patch_focus_input = focus_input;
+        authority.view->static_patch_mode = mode;
+        authority.view->static_patch_address = address;
+        authority.view->static_patch_extent = extent;
+        authority.view->static_patch_generation = generation;
+        authority.view->static_patch_analysis_revision = analysis_revision;
+        authority.view->static_patch_overlay_revision = overlay_revision;
+        authority.view->static_patch_existing = existing_patch;
+        authority.view->static_patch_existing_size = existing_patch_size;
+        authority.view->static_patch_original = std::move(original);
+        authority.view->static_patch_proposed = std::move(proposed);
+        authority.view->static_patch_input.fill('\0');
+        std::memcpy(authority.view->static_patch_input.data(), encoded.data(), encoded.size());
+        authority.view->static_patch_description.fill('\0');
         const std::size_t description_size = (std::min)(description.size(),
-            context.view->static_patch_description.size() - 1U);
-        std::memcpy(context.view->static_patch_description.data(),
+            authority.view->static_patch_description.size() - 1U);
+        std::memcpy(authority.view->static_patch_description.data(),
             description.data(), description_size);
-        context.view->static_patch_error.clear();
-        context.view->static_patch_parse_error.clear();
-        context.view->static_patch_status = existing_patch_size > k_static_patch_maximum_bytes
+        authority.view->static_patch_error.clear();
+        authority.view->static_patch_parse_error.clear();
+        authority.view->static_patch_status = existing_patch_size > k_static_patch_maximum_bytes
             ? "The existing overlay exceeds the 64 KiB interactive editor bound. The editor shows the selected immutable baseline; Revert This Overlay remains available."
             : std::move(status);
     }
@@ -1857,19 +2011,20 @@ bool queue_type_declaration_and_application(
 
 mutation_state_t mutation_state(const workspace_context_t& context) {
     mutation_state_t result;
-    if (!context.workspace || !context.view)
+    const auto authority = authoritative_state(context);
+    if (!context.workspace || !authority)
         return result;
-    result.pending = context.view->pending_mutations.load(std::memory_order_acquire);
+    result.pending = authority->pending_mutations.load(std::memory_order_acquire);
     result.overlay_revision = context.workspace->overlay_revision();
-    std::lock_guard<std::mutex> lock(context.view->mutex);
-    result.error = context.view->mutation_error;
+    std::lock_guard<std::mutex> lock(authority->mutex);
+    result.error = authority->mutation_error;
     result.derived_publication_pending =
-        context.view->derived_publication_retry_pending.load(
+        authority->derived_publication_retry_pending.load(
             std::memory_order_acquire);
     result.derived_publication_revision =
-        context.view->derived_publication_revision;
+        authority->derived_publication_revision;
     result.derived_publication_error =
-        context.view->derived_publication_error;
+        authority->derived_publication_error;
     return result;
 }
 
@@ -1913,10 +2068,9 @@ void render_static_patch_workflow() {
     const auto display = runtime_address(context, state.static_patch_address).value_or(
         state.static_patch_address.value);
     const auto dialog_metrics = aida::ui::design::metrics();
-    const float body_height = (std::max)(120.0f,
-        ImGui::GetContentRegionAvail().y - dialog_metrics.dialog_footer_height);
-    ImGui::BeginChild("##static_patch_body", ImVec2(0.0f, body_height), false,
-        ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+        "Commit Workspace Overlay", "Close");
+    aida::ui::design::begin_dialog_body("static_patch_body", footer_height);
     ImGui::TextUnformatted("Review immutable-source bytes and commit a reversible workspace overlay");
     ImGui::Separator();
     ImGui::Text("Workspace: %s", context.workspace->identity().bin_name().c_str());
@@ -2077,7 +2231,7 @@ void render_static_patch_workflow() {
         }
     }
     if (!state.static_patch_existing || !identity_current || pending) ImGui::EndDisabled();
-    ImGui::EndChild();
+    aida::ui::design::end_dialog_body();
 
     const auto footer = aida::ui::design::dialog_footer("static_patch_footer",
         "Commit Workspace Overlay", can_commit, false, "Close");
@@ -2140,6 +2294,10 @@ void synchronize_workspace_selection(const workspace_context_t& context,
         });
     if (!updated)
         return;
+    if (context.model) {
+        context.model->presentation_selection_revision.store(
+            context.workspace->view_state().revision, std::memory_order_release);
+    }
     std::lock_guard<std::mutex> lock(context.view->mutex);
     context.view->selection = destination;
     context.view->scroll_to_selection = reveal;
@@ -2166,7 +2324,11 @@ void select_address(const aida::analysis::address_t& destination,
                     bool record_history) {
     if (!context.workspace || !context.view || !context.model)
         return;
-    const auto current = context.workspace->view_state().selection;
+    std::optional<aida::analysis::address_t> current;
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        current = context.view->selection;
+    }
     if (current && *current == destination) {
         synchronize_workspace_selection(context, destination, false);
         return;
@@ -2187,7 +2349,11 @@ void goto_address(const aida::analysis::address_t& destination,
                   const workspace_context_t& context) {
     if (!context.workspace || !context.view || !context.model)
         return;
-    const auto current = context.workspace->view_state().selection;
+    std::optional<aida::analysis::address_t> current;
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        current = context.view->selection;
+    }
     if (current && *current == destination) {
         synchronize_workspace_selection(context, destination, true);
         return;
@@ -2376,10 +2542,10 @@ std::uint64_t evidence_hash(const std::string& value) {
     return hash == 0 ? 1 : hash;
 }
 
-void open_instruction_menu(const workspace_context_t& context,
+auto make_instruction_menu(const workspace_context_t& context,
                            const aida::analysis::instruction_record_t& instruction,
-                           const std::optional<formatted_instruction_t>& formatted,
-                           aida::ui::context_menu_open_origin_t origin) {
+                           const std::optional<formatted_instruction_t>& formatted)
+    -> aida::ui::analysis_context_menu::context_t {
     using namespace aida::ui::analysis_context_menu;
     using aida::ui::action_check_state_t;
     using aida::ui::action_handler_result_t;
@@ -2429,7 +2595,7 @@ void open_instruction_menu(const workspace_context_t& context,
         menu.actions.insert_or_assign(id, std::move(slot));
     };
     unavailable("analysis.navigate.disassembly_side",
-        "The current document registry exposes one canonical Disassembly document; duplicate document instances are not implemented");
+        "Independent side documents require per-instance disassembly presentation state");
     unavailable("analysis.navigate.follow",
         "The selected instruction has no direct resolved target");
     unavailable("analysis.navigate.callers",
@@ -2456,8 +2622,8 @@ void open_instruction_menu(const workspace_context_t& context,
         "Breakpoint definitions require a process-backed debugger workspace");
     unavailable("analysis.debug.hardware_breakpoint",
         "Mode-specific breakpoint preselection is not exposed; stage the address, then choose Add HW Exec in Breakpoints");
-    copy("analysis.copy.line", formatted ? address + "  " + text : std::string(),
-        "The instruction is not formatted");
+    copy("analysis.copy.line", address + "  " + text,
+        "The instruction address is unavailable");
     copy("analysis.copy.text", text, "The instruction is not formatted");
     copy("analysis.copy.instruction", text, "The instruction is not formatted");
     copy("analysis.copy.address", address, "The address is unavailable");
@@ -2788,7 +2954,15 @@ void open_instruction_menu(const workspace_context_t& context,
         editor_config::disasm_full_line_select = !editor_config::disasm_full_line_select;
         return action_handler_result_t::completed();
     }, editor_config::disasm_full_line_select ? action_check_state_t::checked : action_check_state_t::unchecked};
-    open(std::move(menu), origin);
+    return menu;
+}
+
+void open_instruction_menu(const workspace_context_t& context,
+                           const aida::analysis::instruction_record_t& instruction,
+                           const std::optional<formatted_instruction_t>& formatted,
+                           aida::ui::context_menu_open_origin_t origin) {
+    aida::ui::analysis_context_menu::open(
+        make_instruction_menu(context, instruction, formatted), origin);
 }
 
 }
@@ -2956,6 +3130,51 @@ void render(float, float, float width, float height,
             ImGui::EndCombo();
         }
     }
+    aida::ui::end_toolbar_group();
+    aida::ui::begin_toolbar_group("analysis_actions");
+    struct toolbar_action_binding_t {
+        const char* id;
+        const char* fallback_label;
+        const char* compact_label;
+        aida::ui::application_ui::action_presentation_t presentation;
+        std::string tooltip;
+    };
+    std::array<toolbar_action_binding_t, 5> action_bindings{{
+        {"analysis.modify.rename", "Rename", "N", {}, {}},
+        {"analysis.navigate.xrefs", "Cross References", "Xrefs", {}, {}},
+        {"analysis.decompile_or_focus_pseudocode", "Decompile", "F5", {}, {}},
+        {"analysis.navigate.graph", "Graph", "Graph", {}, {}},
+        {"analysis.modify.patch", "Patch", "Patch", {}, {}}
+    }};
+    std::array<aida::ui::design::action_t, 5> toolbar_actions{};
+    for (std::size_t index = 0; index < action_bindings.size(); ++index) {
+        auto& binding = action_bindings[index];
+        binding.presentation = aida::ui::application_ui::present_action(binding.id);
+        binding.tooltip = binding.presentation.description;
+        if (!binding.presentation.enabled && !binding.presentation.disabled_reason.empty()) {
+            if (!binding.tooltip.empty()) binding.tooltip.append("\n");
+            binding.tooltip.append(binding.presentation.disabled_reason);
+        }
+        toolbar_actions[index] = {
+            binding.id,
+            binding.presentation.label.empty() ? binding.fallback_label : binding.presentation.label.c_str(),
+            binding.compact_label,
+            binding.tooltip.c_str(),
+            binding.presentation.shortcut.empty() ? nullptr : binding.presentation.shortcut.c_str(),
+            nullptr,
+            aida::ui::components::button_kind_t::ghost,
+            binding.presentation.enabled,
+            false,
+            binding.presentation.visible
+        };
+    }
+    const auto invoked_action = aida::ui::design::render_toolbar(
+        "disassembly.analysis-actions", toolbar_actions.data(), toolbar_actions.size(),
+        (std::max)(1.f, ImGui::GetContentRegionAvail().x));
+    if (invoked_action.invoked && invoked_action.id) {
+        static_cast<void>(aida::ui::application_ui::execute_action(
+            invoked_action.id, aida::ui::action_invocation_source_t::toolbar));
+    }
     aida::ui::end_toolbar_group(false);
     aida::ui::end_toolbar();
 
@@ -2993,12 +3212,16 @@ void render(float, float, float width, float height,
     std::string export_error;
     std::string export_status;
     {
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        mutation_error = context.view->mutation_error;
-        derived_publication_error = context.view->derived_publication_error;
+        const auto authority = authoritative_state(context);
+        std::lock_guard<std::mutex> lock(authority->mutex);
+        mutation_error = authority->mutation_error;
+        derived_publication_error = authority->derived_publication_error;
         derived_publication_pending =
-            context.view->derived_publication_retry_pending.load(
+            authority->derived_publication_retry_pending.load(
                 std::memory_order_acquire);
+    }
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
         format_error = context.view->format_error;
         export_error = context.view->export_error;
         export_status = context.view->export_status;
@@ -3221,14 +3444,21 @@ void render(float, float, float width, float height,
         ImGuiWindowFlags_HorizontalScrollbar);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        if (context.view->scroll_restore_pending) {
+            ImGui::SetScrollY(context.view->target_scroll_y);
+            context.view->scroll_restore_pending = false;
+        }
+    }
     const auto& instructions = context.publication->snapshot->instructions;
     const std::size_t count_size = range->second - range->first;
     const auto& metadata_lines = context.view->metadata_lines;
     const std::size_t metadata_count = metadata_lines.size();
-    const auto open_metadata_menu = [&](std::size_t line_index,
-            aida::ui::context_menu_open_origin_t origin) {
+    const auto make_metadata_menu = [&](std::size_t line_index)
+            -> std::optional<aida::ui::analysis_context_menu::context_t> {
         if (line_index >= metadata_lines.size())
-            return;
+            return std::nullopt;
         std::string listing;
         for (const auto& item : metadata_lines) {
             listing.append(item.text);
@@ -3296,7 +3526,13 @@ void render(float, float, float width, float height,
             return aida::ui::action_handler_result_t::completed();
         };
         menu.actions.emplace("analysis.select.metadata_all", std::move(select_all));
-        aida::ui::analysis_context_menu::open(std::move(menu), origin);
+        return menu;
+    };
+    const auto open_metadata_menu = [&](std::size_t line_index,
+            aida::ui::context_menu_open_origin_t origin) {
+        auto menu = make_metadata_menu(line_index);
+        if (menu)
+            aida::ui::analysis_context_menu::open(std::move(*menu), origin);
     };
     const std::size_t total_size = count_size > static_cast<std::size_t>((std::numeric_limits<int>::max)()) -
         metadata_count ? static_cast<std::size_t>((std::numeric_limits<int>::max)())
@@ -3306,6 +3542,9 @@ void render(float, float, float width, float height,
     if (!code_font)
         code_font = ImGui::GetFont();
     ImGui::PushFont(code_font);
+    const ImVec2 listing_item_spacing = ImGui::GetStyle().ItemSpacing;
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+        ImVec2(listing_item_spacing.x, 0.0f));
     const float code_size = ImGui::GetFontSize();
     const float char_width = (std::max)(1.0f,
         code_font->CalcTextSizeA(code_size, FLT_MAX, 0.0f, "0").x);
@@ -3782,6 +4021,7 @@ void render(float, float, float width, float height,
             ImGui::PopID();
         }
     }
+    ImGui::PopStyleVar();
     ImGui::PopFont();
     aida::ui::context_menu_open_origin_t analysis_menu_origin{};
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
@@ -3816,28 +4056,25 @@ void render(float, float, float width, float height,
                    const aida::analysis::address_t& address) {
                     return instruction.address < address;
                 });
-            if (found != instructions.end() && found->address == *selection) {
-                const auto formatted = formatted_instruction(context, found->id);
-                const std::string address = address_label(context, found->address,
-                    static_cast<addr_format_t>(address_format));
-                const std::string line = address + "  " +
-                    (formatted ? formatted->text : std::string());
-                ImGui::SetClipboardText(line.c_str());
-            }
+            if (found != instructions.end() && found->address == *selection)
+                aida::ui::analysis_context_menu::execute_shortcut(
+                    make_instruction_menu(context, *found,
+                        formatted_instruction(context, found->id)),
+                    "analysis.copy.line");
         }
         bool banner_selected = false;
+        std::size_t banner_line = 0;
         {
             std::lock_guard<std::mutex> lock(context.view->mutex);
             banner_selected = context.view->banner_selected_all;
+            banner_line = context.view->banner_selected_line;
         }
 		if (banner_selected && copy_pressed) {
-            std::string listing;
-            for (const auto& item : metadata_lines) {
-                listing.append(item.text);
-                listing.push_back('\n');
-            }
-            ImGui::SetClipboardText(listing.c_str());
-        }
+			auto menu = make_metadata_menu(banner_line);
+			if (menu)
+				aida::ui::analysis_context_menu::execute_shortcut(
+					std::move(*menu), "analysis.copy.metadata");
+		}
 		if (!escape_consumed && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
 			bool xrefs_open = false;
 			bool rebase_open = false;
@@ -3849,6 +4086,10 @@ void render(float, float, float width, float height,
 			if (!xrefs_open && !rebase_open)
 				navigate_back(context);
 		}
+    }
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        context.view->target_scroll_y = ImGui::GetScrollY();
     }
     ImGui::EndChild();
     render_xref_popup(context);

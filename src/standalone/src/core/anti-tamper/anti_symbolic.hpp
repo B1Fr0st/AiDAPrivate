@@ -1234,7 +1234,7 @@ namespace taint_confusion {
         v *= 0x9E3779B97F4A7C15ULL;
         v ^= v >> 33;
         g_decoy_accumulator ^= v;
-        uint8_t* p = reinterpret_cast<uint8_t*>(&v);
+        const volatile uint8_t* p = reinterpret_cast<const volatile uint8_t*>(&v);
         for (int i = 0; i < 8; ++i)
         {
             size_t idx = (static_cast<size_t>(tag) + i) & 0x1FF;

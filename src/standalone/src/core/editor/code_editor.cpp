@@ -6,6 +6,7 @@
 #include "../debugger/source_debug_service.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/editor_preview_adapter.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
@@ -18,12 +19,14 @@
 #include <Windows.h>
 #endif
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <iterator>
 #include <optional>
 #include <cctype>
 #include <mutex>
@@ -108,6 +111,11 @@ struct mapped_text_source_t {
     }
 };
 
+struct review_hunk_selection_t {
+    code_editor_widget::review_hunk_identity_t identity;
+    bool focus_requested = false;
+};
+
 struct document_runtime_t {
     std::uint64_t document_id = 0;
     std::uint64_t revision = 1;
@@ -132,7 +140,16 @@ struct document_runtime_t {
     float target_scroll_y = 0.f;
     syntax::language_def_t language{};
     bool language_set = false;
+    std::string language_override;
+    std::vector<int> folded_lines;
+    std::vector<int> visible_lines;
+    std::vector<int> logical_to_visual;
+    std::unordered_map<int, int> fold_ends;
+    std::unordered_map<int, int> fold_candidates;
+    std::uint64_t fold_candidate_revision = 0;
+    std::uint64_t fold_projection_revision = 0;
     code_editor_widget::pending_diff_t diff;
+    review_hunk_selection_t review_hunk_selection;
     int diff_hover_hunk = -1;
     float diff_scroll_target = -1.f;
     std::string last_error;
@@ -203,8 +220,18 @@ struct document_runtime_t {
 	std::uint64_t find_task_id = 0;
     bool find_loading = false;
     std::string find_error;
-	std::shared_ptr<std::atomic<bool>> find_dispatch_failed;
+    std::shared_ptr<std::atomic<bool>> find_dispatch_failed;
 };
+
+const syntax::language_def_t& resolved_language(
+        const std::string& filename, std::string_view override_name) {
+    if (override_name == "C/C++") return syntax::detect_language("override.cpp");
+    if (override_name == "x86 Assembly") return syntax::detect_language("override.asm");
+    if (override_name == "Python") return syntax::detect_language("override.py");
+    if (override_name == "JSON") return syntax::detect_language("override.json");
+    if (override_name == "Lua") return syntax::detect_language("override.lua");
+    return syntax::detect_language(filename);
+}
 
 std::unordered_map<std::uint64_t, std::shared_ptr<document_runtime_t>> s_document_states;
 std::uint64_t s_bound_document_id = 0;
@@ -489,8 +516,10 @@ void rebuild_buffer_from_lines(bool content_bytes_are_current = false) {
     }
     document.serialized_dirty = true;
     current_document().dirty = true;
-    if (s_active_document_id != 0)
+    if (s_active_document_id != 0) {
         ++s_document_revision;
+        document.review_hunk_selection = {};
+    }
     s_cache.tokens.resize(s_cache.lines.size());
     s_cache.line_hashes.resize(s_cache.lines.size());
 }
@@ -908,8 +937,18 @@ float s_view_char_w   = 8.f;
 float s_view_text_w   = 0.f;
 float s_max_scroll_x  = 0.f;
 
+void rebuild_fold_projection();
+void reveal_logical_line(int line);
+
 void ensure_caret_visible(float vis_h, float line_h) {
-    float caret_y = static_cast<float>(s_sel.caret_line) * line_h;
+    rebuild_fold_projection();
+    reveal_logical_line(s_sel.caret_line);
+    const auto& document = current_document();
+    const int visual_line = s_sel.caret_line >= 0 &&
+        s_sel.caret_line < static_cast<int>(document.logical_to_visual.size())
+        ? document.logical_to_visual[static_cast<std::size_t>(s_sel.caret_line)]
+        : s_sel.caret_line;
+    float caret_y = static_cast<float>((std::max)(visual_line, 0)) * line_h;
     if (caret_y < s_scroll_y)
         s_target_scroll_y = caret_y;
     else if (caret_y + line_h > s_scroll_y + vis_h)
@@ -930,13 +969,124 @@ void ensure_caret_visible(float vis_h, float line_h) {
     if (s_scroll_x < 0.f) s_scroll_x = 0.f;
 }
 
+int indentation_width(std::string_view line) {
+    int width = 0;
+    for (const char ch : line) {
+        if (ch == ' ') ++width;
+        else if (ch == '\t') width += (std::max)(1, editor_preferences::tab_size);
+        else break;
+    }
+    return width;
+}
+
+int discover_fold_end(int start_line) {
+    if (start_line < 0 || start_line >= line_count() - 1) return start_line;
+    int brace_depth = 0;
+    bool saw_open = false;
+    bool quoted = false;
+    char quote = 0;
+    bool escaped = false;
+    for (int line = start_line; line < line_count(); ++line) {
+        if (line > start_line && !saw_open) break;
+        const std::string& text = line_at(line);
+        for (std::size_t column = line == start_line ? 0U : 0U; column < text.size(); ++column) {
+            const char ch = text[column];
+            if (quoted) {
+                if (escaped) escaped = false;
+                else if (ch == '\\') escaped = true;
+                else if (ch == quote) quoted = false;
+                continue;
+            }
+            if (ch == '\'' || ch == '"') { quoted = true; quote = ch; continue; }
+            if (ch == '/' && column + 1U < text.size() && text[column + 1U] == '/') break;
+            if (ch == '{' || ch == '[' || ch == '(') { ++brace_depth; saw_open = true; }
+            else if (ch == '}' || ch == ']' || ch == ')') {
+                if (saw_open && --brace_depth == 0) return line;
+            }
+        }
+    }
+    const int base_indent = indentation_width(line_at(start_line));
+    int last_content = start_line;
+    for (int line = start_line + 1; line < line_count(); ++line) {
+        const std::string& text = line_at(line);
+        const auto first = text.find_first_not_of(" \t\r");
+        if (first == std::string::npos) continue;
+        if (indentation_width(text) <= base_indent) break;
+        last_content = line;
+    }
+    return last_content;
+}
+
+int cached_fold_end(int start_line) {
+    auto& document = current_document();
+    if (document.fold_candidate_revision != document.revision) {
+        document.fold_candidates.clear();
+        document.fold_candidate_revision = document.revision;
+    }
+    const auto found = document.fold_candidates.find(start_line);
+    if (found != document.fold_candidates.end()) return found->second;
+    const int end = discover_fold_end(start_line);
+    if (document.fold_candidates.size() >= 4096U) document.fold_candidates.clear();
+    document.fold_candidates.emplace(start_line, end);
+    return end;
+}
+
+void rebuild_fold_projection() {
+    auto& document = current_document();
+    const std::uint64_t revision = document.revision ^
+        (static_cast<std::uint64_t>(document.folded_lines.size()) << 48U);
+    if (document.folded_lines.empty()) {
+        document.fold_ends.clear();
+        document.visible_lines.clear();
+        document.logical_to_visual.clear();
+        document.fold_projection_revision = revision;
+        return;
+    }
+    if (document.fold_projection_revision == revision &&
+        document.logical_to_visual.size() == static_cast<std::size_t>(line_count())) return;
+    document.fold_ends.clear();
+    for (const int start : document.folded_lines) {
+        const int end = cached_fold_end(start);
+        if (end > start) document.fold_ends.emplace(start, end);
+    }
+    document.visible_lines.clear();
+    document.logical_to_visual.assign(static_cast<std::size_t>(line_count()), -1);
+    for (int line = 0; line < line_count();) {
+        const int visual = static_cast<int>(document.visible_lines.size());
+        document.visible_lines.push_back(line);
+        document.logical_to_visual[static_cast<std::size_t>(line)] = visual;
+        const auto folded = document.fold_ends.find(line);
+        if (folded == document.fold_ends.end()) { ++line; continue; }
+        for (int hidden = line + 1; hidden <= folded->second; ++hidden)
+            document.logical_to_visual[static_cast<std::size_t>(hidden)] = visual;
+        line = folded->second + 1;
+    }
+    document.fold_projection_revision = revision;
+}
+
+void reveal_logical_line(int line) {
+    auto& document = current_document();
+    for (auto it = document.fold_ends.begin(); it != document.fold_ends.end(); ++it) {
+        if (line > it->first && line <= it->second) {
+            document.folded_lines.erase(std::remove(document.folded_lines.begin(),
+                document.folded_lines.end(), it->first), document.folded_lines.end());
+            document.fold_projection_revision = 0;
+            rebuild_fold_projection();
+            return;
+        }
+    }
+}
+
 
 void screen_to_linecol(float sx, float sy, float origin_x, float origin_y,
                         float gutter_w, float line_h, float char_w,
                         int& out_line, int& out_col) {
     float rel_y = sy - origin_y + s_scroll_y;
     float rel_x = sx - origin_x - gutter_w - 4.f + s_scroll_x;
-    out_line = clamp_line(static_cast<int>(rel_y / line_h));
+    const auto& visible = current_document().visible_lines;
+    const int visual = std::clamp(static_cast<int>(rel_y / line_h), 0,
+        (std::max)(0, (visible.empty() ? line_count() : static_cast<int>(visible.size())) - 1));
+    out_line = visible.empty() ? visual : visible[static_cast<std::size_t>(visual)];
     out_col  = std::max(0, static_cast<int>((rel_x + char_w * 0.5f) / char_w));
     out_col  = clamp_col(out_line, out_col);
     const std::string& ln = line_at(out_line);
@@ -1672,6 +1822,136 @@ std::vector<std::string> split_to_lines(std::string_view text) {
     return out;
 }
 
+void identity_hash_value(std::uint64_t& hash, std::uint64_t value) {
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        hash ^= static_cast<unsigned char>((value >> shift) & 0xFFU);
+        hash *= 1099511628211ULL;
+    }
+}
+
+void identity_hash_text(std::uint64_t& hash, std::string_view value) {
+    identity_hash_value(hash, static_cast<std::uint64_t>(value.size()));
+    for (const char character : value) {
+        hash ^= static_cast<unsigned char>(character);
+        hash *= 1099511628211ULL;
+    }
+}
+
+void assign_diff_identities(code_editor_widget::pending_diff_t& diff) {
+    std::uint64_t proposal = 14695981039346656037ULL;
+    identity_hash_value(proposal, diff.document_id);
+    identity_hash_value(proposal, diff.base_revision);
+    identity_hash_value(proposal, diff.base_content_hash);
+    identity_hash_text(proposal, diff.origin);
+    identity_hash_value(proposal, static_cast<std::uint64_t>(diff.new_lines.size()));
+    for (const auto& line : diff.new_lines)
+        identity_hash_text(proposal, line);
+    diff.proposal_id = proposal == 0 ? 1 : proposal;
+
+    for (auto& hunk : diff.hunks) {
+        std::uint64_t identity = 14695981039346656037ULL;
+        identity_hash_value(identity, static_cast<std::uint64_t>(hunk.old_start));
+        identity_hash_value(identity, static_cast<std::uint64_t>(hunk.old_count));
+        identity_hash_value(identity, static_cast<std::uint64_t>(hunk.new_start));
+        identity_hash_value(identity, static_cast<std::uint64_t>(hunk.new_count));
+        identity_hash_value(identity, static_cast<std::uint64_t>(hunk.lines.size()));
+        for (const auto& line : hunk.lines) {
+            identity_hash_value(identity, static_cast<std::uint64_t>(line.kind));
+            identity_hash_value(identity, static_cast<std::uint64_t>(line.old_line));
+            identity_hash_value(identity, static_cast<std::uint64_t>(line.new_line));
+            identity_hash_text(identity, line.text);
+        }
+        hunk.stable_id = identity == 0 ? 1 : identity;
+    }
+}
+
+code_editor_widget::review_hunk_identity_t review_hunk_identity_locked(
+        const document_runtime_t& document, int index) {
+    code_editor_widget::review_hunk_identity_t identity;
+    const auto& diff = document.diff;
+    if (!diff.active || index < 0 ||
+        index >= static_cast<int>(diff.hunks.size()))
+        return identity;
+    const auto& hunk = diff.hunks[static_cast<std::size_t>(index)];
+    if (diff.document_id != document.document_id ||
+        diff.base_revision != document.revision || diff.proposal_id == 0 ||
+        diff.base_content_hash != code_editor_widget::document_content_fingerprint(
+            document.document_id) ||
+        hunk.stable_id == 0)
+        return identity;
+    identity.document_id = diff.document_id;
+    identity.proposal_id = diff.proposal_id;
+    identity.base_revision = diff.base_revision;
+    identity.stable_hunk_id = hunk.stable_id;
+    return identity;
+}
+
+int resolve_review_hunk_locked(const document_runtime_t& document,
+        const code_editor_widget::review_hunk_identity_t& identity,
+        bool require_pending) {
+    const auto& diff = document.diff;
+    if (!identity.valid() || !diff.active ||
+        identity.document_id != document.document_id ||
+        identity.document_id != diff.document_id ||
+        identity.proposal_id != diff.proposal_id ||
+        identity.base_revision != document.revision ||
+        identity.base_revision != diff.base_revision ||
+        diff.base_content_hash != code_editor_widget::document_content_fingerprint(
+            document.document_id))
+        return -1;
+    int match = -1;
+    for (std::size_t index = 0; index < diff.hunks.size(); ++index) {
+        if (diff.hunks[index].stable_id != identity.stable_hunk_id)
+            continue;
+        if (match >= 0)
+            return -1;
+        match = static_cast<int>(index);
+    }
+    if (match < 0 || (require_pending &&
+        diff.hunks[static_cast<std::size_t>(match)].state !=
+            code_editor_widget::diff_hunk_state_t::pending))
+        return -1;
+    return match;
+}
+
+bool select_review_hunk_locked(document_runtime_t& document, int index,
+        bool request_focus) {
+    const auto identity = review_hunk_identity_locked(document, index);
+    if (!identity.valid() ||
+        resolve_review_hunk_locked(document, identity, true) != index)
+        return false;
+    document.review_hunk_selection.identity = identity;
+    document.review_hunk_selection.focus_requested = request_focus;
+    if (request_focus)
+        document.has_focus = true;
+    return true;
+}
+
+bool select_pending_review_hunk_locked(document_runtime_t& document,
+        bool forward) {
+    const auto& hunks = document.diff.hunks;
+    if (!document.diff.active || hunks.empty() ||
+        document.diff.document_id != document.document_id ||
+        document.diff.base_revision != document.revision ||
+        document.diff.base_content_hash !=
+            code_editor_widget::document_content_fingerprint(document.document_id))
+        return false;
+    const int current = resolve_review_hunk_locked(document,
+        document.review_hunk_selection.identity, false);
+    const int count = static_cast<int>(hunks.size());
+    const int start = current >= 0 ? current : (forward ? -1 : 0);
+    for (int offset = 1; offset <= count; ++offset) {
+        const int candidate = forward
+            ? (start + offset) % count
+            : (start - offset % count + count) % count;
+        if (hunks[static_cast<std::size_t>(candidate)].state ==
+            code_editor_widget::diff_hunk_state_t::pending)
+            return select_review_hunk_locked(document, candidate, true);
+    }
+    document.review_hunk_selection = {};
+    return false;
+}
+
 
 void compute_lcs_diff(const std::vector<std::string>& a,
                       const std::vector<std::string>& b,
@@ -1802,6 +2082,7 @@ void compute_lcs_diff(const std::vector<std::string>& a,
         diff.hunks.push_back(std::move(hunk));
         idx = he;
     }
+    assign_diff_identities(diff);
 }
 
 
@@ -1832,6 +2113,9 @@ void rebuild_pending_from_proposal(const std::string& origin,
     s_diff.new_lines     = new_lines;
     compute_lcs_diff(old_lines, new_lines, s_diff);
     s_diff_hover_hunk    = -1;
+    current_document().review_hunk_selection = {};
+    if (!s_diff.hunks.empty())
+        static_cast<void>(select_review_hunk_locked(current_document(), 0, true));
 }
 
 
@@ -1925,6 +2209,7 @@ void finalize_diff_if_resolved_locked() {
     const bool applied = apply_resolved_diff_to_buffer();
     s_diff = code_editor_widget::pending_diff_t{};
     s_diff.active = false;
+    current_document().review_hunk_selection = {};
     s_diff_hover_hunk = -1;
     s_diff_scroll_target = -1.f;
     if (applied) {
@@ -1961,7 +2246,9 @@ void code_editor_widget::get_caret(int& line, int& col) {
 bool code_editor_widget::load_document(std::uint64_t document_id, std::uint64_t revision,
         std::string_view content, std::string_view filename, std::string_view filepath,
         bool dirty, int caret_line, int caret_column, float scroll_x, float scroll_y,
-        bool replace_existing) {
+        bool replace_existing, int selection_anchor_line, int selection_anchor_column,
+        bool selection_active, const std::vector<int>& folded_lines,
+        std::string_view language_override) {
     if (document_id == 0 || revision == 0 ||
         content.size() > aida::editor::programming_documents::maximum_editable_document_bytes)
         return false;
@@ -1987,8 +2274,13 @@ bool code_editor_widget::load_document(std::uint64_t document_id, std::uint64_t 
     target->cache = {};
     target->cache.dirty = true;
     target->selection = {};
-    target->selection.caret_line = target->selection.anchor_line = (std::max)(0, caret_line);
-    target->selection.caret_col = target->selection.anchor_col = (std::max)(0, caret_column);
+    target->selection.caret_line = (std::max)(0, caret_line);
+    target->selection.caret_col = (std::max)(0, caret_column);
+    target->selection.anchor_line = (std::max)(0, selection_anchor_line);
+    target->selection.anchor_col = (std::max)(0, selection_anchor_column);
+    target->selection.active = selection_active &&
+        (target->selection.anchor_line != target->selection.caret_line ||
+         target->selection.anchor_col != target->selection.caret_col);
     target->scroll_x = (std::max)(0.f, scroll_x);
     target->scroll_y = target->target_scroll_y = (std::max)(0.f, scroll_y);
     target->find = {};
@@ -1996,6 +2288,7 @@ bool code_editor_widget::load_document(std::uint64_t document_id, std::uint64_t 
     target->undo.clear();
     target->redo.clear();
     target->diff = {};
+    target->review_hunk_selection = {};
     target->mapped_source.reset();
 	target->mapped_lines.clear();
 	target->mapped_line_lru.clear();
@@ -2004,8 +2297,17 @@ bool code_editor_widget::load_document(std::uint64_t document_id, std::uint64_t 
 	target->mapped_line_cache_bytes = 0;
     target->stream_loading = false;
     target->stream_error.clear();
-    target->language = syntax::detect_language(target->filename);
-    target->language_set = !target->filename.empty();
+    target->language_override.assign(language_override.substr(0, 64));
+    target->language = resolved_language(target->filename, target->language_override);
+    target->language_set = !target->filename.empty() || !target->language_override.empty();
+    target->folded_lines.clear();
+    target->folded_lines.reserve((std::min)(folded_lines.size(), std::size_t{4096}));
+    for (const int line : folded_lines)
+        if (line >= 0)
+            target->folded_lines.push_back(line);
+    std::sort(target->folded_lines.begin(), target->folded_lines.end());
+    target->folded_lines.erase(std::unique(target->folded_lines.begin(),
+        target->folded_lines.end()), target->folded_lines.end());
     s_bound_document_id = document_id;
     return true;
 }
@@ -2014,13 +2316,17 @@ void code_editor_widget::set_caret(int line, int col) {
     if (s_cache.dirty)
         rebuild_lines();
     const int target_line = clamp_line(line);
+    rebuild_fold_projection();
+    reveal_logical_line(target_line);
     const int target_column = clamp_col(target_line, col);
     s_sel.caret_line = s_sel.anchor_line = target_line;
     s_sel.caret_col = s_sel.anchor_col = target_column;
     s_sel.active = false;
     s_blink_timer = 0.f;
     s_blink_on = true;
-    s_target_scroll_y = static_cast<float>(target_line) *
+    const int visual_line = target_line < static_cast<int>(current_document().logical_to_visual.size())
+        ? current_document().logical_to_visual[static_cast<std::size_t>(target_line)] : target_line;
+    s_target_scroll_y = static_cast<float>(visual_line) *
         (std::max)(editor_preferences::font_size * 1.55f, 1.f);
     break_undo_coalescing();
 }
@@ -2159,11 +2465,60 @@ code_editor_widget::document_metadata(std::uint64_t document_id) {
     result.dirty = document.dirty;
     result.caret_line = document.selection.caret_line;
     result.caret_column = document.selection.caret_col;
+    result.selection_anchor_line = document.selection.anchor_line;
+    result.selection_anchor_column = document.selection.anchor_col;
+    result.selection_active = document.selection.has_selection();
     result.scroll_x = document.scroll_x;
     result.scroll_y = document.scroll_y;
+    result.folded_lines = document.folded_lines;
+    result.language_override = document.language_override;
     result.proposal_pending = document.diff.active;
     result.read_only = document.read_only;
     return result;
+}
+
+bool code_editor_widget::set_document_language_override(
+        std::uint64_t document_id, std::string_view language) {
+    const auto found = s_document_states.find(document_id);
+    if (found == s_document_states.end() || language.size() > 64) return false;
+    static constexpr std::array<std::string_view, 6> supported = {
+        "", "C/C++", "x86 Assembly", "Python", "JSON", "Lua"
+    };
+    if (std::find(supported.begin(), supported.end(), language) == supported.end())
+        return false;
+    auto& document = *found->second;
+    document.language_override.assign(language);
+    document.language = resolved_language(document.filename, document.language_override);
+    document.language_set = true;
+    document.cache.tokens.assign(document.cache.lines.size(), {});
+    return true;
+}
+
+bool code_editor_widget::toggle_document_fold(std::uint64_t document_id, int line) {
+    const auto found = s_document_states.find(document_id);
+    if (found == s_document_states.end() || line < 0) return false;
+    auto& folds = found->second->folded_lines;
+    const auto position = std::lower_bound(folds.begin(), folds.end(), line);
+    if (position != folds.end() && *position == line)
+        folds.erase(position);
+    else if (folds.size() < 4096) {
+        const int end = document_id == s_active_document_id
+            ? cached_fold_end(line) : line;
+        folds.insert(position, line);
+        if (document_id == s_active_document_id && end > line &&
+            found->second->selection.caret_line > line &&
+            found->second->selection.caret_line <= end) {
+            found->second->selection.caret_line = line;
+            found->second->selection.caret_col = (std::min)(
+                found->second->selection.caret_col, line_length(line));
+            found->second->selection.anchor_line = found->second->selection.caret_line;
+            found->second->selection.anchor_col = found->second->selection.caret_col;
+            found->second->selection.active = false;
+        }
+    } else
+        return false;
+    found->second->fold_projection_revision = 0;
+    return true;
 }
 
 code_editor_widget::document_payload_snapshot_t
@@ -2282,6 +2637,8 @@ bool code_editor_widget::request_streamed_document(std::uint64_t document_id,
     target->active = true;
     target->dirty = false;
     target->read_only = true;
+    target->diff = {};
+    target->review_hunk_selection = {};
 	const bool very_large_file = byte_length >=
 		aida::editor::programming_documents::large_document_milestone_bytes;
 	target->read_only_reason = very_large_file
@@ -2451,6 +2808,32 @@ bool code_editor_widget::request_streamed_document(std::uint64_t document_id,
 #endif
 }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+bool code_editor_widget::configure_preview_stream_state(std::uint64_t document_id,
+        bool loading, bool cancellation_requested, std::string_view error) {
+    const auto found = s_document_states.find(document_id);
+    if (found == s_document_states.end() || error.size() > 2048U ||
+        (cancellation_requested && !loading))
+        return false;
+    auto& document = *found->second;
+    cancel_runtime_jobs(document);
+    document.stream_loading = loading;
+    document.stream_error.assign(error);
+    document.stream_cancel = loading
+        ? std::make_shared<std::atomic<bool>>(cancellation_requested)
+        : std::shared_ptr<std::atomic<bool>>{};
+    document.read_only = loading || !error.empty();
+    document.read_only_reason = document.read_only
+        ? cancellation_requested
+            ? "Large-file indexing is cancelling; the document remains read-only until the worker confirms termination."
+            : error.empty()
+                ? "Large-file indexing is active; the document remains read-only until publication."
+                : "The deterministic large-file operation failed; retry or choose Hex View/Binary Map."
+        : std::string{};
+    return true;
+}
+#endif
+
 void code_editor_widget::trigger_undo()   { bind_focused_document(); s_request_undo = true; }
 void code_editor_widget::trigger_redo()   { bind_focused_document(); s_request_redo = true; }
 void code_editor_widget::trigger_cut()    { bind_focused_document(); s_request_cut = true; }
@@ -2505,7 +2888,8 @@ code_editor_widget::document_capabilities_t code_editor_widget::document_capabil
     document_capabilities_t result;
     if (!current_document().active) return result;
     if (s_cache.dirty) rebuild_lines();
-    const auto& language = syntax::detect_language(current_document().filename);
+    const auto& language = resolved_language(current_document().filename,
+        current_document().language_override);
     result.text_editing = !large_read_only_mode();
     result.save = !large_read_only_mode() && !current_document().filepath.empty();
     result.syntax_highlighting = true;
@@ -2554,7 +2938,8 @@ code_editor_widget::document_state_t code_editor_widget::document_state(
     result.capabilities.ai_diff_review = result.capabilities.text_editing &&
         result.content_bytes <= LARGE_FILE_BYTES;
     if (result.active) {
-        const auto& language = syntax::detect_language(document.filename);
+        const auto& language = resolved_language(document.filename,
+            document.language_override);
         result.language = language.name ? language.name : "Text";
         result.capabilities.line_comment = language.line_comment && language.line_comment[0] != '\0';
     }
@@ -2611,9 +2996,36 @@ void code_editor_widget::render_document_pane(const document_pane_render_context
             document.cache.dirty = true;
             document.revision = (std::max)(context.revision, std::uint64_t{1});
             document.selection = {};
+            document.selection.caret_line = (std::max)(0, context.caret_line);
+            document.selection.caret_col = (std::max)(0, context.caret_column);
+            document.selection.anchor_line = (std::max)(0, context.selection_anchor_line);
+            document.selection.anchor_col = (std::max)(0, context.selection_anchor_column);
+            document.selection.active = context.selection_active &&
+                (document.selection.anchor_line != document.selection.caret_line ||
+                 document.selection.anchor_col != document.selection.caret_col);
+            document.scroll_x = (std::max)(0.f, context.scroll_x);
+            document.scroll_y = document.target_scroll_y = (std::max)(0.f, context.scroll_y);
+            document.language_override.assign(context.language_override.substr(0, 64));
+            document.language = resolved_language(document.filename,
+                document.language_override);
+            document.language_set = !document.filename.empty() ||
+                !document.language_override.empty();
+            document.folded_lines.clear();
+            if (context.folded_lines) {
+                document.folded_lines.reserve((std::min)(context.folded_lines->size(),
+                    std::size_t{4096}));
+                for (const int line : *context.folded_lines)
+                    if (line >= 0 && document.folded_lines.size() < 4096U)
+                        document.folded_lines.push_back(line);
+                std::sort(document.folded_lines.begin(), document.folded_lines.end());
+                document.folded_lines.erase(std::unique(document.folded_lines.begin(),
+                    document.folded_lines.end()), document.folded_lines.end());
+            }
+            document.fold_projection_revision = 0;
             document.undo.clear();
             document.redo.clear();
             document.diff = {};
+            document.review_hunk_selection = {};
         }
         document.filename.assign(context.filename);
         document.filepath.assign(context.filepath);
@@ -2631,7 +3043,8 @@ void code_editor_widget::render_document_pane(const document_pane_render_context
             document.read_only_reason.clear();
         }
         if (!document.language_set && !document.filename.empty()) {
-            document.language = syntax::detect_language(document.filename);
+            document.language = resolved_language(document.filename,
+                document.language_override);
             document.language_set = true;
         }
     }
@@ -2652,9 +3065,15 @@ void code_editor_widget::render_document_pane(const document_pane_render_context
         return;
     }
     if (current_document().stream_loading) {
-        ImGui::TextDisabled("Building a bounded memory-mapped line index for %s...",
+        const bool cancellation_requested = current_document().stream_cancel &&
+            current_document().stream_cancel->load(std::memory_order_acquire);
+        ImGui::TextDisabled("%s for %s...",
+            cancellation_requested ? "Cancelling the bounded memory-mapped line index"
+                                   : "Building a bounded memory-mapped line index",
             current_document().filename.c_str());
-        ImGui::TextWrapped("The editor remains responsive; progress and cancellation are available in Task Center.");
+        ImGui::TextWrapped("%s", cancellation_requested
+            ? "The document remains read-only until the worker confirms cancellation; the prior publication is not replaced."
+            : "The editor remains responsive; progress and cancellation are available in Task Center.");
         return;
     }
     if (!current_document().stream_error.empty()) {
@@ -2700,6 +3119,8 @@ bool code_editor_widget::begin_agent_edit(std::string_view origin) {
     s_diff.origin = std::string(origin);
     s_diff.old_lines = base;
     s_diff.new_lines = base;
+    assign_diff_identities(s_diff);
+    current_document().review_hunk_selection = {};
     s_diff_hover_hunk = -1;
     return true;
 }
@@ -2766,6 +3187,9 @@ bool code_editor_widget::propose_document_content(
     compute_lcs_diff(proposal.old_lines, proposal.new_lines, proposal);
     std::lock_guard<std::mutex> lock(s_diff_mtx);
     target.diff = std::move(proposal);
+    target.review_hunk_selection = {};
+    if (!target.diff.hunks.empty())
+        static_cast<void>(select_review_hunk_locked(target, 0, false));
     target.diff_hover_hunk = -1;
     target.diff_scroll_target = -1.f;
     target.last_error.clear();
@@ -2831,38 +3255,118 @@ int code_editor_widget::pending_hunk_count() {
     return static_cast<int>(s_diff.hunks.size());
 }
 
+bool code_editor_widget::has_pending_review_hunks() {
+    bind_focused_document();
+    std::lock_guard<std::mutex> lock(s_diff_mtx);
+    if (!s_diff.active || s_diff.document_id != s_active_document_id ||
+        s_diff.base_revision != s_document_revision ||
+        s_diff.base_content_hash != document_content_fingerprint())
+        return false;
+    return std::any_of(s_diff.hunks.begin(), s_diff.hunks.end(),
+        [](const diff_hunk_t& hunk) {
+            return hunk.state == diff_hunk_state_t::pending;
+        });
+}
+
+code_editor_widget::review_hunk_identity_t code_editor_widget::review_hunk_identity(
+        int index) {
+    bind_focused_document();
+    std::lock_guard<std::mutex> lock(s_diff_mtx);
+    return review_hunk_identity_locked(current_document(), index);
+}
+
+code_editor_widget::review_hunk_identity_t
+code_editor_widget::selected_review_hunk_identity() {
+    bind_focused_document();
+    std::lock_guard<std::mutex> lock(s_diff_mtx);
+    auto& document = current_document();
+    if (resolve_review_hunk_locked(document,
+            document.review_hunk_selection.identity, true) < 0) {
+        document.review_hunk_selection = {};
+        return {};
+    }
+    return document.review_hunk_selection.identity;
+}
+
+int code_editor_widget::resolve_review_hunk(
+        const review_hunk_identity_t& identity, bool require_pending) {
+    std::lock_guard<std::mutex> lock(s_diff_mtx);
+    const auto found = s_document_states.find(identity.document_id);
+    if (found == s_document_states.end() || !found->second)
+        return -1;
+    return resolve_review_hunk_locked(*found->second, identity, require_pending);
+}
+
+bool code_editor_widget::select_review_hunk(int index, bool request_focus) {
+    bind_focused_document();
+    std::lock_guard<std::mutex> lock(s_diff_mtx);
+    return select_review_hunk_locked(current_document(), index, request_focus);
+}
+
+bool code_editor_widget::select_next_pending_hunk() {
+    bind_focused_document();
+    std::lock_guard<std::mutex> lock(s_diff_mtx);
+    return select_pending_review_hunk_locked(current_document(), true);
+}
+
+bool code_editor_widget::select_previous_pending_hunk() {
+    bind_focused_document();
+    std::lock_guard<std::mutex> lock(s_diff_mtx);
+    return select_pending_review_hunk_locked(current_document(), false);
+}
+
 bool code_editor_widget::accept_hunk(int index) {
 	bind_focused_document();
     std::lock_guard<std::mutex> lk(s_diff_mtx);
-    if (!s_diff.active || index < 0 || index >= static_cast<int>(s_diff.hunks.size()))
+    if (!s_diff.active || s_diff.document_id != s_active_document_id ||
+        s_diff.base_revision != s_document_revision ||
+        s_diff.base_content_hash != document_content_fingerprint() ||
+        index < 0 || index >= static_cast<int>(s_diff.hunks.size()))
+        return false;
+    const auto identity = review_hunk_identity_locked(current_document(), index);
+    if (resolve_review_hunk_locked(current_document(), identity, true) != index)
         return false;
     s_diff.hunks[static_cast<std::size_t>(index)].state = code_editor_widget::diff_hunk_state_t::accepted;
+    static_cast<void>(select_pending_review_hunk_locked(current_document(), true));
     return true;
 }
 
 bool code_editor_widget::reject_hunk(int index) {
 	bind_focused_document();
     std::lock_guard<std::mutex> lk(s_diff_mtx);
-    if (!s_diff.active || index < 0 || index >= static_cast<int>(s_diff.hunks.size()))
+    if (!s_diff.active || s_diff.document_id != s_active_document_id ||
+        s_diff.base_revision != s_document_revision ||
+        s_diff.base_content_hash != document_content_fingerprint() ||
+        index < 0 || index >= static_cast<int>(s_diff.hunks.size()))
+        return false;
+    const auto identity = review_hunk_identity_locked(current_document(), index);
+    if (resolve_review_hunk_locked(current_document(), identity, true) != index)
         return false;
     s_diff.hunks[static_cast<std::size_t>(index)].state = code_editor_widget::diff_hunk_state_t::rejected;
+    static_cast<void>(select_pending_review_hunk_locked(current_document(), true));
     return true;
 }
 
 void code_editor_widget::accept_all() {
 	bind_focused_document();
     std::lock_guard<std::mutex> lk(s_diff_mtx);
-    if (!s_diff.active) return;
+    if (!s_diff.active || s_diff.document_id != s_active_document_id ||
+        s_diff.base_revision != s_document_revision ||
+        s_diff.base_content_hash != document_content_fingerprint()) return;
     for (auto& h : s_diff.hunks)
         h.state = code_editor_widget::diff_hunk_state_t::accepted;
+    current_document().review_hunk_selection = {};
 }
 
 void code_editor_widget::reject_all() {
 	bind_focused_document();
     std::lock_guard<std::mutex> lk(s_diff_mtx);
-    if (!s_diff.active) return;
+    if (!s_diff.active || s_diff.document_id != s_active_document_id ||
+        s_diff.base_revision != s_document_revision ||
+        s_diff.base_content_hash != document_content_fingerprint()) return;
     for (auto& h : s_diff.hunks)
         h.state = code_editor_widget::diff_hunk_state_t::rejected;
+    current_document().review_hunk_selection = {};
 }
 
 bool code_editor_widget::commit_resolved_diff() {
@@ -2885,6 +3389,7 @@ void code_editor_widget::cancel_agent_edit() {
     std::lock_guard<std::mutex> lk(s_diff_mtx);
     s_diff = code_editor_widget::pending_diff_t{};
     s_diff.active = false;
+    current_document().review_hunk_selection = {};
     s_diff_hover_hunk = -1;
 }
 
@@ -2925,7 +3430,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (s_request_goto)   { s_goto.visible = true; s_goto.line_buf[0] = '\0'; s_request_goto = false; }
 
     if (!s_lang_set && !current_document().filename.empty()) {
-        s_lang = syntax::detect_language(current_document().filename);
+        s_lang = resolved_language(current_document().filename,
+            current_document().language_override);
         s_lang_set = true;
     }
 
@@ -2974,6 +3480,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
     if (s_cache.dirty)
         rebuild_lines();
+    rebuild_fold_projection();
+    reveal_logical_line(s_sel.caret_line);
 
     const auto& th = aida::ui::resolved();
     const float a   = alpha;
@@ -2982,11 +3490,24 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     const float char_w = ImGui::CalcTextSize("X").x;
 	const bool  show_ln = editor_preferences::show_line_numbers;
 	const int   n_lines = line_count();
+	const int visible_line_count = current_document().visible_lines.empty()
+		? n_lines : static_cast<int>(current_document().visible_lines.size());
+	const auto visual_row_for = [](int logical_line) {
+		const auto& mapping = current_document().logical_to_visual;
+		return logical_line >= 0 && logical_line < static_cast<int>(mapping.size())
+			? mapping[static_cast<std::size_t>(logical_line)] : logical_line;
+	};
+	const auto logical_line_for = [](int visual_row) {
+		const auto& visible = current_document().visible_lines;
+		return visible.empty() ? clamp_line(visual_row) : visible[static_cast<std::size_t>(std::clamp(
+			visual_row, 0, static_cast<int>(visible.size()) - 1))];
+	};
 	const auto source_markers = source_debug_service::markers_for_path(
 		current_document().filepath);
 	const float source_gutter_w = current_document().filepath.empty() ? 0.f : 15.f;
+	const float fold_gutter_w = 14.f;
 	const float line_number_gutter_w = show_ln ? (ImGui::CalcTextSize("00000").x + 12.f) : 0.f;
-	const float gutter_w = source_gutter_w + line_number_gutter_w;
+	const float gutter_w = source_gutter_w + fold_gutter_w + line_number_gutter_w;
 
     bool ghost_consumed_tab = false;
 
@@ -3021,17 +3542,17 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     s_scroll_y = aida::motion::smooth_lerp(s_scroll_y, s_target_scroll_y, 20.f, dt);
     if (std::abs(s_target_scroll_y - s_scroll_y) < 0.5f)
         s_scroll_y = s_target_scroll_y;
-    float max_scroll = std::max(0.f, static_cast<float>(n_lines) * line_h - editor_h + line_h);
+    float max_scroll = std::max(0.f, static_cast<float>(visible_line_count) * line_h - editor_h + line_h);
     s_target_scroll_y = std::max(0.f, std::min(s_target_scroll_y, max_scroll));
     s_scroll_y = std::max(0.f, std::min(s_scroll_y, max_scroll));
 
     int longest_line_chars = 0;
     {
         int probe_lo = std::max(0, static_cast<int>(s_scroll_y / line_h) - 4);
-        int probe_hi = std::min(n_lines - 1,
+        int probe_hi = std::min(visible_line_count - 1,
                                 static_cast<int>((s_scroll_y + editor_h) / line_h) + 4);
-        for (int i = probe_lo; i <= probe_hi; ++i)
-            longest_line_chars = std::max(longest_line_chars, line_length(i));
+        for (int row = probe_lo; row <= probe_hi; ++row)
+            longest_line_chars = std::max(longest_line_chars, line_length(logical_line_for(row)));
     }
     const float h_scrollbar_h = 9.f;
     const bool  word_wrap_on  = editor_preferences::word_wrap;
@@ -3122,12 +3643,17 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         float crumb_x = bc_min.x + 12.f;
         float crumb_y = bc_min.y + (breadcrumb_h - 13.f) * 0.5f;
         float chev_w = 10.f;
+        const float breadcrumb_right = (std::max)(bc_min.x + 24.f, bc_max.x - 144.f);
+        bc_dl->PushClipRect(ImVec2(bc_min.x, bc_min.y),
+            ImVec2(breadcrumb_right, bc_max.y), true);
         for (size_t i = 0; i < segs.size(); ++i) {
             const auto& sg = segs[i];
             float tw = bc_font->CalcTextSizeA(13.f, FLT_MAX, 0.f, sg.text.c_str()).x;
             ImVec2 chip_min(crumb_x - 4.f, crumb_y - 3.f);
             ImVec2 chip_max(crumb_x + tw + 4.f, crumb_y + 16.f);
-            bool seg_hov = ImGui::IsMouseHoveringRect(chip_min, chip_max);
+            bool seg_hov = chip_min.x < breadcrumb_right &&
+                ImGui::IsMouseHoveringRect(chip_min,
+                    ImVec2((std::min)(chip_max.x, breadcrumb_right), chip_max.y));
             ImU32 seg_col = sg.is_path ? th.text_secondary
                                        : (sg.is_active ? th.accent_u32 : th.text_primary);
             if (seg_hov) {
@@ -3146,6 +3672,31 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 crumb_x += chev_w + 4.f;
             }
         }
+        bc_dl->PopClipRect();
+
+		static constexpr std::array<const char*, 6> language_modes = {
+			"Auto", "C/C++", "x86 Assembly", "Python", "JSON", "Lua"
+		};
+		const char* active_language = current_document().language_override.empty()
+			? language_modes[0] : current_document().language_override.c_str();
+		const ImVec2 saved_cursor = ImGui::GetCursorScreenPos();
+		ImGui::SetCursorScreenPos(ImVec2(bc_max.x - 132.f, bc_min.y + 3.f));
+		ImGui::SetNextItemWidth(124.f);
+		if (ImGui::BeginCombo("##editor_language_mode", active_language,
+			ImGuiComboFlags_HeightRegular)) {
+			for (const char* mode : language_modes) {
+				const std::string_view value = std::strcmp(mode, "Auto") == 0
+					? std::string_view{} : std::string_view(mode);
+				const bool selected = current_document().language_override == value;
+				if (ImGui::Selectable(mode, selected))
+					static_cast<void>(code_editor_widget::set_document_language_override(
+						s_active_document_id, value));
+				if (selected) ImGui::SetItemDefaultFocus();
+			}
+			ImGui::EndCombo();
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Language mode");
+		ImGui::SetCursorScreenPos(saved_cursor);
     }
     s_breadcrumb_flash.tick(dt, 2.f);
 
@@ -3158,6 +3709,13 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         if (code_font) ImGui::PopFont();
         return;
     }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string editor_semantic = aida::preview::semantics::stable_id(
+        "aida.code-editor",
+        aida::preview::semantics::entity_token(std::to_string(s_active_document_id)));
+    static_cast<void>(aida::preview::semantics::register_region(editor_semantic,
+        "code-editor", id, bb.Min, bb.Max, true));
+#endif
 
     bool diff_active = false;
     {
@@ -3166,8 +3724,73 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
     if (diff_active) {
+        bool diff_hovered = ImGui::IsMouseHoveringRect(bb.Min, bb.Max);
+        const bool diff_input_blocked = (file_tabs::pending_close_idx >= 0)
+            || globals::ui::process_attach_open
+            || globals::ui::driver_status_open
+            || globals::ui::shortcuts_dialog_open
+            || globals::ui::mcp_servers_dialog_open
+            || globals::ui::command_palette_open
+            || ImGui::IsPopupOpen("##aida_editor_context");
+        if (diff_input_blocked)
+            diff_hovered = false;
+        if (diff_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            ImGui::SetActiveID(id, ImGui::GetCurrentWindow());
+            ImGui::SetFocusID(id, ImGui::GetCurrentWindow());
+            s_has_focus = true;
+        }
+        if (s_has_focus && !diff_hovered &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            s_has_focus = false;
+            if (ImGui::GetActiveID() == id)
+                ImGui::ClearActiveID();
+        }
+        if (s_has_focus)
+            s_focused_document_id = s_active_document_id;
+        aida::ui::application_ui::set_editor_focus(s_has_focus, false, true);
+        if (s_has_focus && !diff_input_blocked)
+            aida::ui::application_ui::process_editor_shortcuts();
+
+        const auto previous_hunk_presentation =
+            aida::ui::application_ui::present_editor_review_action(
+                "editor.ai.previous_pending_hunk");
+        const auto next_hunk_presentation =
+            aida::ui::application_ui::present_editor_review_action(
+                "editor.ai.next_pending_hunk");
+        const auto accept_hunk_presentation =
+            aida::ui::application_ui::present_editor_review_action(
+                "editor.ai.accept_current_hunk");
+        const auto reject_hunk_presentation =
+            aida::ui::application_ui::present_editor_review_action(
+                "editor.ai.reject_current_hunk");
+        std::string review_hints;
+        const auto append_review_hint = [&review_hints](const char* label,
+                const aida::ui::application_ui::action_presentation_t& presentation) {
+            if (presentation.shortcut.empty()) return;
+            if (!review_hints.empty()) review_hints.append("   ");
+            review_hints.append(label).append(" ").append(presentation.shortcut);
+        };
+        append_review_hint("Previous", previous_hunk_presentation);
+        append_review_hint("Next", next_hunk_presentation);
+        append_review_hint("Accept", accept_hunk_presentation);
+        append_review_hint("Reject", reject_hunk_presentation);
+
+        const bool keyboard_context = s_has_focus && !diff_input_blocked &&
+            (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+             (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+        if (keyboard_context)
+            aida::ui::application_ui::open_editor_context_menu(
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+                    ? aida::ui::context_menu_open_origin_t::menu_key
+                    : aida::ui::context_menu_open_origin_t::shift_f10);
+
         std::unique_lock<std::mutex> lk(s_diff_mtx);
         s_scroll_x = 0.f;
+
+        int selected_hunk = resolve_review_hunk_locked(current_document(),
+            current_document().review_hunk_selection.identity, true);
+        if (selected_hunk < 0)
+            current_document().review_hunk_selection = {};
 
         const float hdr_h = 40.f;
         ImVec2 hdr_min(ox, oy);
@@ -3183,16 +3806,29 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             dl->AddText(hdr_font, 14.f, ImVec2(hdr_min.x + 14.f, hdr_min.y + 6.f),
                         aida::ui::with_alpha(th.text_primary, a), title.c_str());
 
-            char stats[96];
             int pend = 0;
             for (const auto& h : s_diff.hunks)
                 if (h.state == code_editor_widget::diff_hunk_state_t::pending) pend++;
-            snprintf(stats, sizeof(stats), "+%d  -%d   %zu hunk%s   %d pending",
-                     s_diff.total_added, s_diff.total_removed,
-                     s_diff.hunks.size(),
-                     s_diff.hunks.size() == 1 ? "" : "s", pend);
-            dl->AddText(hdr_font, 12.f, ImVec2(hdr_min.x + 14.f, hdr_min.y + 22.f),
-                        aida::ui::with_alpha(th.text_secondary, a), stats);
+            char stats_buffer[96];
+            snprintf(stats_buffer, sizeof(stats_buffer),
+                "+%d  -%d   %zu hunk%s   %d pending",
+                s_diff.total_added, s_diff.total_removed, s_diff.hunks.size(),
+                s_diff.hunks.size() == 1 ? "" : "s", pend);
+            std::string stats(stats_buffer);
+            if (!review_hints.empty())
+                stats.append("   |   ").append(review_hints);
+            const ImVec4 stats_clip(hdr_min.x + 14.f, hdr_min.y + 20.f,
+                std::max(hdr_min.x + 14.f, hdr_max.x - 210.f), hdr_max.y - 1.f);
+            dl->AddText(hdr_font, 12.f,
+                ImVec2(hdr_min.x + 14.f, hdr_min.y + 22.f),
+                aida::ui::with_alpha(th.text_secondary, a), stats.c_str(), nullptr,
+                0.f, &stats_clip);
+            if (!review_hints.empty() &&
+                hdr_font->CalcTextSizeA(12.f, FLT_MAX, 0.f, stats.c_str()).x >
+                    stats_clip.z - stats_clip.x &&
+                ImGui::IsMouseHoveringRect(ImVec2(stats_clip.x, stats_clip.y),
+                    ImVec2(stats_clip.z, stats_clip.w)))
+                ImGui::SetTooltip("%s", review_hints.c_str());
         }
 
         bool want_accept_all = false;
@@ -3215,6 +3851,13 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 dl->AddText(hdr_font, 12.f,
                             ImVec2(mn.x + (bw - tw) * 0.5f, mn.y + (bh - 12.f) * 0.5f),
                             aida::ui::with_alpha(base, a), label);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string action_semantic = aida::preview::semantics::stable_id(
+                    editor_semantic, aida::preview::semantics::stable_id("diff-action", label));
+                static_cast<void>(aida::preview::semantics::register_region(action_semantic,
+                    "diff-action", ImGui::GetID(action_semantic.c_str()), mn, mx, false, false,
+                    editor_semantic));
+#endif
                 if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) out = true;
             };
             hdr_button("Accept All", bx_accept, th.success, want_accept_all);
@@ -3313,6 +3956,22 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         const float sign_x = ox + diff_gutter_w + 4.f;
         const float diff_text_x = sign_x + char_w * 1.6f;
 
+        if (selected_hunk >= 0 && current_document().review_hunk_selection.focus_requested) {
+            const auto row = std::find_if(rows.begin(), rows.end(),
+                [selected_hunk](const vis_row_t& candidate) {
+                    return candidate.is_hunk_head && candidate.hunk == selected_hunk;
+                });
+            if (row != rows.end()) {
+                const float row_offset = static_cast<float>(std::distance(rows.begin(), row)) * line_h;
+                s_diff_scroll_target = std::max(0.f, row_offset - body_h * 0.30f);
+                s_has_focus = true;
+                s_focused_document_id = s_active_document_id;
+                ImGui::SetActiveID(id, ImGui::GetCurrentWindow());
+                ImGui::SetFocusID(id, ImGui::GetCurrentWindow());
+            }
+            current_document().review_hunk_selection.focus_requested = false;
+        }
+
         float content_h = static_cast<float>(rows.size()) * line_h;
         float diff_max_scroll = std::max(0.f, content_h - body_h + line_h);
         if (s_diff_scroll_target < 0.f) s_diff_scroll_target = 0.f;
@@ -3342,6 +4001,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         int new_hover_hunk = -1;
         std::vector<int> accept_clicked;
         std::vector<int> reject_clicked;
+        int select_clicked = -1;
+        int context_clicked = -1;
 
         for (int ri = diff_first; ri <= diff_last; ++ri) {
             if (ri < 0 || static_cast<size_t>(ri) >= rows.size()) break;
@@ -3352,8 +4013,22 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 if (r.hunk < 0 || static_cast<size_t>(r.hunk) >= s_diff.hunks.size()) continue;
                 const code_editor_widget::diff_hunk_t& h =
                     s_diff.hunks[static_cast<size_t>(r.hunk)];
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string hunk_semantic = aida::preview::semantics::stable_id(
+                    aida::preview::semantics::stable_id(editor_semantic, "diff-hunk"),
+                    aida::preview::semantics::entity_token(std::to_string(h.stable_id)));
+                static_cast<void>(aida::preview::semantics::register_region(hunk_semantic,
+                    "diff-hunk", ImGui::GetID(hunk_semantic.c_str()), ImVec2(ox, ry),
+                    ImVec2(ox + code_w, ry + line_h), true, false, editor_semantic));
+#endif
+                const bool selected = r.hunk == selected_hunk;
                 dl->AddRectFilled(ImVec2(ox, ry), ImVec2(ox + code_w, ry + line_h),
-                                  aida::ui::with_alpha(th.accent_glow, 0.6f * a));
+                                  aida::ui::with_alpha(th.accent_glow,
+                                      (selected ? 0.95f : 0.6f) * a));
+                if (selected)
+                    dl->AddRect(ImVec2(ox + 0.5f, ry + 0.5f),
+                        ImVec2(ox + code_w - 0.5f, ry + line_h - 0.5f),
+                        aida::ui::with_alpha(th.accent_u32, 0.9f * a), 0.f, 0, 1.5f);
                 char hb[64];
                 snprintf(hb, sizeof(hb), "@@ -%d,%d +%d,%d @@",
                          h.old_start + 1, h.old_count, h.new_start + 1, h.new_count);
@@ -3387,12 +4062,23 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                         float tw = ImGui::CalcTextSize(lbl).x;
                         dl->AddText(ImVec2(mn.x + (hbw - tw) * 0.5f, mn.y + (hbh - ImGui::GetFontSize()) * 0.5f),
                                     aida::ui::with_alpha(base, a), lbl);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                        const std::string action_semantic = aida::preview::semantics::stable_id(
+                            hunk_semantic, aida::preview::semantics::stable_id("action", lbl));
+                        static_cast<void>(aida::preview::semantics::register_region(action_semantic,
+                            "diff-action", ImGui::GetID(action_semantic.c_str()), mn, mx,
+                            false, false, hunk_semantic));
+#endif
                         return hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
                     };
                     if (mini_btn("Accept", hbx_acc, th.success)) accept_clicked.push_back(r.hunk);
                     if (mini_btn("Reject", hbx_rej, th.error))   reject_clicked.push_back(r.hunk);
                     if (mp.x >= ox && mp.x <= ox + code_w && mp.y >= ry && mp.y < ry + line_h)
                         new_hover_hunk = r.hunk;
+                }
+                if (mp.x >= ox && mp.x <= ox + code_w && mp.y >= ry && mp.y < ry + line_h) {
+                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) select_clicked = r.hunk;
+                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) context_clicked = r.hunk;
                 }
                 continue;
             }
@@ -3437,6 +4123,16 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             if (r.hunk >= 0 && r.hunk == s_diff_hover_hunk && !hunk_resolved)
                 dl->AddRectFilled(ImVec2(ox + 3.f, ry), ImVec2(ox + code_w, ry + line_h),
                                   aida::ui::with_alpha(th.accent_u32, 0.05f * a));
+            if (r.hunk >= 0 && r.hunk == selected_hunk && !hunk_resolved)
+                dl->AddRectFilled(ImVec2(ox + 3.f, ry), ImVec2(ox + code_w, ry + line_h),
+                                  aida::ui::with_alpha(th.accent_u32, 0.09f * a));
+
+            if (r.hunk >= 0 && mp.x >= ox && mp.x <= ox + code_w &&
+                mp.y >= ry && mp.y < ry + line_h) {
+                new_hover_hunk = r.hunk;
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) select_clicked = r.hunk;
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) context_clicked = r.hunk;
+            }
 
             char numbuf[24];
             if (r.old_no > 0)
@@ -3510,6 +4206,14 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         s_diff_hover_hunk = new_hover_hunk;
 
         lk.unlock();
+        if (select_clicked >= 0)
+            static_cast<void>(code_editor_widget::select_review_hunk(select_clicked, true));
+        if (context_clicked >= 0) {
+            static_cast<void>(code_editor_widget::select_review_hunk(context_clicked, true));
+            aida::ui::application_ui::set_editor_focus(true, false, true);
+            aida::ui::application_ui::open_editor_context_menu(
+                aida::ui::context_menu_open_origin_t::pointer);
+        }
         for (int hi : accept_clicked)
             aida::ui::application_ui::execute_editor_hunk_action(hi,
                 "editor.ai.accept_hunk", aida::ui::action_invocation_source_t::context_menu);
@@ -3522,6 +4226,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         if (want_reject_all)
             aida::ui::application_ui::execute_action(
                 "editor.ai.reject_all", aida::ui::action_invocation_source_t::context_menu);
+        aida::ui::application_ui::render_editor_context_menu();
         lk.lock();
 
         {
@@ -3602,8 +4307,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
     int first_row = std::max(0, static_cast<int>(s_scroll_y / line_h) - 1);
-    int last_row  = std::min(n_lines - 1, static_cast<int>((s_scroll_y + editor_h) / line_h) + 1);
-    tokenize_range(first_row - 8, last_row + 8);
+    int last_row  = std::min(visible_line_count - 1, static_cast<int>((s_scroll_y + editor_h) / line_h) + 1);
+    tokenize_range(logical_line_for(first_row) - 8, logical_line_for(last_row) + 8);
 
     dl->PushClipRect(ImVec2(ox, oy), ImVec2(ox + code_w, oy + editor_h), true);
 
@@ -3614,7 +4319,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
     if (editor_preferences::highlight_current_line && focus_blend > 0.001f) {
-        float cy = oy + static_cast<float>(s_sel.caret_line) * line_h - s_scroll_y;
+        float cy = oy + static_cast<float>(visual_row_for(s_sel.caret_line)) * line_h - s_scroll_y;
         if (cy >= oy - line_h && cy <= oy + editor_h) {
             dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + code_w, cy + line_h),
                               aida::ui::with_alpha(th.hover_wash, focus_blend * 0.85f * a));
@@ -3633,9 +4338,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (s_caret_move_anim.active) {
         float pe = s_caret_move_anim.eased();
         float prev_x = ox + text_x0 + static_cast<float>(s_prev_caret_col) * char_w - s_scroll_x;
-        float prev_y = oy + static_cast<float>(s_prev_caret_line) * line_h - s_scroll_y;
+        float prev_y = oy + static_cast<float>(visual_row_for(s_prev_caret_line)) * line_h - s_scroll_y;
         float cur_x  = ox + text_x0 + static_cast<float>(s_sel.caret_col) * char_w - s_scroll_x;
-        float cur_y  = oy + static_cast<float>(s_sel.caret_line) * line_h - s_scroll_y;
+        float cur_y  = oy + static_cast<float>(visual_row_for(s_sel.caret_line)) * line_h - s_scroll_y;
         float gx = prev_x + (cur_x - prev_x) * pe;
         float gy = prev_y + (cur_y - prev_y) * pe;
         if (gy >= oy - line_h && gy <= oy + editor_h) {
@@ -3651,7 +4356,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     {
         const int max_indent_render = 16;
         int tab = std::max(1, editor_preferences::tab_size);
-        for (int i = first_row; i <= last_row; i++) {
+        for (int row = first_row; row <= last_row; row++) {
+            const int i = logical_line_for(row);
             const std::string& ln = line_at(i);
             int leading = 0;
             for (char c : ln) {
@@ -3661,7 +4367,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             }
             if (leading <= 0) continue;
             int levels = std::min(max_indent_render, leading / tab);
-            float ly = oy + static_cast<float>(i) * line_h - s_scroll_y;
+            float ly = oy + static_cast<float>(row) * line_h - s_scroll_y;
             for (int lv = 1; lv <= levels; ++lv) {
                 float gx = ox + text_x0 + static_cast<float>(lv * tab) * char_w
                     - s_scroll_x - char_w * 0.5f;
@@ -3678,8 +4384,10 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         int l0, c0, l1, c1;
         selection_ordered(l0, c0, l1, c1);
         ImU32 sel_col = aida::ui::with_alpha(th.selection, a);
-        for (int i = std::max(first_row, l0); i <= std::min(last_row, l1); i++) {
-            float ly = oy + static_cast<float>(i) * line_h - s_scroll_y;
+        for (int row = first_row; row <= last_row; ++row) {
+            const int i = logical_line_for(row);
+            if (i < l0 || i > l1) continue;
+            float ly = oy + static_cast<float>(row) * line_h - s_scroll_y;
             float sx0, sx1;
             if (i == l0 && i == l1) {
                 sx0 = ox + text_x0 + static_cast<float>(c0) * char_w - s_scroll_x;
@@ -3700,6 +4408,15 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             sx1 = std::min(sx1, ox + code_w - 4.f);
             if (sx1 > sx0) {
                 dl->AddRectFilled(ImVec2(sx0, ly), ImVec2(sx1, ly + line_h), sel_col);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string selection_semantic = aida::preview::semantics::stable_id(
+                    aida::preview::semantics::stable_id(editor_semantic, "selection"),
+                    aida::preview::semantics::entity_token(std::to_string(i)));
+                static_cast<void>(aida::preview::semantics::register_region(selection_semantic,
+                    "editor-selection", ImGui::GetID(selection_semantic.c_str()),
+                    ImVec2(sx0, ly), ImVec2(sx1, ly + line_h), true, false,
+                    editor_semantic));
+#endif
             }
         }
     }
@@ -3719,8 +4436,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             int ml = m.line;
             int mc = m.col;
             int mlen = m.length;
-            if (ml < first_row || ml > last_row) continue;
-            float my = oy + static_cast<float>(ml) * line_h - s_scroll_y;
+            const int match_row = visual_row_for(ml);
+            if (match_row < first_row || match_row > last_row || logical_line_for(match_row) != ml) continue;
+            float my = oy + static_cast<float>(match_row) * line_h - s_scroll_y;
             float mx0 = ox + text_x0 + static_cast<float>(mc) * char_w - s_scroll_x;
             float mx1 = mx0 + static_cast<float>(mlen) * char_w;
             mx1 = std::min(mx1, ox + code_w - 4.f);
@@ -3742,8 +4460,18 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
-    for (int i = first_row; i <= last_row; i++) {
-        float y = oy + static_cast<float>(i) * line_h - s_scroll_y;
+    for (int row = first_row; row <= last_row; row++) {
+        const int i = logical_line_for(row);
+        float y = oy + static_cast<float>(row) * line_h - s_scroll_y;
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const std::string line_semantic = aida::preview::semantics::stable_id(
+            aida::preview::semantics::stable_id(editor_semantic, "line"),
+            aida::preview::semantics::entity_token(std::to_string(i + 1)));
+        static_cast<void>(aida::preview::semantics::register_region(line_semantic,
+            "editor-line", ImGui::GetID(line_semantic.c_str()), ImVec2(ox, y),
+            ImVec2(ox + code_w, y + line_h), true, false, editor_semantic));
+#endif
 
 
         if (i & 1)
@@ -3781,8 +4509,21 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             ImU32 ln_col = (i == s_sel.caret_line)
                 ? aida::ui::with_alpha(th.accent_u32, 0.85f * a)
                 : aida::ui::with_alpha(th.text_lineno, a);
-			dl->AddText(ImVec2(ox + source_gutter_w + 4.f, y + 1.f), ln_col, ln_buf);
+			dl->AddText(ImVec2(ox + source_gutter_w + fold_gutter_w + 4.f, y + 1.f), ln_col, ln_buf);
         }
+
+		const int fold_end = cached_fold_end(i);
+		if (fold_end > i) {
+			const float cx = ox + source_gutter_w + fold_gutter_w * 0.5f;
+			const float cy = y + line_h * 0.5f;
+			const bool collapsed = current_document().fold_ends.find(i) != current_document().fold_ends.end();
+			if (collapsed)
+				dl->AddTriangleFilled(ImVec2(cx - 2.f, cy - 4.f), ImVec2(cx - 2.f, cy + 4.f),
+					ImVec2(cx + 3.f, cy), aida::ui::with_alpha(th.text_secondary, a));
+			else
+				dl->AddTriangleFilled(ImVec2(cx - 4.f, cy - 2.f), ImVec2(cx + 4.f, cy - 2.f),
+					ImVec2(cx, cy + 3.f), aida::ui::with_alpha(th.text_secondary, a));
+		}
 
 
         if (i >= 0 && i < static_cast<int>(s_cache.tokens.size()) &&
@@ -3850,7 +4591,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                                    : aida::ui::with_alpha(th.error, 0.18f * a);
             auto draw_box = [&](int bl, int bc) {
                 float bx = ox + text_x0 + static_cast<float>(bc) * char_w - s_scroll_x;
-                float by = oy + static_cast<float>(bl) * line_h - s_scroll_y;
+                const int bracket_row = visual_row_for(bl);
+                if (logical_line_for(bracket_row) != bl) return;
+                float by = oy + static_cast<float>(bracket_row) * line_h - s_scroll_y;
                 if (by < oy - line_h || by > oy + editor_h) return;
                 dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + char_w, by + line_h), fill_col, 2.f);
                 dl->AddRect(ImVec2(bx, by), ImVec2(bx + char_w, by + line_h), box_col, 2.f, 0, 1.f);
@@ -3864,7 +4607,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (s_has_focus) {
         float caret_alpha_pulse = aida::ui::clock::pulse(2.0f, 0.30f, 1.0f);
         float cx = ox + text_x0 + static_cast<float>(s_sel.caret_col) * char_w - s_scroll_x;
-        float cy = oy + static_cast<float>(s_sel.caret_line) * line_h - s_scroll_y;
+        float cy = oy + static_cast<float>(visual_row_for(s_sel.caret_line)) * line_h - s_scroll_y;
         if (cy >= oy - line_h && cy <= oy + editor_h) {
             dl->AddLine(ImVec2(cx, cy), ImVec2(cx, cy + line_h),
                         aida::ui::with_alpha(th.accent_hover, caret_alpha_pulse * a), 1.5f);
@@ -3998,7 +4741,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             float absorb = s_ghost_absorb.is_finished() ? 0.f : (1.f - s_ghost_absorb.eased());
             float vis_alpha = (gv * 0.45f + 0.05f) * a * (1.f - s_ghost_absorb.eased() * 0.6f);
             float gx = ox + text_x0 + static_cast<float>(s_sel.caret_col) * char_w - s_scroll_x;
-            float gy = oy + static_cast<float>(s_sel.caret_line) * line_h - s_scroll_y;
+            float gy = oy + static_cast<float>(visual_row_for(s_sel.caret_line)) * line_h - s_scroll_y;
             if (gy >= oy - line_h && gy <= oy + editor_h) {
                 ImU32 ghost_col = aida::ui::with_alpha(th.text_dim, vis_alpha);
                 dl->AddText(ImVec2(gx, gy + 1.f), ghost_col, s_ghost_text.c_str());
@@ -4040,7 +4783,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 			mp.x >= ox && mp.x < ox + source_gutter_w &&
 			mp.y >= oy && mp.y <= oy + editor_h;
 		if (in_source_gutter) {
-			const int marker_line = clamp_line(static_cast<int>(
+			const int marker_line = logical_line_for(static_cast<int>(
 				(mp.y - oy + s_scroll_y) / line_h));
 			if (source_markers.markers) {
 				const auto found = std::lower_bound(source_markers.markers->begin(),
@@ -4068,6 +4811,20 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 				static_cast<void>(source_debug_service::request_toggle(
 					current_document().filepath,
 					static_cast<std::uint32_t>(marker_line + 1), &ignored));
+			}
+		}
+		const bool in_fold_gutter = mp.x >= ox + source_gutter_w &&
+			mp.x < ox + source_gutter_w + fold_gutter_w && mp.y >= oy && mp.y <= oy + editor_h;
+		if (in_fold_gutter) {
+			in_editor = false;
+			in_text = false;
+			const int line = logical_line_for(static_cast<int>((mp.y - oy + s_scroll_y) / line_h));
+			const int end = cached_fold_end(line);
+			if (end > line) {
+				ImGui::SetTooltip(current_document().fold_ends.count(line) != 0 ? "Expand lines %d-%d" : "Collapse lines %d-%d",
+					line + 1, end + 1);
+				if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+					static_cast<void>(code_editor_widget::toggle_document_fold(s_active_document_id, line));
 			}
 		}
 
@@ -4642,11 +5399,11 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         if (top > total - visible) top = std::max(0, total - visible);
 
         float sx = ox + text_x0 + static_cast<float>(autocomplete::cursor_col) * char_w - s_scroll_x;
-        float sy = oy + static_cast<float>(autocomplete::cursor_line + 1) * line_h - s_scroll_y + 4.f;
+        float sy = oy + static_cast<float>(visual_row_for(autocomplete::cursor_line) + 1) * line_h - s_scroll_y + 4.f;
         if (sx + popup_w > ox + code_w) sx = ox + code_w - popup_w - 4.f;
         if (sx < ox + text_x0) sx = ox + text_x0;
         if (sy + popup_h > oy + editor_h)
-            sy = oy + static_cast<float>(autocomplete::cursor_line) * line_h - s_scroll_y - popup_h;
+            sy = oy + static_cast<float>(visual_row_for(autocomplete::cursor_line)) * line_h - s_scroll_y - popup_h;
 
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         ImVec2 pmin(sx, sy);
@@ -5051,7 +5808,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     {
-        float total_content = static_cast<float>(n_lines) * line_h;
+        float total_content = static_cast<float>(visible_line_count) * line_h;
         if (total_content > editor_h) {
             const float sb_w   = 10.f;
             const float sb_pad = 2.f;
@@ -5233,7 +5990,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 #endif
         }
 
-        float natural_line_h = (n_lines > 0) ? (mm_h / static_cast<float>(n_lines)) : 1.f;
+        float natural_line_h = (visible_line_count > 0)
+            ? (mm_h / static_cast<float>(visible_line_count)) : 1.f;
         float mm_line_h = natural_line_h;
         if (mm_line_h > 4.f) mm_line_h = 4.f;
         if (mm_line_h < 1.f) mm_line_h = 1.f;
@@ -5243,7 +6001,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         bool sampled = (natural_line_h < 1.f);
         int row_count = sampled
             ? static_cast<int>(std::ceil(mm_h / mm_line_h))
-            : n_lines;
+            : visible_line_count;
         if (row_count < 0) row_count = 0;
 
         float base_alpha = 0.75f + mm_hov_v * 0.20f;
@@ -5253,11 +6011,11 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         for (int row = 0; row < row_count; row++) {
             int i = sampled
                 ? static_cast<int>(((static_cast<float>(row) + 0.5f) /
-                                    static_cast<float>(row_count)) * static_cast<float>(n_lines))
+                                    static_cast<float>(row_count)) * static_cast<float>(visible_line_count))
                 : row;
             if (i < 0) i = 0;
-            if (i >= n_lines) break;
-            const std::size_t line_index = static_cast<std::size_t>(i);
+            if (i >= visible_line_count) break;
+            const std::size_t line_index = static_cast<std::size_t>(logical_line_for(i));
             if (line_index >= s_cache.tokens.size() || line_index >= s_cache.lines.size()) break;
 
             float ly = mm_y + static_cast<float>(row) * mm_line_h;
@@ -5299,7 +6057,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         }
 
         if (n_lines > 0) {
-            const float content_height = static_cast<float>(n_lines) * line_h;
+            const float content_height = static_cast<float>(visible_line_count) * line_h;
             float view_y0 = mm_y + (s_scroll_y / std::max(1.f, content_height)) * mm_h;
             float view_h  = (editor_h / std::max(1.f, content_height)) * mm_h;
             if (view_h < 12.f) view_h = 12.f;
@@ -5313,9 +6071,9 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 4.f, 0, 1.f);
         }
 
-        const int caret_line = clamp_line(s_sel.caret_line);
+        const int caret_line = visual_row_for(clamp_line(s_sel.caret_line));
         float caret_mm_y = mm_y + (static_cast<float>(caret_line) /
-                                   std::max(1.f, static_cast<float>(n_lines))) * mm_h;
+                                   std::max(1.f, static_cast<float>(visible_line_count))) * mm_h;
         dl->AddLine(ImVec2(mm_x + 2.f, caret_mm_y),
                     ImVec2(mm_max.x - 2.f, caret_mm_y),
                     aida::ui::with_alpha(th.accent_u32, 0.65f * a), 1.f);
@@ -5325,14 +6083,14 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             if (local < 0.f) local = 0.f;
             if (local > 1.f) local = 1.f;
             s_target_scroll_y = local * std::max(
-                0.f, static_cast<float>(n_lines) * line_h - editor_h * 0.5f);
+                0.f, static_cast<float>(visible_line_count) * line_h - editor_h * 0.5f);
         }
         if (mm_hov && ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f)) {
             float local = (ImGui::GetIO().MousePos.y - mm_y) / mm_h;
             if (local < 0.f) local = 0.f;
             if (local > 1.f) local = 1.f;
             s_target_scroll_y = local * std::max(
-                0.f, static_cast<float>(n_lines) * line_h - editor_h * 0.5f);
+                0.f, static_cast<float>(visible_line_count) * line_h - editor_h * 0.5f);
         }
     }
 

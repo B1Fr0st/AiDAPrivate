@@ -27,20 +27,14 @@ enum class context_menu_open_origin_t : std::uint8_t {
     accessibility
 };
 
-enum class context_menu_visibility_t : std::uint8_t {
-    hide_when_unavailable,
-    show_disabled
-};
-
 struct context_menu_action_t {
     stable_action_id_t action;
     std::string label_override;
     std::string description_override;
     std::string icon_override;
     std::string shortcut_override;
+    stable_action_id_t shortcut_action;
     int order = 0;
-    context_menu_visibility_t visibility = context_menu_visibility_t::show_disabled;
-    bool close_menu_on_execute = true;
 };
 
 struct context_menu_section_t {
@@ -77,7 +71,6 @@ struct context_menu_presented_action_t {
     bool enabled = false;
     bool undoable = false;
     bool reviewable = false;
-    bool close_menu_on_execute = true;
 };
 
 struct context_menu_presented_section_t {

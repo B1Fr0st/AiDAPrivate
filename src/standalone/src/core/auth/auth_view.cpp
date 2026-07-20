@@ -14,16 +14,13 @@
 #include "theme.hpp"
 #include "motion.hpp"
 #include "clock.hpp"
-#include "transition.hpp"
 #include "components.hpp"
 #include "responsive.hpp"
-#include "blur_layer.hpp"
-#include "brand.hpp"
-#include "avatar.hpp"
-#include "empty_state.hpp"
 #include "fonts.hpp"
+#include "../ui/design_system.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "auth_preview_platform.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #include "../infra/executor.hpp"
 #endif
@@ -89,73 +86,18 @@ namespace auth_view {
 			error_state
 		};
 
-		struct modal_brand_t {
-			const char* display_name;
-			const char* subtitle;
-			brand_glyph::kind_t glyph_kind;
-			ImU32 grad_top;
-			ImU32 grad_bot;
-			ImU32 ring;
-		};
-
-		static const modal_brand_t k_brand_claude_code = {
-			"Claude Code",     "Anthropic OAuth (PKCE)",
-			brand_glyph::kind_t::anthropic,
-			IM_COL32(228, 168, 132, 255), IM_COL32(196, 124, 84, 255),
-			IM_COL32(255, 200, 168, 220)
-		};
-		static const modal_brand_t k_brand_codex = {
-			"OpenAI Codex",    "ChatGPT OAuth (PKCE)",
-			brand_glyph::kind_t::openai,
-			IM_COL32(106, 220, 178, 255), IM_COL32(40, 168, 138, 255),
-			IM_COL32(160, 240, 210, 220)
-		};
-		static const modal_brand_t k_brand_copilot = {
-			"GitHub Copilot",  "GitHub Device Code",
-			brand_glyph::kind_t::github,
-			IM_COL32(60, 64, 92, 255),    IM_COL32(28, 32, 52, 255),
-			IM_COL32(150, 158, 198, 220)
-		};
-
 		struct modal_anim_t {
-			aida::ui::transition_t enter;
-			aida::ui::transition_t exit;
-			aida::ui::transition_t shake;
-			aida::ui::transition_t success;
-			aida::ui::transition_t sparkle;
-			bool exiting = false;
 			bool success_played = false;
 
 			void reset_for_open()
 			{
-				exit.reset();
-				shake.reset();
-				success.reset();
-				sparkle.reset();
-				exiting = false;
 				success_played = false;
-				enter.start(aida::motion::dur::lg, aida::motion::ease::out_back);
-			}
-
-			void begin_exit()
-			{
-				if (exiting) return;
-				exiting = true;
-				exit.start(aida::motion::dur::md, aida::motion::ease::in_out_cubic);
-			}
-
-			void begin_shake()
-			{
-				shake.start(aida::motion::dur::md + 0.060f, aida::motion::ease::out_quad);
 			}
 
 			void begin_success()
 			{
 				if (success_played) return;
-				if (exiting) return;
 				success_played = true;
-				success.start(aida::motion::dur::lg, aida::motion::ease::out_quint);
-				sparkle.start(aida::motion::dur::lg, aida::motion::ease::out_quint);
 			}
 		};
 
@@ -282,8 +224,6 @@ namespace auth_view {
 			modal_anim_t codex_anim;
 			modal_anim_t copilot_anim;
 			modal_anim_t claude_code_anim;
-
-			aida::ui::flash_t copilot_copy_flash;
 
 			std::string selected_provider_id;
 			refresh_state_t refresh;
@@ -1249,21 +1189,6 @@ namespace auth_view {
 			}
 		}
 
-		static void request_close_codex()
-		{
-			g_state.codex_anim.begin_exit();
-		}
-
-		static void request_close_copilot()
-		{
-			g_state.copilot_anim.begin_exit();
-		}
-
-		static void request_close_claude_code()
-		{
-			g_state.claude_code_anim.begin_exit();
-		}
-
 		static void poll_active_logins()
 		{
 			std::unique_lock<std::mutex> lk(g_state.mtx);
@@ -1364,7 +1289,6 @@ namespace auth_view {
 						toast_notification::toast_type_t::error, 6.0f);
 					aida::events::publish(aida::events::event_oauth_failed,
 						aida::events::oauth_failed_t{ "openai", err });
-					g_state.codex_anim.begin_shake();
 					lk.lock();
 				}
 			}
@@ -1465,7 +1389,6 @@ namespace auth_view {
 						toast_notification::toast_type_t::error, 6.0f);
 					aida::events::publish(aida::events::event_oauth_failed,
 						aida::events::oauth_failed_t{ "github-copilot", err });
-					g_state.copilot_anim.begin_shake();
 					lk.lock();
 				}
 			}
@@ -1567,7 +1490,6 @@ namespace auth_view {
 						toast_notification::toast_type_t::error, 6.0f);
 					aida::events::publish(aida::events::event_oauth_failed,
 						aida::events::oauth_failed_t{ "anthropic", err });
-					g_state.claude_code_anim.begin_shake();
 					lk.lock();
 				}
 			}
@@ -2907,288 +2829,39 @@ namespace auth_view {
 			ImGui::EndChild();
 		}
 
-		static void render_phase_chips(ImDrawList* fdl, float x, float y, float w,
-									   flow_phase_t phase, float alpha,
-									   ImU32 accent_top, ImU32 accent_bot, bool is_device_flow)
+		static const char* flow_phase_label(flow_phase_t phase)
 		{
-			const auto& th = aida::ui::resolved();
-			const char* labels[3];
-			if (is_device_flow) {
-				labels[0] = "Device Code";
-				labels[1] = "Browser";
-				labels[2] = "Session";
-			} else {
-				labels[0] = "Browser";
-				labels[1] = "Callback";
-				labels[2] = "Session";
-			}
-
-			int active = 0;
-			int completed = 0;
 			switch (phase) {
-				case flow_phase_t::idle:
-				case flow_phase_t::browser:    active = 0; completed = 0; break;
-				case flow_phase_t::callback:   active = 1; completed = 1; break;
-				case flow_phase_t::session:    active = 2; completed = 2; break;
-				case flow_phase_t::complete:   active = -1; completed = 3; break;
-				case flow_phase_t::error_state:active = -1; completed = 0; break;
+			case flow_phase_t::idle: return "Preparing";
+			case flow_phase_t::browser: return "Browser authentication";
+			case flow_phase_t::callback: return "Callback received";
+			case flow_phase_t::session: return "Finalizing session";
+			case flow_phase_t::complete: return "Connected";
+			case flow_phase_t::error_state: return "Authentication failed";
 			}
-
-			ImFont* f = aida::ui::fonts::caption();
-			float fs = aida::ui::components::detail::ui_fs() * 0.82f;
-
-			float chip_h = 28.f;
-			float gap = 8.f;
-			float chip_w = (w - gap * 2.f) / 3.f;
-
-			float pulse = aida::ui::clock::pulse(0.7f, 0.75f, 1.f);
-
-			for (int i = 0; i < 3; ++i) {
-				float cx = x + (chip_w + gap) * (float)i;
-				float cy = y;
-				ImVec2 ca = ImVec2(cx, cy);
-				ImVec2 cb = ImVec2(cx + chip_w, cy + chip_h);
-
-				bool is_active = (i == active);
-				bool is_done = (i < completed);
-
-				ImU32 fill = aida::ui::with_alpha(th.panel_header, alpha * 0.85f);
-				ImU32 border = aida::ui::with_alpha(th.border_subtle, alpha);
-				ImU32 text_col = aida::ui::with_alpha(th.text_dim, alpha);
-
-				if (is_done) {
-					fill = aida::ui::with_alpha(aida::ui::mix(th.success_soft, th.success, 0.35f), alpha);
-					border = aida::ui::with_alpha(th.success, alpha * 0.7f);
-					text_col = aida::ui::with_alpha(th.success, alpha);
-				} else if (is_active) {
-					ImU32 grad_top = aida::ui::with_alpha(accent_top, alpha * pulse);
-					ImU32 grad_bot = aida::ui::with_alpha(accent_bot, alpha * pulse);
-					ImU32 grad_flat = aida::ui::mix(grad_top, grad_bot, 0.5f);
-					fdl->AddRectFilled(ca, cb, grad_flat, chip_h * 0.5f);
-					border = aida::ui::with_alpha(th.accent_hover, alpha);
-					text_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), alpha);
-				}
-
-				if (!is_active || is_done) {
-					fdl->AddRectFilled(ca, cb, fill, chip_h * 0.5f);
-				}
-				fdl->AddRect(ca, cb, border, chip_h * 0.5f, 0, 1.f);
-
-				float dot_r = 4.5f;
-				float dot_x = cx + 12.f;
-				float dot_y = cy + chip_h * 0.5f;
-
-				if (is_done) {
-					aida::ui::brand::render_check_drawn(fdl,
-						ImVec2(dot_x, dot_y), 10.f, 1.f,
-						aida::ui::with_alpha(th.success, alpha), 2.f);
-				} else if (is_active) {
-					fdl->AddCircleFilled(ImVec2(dot_x, dot_y), dot_r * pulse,
-						aida::ui::with_alpha(IM_COL32(255, 255, 255, 235), alpha), 12);
-					fdl->AddCircle(ImVec2(dot_x, dot_y), dot_r + 1.5f,
-						aida::ui::with_alpha(IM_COL32(255, 255, 255, 100), alpha * pulse), 12, 1.f);
-				} else {
-					fdl->AddCircle(ImVec2(dot_x, dot_y), dot_r,
-						aida::ui::with_alpha(th.text_dim, alpha * 0.6f), 12, 1.f);
-				}
-
-				ImVec2 lts = f->CalcTextSizeA(fs, FLT_MAX, 0.f, labels[i]);
-				fdl->AddText(f, fs,
-					ImVec2(cx + chip_w - lts.x - 12.f, cy + (chip_h - lts.y) * 0.5f),
-					text_col, labels[i]);
-
-				if (i < 2) {
-					float lx0 = cx + chip_w;
-					float lx1 = cx + chip_w + gap;
-					float ly = cy + chip_h * 0.5f;
-					ImU32 conn_col = (i < completed)
-						? aida::ui::with_alpha(th.success, alpha * 0.7f)
-						: aida::ui::with_alpha(th.border_subtle, alpha);
-					fdl->AddLine(ImVec2(lx0, ly), ImVec2(lx1, ly), conn_col, 1.5f);
-				}
-			}
+			return "Unknown";
 		}
 
-		struct sheet_layout_t {
-			float px;
-			float py;
-			float pw;
-			float ph;
-			float alpha;
-			float scale;
-			float shake_offset_x;
-		};
-
-		static sheet_layout_t render_modal_chrome(ImDrawList* fdl, modal_anim_t& ma,
-			float pw, float ph, ImU32 stripe_top, ImU32 stripe_bot)
+		static float flow_phase_progress(flow_phase_t phase)
 		{
-			float dt = aida::ui::clock::dt();
-			ma.enter.tick(dt);
-			ma.exit.tick(dt);
-			ma.shake.tick(dt);
-			ma.success.tick(dt);
-			ma.sparkle.tick(dt);
-
-			const auto& th = aida::ui::resolved();
-			ImVec2 display = ImGui::GetIO().DisplaySize;
-
-			float enter_t = ma.enter.eased();
-			float exit_t = ma.exit.eased();
-			float visible = enter_t * (1.f - exit_t);
-
-			float dim_alpha = visible * 0.f;
-			(void)dim_alpha;
-
-			float scale = 0.92f + 0.08f * enter_t;
-			scale *= (1.f - 0.04f * exit_t);
-
-			float right_margin = 36.f;
-			float bottom_margin = 36.f;
-			float anchor_x = display.x - right_margin;
-			float anchor_y = display.y - bottom_margin;
-
-			float sw = pw * scale;
-			float sh = ph * scale;
-			float px_target = anchor_x - sw;
-			float py_target = anchor_y - sh;
-
-			float slide = (1.f - enter_t) * 16.f + exit_t * 16.f;
-			float py = py_target + slide;
-			float px = px_target;
-
-			float shake_x = 0.f;
-			if (ma.shake.active || ma.shake.progress > 0.001f) {
-				float st = ma.shake.progress;
-				float decay = 1.f - st;
-				float osc = sinf(st * 6.2831853f * 3.0f);
-				shake_x = osc * 6.f * decay;
+			switch (phase) {
+			case flow_phase_t::idle: return 0.05f;
+			case flow_phase_t::browser: return 0.25f;
+			case flow_phase_t::callback: return 0.60f;
+			case flow_phase_t::session: return 0.85f;
+			case flow_phase_t::complete: return 1.0f;
+			case flow_phase_t::error_state: return 0.0f;
 			}
-			px += shake_x;
-
-			sheet_layout_t out;
-			out.px = px;
-			out.py = py;
-			out.pw = sw;
-			out.ph = sh;
-			out.alpha = visible;
-			out.scale = scale;
-			out.shake_offset_x = shake_x;
-
-			ImVec2 a = ImVec2(px, py);
-			ImVec2 b = ImVec2(px + sw, py + sh);
-
-			aida::ui::blur::render_drop_shadow(fdl, a, b, 14.f, 4,
-				0.30f * visible, ImVec2(0.f, 6.f));
-
-			ImU32 fill = aida::ui::with_alpha(th.bg_elevated, visible);
-			fdl->AddRectFilled(a, b, fill, 14.f);
-
-			ImU32 glass = aida::ui::with_alpha(th.glass_tint, visible);
-			fdl->AddRectFilled(a, b, glass, 14.f);
-
-			ImU32 border = aida::ui::with_alpha(th.border_strong, visible);
-			fdl->AddRect(a, b, border, 14.f, 0, 1.f);
-
-			ImU32 stripe_a = aida::ui::with_alpha(stripe_top, visible);
-			ImU32 stripe_b = aida::ui::with_alpha(stripe_bot, visible);
-			fdl->AddRectFilledMultiColor(
-				ImVec2(a.x + 1.f, a.y + 1.f),
-				ImVec2(b.x - 1.f, a.y + 4.f),
-				stripe_a, stripe_b, stripe_b, stripe_a);
-
-			return out;
+			return 0.0f;
 		}
 
-		static bool draw_sheet_button(ImDrawList* fdl, float bx, float by, float bw, float bh,
-			const char* label, aida::ui::button_kind_t kind, float alpha,
-			bool pulse_gentle = false, bool disabled = false)
+		static flow_phase_t derive_phase_codex(
+			const aida::auth::codex::codex_login_state_t* state,
+			const modal_anim_t& modal, bool exchange_in_progress)
 		{
-			const auto& th = aida::ui::resolved();
-			ImVec2 mp = ImGui::GetIO().MousePos;
-			bool hov = mp.x >= bx && mp.x <= bx + bw && mp.y >= by && mp.y <= by + bh && !disabled;
-
-			float pulse = pulse_gentle ? aida::ui::clock::pulse(0.42f, 0.97f, 1.02f) : 1.f;
-			float scale = (hov ? 1.02f : 1.0f) * pulse;
-			float dx = (bw - bw * scale) * 0.5f;
-			float dy = (bh - bh * scale) * 0.5f;
-			ImVec2 a = ImVec2(bx + dx, by + dy);
-			ImVec2 b = ImVec2(bx + bw - dx, by + bh - dy);
-
-			ImU32 fill_top, fill_bot, border, text_col;
-			switch (kind) {
-				case aida::ui::button_kind_t::primary:
-					fill_top = aida::ui::with_alpha(th.accent_grad_top, alpha);
-					fill_bot = aida::ui::with_alpha(th.accent_grad_bot, alpha);
-					border = aida::ui::with_alpha(th.accent_hover, alpha);
-					text_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), alpha);
-					break;
-				case aida::ui::button_kind_t::destructive:
-					fill_top = aida::ui::with_alpha(th.error, alpha * 0.18f);
-					fill_bot = aida::ui::with_alpha(th.error, alpha * 0.22f);
-					border = aida::ui::with_alpha(th.error, alpha * 0.55f);
-					text_col = aida::ui::with_alpha(th.error, alpha);
-					break;
-				case aida::ui::button_kind_t::secondary:
-				default:
-					fill_top = aida::ui::with_alpha(th.panel_header, alpha);
-					fill_bot = aida::ui::with_alpha(th.panel_header, alpha);
-					border = aida::ui::with_alpha(th.border_subtle, alpha * (1.f + (hov ? 0.6f : 0.f)));
-					text_col = aida::ui::with_alpha(th.text_primary, alpha);
-					break;
-			}
-
-			{
-				ImU32 fill_flat = aida::ui::mix(fill_top, fill_bot, 0.5f);
-				fdl->AddRectFilled(a, b, fill_flat, 8.f);
-			}
-			fdl->AddRect(a, b, border, 8.f, 0, 1.f);
-
-			if (hov) {
-				ImU32 wash = aida::ui::with_alpha(IM_COL32(255, 255, 255, 32), alpha);
-				fdl->AddRectFilled(a, b, wash, 8.f);
-				ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-			}
-
-			ImFont* f = aida::ui::fonts::body_em();
-			float fs = aida::ui::components::detail::ui_fs() * 0.98f;
-			ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.f, label);
-			fdl->AddText(f, fs,
-				ImVec2(a.x + (bw - ts.x) * 0.5f, a.y + (bh - ts.y) * 0.5f),
-				text_col, label);
-
-			return hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-		}
-
-		static void render_modal_header(ImDrawList* fdl, const sheet_layout_t& sl,
-			const modal_brand_t& def, const char* title)
-		{
-			const auto& th = aida::ui::resolved();
-			float alpha = sl.alpha;
-
-			float glyph_r = 16.f;
-			float glyph_cx = sl.px + 22.f + glyph_r;
-			float glyph_cy = sl.py + 24.f + glyph_r;
-			brand_glyph::render(fdl, def.glyph_kind, ImVec2(glyph_cx, glyph_cy), glyph_r,
-				def.grad_top, def.grad_bot, def.ring, alpha);
-
-			ImFont* f_h2 = aida::ui::fonts::h2();
-			ImFont* f_caption = aida::ui::fonts::caption();
-			const float base_fs = aida::ui::components::detail::ui_fs();
-			fdl->AddText(f_h2, base_fs * 1.18f,
-				ImVec2(glyph_cx + glyph_r + 14.f, glyph_cy - base_fs * 0.95f),
-				aida::ui::with_alpha(th.text_primary, alpha), title);
-
-			fdl->AddText(f_caption, base_fs * 0.88f,
-				ImVec2(glyph_cx + glyph_r + 14.f, glyph_cy + 4.f),
-				aida::ui::with_alpha(th.text_secondary, alpha), def.subtitle);
-		}
-
-		static flow_phase_t derive_phase_codex(const aida::auth::codex::codex_login_state_t* sp,
-			const modal_anim_t& ma, bool exchange_in_progress)
-		{
-			if (ma.success_played) return flow_phase_t::complete;
-			if (!sp) return flow_phase_t::browser;
-			const auto value = aida::auth::codex::snapshot(*sp);
+			if (modal.success_played) return flow_phase_t::complete;
+			if (!state) return flow_phase_t::idle;
+			const auto value = aida::auth::codex::snapshot(*state);
 			if (value.done && !exchange_in_progress && !value.error.empty())
 				return flow_phase_t::error_state;
 			if (value.done) return flow_phase_t::session;
@@ -3196,12 +2869,13 @@ namespace auth_view {
 			return flow_phase_t::browser;
 		}
 
-		static flow_phase_t derive_phase_claude(const aida::auth::claude_code::claude_code_login_state_t* sp,
-			const modal_anim_t& ma, bool exchange_in_progress)
+		static flow_phase_t derive_phase_claude(
+			const aida::auth::claude_code::claude_code_login_state_t* state,
+			const modal_anim_t& modal, bool exchange_in_progress)
 		{
-			if (ma.success_played) return flow_phase_t::complete;
-			if (!sp) return flow_phase_t::browser;
-			const auto value = aida::auth::claude_code::snapshot(*sp);
+			if (modal.success_played) return flow_phase_t::complete;
+			if (!state) return flow_phase_t::idle;
+			const auto value = aida::auth::claude_code::snapshot(*state);
 			if (value.done && !exchange_in_progress && !value.error.empty())
 				return flow_phase_t::error_state;
 			if (value.done) return flow_phase_t::session;
@@ -3209,12 +2883,13 @@ namespace auth_view {
 			return flow_phase_t::browser;
 		}
 
-		static flow_phase_t derive_phase_copilot(const aida::auth::copilot::copilot_login_state_t* sp,
-			const modal_anim_t& ma, bool poll_in_progress)
+		static flow_phase_t derive_phase_copilot(
+			const aida::auth::copilot::copilot_login_state_t* state,
+			const modal_anim_t& modal, bool poll_in_progress)
 		{
-			if (ma.success_played) return flow_phase_t::complete;
-			if (!sp) return flow_phase_t::browser;
-			const auto value = aida::auth::copilot::snapshot(*sp);
+			if (modal.success_played) return flow_phase_t::complete;
+			if (!state) return flow_phase_t::idle;
+			const auto value = aida::auth::copilot::snapshot(*state);
 			if (value.done && !poll_in_progress && !value.error.empty())
 				return flow_phase_t::error_state;
 			if (value.done) return flow_phase_t::session;
@@ -3222,498 +2897,293 @@ namespace auth_view {
 			return flow_phase_t::browser;
 		}
 
-		static void render_modal_footer_overlay(ImDrawList* fdl, const sheet_layout_t& sl,
-			modal_anim_t& ma, ImU32 accent_col)
+		static void render_provider_state(const char* stable_id,
+			const char* provider, const char* flow, flow_phase_t phase,
+			const std::string& error)
 		{
-			float alpha = sl.alpha;
-			if (ma.success.progress > 0.001f) {
-				float t01 = ma.success.eased();
-				float cx = sl.px + sl.pw * 0.5f;
-				float cy = sl.py + sl.ph * 0.5f;
-				aida::ui::brand::render_check_drawn(fdl, ImVec2(cx, cy), 32.f, t01,
-					aida::ui::with_alpha(accent_col, alpha), 3.5f);
-			}
-			if (ma.sparkle.progress > 0.001f) {
-				float t01 = ma.sparkle.eased();
-				float cx = sl.px + sl.pw * 0.5f;
-				float cy = sl.py + sl.ph * 0.5f;
-				aida::ui::brand::render_sparkle_burst(fdl, ImVec2(cx, cy),
-					t01, 60.f, aida::ui::with_alpha(accent_col, alpha), 10);
-			}
-		}
-
-		static void tick_modal_post_success(modal_anim_t& ma)
-		{
-			if (ma.success_played && ma.success.is_finished() && !ma.exiting) {
-				ma.begin_exit();
-			}
-		}
-
-		static bool modal_should_dismiss(const modal_anim_t& ma)
-		{
-			return ma.exiting && ma.exit.is_finished();
+			aida::ui::design::state_presentation_t state;
+			state.stable_id = stable_id;
+			state.state = !error.empty() ? aida::ui::design::view_state_t::error
+				: phase == flow_phase_t::complete ? aida::ui::design::view_state_t::empty
+					: aida::ui::design::view_state_t::loading;
+			state.title = flow_phase_label(phase);
+			state.message = !error.empty() ? error.c_str()
+				: phase == flow_phase_t::complete
+					? "The provider credential was validated and committed."
+					: "Authentication is running in a cancellable background task.";
+			state.target = provider;
+			state.stage = flow;
+			state.progress = !error.empty() ? -1.0f : flow_phase_progress(phase);
+			state.diagnostic_id = !error.empty() ? stable_id : nullptr;
+			state.preserves_stale_data = true;
+			aida::ui::design::render_state(state);
 		}
 
 		static void render_codex_modal()
 		{
 			if (!g_state.codex_modal_open.load()) return;
+			constexpr const char* id = "aida.auth.provider.openai";
+			constexpr const char* title = "Sign in with OpenAI";
+			if (!ImGui::IsPopupOpen("Sign in with OpenAI###aida.auth.provider.openai"))
+				aida::ui::design::open_dialog(id, title);
+			if (!aida::ui::design::begin_dialog(id, title,
+					ImVec2(560.0f, 430.0f), ImVec2(400.0f, 300.0f)))
+				return;
 
-			ImDrawList* fdl = ImGui::GetForegroundDrawList();
-			const float pw = 460.f;
-			const float ph = 320.f;
-
-			const modal_brand_t& def = k_brand_codex;
-			sheet_layout_t sl = render_modal_chrome(fdl, g_state.codex_anim, pw, ph,
-				def.grad_top, def.grad_bot);
-
-			render_modal_header(fdl, sl, def, "Sign in with OpenAI");
-
-			const auto& th = aida::ui::resolved();
-			ImU32 accent_col = aida::ui::mix(def.grad_top, def.grad_bot, 0.5f);
-
-			std::string url_open;
-			std::string err_text;
-			flow_phase_t phase = flow_phase_t::browser;
-			const bool starting_in_progress = g_state.codex_start.active.load();
-			const bool exchange_in_progress = g_state.codex_exchange_in_flight.load();
+			std::string url;
+			std::string error;
+			flow_phase_t phase = flow_phase_t::idle;
+			const bool starting = g_state.codex_start.active.load();
+			const bool exchanging = g_state.codex_exchange_in_flight.load();
 			{
-				std::lock_guard<std::mutex> lk(g_state.mtx);
+				std::lock_guard<std::mutex> lock(g_state.mtx);
 				if (g_state.codex_state) {
-					const auto value = aida::auth::codex::snapshot(*g_state.codex_state);
-					if (!starting_in_progress)
-						url_open = value.auth_url;
-					if (value.done && !exchange_in_progress)
-						err_text = value.error;
-					phase = derive_phase_codex(g_state.codex_state.get(), g_state.codex_anim,
-						exchange_in_progress);
+					const auto snapshot = aida::auth::codex::snapshot(*g_state.codex_state);
+					if (!starting) url = snapshot.auth_url;
+					if (snapshot.done && !exchanging) error = snapshot.error;
+					phase = derive_phase_codex(
+						g_state.codex_state.get(), g_state.codex_anim, exchanging);
 				}
 			}
-
-			float chip_y = sl.py + 76.f;
-			render_phase_chips(fdl, sl.px + 22.f, chip_y, sl.pw - 44.f,
-				phase, sl.alpha, def.grad_top, def.grad_bot, false);
-
-			float center_x = sl.px + sl.pw * 0.5f;
-			float orbit_y = sl.py + 156.f;
-
-			if (g_state.codex_anim.success_played) {
-				aida::ui::brand::render_check_drawn(fdl, ImVec2(center_x, orbit_y), 28.f,
-					g_state.codex_anim.success.eased(),
-					aida::ui::with_alpha(accent_col, sl.alpha), 3.f);
-			} else {
-				aida::ui::brand::render_orbit_ring(fdl, ImVec2(center_x, orbit_y), 18.f, 4, 2.5f,
-					accent_col, sl.alpha);
-				aida::ui::brand::render_orbit_ring(fdl, ImVec2(center_x, orbit_y), 11.f, 3, -1.7f,
-					aida::ui::lighten(accent_col, 30), sl.alpha * 0.85f);
+			const bool complete = phase == flow_phase_t::complete;
+			const char* confirm_label = complete ? "Close" : "Open Browser";
+			const float footer_height =
+				aida::ui::design::dialog_footer_reserve_height(confirm_label, "Cancel");
+			aida::ui::design::begin_dialog_body("auth.openai.body", footer_height);
+			if (aida::ui::design::begin_property_grid("auth.openai.identity", 130.0f)) {
+				aida::ui::design::property_value("provider", "Provider", "OpenAI Codex");
+				aida::ui::design::property_value("flow", "Flow", "ChatGPT OAuth with PKCE");
+				aida::ui::design::property_value("callback", "Callback", "localhost:1455");
+				aida::ui::design::end_property_grid();
 			}
-
-			std::string status = "Waiting for browser callback (port 1455)";
-			if (!err_text.empty()) status = "Error: " + err_text;
-			else if (phase == flow_phase_t::session) status = "Finalizing session";
-			else if (phase == flow_phase_t::callback) status = "Received callback, exchanging code";
-
-			ImFont* f_body = aida::ui::fonts::body();
-			const float status_fs = aida::ui::components::detail::ui_fs() * 0.95f;
-			ImVec2 ss = f_body->CalcTextSizeA(status_fs, FLT_MAX, 0.f, status.c_str());
-			fdl->AddText(f_body, status_fs,
-				ImVec2(sl.px + (sl.pw - ss.x) * 0.5f, sl.py + 198.f),
-				aida::ui::with_alpha(th.text_secondary, sl.alpha * 0.95f), status.c_str());
-
-			float bw = (sl.pw - 44.f - 10.f) * 0.5f;
-			float bh = 36.f;
-			float bx_open = sl.px + 22.f;
-			float bx_cancel = bx_open + bw + 10.f;
-			float by = sl.py + sl.ph - bh - 18.f;
-
-			if (draw_sheet_button(fdl, bx_open, by, bw, bh, "Open browser",
-					aida::ui::button_kind_t::primary, sl.alpha, true) && !url_open.empty()) {
-				open_url_in_browser(url_open);
+			render_provider_state("auth.openai.state", "OpenAI Codex",
+				"OAuth callback", phase, error);
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"auth.openai.footer", confirm_label, complete || !url.empty(), false,
+				"Cancel", true, false);
+			if (footer.confirmed) {
+				if (complete) {
+					close_codex_modal_immediate();
+					ImGui::CloseCurrentPopup();
+				} else {
+					open_url_in_browser(url);
+				}
 			}
-
-			if (draw_sheet_button(fdl, bx_cancel, by, bw, bh, "Cancel",
-					aida::ui::button_kind_t::secondary, sl.alpha)) {
-				request_close_codex();
-			}
-
-			render_modal_footer_overlay(fdl, sl, g_state.codex_anim, accent_col);
-			tick_modal_post_success(g_state.codex_anim);
-
-			if (modal_should_dismiss(g_state.codex_anim)) {
+			if (footer.cancelled) {
 				close_codex_modal_immediate();
+				ImGui::CloseCurrentPopup();
 			}
+			ImGui::EndPopup();
 		}
 
 		static void render_claude_code_modal()
 		{
 			if (!g_state.claude_code_modal_open.load()) return;
+			constexpr const char* id = "aida.auth.provider.anthropic";
+			constexpr const char* title = "Sign in with Claude";
+			if (!ImGui::IsPopupOpen("Sign in with Claude###aida.auth.provider.anthropic"))
+				aida::ui::design::open_dialog(id, title);
+			if (!aida::ui::design::begin_dialog(id, title,
+					ImVec2(560.0f, 430.0f), ImVec2(400.0f, 300.0f)))
+				return;
 
-			ImDrawList* fdl = ImGui::GetForegroundDrawList();
-			const float pw = 460.f;
-			const float ph = 320.f;
-
-			const modal_brand_t& def = k_brand_claude_code;
-			sheet_layout_t sl = render_modal_chrome(fdl, g_state.claude_code_anim, pw, ph,
-				def.grad_top, def.grad_bot);
-
-			render_modal_header(fdl, sl, def, "Sign in with Claude");
-
-			const auto& th = aida::ui::resolved();
-			ImU32 accent_col = aida::ui::mix(def.grad_top, def.grad_bot, 0.5f);
-
-			std::string url_open;
-			std::string err_text;
-			flow_phase_t phase = flow_phase_t::browser;
-			const bool starting_in_progress = g_state.claude_code_start.active.load();
-			const bool exchange_in_progress = g_state.claude_code_exchange_in_flight.load();
+			std::string url;
+			std::string error;
+			flow_phase_t phase = flow_phase_t::idle;
+			const bool starting = g_state.claude_code_start.active.load();
+			const bool exchanging = g_state.claude_code_exchange_in_flight.load();
 			{
-				std::lock_guard<std::mutex> lk(g_state.mtx);
+				std::lock_guard<std::mutex> lock(g_state.mtx);
 				if (g_state.claude_code_state) {
-					const auto value = aida::auth::claude_code::snapshot(*g_state.claude_code_state);
-					if (!starting_in_progress)
-						url_open = value.auth_url;
-					if (value.done && !exchange_in_progress)
-						err_text = value.error;
+					const auto snapshot =
+						aida::auth::claude_code::snapshot(*g_state.claude_code_state);
+					if (!starting) url = snapshot.auth_url;
+					if (snapshot.done && !exchanging) error = snapshot.error;
 					phase = derive_phase_claude(g_state.claude_code_state.get(),
-						g_state.claude_code_anim, exchange_in_progress);
+						g_state.claude_code_anim, exchanging);
 				}
 			}
-
-			float chip_y = sl.py + 76.f;
-			render_phase_chips(fdl, sl.px + 22.f, chip_y, sl.pw - 44.f,
-				phase, sl.alpha, def.grad_top, def.grad_bot, false);
-
-			float center_x = sl.px + sl.pw * 0.5f;
-			float orbit_y = sl.py + 156.f;
-
-			if (g_state.claude_code_anim.success_played) {
-				aida::ui::brand::render_check_drawn(fdl, ImVec2(center_x, orbit_y), 28.f,
-					g_state.claude_code_anim.success.eased(),
-					aida::ui::with_alpha(accent_col, sl.alpha), 3.f);
-			} else {
-				aida::ui::brand::render_orbit_ring(fdl, ImVec2(center_x, orbit_y), 18.f, 4, 2.5f,
-					accent_col, sl.alpha);
-				aida::ui::brand::render_orbit_ring(fdl, ImVec2(center_x, orbit_y), 11.f, 3, -1.7f,
-					aida::ui::lighten(accent_col, 30), sl.alpha * 0.85f);
+			const bool complete = phase == flow_phase_t::complete;
+			const char* confirm_label = complete ? "Close" : "Open Browser";
+			const float footer_height =
+				aida::ui::design::dialog_footer_reserve_height(confirm_label, "Cancel");
+			aida::ui::design::begin_dialog_body("auth.anthropic.body", footer_height);
+			if (aida::ui::design::begin_property_grid("auth.anthropic.identity", 130.0f)) {
+				aida::ui::design::property_value("provider", "Provider", "Claude Code");
+				aida::ui::design::property_value("flow", "Flow", "Anthropic OAuth with PKCE");
+				aida::ui::design::property_value("scope", "Scope",
+					"Claude Code provider session");
+				aida::ui::design::end_property_grid();
 			}
-
-			std::string status = "Waiting for browser callback";
-			if (!err_text.empty()) status = "Error: " + err_text;
-			else if (phase == flow_phase_t::session) status = "Finalizing session";
-			else if (phase == flow_phase_t::callback) status = "Received callback, exchanging code";
-
-			ImFont* f_body = aida::ui::fonts::body();
-			const float status_fs = aida::ui::components::detail::ui_fs() * 0.95f;
-			ImVec2 ss = f_body->CalcTextSizeA(status_fs, FLT_MAX, 0.f, status.c_str());
-			fdl->AddText(f_body, status_fs,
-				ImVec2(sl.px + (sl.pw - ss.x) * 0.5f, sl.py + 198.f),
-				aida::ui::with_alpha(th.text_secondary, sl.alpha * 0.95f), status.c_str());
-
-			float bw = (sl.pw - 44.f - 10.f) * 0.5f;
-			float bh = 36.f;
-			float bx_open = sl.px + 22.f;
-			float bx_cancel = bx_open + bw + 10.f;
-			float by = sl.py + sl.ph - bh - 18.f;
-
-			if (draw_sheet_button(fdl, bx_open, by, bw, bh, "Open browser",
-					aida::ui::button_kind_t::primary, sl.alpha, true) && !url_open.empty()) {
-				open_url_in_browser(url_open);
+			render_provider_state("auth.anthropic.state", "Claude Code",
+				"OAuth callback", phase, error);
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"auth.anthropic.footer", confirm_label, complete || !url.empty(), false,
+				"Cancel", true, false);
+			if (footer.confirmed) {
+				if (complete) {
+					close_claude_code_modal_immediate();
+					ImGui::CloseCurrentPopup();
+				} else {
+					open_url_in_browser(url);
+				}
 			}
-
-			if (draw_sheet_button(fdl, bx_cancel, by, bw, bh, "Cancel",
-					aida::ui::button_kind_t::secondary, sl.alpha)) {
-				request_close_claude_code();
-			}
-
-			render_modal_footer_overlay(fdl, sl, g_state.claude_code_anim, accent_col);
-			tick_modal_post_success(g_state.claude_code_anim);
-
-			if (modal_should_dismiss(g_state.claude_code_anim)) {
+			if (footer.cancelled) {
 				close_claude_code_modal_immediate();
+				ImGui::CloseCurrentPopup();
 			}
+			ImGui::EndPopup();
+		}
+
+		static std::string trimmed_enterprise_url()
+		{
+			std::string value = g_state.copilot_ghe_buf;
+			while (!value.empty() &&
+				(value.back() == ' ' || value.back() == '\t' ||
+				 value.back() == '\r' || value.back() == '\n'))
+				value.pop_back();
+			std::size_t first = 0;
+			while (first < value.size() &&
+				(value[first] == ' ' || value[first] == '\t'))
+				++first;
+			if (first != 0) value.erase(0, first);
+			return value;
 		}
 
 		static void render_copilot_modal()
 		{
 			if (!g_state.copilot_modal_open.load()) return;
-
-			ImDrawList* fdl = ImGui::GetForegroundDrawList();
-			const float pw = 480.f;
-			const float ph = 388.f;
-
-			const modal_brand_t& def = k_brand_copilot;
-			sheet_layout_t sl = render_modal_chrome(fdl, g_state.copilot_anim, pw, ph,
-				def.grad_top, def.grad_bot);
-
-			render_modal_header(fdl, sl, def, "Sign in with GitHub Copilot");
-
-			const auto& th = aida::ui::resolved();
-			ImU32 accent_col = aida::ui::mix(th.accent_grad_top, th.accent_grad_bot, 0.5f);
+			constexpr const char* id = "aida.auth.provider.github-copilot";
+			constexpr const char* title = "Sign in with GitHub Copilot";
+			if (!ImGui::IsPopupOpen(
+					"Sign in with GitHub Copilot###aida.auth.provider.github-copilot"))
+				aida::ui::design::open_dialog(id, title);
+			if (!aida::ui::design::begin_dialog(id, title,
+					ImVec2(580.0f, 500.0f), ImVec2(420.0f, 320.0f)))
+				return;
 
 			const bool flow_started = g_state.copilot_flow_started.load();
-
 			if (!flow_started) {
-				ImFont* f_caption = aida::ui::fonts::caption();
-				ImFont* f_body = aida::ui::fonts::body();
-
-				const char* prompt = "Optional: enter your GitHub Enterprise URL, "
-					"or leave blank to use github.com.";
-				const float prompt_fs = aida::ui::components::detail::ui_fs() * 0.95f;
-				ImVec2 ps = f_body->CalcTextSizeA(prompt_fs, FLT_MAX, sl.pw - 44.f, prompt);
-				fdl->AddText(f_body, prompt_fs,
-					ImVec2(sl.px + 22.f, sl.py + 84.f),
-					aida::ui::with_alpha(th.text_secondary, sl.alpha * 0.95f),
-					prompt, nullptr, sl.pw - 44.f);
-
-				float label_y = sl.py + 84.f + ps.y + 12.f;
-				fdl->AddText(f_caption, aida::ui::components::detail::ui_fs() * 0.85f,
-					ImVec2(sl.px + 22.f, label_y),
-					aida::ui::with_alpha(th.text_secondary, sl.alpha),
-					"GitHub Enterprise URL (optional)");
-
-				float input_x = sl.px + 22.f;
-				float input_y = label_y + 16.f;
-				float input_w = sl.pw - 44.f;
-				float input_h = 36.f;
-
-				ImU32 input_fill = aida::ui::with_alpha(th.bg_elevated, sl.alpha * 0.85f);
-				fdl->AddRectFilled(ImVec2(input_x, input_y),
-					ImVec2(input_x + input_w, input_y + input_h), input_fill, 8.f);
-				ImU32 input_border = aida::ui::with_alpha(th.border_subtle, sl.alpha);
-				fdl->AddRect(ImVec2(input_x, input_y),
-					ImVec2(input_x + input_w, input_y + input_h), input_border, 8.f, 0, 1.f);
-
-				ImGui::SetNextWindowPos(ImVec2(sl.px, sl.py), ImGuiCond_Always);
-				ImGui::SetNextWindowSize(ImVec2(sl.pw, sl.ph), ImGuiCond_Always);
-				ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-				ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
-				ImGui::PushStyleVar(ImGuiStyleVar_Alpha, sl.alpha);
-
-				const ImGuiWindowFlags flags =
-					ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-					ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-					ImGuiWindowFlags_NoSavedSettings |
-#ifndef AIDA_IMGUI_STUDIO_PREVIEW
-					ImGuiWindowFlags_NoDocking |
-#endif
-					ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
-					ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing;
-
-				if (ImGui::Begin("##aida_copilot_preflow", nullptr, flags)) {
-					float input_text_x = input_x + 10.f;
-					float input_text_y = input_y + (input_h - ImGui::GetFontSize()) * 0.5f;
-					ImGui::SetCursorScreenPos(ImVec2(input_text_x, input_text_y));
-					ImGui::PushItemWidth(input_w - 20.f);
-
-					ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
-					ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
-					ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
-					ImGui::PushStyleColor(ImGuiCol_Text,
-						ImGui::ColorConvertU32ToFloat4(
-							aida::ui::with_alpha(th.text_primary, sl.alpha)));
-					ImGui::PushStyleColor(ImGuiCol_TextDisabled,
-						ImGui::ColorConvertU32ToFloat4(
-							aida::ui::with_alpha(th.text_dim, sl.alpha)));
-					ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.f, 0.f));
-
-					if (ImGui::IsWindowAppearing())
-						ImGui::SetKeyboardFocusHere();
-
-					ImGui::InputTextWithHint("##copilot_ghe_url",
-						"https://github.your-company.com",
-						g_state.copilot_ghe_buf,
-						sizeof(g_state.copilot_ghe_buf));
-
-					ImGui::PopStyleVar();
-					ImGui::PopStyleColor(5);
-					ImGui::PopItemWidth();
+				aida::ui::design::form_state_t form;
+				const std::string enterprise = trimmed_enterprise_url();
+				if (!enterprise.empty() &&
+					(enterprise.rfind("https://", 0) != 0 ||
+					 enterprise.find_first_of(" \t\r\n") != std::string::npos)) {
+					form.reject("enterprise-url",
+						"Use an absolute HTTPS URL without whitespace.");
 				}
-				ImGui::End();
-
-				ImGui::PopStyleVar(3);
-				ImGui::PopStyleColor(2);
-
-				float bw = (sl.pw - 44.f - 10.f) * 0.5f;
-				float bh = 36.f;
-				float bx_start = sl.px + 22.f;
-				float bx_cancel = bx_start + bw + 10.f;
-				float by = sl.py + sl.ph - bh - 18.f;
-
-				if (draw_sheet_button(fdl, bx_start, by, bw, bh, "Start login",
-						aida::ui::button_kind_t::primary, sl.alpha, true)
-					&& !g_state.copilot_anim.exiting) {
-					std::string trimmed = g_state.copilot_ghe_buf;
-					while (!trimmed.empty()
-						&& (trimmed.back() == ' ' || trimmed.back() == '\t'
-							|| trimmed.back() == '\r' || trimmed.back() == '\n'))
-						trimmed.pop_back();
-					size_t first_non_ws = 0;
-					while (first_non_ws < trimmed.size()
-						&& (trimmed[first_non_ws] == ' ' || trimmed[first_non_ws] == '\t'))
-						++first_non_ws;
-					if (first_non_ws > 0)
-						trimmed.erase(0, first_non_ws);
-					std::optional<std::string> ghe;
-					if (!trimmed.empty())
-						ghe = trimmed;
-					start_copilot_flow(ghe);
+				const float footer_height =
+					aida::ui::design::dialog_footer_reserve_height(
+						"Start Login", "Cancel");
+				aida::ui::design::begin_dialog_body(
+					"auth.github-copilot.setup.body", footer_height);
+				if (aida::ui::design::begin_property_grid(
+						"auth.github-copilot.setup.identity", 130.0f)) {
+					aida::ui::design::property_value(
+						"provider", "Provider", "GitHub Copilot");
+					aida::ui::design::property_value(
+						"flow", "Flow", "GitHub device code");
+					aida::ui::design::end_property_grid();
 				}
-
-				if (draw_sheet_button(fdl, bx_cancel, by, bw, bh, "Cancel",
-						aida::ui::button_kind_t::secondary, sl.alpha)) {
-					request_close_copilot();
+				aida::ui::design::form_input_text("enterprise-url",
+					"GitHub Enterprise URL", g_state.copilot_ghe_buf,
+					sizeof(g_state.copilot_ghe_buf), form,
+					"https://github.your-company.com (optional)");
+				aida::ui::design::form_summary(
+					"auth.github-copilot.setup.form", form);
+				ImGui::TextWrapped(
+					"Leave the URL empty to authenticate with github.com. Credentials remain owned by the existing encrypted provider store.");
+				aida::ui::design::end_dialog_body();
+				const auto footer = aida::ui::design::dialog_footer(
+					"auth.github-copilot.setup.footer", "Start Login",
+					form.valid(), false, "Cancel", true, true);
+				if (footer.confirmed && form.valid()) {
+					const std::string normalized = trimmed_enterprise_url();
+					start_copilot_flow(normalized.empty()
+						? std::optional<std::string>{}
+						: std::optional<std::string>{normalized});
 				}
-
-				render_modal_footer_overlay(fdl, sl, g_state.copilot_anim, accent_col);
-				tick_modal_post_success(g_state.copilot_anim);
-
-				if (modal_should_dismiss(g_state.copilot_anim)) {
+				if (footer.cancelled) {
 					close_copilot_modal_immediate();
+					ImGui::CloseCurrentPopup();
 				}
+				ImGui::EndPopup();
 				return;
 			}
 
 			std::string user_code;
-			std::string verify_uri;
-			std::string err_text;
-			flow_phase_t phase = flow_phase_t::browser;
-			bool have_code = false;
-			const bool starting_in_progress = g_state.copilot_start.active.load();
-			const bool poll_in_progress = g_state.copilot_poll_in_flight.load();
+			std::string verification_uri;
+			std::string error;
+			flow_phase_t phase = flow_phase_t::idle;
+			const bool starting = g_state.copilot_start.active.load();
+			const bool polling = g_state.copilot_poll_in_flight.load();
 			{
-				std::lock_guard<std::mutex> lk(g_state.mtx);
+				std::lock_guard<std::mutex> lock(g_state.mtx);
 				if (g_state.copilot_state) {
-					const auto value = aida::auth::copilot::snapshot(*g_state.copilot_state);
-					if (!starting_in_progress) {
-						user_code = value.user_code;
-						verify_uri = value.verification_uri;
-						have_code = !user_code.empty();
+					const auto snapshot =
+						aida::auth::copilot::snapshot(*g_state.copilot_state);
+					if (!starting) {
+						user_code = snapshot.user_code;
+						verification_uri = snapshot.verification_uri;
 					}
-					if (value.done && !poll_in_progress)
-						err_text = value.error;
+					if (snapshot.done && !polling) error = snapshot.error;
 					phase = derive_phase_copilot(g_state.copilot_state.get(),
-						g_state.copilot_anim, poll_in_progress);
+						g_state.copilot_anim, polling);
 				}
 			}
-
-			float chip_y = sl.py + 76.f;
-			render_phase_chips(fdl, sl.px + 22.f, chip_y, sl.pw - 44.f,
-				phase, sl.alpha, th.accent_grad_top, th.accent_grad_bot, true);
-
-			if (have_code) {
-				ImFont* fdisp = aida::ui::fonts::display();
-				float code_size = aida::ui::components::detail::ui_fs() * 1.5f;
-				float chip_h = 56.f;
-				float chip_pad_x = 24.f;
-				ImVec2 code_ts = fdisp->CalcTextSizeA(code_size, FLT_MAX, 0.f, user_code.c_str());
-				float chip_w = code_ts.x + chip_pad_x * 2.f + 60.f;
-				if (chip_w > sl.pw - 44.f) chip_w = sl.pw - 44.f;
-				float chip_x = sl.px + (sl.pw - chip_w) * 0.5f;
-				float chip_y_code = sl.py + 124.f;
-
-				ImU32 fill_top = aida::ui::with_alpha(th.accent_grad_top, sl.alpha);
-				ImU32 fill_bot = aida::ui::with_alpha(th.accent_grad_bot, sl.alpha);
-				ImU32 fill_flat = aida::ui::mix(fill_top, fill_bot, 0.5f);
-				fdl->AddRectFilled(
-					ImVec2(chip_x, chip_y_code),
-					ImVec2(chip_x + chip_w, chip_y_code + chip_h),
-					fill_flat, 10.f);
-				fdl->AddRect(
-					ImVec2(chip_x, chip_y_code),
-					ImVec2(chip_x + chip_w, chip_y_code + chip_h),
-					aida::ui::with_alpha(th.accent_hover, sl.alpha), 10.f, 0, 1.5f);
-
-				fdl->AddText(fdisp, code_size,
-					ImVec2(chip_x + chip_pad_x, chip_y_code + (chip_h - code_ts.y) * 0.5f),
-					aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), sl.alpha),
-					user_code.c_str());
-
-				float copy_w = 50.f;
-				float copy_h = 32.f;
-				float copy_x = chip_x + chip_w - copy_w - 12.f;
-				float copy_y = chip_y_code + (chip_h - copy_h) * 0.5f;
-				ImVec2 mp = ImGui::GetIO().MousePos;
-				bool copy_hov = mp.x >= copy_x && mp.x <= copy_x + copy_w
-					&& mp.y >= copy_y && mp.y <= copy_y + copy_h;
-				ImU32 copy_bg = aida::ui::with_alpha(IM_COL32(255, 255, 255, copy_hov ? 60 : 30), sl.alpha);
-				fdl->AddRectFilled(ImVec2(copy_x, copy_y), ImVec2(copy_x + copy_w, copy_y + copy_h),
-					copy_bg, 6.f);
-				fdl->AddRect(ImVec2(copy_x, copy_y), ImVec2(copy_x + copy_w, copy_y + copy_h),
-					aida::ui::with_alpha(IM_COL32(255, 255, 255, 120), sl.alpha), 6.f, 0, 1.f);
-				ImFont* f_em = aida::ui::fonts::body_em();
-				const float copy_fs = aida::ui::components::detail::ui_fs() * 0.95f;
-				ImVec2 cs = f_em->CalcTextSizeA(copy_fs, FLT_MAX, 0.f, "Copy");
-				fdl->AddText(f_em, copy_fs,
-					ImVec2(copy_x + (copy_w - cs.x) * 0.5f, copy_y + (copy_h - cs.y) * 0.5f),
-					aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), sl.alpha), "Copy");
-
-				if (copy_hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-				if (copy_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			const bool complete = phase == flow_phase_t::complete;
+			const char* confirm_label = complete ? "Close" : "Open Verification";
+			const float footer_height =
+				aida::ui::design::dialog_footer_reserve_height(confirm_label, "Cancel");
+			aida::ui::design::begin_dialog_body(
+				"auth.github-copilot.flow.body", footer_height);
+			if (aida::ui::design::begin_property_grid(
+					"auth.github-copilot.flow.identity", 130.0f)) {
+				aida::ui::design::property_value(
+					"provider", "Provider", "GitHub Copilot");
+				aida::ui::design::property_value(
+					"flow", "Flow", "GitHub device code");
+				if (!user_code.empty())
+					aida::ui::design::property_value(
+						"device-code", "Device code", user_code.c_str(),
+						aida::ui::design::semantic_t::info);
+				aida::ui::design::end_property_grid();
+			}
+			if (!user_code.empty()) {
+				if (ImGui::Button("Copy Device Code##auth-github-copilot-copy")) {
 					ImGui::SetClipboardText(user_code.c_str());
 					toast_notification::push("Code copied",
 						toast_notification::toast_type_t::info, 2.5f);
-					g_state.copilot_copy_flash.trigger();
 				}
-
-				float flash_v = g_state.copilot_copy_flash.tick(aida::ui::clock::dt(), 2.0f);
-				if (flash_v > 0.f) {
-					ImVec2 burst_c = ImVec2(copy_x + copy_w * 0.5f, copy_y + copy_h * 0.5f);
-					aida::ui::brand::render_sparkle_burst(fdl, burst_c, 1.f - flash_v, 28.f,
-						aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), sl.alpha * flash_v), 8);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					"aida.auth.provider.github-copilot.copy-code", "command");
+#endif
+				aida::ui::design::tooltip_for_last_item(
+					"Copy the current device code to the clipboard");
+			}
+			render_provider_state("auth.github-copilot.state", "GitHub Copilot",
+				"Device authorization", phase, error);
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"auth.github-copilot.flow.footer", confirm_label,
+				complete || !verification_uri.empty(), false,
+				"Cancel", true, false);
+			if (footer.confirmed) {
+				if (complete) {
+					close_copilot_modal_immediate();
+					ImGui::CloseCurrentPopup();
+				} else {
+					open_url_in_browser(verification_uri);
 				}
 			}
-
-			float orbit_y = sl.py + ph - 122.f;
-			float center_x = sl.px + sl.pw * 0.5f;
-
-			if (g_state.copilot_anim.success_played) {
-				aida::ui::brand::render_check_drawn(fdl, ImVec2(center_x, orbit_y), 24.f,
-					g_state.copilot_anim.success.eased(),
-					aida::ui::with_alpha(accent_col, sl.alpha), 3.f);
-			} else if (have_code) {
-				aida::ui::brand::render_orbit_ring(fdl, ImVec2(center_x, orbit_y), 14.f, 4, 2.0f,
-					accent_col, sl.alpha * 0.85f);
-			}
-
-			std::string status_text = "Initializing device flow";
-			if (!err_text.empty()) status_text = "Error: " + err_text;
-			else if (phase == flow_phase_t::session) status_text = "Authorizing";
-			else if (have_code) status_text = "Polling GitHub for completion";
-
-			ImFont* f_body = aida::ui::fonts::body();
-			const float status_fs = aida::ui::components::detail::ui_fs() * 0.95f;
-			ImVec2 ss = f_body->CalcTextSizeA(status_fs, FLT_MAX, 0.f, status_text.c_str());
-			fdl->AddText(f_body, status_fs,
-				ImVec2(sl.px + (sl.pw - ss.x) * 0.5f, sl.py + ph - 88.f),
-				aida::ui::with_alpha(th.text_secondary, sl.alpha * 0.95f), status_text.c_str());
-
-			float bw = (sl.pw - 44.f - 10.f) * 0.5f;
-			float bh = 36.f;
-			float bx_open = sl.px + 22.f;
-			float bx_cancel = bx_open + bw + 10.f;
-			float by = sl.py + sl.ph - bh - 18.f;
-
-			std::string open_label = verify_uri.empty()
-				? std::string("Open verification")
-				: std::string("Open github.com");
-
-			if (draw_sheet_button(fdl, bx_open, by, bw, bh, open_label.c_str(),
-					aida::ui::button_kind_t::primary, sl.alpha, true) && !verify_uri.empty()) {
-				open_url_in_browser(verify_uri);
-			}
-
-			if (draw_sheet_button(fdl, bx_cancel, by, bw, bh, "Cancel",
-					aida::ui::button_kind_t::secondary, sl.alpha)) {
-				request_close_copilot();
-			}
-
-			render_modal_footer_overlay(fdl, sl, g_state.copilot_anim, accent_col);
-			tick_modal_post_success(g_state.copilot_anim);
-
-			if (modal_should_dismiss(g_state.copilot_anim)) {
+			if (footer.cancelled) {
 				close_copilot_modal_immediate();
+				ImGui::CloseCurrentPopup();
 			}
+			ImGui::EndPopup();
 		}
 
 	}

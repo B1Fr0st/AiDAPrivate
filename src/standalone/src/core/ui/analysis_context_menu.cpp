@@ -41,9 +41,7 @@ stable_view_id_t active_view(menu_kind_t kind) {
     return stable_view_id_t("document.disassembly");
 }
 
-}
-
-void open(context_t context, context_menu_open_origin_t origin) {
+application_ui::retained_entity_context_t make_retained(context_t context) {
     application_ui::retained_entity_context_t retained;
     retained.owner_id = k_owner;
     retained.entity_id = context.entity_id.empty()
@@ -77,7 +75,20 @@ void open(context_t context, context_menu_open_origin_t origin) {
         action.check_state = entry.second.check_state;
         retained.actions.push_back(std::move(action));
     }
-    application_ui::open_retained_entity_context_menu(std::move(retained), origin);
+    return retained;
+}
+
+}
+
+void open(context_t context, context_menu_open_origin_t origin) {
+    application_ui::open_retained_entity_context_menu(
+        make_retained(std::move(context)), origin);
+}
+
+bool execute_shortcut(context_t context, const char* action_id) {
+    const auto retained = make_retained(std::move(context));
+    return application_ui::execute_retained_entity_action(action_id,
+        action_invocation_source_t::shortcut, retained).executed();
 }
 
 void render() {

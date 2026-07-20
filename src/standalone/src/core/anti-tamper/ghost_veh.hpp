@@ -669,6 +669,9 @@ namespace detail {
     }
 }
 
+using detail::dispatch;
+using detail::ghost_veh_thunk;
+
 inline bool is_active()
 {
     return detail::state().active.load(std::memory_order_acquire);

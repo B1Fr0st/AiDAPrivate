@@ -139,7 +139,7 @@ public:
     }
 
     workbench_error_t apply_overlay(std::uint64_t,
-                                    const disasm_document::disasm_overlay_entry_t& entry) override
+                                    const disasm_document::disasm_overlay_entry_t& entry) const override
     {
         for (auto& e : entries_) {
             if (e.address == entry.address) {
@@ -152,7 +152,7 @@ public:
     }
 
     workbench_error_t remove_overlay(std::uint64_t,
-                                     std::uint64_t address) override
+                                     std::uint64_t address) const override
     {
         auto it = std::remove_if(entries_.begin(), entries_.end(),
             [address](const auto& e) { return e.address == address; });
@@ -163,7 +163,7 @@ public:
     }
 
 private:
-    std::vector<disasm_document::disasm_overlay_entry_t> entries_;
+    mutable std::vector<disasm_document::disasm_overlay_entry_t> entries_;
 };
 
 class disasm_nav_t final : public disasm_document::disasm_navigation_adapter_t {
@@ -272,7 +272,7 @@ public:
     }
 
     workbench_error_t apply_overlay(std::uint64_t,
-                                    const hex_document::hex_overlay_entry_t& entry) override
+                                    const hex_document::hex_overlay_entry_t& entry) const override
     {
         for (auto& e : entries_) {
             if (e.address == entry.address) {
@@ -285,7 +285,7 @@ public:
     }
 
     workbench_error_t remove_overlay(std::uint64_t,
-                                     std::uint64_t address) override
+                                     std::uint64_t address) const override
     {
         auto it = std::remove_if(entries_.begin(), entries_.end(),
             [address](const auto& e) { return e.address == address; });
@@ -296,7 +296,7 @@ public:
     }
 
 private:
-    std::vector<hex_document::hex_overlay_entry_t> entries_;
+    mutable std::vector<hex_document::hex_overlay_entry_t> entries_;
 };
 
 class hex_nav_t final : public hex_document::hex_navigation_adapter_t {

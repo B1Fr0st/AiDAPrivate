@@ -12,12 +12,14 @@
 #include "../../helpers/helpers.h"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #include "../analysis/workspace_search.hpp"
 #endif
 #include "../session/analysis_session.hpp"
 #include "../settings/standalone_settings.hpp"
 #include "../infra/executor.hpp"
+#include "../runtime/standalone_driver.hpp"
 
 #include "imgui/imgui.h"
 #include "ide_icons.h"
@@ -28,10 +30,13 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -46,6 +51,16 @@ namespace {
 
 std::string path_key(const std::string& path);
 std::vector<std::string> s_workspace_search_scope;
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+void register_entity_row(std::string_view prefix, std::string_view semantic_type,
+    std::string_view identity) {
+    const std::string semantic = aida::preview::semantics::stable_id(prefix,
+        aida::preview::semantics::entity_token(identity));
+    static_cast<void>(aida::preview::semantics::register_last_item(semantic,
+        semantic_type));
+}
+#endif
 
 std::filesystem::path path_from_utf8(const std::string& value) {
 #if defined(__cpp_char8_t)
@@ -937,6 +952,9 @@ bool render_explorer_row(int index, float row_height, float scale, int& focused_
     const bool activated = ImGui::Selectable("##explorer_row", selected,
         ImGuiSelectableFlags_AllowDoubleClick,
         ImVec2(width, row_height));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    register_entity_row("aida.explorer-row", "explorer-row", path_key(entry.full_path));
+#endif
     const bool focused = ImGui::IsItemFocused();
     const bool hovered = ImGui::IsItemHovered();
     const bool left_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
@@ -1382,21 +1400,27 @@ void render_global_file_operation_dialogs() {
     }
     if (state.name_dialog_open && design::begin_dialog("##project_explorer_name",
             operation_label(state.operation), ImVec2(520.0f, 230.0f), ImVec2(380.0f, 200.0f))) {
+        const char* confirm_label = state.operation == file_operation_t::rename ? "Rename" :
+            state.operation == file_operation_t::duplicate ? "Duplicate" : "Create";
+        const float footer_height = design::dialog_footer_reserve_height(confirm_label);
+        const bool focus_name = ImGui::IsWindowAppearing();
+        design::begin_dialog_body("project-explorer-name-body", footer_height);
         ImGui::TextWrapped("Target directory: %s",
             (state.source_directory && (state.operation == file_operation_t::new_file ||
                 state.operation == file_operation_t::new_folder)
                 ? state.source : path_to_utf8(path_from_utf8(state.source).parent_path())).c_str());
         ImGui::SetNextItemWidth(-1.0f);
+        if (focus_name)
+            ImGui::SetKeyboardFocusHere();
         if (ImGui::InputText("Name", state.name, sizeof(state.name)))
             valid_leaf_name(state.name, state.validation_error);
         if (!state.validation_error.empty())
             design::text(design::text_role_t::caption, state.validation_error.c_str());
         std::string validation;
         const bool valid = valid_leaf_name(state.name, validation);
+        design::end_dialog_body();
         const auto footer = design::dialog_footer("project-explorer-name-footer",
-            state.operation == file_operation_t::rename ? "Rename" :
-            state.operation == file_operation_t::duplicate ? "Duplicate" : "Create",
-            valid, false);
+            confirm_label, valid, false);
         if (footer.confirmed) {
             const std::filesystem::path source = path_from_utf8(state.source);
             const std::filesystem::path base = state.source_directory &&
@@ -1420,6 +1444,9 @@ void render_global_file_operation_dialogs() {
     }
     if (state.delete_dialog_open && design::begin_dialog("##project_explorer_delete",
             "Delete Workspace Item", ImVec2(560.0f, 250.0f), ImVec2(400.0f, 220.0f))) {
+        const float footer_height = design::dialog_footer_reserve_height(
+            "Delete Permanently");
+        design::begin_dialog_body("project-explorer-delete-body", footer_height);
         const bool batch = state.sources.size() > 1;
         design::text(design::text_role_t::title, batch
             ? "Delete these workspace items permanently?"
@@ -1435,6 +1462,9 @@ void render_global_file_operation_dialogs() {
             ImGui::TextWrapped("Target: %s", state.source.c_str());
         }
         ImGui::TextWrapped("This operation is not sent to the Recycle Bin and cannot be undone by AiDA. Every selected folder includes all of its children.");
+        if (!state.operation_error.empty())
+            design::text(design::text_role_t::caption, state.operation_error.c_str());
+        design::end_dialog_body();
         const auto footer = design::dialog_footer("project-explorer-delete-footer",
             "Delete Permanently", true, true);
         if (footer.confirmed) {
@@ -1452,8 +1482,6 @@ void render_global_file_operation_dialogs() {
             state.delete_dialog_open = false;
             ImGui::CloseCurrentPopup();
         }
-        if (!state.operation_error.empty())
-            design::text(design::text_role_t::caption, state.operation_error.c_str());
         ImGui::EndPopup();
     }
     ImGui::End();
@@ -1480,11 +1508,21 @@ void render_start_center() {
     const ImVec2 available = ImGui::GetContentRegionAvail();
     if (design::tiny_view_required(available, ImVec2(minimum_width,
             aida::ui::scale_px(260.0f, metrics.scale)))) {
+        const auto open_binary = application_ui::present_action("tools.load_binary");
+        const auto open_file = application_ui::present_action("file.open");
         const design::action_t actions[] = {
-            {"open-binary", "Open Binary", nullptr, "Open a binary analysis session", nullptr,
-                nullptr, components::button_kind_t::primary, true, true, true},
-            {"open-file", "Open File", nullptr, "Open a programming or data file", "Ctrl+O",
-                nullptr, components::button_kind_t::secondary, true, false, true}
+            {"open-binary", "Open Binary", nullptr,
+                open_binary.enabled || open_binary.disabled_reason.empty()
+                    ? open_binary.description.c_str() : open_binary.disabled_reason.c_str(),
+                open_binary.shortcut.empty() ? nullptr : open_binary.shortcut.c_str(),
+                nullptr, components::button_kind_t::primary,
+                open_binary.enabled, true, open_binary.visible},
+            {"open-file", "Open File", nullptr,
+                open_file.enabled || open_file.disabled_reason.empty()
+                    ? open_file.description.c_str() : open_file.disabled_reason.c_str(),
+                open_file.shortcut.empty() ? nullptr : open_file.shortcut.c_str(),
+                nullptr, components::button_kind_t::secondary,
+                open_file.enabled, false, open_file.visible}
         };
         const design::state_presentation_t state{"start-center-tiny", design::view_state_t::tiny,
             "Start Center", "Widen this dock to show recent sessions, workspace presets and diagnostics.",
@@ -1541,7 +1579,7 @@ void render_start_center() {
         render_start_action("file.restore_previous_session", "Restore Previous Session",
             "Open the most recent closed binary or analysis session", action_width);
         if (paired) ImGui::SameLine(0.0f, action_gap);
-        render_start_action("view.manage.view.recent", "Browse All Recent Work",
+        render_start_action("view.focus.view.recent", "Browse All Recent Work",
             "Open the dockable Recent view", paired ? action_width : ImGui::GetContentRegionAvail().x);
         render_start_action("file.new", "New Programming File",
             "Create an untitled code document", action_width);
@@ -1589,8 +1627,14 @@ void render_start_center() {
             ImGui::PushID(static_cast<int>(index));
             const std::string label = (session->filename.empty() ? path_leaf(session->path) : session->filename) +
                 "\n" + session->path;
-            if (ImGui::Selectable(label.c_str(), index == analysis_session::active_session_idx(),
-                    ImGuiSelectableFlags_AllowDoubleClick)) {
+            const bool activated = ImGui::Selectable(label.c_str(),
+                index == analysis_session::active_session_idx(),
+                ImGuiSelectableFlags_AllowDoubleClick);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_entity_row("aida.start-session-row", "session-row",
+                session->id);
+#endif
+            if (activated) {
                 selected_recent_path = session->path;
                 selected_recent_open = true;
                 analysis_session::switch_session(index);
@@ -1616,7 +1660,11 @@ void render_start_center() {
             rendered_recent = true;
             ImGui::PushID(path.c_str());
             const std::string label = path_leaf(path) + "\n" + path;
-            if (ImGui::Selectable(label.c_str(), selected_recent_path == path)) {
+            const bool activated = ImGui::Selectable(label.c_str(), selected_recent_path == path);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_entity_row("aida.start-recent-row", "recent-row", path_key(path));
+#endif
+            if (activated) {
                 selected_recent_path = path;
                 selected_recent_open = false;
                 request_recent_open(path);
@@ -1654,10 +1702,10 @@ void render_start_center() {
 
         ImGui::Spacing();
         render_start_section_label("Recovery and status");
-        render_start_action("view.manage.view.background_tasks", "Background Tasks",
+        render_start_action("view.focus.view.background_tasks", "Background Tasks",
             "Review long-running work and exact cancellation capability",
             ImGui::GetContentRegionAvail().x);
-        render_start_action("view.manage.view.diagnostics", "Diagnostics",
+        render_start_action("view.focus.view.diagnostics", "Diagnostics",
             "Review persistent failures, stable diagnostic IDs and recovery actions",
             ImGui::GetContentRegionAvail().x);
         render_start_action("tools.settings", "Settings",
@@ -1679,11 +1727,17 @@ void render_project_explorer() {
     if (design::tiny_view_required(available,
             ImVec2(aida::ui::scale_px(220.0f, metrics.scale),
                 aida::ui::scale_px(150.0f, metrics.scale)))) {
+		const auto open_folder = application_ui::present_action("file.open_folder");
+		const auto refresh = application_ui::present_action("explorer.refresh");
         const design::action_t actions[] = {
-            {"open-folder", "Open Folder", nullptr, "Open a Project Explorer root", "Ctrl+K",
-                nullptr, components::button_kind_t::primary, true, true, true},
-            {"refresh", "Refresh", nullptr, "Refresh the current Project Explorer root", nullptr,
-                nullptr, components::button_kind_t::secondary, !file_browser::roots.empty(), false, true}
+			{"open-folder", open_folder.label.c_str(), nullptr,
+				open_folder.enabled ? open_folder.description.c_str() : open_folder.disabled_reason.c_str(),
+				open_folder.shortcut.empty() ? nullptr : open_folder.shortcut.c_str(), nullptr,
+				components::button_kind_t::primary, open_folder.enabled, true, open_folder.visible},
+			{"refresh", refresh.label.c_str(), nullptr,
+				refresh.enabled ? refresh.description.c_str() : refresh.disabled_reason.c_str(),
+				refresh.shortcut.empty() ? nullptr : refresh.shortcut.c_str(), nullptr,
+				components::button_kind_t::secondary, refresh.enabled, false, refresh.visible}
         };
         const design::state_presentation_t compact{
             "project-explorer.tiny", design::view_state_t::tiny,
@@ -1702,13 +1756,26 @@ void render_project_explorer() {
         return;
     }
     const float toolbar_height = aida::ui::scale_px(36.0f, metrics.scale);
+	const auto open_folder = application_ui::present_action("file.open_folder");
+	const auto refresh = application_ui::present_action("explorer.refresh");
+	const auto search = application_ui::present_action("explorer.search");
+	auto toolbar_action = [](const char* id, const char* compact_label,
+		const application_ui::action_presentation_t& action,
+		components::button_kind_t kind, bool primary) {
+		return design::action_t{
+			id, action.label.c_str(), compact_label,
+			action.enabled ? action.description.c_str() : action.disabled_reason.c_str(),
+			action.shortcut.empty() ? nullptr : action.shortcut.c_str(), nullptr,
+			kind, action.enabled, primary, action.visible
+		};
+	};
     const design::action_t toolbar_actions[] = {
-        {"open-folder", "Open Folder", ICON_FILES_EMPTY, "Open a source, script, or binary workspace folder",
-            "Ctrl+K", nullptr, components::button_kind_t::secondary, true, true, true},
-        {"refresh", "Refresh", ICON_SPINNER, "Refresh the project tree from disk",
-            nullptr, nullptr, components::button_kind_t::ghost, true, false, true},
-        {"search", "Search", ICON_SEARCH, "Search files in the open workspace",
-            "Ctrl+Shift+F", nullptr, components::button_kind_t::ghost, true, false, true}
+		toolbar_action("open-folder", ICON_FILES_EMPTY, open_folder,
+			components::button_kind_t::secondary, true),
+		toolbar_action("refresh", ICON_SPINNER, refresh,
+			components::button_kind_t::ghost, false),
+		toolbar_action("search", ICON_SEARCH, search,
+			components::button_kind_t::ghost, false)
     };
     ImGui::BeginChild("##explorer_toolbar", ImVec2(0.0f, toolbar_height), false,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings);
@@ -1817,11 +1884,17 @@ void render_project_explorer() {
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_HorizontalScrollbar);
     const bool invalid_root = file_browser::index_state == file_browser::index_state_t::error;
     if (invalid_root) {
+		const auto open_folder = application_ui::present_action("file.open_folder");
+		const auto refresh = application_ui::present_action("explorer.refresh");
         const design::action_t actions[] = {
-            {"open-folder", "Open Folder", nullptr, "Choose an accessible workspace folder", "Ctrl+K",
-                nullptr, components::button_kind_t::primary, true, true, true},
-            {"retry", "Retry", nullptr, "Retry reading the current workspace root", nullptr,
-                nullptr, components::button_kind_t::secondary, true, false, true}
+			{"open-folder", open_folder.label.c_str(), nullptr,
+				open_folder.enabled ? open_folder.description.c_str() : open_folder.disabled_reason.c_str(),
+				open_folder.shortcut.empty() ? nullptr : open_folder.shortcut.c_str(), nullptr,
+				components::button_kind_t::primary, open_folder.enabled, true, open_folder.visible},
+			{"retry", "Retry", nullptr,
+				refresh.enabled ? "Retry reading the current workspace root" : refresh.disabled_reason.c_str(),
+				refresh.shortcut.empty() ? nullptr : refresh.shortcut.c_str(), nullptr,
+				components::button_kind_t::secondary, refresh.enabled, false, refresh.visible}
         };
         const design::state_presentation_t state{
             "project-explorer.error", design::view_state_t::error,
@@ -1842,9 +1915,12 @@ void render_project_explorer() {
         }
     } else if (file_browser::index_state == file_browser::index_state_t::cancelled &&
             file_browser::entries.empty()) {
+		const auto refresh = application_ui::present_action("explorer.refresh");
         const design::action_t retry_action{
-            "retry", "Refresh", nullptr, "Restart project indexing", nullptr,
-            nullptr, components::button_kind_t::primary, true, true, true
+			"retry", refresh.label.c_str(), nullptr,
+			refresh.enabled ? "Restart project indexing" : refresh.disabled_reason.c_str(),
+			refresh.shortcut.empty() ? nullptr : refresh.shortcut.c_str(), nullptr,
+			components::button_kind_t::primary, refresh.enabled, true, refresh.visible
         };
         const design::state_presentation_t state{
             "project-explorer.cancelled", design::view_state_t::empty,
@@ -1861,9 +1937,13 @@ void render_project_explorer() {
             (presentation.filter[0] != '\0' && presentation.visible_indices.empty())) {
         const bool no_root = file_browser::current_dir.empty();
         const bool no_results = !no_root && presentation.filter[0] != '\0';
+		const auto open_folder = application_ui::present_action("file.open_folder");
         const design::action_t open_action{
-            "open-folder", "Open Folder", nullptr, "Choose a project workspace folder", "Ctrl+K",
-            nullptr, components::button_kind_t::primary, true, true, no_root
+			"open-folder", open_folder.label.c_str(), nullptr,
+			open_folder.enabled ? open_folder.description.c_str() : open_folder.disabled_reason.c_str(),
+			open_folder.shortcut.empty() ? nullptr : open_folder.shortcut.c_str(), nullptr,
+			components::button_kind_t::primary, open_folder.enabled, true,
+			no_root && open_folder.visible
         };
         const design::state_presentation_t state{
             no_results ? "project-explorer.no-results" :
@@ -2028,7 +2108,15 @@ void render_workspace_search() {
                 const auto& result = results[result_index].second;
                 ImGui::PushID(source_index);
                 const std::string label = std::to_string(result.line_number) + ": " + result.line_text;
-                if (ImGui::Selectable(label.c_str(), workspace_search::g_search.selected_idx == source_index)) {
+                const bool activated = ImGui::Selectable(label.c_str(),
+                    workspace_search::g_search.selected_idx == source_index);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                const std::string result_identity = path_key(result.filepath) + ":" +
+					std::to_string(result.line_number);
+                register_entity_row("aida.workspace-search-row", "workspace-search-row",
+                    result_identity);
+#endif
+                if (activated) {
                     workspace_search::g_search.selected_idx = source_index;
                     open_search_result(result);
                 }
@@ -2088,8 +2176,14 @@ void render_recent() {
             const std::string label = (session->filename.empty() ? path_leaf(session->path) : session->filename) +
                 "\n" + session->path;
             const float row_width = (std::max)(1.0f, ImGui::GetContentRegionAvail().x - 54.0f);
-            if (ImGui::Selectable(label.c_str(), index == active_index || selected_path == session->path,
-                    ImGuiSelectableFlags_AllowDoubleClick, ImVec2(row_width, 0.0f))) {
+            const bool activated = ImGui::Selectable(label.c_str(),
+                index == active_index || selected_path == session->path,
+                ImGuiSelectableFlags_AllowDoubleClick, ImVec2(row_width, 0.0f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_entity_row("aida.binary-session-row", "session-row",
+                session->id);
+#endif
+            if (activated) {
                 selected_path = session->path;
                 selected_open = true;
                 analysis_session::switch_session(index);
@@ -2130,7 +2224,11 @@ void render_recent() {
             any = true;
             ImGui::PushID(static_cast<int>(open_count + index));
             const std::string label = path_leaf(path) + "\n" + path;
-            if (ImGui::Selectable(label.c_str(), selected_path == path)) {
+            const bool activated = ImGui::Selectable(label.c_str(), selected_path == path);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            register_entity_row("aida.binary-recent-row", "recent-row", path_key(path));
+#endif
+            if (activated) {
                 selected_path = path;
                 selected_open = false;
                 request_recent_open(path);
@@ -2166,63 +2264,283 @@ void render_recent() {
 
 void render_sessions() {
     g_render_section = "registry_sessions";
-    if (ImGui::Button("Open Binary..."))
-        application_ui::execute_action("file.open", action_invocation_source_t::toolbar);
+    const auto session_action = [](const char* action_id, const char* label) {
+        const auto presentation = application_ui::present_action(action_id);
+        if (!presentation.visible)
+            return false;
+        ImGui::BeginDisabled(!presentation.enabled);
+        const bool clicked = ImGui::Button(label);
+        ImGui::EndDisabled();
+        const char* detail = !presentation.enabled && !presentation.disabled_reason.empty()
+            ? presentation.disabled_reason.c_str() : presentation.description.c_str();
+        design::tooltip_for_last_item(detail,
+            presentation.shortcut.empty() ? nullptr : presentation.shortcut.c_str());
+        if (clicked)
+            static_cast<void>(application_ui::execute_action(
+                action_id, action_invocation_source_t::toolbar));
+        return clicked;
+    };
+    session_action("tools.load_binary", "Open Binary...");
     ImGui::SameLine();
-    if (ImGui::Button("Attach..."))
-        application_ui::execute_action("tools.attach_process", action_invocation_source_t::toolbar);
+    session_action("tools.attach_process", "Attach...");
     ImGui::SameLine();
-    if (ImGui::Button("Run..."))
-        application_ui::execute_action("debugger.launch", action_invocation_source_t::toolbar);
+    session_action("debugger.launch", "Run...");
     ImGui::Separator();
 
-    const std::size_t count = analysis_session::session_count();
+    struct reattach_operation_t {
+        std::uint64_t task_id = 0;
+        std::uint32_t pid = 0;
+        std::uint64_t process_creation_time_100ns = 0;
+        std::string session_id;
+        std::shared_ptr<aida::analysis::cancellation_source_t> cancellation;
+        std::mutex result_mutex;
+        std::string detail;
+        std::atomic<bool> attached{false};
+        std::atomic<bool> cancelled{false};
+        std::atomic<bool> completed{false};
+    };
+    struct lifecycle_state_t {
+        std::shared_ptr<reattach_operation_t> reattach;
+        std::string feedback;
+        bool feedback_error = false;
+    };
+    static lifecycle_state_t lifecycle;
+    if (lifecycle.reattach &&
+        lifecycle.reattach->completed.load(std::memory_order_acquire)) {
+        const bool attached = lifecycle.reattach->attached.load(std::memory_order_acquire);
+        const bool cancelled = lifecycle.reattach->cancelled.load(std::memory_order_acquire);
+        {
+            std::lock_guard<std::mutex> lock(lifecycle.reattach->result_mutex);
+            lifecycle.feedback = cancelled
+                ? "Reattach cancelled before commit."
+                : lifecycle.reattach->detail;
+        }
+        lifecycle.feedback_error = !attached && !cancelled;
+        output_log::push(bottom_tab_t::output,
+            std::string("[Sessions] ") + lifecycle.feedback + "\n");
+        lifecycle.reattach.reset();
+    }
+    const auto request_reattach = [&](const analysis_session::session_summary_t& summary) {
+        if (summary.kind != analysis_session::session_kind_t::live_attach || summary.pid == 0 ||
+            lifecycle.reattach)
+            return;
+        auto operation = std::make_shared<reattach_operation_t>();
+        operation->pid = summary.pid;
+        operation->process_creation_time_100ns = summary.process_creation_time_100ns;
+        operation->session_id = summary.id;
+        operation->cancellation = std::make_shared<aida::analysis::cancellation_source_t>();
+        const std::uint32_t pid = operation->pid;
+        const std::string session_id = operation->session_id;
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "analysis_sessions";
+        submission.label = "session.reattach";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::feature_worker;
+        submission.priority = 2;
+        submission.body = [operation] {
+            std::string detail;
+            bool attached = false;
+            try {
+                attached = analysis_session::reattach_session_exact(
+                    operation->session_id, operation->pid,
+                    operation->process_creation_time_100ns, &detail,
+                    operation->cancellation->token());
+            } catch (const std::exception& exception) {
+                detail = exception.what();
+            } catch (...) {
+                detail = "Unknown exception while reattaching the session";
+            }
+            if (detail.empty())
+                detail = attached ? "The live session is active." : "The session could not be reattached.";
+            {
+                std::lock_guard<std::mutex> lock(operation->result_mutex);
+                operation->detail = std::move(detail);
+            }
+            operation->attached.store(attached, std::memory_order_release);
+            operation->cancelled.store(!attached &&
+                operation->cancellation->token().stop_requested(), std::memory_order_release);
+            operation->completed.store(true, std::memory_order_release);
+        };
+        const auto submitted = aida::infra::executor::submit(std::move(submission));
+        if (!submitted.submitted || submitted.task_id == 0) {
+            lifecycle.feedback = submitted.reject_reason.empty()
+                ? "The bounded executor rejected the reattach request."
+                : submitted.reject_reason;
+            lifecycle.feedback_error = true;
+            return;
+        }
+        operation->task_id = submitted.task_id;
+        lifecycle.reattach = operation;
+        lifecycle.feedback = "Reattaching PID " + std::to_string(pid) + "...";
+        lifecycle.feedback_error = false;
+        task_center::task_registration_t registration;
+        registration.owner = "analysis";
+        registration.owner_view = "view.sessions";
+        registration.owner_action = "session.reattach";
+        registration.session = session_id;
+        registration.target = "PID " + std::to_string(pid);
+        registration.label = "Reattach live session";
+        registration.stage = "Validating retained process identity";
+        registration.cancellation_is_safe = true;
+        registration.callbacks.cancel = [operation] {
+            operation->cancellation->request_cancel();
+            static_cast<void>(aida::infra::executor::cancel(operation->task_id));
+            return true;
+        };
+        registration.callbacks.focus = [] {
+            static_cast<void>(application_views::open_or_focus(
+                stable_view_id_t("view.sessions")));
+        };
+        if (!task_center::register_executor_job(submitted.task_id, std::move(registration))) {
+            operation->cancellation->request_cancel();
+            static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+            lifecycle.feedback = "Task Center rejected the reattach owner; cancellation was requested.";
+            lifecycle.feedback_error = true;
+        }
+    };
+
+    const auto summaries = analysis_session::list_session_summaries();
+    const std::size_t count = summaries.size();
     const std::size_t active = analysis_session::active_session_idx();
+    const std::uint32_t active_driver_pid = driver_bridge::attached_pid();
     static std::string selected_path;
     static bool selected_open = false;
     bool focused_row = false;
-    std::optional<std::size_t> close_requested;
+    std::optional<std::string> close_requested;
+    std::optional<std::string> detach_requested;
+    std::optional<std::string> reattach_requested;
     for (std::size_t index = 0; index < count; ++index) {
-        const auto session = analysis_session::session_handle_at(index);
-        if (!session)
-            continue;
+        const auto& session = summaries[index];
         ImGui::PushID(static_cast<int>(index));
-        const std::string name = session->filename.empty()
-            ? path_leaf(session->path) : session->filename;
+        const std::string name = session.filename.empty()
+            ? path_leaf(session.path) : session.filename;
         std::string label = name.empty() ? "Untitled session" : name;
-        if (session->attached_pid != 0)
-            label += "  ·  PID " + std::to_string(session->attached_pid);
-        label += "\n" + (session->path.empty() ? session->session_name : session->path);
-        const float row_width = (std::max)(1.0f, ImGui::GetContentRegionAvail().x - 54.0f);
-        if (ImGui::Selectable(label.c_str(), index == active || selected_path == session->path,
-                ImGuiSelectableFlags_AllowDoubleClick, ImVec2(row_width, 0.0f))) {
-            selected_path = session->path;
+        if (session.pid != 0)
+            label += "  |  PID " + std::to_string(session.pid);
+        label += "\n" + (session.path.empty() ? session.process_name : session.path);
+        const bool dead = !session.is_alive ||
+            session.load_state == analysis_session::session_load_state_t::failed ||
+            session.load_state == analysis_session::session_load_state_t::closed;
+        const bool loading = session.load_state == analysis_session::session_load_state_t::opening ||
+            session.load_state == analysis_session::session_load_state_t::analyzing;
+        const bool closing = session.load_state == analysis_session::session_load_state_t::closing;
+        const bool live_attached = session.kind == analysis_session::session_kind_t::live_attach &&
+            session.pid != 0 && session.pid == active_driver_pid && session.is_active &&
+            analysis_session::active_live_session_matches(session.pid, session.id);
+        const char* badge = dead ? "Dead" : loading ? "Loading" : closing ? "Closing" :
+            session.kind == analysis_session::session_kind_t::static_file ? "Static" :
+            live_attached ? "Live" : "Detached";
+        const components::status_kind_t badge_kind = dead
+            ? components::status_kind_t::error
+            : loading ? components::status_kind_t::info
+            : closing || (!live_attached && session.kind == analysis_session::session_kind_t::live_attach)
+                ? components::status_kind_t::warning
+                : live_attached ? components::status_kind_t::success
+                : components::status_kind_t::neutral;
+        components::status_badge(badge, badge_kind);
+        ImGui::SameLine();
+        const bool can_reattach = session.kind == analysis_session::session_kind_t::live_attach &&
+            session.pid != 0 && session.process_creation_time_100ns != 0 &&
+            !live_attached && !closing && !loading;
+        const bool can_detach = session.kind == analysis_session::session_kind_t::live_attach &&
+            live_attached && !dead && !closing && !loading &&
+            session.load_state == analysis_session::session_load_state_t::ready;
+        const float actions_width = (can_reattach ? 78.0f : 0.0f) +
+            (can_detach ? 66.0f : 0.0f) + 58.0f;
+        const float row_width = (std::max)(1.0f, ImGui::GetContentRegionAvail().x - actions_width);
+        const bool activated = ImGui::Selectable(label.c_str(),
+            index == active || selected_path == session.path,
+            ImGuiSelectableFlags_AllowDoubleClick, ImVec2(row_width, 0.0f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        register_entity_row("aida.session-row", "session-row", session.id);
+#endif
+        const bool middle_close = ImGui::IsItemClicked(ImGuiMouseButton_Middle);
+        if (activated) {
+            selected_path = session.path;
             selected_open = true;
             analysis_session::switch_session(index);
         }
         if (ImGui::IsItemFocused()) {
-            selected_path = session->path;
+            selected_path = session.path;
             selected_open = true;
             focused_row = true;
         }
         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-            selected_path = session->path;
+            selected_path = session.path;
             selected_open = true;
-            application_ui::open_recent_context_menu(session->path, true,
+            application_ui::open_recent_context_menu(session.path, true,
                 context_menu_open_origin_t::pointer);
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", session->path.empty() ? session->session_name.c_str() : session->path.c_str());
+            ImGui::SetTooltip("%s", session.path.empty() ? session.process_name.c_str() : session.path.c_str());
+        if (middle_close)
+            close_requested = session.id;
+        if (can_reattach) {
+            ImGui::SameLine();
+            ImGui::BeginDisabled(lifecycle.reattach != nullptr);
+            if (ImGui::SmallButton("Reattach"))
+                reattach_requested = session.id;
+            ImGui::EndDisabled();
+            design::tooltip_for_last_item(lifecycle.reattach
+                ? "Another exact session reattach is already active"
+                : "Revalidate the retained process identity and attach this session");
+        }
+        if (can_detach) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Detach"))
+                detach_requested = session.id;
+            design::tooltip_for_last_item("Activate this exact live session and detach it without terminating the target");
+        }
         ImGui::SameLine();
         if (ImGui::SmallButton("Close"))
-            close_requested = index;
+            close_requested = session.id;
         ImGui::PopID();
     }
-    if (close_requested)
-        analysis_session::close_session(*close_requested);
+    if (reattach_requested) {
+        std::size_t index = 0;
+        if (analysis_session::find_session_by_id(*reattach_requested, &index))
+            request_reattach(analysis_session::summarize_session_at(index));
+        else {
+            lifecycle.feedback = "The selected session changed before reattach could start.";
+            lifecycle.feedback_error = true;
+        }
+    }
+    if (detach_requested) {
+        std::size_t index = 0;
+        if (!analysis_session::find_session_by_id(*detach_requested, &index)) {
+            lifecycle.feedback = "The selected session changed before detach could start.";
+            lifecycle.feedback_error = true;
+        } else if (!analysis_session::switch_session(index)) {
+            lifecycle.feedback = "The selected live session could not be activated for detach.";
+            lifecycle.feedback_error = true;
+        } else {
+            const auto result = application_ui::execute_action("debugger.detach",
+                action_invocation_source_t::toolbar);
+            lifecycle.feedback = result.executed()
+                ? "Detach queued for the selected live session."
+                : result.message.empty() ? "The detach request was rejected." : result.message;
+            lifecycle.feedback_error = !result.executed();
+        }
+    }
+    if (close_requested) {
+        std::size_t index = 0;
+        if (analysis_session::find_session_by_id(*close_requested, &index))
+            static_cast<void>(analysis_session::close_session(index));
+        else {
+            lifecycle.feedback = "The selected session changed before close could start.";
+            lifecycle.feedback_error = true;
+        }
+    }
     if (count == 0) {
         ImGui::TextDisabled("No open sessions.");
         ImGui::TextWrapped("Open a binary, attach to a process, or launch a target to create a session.");
+    }
+    if (!lifecycle.feedback.empty()) {
+        ImGui::Separator();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(lifecycle.feedback_error
+            ? resolved().error : resolved().text_secondary), "%s", lifecycle.feedback.c_str());
+        if (!lifecycle.reattach && ImGui::SmallButton("Dismiss##session_lifecycle_feedback"))
+            lifecycle.feedback.clear();
     }
 
     context_menu_open_origin_t origin = context_menu_open_origin_t::pointer;

@@ -540,6 +540,9 @@ inline bool activate(runtime_t& state, const result_t& result, bool open_to_side
     }
     const auto executed = ui::application_ui::execute_action(result.target_id.c_str(),
         ui::action_invocation_source_t::command_palette);
+    if (executed.status == ui::action_execution_status_t::confirmation_required ||
+        executed.status == ui::action_execution_status_t::review_required)
+        return true;
     if (!executed.executed()) {
         state.error = executed.message.empty() ?
             "The selected command could not be executed" : executed.message;

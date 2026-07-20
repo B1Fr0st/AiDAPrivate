@@ -294,7 +294,7 @@ void verify_workspace_dispatch(mcp_standalone::tool_registry_t& registry)
                 const auto image = context.workspace->normalized_image();
                 if (!image || image->address_mappings.empty())
                     return mcp_standalone::tool_result_t::error(
-                        "mapped image unavailable", "NO_IMAGE");
+                        "mapped image unavailable", "NO_IMAGE", json::object());
                 const auto mapping = std::find_if(
                     image->address_mappings.begin(),
                     image->address_mappings.end(), [](const auto& item) {
@@ -306,7 +306,7 @@ void verify_workspace_dispatch(mcp_standalone::tool_registry_t& registry)
                     });
                 if (mapping == image->address_mappings.end())
                     return mcp_standalone::tool_result_t::error(
-                        "mapped address unavailable", "NO_ADDRESS");
+                        "mapped address unavailable", "NO_ADDRESS", json::object());
                 overlay_transaction_request_t transaction;
                 transaction.expected_revision =
                     context.workspace->overlay_revision();

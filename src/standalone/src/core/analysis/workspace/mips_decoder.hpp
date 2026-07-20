@@ -17,7 +17,7 @@ struct mips_decoder_profile_t {
     static constexpr std::uint64_t schema_version = 4;
     static constexpr std::uint64_t capstone_api_major = 5;
     static constexpr std::uint64_t capstone_api_minor = 0;
-    static constexpr std::uint64_t capstone_version_extra = 7;
+    static constexpr std::uint64_t capstone_version_extra = 9;
     static constexpr std::size_t canonical_byte_count = 64;
 
     mips_mode_t mode = mips_mode_t::mips32;

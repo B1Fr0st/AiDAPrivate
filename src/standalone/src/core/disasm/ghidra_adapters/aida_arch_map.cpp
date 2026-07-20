@@ -128,13 +128,6 @@ std::optional<arch_descriptor_t> detect_arch_from_workspace(
 	return descriptor;
 }
 
-bool is_x86_family(const std::string& sleigh_id)
-{
-	if (sleigh_id.size() < 3)
-		return false;
-	return sleigh_id.compare(0, 3, "x86") == 0;
-}
-
 }
 
 namespace aida::analysis::ghidra_adapter {

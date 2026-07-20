@@ -307,6 +307,23 @@ namespace detail {
         }
     }
 
+    __declspec(noinline) inline void load_self_heal_siphash_keys(
+        uint64_t* key0, uint64_t* key1)
+    {
+        __try
+        {
+            *key0 = anti_tamper::integrity::detail::s_siphash_k0_obf.load(
+                std::memory_order_acquire);
+            *key1 = anti_tamper::integrity::detail::s_siphash_k1_obf.load(
+                std::memory_order_acquire);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            *key0 = static_cast<uint64_t>(__rdtsc());
+            *key1 = static_cast<uint64_t>(GetCurrentProcessId());
+        }
+    }
+
     __declspec(noinline) inline bool safe_write_bytes(void* dst, const void* src, size_t len)
     {
         __try {
@@ -1555,15 +1572,7 @@ namespace self_heal {
             return;
 
         uint64_t k0 = 0, k1 = 0;
-        __try {
-            auto& sip_k0 = anti_tamper::integrity::detail::s_siphash_k0_obf;
-            auto& sip_k1 = anti_tamper::integrity::detail::s_siphash_k1_obf;
-            k0 = sip_k0.load(std::memory_order_acquire);
-            k1 = sip_k1.load(std::memory_order_acquire);
-        } __except(1) {
-            k0 = static_cast<uint64_t>(__rdtsc());
-            k1 = static_cast<uint64_t>(GetCurrentProcessId());
-        }
+        detail::load_self_heal_siphash_keys(&k0, &k1);
         e.encryption_key = k0 ^ k1 ^ 0xA1DA5EED12345678ULL;
 
         for (uint32_t i = 0; i < 32; ++i)

@@ -390,6 +390,19 @@ __declspec(noinline) void capture_modified_bytes(
     *out_len = captured;
 }
 
+__declspec(noinline) void capture_live_region_snapshot_seh(
+    uint64_t region_base, size_t snapshot_size, uint8_t out_snapshot[256])
+{
+    __try
+    {
+        memcpy(out_snapshot, reinterpret_cast<const void*>(region_base), snapshot_size);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        memset(out_snapshot, 0xFF, 256);
+    }
+}
+
 __declspec(noinline) void handle_hash_mismatch(
     uint32_t detecting_checker_id,
     uint32_t target_checker_id,
@@ -411,19 +424,10 @@ __declspec(noinline) void handle_hash_mismatch(
     memcpy(evidence.expected_hash, expected_hash, 32);
     memcpy(evidence.actual_hash, actual_hash, 32);
 
-    uint8_t expected_region_snapshot[256] = {};
     uint8_t live_region_snapshot[256] = {};
 
     size_t snapshot_size = (region_size < 256) ? region_size : 256;
-
-    __try
-    {
-        memcpy(live_region_snapshot, reinterpret_cast<const void*>(region_base), snapshot_size);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        memset(live_region_snapshot, 0xFF, sizeof(live_region_snapshot));
-    }
+    capture_live_region_snapshot_seh(region_base, snapshot_size, live_region_snapshot);
 
     evidence.modified_bytes_len = static_cast<uint32_t>(snapshot_size);
     memcpy(evidence.modified_bytes, live_region_snapshot, snapshot_size);

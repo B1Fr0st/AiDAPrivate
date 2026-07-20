@@ -878,7 +878,7 @@ inline bool check_unicorn_page_fault_behavior()
         PAGE_NOACCESS);
     if (!page) return false;
 
-    DWORD exception_code = 0;
+    DWORD observed_exception_code = 0;
     bool got_exception = false;
 
     __try
@@ -886,7 +886,7 @@ inline bool check_unicorn_page_fault_behavior()
         volatile uint64_t val = *static_cast<volatile uint64_t*>(page);
         (void)val;
     }
-    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    __except ((observed_exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
     }
@@ -896,7 +896,7 @@ inline bool check_unicorn_page_fault_behavior()
     if (!got_exception)
         return true;
 
-    return exception_code != EXCEPTION_ACCESS_VIOLATION;
+    return observed_exception_code != EXCEPTION_ACCESS_VIOLATION;
 }
 
 inline bool check_unicorn_no_tlb()
@@ -924,14 +924,14 @@ inline bool check_unicorn_no_tlb()
     Sleep(1);
 
     bool got_exception = false;
-    DWORD exception_code = 0;
+    DWORD observed_exception_code = 0;
 
     __try
     {
         volatile uint64_t val = *ptr;
         (void)val;
     }
-    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    __except ((observed_exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
     }
@@ -942,7 +942,7 @@ inline bool check_unicorn_no_tlb()
     if (!got_exception)
         return true;
 
-    return exception_code != EXCEPTION_ACCESS_VIOLATION;
+    return observed_exception_code != EXCEPTION_ACCESS_VIOLATION;
 }
 
 inline bool check_unicorn_invlpg_no_ud()
@@ -965,14 +965,14 @@ inline bool check_unicorn_invlpg_no_ud()
     using fn_t = void(*)();
     auto fn = reinterpret_cast<fn_t>(code);
 
-    DWORD exception_code = 0;
+    DWORD observed_exception_code = 0;
     bool got_exception = false;
 
     __try
     {
         fn();
     }
-    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    __except ((observed_exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
     }
@@ -982,7 +982,7 @@ inline bool check_unicorn_invlpg_no_ud()
     if (!got_exception)
         return true;
 
-    return exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
+    return observed_exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
 }
 
 inline bool check_unicorn_wbinvd_no_ud()
@@ -1004,14 +1004,14 @@ inline bool check_unicorn_wbinvd_no_ud()
     using fn_t = void(*)();
     auto fn = reinterpret_cast<fn_t>(code);
 
-    DWORD exception_code = 0;
+    DWORD observed_exception_code = 0;
     bool got_exception = false;
 
     __try
     {
         fn();
     }
-    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    __except ((observed_exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
     }
@@ -1021,7 +1021,7 @@ inline bool check_unicorn_wbinvd_no_ud()
     if (!got_exception)
         return true;
 
-    return exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
+    return observed_exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
 }
 
 inline bool check_unicorn_vmx_unmodeled()
@@ -1049,14 +1049,14 @@ inline bool check_unicorn_vmx_unmodeled()
     using fn_t = void(*)();
     auto fn = reinterpret_cast<fn_t>(code);
 
-    DWORD exception_code = 0;
+    DWORD observed_exception_code = 0;
     bool got_exception = false;
 
     __try
     {
         fn();
     }
-    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    __except ((observed_exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
     }
@@ -1066,7 +1066,7 @@ inline bool check_unicorn_vmx_unmodeled()
     if (!got_exception)
         return true;
 
-    return exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
+    return observed_exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
 }
 
 inline bool check_unicorn_sgx_unmodeled()
@@ -1093,14 +1093,14 @@ inline bool check_unicorn_sgx_unmodeled()
     using fn_t = void(*)();
     auto fn = reinterpret_cast<fn_t>(code);
 
-    DWORD exception_code = 0;
+    DWORD observed_exception_code = 0;
     bool got_exception = false;
 
     __try
     {
         fn();
     }
-    __except ((exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    __except ((observed_exception_code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
         got_exception = true;
     }
@@ -1110,7 +1110,7 @@ inline bool check_unicorn_sgx_unmodeled()
     if (!got_exception)
         return true;
 
-    return exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
+    return observed_exception_code != EXCEPTION_ILLEGAL_INSTRUCTION;
 }
 
 inline bool check_unicorn_rdpid_zeros()

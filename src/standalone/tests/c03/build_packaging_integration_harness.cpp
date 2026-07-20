@@ -107,7 +107,7 @@ std::string file_hash(const std::filesystem::path& path) {
     return result.sha256;
 }
 
-std::uint64_t file_size(const std::filesystem::path& path) {
+std::uint64_t file_byte_size(const std::filesystem::path& path) {
     std::error_code error;
     const auto size = std::filesystem::file_size(path, error);
     require(!error && size != 0, "fixture file size is invalid");
@@ -253,7 +253,7 @@ public:
         require(found != value["artifacts"].end(), "fixture artifact id is absent");
         const auto path = package_ / std::filesystem::u8path(
             found->at("relative_path").get<std::string>());
-        (*found)["size_bytes"] = file_size(path);
+        (*found)["size_bytes"] = file_byte_size(path);
         (*found)["sha256"] = file_hash(path);
     }
 
@@ -262,7 +262,7 @@ private:
                   std::string owner, std::vector<std::string> licenses = {}) const {
         const auto absolute = package_ / std::filesystem::u8path(path);
         return {{"id", std::move(id)}, {"kind", std::move(kind)},
-                {"relative_path", std::move(path)}, {"size_bytes", file_size(absolute)},
+                {"relative_path", std::move(path)}, {"size_bytes", file_byte_size(absolute)},
                 {"sha256", file_hash(absolute)}, {"owner", std::move(owner)},
                 {"license_ids", std::move(licenses)}};
     }
@@ -283,7 +283,7 @@ private:
     json inventory_entry(const std::filesystem::path& path,
                          std::string relative) const {
         return {{"relative_path", std::move(relative)},
-                {"size_bytes", file_size(path)}, {"sha256", file_hash(path)}};
+                {"size_bytes", file_byte_size(path)}, {"sha256", file_hash(path)}};
     }
 
     std::string create_managed_runtime() {
@@ -416,7 +416,7 @@ private:
             for (const auto mirror : {"ghidra_specs", "deps/ghidra_specs"})
                 write_text(package_ / mirror / name, contents);
             const auto path = package_ / "ghidra_specs" / name;
-            const auto size = file_size(path);
+            const auto size = file_byte_size(path);
             const auto hash = file_hash(path);
             files.push_back({{"name", name}, {"kind", specification.second},
                              {"size_bytes", size}, {"sha256", hash}});
@@ -490,7 +490,7 @@ private:
         const json protector{
             {"schema", "aida.protector.receipt"}, {"schema_version", 4},
             {"status", "passed"}, {"artifact_relative_path", std::string(executable_path)},
-            {"artifact_sha256", executable_hash}, {"artifact_size_bytes", file_size(executable)},
+            {"artifact_sha256", executable_hash}, {"artifact_size_bytes", file_byte_size(executable)},
             {"tool_sha256", std::string(64, '1')},
             {"verifier_sha256", std::string(64, '2')},
             {"signer_policy_sha256", std::string(64, '5')},
@@ -510,7 +510,7 @@ private:
         const json signature{
             {"schema", "aida.signature.receipt"}, {"schema_version", 4},
             {"status", "verified"}, {"artifact_relative_path", std::string(executable_path)},
-            {"artifact_sha256", executable_hash}, {"artifact_size_bytes", file_size(executable)},
+            {"artifact_sha256", executable_hash}, {"artifact_size_bytes", file_byte_size(executable)},
             {"verification_mode", "wintrust_offline"},
             {"signer_thumbprint_sha256", std::string(64, '4')},
             {"verifier_sha256", std::string(64, '3')},
@@ -552,7 +552,7 @@ private:
             {"schema", "aida.protector.receipt"}, {"schema_version", 4},
             {"status", "passed"}, {"artifact_relative_path", "AiDAStandalone.exe"},
             {"artifact_sha256", standalone_hash},
-            {"artifact_size_bytes", file_size(standalone)},
+            {"artifact_size_bytes", file_byte_size(standalone)},
             {"tool_sha256", std::string(64, '1')},
             {"verifier_sha256", std::string(64, '2')},
             {"signer_policy_sha256", std::string(64, '5')},
@@ -573,7 +573,7 @@ private:
             {"schema", "aida.signature.receipt"}, {"schema_version", 4},
             {"status", "verified"}, {"artifact_relative_path", "AiDAStandalone.exe"},
             {"artifact_sha256", standalone_hash},
-            {"artifact_size_bytes", file_size(standalone)},
+            {"artifact_size_bytes", file_byte_size(standalone)},
             {"verification_mode", "wintrust_offline"},
             {"signer_thumbprint_sha256", std::string(64, '4')},
             {"verifier_sha256", std::string(64, '3')},
@@ -591,7 +591,7 @@ private:
             "aida_c03_auth_preview_implementation",
             "aida_c03_safe_headless_manifest_suite",
             "aida_c03_b14_native_decompiler_worker", "aida_c03_package_verifier"};
-        for (std::size_t index = 0; index < 57; ++index)
+        for (std::size_t index = 0; index < 56; ++index)
             production_roots.emplace_back("fixture_manifest_root_" + std::to_string(index));
         for (std::size_t index = 0; index < 15; ++index)
             production_roots.emplace_back("fixture_direct_root_" + std::to_string(index));
@@ -603,7 +603,7 @@ private:
             {"schema", "aida.c03.production-link-graph.v3"}, {"schema_version", 3},
             {"configuration", "fixture"},
             {"denylist", {"lief", "lmdb", "unicorn", "remill"}},
-            {"manifest_root_count", 57}, {"direct_root_count", 15},
+            {"manifest_root_count", 56}, {"direct_root_count", 15},
             {"strict_root_count", production_roots.size()},
             {"strict_roots", production_roots},
             {"strict_targets", production_targets},
@@ -1169,7 +1169,7 @@ void verify_allowed_customer_path_neighbors(fixture_t& fixture,
         write_text(absolute, std::string(path) + "\n");
         candidate["artifacts"].push_back({
             {"id", "allowed-neighbor-" + std::to_string(index++)}, {"kind", "resource"},
-            {"relative_path", std::string(path)}, {"size_bytes", file_size(absolute)},
+            {"relative_path", std::string(path)}, {"size_bytes", file_byte_size(absolute)},
             {"sha256", file_hash(absolute)}, {"owner", "fixture"},
             {"license_ids", json::array()}});
     }
@@ -1700,7 +1700,7 @@ void verify_distribution_contract() {
     sdk_leak["artifacts"].push_back({
         {"id", "managed-sdk-leak"}, {"kind", "worker_runtime"},
         {"relative_path", "deps/dotnet/sdk/leak.dll"},
-        {"size_bytes", file_size(leaked_sdk_path)}, {"sha256", file_hash(leaked_sdk_path)},
+        {"size_bytes", file_byte_size(leaked_sdk_path)}, {"sha256", file_hash(leaked_sdk_path)},
         {"owner", "managed_cli_decompiler"}, {"license_ids", json::array()}});
     const auto sdk_leak_hash = fixture.publish_manifest(sdk_leak, "sdk-leak.json");
     const auto sdk_rejected = integration.verify_distribution_package(

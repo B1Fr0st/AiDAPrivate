@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <cstddef>
 #include <cstdint>
 
 #include <nlohmann/json.hpp>
@@ -165,6 +166,52 @@ struct session_info_t
 };
 
 
+struct proposal_audit_hunk_t
+{
+    std::uint32_t index = 0;
+    std::int32_t old_start = 0;
+    std::int32_t old_count = 0;
+    std::int32_t new_start = 0;
+    std::int32_t new_count = 0;
+    std::string decision;
+    std::string before_hash;
+    std::string after_hash;
+};
+
+
+struct proposal_audit_record_t
+{
+    std::string audit_id;
+    std::string proposal_id;
+    std::string family;
+    std::string kind;
+    std::string session_id;
+    std::uint64_t source_index = 0;
+    std::int64_t source_timestamp = 0;
+    std::uint64_t source_fingerprint = 0;
+    std::string target_id;
+    std::string target_view_id;
+    std::uint64_t target_generation = 0;
+    std::uint64_t source_revision = 0;
+    std::uint64_t target_overlay_revision = 0;
+    std::string before_hash;
+    std::string after_hash;
+    std::string result_hash;
+    std::uint64_t result_revision = 0;
+    std::string provenance;
+    std::string detail;
+    std::string lifecycle_state;
+    std::string outcome;
+    std::string task_id;
+    std::string diagnostic_id;
+    std::string undo_revert_identity;
+    std::int64_t created_unix = 0;
+    std::int64_t updated_unix = 0;
+    bool revalidation_required = false;
+    std::vector<proposal_audit_hunk_t> hunks;
+};
+
+
 bool initialize();
 bool shutdown();
 
@@ -197,6 +244,11 @@ usage_tokens_t session_tokens(const std::string& session_id);
 
 bool        get_session_todos(const std::string& session_id, std::string& out);
 bool        set_session_todos(const std::string& session_id, const std::string& todos_text);
+
+bool upsert_proposal_audit(proposal_audit_record_t record);
+bool restore_proposal_audits(const std::string& session_id,
+                             std::vector<proposal_audit_record_t>& out,
+                             std::size_t limit = 16);
 
 const std::string& last_error();
 

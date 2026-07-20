@@ -55,6 +55,35 @@ action_surface_t surface_for_source(action_invocation_source_t source) noexcept 
     return action_surface_t::none;
 }
 
+action_handler_result_t prepare_confirmation_safely(
+    const application_action_descriptor_t& descriptor,
+    const action_invocation_t& invocation) {
+    if (!descriptor.prepare_confirmation)
+        return action_handler_result_t::completed();
+    try {
+        return descriptor.prepare_confirmation(invocation);
+    } catch (const std::exception& exception) {
+        return action_handler_result_t::failed(exception.what());
+    } catch (...) {
+        return action_handler_result_t::failed(
+            "The action confirmation could not be prepared");
+    }
+}
+
+std::string cancel_failed_confirmation_safely(
+    const application_action_descriptor_t& descriptor) {
+    if (!descriptor.cancel_confirmation)
+        return {};
+    try {
+        descriptor.cancel_confirmation();
+        return {};
+    } catch (const std::exception& exception) {
+        return exception.what();
+    } catch (...) {
+        return "The failed confirmation cleanup raised an unknown error";
+    }
+}
+
 }
 
 action_handler_result_t action_handler_result_t::completed(std::string message_value) {
@@ -207,14 +236,16 @@ action_execution_result_t application_action_registry_t::execute(
 
     if (descriptor->consequence.confirmation == confirmation_requirement_t::review &&
         !invocation.review_completed) {
-        if (descriptor->prepare_confirmation) {
-            const auto prepared = descriptor->prepare_confirmation(invocation);
-            if (!prepared.success) {
-                result.status = action_execution_status_t::failed;
-                result.message = prepared.message.empty()
-                    ? "The action review could not be prepared" : prepared.message;
-                return result;
-            }
+        const auto prepared = prepare_confirmation_safely(*descriptor, invocation);
+        if (!prepared.success) {
+            result.status = action_execution_status_t::failed;
+            result.message = prepared.message.empty()
+                ? "The action review could not be prepared" : prepared.message;
+            const std::string cleanup_failure =
+                cancel_failed_confirmation_safely(*descriptor);
+            if (!cleanup_failure.empty())
+                result.message.append("; cleanup failed: ").append(cleanup_failure);
+            return result;
         }
         result.status = action_execution_status_t::review_required;
         result.message = "Review is required before this action can run";
@@ -222,14 +253,16 @@ action_execution_result_t application_action_registry_t::execute(
     }
     if (descriptor->consequence.confirmation == confirmation_requirement_t::explicit_confirmation &&
         !invocation.confirmation_granted) {
-        if (descriptor->prepare_confirmation) {
-            const auto prepared = descriptor->prepare_confirmation(invocation);
-            if (!prepared.success) {
-                result.status = action_execution_status_t::failed;
-                result.message = prepared.message.empty()
-                    ? "The action confirmation could not be prepared" : prepared.message;
-                return result;
-            }
+        const auto prepared = prepare_confirmation_safely(*descriptor, invocation);
+        if (!prepared.success) {
+            result.status = action_execution_status_t::failed;
+            result.message = prepared.message.empty()
+                ? "The action confirmation could not be prepared" : prepared.message;
+            const std::string cleanup_failure =
+                cancel_failed_confirmation_safely(*descriptor);
+            if (!cleanup_failure.empty())
+                result.message.append("; cleanup failed: ").append(cleanup_failure);
+            return result;
         }
         result.status = action_execution_status_t::confirmation_required;
         result.message = "Explicit confirmation is required before this action can run";
@@ -241,7 +274,8 @@ action_execution_result_t application_action_registry_t::execute(
         result.status = handler_result.success
             ? action_execution_status_t::executed
             : action_execution_status_t::failed;
-        result.message = handler_result.message;
+        result.message = !handler_result.success && handler_result.message.empty()
+            ? "The action failed" : handler_result.message;
     } catch (const std::exception& exception) {
         result.status = action_execution_status_t::failed;
         result.message = exception.what();

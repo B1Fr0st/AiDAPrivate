@@ -361,16 +361,6 @@ std::uint64_t bounded_decimal(const std::filesystem::path& value,
     return result;
 }
 
-void configure_deadline(const parsed_arguments_t& parsed) {
-    const auto found = parsed.values.find(L"deadline-ms");
-    if (found == parsed.values.end())
-        fail("missing verifier deadline");
-    const auto milliseconds = bounded_decimal(found->second, 1, 7200000);
-    command_deadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(milliseconds);
-    poll_command();
-}
-
 struct signer_policy_t final {
     locked_file_t authority;
     std::vector<std::string> authorized_signers;
@@ -648,6 +638,16 @@ struct parsed_arguments_t final {
     std::wstring mode;
     std::unordered_map<std::wstring, std::filesystem::path> values;
 };
+
+void configure_deadline(const parsed_arguments_t& parsed) {
+    const auto found = parsed.values.find(L"deadline-ms");
+    if (found == parsed.values.end())
+        fail("missing verifier deadline");
+    const auto milliseconds = bounded_decimal(found->second, 1, 7200000);
+    command_deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(milliseconds);
+    poll_command();
+}
 
 parsed_arguments_t parse_arguments(int argc, wchar_t** argv) {
     if (argc < 4 || (argc % 2) != 0 || argv[1][0] == L'\0')

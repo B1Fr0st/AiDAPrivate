@@ -59,6 +59,11 @@ def is_safe_relative(value):
     return not parsed.is_absolute() and bool(parsed.parts) and all(part not in ("", ".", "..") for part in parsed.parts)
 
 
+def canonical_windows_path_order(value):
+    encoded = value.encode("utf-8", errors="strict")
+    return value.casefold().encode("utf-8", errors="strict"), encoded
+
+
 def safe_join(root, relative, label, must_exist=False):
     if not is_safe_relative(relative):
         fail(label + " contains an unsafe relative path")
@@ -244,7 +249,7 @@ def inventory_sources(source_root):
             fail("managed runtime source contains a non-file entry")
         relative = candidate.relative_to(source_root).as_posix()
         directory_files.append((relative, candidate))
-    directory_files.sort(key=lambda item: item[0].encode("utf-8"))
+    directory_files.sort(key=lambda item: canonical_windows_path_order(item[0]))
     if len(directory_files) != EXPECTED_RUNTIME_DIRECTORY_FILE_COUNT:
         fail("managed runtime directory file count does not match the locked source")
     selected.extend(directory_files)
@@ -260,7 +265,7 @@ def canonical_source_inventory(entries):
 
 
 def canonical_packaged_inventory(entries):
-    ordered = sorted(entries, key=lambda entry: entry["relative_path"].encode("utf-8"))
+    ordered = sorted(entries, key=lambda entry: canonical_windows_path_order(entry["relative_path"]))
     material = "\n".join(f"{entry['relative_path']}|{entry['size_bytes']}|{entry['sha256']}"
                          for entry in ordered)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
@@ -293,7 +298,7 @@ def enumerate_destination(runtime_root):
         if not candidate.is_file():
             fail("managed runtime destination contains a non-file entry")
         entries.append(candidate.relative_to(runtime_root).as_posix())
-    return sorted(entries, key=lambda value: value.encode("utf-8"))
+    return sorted(entries, key=canonical_windows_path_order)
 
 
 def materialize(arguments):
@@ -317,7 +322,7 @@ def materialize(arguments):
     runtime_root = safe_join(package_root, RUNTIME_RELATIVE_ROOT, "managed runtime package root")
     source_entries = inventory_sources(source_root)
     expected_paths = [relative for relative, _ in source_entries]
-    sorted_expected_paths = sorted(expected_paths, key=lambda value: value.encode("utf-8"))
+    sorted_expected_paths = sorted(expected_paths, key=canonical_windows_path_order)
     if arguments.verify_only and enumerate_destination(runtime_root) != sorted_expected_paths:
         fail("managed runtime destination exact inventory is invalid")
     if not arguments.verify_only:

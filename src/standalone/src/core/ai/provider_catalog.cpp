@@ -1,12 +1,16 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <shlobj.h>
 
 #include "provider_catalog.hpp"
 #include "../auth/auth_http.hpp"
 #include "../infra/executor.hpp"
-
-#include <windows.h>
-#include <shlobj.h>
 
 #include <algorithm>
 #include <atomic>

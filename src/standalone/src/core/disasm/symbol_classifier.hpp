@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#include "event_bus.hpp"
+#include "../infra/event_bus.hpp"
 #include "pdb_events.hpp"
 #include "pe_parser.hpp"
 #include "standalone_driver.hpp"

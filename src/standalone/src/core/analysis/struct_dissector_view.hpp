@@ -2,8 +2,8 @@
 
 #include "struct_dissector.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include "memory_scanner.hpp"
-#include "standalone_driver.hpp"
+#include "../scanner/memory_scanner.hpp"
+#include "../runtime/standalone_driver.hpp"
 #endif
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
@@ -27,6 +27,9 @@
 #include "../disasm/disasm_view.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
 #include "imgui/imgui.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/studio_semantics.hpp"
+#endif
 #include "../helpers/globals.h"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
@@ -48,6 +51,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -94,7 +98,10 @@ struct ui_state_t {
 	char  list_filter[96] = {};
 	char  layout_pack_buf[16] = {};
 	char  layout_align_buf[16] = {};
+	char  enum_name_buf[257] = {};
+	char  enum_values_buf[8192] = {};
 	int   editing_field = -1;
+	int   pending_insert_index = -1;
 	int   add_type = 0;
 	int   selected_struct = -1;
 	bool  sb_dragging = false;
@@ -122,6 +129,21 @@ struct ui_state_t {
 	bool remove_confirmation_requested = false;
 	bool inline_edit_popup_requested = false;
 	bool layout_popup_requested = false;
+	bool enum_popup_requested = false;
+	std::uint64_t selected_enum_id = 0;
+	int enum_underlying_type = static_cast<int>(struct_dissector::field_type_t::int32);
+	aida::ui::design::form_state_t enum_form;
+	struct_dissector::enum_def_t enum_draft;
+	std::uint64_t enum_draft_schema_revision = 0;
+	bool enum_values_oversized = false;
+	bool enum_requires_reselection = false;
+	bool enum_form_refresh = true;
+	std::uint64_t enum_catalog_revision = 0;
+	std::vector<struct_dissector::enum_def_t> enum_catalog_snapshot;
+	bool enum_delete_review = false;
+	std::uint64_t enum_delete_id = 0;
+	std::uint64_t enum_delete_schema_revision = 0;
+	std::string enum_delete_name;
 	std::string operation_status;
 	bool operation_error = false;
 	std::uint64_t validation_structure_id = 0;
@@ -205,6 +227,25 @@ inline std::uint64_t structure_identity_locked(int structure_index) {
 	}
 	return hash;
 }
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline std::string studio_dissector_structure_id(std::uint64_t stable_id,
+	const std::string& name) {
+	const std::string identity = stable_id != 0
+		? std::to_string(stable_id) : std::string("name:") + name;
+	return aida::preview::semantics::stable_id("aida.types",
+		"dissector-structure-" + aida::preview::semantics::entity_token(identity));
+}
+
+inline std::string studio_dissector_field_id(const std::string& structure_id,
+	const struct_dissector::field_def_t& field) {
+	const std::string identity = field.stable_id != 0
+		? std::to_string(field.stable_id)
+		: std::to_string(field.offset) + ":" + field.name;
+	return aida::preview::semantics::stable_id(structure_id,
+		"field-" + aida::preview::semantics::entity_token(identity));
+}
+#endif
 
 inline std::optional<std::vector<std::uint8_t>> parse_preview_field_value(
 	const struct_dissector::field_def_t& field, const char* text) {
@@ -296,6 +337,110 @@ inline std::string format_review_bytes(const std::vector<std::uint8_t>& bytes) {
 	if (shown != bytes.size())
 		output.append(" ... (").append(std::to_string(bytes.size())).append(" bytes)");
 	return output;
+}
+
+inline std::string trim_enum_token(std::string value) {
+	const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
+		return std::isspace(ch) != 0;
+	});
+	const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char ch) {
+		return std::isspace(ch) != 0;
+	}).base();
+	if (first >= last)
+		return {};
+	return std::string(first, last);
+}
+
+inline bool rebuild_enum_form(ui_state_t& ui, struct_dissector::enum_def_t& definition) {
+	ui.enum_form.clear();
+	definition = {};
+	definition.stable_id = ui.selected_enum_id;
+	definition.name = trim_enum_token(ui.enum_name_buf);
+	definition.underlying_type = static_cast<struct_dissector::field_type_t>(
+		ui.enum_underlying_type);
+	if (definition.name.empty())
+		ui.enum_form.reject("enum-name", "Enter an enum name.");
+	else if (definition.name.size() > 256)
+		ui.enum_form.reject("enum-name", "Enum names are limited to 256 bytes.");
+	if (ui.enum_values_oversized)
+		ui.enum_form.reject("enum-values",
+			"This definition exceeds the 8,191-byte inline editor bound. Use schema export/import; Save is blocked to prevent truncation.");
+	if (ui.enum_requires_reselection)
+		ui.enum_form.reject("enum-name",
+			"The catalog changed during the last save attempt. Select the current enum or start a new draft.");
+	const int underlying = static_cast<int>(definition.underlying_type);
+	if (underlying < static_cast<int>(struct_dissector::field_type_t::int8) ||
+		underlying > static_cast<int>(struct_dissector::field_type_t::uint64))
+		ui.enum_form.reject("enum-underlying", "Choose an integer underlying type.");
+	std::unordered_set<std::string> names;
+	const std::string source = ui.enum_values_buf;
+	std::size_t cursor = 0;
+	std::size_t line_number = 1;
+	while (cursor <= source.size()) {
+		const std::size_t end = source.find('\n', cursor);
+		std::string line = trim_enum_token(source.substr(cursor,
+			end == std::string::npos ? std::string::npos : end - cursor));
+		if (!line.empty()) {
+			const std::size_t separator = line.find('=');
+			if (separator == std::string::npos) {
+				ui.enum_form.reject("enum-values", "Line " + std::to_string(line_number) +
+					" must use NAME=VALUE.");
+				break;
+			}
+			std::string name = trim_enum_token(line.substr(0, separator));
+			const std::string number_text = trim_enum_token(line.substr(separator + 1));
+			char* number_end = nullptr;
+			errno = 0;
+			const long long value = std::strtoll(number_text.c_str(), &number_end, 0);
+			if (name.empty() || name.size() > 256) {
+				ui.enum_form.reject("enum-values", "Line " + std::to_string(line_number) +
+					" has an invalid value name.");
+				break;
+			}
+			if (!names.insert(name).second) {
+				ui.enum_form.reject("enum-values", "Line " + std::to_string(line_number) +
+					" repeats value name " + name + ".");
+				break;
+			}
+			if (number_text.empty() || errno == ERANGE || !number_end || *number_end != '\0') {
+				ui.enum_form.reject("enum-values", "Line " + std::to_string(line_number) +
+					" has an invalid integer value.");
+				break;
+			}
+			definition.values.push_back({std::move(name), static_cast<std::int64_t>(value)});
+			if (definition.values.size() > 65536) {
+				ui.enum_form.reject("enum-values", "An enum is limited to 65,536 values.");
+				break;
+			}
+		}
+		if (end == std::string::npos)
+			break;
+		cursor = end + 1;
+		++line_number;
+	}
+	auto& st = struct_dissector::g_state;
+	{
+		std::lock_guard<std::mutex> lock(st.mtx);
+		ui.enum_draft_schema_revision = st.schema_revision;
+		const auto selected = ui.selected_enum_id == 0 ? st.enums.end() :
+			std::find_if(st.enums.begin(), st.enums.end(), [&](const auto& item) {
+				return item.stable_id == ui.selected_enum_id;
+			});
+		if (ui.selected_enum_id != 0 && selected == st.enums.end())
+			ui.enum_form.reject("enum-name", "The selected enum no longer exists. Select it again.");
+		if (std::any_of(st.enums.begin(), st.enums.end(), [&](const auto& item) {
+			return item.name == definition.name && item.stable_id != ui.selected_enum_id;
+		}))
+			ui.enum_form.reject("enum-name", "Another enum already uses this name.");
+		if (selected != st.enums.end() && selected->underlying_type != definition.underlying_type &&
+			std::any_of(st.structs.begin(), st.structs.end(), [&](const auto& structure) {
+				return std::any_of(structure.fields.begin(), structure.fields.end(),
+					[&](const auto& field) { return field.enum_id == selected->stable_id; });
+			}))
+			ui.enum_form.reject("enum-underlying",
+				"Referenced enums cannot change their underlying storage type.");
+	}
+	return ui.enum_form.valid();
 }
 
 inline std::optional<std::vector<std::uint8_t>> parse_field_value(
@@ -1078,8 +1223,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 	bx += 110.f;
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
-	if (aida::ui::button("Layout", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(78.f, 28.f)))
+	const bool layout_open_clicked = aida::ui::button("Layout",
+		aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(78.f, 28.f));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::semantics::register_last_item(
+		"aida.types.dissector-layout-open", "dissector-layout-action", false, false,
+		"aida.dock-window.view.types.dissector");
+#endif
+	if (layout_open_clicked)
 		ImGui::OpenPopup("##sd_layout_config");
 	if (ui.layout_popup_requested) {
 		ui.layout_popup_requested = false;
@@ -1088,12 +1240,31 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (ImGui::BeginPopup("##sd_layout_config")) {
 		int structure_index = -1;
 		struct_dissector::structure_kind_t kind = struct_dissector::structure_kind_t::structure;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		std::string layout_structure_semantic_id;
+#endif
 		{
 			std::lock_guard<std::mutex> lock(st.mtx);
 			structure_index = st.active_struct;
-			if (struct_dissector::valid_index(structure_index, st.structs.size()))
+			if (struct_dissector::valid_index(structure_index, st.structs.size())) {
 				kind = st.structs[static_cast<std::size_t>(structure_index)].kind;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const auto& definition = st.structs[static_cast<std::size_t>(structure_index)];
+				layout_structure_semantic_id = studio_dissector_structure_id(
+					definition.stable_id, definition.name);
+#endif
+			}
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const auto register_layout_item = [&](const char* action, bool disabled = false) {
+			if (layout_structure_semantic_id.empty()) return;
+			aida::preview::semantics::register_last_item(
+				aida::preview::semantics::stable_id(
+					layout_structure_semantic_id, std::string("layout-") + action),
+				"dissector-layout-action", true, disabled,
+				layout_structure_semantic_id);
+		};
+#endif
 		ImGui::TextDisabled("Structure layout");
 		if (ImGui::Button(kind == struct_dissector::structure_kind_t::union_type ? "Convert to Struct" : "Convert to Union")) {
 			const bool applied = struct_dissector::set_structure_kind(structure_index,
@@ -1103,8 +1274,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ui.operation_error = !applied;
 			ui.operation_status = applied ? "Structure kind updated" : "Structure kind change rejected";
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		register_layout_item("convert-kind", structure_index < 0);
+#endif
 		ImGui::InputTextWithHint("##sd_pack", "packing: 0,1,2,4,8,16", ui.layout_pack_buf,
 			sizeof(ui.layout_pack_buf), ImGuiInputTextFlags_CharsDecimal);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		register_layout_item("packing-input", structure_index < 0);
+#endif
 		ImGui::SameLine();
 		if (ImGui::Button("Set Pack")) {
 			unsigned int value = 0;
@@ -1114,8 +1291,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ui.operation_error = !applied;
 			ui.operation_status = applied ? "Packing updated" : "Packing must be 0 or a power of two up to 4096";
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		register_layout_item("set-packing", structure_index < 0);
+#endif
 		ImGui::InputTextWithHint("##sd_struct_align", "alignment: 0,1,2,4,8,16", ui.layout_align_buf,
 			sizeof(ui.layout_align_buf), ImGuiInputTextFlags_CharsDecimal);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		register_layout_item("alignment-input", structure_index < 0);
+#endif
 		ImGui::SameLine();
 		if (ImGui::Button("Set Align")) {
 			unsigned int value = 0;
@@ -1125,19 +1308,36 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ui.operation_error = !applied;
 			ui.operation_status = applied ? "Structure alignment updated" : "Alignment must be 0 or a power of two up to 4096";
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		register_layout_item("set-alignment", structure_index < 0);
+#endif
+		ImGui::Separator();
+		if (ImGui::Button("Manage Enums...")) {
+			ui.enum_popup_requested = true;
+			ImGui::CloseCurrentPopup();
+		}
 		ImGui::Separator();
 		bool persistence_running = st.persistence_in_flight.load(std::memory_order_acquire);
 		ImGui::BeginDisabled(persistence_running);
 		if (ImGui::Button("Save Catalog"))
 			struct_dissector::request_save_schema();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		register_layout_item("save-catalog", persistence_running);
+#endif
 		ImGui::SameLine();
 		if (ImGui::Button("Load Catalog"))
 			struct_dissector::request_load_schema();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		register_layout_item("load-catalog", persistence_running);
+#endif
 		ImGui::EndDisabled();
 		if (persistence_running) {
 			ImGui::SameLine();
 			if (ImGui::Button("Cancel"))
 				struct_dissector::cancel_persistence();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			register_layout_item("cancel-catalog");
+#endif
 		}
 		std::string persistence_status;
 		bool persistence_error = false;
@@ -1149,6 +1349,262 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (!persistence_status.empty())
 			ImGui::TextColored(persistence_error ? ImVec4(0.95f, 0.35f, 0.35f, 1.f) :
 				ImVec4(0.45f, 0.82f, 0.95f, 1.f), "%s", persistence_status.c_str());
+		ImGui::EndPopup();
+	}
+	if (ui.enum_popup_requested) {
+		ui.enum_popup_requested = false;
+		ui.enum_delete_review = false;
+		ui.enum_form_refresh = true;
+		aida::ui::design::open_dialog("types.enum.manager", "Enum Manager");
+	}
+	if (aida::ui::design::begin_dialog("types.enum.manager", "Enum Manager",
+		ImVec2(720.0f, 560.0f), ImVec2(420.0f, 320.0f))) {
+		std::uint64_t schema_revision = 0;
+		{
+			std::lock_guard<std::mutex> lock(st.mtx);
+			schema_revision = st.schema_revision;
+			if (ui.enum_catalog_revision != schema_revision) {
+				ui.enum_catalog_snapshot = st.enums;
+				ui.enum_catalog_revision = schema_revision;
+			}
+		}
+		const auto& enums = ui.enum_catalog_snapshot;
+		if (ui.enum_delete_review) {
+			bool exact_identity = false;
+			std::size_t reference_count = 0;
+			{
+				std::lock_guard<std::mutex> lock(st.mtx);
+				const auto found = std::find_if(st.enums.begin(), st.enums.end(), [&](const auto& item) {
+					return item.stable_id == ui.enum_delete_id && item.name == ui.enum_delete_name;
+				});
+				exact_identity = found != st.enums.end() &&
+					st.schema_revision == ui.enum_delete_schema_revision;
+				if (exact_identity) {
+					for (const auto& structure : st.structs)
+						reference_count += static_cast<std::size_t>(std::count_if(
+							structure.fields.begin(), structure.fields.end(), [&](const auto& field) {
+								return field.enum_id == ui.enum_delete_id;
+							}));
+				}
+			}
+			const bool can_delete = exact_identity && reference_count == 0;
+			const std::string scope = "Enum catalog entry #" +
+				std::to_string(ui.enum_delete_id) + " at schema revision " +
+				std::to_string(ui.enum_delete_schema_revision);
+			const std::string prerequisite = !exact_identity
+				? "The enum catalog changed after review began. Cancel and select the current entry again."
+				: reference_count != 0
+					? std::to_string(reference_count) +
+						" structure field reference(s) must be removed first."
+					: "Exact enum identity and zero field references were revalidated.";
+			aida::ui::design::confirmation_t confirmation;
+			confirmation.verb = "Delete";
+			confirmation.target = ui.enum_delete_name.c_str();
+			confirmation.scope = scope.c_str();
+			confirmation.effect = "Removes this enum definition from the persisted type catalog.";
+			confirmation.reversibility = "Not automatically reversible; cancel leaves the catalog unchanged.";
+			confirmation.prerequisite = prerequisite.c_str();
+			confirmation.confirm_label = "Delete Enum";
+			confirmation.destructive = true;
+			confirmation.confirm_enabled = can_delete;
+			const auto result = aida::ui::design::confirmation_dialog(
+				"types.enum.manager.delete-review", confirmation);
+			if (result.cancelled) {
+				ui.enum_delete_review = false;
+			} else if (result.confirmed) {
+				const bool deleted = struct_dissector::delete_enum_exact(ui.enum_delete_id,
+					ui.enum_delete_name, ui.enum_delete_schema_revision);
+				ui.operation_error = !deleted;
+				ui.operation_status = deleted ? "Enum deleted" :
+					"Enum deletion rejected because its identity, revision, or references changed";
+				if (deleted) {
+					ui.selected_enum_id = 0;
+					ui.enum_name_buf[0] = '\0';
+					ui.enum_values_buf[0] = '\0';
+					ui.enum_values_oversized = false;
+					ui.enum_requires_reselection = false;
+					ui.enum_form_refresh = true;
+					ui.enum_delete_review = false;
+				}
+			}
+		} else {
+			if (ui.enum_form_refresh) {
+				rebuild_enum_form(ui, ui.enum_draft);
+				ui.enum_form_refresh = false;
+			}
+			const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+				"Save Enum", "Close");
+			aida::ui::design::begin_dialog_body("types.enum.manager.body", footer_height);
+			const float scale = aida::ui::design::metrics().scale;
+			const bool compact = ImGui::GetContentRegionAvail().x <
+				aida::ui::scale_px(600.0f, scale);
+			const ImVec2 list_size(compact ? -1.0f : aida::ui::scale_px(210.0f, scale),
+				compact ? aida::ui::scale_px(132.0f, scale) :
+					(std::max)(aida::ui::scale_px(180.0f, scale), ImGui::GetContentRegionAvail().y));
+			bool focus_first_invalid = false;
+			ImGui::BeginChild("##sd_enum_list", list_size, true);
+			if (ImGui::Button("New Enum", ImVec2(-1.0f, 0.0f))) {
+				ui.selected_enum_id = 0;
+				ui.enum_name_buf[0] = '\0';
+				ui.enum_values_buf[0] = '\0';
+				ui.enum_underlying_type = static_cast<int>(struct_dissector::field_type_t::int32);
+				ui.enum_values_oversized = false;
+				ui.enum_requires_reselection = false;
+				ui.enum_form_refresh = true;
+				focus_first_invalid = true;
+			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.types.enum-manager.new", "enum-action");
+#endif
+			ImGuiListClipper enum_clipper;
+			enum_clipper.Begin(static_cast<int>((std::min)(enums.size(),
+				static_cast<std::size_t>((std::numeric_limits<int>::max)()))));
+			while (enum_clipper.Step()) for (int enum_index = enum_clipper.DisplayStart;
+				enum_index < enum_clipper.DisplayEnd; ++enum_index) {
+				const auto& definition = enums[static_cast<std::size_t>(enum_index)];
+				const std::string enum_row_id = std::to_string(definition.stable_id);
+				ImGui::PushID(enum_row_id.c_str());
+				if (ImGui::Selectable(definition.name.c_str(),
+					ui.selected_enum_id == definition.stable_id)) {
+					ui.selected_enum_id = definition.stable_id;
+					ui.enum_requires_reselection = false;
+					std::strncpy(ui.enum_name_buf, definition.name.c_str(),
+						sizeof(ui.enum_name_buf) - 1);
+					ui.enum_name_buf[sizeof(ui.enum_name_buf) - 1] = '\0';
+					ui.enum_underlying_type = static_cast<int>(definition.underlying_type);
+					std::string values;
+					values.reserve(sizeof(ui.enum_values_buf) - 1);
+					ui.enum_values_oversized = false;
+					for (const auto& value : definition.values) {
+						std::string line = value.name + "=" + std::to_string(value.value);
+						const std::size_t separator = values.empty() ? 0 : 1;
+						if (line.size() + separator > sizeof(ui.enum_values_buf) - 1 - values.size()) {
+							ui.enum_values_oversized = true;
+							values.clear();
+							break;
+						}
+						if (separator != 0)
+							values.push_back('\n');
+						values.append(line);
+					}
+					std::strncpy(ui.enum_values_buf, values.c_str(),
+						sizeof(ui.enum_values_buf) - 1);
+					ui.enum_values_buf[sizeof(ui.enum_values_buf) - 1] = '\0';
+					ui.enum_form_refresh = true;
+				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					aida::preview::semantics::stable_id("aida.types.enum-manager.row",
+						std::to_string(definition.stable_id)), "enum-row");
+#endif
+				ImGui::PopID();
+			}
+			ImGui::EndChild();
+			if (!compact)
+				ImGui::SameLine();
+			ImGui::BeginGroup();
+			bool changed = aida::ui::design::form_input_text("enum-name", "Name",
+				ui.enum_name_buf, sizeof(ui.enum_name_buf), ui.enum_form, "Enum name");
+			static const char* integer_types[] = {
+				"Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64"
+			};
+			aida::ui::design::text(aida::ui::design::text_role_t::secondary,
+				"Underlying type");
+			if (ui.enum_form.consume_focus_request("enum-underlying"))
+				ImGui::SetKeyboardFocusHere();
+			int integer_index = ui.enum_underlying_type -
+				static_cast<int>(struct_dissector::field_type_t::int8);
+			if (integer_index < 0 || integer_index >= 8)
+				integer_index = 4;
+			ImGui::SetNextItemWidth(-1.0f);
+			if (ImGui::Combo("##sd_enum_underlying", &integer_index, integer_types, 8)) {
+				ui.enum_underlying_type = integer_index +
+					static_cast<int>(struct_dissector::field_type_t::int8);
+				changed = true;
+			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.types.enum-manager.underlying", "form-field");
+#endif
+			aida::ui::design::inline_validation("enum-underlying", ui.enum_form);
+			aida::ui::design::text(aida::ui::design::text_role_t::secondary,
+				"Values (one NAME=VALUE entry per line)");
+			if (ui.enum_form.consume_focus_request("enum-values"))
+				ImGui::SetKeyboardFocusHere();
+			const float values_height = compact ? aida::ui::scale_px(150.0f, scale) :
+				(std::max)(aida::ui::scale_px(180.0f, scale), ImGui::GetContentRegionAvail().y -
+					aida::ui::scale_px(54.0f, scale));
+			if (ImGui::InputTextMultiline("##sd_enum_values", ui.enum_values_buf,
+				sizeof(ui.enum_values_buf), ImVec2(-1.0f, values_height)))
+				changed = true;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.types.enum-manager.values", "form-field");
+#endif
+			aida::ui::design::inline_validation("enum-values", ui.enum_form);
+			if (changed || ui.enum_form_refresh) {
+				rebuild_enum_form(ui, ui.enum_draft);
+				ui.enum_form_refresh = false;
+			}
+			if (focus_first_invalid)
+				ui.enum_form.request_first_invalid_focus();
+			aida::ui::design::form_summary("types.enum.manager.validation", ui.enum_form);
+			if (!ui.operation_status.empty()) {
+				ImGui::TextColored(ui.operation_error ? ImVec4(0.95f, 0.35f, 0.35f, 1.0f) :
+					ImVec4(0.45f, 0.82f, 0.95f, 1.0f), "%s", ui.operation_status.c_str());
+			}
+			ImGui::BeginDisabled(ui.selected_enum_id == 0);
+			if (ImGui::Button("Delete Enum...")) {
+				const auto selected = std::find_if(enums.begin(), enums.end(), [&](const auto& item) {
+					return item.stable_id == ui.selected_enum_id;
+				});
+				if (selected != enums.end()) {
+					ui.enum_delete_review = true;
+					ui.enum_delete_id = selected->stable_id;
+					ui.enum_delete_name = selected->name;
+					ui.enum_delete_schema_revision = schema_revision;
+				} else {
+					ui.operation_error = true;
+					ui.operation_status = "The selected enum changed; select it again";
+				}
+			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.types.enum-manager.delete-review", "enum-action", false,
+				ui.selected_enum_id == 0);
+#endif
+			ImGui::EndDisabled();
+			ImGui::EndGroup();
+			aida::ui::design::end_dialog_body();
+			const bool enum_valid = ui.enum_form.valid();
+			const auto result = aida::ui::design::dialog_footer(
+				"types.enum.manager.footer", enum_valid ? "Save Enum" : "Review Errors",
+				true, false, "Close", true, enum_valid);
+			if (result.cancelled) {
+				ImGui::CloseCurrentPopup();
+			} else if (result.confirmed) {
+				if (!ui.enum_form.valid()) {
+					ui.enum_form.request_first_invalid_focus();
+				} else {
+					const bool creating = ui.enum_draft.stable_id == 0;
+					const bool saved = struct_dissector::upsert_enum_exact(ui.enum_draft,
+						ui.enum_draft_schema_revision);
+					ui.operation_error = !saved;
+					ui.operation_status = saved ? "Enum catalog updated" :
+						"Enum rejected because its catalog identity or references changed";
+					ui.enum_requires_reselection = !saved;
+					if (saved && creating) {
+						std::lock_guard<std::mutex> lock(st.mtx);
+						const auto found = std::find_if(st.enums.begin(), st.enums.end(),
+							[&](const auto& item) { return item.name == ui.enum_draft.name; });
+						if (found != st.enums.end())
+							ui.selected_enum_id = found->stable_id;
+					}
+					ui.enum_form_refresh = true;
+				}
+			}
+		}
 		ImGui::EndPopup();
 	}
 
@@ -1270,6 +1726,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		std::vector<std::pair<std::string, uint32_t>> entries;
 		std::vector<int> entry_index;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		std::vector<std::uint64_t> entry_stable_ids;
+#endif
 		std::string filter_lc;
 		filter_lc.reserve(64);
 		for (std::size_t i = 0; i < sizeof(ui.list_filter) && ui.list_filter[i] != '\0'; ++i) {
@@ -1282,6 +1741,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			active_struct_idx = st.active_struct;
 			entries.reserve(st.structs.size());
 			entry_index.reserve(st.structs.size());
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			entry_stable_ids.reserve(st.structs.size());
+#endif
 			for (std::size_t i = 0; i < st.structs.size(); ++i) {
 				auto& sd = st.structs[i];
 				if (!filter_lc.empty()) {
@@ -1296,6 +1758,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (!struct_dissector::index_fits_int(i)) break;
 				entries.emplace_back(sd.name, sd.total_size);
 				entry_index.push_back(static_cast<int>(i));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				entry_stable_ids.push_back(sd.stable_id);
+#endif
 			}
 		}
 		const std::size_t struct_count = entries.size();
@@ -1323,6 +1788,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			ImVec2 a = ImVec2(lx + 4.f, ry);
 			ImVec2 b = ImVec2(lx + lw - 4.f, ry + line_h);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const std::string structure_semantic_id = studio_dissector_structure_id(
+				entry_stable_ids[i], entries[i].first);
+			aida::preview::semantics::register_region(structure_semantic_id,
+				"dissector-structure-row", ImGui::GetID(structure_semantic_id.c_str()),
+				a, b, false, false, "aida.dock-window.view.types.dissector");
+#endif
 			bool hov = ImGui::IsMouseHoveringRect(a, b, true);
 			bool sel = (active_struct_idx == sd_idx);
 
@@ -1676,6 +2148,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		std::uint64_t active_base_address = 0;
 		std::uint64_t active_structure_id = 0;
 		std::uint64_t active_layout_revision = 0;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		std::string active_structure_name_snapshot;
+#endif
 		{
 			std::lock_guard<std::mutex> lk(st.mtx);
 			active_idx = st.active_struct;
@@ -1684,8 +2159,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				field_count = st.structs[static_cast<std::size_t>(active_idx)].fields.size();
 				active_structure_id = st.structs[static_cast<std::size_t>(active_idx)].stable_id;
 				active_layout_revision = st.structs[static_cast<std::size_t>(active_idx)].layout_revision;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				active_structure_name_snapshot =
+					st.structs[static_cast<std::size_t>(active_idx)].name;
+#endif
 			}
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string active_structure_semantic_id = studio_dissector_structure_id(
+			active_structure_id, active_structure_name_snapshot);
+#endif
 
 		if (active_idx < 0) {
 			ImVec2 sz = ImVec2(rw, rh);
@@ -1805,6 +2288,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					const std::size_t field_index = row.index;
 					if (!struct_dissector::index_fits_int(field_index)) break;
 					const int fi = static_cast<int>(field_index);
+					const auto& f = row.field;
 					float row_y = table_y + static_cast<float>(field_index) * line_h - ui.scroll_y;
 					if (row_y + line_h < table_y || row_y > table_y + table_h) continue;
 
@@ -1814,6 +2298,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					if (entrance_t > 1.f) entrance_t = 1.f;
 					float entrance = aida::motion::ease::out_cubic(entrance_t);
 					if (entrance < 0.01f) continue;
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					const std::string field_semantic_id = studio_dissector_field_id(
+						active_structure_semantic_id, f);
+					aida::preview::semantics::register_region(field_semantic_id,
+						"dissector-field-row", ImGui::GetID(field_semantic_id.c_str()),
+						ImVec2(rx, row_y), ImVec2(rx + rw, row_y + line_h),
+						false, false, active_structure_semantic_id);
+#endif
 
 					bool row_sel = (ui.selected_field == fi);
 					bool row_hov = ImGui::IsMouseHoveringRect(
@@ -1848,7 +2341,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							pulse, 4.f);
 					}
 
-					const auto& f = row.field;
 					if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 						ui.selected_field = fi;
 						publish_field_selection(active_structure_name, f);
@@ -1910,6 +2402,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 					if (row.has_value) {
 						const auto& cv = row.value;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						const std::string live_semantic_id = aida::preview::semantics::stable_id(
+							field_semantic_id, "live");
+						aida::preview::semantics::register_region(live_semantic_id,
+							"dissector-live-value", ImGui::GetID(live_semantic_id.c_str()),
+							ImVec2(fx, row_y), ImVec2(fx + col_value_w, row_y + line_h),
+							true, false, field_semantic_id);
+#endif
 						bool changed_now = cv.changed && fa.has_last && fa.last_bytes != cv.raw_bytes;
 						if (changed_now) fa.change_flash.trigger();
 						fa.last_bytes = cv.raw_bytes;
@@ -2496,6 +2996,43 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				return open_field_edit(edit_target_t::field_alignment,
 					std::to_string(field_snapshot.explicit_alignment));
 			});
+			add_action("types.dissector.field.insert_before", valid_field,
+				"The retained field is stale", [activate_retained_field] {
+				const auto resolved = activate_retained_field();
+				if (!resolved)
+					return aida::ui::action_handler_result_t::failed("The retained field is stale");
+				g_ui.pending_insert_index = resolved->second;
+				g_ui.field_name_buf[0] = '\0';
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add_action("types.dissector.field.insert_after", valid_field,
+				"The retained field is stale", [activate_retained_field] {
+				const auto resolved = activate_retained_field();
+				if (!resolved)
+					return aida::ui::action_handler_result_t::failed("The retained field is stale");
+				g_ui.pending_insert_index = resolved->second + 1;
+				g_ui.field_name_buf[0] = '\0';
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add_action("types.dissector.field.move_up", valid_field && tgt_field > 0,
+				"The field is already first", [activate_retained_field] {
+				const auto resolved = activate_retained_field();
+				if (!resolved || resolved->second <= 0)
+					return aida::ui::action_handler_result_t::failed("The retained field cannot move up");
+				return struct_dissector::move_field(resolved->first, resolved->second, resolved->second - 1)
+					? aida::ui::action_handler_result_t::completed()
+					: aida::ui::action_handler_result_t::failed("The reordered layout failed validation");
+			});
+			add_action("types.dissector.field.move_down", valid_field &&
+				static_cast<std::size_t>(tgt_field + 1) < field_count,
+				"The field is already last", [activate_retained_field] {
+				const auto resolved = activate_retained_field();
+				if (!resolved)
+					return aida::ui::action_handler_result_t::failed("The retained field is stale");
+				return struct_dissector::move_field(resolved->first, resolved->second, resolved->second + 1)
+					? aida::ui::action_handler_result_t::completed()
+					: aida::ui::action_handler_result_t::failed("The reordered layout failed validation");
+			});
 			add_action("types.dissector.field.remove", valid_field,
 				"The retained field is stale", [activate_retained_field,
 					retained_structure_id, retained_structure_revision, retained_field_id] {
@@ -2628,7 +3165,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleColor(2);
 		ImGui::PopStyleVar();
 
-		if (aida::ui::button("Add", aida::ui::button_kind_t::primary,
+		const char* add_label = ui.pending_insert_index >= 0 ? "Insert" : "Add";
+		if (aida::ui::button(add_label, aida::ui::button_kind_t::primary,
 			aida::ui::size_t_::sm, ImVec2(72.f, 28.f))) {
 			if (ui.field_name_buf[0] != '\0') {
 				struct_dissector::field_def_t fd;
@@ -2639,7 +3177,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				fd.offset = off;
 				std::size_t ts = struct_dissector::field_type_size(fd.type);
 				fd.size = static_cast<uint32_t>(ts > 0 ? ts : 1);
-				struct_dissector::add_field(active_idx, fd);
+				const int added_index = ui.pending_insert_index >= 0
+					? struct_dissector::insert_field(active_idx, ui.pending_insert_index, fd)
+					: struct_dissector::add_field(active_idx, fd);
+				ui.operation_error = added_index < 0;
+				ui.operation_status = added_index < 0
+					? "Field insertion failed layout validation" : "Field added";
+				ui.pending_insert_index = -1;
 				ui.field_name_buf[0] = '\0';
 				ui.offset_buf[0] = '\0';
 			} else {

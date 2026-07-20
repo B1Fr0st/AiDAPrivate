@@ -969,7 +969,7 @@ void test_managed_artifact_dispatch() {
     temp_fixture_t cf_fixture(classfile_bytes, ".class");
     auto cf_provider = cf_fixture.open_provider();
     auto cf_result = mr::read_managed_artifact(*cf_provider);
-    require(cf_result, "auto-detection should detect classfile format");
+    require(cf_result.has_value(), "auto-detection should detect classfile format");
     require(cf_result.value().kind == mr::managed_artifact_kind_t::java_classfile,
             "auto-detection classfile kind mismatch");
 
@@ -977,7 +977,7 @@ void test_managed_artifact_dispatch() {
     temp_fixture_t dex_fixture(dex_bytes, ".dex");
     auto dex_provider = dex_fixture.open_provider();
     auto dex_result = mr::read_managed_artifact(*dex_provider);
-    require(dex_result, "auto-detection should detect DEX format");
+    require(dex_result.has_value(), "auto-detection should detect DEX format");
     require(dex_result.value().kind == mr::managed_artifact_kind_t::dex,
             "auto-detection DEX kind mismatch");
 
@@ -998,7 +998,7 @@ void test_multidex_container() {
     auto provider = fixture.open_provider();
 
     auto multidex_result = mr::read_multidex_container(*provider);
-    require(multidex_result, "multidex container read should succeed for single DEX");
+    require(multidex_result.has_value(), "multidex container read should succeed for single DEX");
     require(multidex_result.value().valid(), "multidex should be valid");
     require(!multidex_result.value().artifacts.empty(),
             "multidex should have at least one artifact");

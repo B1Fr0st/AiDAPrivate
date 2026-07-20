@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -58,6 +59,15 @@ struct mutation_state_t {
     std::string derived_publication_error;
 };
 
+struct presentation_snapshot_t {
+    addr_format_t addr_format = addr_format_t::va;
+    bool show_bytes = true;
+    std::optional<std::uint64_t> display_image_base;
+    int active_section = -1;
+    std::optional<aida::analysis::address_t> selection;
+    float scroll_y = 0.0f;
+};
+
 enum class metadata_line_kind_t : std::uint8_t {
     blank = 0,
     comment,
@@ -88,6 +98,7 @@ struct state_t {
     int active_section = -1;
     std::optional<aida::analysis::address_t> selection;
     float target_scroll_y = 0.0f;
+    bool scroll_restore_pending = false;
     bool scroll_to_selection = false;
     bool goto_visible = false;
     char goto_buf[192] = {};
@@ -133,6 +144,7 @@ struct state_t {
     std::string static_patch_error;
     std::string static_patch_parse_error;
     std::string static_patch_status;
+    bool selection_initialized = false;
     std::mutex mutex;
 };
 
@@ -153,7 +165,18 @@ struct workspace_context_t {
 
 workspace_context_t capture_workspace(
     const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace);
+workspace_context_t capture_workspace(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    std::string_view presentation_key);
 workspace_context_t capture_selected_workspace();
+workspace_context_t capture_selected_workspace(std::string_view presentation_key);
+void reset_presentation(std::string_view presentation_key);
+void release_presentation(std::string_view presentation_key);
+void clone_presentation(std::string_view source_key, std::string_view target_key);
+bool capture_selected_presentation(std::string_view presentation_key,
+                                   presentation_snapshot_t& snapshot);
+bool restore_selected_presentation(std::string_view presentation_key,
+                                   const presentation_snapshot_t& snapshot);
 
 std::optional<aida::analysis::address_t> typed_address(
     const workspace_context_t& context, std::uint64_t runtime_address);

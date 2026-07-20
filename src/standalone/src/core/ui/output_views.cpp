@@ -351,25 +351,53 @@ void render_toolbar(bottom_tab_t tab, const char* stable_scope) {
     const float available = (std::max)(1.0f, ImGui::GetContentRegionAvail().x);
     const bool supports_search = supports_filter(tab);
     const bool wide = supports_search && available >= 620.0f * metrics.scale;
-    const bool content = has_content(tab);
     const bool follow = follows_tail(tab);
     const char* follow_label = follow ? "Following" : "Follow tail";
     const char* follow_compact = follow ? "Follow: on" : "Follow: off";
+    const auto copy = application_ui::present_output_action(
+        static_cast<int>(tab), "output.copy_all");
+    const auto select = application_ui::present_output_action(
+        static_cast<int>(tab), "output.select_all");
+    const auto clear = application_ui::present_output_action(
+        static_cast<int>(tab), "output.clear");
+    const auto export_output = application_ui::present_output_action(
+        static_cast<int>(tab), "output.export");
+    const auto follow_output = application_ui::present_output_action(
+        static_cast<int>(tab), "output.follow");
+    const auto filter = application_ui::present_output_action(
+        static_cast<int>(tab), "output.filter");
+    const auto tooltip = [](const application_ui::action_presentation_t& presentation,
+            const char* fallback) {
+        if (!presentation.enabled && !presentation.disabled_reason.empty())
+            return presentation.disabled_reason.c_str();
+        return presentation.description.empty()
+            ? fallback : presentation.description.c_str();
+    };
+    const auto shortcut = [](const application_ui::action_presentation_t& presentation) {
+        return presentation.shortcut.empty() ? nullptr : presentation.shortcut.c_str();
+    };
     const design::action_t actions[] = {
-        {"output.copy_all", "Copy All", "Copy", "Copy all output text", "Ctrl+C", nullptr,
-            components::button_kind_t::secondary, content, false, true},
-        {"output.select_all", "Select All", "Select", "Select all output text", "Ctrl+A", nullptr,
-            components::button_kind_t::secondary, content, false, true},
-        {"output.clear", "Clear", "Clear", "Clear this output buffer", nullptr,
+        {"output.copy_all", "Copy All", "Copy", tooltip(copy, "Copy all output text"),
+            shortcut(copy), nullptr, components::button_kind_t::secondary,
+            copy.enabled, false, copy.visible},
+        {"output.select_all", "Select All", "Select", tooltip(select, "Select all output text"),
+            shortcut(select), nullptr, components::button_kind_t::secondary,
+            select.enabled, false, select.visible},
+        {"output.clear", "Clear", "Clear", tooltip(clear, "Clear this output buffer"), nullptr,
             "Clears the visible output buffer", components::button_kind_t::secondary,
-            content, false, true},
-        {"output.export", "Export...", "Export", "Export all output to a file", nullptr, nullptr,
-            components::button_kind_t::secondary, content, false, true},
+            clear.enabled, false, clear.visible},
+        {"output.export", "Export...", "Export", tooltip(export_output,
+            "Export all output to a file"), nullptr, nullptr,
+            components::button_kind_t::secondary, export_output.enabled, false,
+            export_output.visible},
         {"output.follow", follow_label, follow_compact,
-            follow ? "Stop following new output" : "Follow new output as it arrives", nullptr, nullptr,
-            components::button_kind_t::ghost, true, false, true},
-        {"output.filter", "Filter...", "Filter", "Focus the output filter", "Ctrl+F", nullptr,
-            components::button_kind_t::ghost, supports_search, false, supports_search && !wide}
+            tooltip(follow_output, follow ? "Stop following new output" :
+                "Follow new output as it arrives"), nullptr, nullptr,
+            components::button_kind_t::ghost, follow_output.enabled, false,
+            follow_output.visible},
+        {"output.filter", "Filter...", "Filter", tooltip(filter, "Focus the output filter"),
+            shortcut(filter), nullptr, components::button_kind_t::ghost,
+            filter.enabled, false, filter.visible}
     };
     const float toolbar_height = metrics.control_height + 4.0f * metrics.scale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -384,12 +412,8 @@ void render_toolbar(bottom_tab_t tab, const char* stable_scope) {
             available - filter_width - metrics.spacing_sm) : available;
     const auto result = design::render_toolbar(stable_scope, actions,
         sizeof(actions) / sizeof(actions[0]), action_width);
-    if (result.invoked && result.id) {
-        if (std::strcmp(result.id, "output.filter") == 0)
-            state().focus_filter[index(tab)] = true;
-        else
-            invoke(result.id);
-    }
+    if (result.invoked && result.id)
+        invoke(result.id);
     if (wide) {
         ImGui::SameLine(0.0f, metrics.spacing_sm);
         ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(),
@@ -402,7 +426,7 @@ void render_toolbar(bottom_tab_t tab, const char* stable_scope) {
         }
         ImGui::InputTextWithHint("##output_filter", "Filter output",
             state().filters[slot].data(), state().filters[slot].size());
-        design::tooltip_for_last_item("Filter visible output", "Ctrl+F");
+        design::tooltip_for_last_item("Filter visible output", shortcut(filter));
         design::draw_focus_ring_for_last_item();
     }
     ImGui::EndChild();
@@ -716,33 +740,49 @@ void render_terminal_session_bar() {
         ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoBackground);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 3.0f));
-    if (ImGui::SmallButton("New")) ImGui::OpenPopup("##new_terminal_profile");
+    const auto terminal_action = [](const char* action_id, const char* label) {
+        const auto presentation = application_ui::present_output_action(
+            static_cast<int>(bottom_tab_t::terminal), action_id);
+        if (!presentation.visible)
+            return false;
+        ImGui::BeginDisabled(!presentation.enabled);
+        const bool clicked = ImGui::SmallButton(label);
+        ImGui::EndDisabled();
+        const char* detail = !presentation.enabled && !presentation.disabled_reason.empty()
+            ? presentation.disabled_reason.c_str() : presentation.description.c_str();
+        design::tooltip_for_last_item(detail,
+            presentation.shortcut.empty() ? nullptr : presentation.shortcut.c_str());
+        if (clicked)
+            static_cast<void>(application_ui::execute_output_action(
+                static_cast<int>(bottom_tab_t::terminal), action_id,
+                action_invocation_source_t::toolbar));
+        return clicked;
+    };
+    const auto new_terminal = application_ui::present_output_action(
+        static_cast<int>(bottom_tab_t::terminal), "terminal.new");
+    ImGui::BeginDisabled(!new_terminal.enabled);
+    const bool choose_new_terminal = ImGui::SmallButton("New");
+    ImGui::EndDisabled();
+    design::tooltip_for_last_item(new_terminal.enabled
+        ? "Choose a terminal profile and working directory"
+        : new_terminal.disabled_reason.c_str(),
+        new_terminal.shortcut.empty() ? nullptr : new_terminal.shortcut.c_str());
+    if (choose_new_terminal)
+        ImGui::OpenPopup("##new_terminal_profile");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Split Right"))
-        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
-            "terminal.split_vertical", action_invocation_source_t::toolbar);
+    terminal_action("terminal.split_vertical", "Split Right");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Split Down"))
-        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
-            "terminal.split_horizontal", action_invocation_source_t::toolbar);
+    terminal_action("terminal.split_horizontal", "Split Down");
     if (manager.split_mode != terminal_view::split_mode_t::none) {
         ImGui::SameLine();
-        if (ImGui::SmallButton("Unsplit"))
-            application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
-                "terminal.unsplit", action_invocation_source_t::toolbar);
+        terminal_action("terminal.unsplit", "Unsplit");
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Search"))
-        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
-            "terminal.search", action_invocation_source_t::toolbar);
+    terminal_action("terminal.search", "Search");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Restart"))
-        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
-            "terminal.restart", action_invocation_source_t::toolbar);
+    terminal_action("terminal.restart", "Restart");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Close"))
-        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
-            "terminal.close", action_invocation_source_t::toolbar);
+    terminal_action("terminal.close", "Close");
     ImGui::PopStyleVar();
     if (!view.terminal_persistence_error.empty()) {
         ImGui::SameLine();
@@ -1197,17 +1237,6 @@ void render(bottom_tab_t tab, std::string_view stable_view_id,
         render_terminal();
     } else {
         render_log(tab);
-    }
-    if (!terminal_tab(tab) && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false))
-            application_ui::execute_output_action(static_cast<int>(tab), "output.select_all",
-                action_invocation_source_t::shortcut);
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
-            application_ui::execute_output_action(static_cast<int>(tab), "output.copy_all",
-                action_invocation_source_t::shortcut);
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false))
-            application_ui::execute_output_action(static_cast<int>(tab), "output.filter",
-                action_invocation_source_t::shortcut);
     }
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && context_key_pressed())
         application_ui::open_output_context_menu(static_cast<int>(tab), context_origin());

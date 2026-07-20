@@ -28,7 +28,7 @@
 namespace aida::editor::programming_documents {
 
 inline constexpr std::uint32_t journal_version = 1;
-inline constexpr std::uint32_t session_version = 3;
+inline constexpr std::uint32_t session_version = 4;
 inline constexpr std::size_t maximum_documents = 4096;
 inline constexpr std::size_t normal_editable_document_bytes = 1ULL * 1024ULL * 1024ULL;
 inline constexpr std::size_t maximum_editable_document_bytes = 1ULL * 1024ULL * 1024ULL;
@@ -263,8 +263,13 @@ struct document_record_t {
     bool dirty = false;
     int caret_line = 0;
     int caret_column = 0;
+    int selection_anchor_line = 0;
+    int selection_anchor_column = 0;
+    bool selection_active = false;
     float scroll_x = 0.f;
     float scroll_y = 0.f;
+    std::vector<int> folded_lines;
+    std::string language_override;
     text_metadata_t text;
     std::string content;
 };
@@ -402,8 +407,13 @@ inline nlohmann::json record_metadata_json(const document_record_t& record) {
         {"pinned", record.pinned},
         {"caret_line", record.caret_line},
         {"caret_column", record.caret_column},
+        {"selection_anchor_line", record.selection_anchor_line},
+        {"selection_anchor_column", record.selection_anchor_column},
+        {"selection_active", record.selection_active},
         {"scroll_x", record.scroll_x},
-        {"scroll_y", record.scroll_y}
+        {"scroll_y", record.scroll_y},
+        {"folded_lines", record.folded_lines},
+        {"language_override", record.language_override}
     };
 }
 
@@ -436,11 +446,20 @@ inline bool parse_record_metadata(const nlohmann::json& object, document_record_
     record.pinned = object.value("pinned", false);
     record.caret_line = object.value("caret_line", 0);
     record.caret_column = object.value("caret_column", 0);
+    record.selection_anchor_line = object.value("selection_anchor_line", record.caret_line);
+    record.selection_anchor_column = object.value("selection_anchor_column", record.caret_column);
+    record.selection_active = object.value("selection_active", false);
     record.scroll_x = object.value("scroll_x", 0.f);
     record.scroll_y = object.value("scroll_y", 0.f);
+    record.folded_lines = object.value("folded_lines", std::vector<int>{});
+    record.language_override = object.value("language_override", std::string{});
     if (record.document_id == 0 || record.revision == 0 || record.content_hash == 0 ||
         record.byte_length > maximum_document_bytes || record.caret_line < 0 ||
-        record.caret_column < 0 || record.scroll_x < 0.f || record.scroll_y < 0.f) {
+        record.caret_column < 0 || record.selection_anchor_line < 0 ||
+        record.selection_anchor_column < 0 || record.scroll_x < 0.f || record.scroll_y < 0.f ||
+        record.folded_lines.size() > 4096 || record.language_override.size() > 64 ||
+        std::any_of(record.folded_lines.begin(), record.folded_lines.end(),
+            [](int line) { return line < 0; })) {
         error = "Recovery metadata contains an invalid identity, revision, size, or editor position.";
         return false;
     }
@@ -1134,7 +1153,11 @@ inline std::string encode_session(const session_state_t& state) {
             {"caret_column", item.caret_column}, {"scroll_x", item.scroll_x},
             {"scroll_y", item.scroll_y}, {"revision", item.revision},
             {"content_hash", item.content_hash}, {"base_fingerprint", item.base_fingerprint},
-            {"encoding", item.text.encoding}, {"bom", item.text.bom}, {"eol", item.text.eol}
+            {"encoding", item.text.encoding}, {"bom", item.text.bom}, {"eol", item.text.eol},
+            {"selection_anchor_line", item.selection_anchor_line},
+            {"selection_anchor_column", item.selection_anchor_column},
+            {"selection_active", item.selection_active},
+            {"folded_lines", item.folded_lines}, {"language_override", item.language_override}
         });
     }
     for (const auto& source : state.groups) {
@@ -1165,7 +1188,7 @@ inline operation_result_t decode_session(std::string_view raw, session_state_t& 
     if (document.is_object()) {
         version = document.value("version", 0U);
         if (document.value("schema", std::string{}) != "aida.programming-documents" ||
-            (version != 1 && version != 2 && version != session_version) ||
+            (version < 1 || version > session_version) ||
             !document.contains("tabs") || !document["tabs"].is_array())
             return {false, "Programming document session schema or version is unsupported."};
         tabs = &document["tabs"];
@@ -1189,8 +1212,15 @@ inline operation_result_t decode_session(std::string_view raw, session_state_t& 
             record.pinned = item.value("pinned", false);
             record.caret_line = (std::max)(item.value("caret_line", 0), 0);
             record.caret_column = (std::max)(item.value("caret_column", 0), 0);
+            record.selection_anchor_line = (std::max)(
+                item.value("selection_anchor_line", record.caret_line), 0);
+            record.selection_anchor_column = (std::max)(
+                item.value("selection_anchor_column", record.caret_column), 0);
+            record.selection_active = item.value("selection_active", false);
             record.scroll_x = (std::max)(item.value("scroll_x", 0.f), 0.f);
             record.scroll_y = (std::max)(item.value("scroll_y", 0.f), 0.f);
+            record.folded_lines = item.value("folded_lines", std::vector<int>{});
+            record.language_override = item.value("language_override", std::string{});
             record.revision = (std::max)(item.value("revision", std::uint64_t{1}), std::uint64_t{1});
             record.content_hash = item.value("content_hash", std::uint64_t{0});
             record.base_fingerprint = item.value("base_fingerprint", std::uint64_t{0});
@@ -1203,7 +1233,10 @@ inline operation_result_t decode_session(std::string_view raw, session_state_t& 
         if (record.filename.size() > 1024 || record.canonical_path.size() > 32768 ||
             record.original_path.size() > 32768 ||
             record.text.encoding.size() > 32 || record.text.bom.size() > 32 ||
-            record.text.eol.size() > 16)
+            record.text.eol.size() > 16 || record.folded_lines.size() > 4096 ||
+            record.language_override.size() > 64 ||
+            std::any_of(record.folded_lines.begin(), record.folded_lines.end(),
+                [](int line) { return line < 0; }))
             continue;
         if (!record.canonical_path.empty() || record.document_id != 0)
             state.documents.push_back(std::move(record));

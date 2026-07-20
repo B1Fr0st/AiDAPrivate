@@ -320,7 +320,6 @@ build_classfile_artifact(const classfile_metadata_t& metadata,
             method.code_offset = m.code->code_offset;
             method.code_size = m.code->code_length;
             method.max_stack = m.code->max_stack;
-            method.max_locals = m.code->max_locals;
         }
         for (const auto& attr : m.attributes) {
             if (attr.name == "Signature") {

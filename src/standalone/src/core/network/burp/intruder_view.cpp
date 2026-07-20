@@ -1,5 +1,6 @@
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/studio_semantics.hpp"
 #else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -12,6 +13,7 @@
 
 #include "intruder_view.hpp"
 #include "../network_view.hpp"
+#include "../human_request_editor.hpp"
 #include "burp_ui_operation.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_routed.hpp"
@@ -157,6 +159,21 @@ static ::network_view::artifact_identity_t response_identity(
     identity.label = "Intruder response #" + std::to_string(result.index);
     return identity;
 }
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+static std::string semantic_result_id(
+    const ::network_view::artifact_identity_t& identity)
+{
+    const std::string retained = identity.id + ":" +
+        std::to_string(identity.timestamp) + ":" +
+        std::to_string(identity.revision) + ":" +
+        std::to_string(identity.content_hash) + ":" +
+        std::to_string(identity.content_size);
+    return aida::preview::semantics::stable_id(
+        "aida.network", "intruder-result-" +
+            aida::preview::semantics::entity_token(retained));
+}
+#endif
 
 static bool same_status(const intruder::status_t& left, const intruder::status_t& right)
 {
@@ -457,7 +474,12 @@ void render(float pos_x, float pos_y, float width, float height,
         const bool shift_f10_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
             ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
 
-        for (auto& r : rows) {
+        ImGuiListClipper result_clipper;
+        result_clipper.Begin(static_cast<int>(rows.size()), row_h);
+        while (result_clipper.Step()) {
+        for (int visible_index = result_clipper.DisplayStart;
+             visible_index < result_clipper.DisplayEnd; ++visible_index) {
+            auto& r = rows[static_cast<std::size_t>(visible_index)];
             float ry = ImGui::GetCursorPosY();
             float abs_ry = ImGui::GetCursorScreenPos().y;
             bool is_sel = (static_cast<int>(r.index) == sel_row);
@@ -473,6 +495,20 @@ void render(float pos_x, float pos_y, float width, float height,
             ImVec2 mouse = ImGui::GetMousePos();
             const bool hovered = mouse.x >= org.x && mouse.x < org.x + ImGui::GetWindowWidth() &&
                 mouse.y >= abs_ry && mouse.y < abs_ry + row_h;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            const ImRect clip_rect = ImGui::GetCurrentWindow()->ClipRect;
+            if (abs_ry + row_h > clip_rect.Min.y && abs_ry < clip_rect.Max.y) {
+                const auto identity = response_identity(r, s_info.started_unix_ms);
+                ImGui::PushID(static_cast<int>(r.index));
+                const ImGuiID row_id = ImGui::GetID("##intruder_result_row");
+                ImGui::PopID();
+                aida::preview::semantics::register_region(
+                    semantic_result_id(identity), "network-intruder-result", row_id,
+                    ImVec2(org.x, abs_ry),
+                    ImVec2(org.x + ImGui::GetWindowWidth(), abs_ry + row_h), false, false,
+                    "aida.dock-window.view.network.intruder");
+            }
+#endif
             if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 std::lock_guard<std::mutex> lk(st.mtx);
                 st.selected_result_index = static_cast<int>(r.index);
@@ -521,6 +557,7 @@ void render(float pos_x, float pos_y, float width, float height,
                              aida::ui::with_alpha(th.error, alpha), r.error_msg.c_str());
             }
             ImGui::SetCursorPosY(ry + row_h);
+        }
         }
         ImGui::EndChild();
 
@@ -571,6 +608,8 @@ void render(float pos_x, float pos_y, float width, float height,
     }
     if (aida::ui::design::begin_dialog_exact("Intruder - New Attack",
         ImVec2(800.f, 620.f), ImVec2(560.f, 420.f))) {
+        static network_view::human_request_editor::fixed_state_t request_editor;
+        network_view::human_request_editor::render_result_t request_editor_result;
         const float footer = aida::ui::design::dialog_footer_reserve_height("Launch");
         if (aida::ui::design::begin_dialog_body("intruder_new_attack_body", footer)) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Host:");
@@ -598,8 +637,13 @@ void render(float pos_x, float pos_y, float width, float height,
             }
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                                "Request template (mark positions with $...$):");
-            ImGui::InputTextMultiline("##na_req", st.new_request, sizeof(st.new_request),
-                                      ImVec2(ImGui::GetContentRegionAvail().x, 180.f));
+            network_view::human_request_editor::render_config_t request_config;
+            request_config.stable_id = "intruder-new-attack";
+            request_config.size = ImVec2(ImGui::GetContentRegionAvail().x, 180.f);
+            request_config.max_bytes = sizeof(st.new_request) - 1;
+            request_config.editable = !st.operation.pending();
+            request_editor_result = network_view::human_request_editor::render_fixed(
+                request_editor, "intruder.new-attack", st.new_request, request_config);
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                                "Payload set (one per line):");
             ImGui::InputTextMultiline("##na_ps", st.new_payload_set, sizeof(st.new_payload_set),
@@ -607,7 +651,10 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         aida::ui::design::end_dialog_body();
         const auto result = aida::ui::design::dialog_footer(
-            "intruder_new_attack_footer", "Launch", !st.operation.pending(), false);
+            "intruder_new_attack_footer", "Launch",
+            !st.operation.pending() && request_editor_result.valid &&
+                !request_editor_result.has_unapplied_pretty,
+            false);
         if (result.confirmed) {
             intruder::config_t cfg;
             cfg.host = st.new_host;

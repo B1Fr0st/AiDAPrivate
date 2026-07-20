@@ -116,7 +116,7 @@ namespace
         const auto path = root / std::filesystem::u8path(source.request.relative_path);
         std::error_code size_error;
         const auto size = std::filesystem::file_size(path, size_error);
-        require(!size_error && size != 0 && size <= source.request.max_bytes &&
+        require(!size_error && size != 0 && size <= source.request.maximum_bytes &&
                 size <= static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)()),
             "bound JSON evidence is absent, empty, or oversized");
         std::ifstream stream(path, std::ios::binary);
@@ -505,11 +505,16 @@ namespace
         require(worker_binding_roles.size() == identity_workers.size(),
             "provider worker binding set is incomplete");
         const auto& corpus = provider.at("corpus");
-        require(corpus.at("manifest_sha256") == manifest_hash &&
-            corpus.at("recipes_sha256") == recipes_hash &&
-            corpus.at("ground_truth_sha256") == ground_truth_hash &&
-            corpus.at("materialization_receipt_sha256") == materialization_receipt_hash &&
-            corpus.at("fixture_set_sha256") == fixture_set_hash,
+        require(require_text(corpus, "manifest_sha256", "provider corpus") ==
+                std::string(manifest_hash) &&
+            require_text(corpus, "recipes_sha256", "provider corpus") ==
+                std::string(recipes_hash) &&
+            require_text(corpus, "ground_truth_sha256", "provider corpus") ==
+                std::string(ground_truth_hash) &&
+            require_text(corpus, "materialization_receipt_sha256", "provider corpus") ==
+                std::string(materialization_receipt_hash) &&
+            require_text(corpus, "fixture_set_sha256", "provider corpus") ==
+                std::string(fixture_set_hash),
             "provider corpus identity differs from the scored immutable corpus");
         const auto& fixtures = provider.at("fixtures");
         require(fixtures.is_array() && fixtures.size() == selected_ids.size(),

@@ -711,7 +711,7 @@ void verify_segment_expressions(const std::shared_ptr<analysis_workspace_t>& wor
         throw fixture_error_t("FS/GS target expressions lost segment-relative access width");
 }
 
-void verify_function_recovery_contracts(const pe_image_t& image)
+void verify_function_recovery_contracts(const workspace_image_t& image)
 {
     std::vector<instruction_record_t> instructions(3);
     instructions[0].id = 1;
@@ -809,7 +809,8 @@ void verify_analysis_contract_fixture(const std::filesystem::path& path)
     auto workspace = open_workspace(path, "analysis-contract.exe");
     try {
         const auto image = workspace->image();
-        if (!image || image->imports().size() != 1 ||
+        const auto normalized_image = workspace->normalized_image();
+        if (!image || !normalized_image || image->imports().size() != 1 ||
             !image->imports().front().name || *image->imports().front().name != "ExitProcess" ||
             image->imports().front().iat_rva != 0x4060 || image->relocations().size() != 1 ||
             image->relocations().front().rva != 0x1100 || image->runtime_functions().size() != 2 ||
@@ -826,7 +827,7 @@ void verify_analysis_contract_fixture(const std::filesystem::path& path)
             chained->chained_function->end_rva != 0x100C)
             throw fixture_error_t("unwind handler/chained metadata contract diverged");
         verify_segment_expressions(workspace);
-        verify_function_recovery_contracts(*image);
+        verify_function_recovery_contracts(*normalized_image);
         install_services(workspace);
         analyze_workspace(workspace, 3);
         const auto snapshot = workspace->snapshot();

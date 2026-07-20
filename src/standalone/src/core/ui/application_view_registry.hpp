@@ -36,6 +36,8 @@ void clone_persisted_workspace_visibility(std::string_view source_identity,
 void rename_persisted_workspace_visibility(std::string_view source_identity,
                                            std::string_view target_identity) noexcept;
 void remove_persisted_workspace_visibility(std::string_view identity) noexcept;
+std::string persistence_fingerprint() noexcept;
+void migrate_persisted_window_settings() noexcept;
 void dismiss_start_center_when_work_available() noexcept;
 view_operation_result_t open_or_focus(const stable_view_id_t& id);
 view_operation_result_t open_for_layout(const stable_view_id_t& id);
@@ -52,6 +54,7 @@ bool is_pinned(const view_instance_id_t& id) noexcept;
 bool can_duplicate(const view_instance_id_t& id) noexcept;
 bool can_reset_state(const view_instance_id_t& id) noexcept;
 bool can_reopen_last_closed() noexcept;
+std::string focused_disassembly_presentation_key() noexcept;
 void render_registry_owned_windows() noexcept;
 void for_each_menu_entry(const std::function<void(const menu_entry_t&)>& visitor);
 const char* category_label(view_category_t category) noexcept;

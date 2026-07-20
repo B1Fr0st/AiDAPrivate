@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -28,7 +29,7 @@
 #include "standalone_driver.hpp"
 #include "symbol_classifier.hpp"
 #include "zydis_disasm.hpp"
-#include "debugger_engine.hpp"
+#include "../debugger/debugger_engine.hpp"
 #include "ui_anim.hpp"
 #include "../analysis/pdb_events.hpp"
 #include "../analysis/symbol_store.hpp"
@@ -45,6 +46,7 @@
 #include "../ui/fonts.hpp"
 #else
 #include "../../preview/debugger_preview_runtime.hpp"
+#include "../../preview/studio_semantics.hpp"
 #include "ui_anim.hpp"
 #include "../ui/motion.hpp"
 #include "../ui/clock.hpp"
@@ -1004,10 +1006,6 @@ inline bool handle_view_keys(float view_width, float view_height)
 			disasm_view::goto_address(back_addr, disasm_view::capture_selected_workspace());
 		return true;
 	}
-	if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
-		fit_to_view(view_width, view_height);
-		return true;
-	}
 	return false;
 }
 
@@ -1316,6 +1314,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (br.x < pos_x || tl.x > pos_x + width || br.y < pos_y || tl.y > pos_y + height)
 			continue;
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string legacy_node_identity = std::to_string(blk.start_addr) + ":" +
+			std::to_string(blk.end_addr);
+		const std::string legacy_node_semantic = aida::preview::semantics::stable_id(
+			aida::preview::semantics::stable_id("aida.graph-node", "legacy"),
+			aida::preview::semantics::entity_token(legacy_node_identity));
+		static_cast<void>(aida::preview::semantics::register_region(legacy_node_semantic,
+			"graph-node", ImGui::GetID(legacy_node_semantic.c_str()), tl, br));
+#endif
 
 		bool is_rip_block = (model->current_rip >= blk.start_addr && model->current_rip < blk.end_addr);
 		bool is_selected = (n.id == g_state.selected_block);
@@ -1635,13 +1643,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const bool legacy_pointer_context_requested = typed_context_requested;
 	if (hovered && aida::ui::analysis_context_menu::keyboard_request(legacy_graph_origin))
 		typed_context_requested = g_state.last_cursor_addr != 0;
-	if (typed_context_requested) {
+	const auto make_legacy_graph_context = [&](int action_block) {
 		using namespace aida::ui::analysis_context_menu;
 		using aida::ui::action_handler_result_t;
 		context_t menu;
 		menu.kind = menu_kind_t::graph;
 		menu.entity_id = "legacy-graph:" + std::to_string(g_state.selected_block) + ":" +
-			std::to_string(g_state.last_cursor_addr);
+			std::to_string(g_state.last_cursor_addr) + ":" +
+			std::to_string(g_state.text_sel_block) + ":" +
+			std::to_string(g_state.text_sel_line_anchor) + ":" +
+			std::to_string(g_state.text_sel_line_extent);
 		menu.generation = model->generation;
 		menu.live_generation = []() {
 			const auto current = capture_model();
@@ -1649,9 +1660,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		};
 		const auto address = g_state.last_cursor_addr;
 		const auto selected_block = g_state.selected_block;
-		menu.validate_identity = [address, selected_block]() {
+		const auto selection_block = g_state.text_sel_block;
+		const auto selection_anchor = g_state.text_sel_line_anchor;
+		const auto selection_extent = g_state.text_sel_line_extent;
+		menu.validate_identity = [address, selected_block, selection_block,
+			selection_anchor, selection_extent]() {
 			return g_state.last_cursor_addr == address &&
-				g_state.selected_block == selected_block
+				g_state.selected_block == selected_block &&
+				g_state.text_sel_block == selection_block &&
+				g_state.text_sel_line_anchor == selection_anchor &&
+				g_state.text_sel_line_extent == selection_extent
 				? aida::ui::capability_state_t::available()
 				: aida::ui::capability_state_t::unavailable(
 					"The selected graph entity changed");
@@ -1693,9 +1711,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			g_state.target_zoom = (std::max)(0.1f, g_state.target_zoom * 0.85f);
 			return action_handler_result_t::completed();
 		};
-		if (g_state.text_ctx_block >= 0 &&
-			static_cast<std::size_t>(g_state.text_ctx_block) < model->blocks.size()) {
-			const int context_block = g_state.text_ctx_block;
+		if (action_block >= 0 &&
+			static_cast<std::size_t>(action_block) < model->blocks.size()) {
+			const int context_block = action_block;
 			menu.actions["analysis.graph.select_block"].invoke = [model, context_block]() {
 				const auto& block = model->blocks[static_cast<std::size_t>(context_block)];
 				g_state.text_sel_block = context_block;
@@ -1712,29 +1730,39 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				return action_handler_result_t::completed();
 			};
 		}
-		open(std::move(menu), legacy_pointer_context_requested
-			? aida::ui::context_menu_open_origin_t::pointer : legacy_graph_origin);
+		return menu;
+	};
+	if (typed_context_requested) {
+		const int action_block = g_state.text_ctx_block >= 0
+			? g_state.text_ctx_block : g_state.selected_block;
+		aida::ui::analysis_context_menu::open(
+			make_legacy_graph_context(action_block), legacy_pointer_context_requested
+				? aida::ui::context_menu_open_origin_t::pointer : legacy_graph_origin);
 	}
 
 	if (hovered && !io.WantTextInput && !io.WantCaptureKeyboard
 		&& io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
 			ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
 	{
-		std::string txt = build_sel_text(true);
-		if (!txt.empty()) ImGui::SetClipboardText(txt.c_str());
+		if (!build_sel_text(true).empty())
+			aida::ui::analysis_context_menu::execute_shortcut(
+				make_legacy_graph_context(g_state.selected_block),
+				"analysis.copy.block_addressed");
 	}
 	if (hovered && !io.WantTextInput && !io.WantCaptureKeyboard
 		&& io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false))
 	{
-		if (g_state.selected_block >= 0
-			&& static_cast<std::size_t>(g_state.selected_block) < model->blocks.size())
-		{
-			const auto& sblk = model->blocks[static_cast<std::size_t>(g_state.selected_block)];
-			g_state.text_sel_block = g_state.selected_block;
-			g_state.text_sel_line_anchor = 0;
-			g_state.text_sel_line_extent = static_cast<int>(sblk.instructions.size()) - 1;
-		}
+		if (g_state.selected_block >= 0 &&
+			static_cast<std::size_t>(g_state.selected_block) < model->blocks.size())
+			aida::ui::analysis_context_menu::execute_shortcut(
+				make_legacy_graph_context(g_state.selected_block),
+				"analysis.graph.select_block");
 	}
+	if (!io.WantTextInput && !ImGui::IsAnyItemActive() &&
+		!io.KeyCtrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_F, false))
+		aida::ui::analysis_context_menu::execute_shortcut(
+			make_legacy_graph_context(g_state.selected_block),
+			"analysis.graph.fit");
 
 	{
 		float zoom_w = 220.f;
@@ -2012,6 +2040,10 @@ struct workspace_graph_view_state_t {
 	std::optional<aida::analysis::entity_id_t> selected_block;
 	std::optional<aida::analysis::entity_id_t> selected_instruction;
 	std::uint64_t selected_address = 0;
+	std::unordered_set<aida::analysis::entity_id_t> collapsed_reachable_roots;
+	std::unordered_map<aida::analysis::entity_id_t, ImVec2> pinned_node_positions;
+	bool layout_pinned = false;
+	std::uint32_t persisted_state_version = 1;
 };
 
 inline std::mutex& workspace_graph_registry_mutex()
@@ -2143,6 +2175,27 @@ inline void workspace_graph_rebuild_layout(
 	std::size_t page_begin, std::size_t page_end)
 {
 	const auto& snapshot = *context.publication->snapshot;
+	if (view.persisted_state_version != 1) {
+		view.collapsed_reachable_roots.clear();
+		view.pinned_node_positions.clear();
+		view.layout_pinned = false;
+		view.persisted_state_version = 1;
+	}
+	std::unordered_set<aida::analysis::entity_id_t> function_blocks;
+	for (std::size_t local = page_begin; local < page_end; ++local) {
+		const std::size_t index = static_cast<std::size_t>(function.first_block) + local;
+		if (index < snapshot.blocks.size()) function_blocks.insert(snapshot.blocks[index].id);
+	}
+	for (auto iterator = view.collapsed_reachable_roots.begin();
+		iterator != view.collapsed_reachable_roots.end();) {
+		if (function_blocks.count(*iterator) == 0) iterator = view.collapsed_reachable_roots.erase(iterator);
+		else ++iterator;
+	}
+	for (auto iterator = view.pinned_node_positions.begin();
+		iterator != view.pinned_node_positions.end();) {
+		if (function_blocks.count(iterator->first) == 0) iterator = view.pinned_node_positions.erase(iterator);
+		else ++iterator;
+	}
 	view.layout = {};
 	view.block_indices.clear();
 	view.edges.clear();
@@ -2150,11 +2203,26 @@ inline void workspace_graph_rebuild_layout(
 	view.node_by_entity.clear();
 	view.block_indices.reserve(page_end - page_begin);
 	view.layout.nodes.reserve(page_end - page_begin);
+	std::unordered_set<aida::analysis::entity_id_t> hidden;
+	std::vector<aida::analysis::entity_id_t> frontier;
+	for (const auto root : view.collapsed_reachable_roots)
+		frontier.push_back(root);
+	for (std::size_t cursor = 0; cursor < frontier.size() && cursor < 4096; ++cursor) {
+		for (const auto& edge : snapshot.edges) {
+			if (edge.source_entity != frontier[cursor] || !edge.target_entity ||
+				view.collapsed_reachable_roots.count(*edge.target_entity) != 0)
+				continue;
+			if (hidden.insert(*edge.target_entity).second)
+				frontier.push_back(*edge.target_entity);
+		}
+	}
 	for (std::size_t local = page_begin; local < page_end; ++local) {
 		const std::size_t index = static_cast<std::size_t>(function.first_block) + local;
 		if (index >= snapshot.blocks.size())
 			break;
 		const auto& block = snapshot.blocks[index];
+		if (hidden.count(block.id) != 0)
+			continue;
 		const int node_id = static_cast<int>(view.layout.nodes.size());
 		const std::size_t shown = (std::min)(static_cast<std::size_t>(block.instruction_count),
 			static_cast<std::size_t>(14));
@@ -2196,6 +2264,14 @@ inline void workspace_graph_rebuild_layout(
 			++view.outgoing[static_cast<std::size_t>(edge.from)];
 	}
 	cfg_layout::layout(view.layout, 82.0f, 94.0f);
+	for (std::size_t index = 0; index < view.block_indices.size(); ++index) {
+		const auto id = snapshot.blocks[view.block_indices[index]].id;
+		const auto pinned = view.pinned_node_positions.find(id);
+		if (pinned != view.pinned_node_positions.end()) {
+			view.layout.nodes[index].x = pinned->second.x;
+			view.layout.nodes[index].y = pinned->second.y;
+		}
+	}
 	if (view.selected_block &&
 		view.node_by_entity.find(*view.selected_block) == view.node_by_entity.end()) {
 		view.selected_block.reset();
@@ -2650,6 +2726,14 @@ inline void render(float, float, float width, float height,
 		ImGui::InvisibleButton("##workspace_cfg_node",
 			ImVec2((std::max)(1.0f, bottom_right.x - top_left.x),
 				(std::max)(1.0f, bottom_right.y - top_left.y)));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::string workspace_node_identity = std::to_string(block_address);
+		const std::string workspace_node_semantic = aida::preview::semantics::stable_id(
+			aida::preview::semantics::stable_id("aida.graph-node", "workspace"),
+			aida::preview::semantics::entity_token(workspace_node_identity));
+		static_cast<void>(aida::preview::semantics::register_last_item(
+			workspace_node_semantic, "graph-node"));
+#endif
 		const bool hovered = ImGui::IsItemHovered();
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			std::size_t row = 0;
@@ -2713,7 +2797,8 @@ inline void render(float, float, float width, float height,
 				context_block = &snapshot.blocks[view->block_indices[found->second]];
 		}
 	}
-	if (context_requested && context_block) {
+	const auto make_workspace_graph_context = [&](const auto& retained_context_block) {
+		const auto* context_block = &retained_context_block;
 		using namespace aida::ui::analysis_context_menu;
 		using aida::ui::action_handler_result_t;
 		using aida::ui::capability_state_t;
@@ -2828,6 +2913,105 @@ inline void render(float, float, float width, float height,
 		} else {
 			unavailable("analysis.navigate.follow", "The selected graph instruction has no direct resolved target");
 		}
+		std::optional<std::uint64_t> source_address;
+		bool has_reachable_target = false;
+		for (const auto& edge : snapshot.edges) {
+			if (edge.source_entity == retained_block && edge.target_entity)
+				has_reachable_target = true;
+			if (edge.target_entity && *edge.target_entity == retained_block) {
+				const auto source = std::find_if(snapshot.blocks.begin(), snapshot.blocks.end(),
+					[&](const auto& candidate) { return candidate.id == edge.source_entity; });
+				if (source != snapshot.blocks.end()) {
+					source_address = disasm_view::runtime_address(context, source->start)
+						.value_or(source->start.value);
+					break;
+				}
+			}
+		}
+		if (source_address) {
+			menu.actions["analysis.graph.navigate_source"].invoke =
+				[context, value = *source_address]() {
+					disasm_view::goto_address(value, context);
+					return action_handler_result_t::completed();
+				};
+		} else {
+			unavailable("analysis.graph.navigate_source",
+				"The selected block has no published incoming source block");
+		}
+		if (direct_target) {
+			menu.actions["analysis.graph.navigate_target"].invoke =
+				[context, value = *direct_target]() {
+					disasm_view::goto_address(value, context);
+					return action_handler_result_t::completed();
+				};
+		} else {
+			unavailable("analysis.graph.navigate_target",
+				"Select an instruction with a published direct target");
+		}
+		const bool collapsed = view->collapsed_reachable_roots.count(retained_block) != 0;
+		if (has_reachable_target && !collapsed) {
+			menu.actions["analysis.graph.collapse_reachable"].invoke = [view, retained_block]() {
+				if (view->collapsed_reachable_roots.size() >= 256)
+					return action_handler_result_t::failed(
+						"The bounded graph collapse-state limit was reached");
+				view->collapsed_reachable_roots.insert(retained_block);
+				view->layout_signature = 0;
+				return action_handler_result_t::completed();
+			};
+		} else {
+			unavailable("analysis.graph.collapse_reachable", collapsed
+				? "The selected reachable scope is already collapsed"
+				: "The selected block has no reachable target blocks");
+		}
+		if (collapsed) {
+			menu.actions["analysis.graph.expand_reachable"].invoke = [view, retained_block]() {
+				view->collapsed_reachable_roots.erase(retained_block);
+				view->layout_signature = 0;
+				return action_handler_result_t::completed();
+			};
+		} else {
+			unavailable("analysis.graph.expand_reachable",
+				"The selected reachable scope is already expanded");
+		}
+		const bool node_pinned = view->pinned_node_positions.count(retained_block) != 0;
+		auto& pin_node = menu.actions[node_pinned
+			? "analysis.graph.unpin_node" : "analysis.graph.pin_node"];
+		pin_node.check_state = node_pinned ? aida::ui::action_check_state_t::checked
+			: aida::ui::action_check_state_t::unchecked;
+		pin_node.invoke = [view, retained_block, node_pinned]() {
+			if (node_pinned) {
+				view->pinned_node_positions.erase(retained_block);
+				return action_handler_result_t::completed();
+			}
+			if (view->pinned_node_positions.size() >= 256)
+				return action_handler_result_t::failed(
+					"The bounded pinned-node limit was reached");
+			const auto found = view->node_by_entity.find(retained_block);
+			if (found == view->node_by_entity.end() || found->second >= view->layout.nodes.size())
+				return action_handler_result_t::failed("The graph node layout changed");
+			const auto& node = view->layout.nodes[found->second];
+			view->pinned_node_positions[retained_block] = ImVec2(node.x, node.y);
+			return action_handler_result_t::completed();
+		};
+		auto& pin_layout = menu.actions[view->layout_pinned
+			? "analysis.graph.unpin_layout" : "analysis.graph.pin_layout"];
+		pin_layout.check_state = view->layout_pinned ? aida::ui::action_check_state_t::checked
+			: aida::ui::action_check_state_t::unchecked;
+		pin_layout.invoke = [view]() {
+			view->layout_pinned = !view->layout_pinned;
+			if (view->layout_pinned) {
+				view->pinned_node_positions.clear();
+				for (const auto& item : view->node_by_entity) {
+					if (item.second >= view->layout.nodes.size()) continue;
+					const auto& node = view->layout.nodes[item.second];
+					view->pinned_node_positions[item.first] = ImVec2(node.x, node.y);
+				}
+			} else {
+				view->pinned_node_positions.clear();
+				view->layout_signature = 0;
+			}
+			return action_handler_result_t::completed();
+		};
 		char address_text[32]{};
 		std::snprintf(address_text, sizeof(address_text), "%016llX",
 			static_cast<unsigned long long>(address));
@@ -2978,7 +3162,8 @@ inline void render(float, float, float width, float height,
 			view->selected_address = 0;
 			return action_handler_result_t::completed();
 		};
-		unavailable("analysis.navigate.disassembly_side", "The document registry exposes one canonical Disassembly document");
+		unavailable("analysis.navigate.disassembly_side",
+			"Independent side documents require per-instance disassembly presentation state");
 		unavailable("analysis.navigate.callees", "Filtered outgoing-call presentation is not available in the graph snapshot");
 		unavailable("analysis.modify.retype", "Use Type Views to stage a type application for this address");
 		unavailable("analysis.modify.patch", "Use the reviewed Patch workflow from Disassembly");
@@ -2986,12 +3171,60 @@ inline void render(float, float, float width, float height,
 		unavailable("analysis.modify.nop", "Use the reviewed NOP workflow from Disassembly");
 		unavailable("analysis.debug.breakpoint", "Use the debugger Breakpoints workflow from Disassembly");
 		unavailable("analysis.debug.hardware_breakpoint", "Use the debugger Breakpoints workflow from Disassembly");
-		open(std::move(menu), context_origin);
-	}
+		return menu;
+	};
+	const auto make_workspace_graph_canvas_context = [&]() {
+		using namespace aida::ui::analysis_context_menu;
+		using aida::ui::action_handler_result_t;
+		context_t menu;
+		menu.kind = menu_kind_t::graph;
+		menu.entity_id = "graph-canvas:" +
+			context.workspace->identity().binary_id().to_hex();
+		menu.generation = workspace_graph_generation(context);
+		menu.live_generation = [context]() { return workspace_graph_generation(context); };
+		menu.validate_identity = [context, view]() {
+			return workspace_graph_state(context) == view
+				? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(
+					"The active graph canvas changed");
+		};
+		menu.actions["analysis.graph.fit"].invoke = [view]() {
+			view->fit_request = true;
+			return action_handler_result_t::completed();
+		};
+		return menu;
+	};
+	if (context_requested && context_block)
+		aida::ui::analysis_context_menu::open(
+			make_workspace_graph_context(*context_block), context_origin);
 	if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
 		!io.WantTextInput && !ImGui::IsAnyItemActive()) {
-		if (!io.KeyCtrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_F, false))
-			view->fit_request = true;
+		if (!io.KeyCtrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+			bool executed = false;
+			if (view->selected_block) {
+				const auto found = view->node_by_entity.find(*view->selected_block);
+				if (found != view->node_by_entity.end() &&
+					found->second < view->block_indices.size())
+					executed = aida::ui::analysis_context_menu::execute_shortcut(
+						make_workspace_graph_context(
+							snapshot.blocks[view->block_indices[found->second]]),
+						"analysis.graph.fit");
+			}
+			if (!executed)
+					aida::ui::analysis_context_menu::execute_shortcut(
+						make_workspace_graph_canvas_context(), "analysis.graph.fit");
+		}
+		if (!io.KeyCtrl && !io.KeyAlt && view->selected_block &&
+			(ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+			 ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) {
+			const auto found = view->node_by_entity.find(*view->selected_block);
+			if (found != view->node_by_entity.end() &&
+				found->second < view->block_indices.size())
+				aida::ui::analysis_context_menu::execute_shortcut(
+					make_workspace_graph_context(
+						snapshot.blocks[view->block_indices[found->second]]),
+					"analysis.graph.navigate_target");
+		}
 	}
 	if (!view->layout.nodes.empty() && canvas_size.x >= 320.0f && canvas_size.y >= 220.0f) {
 		const float minimap_width = 214.0f;

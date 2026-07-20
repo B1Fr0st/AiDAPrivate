@@ -48,8 +48,12 @@ workspace_registry_t& workspace_registry() {
 #include "zip_container.hpp"
 #include "../readers/pe_coff_reader.hpp"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <Windows.h>
 
 #include <algorithm>

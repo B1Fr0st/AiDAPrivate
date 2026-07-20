@@ -3,6 +3,7 @@
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 #include "shell_preview_platform.hpp"
+#include "preview_fixture_controls.hpp"
 #include "../core/disasm/zydis_disasm.hpp"
 #include "ui_task_executor.hpp"
 #include "../core/debugger/debugger_engine.hpp"
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -53,6 +55,8 @@ struct receipt_t {
 inline std::vector<receipt_t> receipts;
 inline std::uint64_t next_sequence = 1;
 inline bool fixture_initialized = false;
+inline fixture_state_t fixture_state = fixture_state_t::normal;
+inline bool driver_available = true;
 
 inline void record(std::string action, std::string detail = {}) {
 	receipts.push_back({std::move(action), std::move(detail), next_sequence++});
@@ -71,6 +75,40 @@ inline std::vector<std::uint8_t> bytes_for(std::uint64_t address, std::size_t si
 	for (std::size_t i = 0; i < size; ++i)
 		out[i] = code[static_cast<std::size_t>((address + i) % code.size())];
 	return out;
+}
+
+inline debugger_engine::breakpoint_t make_breakpoint(
+		std::uint64_t address,
+		debugger_engine::bp_type_t type,
+		debugger_engine::bp_state_t state,
+		int hw_slot,
+		int size,
+		std::string name,
+		std::string condition,
+		std::string log_text,
+		int hit_count,
+		std::uint8_t original_byte,
+		bool byte_written,
+		bool readback_verified,
+		std::uint64_t mutation_identity) {
+	debugger_engine::breakpoint_t breakpoint;
+	breakpoint.address = address;
+	breakpoint.type = type;
+	breakpoint.state = state;
+	breakpoint.hw_slot = hw_slot;
+	breakpoint.size = size;
+	breakpoint.name = std::move(name);
+	breakpoint.condition = std::move(condition);
+	breakpoint.log_text = std::move(log_text);
+	breakpoint.hit_count = hit_count;
+	breakpoint.original_byte = original_byte;
+	breakpoint.byte_written = byte_written;
+	breakpoint.install_state = debugger_engine::breakpoint_install_state_t::installed;
+	breakpoint.readback_verified = readback_verified;
+	breakpoint.definition_resolved = true;
+	breakpoint.mutation_identity = mutation_identity;
+	breakpoint.mutation_generation = 1;
+	return breakpoint;
 }
 
 inline void initialize_fixture() {
@@ -102,9 +140,15 @@ inline void initialize_fixture() {
 		{8132, 6420, 8, 2, 0x00007FFDA111C4E0}
 	};
 	state.breakpoints = {
-		{0x00007FF7A4C16A32, debugger_engine::bp_type_t::software, debugger_engine::bp_state_t::enabled, -1, 1, "license_gate", "rax == 1", "authorization branch", 4, 0x75, false, false, true, "", 0, 0, false, true, "", "", "", 0, 0},
-		{0x00007FF7A4C1B420, debugger_engine::bp_type_t::hardware_execute, debugger_engine::bp_state_t::enabled, 0, 1, "decrypt_stage", "", "", 1, 0, false, false, false, "", 0, 0, false, true, "", "", "", 0, 0},
-		{0x00007FF7A4C208F0, debugger_engine::bp_type_t::hardware_write, debugger_engine::bp_state_t::disabled, 1, 8, "iat_write", "", "", 0, 0, false, false, false, "", 0, 0, false, true, "", "", "", 0, 0}
+		make_breakpoint(0x00007FF7A4C16A32, debugger_engine::bp_type_t::software,
+			debugger_engine::bp_state_t::enabled, -1, 1, "license_gate", "rax == 1",
+			"authorization branch", 4, 0x75, true, true, 1),
+		make_breakpoint(0x00007FF7A4C1B420, debugger_engine::bp_type_t::hardware_execute,
+			debugger_engine::bp_state_t::enabled, 0, 1, "decrypt_stage", "", "", 1, 0,
+			false, true, 2),
+		make_breakpoint(0x00007FF7A4C208F0, debugger_engine::bp_type_t::hardware_write,
+			debugger_engine::bp_state_t::disabled, 1, 8, "iat_write", "", "", 0, 0,
+			false, true, 3)
 	};
 	state.call_stack = {
 		{0x00007FF7A4C16A32, 0x00007FF7A4C16B14, 0x00007FF7A4C00000, 0x001A0000, "sample.exe", "C:/Samples/sample.exe", "validate_license", 0x16A32, 0x00007FF7A4C169D0, 0x62, "pdb", "resolved"},
@@ -152,6 +196,54 @@ inline void initialize_fixture() {
 	record("fixture_loaded", "Debugger 14-tab state");
 }
 
+inline void apply_fixture_state(fixture_state_t requested, std::size_t cardinality) {
+	fixture_initialized = false;
+	initialize_fixture();
+	fixture_state = requested;
+	driver_available = requested != fixture_state_t::disconnected;
+	auto& state = debugger_engine::g_state;
+	if (requested == fixture_state_t::empty || requested == fixture_state_t::disconnected) {
+		state.status.store(debugger_engine::dbg_status_t::idle, std::memory_order_release);
+		state.target_pid = 0;
+		state.active_tid = 0;
+		state.registers = {};
+		state.cached_regs = {};
+		state.cached_threads.clear();
+		state.cached_stack.clear();
+		state.cached_disasm_bytes.clear();
+		state.breakpoints.clear();
+		state.call_stack.clear();
+		state.trace_log.clear();
+		state.memory_map.clear();
+		state.watches.clear();
+		state.strings.clear();
+		state.handles.clear();
+		return;
+	}
+	state.target_pid = 6420;
+	state.active_tid = 6872;
+	state.status.store(requested == fixture_state_t::loading
+		? debugger_engine::dbg_status_t::running
+		: requested == fixture_state_t::error
+			? debugger_engine::dbg_status_t::terminated
+			: debugger_engine::dbg_status_t::paused,
+		std::memory_order_release);
+	if (cardinality > state.trace_log.size()) {
+		const std::size_t bounded = (std::min<std::size_t>)(cardinality, 10000U);
+		state.trace_log.reserve(bounded);
+		for (std::size_t index = state.trace_log.size(); index < bounded; ++index) {
+			debugger_engine::trace_record_t row;
+			row.index = static_cast<int>(index + 1U);
+			row.address = 0x00007FF7A4C16A10ULL + static_cast<std::uint64_t>(index * 4U);
+			row.regs = state.registers;
+			row.regs.rip = row.address;
+			row.disasm_text = index % 3U == 0U ? "mov rax, qword ptr [rbx+18h]"
+				: index % 3U == 1U ? "test rax, rax" : "jne sample.dispatch_command";
+			state.trace_log.push_back(std::move(row));
+		}
+	}
+}
+
 inline void record_save_dialog(const char* title) {
 	record("save_dialog", title ? title : "Save");
 }
@@ -183,15 +275,17 @@ inline BOOL TerminateProcess(HANDLE process, UINT) { aida::preview::debugger::re
 inline BOOL CloseHandle(HANDLE) { return TRUE; }
 
 namespace driver_bridge {
-inline bool is_loaded() { return true; }
-inline bool using_kernel_driver() { return true; }
-inline bool dynamic_ioctls_ready() { return true; }
-inline bool kernel_session_available(std::string* reason) { if (reason) *reason = "Preview fixture"; return true; }
-inline std::uint32_t attached_pid() { return 6420; }
-inline std::string status() { return "Attached · kernel session ready"; }
-inline std::string last_error() { return {}; }
+inline bool is_loaded() { return aida::preview::debugger::driver_available; }
+inline bool using_kernel_driver() { return aida::preview::debugger::driver_available; }
+inline bool dynamic_ioctls_ready() { return aida::preview::debugger::driver_available; }
+inline bool kernel_session_available(std::string* reason) { if (reason) *reason = aida::preview::debugger::driver_available ? "Preview fixture" : "Preview driver disconnected"; return aida::preview::debugger::driver_available; }
+inline std::uint32_t attached_pid() { return aida::preview::debugger::driver_available ? debugger_engine::g_state.target_pid : 0; }
+inline std::string status() { return aida::preview::debugger::driver_available
+	? "Attached - kernel session ready" : "Disconnected"; }
+inline std::string last_error() { return aida::preview::debugger::driver_available ? std::string{} : "Preview driver disconnected"; }
 inline void detach() { aida::preview::debugger::record("detach", "PID 6420"); }
 inline std::vector<module_info_t> enumerate_modules() {
+	if (!aida::preview::debugger::driver_available) return {};
 	return {
 		{0x00007FF7A4C00000, 0x001A0000, "sample.exe", "C:/Samples/sample.exe"},
 		{0x00007FFDA1700000, 0x001F0000, "KERNEL32.DLL", "C:/Windows/System32/KERNEL32.DLL"},
@@ -200,16 +294,17 @@ inline std::vector<module_info_t> enumerate_modules() {
 	};
 }
 inline std::vector<thread_info_t> enumerate_threads() {
+	if (!aida::preview::debugger::driver_available) return {};
 	return {{6872, 6420, 10, 5, 0x00007FF7A4C16A32}, {7044, 6420, 8, 2, 0x00007FFDA19323C0}, {7296, 6420, 8, 5, 0x00007FFDA18F1B20}};
 }
-inline bool read_memory(std::uint64_t address, std::size_t size, std::vector<std::uint8_t>& out) { out = aida::preview::debugger::bytes_for(address, size); return true; }
+inline bool read_memory(std::uint64_t address, std::size_t size, std::vector<std::uint8_t>& out) { if (!aida::preview::debugger::driver_available) { out.clear(); return false; } out = aida::preview::debugger::bytes_for(address, size); return true; }
 inline bool write_memory(std::uint64_t address, const std::vector<std::uint8_t>& data) { aida::preview::debugger::record("write_memory", std::to_string(address) + ":" + std::to_string(data.size())); return !data.empty(); }
 inline bool protect_memory(std::uint64_t address, std::uint64_t size, std::uint32_t value, std::uint32_t* old) { if (old) *old = PAGE_EXECUTE_READ; aida::preview::debugger::record("protect_memory", std::to_string(address) + ":" + std::to_string(size) + ":" + std::to_string(value)); return true; }
 inline bool suspend_thread(std::uint32_t tid, std::uint32_t* previous) { if (previous) *previous = 0; aida::preview::debugger::record("suspend_thread", std::to_string(tid)); return true; }
 inline bool resume_thread(std::uint32_t tid, std::uint32_t* previous) { if (previous) *previous = 1; aida::preview::debugger::record("resume_thread", std::to_string(tid)); return true; }
 inline bool terminate_thread(std::uint32_t tid, std::uint32_t) { aida::preview::debugger::record("terminate_thread", std::to_string(tid)); return true; }
 inline bool close_process_handle(std::uint32_t, std::uint64_t handle) { aida::preview::debugger::record("close_handle", std::to_string(handle)); return true; }
-inline bool get_thread_context(std::uint32_t, thread_context_t& context) { auto regs = debugger_engine::g_state.cached_regs; context.rip = regs.rip; context.rsp = regs.rsp; context.rax = regs.rax; context.rbx = regs.rbx; return true; }
+inline bool get_thread_context(std::uint32_t, thread_context_t& context) { std::lock_guard<std::mutex> lock(debugger_engine::g_state.cache_mtx); const auto regs = debugger_engine::g_state.cached_regs; context.rip = regs.rip; context.rsp = regs.rsp; context.rax = regs.rax; context.rbx = regs.rbx; return true; }
 inline bool query_thread_information(std::uint32_t, std::uint32_t, void* buffer, std::uint32_t size, std::uint32_t* returned) { if (buffer && size) std::memset(buffer, 0, size); if (returned) *returned = size; return true; }
 }
 
@@ -220,12 +315,12 @@ inline void shutdown() {}
 inline const std::string& last_error() { return preview_last_error(); }
 inline bool run_target() { aida::preview::debugger::initialize_fixture(); g_state.status.store(dbg_status_t::running); aida::preview::debugger::record("continue", "running"); return true; }
 inline bool pause_target() { g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("pause", "paused"); return true; }
-inline bool step_into() { g_state.cached_regs.rip += 3; g_state.registers = g_state.cached_regs; g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_into", std::to_string(g_state.cached_regs.rip)); return true; }
-inline bool step_over() { g_state.cached_regs.rip += 5; g_state.registers = g_state.cached_regs; g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_over", std::to_string(g_state.cached_regs.rip)); return true; }
-inline bool step_out() { g_state.cached_regs.rip = 0x00007FF7A4C1B5A8; g_state.registers = g_state.cached_regs; g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_out", std::to_string(g_state.cached_regs.rip)); return true; }
-inline bool run_to_address(std::uint64_t address, bool, std::uint32_t) { if (address == 0) { preview_last_error() = "run_to_address: invalid address"; return false; } g_state.cached_regs.rip = address; g_state.registers = g_state.cached_regs; g_state.status.store(dbg_status_t::paused); preview_last_error().clear(); aida::preview::debugger::record("run_to_address", std::to_string(address)); return true; }
-inline register_set_t get_registers() { aida::preview::debugger::initialize_fixture(); return g_state.registers; }
-inline register_set_t cached_registers() { aida::preview::debugger::initialize_fixture(); return g_state.cached_regs; }
+inline bool step_into() { std::uint64_t rip = 0; { std::scoped_lock lock(g_state.cache_mtx, g_state.reg_mutex); g_state.cached_regs.rip += 3; g_state.registers = g_state.cached_regs; rip = g_state.cached_regs.rip; } g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_into", std::to_string(rip)); return true; }
+inline bool step_over() { std::uint64_t rip = 0; { std::scoped_lock lock(g_state.cache_mtx, g_state.reg_mutex); g_state.cached_regs.rip += 5; g_state.registers = g_state.cached_regs; rip = g_state.cached_regs.rip; } g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_over", std::to_string(rip)); return true; }
+inline bool step_out() { constexpr std::uint64_t rip = 0x00007FF7A4C1B5A8; { std::scoped_lock lock(g_state.cache_mtx, g_state.reg_mutex); g_state.cached_regs.rip = rip; g_state.registers = g_state.cached_regs; } g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_out", std::to_string(rip)); return true; }
+inline bool run_to_address(std::uint64_t address, bool, std::uint32_t) { if (address == 0) { preview_last_error() = "run_to_address: invalid address"; return false; } { std::scoped_lock lock(g_state.cache_mtx, g_state.reg_mutex); g_state.cached_regs.rip = address; g_state.registers = g_state.cached_regs; } g_state.status.store(dbg_status_t::paused); preview_last_error().clear(); aida::preview::debugger::record("run_to_address", std::to_string(address)); return true; }
+inline register_set_t get_registers() { aida::preview::debugger::initialize_fixture(); std::lock_guard<std::mutex> lock(g_state.reg_mutex); return g_state.registers; }
+inline register_set_t cached_registers() { aida::preview::debugger::initialize_fixture(); std::lock_guard<std::mutex> lock(g_state.cache_mtx); return g_state.cached_regs; }
 inline std::vector<cached_thread_t> cached_thread_list() { aida::preview::debugger::initialize_fixture(); return g_state.cached_threads; }
 inline std::vector<std::uint8_t> cached_stack_bytes(std::uint64_t& address) { aida::preview::debugger::initialize_fixture(); address = g_state.cached_stack_addr; return g_state.cached_stack; }
 inline std::vector<std::uint8_t> cached_disasm_window(std::uint64_t& base) { aida::preview::debugger::initialize_fixture(); base = g_state.cached_disasm_base; return g_state.cached_disasm_bytes; }
@@ -235,32 +330,40 @@ inline void request_stack_refresh(std::uint64_t rsp, std::size_t size, std::uint
 inline void request_disasm_refresh(std::uint64_t rip, std::uint32_t) { g_state.cached_disasm_base = rip > 32 ? rip - 32 : rip; g_state.cached_disasm_bytes = aida::preview::debugger::bytes_for(g_state.cached_disasm_base, 512); }
 inline void invalidate_cache() {}
 inline bool set_register(const std::string& name, std::uint64_t value) {
+	std::scoped_lock lock(g_state.cache_mtx, g_state.reg_mutex);
 	auto& r = g_state.cached_regs;
 	if (name == "rip") r.rip = value; else if (name == "rsp") r.rsp = value; else if (name == "rax") r.rax = value; else if (name == "rbx") r.rbx = value; else if (name == "rcx") r.rcx = value; else if (name == "rdx") r.rdx = value; else if (name == "rflags") r.rflags = value; else return false;
 	g_state.registers = r;
 	aida::preview::debugger::record("set_register", name + "=" + std::to_string(value));
 	return true;
 }
-inline int add_breakpoint(std::uint64_t address, bp_type_t type, const std::string& name, const std::string& condition, int size) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.push_back({address, type, bp_state_t::enabled, -1, size, name, condition, "", 0, 0, false, false, false, "", 0, 0, false, true, "", "", "", 0, 0}); aida::preview::debugger::record("add_breakpoint", std::to_string(address)); return static_cast<int>(g_state.breakpoints.size() - 1); }
+inline int add_breakpoint(std::uint64_t address, bp_type_t type, const std::string& name, const std::string& condition, int size) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); const std::uint64_t identity = static_cast<std::uint64_t>(g_state.breakpoints.size()) + 1024; g_state.breakpoints.push_back(aida::preview::debugger::make_breakpoint(address, type, bp_state_t::enabled, -1, size, name, condition, "", 0, 0, false, true, identity)); aida::preview::debugger::record("add_breakpoint", std::to_string(address)); return static_cast<int>(g_state.breakpoints.size() - 1); }
 inline bool remove_breakpoint(int index) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); if (index < 0 || index >= static_cast<int>(g_state.breakpoints.size())) return false; g_state.breakpoints.erase(g_state.breakpoints.begin() + index); aida::preview::debugger::record("remove_breakpoint", std::to_string(index)); return true; }
 inline bool toggle_breakpoint(int index) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); if (index < 0 || index >= static_cast<int>(g_state.breakpoints.size())) return false; auto& state = g_state.breakpoints[static_cast<std::size_t>(index)].state; state = state == bp_state_t::disabled ? bp_state_t::enabled : bp_state_t::disabled; aida::preview::debugger::record("toggle_breakpoint", std::to_string(index)); return true; }
-inline void clear_all_breakpoints() { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.clear(); aida::preview::debugger::record("clear_breakpoints"); }
+inline bool clear_all_breakpoints() { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.clear(); aida::preview::debugger::record("clear_breakpoints"); return true; }
 inline bool set_breakpoint_condition(int index, const std::string& condition) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); if (index < 0 || index >= static_cast<int>(g_state.breakpoints.size())) return false; g_state.breakpoints[static_cast<std::size_t>(index)].condition = condition; return true; }
 inline bool set_breakpoint_log(int index, const std::string& text, bool auto_continue) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); if (index < 0 || index >= static_cast<int>(g_state.breakpoints.size())) return false; auto& bp = g_state.breakpoints[static_cast<std::size_t>(index)]; bp.log_text = text; bp.auto_continue = auto_continue; return true; }
 inline std::vector<breakpoint_t> snapshot_breakpoints() { std::lock_guard<std::mutex> lock(g_state.bp_mutex); return g_state.breakpoints; }
 inline std::vector<stack_frame_t> get_call_stack() { aida::preview::debugger::initialize_fixture(); return g_state.call_stack; }
 inline std::vector<memory_region_t> get_memory_map() { aida::preview::debugger::initialize_fixture(); return g_state.memory_map; }
-inline int add_watch(const std::string& expression) { std::lock_guard<std::mutex> lock(g_state.watch_mutex); g_state.watches.push_back({expression, "00007FF7A4C16A32", "uint64_t", "", true, expression, "", 0, 0, false, true}); aida::preview::debugger::record("add_watch", expression); return static_cast<int>(g_state.watches.size() - 1); }
-inline bool remove_watch(int index) { std::lock_guard<std::mutex> lock(g_state.watch_mutex); if (index < 0 || index >= static_cast<int>(g_state.watches.size())) return false; g_state.watches.erase(g_state.watches.begin() + index); return true; }
-inline void refresh_watches() { aida::preview::debugger::record("refresh_watches"); }
-inline expression_evaluation_t evaluate_expression(const std::string& expression) {
-	aida::preview::debugger::initialize_fixture();
-	expression_evaluation_t result;
-	if (expression.empty() || expression.size() > 96) {
-		result.error = expression.empty() ? "empty expression" : "expression exceeds the 96-byte debugger limit";
-		return result;
+inline int add_watch(const std::string& expression) {
+	if (expression.empty() || expression.size() > k_max_watch_expression_bytes ||
+		expression.find('\n') != std::string::npos || expression.find('\r') != std::string::npos)
+		return -1;
+	std::lock_guard<std::mutex> lock(g_state.watch_mutex);
+	if (g_state.watches.size() >= k_max_watch_count) return -1;
+	g_state.watches.push_back({expression, "00007FF7A4C16A32", "uint64_t", "", true, expression, "", 0, 0, false, true});
+	g_state.watches_generation.fetch_add(1, std::memory_order_release);
+	aida::preview::debugger::record("add_watch", expression);
+	return static_cast<int>(g_state.watches.size() - 1);
+}
+inline bool remove_watch(int index) { std::lock_guard<std::mutex> lock(g_state.watch_mutex); if (index < 0 || index >= static_cast<int>(g_state.watches.size())) return false; g_state.watches.erase(g_state.watches.begin() + index); g_state.watches_generation.fetch_add(1, std::memory_order_release); return true; }
+inline expression_eval::context_t preview_watch_expression_context() {
+	register_set_t registers;
+	{
+		std::lock_guard<std::mutex> lock(g_state.cache_mtx);
+		registers = g_state.cached_regs;
 	}
-	const auto registers = g_state.cached_regs;
 	expression_eval::context_t context;
 	context.rax = registers.rax; context.rbx = registers.rbx; context.rcx = registers.rcx; context.rdx = registers.rdx;
 	context.rsi = registers.rsi; context.rdi = registers.rdi; context.rbp = registers.rbp; context.rsp = registers.rsp;
@@ -274,6 +377,18 @@ inline expression_evaluation_t evaluate_expression(const std::string& expression
 		std::memcpy(output, bytes.data(), size);
 		return true;
 	};
+	return context;
+}
+inline expression_evaluation_t preview_evaluate_expression_with_context(
+		const std::string& expression, const expression_eval::context_t& context) {
+	expression_evaluation_t result;
+	if (expression.empty() || expression.size() > k_max_watch_expression_bytes ||
+		expression.find('\n') != std::string::npos || expression.find('\r') != std::string::npos) {
+		if (expression.empty()) result.error = "empty expression";
+		else if (expression.size() > k_max_watch_expression_bytes) result.error = "expression exceeds the 96-byte debugger limit";
+		else result.error = "expression must be a single line";
+		return result;
+	}
 	const auto evaluated = expression_eval::evaluate(expression, context);
 	if (!evaluated.ok) {
 		result.error = evaluated.error;
@@ -288,9 +403,153 @@ inline expression_evaluation_t evaluate_expression(const std::string& expression
 	result.type = "uint64";
 	return result;
 }
+inline expression_evaluation_t evaluate_expression(const std::string& expression) {
+	aida::preview::debugger::initialize_fixture();
+	const auto context = preview_watch_expression_context();
+	return preview_evaluate_expression_with_context(expression, context);
+}
+inline watch_refresh_batch_ptr capture_watch_refresh_batch() {
+	auto batch = std::make_shared<watch_refresh_batch_t>();
+	std::lock_guard<std::mutex> lock(g_state.watch_mutex);
+	batch->generation = g_state.watches_generation.load(std::memory_order_acquire);
+	batch->cardinality = g_state.watches.size();
+	if (batch->cardinality > k_max_watch_count) {
+		batch->error = "watch collection exceeds the 4096-entry refresh limit";
+		return batch;
+	}
+	batch->targets.reserve(batch->cardinality);
+	for (const auto& watch : g_state.watches) {
+		watch_refresh_target_t target;
+		target.expression = watch.expression;
+		target.persistent_expression = watch.persistent_expression;
+		target.definition_module = watch.definition_module;
+		target.definition_module_offset = watch.definition_module_offset;
+		target.definition_module_size = watch.definition_module_size;
+		target.persistent_definition = watch.persistent_definition;
+		target.definition_resolved = watch.definition_resolved;
+		if (watch.persistent_definition && !watch.definition_resolved)
+			target.unresolved_error = watch.error.empty()
+				? "Persisted watch binding is unresolved" : watch.error;
+		batch->targets.push_back(std::move(target));
+	}
+	return batch;
+}
+inline watch_refresh_evaluation_batch_t evaluate_watch_refresh_batch(
+		watch_refresh_batch_ptr batch,
+		watch_refresh_cancel_fn_t cancel_requested) {
+	watch_refresh_evaluation_batch_t evaluated;
+	evaluated.source = std::move(batch);
+	if (!evaluated.source) {
+		evaluated.error = "watch refresh capture is unavailable";
+		return evaluated;
+	}
+	if (!evaluated.source->valid()) {
+		evaluated.error = evaluated.source->error.empty()
+			? "watch refresh capture is invalid" : evaluated.source->error;
+		return evaluated;
+	}
+	if (cancel_requested && cancel_requested()) {
+		evaluated.cancelled = true;
+		return evaluated;
+	}
+	evaluated.results.resize(evaluated.source->targets.size());
+	bool requires_context = false;
+	for (const auto& target : evaluated.source->targets) {
+		if (!(target.persistent_definition && !target.definition_resolved) &&
+			!target.expression.empty() &&
+			target.expression.size() <= k_max_watch_expression_bytes &&
+			target.expression.find('\n') == std::string::npos &&
+			target.expression.find('\r') == std::string::npos) {
+			requires_context = true;
+			break;
+		}
+	}
+	expression_eval::context_t context;
+	if (requires_context) {
+		if (cancel_requested && cancel_requested()) {
+			evaluated.cancelled = true;
+			return evaluated;
+		}
+		aida::preview::debugger::initialize_fixture();
+		context = preview_watch_expression_context();
+	}
+	for (std::size_t index = 0; index < evaluated.source->targets.size(); ++index) {
+		if (cancel_requested && cancel_requested()) {
+			evaluated.cancelled = true;
+			return evaluated;
+		}
+		const auto& target = evaluated.source->targets[index];
+		auto& result = evaluated.results[index];
+		if (target.persistent_definition && !target.definition_resolved) {
+			result.error = target.unresolved_error.empty()
+				? "Persisted watch binding is unresolved" : target.unresolved_error;
+		} else {
+			result = preview_evaluate_expression_with_context(target.expression, context);
+		}
+	}
+	return evaluated;
+}
+inline watch_refresh_publish_result_t publish_watch_refresh_batch(
+		const watch_refresh_evaluation_batch_t& batch) {
+	if (!batch.source || !batch.source->valid())
+		return watch_refresh_publish_result_t::invalid_batch;
+	if (batch.cancelled || !batch.error.empty() ||
+		batch.results.size() != batch.source->targets.size())
+		return watch_refresh_publish_result_t::result_mismatch;
+	std::vector<watch_entry_t> updated;
+	updated.reserve(batch.source->targets.size());
+	for (std::size_t index = 0; index < batch.source->targets.size(); ++index) {
+		const auto& target = batch.source->targets[index];
+		const auto& result = batch.results[index];
+		watch_entry_t watch;
+		watch.expression = target.expression;
+		watch.value = result.succeeded ? result.rendered_value : std::string{};
+		watch.type = result.succeeded ? result.type : std::string{};
+		watch.error = result.succeeded ? std::string{} : result.error;
+		watch.valid = result.succeeded;
+		watch.persistent_expression = target.persistent_expression;
+		watch.definition_module = target.definition_module;
+		watch.definition_module_offset = target.definition_module_offset;
+		watch.definition_module_size = target.definition_module_size;
+		watch.persistent_definition = target.persistent_definition;
+		watch.definition_resolved = target.definition_resolved;
+		updated.push_back(std::move(watch));
+	}
+	std::lock_guard<std::mutex> lock(g_state.watch_mutex);
+	if (g_state.watches_generation.load(std::memory_order_acquire) != batch.source->generation)
+		return watch_refresh_publish_result_t::stale_generation;
+	if (g_state.watches.size() != batch.source->cardinality ||
+		g_state.watches.size() != batch.source->targets.size())
+		return watch_refresh_publish_result_t::cardinality_mismatch;
+	for (std::size_t index = 0; index < g_state.watches.size(); ++index) {
+		const auto& watch = g_state.watches[index];
+		const auto& target = batch.source->targets[index];
+		if (watch.expression != target.expression ||
+			watch.persistent_expression != target.persistent_expression ||
+			watch.definition_module != target.definition_module ||
+			watch.definition_module_offset != target.definition_module_offset ||
+			watch.definition_module_size != target.definition_module_size ||
+			watch.persistent_definition != target.persistent_definition ||
+			watch.definition_resolved != target.definition_resolved)
+			return watch_refresh_publish_result_t::identity_mismatch;
+	}
+	g_state.watches.swap(updated);
+	if (!g_state.watches.empty())
+		g_state.watches_generation.fetch_add(1, std::memory_order_release);
+	aida::preview::debugger::record("refresh_watches_batch",
+		std::to_string(batch.results.size()));
+	return watch_refresh_publish_result_t::published;
+}
+inline void refresh_watches() {
+	const auto captured = capture_watch_refresh_batch();
+	auto evaluated = evaluate_watch_refresh_batch(captured);
+	static_cast<void>(publish_watch_refresh_batch(evaluated));
+}
 inline bool publish_watch_evaluation(int index, const std::string& expected_expression,
+		std::uint64_t expected_watches_generation,
 		const expression_evaluation_t& evaluation) {
 	std::lock_guard<std::mutex> lock(g_state.watch_mutex);
+	if (g_state.watches_generation.load(std::memory_order_acquire) != expected_watches_generation) return false;
 	if (index < 0 || index >= static_cast<int>(g_state.watches.size())) return false;
 	auto& watch = g_state.watches[static_cast<std::size_t>(index)];
 	const std::string& retained = watch.persistent_expression.empty() ? watch.expression : watch.persistent_expression;
