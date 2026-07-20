@@ -735,7 +735,8 @@ action_result_t render_state(const state_presentation_t& state, ImVec2 size) {
 bool begin_property_grid(const char* stable_id, float label_width) {
     const float width = label_width > 0.f ? label_width : metrics().property_label_width;
     if (!ImGui::BeginTable(safe(stable_id), 2,
-        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg)) return false;
+        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH |
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_NoClip)) return false;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     std::string property_scope(safe(stable_id));
     const std::string& parent_scope = aida::preview::semantics::active_parent_storage();

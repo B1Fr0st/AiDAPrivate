@@ -1,3 +1,7 @@
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
+
 #include "telemetry_client.hpp"
 
 #include "../../../libs/cpp-httplib/httplib.h"
@@ -7,10 +11,9 @@
 #include <bcrypt.h>
 #include <mutex>
 #include <chrono>
-#include <exception>
+#include <ctime>
 #include <thread>
 #include <atomic>
-#include <random>
 #include <algorithm>
 
 #pragma comment(lib, "bcrypt.lib")
@@ -32,52 +35,6 @@ namespace aida::telemetry
                 case severity_t::critical: return "critical";
             }
             return "info";
-        }
-
-        bool http_post_json(const std::string& base_url,
-                            const std::string& path,
-                            const std::string& body,
-                            std::string& response_out)
-        {
-            try {
-                httplib::Client cli(base_url.c_str());
-                cli.set_connection_timeout(5);
-                cli.set_read_timeout(10);
-                cli.enable_server_certificate_verification(false);
-                auto res = cli.Post(path.c_str(), body, "application/json");
-                if (!res) return false;
-                response_out = res->body;
-                return res->status >= 200 && res->status < 300;
-            } catch (...) {
-                return false;
-            }
-        }
-
-        std::vector<std::uint8_t> base64_decode_b(const std::string& s)
-        {
-            static const int8_t lut[128] = {
-                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-                52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-                -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-                15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-                -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-                41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-            };
-            std::vector<std::uint8_t> out;
-            int val = 0, bits = 0;
-            for (char c : s) {
-                if (c == '=' || c == '\r' || c == '\n' || c == ' ') continue;
-                if (static_cast<unsigned char>(c) > 127 || lut[static_cast<unsigned char>(c)] < 0) continue;
-                val = (val << 6) | lut[static_cast<unsigned char>(c)];
-                bits += 6;
-                if (bits >= 8) {
-                    bits -= 8;
-                    out.push_back(static_cast<std::uint8_t>((val >> bits) & 0xFF));
-                }
-            }
-            return out;
         }
 
         std::string hex_encode_b(const std::uint8_t* d, size_t n)
@@ -128,9 +85,11 @@ namespace aida::telemetry
             try {
                 if (auth_key.empty() || session_token.empty()) return false;
                 httplib::Client cli(base_url.c_str());
+                if (!cli.is_valid()) return false;
                 cli.set_connection_timeout(5);
                 cli.set_read_timeout(10);
-                cli.enable_server_certificate_verification(false);
+                cli.enable_server_certificate_verification(true);
+                cli.enable_server_hostname_verification(true);
 
                 std::string nonce = make_random_nonce_b(16);
                 std::int64_t ts = static_cast<std::int64_t>(std::time(nullptr));

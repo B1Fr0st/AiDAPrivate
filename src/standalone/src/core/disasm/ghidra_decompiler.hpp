@@ -912,8 +912,18 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 		return result;
 	}
 
-	(void)perform_res;
 	(void)perform_ms;
+	if (perform_res < 0) {
+		result.is_error = true;
+		result.error_text = "Ghidra action stopped before completion";
+		auto end_time = std::chrono::high_resolution_clock::now();
+		result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+		diag::log_tagged_critical_fmt("dec",
+			"do_decompile_exit addr=0x%llx outcome=partial_action total_ms=%.2f",
+			static_cast<unsigned long long>(entry_addr),
+			result.elapsed_ms);
+		return result;
+	}
 
 	if (typed_request) {
 		auto typed = aida::analysis::ghidra_ir_adapter::extract(*fd, *typed_request);
@@ -1045,6 +1055,30 @@ struct prepared_arch_t {
 
 		ghidra::DocumentStorage store;
 		arch->init(store);
+	}
+
+	prepared_arch_t(
+		std::shared_ptr<const aida::analysis::ghidra_adapter::ghidra_load_image_t> image,
+		aida::analysis::address_space_id_t address_space,
+		aida::analysis::architecture_mode_t architecture_mode,
+		std::function<bool()> cancel_check,
+		const std::string& sleigh_id)
+	{
+		auto loader = std::make_unique<aida_ghidra::load_image_t>(
+			std::move(image), address_space, std::move(cancel_check));
+		arch = std::make_unique<aida_ghidra::architecture_t>(sleigh_id, &err);
+		arch->take_loader(std::move(loader));
+
+		ghidra::DocumentStorage store;
+		arch->init(store);
+		if (architecture_mode == aida::analysis::architecture_mode_t::arm_a32 ||
+			architecture_mode == aida::analysis::architecture_mode_t::arm_thumb) {
+			auto* context = arch->context_database();
+			if (!context)
+				throw ghidra::LowlevelError("ARM context database is unavailable");
+			context->setVariableDefault("TMode",
+				architecture_mode == aida::analysis::architecture_mode_t::arm_thumb ? 1 : 0);
+		}
 	}
 };
 
@@ -1674,14 +1708,13 @@ inline ghidra_result_t decompile_isolated_regions(
 }
 
 inline ghidra_result_t decompile_workspace(
-	const std::shared_ptr<const aida::analysis::byte_provider_t>& provider,
-	const std::shared_ptr<const aida::analysis::pe_image_t>& image,
+	const std::shared_ptr<const aida::analysis::ghidra_adapter::ghidra_load_image_t>& load_image,
 	const aida::analysis::workspace_identity_t& identity,
 	const std::shared_ptr<const aida::analysis::analysis_snapshot_t>& snapshot,
 	uint64_t entry_addr,
+	aida::analysis::address_space_id_t address_space,
 	std::atomic<bool>* cancel,
 	std::function<bool()> cancel_check,
-	std::vector<aida_ghidra::provider_patch_t> patches = {},
 	std::optional<std::chrono::steady_clock::time_point> deadline = {},
 	const ghidra_decompile_result_limits_t& result_limits = {},
 	const aida::analysis::ghidra_ir_adapter::capture_request_t* typed_request = nullptr)
@@ -1695,9 +1728,9 @@ inline ghidra_result_t decompile_workspace(
 		result.error_text = "decompiler is shutting down";
 		return result;
 	}
-	if (!provider) {
+	if (!load_image) {
 		result.is_error = true;
-		result.error_text = "workspace byte provider is unavailable";
+		result.error_text = "normalized workspace load image is unavailable";
 		return result;
 	}
 	if (!g_state.initialized.load(std::memory_order_acquire) && !init()) {
@@ -1720,15 +1753,10 @@ inline ghidra_result_t decompile_workspace(
 	}
 
 	try {
-		const uint64_t load_base =
-			identity.target_kind() == aida::analysis::target_kind_t::live_snapshot &&
-			identity.module()
-				? identity.module()->base
-				: identity.image_base();
-		detail::prepared_arch_t prepared(provider, image, load_base, cancel_check,
-			descriptor->sleigh_id, std::move(patches));
+		detail::prepared_arch_t prepared(load_image, address_space,
+			identity.architecture_mode(), cancel_check, descriptor->sleigh_id);
 		aida_ghidra::populate_from_workspace(prepared.arch->symbol_database(),
-			identity, image.get(), snapshot.get());
+			identity, snapshot ? snapshot->image.get() : nullptr, snapshot.get());
 		if ((cancel && cancel->load(std::memory_order_acquire)) ||
 			(cancel_check && cancel_check()))
 			throw ghidra::LowlevelError("cancelled");
@@ -2115,22 +2143,8 @@ decompile_adapter(const ghidra_adapter_decompile_request_t& request)
 				"ghidra.adapter.execute"));
 	}
 
-	const uint64_t load_base = request.workspace_identity->target_kind() ==
-		aida::analysis::target_kind_t::live_snapshot && request.workspace_identity->module()
-		? request.workspace_identity->module()->base
-		: request.workspace_identity->image_base();
-	uint64_t entry_addr = function->key.address.value;
 	switch (function->key.address.space) {
 	case aida::analysis::address_space_id_t::relative_virtual:
-		if (entry_addr > (std::numeric_limits<uint64_t>::max)() - load_base) {
-			return aida::analysis::workspace_result_t<ghidra_adapter_decompile_result_t>::failure(
-				aida::analysis::make_workspace_error(
-					aida::analysis::workspace_error_code_t::range_overflow,
-					"Ghidra adapter function address overflows the workspace load base",
-					"ghidra.adapter.execute"));
-		}
-		entry_addr += load_base;
-		break;
 	case aida::analysis::address_space_id_t::virtual_address:
 	case aida::analysis::address_space_id_t::live_virtual:
 		break;
@@ -2141,6 +2155,25 @@ decompile_adapter(const ghidra_adapter_decompile_request_t& request)
 				"Ghidra adapter function address is not a native image address",
 				"ghidra.adapter.execute"));
 	}
+	uint64_t entry_addr = function->key.address.value;
+	if (function->key.address.space == aida::analysis::address_space_id_t::relative_virtual) {
+		const uint64_t load_base = request.workspace_identity->target_kind() ==
+			aida::analysis::target_kind_t::live_snapshot && request.workspace_identity->module()
+			? request.workspace_identity->module()->base
+			: request.workspace_identity->image_base();
+		if (entry_addr > (std::numeric_limits<uint64_t>::max)() - load_base) {
+			return aida::analysis::workspace_result_t<ghidra_adapter_decompile_result_t>::failure(
+				aida::analysis::make_workspace_error(
+					aida::analysis::workspace_error_code_t::range_overflow,
+					"Ghidra adapter function address overflows the workspace load base",
+					"ghidra.adapter.execute"));
+		}
+		entry_addr += load_base;
+	}
+	const auto ghidra_address_space = request.workspace_identity->target_kind() ==
+		aida::analysis::target_kind_t::live_snapshot
+		? aida::analysis::address_space_id_t::live_virtual
+		: aida::analysis::address_space_id_t::virtual_address;
 
 	std::atomic<bool> local_cancel{false};
 	std::atomic<bool>* native_cancel = request.engine_cancel ? request.engine_cancel : &local_cancel;
@@ -2163,12 +2196,12 @@ decompile_adapter(const ghidra_adapter_decompile_request_t& request)
 			return true;
 		}
 	};
-	std::shared_ptr<const aida::analysis::byte_provider_t> provider(
-		request.load_image, &request.load_image->provider());
 	auto typed_request = make_typed_capture_request(request, *function);
-	ghidra_result_t result = decompile_workspace(provider, request.analysis_snapshot->image,
-		*request.workspace_identity, request.analysis_snapshot, entry_addr, native_cancel,
-		std::move(cancel_check), {}, deadline, request.result_limits, &typed_request);
+	ghidra_result_t result = decompile_workspace(request.load_image,
+		*request.workspace_identity, request.analysis_snapshot, entry_addr,
+		ghidra_address_space,
+		native_cancel, std::move(cancel_check), deadline, request.result_limits,
+		&typed_request);
 	if (!result.is_error && !result.typed_artifacts) {
 		result.is_error = true;
 		result.complete = false;

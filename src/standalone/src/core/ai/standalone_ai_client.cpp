@@ -1,6 +1,8 @@
 
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
 #include "standalone_license.hpp"

@@ -26,6 +26,10 @@ constexpr const char* tile_phase = "x86_tile_decode";
 constexpr std::uint64_t instruction_domain = 0x78493634696E7374ULL;
 constexpr std::uint64_t operand_domain = 0x784936346F706E64ULL;
 constexpr std::uint64_t expression_domain = 0x7849363465787072ULL;
+constexpr std::size_t initial_instruction_reserve = 4096;
+constexpr std::size_t initial_operands_per_instruction = 3;
+constexpr std::size_t initial_targets_per_instruction = 2;
+constexpr std::size_t initial_coverage_reserve = 1024;
 
 class active_decode_guard_t final {
 public:
@@ -600,14 +604,19 @@ worker_owned_x86_tile_decoder_t::decode_tile(
         output.usage.snapshot_window_leases = 1;
         output.usage.snapshot_window_bytes = request.byte_count;
         const auto window_size = static_cast<std::size_t>(request.byte_count);
-        output.instructions.reserve((std::min)(window_size,
-            static_cast<std::size_t>(request.limits.maximum_instructions)));
-        output.operand_facts.reserve((std::min)(window_size * ZYDIS_MAX_OPERAND_COUNT,
+        const auto instruction_reserve = (std::min)({window_size,
+            static_cast<std::size_t>(request.limits.maximum_instructions),
+            initial_instruction_reserve});
+        output.instructions.reserve(instruction_reserve);
+        output.operand_facts.reserve((std::min)(
+            instruction_reserve * initial_operands_per_instruction,
             static_cast<std::size_t>(request.limits.maximum_operand_facts)));
-        output.target_facts.reserve((std::min)(window_size * (ZYDIS_MAX_OPERAND_COUNT + 1ULL),
+        output.target_facts.reserve((std::min)(
+            instruction_reserve * initial_targets_per_instruction,
             static_cast<std::size_t>(request.limits.maximum_target_facts)));
-        output.coverage.reserve((std::min)(window_size,
-            static_cast<std::size_t>(request.limits.maximum_coverage_spans)));
+        output.coverage.reserve((std::min)({window_size,
+            static_cast<std::size_t>(request.limits.maximum_coverage_spans),
+            initial_coverage_reserve}));
 
         bool invalid_run = false;
         address_t invalid_start{};

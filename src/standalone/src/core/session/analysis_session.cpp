@@ -74,8 +74,11 @@ void select_locked(preview_session_state_t& value, std::size_t index) {
     value.active = index;
     for (std::size_t current = 0; current < value.sessions.size(); ++current)
         value.sessions[current]->ui_selected = current == index;
-    if (index < value.sessions.size())
+    if (index < value.sessions.size()) {
         value.sessions[index]->last_active_steady_ms = now_ms();
+        aida::analysis::workspace_registry().bind_preview_workspace(
+            value.sessions[index]->workspace);
+    }
 }
 
 bool same_path(const std::string& left, const std::string& right) {
@@ -252,6 +255,7 @@ bool close_session(std::size_t index) {
                          static_cast<std::ptrdiff_t>(index));
     if (value.sessions.empty()) {
         value.active = 0;
+        aida::analysis::workspace_registry().clear_preview_workspaces();
         return true;
     }
     select_locked(value, (std::min)(value.active,
@@ -3204,6 +3208,21 @@ std::shared_ptr<analysis_workspace_t> active_workspace()
         state().active_idx >= static_cast<int>(state().sessions.size()))
         return {};
     return state().sessions[static_cast<size_t>(state().active_idx)]->workspace;
+}
+
+bool try_active_workspace(std::shared_ptr<analysis_workspace_t>& output)
+{
+    auto& current = state();
+    std::unique_lock<std::mutex> lock(current.mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return false;
+    if (current.active_idx < 0 ||
+        current.active_idx >= static_cast<int>(current.sessions.size())) {
+        output.reset();
+        return true;
+    }
+    output = current.sessions[static_cast<size_t>(current.active_idx)]->workspace;
+    return true;
 }
 
 std::shared_ptr<analysis_workspace_t> workspace_for_session(size_t idx)

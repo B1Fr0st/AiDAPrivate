@@ -196,6 +196,10 @@ inline bool register_region(std::string_view stable_id_value,
         maximum.y <= minimum.y || ImGui::GetCurrentContext() == nullptr ||
         (!resolved_parent.empty() && !valid_stable_id(resolved_parent)))
         return false;
+    const ImVec2 viewport = ImGui::GetIO().DisplaySize;
+    if (maximum.x <= 0.0f || maximum.y <= 0.0f || minimum.x >= viewport.x ||
+        minimum.y >= viewport.y)
+        return false;
     if (!consume_budget(stable_id_value))
         return false;
     const auto interaction = studio::InspectRegion({
@@ -224,7 +228,8 @@ inline bool register_last_item(std::string_view stable_id_value,
     const ImGuiID item_id = ImGui::GetItemID();
     const ImVec2 minimum = ImGui::GetItemRectMin();
     const ImVec2 maximum = ImGui::GetItemRectMax();
-    if (item_id == 0 || maximum.x <= minimum.x || maximum.y <= minimum.y)
+    if (item_id == 0 || maximum.x <= minimum.x || maximum.y <= minimum.y ||
+        !ImGui::IsItemVisible())
         return false;
     if (!consume_budget(stable_id_value))
         return false;

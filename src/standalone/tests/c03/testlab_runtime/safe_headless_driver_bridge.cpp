@@ -2,10 +2,38 @@
 #error AIDA_C03_SAFE_HEADLESS_RUNTIME_must_equal_1
 #endif
 
+#include <algorithm>
+
 #include "../../../src/core/runtime/standalone_driver.hpp"
 #include "../../../src/core/runtime/standalone_driver_identity.hpp"
+#include "../../../../../driver/comm.h"
+
+namespace {
+
+thread_local driver_bridge::remote_call_context_t g_safe_remote_call_context{};
+thread_local bool g_safe_remote_call_context_active = false;
+
+}
 
 namespace driver_bridge {
+
+bool initialize()
+{
+    return false;
+}
+
+bool load_kernel_driver()
+{
+    return false;
+}
+
+void invalidate_kernel_session(const char*)
+{
+}
+
+void install_kernel_demote_kick_callback(kernel_demote_kick_callback_t)
+{
+}
 
 bool is_loaded()
 {
@@ -17,9 +45,29 @@ bool using_kernel_driver()
     return false;
 }
 
+bool can_read_memory()
+{
+    return false;
+}
+
+bool kernel_session_available(std::string* reason)
+{
+    if (reason)
+        *reason = "Safe headless runtime has no kernel session";
+    return false;
+}
+
 bool attach(uint32_t)
 {
     return false;
+}
+
+void detach()
+{
+}
+
+void shutdown(const char*)
+{
 }
 
 bool attach_additional(uint32_t)
@@ -47,6 +95,11 @@ std::vector<uint32_t> attached_pids()
     return {};
 }
 
+std::string status()
+{
+    return "Safe headless runtime: driver unavailable";
+}
+
 std::string last_error()
 {
     return "Safe headless runtime prohibits driver and process access";
@@ -57,6 +110,23 @@ uint32_t attached_pid()
     return 0;
 }
 
+bool attached_process_alive(uint32_t* exit_code_out)
+{
+    if (exit_code_out)
+        *exit_code_out = 0;
+    return false;
+}
+
+std::string attached_process_name()
+{
+    return {};
+}
+
+std::vector<process_info_t> enumerate_processes()
+{
+    return {};
+}
+
 std::vector<module_info_t> enumerate_modules()
 {
     return {};
@@ -65,6 +135,17 @@ std::vector<module_info_t> enumerate_modules()
 std::vector<thread_info_t> enumerate_threads()
 {
     return {};
+}
+
+std::vector<memory_region_t> enumerate_memory_regions(size_t)
+{
+    return {};
+}
+
+bool query_memory(uint64_t, memory_region_t& region)
+{
+    region = {};
+    return false;
 }
 
 bool read_memory(uint64_t, size_t, std::vector<uint8_t>& out)
@@ -78,15 +159,93 @@ bool write_memory(uint64_t, const std::vector<uint8_t>&)
     return false;
 }
 
+bool read_string(uint64_t, size_t, std::string& out)
+{
+    out.clear();
+    return false;
+}
+
 bool read_memory_for(uint32_t, uint64_t, size_t, std::vector<uint8_t>& out)
 {
     out.clear();
     return false;
 }
 
+bool write_memory_for(uint32_t, uint64_t, const std::vector<uint8_t>&)
+{
+    return false;
+}
+
+bool query_memory_for(uint32_t, uint64_t, memory_region_t& region)
+{
+    region = {};
+    return false;
+}
+
+bool protect_memory_for(uint32_t, uint64_t, uint64_t, uint32_t, uint32_t* old_protect)
+{
+    if (old_protect)
+        *old_protect = 0;
+    return false;
+}
+
+bool protect_memory_for_bounded(uint32_t, uint64_t, uint64_t, uint32_t, uint32_t* old_protect, uint32_t)
+{
+    if (old_protect)
+        *old_protect = 0;
+    return false;
+}
+
 std::vector<module_info_t> enumerate_modules_for(uint32_t)
 {
     return {};
+}
+
+std::vector<thread_info_t> enumerate_threads_for(uint32_t)
+{
+    return {};
+}
+
+std::vector<memory_region_t> enumerate_memory_regions_for(uint32_t, size_t)
+{
+    return {};
+}
+
+bool read_peb_for(uint32_t, peb_info_t& out)
+{
+    out = {};
+    return false;
+}
+
+uint64_t resolve_export_for(uint32_t, uint64_t, const char*)
+{
+    return 0;
+}
+
+uint64_t resolve_export_for_kernel_strict(uint32_t, uint64_t, const char*)
+{
+    return 0;
+}
+
+uint64_t allocate_memory_for(uint32_t, size_t)
+{
+    return 0;
+}
+
+bool free_memory_for(uint32_t, uint64_t)
+{
+    return false;
+}
+
+bool read_kernel_memory(uint64_t, size_t, std::vector<uint8_t>& out)
+{
+    out.clear();
+    return false;
+}
+
+bool write_kernel_memory(uint64_t, const std::vector<uint8_t>&)
+{
+    return false;
 }
 
 bool verify_cross_ring_evidence(const uint8_t*, uint32_t)
@@ -122,6 +281,337 @@ bool set_thread_context(uint32_t, const thread_context_t&, uint64_t)
     return false;
 }
 
+bool suspend_thread(uint32_t, uint32_t* prev_count)
+{
+    if (prev_count)
+        *prev_count = 0;
+    return false;
+}
+
+bool resume_thread(uint32_t, uint32_t* prev_count)
+{
+    if (prev_count)
+        *prev_count = 0;
+    return false;
+}
+
+bool query_thread_information(uint32_t, uint32_t, void* buffer, uint32_t buffer_size, uint32_t* return_length)
+{
+    if (buffer && buffer_size != 0)
+        std::fill_n(static_cast<uint8_t*>(buffer), buffer_size, static_cast<uint8_t>(0));
+    if (return_length)
+        *return_length = 0;
+    return false;
+}
+
+uint64_t resolve_export(uint64_t, const char*)
+{
+    return 0;
+}
+
+uint64_t call_function(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    return 0;
+}
+
+bool set_hardware_breakpoint(uint32_t, int, uint64_t, int, int)
+{
+    return false;
+}
+
+bool clear_hardware_breakpoint(uint32_t, int)
+{
+    return false;
+}
+
+scoped_remote_call_context_t::scoped_remote_call_context_t(const remote_call_context_t& context)
+    : previous_(g_safe_remote_call_context)
+    , previous_active_(g_safe_remote_call_context_active)
+    , active_(true)
+{
+    g_safe_remote_call_context = context;
+    g_safe_remote_call_context_active = true;
+}
+
+scoped_remote_call_context_t::~scoped_remote_call_context_t()
+{
+    if (!active_)
+        return;
+    if (previous_active_) {
+        g_safe_remote_call_context = previous_;
+        g_safe_remote_call_context_active = true;
+    } else {
+        g_safe_remote_call_context = {};
+        g_safe_remote_call_context_active = false;
+    }
+    active_ = false;
+}
+
+const char* current_remote_call_tool_name() noexcept
+{
+    return g_safe_remote_call_context_active ? g_safe_remote_call_context.tool : nullptr;
+}
+
+const char* current_remote_call_diag_id() noexcept
+{
+    return g_safe_remote_call_context_active ? g_safe_remote_call_context.diag_id : nullptr;
+}
+
+uint32_t current_remote_call_timeout_ms() noexcept
+{
+    return g_safe_remote_call_context_active ? g_safe_remote_call_context.timeout_ms : 0;
+}
+
+uint64_t current_remote_call_deadline_ms() noexcept
+{
+    return g_safe_remote_call_context_active ? g_safe_remote_call_context.deadline_ms : 0;
+}
+
+bool current_remote_call_cancelled() noexcept
+{
+    if (!g_safe_remote_call_context_active)
+        return false;
+    if (g_safe_remote_call_context.cancel_token &&
+        g_safe_remote_call_context.cancel_token->load(std::memory_order_acquire))
+        return true;
+    return g_safe_remote_call_context.deadline_ms != 0 &&
+           GetTickCount64() >= g_safe_remote_call_context.deadline_ms;
+}
+
+remote_call_execution_diag_t last_remote_call_execution_diag()
+{
+    return {};
+}
+
+bool lower_remote_call_last_abandoned() noexcept
+{
+    return false;
+}
+
+namespace detail {
+
+uint32_t remote_call_um_inflight_count_global() noexcept
+{
+    return 0;
+}
+
+}
+
+std::vector<net_connection_info_t> enumerate_connections(uint32_t, uint32_t)
+{
+    return {};
+}
+
+bool start_capture(uint32_t, uint32_t, uint32_t, const uint8_t*, uint32_t)
+{
+    return false;
+}
+
+bool stop_capture()
+{
+    return false;
+}
+
+void cancel_inflight_capture()
+{
+}
+
+bool get_capture_status(bool& active, uint32_t& captured, uint32_t& dropped)
+{
+    active = false;
+    captured = 0;
+    dropped = 0;
+    return false;
+}
+
+std::vector<captured_packet_t> get_captured_packets(uint32_t)
+{
+    return {};
+}
+
+std::vector<captured_packet_t> get_captured_packets_bounded(uint32_t, uint32_t)
+{
+    return {};
+}
+
+std::vector<dns_entry_t> get_dns_queries(uint32_t)
+{
+    return {};
+}
+
+bool add_filter_rule(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    const uint8_t*, const uint8_t*, uint32_t* out_rule_id)
+{
+    if (out_rule_id)
+        *out_rule_id = 0;
+    return false;
+}
+
+bool remove_filter_rule(uint32_t)
+{
+    return false;
+}
+
+bool clear_filter_rules()
+{
+    return false;
+}
+
+bool get_network_stats(network_stats_t& stats)
+{
+    stats = {};
+    return false;
+}
+
+bool bw_monitor_op(uint32_t, uint32_t, bw_stats_t* out_stats)
+{
+    if (out_stats)
+        *out_stats = {};
+    return false;
+}
+
+std::vector<bw_process_info_t> get_bw_per_process(uint32_t)
+{
+    return {};
+}
+
+std::vector<dpi_result_t> get_dpi_results(uint32_t, uint32_t, uint32_t, uint32_t)
+{
+    return {};
+}
+
+std::vector<wfp_callout_info_t> enumerate_wfp_callouts(const std::string&)
+{
+    return {};
+}
+
+std::vector<socket_info_t> get_socket_handles(uint32_t)
+{
+    return {};
+}
+
+std::vector<tcpip_connection_t> dump_tcpip_connections(uint32_t, uint32_t)
+{
+    return {};
+}
+
+std::vector<net_iface_info_t> enumerate_interfaces()
+{
+    return {};
+}
+
+std::vector<held_packet_info_t> get_held_packets()
+{
+    return {};
+}
+
+std::vector<mod_rule_info_t> list_packet_mod_rules()
+{
+    return {};
+}
+
+std::vector<redirect_rule_info_t> list_redirect_rules()
+{
+    return {};
+}
+
+std::vector<dns_spoof_info_t> list_dns_spoof_rules()
+{
+    return {};
+}
+
+bool fingerprint_op(uint32_t)
+{
+    return false;
+}
+
+std::vector<fingerprint_info_t> get_fingerprints()
+{
+    return {};
+}
+
+bool export_pcap(uint32_t, uint32_t, uint32_t, pcap_export_result_t* out)
+{
+    if (out)
+        *out = {};
+    return false;
+}
+
+bool traffic_redirect_op(uint32_t, uint32_t, uint32_t, uint32_t, const uint8_t*,
+    uint32_t, const uint8_t*, uint32_t, uint32_t* out_rule_id, uint32_t)
+{
+    if (out_rule_id)
+        *out_rule_id = 0;
+    return false;
+}
+
+bool inject_packet(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    const uint8_t*, const uint8_t*, const uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t)
+{
+    return false;
+}
+
+bool kill_connection(uint32_t, uint32_t, uint32_t, uint32_t,
+    const uint8_t*, const uint8_t*, uint32_t)
+{
+    return false;
+}
+
+bool intercept_op(uint32_t, uint32_t, uint32_t, uint32_t, uint64_t,
+    const uint8_t*, uint32_t, uint32_t* out_held_count, bool* out_active)
+{
+    if (out_held_count)
+        *out_held_count = 0;
+    if (out_active)
+        *out_active = false;
+    return false;
+}
+
+bool dns_spoof_op(uint32_t, uint32_t, const char*, const uint8_t*,
+    uint32_t, uint32_t, uint32_t* out_rule_id)
+{
+    if (out_rule_id)
+        *out_rule_id = 0;
+    return false;
+}
+
+bool packet_mod_rule_op(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    const uint8_t*, uint32_t, const uint8_t*, uint32_t, uint32_t* out_rule_id)
+{
+    if (out_rule_id)
+        *out_rule_id = 0;
+    return false;
+}
+
+bool stream_reassemble_op(uint32_t, uint32_t, uint32_t, uint32_t,
+    const uint8_t*, const uint8_t*, std::vector<uint8_t>* out_data,
+    uint32_t* out_packets, uint32_t* out_truncated)
+{
+    if (out_data)
+        out_data->clear();
+    if (out_packets)
+        *out_packets = 0;
+    if (out_truncated)
+        *out_truncated = 0;
+    return false;
+}
+
+bool sniff_net_buffers_start(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)
+{
+    return false;
+}
+
+bool sniff_net_buffers_stop()
+{
+    return false;
+}
+
+std::vector<sniff_result_t> sniff_net_buffers_get(bool& active)
+{
+    active = false;
+    return {};
+}
+
 bool spoof_debug_flags(uint32_t* result_flags)
 {
     if (result_flags)
@@ -129,9 +619,503 @@ bool spoof_debug_flags(uint32_t* result_flags)
     return false;
 }
 
+bool refresh_heartbeat()
+{
+    return false;
+}
+
+bool sentinel_bridge_ready()
+{
+    return false;
+}
+
+uint64_t sentinel_ready_since_tsc()
+{
+    return 0;
+}
+
+dynamic_ioctl_state_t dynamic_ioctl_state()
+{
+    return {};
+}
+
+bool dynamic_ioctls_ready()
+{
+    return false;
+}
+
+bool register_self_dll_protection(uint64_t, uint64_t, uint32_t, uint64_t, uint32_t)
+{
+    return false;
+}
+
 bool trigger_kernel_bsod(uint32_t, uint64_t)
 {
     return false;
+}
+
+bool latch_targeting_from_usermode(uint32_t)
+{
+    return false;
+}
+
+bool tier_a_driver_present_query(bool* out_present, uint32_t* out_mask, uint64_t* out_first_base)
+{
+    if (out_present)
+        *out_present = false;
+    if (out_mask)
+        *out_mask = 0;
+    if (out_first_base)
+        *out_first_base = 0;
+    return false;
+}
+
+bool canary_register(void*, size_t)
+{
+    return false;
+}
+
+bool update_re_tool_hashes(const uint8_t*, uint32_t)
+{
+    return false;
+}
+
+bool update_werfault_hashes(const uint8_t*, uint32_t)
+{
+    return false;
+}
+
+bool update_ce_driver_hashes(const uint8_t*, uint32_t)
+{
+    return false;
+}
+
+bool kernel_anti_debug_query(anti_debug_result_t& out)
+{
+    out = {};
+    return false;
+}
+
+bool kernel_anti_debug_clear_dr(uint64_t* out_clear_count)
+{
+    if (out_clear_count)
+        *out_clear_count = 0;
+    return false;
+}
+
+bool kernel_anti_debug_clear_process_dr(uint32_t, uint64_t* out_clear_count)
+{
+    if (out_clear_count)
+        *out_clear_count = 0;
+    return false;
+}
+
+bool kernel_anti_debug_scan_debuggers(uint64_t* out_debugger_pid)
+{
+    if (out_debugger_pid)
+        *out_debugger_pid = 0;
+    return false;
+}
+
+bool kernel_anti_debug_scan_text(uint64_t, uint64_t, uint32_t, uint64_t* hit_rva)
+{
+    if (hit_rva)
+        *hit_rva = 0;
+    return false;
+}
+
+bool kernel_anti_debug_hide_all_threads(uint32_t)
+{
+    return false;
+}
+
+bool kernel_anti_dump_full(uint32_t)
+{
+    return false;
+}
+
+bool kernel_anti_dump_start_continuous(uint32_t)
+{
+    return false;
+}
+
+bool relay_server_token_v2(uint32_t, uint64_t, uint64_t* out_driver_proof)
+{
+    if (out_driver_proof)
+        *out_driver_proof = 0;
+    return false;
+}
+
+bool initiate_driver_handshake(uint8_t out_driver_challenge[32])
+{
+    if (out_driver_challenge)
+        std::fill_n(out_driver_challenge, 32, static_cast<uint8_t>(0));
+    return false;
+}
+
+bool complete_driver_challenge(const uint8_t[32])
+{
+    return false;
+}
+
+bool run_kernel_hv_detection(hv_kernel_detect_result_t& result)
+{
+    result = {};
+    return false;
+}
+
+bool kernel_read_prologue_hash(uint64_t, uint32_t, uint64_t& out_hash)
+{
+    out_hash = 0;
+    return false;
+}
+
+bool query_sentinel_dispatch_guard(uint8_t& hook_detected, uint64_t& hook_target)
+{
+    hook_detected = 0;
+    hook_target = 0;
+    return false;
+}
+
+bool query_sentinel_callback_scan(uint8_t& hostile_drivers, uint8_t& modified_callbacks)
+{
+    hostile_drivers = 0;
+    modified_callbacks = 0;
+    return false;
+}
+
+}
+
+namespace voyager {
+
+bool device_t::connect() noexcept
+{
+    disconnect();
+    last_connect_error_ = ERROR_ACCESS_DENIED;
+    return false;
+}
+
+void device_t::clear_process_context() noexcept
+{
+    process_id_ = 0;
+    base_address_ = 0;
+    dtb_ = 0;
+    shellcode_address_ = 0;
+    spoof_gadget_ = 0;
+    shellcode_pid_ = 0;
+    shellcode_dtb_at_alloc_ = 0;
+}
+
+std::uint64_t device_t::find_image() noexcept
+{
+    base_address_ = 0;
+    return 0;
+}
+
+void device_t::solve_dtb() noexcept
+{
+    dtb_ = 0;
+}
+
+std::size_t device_t::read_raw(std::uint64_t, void* buffer, std::size_t size) const noexcept
+{
+    if (buffer && size != 0)
+        std::fill_n(static_cast<std::uint8_t*>(buffer), size, static_cast<std::uint8_t>(0));
+    return 0;
+}
+
+std::size_t device_t::write_raw(std::uint64_t, const void*, std::size_t) const noexcept
+{
+    return 0;
+}
+
+std::size_t device_t::read_kernel_raw(std::uint64_t, void* buffer, std::size_t size) const noexcept
+{
+    if (buffer && size != 0)
+        std::fill_n(static_cast<std::uint8_t*>(buffer), size, static_cast<std::uint8_t>(0));
+    return 0;
+}
+
+std::uint64_t device_t::allocate_memory(std::size_t) noexcept
+{
+    return 0;
+}
+
+bool device_t::free_memory(std::uint64_t) noexcept
+{
+    return false;
+}
+
+std::uint64_t device_t::call_function(std::uint64_t, std::uint64_t, std::uint64_t,
+    std::uint64_t, std::uint64_t) noexcept
+{
+    return 0;
+}
+
+bool device_t::get_thread_context(std::uint32_t, thread_context& context) noexcept
+{
+    context = {};
+    return false;
+}
+
+std::vector<device_t::thread_info> device_t::enumerate_threads() noexcept
+{
+    return {};
+}
+
+bool device_t::suspend_thread(std::uint32_t, std::uint32_t* prev_count) noexcept
+{
+    if (prev_count)
+        *prev_count = 0;
+    return false;
+}
+
+bool device_t::resume_thread(std::uint32_t, std::uint32_t* prev_count) noexcept
+{
+    if (prev_count)
+        *prev_count = 0;
+    return false;
+}
+
+bool device_t::query_thread_basic_information(
+    std::uint32_t, detail::thread_query_information_request& info) noexcept
+{
+    info = {};
+    return false;
+}
+
+bool device_t::query_memory(std::uint64_t, memory_region_info& info) noexcept
+{
+    info = {};
+    return false;
+}
+
+bool device_t::protect_memory(std::uint64_t, std::uint64_t, std::uint32_t,
+    std::uint32_t* old_protect) noexcept
+{
+    if (old_protect)
+        *old_protect = 0;
+    return false;
+}
+
+std::vector<detail::region_entry> device_t::enumerate_memory_regions(
+    std::uint64_t, std::uint64_t, bool) noexcept
+{
+    return {};
+}
+
+bool device_t::read_peb(peb_info& info) noexcept
+{
+    info = {};
+    return false;
+}
+
+std::uint64_t device_t::resolve_export(std::uint64_t, const char*) noexcept
+{
+    return 0;
+}
+
+std::uint64_t device_t::virtual_to_physical(std::uint64_t) noexcept
+{
+    return 0;
+}
+
+bool device_t::query_ssdt(ssdt_info& info) noexcept
+{
+    info = {};
+    return false;
+}
+
+bool device_t::set_hardware_breakpoint(std::uint32_t, int, std::uint64_t, int, int) noexcept
+{
+    return false;
+}
+
+bool device_t::clear_hardware_breakpoint(std::uint32_t, int) noexcept
+{
+    return false;
+}
+
+bool device_t::start_capture(std::uint32_t, std::uint32_t, std::uint32_t,
+    const std::uint8_t*, std::uint32_t) noexcept
+{
+    return false;
+}
+
+bool device_t::stop_capture() noexcept
+{
+    return false;
+}
+
+bool device_t::get_capture_status(bool& active, std::uint32_t& captured,
+    std::uint32_t& dropped) noexcept
+{
+    active = false;
+    captured = 0;
+    dropped = 0;
+    return false;
+}
+
+std::vector<device_t::captured_packet> device_t::get_captured_packets(std::uint32_t) noexcept
+{
+    return {};
+}
+
+bool device_t::sniff_net_buffers_start(std::uint64_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t, std::uint32_t) noexcept
+{
+    return false;
+}
+
+bool device_t::sniff_net_buffers_stop() noexcept
+{
+    return false;
+}
+
+std::vector<device_t::sniff_result> device_t::sniff_net_buffers_get(bool& active) noexcept
+{
+    active = false;
+    return {};
+}
+
+bool device_t::sniff_net_buffers_store(std::uint64_t, std::uint64_t,
+    const std::uint8_t*, std::uint32_t) noexcept
+{
+    return false;
+}
+
+std::vector<device_t::dpi_result> device_t::get_dpi_results(
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) noexcept
+{
+    return {};
+}
+
+bool device_t::intercept_op(std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint64_t, const std::uint8_t*, std::uint32_t,
+    std::uint32_t* out_held_count, bool* out_active) noexcept
+{
+    if (out_held_count)
+        *out_held_count = 0;
+    if (out_active)
+        *out_active = false;
+    return false;
+}
+
+std::vector<device_t::held_packet_info> device_t::get_held_packets() noexcept
+{
+    return {};
+}
+
+bool device_t::stream_reassemble_op(std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t, const std::uint8_t*, const std::uint8_t*,
+    std::vector<std::uint8_t>* out_data, std::uint32_t* out_packets,
+    std::uint32_t* out_truncated) noexcept
+{
+    if (out_data)
+        out_data->clear();
+    if (out_packets)
+        *out_packets = 0;
+    if (out_truncated)
+        *out_truncated = 0;
+    return false;
+}
+
+void device_t::set_process_id(std::uint32_t) noexcept
+{
+    clear_process_context();
+}
+
+void device_t::disconnect() noexcept
+{
+    driver_handle_ = INVALID_HANDLE_VALUE;
+    process_id_ = 0;
+    base_address_ = 0;
+    dtb_ = 0;
+    kernel_dtb_ = 0;
+    shellcode_address_ = 0;
+    spoof_gadget_ = 0;
+    session_key_ = 0;
+    server_seed_ = 0;
+    server_ioctl_seed_ = 0;
+    last_heartbeat_tsc_.store(0, std::memory_order_release);
+    last_bridge_whoswho_tsc_ = 0;
+    last_bridge_sentinel_tsc_ = 0;
+    first_sentinel_ready_tsc_ = 0;
+    last_failed_tid_ = 0;
+    last_hijacked_tid_ = 0;
+    last_connect_error_ = 0;
+    last_heartbeat_error_.store(0, std::memory_order_release);
+    last_heartbeat_bytes_ = 0;
+    last_heartbeat_response_ = 0;
+    last_heartbeat_ioctl_code_ = 0;
+    last_heartbeat_magic_ = 0;
+    last_heartbeat_dioctl_result_ = FALSE;
+    last_heartbeat_base_ = 0;
+    last_heartbeat_key_hash_ = 0;
+    last_heartbeat_ioctl_seed_hash_ = 0;
+    last_heartbeat_server_seed_present_ = 0;
+    last_heartbeat_ioctl_seed_present_ = 0;
+    last_heartbeat_global_server_seed_present_ = 0;
+    last_heartbeat_global_ioctl_seed_present_ = 0;
+    last_heartbeat_offset_ = 0;
+    inflight_capture_thread_.store(nullptr, std::memory_order_release);
+    inflight_capture_cancel_pending_.store(false, std::memory_order_release);
+    ntdll_base_ = 0;
+    ntdll_size_ = 0;
+    server_token_relay_priority_request_.store(0, std::memory_order_release);
+    server_token_relay_priority_yields_observed_.store(0, std::memory_order_release);
+    last_acquiring_reader_tid_.store(0, std::memory_order_release);
+    last_acquiring_reader_ioctl_.store(0, std::memory_order_release);
+    last_acquiring_reader_tsc_.store(0, std::memory_order_release);
+    relay_v2_attempts_.store(0, std::memory_order_release);
+    relay_v2_commits_.store(0, std::memory_order_release);
+    relay_v2_writer_timeouts_.store(0, std::memory_order_release);
+    relay_v2_last_attempt_tick_.store(0, std::memory_order_release);
+    relay_v2_last_commit_tick_.store(0, std::memory_order_release);
+    relay_v2_last_writer_timeout_tick_.store(0, std::memory_order_release);
+    seed_rotation_writer_acquiring_.store(0, std::memory_order_release);
+    shared_send_request_inflight_count_.store(0, std::memory_order_release);
+    shared_lock_oldest_holder_tid_.store(0, std::memory_order_release);
+    shared_lock_oldest_holder_acquired_tsc_.store(0, std::memory_order_release);
+    session_pending_recovery_.store(0, std::memory_order_release);
+    session_pending_recovery_since_tick_.store(0, std::memory_order_release);
+    session_relay_cache_provider_.store(nullptr, std::memory_order_release);
+    shellcode_pid_ = 0;
+    shellcode_dtb_at_alloc_ = 0;
+}
+
+std::uint32_t device_t::compute_dynamic_key_snapshot() const noexcept
+{
+    return 0;
+}
+
+std::uint32_t device_t::compute_ioctl_base_snapshot() const noexcept
+{
+    return 0;
+}
+
+DWORD device_t::make_ioctl_snapshot(std::uint32_t) const noexcept
+{
+    return 0;
+}
+
+std::uint32_t device_t::heartbeat_magic_snapshot() const noexcept
+{
+    return 0;
+}
+
+void device_t::capture_heartbeat_security_snapshot(std::uint32_t, DWORD, std::uint32_t) const noexcept
+{
+    last_heartbeat_ioctl_code_ = 0;
+    last_heartbeat_magic_ = 0;
+    last_heartbeat_base_ = 0;
+    last_heartbeat_key_hash_ = 0;
+    last_heartbeat_ioctl_seed_hash_ = 0;
+    last_heartbeat_server_seed_present_ = 0;
+    last_heartbeat_ioctl_seed_present_ = 0;
+    last_heartbeat_global_server_seed_present_ = 0;
+    last_heartbeat_global_ioctl_seed_present_ = 0;
+    last_heartbeat_offset_ = 0;
 }
 
 }

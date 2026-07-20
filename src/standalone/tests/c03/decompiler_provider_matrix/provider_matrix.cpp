@@ -12,6 +12,7 @@
 #include "core/analysis/collection/artifact_collection.hpp"
 #include "core/analysis/subrange_provider.hpp"
 #include "core/analysis/workspace/coff_image.hpp"
+#include "core/analysis/workspace/ipa_container.hpp"
 #include "core/disasm/ghidra_adapters/aida_arch_map.hpp"
 #include "core/disasm/ghidra_adapters/aida_load_image.hpp"
 
@@ -1242,6 +1243,7 @@ struct corpus_context_t final {
     corpus_materialization_result_t materialization;
     struct provider_fixture_t final : materialized_fixture_t {
         std::string architecture_identity;
+        std::optional<raw_code_profile_t> raw_code_profile;
         bool managed_only = false;
     };
     std::vector<provider_fixture_t> fixtures;
@@ -1249,6 +1251,79 @@ struct corpus_context_t final {
 };
 
 using provider_fixture_t = corpus_context_t::provider_fixture_t;
+
+std::optional<raw_code_profile_t> raw_code_profile_from_fixture(
+    std::string_view format, std::string_view architecture,
+    std::string_view architecture_identity, std::string_view mode,
+    std::string_view endian, const std::uint64_t size)
+{
+    if (format != "raw_code")
+        return std::nullopt;
+    if (size == 0)
+        throw matrix_error_t("raw-code fixture is empty");
+    raw_code_profile_t profile;
+    profile.abi = abi_id_t::sysv;
+    if (endian == "little")
+        profile.endian = endian_t::little;
+    else if (endian == "big")
+        profile.endian = endian_t::big;
+    else
+        throw matrix_error_t("raw-code fixture endian identity is unsupported");
+    if (architecture == "x86" && architecture_identity == "x86" && mode == "32") {
+        profile.architecture = architecture_id_t::x86;
+        profile.architecture_mode = architecture_mode_t::x86_32;
+        profile.address_width_bits = 32;
+    } else if (architecture == "x64" && architecture_identity == "x64" && mode == "64") {
+        profile.architecture = architecture_id_t::x86_64;
+        profile.architecture_mode = architecture_mode_t::x86_64;
+        profile.address_width_bits = 64;
+    } else if (architecture == "arm" && architecture_identity == "arm" && mode == "arm") {
+        profile.architecture = architecture_id_t::arm;
+        profile.architecture_mode = architecture_mode_t::arm_a32;
+        profile.address_width_bits = 32;
+    } else if (architecture == "arm" && architecture_identity == "thumb" && mode == "thumb") {
+        profile.architecture = architecture_id_t::arm;
+        profile.architecture_mode = architecture_mode_t::arm_thumb;
+        profile.address_width_bits = 32;
+    } else if (architecture == "aarch64" && architecture_identity == "aarch64" && mode == "64") {
+        profile.architecture = architecture_id_t::aarch64;
+        profile.architecture_mode = architecture_mode_t::aarch64;
+        profile.address_width_bits = 64;
+    } else if (architecture == "mips" && architecture_identity == "mips32" && mode == "32") {
+        profile.architecture = architecture_id_t::mips;
+        profile.architecture_mode = architecture_mode_t::mips32;
+        profile.address_width_bits = 32;
+    } else if (architecture == "mips" && architecture_identity == "mips64" && mode == "64") {
+        profile.architecture = architecture_id_t::mips64;
+        profile.architecture_mode = architecture_mode_t::mips64;
+        profile.address_width_bits = 64;
+    } else if (architecture == "ppc" && architecture_identity == "ppc32" && mode == "32") {
+        profile.architecture = architecture_id_t::ppc;
+        profile.architecture_mode = architecture_mode_t::ppc32;
+        profile.address_width_bits = 32;
+    } else if (architecture == "ppc" && architecture_identity == "ppc64" && mode == "64") {
+        profile.architecture = architecture_id_t::ppc64;
+        profile.architecture_mode = architecture_mode_t::ppc64;
+        profile.address_width_bits = 64;
+    } else if (architecture == "riscv" && architecture_identity == "riscv32" && mode == "32") {
+        profile.architecture = architecture_id_t::riscv32;
+        profile.architecture_mode = architecture_mode_t::riscv32;
+        profile.address_width_bits = 32;
+    } else if (architecture == "riscv" && architecture_identity == "riscv64" && mode == "64") {
+        profile.architecture = architecture_id_t::riscv64;
+        profile.architecture_mode = architecture_mode_t::riscv64;
+        profile.address_width_bits = 64;
+    } else {
+        throw matrix_error_t("raw-code fixture architecture identity is inconsistent");
+    }
+    profile.image_base = 0x00100000ULL;
+    profile.code_file_offset = 0;
+    profile.code_rva = 0;
+    profile.code_size = size;
+    profile.entry_rva = 0;
+    profile.symbol_name = "fragment";
+    return profile;
+}
 
 corpus_context_t prepare_corpus(const matrix_config_t& config)
 {
@@ -1325,6 +1400,10 @@ corpus_context_t prepare_corpus(const matrix_config_t& config)
         static_cast<materialized_fixture_t&>(provider_fixture) = fixture;
         provider_fixture.architecture_identity =
             identity_entry->second.architecture_identity;
+        provider_fixture.raw_code_profile = raw_code_profile_from_fixture(
+            provider_fixture.format, provider_fixture.architecture,
+            provider_fixture.architecture_identity, provider_fixture.mode,
+            provider_fixture.endian, provider_fixture.size_bytes);
         provider_fixture.managed_only = provider_fixture.format == "cli" ||
             provider_fixture.architecture_identity == "jvm" ||
             provider_fixture.architecture_identity == "dalvik";
@@ -1386,7 +1465,8 @@ class metadata_bound_provider_t final : public byte_provider_t {
 public:
     static std::shared_ptr<const byte_provider_t> create(
         std::shared_ptr<const byte_provider_t> provider,
-        provider_member_metadata_t metadata)
+        provider_member_metadata_t metadata,
+        std::string normalized_source)
     {
         bool normalized = true;
         std::size_t component_start = 0;
@@ -1406,7 +1486,9 @@ public:
                 break;
             component_start = separator + 1;
         }
-        if (!provider || provider->size() == 0 || metadata.normalized_member_path.empty() ||
+        if (!provider || provider->size() == 0 || normalized_source.empty() ||
+            normalized_source.find('\0') != std::string::npos ||
+            metadata.normalized_member_path.empty() ||
             !normalized ||
             metadata.normalized_member_path.front() == '/' ||
             metadata.normalized_member_path.find('\\') != std::string::npos ||
@@ -1415,7 +1497,7 @@ public:
             metadata.uncompressed_size != provider->size())
             throw matrix_error_t("collection member metadata cannot be bound to opened bytes");
         auto identity = provider->identity();
-        identity.normalized_source += "#member:" + metadata.normalized_member_path;
+        identity.normalized_source = std::move(normalized_source);
         identity.size = provider->size();
         identity.member = std::move(metadata);
         return std::shared_ptr<const byte_provider_t>(new metadata_bound_provider_t(
@@ -1463,7 +1545,8 @@ std::string archive_member_path(const coff_archive_member_t& member)
 }
 
 std::vector<analysis_unit_source_t> archive_analysis_sources(
-    const std::shared_ptr<const byte_provider_t>& provider)
+    const std::shared_ptr<const byte_provider_t>& provider,
+    const std::string& normalized_source)
 {
     auto parsed = parse_coff_image(*provider);
     if (!parsed)
@@ -1494,8 +1577,10 @@ std::vector<analysis_unit_source_t> archive_analysis_sources(
         if (!opened)
             throw matrix_error_t(opened.error().stable_code() + ":" +
                 opened.error().message);
-        output.push_back({std::static_pointer_cast<const byte_provider_t>(
-            opened.take_value()), metadata.normalized_member_path});
+        auto member_provider = metadata_bound_provider_t::create(
+            std::static_pointer_cast<const byte_provider_t>(opened.take_value()),
+            metadata, normalized_source);
+        output.push_back({std::move(member_provider), metadata.normalized_member_path});
     }
     if (output.empty() && import_object_count != 0)
         throw matrix_not_applicable_t(
@@ -1506,7 +1591,8 @@ std::vector<analysis_unit_source_t> archive_analysis_sources(
 }
 
 std::vector<analysis_unit_source_t> collection_analysis_sources(
-    const std::shared_ptr<const byte_provider_t>& provider)
+    const std::shared_ptr<const byte_provider_t>& provider,
+    const std::string& normalized_source)
 {
     auto collection = artifact_collection_t::open(
         provider);
@@ -1530,7 +1616,17 @@ std::vector<analysis_unit_source_t> collection_analysis_sources(
             const auto& member = current->members()[index];
             const auto path = prefix.empty() ? member.normalized_path :
                 prefix + "!/" + member.normalized_path;
-            if (code_bearing_member(member)) {
+            const bool typed_member = member.format == format_id_t::pe32 ||
+                member.format == format_id_t::pe32_plus ||
+                member.format == format_id_t::elf ||
+                member.format == format_id_t::macho ||
+                member.format == format_id_t::macho_fat ||
+                member.format == format_id_t::coff ||
+                member.format == format_id_t::dex ||
+                member.format == format_id_t::oat ||
+                member.format == format_id_t::vdex ||
+                member.format == format_id_t::classfile;
+            if (code_bearing_member(member) || typed_member) {
                 auto opened = current->open_member(index);
                 if (!opened)
                     throw matrix_error_t(opened.error().stable_code() + ":" +
@@ -1539,7 +1635,7 @@ std::vector<analysis_unit_source_t> collection_analysis_sources(
                 metadata.normalized_member_path = path;
                 metadata.ordinal = member.ordinal;
                 auto member_provider = metadata_bound_provider_t::create(
-                    opened.take_value(), std::move(metadata));
+                    opened.take_value(), std::move(metadata), normalized_source);
                 output.push_back({std::move(member_provider), path});
             }
             if (member.is_nested_collection ||
@@ -1569,6 +1665,37 @@ std::vector<analysis_unit_source_t> collection_analysis_sources(
     return output;
 }
 
+std::vector<analysis_unit_source_t> ipa_analysis_sources(
+    const std::shared_ptr<const byte_provider_t>& provider,
+    const std::string& normalized_source)
+{
+    auto container = ipa_container_t::open(provider);
+    if (!container)
+        throw matrix_error_t(container.error().stable_code() + ":" +
+            container.error().message);
+    std::vector<analysis_unit_source_t> output;
+    output.reserve(container.value()->members().size());
+    for (std::size_t index = 0; index < container.value()->members().size(); ++index) {
+        if (output.size() >= k_max_entities_per_fixture)
+            throw matrix_error_t("IPA code-member count exceeds the provider bound");
+        const auto& member = container.value()->members()[index];
+        if (member.role == ipa_member_role_t::debug_companion)
+            continue;
+        auto opened = container.value()->open_member_provider(index);
+        if (!opened)
+            throw matrix_error_t(opened.error().stable_code() + ":" +
+                opened.error().message);
+        auto metadata = member.provider_metadata;
+        metadata.normalized_member_path = member.normalized_path;
+        auto member_provider = metadata_bound_provider_t::create(
+            opened.take_value(), std::move(metadata), normalized_source);
+        output.push_back({std::move(member_provider), member.normalized_path});
+    }
+    if (output.empty())
+        throw matrix_error_t("IPA contains no code-bearing Mach-O member");
+    return output;
+}
+
 std::vector<analysis_unit_source_t> analysis_unit_sources(
     const materialized_fixture_t& fixture)
 {
@@ -1579,10 +1706,13 @@ std::vector<analysis_unit_source_t> analysis_unit_sources(
         throw matrix_error_t(mapped.error().stable_code() + ":" +
             mapped.error().message);
     auto provider = std::static_pointer_cast<const byte_provider_t>(mapped.take_value());
+    const auto normalized_source = canonical_path(fixture.path).u8string();
+    if (fixture.format == "ipa")
+        return ipa_analysis_sources(provider, normalized_source);
     if (fixture.format == "archive" || fixture.format == "static_library" ||
         fixture.format == "import_library")
-        return archive_analysis_sources(provider);
-    return collection_analysis_sources(provider);
+        return archive_analysis_sources(provider, normalized_source);
+    return collection_analysis_sources(provider, normalized_source);
 }
 
 class workspace_scope_t final {
@@ -1597,8 +1727,14 @@ public:
             return;
         const auto database_path = workspace_->database()
             ? workspace_->database()->path() : std::string{};
-        (void)workspace_registry().close(workspace_->identity().binary_id(),
+        auto closed = workspace_registry().close(workspace_->identity().binary_id(),
             clock_t::now() + std::chrono::seconds(10));
+        if (!closed) {
+            auto& failure = deferred_close_failure();
+            if (!failure)
+                failure = std::move(closed.error());
+            return;
+        }
         if (!database_path.empty()) {
             std::error_code error;
             for (const auto& candidate : {
@@ -1610,10 +1746,31 @@ public:
     }
 
     static std::unique_ptr<workspace_scope_t> create(
-        const materialized_fixture_t& fixture, std::string bin_name,
+        const provider_fixture_t& fixture, std::string bin_name,
         const analysis_unit_source_t* source = nullptr)
     {
+        auto& close_failure = deferred_close_failure();
+        if (close_failure) {
+            auto detail = close_failure->stable_code() + ":" +
+                close_failure->message;
+            close_failure.reset();
+            throw matrix_error_t("previous scorer workspace close failed:" + detail);
+        }
         auto result = std::make_unique<workspace_scope_t>();
+        const auto scorer_profile_identity = bin_name;
+        const auto bind_scorer_profile = [&scorer_profile_identity](
+                std::vector<std::uint8_t>& profile) {
+            constexpr std::string_view domain = "aida.c03.provider-matrix";
+            profile.push_back(0);
+            profile.insert(profile.end(), domain.begin(), domain.end());
+            profile.push_back(0);
+            profile.insert(profile.end(), scorer_profile_identity.begin(),
+                scorer_profile_identity.end());
+            profile.push_back(0);
+            const auto execution = scorer_execution_identity();
+            for (std::size_t index = 0; index < sizeof(execution); ++index)
+                profile.push_back(static_cast<std::uint8_t>(execution >> (index * 8U)));
+        };
         if (source) {
             if (!source->provider || !source->provider->member_metadata())
                 throw matrix_error_t("analysis unit provider lacks immutable member metadata");
@@ -1626,14 +1783,43 @@ public:
                 .lexically_normal().u8string() + "!/" + source->logical_path;
             request.load_profile.insert(request.load_profile.end(),
                 source_identity.begin(), source_identity.end());
+            bind_scorer_profile(request.load_profile);
             auto opened = workspace_registry().admit_verified_provider(request);
             if (!opened)
                 throw matrix_error_t(opened.error().stable_code() + ":" +
                     opened.error().message);
             result->workspace_ = opened.take_value();
+        } else if (fixture.raw_code_profile) {
+            open_static_workspace_request_t request;
+            request.source_path = fixture.path.u8string();
+            request.bin_name = std::move(bin_name);
+            request.raw_code_profile = fixture.raw_code_profile;
+            request.load_profile = {1, 0, 0, 0};
+            const auto path_identity = std::filesystem::absolute(fixture.path)
+                .lexically_normal().u8string();
+            request.load_profile.insert(request.load_profile.end(),
+                path_identity.begin(), path_identity.end());
+            bind_scorer_profile(request.load_profile);
+            auto opened = workspace_registry().open_static(request);
+            if (!opened)
+                throw matrix_error_t(opened.error().stable_code() + ":" +
+                    opened.error().message);
+            result->workspace_ = opened.take_value();
         } else {
-            result->workspace_ = test_fixture::open_workspace(
-                fixture.path, std::move(bin_name));
+            open_static_workspace_request_t request;
+            request.source_path = fixture.path.u8string();
+            request.bin_name = std::move(bin_name);
+            request.load_profile = {1, 0, 0, 0};
+            const auto path_identity = std::filesystem::absolute(fixture.path)
+                .lexically_normal().u8string();
+            request.load_profile.insert(request.load_profile.end(),
+                path_identity.begin(), path_identity.end());
+            bind_scorer_profile(request.load_profile);
+            auto opened = workspace_registry().open_static(request);
+            if (!opened)
+                throw matrix_error_t(opened.error().stable_code() + ":" +
+                    opened.error().message);
+            result->workspace_ = opened.take_value();
         }
         test_fixture::install_services(result->workspace_);
         test_fixture::analyze_workspace(result->workspace_, 1);
@@ -1651,6 +1837,29 @@ public:
     }
 
 private:
+    static std::uint64_t scorer_execution_identity() noexcept
+    {
+        static const std::uint64_t identity = []() noexcept {
+            const auto process = static_cast<std::uint64_t>(::GetCurrentProcessId());
+            FILETIME created{};
+            FILETIME exited{};
+            FILETIME kernel{};
+            FILETIME user{};
+            std::uint64_t epoch = static_cast<std::uint64_t>(::GetTickCount64());
+            if (::GetProcessTimes(::GetCurrentProcess(), &created, &exited, &kernel, &user))
+                epoch = (static_cast<std::uint64_t>(created.dwHighDateTime) << 32U) |
+                    static_cast<std::uint64_t>(created.dwLowDateTime);
+            return epoch ^ (process * 0x9E3779B97F4A7C15ULL);
+        }();
+        return identity;
+    }
+
+    static std::optional<workspace_error_t>& deferred_close_failure()
+    {
+        static std::optional<workspace_error_t> failure;
+        return failure;
+    }
+
     std::shared_ptr<analysis_workspace_t> workspace_;
 };
 
@@ -1756,7 +1965,7 @@ struct workspace_unit_t final {
 };
 
 std::vector<workspace_unit_t> make_workspace_units(
-    const materialized_fixture_t& fixture,
+    const provider_fixture_t& fixture,
     const std::string& label,
     const std::filesystem::path& runtime_root)
 {
@@ -2059,9 +2268,31 @@ json run_candidate_fixture(
                         throw matrix_error_t(result.error().stable_code() + ":" +
                             result.error().message);
                     const auto& value = result.value();
-                    if (!value.succeeded() || !value.provider || !value.provider_stage ||
-                        !value.normalized_stage || !value.document)
-                        throw matrix_error_t("production typed pipeline omitted a required stage");
+                    const auto candidate_detail = [&]() {
+                        if (!value.diagnostics.empty()) {
+                            const auto& diagnostic = value.diagnostics.front();
+                            if (!diagnostic.message.empty())
+                                return diagnostic.localization_key + ":" + diagnostic.message;
+                            return diagnostic.localization_key;
+                        }
+                        return std::string{"no diagnostic"};
+                    }();
+                    if (!value.succeeded())
+                        throw matrix_error_t("production typed pipeline did not complete: status=" +
+                            std::to_string(static_cast<unsigned>(value.status)) + ":" +
+                            candidate_detail);
+                    if (!value.provider)
+                        throw matrix_error_t("production typed pipeline omitted provider: " +
+                            candidate_detail);
+                    if (!value.provider_stage)
+                        throw matrix_error_t("production typed pipeline omitted provider stage: " +
+                            candidate_detail);
+                    if (!value.normalized_stage)
+                        throw matrix_error_t("production typed pipeline omitted normalized stage: " +
+                            candidate_detail);
+                    if (!value.document)
+                        throw matrix_error_t("production typed pipeline omitted document: " +
+                            candidate_detail);
                     if (const auto role = worker_role(*value.provider))
                         observed_roles.insert(*role);
                     bundles.provider_ir.append(serialize_provider_ir(
@@ -2240,20 +2471,46 @@ json run_ghidra_fixture(
                         [] { return false; });
                     append_diagnostics(diagnostics, result.worker_diagnostics);
                     append_diagnostics(diagnostics, result.diagnostics);
-                    if (result.status != native_worker::native_worker_execution_status_t::completed ||
-                        !result.document || result.provider_artifacts.empty() ||
-                        !result.printc_evidence || result.printc_evidence->empty() ||
-                        result.document->ast.root_node_id == 0 ||
-                        result.document->ast.nodes.empty() ||
-                        result.document->rendered_text.empty() ||
-                        result.worker_process_id == 0 ||
-                        result.manifest_hash != runtime.manifest_hash ||
-                        result.snapshot_hash != job.snapshot.hash ||
-                        stable_serialization_hash(result.provider_artifacts) !=
-                            result.provider_artifacts_hash ||
-                        stable_serialization_hash(*result.printc_evidence) !=
-                            result.printc_evidence_hash)
-                        throw matrix_error_t("verified native worker returned incomplete or unbound evidence");
+                    const auto worker_detail = [&]() {
+                        if (!result.diagnostics.empty()) {
+                            const auto& diagnostic = result.diagnostics.front();
+                            return diagnostic.phase + ":" + diagnostic.detail;
+                        }
+                        if (!result.worker_diagnostics.empty()) {
+                            const auto& diagnostic = result.worker_diagnostics.front();
+                            std::string detail = diagnostic.localization_key;
+                            for (const auto& argument : diagnostic.localization_arguments)
+                                detail.append(":").append(argument);
+                            return detail;
+                        }
+                        return std::string{"no diagnostic"};
+                    }();
+                    if (result.status != native_worker::native_worker_execution_status_t::completed)
+                        throw matrix_error_t("verified native worker did not complete: status=" +
+                            std::to_string(static_cast<unsigned>(result.status)) + ":" +
+                            worker_detail);
+                    if (!result.document)
+                        throw matrix_error_t("verified native worker omitted document: " + worker_detail);
+                    if (result.provider_artifacts.empty())
+                        throw matrix_error_t("verified native worker omitted provider artifacts: " + worker_detail);
+                    if (!result.printc_evidence || result.printc_evidence->empty())
+                        throw matrix_error_t("verified native worker omitted PrintC evidence: " + worker_detail);
+                    if (result.document->ast.root_node_id == 0 || result.document->ast.nodes.empty())
+                        throw matrix_error_t("verified native worker returned an invalid AST: " + worker_detail);
+                    if (result.document->rendered_text.empty())
+                        throw matrix_error_t("verified native worker returned empty rendered text: " + worker_detail);
+                    if (result.worker_process_id == 0)
+                        throw matrix_error_t("verified native worker omitted process identity: " + worker_detail);
+                    if (result.manifest_hash != runtime.manifest_hash)
+                        throw matrix_error_t("verified native worker manifest binding mismatch: " + worker_detail);
+                    if (result.snapshot_hash != job.snapshot.hash)
+                        throw matrix_error_t("verified native worker snapshot binding mismatch: " + worker_detail);
+                    if (stable_serialization_hash(result.provider_artifacts) !=
+                        result.provider_artifacts_hash)
+                        throw matrix_error_t("verified native worker provider-artifact hash mismatch: " + worker_detail);
+                    if (stable_serialization_hash(*result.printc_evidence) !=
+                        result.printc_evidence_hash)
+                        throw matrix_error_t("verified native worker PrintC hash mismatch: " + worker_detail);
                     std::vector<decompiler_diagnostic_t> decode_diagnostics;
                     auto decoded = ghidra_ir_adapter::deserialize_artifacts(
                         result.provider_artifacts, decode_diagnostics);

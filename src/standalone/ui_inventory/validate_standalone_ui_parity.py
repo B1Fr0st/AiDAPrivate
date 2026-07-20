@@ -35,7 +35,9 @@ MINIMUM_KIND_COUNTS = {
     "state": 7,
     "shortcut": 12,
 }
-EXPECTED_DIALOG_COUNT = 74
+EXPECTED_DIALOG_COUNT = 73
+EXPECTED_CATALOG_DESCRIPTOR_COUNT = 113
+EXPECTED_DYNAMIC_DESCRIPTOR_COUNT = 2
 REQUIRED_IDS = {
     "document.code", "document.disassembly", "document.hex", "document.pseudocode",
     "document.graph", "document.diff", "view.project_explorer", "view.workspace_search",
@@ -72,10 +74,52 @@ DYNAMIC_VIEW_SOURCES = {
         "diagnostics.render = render_diagnostics_view",
     ),
 }
+RAW_MODAL_OWNERS = {
+    "src/standalone/src/core/analysis/struct_recon_view.cpp": {
+        "Review Reconstructed Type Application",
+    },
+    "src/standalone/src/core/analysis/struct_dissector_view.hpp": {
+        "Review Editable Type Declaration",
+    },
+    "src/standalone/src/core/analysis/types_hub_view.hpp": {
+        "Review Global Type Declaration",
+    },
+}
 
 
 def fail(errors: list[str], message: str) -> None:
     errors.append(message)
+
+
+def preview_active_catalog(catalog: str, errors: list[str]) -> str:
+    active_lines: list[str] = []
+    excluded_depth = 0
+    excluded_blocks = 0
+    guard = re.compile(r"#if\s+!defined\(AIDA_IMGUI_STUDIO_PREVIEW\)")
+    nested_guard = re.compile(r"#(?:if|ifdef|ifndef)\b")
+    alternate_branch = re.compile(r"#(?:else|elif)\b")
+    for line in catalog.splitlines(keepends=True):
+        directive = line.strip()
+        if excluded_depth == 0:
+            if guard.fullmatch(directive):
+                excluded_depth = 1
+                excluded_blocks += 1
+            else:
+                active_lines.append(line)
+            continue
+        if nested_guard.match(directive):
+            excluded_depth += 1
+        elif directive == "#endif":
+            excluded_depth -= 1
+        elif excluded_depth == 1 and alternate_branch.match(directive):
+            fail(errors, "preview-excluded registry guard contains an unsupported alternate branch")
+            return catalog
+    if excluded_depth != 0:
+        fail(errors, "preview-excluded registry guard is unterminated")
+        return catalog
+    if excluded_blocks != 1:
+        fail(errors, f"expected one preview-excluded registry block, found {excluded_blocks}")
+    return "".join(active_lines)
 
 
 def validate_registry_coverage(target_ids: set[str], errors: list[str]) -> None:
@@ -89,15 +133,12 @@ def validate_registry_coverage(target_ids: set[str], errors: list[str]) -> None:
     if catalog_start < 0 or catalog_end < 0:
         fail(errors, "canonical view registry catalog boundary is missing")
         return
-    catalog = source[catalog_start:catalog_end]
+    catalog = preview_active_catalog(source[catalog_start:catalog_end], errors)
     entries: dict[str, tuple[str, str, str]] = {}
-    for line in catalog.splitlines():
-        macro_match = re.search(
-            r'\b(AIDA_VIEW|AIDA_DEBUG_VIEW|AIDA_NETWORK_VIEW)\(\s*"([a-z0-9._-]+)"',
-            line,
-        )
-        if not macro_match:
-            continue
+    for macro_match in re.finditer(
+        r'\b(AIDA_VIEW|AIDA_DEBUG_VIEW|AIDA_NETWORK_VIEW)\(\s*"([a-z0-9._-]+)"',
+        catalog,
+    ):
         macro, view_id = macro_match.groups()
         if view_id in entries:
             fail(errors, f"duplicate canonical registry view {view_id}")
@@ -105,6 +146,9 @@ def validate_registry_coverage(target_ids: set[str], errors: list[str]) -> None:
         category = ""
         subview = ""
         if macro == "AIDA_VIEW":
+            line_start = catalog.rfind("\n", 0, macro_match.start()) + 1
+            line_end = catalog.find("\n", macro_match.end())
+            line = catalog[line_start:line_end if line_end >= 0 else len(catalog)]
             route_match = re.search(
                 r'AIDA_VIEW\(\s*"[^"]+"\s*,\s*"[^"]*"\s*,\s*([a-z_]+)\s*,\s*'
                 r'[a-z_]+\s*,\s*[a-z_]+\s*,\s*([a-z_]+)\s*,',
@@ -118,6 +162,10 @@ def validate_registry_coverage(target_ids: set[str], errors: list[str]) -> None:
     if not entries:
         fail(errors, "canonical view registry catalog contains no parsed views")
         return
+    if len(entries) != EXPECTED_CATALOG_DESCRIPTOR_COUNT:
+        fail(errors, f"canonical registry has {len(entries)} descriptors, expected {EXPECTED_CATALOG_DESCRIPTOR_COUNT}")
+    if len(DYNAMIC_VIEW_SOURCES) != EXPECTED_DYNAMIC_DESCRIPTOR_COUNT:
+        fail(errors, f"dynamic registry has {len(DYNAMIC_VIEW_SOURCES)} descriptors, expected {EXPECTED_DYNAMIC_DESCRIPTOR_COUNT}")
 
     generic_routes = {
         ("analysis", "analysis"): "analysis_hub_view::render_subview",
@@ -281,6 +329,7 @@ def main() -> int:
 
     standalone_source = ROOT / "src" / "standalone" / "src"
     shared_modal_owner = standalone_source / "core" / "ui" / "design_system.cpp"
+    observed_raw_modal_owners: dict[str, set[str]] = {}
     for suffix in ("*.cpp", "*.hpp"):
         for source in standalone_source.rglob(suffix):
             if source == shared_modal_owner:
@@ -289,8 +338,19 @@ def main() -> int:
                 text = source.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 text = source.read_text(encoding="utf-8", errors="replace")
-            if "BeginPopupModal(" in text:
-                fail(errors, f"raw BeginPopupModal outside shared owner: {source.relative_to(ROOT)}")
+            if "BeginPopupModal(" not in text:
+                continue
+            relative = source.relative_to(ROOT).as_posix()
+            literals = set(re.findall(r'BeginPopupModal\(\s*"([^"]+)"', text))
+            occurrences = text.count("BeginPopupModal(")
+            allowed = RAW_MODAL_OWNERS.get(relative)
+            if allowed is None or occurrences != len(literals) or literals != allowed:
+                fail(errors, f"raw BeginPopupModal outside exact review owner: {relative}")
+                continue
+            observed_raw_modal_owners[relative] = literals
+    for relative, expected in RAW_MODAL_OWNERS.items():
+        if observed_raw_modal_owners.get(relative) != expected:
+            fail(errors, f"exact review modal owner is missing or changed: {relative}")
 
     if errors:
         for error in errors:
@@ -299,6 +359,7 @@ def main() -> int:
         return 1
     category_summary = ",".join(f"{key}:{counts[key]}" for key in sorted(counts))
     print(f"PASS rows={len(inventory)} stable_ids={len(stable_ids)} target_ids={len(target_ids)}")
+    print(f"DESCRIPTORS catalog={EXPECTED_CATALOG_DESCRIPTOR_COUNT} dynamic={EXPECTED_DYNAMIC_DESCRIPTOR_COUNT} total={EXPECTED_CATALOG_DESCRIPTOR_COUNT + EXPECTED_DYNAMIC_DESCRIPTOR_COUNT}")
     print(f"CATEGORIES {category_summary}")
     print(f"WORKSPACES {','.join(sorted(workspaces))}")
     return 0

@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -29,6 +31,68 @@ namespace {
 constexpr std::uint32_t k_artifact_magic = 0x41524947U;
 constexpr std::uint32_t k_artifact_version = 1;
 constexpr std::size_t k_artifact_max_bytes = 32U * 1024U * 1024U;
+constexpr std::size_t k_provider_text_max_bytes = 4096U;
+
+std::string bounded_utf8(const std::string_view input)
+{
+    std::string output;
+    output.reserve((std::min)(input.size(), k_provider_text_max_bytes));
+    const auto replacement = [&output]() {
+        if (output.size() <= k_provider_text_max_bytes - 3U)
+            output.append("\xEF\xBF\xBD", 3U);
+    };
+    for (std::size_t index = 0; index < input.size() && output.size() < k_provider_text_max_bytes;) {
+        const auto first = static_cast<unsigned char>(input[index]);
+        if (first <= 0x7FU) {
+            if (first >= 0x20U && first != 0x7FU)
+                output.push_back(static_cast<char>(first));
+            else
+                replacement();
+            ++index;
+            continue;
+        }
+        std::size_t length = 0;
+        std::uint32_t scalar = 0;
+        std::uint32_t minimum = 0;
+        if (first >= 0xC2U && first <= 0xDFU) {
+            length = 2;
+            scalar = first & 0x1FU;
+            minimum = 0x80U;
+        } else if (first >= 0xE0U && first <= 0xEFU) {
+            length = 3;
+            scalar = first & 0x0FU;
+            minimum = 0x800U;
+        } else if (first >= 0xF0U && first <= 0xF4U) {
+            length = 4;
+            scalar = first & 0x07U;
+            minimum = 0x10000U;
+        }
+        bool valid = length != 0 && length <= input.size() - index;
+        if (valid) {
+            for (std::size_t offset = 1; offset < length; ++offset) {
+                const auto continuation = static_cast<unsigned char>(input[index + offset]);
+                if ((continuation & 0xC0U) != 0x80U) {
+                    valid = false;
+                    break;
+                }
+                scalar = (scalar << 6U) | (continuation & 0x3FU);
+            }
+        }
+        if (valid && (scalar < minimum || scalar > 0x10FFFFU ||
+                      (scalar >= 0xD800U && scalar <= 0xDFFFU)))
+            valid = false;
+        if (!valid) {
+            replacement();
+            ++index;
+            continue;
+        }
+        if (length > k_provider_text_max_bytes - output.size())
+            break;
+        output.append(input.data() + index, length);
+        index += length;
+    }
+    return output;
+}
 
 struct artifact_reader_t {
     const std::string& bytes;
@@ -237,6 +301,154 @@ std::string value_text(const capture_value_t& value)
     return ghidra::get_opname(static_cast<ghidra::OpCode>(value.pcode_opcode));
 }
 
+std::string binary_operator(const std::uint16_t opcode)
+{
+    switch (opcode) {
+    case ghidra::CPUI_INT_EQUAL:
+    case ghidra::CPUI_FLOAT_EQUAL: return "==";
+    case ghidra::CPUI_INT_NOTEQUAL:
+    case ghidra::CPUI_FLOAT_NOTEQUAL:
+    case ghidra::CPUI_BOOL_XOR: return "!=";
+    case ghidra::CPUI_INT_SLESS:
+    case ghidra::CPUI_INT_LESS:
+    case ghidra::CPUI_FLOAT_LESS: return "<";
+    case ghidra::CPUI_INT_SLESSEQUAL:
+    case ghidra::CPUI_INT_LESSEQUAL:
+    case ghidra::CPUI_FLOAT_LESSEQUAL: return "<=";
+    case ghidra::CPUI_INT_ADD:
+    case ghidra::CPUI_FLOAT_ADD: return "+";
+    case ghidra::CPUI_INT_SUB:
+    case ghidra::CPUI_FLOAT_SUB: return "-";
+    case ghidra::CPUI_INT_XOR: return "^";
+    case ghidra::CPUI_INT_AND: return "&";
+    case ghidra::CPUI_INT_OR: return "|";
+    case ghidra::CPUI_INT_LEFT: return "<<";
+    case ghidra::CPUI_INT_RIGHT:
+    case ghidra::CPUI_INT_SRIGHT: return ">>";
+    case ghidra::CPUI_INT_MULT:
+    case ghidra::CPUI_FLOAT_MULT: return "*";
+    case ghidra::CPUI_INT_DIV:
+    case ghidra::CPUI_INT_SDIV:
+    case ghidra::CPUI_FLOAT_DIV: return "/";
+    case ghidra::CPUI_INT_REM:
+    case ghidra::CPUI_INT_SREM: return "%";
+    case ghidra::CPUI_BOOL_AND: return "&&";
+    case ghidra::CPUI_BOOL_OR: return "||";
+    default: return {};
+    }
+}
+
+std::string unary_operator(const std::uint16_t opcode)
+{
+    switch (opcode) {
+    case ghidra::CPUI_INT_2COMP:
+    case ghidra::CPUI_FLOAT_NEG: return "-";
+    case ghidra::CPUI_INT_NEGATE: return "~";
+    case ghidra::CPUI_BOOL_NEGATE: return "!";
+    default: return {};
+    }
+}
+
+struct hir_semantics_t {
+    hir_node_kind_t kind = hir_node_kind_t::unknown;
+    std::vector<std::uint64_t> operands;
+    std::string stable_value;
+    bool supported = true;
+};
+
+hir_semantics_t hir_semantics(const capture_value_t& value,
+                              const provider_ir_opcode_t opcode,
+                              const bool provider_supported)
+{
+    hir_semantics_t result;
+    result.kind = hir_kind(opcode);
+    result.operands = value.operand_ids;
+    result.stable_value = value_text(value);
+    result.supported = provider_supported;
+    if (value.kind != capture_value_kind_t::pcode) {
+        if (value.kind == capture_value_kind_t::constant && !value.stable_symbol.empty())
+            result.kind = hir_node_kind_t::reference;
+        return result;
+    }
+    const auto select = [&result, &value](const std::initializer_list<std::size_t> indices) {
+        std::vector<std::uint64_t> selected;
+        selected.reserve(indices.size());
+        for (const auto index : indices) {
+            if (index >= value.operand_ids.size())
+                return false;
+            selected.push_back(value.operand_ids[index]);
+        }
+        result.operands = std::move(selected);
+        return true;
+    };
+    switch (value.pcode_opcode) {
+    case ghidra::CPUI_COPY:
+        result.kind = hir_node_kind_t::cast;
+        result.stable_value = "copy";
+        result.supported = select({0}) && value.operand_ids.size() == 1;
+        break;
+    case ghidra::CPUI_LOAD:
+        result.supported = select({1}) && value.operand_ids.size() == 2;
+        break;
+    case ghidra::CPUI_STORE:
+        result.supported = select({1, 2}) && value.operand_ids.size() == 3;
+        break;
+    case ghidra::CPUI_BRANCH:
+        result.operands.clear();
+        result.supported = value.operand_ids.size() == 1;
+        break;
+    case ghidra::CPUI_CBRANCH:
+        result.supported = select({1}) && value.operand_ids.size() == 2;
+        break;
+    case ghidra::CPUI_BRANCHIND:
+        result.supported = false;
+        break;
+    case ghidra::CPUI_CALL:
+    case ghidra::CPUI_CALLIND:
+        result.supported = !value.operand_ids.empty();
+        break;
+    case ghidra::CPUI_RETURN:
+        result.operands.clear();
+        if (value.operand_ids.size() > 1)
+            result.operands.assign(value.operand_ids.begin() + 1, value.operand_ids.end());
+        result.supported = result.operands.size() <= 1;
+        break;
+    case ghidra::CPUI_MULTIEQUAL:
+        result.supported = false;
+        break;
+    case ghidra::CPUI_CAST:
+    case ghidra::CPUI_INT_ZEXT:
+    case ghidra::CPUI_INT_SEXT:
+        result.supported = select({0}) && value.operand_ids.size() == 1;
+        break;
+    case ghidra::CPUI_SUBPIECE:
+        result.supported = false;
+        break;
+    case ghidra::CPUI_PTRADD:
+    case ghidra::CPUI_PTRSUB:
+        result.kind = hir_node_kind_t::index;
+        result.supported = select({0, 1}) &&
+            (value.pcode_opcode == ghidra::CPUI_PTRSUB || value.operand_ids.size() == 3);
+        break;
+    default:
+        if (result.kind == hir_node_kind_t::unary) {
+            result.stable_value = unary_operator(value.pcode_opcode);
+            result.supported = !result.stable_value.empty() && value.operand_ids.size() == 1;
+        } else if (result.kind == hir_node_kind_t::binary) {
+            result.stable_value = binary_operator(value.pcode_opcode);
+            result.supported = !result.stable_value.empty() && value.operand_ids.size() == 2;
+        }
+        break;
+    }
+    if (!result.supported) {
+        result.kind = hir_node_kind_t::unknown;
+        result.operands.clear();
+        result.stable_value = "unknown_pcode_" + std::to_string(value.pcode_opcode) +
+            "_" + std::to_string(value.id);
+    }
+    return result;
+}
+
 bool sorted_unique(std::vector<std::uint64_t>& ids)
 {
     std::sort(ids.begin(), ids.end());
@@ -405,17 +617,18 @@ extraction_result_t normalize(const capture_t& capture)
             provider_value.confidence = supported ? 100U : 50U;
             provider_value.provenance = decompiler_fact_provenance_t::provider_semantics;
             provider_block.values.push_back(provider_value);
+            const auto semantics = hir_semantics(value, opcode, supported);
             hir_value_t hir_value;
             hir_value.id = value.id;
-            hir_value.kind = hir_kind(opcode);
+            hir_value.kind = semantics.kind;
             hir_value.type_id = provider_value.type_id;
-            hir_value.operand_ids = provider_value.operand_ids;
-            hir_value.stable_value = value_text(value);
+            hir_value.operand_ids = semantics.operands;
+            hir_value.stable_value = semantics.stable_value;
             hir_value.coordinate = coordinate(capture.request, decompiler_coordinate_layer_t::hir, value.address);
-            hir_value.confidence = provider_value.confidence;
+            hir_value.confidence = semantics.supported ? provider_value.confidence : 0U;
             hir_value.provenance = provider_value.provenance;
             hir_block.values.push_back(std::move(hir_value));
-            if (!supported) {
+            if (!semantics.supported) {
                 decompiler_unknown_t provider_unknown;
                 provider_unknown.reason = decompiler_unknown_reason_t::unsupported_instruction;
                 provider_unknown.stable_token = "ghidra.pcode." + std::to_string(value.pcode_opcode) + "." + std::to_string(value.id);
@@ -479,6 +692,35 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
 {
     capture_t capture;
     capture.request = request;
+    if (auto* native = std::get_if<native_decompiler_entity_identity_t>(
+            &capture.request.entity.identity)) {
+        native->canonical_symbol = bounded_utf8(native->canonical_symbol);
+        if (native->canonical_symbol.empty())
+            native->canonical_symbol = "sub_" + std::to_string(native->entry.value);
+    }
+    const auto* native_entity = std::get_if<native_decompiler_entity_identity_t>(
+        &capture.request.entity.identity);
+    const std::uint64_t runtime_entry = function.getAddress().getOffset();
+    std::uint64_t coordinate_bias = 0;
+    if (native_entity && native_entity->entry.space == address_space_id_t::relative_virtual) {
+        if (runtime_entry < native_entity->entry.value) {
+            extraction_result_t result;
+            result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                decompiler_diagnostic_code_t::source_map_rejected,
+                "ghidra_ir.runtime_entry_bias", 1));
+            return result;
+        }
+        coordinate_bias = runtime_entry - native_entity->entry.value;
+    }
+    const auto code_coordinate = [coordinate_bias, runtime_entry, native_entity](
+            const std::uint64_t address) {
+        if (!native_entity || native_entity->entry.space != address_space_id_t::relative_virtual)
+            return address;
+        if (address < coordinate_bias)
+            return native_entity->entry.value;
+        const auto normalized = address - coordinate_bias;
+        return address < runtime_entry ? native_entity->entry.value : normalized;
+    };
     std::map<const ghidra::Datatype*, std::uint64_t> types;
     std::function<std::uint64_t(const ghidra::Datatype*)> ensure_type;
     ensure_type = [&capture, &types, &ensure_type](const ghidra::Datatype* type) {
@@ -492,8 +734,8 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         capture_type_t value;
         value.id = id;
         value.kind = type_kind(type);
-        value.canonical_name = type->getName();
-        value.display_name = type->getDisplayName();
+        value.canonical_name = bounded_utf8(type->getName());
+        value.display_name = bounded_utf8(type->getDisplayName());
         if (type->getSize() > 0)
             value.byte_size = static_cast<std::uint64_t>(type->getSize());
         value.alignment = type->getAlignment() > 0 ? static_cast<std::uint32_t>(type->getAlignment()) : 1U;
@@ -529,7 +771,7 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             std::uint32_t index = 0;
             for (auto field = structure->beginField(); field != structure->endField(); ++field, ++index) {
                 const std::string name = field->name.empty()
-                    ? "member." + std::to_string(index) : field->name;
+                    ? "member." + std::to_string(index) : bounded_utf8(field->name);
                 append_edge(field->type, decompiler_type_edge_kind_t::member, name,
                     field->offset >= 0 ? std::optional<std::uint64_t>{static_cast<std::uint64_t>(field->offset)}
                                        : std::nullopt);
@@ -542,7 +784,7 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
                 if (!field)
                     continue;
                 const std::string name = field->name.empty()
-                    ? "member." + std::to_string(index) : field->name;
+                    ? "member." + std::to_string(index) : bounded_utf8(field->name);
                 append_edge(field->type, decompiler_type_edge_kind_t::member, name,
                     field->offset >= 0 ? std::optional<std::uint64_t>{static_cast<std::uint64_t>(field->offset)}
                                        : std::nullopt);
@@ -571,9 +813,26 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
     std::map<const ghidra::PcodeOp*, std::uint64_t> operation_ids;
     std::map<std::uint64_t, std::vector<const ghidra::PcodeOp*>> operations_by_block;
     std::map<const ghidra::Varnode*, std::uint64_t> input_ids;
+    std::map<const ghidra::Varnode*, std::string> input_symbols;
     std::map<const ghidra::Varnode*, std::uint64_t> defined_ids;
     std::map<const ghidra::HighVariable*, std::uint64_t> high_ids;
     std::uint64_t next_value_id = 1;
+    const auto associated_high = [](const ghidra::Varnode* node)
+        -> const ghidra::HighVariable* {
+        if (!node || node->isAnnotation())
+            return nullptr;
+        return node->getHigh();
+    };
+    const auto value_type = [&associated_high](const ghidra::Varnode* node,
+                                                const bool definition_facing)
+        -> const ghidra::Datatype* {
+        if (!node)
+            return nullptr;
+        const auto* high = associated_high(node);
+        if (!high)
+            return definition_facing ? node->getTypeDefFacing() : node->getType();
+        return definition_facing ? node->getHighTypeDefFacing() : high->getType();
+    };
     const auto& graph = function.getBasicBlocks();
     for (ghidra::int4 index = 0; index < graph.getSize(); ++index) {
         const auto* block = graph.getBlock(index);
@@ -598,6 +857,16 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             continue;
         operation_ids.emplace(operation, 0);
         operations_by_block[block_id].push_back(operation);
+        if (operation->code() == ghidra::CPUI_CALL && operation->numInput() > 0) {
+            const auto* target = operation->getIn(0);
+            const auto* specification = function.getCallSpecs(operation);
+            if (target && specification) {
+                auto name = bounded_utf8(specification->getName());
+                if (name.empty())
+                    name = "sub_" + std::to_string(specification->getEntryAddress().getOffset());
+                input_symbols[target] = std::move(name);
+            }
+        }
     }
     if (operation_ids.empty()) {
         extraction_result_t result;
@@ -632,10 +901,12 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             }
         }
     }
-    const auto collect_high = [&capture, &high_ids, &ensure_type](const ghidra::Varnode* node) {
-        if (!node || !node->getHigh())
+    const auto collect_high = [&capture, &high_ids, &ensure_type, &associated_high,
+                               native_entity, &code_coordinate, runtime_entry](
+                               const ghidra::Varnode* node) {
+        const auto* high = associated_high(node);
+        if (!high)
             return true;
-        const auto* high = node->getHigh();
         if (high_ids.find(high) != high_ids.end())
             return true;
         const auto type_id = ensure_type(high->getType());
@@ -648,7 +919,7 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         variable.parameter = high->isInput();
         variable.stable_name = "high_" + std::to_string(id);
         variable.type_id = type_id;
-        variable.address = node->getAddr().getOffset();
+        variable.address = native_entity ? native_entity->entry.value : code_coordinate(runtime_entry);
         capture.high_variables.push_back(std::move(variable));
         return true;
     };
@@ -658,11 +929,13 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         value.id = pair.second;
         value.kind = input->isConstant() ? capture_value_kind_t::constant :
             (input->isInput() ? capture_value_kind_t::parameter : capture_value_kind_t::local);
-        value.type_id = ensure_type(input->getHighTypeDefFacing());
+        value.type_id = ensure_type(value_type(input, false));
         if (value.type_id == 0)
-            value.type_id = ensure_type(input->getTypeDefFacing());
-        value.address = input->getAddr().getOffset();
+            value.type_id = ensure_type(input->getType());
+        value.address = native_entity ? native_entity->entry.value : code_coordinate(runtime_entry);
         value.stable_immediate = input->isConstant() ? std::to_string(input->getOffset()) : std::string{};
+        if (const auto symbol = input_symbols.find(input); symbol != input_symbols.end())
+            value.stable_symbol = symbol->second;
         entry->second.values.push_back(std::move(value));
         if (!collect_high(input)) {
             extraction_result_t result;
@@ -688,7 +961,7 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
                     decompiler_diagnostic_code_t::malformed_provider_ir, "ghidra_ir.output_varnode_binding", 1));
                 return result;
             }
-            value.type_id = ensure_type(output ? output->getHighTypeDefFacing() : function.getFuncProto().getOutputType());
+            value.type_id = ensure_type(output ? value_type(output, true) : function.getFuncProto().getOutputType());
             if (value.type_id == 0)
                 value.type_id = ensure_type(output ? output->getTypeDefFacing() : function.getFuncProto().getOutputType());
             if (value.type_id == 0) {
@@ -697,8 +970,16 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
                     decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.output_varnode_type", 1));
                 return result;
             }
-            value.address = operation->getSeqNum().getAddr().getOffset();
-            value.stable_symbol = ghidra::get_opname(operation->code());
+            value.address = code_coordinate(operation->getSeqNum().getAddr().getOffset());
+            if (operation->code() == ghidra::CPUI_CBRANCH && operation->getParent() &&
+                operation->getParent()->sizeOut() == 2) {
+                const auto true_id = static_cast<std::uint64_t>(
+                    operation->getParent()->getTrueOut()->getIndex() + 1);
+                value.stable_symbol = "condition.true=" + std::to_string(true_id) +
+                    ";negated=" + (operation->isBooleanFlip() ? "1" : "0");
+            } else {
+                value.stable_symbol = ghidra::get_opname(operation->code());
+            }
             for (ghidra::int4 index = 0; index < operation->numInput(); ++index) {
                 const auto* input = operation->getIn(index);
                 if (!input)

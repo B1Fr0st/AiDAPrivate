@@ -134,9 +134,15 @@ namespace skills {
 
 #ifdef AIDA_SKILLS_IMPLEMENTATION
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
 
 #include <windows.h>
 #include <shlobj.h>

@@ -1847,17 +1847,43 @@ void verify_legacy_preservation(const json& baseline, const json& current) {
                 }),
                 "baseline UI action was removed: " + label);
     }
+    names_t current_shortcut_keys;
+    for (const auto& shortcut : object_member(current_ui, "shortcuts", "current UI"))
+        current_shortcut_keys.insert(string_member(shortcut, "key", "current shortcut"));
     for (const auto& shortcut : object_member(baseline_ui, "shortcuts", "baseline UI")) {
-        const auto expression = string_member(shortcut, "expression", "baseline shortcut");
         const auto key = string_member(shortcut, "key", "baseline shortcut");
-        const auto& shortcuts = object_member(current_ui, "shortcuts", "current UI");
-        require(std::any_of(shortcuts.begin(), shortcuts.end(), [&](const json& candidate) {
-                    return candidate.is_object() &&
-                           candidate.value("expression", std::string()) == expression &&
-                           candidate.value("key", std::string()) == key;
-                }),
-                "baseline shortcut was removed or changed: " + key);
+        require(current_shortcut_keys.find(key) != current_shortcut_keys.end(),
+                "baseline shortcut key was removed: " + key);
     }
+    names_t current_binding_ids;
+    for (const auto& binding : object_member(current_ui, "shortcut_bindings", "current UI")) {
+        const auto id = string_member(binding, "binding_id", "current shortcut binding");
+        require(current_binding_ids.insert(id).second,
+                "duplicate canonical shortcut binding: " + id);
+        static_cast<void>(string_member(binding, "action_id", "current shortcut binding"));
+        static_cast<void>(string_member(binding, "display", "current shortcut binding"));
+        require(binding.contains("chord_expressions") && binding.at("chord_expressions").is_array() &&
+                    !binding.at("chord_expressions").empty(),
+                "canonical shortcut binding lacks chord provenance: " + id);
+        require(binding.contains("keys") && binding.at("keys").is_array() &&
+                    binding.at("keys").size() == binding.at("chord_expressions").size(),
+                "canonical shortcut binding key/chord mismatch: " + id);
+        require(binding.contains("source") && binding.at("source").is_object(),
+                "canonical shortcut binding lacks source provenance: " + id);
+    }
+    constexpr std::array<std::string_view, 22> required_shortcut_bindings{{
+        "binding.editor.save", "binding.editor.copy", "binding.editor.select_all",
+        "binding.editor.next_document_or_session", "binding.editor.previous_document_or_session",
+        "binding.global.new", "binding.global.explorer", "binding.global.chat",
+        "binding.global.output", "binding.global.network", "binding.global.debugger",
+        "binding.global.scan", "binding.global.binary_map", "binding.global.command_palette",
+        "binding.global.workspace_search", "binding.global.preferences", "binding.global.xrefs",
+        "binding.global.deobfuscation", "binding.global.shell.maximize",
+        "binding.analysis.decompile", "binding.output.copy_all", "binding.output.select_all"
+    }};
+    for (const auto id : required_shortcut_bindings)
+        require(current_binding_ids.find(std::string(id)) != current_binding_ids.end(),
+                "required canonical shortcut binding was removed: " + std::string(id));
 
     const auto baseline_methods = names_from(
         object_member(object_member(baseline, "session", "baseline manifest"),

@@ -11,6 +11,8 @@
 
 #include <windows.h>
 #include <aclapi.h>
+#include <objbase.h>
+#include <sddl.h>
 #include <userenv.h>
 
 #include <nlohmann/json.hpp>
@@ -22,6 +24,7 @@
 #include <cstring>
 #include <cwctype>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
@@ -31,6 +34,7 @@
 
 #pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace aida::analysis::native_worker {
 namespace {
@@ -521,7 +525,11 @@ sha256_digest_t canonical_runtime_inventory_hash(
     std::vector<managed_runtime_file_t> files)
 {
     std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
-        return left.relative_path < right.relative_path;
+        const auto left_key = lowercase_path_key(left.relative_path);
+        const auto right_key = lowercase_path_key(right.relative_path);
+        return left_key == right_key
+            ? left.relative_path < right.relative_path
+            : left_key < right_key;
     });
     std::string material;
     for (std::size_t index = 0; index < files.size(); ++index) {
@@ -804,6 +812,14 @@ std::optional<managed_runtime_package_t> verify_managed_runtime_package(
             throw std::invalid_argument("managed runtime exact inventory");
         package.dotnet_root = *dotnet_root_final;
         return package;
+    } catch (const std::exception& exception) {
+        append_diagnostic(result,
+            native_worker_diagnostic_code_t::runtime_inventory_mismatch,
+            "native_worker.managed_runtime.inventory",
+            std::string("managed runtime package violates its exact app-local identity: ") +
+                exception.what(),
+            ERROR_INVALID_DATA);
+        return std::nullopt;
     } catch (...) {
         append_diagnostic(result,
             native_worker_diagnostic_code_t::runtime_inventory_mismatch,
@@ -958,7 +974,8 @@ std::wstring quote_argument(const std::wstring& value)
 }
 
 std::optional<std::vector<wchar_t>> minimal_environment(
-    const std::optional<std::wstring>& dotnet_root)
+    const std::optional<std::wstring>& dotnet_root,
+    const std::wstring& app_container_local_app_data)
 {
     std::wstring system_root(32768, L'\0');
     const UINT written = GetWindowsDirectoryW(system_root.data(),
@@ -966,9 +983,15 @@ std::optional<std::vector<wchar_t>> minimal_environment(
     if (written == 0 || written >= static_cast<UINT>(system_root.size()))
         return std::nullopt;
     system_root.resize(written);
+    if (app_container_local_app_data.empty())
+        return std::nullopt;
     if (dotnet_root && (dotnet_root->empty() ||
         dotnet_root->find(L'=') != std::wstring::npos))
         return std::nullopt;
+    std::wstring app_container_temp = app_container_local_app_data;
+    if (app_container_temp.back() != L'\\' && app_container_temp.back() != L'/')
+        app_container_temp.push_back(L'\\');
+    app_container_temp.append(L"Temp");
     std::vector<std::wstring> entries{
         L"COMPlus_EnableDiagnostics=0",
         L"DOTNET_CLI_TELEMETRY_OPTOUT=1",
@@ -978,8 +1001,11 @@ std::optional<std::vector<wchar_t>> minimal_environment(
         L"DOTNET_ROLL_FORWARD=Disable",
         L"DOTNET_ROLL_FORWARD_TO_PRERELEASE=0",
         L"DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1",
+        L"LOCALAPPDATA=" + app_container_local_app_data,
         L"PATH=" + system_root + L"\\System32",
         L"SystemRoot=" + system_root,
+        L"TEMP=" + app_container_temp,
+        L"TMP=" + app_container_temp,
         L"WINDIR=" + system_root};
     if (dotnet_root)
         entries.push_back(L"DOTNET_ROOT=" + *dotnet_root);
@@ -1022,15 +1048,348 @@ public:
             error = HRESULT_FACILITY(status) == FACILITY_WIN32 ? HRESULT_CODE(status) : ERROR_ACCESS_DENIED;
             return false;
         }
+        LPWSTR sid_string = nullptr;
+        if (!ConvertSidToStringSidW(sid_, &sid_string) || !sid_string) {
+            error = GetLastError();
+            if (error == ERROR_SUCCESS)
+                error = ERROR_INVALID_SID;
+            return false;
+        }
+        PWSTR profile_path = nullptr;
+        status = GetAppContainerFolderPath(sid_string, &profile_path);
+        LocalFree(sid_string);
+        if (FAILED(status) || !profile_path || profile_path[0] == L'\0') {
+            if (profile_path)
+                CoTaskMemFree(profile_path);
+            error = HRESULT_FACILITY(status) == FACILITY_WIN32
+                ? HRESULT_CODE(status)
+                : ERROR_PATH_NOT_FOUND;
+            if (error == ERROR_SUCCESS)
+                error = ERROR_PATH_NOT_FOUND;
+            return false;
+        }
+        try {
+            local_app_data_.assign(profile_path);
+        } catch (...) {
+            CoTaskMemFree(profile_path);
+            error = ERROR_NOT_ENOUGH_MEMORY;
+            return false;
+        }
+        CoTaskMemFree(profile_path);
         error = ERROR_SUCCESS;
         return true;
     }
 
     PSID sid() const noexcept { return sid_; }
+    const std::wstring& local_app_data() const noexcept { return local_app_data_; }
 
 private:
     PSID sid_ = nullptr;
+    std::wstring local_app_data_;
 };
+
+constexpr ACCESS_MASK k_app_container_runtime_read_execute =
+    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+constexpr ACCESS_MASK k_app_container_runtime_directory_traverse =
+    FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+constexpr ACCESS_MASK k_app_container_runtime_forbidden =
+    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+    FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
+constexpr std::size_t k_ghidra_spec_mirror_file_count = 51;
+
+std::mutex& app_container_runtime_acl_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+bool app_container_runtime_acl_satisfied(PACL acl, PSID app_container_sid,
+                                         ACCESS_MASK required_access) noexcept
+{
+    if (!acl || !IsValidAcl(acl) || !app_container_sid ||
+        !IsValidSid(app_container_sid) || required_access == 0 ||
+        (required_access & k_app_container_runtime_forbidden) != 0)
+        return false;
+    ACCESS_MASK allowed = 0;
+    ACCESS_MASK denied = 0;
+    for (DWORD index = 0; index < acl->AceCount; ++index) {
+        void* raw_ace = nullptr;
+        if (!GetAce(acl, index, &raw_ace) || !raw_ace)
+            return false;
+        const auto* header = static_cast<const ACE_HEADER*>(raw_ace);
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE &&
+            header->AceType != ACCESS_DENIED_ACE_TYPE)
+            continue;
+        const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
+        PSID ace_sid = const_cast<DWORD*>(&ace->SidStart);
+        if (!IsValidSid(ace_sid) || !EqualSid(ace_sid, app_container_sid))
+            continue;
+        if (header->AceType == ACCESS_ALLOWED_ACE_TYPE)
+            allowed |= ace->Mask;
+        else
+            denied |= ace->Mask;
+    }
+    return (allowed & required_access) == required_access &&
+        (denied & k_app_container_runtime_forbidden) ==
+            k_app_container_runtime_forbidden &&
+        (denied & required_access) == 0;
+}
+
+bool query_app_container_runtime_acl(HANDLE handle, PSID app_container_sid,
+                                     ACCESS_MASK required_access,
+                                     bool& satisfied, DWORD& error) noexcept
+{
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr,
+        &descriptor);
+    if (status != ERROR_SUCCESS || !descriptor) {
+        if (descriptor)
+            LocalFree(descriptor);
+        error = status == ERROR_SUCCESS ? ERROR_INVALID_SECURITY_DESCR : status;
+        return false;
+    }
+    satisfied = app_container_runtime_acl_satisfied(dacl, app_container_sid,
+        required_access);
+    LocalFree(descriptor);
+    error = ERROR_SUCCESS;
+    return true;
+}
+
+bool grant_app_container_runtime_acl(HANDLE handle, PSID app_container_sid,
+                                     ACCESS_MASK required_access,
+                                     DWORD& error) noexcept
+{
+    if (required_access == 0 ||
+        (required_access & k_app_container_runtime_forbidden) != 0) {
+        error = ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    PACL existing_dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION, nullptr, nullptr, &existing_dacl, nullptr,
+        &descriptor);
+    if (status != ERROR_SUCCESS || !descriptor || !existing_dacl) {
+        if (descriptor)
+            LocalFree(descriptor);
+        error = status == ERROR_SUCCESS ? ERROR_INVALID_ACL : status;
+        return false;
+    }
+    std::array<EXPLICIT_ACCESSW, 2> entries{};
+    entries[0].grfAccessPermissions = k_app_container_runtime_forbidden;
+    entries[0].grfAccessMode = DENY_ACCESS;
+    entries[0].grfInheritance = NO_INHERITANCE;
+    BuildTrusteeWithSidW(&entries[0].Trustee, app_container_sid);
+    entries[1].grfAccessPermissions = required_access;
+    entries[1].grfAccessMode = GRANT_ACCESS;
+    entries[1].grfInheritance = NO_INHERITANCE;
+    BuildTrusteeWithSidW(&entries[1].Trustee, app_container_sid);
+    PACL updated_dacl = nullptr;
+    status = SetEntriesInAclW(static_cast<ULONG>(entries.size()), entries.data(),
+        existing_dacl, &updated_dacl);
+    if (status == ERROR_SUCCESS && updated_dacl) {
+        status = SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, updated_dacl, nullptr);
+    } else if (status == ERROR_SUCCESS) {
+        status = ERROR_INVALID_ACL;
+    }
+    if (updated_dacl)
+        LocalFree(updated_dacl);
+    LocalFree(descriptor);
+    if (status != ERROR_SUCCESS) {
+        error = status;
+        return false;
+    }
+    bool satisfied = false;
+    return query_app_container_runtime_acl(handle, app_container_sid,
+        required_access, satisfied, error) && satisfied;
+}
+
+bool ensure_app_container_runtime_acl(HANDLE verified_handle,
+                                      PSID app_container_sid,
+                                      ACCESS_MASK required_access,
+                                      DWORD& error) noexcept
+{
+    bool satisfied = false;
+    if (!query_app_container_runtime_acl(verified_handle, app_container_sid,
+            required_access, satisfied, error))
+        return false;
+    if (satisfied)
+        return true;
+    handle_t writable(ReOpenFile(verified_handle, READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_READ, 0));
+    if (!writable) {
+        error = GetLastError();
+        return false;
+    }
+    return grant_app_container_runtime_acl(writable.get(), app_container_sid,
+        required_access, error);
+}
+
+bool ensure_app_container_runtime_path_acl(const std::filesystem::path& path,
+                                           const std::wstring& approved_root,
+                                           bool directory,
+                                           PSID app_container_sid,
+                                           ACCESS_MASK required_access,
+                                           DWORD& error)
+{
+    const DWORD flags = FILE_FLAG_OPEN_REPARSE_POINT |
+        (directory ? FILE_FLAG_BACKUP_SEMANTICS : FILE_ATTRIBUTE_NORMAL);
+    handle_t readable(CreateFileW(path.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr));
+    if (!readable) {
+        error = GetLastError();
+        return false;
+    }
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    const auto resolved = final_path(readable.get());
+    if (!GetFileInformationByHandleEx(readable.get(), FileAttributeTagInfo,
+            &tag, sizeof(tag)) ||
+        (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        ((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory ||
+        !resolved || !path_within(approved_root, *resolved)) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    bool satisfied = false;
+    if (!query_app_container_runtime_acl(readable.get(), app_container_sid,
+            required_access, satisfied, error))
+        return false;
+    if (satisfied)
+        return true;
+    readable.reset();
+    handle_t writable(CreateFileW(path.c_str(),
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, flags, nullptr));
+    if (!writable) {
+        error = GetLastError();
+        return false;
+    }
+    const auto writable_resolved = final_path(writable.get());
+    if (!GetFileInformationByHandleEx(writable.get(), FileAttributeTagInfo,
+            &tag, sizeof(tag)) ||
+        (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        ((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory ||
+        !writable_resolved || !path_within(approved_root, *writable_resolved)) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    return grant_app_container_runtime_acl(writable.get(), app_container_sid,
+        required_access, error);
+}
+
+bool collect_native_spec_acl_inventory(const verified_worker_t& verified,
+                                       std::vector<std::filesystem::path>& files,
+                                       std::array<std::filesystem::path, 2>& directories,
+                                       DWORD& error)
+{
+    directories = {
+        std::filesystem::path(verified.root_path) / L"ghidra_specs",
+        std::filesystem::path(verified.root_path) / L"deps" / L"ghidra_specs"};
+    std::vector<std::wstring> expected_names;
+    files.clear();
+    files.reserve(k_ghidra_spec_mirror_file_count * directories.size());
+    for (std::size_t mirror = 0; mirror < directories.size(); ++mirror) {
+        const DWORD attributes = GetFileAttributesW(directories[mirror].c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_ACCESS_DENIED;
+            return false;
+        }
+        std::error_code ec;
+        std::vector<std::wstring> names;
+        for (std::filesystem::directory_iterator iterator(directories[mirror],
+                 std::filesystem::directory_options::none, ec), end;
+             !ec && iterator != end; iterator.increment(ec)) {
+            const DWORD child_attributes = GetFileAttributesW(iterator->path().c_str());
+            if (child_attributes == INVALID_FILE_ATTRIBUTES ||
+                (child_attributes & (FILE_ATTRIBUTE_DIRECTORY |
+                    FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+                error = child_attributes == INVALID_FILE_ATTRIBUTES
+                    ? GetLastError() : ERROR_ACCESS_DENIED;
+                return false;
+            }
+            names.push_back(iterator->path().filename().wstring());
+            files.push_back(iterator->path());
+        }
+        if (ec || names.size() != k_ghidra_spec_mirror_file_count) {
+            error = ec ? static_cast<DWORD>(ec.value()) : ERROR_INVALID_DATA;
+            return false;
+        }
+        std::sort(names.begin(), names.end(), [](const auto& left, const auto& right) {
+            const int insensitive = _wcsicmp(left.c_str(), right.c_str());
+            return insensitive == 0 ? left < right : insensitive < 0;
+        });
+        if (mirror == 0)
+            expected_names = std::move(names);
+        else if (names != expected_names) {
+            error = ERROR_INVALID_DATA;
+            return false;
+        }
+    }
+    error = ERROR_SUCCESS;
+    return true;
+}
+
+bool ensure_app_container_runtime_access(verified_worker_t& verified,
+                                         PSID app_container_sid,
+                                         DWORD& error)
+{
+    std::lock_guard lock(app_container_runtime_acl_mutex());
+    const auto root = std::filesystem::path(verified.root_path).lexically_normal();
+    auto ancestor = std::filesystem::path(verified.worker_path).parent_path().lexically_normal();
+    if (root.empty() || ancestor.empty() ||
+        !path_within(verified.root_path, ancestor.wstring())) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    std::vector<std::filesystem::path> ancestors;
+    while (true) {
+        ancestors.push_back(ancestor);
+        if (_wcsicmp(ancestor.c_str(), root.c_str()) == 0)
+            break;
+        const auto parent = ancestor.parent_path().lexically_normal();
+        if (parent.empty() || _wcsicmp(parent.c_str(), ancestor.c_str()) == 0 ||
+            !path_within(verified.root_path, parent.wstring())) {
+            error = ERROR_ACCESS_DENIED;
+            return false;
+        }
+        ancestor = parent;
+    }
+    std::reverse(ancestors.begin(), ancestors.end());
+    for (const auto& directory : ancestors) {
+        if (!ensure_app_container_runtime_path_acl(directory, verified.root_path,
+                true, app_container_sid,
+                k_app_container_runtime_directory_traverse, error))
+            return false;
+    }
+    if (!ensure_app_container_runtime_acl(verified.worker_file.get(),
+            app_container_sid, k_app_container_runtime_read_execute, error))
+        return false;
+    if (verified.manifest.provider.provider != decompiler_provider_id_t::ghidra_native)
+        return true;
+    std::vector<std::filesystem::path> files;
+    std::array<std::filesystem::path, 2> directories;
+    if (!collect_native_spec_acl_inventory(verified, files, directories, error))
+        return false;
+    for (const auto& directory : directories) {
+        if (!ensure_app_container_runtime_path_acl(directory, verified.root_path,
+                true, app_container_sid, k_app_container_runtime_read_execute,
+                error))
+            return false;
+    }
+    for (const auto& file : files) {
+        if (!ensure_app_container_runtime_path_acl(file, verified.root_path,
+                false, app_container_sid, k_app_container_runtime_read_execute,
+                error))
+            return false;
+    }
+    error = ERROR_SUCCESS;
+    return true;
+}
 
 class restricted_pipe_security_t final {
 public:
@@ -1198,6 +1557,16 @@ bool create_worker_identity_handle(HANDLE verified_worker_file, handle_t& child_
     return true;
 }
 
+struct worker_wait_observation_t {
+    DWORD pipe_error = ERROR_SUCCESS;
+    DWORD process_error = ERROR_SUCCESS;
+    DWORD exit_code = STILL_ACTIVE;
+    bool pipe_closed = false;
+    bool process_exited = false;
+    bool exit_code_available = false;
+    bool native_protocol = false;
+};
+
 struct worker_instance_t {
     handle_t job;
     handle_t process;
@@ -1209,6 +1578,8 @@ struct worker_instance_t {
     std::uint64_t next_host_sequence = 1;
     std::uint64_t next_worker_sequence = 1;
     DWORD process_id = 0;
+    bool native_protocol = false;
+    worker_wait_observation_t wait_observation;
 };
 
 bool create_pipe_pair(handle_t& child_end, handle_t& parent_end, bool child_reads,
@@ -1255,6 +1626,13 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
         append_diagnostic(result, native_worker_diagnostic_code_t::app_container_unavailable, "native_worker.app_container", "networkless AppContainer could not be established", error);
         return false;
     }
+    if (!ensure_app_container_runtime_access(verified, container.sid(), error)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected,
+            "native_worker.runtime_acl",
+            "verified worker runtime could not be restricted to manifest-bound AppContainer read and execute access",
+            error);
+        return false;
+    }
     restricted_pipe_security_t pipe_security;
     if (!pipe_security.create(container.sid(), error)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected, "native_worker.pipe_security", "restricted pipe security descriptor could not be established", error);
@@ -1278,6 +1656,7 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
     }
     const bool managed = verified.manifest.provider.provider ==
         decompiler_provider_id_t::ilspy_cli;
+    worker.native_protocol = !managed;
     std::array<HANDLE, 4> inherited_handles{child_read.get(), child_write.get(), child_snapshot.get(), child_identity.get()};
     std::uint64_t mitigation_policy = PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE |
         PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE |
@@ -1375,7 +1754,8 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
     }
     const auto environment = minimal_environment(managed
         ? std::optional<std::wstring>{verified.managed_runtime->dotnet_root}
-        : std::nullopt);
+        : std::nullopt,
+        container.local_app_data());
     if (!environment) {
         DeleteProcThreadAttributeList(attribute_list);
         SecureZeroMemory(attributes.data(), attributes.size());
@@ -1517,10 +1897,49 @@ enum class terminal_wait_t : std::uint8_t {
     protocol_failure
 };
 
+enum class process_wait_state_t : std::uint8_t {
+    running,
+    exited,
+    failure
+};
+
+bool terminal_pipe_error(DWORD error) noexcept
+{
+    return error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ||
+        error == ERROR_PIPE_NOT_CONNECTED || error == ERROR_HANDLE_EOF;
+}
+
+process_wait_state_t observe_process_exit(worker_instance_t& worker,
+                                          DWORD timeout) noexcept
+{
+    const DWORD wait = WaitForSingleObject(worker.process.get(), timeout);
+    if (wait == WAIT_TIMEOUT)
+        return process_wait_state_t::running;
+    if (wait == WAIT_FAILED) {
+        worker.wait_observation.process_error = GetLastError();
+        return process_wait_state_t::failure;
+    }
+    if (wait != WAIT_OBJECT_0) {
+        worker.wait_observation.process_error = ERROR_INVALID_DATA;
+        return process_wait_state_t::failure;
+    }
+    worker.wait_observation.process_exited = true;
+    DWORD exit_code = STILL_ACTIVE;
+    if (!GetExitCodeProcess(worker.process.get(), &exit_code)) {
+        worker.wait_observation.process_error = GetLastError();
+        return process_wait_state_t::exited;
+    }
+    worker.wait_observation.exit_code = exit_code;
+    worker.wait_observation.exit_code_available = true;
+    return process_wait_state_t::exited;
+}
+
 terminal_wait_t wait_for_message(worker_instance_t& worker, const native_worker_execution_request_t& request,
                                  const native_worker_host_limits_t& limits, std::chrono::steady_clock::time_point deadline,
                                  wire::frame_t& frame, DWORD& error)
 {
+    worker.wait_observation = {};
+    worker.wait_observation.native_protocol = worker.native_protocol;
     while (true) {
         if (request.cancellation_requested) {
             bool cancelled = true;
@@ -1540,26 +1959,106 @@ terminal_wait_t wait_for_message(worker_instance_t& worker, const native_worker_
             ++worker.next_worker_sequence;
             return terminal_wait_t::message;
         }
-        if (state == wire::read_state_t::failure)
-            return terminal_wait_t::protocol_failure;
-        const DWORD wait = WaitForSingleObject(worker.process.get(), 0);
-        if (wait == WAIT_OBJECT_0) {
-            if (worker.reader.has_partial_frame()) {
-                error = ERROR_HANDLE_EOF;
-                return terminal_wait_t::protocol_failure;
+        if (state == wire::read_state_t::failure) {
+            worker.wait_observation.pipe_error = error;
+            worker.wait_observation.pipe_closed = terminal_pipe_error(error);
+            const auto frame_failure = worker.reader.failure();
+            const DWORD settle_timeout = worker.wait_observation.pipe_closed
+                ? 100
+                : 0;
+            const auto process_state = observe_process_exit(worker, settle_timeout);
+            if (frame_failure == wire::frame_failure_t::io &&
+                worker.wait_observation.pipe_closed &&
+                process_state == process_wait_state_t::exited &&
+                !worker.reader.has_partial_frame()) {
+                error = worker.wait_observation.exit_code_available
+                    ? worker.wait_observation.exit_code
+                    : worker.wait_observation.process_error;
+                return terminal_wait_t::exited;
             }
-            return terminal_wait_t::exited;
+            if (frame_failure == wire::frame_failure_t::io &&
+                process_state == process_wait_state_t::failure)
+                error = worker.wait_observation.process_error;
+            else
+                error = worker.wait_observation.pipe_error;
+            return terminal_wait_t::protocol_failure;
         }
-        if (wait == WAIT_FAILED) {
-            error = GetLastError();
+        const auto process_state = observe_process_exit(worker, 0);
+        if (process_state == process_wait_state_t::failure) {
+            error = worker.wait_observation.process_error;
             return terminal_wait_t::protocol_failure;
         }
         Sleep(static_cast<DWORD>((std::max)(std::int64_t{1}, limits.poll_interval.count())));
     }
 }
 
+std::string worker_status_hex(DWORD status)
+{
+    constexpr char digits[] = "0123456789ABCDEF";
+    std::string result = "0x00000000";
+    for (std::size_t index = 0; index < 8; ++index) {
+        const auto shift = static_cast<unsigned>((7 - index) * 4);
+        result[index + 2] = digits[(status >> shift) & 0xFU];
+    }
+    return result;
+}
+
+const char* native_worker_startup_exit_stage(DWORD exit_code) noexcept
+{
+    switch (exit_code) {
+    case 2:
+        return "startup_arguments_or_authenticated_bootstrap";
+    case 3:
+        return "worker_identity_hash_or_authenticated_hello_write";
+    default:
+        return nullptr;
+    }
+}
+
+void append_wait_observation(std::string& detail,
+                             const worker_wait_observation_t& observation)
+{
+    if (observation.pipe_error != ERROR_SUCCESS) {
+        detail.append("; pipe_error=");
+        detail.append(std::to_string(observation.pipe_error));
+    }
+    if (observation.process_exited)
+        detail.append("; process_signaled=1");
+    if (observation.exit_code_available) {
+        detail.append("; exit_status=");
+        detail.append(worker_status_hex(observation.exit_code));
+        detail.push_back('(');
+        detail.append(std::to_string(observation.exit_code));
+        detail.push_back(')');
+        if (const char* stage = observation.native_protocol
+                ? native_worker_startup_exit_stage(observation.exit_code)
+                : nullptr) {
+            detail.append("; startup_stage=");
+            detail.append(stage);
+        }
+    } else if (observation.process_error != ERROR_SUCCESS) {
+        detail.append("; process_error=");
+        detail.append(std::to_string(observation.process_error));
+    }
+}
+
+void append_worker_exit(native_worker_execution_result_t& result,
+                        const worker_instance_t& worker, std::string phase,
+                        std::string detail)
+{
+    append_wait_observation(detail, worker.wait_observation);
+    const DWORD status = worker.wait_observation.exit_code_available
+        ? worker.wait_observation.exit_code
+        : (worker.wait_observation.process_error != ERROR_SUCCESS
+            ? worker.wait_observation.process_error
+            : worker.wait_observation.pipe_error);
+    append_diagnostic(result, native_worker_diagnostic_code_t::worker_crashed,
+        std::move(phase), std::move(detail), status, true);
+}
+
 void append_protocol_failure(native_worker_execution_result_t& result, wire::frame_failure_t failure,
-                             std::string phase, DWORD error)
+                             std::string phase, DWORD error,
+                             const worker_wait_observation_t* observation = nullptr)
 {
     native_worker_diagnostic_code_t code = native_worker_diagnostic_code_t::protocol_truncated;
     std::string detail = "worker frame could not be read completely";
@@ -1592,6 +2091,8 @@ void append_protocol_failure(native_worker_execution_result_t& result, wire::fra
     case wire::frame_failure_t::io:
         break;
     }
+    if (observation)
+        append_wait_observation(detail, *observation);
     append_diagnostic(result, code, std::move(phase), std::move(detail), error, true);
 }
 
@@ -2129,8 +2630,13 @@ workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_work
         managed_launch_contract.expected_manifest_hash = managed_manifest_hash;
         native_worker_execution_result_t managed_runtime_verification;
         if (!verify_worker(managed_launch_contract, managed_runtime_verification)) {
+            std::string detail = "managed decompiler app-local runtime failed package verification";
+            if (!managed_runtime_verification.diagnostics.empty()) {
+                detail.append(": ");
+                detail.append(managed_runtime_verification.diagnostics.front().detail);
+            }
             return failure(workspace_error_code_t::integrity_failure,
-                "managed decompiler app-local runtime failed package verification",
+                std::move(detail),
                 "native_worker.runtime.managed_runtime", ERROR_CRC);
         }
         auto managed_host = std::make_shared<native_worker_host_t>(
@@ -2334,10 +2840,11 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
             append_diagnostic(result, native_worker_diagnostic_code_t::deadline_exceeded, "native_worker.hello",
                 "worker did not provide an authenticated hello before the startup deadline", error, true);
         } else if (hello_wait == terminal_wait_t::exited) {
-            append_diagnostic(result, native_worker_diagnostic_code_t::worker_crashed, "native_worker.hello",
-                "worker exited before providing an authenticated hello", error, true);
+            append_worker_exit(result, worker, "native_worker.hello",
+                "worker exited before providing an authenticated hello");
         } else {
-            append_protocol_failure(result, worker.reader.failure(), "native_worker.hello", error);
+            append_protocol_failure(result, worker.reader.failure(), "native_worker.hello", error,
+                &worker.wait_observation);
         }
         terminate_worker(worker, ERROR_CANCELLED, result, true);
         return result;
@@ -2390,17 +2897,16 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
                 return result;
             }
             if (terminal == terminal_wait_t::exited) {
-                DWORD exit_code = 0;
-                GetExitCodeProcess(worker.process.get(), &exit_code);
-                append_diagnostic(result, native_worker_diagnostic_code_t::worker_crashed,
-                    "native_worker.managed_wait",
-                    "managed worker exited before a terminal result", exit_code, true);
+                append_worker_exit(result, worker, "native_worker.managed_wait",
+                    "managed worker exited before a terminal result");
+                const DWORD exit_code = worker.wait_observation.exit_code_available
+                    ? worker.wait_observation.exit_code : ERROR_PROCESS_ABORTED;
                 terminate_worker(worker, exit_code, result, true);
                 return result;
             }
             if (terminal == terminal_wait_t::protocol_failure) {
                 append_protocol_failure(result, worker.reader.failure(),
-                    "native_worker.managed_response", error);
+                    "native_worker.managed_response", error, &worker.wait_observation);
                 terminate_worker(worker, ERROR_CRC, result, true);
                 return result;
             }
@@ -2477,14 +2983,16 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
             return result;
         }
         if (terminal == terminal_wait_t::exited) {
-            DWORD exit_code = 0;
-            GetExitCodeProcess(worker.process.get(), &exit_code);
-            append_diagnostic(result, native_worker_diagnostic_code_t::worker_crashed, "native_worker.wait", "worker exited before a terminal result", exit_code, true);
+            append_worker_exit(result, worker, "native_worker.wait",
+                "worker exited before a terminal result");
+            const DWORD exit_code = worker.wait_observation.exit_code_available
+                ? worker.wait_observation.exit_code : ERROR_PROCESS_ABORTED;
             terminate_worker(worker, exit_code, result, true);
             return result;
         }
         if (terminal == terminal_wait_t::protocol_failure) {
-            append_protocol_failure(result, worker.reader.failure(), "native_worker.response", error);
+            append_protocol_failure(result, worker.reader.failure(), "native_worker.response", error,
+                &worker.wait_observation);
             terminate_worker(worker, ERROR_CRC, result, true);
             return result;
         }

@@ -1,6 +1,8 @@
 
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include "standalone_compat.hpp"
@@ -9,6 +11,7 @@
 #include "obfuscation.hpp"
 #include "pro.h"
 #include "../runtime/standalone_driver.hpp"
+#include "../runtime/standalone_driver_identity.hpp"
 #include "zydis_disasm.hpp"
 #include "xref_engine.hpp"
 #include "cfg_view.hpp"
@@ -309,6 +312,111 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
     }
 
     return std::nullopt;
+}
+
+struct cfg_publication_binding_t
+{
+    driver_bridge::identity::live_target_identity_t target;
+    std::uint64_t model_generation = 0;
+    std::uint64_t entry_addr = 0;
+    bool valid = false;
+};
+
+static std::mutex g_cfg_request_mutex;
+static std::mutex g_cfg_binding_mutex;
+static cfg_publication_binding_t g_cfg_binding;
+
+enum class cfg_wait_result_t : std::uint8_t
+{
+    completed,
+    cancelled,
+    deadline,
+    timeout
+};
+
+static cfg_wait_result_t wait_for_cfg_publication_idle(std::uint64_t timeout_ms)
+{
+    const std::uint64_t started = GetTickCount64();
+    const std::uint64_t timeout_at = started >
+        (std::numeric_limits<std::uint64_t>::max)() - timeout_ms
+        ? (std::numeric_limits<std::uint64_t>::max)()
+        : started + timeout_ms;
+    while (cfg_view::g_state.building.load(std::memory_order_acquire))
+    {
+        if (mcp_standalone::current_call_cancelled())
+            return cfg_wait_result_t::cancelled;
+        const std::uint64_t now = GetTickCount64();
+        const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+        if (call_deadline != 0 && now >= call_deadline)
+            return cfg_wait_result_t::deadline;
+        if (now >= timeout_at)
+            return cfg_wait_result_t::timeout;
+        Sleep(10);
+    }
+    return cfg_wait_result_t::completed;
+}
+
+static std::optional<tool_result_t> cfg_wait_error(cfg_wait_result_t result,
+                                                   const char* operation)
+{
+    switch (result)
+    {
+    case cfg_wait_result_t::completed:
+        return std::nullopt;
+    case cfg_wait_result_t::cancelled:
+        diag::log_tagged_fmt("dbg_tools", "%s: cancelled while waiting for CFG publication", operation);
+        return tool_result_t::error("Tool cancelled during CFG build.");
+    case cfg_wait_result_t::deadline:
+        diag::log_tagged_fmt("dbg_tools", "%s: call deadline expired while waiting for CFG publication", operation);
+        return tool_result_t::error("Tool deadline expired during CFG build.");
+    case cfg_wait_result_t::timeout:
+        diag::log_tagged_fmt("dbg_tools", "%s: timed out waiting for CFG publication", operation);
+        return tool_result_t::error("CFG build did not complete within 3000 ms.");
+    }
+    return tool_result_t::error("CFG publication wait failed.");
+}
+
+static void invalidate_cfg_binding()
+{
+    std::lock_guard<std::mutex> lock(g_cfg_binding_mutex);
+    g_cfg_binding = {};
+}
+
+static std::optional<tool_result_t> capture_cfg_target_identity(
+    driver_bridge::identity::live_target_identity_t& identity)
+{
+    std::string error;
+    const std::uint32_t pid = driver_bridge::attached_pid();
+    if (pid == 0 || !driver_bridge::identity::capture_live_target_identity(
+        pid, 0, identity, &error))
+    {
+        if (error.empty())
+            error = "live_target_identity_unavailable";
+        diag::log_tagged_fmt("dbg_tools",
+            "CFG target identity capture failed pid=%u error=%s", pid, error.c_str());
+        return tool_result_t::error(
+            "Unable to capture the attached CFG target identity: " + error);
+    }
+    return std::nullopt;
+}
+
+static std::optional<tool_result_t> validate_cfg_target_identity(
+    const driver_bridge::identity::live_target_identity_t& identity,
+    const char* operation)
+{
+    const auto validation =
+        driver_bridge::identity::validate_attached_target_identity(identity);
+    if (validation.matches)
+        return std::nullopt;
+    const char* code = driver_bridge::identity::staleness_code(validation.staleness);
+    const std::string detail = validation.detail.empty()
+        ? std::string(code ? code : "live_target_identity_changed")
+        : validation.detail;
+    diag::log_tagged_fmt("dbg_tools",
+        "%s: CFG target identity validation failed pid=%u reason=%s detail=%s",
+        operation, identity.process.pid, code ? code : "unknown", detail.c_str());
+    return tool_result_t::error(
+        "Attached CFG target identity changed during the operation: " + detail);
 }
 
 static std::optional<std::uint32_t> parse_tid(const json& params)
@@ -4166,22 +4274,63 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return tool_result_t::error(OBFSTR("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
             if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
-            diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: building CFG from 0x%llX", (unsigned long long)*addr);
-            cfg_view::build_cfg(*addr);
-            for (int i = 0; i < 300; ++i) {
-                if (!cfg_view::g_state.building.load()) break;
-                if (mcp_standalone::current_call_cancelled())
-                    return tool_result_t::error("Tool cancelled during CFG build.");
-                Sleep(10);
+            std::lock_guard<std::mutex> request_lock(g_cfg_request_mutex);
+            if (mcp_standalone::current_call_cancelled())
+                return tool_result_t::error("Tool cancelled before CFG build.");
+            const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+            if (call_deadline != 0 && GetTickCount64() >= call_deadline)
+                return tool_result_t::error("Tool deadline expired before CFG build.");
+            if (auto wait_error = cfg_wait_error(
+                wait_for_cfg_publication_idle(3000), "dbg_build_cfg.preflight"))
+                return *wait_error;
+            driver_bridge::identity::live_target_identity_t target_identity;
+            if (auto identity_error = capture_cfg_target_identity(target_identity))
+                return *identity_error;
+            const auto previous_model = cfg_view::capture_model();
+            const std::uint64_t previous_generation = previous_model
+                ? previous_model->generation : 0;
+            invalidate_cfg_binding();
+            diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: building CFG from 0x%llX pid=%u previous_generation=%llu",
+                (unsigned long long)*addr, target_identity.process.pid,
+                static_cast<unsigned long long>(previous_generation));
+            cfg_view::build_cfg(disasm_view::workspace_context_t{}, *addr);
+            if (auto wait_error = cfg_wait_error(
+                wait_for_cfg_publication_idle(3000), "dbg_build_cfg.publication"))
+                return *wait_error;
+            const auto model = cfg_view::capture_model();
+            if (!model || model->blocks.empty() || model->generation <= previous_generation ||
+                model->entry_addr != *addr)
+            {
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_build_cfg: publication rejected requested_entry=0x%llX model=%d blocks=%zu generation=%llu previous_generation=%llu model_entry=0x%llX",
+                    static_cast<unsigned long long>(*addr), model ? 1 : 0,
+                    model ? model->blocks.size() : 0,
+                    static_cast<unsigned long long>(model ? model->generation : 0),
+                    static_cast<unsigned long long>(previous_generation),
+                    static_cast<unsigned long long>(model ? model->entry_addr : 0));
+                return tool_result_t::error(
+                    "CFG build failed to publish a complete graph for the requested entry.");
             }
-            std::lock_guard<std::mutex> lk(cfg_view::g_state.mutex);
+            if (auto identity_error = validate_cfg_target_identity(
+                target_identity, "dbg_build_cfg.publication"))
+                return *identity_error;
+            {
+                std::lock_guard<std::mutex> binding_lock(g_cfg_binding_mutex);
+                g_cfg_binding.target = target_identity;
+                g_cfg_binding.model_generation = model->generation;
+                g_cfg_binding.entry_addr = model->entry_addr;
+                g_cfg_binding.valid = true;
+            }
             json result;
             result["entry"] = sa_format_address(*addr);
-            result["blocks"] = cfg_view::g_state.blocks.size();
-            result["built"] = cfg_view::g_state.built;
-            diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: CFG built for 0x%llX with %zu blocks", (unsigned long long)*addr, cfg_view::g_state.blocks.size());
+            result["blocks"] = model->blocks.size();
+            result["built"] = true;
+            diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: CFG built for 0x%llX with %zu blocks generation=%llu pid=%u",
+                (unsigned long long)*addr, model->blocks.size(),
+                static_cast<unsigned long long>(model->generation),
+                target_identity.process.pid);
             return tool_result_t::ok(
-                OBFSTR("CFG built: ") + std::to_string(cfg_view::g_state.blocks.size()) + OBFSTR(" blocks."), result);
+                OBFSTR("CFG built: ") + std::to_string(model->blocks.size()) + OBFSTR(" blocks."), result);
         }, true});
 
     register_compat(srv, {
@@ -4190,14 +4339,47 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         {},
         [](const json&) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_get_cfg: entry");
-            std::lock_guard<std::mutex> lk(cfg_view::g_state.mutex);
-            if (!cfg_view::g_state.built) {
-                diag::log_tagged_fmt("dbg_tools", "dbg_get_cfg: no CFG built yet");
+            const json empty_params = json::object();
+            if (auto err = ensure_attached(empty_params)) return *err;
+            if (mcp_standalone::current_call_cancelled())
+                return tool_result_t::error("Tool cancelled before CFG read.");
+            const std::uint64_t call_deadline = mcp_standalone::current_call_deadline_ms();
+            if (call_deadline != 0 && GetTickCount64() >= call_deadline)
+                return tool_result_t::error("Tool deadline expired before CFG read.");
+            if (cfg_view::g_state.building.load(std::memory_order_acquire))
+                return tool_result_t::error("CFG publication is being rebuilt. Retry after the build completes.");
+            cfg_publication_binding_t binding;
+            {
+                std::lock_guard<std::mutex> binding_lock(g_cfg_binding_mutex);
+                binding = g_cfg_binding;
+            }
+            const auto model = cfg_view::capture_model();
+            if (!binding.valid || !model || model->blocks.empty() ||
+                model->generation != binding.model_generation ||
+                model->entry_addr != binding.entry_addr ||
+                binding.target.process.pid != driver_bridge::attached_pid())
+            {
+                diag::log_tagged_fmt("dbg_tools",
+                    "dbg_get_cfg: no current target-bound CFG binding_valid=%d model=%d blocks=%zu model_generation=%llu binding_generation=%llu model_entry=0x%llX binding_entry=0x%llX binding_pid=%u attached_pid=%u",
+                    binding.valid ? 1 : 0, model ? 1 : 0,
+                    model ? model->blocks.size() : 0,
+                    static_cast<unsigned long long>(model ? model->generation : 0),
+                    static_cast<unsigned long long>(binding.model_generation),
+                    static_cast<unsigned long long>(model ? model->entry_addr : 0),
+                    static_cast<unsigned long long>(binding.entry_addr),
+                    binding.target.process.pid, driver_bridge::attached_pid());
                 return tool_result_t::error(OBFSTR("No CFG built. Call dbg_build_cfg first."));
             }
+            if (auto identity_error = validate_cfg_target_identity(
+                binding.target, "dbg_get_cfg.preflight"))
+                return *identity_error;
             json blocks_arr = json::array();
-            for (size_t bi = 0; bi < cfg_view::g_state.blocks.size(); ++bi) {
-                const auto& blk = cfg_view::g_state.blocks[bi];
+            for (size_t bi = 0; bi < model->blocks.size(); ++bi) {
+                if (mcp_standalone::current_call_cancelled())
+                    return tool_result_t::error("Tool cancelled during CFG read.");
+                if (call_deadline != 0 && GetTickCount64() >= call_deadline)
+                    return tool_result_t::error("Tool deadline expired during CFG read.");
+                const auto& blk = model->blocks[bi];
                 json bj;
                 bj["index"] = bi;
                 bj["start"] = sa_format_address(blk.start_addr);
@@ -4214,13 +4396,24 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 bj["successors"] = blk.successors;
                 blocks_arr.push_back(std::move(bj));
             }
+            if (cfg_view::g_state.building.load(std::memory_order_acquire))
+                return tool_result_t::error("CFG publication changed during the read.");
+            const auto current_model = cfg_view::capture_model();
+            if (!current_model || current_model->generation != model->generation)
+                return tool_result_t::error("CFG publication changed during the read.");
+            if (auto identity_error = validate_cfg_target_identity(
+                binding.target, "dbg_get_cfg.completion"))
+                return *identity_error;
             json result;
-            result["entry"] = sa_format_address(cfg_view::g_state.entry_addr);
-            result["block_count"] = cfg_view::g_state.blocks.size();
+            result["entry"] = sa_format_address(model->entry_addr);
+            result["block_count"] = model->blocks.size();
             result["blocks"] = std::move(blocks_arr);
-            diag::log_tagged_fmt("dbg_tools", "dbg_get_cfg: returning %zu blocks entry=0x%llX", cfg_view::g_state.blocks.size(), (unsigned long long)cfg_view::g_state.entry_addr);
+            diag::log_tagged_fmt("dbg_tools", "dbg_get_cfg: returning %zu blocks entry=0x%llX generation=%llu pid=%u",
+                model->blocks.size(), (unsigned long long)model->entry_addr,
+                static_cast<unsigned long long>(model->generation),
+                binding.target.process.pid);
             return tool_result_t::ok(
-                OBFSTR("CFG: ") + std::to_string(cfg_view::g_state.blocks.size()) + OBFSTR(" blocks."), result);
+                OBFSTR("CFG: ") + std::to_string(model->blocks.size()) + OBFSTR(" blocks."), result);
         }, true});
 
 

@@ -4,12 +4,13 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <fstream>
 #include <future>
-#include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -21,9 +22,45 @@ namespace {
 using namespace aida::standalone::mcp::compat;
 namespace worker_wire = aida::standalone::mcp::python_worker::wire;
 
+constexpr std::uintmax_t k_source_contract_max_bytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uintmax_t k_fixture_worker_max_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+
 void require(bool condition, std::string_view message) {
     if (!condition)
         throw std::runtime_error(std::string(message));
+}
+
+std::vector<std::uint8_t> read_binary_file(const std::filesystem::path& path,
+                                            std::uintmax_t maximum_bytes,
+                                            std::string_view failure) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    require(!ec && size <= maximum_bytes &&
+        size <= static_cast<std::uintmax_t>((std::numeric_limits<std::size_t>::max)()) &&
+        size <= static_cast<std::uintmax_t>((std::numeric_limits<std::streamsize>::max)()), failure);
+    std::ifstream input(path, std::ios::binary);
+    require(static_cast<bool>(input), failure);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    if (!bytes.empty()) {
+        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        require(input.gcount() == static_cast<std::streamsize>(bytes.size()) &&
+            !input.fail() && !input.bad(), failure);
+    }
+    const auto trailing = input.get();
+    require(trailing == std::char_traits<char>::eof() && input.eof() && !input.bad(), failure);
+    return bytes;
+}
+
+void write_binary_file(const std::filesystem::path& path, std::string_view contents,
+                       std::string_view failure) {
+    require(contents.size() <= static_cast<std::size_t>(
+        (std::numeric_limits<std::streamsize>::max)()), failure);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    require(static_cast<bool>(output), failure);
+    if (!contents.empty())
+        output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    output.close();
+    require(static_cast<bool>(output), failure);
 }
 
 std::filesystem::path locate_root() {
@@ -52,9 +89,10 @@ std::filesystem::path unique_temp_directory() {
 
 void verify_source_contract() {
     const auto source = locate_root() / "src/standalone/workers/analysis_python/analysis_python_worker.py";
-    std::ifstream input(source, std::ios::binary);
-    require(static_cast<bool>(input), "analysis Python worker source is unavailable");
-    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const auto bytes = read_binary_file(source, k_source_contract_max_bytes,
+        "analysis Python worker source is unavailable or changed while being read");
+    require(!bytes.empty(), "analysis Python worker source is empty");
+    const std::string text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     for (const std::string_view forbidden : {"camoufox", "socket", "subprocess", "Popen", "CreateProcess", "WriteProcessMemory", "py_eval"})
         require(text.find(forbidden) == std::string::npos, "analysis Python worker source exposes a forbidden capability");
     require(text.find("WorkspaceApi") != std::string::npos && text.find("read_bytes") != std::string::npos &&
@@ -79,6 +117,22 @@ void verify_manifest_contract() {
     std::string corrupt = encoded;
     corrupt.back() ^= 0x40;
     require(!deserialize_python_worker_manifest(corrupt).valid(), "corrupt worker manifest was accepted");
+    require(!deserialize_python_worker_manifest(encoded.substr(0, encoded.size() - 1U)).valid(),
+        "truncated worker manifest was accepted");
+    require(!deserialize_python_worker_manifest(encoded + std::string(1, '\0')).valid(),
+        "worker manifest with trailing material was accepted");
+    auto invalid_manifest = manifest;
+    invalid_manifest.worker_relative_path = "deps/../AiDA_AnalysisPythonWorker.exe";
+    require(serialize_python_worker_manifest(invalid_manifest).empty(),
+        "worker manifest path traversal was accepted");
+    invalid_manifest = manifest;
+    invalid_manifest.protocol_hash.bytes[0] ^= 1U;
+    require(serialize_python_worker_manifest(invalid_manifest).empty(),
+        "worker manifest protocol mismatch was accepted");
+    invalid_manifest = manifest;
+    invalid_manifest.capabilities |= 2U;
+    require(serialize_python_worker_manifest(invalid_manifest).empty(),
+        "worker manifest capability expansion was accepted");
     require(python_workspace_operation_allowed("metadata") && python_workspace_operation_allowed("read_bytes") &&
         python_workspace_operation_allowed("find") && python_workspace_operation_allowed("list_functions"),
         "approved workspace operation is rejected");
@@ -95,14 +149,15 @@ struct package_fixture_t final {
     std::filesystem::path root;
     std::filesystem::path scripts;
     python_worker_launch_contract_t contract;
+    std::string manifest_bytes;
 
     explicit package_fixture_t(const std::filesystem::path& fake_worker) : root(unique_temp_directory()), scripts(root / "scripts") {
         std::filesystem::create_directories(root / "deps");
         std::filesystem::create_directories(scripts);
         const auto worker = root / "deps/AiDA_AnalysisPythonWorker.exe";
         std::filesystem::copy_file(fake_worker, worker, std::filesystem::copy_options::overwrite_existing);
-        std::ifstream input(worker, std::ios::binary);
-        const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        const auto bytes = read_binary_file(worker, k_fixture_worker_max_bytes,
+            "fake worker fixture cannot be read completely");
         require(!bytes.empty(), "fake worker fixture is empty");
         python_worker_manifest_t manifest;
         manifest.schema_version = k_python_worker_manifest_schema_version;
@@ -110,19 +165,13 @@ struct package_fixture_t final {
         require(worker_wire::sha256(bytes.data(), bytes.size(), manifest.worker_binary_hash), "fake worker hash failed");
         manifest.protocol_hash = worker_wire::protocol_hash();
         manifest.capabilities = k_python_worker_capability_execute_file;
-        const std::string encoded = serialize_python_worker_manifest(manifest);
-        const auto manifest_path = root / "deps/AiDA_AnalysisPythonWorker.manifest.bin";
-        std::ofstream output(manifest_path, std::ios::binary | std::ios::trunc);
-        output.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
-        output.close();
-        require(static_cast<bool>(output), "fake worker manifest cannot be written");
-        require(worker_wire::sha256(encoded.data(), encoded.size(), contract.expected_manifest_hash), "fake manifest hash failed");
-        const auto digest_path = root / "deps/AiDA_AnalysisPythonWorker.manifest.sha256";
-        std::ofstream digest_output(digest_path, std::ios::binary | std::ios::trunc);
-        digest_output << contract.expected_manifest_hash.to_hex() << '\n';
-        digest_output.close();
-        require(static_cast<bool>(digest_output), "fake worker manifest digest cannot be written");
-        const auto resolved_contract = resolve_python_worker_launch_contract(root, scripts);
+        manifest_bytes = serialize_python_worker_manifest(manifest);
+        write_manifest(manifest_bytes);
+        worker_wire::digest_t manifest_hash;
+        require(worker_wire::sha256(manifest_bytes.data(), manifest_bytes.size(), manifest_hash),
+            "fake manifest hash failed");
+        write_digest(manifest_hash.to_hex() + "\n");
+        const auto resolved_contract = resolve();
         require(resolved_contract.valid() && resolved_contract.value,
             "production worker launch contract cannot be resolved from the fixture package");
         contract = *resolved_contract.value;
@@ -135,11 +184,28 @@ struct package_fixture_t final {
 
     std::filesystem::path script(std::string_view name, std::string_view contents) const {
         const auto path = scripts / std::string(name);
-        std::ofstream output(path, std::ios::binary | std::ios::trunc);
-        output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        output.close();
-        require(static_cast<bool>(output), "fixture script cannot be written");
+        write_binary_file(path, contents, "fixture script cannot be written");
         return path;
+    }
+
+    std::filesystem::path manifest_path() const {
+        return root / "deps/AiDA_AnalysisPythonWorker.manifest.bin";
+    }
+
+    std::filesystem::path digest_path() const {
+        return root / "deps/AiDA_AnalysisPythonWorker.manifest.sha256";
+    }
+
+    void write_manifest(std::string_view contents) const {
+        write_binary_file(manifest_path(), contents, "fake worker manifest cannot be written");
+    }
+
+    void write_digest(std::string_view contents) const {
+        write_binary_file(digest_path(), contents, "fake worker manifest digest cannot be written");
+    }
+
+    python_worker_launch_contract_resolution_t resolve() const {
+        return resolve_python_worker_launch_contract(root, scripts);
     }
 };
 
@@ -152,6 +218,80 @@ python_worker_execution_request_t request_for(std::uint64_t job_id, const std::f
     request.unsafe_approved = true;
     request.cancellation = cancellation;
     return request;
+}
+
+bool has_diagnostic(const python_worker_execution_result_t& result,
+                    python_worker_error_code_t code, std::uint32_t win32_error = ERROR_SUCCESS) {
+    return std::any_of(result.diagnostics.begin(), result.diagnostics.end(),
+        [code, win32_error](const auto& diagnostic) {
+            return diagnostic.code == code &&
+                (win32_error == ERROR_SUCCESS || diagnostic.win32_error == win32_error);
+        });
+}
+
+void verify_package_contract_rejections(const std::filesystem::path& fake_worker) {
+    package_fixture_t fixture(fake_worker);
+    const std::string valid_digest = fixture.contract.expected_manifest_hash.to_hex() + "\n";
+
+    fixture.write_digest(valid_digest.substr(0, 63));
+    require(!fixture.resolve().valid(), "truncated worker manifest digest was accepted");
+    fixture.write_digest(std::string(64, 'g'));
+    require(!fixture.resolve().valid(), "non-hex worker manifest digest was accepted");
+    fixture.write_digest(std::string(257, '0'));
+    require(!fixture.resolve().valid(), "oversized worker manifest digest was accepted");
+    std::error_code ec;
+    require(std::filesystem::remove(fixture.digest_path(), ec) && !ec,
+        "worker manifest digest cannot be removed for the unavailable-file case");
+    require(!fixture.resolve().valid(), "missing worker manifest digest was accepted");
+    fixture.write_digest(valid_digest);
+    require(fixture.resolve().valid(), "valid worker manifest digest was not recoverable");
+
+    const auto script = fixture.script("manifest_rejection.py", "fixture:success\n");
+    std::uint64_t job_id = 1;
+    const auto execute_material = [&](std::string_view material) {
+        worker_wire::digest_t hash;
+        require(worker_wire::sha256(material.data(), material.size(), hash),
+            "fixture manifest material cannot be hashed");
+        fixture.write_manifest(material);
+        fixture.write_digest(hash.to_hex() + "\n");
+        const auto resolved = fixture.resolve();
+        require(resolved.valid() && resolved.value,
+            "fixture manifest contract cannot be resolved through production code");
+        python_worker_host_t host(*resolved.value);
+        return host.execute(request_for(job_id++, script));
+    };
+
+    std::string truncated_manifest = fixture.manifest_bytes;
+    truncated_manifest.pop_back();
+    const auto truncated_result = execute_material(truncated_manifest);
+    require(truncated_result.error_code == "PYTHON_WORKER_MANIFEST_REJECTED" &&
+        has_diagnostic(truncated_result, python_worker_error_code_t::manifest_malformed),
+        "truncated production worker manifest was accepted");
+
+    std::string malformed_manifest = fixture.manifest_bytes;
+    malformed_manifest.back() ^= 0x40;
+    const auto malformed_result = execute_material(malformed_manifest);
+    require(malformed_result.error_code == "PYTHON_WORKER_MANIFEST_REJECTED" &&
+        has_diagnostic(malformed_result, python_worker_error_code_t::manifest_malformed),
+        "malformed production worker manifest was accepted");
+
+    const std::string oversized_manifest(64U * 1024U + 1U, '\0');
+    const auto oversized_result = execute_material(oversized_manifest);
+    require(oversized_result.error_code == "PYTHON_WORKER_MANIFEST_REJECTED" &&
+        has_diagnostic(oversized_result, python_worker_error_code_t::manifest_unavailable,
+            ERROR_FILE_TOO_LARGE),
+        "oversized production worker manifest was accepted");
+
+    fixture.write_manifest(fixture.manifest_bytes + std::string(1, '\0'));
+    fixture.write_digest(valid_digest);
+    const auto mismatched_contract = fixture.resolve();
+    require(mismatched_contract.valid() && mismatched_contract.value,
+        "hash-mismatch fixture contract cannot be resolved through production code");
+    python_worker_host_t mismatch_host(*mismatched_contract.value);
+    const auto mismatch_result = mismatch_host.execute(request_for(job_id, script));
+    require(mismatch_result.error_code == "PYTHON_WORKER_MANIFEST_REJECTED" &&
+        has_diagnostic(mismatch_result, python_worker_error_code_t::manifest_hash_mismatch),
+        "production worker manifest hash mismatch was accepted");
 }
 
 void verify_runtime_contract(const std::filesystem::path& fake_worker) {
@@ -225,6 +365,7 @@ bool run_python_worker_harness(std::string& failure, const std::filesystem::path
         }
         verify_source_contract();
         verify_manifest_contract();
+        verify_package_contract_rejections(fake_worker_path);
         verify_runtime_contract(fake_worker_path);
     } catch (const std::exception& error) {
         failure.assign(error.what());

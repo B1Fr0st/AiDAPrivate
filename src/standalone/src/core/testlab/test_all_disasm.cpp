@@ -1892,7 +1892,7 @@ namespace {
             log_msg(hf, tag, "INPUT -- read_live_memory(addr=0x%016llX, size=64) attached_pid=%u",
                 (unsigned long long)addr, attached);
             auto context = disasm_view::capture_selected_workspace();
-            bool ok = hex_view::read_live_memory(context, addr, 64);
+            bool ok = hex_view::request_live_memory(context, addr, 64);
             std::vector<uint8_t> local_data;
             if (ok) driver_bridge::read_memory(addr, 64, local_data);
             size_t got = ok ? local_data.size() : 0;
@@ -1919,7 +1919,7 @@ namespace {
         try {
             auto context = disasm_view::capture_selected_workspace();
             hex_view::activate(context);
-            const bool rejected = !hex_view::read_live_memory(context, 0, 0);
+            const bool rejected = !hex_view::request_live_memory(context, 0, 0);
             const std::string rejected_error = hex_view::last_error(context);
             hex_view::activate(context);
             const std::string activated_error = hex_view::last_error(context);
@@ -2521,7 +2521,7 @@ namespace {
             log_msg(hf, tag, "INPUT -- read_live_memory(ntdll base=0x%016llX, size=256) attached_pid=%u",
                 (unsigned long long)addr, attached);
             auto context = disasm_view::capture_selected_workspace();
-            bool ok = hex_view::read_live_memory(context, addr, 256);
+            bool ok = hex_view::request_live_memory(context, addr, 256);
             std::vector<uint8_t> local_data;
             if (ok) driver_bridge::read_memory(addr, 256, local_data);
             size_t got = ok ? local_data.size() : 0;
@@ -2560,7 +2560,7 @@ namespace {
             log_msg(hf, tag, "INPUT -- read_live_memory(kernel32 base=0x%016llX, size=128) attached_pid=%u",
                 (unsigned long long)addr, attached);
             auto context = disasm_view::capture_selected_workspace();
-            bool ok = hex_view::read_live_memory(context, addr, 128);
+            bool ok = hex_view::request_live_memory(context, addr, 128);
             std::vector<uint8_t> local_data;
             if (ok) driver_bridge::read_memory(addr, 128, local_data);
             size_t got = ok ? local_data.size() : 0;

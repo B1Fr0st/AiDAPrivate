@@ -25,6 +25,7 @@
 #include "ui/ui_thread_dispatcher.hpp"
 #endif
 #include "../disasm/disasm_view.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
 #include "imgui/imgui.h"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -149,6 +150,16 @@ struct ui_state_t {
 	std::uint64_t validation_structure_id = 0;
 	std::uint64_t validation_revision = 0;
 	struct_dissector::layout_validation_t validation;
+	bool overlay_review_requested = false;
+	std::string overlay_review_name;
+	std::string overlay_review_declaration;
+	std::string overlay_review_workspace_id;
+	std::uint64_t overlay_review_workspace_generation = 0;
+	std::uint64_t overlay_review_analysis_revision = 0;
+	std::uint64_t overlay_review_overlay_revision = 0;
+	std::weak_ptr<aida::analysis::analysis_workspace_t> overlay_review_workspace;
+	std::shared_ptr<const aida::analysis::analysis_publication_t>
+		overlay_review_publication;
 };
 
 inline ui_state_t g_ui;
@@ -190,6 +201,29 @@ inline std::atomic<std::uint64_t> g_write_serial{0};
 inline std::atomic<std::uint64_t> g_write_running_serial{0};
 inline std::atomic<std::uint64_t> g_write_dispatch_failure{0};
 inline std::atomic<std::uint64_t> g_write_dispatch_applied{0};
+
+inline aida::ui::action_handler_result_t stage_overlay_declaration_review(
+	std::string name, std::string declaration) {
+	const auto context = disasm_view::capture_selected_workspace();
+	if (!context.workspace || !context.publication || context.workspace->closing() ||
+		context.workspace->closed())
+		return aida::ui::action_handler_result_t::failed(
+			"No current analysis workspace can receive the type declaration");
+	if (name.empty() || name.size() > 256 || declaration.empty() ||
+		declaration.size() > 64U * 1024U)
+		return aida::ui::action_handler_result_t::failed(
+			"The declaration is empty or exceeds the bounded 64 KiB review contract");
+	g_ui.overlay_review_name = std::move(name);
+	g_ui.overlay_review_declaration = std::move(declaration);
+	g_ui.overlay_review_workspace_id = context.workspace->identity().binary_id().to_hex();
+	g_ui.overlay_review_workspace_generation = context.workspace->generation();
+	g_ui.overlay_review_analysis_revision = context.publication->analysis_revision;
+	g_ui.overlay_review_overlay_revision = context.workspace->overlay_revision();
+	g_ui.overlay_review_workspace = context.workspace;
+	g_ui.overlay_review_publication = context.publication;
+	g_ui.overlay_review_requested = true;
+	return aida::ui::action_handler_result_t::completed();
+}
 
 inline std::uint64_t structure_identity_locked(int structure_index) {
 	const auto& state = struct_dissector::g_state;
@@ -349,6 +383,27 @@ inline std::string trim_enum_token(std::string value) {
 	if (first >= last)
 		return {};
 	return std::string(first, last);
+}
+
+inline std::string export_enum_to_c(const struct_dissector::enum_def_t& definition) {
+	constexpr std::size_t maximum_output = 64U * 1024U;
+	if (definition.name.size() > maximum_output || definition.values.size() > 65536)
+		return {};
+	std::string output;
+	const auto append = [&output](const std::string& value) {
+		if (value.size() > maximum_output - output.size())
+			return false;
+		output.append(value);
+		return true;
+	};
+	if (!append("enum ") || !append(definition.name) || !append(" {\n"))
+		return {};
+	for (const auto& value : definition.values) {
+		if (!append("    ") || !append(value.name) || !append(" = ") ||
+			!append(std::to_string(value.value)) || !append(",\n"))
+			return {};
+	}
+	return append("};\n") ? output : std::string{};
 }
 
 inline bool rebuild_enum_form(ui_state_t& ui, struct_dissector::enum_def_t& definition) {
@@ -1027,6 +1082,68 @@ inline void render_write_review_modal() {
 	ImGui::EndPopup();
 }
 
+inline void render_overlay_declaration_review() {
+	if (g_ui.overlay_review_requested) {
+		g_ui.overlay_review_requested = false;
+		ImGui::OpenPopup("Review Editable Type Declaration");
+	}
+	ImGui::SetNextWindowSize(ImVec2(720.0f, 560.0f), ImGuiCond_Appearing);
+	if (!ImGui::BeginPopupModal("Review Editable Type Declaration", nullptr,
+			ImGuiWindowFlags_NoSavedSettings))
+		return;
+	const auto context = disasm_view::capture_selected_workspace();
+	const auto review_workspace = g_ui.overlay_review_workspace.lock();
+	const bool current = context.workspace && context.publication &&
+		!context.workspace->closing() && !context.workspace->closed() &&
+		context.workspace->identity().binary_id().to_hex() ==
+			g_ui.overlay_review_workspace_id &&
+		context.workspace == review_workspace &&
+		context.publication == g_ui.overlay_review_publication &&
+		context.workspace->generation() == g_ui.overlay_review_workspace_generation &&
+		context.publication->analysis_revision == g_ui.overlay_review_analysis_revision &&
+		context.workspace->overlay_revision() == g_ui.overlay_review_overlay_revision;
+	ImGui::Text("Global declaration: %s", g_ui.overlay_review_name.c_str());
+	ImGui::TextDisabled("Workspace generation %llu  analysis revision %llu  overlay revision %llu",
+		static_cast<unsigned long long>(g_ui.overlay_review_workspace_generation),
+		static_cast<unsigned long long>(g_ui.overlay_review_analysis_revision),
+		static_cast<unsigned long long>(g_ui.overlay_review_overlay_revision));
+	ImGui::Separator();
+	ImGui::BeginChild("##editable_type_declaration_review", ImVec2(0.0f, -44.0f), true,
+		ImGuiWindowFlags_HorizontalScrollbar);
+	ImGui::TextUnformatted(g_ui.overlay_review_declaration.c_str());
+	ImGui::EndChild();
+	ImGui::BeginDisabled(!current);
+	if (ImGui::Button("Commit to Overlay")) {
+		if (disasm_view::queue_type_declaration(context,
+				g_ui.overlay_review_declaration)) {
+			g_ui.operation_error = false;
+			g_ui.operation_status =
+				"Global declaration queued through the reversible overlay authority";
+			g_ui.overlay_review_declaration.clear();
+			g_ui.overlay_review_name.clear();
+			g_ui.overlay_review_publication.reset();
+			g_ui.overlay_review_workspace.reset();
+			ImGui::CloseCurrentPopup();
+		} else {
+			g_ui.operation_error = true;
+			g_ui.operation_status =
+				"The overlay authority rejected the global declaration; no change was claimed";
+		}
+	}
+	ImGui::EndDisabled();
+	ImGui::SameLine();
+	if (ImGui::Button("Cancel")) {
+		g_ui.overlay_review_declaration.clear();
+		g_ui.overlay_review_name.clear();
+		g_ui.overlay_review_publication.reset();
+		g_ui.overlay_review_workspace.reset();
+		ImGui::CloseCurrentPopup();
+	}
+	if (!current)
+		ImGui::TextDisabled("The workspace, analysis, or overlay revision changed. Cancel and select the type again.");
+	ImGui::EndPopup();
+}
+
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -1051,6 +1168,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
 	auto& ui = g_ui;
 	auto& st = struct_dissector::g_state;
+	render_overlay_declaration_review();
 	const float dt = aida::ui::clock::dt();
 	const float line_h = 36.f;
 	const float top_bar_h = 52.f;
@@ -1442,6 +1560,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				compact ? aida::ui::scale_px(132.0f, scale) :
 					(std::max)(aida::ui::scale_px(180.0f, scale), ImGui::GetContentRegionAvail().y));
 			bool focus_first_invalid = false;
+			std::uint64_t enum_context_id = 0;
+			aida::ui::context_menu_open_origin_t enum_context_origin =
+				aida::ui::context_menu_open_origin_t::pointer;
 			ImGui::BeginChild("##sd_enum_list", list_size, true);
 			if (ImGui::Button("New Enum", ImVec2(-1.0f, 0.0f))) {
 				ui.selected_enum_id = 0;
@@ -1493,6 +1614,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					ui.enum_values_buf[sizeof(ui.enum_values_buf) - 1] = '\0';
 					ui.enum_form_refresh = true;
 				}
+				if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+					enum_context_id = definition.stable_id;
+					enum_context_origin = aida::ui::context_menu_open_origin_t::pointer;
+				}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 				aida::preview::semantics::register_last_item(
 					aida::preview::semantics::stable_id("aida.types.enum-manager.row",
@@ -1500,7 +1625,177 @@ inline void render(float pos_x, float pos_y, float width, float height,
 #endif
 				ImGui::PopID();
 			}
+			const bool enum_list_focused = ImGui::IsWindowFocused();
+			if (enum_context_id == 0 && enum_list_focused && ui.selected_enum_id != 0 &&
+				(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+				 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+				enum_context_id = ui.selected_enum_id;
+				enum_context_origin = ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+					? aida::ui::context_menu_open_origin_t::menu_key
+					: aida::ui::context_menu_open_origin_t::shift_f10;
+			}
 			ImGui::EndChild();
+			if (enum_context_id != 0) {
+				const auto selected = std::find_if(enums.begin(), enums.end(),
+					[&](const auto& item) { return item.stable_id == enum_context_id; });
+				if (selected != enums.end()) {
+					const auto snapshot = *selected;
+					const std::uint64_t retained_revision = schema_revision;
+					const auto resolve_enum = [id = snapshot.stable_id,
+						name = snapshot.name, retained_revision]()
+						-> std::optional<struct_dissector::enum_def_t> {
+						auto& state = struct_dissector::g_state;
+						std::lock_guard<std::mutex> lock(state.mtx);
+						if (state.schema_revision != retained_revision)
+							return std::nullopt;
+						const auto found = std::find_if(state.enums.begin(), state.enums.end(),
+							[&](const auto& item) {
+								return item.stable_id == id && item.name == name;
+							});
+						return found == state.enums.end()
+							? std::optional<struct_dissector::enum_def_t>{}
+							: std::optional<struct_dissector::enum_def_t>{*found};
+					};
+					aida::ui::application_ui::retained_entity_context_t retained;
+					retained.owner_id = "types.dissector.enum";
+					retained.entity_id = std::to_string(snapshot.stable_id);
+					retained.entity_generation = retained_revision;
+					retained.active_view = aida::ui::stable_view_id_t("view.types.dissector");
+					const auto enum_workspace = disasm_view::capture_selected_workspace();
+					const std::string enum_workspace_id = enum_workspace.workspace
+						? enum_workspace.workspace->identity().binary_id().to_hex() : std::string{};
+					const std::uint64_t enum_workspace_generation = enum_workspace.workspace
+						? enum_workspace.workspace->generation() : 0;
+					const std::uint64_t enum_analysis_revision = enum_workspace.publication
+						? enum_workspace.publication->analysis_revision : 0;
+					retained.validate_identity = [resolve_enum, enum_workspace,
+						enum_workspace_id,
+						enum_workspace_generation, enum_analysis_revision] {
+						const auto selected = disasm_view::capture_selected_workspace();
+						const bool workspace_current = enum_workspace_id.empty()
+							? !selected.workspace
+							: enum_workspace.workspace && enum_workspace.publication &&
+							  selected.workspace && selected.publication &&
+							  selected.workspace == enum_workspace.workspace &&
+							  selected.publication == enum_workspace.publication &&
+							  selected.workspace->identity().binary_id().to_hex() == enum_workspace_id &&
+							  selected.workspace->generation() == enum_workspace_generation &&
+							  selected.publication->analysis_revision == enum_analysis_revision;
+						return resolve_enum() && workspace_current
+							? aida::ui::capability_state_t::available()
+							: aida::ui::capability_state_t::unavailable(
+								"The enum catalog or selected workspace changed; select the enum again");
+					};
+					const auto add = [&retained](const char* id, bool enabled,
+						const char* reason, auto invoke) {
+						retained.actions.push_back({id,
+							enabled ? aida::ui::capability_state_t::available()
+								: aida::ui::capability_state_t::unavailable(reason),
+							std::move(invoke)});
+					};
+					const std::string declaration = export_enum_to_c(snapshot);
+					add("types.dissector.enum.export_declaration", !declaration.empty(),
+						"The enum exceeds the bounded 64 KiB export limit",
+						[resolve_enum, declaration] {
+							if (!resolve_enum())
+								return aida::ui::action_handler_result_t::failed(
+									"The retained enum is stale");
+							ImGui::SetClipboardText(declaration.c_str());
+							return aida::ui::action_handler_result_t::completed();
+						});
+					const bool persistence_available =
+						!st.persistence_in_flight.load(std::memory_order_acquire);
+					add("types.dissector.enum.duplicate", persistence_available,
+						"Another structure catalog operation is running",
+						[resolve_enum] {
+							auto duplicate = resolve_enum();
+							if (!duplicate)
+								return aida::ui::action_handler_result_t::failed(
+									"The retained enum is stale");
+							duplicate->stable_id = 0;
+							auto rollback_state =
+								struct_dissector::capture_catalog_transaction();
+							std::uint64_t expected_revision = 0;
+							{
+								auto& state = struct_dissector::g_state;
+								std::lock_guard<std::mutex> lock(state.mtx);
+								if (state.persistence_in_flight.load(std::memory_order_acquire))
+									return aida::ui::action_handler_result_t::failed(
+										"Another structure catalog operation started before duplication");
+								expected_revision = state.schema_revision;
+								std::string base = duplicate->name + "_copy";
+								if (base.size() > 240) base.resize(240);
+								duplicate->name = base;
+								for (std::size_t suffix = 2; suffix <= 4096 &&
+									std::any_of(state.enums.begin(), state.enums.end(),
+										[&](const auto& item) { return item.name == duplicate->name; }); ++suffix)
+									duplicate->name = base + "_" + std::to_string(suffix);
+								if (std::any_of(state.enums.begin(), state.enums.end(),
+									[&](const auto& item) { return item.name == duplicate->name; }))
+									return aida::ui::action_handler_result_t::failed(
+										"A bounded unique enum name could not be allocated");
+							}
+							if (!struct_dissector::upsert_enum_exact(*duplicate, expected_revision)) {
+								if (!struct_dissector::rollback_catalog_transaction(
+										std::move(rollback_state), expected_revision))
+									return aida::ui::action_handler_result_t::failed(
+										"Enum duplication failed and exact catalog rollback was blocked");
+								return aida::ui::action_handler_result_t::failed(
+									"The enum duplicate failed exact catalog validation; no mutation was retained");
+							}
+							std::uint64_t created_id = 0;
+							std::uint64_t created_revision = 0;
+							{
+								auto& state = struct_dissector::g_state;
+								std::lock_guard<std::mutex> lock(state.mtx);
+								const auto found = std::find_if(state.enums.begin(), state.enums.end(),
+									[&](const auto& item) { return item.name == duplicate->name; });
+								if (found != state.enums.end()) created_id = found->stable_id;
+								created_revision = state.schema_revision;
+							}
+							if (created_id == 0 || !struct_dissector::request_save_schema()) {
+								if (!struct_dissector::rollback_catalog_transaction(
+										std::move(rollback_state), created_revision))
+									return aida::ui::action_handler_result_t::failed(
+										"The durable save was rejected and exact enum rollback was blocked");
+								return aida::ui::action_handler_result_t::failed(
+									"The durable save was not queued; the enum duplicate was rolled back");
+							}
+							return aida::ui::action_handler_result_t::completed(
+								"Enum duplicate created; durable catalog save queued");
+						});
+					add("types.dissector.enum.review_global_overlay",
+						!enum_workspace_id.empty() && !declaration.empty(),
+						enum_workspace_id.empty()
+							? "Select an analysis workspace before reviewing global propagation"
+							: "The enum cannot produce a bounded declaration",
+						[resolve_enum, name = snapshot.name, declaration] {
+							if (!resolve_enum())
+								return aida::ui::action_handler_result_t::failed(
+									"The retained enum is stale");
+							return stage_overlay_declaration_review(name, declaration);
+						});
+					aida::automation_ui::entity_evidence::snapshot_t evidence;
+					evidence.workspace_id = enum_workspace.workspace
+						? enum_workspace.workspace->identity().binary_id().to_hex() : "types.catalog";
+					evidence.source_view_id = "view.types.dissector";
+					evidence.source_kind = "editable_enum";
+					evidence.entity_id = retained.entity_id;
+					evidence.display_label = snapshot.name;
+					evidence.excerpt = declaration;
+					evidence.revision = retained_revision;
+					evidence.generation = enum_workspace_generation;
+					aida::automation_ui::entity_evidence::append_actions(retained,
+						std::move(evidence), declaration.empty()
+							? aida::ui::capability_state_t::unavailable(
+								"The enum has no bounded declaration evidence")
+							: aida::ui::capability_state_t::available());
+					aida::ui::application_ui::open_retained_entity_context_menu(
+						std::move(retained), enum_context_origin);
+				}
+			}
+			aida::ui::application_ui::render_retained_entity_context_menu(
+				"types.dissector.enum");
 			if (!compact)
 				ImGui::SameLine();
 			ImGui::BeginGroup();
@@ -1980,25 +2275,29 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (structure_context_requested) {
 		struct_dissector::struct_def_t snapshot;
 		bool valid_structure = false;
+		std::uint64_t retained_schema_revision = 0;
 		{
 			std::lock_guard<std::mutex> lock(st.mtx);
 			if (struct_dissector::valid_index(
 					structure_context_index, st.structs.size())) {
 				snapshot = st.structs[
 					static_cast<std::size_t>(structure_context_index)];
+				retained_schema_revision = st.schema_revision;
 				valid_structure = snapshot.stable_id != 0;
 			}
 		}
 		if (valid_structure) {
 			const std::uint64_t retained_id = snapshot.stable_id;
 			const std::uint64_t retained_revision = snapshot.layout_revision;
-			const auto resolve_structure = [retained_id, retained_revision]()
+			const auto resolve_structure = [retained_id, retained_revision,
+				retained_schema_revision]()
 				-> std::optional<int> {
 				auto& state = struct_dissector::g_state;
 				std::lock_guard<std::mutex> lock(state.mtx);
 				const int index =
 					struct_dissector::structure_index_by_id_locked(retained_id);
-				if (!struct_dissector::valid_index(index, state.structs.size()) ||
+				if (state.schema_revision != retained_schema_revision ||
+					!struct_dissector::valid_index(index, state.structs.size()) ||
 					state.structs[static_cast<std::size_t>(index)].stable_id !=
 						retained_id ||
 					state.structs[static_cast<std::size_t>(index)].layout_revision !=
@@ -2012,11 +2311,30 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			retained.entity_generation = retained_revision;
 			retained.active_view =
 				aida::ui::stable_view_id_t("view.types.dissector");
-			retained.validate_identity = [resolve_structure] {
-				return resolve_structure()
+			const auto structure_workspace = disasm_view::capture_selected_workspace();
+			const std::string structure_workspace_id = structure_workspace.workspace
+				? structure_workspace.workspace->identity().binary_id().to_hex() : std::string{};
+			const std::uint64_t structure_workspace_generation = structure_workspace.workspace
+				? structure_workspace.workspace->generation() : 0;
+			const std::uint64_t structure_analysis_revision = structure_workspace.publication
+				? structure_workspace.publication->analysis_revision : 0;
+			retained.validate_identity = [resolve_structure, structure_workspace,
+				structure_workspace_id,
+				structure_workspace_generation, structure_analysis_revision] {
+				const auto selected = disasm_view::capture_selected_workspace();
+				const bool workspace_current = structure_workspace_id.empty()
+					? !selected.workspace
+					: structure_workspace.workspace && structure_workspace.publication &&
+					  selected.workspace && selected.publication &&
+					  selected.workspace == structure_workspace.workspace &&
+					  selected.publication == structure_workspace.publication &&
+					  selected.workspace->identity().binary_id().to_hex() == structure_workspace_id &&
+					  selected.workspace->generation() == structure_workspace_generation &&
+					  selected.publication->analysis_revision == structure_analysis_revision;
+				return resolve_structure() && workspace_current
 					? aida::ui::capability_state_t::available()
 					: aida::ui::capability_state_t::unavailable(
-						"The structure layout changed; select it again");
+						"The structure layout or selected workspace changed; select it again");
 			};
 			auto add_structure_action = [&retained](std::string id,
 				bool enabled, const char* reason,
@@ -2063,6 +2381,106 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					ImGui::SetClipboardText(declaration.c_str());
 					return aida::ui::action_handler_result_t::completed();
 				});
+			const std::string retained_declaration =
+				struct_dissector::export_to_c(structure_context_index);
+			const bool persistence_available =
+				!st.persistence_in_flight.load(std::memory_order_acquire);
+			add_structure_action("types.dissector.structure.export_declaration",
+				!retained_declaration.empty() && retained_declaration.size() <= 64U * 1024U,
+				"The declaration is empty or exceeds the bounded 64 KiB export limit",
+				[resolve_structure, retained_declaration] {
+					if (!resolve_structure())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					ImGui::SetClipboardText(retained_declaration.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_structure_action("types.dissector.structure.review_global_overlay",
+				!structure_workspace_id.empty() && !retained_declaration.empty() &&
+					retained_declaration.size() <= 64U * 1024U,
+				structure_workspace_id.empty()
+					? "Select an analysis workspace before reviewing global propagation"
+					: "The declaration is empty or exceeds the bounded review contract",
+				[resolve_structure, name = snapshot.name, retained_declaration] {
+					if (!resolve_structure())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					return stage_overlay_declaration_review(name, retained_declaration);
+				});
+			add_structure_action("types.dissector.structure.duplicate",
+				persistence_available && snapshot.fields.size() <= 65536,
+				!persistence_available ? "Another structure catalog operation is running"
+					: "The structure exceeds the bounded mutable field limit",
+				[resolve_structure, snapshot] {
+					if (!resolve_structure())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					auto rollback_state = struct_dissector::capture_catalog_transaction();
+					std::string base = snapshot.name + "_copy";
+					if (base.size() > 240) base.resize(240);
+					std::string name = base;
+					{
+						auto& state = struct_dissector::g_state;
+						std::lock_guard<std::mutex> lock(state.mtx);
+						if (state.persistence_in_flight.load(std::memory_order_acquire))
+							return aida::ui::action_handler_result_t::failed(
+								"Another structure catalog operation started before duplication");
+						for (std::size_t suffix = 2; suffix <= 1024 &&
+							std::any_of(state.structs.begin(), state.structs.end(),
+								[&](const auto& item) { return item.name == name; }); ++suffix)
+							name = base + "_" + std::to_string(suffix);
+						if (std::any_of(state.structs.begin(), state.structs.end(),
+							[&](const auto& item) { return item.name == name; }))
+							return aida::ui::action_handler_result_t::failed(
+								"A bounded unique structure name could not be allocated");
+					}
+					const int created = struct_dissector::create_struct(name);
+					if (created < 0)
+						return aida::ui::action_handler_result_t::failed(
+							"The mutable catalog rejected the duplicate structure");
+					std::uint64_t created_id = 0;
+					{
+						auto& state = struct_dissector::g_state;
+						std::lock_guard<std::mutex> lock(state.mtx);
+						if (struct_dissector::valid_index(created, state.structs.size()))
+							created_id = state.structs[static_cast<std::size_t>(created)].stable_id;
+					}
+					bool complete = created_id != 0 &&
+						struct_dissector::set_structure_kind(created, snapshot.kind) &&
+						struct_dissector::set_structure_packing(created, snapshot.packing) &&
+						struct_dissector::set_structure_alignment(created,
+							snapshot.explicit_alignment);
+					for (const auto& source : snapshot.fields) {
+						if (!complete) break;
+						auto field = source;
+						field.stable_id = 0;
+						field.children.clear();
+						if (field.target_structure_id == snapshot.stable_id) {
+							field.target_structure_id = created_id;
+							field.pointer_target_struct = created;
+						}
+						complete = struct_dissector::add_field(created, field) >= 0;
+					}
+					if (!complete || !struct_dissector::request_save_schema()) {
+						const bool rolled_back = struct_dissector::rollback_catalog_transaction(
+							std::move(rollback_state), struct_dissector::catalog_schema_revision());
+						if (!rolled_back)
+							return aida::ui::action_handler_result_t::failed(
+								"The duplicate failed and exact catalog rollback was blocked");
+						return aida::ui::action_handler_result_t::failed(complete
+							? "The durable catalog save was not queued; the duplicate was rolled back"
+							: "The duplicate failed layout validation and was rolled back");
+					}
+					{
+						auto& state = struct_dissector::g_state;
+						std::lock_guard<std::mutex> lock(state.mtx);
+						state.active_struct = created;
+					}
+					g_ui.selected_field = -1;
+					g_ui.editing_field = -1;
+					return aida::ui::action_handler_result_t::completed(
+						"Structure duplicate created; durable catalog save queued");
+				});
 			add_structure_action(
 				"types.dissector.structure.configure_layout", true,
 				"The retained structure is stale", [resolve_structure] {
@@ -2098,8 +2516,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						: aida::ui::action_handler_result_t::failed(
 							"The structure kind change failed validation");
 				});
-			const bool persistence_available =
-				!st.persistence_in_flight.load(std::memory_order_acquire);
 			add_structure_action("types.dissector.structure.save_catalog",
 				persistence_available,
 				"Another structure catalog operation is running",
@@ -2126,6 +2542,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						: aida::ui::action_handler_result_t::failed(
 							"Structure schema load was not queued");
 				});
+			auto workspace = disasm_view::capture_selected_workspace();
+			aida::automation_ui::entity_evidence::snapshot_t evidence;
+			evidence.workspace_id = workspace.workspace
+				? workspace.workspace->identity().binary_id().to_hex() : "types.catalog";
+			evidence.source_view_id = "view.types.dissector";
+			evidence.source_kind = snapshot.kind == struct_dissector::structure_kind_t::union_type
+				? "editable_union" : "editable_structure";
+			evidence.entity_id = retained.entity_id;
+			evidence.display_label = snapshot.name;
+			evidence.excerpt = retained_declaration;
+			evidence.revision = snapshot.layout_revision;
+			evidence.generation = workspace.workspace ? workspace.workspace->generation() : 0;
+			aida::automation_ui::entity_evidence::append_actions(retained,
+				std::move(evidence), retained_declaration.empty()
+					? aida::ui::capability_state_t::unavailable(
+						"The retained structure has no bounded declaration")
+					: aida::ui::capability_state_t::available());
 			aida::ui::application_ui::open_retained_entity_context_menu(
 				std::move(retained), structure_context_origin);
 		} else {
@@ -2726,6 +3159,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			bool valid_field = false;
 			std::uint64_t retained_structure_id = 0;
 			std::uint64_t retained_structure_revision = 0;
+			std::uint64_t retained_schema_revision = 0;
+			std::string retained_structure_name;
 			{
 				std::lock_guard<std::mutex> lk(st.mtx);
 				if (struct_dissector::valid_index(active_idx, st.structs.size())) {
@@ -2736,6 +3171,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						field_snapshot = fields[static_cast<std::size_t>(tgt_field)];
 						retained_structure_id = selected.stable_id;
 						retained_structure_revision = selected.layout_revision;
+						retained_schema_revision = st.schema_revision;
+						retained_structure_name = selected.name;
 						if (static_cast<std::size_t>(tgt_field) < st.cached_values.size())
 							value_snapshot = st.cached_values[static_cast<std::size_t>(tgt_field)];
 						valid_field = true;
@@ -2762,16 +3199,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::to_string(field_snapshot.stable_id);
 			retained.entity_generation = retained_structure_revision;
 			retained.active_view = aida::ui::stable_view_id_t("view.types.dissector");
+			const auto retained_workspace = disasm_view::capture_selected_workspace();
+			const std::uint64_t retained_workspace_generation = retained_workspace.workspace
+				? retained_workspace.workspace->generation() : 0;
+			const std::uint64_t retained_analysis_revision = retained_workspace.publication
+				? retained_workspace.publication->analysis_revision : 0;
+			const std::string retained_workspace_id = retained_workspace.workspace
+				? retained_workspace.workspace->identity().binary_id().to_hex() : std::string{};
 			const std::uint64_t retained_field_id = field_snapshot.stable_id;
 			const auto resolve_field = [retained_structure_id,
-				retained_structure_revision, retained_field_id]()
+				retained_structure_revision, retained_field_id,
+				retained_schema_revision]()
 				-> std::optional<std::pair<int, int>> {
 				auto& state = struct_dissector::g_state;
 				std::lock_guard<std::mutex> lock(state.mtx);
 				const int structure_index =
 					struct_dissector::structure_index_by_id_locked(
 						retained_structure_id);
-				if (!struct_dissector::valid_index(
+				if (state.schema_revision != retained_schema_revision ||
+					!struct_dissector::valid_index(
 						structure_index, state.structs.size()))
 					return std::nullopt;
 				const auto& structure =
@@ -2793,11 +3239,27 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				return std::pair<int, int>{structure_index,
 					static_cast<int>(distance)};
 			};
-			retained.validate_identity = [resolve_field] {
-				return resolve_field()
+			retained.validate_identity = [resolve_field, retained_workspace,
+				retained_workspace_generation, retained_analysis_revision,
+				retained_workspace_id] {
+				const auto selected = disasm_view::capture_selected_workspace();
+				const bool workspace_current = retained_workspace_id.empty()
+					? !selected.workspace
+					: retained_workspace.publication && selected.workspace &&
+					 selected.publication &&
+					 selected.workspace == retained_workspace.workspace &&
+					 selected.publication == retained_workspace.publication &&
+					 !retained_workspace.workspace->closing() &&
+					 !retained_workspace.workspace->closed() &&
+					 selected.workspace->identity().binary_id().to_hex() == retained_workspace_id &&
+					 selected.workspace->generation() == retained_workspace_generation &&
+					 selected.publication->analysis_revision == retained_analysis_revision &&
+					 retained_workspace.workspace->generation() == retained_workspace_generation &&
+					 retained_workspace.publication->analysis_revision == retained_analysis_revision;
+				return resolve_field() && workspace_current
 					? aida::ui::capability_state_t::available()
 					: aida::ui::capability_state_t::unavailable(
-						"The structure or retained field changed; select it again");
+						"The structure, field, or selected workspace changed; select it again");
 			};
 			auto add_action = [&retained](std::string id, bool enabled,
 				const char* reason,
@@ -2892,8 +3354,115 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						"The retained field is stale");
 				}
 				ImGui::SetClipboardText(display_value.c_str());
-				return aida::ui::action_handler_result_t::completed();
-			});
+					return aida::ui::action_handler_result_t::completed();
+				});
+			const std::string field_declaration = std::string(
+				struct_dissector::field_type_name(field_snapshot.type)) + " " +
+				field_snapshot.name + (field_snapshot.array_count > 1
+					? "[" + std::to_string(field_snapshot.array_count) + "]" : "") +
+				"; /* +0x" + [&] {
+					char value[16]{};
+					std::snprintf(value, sizeof(value), "%X", field_snapshot.offset);
+					return std::string(value);
+				}() + " */";
+			const bool field_persistence_available =
+				!st.persistence_in_flight.load(std::memory_order_acquire);
+			std::string containing_declaration;
+			{
+				const auto resolved = resolve_field();
+				if (resolved)
+					containing_declaration = struct_dissector::export_to_c(resolved->first);
+			}
+			add_action("types.dissector.field.export_declaration",
+				field_declaration.size() <= 4096,
+				"The field declaration exceeds the bounded export limit",
+				[resolve_field, field_declaration] {
+					if (!resolve_field())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained field is stale");
+					ImGui::SetClipboardText(field_declaration.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_action("types.dissector.field.duplicate", valid_field &&
+				field_persistence_available && field_snapshot.parent_idx < 0 &&
+				field_snapshot.children.empty(),
+				!field_persistence_available ? "Another structure catalog operation is running"
+					: "Only a current leaf top-level field can be duplicated without losing hierarchy",
+				[activate_retained_field, field_snapshot] {
+					const auto resolved = activate_retained_field();
+					if (!resolved)
+						return aida::ui::action_handler_result_t::failed(
+							"The retained field is stale");
+					auto rollback_state = struct_dissector::capture_catalog_transaction();
+					struct_dissector::field_def_t duplicate = field_snapshot;
+					duplicate.stable_id = 0;
+					duplicate.parent_idx = -1;
+					duplicate.children.clear();
+					{
+						auto& state = struct_dissector::g_state;
+						std::lock_guard<std::mutex> lock(state.mtx);
+						if (state.persistence_in_flight.load(std::memory_order_acquire))
+							return aida::ui::action_handler_result_t::failed(
+								"Another structure catalog operation started before duplication");
+						if (!struct_dissector::valid_index(resolved->first, state.structs.size()))
+							return aida::ui::action_handler_result_t::failed(
+								"The retained structure is stale");
+						const auto& structure = state.structs[static_cast<std::size_t>(resolved->first)];
+						std::string base = duplicate.name + "_copy";
+						if (base.size() > 240) base.resize(240);
+						duplicate.name = base;
+						for (std::size_t suffix = 2; suffix <= 65536 &&
+							std::any_of(structure.fields.begin(), structure.fields.end(),
+								[&](const auto& item) { return item.name == duplicate.name; }); ++suffix)
+							duplicate.name = base + "_" + std::to_string(suffix);
+						if (std::any_of(structure.fields.begin(), structure.fields.end(),
+							[&](const auto& item) { return item.name == duplicate.name; }))
+							return aida::ui::action_handler_result_t::failed(
+								"A bounded unique field name could not be allocated");
+						if (structure.kind == struct_dissector::structure_kind_t::union_type)
+							duplicate.offset = 0;
+						else {
+							const std::uint32_t alignment = duplicate.explicit_alignment != 0
+								? duplicate.explicit_alignment
+								: static_cast<std::uint32_t>((std::min)(
+									struct_dissector::field_type_size(duplicate.type),
+									static_cast<std::size_t>(8)));
+							duplicate.offset = struct_dissector::align_up_u32(
+								structure.total_size, alignment == 0 ? 1 : alignment);
+						}
+					}
+					const int created = struct_dissector::add_field(resolved->first, duplicate);
+					if (created < 0) {
+						if (!struct_dissector::rollback_catalog_transaction(
+								std::move(rollback_state), struct_dissector::catalog_schema_revision()))
+							return aida::ui::action_handler_result_t::failed(
+								"Field duplication failed and exact catalog rollback was blocked");
+						return aida::ui::action_handler_result_t::failed(
+							"The duplicated field failed layout validation; no mutation was retained");
+					}
+					if (!struct_dissector::request_save_schema()) {
+						if (!struct_dissector::rollback_catalog_transaction(
+								std::move(rollback_state), struct_dissector::catalog_schema_revision()))
+							return aida::ui::action_handler_result_t::failed(
+								"The durable save was rejected and exact field rollback was blocked");
+						return aida::ui::action_handler_result_t::failed(
+							"The durable catalog save was not queued; the duplicate was rolled back");
+					}
+					return aida::ui::action_handler_result_t::completed(
+						"Field duplicate created; durable catalog save queued");
+				});
+			add_action("types.dissector.field.review_containing_type_global",
+				static_cast<bool>(retained_workspace) && !containing_declaration.empty() &&
+					containing_declaration.size() <= 64U * 1024U,
+				!retained_workspace
+					? "Select an analysis workspace before reviewing global propagation"
+					: "The containing type cannot produce a bounded global declaration",
+				[resolve_field, name = retained_structure_name, containing_declaration] {
+					if (!resolve_field())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained field is stale");
+					return stage_overlay_declaration_review(name, containing_declaration);
+				});
 			add_action("types.dissector.field.edit_live_value",
 				live_current && !value_snapshot.raw_bytes.empty(),
 				"Attach the original target and reselect the field before editing live memory",
@@ -3046,6 +3615,59 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				g_ui.remove_confirmation_requested = true;
 				return aida::ui::action_handler_result_t::completed();
 			});
+			aida::automation_ui::entity_evidence::snapshot_t evidence;
+			evidence.workspace_id = retained_workspace.workspace
+				? retained_workspace.workspace->identity().binary_id().to_hex()
+				: "types.catalog";
+			evidence.source_view_id = "view.types.dissector";
+			evidence.source_kind = "editable_structure_field";
+			evidence.entity_id = retained.entity_id;
+			evidence.display_label = retained_structure_name + "." + field_snapshot.name;
+			constexpr std::size_t maximum_evidence_bytes = 64U * 1024U;
+			const auto append_evidence = [&](const std::string& value) {
+				if (value.size() > maximum_evidence_bytes - evidence.excerpt.size())
+					return false;
+				evidence.excerpt.append(value);
+				return true;
+			};
+			const bool evidence_bounded = append_evidence(field_declaration) &&
+				append_evidence("\nSize: ") &&
+				append_evidence(std::to_string(field_snapshot.size)) &&
+				append_evidence("\nArray count: ") &&
+				append_evidence(std::to_string(field_snapshot.array_count)) &&
+				append_evidence("\nComment: ") &&
+				append_evidence(field_snapshot.description) &&
+				(display_value.empty() || (append_evidence("\nCurrent value: ") &&
+					append_evidence(display_value)));
+			if (!evidence_bounded)
+				evidence.excerpt.clear();
+			evidence.address = ui.context_base_address != 0 ? absolute_address : 0;
+			evidence.revision = retained_structure_revision;
+			evidence.generation = retained_workspace_generation;
+			evidence.sensitive = live_current;
+			evidence.return_to_source = [resolve_field, retained_workspace_id,
+				retained_workspace_generation, retained_analysis_revision](std::string& reason) {
+				const auto selected = disasm_view::capture_selected_workspace();
+				const bool workspace_current = retained_workspace_id.empty()
+					? !selected.workspace
+					: selected.workspace && selected.publication &&
+					  selected.workspace->identity().binary_id().to_hex() == retained_workspace_id &&
+					  selected.workspace->generation() == retained_workspace_generation &&
+					  selected.publication->analysis_revision == retained_analysis_revision;
+				if (!workspace_current || !resolve_field()) {
+					reason = "The editable structure field changed; capture it again.";
+					return false;
+				}
+				const auto opened = aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.types.dissector"));
+				reason = opened.ok() ? std::string{} : opened.detail;
+				return opened.ok();
+			};
+			aida::automation_ui::entity_evidence::append_actions(retained,
+				std::move(evidence), evidence_bounded
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(
+						"The field evidence exceeds the bounded 64 KiB contract"));
 			aida::ui::application_ui::open_retained_entity_context_menu(
 				std::move(retained), ctx_open_origin);
 			}

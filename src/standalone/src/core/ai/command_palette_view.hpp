@@ -58,7 +58,6 @@ namespace command_palette {
 
 		inline ui::transition_t& open_anim()        { static ui::transition_t t; return t; }
 		inline ui::transition_t& close_anim()       { static ui::transition_t t; return t; }
-		inline ui::transition_t& filter_xfade()     { static ui::transition_t t; return t; }
 		inline ui::transition_t& preview_anim()     { static ui::transition_t t; return t; }
 		inline std::vector<ui::transition_t>& row_anims() {
 			static std::vector<ui::transition_t> v; return v;
@@ -232,7 +231,6 @@ namespace command_palette {
 			is_closing() = false;
 			open_anim().reset();
 			close_anim().reset();
-			filter_xfade().reset();
 			preview_anim().reset();
 			row_anims().clear();
 			preview_state().key.clear();
@@ -290,25 +288,27 @@ namespace command_palette {
 		                                float radius, float open_t, float close_t)
 		{
 			const auto& th = ui::resolved();
+			const float visibility = (std::clamp)(open_t * (1.f - close_t), 0.f, 1.f);
 
 			const int   shadow_passes = std::max(1, static_cast<int>(floorf(open_t * 4.5f)) - static_cast<int>(floorf(close_t * 4.0f)));
-			const float shadow_strength = 0.40f * open_t * (1.f - close_t);
+			const float shadow_strength = 0.40f * visibility;
 			ui::blur::render_drop_shadow(dl, a, b, radius, shadow_passes, shadow_strength,
 				ImVec2(0.f, 6.f + 2.f * (1.f - open_t)));
 
-			ImU32 fill = ui::with_alpha(th.bg_overlay, 0.92f);
-			ImU32 tint = ui::with_alpha(th.glass_tint, 0.65f);
+			ImU32 fill = ui::with_alpha(th.bg_overlay, 0.92f * visibility);
+			ImU32 tint = ui::with_alpha(th.glass_tint, 0.65f * visibility);
 			dl->AddRectFilled(a, b, fill, radius);
 			dl->AddRectFilled(a, b, tint, radius);
 
-			ImU32 grad_top = ui::with_alpha(th.accent_grad_top, 0.10f);
-			ImU32 grad_bot = ui::with_alpha(th.accent_grad_bot, 0.04f);
+			ImU32 grad_top = ui::with_alpha(th.accent_grad_top, 0.10f * visibility);
+			ImU32 grad_bot = ui::with_alpha(th.accent_grad_bot, 0.04f * visibility);
 			ImU32 grad_flat = ui::mix(grad_top, grad_bot, 0.5f);
 			dl->AddRectFilled(a, b, grad_flat, radius);
 
-			ui::blur::render_glass_border(dl, a, b, radius, 1.f, 1.f);
+			if (close_t <= 0.f)
+				ui::blur::render_glass_border(dl, a, b, radius, 1.f, 1.f);
 
-			ImU32 inner = ui::with_alpha(th.accent_glow, 0.55f);
+			ImU32 inner = ui::with_alpha(th.accent_glow, 0.55f * visibility);
 			ui::blur::render_inner_glow(dl, a, b, radius, inner, 3);
 		}
 
@@ -780,7 +780,6 @@ namespace command_palette {
 			open_anim().reset();
 			open_anim().start(0.220f, motion::ease::out_back);
 			close_anim().reset();
-			filter_xfade().reset();
 			preview_anim().reset();
 			preview_anim().start(0.220f, motion::ease::out_cubic);
 			row_anims().clear();
@@ -788,7 +787,6 @@ namespace command_palette {
 
 		open_anim().tick(dt);
 		close_anim().tick(dt);
-		filter_xfade().tick(dt);
 		preview_anim().tick(dt);
 
 		if (is_closing() && close_anim().is_finished()) {
@@ -804,37 +802,6 @@ namespace command_palette {
 		}
 
 		was_open_last_frame() = true;
-
-		const std::string current_query(globals::ui::command_palette_buf);
-		const bool query_changed = (current_query != last_query());
-
-		std::vector<commands::command_t> hits = commands::fuzzy_search(current_query, 256);
-
-		std::sort(hits.begin(), hits.end(), [](const commands::command_t& a, const commands::command_t& b) {
-			category_t ca = classify(a);
-			category_t cb = classify(b);
-			if (ca != cb) return static_cast<int>(ca) < static_cast<int>(cb);
-			return a.name < b.name;
-		});
-
-		const int hit_count = static_cast<int>(hits.size());
-		if (selected_index() >= hit_count) selected_index() = std::max(0, hit_count - 1);
-		if (selected_index() < 0) selected_index() = 0;
-
-		std::string new_results_key = compute_results_key(hits);
-		if (query_changed) {
-			last_query() = current_query;
-			selected_index() = 0;
-		}
-
-		if (new_results_key != last_result_key()) {
-			retrigger_row_anims(hits.size());
-			filter_xfade().reset();
-			filter_xfade().start(0.140f, motion::ease::out_cubic);
-			last_result_key() = new_results_key;
-		} else {
-			ensure_row_anims(hits.size());
-		}
 
 		const float open_t = open_anim().eased();
 		const float close_t = is_closing() ? close_anim().eased() : 0.f;
@@ -870,10 +837,9 @@ namespace command_palette {
 		const ImVec2 card_b(palette_x + draw_w, palette_y + draw_h);
 		const float card_radius = 8.f * dpi;
 
-		render_card_chrome(fdl, card_a, card_b, card_radius, open_t, close_t);
-
 		ImGui::SetNextWindowPos(card_a);
 		ImGui::SetNextWindowSize(ImVec2(draw_w, draw_h));
+		if (just_opened) ImGui::SetNextWindowFocus();
 
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
 		ImGui::PushStyleColor(ImGuiCol_Border,   ImVec4(0, 0, 0, 0));
@@ -888,8 +854,7 @@ namespace command_palette {
 			ImGuiWindowFlags_NoTitleBar   | ImGuiWindowFlags_NoResize |
 			ImGuiWindowFlags_NoMove       | ImGuiWindowFlags_NoCollapse |
 			ImGuiWindowFlags_NoSavedSettings |
-			ImGuiWindowFlags_NoScrollbar  | ImGuiWindowFlags_NoScrollWithMouse |
-			ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing;
+			ImGuiWindowFlags_NoScrollbar  | ImGuiWindowFlags_NoScrollWithMouse;
 #ifdef IMGUI_HAS_DOCK
 		flags |= ImGuiWindowFlags_NoDocking;
 #endif
@@ -901,6 +866,8 @@ namespace command_palette {
 			ImGui::PopStyleColor(3);
 			return;
 		}
+		ImDrawList* palette_draw_list = ImGui::GetWindowDrawList();
+		render_card_chrome(palette_draw_list, card_a, card_b, card_radius, open_t, close_t);
 
 		const float logical_width = draw_w / dpi;
 		const float logical_height = draw_h / dpi;
@@ -909,32 +876,24 @@ namespace command_palette {
 		const float footer_h = (compact_layout ? 30.f : 38.f) * dpi;
 		const float side_pad = (compact_layout ? 10.f : 18.f) * dpi;
 
-		const bool wide_enough_for_preview = logical_width >= 680.f &&
-			logical_height >= 420.f && dpi <= 1.01f;
-		const bool show_preview = preview_visible() && hit_count > 0 && wide_enough_for_preview;
-
-		const float list_w = show_preview ? (draw_w - side_pad * 3.f) * 0.58f : (draw_w - side_pad * 2.f);
-		const float preview_w = show_preview ? (draw_w - side_pad * 3.f) - list_w : 0.f;
-		(void)preview_w;
-
 		ImVec2 input_a(card_a.x + side_pad, card_a.y + side_pad);
 		ImVec2 input_b(card_b.x - side_pad, input_a.y + input_h);
 		{
 			ImU32 fill = ui::with_alpha(th.bg_elevated, 0.85f * close_alpha);
-			fdl->AddRectFilled(input_a, input_b, fill, 6.f * dpi);
+			palette_draw_list->AddRectFilled(input_a, input_b, fill, 6.f * dpi);
 
 			ImU32 border = ui::with_alpha(th.border_focus,
 				(0.55f + 0.45f * ui::clock::pulse(1.5f, 0.f, 1.f)) * close_alpha * open_t);
-			fdl->AddRect(input_a, input_b, border, 6.f * dpi, 0, 1.4f * dpi);
+			palette_draw_list->AddRect(input_a, input_b, border, 6.f * dpi, 0, 1.4f * dpi);
 
 			ImU32 wash = ui::with_alpha(th.glass_tint, 0.35f * close_alpha);
-			fdl->AddRectFilled(input_a, input_b, wash, 6.f * dpi);
+			palette_draw_list->AddRectFilled(input_a, input_b, wash, 6.f * dpi);
 		}
 
 		const float chip_size = 22.f * dpi;
 		ImVec2 chip_center(input_a.x + 18.f * dpi + chip_size * 0.5f,
 		                   (input_a.y + input_b.y) * 0.5f);
-		draw_search_chip(fdl, chip_center, chip_size,
+		draw_search_chip(palette_draw_list, chip_center, chip_size,
 			ui::with_alpha(th.text_secondary, 0.92f * close_alpha));
 
 		const float input_text_left = input_a.x + 18.f * dpi + chip_size + 14.f * dpi;
@@ -954,7 +913,10 @@ namespace command_palette {
 			ui::with_alpha(th.text_primary, close_alpha)));
 		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.f, 0.f));
 
-		if (just_opened) ImGui::SetKeyboardFocusHere(0);
+		if (just_opened || (!is_closing() &&
+			ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+			!ImGui::IsAnyItemActive()))
+			ImGui::SetKeyboardFocusHere(0);
 
 		const bool enter_pressed = ImGui::InputTextWithHint(
 			"##palette_input",
@@ -970,7 +932,7 @@ namespace command_palette {
 		if (globals::ui::command_palette_buf[0] == '\0') {
 			ImFont* placeholder_font = ui::fonts::lg();
 			float pfs = ui::fonts::size_or(placeholder_font, ImGui::GetFontSize());
-			fdl->AddText(placeholder_font, pfs,
+			palette_draw_list->AddText(placeholder_font, pfs,
 				ImVec2(input_text_left, (input_a.y + input_b.y) * 0.5f - pfs * 0.5f),
 				ui::with_alpha(th.text_dim, close_alpha),
 				"Search commands, files, agents, or AI actions...");
@@ -980,6 +942,41 @@ namespace command_palette {
 		ImGui::PopStyleColor(4);
 		ImGui::PopItemWidth();
 		ImGui::PopFont();
+
+		const std::string current_query(globals::ui::command_palette_buf);
+		const bool query_changed = (current_query != last_query());
+		std::vector<commands::command_t> hits = commands::fuzzy_search(current_query, 256);
+		if (current_query.empty()) {
+			std::sort(hits.begin(), hits.end(), [](const commands::command_t& a,
+				const commands::command_t& b) {
+				category_t ca = classify(a);
+				category_t cb = classify(b);
+				if (ca != cb) return static_cast<int>(ca) < static_cast<int>(cb);
+				return a.name < b.name;
+			});
+		}
+		const int hit_count = static_cast<int>(hits.size());
+		if (selected_index() >= hit_count) selected_index() = std::max(0, hit_count - 1);
+		if (selected_index() < 0) selected_index() = 0;
+		std::string new_results_key = compute_results_key(hits);
+		if (query_changed) {
+			last_query() = current_query;
+			selected_index() = 0;
+		}
+		if (new_results_key != last_result_key()) {
+			retrigger_row_anims(hits.size());
+			last_result_key() = new_results_key;
+		} else {
+			ensure_row_anims(hits.size());
+		}
+
+		const bool wide_enough_for_preview = logical_width >= 680.f &&
+			logical_height >= 420.f && dpi <= 1.01f;
+		const bool show_preview = preview_visible() && hit_count > 0 && wide_enough_for_preview;
+		const float list_w = show_preview ?
+			(draw_w - side_pad * 3.f) * 0.58f : (draw_w - side_pad * 2.f);
+		const float preview_w = show_preview ? (draw_w - side_pad * 3.f) - list_w : 0.f;
+		(void)preview_w;
 
 		const bool block_input = is_closing();
 
@@ -1033,7 +1030,7 @@ namespace command_palette {
 				prev_cat = cat;
 			}
 		}
-		const bool show_headers = any_two_categories;
+		const bool show_headers = current_query.empty() && any_two_categories;
 
 		const ImVec2 list_clip_a = list_a;
 		const ImVec2 list_clip_b = list_b;
@@ -1046,10 +1043,6 @@ namespace command_palette {
 		ImDrawList* wdl = ImGui::GetWindowDrawList();
 
 		float y_cursor = 0.f;
-		const float xfade_t = filter_xfade().eased();
-		const float xfade_dx = (1.f - xfade_t) * 24.f * dpi;
-		const float new_alpha = xfade_t;
-
 		ImVec2 win_pos = ImGui::GetCursorScreenPos();
 		ImVec2 win_avail = ImGui::GetContentRegionAvail();
 
@@ -1065,8 +1058,8 @@ namespace command_palette {
 				y_cursor += 26.f * dpi;
 			}
 
-			ImVec2 ra(win_pos.x + xfade_dx, win_pos.y + y_cursor);
-			ImVec2 rb(ra.x + win_avail.x - xfade_dx, ra.y + row_h);
+			ImVec2 ra(win_pos.x, win_pos.y + y_cursor);
+			ImVec2 rb(ra.x + win_avail.x, ra.y + row_h);
 
 			ImGui::SetCursorScreenPos(ImVec2(win_pos.x, win_pos.y + y_cursor));
 			ImGui::PushID(row_index);
@@ -1085,8 +1078,8 @@ namespace command_palette {
 
 			if (hovered) selected_index() = row_index;
 
-			float entrance_t = row_eased_progress(row_index);
-			float row_close_alpha = new_alpha * close_alpha;
+			float entrance_t = current_query.empty() ? row_eased_progress(row_index) : 1.f;
+			float row_close_alpha = close_alpha;
 
 			ImGui::PushClipRect(ra, rb, true);
 			render_row(wdl, ra, rb, c, row_index == selected_index(), hovered,

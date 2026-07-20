@@ -81,7 +81,7 @@ protocol::effect_lock_t protocol_lock(contract_lock_t lock) {
 
 void validate_generated_descriptor(const contract_descriptor_t& descriptor) {
     constexpr std::string_view expected_adapter =
-        "aida::standalone::mcp::compat::python_worker_host_t::execute";
+        "aida::standalone::mcp::compat::adapters::py_exec_file";
     if (descriptor.name != "py_exec_file" ||
         descriptor.adapter_symbol != expected_adapter ||
         !descriptor.archive_backed || !descriptor.target_dependent ||

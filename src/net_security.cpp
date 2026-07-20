@@ -2,7 +2,7 @@
 
 #ifdef __NT__
 #include "standalone/src/helpers/diag_log.hpp"
-#include "standalone/src/core/infra/work_queue.hpp"
+#include "standalone/src/core/infra/executor.hpp"
 #include "standalone/src/core/runtime/standalone_driver.hpp"
 #include "../driver/comm.h"
 #include <nlohmann/json.hpp>
@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <system_error>
+#include <utility>
 #include <wincrypt.h>
 #include <shlobj.h>
 #include <bcrypt.h>
@@ -3743,12 +3744,36 @@ bool TlsKeyExtractor::start_keylog(const keylog_config_t& config) {
 
     bool worker_started = false;
     DWORD post_err = ERROR_SUCCESS;
+    bool executor_submit_exception = false;
+    std::string post_reject_reason;
     try {
-        worker_started = work_queue::post_service([this, generation]() {
-            keylog_worker_loop("work_queue_service", generation);
-        });
-        post_err = GetLastError();
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "net_security.tls_key_extractor";
+        submission.label = "net_security.tls_keylog.worker";
+        submission.thread_class = "long_lived_service";
+        submission.domain = aida::infra::executor::domain_t::service;
+        submission.priority = 3;
+        submission.cancel_hook = [this, generation]() {
+            if (_keylog_generation.load(std::memory_order_acquire) == generation)
+                _keylog_active.store(false, std::memory_order_release);
+            _keylog_worker_cv.notify_all();
+        };
+        submission.deadline_ms = 0;
+        submission.generation = generation;
+        submission.target_pid = config.pid;
+        submission.diagnostic_id = "net_security.tls_keylog.worker";
+        submission.ui_access_policy = "none";
+        submission.failure_policy = "reject_not_started";
+        submission.shutdown_policy = "cancel_pending";
+        submission.body = [this, generation]() {
+            keylog_worker_loop("executor_service", generation);
+        };
+        auto submit_result = aida::infra::executor::submit(std::move(submission));
+        worker_started = submit_result.submitted;
+        post_reject_reason = std::move(submit_result.reject_reason);
+        post_err = worker_started ? ERROR_SUCCESS : ERROR_NOT_READY;
     } catch (const std::exception& ex) {
+        executor_submit_exception = true;
         post_err = GetLastError();
         if (post_err == ERROR_SUCCESS)
             post_err = ERROR_NOT_ENOUGH_MEMORY;
@@ -3757,6 +3782,7 @@ bool TlsKeyExtractor::start_keylog(const keylog_config_t& config) {
             static_cast<unsigned long>(post_err),
             ex.what());
     } catch (...) {
+        executor_submit_exception = true;
         post_err = GetLastError();
         if (post_err == ERROR_SUCCESS)
             post_err = ERROR_NOT_ENOUGH_MEMORY;
@@ -3770,9 +3796,11 @@ bool TlsKeyExtractor::start_keylog(const keylog_config_t& config) {
         _keylog_active.store(false, std::memory_order_release);
         _keylog_worker_done.store(true, std::memory_order_release);
         _keylog_worker_cv.notify_all();
-        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog worker_post_failed generation=%llu gle=%lu",
+        diag::log_tagged_fmt("net_sec", "TlsKeyExtractor::start_keylog worker_post_failed generation=%llu gle=%lu reason=%s",
             static_cast<unsigned long long>(generation),
-            static_cast<unsigned long>(post_err));
+            static_cast<unsigned long>(post_err),
+            executor_submit_exception ? "executor_submit_exception" :
+                (post_reject_reason.empty() ? "executor_rejected" : post_reject_reason.c_str()));
         return false;
     }
 
@@ -5531,18 +5559,41 @@ bool AutoResponder::start() {
 
     const ULONGLONG post_t0 = GetTickCount64();
     diag::log_tagged_critical_fmt("net_sec",
-        "AutoResponder::start work_queue_post_pre generation=%llu tid=%lu tick_ms=%llu",
+        "AutoResponder::start executor_submit_pre generation=%llu tid=%lu tick_ms=%llu",
         static_cast<unsigned long long>(generation),
         static_cast<unsigned long>(entry_tid),
         static_cast<unsigned long long>(post_t0));
     bool worker_started = false;
     DWORD post_err = ERROR_SUCCESS;
+    bool executor_submit_exception = false;
+    std::string post_reject_reason;
     try {
-        worker_started = work_queue::post([this, generation]() {
-            worker_loop("work_queue", generation);
-        });
-        post_err = GetLastError();
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "net_security.autoresponder";
+        submission.label = "net_security.autoresponder.worker";
+        submission.thread_class = "long_lived_general_worker";
+        submission.domain = aida::infra::executor::domain_t::general;
+        submission.priority = 3;
+        submission.cancel_hook = [this, generation]() {
+            if (_worker_generation.load(std::memory_order_acquire) == generation)
+                _active.store(false, std::memory_order_release);
+            _worker_cv.notify_all();
+        };
+        submission.deadline_ms = 0;
+        submission.generation = generation;
+        submission.diagnostic_id = "net_security.autoresponder.worker";
+        submission.ui_access_policy = "none";
+        submission.failure_policy = "reject_not_started";
+        submission.shutdown_policy = "cancel_pending";
+        submission.body = [this, generation]() {
+            worker_loop("executor_general", generation);
+        };
+        auto submit_result = aida::infra::executor::submit(std::move(submission));
+        worker_started = submit_result.submitted;
+        post_reject_reason = std::move(submit_result.reject_reason);
+        post_err = worker_started ? ERROR_SUCCESS : ERROR_NOT_READY;
     } catch (const std::exception& ex) {
+        executor_submit_exception = true;
         post_err = GetLastError();
         if (post_err == ERROR_SUCCESS)
             post_err = ERROR_NOT_ENOUGH_MEMORY;
@@ -5552,6 +5603,7 @@ bool AutoResponder::start() {
             static_cast<unsigned long>(post_err),
             ex.what());
     } catch (...) {
+        executor_submit_exception = true;
         post_err = GetLastError();
         if (post_err == ERROR_SUCCESS)
             post_err = ERROR_NOT_ENOUGH_MEMORY;
@@ -5562,13 +5614,15 @@ bool AutoResponder::start() {
     }
     const ULONGLONG post_t1 = GetTickCount64();
     diag::log_tagged_critical_fmt("net_sec",
-        "AutoResponder::start work_queue_post_post elapsed_ms=%llu ok=%d gle=%lu generation=%llu tid=%lu tick_ms=%llu",
+        "AutoResponder::start executor_submit_post elapsed_ms=%llu ok=%d gle=%lu generation=%llu tid=%lu tick_ms=%llu reason=%s",
         static_cast<unsigned long long>(post_t1 - post_t0),
         worker_started ? 1 : 0,
         static_cast<unsigned long>(post_err),
         static_cast<unsigned long long>(generation),
         static_cast<unsigned long>(entry_tid),
-        static_cast<unsigned long long>(post_t1));
+        static_cast<unsigned long long>(post_t1),
+        executor_submit_exception ? "executor_submit_exception" :
+            (post_reject_reason.empty() ? (worker_started ? "accepted" : "executor_rejected") : post_reject_reason.c_str()));
     if (!worker_started) {
         if (post_err == ERROR_SUCCESS)
             post_err = ERROR_NOT_READY;

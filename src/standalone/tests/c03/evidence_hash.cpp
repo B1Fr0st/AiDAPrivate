@@ -177,7 +177,7 @@ evidence_hash_result_t sha256_evidence_file(const std::filesystem::path& path,
     std::string hash_error;
     if (!hash.open(hash_error))
         return failure(std::move(hash_error));
-    std::array<std::uint8_t, 1024 * 1024> buffer{};
+    std::vector<std::uint8_t> buffer(1024 * 1024);
     std::uint64_t consumed = 0;
     while (stream) {
         stream.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));

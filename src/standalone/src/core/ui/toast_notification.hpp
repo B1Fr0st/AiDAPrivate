@@ -282,6 +282,15 @@ namespace toast_notification
         }
     }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    inline void clear_preview_state()
+    {
+        std::lock_guard<std::mutex> lk(detail::s_mtx);
+        detail::s_toasts.clear();
+        detail::s_next_id = 1;
+    }
+#endif
+
     inline void render()
     {
         std::array<std::function<void()>, MAX_VISIBLE * 2> deferred_callbacks;

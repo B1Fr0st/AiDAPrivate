@@ -104,6 +104,24 @@ struct address_entry_t {
 	driver_bridge::identity::live_target_identity_t target_identity;
 };
 
+struct write_transaction_result_t {
+	bool original_read_ok = false;
+	bool write_attempted = false;
+	bool write_ok = false;
+	bool readback_ok = false;
+	bool verified = false;
+	bool rollback_attempted = false;
+	bool rollback_write_ok = false;
+	bool rollback_readback_ok = false;
+	bool rollback_verified = false;
+	uint32_t target_pid = 0;
+	uint64_t process_creation_time_100ns = 0;
+	std::vector<uint8_t> original_bytes;
+	std::vector<uint8_t> readback_bytes;
+	std::vector<uint8_t> rollback_readback_bytes;
+	std::string error;
+};
+
 struct pointer_result_t {
 	uint64_t              base_address = 0;
 	std::string           module_name;
@@ -192,6 +210,9 @@ void reset_scan();
 void add_address(uint64_t address, const std::string& description, value_type_t type);
 void remove_address(size_t index);
 void freeze_address(size_t index, bool enable);
+write_transaction_result_t write_value_exact(uint64_t address, value_type_t type,
+	const std::string& value_text, bool hex, uint32_t expected_pid,
+	uint64_t expected_process_creation_time_100ns);
 void write_value(uint64_t address, value_type_t type, const std::string& value_text, bool hex = false);
 std::string read_value_string(uint64_t address, value_type_t type);
 void refresh_address_list();

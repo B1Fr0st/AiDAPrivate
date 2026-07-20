@@ -1,7 +1,11 @@
 
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include <windows.h>
 #include <winsock2.h>

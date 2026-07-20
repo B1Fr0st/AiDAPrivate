@@ -1,5 +1,9 @@
+#if !defined(NOMINMAX)
 #define NOMINMAX
+#endif
+#if !defined(WIN32_LEAN_AND_MEAN)
 #define WIN32_LEAN_AND_MEAN
+#endif
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "standalone_license.hpp"
 
@@ -6171,7 +6175,7 @@ namespace
 
             if (action == "heartbeat")
             {
-                std::string build_id = get_build_id();
+                std::string build_id = standalone_license::get_build_id();
                 body["build_id"] = build_id;
 
                 const uint32_t hb_count = body.value("heartbeat_count", 0);
@@ -6203,7 +6207,7 @@ namespace
                 if (!srv_nonce_bytes.empty() && srv_nonce_bytes.size() >= 16)
                 {
                     uint8_t integrity_hmac[32] = {};
-                    bool hmac_ok = compute_integrity_gated_hmac(
+                    bool hmac_ok = standalone_license::compute_integrity_gated_hmac(
                         reinterpret_cast<const uint8_t*>(canonical_payload.data()),
                         canonical_payload.size(),
                         srv_nonce_bytes.data(), srv_nonce_bytes.size(),
@@ -6284,7 +6288,7 @@ namespace
                     if (!srv_nonce_bytes.empty() && srv_nonce_bytes.size() >= 16)
                     {
                         uint8_t integrity_hmac[32] = {};
-                        if (compute_integrity_gated_hmac(
+                        if (standalone_license::compute_integrity_gated_hmac(
                                 reinterpret_cast<const uint8_t*>(canonical_payload.data()),
                                 canonical_payload.size(),
                                 srv_nonce_bytes.data(), srv_nonce_bytes.size(),
@@ -10219,19 +10223,19 @@ namespace standalone_license
 
         uint64_t server_nonce = get_server_nonce_hash();
 
-        anti_tamper::cff::dispatch_table_t
-            tables[anti_tamper::cff::DISPATCH_DEPTH];
+        anti_tamper::path_explosion::dispatch_table_t
+            tables[anti_tamper::path_explosion::DISPATCH_DEPTH];
 
-        for (uint32_t d = 0; d < anti_tamper::cff::DISPATCH_DEPTH; ++d)
+        for (uint32_t d = 0; d < anti_tamper::path_explosion::DISPATCH_DEPTH; ++d)
         {
             uint64_t seed = env.aggregate ^
                 _rotl64(env.server_hmac, static_cast<int>(d + 1)) ^
                 (static_cast<uint64_t>(d) * 0x9E3779B97F4A7C15ULL);
-            anti_tamper::cff::generate_dispatch_table(
+            anti_tamper::path_explosion::generate_dispatch_table(
                 tables[d], seed, server_nonce);
         }
 
-        uint64_t dispatch_result = anti_tamper::cff::run_nested_dispatch(
+        uint64_t dispatch_result = anti_tamper::path_explosion::run_nested_dispatch(
             tables, env.aggregate, env);
 
         uint8_t block_selection = anti_tamper::anti_symbolic::hash_select_block(

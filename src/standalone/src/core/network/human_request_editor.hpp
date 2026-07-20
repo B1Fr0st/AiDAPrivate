@@ -31,7 +31,9 @@ struct state_t {
     std::vector<char> body;
     std::string line_ending = "\r\n";
     std::string error;
-    std::uint64_t authority_hash = 0;
+    std::string pretty_candidate;
+    const char* authority_data = nullptr;
+    std::size_t authority_size = 0;
     std::size_t max_bytes = 0;
     std::size_t raw_length = 0;
     std::size_t request_line_length = 0;
@@ -48,6 +50,8 @@ struct state_t {
     std::vector<std::size_t> matches;
     int active_match = -1;
     bool select_match = false;
+    std::uint64_t pretty_revision = 0;
+    std::uint64_t validated_pretty_revision = 0;
 };
 
 struct render_config_t {
@@ -71,21 +75,13 @@ struct render_result_t {
 struct fixed_state_t {
     state_t editor;
     std::string authority;
-    std::uint64_t buffer_hash = 0;
+    std::size_t buffer_length = 0;
+    std::string identity;
 };
 
-inline std::uint64_t hash_bytes(std::string_view value) noexcept {
-    std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char byte : value) {
-        hash ^= byte;
-        hash *= 1099511628211ULL;
-    }
-    hash ^= static_cast<std::uint64_t>(value.size());
-    hash *= 1099511628211ULL;
-    return hash == 0 ? 1 : hash;
-}
-
 inline bool contains_binary_bytes(std::string_view value) noexcept {
+    if (value.empty())
+        return false;
     const char* cursor = value.data();
     const char* const end = cursor + value.size();
     while (cursor < end) {
@@ -103,9 +99,12 @@ inline bool contains_binary_bytes(std::string_view value) noexcept {
 
 inline void assign_buffer(std::vector<char>& buffer, std::size_t capacity,
                           std::string_view value, std::size_t& length) {
-    if (buffer.size() != capacity + 1)
-        buffer.resize(capacity + 1);
     length = std::min(value.size(), capacity);
+    const std::size_t minimum = (std::min)(capacity + 1U, static_cast<std::size_t>(4096));
+    const std::size_t required = (std::min)(capacity + 1U,
+        (std::max)(length + 1U, minimum));
+    if (buffer.size() < required)
+        buffer.resize(required);
     if (length != 0)
         std::memcpy(buffer.data(), value.data(), length);
     buffer[length] = '\0';
@@ -171,6 +170,10 @@ inline bool validate_headers(std::string_view headers, std::string& error) {
 inline void parse_pretty(state_t& state, std::string_view authority) {
     state.parsed = false;
     state.error.clear();
+    state.pretty_dirty = false;
+    state.pretty_candidate.clear();
+    state.pretty_revision = 0;
+    state.validated_pretty_revision = 0;
     if (state.oversized) {
         state.error = "The request exceeds this editor's bounded capacity.";
         return;
@@ -207,8 +210,13 @@ inline void parse_pretty(state_t& state, std::string_view authority) {
     assign_buffer(state.request_line, state.max_bytes, request_line, state.request_line_length);
     assign_buffer(state.headers, state.max_bytes, headers, state.headers_length);
     assign_buffer(state.body, state.max_bytes, body, state.body_length);
-    state.pretty_dirty = false;
     state.parsed = true;
+}
+
+inline void mark_pretty_changed(state_t& state) noexcept {
+    if (++state.pretty_revision == 0)
+        ++state.pretty_revision;
+    state.pretty_dirty = true;
 }
 
 inline void load(state_t& state, std::string_view identity, std::string_view authority,
@@ -217,10 +225,14 @@ inline void load(state_t& state, std::string_view identity, std::string_view aut
     state.identity.assign(identity);
     state.max_bytes = std::max<std::size_t>(1024, config.max_bytes);
     state.editable = config.editable;
-    state.authority_hash = hash_bytes(authority);
+    state.authority_data = authority.data();
+    state.authority_size = authority.size();
     state.oversized = authority.size() > state.max_bytes;
     state.binary = contains_binary_bytes(authority);
-    assign_buffer(state.raw, state.max_bytes, authority, state.raw_length);
+    const std::string_view raw_display = state.oversized
+        ? authority.substr(0, (std::min)(authority.size(), static_cast<std::size_t>(4095)))
+        : authority;
+    assign_buffer(state.raw, state.max_bytes, raw_display, state.raw_length);
     parse_pretty(state, authority);
 }
 
@@ -242,9 +254,29 @@ inline void update_matches(state_t& state, std::string_view source) {
         state.active_match = 0;
 }
 
-inline int select_match_callback(ImGuiInputTextCallbackData* data) {
-    auto* state = static_cast<state_t*>(data->UserData);
-    if (!state || !state->select_match || state->active_match < 0 ||
+struct input_callback_context_t {
+    state_t* state = nullptr;
+    std::vector<char>* buffer = nullptr;
+    std::size_t max_bytes = 0;
+    bool select_match = false;
+};
+
+inline int editor_input_callback(ImGuiInputTextCallbackData* data) {
+    auto* context = static_cast<input_callback_context_t*>(data->UserData);
+    if (!context || !context->state || !context->buffer)
+        return 0;
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        const std::size_t required = static_cast<std::size_t>(data->BufTextLen) + 1U;
+        const std::size_t current = context->buffer->size();
+        const std::size_t grown = (std::max)(required,
+            (std::min)(context->max_bytes + 1U, (std::max)(current * 2U, static_cast<std::size_t>(64))));
+        context->buffer->resize((std::min)(context->max_bytes + 1U, grown));
+        data->Buf = context->buffer->data();
+        data->BufSize = static_cast<int>(context->buffer->size());
+        return 0;
+    }
+    auto* state = context->state;
+    if (!context->select_match || !state->select_match || state->active_match < 0 ||
         state->active_match >= static_cast<int>(state->matches.size()))
         return 0;
     const auto begin = state->matches[static_cast<std::size_t>(state->active_match)];
@@ -262,9 +294,8 @@ inline void register_semantic(const render_config_t& config, std::string_view su
 inline render_result_t render(state_t& state, std::string_view identity,
                               std::string& authority, const render_config_t& config) {
     render_result_t result;
-    const auto current_hash = hash_bytes(authority);
     if (state.identity != identity || state.max_bytes != std::max<std::size_t>(1024, config.max_bytes) ||
-        state.authority_hash != current_hash)
+        state.authority_data != authority.data() || state.authority_size != authority.size())
         load(state, identity, authority, config);
     if (config.allow_empty && authority.empty())
         state.error.clear();
@@ -347,14 +378,17 @@ inline render_result_t render(state_t& state, std::string_view identity,
 
     const ImVec2 editor_size(config.size.x, std::max(64.f, config.size.y - ImGui::GetFrameHeightWithSpacing()));
     if (state.mode == mode_t::raw) {
-        ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackAlways;
+        ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackAlways |
+            ImGuiInputTextFlags_CallbackResize;
         if (!result.editable)
             flags |= ImGuiInputTextFlags_ReadOnly;
+        input_callback_context_t callback{&state, &state.raw, state.max_bytes, true};
         if (ImGui::InputTextMultiline("##raw", state.raw.data(), state.raw.size(), editor_size,
-                flags, select_match_callback, &state) && result.editable) {
+                flags, editor_input_callback, &callback) && result.editable) {
             state.raw_length = bounded_length(state.raw);
             authority.assign(state.raw.data(), state.raw_length);
-            state.authority_hash = hash_bytes(authority);
+            state.authority_data = authority.data();
+            state.authority_size = authority.size();
             state.raw_dirty = true;
             parse_pretty(state, authority);
             state.raw_dirty = true;
@@ -370,58 +404,82 @@ inline render_result_t render(state_t& state, std::string_view identity,
         if (!result.editable)
             ImGui::BeginDisabled();
         ImGui::SetNextItemWidth(-1.f);
-        if (ImGui::InputText("##request-line", state.request_line.data(), state.request_line.size())) {
+        input_callback_context_t request_line_callback{
+            &state, &state.request_line, state.max_bytes, false};
+        if (ImGui::InputText("##request-line", state.request_line.data(), state.request_line.size(),
+                ImGuiInputTextFlags_CallbackResize, editor_input_callback, &request_line_callback)) {
             state.request_line_length = bounded_length(state.request_line);
-            state.pretty_dirty = true;
+            mark_pretty_changed(state);
         }
         register_semantic(config, "pretty.request-line", "network-request-editor-request-line", !result.editable);
+        input_callback_context_t headers_callback{&state, &state.headers, state.max_bytes, false};
         if (ImGui::InputTextMultiline("##headers", state.headers.data(), state.headers.size(),
-                ImVec2(-1.f, header_height))) {
+                ImVec2(-1.f, header_height), ImGuiInputTextFlags_CallbackResize,
+                editor_input_callback, &headers_callback)) {
             state.headers_length = bounded_length(state.headers);
-            state.pretty_dirty = true;
+            mark_pretty_changed(state);
         }
         register_semantic(config, "pretty.headers", "network-request-editor-headers", !result.editable);
+        input_callback_context_t body_callback{&state, &state.body, state.max_bytes, true};
         if (ImGui::InputTextMultiline("##body", state.body.data(), state.body.size(),
-                ImVec2(-1.f, body_height), ImGuiInputTextFlags_CallbackAlways,
-                select_match_callback, &state)) {
+                ImVec2(-1.f, body_height), ImGuiInputTextFlags_CallbackAlways |
+                    ImGuiInputTextFlags_CallbackResize,
+                editor_input_callback, &body_callback)) {
             state.body_length = bounded_length(state.body);
-            state.pretty_dirty = true;
+            mark_pretty_changed(state);
             update_matches(state, std::string_view(state.body.data(), state.body_length));
         }
         register_semantic(config, "pretty.body", "network-request-editor-body", !result.editable);
         if (!result.editable)
             ImGui::EndDisabled();
 
-        std::string validation_error;
-        const std::string_view request_line(state.request_line.data(), state.request_line_length);
-        const std::string_view headers(state.headers.data(), state.headers_length);
-        const std::string_view body(state.body.data(), state.body_length);
-        const bool valid_line = validate_request_line(request_line);
-        const bool valid_headers = validate_headers(headers, validation_error);
-        std::string candidate;
-        if (valid_line && valid_headers) {
-            candidate.reserve(request_line.size() + headers.size() + body.size() + 8);
-            candidate.append(request_line);
-            candidate.append(state.line_ending);
-            if (!headers.empty()) {
-                candidate.append(headers);
-                candidate.append(state.line_ending);
+        if (state.pretty_dirty &&
+            state.validated_pretty_revision != state.pretty_revision) {
+            const std::string_view request_line(state.request_line.data(), state.request_line_length);
+            const std::string_view headers(state.headers.data(), state.headers_length);
+            const std::string_view body(state.body.data(), state.body_length);
+            const bool valid_line = validate_request_line(request_line);
+            std::string validation_error;
+            const bool valid_headers = validate_headers(headers, validation_error);
+            state.pretty_candidate.clear();
+            if (valid_line && valid_headers) {
+                std::size_t candidate_size = request_line.size();
+                const auto include = [&](std::size_t length) {
+                    if (length > state.max_bytes - candidate_size)
+                        return false;
+                    candidate_size += length;
+                    return true;
+                };
+                const bool bounded = include(state.line_ending.size()) &&
+                    (headers.empty() ||
+                        (include(headers.size()) && include(state.line_ending.size()))) &&
+                    include(state.line_ending.size()) && include(body.size());
+                if (!bounded) {
+                    validation_error = "The edited request exceeds this editor's bounded capacity.";
+                } else {
+                    state.pretty_candidate.reserve(candidate_size);
+                    state.pretty_candidate.append(request_line);
+                    state.pretty_candidate.append(state.line_ending);
+                    if (!headers.empty()) {
+                        state.pretty_candidate.append(headers);
+                        state.pretty_candidate.append(state.line_ending);
+                    }
+                    state.pretty_candidate.append(state.line_ending);
+                    state.pretty_candidate.append(body);
+                }
+            } else if (!valid_line) {
+                validation_error = "The request line must contain method, target, and HTTP version.";
             }
-            candidate.append(state.line_ending);
-            candidate.append(body);
-            if (candidate.size() > state.max_bytes)
-                validation_error = "The edited request exceeds this editor's bounded capacity.";
-        } else if (!valid_line) {
-            validation_error = "The request line must contain method, target, and HTTP version.";
-        }
-        if (state.pretty_dirty)
             state.error = validation_error;
-        const bool can_apply = state.pretty_dirty && result.editable && validation_error.empty();
+            state.validated_pretty_revision = state.pretty_revision;
+        }
+        const bool can_apply = state.pretty_dirty && result.editable && state.error.empty();
         if (!can_apply)
             ImGui::BeginDisabled();
         if (ImGui::SmallButton("Apply to Raw##pretty-apply")) {
-            authority = std::move(candidate);
-            state.authority_hash = hash_bytes(authority);
+            authority = std::move(state.pretty_candidate);
+            state.authority_data = authority.data();
+            state.authority_size = authority.size();
             assign_buffer(state.raw, state.max_bytes, authority, state.raw_length);
             state.pretty_dirty = false;
             state.raw_dirty = true;
@@ -435,8 +493,10 @@ inline render_result_t render(state_t& state, std::string_view identity,
         const bool can_discard = state.pretty_dirty && result.editable;
         if (!can_discard)
             ImGui::BeginDisabled();
-        if (ImGui::SmallButton("Discard Pretty Edits##pretty-discard"))
+        if (ImGui::SmallButton("Discard Pretty Edits##pretty-discard")) {
             parse_pretty(state, authority);
+            update_matches(state, std::string_view(state.body.data(), state.body_length));
+        }
         register_semantic(config, "pretty.discard", "network-request-editor-action", !can_discard);
         if (!can_discard)
             ImGui::EndDisabled();
@@ -463,10 +523,10 @@ inline render_result_t render_fixed(fixed_state_t& state, std::string_view ident
     const auto terminator = std::find(authority_buffer, authority_buffer + Capacity, '\0');
     const std::string_view external(authority_buffer,
         static_cast<std::size_t>(std::distance(authority_buffer, terminator)));
-    const auto external_hash = hash_bytes(external);
-    if (state.buffer_hash != external_hash) {
+    if (state.identity != identity || state.buffer_length != external.size()) {
         state.authority.assign(external);
-        state.buffer_hash = external_hash;
+        state.buffer_length = external.size();
+        state.identity.assign(identity);
     }
     config.max_bytes = std::min<std::size_t>(config.max_bytes, Capacity - 1);
     auto result = render(state.editor, identity, state.authority, config);
@@ -478,7 +538,7 @@ inline render_result_t render_fixed(fixed_state_t& state, std::string_view ident
         } else {
             std::memcpy(authority_buffer, state.authority.data(), state.authority.size());
             authority_buffer[state.authority.size()] = '\0';
-            state.buffer_hash = hash_bytes(state.authority);
+            state.buffer_length = state.authority.size();
         }
     }
     return result;

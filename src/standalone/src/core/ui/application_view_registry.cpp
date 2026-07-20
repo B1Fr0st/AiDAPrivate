@@ -37,6 +37,9 @@
 #include "../network/burp/project_view.hpp"
 #include "../scanner/scan_hub_view.hpp"
 #include "../session/analysis_session.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../testlab/test_lab_view.hpp"
+#endif
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "../../preview/studio_semantics.hpp"
@@ -183,6 +186,9 @@ constexpr catalog_entry_t k_catalog[] = {
     AIDA_VIEW("view.ai.mcp_marketplace", "MCP Marketplace", automation, tool_window, registry, none, 0, 600, 420, false, true, false),
     AIDA_VIEW("view.ai.evidence", "Evidence Review", automation, tool_window, registry, none, 0, 420, 280, false, true, false),
     AIDA_VIEW("view.ai.scripts", "Automation Scripts", automation, tool_window, registry, none, 0, 520, 300, false, true, false),
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    AIDA_VIEW("view.test_lab", "Test Lab", automation, tool_window, registry, none, 0, 620, 420, false, true, false),
+#endif
     AIDA_VIEW("view.settings", "Settings", settings, tool_window, registry, none, 0, 520, 360, false, true, false)
 };
 
@@ -1425,6 +1431,16 @@ void initialize() {
                 aida::mcp_marketplace_view::render((std::max)(available.x, 1.f),
                     (std::max)(available.y, 1.f));
             };
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        else if (std::strcmp(entry.id, "view.test_lab") == 0)
+            descriptor.render = [](const view_render_context_t&) {
+                static float accumulated_time = 0.f;
+                accumulated_time += ImGui::GetIO().DeltaTime;
+                const ImVec2 available = ImGui::GetContentRegionAvail();
+                test_lab_view::render((std::max)(available.x, 1.f),
+                    (std::max)(available.y, 1.f), accumulated_time);
+            };
+#endif
         else if (std::strcmp(entry.id, "view.settings") == 0)
             descriptor.render = [](const view_render_context_t&) {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
@@ -1466,6 +1482,10 @@ void initialize() {
         if (descriptor.id.value() == "document.code") {
             descriptor.deactivate = [](const view_instance_id_t& instance) {
                 close_code_group(instance);
+            };
+        } else if (descriptor.id.value() == "document.hex") {
+            descriptor.deactivate = [](const view_instance_id_t&) {
+                hex_view::close(disasm_view::capture_selected_workspace());
             };
         }
         current.registry.register_view(std::move(descriptor));
@@ -2276,7 +2296,28 @@ void render_registry_owned_windows() noexcept {
             } else {
                 result = current.registry.render(id, current.context);
             }
-            if (!result.ok()) {
+            if (result.status == view_operation_status_t::unavailable) {
+                std::string empty_id = "state.view.unavailable.";
+                empty_id.append(id.view.value());
+                if (!id.instance.empty())
+                    empty_id.append(".").append(id.instance.value());
+                design::state_presentation_t unavailable;
+                unavailable.stable_id = empty_id.c_str();
+                unavailable.state = design::view_state_t::empty;
+                unavailable.title = descriptor->category == view_category_t::analysis ||
+                    descriptor->category == view_category_t::document
+                    ? "No analysis workspace"
+                    : "View unavailable";
+                unavailable.message = result.detail.c_str();
+                unavailable.target = descriptor->display_name.c_str();
+                unavailable.hint = descriptor->category == view_category_t::analysis ||
+                    descriptor->category == view_category_t::document
+                    ? "Open or analyze a binary to populate this view."
+                    : "Complete the required setup, then reopen or focus this view.";
+                static_cast<void>(design::render_state(unavailable,
+                    ImGui::GetContentRegionAvail()));
+                current.render_failures.erase(id);
+            } else if (!result.ok()) {
                 std::string diagnostic_id = "diagnostic.view.render.";
                 diagnostic_id.append(id.view.value());
                 if (!id.instance.empty())

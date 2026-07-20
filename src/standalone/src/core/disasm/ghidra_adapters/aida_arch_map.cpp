@@ -14,6 +14,8 @@ namespace {
 constexpr uint16_t kMachineAmd64 = 0x8664;
 constexpr uint16_t kMachineI386 = 0x014C;
 constexpr uint16_t kMachineArm64 = 0xAA64;
+constexpr uint16_t kMachineArm64Ec = 0xA641;
+constexpr uint16_t kMachineArm64X = 0xA64E;
 constexpr uint16_t kMachineArmNT = 0x01C4;
 
 uint16_t read_pe_machine(const DisasmFile& file)
@@ -68,6 +70,8 @@ arch_descriptor_t detect_arch_from_machine(uint16_t pe_machine)
 		d.is_big_endian = false;
 		break;
 	case kMachineArm64:
+	case kMachineArm64Ec:
+	case kMachineArm64X:
 		d.sleigh_id = "AARCH64:LE:64:v8A";
 		d.compiler_spec = "windows";
 		d.bits = 64;
@@ -163,6 +167,7 @@ bool native_format(format_id_t format) noexcept {
     case format_id_t::macho:
     case format_id_t::macho_fat:
     case format_id_t::coff:
+    case format_id_t::raw_code:
         return true;
     default:
         return false;
@@ -232,6 +237,8 @@ bool abi_matches_format(format_id_t format, abi_id_t abi) noexcept {
         return darwin_abi(abi);
     case format_id_t::coff:
         return windows_abi(abi) || abi == abi_id_t::sysv;
+    case format_id_t::raw_code:
+        return windows_abi(abi) || elf_abi(abi) || darwin_abi(abi);
     default:
         return false;
     }
@@ -241,25 +248,30 @@ bool abi_matches_architecture(architecture_id_t architecture, abi_id_t abi) noex
     switch (architecture) {
     case architecture_id_t::x86:
         return abi == abi_id_t::windows_x86 || abi == abi_id_t::linux_x86 ||
-               abi == abi_id_t::android_x86 || abi == abi_id_t::sysv;
+               abi == abi_id_t::android_x86 || abi == abi_id_t::darwin ||
+               abi == abi_id_t::sysv;
     case architecture_id_t::x86_64:
         return abi == abi_id_t::windows_x64 || abi == abi_id_t::linux_x64 ||
                abi == abi_id_t::android_x86_64 || abi == abi_id_t::darwin ||
                abi == abi_id_t::darwin_x86_64 || abi == abi_id_t::sysv;
     case architecture_id_t::arm:
         return abi == abi_id_t::linux_arm || abi == abi_id_t::android_arm ||
-               abi == abi_id_t::sysv;
+               abi == abi_id_t::darwin || abi == abi_id_t::sysv;
     case architecture_id_t::aarch64:
         return abi == abi_id_t::windows_arm64 || abi == abi_id_t::linux_aarch64 ||
                abi == abi_id_t::android_aarch64 || abi == abi_id_t::darwin ||
                abi == abi_id_t::darwin_aarch64 || abi == abi_id_t::sysv;
+    case architecture_id_t::arm64ec:
+        return abi == abi_id_t::windows_arm64ec;
     case architecture_id_t::mips:
     case architecture_id_t::mips64:
         return abi == abi_id_t::linux_mips || abi == abi_id_t::sysv;
     case architecture_id_t::ppc:
-        return abi == abi_id_t::linux_ppc || abi == abi_id_t::sysv;
+        return abi == abi_id_t::linux_ppc || abi == abi_id_t::darwin ||
+               abi == abi_id_t::sysv;
     case architecture_id_t::ppc64:
-        return abi == abi_id_t::linux_ppc64 || abi == abi_id_t::sysv;
+        return abi == abi_id_t::linux_ppc64 || abi == abi_id_t::darwin ||
+               abi == abi_id_t::sysv;
     case architecture_id_t::riscv:
     case architecture_id_t::riscv32:
     case architecture_id_t::riscv64:
@@ -275,13 +287,13 @@ const char* compiler_for_request(const ghidra_language_request_t& request) noexc
     case architecture_id_t::x86_64:
         if (windows_abi(request.abi))
             return "windows";
-        if (elf_abi(request.abi))
+        if (elf_abi(request.abi) || darwin_abi(request.abi))
             return "gcc";
         return "";
     case architecture_id_t::arm:
         if (windows_abi(request.abi) && request.endian == endian_t::little)
             return "windows";
-        if (elf_abi(request.abi))
+        if (elf_abi(request.abi) || darwin_abi(request.abi))
             return "default";
         return "";
     case architecture_id_t::aarch64:
@@ -290,11 +302,15 @@ const char* compiler_for_request(const ghidra_language_request_t& request) noexc
         if (elf_abi(request.abi) || darwin_abi(request.abi))
             return "default";
         return "";
+    case architecture_id_t::arm64ec:
+        return request.abi == abi_id_t::windows_arm64ec &&
+                request.endian == endian_t::little
+            ? "windows" : "";
     case architecture_id_t::mips:
     case architecture_id_t::mips64:
     case architecture_id_t::ppc:
     case architecture_id_t::ppc64:
-        return elf_abi(request.abi) ? "default" : "";
+        return elf_abi(request.abi) || darwin_abi(request.abi) ? "default" : "";
     case architecture_id_t::riscv:
     case architecture_id_t::riscv32:
     case architecture_id_t::riscv64:
@@ -460,13 +476,6 @@ workspace_result_t<void> validate_request(const ghidra_language_request_t& reque
             "workspace format is not a directly loadable native Ghidra image",
             "ghidra.arch.format"));
     }
-    if (request.architecture == architecture_id_t::arm64ec ||
-        request.abi == abi_id_t::windows_arm64ec) {
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::unsupported_format,
-            "ARM64EC hybrid ABI does not map to a single native Ghidra compiler specification",
-            "ghidra.arch.arm64ec"));
-    }
     if (!workspace_architecture_mode_matches(request.architecture, request.mode)) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::unsupported_format,
@@ -609,6 +618,7 @@ workspace_result_t<ghidra_language_spec_t> resolve_ghidra_language(
             ? "ARM:LE:32:v7" : "ARM:BE:32:v7";
         break;
     case architecture_id_t::aarch64:
+    case architecture_id_t::arm64ec:
         spec.family = ghidra_language_family_t::aarch64;
         spec.language_root = "AARCH64";
         spec.language_id = request.endian == endian_t::little

@@ -741,7 +741,22 @@ void start_authorized_mcp_services() {}
 void tick_ai_chat() {}
 void poll_ai_chat() {}
 bool is_ai_busy() { return s_preview_busy.load(std::memory_order_acquire); }
-void chat_request_cancel() { s_preview_cancel.store(true, std::memory_order_release); s_preview_busy.store(false, std::memory_order_release); }
+void chat_request_cancel()
+{
+    if (!s_preview_busy.exchange(false, std::memory_order_acq_rel))
+        return;
+    s_preview_cancel.store(true, std::memory_order_release);
+    g_ai_thinking_active = false;
+    if (!g_chat_messages.empty()) {
+        ChatMessage& message = g_chat_messages.back();
+        message.text = "AI operation cancelled. No pending tool or response work remains.";
+        message.thinking_text.clear();
+        message.has_thinking = false;
+        message.streaming = false;
+    }
+    globals::ui::status_driver_info = "AI operation cancelled";
+    globals::ui::status_model_info = "Cancelled";
+}
 std::atomic<bool>* chat_cancel_flag() { return &s_preview_cancel; }
 void chat_bind_session(const std::string& session_id) { s_preview_session = session_id.empty() ? "preview-nightfall-session" : session_id; }
 std::string chat_active_session() { return s_preview_session; }

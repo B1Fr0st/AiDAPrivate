@@ -93,6 +93,7 @@ enum class workspace_request_result_t {
 bool initialize(ImGuiID root_dockspace_id) noexcept;
 void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexcept;
 bool surfaces_ready() noexcept;
+void render_transition_surface() noexcept;
 void render_global_dock_navigator() noexcept;
 void settle_default_selection() noexcept;
 ImGuiID node_id(dock_role_t role) noexcept;

@@ -83,7 +83,25 @@ load_image_t::load_image_t(
 	std::sort(patches_.begin(), patches_.end(),
 		[](const provider_patch_t& left, const provider_patch_t& right) {
 			return left.provider_offset < right.provider_offset;
-		});
+	});
+}
+
+load_image_t::load_image_t(
+	std::shared_ptr<const aida::analysis::ghidra_adapter::ghidra_load_image_t> image,
+	aida::analysis::address_space_id_t address_space,
+	std::function<bool()> cancel_check)
+	: ghidra::LoadImage("aida_normalized_workspace"),
+	  buffer_(nullptr),
+	  buffer_size_(0),
+	  buffer_base_(0),
+	  file_(nullptr),
+	  cancel_flag_(nullptr),
+	  image_size_(image ? image->image().image_size : 0),
+	  addr_space_manager_(nullptr),
+	  cancel_check_(std::move(cancel_check)),
+	  normalized_image_(std::move(image)),
+	  normalized_address_space_(address_space)
+{
 }
 #endif
 
@@ -100,6 +118,51 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 
 	uint64_t offset = addr.getOffset();
 #if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
+	if (normalized_image_) {
+		const auto& image = normalized_image_->image();
+		const uint64_t image_begin =
+			(normalized_address_space_ == aida::analysis::address_space_id_t::virtual_address ||
+			 normalized_address_space_ == aida::analysis::address_space_id_t::live_virtual)
+				? image.image_base : 0;
+		if (image.image_size > UINT64_MAX - image_begin)
+			throw ghidra::LowlevelError("normalized workspace image address range overflow");
+		const uint64_t image_end = image_begin + image.image_size;
+		const uint64_t request_size = static_cast<uint64_t>(size);
+		const uint64_t request_end = request_size > UINT64_MAX - offset
+			? UINT64_MAX : offset + request_size;
+		const uint64_t read_begin = (std::max)(offset, image_begin);
+		const uint64_t read_end = (std::min)(request_end, image_end);
+		if (read_begin >= read_end)
+			return;
+		uint64_t cursor = read_begin;
+		while (cursor < read_end) {
+			if (cancel_check_ && cancel_check_())
+				throw ghidra::LowlevelError("decompile cancelled");
+			const uint64_t amount = (std::min)(normalized_image_->max_read_bytes(),
+				read_end - cursor);
+			aida::analysis::address_t source;
+			source.space = normalized_address_space_;
+			source.value = cursor;
+			source.architecture = image.architecture;
+			source.mode = image.architecture_mode;
+			auto read = normalized_image_->read(source, amount);
+			if (!read) {
+				if (read.error().code == aida::analysis::workspace_error_code_t::cancelled ||
+					read.error().code == aida::analysis::workspace_error_code_t::deadline_exceeded)
+					throw ghidra::LowlevelError("decompile cancelled");
+				throw ghidra::LowlevelError(std::string("normalized workspace image read failed: ") +
+					read.error().stable_code() + ":" + read.error().message);
+			}
+			if (read.value().bytes.size() != static_cast<std::size_t>(amount))
+				throw ghidra::LowlevelError("normalized workspace image returned a truncated read");
+			std::memcpy(ptr + static_cast<std::size_t>(cursor - offset),
+				read.value().bytes.data(), read.value().bytes.size());
+			cursor += amount;
+		}
+		ghidra_decompiler::g_state.last_loadfill_tick_ms.store(
+			static_cast<uint64_t>(::GetTickCount64()), std::memory_order_release);
+		return;
+	}
 	if (provider_) {
 		auto read_and_patch = [&](uint64_t provider_offset, ghidra::uint1* destination,
 			size_t amount) {
@@ -268,6 +331,26 @@ void load_image_t::getReadonly(ghidra::RangeList& list) const
 		return;
 
 #if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
+	if (normalized_image_) {
+		const auto& image = normalized_image_->image();
+		for (const auto& range : normalized_image_->readonly_ranges()) {
+			if (range.size == 0)
+				continue;
+			uint64_t start = range.start.value;
+			if (normalized_address_space_ == aida::analysis::address_space_id_t::virtual_address ||
+				normalized_address_space_ == aida::analysis::address_space_id_t::live_virtual) {
+				if (start > UINT64_MAX - image.image_base)
+					throw ghidra::LowlevelError("normalized workspace readonly range start overflow");
+				start += image.image_base;
+			}
+			if (range.size > UINT64_MAX - start)
+				throw ghidra::LowlevelError("normalized workspace readonly range end overflow");
+			const uint64_t end = start + range.size;
+			if (end > start)
+				list.insertRange(code_space, start, end - 1);
+		}
+		return;
+	}
 	if (image_) {
 		for (const auto& section : image_->sections()) {
 			if (section.virtual_size == 0 || section.writable)

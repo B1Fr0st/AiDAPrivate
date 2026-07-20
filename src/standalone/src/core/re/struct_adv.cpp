@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -180,7 +181,7 @@ std::string infer_scalar_type_for_process(std::uint32_t pid, const std::vector<s
     return infer_scalar_type(data);
 }
 
-std::optional<snapshot_diff::snapshot_t> find_scanner_snapshot(const std::string& id)
+std::shared_ptr<const snapshot_diff::snapshot_t> find_scanner_snapshot(const std::string& id)
 {
     std::uint64_t numeric = 0;
     bool numeric_ok = false;
@@ -196,10 +197,10 @@ std::optional<snapshot_diff::snapshot_t> find_scanner_snapshot(const std::string
     std::lock_guard<std::mutex> lk(snapshot_diff::g_state.mutex);
     for (const auto& snap : snapshot_diff::g_state.snapshots)
     {
-        if ((numeric_ok && snap.id == numeric) || snap.name == id)
+        if (snap && ((numeric_ok && snap->id == numeric) || snap->name == id))
             return snap;
     }
-    return std::nullopt;
+    return {};
 }
 
 bool extract_snapshot_region(const snapshot_diff::snapshot_t& snap,

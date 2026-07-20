@@ -2,6 +2,7 @@
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
+#include "../core/analysis/decompiler/decompiler_contracts.hpp"
 #include "../core/analysis/workspace/analysis_workspace.hpp"
 #include "shell_preview.hpp"
 
@@ -9,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace source_reconstructor {
@@ -44,7 +46,7 @@ struct workspace_reconstruction_result_t {
 	int failed_functions = 0;
 	int modules_created = 0;
 	std::vector<std::string> files_created;
-	std::vector<std::string> diagnostics;
+	std::vector<aida::analysis::decompiler_diagnostic_t> diagnostics;
 	std::string output_dir;
 };
 
@@ -125,9 +127,13 @@ inline void reconstruct_workspace(
 		config.output_dir + "/src/reconstructed.cpp",
 		config.output_dir + "/CMakeLists.txt"
 	};
-	state.last_result.diagnostics = {
-		"Deterministic Studio reconstruction receipt"
-	};
+	aida::analysis::decompiler_diagnostic_t receipt;
+	receipt.severity = aida::analysis::decompiler_diagnostic_severity_t::note;
+	receipt.code = aida::analysis::decompiler_diagnostic_code_t::unsupported_provider;
+	receipt.localization_key = "studio.preview.reconstruction_receipt";
+	receipt.confidence = 100;
+	receipt.ordinal = 1;
+	state.last_result.diagnostics = {std::move(receipt)};
 	state.last_result.output_dir = config.output_dir;
 	aida::preview::record(aida::preview::shell_action_t::source_reconstruct,
 		config.output_dir);

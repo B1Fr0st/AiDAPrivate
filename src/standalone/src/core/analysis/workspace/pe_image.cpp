@@ -148,6 +148,9 @@ const pe_section_t* pe_image_t::section_for_file_offset(std::uint64_t offset,
 namespace aida::analysis {
 namespace {
 
+constexpr std::uint16_t pe_machine_arm64ec = 0xa641;
+constexpr std::uint16_t pe_machine_arm64x = 0xa64e;
+
 struct delay_descriptor_t {
     std::uint32_t attributes;
     std::uint32_t name;
@@ -552,9 +555,21 @@ private:
             image_->architecture_ = architecture_id_t::x86_64;
             image_->mode_ = architecture_mode_t::x86_64;
             image_->abi_ = abi_id_t::windows_x64;
+        } else if (file_header.Machine == IMAGE_FILE_MACHINE_ARM64) {
+            image_->architecture_ = architecture_id_t::aarch64;
+            image_->mode_ = architecture_mode_t::aarch64;
+            image_->abi_ = abi_id_t::windows_arm64;
+        } else if (file_header.Machine == pe_machine_arm64ec) {
+            image_->architecture_ = architecture_id_t::arm64ec;
+            image_->mode_ = architecture_mode_t::aarch64;
+            image_->abi_ = abi_id_t::windows_arm64ec;
+        } else if (file_header.Machine == pe_machine_arm64x) {
+            image_->architecture_ = architecture_id_t::aarch64;
+            image_->mode_ = architecture_mode_t::aarch64;
+            image_->abi_ = abi_id_t::windows_arm64;
         } else {
             auto error = make_workspace_error(workspace_error_code_t::unsupported_pe_arch,
-                                              "PE machine is not x86 or x86-64", "pe_parse");
+                                              "PE machine architecture is unsupported", "pe_parse");
             error.details.emplace_back("machine", std::to_string(file_header.Machine));
             return workspace_result_t<void>::failure(std::move(error));
         }
@@ -595,7 +610,9 @@ private:
             directory_count = header.NumberOfRvaAndSizes;
             directory_offset = offsetof(IMAGE_OPTIONAL_HEADER32, DataDirectory);
         } else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-            if (image_->architecture_ != architecture_id_t::x86_64 ||
+            if ((image_->architecture_ != architecture_id_t::x86_64 &&
+                 image_->architecture_ != architecture_id_t::aarch64 &&
+                 image_->architecture_ != architecture_id_t::arm64ec) ||
                 optional_bytes.size() < offsetof(IMAGE_OPTIONAL_HEADER64, DataDirectory))
                 return workspace_result_t<void>::failure(pe_error("PE32+ optional header is inconsistent"));
             IMAGE_OPTIONAL_HEADER64 header{};

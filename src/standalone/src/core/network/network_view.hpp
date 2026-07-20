@@ -172,6 +172,7 @@ struct bw_entry_t {
 struct repeater_entry_t {
     std::uint64_t       id = 0;
     std::string         source_artifact_id;
+    std::string         source_session_id;
     std::uint64_t       request_revision = 1;
     std::uint64_t       request_hash = 0;
     std::uint64_t       response_hash = 0;
@@ -430,6 +431,7 @@ struct state_t {
     };
 
     fuzzer_entry_t                fuzz_config;
+    std::uint64_t                 fuzz_request_revision = 1;
     std::mutex                    fuzz_mutex;
     std::vector<fuzzer_result_t>  fuzz_results;
     std::atomic<bool>             fuzz_running{false};
@@ -502,6 +504,7 @@ struct state_t {
     };
     std::vector<decoder_step_t>   decoder_pipeline;
     char                          decoder_input[16384] = {};
+    std::size_t                   decoder_input_size = 0;
     std::string                   decoder_output;
     int                           decoder_selected_step = -1;
     int                           decoder_add_transform = 0;

@@ -14,6 +14,13 @@ void workspace_registry_t::bind_preview_workspace(
     ui_selection_ = id;
 }
 
+void workspace_registry_t::clear_preview_workspaces() {
+    std::unique_lock lock(mutex_);
+    ui_selection_.reset();
+    pe_coff_metadata_.clear();
+    workspaces_.clear();
+}
+
 std::shared_ptr<analysis_workspace_t> workspace_registry_t::selected_for_ui() const {
     std::shared_lock lock(mutex_);
     if (!ui_selection_)
@@ -74,6 +81,10 @@ const std::array<std::uint8_t, 23> default_static_profile{{
 
 const std::array<std::uint8_t, 28> default_live_profile{{
     'a','i','d','a','-','p','e','-','x','8','6','-','l','i','v','e','-','s','n','a','p','s','h','o','t','-','v','1'
+}};
+
+const std::array<std::uint8_t, 23> default_raw_code_profile{{
+    'a','i','d','a','-','r','a','w','-','c','o','d','e','-','s','t','a','t','i','c','-','v','1'
 }};
 
 class canonical_profile_writer_t final {
@@ -241,7 +252,10 @@ workspace_result_t<sha256_digest_t> canonical_normalized_static_profile_hash(
         canonical_profile_writer_t writer;
         writer.append_u64(static_cast<std::uint64_t>(target_kind_t::static_file));
         writer.append_u64(5);
-        append_profile(writer, request.load_profile, default_static_profile);
+        if (request.raw_code_profile)
+            append_profile(writer, request.load_profile, default_raw_code_profile);
+        else
+            append_profile(writer, request.load_profile, default_static_profile);
         writer.append_u64(request.provider_options.max_lease_size);
         writer.append_u64(request.provider_options.read_chunk_size);
         const bool pe_image = image.format == format_id_t::pe32 ||
@@ -271,6 +285,21 @@ workspace_result_t<sha256_digest_t> canonical_normalized_static_profile_hash(
         writer.append_u64(image.image_size);
         writer.append_u64(image.header_size);
         writer.append_text(image.format_name);
+        if (request.raw_code_profile) {
+            const auto& raw = *request.raw_code_profile;
+            writer.append_u64(raw.schema_version);
+            writer.append_u64(static_cast<std::uint64_t>(raw.architecture));
+            writer.append_u64(static_cast<std::uint64_t>(raw.architecture_mode));
+            writer.append_u64(static_cast<std::uint64_t>(raw.abi));
+            writer.append_u64(static_cast<std::uint64_t>(raw.endian));
+            writer.append_u64(raw.address_width_bits);
+            writer.append_u64(raw.image_base);
+            writer.append_u64(raw.code_file_offset);
+            writer.append_u64(raw.code_rva);
+            writer.append_u64(raw.code_size);
+            writer.append_u64(raw.entry_rva);
+            writer.append_text(raw.symbol_name);
+        }
         writer.append_text(request.analysis_settings.canonical_json());
         writer.append_u64(member.has_value() ? 1 : 0);
         if (member) {
@@ -577,6 +606,197 @@ workspace_result_t<std::shared_ptr<const workspace_image_t>> make_normalized_ima
     }
 }
 
+std::uint8_t raw_code_address_width(architecture_mode_t mode) noexcept {
+    switch (mode) {
+    case architecture_mode_t::x86_32:
+    case architecture_mode_t::arm_a32:
+    case architecture_mode_t::arm_thumb:
+    case architecture_mode_t::mips32:
+    case architecture_mode_t::ppc32:
+    case architecture_mode_t::riscv32:
+        return 32;
+    case architecture_mode_t::x86_64:
+    case architecture_mode_t::aarch64:
+    case architecture_mode_t::mips64:
+    case architecture_mode_t::ppc64:
+    case architecture_mode_t::riscv64:
+        return 64;
+    default:
+        return 0;
+    }
+}
+
+bool raw_code_abi_matches(architecture_id_t architecture, abi_id_t abi) noexcept {
+    switch (architecture) {
+    case architecture_id_t::x86:
+        return abi == abi_id_t::windows_x86 || abi == abi_id_t::linux_x86 ||
+            abi == abi_id_t::android_x86 || abi == abi_id_t::darwin ||
+            abi == abi_id_t::sysv;
+    case architecture_id_t::x86_64:
+        return abi == abi_id_t::windows_x64 || abi == abi_id_t::linux_x64 ||
+            abi == abi_id_t::android_x86_64 || abi == abi_id_t::darwin ||
+            abi == abi_id_t::darwin_x86_64 || abi == abi_id_t::sysv;
+    case architecture_id_t::arm:
+        return abi == abi_id_t::linux_arm || abi == abi_id_t::android_arm ||
+            abi == abi_id_t::darwin || abi == abi_id_t::sysv;
+    case architecture_id_t::aarch64:
+        return abi == abi_id_t::windows_arm64 || abi == abi_id_t::linux_aarch64 ||
+            abi == abi_id_t::android_aarch64 || abi == abi_id_t::darwin ||
+            abi == abi_id_t::darwin_aarch64 || abi == abi_id_t::sysv;
+    case architecture_id_t::arm64ec:
+        return abi == abi_id_t::windows_arm64ec;
+    case architecture_id_t::mips:
+    case architecture_id_t::mips64:
+        return abi == abi_id_t::linux_mips || abi == abi_id_t::sysv;
+    case architecture_id_t::ppc:
+        return abi == abi_id_t::linux_ppc || abi == abi_id_t::darwin ||
+            abi == abi_id_t::sysv;
+    case architecture_id_t::ppc64:
+        return abi == abi_id_t::linux_ppc64 || abi == abi_id_t::darwin ||
+            abi == abi_id_t::sysv;
+    case architecture_id_t::riscv:
+    case architecture_id_t::riscv32:
+    case architecture_id_t::riscv64:
+        return abi == abi_id_t::linux_riscv || abi == abi_id_t::sysv;
+    default:
+        return false;
+    }
+}
+
+workspace_result_t<std::shared_ptr<const workspace_image_t>> make_raw_code_image(
+    const byte_provider_t& provider, const raw_code_profile_t& profile,
+    const cancellation_token_t& cancel) {
+    if (cancel.stop_requested()) {
+        auto error = make_workspace_error(
+            cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
+                                       : workspace_error_code_t::cancelled,
+            "raw-code admission was cancelled", "workspace_open.raw_code");
+        error.deadline = cancel.deadline_exceeded();
+        error.cancellation = !error.deadline;
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            std::move(error));
+    }
+    const auto expected_width = raw_code_address_width(profile.architecture_mode);
+    const bool endian_supported =
+        ((profile.architecture != architecture_id_t::x86 &&
+          profile.architecture != architecture_id_t::x86_64 &&
+          profile.architecture != architecture_id_t::arm64ec &&
+          profile.architecture != architecture_id_t::riscv &&
+          profile.architecture != architecture_id_t::riscv32 &&
+          profile.architecture != architecture_id_t::riscv64) ||
+         profile.endian == endian_t::little);
+    if (profile.schema_version != 1 || expected_width == 0 ||
+        profile.address_width_bits != expected_width ||
+        !workspace_architecture_mode_matches(profile.architecture,
+                                             profile.architecture_mode) ||
+        !raw_code_abi_matches(profile.architecture, profile.abi) ||
+        profile.endian > endian_t::big || !endian_supported ||
+        profile.symbol_name.empty() || profile.symbol_name.size() > 4096 ||
+        profile.symbol_name.find('\0') != std::string::npos) {
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "raw-code architecture profile is invalid",
+                                 "workspace_open.raw_code"));
+    }
+    if (profile.code_size == 0 || profile.code_file_offset > provider.size() ||
+        profile.code_size > provider.size() - profile.code_file_offset) {
+        auto error = make_workspace_error(workspace_error_code_t::out_of_range,
+                                          "raw-code file range exceeds the provider",
+                                          "workspace_open.raw_code");
+        error.offset = profile.code_file_offset;
+        error.size = profile.code_size;
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            std::move(error));
+    }
+    if (profile.code_rva > (std::numeric_limits<std::uint64_t>::max)() -
+            profile.code_size) {
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            make_workspace_error(workspace_error_code_t::range_overflow,
+                                 "raw-code virtual range overflows",
+                                 "workspace_open.raw_code"));
+    }
+    const auto code_end = profile.code_rva + profile.code_size;
+    if (profile.entry_rva < profile.code_rva || profile.entry_rva >= code_end) {
+        auto error = make_workspace_error(workspace_error_code_t::out_of_range,
+                                          "raw-code entry is outside the executable range",
+                                          "workspace_open.raw_code");
+        error.offset = profile.entry_rva;
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            std::move(error));
+    }
+    const auto address_limit = profile.address_width_bits == 32
+        ? (std::uint64_t{1} << 32)
+        : (std::numeric_limits<std::uint64_t>::max)();
+    if ((profile.address_width_bits == 32 &&
+         (profile.image_base >= address_limit || code_end > address_limit - profile.image_base)) ||
+        (profile.address_width_bits == 64 &&
+         profile.image_base > address_limit - code_end)) {
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            make_workspace_error(workspace_error_code_t::range_overflow,
+                                 "raw-code mapped range exceeds the address width",
+                                 "workspace_open.raw_code"));
+    }
+    try {
+        workspace_image_t image;
+        image.format = format_id_t::raw_code;
+        image.architecture = profile.architecture;
+        image.architecture_mode = profile.architecture_mode;
+        image.abi = profile.abi;
+        image.endian = profile.endian;
+        image.address_width_bits = profile.address_width_bits;
+        image.image_base = profile.image_base;
+        image.image_size = code_end;
+        image.header_size = 0;
+        image.format_name = "raw_code";
+        image.provider_size = provider.size();
+        image.member = provider.member_metadata();
+
+        image_address_mapping_t mapping;
+        mapping.source_space = address_space_id_t::file_offset;
+        mapping.target_space = address_space_id_t::relative_virtual;
+        mapping.source_start = profile.code_file_offset;
+        mapping.target_start = profile.code_rva;
+        mapping.size = profile.code_size;
+        mapping.permissions = image_permission_read | image_permission_execute;
+        image.address_mappings.push_back(mapping);
+
+        image_section_t section;
+        section.index = 1;
+        section.name = ".text";
+        section.virtual_address = profile.code_rva;
+        section.virtual_size = profile.code_size;
+        section.file_offset = profile.code_file_offset;
+        section.file_size = profile.code_size;
+        section.permissions = image_permission_read | image_permission_execute;
+        image.sections.push_back(section);
+
+        const address_t entry{address_space_id_t::relative_virtual,
+                              profile.entry_rva, profile.architecture,
+                              profile.architecture_mode};
+        image.entry_points.push_back({entry, "raw_profile"});
+        image_symbol_t symbol;
+        symbol.ordinal = 1;
+        symbol.name = profile.symbol_name;
+        symbol.address = entry;
+        symbol.size = code_end - profile.entry_rva;
+        symbol.kind = image_symbol_kind_t::function;
+        symbol.binding = image_symbol_binding_t::global;
+        symbol.defined = true;
+        image.symbols.push_back(std::move(symbol));
+
+        auto validation = validate_workspace_image(image, {}, false, cancel);
+        if (!validation)
+            return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+                validation.error());
+        return make_normalized_image(std::move(image));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<const workspace_image_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "raw-code normalized image allocation failed",
+                                 "workspace_open.raw_code"));
+    }
+}
+
 workspace_result_t<parsed_static_image_t> admit_fat_macho_slice(
     std::shared_ptr<const byte_provider_t> provider, fat_image_t fat,
     const cancellation_token_t& cancel) {
@@ -604,11 +824,21 @@ workspace_result_t<parsed_static_image_t> admit_fat_macho_slice(
 
 workspace_result_t<parsed_static_image_t> parse_static_image(
     std::shared_ptr<const byte_provider_t> provider, const pe_parse_limits_t& pe_limits,
+    const std::optional<raw_code_profile_t>& raw_code_profile,
     const cancellation_token_t& cancel) {
     if (!provider)
         return workspace_result_t<parsed_static_image_t>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "workspace provider is required", "workspace_open.detect"));
+    if (raw_code_profile) {
+        auto image = make_raw_code_image(*provider, *raw_code_profile, cancel);
+        if (!image)
+            return workspace_result_t<parsed_static_image_t>::failure(image.error());
+        parsed_static_image_t result;
+        result.provider = std::move(provider);
+        result.normalized = image.take_value();
+        return workspace_result_t<parsed_static_image_t>::success(std::move(result));
+    }
     auto probe_result = read_provider_probe(*provider, cancel);
     if (!probe_result)
         return workspace_result_t<parsed_static_image_t>::failure(probe_result.error());
@@ -852,6 +1082,7 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
     open_provider_workspace_request_t admission;
     admission.provider = std::static_pointer_cast<const byte_provider_t>(root_provider);
     admission.bin_name = request.bin_name;
+    admission.raw_code_profile = request.raw_code_profile;
     admission.load_profile = request.load_profile;
     admission.provider_options = request.provider_options;
     admission.pe_limits = request.pe_limits;
@@ -919,7 +1150,8 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
     workspace_result_t<parsed_static_image_t> parsed = pre_parsed_image
         ? workspace_result_t<parsed_static_image_t>::success(
             parsed_static_image_t{request.provider, std::move(pre_parsed_image), {}, {}})
-        : parse_static_image(request.provider, request.pe_limits, cancel);
+        : parse_static_image(request.provider, request.pe_limits,
+                             request.raw_code_profile, cancel);
     if (!parsed)
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(parsed.error());
     const auto admitted_provider = parsed.value().provider ? parsed.value().provider : request.provider;
@@ -927,6 +1159,12 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
             make_workspace_error(workspace_error_code_t::malformed_image,
                                  "parser did not produce a normalized image",
+                                 "workspace_open.provider"));
+    if ((parsed.value().normalized->format == format_id_t::raw_code) !=
+        request.raw_code_profile.has_value())
+        return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "raw-code normalized image lacks its explicit admission profile",
                                  "workspace_open.provider"));
     auto provider_binding = admitted_provider == request.provider
         ? std::move(source_binding)
@@ -955,9 +1193,80 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
             profile_hash_result.error());
 
+    const auto& provider_source = provider_binding.value().normalized_source;
+    constexpr std::string_view member_marker = "#member:";
+    const auto first_member_marker = provider_source.find(member_marker);
+    std::string identity_source = provider_source;
+    if (!member && first_member_marker != std::string::npos)
+        return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
+            make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                 "non-member provider contains a member source identity",
+                                 "workspace_open.provider"));
+    if (member && first_member_marker != std::string::npos) {
+        if (first_member_marker == 0)
+            return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
+                make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                     "provider member source identity has no container source",
+                                     "workspace_open.provider"));
+        std::string_view final_member_component;
+        auto marker = first_member_marker;
+        while (marker != std::string::npos) {
+            const auto component_start = marker + member_marker.size();
+            const auto next_marker = provider_source.find(member_marker, component_start);
+            const auto component_end = next_marker == std::string::npos
+                ? provider_source.size() : next_marker;
+            const std::string_view component(provider_source.data() + component_start,
+                                             component_end - component_start);
+            bool normalized = !component.empty() && component.size() <= 32768 &&
+                component.front() != '/' && component.find('\\') == std::string_view::npos &&
+                component.find('\0') == std::string_view::npos;
+            std::size_t path_component_start = 0;
+            while (normalized && path_component_start < component.size()) {
+                const auto separator = component.find('/', path_component_start);
+                const auto path_component_end = separator == std::string_view::npos
+                    ? component.size() : separator;
+                const auto path_component_size = path_component_end - path_component_start;
+                normalized = path_component_size != 0 &&
+                    !(path_component_size == 1 && component[path_component_start] == '.') &&
+                    !(path_component_size == 2 && component[path_component_start] == '.' &&
+                      component[path_component_start + 1] == '.');
+                if (separator == std::string_view::npos)
+                    break;
+                path_component_start = separator + 1;
+            }
+            if (!normalized)
+                return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                         "provider member source identity is malformed",
+                                         "workspace_open.provider"));
+            final_member_component = component;
+            marker = next_marker;
+        }
+        std::string encoded_member_path;
+        encoded_member_path.reserve(member->normalized_member_path.size());
+        constexpr char hex_digits[] = "0123456789ABCDEF";
+        for (const char raw : member->normalized_member_path) {
+            const auto byte = static_cast<unsigned char>(raw);
+            if (byte == '%' || byte == '#') {
+                encoded_member_path.push_back('%');
+                encoded_member_path.push_back(hex_digits[byte >> 4U]);
+                encoded_member_path.push_back(hex_digits[byte & 0x0fU]);
+            } else {
+                encoded_member_path.push_back(static_cast<char>(byte));
+            }
+        }
+        if (final_member_component != member->normalized_member_path &&
+            final_member_component != encoded_member_path)
+            return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
+                make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                     "provider member source identity disagrees with member metadata",
+                                     "workspace_open.provider"));
+        identity_source.assign(provider_source.data(), first_member_marker);
+    }
+
     workspace_identity_input_t identity_input;
     identity_input.bin_name = request.bin_name;
-    identity_input.source_path = provider_binding.value().normalized_source;
+    identity_input.source_path = std::move(identity_source);
     if (member)
         identity_input.member_path = member->normalized_member_path;
     identity_input.content_hash = provider_binding.value().content_hash;

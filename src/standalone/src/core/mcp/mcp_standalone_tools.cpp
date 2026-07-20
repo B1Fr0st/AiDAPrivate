@@ -1,8 +1,10 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include "mcp_standalone.hpp"
-#include "standalone_tools_fwd.hpp"
+#include "../tools/standalone_tools_fwd.hpp"
 #include "sandbox.hpp"
 #include "standalone_driver.hpp"
 #include "vm_guest_bridge.hpp"
@@ -3997,14 +3999,9 @@ namespace mcp_standalone
 
         srv.register_tool({"list_processes", "Enumerate processes. If a VM bridge is active this lists VM processes by default; pass target='host' for host processes.",
             {{"filter", "string", "Optional substring filter", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_list_processes});
-        srv.register_tool({"read_memory", "Read one or more memory ranges from the attached process with arithmetic address expressions, typed decoding, and optional struct fields. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
-            {{"address", "string", "Target address or arithmetic expression such as 0xFFFF928956892700+0x88", false},
-             {"addresses", "array", "Batch addresses as expressions or objects containing address plus optional size, value_type, and fields", false},
-             {"size", "number", "Shared bytes to read; defaults to the type width, field span, or 256", false},
-             {"sizes", "array", "Batch byte counts with one entry per address", false},
-             {"value_type", "string", "Optional typed decode: byte/int8/uint8/int16/uint16/int32/uint32/int64/uint64/pointer/float/double/ascii/utf16/bytes", false},
-             {"value_types", "array", "Batch typed decodes with one entry per address", false},
-             {"fields", "array", "Struct fields [{name,offset,type,size?}]; variable-width fields require size", false},
+        srv.register_tool({"read_memory", "Read bytes or a typed scalar/string from the attached process. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address", true}, {"size", "number", "Bytes to read", false},
+             {"value_type", "string", "Optional typed decode: byte/int8/uint8/int16/uint16/int32/uint32/int64/uint64/float/double/ascii/utf16", false},
              {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             true, handle_read_memory});
         srv.register_tool({"read_u8", "Read an unsigned 8-bit value from one address or an addresses batch.",

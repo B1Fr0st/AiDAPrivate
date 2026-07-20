@@ -89,6 +89,42 @@ bool executable_rva(const workspace_image_t& image, std::uint64_t rva) noexcept
     return false;
 }
 
+std::optional<std::uint64_t> executable_region_end(
+    const workspace_image_t& image, std::uint64_t rva) noexcept
+{
+    std::optional<std::uint64_t> result;
+    const auto consider = [&](const auto& region) noexcept {
+        if ((region.permissions & image_permission_execute) == 0)
+            return;
+        const auto extent = region.virtual_size == 0
+            ? region.file_size
+            : std::min(region.virtual_size, region.file_size);
+        std::uint64_t end = 0;
+        if (extent == 0 || !checked_add_u64(region.virtual_address, extent, end) ||
+            end > image.image_size || rva < region.virtual_address || rva >= end)
+            return;
+        if (!result || end < *result)
+            result = end;
+    };
+    if (!image.sections.empty()) {
+        for (const auto& section : image.sections)
+            consider(section);
+    } else {
+        for (const auto& segment : image.segments)
+            consider(segment);
+    }
+    return result;
+}
+
+bool authoritative_loader_seed(function_seed_kind_t kind) noexcept
+{
+    return kind == function_seed_kind_t::image_entry ||
+        kind == function_seed_kind_t::export_entry ||
+        kind == function_seed_kind_t::unwind_range ||
+        kind == function_seed_kind_t::debug_symbol ||
+        kind == function_seed_kind_t::load_config_entry;
+}
+
 std::optional<std::uint64_t> to_rva_endpoint(const workspace_image_t& image,
                                              const address_t& address) noexcept
 {
@@ -612,6 +648,7 @@ struct selected_seed_t {
     function_seed_t seed;
     std::uint64_t start = 0;
     std::optional<std::uint64_t> end;
+    bool loader_only = false;
 };
 
 bool selected_seed_less(const selected_seed_t& lhs, const selected_seed_t& rhs) noexcept
@@ -1359,6 +1396,9 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
             continue;
         }
         const auto block = block_by_start.find(*start);
+        const bool loader_only = block == block_by_start.end() &&
+            authoritative_loader_seed(seed.kind) && executable_rva(image, *start) &&
+            executable_region_end(image, *start).has_value();
         if (block == block_by_start.end()) {
             function_recovery_conflict_t conflict;
             conflict.kind = function_recovery_conflict_kind_t::seed_without_block;
@@ -1369,13 +1409,18 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
             if (!appended)
                 return workspace_result_t<function_recovery_result_t>::failure(
                     appended.error());
-            continue;
+            if (!loader_only)
+                continue;
         }
         std::optional<std::uint64_t> end;
         if (seed.known_end) {
             end = to_rva_endpoint(image, *seed.known_end);
-            if (!end || *end <= *start ||
-                block_boundaries.find(*end) == block_boundaries.end()) {
+            const auto executable_end = executable_region_end(image, *start);
+            const bool valid_end = end && *end > *start &&
+                (loader_only
+                    ? executable_end && *end <= *executable_end
+                    : block_boundaries.find(*end) != block_boundaries.end());
+            if (!valid_end) {
                 function_recovery_conflict_t conflict;
                 conflict.kind = function_recovery_conflict_kind_t::invalid_seed_range;
                 conflict.rva = *start;
@@ -1389,7 +1434,7 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
                 end.reset();
             }
         }
-        selected.push_back({seed, *start, end});
+        selected.push_back({seed, *start, end, loader_only});
     }
     std::sort(selected.begin(), selected.end(), selected_seed_less);
     std::vector<selected_seed_t> canonical;
@@ -1405,6 +1450,7 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
                 winner.seed.name = selected[index].seed.name;
             if (!winner.end && selected[index].end)
                 winner.end = selected[index].end;
+            winner.loader_only = winner.loader_only || selected[index].loader_only;
             function_recovery_conflict_t conflict;
             conflict.kind = function_recovery_conflict_kind_t::duplicate_seed;
             conflict.rva = winner.start;
@@ -1420,6 +1466,24 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
         }
         canonical.push_back(std::move(winner));
         first = end;
+    }
+    for (std::size_t index = 0; index < canonical.size(); ++index) {
+        if (!canonical[index].loader_only || canonical[index].end)
+            continue;
+        const auto region_end = executable_region_end(image, canonical[index].start);
+        if (!region_end || *region_end <= canonical[index].start)
+            continue;
+        std::uint64_t end = *region_end;
+        for (std::size_t next = index + 1; next < canonical.size(); ++next) {
+            if (canonical[next].start >= end)
+                break;
+            if (canonical[next].start > canonical[index].start &&
+                authoritative_loader_seed(canonical[next].seed.kind)) {
+                end = canonical[next].start;
+                break;
+            }
+        }
+        canonical[index].end = end;
     }
     if (canonical.size() > limits.max_functions) {
         return workspace_result_t<function_recovery_result_t>::failure(make_workspace_error(
@@ -1476,8 +1540,11 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
         values.erase(std::unique(values.begin(), values.end()), values.end());
     }
     std::map<std::size_t, std::size_t> seeded_blocks;
-    for (std::size_t index = 0; index < canonical.size(); ++index)
-        seeded_blocks.emplace(block_by_start[canonical[index].start], index);
+    for (std::size_t index = 0; index < canonical.size(); ++index) {
+        const auto block = block_by_start.find(canonical[index].start);
+        if (block != block_by_start.end())
+            seeded_blocks.emplace(block->second, index);
+    }
     std::vector<std::uint32_t> visit_marks(result.blocks.size(), 0);
     result.reachability_mark_slots = visit_marks.size();
     std::uint32_t generation = 0;
@@ -1540,6 +1607,14 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
     std::vector<function_candidate_t> candidates;
     candidates.reserve(canonical.size());
     for (const auto& selection : canonical) {
+        if (selection.loader_only) {
+            if (!selection.end || *selection.end <= selection.start)
+                continue;
+            function_candidate_t candidate;
+            candidate.selection = selection;
+            candidates.push_back(std::move(candidate));
+            continue;
+        }
         auto reached = traverse(selection, false);
         if (!reached)
             return workspace_result_t<function_recovery_result_t>::failure(reached.error());
@@ -1661,8 +1736,30 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
     for (std::size_t candidate_index = 0;
          candidate_index < candidates.size(); ++candidate_index) {
         auto& candidate = candidates[candidate_index];
-        if (candidate.blocks.empty())
+        if (candidate.blocks.empty()) {
+            if (!candidate.selection.loader_only || !candidate.selection.end ||
+                *candidate.selection.end <= candidate.selection.start) {
+                return workspace_result_t<function_recovery_result_t>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                        "loader-backed function range is invalid", "functions"));
+            }
+            function_record_t function;
+            function.id = candidate.function_id;
+            function.start = rva_address(image, candidate.selection.start);
+            function.end = rva_address(image, *candidate.selection.end);
+            function.provenance = candidate.selection.seed.provenance;
+            function.confidence = candidate.selection.seed.confidence;
+            function.noreturn = candidate.selection.seed.noreturn ||
+                known_noreturn_name(candidate.selection.seed.name);
+            auto appended_function = append_bounded(result.functions,
+                std::move(function), limits.max_functions, limits.max_result_bytes,
+                result.storage_bytes, "functions",
+                "function storage exceeds analysis budget");
+            if (!appended_function)
+                return workspace_result_t<function_recovery_result_t>::failure(
+                    appended_function.error());
             continue;
+        }
         std::vector<chunk_run_t> runs;
         std::size_t run_begin = 0;
         while (run_begin < candidate.blocks.size()) {

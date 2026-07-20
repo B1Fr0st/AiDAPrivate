@@ -230,7 +230,7 @@ std::uint64_t zero_bytes(const std::filesystem::path& path, std::uint64_t expect
     std::ifstream stream(path, std::ios::binary);
     if (!stream)
         throw fixture_error_t("benchmark fixture cannot be opened for zero-padding qualification");
-    std::array<char, 1024 * 1024> buffer{};
+    std::vector<char> buffer(1024 * 1024);
     std::uint64_t consumed = 0;
     std::uint64_t zeros = 0;
     while (stream) {
@@ -414,9 +414,19 @@ std::shared_ptr<analysis_workspace_t> reopen_persisted_benchmark_workspace(
     try {
         if (workspace->identity().binary_id() != expected_identity.binary_id() ||
             workspace->identity().content_hash() != expected_identity.content_hash() ||
-            workspace->identity().load_profile_hash() != expected_identity.load_profile_hash() ||
-            workspace->snapshot() || workspace->analysis_revision() != 0)
+            workspace->identity().load_profile_hash() != expected_identity.load_profile_hash())
             throw fixture_error_t("warm reopen acquisition did not preserve the exact cold workspace identity");
+        const auto admission_snapshot = workspace->snapshot();
+        if (!admission_snapshot || admission_snapshot->baseline_complete ||
+            admission_snapshot->binary_id != expected_identity.binary_id() ||
+            admission_snapshot->load_profile_hash != expected_identity.load_profile_hash() ||
+            admission_snapshot->generation != workspace->generation() ||
+            admission_snapshot->analysis_revision != 0 ||
+            admission_snapshot->overlay_revision != 0 ||
+            admission_snapshot->normalized_image != workspace->normalized_image() ||
+            admission_snapshot->image != workspace->image() || workspace->analysis_revision() != 0 ||
+            workspace->overlay_revision() != 0 || workspace->search_index())
+            throw fixture_error_t("warm reopen acquisition did not begin from a parsed revision-zero publication");
 
         const auto snapshot_begin = steady_clock_t::now();
         auto loaded = workspace->database()->load_snapshot(

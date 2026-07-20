@@ -3584,19 +3584,12 @@ namespace test_all_features {
 				Sleep(25);
 			}
 
-			std::size_t blocks = 0;
-			std::size_t nodes = 0;
-			std::size_t edges = 0;
-			bool built = false;
-			std::uint64_t entry = 0;
-			{
-				std::lock_guard<std::mutex> lk(cfg_view::g_state.mutex);
-				blocks = cfg_view::g_state.blocks.size();
-				nodes = cfg_view::g_state.graph.nodes.size();
-				edges = cfg_view::g_state.graph.edges.size();
-				built = cfg_view::g_state.built;
-				entry = cfg_view::g_state.entry_addr;
-			}
+			const auto model = cfg_view::capture_model();
+			const std::size_t blocks = model ? model->blocks.size() : 0;
+			const std::size_t nodes = model ? model->graph.nodes.size() : 0;
+			const std::size_t edges = model ? model->graph.edges.size() : 0;
+			const bool built = model && !model->blocks.empty();
+			const std::uint64_t entry = model ? model->entry_addr : 0;
 
 			auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::steady_clock::now() - t0).count();

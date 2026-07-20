@@ -16,6 +16,7 @@
 #include "../ui/design_system.hpp"
 #include "../ai/standalone_chat.hpp"
 #include "standalone_driver.hpp"
+
 #ifndef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../runtime/standalone_license.hpp"
 #endif
@@ -165,6 +166,8 @@ namespace network_open_dialog = win32_dialog;
 #endif
 
 namespace network_view {
+
+static constexpr std::size_t k_max_repeater_entries = 128;
 
 using json = nlohmann::json;
 
@@ -448,6 +451,7 @@ static artifact_identity_t repeater_artifact_identity(const repeater_entry_t& en
     identity.target_port = entry.port;
     identity.use_tls = entry.use_tls;
     identity.parent_id = entry.source_artifact_id;
+    identity.session_id = entry.source_session_id;
     identity.id = "network.repeater." + std::to_string(entry.id) +
         (response ? ".response." + std::to_string(entry.response_timestamp)
                   : ".request." + std::to_string(entry.request_revision));
@@ -467,11 +471,78 @@ static artifact_identity_t repeater_artifact_identity(const repeater_entry_t& en
 struct network_selection_publication_t {
     std::weak_ptr<aida::analysis::analysis_workspace_t> workspace;
     std::uint64_t workspace_generation = 0;
+    aida::workbench::document_id_t document;
     std::string entity_key;
     std::string source_view_id;
+    std::string analysis_session_id;
+    std::string binary_id;
 };
 
 static network_selection_publication_t s_network_selection_publication;
+
+struct network_artifact_workspace_binding_t {
+    std::string analysis_session_id;
+    std::string binary_id;
+};
+
+static std::unordered_map<std::string, network_artifact_workspace_binding_t>
+    s_network_artifact_workspace_bindings;
+static constexpr std::size_t k_max_network_artifact_workspace_bindings = 4096;
+
+static std::string network_analysis_session_id(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    if (!workspace)
+        return {};
+    const auto count = analysis_session::session_count();
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto session = analysis_session::session_handle_at(index);
+        if (session && session->workspace == workspace)
+            return session->id;
+    }
+    return {};
+}
+
+static std::string network_artifact_binding_key(const artifact_identity_t& identity) {
+    std::string key;
+    key.reserve(identity.source_view_id.size() + identity.parent_id.size() + identity.id.size() + 48);
+    key.append(identity.source_view_id);
+    key.push_back('|');
+    key.append(identity.session_id);
+    key.push_back('|');
+    key.append(identity.parent_id.empty() ? identity.id : identity.parent_id);
+    key.push_back('|');
+    key.append(std::to_string(identity.source_id));
+    key.push_back('|');
+    key.append(std::to_string(
+        identity.kind == artifact_kind_t::repeater_request ||
+        identity.kind == artifact_kind_t::repeater_response
+            ? 0 : identity.timestamp));
+    return key;
+}
+
+static bool bind_network_artifact_workspace(
+    const artifact_identity_t& identity,
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    std::string& session_id,
+    std::string& binary_id) {
+    if (!workspace)
+        return false;
+    session_id = network_analysis_session_id(workspace);
+    binary_id = workspace->identity().binary_id().to_hex();
+    if (session_id.empty() || binary_id.empty())
+        return false;
+    const std::string key = network_artifact_binding_key(identity);
+    auto found = s_network_artifact_workspace_bindings.find(key);
+    if (found != s_network_artifact_workspace_bindings.end())
+        return found->second.analysis_session_id == session_id &&
+            found->second.binary_id == binary_id;
+    if (s_network_artifact_workspace_bindings.size() >=
+        k_max_network_artifact_workspace_bindings)
+        return false;
+    s_network_artifact_workspace_bindings.emplace(key,
+        network_artifact_workspace_binding_t{session_id, binary_id});
+    return true;
+}
 
 static std::string network_selection_entity_key(const artifact_identity_t& identity) {
     std::string key = "network.artifact|";
@@ -508,82 +579,121 @@ static std::string network_selection_entity_key(const artifact_identity_t& ident
 
 static bool publish_workbench_network_selection(
     const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-    const aida::workbench::selection_context_t& selection) {
+    const aida::workbench::selection_context_t& selection,
+    aida::workbench::document_id_t requested_document,
+    aida::workbench::document_id_t& published_document) {
     if (!workspace || workspace->closing() || workspace->closed())
         return false;
     aida::workbench::document_local_cursor_t cursor;
     aida::workbench::workbench_shell_workspace_context_t output;
-    return static_cast<bool>(aida::workbench::workbench_shell_runtime_t::instance()
-        .publish_selection(workspace, selection, cursor,
-            aida::workbench::navigation_origin_t::user, output));
+    auto& runtime = aida::workbench::workbench_shell_runtime_t::instance();
+    const auto result = requested_document.value != 0
+        ? runtime.publish_document_selection(workspace, requested_document, selection, cursor,
+            aida::workbench::navigation_origin_t::user, output)
+        : runtime.publish_selection(workspace, selection, cursor,
+            aida::workbench::navigation_origin_t::user, output);
+    if (!result)
+        return false;
+    if (requested_document.value != 0) {
+        published_document = requested_document;
+        return true;
+    }
+    const auto focused = std::find_if(output.persistence.views.begin(),
+        output.persistence.views.end(), [](const auto& view) { return view.focused; });
+    if (focused == output.persistence.views.end() || focused->document.value == 0)
+        return false;
+    published_document = focused->document;
+    return true;
 }
 
-static bool current_workbench_selection_matches(
+static bool document_workbench_selection_matches(
     const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    aida::workbench::document_id_t document_id,
     std::string_view entity_key) {
-    if (!workspace || entity_key.empty())
+    if (!workspace || document_id.value == 0 || entity_key.empty())
         return false;
     aida::workbench::workbench_shell_workspace_context_t context;
     if (!aida::workbench::workbench_shell_runtime_t::instance()
             .workspace_context(workspace, context))
         return false;
-    const auto focused = std::find_if(context.persistence.views.begin(),
-        context.persistence.views.end(), [](const auto& view) { return view.focused; });
-    if (focused == context.persistence.views.end())
-        return false;
     const auto document = std::find_if(context.persistence.documents.begin(),
         context.persistence.documents.end(), [&](const auto& candidate) {
-            return candidate.id == focused->document;
+            return candidate.id == document_id;
         });
     return document != context.persistence.documents.end() &&
         document->local_state.selection.kind == aida::workbench::selection_kind_t::entity &&
         document->local_state.selection.entity_key == entity_key;
 }
 
+static void clear_owned_network_selection() {
+    auto publication = std::move(s_network_selection_publication);
+    s_network_selection_publication = {};
+    auto workspace = publication.workspace.lock();
+    if (!workspace || workspace->closing() || workspace->closed() ||
+        publication.document.value == 0 ||
+        !document_workbench_selection_matches(
+            workspace, publication.document, publication.entity_key))
+        return;
+    aida::workbench::selection_context_t empty;
+    aida::workbench::document_id_t ignored;
+    static_cast<void>(publish_workbench_network_selection(
+        workspace, empty, publication.document, ignored));
+}
+
 static void clear_stale_network_selection(std::string_view source_view_id) {
     if (s_network_selection_publication.source_view_id != source_view_id)
         return;
-    auto workspace = s_network_selection_publication.workspace.lock();
-    if (workspace && !workspace->closing() && !workspace->closed() &&
-        current_workbench_selection_matches(
-            workspace, s_network_selection_publication.entity_key)) {
-        aida::workbench::selection_context_t empty;
-        static_cast<void>(publish_workbench_network_selection(workspace, empty));
-    }
-    s_network_selection_publication = {};
+    clear_owned_network_selection();
 }
 
 static void publish_network_selection(const artifact_identity_t& identity, bool force = false) {
-    if (!identity.valid() || identity.source_view_id.empty())
+    if (!identity.valid() || identity.source_view_id.empty()) {
+        clear_owned_network_selection();
         return;
+    }
     auto workspace = analysis_session::active_workspace();
-    if (!workspace || workspace->closing() || workspace->closed())
+    if (!workspace || workspace->closing() || workspace->closed()) {
+        clear_owned_network_selection();
         return;
+    }
+    std::string analysis_session_id;
+    std::string binary_id;
+    if (!bind_network_artifact_workspace(
+            identity, workspace, analysis_session_id, binary_id)) {
+        clear_owned_network_selection();
+        return;
+    }
     const auto generation = workspace->generation();
     const std::string entity_key = network_selection_entity_key(identity);
     auto previous_workspace = s_network_selection_publication.workspace.lock();
-    if (previous_workspace &&
-        (previous_workspace.get() != workspace.get() ||
-         s_network_selection_publication.workspace_generation != generation) &&
-        !previous_workspace->closing() && !previous_workspace->closed() &&
-        current_workbench_selection_matches(
-            previous_workspace, s_network_selection_publication.entity_key)) {
-        aida::workbench::selection_context_t empty;
-        static_cast<void>(publish_workbench_network_selection(previous_workspace, empty));
-    }
-    if (previous_workspace.get() == workspace.get() &&
+    const bool same_publication = previous_workspace.get() == workspace.get() &&
         s_network_selection_publication.workspace_generation == generation &&
-        s_network_selection_publication.entity_key == entity_key && !force)
+        s_network_selection_publication.analysis_session_id == analysis_session_id &&
+        s_network_selection_publication.binary_id == binary_id &&
+        s_network_selection_publication.entity_key == entity_key &&
+        s_network_selection_publication.document.value != 0;
+    if (same_publication && !force)
         return;
+    const aida::workbench::document_id_t requested_document = same_publication
+        ? s_network_selection_publication.document : aida::workbench::document_id_t{};
+    if (!same_publication && s_network_selection_publication.document.value != 0)
+        clear_owned_network_selection();
     aida::workbench::selection_context_t selection;
     selection.kind = aida::workbench::selection_kind_t::entity;
     selection.entity_key = entity_key;
-    if (!publish_workbench_network_selection(workspace, selection))
+    aida::workbench::document_id_t published_document;
+    if (!publish_workbench_network_selection(
+            workspace, selection, requested_document, published_document)) {
+        clear_owned_network_selection();
         return;
+    }
     s_network_selection_publication.workspace = workspace;
     s_network_selection_publication.workspace_generation = generation;
+    s_network_selection_publication.document = published_document;
     s_network_selection_publication.entity_key = entity_key;
     s_network_selection_publication.source_view_id = identity.source_view_id;
+    s_network_selection_publication.analysis_session_id = std::move(analysis_session_id);
+    s_network_selection_publication.binary_id = std::move(binary_id);
 }
 #else
 static void clear_stale_network_selection(std::string_view) {}
@@ -5230,7 +5340,10 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                        "TLS");
     ImGui::SameLine();
 
-    if (aida::ui::button("New", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+    const bool repeater_capacity_full =
+        state.repeater_entries.size() >= k_max_repeater_entries;
+    if (aida::ui::button("New", aida::ui::button_kind_t::primary,
+            aida::ui::size_t_::sm, ImVec2(0.f, 0.f), repeater_capacity_full)) {
         auto rep = std::make_shared<repeater_entry_t>();
         rep->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
         rep->host = state.rep_host;
@@ -8522,8 +8635,13 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     request_config.size = ImVec2(w - 8.f, tmpl_h);
     request_config.max_bytes = 65535;
     request_config.editable = !state.fuzz_running.load(std::memory_order_acquire);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    request_config.semantic_parent_id = "aida.dock-window.view.network.fuzzer";
+#endif
     const auto request_editor_result = human_request_editor::render(
-        request_editor, "network.fuzzer.request-template", cfg.base_request,
+        request_editor,
+        "network.fuzzer.request-template." + std::to_string(state.fuzz_request_revision),
+        cfg.base_request,
         request_config);
 
     ImGui::Spacing();
@@ -9269,6 +9387,9 @@ static void render_offensive(state_t& state, float x, float y, float w, float h,
     request_config.max_bytes = sizeof(state.off_raw_request) - 1;
     request_config.editable = !state.off_running.load(std::memory_order_acquire);
     request_config.allow_empty = true;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    request_config.semantic_parent_id = "aida.dock-window.view.network.offensive";
+#endif
     const auto request_editor_result = human_request_editor::render_fixed(
         request_editor, "network.offensive.raw-request", state.off_raw_request,
         request_config);
@@ -10676,8 +10797,8 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
     ImGui::SameLine();
     if (aida::ui::button("Execute", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
 
-        std::string input(state.decoder_input);
-        std::vector<uint8_t> data(input.begin(), input.end());
+        std::vector<uint8_t> data(state.decoder_input,
+            state.decoder_input + state.decoder_input_size);
         diag::log_tagged_fmt("network", "decoder_execute steps=%zu input_size=%zu",
             state.decoder_pipeline.size(), data.size());
 
@@ -10758,8 +10879,10 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
                  aida::ui::with_alpha(th.accent_u32, alpha), "Input");
 
     ImGui::SetCursorPos(ImVec2(4.f, dec_label_h));
-    ImGui::InputTextMultiline("##dec_in", state.decoder_input, sizeof(state.decoder_input),
-        ImVec2(right_w - 8.f, input_h - dec_label_h - 6.f), ImGuiInputTextFlags_AllowTabInput);
+    if (ImGui::InputTextMultiline("##dec_in", state.decoder_input, sizeof(state.decoder_input),
+            ImVec2(right_w - 8.f, input_h - dec_label_h - 6.f),
+            ImGuiInputTextFlags_AllowTabInput))
+        state.decoder_input_size = std::strlen(state.decoder_input);
     {
         ImVec2 bmin = ImGui::GetItemRectMin();
         ImVec2 bmax = ImGui::GetItemRectMax();
@@ -11496,6 +11619,10 @@ bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& 
 }
 
 bool send_artifact_to_repeater(const artifact_identity_t& identity, std::string& unavailable_reason) {
+    if (g_state.repeater_entries.size() >= k_max_repeater_entries) {
+        unavailable_reason = "Repeater retains at most 128 reviewed tabs; close a tab before opening another.";
+        return false;
+    }
     if (identity.kind == artifact_kind_t::response ||
         identity.kind == artifact_kind_t::repeater_response ||
         identity.kind == artifact_kind_t::sitemap_response ||
@@ -11522,9 +11649,16 @@ bool send_artifact_to_repeater(const artifact_identity_t& identity, std::string&
     }
     artifact_snapshot_t snapshot;
     if (!resolve_artifact(identity, snapshot, unavailable_reason)) return false;
+    if (snapshot.bytes.size() > 65535U) {
+        unavailable_reason = "Repeater accepts reviewed requests of at most 65535 bytes.";
+        return false;
+    }
+    if (!intercept_editor_compatible(snapshot.bytes, unavailable_reason))
+        return false;
     auto entry = std::make_shared<repeater_entry_t>();
     entry->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
     entry->source_artifact_id = identity.id;
+    entry->source_session_id = identity.session_id;
     entry->host = identity.target_host;
     entry->port = identity.target_port == 0 ? 443 : identity.target_port;
     entry->use_tls = identity.use_tls;
@@ -11833,6 +11967,10 @@ bool stage_validated_reviewed_request(const artifact_identity_t& source,
                                       artifact_identity_t& staged_identity,
                                       std::string& unavailable_reason) {
     staged_identity = {};
+    if (g_state.repeater_entries.size() >= k_max_repeater_entries) {
+        unavailable_reason = "Repeater retains at most 128 reviewed tabs; close a tab before staging another.";
+        return false;
+    }
     if (reviewed_request.empty() || reviewed_request.size() > 65535U) {
         unavailable_reason = "The prevalidated request payload is outside its bounded staging range.";
         return false;
@@ -11862,6 +12000,7 @@ bool stage_validated_reviewed_request(const artifact_identity_t& source,
     auto entry = std::make_shared<repeater_entry_t>();
     entry->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
     entry->source_artifact_id = canonical_source.id;
+    entry->source_session_id = canonical_source.session_id;
     entry->host = canonical_source.target_host;
     entry->port = canonical_source.target_port;
     entry->use_tls = canonical_source.use_tls;
@@ -12127,13 +12266,61 @@ std::string capability_reason(network_exchange_action_t action,
     case network_exchange_action_t::fuzzer:
     case network_exchange_action_t::intruder:
     case network_exchange_action_t::scanner:
-    case network_exchange_action_t::sequencer:
+    case network_exchange_action_t::sequencer: {
         if (!request) return "This action requires a retained HTTP request artifact.";
         if (request->kind == artifact_kind_t::http2_request)
             return "HTTP/2 requests must be reviewed and replayed in the HTTP/2 editor; HTTP/1 tools cannot preserve frame semantics.";
         if (request->target_host.empty() || request->target_port == 0)
             return "The request has no verified target host and port.";
+        if ((action == network_exchange_action_t::intruder ||
+             action == network_exchange_action_t::sequencer) &&
+            (request->target_host.size() >= 256U ||
+             human_request_editor::contains_binary_bytes(request->target_host)))
+            return "The retained request host cannot be represented by the destination's bounded text field.";
+        if (action == network_exchange_action_t::repeater)
+            return g_state.repeater_entries.size() < k_max_repeater_entries
+                ? std::string()
+                : "Repeater retains at most 128 reviewed tabs; close a tab before opening another.";
+        const std::size_t limit = action == network_exchange_action_t::sequencer
+            ? 8191U : 65535U;
+        if (request->content_size > limit)
+            return "The retained request exceeds the destination editor's bounded capacity.";
+        if (request->target_host.size() >= 256U)
+            return "The retained request host exceeds the destination's bounded host field.";
+        artifact_snapshot_t snapshot;
+        std::string reason;
+        if (!snapshot_for(*request, snapshot, reason))
+            return reason.empty() ? "The retained request is no longer available." : reason;
+        if (std::find(snapshot.bytes.begin(), snapshot.bytes.end(), 0) != snapshot.bytes.end())
+            return "This text-based tool cannot accept a request containing embedded NUL bytes.";
+        if (action == network_exchange_action_t::sequencer ||
+            action == network_exchange_action_t::scanner) {
+            const std::string raw = artifact_text(snapshot);
+            const std::string url = artifact_url(*request, raw);
+            if (url.size() >= 1024U || human_request_editor::contains_binary_bytes(url))
+                return "The retained request URL cannot be represented by the destination's bounded text field.";
+        }
+        if (!intercept_editor_compatible(snapshot.bytes, reason))
+            return reason;
         return {};
+    }
+    case network_exchange_action_t::decoder: {
+        if (context.primary.content_size >= sizeof(g_state.decoder_input))
+            return "Decoder's reviewed input accepts at most 16383 bytes.";
+        artifact_snapshot_t snapshot;
+        std::string reason;
+        if (!snapshot_for(context.primary, snapshot, reason))
+            return reason.empty() ? "The retained artifact is no longer available." : reason;
+        if (std::find(snapshot.bytes.begin(), snapshot.bytes.end(), 0) != snapshot.bytes.end())
+            return "Decoder's text input cannot accept embedded NUL bytes.";
+        const std::string_view decoder_text(
+            snapshot.bytes.empty() ? "" :
+                reinterpret_cast<const char*>(snapshot.bytes.data()),
+            snapshot.bytes.size());
+        if (human_request_editor::contains_binary_bytes(decoder_text))
+            return "Decoder's text input requires valid UTF-8 without binary control bytes.";
+        return {};
+    }
     case network_exchange_action_t::camoufox:
     case network_exchange_action_t::copy_url:
     case network_exchange_action_t::copy_method:
@@ -12221,25 +12408,33 @@ bool execute_exchange_action(network_exchange_action_t action,
         g_state.fuzz_config.use_tls = request->use_tls;
         g_state.fuzz_config.base_request.assign(
             request_snapshot.bytes.begin(), request_snapshot.bytes.end());
+        if (++g_state.fuzz_request_revision == 0)
+            ++g_state.fuzz_request_revision;
         g_state.active_tab = sub_tab_t::fuzzer;
         reason.clear();
         return true;
     case network_exchange_action_t::comparer:
         return send_artifact_to_comparer(context.primary, reason);
     case network_exchange_action_t::intruder:
-        if (!request || request_raw.size() >= 65536U) {
-            reason = "Intruder's reviewed request editor accepts at most 65535 bytes.";
+        if (!request || request_raw.size() >= 65536U ||
+            request_raw.find('\0') != std::string::npos) {
+            reason = "Intruder requires a NUL-free reviewed request of at most 65535 bytes.";
             return false;
         }
+        if (!intercept_editor_compatible(request_snapshot.bytes, reason))
+            return false;
         if (!aida::burp::intruder_view::open_new_attack_with(request->target_host,
                 request->target_port, request->use_tls, request_raw, reason)) return false;
         return aida::ui::application_views::open_or_focus(
             aida::ui::stable_view_id_t("view.network.intruder")).ok();
     case network_exchange_action_t::scanner:
-        if (!request || request_raw.size() >= 65536U) {
-            reason = "Scanner's reviewed audit editor accepts at most 65535 bytes.";
+        if (!request || request_raw.size() >= 65536U ||
+            request_raw.find('\0') != std::string::npos) {
+            reason = "Scanner requires a NUL-free reviewed request of at most 65535 bytes.";
             return false;
         }
+        if (!intercept_editor_compatible(request_snapshot.bytes, reason))
+            return false;
         if (!aida::burp::scanner_view::open_new_audit_with(url, request_raw)) {
             reason = "Scanner rejected the reviewed audit draft.";
             return false;
@@ -12247,19 +12442,35 @@ bool execute_exchange_action(network_exchange_action_t action,
         return aida::ui::application_views::open_or_focus(
             aida::ui::stable_view_id_t("view.network.scanner")).ok();
     case network_exchange_action_t::decoder:
-        if (primary_snapshot.bytes.size() >= sizeof(g_state.decoder_input)) {
-            reason = "Decoder's reviewed input accepts at most 16383 bytes.";
+        if (primary_snapshot.bytes.size() >= sizeof(g_state.decoder_input) ||
+            std::find(primary_snapshot.bytes.begin(), primary_snapshot.bytes.end(), 0) !=
+                primary_snapshot.bytes.end()) {
+            reason = "Decoder requires NUL-free reviewed input of at most 16383 bytes.";
             return false;
+        }
+        {
+            const std::string_view decoder_text(
+                primary_snapshot.bytes.empty() ? "" :
+                    reinterpret_cast<const char*>(primary_snapshot.bytes.data()),
+                primary_snapshot.bytes.size());
+            if (human_request_editor::contains_binary_bytes(decoder_text)) {
+                reason = "Decoder's text input requires valid UTF-8 without binary control bytes.";
+                return false;
+            }
         }
         std::memcpy(g_state.decoder_input, primary_snapshot.bytes.data(), primary_snapshot.bytes.size());
         g_state.decoder_input[primary_snapshot.bytes.size()] = '\0';
+        g_state.decoder_input_size = primary_snapshot.bytes.size();
         return aida::ui::application_views::open_or_focus(
             aida::ui::stable_view_id_t("view.network.decoder")).ok();
     case network_exchange_action_t::sequencer:
-        if (!request || request_raw.size() >= 8192U) {
-            reason = "Sequencer's reviewed request editor accepts at most 8191 bytes.";
+        if (!request || request_raw.size() >= 8192U ||
+            request_raw.find('\0') != std::string::npos || url.size() >= 1024U) {
+            reason = "Sequencer requires a bounded NUL-free URL and request of at most 8191 bytes.";
             return false;
         }
+        if (!intercept_editor_compatible(request_snapshot.bytes, reason))
+            return false;
         if (!aida::burp::sequencer_view::open_new_collection_with(url, request->target_host,
                 request->target_port, request->use_tls, request_raw, reason)) return false;
         return aida::ui::application_views::open_or_focus(
@@ -12534,7 +12745,10 @@ void open_exchange_context(artifact_identity_t primary, artifact_identity_t rela
 
     if (request && request->kind == artifact_kind_t::repeater_request) {
         const auto retained_request = *request;
-        append("network.repeater.duplicate", true, "", [retained_request] {
+        const bool can_duplicate = g_state.repeater_entries.size() < k_max_repeater_entries;
+        append("network.repeater.duplicate", can_duplicate,
+            "Repeater retains at most 128 reviewed tabs; close a tab before duplicating.",
+            [retained_request] {
             const auto found = std::find_if(g_state.repeater_entries.begin(),
                 g_state.repeater_entries.end(), [&](const auto& item) {
                     return item && item->id == retained_request.source_id;
@@ -12547,10 +12761,14 @@ void open_exchange_context(artifact_identity_t primary, artifact_identity_t rela
                 source.request_hash != retained_request.content_hash)
                 return aida::ui::action_handler_result_t::failed(
                     "The Repeater request changed; review it again before duplicating");
+            if (g_state.repeater_entries.size() >= k_max_repeater_entries)
+                return aida::ui::action_handler_result_t::failed(
+                    "Repeater capacity changed; close a tab before duplicating");
             auto duplicate = std::make_shared<repeater_entry_t>();
             duplicate->id = s_repeater_artifact_sequence.fetch_add(
                 1, std::memory_order_relaxed);
             duplicate->source_artifact_id = retained_request.id;
+            duplicate->source_session_id = retained_request.session_id;
             duplicate->host = source.host;
             duplicate->port = source.port;
             duplicate->use_tls = source.use_tls;

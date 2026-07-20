@@ -1450,6 +1450,18 @@ namespace {
 
 	void request_chrome_shutdown_from_render(const char* source, const char* cleanup_reason)
 	{
+		if (!file_tabs::exit_review_committed) {
+			const auto requested = file_tabs::request_exit_review();
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			if (!requested.succeeded)
+				diag::log_tagged_critical_fmt("chrome",
+					"shutdown_review_rejected source=%s reason=%.512s",
+					source ? source : "<null>", requested.detail.c_str());
+#else
+			static_cast<void>(requested);
+#endif
+			return;
+		}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		(void)cleanup_reason;
 		aida::preview::record(aida::preview::shell_action_t::close_window, source ? source : "render");
@@ -3128,8 +3140,7 @@ void helpers::render_title()
 	};
 	application_callbacks.save_as = [save_document_as] {
 		const auto result = save_document_as(file_tabs::active_tab);
-		if (!result.succeeded)
-			file_tabs::close_confirm_error = result.detail;
+		file_tabs::shell_save_as_result = result;
 	};
 	application_callbacks.exit_application = [] {
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -3527,8 +3538,6 @@ void helpers::render_title()
 		}
 	}
 	globals::ui::accent = aida::ui::resolved().accent;
-
-	const auto& shell_theme = aida::ui::resolved();
 
 	if (!ImGui::GetIO().WantTextInput) {
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -5056,7 +5065,15 @@ void helpers::render_title()
 				close_b.y,
 				ui_input_gate::chrome_input_blocked() ? 1 : 0);
 #endif
-			request_chrome_shutdown_from_render("close_button", "chrome.close_button");
+			const auto requested = file_tabs::request_exit_review();
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			if (!requested.succeeded)
+				diag::log_tagged_critical_fmt("chrome",
+					"close_button_review_rejected reason=%.512s",
+					requested.detail.c_str());
+#else
+			static_cast<void>(requested);
+#endif
 		}
 		ctl_off += metrics.title_control + gap * 1.5f;
 
@@ -6383,15 +6400,15 @@ void helpers::render_title()
 					auto render_debugger_menu = [&]() {
 						action_menu_item("debugger.launch");
 						action_menu_item("tools.attach_process");
-						action_menu_item("debugger.run_continue", "F5");
-						action_menu_item("debugger.pause", "F6");
-						action_menu_item("debugger.step_over", "F10");
-						action_menu_item("debugger.step_into", "F11");
-						action_menu_item("debugger.step_out", "Shift+F11");
-						action_menu_item("debugger.restart", "Ctrl+Shift+F5");
-						action_menu_item("debugger.detach", "Ctrl+F2");
-						action_menu_item("debugger.stop", "Shift+F5");
-						action_menu_item("debugger.watch.refresh_all", "Ctrl+R");
+						action_menu_item("debugger.run_continue");
+						action_menu_item("debugger.pause");
+						action_menu_item("debugger.step_over");
+						action_menu_item("debugger.step_into");
+						action_menu_item("debugger.step_out");
+						action_menu_item("debugger.restart");
+						action_menu_item("debugger.detach");
+						action_menu_item("debugger.stop");
+						action_menu_item("debugger.watch.refresh_all");
 						menu_sep();
 						if (begin_semantic_menu("Debugger Views", "debugger.views")) {
 							render_debugger_view_groups();
@@ -6946,6 +6963,12 @@ void helpers::render_title()
 				file_tabs::tabs[file_tabs::tab_index(ci)].document_id == reviewed_close_document;
 			const std::string fname = target_current
 				? file_tabs::tabs[file_tabs::tab_index(ci)].filename : "the reviewed document";
+			const auto save_gate = target_current
+				? file_tabs::verify_tab_save_gate(ci, false)
+				: file_tabs::save_result_t{false, "The reviewed document is no longer current."};
+			const bool save_disabled = !target_current || !save_gate.succeeded;
+			const bool close_disabled = !target_current ||
+				file_tabs::close_operation_pending(file_tabs::tabs[file_tabs::tab_index(ci)]);
 			const bool stack_close_actions = ImGui::GetContentRegionAvail().x < 320.f;
 			const float footer_height = stack_close_actions
 				? 126.f : aida::ui::design::dialog_footer_reserve_height("Cancel", "") + 8.f;
@@ -6958,6 +6981,9 @@ void helpers::render_title()
 				aida::ui::components::inline_notice("stale_target", "Document changed",
 					"The reviewed document is no longer current. Cancel and review the active close request.",
 					aida::ui::components::status_kind_t::warning);
+			else if (!save_gate.succeeded)
+				aida::ui::components::inline_notice("save_unavailable", "Save unavailable",
+					save_gate.detail.c_str(), aida::ui::components::status_kind_t::warning);
 			if (!file_tabs::pending_close_all_document_ids.empty()) {
 				ImGui::SeparatorText("Close queue");
 				std::unordered_map<std::uint64_t, std::string> document_names;
@@ -6998,20 +7024,22 @@ void helpers::render_title()
 					(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.f) / 3.f);
 			int action = -1;
 			if (aida::ui::components::button("Save", aida::ui::components::button_kind_t::primary,
-					aida::ui::components::size_t_::md, ImVec2(action_width, 34.f), !target_current))
+					aida::ui::components::size_t_::md, ImVec2(action_width, 34.f), save_disabled))
 				action = 0;
+			if (!save_disabled)
+				ImGui::SetItemDefaultFocus();
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			aida::preview::semantics::register_last_item(
-				"aida.editor.dirty-close.save", "dialog-action", false, !target_current);
+				"aida.editor.dirty-close.save", "dialog-action", false, save_disabled);
 #endif
 			if (!stack_close_actions)
 				ImGui::SameLine();
 			if (aida::ui::components::button("Don't Save", aida::ui::components::button_kind_t::destructive,
-					aida::ui::components::size_t_::md, ImVec2(action_width, 34.f), !target_current))
+					aida::ui::components::size_t_::md, ImVec2(action_width, 34.f), close_disabled))
 				action = 1;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			aida::preview::semantics::register_last_item(
-				"aida.editor.dirty-close.discard", "dialog-action", false, !target_current);
+				"aida.editor.dirty-close.discard", "dialog-action", false, close_disabled);
 #endif
 			if (!stack_close_actions)
 				ImGui::SameLine();
@@ -7023,11 +7051,6 @@ void helpers::render_title()
 			aida::preview::semantics::register_last_item(
 				"aida.editor.dirty-close.cancel", "dialog-action");
 #endif
-			if (target_current && !ImGui::GetIO().WantTextInput &&
-				(ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-				 ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
-				action = 0;
-
 			if (action == 0) {
 				const std::uint64_t closing_document = file_tabs::is_valid_tab_index(ci)
 					? file_tabs::tabs[file_tabs::tab_index(ci)].document_id : 0;

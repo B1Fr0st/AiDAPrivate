@@ -63,6 +63,8 @@
 #include "rename_dialog.hpp"
 #include "../ai/standalone_chat.hpp"
 #include "../ui/theme.hpp"
+#include "../settings/settings_persistence_service.hpp"
+#include "../settings/standalone_settings.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #endif
@@ -2018,6 +2020,126 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->PopClipRect();
 }
 
+struct workspace_graph_block_key_t {
+	std::uint8_t function_space = 0;
+	std::uint64_t function_value = 0;
+	std::uint8_t block_space = 0;
+	std::uint64_t block_value = 0;
+
+	friend bool operator==(const workspace_graph_block_key_t& left,
+		const workspace_graph_block_key_t& right) noexcept
+	{
+		return left.function_space == right.function_space &&
+			left.function_value == right.function_value &&
+			left.block_space == right.block_space &&
+			left.block_value == right.block_value;
+	}
+};
+
+struct workspace_graph_block_key_hash_t {
+	std::size_t operator()(const workspace_graph_block_key_t& value) const noexcept
+	{
+		std::uint64_t hash = value.function_value;
+		hash ^= value.block_value + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
+		hash ^= static_cast<std::uint64_t>(value.function_space) << 56u;
+		hash ^= static_cast<std::uint64_t>(value.block_space) << 48u;
+		return static_cast<std::size_t>(hash ^ (hash >> 32u));
+	}
+};
+
+struct workspace_graph_layout_key_t {
+	std::uint8_t function_space = 0;
+	std::uint64_t function_value = 0;
+	std::uint8_t page_space = 0;
+	std::uint64_t page_value = 0;
+
+	friend bool operator==(const workspace_graph_layout_key_t& left,
+		const workspace_graph_layout_key_t& right) noexcept
+	{
+		return left.function_space == right.function_space &&
+			left.function_value == right.function_value &&
+			left.page_space == right.page_space &&
+			left.page_value == right.page_value;
+	}
+
+	friend bool operator!=(const workspace_graph_layout_key_t& left,
+		const workspace_graph_layout_key_t& right) noexcept
+	{
+		return !(left == right);
+	}
+};
+
+struct workspace_graph_layout_key_hash_t {
+	std::size_t operator()(const workspace_graph_layout_key_t& value) const noexcept
+	{
+		std::uint64_t hash = value.function_value;
+		hash ^= value.page_value + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
+		hash ^= static_cast<std::uint64_t>(value.function_space) << 56u;
+		hash ^= static_cast<std::uint64_t>(value.page_space) << 48u;
+		return static_cast<std::size_t>(hash ^ (hash >> 32u));
+	}
+};
+
+struct workspace_graph_layout_node_key_t {
+	workspace_graph_layout_key_t layout;
+	workspace_graph_block_key_t block;
+
+	friend bool operator==(const workspace_graph_layout_node_key_t& left,
+		const workspace_graph_layout_node_key_t& right) noexcept
+	{
+		return left.layout == right.layout && left.block == right.block;
+	}
+};
+
+struct workspace_graph_layout_node_key_hash_t {
+	std::size_t operator()(const workspace_graph_layout_node_key_t& value) const noexcept
+	{
+		const auto left = workspace_graph_layout_key_hash_t{}(value.layout);
+		const auto right = workspace_graph_block_key_hash_t{}(value.block);
+		return left ^ (right + static_cast<std::size_t>(0x9E3779B97F4A7C15ull) +
+			(left << 6u) + (left >> 2u));
+	}
+};
+
+struct workspace_graph_edge_key_t {
+	aida::analysis::entity_id_t source = 0;
+	aida::analysis::entity_id_t target = 0;
+	aida::analysis::edge_kind_t kind = aida::analysis::edge_kind_t::fallthrough;
+
+	friend bool operator==(const workspace_graph_edge_key_t& left,
+		const workspace_graph_edge_key_t& right) noexcept
+	{
+		return left.source == right.source && left.target == right.target &&
+			left.kind == right.kind;
+	}
+};
+
+struct workspace_graph_edge_key_hash_t {
+	std::size_t operator()(const workspace_graph_edge_key_t& value) const noexcept
+	{
+		std::uint64_t hash = value.source;
+		hash ^= value.target + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
+		hash ^= static_cast<std::uint64_t>(value.kind) << 56u;
+		return static_cast<std::size_t>(hash ^ (hash >> 32u));
+	}
+};
+
+inline workspace_graph_block_key_t workspace_graph_block_key(
+	const aida::analysis::function_record_t& function,
+	const aida::analysis::basic_block_record_t& block) noexcept
+{
+	return {static_cast<std::uint8_t>(function.start.space), function.start.value,
+		static_cast<std::uint8_t>(block.start.space), block.start.value};
+}
+
+inline workspace_graph_layout_key_t workspace_graph_layout_key(
+	const aida::analysis::function_record_t& function,
+	const aida::analysis::basic_block_record_t& page_anchor) noexcept
+{
+	return {static_cast<std::uint8_t>(function.start.space), function.start.value,
+		static_cast<std::uint8_t>(page_anchor.start.space), page_anchor.start.value};
+}
+
 struct workspace_graph_view_state_t {
 	std::size_t block_page = 0;
 	float pan_x = 0.0f;
@@ -2035,16 +2157,288 @@ struct workspace_graph_view_state_t {
 		aida::analysis::edge_kind_t kind = aida::analysis::edge_kind_t::fallthrough;
 	};
 	std::vector<edge_t> edges;
+	bool edge_set_truncated = false;
 	std::vector<int> outgoing;
 	std::unordered_map<aida::analysis::entity_id_t, std::size_t> node_by_entity;
+	std::unordered_map<aida::analysis::entity_id_t,
+		std::vector<aida::analysis::entity_id_t>> successors;
+	std::unordered_map<aida::analysis::entity_id_t,
+		std::vector<aida::analysis::entity_id_t>> predecessors;
+	std::unordered_map<aida::analysis::entity_id_t, std::size_t> page_block_by_entity;
 	std::optional<aida::analysis::entity_id_t> selected_block;
 	std::optional<aida::analysis::entity_id_t> selected_instruction;
 	std::uint64_t selected_address = 0;
-	std::unordered_set<aida::analysis::entity_id_t> collapsed_reachable_roots;
-	std::unordered_map<aida::analysis::entity_id_t, ImVec2> pinned_node_positions;
-	bool layout_pinned = false;
-	std::uint32_t persisted_state_version = 1;
+	std::unordered_set<workspace_graph_block_key_t, workspace_graph_block_key_hash_t>
+		collapsed_reachable_roots;
+	std::unordered_map<workspace_graph_block_key_t, ImVec2,
+		workspace_graph_block_key_hash_t> pinned_node_positions;
+	std::unordered_set<workspace_graph_layout_key_t, workspace_graph_layout_key_hash_t>
+		pinned_layouts;
+	std::unordered_map<workspace_graph_layout_node_key_t, ImVec2,
+		workspace_graph_layout_node_key_hash_t> pinned_layout_positions;
+	std::optional<workspace_graph_layout_key_t> current_layout;
+	bool persisted_state_dirty = false;
+	std::uint32_t persisted_state_version = 3;
 };
+
+inline constexpr std::size_t k_workspace_graph_persisted_entry_limit = 32;
+inline constexpr std::size_t k_workspace_graph_persisted_item_limit = 256;
+inline constexpr std::size_t k_workspace_graph_edge_candidate_limit = 65536;
+inline constexpr std::size_t k_workspace_graph_edge_limit = 4096;
+
+inline void workspace_graph_load_persisted(const disasm_view::workspace_context_t& context,
+	workspace_graph_view_state_t& view)
+{
+	if (!context.workspace || g_sa_settings.workspace.graph_state_json.empty())
+		return;
+	const auto root = nlohmann::json::parse(g_sa_settings.workspace.graph_state_json,
+		nullptr, false);
+	const auto version = root.is_object() ? root.find("version") : root.end();
+	const auto entries = root.is_object() ? root.find("entries") : root.end();
+	const std::uint64_t root_version = version != root.end() && version->is_number_unsigned()
+		? version->get<std::uint64_t>() : 0U;
+	if (root.is_discarded() || !root.is_object() || version == root.end() ||
+		!version->is_number_unsigned() || (root_version != 2U && root_version != 3U) ||
+		entries == root.end() || !entries->is_array()) {
+		view.persisted_state_version = 0;
+		return;
+	}
+	const std::string binary_id = context.workspace->identity().binary_id().to_hex();
+	std::size_t inspected_entries = 0;
+	for (const auto& entry : *entries) {
+		if (inspected_entries++ >= k_workspace_graph_persisted_entry_limit)
+			break;
+		const auto entry_binary = entry.is_object() ? entry.find("binary_id") : entry.end();
+		if (!entry.is_object() || entry_binary == entry.end() ||
+			!entry_binary->is_string() || entry_binary->get<std::string>() != binary_id)
+			continue;
+		const auto entry_version = entry.find("version");
+		const std::uint64_t entry_version_value = entry_version != entry.end() &&
+			entry_version->is_number_unsigned()
+			? entry_version->get<std::uint64_t>() : 0U;
+		if ((entry_version_value != 2U && entry_version_value != 3U) ||
+			entry_version_value != root_version) {
+			view.persisted_state_version = 0;
+			return;
+		}
+		view.persisted_state_version = static_cast<std::uint32_t>(entry_version_value);
+		view.persisted_state_dirty = view.persisted_state_version == 2U;
+		if (entry.contains("collapsed") && entry["collapsed"].is_array()) {
+			std::size_t inspected_collapsed = 0;
+			for (const auto& value : entry["collapsed"]) {
+				if (inspected_collapsed++ >= k_workspace_graph_persisted_item_limit)
+					break;
+				if (!value.is_object())
+					continue;
+				const auto function_space = value.find("function_space");
+				const auto function_value = value.find("function_value");
+				const auto block_space = value.find("block_space");
+				const auto block_value = value.find("block_value");
+				if (function_space == value.end() || function_value == value.end() ||
+					block_space == value.end() || block_value == value.end() ||
+					!function_space->is_number_unsigned() ||
+					function_space->get<std::uint64_t>() > 3U ||
+					!function_value->is_number_unsigned() ||
+					!block_space->is_number_unsigned() ||
+					block_space->get<std::uint64_t>() > 3U ||
+					!block_value->is_number_unsigned())
+					continue;
+				view.collapsed_reachable_roots.insert({
+					static_cast<std::uint8_t>(function_space->get<std::uint64_t>()),
+					function_value->get<std::uint64_t>(),
+					static_cast<std::uint8_t>(block_space->get<std::uint64_t>()),
+					block_value->get<std::uint64_t>()});
+			}
+		}
+		if (entry.contains("pins") && entry["pins"].is_array()) {
+			std::size_t inspected_pins = 0;
+			for (const auto& pin : entry["pins"]) {
+				if (inspected_pins++ >= k_workspace_graph_persisted_item_limit)
+					break;
+				if (!pin.is_object())
+					continue;
+				const auto function_space = pin.find("function_space");
+				const auto function_value = pin.find("function_value");
+				const auto block_space = pin.find("block_space");
+				const auto block_value = pin.find("block_value");
+				const auto x_value = pin.find("x");
+				const auto y_value = pin.find("y");
+				if (function_space == pin.end() || function_value == pin.end() ||
+					block_space == pin.end() || block_value == pin.end() ||
+					x_value == pin.end() || y_value == pin.end() ||
+					!function_space->is_number_unsigned() ||
+					function_space->get<std::uint64_t>() > 3U ||
+					!function_value->is_number_unsigned() ||
+					!block_space->is_number_unsigned() ||
+					block_space->get<std::uint64_t>() > 3U ||
+					!block_value->is_number_unsigned() ||
+					!x_value->is_number() || !y_value->is_number())
+					continue;
+				const float x = x_value->get<float>();
+				const float y = y_value->get<float>();
+				if (!std::isfinite(x) || !std::isfinite(y) ||
+					std::abs(x) > 1000000.0f || std::abs(y) > 1000000.0f)
+					continue;
+				view.pinned_node_positions.emplace(workspace_graph_block_key_t{
+					static_cast<std::uint8_t>(function_space->get<std::uint64_t>()),
+					function_value->get<std::uint64_t>(),
+					static_cast<std::uint8_t>(block_space->get<std::uint64_t>()),
+					block_value->get<std::uint64_t>()}, ImVec2(x, y));
+			}
+		}
+		if (view.persisted_state_version == 3U && entry.contains("layout_pins") &&
+			entry["layout_pins"].is_array()) {
+			std::size_t inspected_layout_pins = 0;
+			for (const auto& pin : entry["layout_pins"]) {
+				if (inspected_layout_pins++ >= k_workspace_graph_persisted_item_limit)
+					break;
+				if (!pin.is_object())
+					continue;
+				const auto fs = pin.find("function_space");
+				const auto fv = pin.find("function_value");
+				const auto ps = pin.find("page_space");
+				const auto pv = pin.find("page_value");
+				const auto bs = pin.find("block_space");
+				const auto bv = pin.find("block_value");
+				const auto x = pin.find("x");
+				const auto y = pin.find("y");
+				if (fs == pin.end() || fv == pin.end() || ps == pin.end() ||
+					pv == pin.end() || bs == pin.end() || bv == pin.end() ||
+					x == pin.end() || y == pin.end() || !fs->is_number_unsigned() ||
+					fs->get<std::uint64_t>() > 3U || !fv->is_number_unsigned() ||
+					!ps->is_number_unsigned() || ps->get<std::uint64_t>() > 3U ||
+					!pv->is_number_unsigned() || !bs->is_number_unsigned() ||
+					bs->get<std::uint64_t>() > 3U || !bv->is_number_unsigned() ||
+					!x->is_number() || !y->is_number())
+					continue;
+				const float px = x->get<float>();
+				const float py = y->get<float>();
+				if (!std::isfinite(px) || !std::isfinite(py) ||
+					std::abs(px) > 1000000.0f || std::abs(py) > 1000000.0f)
+					continue;
+				workspace_graph_layout_node_key_t key{{
+					static_cast<std::uint8_t>(fs->get<std::uint64_t>()),
+					fv->get<std::uint64_t>(),
+					static_cast<std::uint8_t>(ps->get<std::uint64_t>()),
+					pv->get<std::uint64_t>()}, {
+					static_cast<std::uint8_t>(fs->get<std::uint64_t>()),
+					fv->get<std::uint64_t>(),
+					static_cast<std::uint8_t>(bs->get<std::uint64_t>()),
+					bv->get<std::uint64_t>()}};
+				view.pinned_layouts.insert(key.layout);
+				view.pinned_layout_positions.emplace(key, ImVec2(px, py));
+			}
+		}
+		view.fit_request = view.pinned_layouts.empty();
+		return;
+	}
+	if (root_version == 2U) {
+		view.persisted_state_version = 2;
+		view.persisted_state_dirty = true;
+	}
+}
+
+inline bool workspace_graph_save_persisted(const disasm_view::workspace_context_t& context,
+	const workspace_graph_view_state_t& view)
+{
+	if (!context.workspace ||
+		view.collapsed_reachable_roots.size() > k_workspace_graph_persisted_item_limit ||
+		view.pinned_node_positions.size() > k_workspace_graph_persisted_item_limit ||
+		view.pinned_layout_positions.size() > k_workspace_graph_persisted_item_limit ||
+		view.pinned_layouts.size() > k_workspace_graph_persisted_item_limit)
+		return false;
+	nlohmann::json root = nlohmann::json::parse(g_sa_settings.workspace.graph_state_json,
+		nullptr, false);
+	const auto version = root.is_object() ? root.find("version") : root.end();
+	const std::uint64_t root_version = version != root.end() && version->is_number_unsigned()
+		? version->get<std::uint64_t>() : 0U;
+	if (root.is_discarded() || !root.is_object() || version == root.end() ||
+		!version->is_number_unsigned() || (root_version != 2U && root_version != 3U))
+		root = nlohmann::json{{"version", 3U}, {"entries", nlohmann::json::array()}};
+	else if (root_version == 2U) {
+		root["version"] = 3U;
+		if (root.contains("entries") && root["entries"].is_array()) {
+			for (auto& entry : root["entries"]) {
+				if (!entry.is_object())
+					continue;
+				entry["version"] = 3U;
+				entry.erase("layout_pinned");
+				entry["layout_pins"] = nlohmann::json::array();
+			}
+		}
+	}
+	if (!root.contains("entries") || !root["entries"].is_array())
+		root["entries"] = nlohmann::json::array();
+	const std::string binary_id = context.workspace->identity().binary_id().to_hex();
+	auto& entries = root["entries"];
+	for (auto iterator = entries.begin(); iterator != entries.end();) {
+		const auto entry_binary = iterator->is_object()
+			? iterator->find("binary_id") : iterator->end();
+		if (!iterator->is_object() || entry_binary == iterator->end() ||
+			!entry_binary->is_string() || entry_binary->get<std::string>() == binary_id)
+			iterator = entries.erase(iterator);
+		else
+			++iterator;
+	}
+	nlohmann::json collapsed = nlohmann::json::array();
+	for (const auto& key : view.collapsed_reachable_roots)
+		collapsed.push_back({{"function_space", key.function_space},
+			{"function_value", key.function_value}, {"block_space", key.block_space},
+			{"block_value", key.block_value}});
+	nlohmann::json pins = nlohmann::json::array();
+	for (const auto& item : view.pinned_node_positions)
+		pins.push_back({{"function_space", item.first.function_space},
+			{"function_value", item.first.function_value},
+			{"block_space", item.first.block_space}, {"block_value", item.first.block_value},
+			{"x", item.second.x}, {"y", item.second.y}});
+	nlohmann::json layout_pins = nlohmann::json::array();
+	for (const auto& item : view.pinned_layout_positions)
+		layout_pins.push_back({{"function_space", item.first.layout.function_space},
+			{"function_value", item.first.layout.function_value},
+			{"page_space", item.first.layout.page_space},
+			{"page_value", item.first.layout.page_value},
+			{"block_space", item.first.block.block_space},
+			{"block_value", item.first.block.block_value},
+			{"x", item.second.x}, {"y", item.second.y}});
+	entries.insert(entries.begin(), nlohmann::json{{"version", 3U},
+		{"binary_id", binary_id},
+		{"collapsed", std::move(collapsed)}, {"pins", std::move(pins)}});
+	entries.front()["layout_pins"] = std::move(layout_pins);
+	while (entries.size() > k_workspace_graph_persisted_entry_limit)
+		entries.erase(entries.end() - 1);
+	const std::string encoded = root.dump();
+	if (encoded.size() > 256U * 1024U)
+		return false;
+	const std::string previous = g_sa_settings.workspace.graph_state_json;
+	g_sa_settings.workspace.graph_state_json = encoded;
+	if (aida::settings_persistence::accepted(
+			aida::settings_persistence::request_save(g_sa_settings)))
+		return true;
+	g_sa_settings.workspace.graph_state_json = previous;
+	return false;
+}
+
+template <typename Mutator>
+inline aida::ui::action_handler_result_t workspace_graph_persist_mutation(
+	const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<workspace_graph_view_state_t>& view, Mutator&& mutator)
+{
+	const auto old_collapsed = view->collapsed_reachable_roots;
+	const auto old_positions = view->pinned_node_positions;
+	const auto old_pinned_layouts = view->pinned_layouts;
+	const auto old_layout_positions = view->pinned_layout_positions;
+	const auto old_signature = view->layout_signature;
+	mutator();
+	if (workspace_graph_save_persisted(context, *view))
+		return aida::ui::action_handler_result_t::completed();
+	view->collapsed_reachable_roots = old_collapsed;
+	view->pinned_node_positions = old_positions;
+	view->pinned_layouts = old_pinned_layouts;
+	view->pinned_layout_positions = old_layout_positions;
+	view->layout_signature = old_signature;
+	return aida::ui::action_handler_result_t::failed(
+		"Graph state persistence rejected the update");
+}
 
 inline std::mutex& workspace_graph_registry_mutex()
 {
@@ -2052,13 +2446,24 @@ inline std::mutex& workspace_graph_registry_mutex()
 	return value;
 }
 
+struct workspace_graph_registry_entry_t {
+	std::shared_ptr<workspace_graph_view_state_t> view;
+	std::uint64_t access = 0;
+};
+
 inline std::unordered_map<aida::analysis::binary_id_t,
-	std::shared_ptr<workspace_graph_view_state_t>,
+	workspace_graph_registry_entry_t,
 	aida::analysis::binary_id_hash_t>& workspace_graph_registry()
 {
 	static std::unordered_map<aida::analysis::binary_id_t,
-		std::shared_ptr<workspace_graph_view_state_t>,
+		workspace_graph_registry_entry_t,
 		aida::analysis::binary_id_hash_t> value;
+	return value;
+}
+
+inline std::uint64_t& workspace_graph_registry_clock()
+{
+	static std::uint64_t value = 0;
 	return value;
 }
 
@@ -2071,10 +2476,22 @@ inline std::shared_ptr<workspace_graph_view_state_t> workspace_graph_state(
 	auto& registry = workspace_graph_registry();
 	const auto id = context.workspace->identity().binary_id();
 	auto found = registry.find(id);
-	if (found != registry.end())
-		return found->second;
+	if (found != registry.end()) {
+		found->second.access = ++workspace_graph_registry_clock();
+		return found->second.view;
+	}
+	if (registry.size() >= k_workspace_graph_persisted_entry_limit) {
+		const auto oldest = std::min_element(registry.begin(), registry.end(),
+			[](const auto& left, const auto& right) {
+				return left.second.access < right.second.access;
+			});
+		if (oldest != registry.end())
+			registry.erase(oldest);
+	}
 	auto created = std::make_shared<workspace_graph_view_state_t>();
-	registry.emplace(id, created);
+	workspace_graph_load_persisted(context, *created);
+	registry.emplace(id, workspace_graph_registry_entry_t{
+		created, ++workspace_graph_registry_clock()});
 	return created;
 }
 
@@ -2133,6 +2550,23 @@ inline std::uint64_t workspace_graph_evidence_hash(const std::string& value)
 	return hash == 0 ? 1 : hash;
 }
 
+inline bool workspace_graph_cfg_edge_kind(aida::analysis::edge_kind_t kind) noexcept
+{
+	switch (kind) {
+	case aida::analysis::edge_kind_t::fallthrough:
+	case aida::analysis::edge_kind_t::conditional_taken:
+	case aida::analysis::edge_kind_t::unconditional:
+	case aida::analysis::edge_kind_t::exception_edge:
+	case aida::analysis::edge_kind_t::indirect:
+		return true;
+	case aida::analysis::edge_kind_t::call:
+	case aida::analysis::edge_kind_t::tail_call:
+	case aida::analysis::edge_kind_t::return_edge:
+		return false;
+	}
+	return false;
+}
+
 inline const char* workspace_graph_edge_label(aida::analysis::edge_kind_t kind,
 	bool branching)
 {
@@ -2168,6 +2602,50 @@ inline ImU32 workspace_graph_edge_color(aida::analysis::edge_kind_t kind,
 	return aida::ui::with_alpha(color, alpha);
 }
 
+inline bool workspace_graph_contains_block_key(
+	const aida::analysis::analysis_snapshot_t& snapshot,
+	const workspace_graph_block_key_t& key)
+{
+	const auto function = std::lower_bound(snapshot.functions.begin(), snapshot.functions.end(), key,
+		[](const aida::analysis::function_record_t& candidate,
+		   const workspace_graph_block_key_t& value) {
+			const auto space = static_cast<std::uint8_t>(candidate.start.space);
+			return space < value.function_space ||
+				(space == value.function_space && candidate.start.value < value.function_value);
+		});
+	if (function == snapshot.functions.end() ||
+		static_cast<std::uint8_t>(function->start.space) != key.function_space ||
+		function->start.value != key.function_value)
+		return false;
+	const std::size_t begin = function->first_block;
+	if (begin > snapshot.blocks.size())
+		return false;
+	const std::size_t available = begin <= snapshot.blocks.size()
+		? snapshot.blocks.size() - begin : 0;
+	const std::size_t count = (std::min)(
+		static_cast<std::size_t>(function->block_count), available);
+	const auto first = snapshot.blocks.begin() + static_cast<std::ptrdiff_t>(begin);
+	const auto last = first + static_cast<std::ptrdiff_t>(count);
+	const auto block = std::lower_bound(first, last, key,
+		[](const aida::analysis::basic_block_record_t& candidate,
+		   const workspace_graph_block_key_t& value) {
+			const auto space = static_cast<std::uint8_t>(candidate.start.space);
+			return space < value.block_space ||
+				(space == value.block_space && candidate.start.value < value.block_value);
+		});
+	return block != last && block->function_id == function->id &&
+		static_cast<std::uint8_t>(block->start.space) == key.block_space &&
+		block->start.value == key.block_value;
+}
+
+inline bool workspace_graph_contains_layout_key(
+	const aida::analysis::analysis_snapshot_t& snapshot,
+	const workspace_graph_layout_key_t& key)
+{
+	return workspace_graph_contains_block_key(snapshot, {
+		key.function_space, key.function_value, key.page_space, key.page_value});
+}
+
 inline void workspace_graph_rebuild_layout(
 	workspace_graph_view_state_t& view,
 	const disasm_view::workspace_context_t& context,
@@ -2175,51 +2653,183 @@ inline void workspace_graph_rebuild_layout(
 	std::size_t page_begin, std::size_t page_end)
 {
 	const auto& snapshot = *context.publication->snapshot;
-	if (view.persisted_state_version != 1) {
-		view.collapsed_reachable_roots.clear();
-		view.pinned_node_positions.clear();
-		view.layout_pinned = false;
-		view.persisted_state_version = 1;
+	const auto old_collapsed = view.collapsed_reachable_roots;
+	const auto old_positions = view.pinned_node_positions;
+	const auto old_pinned_layouts = view.pinned_layouts;
+	const auto old_layout_positions = view.pinned_layout_positions;
+	const auto old_persisted_version = view.persisted_state_version;
+	bool persisted_state_changed = view.persisted_state_dirty;
+	if (view.persisted_state_version != 3) {
+		if (view.persisted_state_version != 2) {
+			view.collapsed_reachable_roots.clear();
+			view.pinned_node_positions.clear();
+		}
+		view.pinned_layouts.clear();
+		view.pinned_layout_positions.clear();
+		view.persisted_state_version = 3;
+		persisted_state_changed = true;
 	}
-	std::unordered_set<aida::analysis::entity_id_t> function_blocks;
-	for (std::size_t local = page_begin; local < page_end; ++local) {
-		const std::size_t index = static_cast<std::size_t>(function.first_block) + local;
-		if (index < snapshot.blocks.size()) function_blocks.insert(snapshot.blocks[index].id);
-	}
+	std::unordered_set<workspace_graph_block_key_t, workspace_graph_block_key_hash_t>
+		persisted_keys;
+	persisted_keys.reserve(view.collapsed_reachable_roots.size() +
+		view.pinned_node_positions.size());
+	for (const auto& key : view.collapsed_reachable_roots) persisted_keys.insert(key);
+	for (const auto& item : view.pinned_node_positions) persisted_keys.insert(item.first);
+	for (const auto& item : view.pinned_layout_positions) persisted_keys.insert(item.first.block);
+	std::unordered_set<workspace_graph_layout_key_t, workspace_graph_layout_key_hash_t>
+		valid_layout_keys;
+	valid_layout_keys.reserve(view.pinned_layouts.size());
+	std::unordered_set<workspace_graph_block_key_t, workspace_graph_block_key_hash_t>
+		valid_persisted_keys;
+	valid_persisted_keys.reserve(persisted_keys.size());
+	for (const auto& key : persisted_keys)
+		if (workspace_graph_contains_block_key(snapshot, key))
+			valid_persisted_keys.insert(key);
+	for (const auto& key : view.pinned_layouts)
+		if (workspace_graph_contains_layout_key(snapshot, key))
+			valid_layout_keys.insert(key);
 	for (auto iterator = view.collapsed_reachable_roots.begin();
 		iterator != view.collapsed_reachable_roots.end();) {
-		if (function_blocks.count(*iterator) == 0) iterator = view.collapsed_reachable_roots.erase(iterator);
+		if (valid_persisted_keys.count(*iterator) == 0) {
+			iterator = view.collapsed_reachable_roots.erase(iterator);
+			persisted_state_changed = true;
+		}
 		else ++iterator;
 	}
 	for (auto iterator = view.pinned_node_positions.begin();
 		iterator != view.pinned_node_positions.end();) {
-		if (function_blocks.count(iterator->first) == 0) iterator = view.pinned_node_positions.erase(iterator);
+		if (valid_persisted_keys.count(iterator->first) == 0) {
+			iterator = view.pinned_node_positions.erase(iterator);
+			persisted_state_changed = true;
+		}
 		else ++iterator;
+	}
+	for (auto iterator = view.pinned_layouts.begin(); iterator != view.pinned_layouts.end();) {
+		if (valid_layout_keys.count(*iterator) == 0) {
+			iterator = view.pinned_layouts.erase(iterator);
+			persisted_state_changed = true;
+		} else ++iterator;
+	}
+	for (auto iterator = view.pinned_layout_positions.begin();
+		iterator != view.pinned_layout_positions.end();) {
+		if (valid_layout_keys.count(iterator->first.layout) == 0 ||
+			valid_persisted_keys.count(iterator->first.block) == 0) {
+			iterator = view.pinned_layout_positions.erase(iterator);
+			persisted_state_changed = true;
+		} else ++iterator;
+	}
+	if (persisted_state_changed && !workspace_graph_save_persisted(context, view)) {
+		view.collapsed_reachable_roots = old_collapsed;
+		view.pinned_node_positions = old_positions;
+		view.pinned_layouts = old_pinned_layouts;
+		view.pinned_layout_positions = old_layout_positions;
+		view.persisted_state_version = old_persisted_version;
+		view.persisted_state_dirty = true;
+		view.layout_signature = 0;
+	} else if (persisted_state_changed) {
+		view.persisted_state_dirty = false;
 	}
 	view.layout = {};
 	view.block_indices.clear();
 	view.edges.clear();
+	view.edge_set_truncated = false;
 	view.outgoing.clear();
 	view.node_by_entity.clear();
+	view.successors.clear();
+	view.predecessors.clear();
+	view.page_block_by_entity.clear();
 	view.block_indices.reserve(page_end - page_begin);
 	view.layout.nodes.reserve(page_end - page_begin);
-	std::unordered_set<aida::analysis::entity_id_t> hidden;
-	std::vector<aida::analysis::entity_id_t> frontier;
-	for (const auto root : view.collapsed_reachable_roots)
-		frontier.push_back(root);
-	for (std::size_t cursor = 0; cursor < frontier.size() && cursor < 4096; ++cursor) {
-		for (const auto& edge : snapshot.edges) {
-			if (edge.source_entity != frontier[cursor] || !edge.target_entity ||
-				view.collapsed_reachable_roots.count(*edge.target_entity) != 0)
-				continue;
-			if (hidden.insert(*edge.target_entity).second)
-				frontier.push_back(*edge.target_entity);
-		}
-	}
+	std::vector<std::size_t> page_block_indices;
+	page_block_indices.reserve(page_end - page_begin);
+	std::unordered_set<aida::analysis::entity_id_t> page_block_ids;
+	page_block_ids.reserve(page_end - page_begin);
+	std::unordered_map<aida::analysis::entity_id_t, workspace_graph_block_key_t>
+		page_block_keys;
+	page_block_keys.reserve(page_end - page_begin);
+	view.page_block_by_entity.reserve(page_end - page_begin);
 	for (std::size_t local = page_begin; local < page_end; ++local) {
 		const std::size_t index = static_cast<std::size_t>(function.first_block) + local;
 		if (index >= snapshot.blocks.size())
 			break;
+		const auto& block = snapshot.blocks[index];
+		page_block_indices.push_back(index);
+		page_block_ids.insert(block.id);
+		page_block_keys.emplace(block.id, workspace_graph_block_key(function, block));
+		view.page_block_by_entity.emplace(block.id, index);
+	}
+	view.current_layout = page_block_indices.empty() ?
+		std::optional<workspace_graph_layout_key_t>{} :
+		std::optional<workspace_graph_layout_key_t>{workspace_graph_layout_key(
+			function, snapshot.blocks[page_block_indices.front()])};
+	std::vector<const aida::analysis::edge_record_t*> page_cfg_edges;
+	page_cfg_edges.reserve((std::min)(k_workspace_graph_edge_limit,
+		page_block_indices.size() * 4U));
+	if (!page_block_indices.empty()) {
+		auto range_begin = snapshot.blocks[page_block_indices.front()].start;
+		auto range_end = snapshot.blocks[page_block_indices.front()].end;
+		for (const auto index : page_block_indices) {
+			range_begin = (std::min)(range_begin, snapshot.blocks[index].start);
+			range_end = (std::max)(range_end, snapshot.blocks[index].end);
+		}
+		auto edge = std::lower_bound(snapshot.edges.begin(), snapshot.edges.end(), range_begin,
+			[](const aida::analysis::edge_record_t& candidate,
+			   const aida::analysis::address_t& address) {
+				return candidate.source < address;
+			});
+		std::unordered_set<workspace_graph_edge_key_t, workspace_graph_edge_key_hash_t>
+			deduplicated;
+		deduplicated.reserve((std::min)(k_workspace_graph_edge_limit,
+			page_block_indices.size() * 4U));
+		std::size_t inspected = 0;
+		for (; edge != snapshot.edges.end() && edge->source < range_end &&
+			inspected < k_workspace_graph_edge_candidate_limit; ++edge, ++inspected) {
+			if (!edge->target_entity || !workspace_graph_cfg_edge_kind(edge->kind) ||
+				page_block_ids.count(edge->source_entity) == 0 ||
+				page_block_ids.count(*edge->target_entity) == 0)
+				continue;
+			const workspace_graph_edge_key_t key{edge->source_entity,
+				*edge->target_entity, edge->kind};
+			if (!deduplicated.insert(key).second)
+				continue;
+			if (page_cfg_edges.size() >= k_workspace_graph_edge_limit) {
+				view.edge_set_truncated = true;
+				break;
+			}
+			page_cfg_edges.push_back(&*edge);
+		}
+		if (inspected >= k_workspace_graph_edge_candidate_limit &&
+			edge != snapshot.edges.end() && edge->source < range_end)
+			view.edge_set_truncated = true;
+	}
+	view.successors.reserve(page_block_ids.size());
+	view.predecessors.reserve(page_block_ids.size());
+	for (const auto* edge : page_cfg_edges) {
+		view.successors[edge->source_entity].push_back(*edge->target_entity);
+		view.predecessors[*edge->target_entity].push_back(edge->source_entity);
+	}
+	std::unordered_set<aida::analysis::entity_id_t> hidden;
+	std::unordered_set<aida::analysis::entity_id_t> protected_roots;
+	std::vector<aida::analysis::entity_id_t> frontier;
+	for (const auto& item : page_block_keys) {
+		if (view.collapsed_reachable_roots.count(item.second) != 0) {
+			protected_roots.insert(item.first);
+			frontier.push_back(item.first);
+		}
+	}
+	std::unordered_set<aida::analysis::entity_id_t> visited = protected_roots;
+	for (std::size_t cursor = 0; cursor < frontier.size(); ++cursor) {
+		const auto adjacent = view.successors.find(frontier[cursor]);
+		if (adjacent == view.successors.end())
+			continue;
+		for (const auto target : adjacent->second) {
+			if (protected_roots.count(target) == 0)
+				hidden.insert(target);
+			if (visited.insert(target).second)
+				frontier.push_back(target);
+		}
+	}
+	for (const auto index : page_block_indices) {
 		const auto& block = snapshot.blocks[index];
 		if (hidden.count(block.id) != 0)
 			continue;
@@ -2232,28 +2842,26 @@ inline void workspace_graph_rebuild_layout(
 		node.height = 43.0f + static_cast<float>(shown) * 19.0f +
 			(block.instruction_count > shown ? 20.0f : 8.0f);
 		node.addr_col_w = 112.0f;
-		node.is_entry = local == 0;
+		node.is_entry = index == static_cast<std::size_t>(function.first_block);
 		view.node_by_entity.emplace(block.id, view.layout.nodes.size());
 		view.block_indices.push_back(index);
 		view.layout.nodes.push_back(node);
 	}
-	for (const auto& edge : snapshot.edges) {
-		if (!edge.target_entity)
-			continue;
-		const auto from = view.node_by_entity.find(edge.source_entity);
-		const auto to = view.node_by_entity.find(*edge.target_entity);
+	for (const auto* edge : page_cfg_edges) {
+		const auto from = view.node_by_entity.find(edge->source_entity);
+		const auto to = view.node_by_entity.find(*edge->target_entity);
 		if (from == view.node_by_entity.end() || to == view.node_by_entity.end())
 			continue;
 		workspace_graph_view_state_t::edge_t visual;
 		visual.from = static_cast<int>(from->second);
 		visual.to = static_cast<int>(to->second);
-		visual.kind = edge.kind;
+		visual.kind = edge->kind;
 		view.edges.push_back(visual);
 		if (visual.to > visual.from) {
 			cfg_layout::edge_t layout_edge;
 			layout_edge.from = visual.from;
 			layout_edge.to = visual.to;
-			layout_edge.is_true_branch = edge.kind ==
+			layout_edge.is_true_branch = edge->kind ==
 				aida::analysis::edge_kind_t::conditional_taken;
 			view.layout.edges.push_back(layout_edge);
 		}
@@ -2265,11 +2873,20 @@ inline void workspace_graph_rebuild_layout(
 	}
 	cfg_layout::layout(view.layout, 82.0f, 94.0f);
 	for (std::size_t index = 0; index < view.block_indices.size(); ++index) {
-		const auto id = snapshot.blocks[view.block_indices[index]].id;
-		const auto pinned = view.pinned_node_positions.find(id);
+		const auto& block = snapshot.blocks[view.block_indices[index]];
+		const auto block_key = workspace_graph_block_key(function, block);
+		const auto pinned = view.pinned_node_positions.find(block_key);
 		if (pinned != view.pinned_node_positions.end()) {
 			view.layout.nodes[index].x = pinned->second.x;
 			view.layout.nodes[index].y = pinned->second.y;
+		} else if (view.current_layout &&
+			view.pinned_layouts.count(*view.current_layout) != 0) {
+			const auto layout_pinned = view.pinned_layout_positions.find(
+				workspace_graph_layout_node_key_t{*view.current_layout, block_key});
+			if (layout_pinned != view.pinned_layout_positions.end()) {
+				view.layout.nodes[index].x = layout_pinned->second.x;
+				view.layout.nodes[index].y = layout_pinned->second.y;
+			}
 		}
 	}
 	if (view.selected_block &&
@@ -2389,7 +3006,9 @@ inline void render(float, float, float width, float height,
 		"%016llX", static_cast<unsigned long long>(function_address));
 	ImGui::SameLine();
 	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.text_dim),
-		"%zu blocks  %zu edges", total, view->edges.size());
+		"%zu/%zu page blocks visible  %zu visible edges%s  %zu function blocks",
+		view->layout.nodes.size(), page_end - page_begin, view->edges.size(),
+		view->edge_set_truncated ? "  bounded" : "", total);
 	ImGui::SameLine();
 	if (ImGui::SmallButton("Disassembly  Space"))
 		workspace_graph_open_disassembly(context,
@@ -2805,6 +3424,8 @@ inline void render(float, float, float width, float height,
 		context_t menu;
 		menu.kind = menu_kind_t::graph;
 		const auto retained_block = context_block->id;
+		const auto retained_block_key = workspace_graph_block_key(*function, *context_block);
+		const auto retained_layout = view->current_layout;
 		const auto retained_instruction = view->selected_instruction;
 		const auto retained_address = view->selected_address;
 		menu.entity_id = "graph-block:" + std::to_string(retained_block) + ":" +
@@ -2813,10 +3434,11 @@ inline void render(float, float, float width, float height,
 		menu.generation = workspace_graph_generation(context);
 		menu.live_generation = [context]() { return workspace_graph_generation(context); };
 		menu.validate_identity = [view, retained_block, retained_instruction,
-			retained_address]() {
+			retained_address, retained_layout]() {
 			return view->selected_block && *view->selected_block == retained_block &&
 				view->selected_instruction == retained_instruction &&
-				view->selected_address == retained_address
+				view->selected_address == retained_address &&
+				view->current_layout == retained_layout
 				? aida::ui::capability_state_t::available()
 				: aida::ui::capability_state_t::unavailable(
 					"The selected graph block or instruction changed");
@@ -2914,18 +3536,27 @@ inline void render(float, float, float width, float height,
 			unavailable("analysis.navigate.follow", "The selected graph instruction has no direct resolved target");
 		}
 		std::optional<std::uint64_t> source_address;
-		bool has_reachable_target = false;
-		for (const auto& edge : snapshot.edges) {
-			if (edge.source_entity == retained_block && edge.target_entity)
-				has_reachable_target = true;
-			if (edge.target_entity && *edge.target_entity == retained_block) {
-				const auto source = std::find_if(snapshot.blocks.begin(), snapshot.blocks.end(),
-					[&](const auto& candidate) { return candidate.id == edge.source_entity; });
-				if (source != snapshot.blocks.end()) {
-					source_address = disasm_view::runtime_address(context, source->start)
-						.value_or(source->start.value);
-					break;
-				}
+		const auto successor = view->successors.find(retained_block);
+		const bool has_reachable_target = successor != view->successors.end() &&
+			std::any_of(successor->second.begin(), successor->second.end(),
+				[view, retained_block](const auto target) {
+					return target != retained_block &&
+						view->node_by_entity.count(target) != 0;
+				});
+		const auto predecessor = view->predecessors.find(retained_block);
+		if (predecessor != view->predecessors.end()) {
+			const auto visible_source = std::find_if(predecessor->second.begin(),
+				predecessor->second.end(), [view](const auto source) {
+					return view->node_by_entity.count(source) != 0;
+				});
+			const auto source = visible_source == predecessor->second.end()
+				? view->page_block_by_entity.end()
+				: view->page_block_by_entity.find(*visible_source);
+			if (source != view->page_block_by_entity.end() &&
+				source->second < snapshot.blocks.size()) {
+				const auto& source_block = snapshot.blocks[source->second];
+				source_address = disasm_view::runtime_address(context, source_block.start)
+					.value_or(source_block.start.value);
 			}
 		}
 		if (source_address) {
@@ -2936,82 +3567,162 @@ inline void render(float, float, float width, float height,
 				};
 		} else {
 			unavailable("analysis.graph.navigate_source",
-				"The selected block has no published incoming source block");
+				"No incoming source block is present in the visible page edge set; it may be on another page or hidden");
 		}
+		std::optional<std::uint64_t> visible_direct_target;
 		if (direct_target) {
+			const auto typed_target = disasm_view::typed_address(context, *direct_target);
+			if (typed_target && successor != view->successors.end()) {
+				for (const auto target_entity : successor->second) {
+					if (view->node_by_entity.count(target_entity) == 0)
+						continue;
+					const auto target = view->page_block_by_entity.find(target_entity);
+					if (target == view->page_block_by_entity.end() ||
+						target->second >= snapshot.blocks.size())
+						continue;
+					const auto& block = snapshot.blocks[target->second];
+					if (typed_target->space == block.start.space &&
+						typed_target->value >= block.start.value &&
+						typed_target->value < block.end.value) {
+						visible_direct_target = *direct_target;
+						break;
+					}
+				}
+			}
+		}
+		if (visible_direct_target) {
 			menu.actions["analysis.graph.navigate_target"].invoke =
-				[context, value = *direct_target]() {
+				[context, value = *visible_direct_target]() {
 					disasm_view::goto_address(value, context);
 					return action_handler_result_t::completed();
 				};
 		} else {
 			unavailable("analysis.graph.navigate_target",
-				"Select an instruction with a published direct target");
+				"The selected instruction's direct target is not present in the visible page edge set; it may be on another page or hidden");
 		}
-		const bool collapsed = view->collapsed_reachable_roots.count(retained_block) != 0;
-		if (has_reachable_target && !collapsed) {
-			menu.actions["analysis.graph.collapse_reachable"].invoke = [view, retained_block]() {
-				if (view->collapsed_reachable_roots.size() >= 256)
+		const bool collapsed = view->collapsed_reachable_roots.count(retained_block_key) != 0;
+		if (view->edge_set_truncated) {
+			const std::string reason =
+				"The visible page edge set is bounded; complete reachability is unavailable";
+			unavailable("analysis.graph.collapse_reachable", reason);
+			unavailable("analysis.graph.expand_reachable", reason);
+		} else if (has_reachable_target && !collapsed) {
+			unavailable("analysis.graph.expand_reachable",
+				"The selected visible-page reachable scope is already expanded");
+			menu.actions["analysis.graph.collapse_reachable"].invoke =
+				[context, view, retained_block_key]() {
+				if (view->collapsed_reachable_roots.size() >=
+					k_workspace_graph_persisted_item_limit)
 					return action_handler_result_t::failed(
 						"The bounded graph collapse-state limit was reached");
-				view->collapsed_reachable_roots.insert(retained_block);
-				view->layout_signature = 0;
-				return action_handler_result_t::completed();
+				return workspace_graph_persist_mutation(context, view, [&] {
+					view->collapsed_reachable_roots.insert(retained_block_key);
+					view->layout_signature = 0;
+				});
 			};
 		} else {
 			unavailable("analysis.graph.collapse_reachable", collapsed
 				? "The selected reachable scope is already collapsed"
-				: "The selected block has no reachable target blocks");
-		}
-		if (collapsed) {
-			menu.actions["analysis.graph.expand_reachable"].invoke = [view, retained_block]() {
-				view->collapsed_reachable_roots.erase(retained_block);
-				view->layout_signature = 0;
-				return action_handler_result_t::completed();
-			};
-		} else {
-			unavailable("analysis.graph.expand_reachable",
-				"The selected reachable scope is already expanded");
-		}
-		const bool node_pinned = view->pinned_node_positions.count(retained_block) != 0;
-		auto& pin_node = menu.actions[node_pinned
-			? "analysis.graph.unpin_node" : "analysis.graph.pin_node"];
-		pin_node.check_state = node_pinned ? aida::ui::action_check_state_t::checked
-			: aida::ui::action_check_state_t::unchecked;
-		pin_node.invoke = [view, retained_block, node_pinned]() {
-			if (node_pinned) {
-				view->pinned_node_positions.erase(retained_block);
-				return action_handler_result_t::completed();
-			}
-			if (view->pinned_node_positions.size() >= 256)
-				return action_handler_result_t::failed(
-					"The bounded pinned-node limit was reached");
-			const auto found = view->node_by_entity.find(retained_block);
-			if (found == view->node_by_entity.end() || found->second >= view->layout.nodes.size())
-				return action_handler_result_t::failed("The graph node layout changed");
-			const auto& node = view->layout.nodes[found->second];
-			view->pinned_node_positions[retained_block] = ImVec2(node.x, node.y);
-			return action_handler_result_t::completed();
-		};
-		auto& pin_layout = menu.actions[view->layout_pinned
-			? "analysis.graph.unpin_layout" : "analysis.graph.pin_layout"];
-		pin_layout.check_state = view->layout_pinned ? aida::ui::action_check_state_t::checked
-			: aida::ui::action_check_state_t::unchecked;
-		pin_layout.invoke = [view]() {
-			view->layout_pinned = !view->layout_pinned;
-			if (view->layout_pinned) {
-				view->pinned_node_positions.clear();
-				for (const auto& item : view->node_by_entity) {
-					if (item.second >= view->layout.nodes.size()) continue;
-					const auto& node = view->layout.nodes[item.second];
-					view->pinned_node_positions[item.first] = ImVec2(node.x, node.y);
-				}
+				: "The selected block has no reachable target blocks on the visible page");
+			if (collapsed) {
+				menu.actions["analysis.graph.expand_reachable"].invoke =
+					[context, view, retained_block_key]() {
+						return workspace_graph_persist_mutation(context, view, [&] {
+							view->collapsed_reachable_roots.erase(retained_block_key);
+							view->layout_signature = 0;
+						});
+					};
 			} else {
-				view->pinned_node_positions.clear();
-				view->layout_signature = 0;
+				unavailable("analysis.graph.expand_reachable",
+					"The selected visible-page reachable scope is already expanded");
 			}
-			return action_handler_result_t::completed();
-		};
+		}
+		const bool node_pinned = view->pinned_node_positions.count(retained_block_key) != 0;
+		if (node_pinned) {
+			unavailable("analysis.graph.pin_node", "The selected node is already pinned");
+			menu.actions["analysis.graph.pin_node"].check_state =
+				aida::ui::action_check_state_t::checked;
+			menu.actions["analysis.graph.unpin_node"].invoke =
+				[context, view, retained_block_key]() {
+					return workspace_graph_persist_mutation(context, view, [&] {
+						view->pinned_node_positions.erase(retained_block_key);
+						view->layout_signature = 0;
+					});
+				};
+		} else {
+			unavailable("analysis.graph.unpin_node", "The selected node is not pinned");
+			if (view->pinned_node_positions.size() >=
+				k_workspace_graph_persisted_item_limit) {
+				unavailable("analysis.graph.pin_node", "The bounded pinned-node limit was reached");
+			} else {
+				menu.actions["analysis.graph.pin_node"].invoke =
+					[context, view, retained_block, retained_block_key]() {
+						const auto found = view->node_by_entity.find(retained_block);
+						if (found == view->node_by_entity.end() ||
+							found->second >= view->layout.nodes.size())
+							return action_handler_result_t::failed("The graph node layout changed");
+						const auto& node = view->layout.nodes[found->second];
+						return workspace_graph_persist_mutation(context, view, [&] {
+							view->pinned_node_positions[retained_block_key] =
+								ImVec2(node.x, node.y);
+						});
+					};
+			}
+		}
+		const bool layout_pinned = retained_layout &&
+			view->pinned_layouts.count(*retained_layout) != 0;
+		if (!retained_layout) {
+			unavailable("analysis.graph.pin_layout", "The current graph page has no layout identity");
+			unavailable("analysis.graph.unpin_layout", "The current graph page has no layout identity");
+		} else if (layout_pinned) {
+			unavailable("analysis.graph.pin_layout", "The current function page layout is already pinned");
+			menu.actions["analysis.graph.pin_layout"].check_state =
+				aida::ui::action_check_state_t::checked;
+			menu.actions["analysis.graph.unpin_layout"].invoke =
+				[context, view, retained_layout]() {
+					return workspace_graph_persist_mutation(context, view, [&] {
+						view->pinned_layouts.erase(*retained_layout);
+						for (auto iterator = view->pinned_layout_positions.begin();
+							iterator != view->pinned_layout_positions.end();) {
+							if (iterator->first.layout == *retained_layout)
+								iterator = view->pinned_layout_positions.erase(iterator);
+							else ++iterator;
+						}
+						view->layout_signature = 0;
+					});
+				};
+		} else if (view->node_by_entity.size() > k_workspace_graph_persisted_item_limit ||
+			view->pinned_layout_positions.size() + view->node_by_entity.size() >
+				k_workspace_graph_persisted_item_limit) {
+			const std::string reason =
+				"The bounded 256-node pinned-layout position limit was reached";
+			unavailable("analysis.graph.pin_layout", reason);
+			unavailable("analysis.graph.unpin_layout", "The current function page layout is not pinned");
+		} else {
+			unavailable("analysis.graph.unpin_layout", "The current function page layout is not pinned");
+			menu.actions["analysis.graph.pin_layout"].invoke = [context, view, retained_layout]() {
+				const auto* current_function = workspace_graph_function(context);
+				if (!current_function || !context.publication ||
+					!context.publication->snapshot || view->current_layout != retained_layout)
+					return action_handler_result_t::failed(
+						"The graph publication changed before the layout could be pinned");
+				return workspace_graph_persist_mutation(context, view, [&] {
+					view->pinned_layouts.insert(*retained_layout);
+					const auto& current_snapshot = *context.publication->snapshot;
+					for (const auto& item : view->node_by_entity) {
+						if (item.second >= view->layout.nodes.size() ||
+							item.second >= view->block_indices.size() ||
+							view->block_indices[item.second] >= current_snapshot.blocks.size())
+							continue;
+						const auto& node = view->layout.nodes[item.second];
+						const auto& block = current_snapshot.blocks[view->block_indices[item.second]];
+						view->pinned_layout_positions[{*retained_layout,
+							workspace_graph_block_key(*current_function, block)}] =
+							ImVec2(node.x, node.y);
+					}
+				});
+			};
+		}
 		char address_text[32]{};
 		std::snprintf(address_text, sizeof(address_text), "%016llX",
 			static_cast<unsigned long long>(address));

@@ -10,6 +10,7 @@
 #include "workspace/search_index.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/pseudocode_view.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/taskflow_runtime.hpp"
 #endif
@@ -114,6 +115,20 @@ struct state_t {
     bool apply_pending = false;
     std::uint64_t apply_generation = 0;
     std::uint64_t apply_expected_overlay_revision = 0;
+	bool declaration_review_requested = false;
+	std::string declaration_review_name;
+	std::shared_ptr<const std::string> declaration_review_text;
+	std::weak_ptr<aida::analysis::analysis_workspace_t> declaration_review_workspace;
+	std::shared_ptr<const aida::analysis::analysis_publication_t>
+		declaration_review_publication;
+	std::string declaration_review_workspace_id;
+	std::uint64_t declaration_review_generation = 0;
+	std::uint64_t declaration_review_analysis_revision = 0;
+	std::uint64_t declaration_review_overlay_revision = 0;
+	std::uint64_t enum_declaration_cache_generation = 0;
+	std::uint64_t enum_declaration_cache_analysis_revision = 0;
+	std::string enum_declaration_cache_identity;
+	std::shared_ptr<const std::string> enum_declaration_cache;
     const struct catalog_t* reference_catalog = nullptr;
     std::string reference_type;
     std::shared_ptr<const std::vector<type_reference_t>> references;
@@ -620,8 +635,11 @@ inline sub_tab_t active_sub_tab() {
 }
 
 inline std::string struct_to_ida_syntax(const pdb_parser::struct_def_t& definition) {
+	constexpr std::size_t maximum_output = 64U * 1024U;
     std::string output = definition.is_union ? "union " : "struct ";
     output += definition.name + "\n{\n";
+	if (output.size() > maximum_output)
+		return {};
     std::uint64_t last_end = 0;
     int padding_index = 0;
     for (const auto& member : definition.members) {
@@ -630,6 +648,8 @@ inline std::string struct_to_ida_syntax(const pdb_parser::struct_def_t& definiti
             std::snprintf(padding, sizeof(padding), "  _BYTE pad_%d[%llu];\n",
                 padding_index++, static_cast<unsigned long long>(member.offset - last_end));
             output += padding;
+			if (output.size() > maximum_output)
+				return {};
         }
         std::string type = member.type_name;
         if (type == "uint8_t" || type == "int8_t" || type == "char" || type == "BYTE")
@@ -655,6 +675,8 @@ inline std::string struct_to_ida_syntax(const pdb_parser::struct_def_t& definiti
                 type.c_str(), member.name.c_str());
         }
         output += line;
+		if (output.size() > maximum_output)
+			return {};
         last_end = member.size > (std::numeric_limits<std::uint64_t>::max)() - member.offset
             ? (std::numeric_limits<std::uint64_t>::max)() : member.offset + member.size;
     }
@@ -663,9 +685,11 @@ inline std::string struct_to_ida_syntax(const pdb_parser::struct_def_t& definiti
         std::snprintf(padding, sizeof(padding), "  _BYTE pad_%d[%llu];\n", padding_index,
             static_cast<unsigned long long>(definition.size - last_end));
         output += padding;
+		if (output.size() > maximum_output)
+			return {};
     }
     output += "};\n";
-    return output;
+	return output.size() <= maximum_output ? output : std::string{};
 }
 
 inline std::vector<type_reference_t> references_for_type(
@@ -692,6 +716,117 @@ inline std::vector<type_reference_t> references_for_type(
             return left.address == right.address && left.label == right.label;
         }), references.end());
     return references;
+}
+
+inline std::string enum_to_c(const pdb_parser::enum_def_t& definition) {
+	constexpr std::size_t maximum_output = 64U * 1024U;
+	if (definition.name.size() > maximum_output || definition.members.size() > 65536)
+		return {};
+	std::string declaration;
+	const auto append = [&declaration](const std::string& value) {
+		if (value.size() > maximum_output - declaration.size())
+			return false;
+		declaration.append(value);
+		return true;
+	};
+	if (!append("enum ") || !append(definition.name) || !append(" {\n"))
+		return {};
+	for (const auto& member : definition.members) {
+		if (!append("    ") || !append(member.name) || !append(" = ") ||
+			!append(std::to_string(member.value)) || !append(",\n"))
+			return {};
+	}
+	return append("};\n") ? declaration : std::string{};
+}
+
+inline std::string struct_to_c_bounded(const pdb_parser::struct_def_t& definition) {
+	constexpr std::size_t maximum_output = 64U * 1024U;
+	if (definition.members.size() > 65536 || definition.name.size() > maximum_output)
+		return {};
+	std::string declaration = definition.is_union ? "union " : "struct ";
+	const auto append = [&declaration](const char* text, std::size_t length) {
+		if (length > maximum_output - declaration.size())
+			return false;
+		declaration.append(text, length);
+		return true;
+	};
+	if (!append(definition.name.data(), definition.name.size()) ||
+		!append(" {\n", 3))
+		return {};
+	std::uint64_t last_end = 0;
+	int padding_index = 0;
+	for (const auto& member : definition.members) {
+		char line[256]{};
+		if (member.offset > last_end) {
+			const int length = std::snprintf(line, sizeof(line),
+				"    uint8_t _pad%d[%llu];\n", padding_index++,
+				static_cast<unsigned long long>(member.offset - last_end));
+			if (length < 0 || !append(line, (std::min)(
+				static_cast<std::size_t>(length), sizeof(line) - 1)))
+				return {};
+		}
+		int length = 0;
+		if (member.bit_size >= 0)
+			length = std::snprintf(line, sizeof(line), "    %s %s : %d;\n",
+				member.type_name.c_str(), member.name.c_str(), member.bit_size);
+		else if (member.is_array)
+			length = std::snprintf(line, sizeof(line), "    %s %s[%d];\n",
+				member.type_name.c_str(), member.name.c_str(), member.array_count);
+		else
+			length = std::snprintf(line, sizeof(line), "    %s %s;\n",
+				member.type_name.c_str(), member.name.c_str());
+		if (length < 0 || !append(line, (std::min)(
+			static_cast<std::size_t>(length), sizeof(line) - 1)))
+			return {};
+		last_end = member.size > (std::numeric_limits<std::uint64_t>::max)() - member.offset
+			? (std::numeric_limits<std::uint64_t>::max)() : member.offset + member.size;
+	}
+	if (last_end < definition.size) {
+		char padding[96]{};
+		const int length = std::snprintf(padding, sizeof(padding),
+			"    uint8_t _pad%d[%llu];\n", padding_index,
+			static_cast<unsigned long long>(definition.size - last_end));
+		if (length < 0 || !append(padding, (std::min)(
+			static_cast<std::size_t>(length), sizeof(padding) - 1)))
+			return {};
+	}
+	char footer[96]{};
+	const int footer_length = std::snprintf(footer, sizeof(footer),
+		"}; // size: 0x%llX (%llu bytes)\n",
+		static_cast<unsigned long long>(definition.size),
+		static_cast<unsigned long long>(definition.size));
+	if (footer_length < 0 || !append(footer, (std::min)(
+		static_cast<std::size_t>(footer_length), sizeof(footer) - 1)))
+		return {};
+	return declaration;
+}
+
+inline aida::ui::action_handler_result_t stage_global_declaration_review(
+	const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& state, std::string name, std::string declaration) {
+	if (!context.workspace || !context.publication || context.workspace->closing() ||
+		context.workspace->closed())
+		return aida::ui::action_handler_result_t::failed(
+			"The type workspace is unavailable");
+	if (name.empty() || name.size() > 256 || declaration.empty() ||
+		declaration.size() > 64U * 1024U)
+		return aida::ui::action_handler_result_t::failed(
+			"The declaration is empty or exceeds the bounded 64 KiB review contract");
+	std::lock_guard<std::mutex> lock(state->mutex);
+	state->declaration_review_name = std::move(name);
+	state->declaration_review_text =
+		std::make_shared<const std::string>(std::move(declaration));
+	state->declaration_review_workspace = context.workspace;
+	state->declaration_review_publication = context.publication;
+	state->declaration_review_workspace_id =
+		context.workspace->identity().binary_id().to_hex();
+	state->declaration_review_generation = context.publication->generation;
+	state->declaration_review_analysis_revision = context.publication->analysis_revision;
+	state->declaration_review_overlay_revision = context.workspace->overlay_revision();
+	state->declaration_review_requested = true;
+	state->apply_error = false;
+	state->apply_status = "Review the global declaration before committing it to the reversible overlay.";
+	return aida::ui::action_handler_result_t::completed();
 }
 
 inline void request_type_references(const disasm_view::workspace_context_t& context,
@@ -867,30 +1002,48 @@ inline const pdb_parser::enum_def_t* catalog_enum(const catalog_t& catalog, cons
 
 inline int send_to_dissector_recursive(const pdb_parser::struct_def_t& definition,
                                        const catalog_t* catalog,
-                                       std::set<std::string>& importing) {
+                                       std::set<std::string>& importing,
+									   bool strict_validation = false,
+									   const std::string& root_source_name = {}) {
     int index = struct_dissector::structure_index_by_name(definition.name);
     if (index >= 0)
         return index;
-    if (!importing.insert(definition.name).second || importing.size() > 256)
+    if (!importing.insert(definition.name).second || importing.size() > 256) {
         return -1;
+    }
+	const auto fail = [&] {
+		importing.erase(definition.name);
+		return -1;
+	};
     if (catalog) {
-        for (const auto& member : definition.members) {
+		for (const auto& member : definition.members) {
             if (member.is_pointer)
                 continue;
-            if (const auto* target = catalog_record(*catalog, member.type_name))
-                send_to_dissector_recursive(*target, catalog, importing);
+			if (!root_source_name.empty() &&
+				canonical_record_name(member.type_name) ==
+					canonical_record_name(root_source_name))
+				continue;
+			if (const auto* target = catalog_record(*catalog, member.type_name)) {
+				if (send_to_dissector_recursive(*target, catalog, importing,
+						strict_validation) < 0 && strict_validation)
+					return fail();
+			}
         }
     }
     index = struct_dissector::create_struct(definition.name);
     if (index < 0)
-        return -1;
-    struct_dissector::set_structure_kind(index, definition.is_union
+		return fail();
+	if (!struct_dissector::set_structure_kind(index, definition.is_union
         ? struct_dissector::structure_kind_t::union_type
-        : struct_dissector::structure_kind_t::structure);
+        : struct_dissector::structure_kind_t::structure) && strict_validation)
+		return fail();
     for (const auto& member : definition.members) {
         if (member.offset > (std::numeric_limits<std::uint32_t>::max)() ||
-            member.size > (std::numeric_limits<std::uint32_t>::max)())
+			member.size > (std::numeric_limits<std::uint32_t>::max)()) {
+			if (strict_validation)
+				return fail();
             continue;
+		}
         struct_dissector::field_def_t field;
         field.name = member.name.empty() ? "field_" + std::to_string(member.offset) : member.name;
         field.offset = static_cast<std::uint32_t>(member.offset);
@@ -920,22 +1073,35 @@ inline int send_to_dissector_recursive(const pdb_parser::struct_def_t& definitio
             field.bit_width = static_cast<std::uint16_t>((std::min)(member.bit_size, 65535));
         }
         const int field_index = struct_dissector::add_field(index, field);
-        if (field_index < 0)
+        if (field_index < 0) {
+			if (strict_validation)
+				return fail();
             continue;
+		}
         if (catalog) {
             if (const auto* target = catalog_record(*catalog, member.type_name)) {
-                const int target_index = struct_dissector::structure_index_by_name(target->name);
-                if (target_index >= 0)
-                    struct_dissector::set_field_nested_target(index, field_index, target_index, member.is_pointer);
+				const int target_index = !root_source_name.empty() &&
+					canonical_record_name(member.type_name) ==
+						canonical_record_name(root_source_name)
+					? index : struct_dissector::structure_index_by_name(target->name);
+				if (target_index >= 0) {
+					if (!struct_dissector::set_field_nested_target(index, field_index,
+							target_index, member.is_pointer) && strict_validation)
+						return fail();
+				} else if (strict_validation && !member.is_pointer) {
+					return fail();
+				}
 			} else if (const auto* source_enum = catalog_enum(*catalog, member.type_name)) {
 				struct_dissector::enum_def_t enumeration;
 				enumeration.name = source_enum->name;
 				enumeration.values.reserve(source_enum->members.size());
 				for (const auto& value : source_enum->members)
 					enumeration.values.push_back({value.name, value.value});
-				struct_dissector::upsert_enum(enumeration);
-                struct_dissector::set_field_enum_reference(index, field_index,
-                    canonical_record_name(member.type_name));
+				if (!struct_dissector::upsert_enum(enumeration) && strict_validation)
+					return fail();
+                if (!struct_dissector::set_field_enum_reference(index, field_index,
+						canonical_record_name(member.type_name)) && strict_validation)
+					return fail();
             }
         }
     }
@@ -943,10 +1109,25 @@ inline int send_to_dissector_recursive(const pdb_parser::struct_def_t& definitio
     return index;
 }
 
-inline void send_to_dissector(const pdb_parser::struct_def_t& definition,
-                              const catalog_t* catalog = nullptr) {
+inline bool send_to_dissector(const pdb_parser::struct_def_t& definition,
+	const catalog_t* catalog = nullptr, bool* rollback_complete = nullptr) {
+	if (rollback_complete)
+		*rollback_complete = true;
+	if (!struct_dissector::catalog_mutation_available())
+		return false;
+	auto rollback_state = struct_dissector::capture_catalog_transaction();
     std::set<std::string> importing;
-    send_to_dissector_recursive(definition, catalog, importing);
+	const int imported = send_to_dissector_recursive(definition, catalog, importing, true);
+	if (imported >= 0) {
+		const auto imported_revision = struct_dissector::catalog_schema_revision();
+		return struct_dissector::request_save_schema_transactional(
+			std::move(rollback_state), imported_revision);
+	}
+	const bool rolled_back = struct_dissector::rollback_catalog_transaction(
+		std::move(rollback_state), struct_dissector::catalog_schema_revision());
+	if (rollback_complete)
+		*rollback_complete = rolled_back;
+	return false;
 }
 
 inline void render_struct_detail(const disasm_view::workspace_context_t& context,
@@ -959,23 +1140,37 @@ inline void render_struct_detail(const disasm_view::workspace_context_t& context
     ImGui::TextDisabled("%s  size 0x%llX  %zu members", entry.module.c_str(),
         static_cast<unsigned long long>(definition.size), definition.members.size());
     if (ImGui::Button("Copy C")) {
-        const std::string declaration = pdb_parser::struct_to_cpp(definition);
-        ImGui::SetClipboardText(declaration.c_str());
+		const std::string declaration = struct_to_c_bounded(definition);
+		if (!declaration.empty())
+			ImGui::SetClipboardText(declaration.c_str());
     }
     ImGui::SameLine();
     if (ImGui::Button("Copy IDA")) {
         const std::string declaration = struct_to_ida_syntax(definition);
-        ImGui::SetClipboardText(declaration.c_str());
+		if (!declaration.empty() && declaration.size() <= 64U * 1024U)
+			ImGui::SetClipboardText(declaration.c_str());
     }
     ImGui::SameLine();
-    if (ImGui::Button("To Dissector"))
-        send_to_dissector(definition, catalog_handle.get());
+    if (ImGui::Button("Open Dissector")) {
+		bool rollback_complete = true;
+		const bool imported = send_to_dissector(definition, catalog_handle.get(),
+			&rollback_complete);
+		{
+			std::lock_guard<std::mutex> lock(state->mutex);
+			state->apply_error = !imported;
+			state->apply_status = imported
+				? "Imported the editable type and queued durable catalog persistence."
+				: rollback_complete
+					? "The editable import failed or durable persistence was rejected; no mutation was retained."
+					: "The editable import failed and exact catalog rollback was blocked; review the persistent diagnostic.";
+		}
+		if (imported)
+			set_sub_tab(context, sub_tab_t::dissector);
+	}
     ImGui::SameLine();
-    if (ImGui::Button("Open Dissector"))
-        set_sub_tab(context, sub_tab_t::dissector);
-    ImGui::SameLine();
-    if (ImGui::Button("Declare in overlay"))
-        disasm_view::queue_type_declaration(context, pdb_parser::struct_to_cpp(definition));
+	if (ImGui::Button("Declare in overlay"))
+		static_cast<void>(stage_global_declaration_review(context, state,
+			definition.name, struct_to_c_bounded(definition)));
     ImGui::Separator();
     const float members_height = (std::max)(96.0f, height * 0.58f);
     ImGui::BeginChild("##type_members", ImVec2(0.0f, members_height), false);
@@ -1007,24 +1202,37 @@ inline void render_struct_detail(const disasm_view::workspace_context_t& context
             height - members_height - 48.0f);
 }
 
-inline void render_enum_detail(const enum_entry_t& entry, float height) {
+inline void render_enum_detail(const enum_entry_t& entry, float height,
+	const std::shared_ptr<state_t>& state, std::uint64_t generation,
+	std::uint64_t analysis_revision) {
     const auto& definition = entry.definition;
+	const std::string identity = entry.module + ":" + definition.name;
+	std::shared_ptr<const std::string> declaration;
+	{
+		std::lock_guard<std::mutex> lock(state->mutex);
+		if (state->enum_declaration_cache_generation == generation &&
+			state->enum_declaration_cache_analysis_revision == analysis_revision &&
+			state->enum_declaration_cache_identity == identity)
+			declaration = state->enum_declaration_cache;
+	}
+	if (!declaration) {
+		declaration = std::make_shared<const std::string>(enum_to_c(definition));
+		std::lock_guard<std::mutex> lock(state->mutex);
+		state->enum_declaration_cache_generation = generation;
+		state->enum_declaration_cache_analysis_revision = analysis_revision;
+		state->enum_declaration_cache_identity = identity;
+		state->enum_declaration_cache = declaration;
+	}
     ImGui::Text("enum %s", definition.name.c_str());
     ImGui::TextDisabled("%s  %zu values", entry.module.c_str(), definition.members.size());
-    const bool copy_c = ImGui::Button("Copy C");
-    ImGui::SameLine();
-    const bool copy_ida = ImGui::Button("Copy IDA");
-    if (copy_c || copy_ida) {
-        std::string declaration = "enum " + definition.name + " {\n";
-        for (const auto& member : definition.members) {
-            char line[256]{};
-            std::snprintf(line, sizeof(line), "    %s = 0x%llX,\n", member.name.c_str(),
-                static_cast<unsigned long long>(member.value));
-            declaration += line;
-        }
-        declaration += "};\n";
-        ImGui::SetClipboardText(declaration.c_str());
+    ImGui::BeginDisabled(declaration->empty());
+	const bool export_declaration = ImGui::Button("Export Declaration");
+	ImGui::EndDisabled();
+	if (export_declaration) {
+        ImGui::SetClipboardText(declaration->c_str());
     }
+	if (declaration->empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+		ImGui::SetTooltip("The enum declaration exceeds the bounded 64 KiB export limit");
     ImGui::Separator();
     ImGui::BeginChild("##enum_members", ImVec2(0.0f, height), false);
     ImGuiListClipper clipper;
@@ -1091,12 +1299,25 @@ inline void render_catalog_context_menu(const disasm_view::workspace_context_t& 
         tab == sub_tab_t::inferred ? "view.types.inferred" : "view.types.typedefs");
     const auto publication = context.publication;
     const auto workspace = context.workspace;
+	const std::string workspace_id = context.workspace
+		? context.workspace->identity().binary_id().to_hex() : std::string{};
+	const std::uint64_t workspace_generation = context.workspace
+		? context.workspace->generation() : 0;
     const std::uint64_t analysis_revision = context.publication
         ? context.publication->analysis_revision : 0;
     retained.validate_identity = [publication, workspace, catalog_handle, visible_handle,
-                                  index, row, tab, analysis_revision, state] {
+                                  index, row, tab, analysis_revision,
+								  workspace_generation, workspace_id, state] {
+		const auto selected = disasm_view::capture_selected_workspace();
         if (!publication || !workspace || workspace->closing() || workspace->closed() ||
-            publication->analysis_revision != analysis_revision)
+			workspace->generation() != workspace_generation ||
+			publication->generation != workspace_generation ||
+			publication->analysis_revision != analysis_revision ||
+			!selected.workspace || !selected.publication ||
+			selected.workspace != workspace || selected.publication != publication ||
+			selected.workspace->identity().binary_id().to_hex() != workspace_id ||
+			selected.workspace->generation() != workspace_generation ||
+			selected.publication->analysis_revision != analysis_revision)
             return aida::ui::capability_state_t::unavailable(
                 "The analysis workspace changed; select the type again");
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -1131,31 +1352,122 @@ inline void render_catalog_context_menu(const disasm_view::workspace_context_t& 
             ImGui::SetClipboardText(name.c_str());
             return aida::ui::action_handler_result_t::completed();
         });
-        add_action("types.catalog.copy_c_declaration", true, "", [definition] {
-            const std::string text = pdb_parser::struct_to_cpp(definition);
-            ImGui::SetClipboardText(text.c_str());
+		const std::string ida_declaration = struct_to_ida_syntax(definition);
+		add_action("types.catalog.copy_ida_declaration",
+			!ida_declaration.empty() && ida_declaration.size() <= 64U * 1024U,
+			"The IDA declaration exceeds the bounded 64 KiB export limit",
+			[ida_declaration] {
+			ImGui::SetClipboardText(ida_declaration.c_str());
             return aida::ui::action_handler_result_t::completed();
         });
-        add_action("types.catalog.copy_ida_declaration", true, "", [definition] {
-            const std::string text = struct_to_ida_syntax(definition);
-            ImGui::SetClipboardText(text.c_str());
-            return aida::ui::action_handler_result_t::completed();
-        });
-        add_action("types.catalog.open_structure_editor", true, "", [definition, context, catalog_handle] {
-            send_to_dissector(definition, catalog_handle.get());
+		const std::string c_declaration = struct_to_c_bounded(definition);
+		const bool mutable_persistence_available =
+			!struct_dissector::g_state.persistence_in_flight.load(std::memory_order_acquire);
+		add_action("types.catalog.export_declaration",
+			!c_declaration.empty() && c_declaration.size() <= 64U * 1024U,
+			"The declaration is empty or exceeds the bounded 64 KiB export limit",
+			[c_declaration] {
+				ImGui::SetClipboardText(c_declaration.c_str());
+				return aida::ui::action_handler_result_t::completed();
+			});
+		add_action("types.catalog.duplicate_to_editor", mutable_persistence_available &&
+			definition.members.size() <= 65536,
+			!mutable_persistence_available ? "Another mutable catalog operation is running"
+				: "The type exceeds the mutable editor's bounded member limit",
+			[definition, context, catalog_handle] {
+				pdb_parser::struct_def_t duplicate = definition;
+				auto rollback_state = struct_dissector::capture_catalog_transaction();
+				std::string base = definition.name.empty() ? "anonymous_copy" : definition.name + "_copy";
+				if (base.size() > 240) base.resize(240);
+				{
+					auto& editor = struct_dissector::g_state;
+					std::lock_guard<std::mutex> lock(editor.mtx);
+					if (editor.persistence_in_flight.load(std::memory_order_acquire))
+						return aida::ui::action_handler_result_t::failed(
+							"Another mutable catalog operation started before duplication");
+					std::string candidate = base;
+					for (std::size_t suffix = 2; suffix <= 1024 &&
+						std::any_of(editor.structs.begin(), editor.structs.end(),
+							[&](const auto& item) { return item.name == candidate; }); ++suffix)
+						candidate = base + "_" + std::to_string(suffix);
+					if (std::any_of(editor.structs.begin(), editor.structs.end(),
+						[&](const auto& item) { return item.name == candidate; }))
+						return aida::ui::action_handler_result_t::failed(
+							"A bounded unique duplicate name could not be allocated");
+					duplicate.name = std::move(candidate);
+				}
+				auto rollback = [&] {
+					return struct_dissector::rollback_catalog_transaction(
+						std::move(rollback_state), struct_dissector::catalog_schema_revision());
+				};
+				std::set<std::string> importing;
+				const int created = send_to_dissector_recursive(duplicate,
+					catalog_handle.get(), importing, true, definition.name);
+				if (created < 0) {
+					if (!rollback())
+						return aida::ui::action_handler_result_t::failed(
+							"Duplicate validation failed and exact catalog rollback was blocked");
+					return aida::ui::action_handler_result_t::failed(
+						"The duplicate failed mutable-catalog validation");
+				}
+				{
+					auto& editor = struct_dissector::g_state;
+					std::lock_guard<std::mutex> lock(editor.mtx);
+					editor.active_struct = created;
+				}
+				if (!struct_dissector::request_save_schema()) {
+					if (!rollback())
+						return aida::ui::action_handler_result_t::failed(
+							"Durable save was rejected and exact catalog rollback was blocked");
+					return aida::ui::action_handler_result_t::failed(
+						"The durable catalog save was not queued; all imported dependencies were rolled back");
+				}
+				struct_dissector_view::g_ui.selected_field = -1;
+				struct_dissector_view::g_ui.editing_field = -1;
+				set_sub_tab(context, sub_tab_t::dissector);
+				return aida::ui::action_handler_result_t::completed(
+					"Editable duplicate created; durable catalog save queued");
+			});
+		add_action("types.catalog.open_structure_editor", true, "", [definition, context, catalog_handle] {
+			bool rollback_complete = true;
+			if (!send_to_dissector(definition, catalog_handle.get(), &rollback_complete))
+				return aida::ui::action_handler_result_t::failed(
+					rollback_complete
+						? "The editable import failed or durable persistence was rejected; no mutation was retained"
+						: "The editable import failed and exact catalog rollback was blocked");
             set_sub_tab(context, sub_tab_t::dissector);
-            return aida::ui::action_handler_result_t::completed();
+			return aida::ui::action_handler_result_t::completed(
+				"Editable type imported; durable catalog save queued");
         });
-        add_action("types.catalog.declare_overlay", true, "", [definition, context] {
-            disasm_view::queue_type_declaration(context, pdb_parser::struct_to_cpp(definition));
-            return aida::ui::action_handler_result_t::completed();
-        });
+		const bool global_promotion_available = !name.empty() && name.size() <= 256 &&
+			!c_declaration.empty();
+		add_action("types.catalog.promote_global", global_promotion_available,
+			name.empty() || name.size() > 256
+				? "The type name is empty or exceeds the bounded 256-byte review identity"
+				: "The declaration is empty or exceeds the bounded 64 KiB review limit",
+			[name, c_declaration, context, state] {
+			return stage_global_declaration_review(context, state, name, c_declaration);
+		});
         add_action("types.catalog.rename", false,
             "PDB catalog definitions are immutable; declare an edited overlay type instead",
             [] { return aida::ui::action_handler_result_t::completed(); });
         add_action("types.catalog.delete", false,
             "PDB catalog definitions cannot be deleted from the analysis workspace",
             [] { return aida::ui::action_handler_result_t::completed(); });
+		aida::automation_ui::entity_evidence::snapshot_t evidence;
+		evidence.workspace_id = context.workspace->identity().binary_id().to_hex();
+		evidence.source_view_id = definition.is_union ? "view.types.unions" : "view.types.structures";
+		evidence.source_kind = definition.is_union ? "type_union" : "type_structure";
+		evidence.entity_id = retained.entity_id;
+		evidence.display_label = (definition.is_union ? "union " : "struct ") + definition.name;
+		evidence.excerpt = c_declaration;
+		evidence.revision = analysis_revision;
+		evidence.generation = retained.entity_generation;
+		aida::automation_ui::entity_evidence::append_actions(retained, std::move(evidence),
+			c_declaration.empty()
+				? aida::ui::capability_state_t::unavailable(
+					"The retained type has no bounded declaration evidence")
+				: aida::ui::capability_state_t::available());
     } else if (tab == sub_tab_t::enums) {
         const auto& entry = catalog.enums[index];
         retained.entity_id = "enum:" + entry.module + ":" + entry.definition.name;
@@ -1163,15 +1475,6 @@ inline void render_catalog_context_menu(const disasm_view::workspace_context_t& 
         const std::string name = definition.name;
         add_action("types.catalog.copy_name", true, "", [name] {
             ImGui::SetClipboardText(name.c_str());
-            return aida::ui::action_handler_result_t::completed();
-        });
-        add_action("types.catalog.copy_c_declaration", true, "", [definition] {
-            std::string declaration = "enum " + definition.name + " {\n";
-            for (const auto& member : definition.members) {
-                declaration += "    " + member.name + " = " + std::to_string(member.value) + ",\n";
-            }
-            declaration += "};\n";
-            ImGui::SetClipboardText(declaration.c_str());
             return aida::ui::action_handler_result_t::completed();
         });
         add_action("types.catalog.edit_enum", true, "", [definition, context] {
@@ -1188,14 +1491,30 @@ inline void render_catalog_context_menu(const disasm_view::workspace_context_t& 
                 }
             }
             if (!existing) {
+				if (!struct_dissector::catalog_mutation_available())
+					return aida::ui::action_handler_result_t::failed(
+						"Another mutable catalog operation is running");
+				auto rollback_state = struct_dissector::capture_catalog_transaction();
+				const auto import_base_revision = rollback_state.schema_revision;
                 editable.name = definition.name;
                 editable.underlying_type = struct_dissector::field_type_t::int64;
                 editable.values.reserve(definition.members.size());
                 for (const auto& member : definition.members)
                     editable.values.push_back({member.name, member.value});
-                if (!struct_dissector::upsert_enum(editable))
+				if (!struct_dissector::upsert_enum(editable)) {
+					if (!struct_dissector::rollback_catalog_transaction(
+							std::move(rollback_state), import_base_revision))
+						return aida::ui::action_handler_result_t::failed(
+							"The enum import failed and exact catalog rollback was blocked");
                     return aida::ui::action_handler_result_t::failed(
-                        "The enum could not be imported into the mutable catalog");
+						"The enum could not be imported; no catalog mutation was retained");
+				}
+				const auto imported_revision = struct_dissector::catalog_schema_revision();
+				if (!struct_dissector::request_save_schema_transactional(
+						std::move(rollback_state), imported_revision)) {
+					return aida::ui::action_handler_result_t::failed(
+						"Durable enum import was rejected; the mutable catalog was restored");
+				}
                 auto& state = struct_dissector::g_state;
                 std::lock_guard<std::mutex> lock(state.mtx);
                 const auto found = std::find_if(state.enums.begin(), state.enums.end(),
@@ -1229,6 +1548,96 @@ inline void render_catalog_context_menu(const disasm_view::workspace_context_t& 
             set_sub_tab(context, sub_tab_t::dissector);
             return aida::ui::action_handler_result_t::completed();
         });
+		const std::string enum_declaration = enum_to_c(definition);
+		const bool mutable_persistence_available =
+			!struct_dissector::g_state.persistence_in_flight.load(std::memory_order_acquire);
+		add_action("types.catalog.export_declaration", !enum_declaration.empty(),
+			"The enum declaration exceeds the bounded 64 KiB export limit",
+			[enum_declaration] {
+				ImGui::SetClipboardText(enum_declaration.c_str());
+				return aida::ui::action_handler_result_t::completed();
+			});
+		add_action("types.catalog.duplicate_to_editor", mutable_persistence_available &&
+			definition.members.size() <= 65536,
+			!mutable_persistence_available ? "Another mutable catalog operation is running"
+				: "The enum exceeds the mutable editor's bounded value limit", [definition, context] {
+			struct_dissector::enum_def_t duplicate;
+			duplicate.underlying_type = struct_dissector::field_type_t::int64;
+			duplicate.values.reserve(definition.members.size());
+			for (const auto& member : definition.members)
+				duplicate.values.push_back({member.name, member.value});
+			auto rollback_state = struct_dissector::capture_catalog_transaction();
+			std::uint64_t before_revision = 0;
+			{
+				auto& editor = struct_dissector::g_state;
+				std::lock_guard<std::mutex> lock(editor.mtx);
+				if (editor.persistence_in_flight.load(std::memory_order_acquire))
+					return aida::ui::action_handler_result_t::failed(
+						"Another mutable catalog operation started before duplication");
+				before_revision = editor.schema_revision;
+				std::string base = definition.name.empty() ? "anonymous_enum_copy"
+					: definition.name + "_copy";
+				if (base.size() > 240) base.resize(240);
+				duplicate.name = base;
+				for (std::size_t suffix = 2; suffix <= 4096 &&
+					std::any_of(editor.enums.begin(), editor.enums.end(),
+						[&](const auto& item) { return item.name == duplicate.name; }); ++suffix)
+					duplicate.name = base + "_" + std::to_string(suffix);
+				if (std::any_of(editor.enums.begin(), editor.enums.end(),
+					[&](const auto& item) { return item.name == duplicate.name; }))
+					return aida::ui::action_handler_result_t::failed(
+						"A bounded unique enum name could not be allocated");
+			}
+			if (!struct_dissector::upsert_enum_exact(duplicate, before_revision)) {
+				if (!struct_dissector::rollback_catalog_transaction(
+						std::move(rollback_state), before_revision))
+					return aida::ui::action_handler_result_t::failed(
+						"Enum duplication failed and exact catalog rollback was blocked");
+				return aida::ui::action_handler_result_t::failed(
+					"The enum catalog changed or duplication failed; no mutation was retained");
+			}
+			std::uint64_t created_revision = 0;
+			{
+				auto& editor = struct_dissector::g_state;
+				std::lock_guard<std::mutex> lock(editor.mtx);
+				created_revision = editor.schema_revision;
+			}
+			if (!struct_dissector::request_save_schema()) {
+				if (!struct_dissector::rollback_catalog_transaction(
+						std::move(rollback_state), created_revision))
+					return aida::ui::action_handler_result_t::failed(
+						"The durable save was rejected and exact enum rollback was blocked");
+				return aida::ui::action_handler_result_t::failed(
+					"The durable catalog save was not queued; the duplicate was rolled back");
+			}
+			set_sub_tab(context, sub_tab_t::dissector);
+			return aida::ui::action_handler_result_t::completed(
+				"Editable enum duplicate created; durable catalog save queued");
+		});
+		const bool global_enum_promotion_available = !definition.name.empty() &&
+			definition.name.size() <= 256 && !enum_declaration.empty();
+		add_action("types.catalog.promote_global", global_enum_promotion_available,
+			definition.name.empty() || definition.name.size() > 256
+				? "The enum name is empty or exceeds the bounded 256-byte review identity"
+				: "The enum declaration exceeds the bounded review limit",
+			[definition, enum_declaration, context, state] {
+				return stage_global_declaration_review(context, state, definition.name,
+					enum_declaration);
+			});
+		aida::automation_ui::entity_evidence::snapshot_t evidence;
+		evidence.workspace_id = context.workspace->identity().binary_id().to_hex();
+		evidence.source_view_id = "view.types.enums";
+		evidence.source_kind = "type_enum";
+		evidence.entity_id = retained.entity_id;
+		evidence.display_label = "enum " + definition.name;
+		evidence.excerpt = enum_declaration;
+		evidence.revision = analysis_revision;
+		evidence.generation = retained.entity_generation;
+		aida::automation_ui::entity_evidence::append_actions(retained, std::move(evidence),
+			enum_declaration.empty()
+				? aida::ui::capability_state_t::unavailable(
+					"The enum declaration exceeds the bounded evidence contract")
+				: aida::ui::capability_state_t::available());
     } else if (tab == sub_tab_t::functions) {
         const auto& entry = catalog.functions[index];
         const auto address = disasm_view::runtime_address(context, entry.address).value_or(entry.address.value);
@@ -1266,6 +1675,17 @@ inline void render_catalog_context_menu(const disasm_view::workspace_context_t& 
         add_action("types.catalog.function.retype", false,
             "Use the reversible type overlay at a concrete function address",
             [] { return aida::ui::action_handler_result_t::completed(); });
+		aida::automation_ui::entity_evidence::snapshot_t evidence;
+		evidence.workspace_id = context.workspace->identity().binary_id().to_hex();
+		evidence.source_view_id = "view.types.functions";
+		evidence.source_kind = "typed_function";
+		evidence.entity_id = retained.entity_id;
+		evidence.display_label = name;
+		evidence.excerpt = signature.empty() ? name : signature;
+		evidence.address = address;
+		evidence.revision = analysis_revision;
+		evidence.generation = retained.entity_generation;
+		aida::automation_ui::entity_evidence::append_actions(retained, std::move(evidence));
     } else {
         const auto& entry = catalog.typedefs[index];
         retained.entity_id = (tab == sub_tab_t::typedefs ? "typedef:" : "inferred:") +
@@ -1290,13 +1710,123 @@ inline void render_catalog_context_menu(const disasm_view::workspace_context_t& 
             aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
             return aida::ui::action_handler_result_t::completed();
         });
-        add_action("types.catalog.promote_global", false,
-            "No global type-propagation backend is exposed; apply a reversible overlay at a concrete address",
-            [] { return aida::ui::action_handler_result_t::completed(); });
+		const std::string alias_declaration = !entry.explicitly_unknown && !name.empty() &&
+			!canonical.empty() ? "using " + name + " = " + canonical + ";\n" : std::string{};
+		add_action("types.catalog.export_declaration", !alias_declaration.empty() &&
+			alias_declaration.size() <= 64U * 1024U,
+			"The retained type cannot produce a bounded declaration", [alias_declaration] {
+				ImGui::SetClipboardText(alias_declaration.c_str());
+				return aida::ui::action_handler_result_t::completed();
+			});
+		add_action("types.catalog.promote_global", !alias_declaration.empty() &&
+			alias_declaration.size() <= 64U * 1024U,
+			"The retained type is unknown or cannot produce a bounded declaration",
+			[context, state, name, alias_declaration] {
+				return stage_global_declaration_review(context, state, name, alias_declaration);
+			});
+		aida::automation_ui::entity_evidence::snapshot_t evidence;
+		evidence.workspace_id = context.workspace->identity().binary_id().to_hex();
+		evidence.source_view_id = tab == sub_tab_t::typedefs
+			? "view.types.typedefs" : "view.types.inferred";
+		evidence.source_kind = tab == sub_tab_t::typedefs ? "type_alias" : "inferred_type";
+		evidence.entity_id = retained.entity_id;
+		evidence.display_label = name;
+		evidence.excerpt = alias_declaration.empty()
+			? name + ": unknown type evidence" : alias_declaration;
+		evidence.address = address;
+		evidence.revision = analysis_revision;
+		evidence.generation = retained.entity_generation;
+		aida::automation_ui::entity_evidence::append_actions(retained, std::move(evidence));
     }
     aida::ui::application_ui::open_retained_entity_context_menu(
         std::move(retained), origin);
     aida::ui::application_ui::render_retained_entity_context_menu("types.catalog.entity");
+}
+
+inline void render_declaration_review(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& state) {
+	bool open = false;
+	{
+		std::lock_guard<std::mutex> lock(state->mutex);
+		if (state->declaration_review_requested) {
+			state->declaration_review_requested = false;
+			open = true;
+		}
+	}
+	if (open)
+		ImGui::OpenPopup("Review Global Type Declaration");
+	ImGui::SetNextWindowSize(ImVec2(720.0f, 560.0f), ImGuiCond_Appearing);
+	if (!ImGui::BeginPopupModal("Review Global Type Declaration", nullptr,
+			ImGuiWindowFlags_NoSavedSettings))
+		return;
+	std::string name;
+	std::shared_ptr<const std::string> declaration;
+	std::shared_ptr<aida::analysis::analysis_workspace_t> review_workspace;
+	std::shared_ptr<const aida::analysis::analysis_publication_t> review_publication;
+	std::string workspace_id;
+	std::uint64_t generation = 0;
+	std::uint64_t analysis_revision = 0;
+	std::uint64_t overlay_revision = 0;
+	{
+		std::lock_guard<std::mutex> lock(state->mutex);
+		name = state->declaration_review_name;
+		declaration = state->declaration_review_text;
+		review_workspace = state->declaration_review_workspace.lock();
+		review_publication = state->declaration_review_publication;
+		workspace_id = state->declaration_review_workspace_id;
+		generation = state->declaration_review_generation;
+		analysis_revision = state->declaration_review_analysis_revision;
+		overlay_revision = state->declaration_review_overlay_revision;
+	}
+	const bool current = declaration && context.workspace && context.publication &&
+		!context.workspace->closing() && !context.workspace->closed() &&
+		context.workspace == review_workspace && context.publication == review_publication &&
+		context.workspace->identity().binary_id().to_hex() == workspace_id &&
+		context.publication->generation == generation &&
+		context.publication->analysis_revision == analysis_revision &&
+		context.workspace->overlay_revision() == overlay_revision;
+	ImGui::Text("Global declaration: %s", name.c_str());
+	ImGui::TextDisabled("Workspace generation %llu  analysis revision %llu  overlay revision %llu",
+		static_cast<unsigned long long>(generation),
+		static_cast<unsigned long long>(analysis_revision),
+		static_cast<unsigned long long>(overlay_revision));
+	ImGui::Separator();
+	ImGui::BeginChild("##global_type_declaration_review", ImVec2(0.0f, -44.0f), true,
+		ImGuiWindowFlags_HorizontalScrollbar);
+	ImGui::TextUnformatted(declaration ? declaration->c_str() : "");
+	ImGui::EndChild();
+	ImGui::BeginDisabled(!current);
+	if (ImGui::Button("Commit to Overlay")) {
+		const bool queued = disasm_view::queue_type_declaration(context, *declaration);
+		std::lock_guard<std::mutex> lock(state->mutex);
+		state->apply_error = !queued;
+		state->apply_pending = queued;
+		state->apply_generation = generation;
+		state->apply_expected_overlay_revision = overlay_revision;
+		state->apply_status = queued
+			? "Queued global declaration; waiting for the reversible overlay revision to commit."
+			: "The overlay authority rejected the global declaration; no change was claimed.";
+		if (queued) {
+			state->declaration_review_text.reset();
+			state->declaration_review_publication.reset();
+			state->declaration_review_workspace.reset();
+			ImGui::CloseCurrentPopup();
+		}
+	}
+	ImGui::EndDisabled();
+	ImGui::SameLine();
+	if (ImGui::Button("Cancel")) {
+		std::lock_guard<std::mutex> lock(state->mutex);
+		state->declaration_review_text.reset();
+		state->declaration_review_name.clear();
+		state->declaration_review_publication.reset();
+		state->declaration_review_workspace.reset();
+		state->declaration_review_workspace_id.clear();
+		ImGui::CloseCurrentPopup();
+	}
+	if (!current)
+		ImGui::TextDisabled("The workspace, analysis, or overlay revision changed. Cancel and select the type again.");
+	ImGui::EndPopup();
 }
 
 inline void render(float, float, float width, float height,
@@ -1309,6 +1839,7 @@ inline void render(float, float, float width, float height,
         return;
     }
     auto state = state_for(context);
+	render_declaration_review(context, state);
     request_catalog(context, state);
     if (state->apply_pending) {
         const auto mutation = disasm_view::mutation_state(context);
@@ -1682,7 +2213,9 @@ inline void render(float, float, float width, float height,
         else if (active == sub_tab_t::unions)
             render_struct_detail(context, catalog_handle, state, catalog.unions[index], content_height - 80.0f);
         else if (active == sub_tab_t::enums)
-            render_enum_detail(catalog.enums[index], content_height - 80.0f);
+			render_enum_detail(catalog.enums[index], content_height - 80.0f,
+				state, context.publication ? context.publication->generation : 0,
+				context.publication ? context.publication->analysis_revision : 0);
         else if (active == sub_tab_t::functions) {
             const auto& entry = catalog.functions[index];
             const auto address = disasm_view::runtime_address(context, entry.address).value_or(

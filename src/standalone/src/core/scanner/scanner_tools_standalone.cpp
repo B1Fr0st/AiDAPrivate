@@ -1,5 +1,7 @@
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include "standalone_compat.hpp"
@@ -2233,10 +2235,10 @@ static tool_result_t handle_assert_memory_type(const json& params) {
 }
 
 static tool_result_t handle_write_value(const json& params) {
+	const std::uint32_t attached_pid = driver_bridge::attached_pid();
 	{
 		self_guard::self_guard_context_t sg_ctx;
 		sg_ctx.tool_name = "scanner_write_value";
-		const std::uint32_t attached_pid = driver_bridge::attached_pid();
 		if (attached_pid != 0) {
 			sg_ctx.has_pid = true;
 			sg_ctx.target_pid = attached_pid;
@@ -2252,6 +2254,15 @@ static tool_result_t handle_write_value(const json& params) {
 		if (sg_result != self_guard::self_guard_result_t::allow)
 			self_guard::execute_self_guard_bsod(sg_result, sg_ctx);
 	}
+	driver_bridge::identity::live_target_identity_t authorized_identity;
+	std::string identity_error;
+	const bool identity_captured = attached_pid != 0 &&
+		driver_bridge::identity::capture_live_target_identity(
+			attached_pid, 0, authorized_identity, &identity_error) &&
+		driver_bridge::identity::validate_attached_target_identity(authorized_identity).matches;
+	if (!identity_captured)
+		return tool_result_t::error(identity_error.empty()
+			? OBFSTR("No verified live target is attached.") : identity_error);
 
 	if (!params.contains("address") || !params.contains("value"))
 		return tool_result_t::error(OBFSTR("Missing 'address' or 'value' parameter."));
@@ -2278,19 +2289,16 @@ static tool_result_t handle_write_value(const json& params) {
 
 	const size_t before_count = address_list_count();
 	const auto list_index = address_index_by_address(addr);
-	std::vector<uint8_t> before_bytes;
-	const bool before_read_ok = read_memory_exact(addr, bytes.size(), before_bytes);
-	const bool write_ok = driver_bridge::write_memory(addr, bytes);
-	std::vector<uint8_t> readback;
-	const bool readback_ok = read_memory_exact(addr, bytes.size(), readback);
-	const bool verified = readback_ok && readback == bytes;
-	if (write_ok && list_index.has_value())
+	const auto transaction = memory_scanner::write_value_exact(addr, vtype, val_str, hex,
+		authorized_identity.process.pid,
+		authorized_identity.process.creation_time_100ns);
+	if (transaction.verified && list_index.has_value())
 		memory_scanner::refresh_address_list();
 	const size_t after_count = address_list_count();
 
 	json result;
 	add_scanner_action_context(result, "scanner_write_value");
-	result["success"] = write_ok && (!readback_ok || verified);
+	result["success"] = transaction.verified;
 	result["address"] = sa_format_address(addr);
 	result["index"] = list_index.has_value() ? json(*list_index) : json(nullptr);
 	result["list_count_before"] = before_count;
@@ -2300,19 +2308,32 @@ static tool_result_t handle_write_value(const json& params) {
 	result["requested_value"] = val_str;
 	result["requested_bytes"] = bytes_hex_preview(bytes, 256);
 	result["requested_size"] = bytes.size();
-	result["bytes_written"] = write_ok ? bytes.size() : 0;
+	result["bytes_written"] = transaction.verified ? bytes.size() : 0;
 	result["cancel_requested"] = false;
-	result["before_read_ok"] = before_read_ok;
-	if (before_read_ok) {
-		result["before"] = memory_scanner::format_value(before_bytes, vtype);
-		result["before_hex"] = bytes_hex_preview(before_bytes, 256);
+	result["target_pid"] = transaction.target_pid;
+	result["process_creation_time_100ns"] =
+		std::to_string(transaction.process_creation_time_100ns);
+	result["write_attempted"] = transaction.write_attempted;
+	result["write_ok"] = transaction.write_ok;
+	result["before_read_ok"] = transaction.original_read_ok;
+	if (transaction.original_read_ok) {
+		result["before"] = memory_scanner::format_value(transaction.original_bytes, vtype);
+		result["before_hex"] = bytes_hex_preview(transaction.original_bytes, 256);
 	}
-	result["readback_ok"] = readback_ok;
-	result["verified"] = verified;
-	if (readback_ok) {
-		result["readback"] = memory_scanner::format_value(readback, vtype);
-		result["readback_hex"] = bytes_hex_preview(readback, 256);
+	result["readback_ok"] = transaction.readback_ok;
+	result["verified"] = transaction.verified;
+	if (transaction.readback_ok) {
+		result["readback"] = memory_scanner::format_value(transaction.readback_bytes, vtype);
+		result["readback_hex"] = bytes_hex_preview(transaction.readback_bytes, 256);
 	}
+	result["rollback_attempted"] = transaction.rollback_attempted;
+	result["rollback_write_ok"] = transaction.rollback_write_ok;
+	result["rollback_readback_ok"] = transaction.rollback_readback_ok;
+	result["rollback_verified"] = transaction.rollback_verified;
+	if (transaction.rollback_readback_ok)
+		result["rollback_readback_hex"] =
+			bytes_hex_preview(transaction.rollback_readback_bytes, 256);
+	if (!transaction.error.empty()) result["error"] = transaction.error;
 	if (list_index.has_value()) {
 		json entry;
 		if (address_entry_by_index(*list_index, entry)) {
@@ -2322,10 +2343,9 @@ static tool_result_t handle_write_value(const json& params) {
 	} else {
 		result["frozen"] = false;
 	}
-	if (!write_ok)
-		return tool_result_t{false, OBFSTR("Value write failed."), result};
-	if (readback_ok && !verified)
-		return tool_result_t{false, OBFSTR("Value write verification failed."), result};
+	if (!transaction.verified)
+		return tool_result_t{false, transaction.error.empty()
+			? OBFSTR("Value write verification failed.") : transaction.error, result};
 	return tool_result_t::ok(OBFSTR("Value written successfully."), result);
 }
 

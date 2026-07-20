@@ -6007,6 +6007,83 @@ workbench_error_t workbench_shell_runtime_t::publish_selection(
     return {};
 }
 
+workbench_error_t workbench_shell_runtime_t::publish_document_selection(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    document_id_t document,
+    const selection_context_t& selection,
+    const document_local_cursor_t& cursor,
+    navigation_origin_t origin,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    if (document.value == 0 || !validate_selection_context(selection) ||
+        !validate_document_local_cursor(cursor))
+        return shell_error(workbench_error_code_t::invalid_navigation, document.value);
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        const auto source_document = std::find_if(
+            output.persistence.documents.begin(), output.persistence.documents.end(),
+            [document](const document_persistence_dto_t& candidate) {
+                return candidate.id == document;
+            });
+        if (source_document == output.persistence.documents.end())
+            return shell_error(workbench_error_code_t::invalid_document, document.value);
+        const auto source_view = std::find_if(
+            output.persistence.views.begin(), output.persistence.views.end(),
+            [document](const view_persistence_dto_t& candidate) {
+                return candidate.document == document;
+            });
+        if (source_view == output.persistence.views.end())
+            return shell_error(workbench_error_code_t::invalid_view, document.value);
+        document_navigation_bridge_request_t request;
+        auto event_id = binding->next_navigation_id.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (event_id == 0)
+            event_id = binding->next_navigation_id.fetch_add(
+                1, std::memory_order_acq_rel);
+        request.id = navigation_event_id_t{event_id};
+        request.sequence = event_id;
+        request.origin = origin;
+        request.source.workspace = binding->workspace;
+        request.source.document = source_document->id;
+        request.source.view = source_view->id;
+        request.source.selection = source_document->local_state.selection;
+        request.source.cursor = source_document->local_state.cursor;
+        request.source.synchronization_group = source_view->synchronization_group;
+        request.source.synchronization_policy = source_view->synchronization_policy;
+        request.target.document = source_document->identity;
+        request.target.selection = selection;
+        request.target.cursor = cursor;
+        request.request_focus = false;
+        navigation_event_t event;
+        const auto emitted = output.document_bridge->emit(request, event);
+        if (!emitted)
+            return emitted;
+        workbench_command_result_t result;
+        const auto dispatched = binding->shell->dispatch_navigation(
+            binding->workspace, output.persistence.revision, event, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current = binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
 workbench_error_t workbench_shell_runtime_t::navigate_history(
     const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
     bool forward,

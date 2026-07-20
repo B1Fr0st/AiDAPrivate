@@ -36,7 +36,9 @@ enum class capability_t : std::uint8_t {
 	unfreeze,
 	remove,
 	stage_patch,
-	revert_patch
+	revert_patch,
+	compare_selected,
+	export_selected
 };
 
 struct runtime_t {
@@ -64,6 +66,9 @@ struct context_t {
 	std::uint64_t scan_revision = 0;
 	std::string workspace_id;
 	std::uint64_t workspace_generation = 0;
+	std::string owner_workspace_id;
+	std::uint64_t owner_workspace_generation = 0;
+	std::uint64_t document_id = 0;
 	std::uint64_t address = 0;
 	std::uint64_t extent = 0;
 	int index = -1;

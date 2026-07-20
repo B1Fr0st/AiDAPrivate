@@ -163,7 +163,7 @@ void verify_generated_contract(const python_handlers_t& handlers,
     require_fixture(descriptor != nullptr,
                     "generated_contract", "generated descriptor is absent");
     require_fixture(descriptor->adapter_symbol ==
-                        "aida::standalone::mcp::compat::python_worker_host_t::execute" &&
+                        "aida::standalone::mcp::compat::adapters::py_exec_file" &&
                         descriptor->target_dependent && descriptor->accepts_pid &&
                         descriptor->accepts_bin_name && descriptor->unsafe,
                     "generated_contract", "generated worker adapter policy is incorrect");

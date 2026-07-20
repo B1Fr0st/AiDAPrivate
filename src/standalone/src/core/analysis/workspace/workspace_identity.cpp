@@ -569,8 +569,16 @@ make_workspace_identity(workspace_identity_input_t input) {
           (input.format == format_id_t::pe32_plus &&
            input.architecture == architecture_id_t::x86_64 &&
            input.architecture_mode == architecture_mode_t::x86_64 &&
-           input.abi == abi_id_t::windows_x64))));
-    if (input.format == format_id_t::unknown || input.format > format_id_t::classfile ||
+           input.abi == abi_id_t::windows_x64) ||
+          (input.format == format_id_t::pe32_plus &&
+           input.architecture == architecture_id_t::aarch64 &&
+           input.architecture_mode == architecture_mode_t::aarch64 &&
+           input.abi == abi_id_t::windows_arm64) ||
+          (input.format == format_id_t::pe32_plus &&
+           input.architecture == architecture_id_t::arm64ec &&
+           input.architecture_mode == architecture_mode_t::aarch64 &&
+           input.abi == abi_id_t::windows_arm64ec))));
+    if (input.format == format_id_t::unknown || input.format > format_id_t::raw_code ||
         input.architecture == architecture_id_t::unknown ||
         input.architecture > architecture_id_t::dalvik_bytecode ||
         input.architecture_mode == architecture_mode_t::unknown ||

@@ -10,6 +10,52 @@
 namespace aida::analysis::readers::managed {
 namespace {
 
+constexpr std::uint8_t cli_table_module = 0x00;
+constexpr std::uint8_t cli_table_type_ref = 0x01;
+constexpr std::uint8_t cli_table_type_def = 0x02;
+constexpr std::uint8_t cli_table_field_ptr = 0x03;
+constexpr std::uint8_t cli_table_field = 0x04;
+constexpr std::uint8_t cli_table_method_ptr = 0x05;
+constexpr std::uint8_t cli_table_method_def = 0x06;
+constexpr std::uint8_t cli_table_param_ptr = 0x07;
+constexpr std::uint8_t cli_table_param = 0x08;
+constexpr std::uint8_t cli_table_interface_impl = 0x09;
+constexpr std::uint8_t cli_table_member_ref = 0x0A;
+constexpr std::uint8_t cli_table_constant = 0x0B;
+constexpr std::uint8_t cli_table_custom_attribute = 0x0C;
+constexpr std::uint8_t cli_table_field_marshal = 0x0D;
+constexpr std::uint8_t cli_table_decl_security = 0x0E;
+constexpr std::uint8_t cli_table_class_layout = 0x0F;
+constexpr std::uint8_t cli_table_field_layout = 0x10;
+constexpr std::uint8_t cli_table_standalone_sig = 0x11;
+constexpr std::uint8_t cli_table_event_map = 0x12;
+constexpr std::uint8_t cli_table_event_ptr = 0x13;
+constexpr std::uint8_t cli_table_event = 0x14;
+constexpr std::uint8_t cli_table_property_map = 0x15;
+constexpr std::uint8_t cli_table_property_ptr = 0x16;
+constexpr std::uint8_t cli_table_property = 0x17;
+constexpr std::uint8_t cli_table_method_semantics = 0x18;
+constexpr std::uint8_t cli_table_method_impl = 0x19;
+constexpr std::uint8_t cli_table_module_ref = 0x1A;
+constexpr std::uint8_t cli_table_type_spec = 0x1B;
+constexpr std::uint8_t cli_table_impl_map = 0x1C;
+constexpr std::uint8_t cli_table_field_rva = 0x1D;
+constexpr std::uint8_t cli_table_enc_log = 0x1E;
+constexpr std::uint8_t cli_table_enc_map = 0x1F;
+constexpr std::uint8_t cli_table_assembly = 0x20;
+constexpr std::uint8_t cli_table_assembly_processor = 0x21;
+constexpr std::uint8_t cli_table_assembly_os = 0x22;
+constexpr std::uint8_t cli_table_assembly_ref = 0x23;
+constexpr std::uint8_t cli_table_assembly_ref_processor = 0x24;
+constexpr std::uint8_t cli_table_assembly_ref_os = 0x25;
+constexpr std::uint8_t cli_table_file = 0x26;
+constexpr std::uint8_t cli_table_exported_type = 0x27;
+constexpr std::uint8_t cli_table_manifest_resource = 0x28;
+constexpr std::uint8_t cli_table_nested_class = 0x29;
+constexpr std::uint8_t cli_table_generic_param = 0x2A;
+constexpr std::uint8_t cli_table_method_spec = 0x2B;
+constexpr std::uint8_t cli_table_generic_param_constraint = 0x2C;
+
 workspace_error_t cli_error(workspace_error_code_t code, std::string message,
                             std::string phase, std::optional<std::uint64_t> offset = {},
                             std::optional<std::uint64_t> size = {}) {
@@ -57,12 +103,19 @@ struct cli_byte_reader_t {
     const std::uint8_t* data = nullptr;
     std::uint64_t size = 0;
     std::uint64_t offset = 0;
+    workspace_error_t* propagated_error = nullptr;
+    bool* propagated_failure = nullptr;
 
     bool require(std::uint64_t length, std::string_view phase) {
         if (!span_within(offset, length, size)) {
             error_ = cli_error(workspace_error_code_t::out_of_range,
                                "CLI metadata structure exceeds input bounds",
                                std::string(phase), offset, length);
+            if (propagated_error != nullptr && propagated_failure != nullptr &&
+                !*propagated_failure) {
+                *propagated_error = error_;
+                *propagated_failure = true;
+            }
             return false;
         }
         return true;
@@ -141,57 +194,49 @@ struct cli_coded_index_info_t {
 };
 
 cli_coded_index_info_t coded_index_type_def_or_ref() {
-    return {2, {static_cast<std::uint8_t>(cli_table_id_t::type_def),
-                static_cast<std::uint8_t>(cli_table_id_t::type_ref),
-                0x1B}};
+    return {2, {cli_table_type_def, cli_table_type_ref, cli_table_type_spec}};
 }
 
 cli_coded_index_info_t coded_index_has_custom_attribute() {
-    return {5, {static_cast<std::uint8_t>(cli_table_id_t::method_def),
-                static_cast<std::uint8_t>(cli_table_id_t::field),
-                0x01, static_cast<std::uint8_t>(cli_table_id_t::type_ref),
-                static_cast<std::uint8_t>(cli_table_id_t::type_def),
-                0x06, 0x08, 0x09, 0x0A, 0x00, 0x0E,
-                static_cast<std::uint8_t>(cli_table_id_t::assembly),
-                static_cast<std::uint8_t>(cli_table_id_t::assembly_ref),
-                0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
-                0x0C, 0x0D, 0x11, 0x1C, 0x0B}};
+    return {5, {cli_table_method_def, cli_table_field, cli_table_type_ref,
+                cli_table_type_def, cli_table_param, cli_table_interface_impl,
+                cli_table_member_ref, cli_table_module, cli_table_decl_security,
+                cli_table_property, cli_table_event, cli_table_standalone_sig,
+                cli_table_module_ref, cli_table_type_spec, cli_table_assembly,
+                cli_table_assembly_ref, cli_table_file, cli_table_exported_type,
+                cli_table_manifest_resource, cli_table_generic_param,
+                cli_table_generic_param_constraint, cli_table_method_spec}};
 }
 
 cli_coded_index_info_t coded_index_member_ref_parent() {
-    return {3, {static_cast<std::uint8_t>(cli_table_id_t::type_def),
-                static_cast<std::uint8_t>(cli_table_id_t::type_ref),
-                0x00, static_cast<std::uint8_t>(cli_table_id_t::method_def),
-                0x1B}};
+    return {3, {cli_table_type_def, cli_table_type_ref, cli_table_module_ref,
+                cli_table_method_def, cli_table_type_spec}};
 }
 
 cli_coded_index_info_t coded_index_resolution_scope() {
-    return {2, {0x00, 0x1A, static_cast<std::uint8_t>(cli_table_id_t::assembly_ref),
-                static_cast<std::uint8_t>(cli_table_id_t::type_ref)}};
+    return {2, {cli_table_module, cli_table_module_ref, cli_table_assembly_ref,
+                cli_table_type_ref}};
 }
 
 cli_coded_index_info_t coded_index_implementation() {
-    return {2, {0x16, static_cast<std::uint8_t>(cli_table_id_t::assembly_ref),
-                0x17}};
+    return {2, {cli_table_file, cli_table_assembly_ref,
+                cli_table_exported_type}};
 }
 
 cli_coded_index_info_t coded_index_type_or_method_def() {
-    return {1, {static_cast<std::uint8_t>(cli_table_id_t::type_def),
-                static_cast<std::uint8_t>(cli_table_id_t::method_def)}};
+    return {1, {cli_table_type_def, cli_table_method_def}};
 }
 
 cli_coded_index_info_t coded_index_method_def_or_ref() {
-    return {1, {static_cast<std::uint8_t>(cli_table_id_t::method_def),
-                static_cast<std::uint8_t>(cli_table_id_t::member_ref)}};
+    return {1, {cli_table_method_def, cli_table_member_ref}};
 }
 
 cli_coded_index_info_t coded_index_custom_attribute_type() {
-    return {3, {0, 0, static_cast<std::uint8_t>(cli_table_id_t::method_def),
-                static_cast<std::uint8_t>(cli_table_id_t::member_ref), 0}};
+    return {3, {0, 0, cli_table_method_def, cli_table_member_ref, 0}};
 }
 
 cli_coded_index_info_t coded_index_has_semantics() {
-    return {1, {0x14, 0x17}};
+    return {1, {cli_table_event, cli_table_property}};
 }
 
 std::uint32_t coded_index_size(const cli_coded_index_info_t& info,
@@ -204,8 +249,7 @@ std::uint32_t coded_index_size(const cli_coded_index_info_t& info,
                 max_rows = rows;
         }
     }
-    const std::uint32_t tag_limit = 1u << info.tag_bits;
-    if (max_rows > (0xFFFFu >> (info.tag_bits)) || max_rows >= tag_limit)
+    if (max_rows > (0xFFFFu >> info.tag_bits))
         return 4;
     return 2;
 }
@@ -226,81 +270,123 @@ bool decode_coded_index(std::uint32_t raw, const cli_coded_index_info_t& info,
 
 std::uint32_t table_row_size(std::uint8_t table_id, const cli_heap_sizes_t& heaps,
                               const cli_table_row_counts_t& counts) noexcept {
-    switch (static_cast<cli_table_id_t>(table_id)) {
-        case cli_table_id_t::module:
-            return 2 + string_index_size(heaps) + guid_index_size(heaps) * 2;
-        case cli_table_id_t::type_ref:
+    switch (table_id) {
+        case cli_table_module:
+            return 2 + string_index_size(heaps) + guid_index_size(heaps) * 3;
+        case cli_table_type_ref:
             return coded_index_size(coded_index_resolution_scope(), counts) +
                    string_index_size(heaps) * 2;
-        case cli_table_id_t::type_def:
+        case cli_table_type_def:
             return 4 + string_index_size(heaps) * 2 +
                    coded_index_size(coded_index_type_def_or_ref(), counts) +
-                   simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::field)]) +
-                   simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::method_def)]);
-        case cli_table_id_t::field:
+                   simple_index_size(counts.counts[cli_table_field]) +
+                   simple_index_size(counts.counts[cli_table_method_def]);
+        case cli_table_field_ptr:
+            return simple_index_size(counts.counts[cli_table_field]);
+        case cli_table_field:
             return 2 + string_index_size(heaps) + blob_index_size(heaps);
-        case cli_table_id_t::method_def:
+        case cli_table_method_ptr:
+            return simple_index_size(counts.counts[cli_table_method_def]);
+        case cli_table_method_def:
             return 4 + 2 + 2 + string_index_size(heaps) + blob_index_size(heaps) +
-                   simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::param)]);
-        case cli_table_id_t::param:
+                   simple_index_size(counts.counts[cli_table_param]);
+        case cli_table_param_ptr:
+            return simple_index_size(counts.counts[cli_table_param]);
+        case cli_table_param:
             return 2 + 2 + string_index_size(heaps);
-        case cli_table_id_t::interface_impl:
-            return simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::type_def)]) +
+        case cli_table_interface_impl:
+            return simple_index_size(counts.counts[cli_table_type_def]) +
                    coded_index_size(coded_index_type_def_or_ref(), counts);
-        case cli_table_id_t::member_ref:
+        case cli_table_member_ref:
             return coded_index_size(coded_index_member_ref_parent(), counts) +
                    string_index_size(heaps) + blob_index_size(heaps);
-        case cli_table_id_t::constant:
-            return 2 + 2 + coded_index_size({2, {static_cast<std::uint8_t>(cli_table_id_t::field),
-                                                   static_cast<std::uint8_t>(cli_table_id_t::param),
-                                                   0x17}}, counts) + blob_index_size(heaps);
-        case cli_table_id_t::custom_attribute:
+        case cli_table_constant:
+            return 2 + coded_index_size({2, {cli_table_field, cli_table_param,
+                                             cli_table_property}}, counts) +
+                   blob_index_size(heaps);
+        case cli_table_custom_attribute:
             return coded_index_size(coded_index_has_custom_attribute(), counts) +
                    coded_index_size(coded_index_custom_attribute_type(), counts) +
                    blob_index_size(heaps);
-        case cli_table_id_t::field_marshal:
-            return coded_index_size({1, {static_cast<std::uint8_t>(cli_table_id_t::field),
-                                          static_cast<std::uint8_t>(cli_table_id_t::param)}}, counts) +
+        case cli_table_field_marshal:
+            return coded_index_size({1, {cli_table_field, cli_table_param}}, counts) +
                    blob_index_size(heaps);
-        case cli_table_id_t::decl_security:
-            return 2 + coded_index_size({2, {static_cast<std::uint8_t>(cli_table_id_t::type_def),
-                                              static_cast<std::uint8_t>(cli_table_id_t::method_def),
-                                              static_cast<std::uint8_t>(cli_table_id_t::assembly)}}, counts) +
+        case cli_table_decl_security:
+            return 2 + coded_index_size({2, {cli_table_type_def,
+                                             cli_table_method_def,
+                                             cli_table_assembly}}, counts) +
                    blob_index_size(heaps);
-        case cli_table_id_t::class_layout:
-            return 2 + 4 + simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::type_def)]);
-        case cli_table_id_t::field_layout:
-            return 4 + simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::field)]);
-        case cli_table_id_t::semantics:
-            return 2 + simple_index_size(counts.counts[0x14]) + coded_index_size(coded_index_has_semantics(), counts);
-        case cli_table_id_t::impl_map:
-            return 2 + coded_index_size({1, {static_cast<std::uint8_t>(cli_table_id_t::field),
-                                              static_cast<std::uint8_t>(cli_table_id_t::method_def)}}, counts) +
-                   string_index_size(heaps) + simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::assembly_ref)]);
-        case cli_table_id_t::field_rva:
-            return 4 + simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::field)]);
-        case cli_table_id_t::assembly:
+        case cli_table_class_layout:
+            return 2 + 4 + simple_index_size(counts.counts[cli_table_type_def]);
+        case cli_table_field_layout:
+            return 4 + simple_index_size(counts.counts[cli_table_field]);
+        case cli_table_standalone_sig:
+            return blob_index_size(heaps);
+        case cli_table_event_map:
+            return simple_index_size(counts.counts[cli_table_type_def]) +
+                   simple_index_size(counts.counts[cli_table_event]);
+        case cli_table_event_ptr:
+            return simple_index_size(counts.counts[cli_table_event]);
+        case cli_table_event:
+            return 2 + string_index_size(heaps) +
+                   coded_index_size(coded_index_type_def_or_ref(), counts);
+        case cli_table_property_map:
+            return simple_index_size(counts.counts[cli_table_type_def]) +
+                   simple_index_size(counts.counts[cli_table_property]);
+        case cli_table_property_ptr:
+            return simple_index_size(counts.counts[cli_table_property]);
+        case cli_table_property:
+            return 2 + string_index_size(heaps) + blob_index_size(heaps);
+        case cli_table_method_semantics:
+            return 2 + simple_index_size(counts.counts[cli_table_method_def]) +
+                   coded_index_size(coded_index_has_semantics(), counts);
+        case cli_table_method_impl:
+            return simple_index_size(counts.counts[cli_table_type_def]) +
+                   coded_index_size(coded_index_method_def_or_ref(), counts) * 2;
+        case cli_table_module_ref:
+            return string_index_size(heaps);
+        case cli_table_type_spec:
+            return blob_index_size(heaps);
+        case cli_table_impl_map:
+            return 2 + coded_index_size({1, {cli_table_field,
+                                             cli_table_method_def}}, counts) +
+                   string_index_size(heaps) +
+                   simple_index_size(counts.counts[cli_table_module_ref]);
+        case cli_table_field_rva:
+            return 4 + simple_index_size(counts.counts[cli_table_field]);
+        case cli_table_enc_log:
+            return 8;
+        case cli_table_enc_map:
+            return 4;
+        case cli_table_assembly:
             return 4 + 2 + 2 + 2 + 2 + 4 + blob_index_size(heaps) + string_index_size(heaps) * 2;
-        case cli_table_id_t::assembly_ref:
+        case cli_table_assembly_processor:
+            return 4;
+        case cli_table_assembly_os:
+            return 12;
+        case cli_table_assembly_ref:
             return 2 + 2 + 2 + 2 + 4 + blob_index_size(heaps) + string_index_size(heaps) * 2 + blob_index_size(heaps);
-        case cli_table_id_t::file:
+        case cli_table_assembly_ref_processor:
+            return 4 + simple_index_size(counts.counts[cli_table_assembly_ref]);
+        case cli_table_assembly_ref_os:
+            return 12 + simple_index_size(counts.counts[cli_table_assembly_ref]);
+        case cli_table_file:
             return 4 + string_index_size(heaps) + blob_index_size(heaps);
-        case cli_table_id_t::exported_type:
-            return 4 + string_index_size(heaps) * 2 +
-                   coded_index_size(coded_index_implementation(), counts) +
-                   string_index_size(heaps) + 4;
-        case cli_table_id_t::manifest_resource:
+        case cli_table_exported_type:
+            return 8 + string_index_size(heaps) * 2 +
+                   coded_index_size(coded_index_implementation(), counts);
+        case cli_table_manifest_resource:
             return 4 + 4 + string_index_size(heaps) +
                    coded_index_size(coded_index_implementation(), counts);
-        case cli_table_id_t::nested_class:
-            return simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::type_def)]) * 2;
-        case cli_table_id_t::generic_param:
+        case cli_table_nested_class:
+            return simple_index_size(counts.counts[cli_table_type_def]) * 2;
+        case cli_table_generic_param:
             return 2 + 2 + coded_index_size(coded_index_type_or_method_def(), counts) +
                    string_index_size(heaps);
-        case cli_table_id_t::method_spec:
+        case cli_table_method_spec:
             return coded_index_size(coded_index_method_def_or_ref(), counts) + blob_index_size(heaps);
-        case cli_table_id_t::generic_param_constraint:
-            return simple_index_size(counts.counts[static_cast<std::uint8_t>(cli_table_id_t::generic_param)]) +
+        case cli_table_generic_param_constraint:
+            return simple_index_size(counts.counts[cli_table_generic_param]) +
                    coded_index_size(coded_index_type_def_or_ref(), counts);
         default:
             return 0;
@@ -362,16 +448,23 @@ std::vector<std::uint8_t> read_blob_heap(const std::vector<std::uint8_t>& heap, 
 class cli_metadata_parser_t {
 public:
     cli_metadata_parser_t(std::vector<std::uint8_t> data, std::uint64_t metadata_offset,
+                          const byte_provider_t& provider,
                           std::shared_ptr<const pe_image_t> pe_image,
                           const cli_metadata_parse_limits_t& limits,
                           const cancellation_token_t& cancel)
         : data_(std::move(data)), metadata_offset_(metadata_offset),
-          pe_image_(std::move(pe_image)), limits_(limits), cancel_(cancel) {}
+          provider_(provider), pe_image_(std::move(pe_image)), limits_(limits),
+          cancel_(cancel) {}
 
     workspace_result_t<cli_metadata_t> parse() {
         if (!parse_root_header() || !parse_streams() || !parse_table_header() ||
-            !parse_tables() || !parse_method_bodies())
+            !parse_tables() || !parse_method_bodies()) {
+            if (error_.code == workspace_error_code_t::none)
+                error_ = cli_error(workspace_error_code_t::integrity_failure,
+                    "CLI metadata parser failed without a diagnostic",
+                    "cli.parse");
             return workspace_result_t<cli_metadata_t>::failure(std::move(error_));
+        }
         result_.pe_image = pe_image_;
         return workspace_result_t<cli_metadata_t>::success(std::move(result_));
     }
@@ -414,6 +507,12 @@ private:
         if (!require(offset, 2, phase)) return false;
         value = read_u16_le(data_.data() + offset);
         return true;
+    }
+
+    cli_byte_reader_t make_reader(const std::uint8_t* data,
+                                  std::uint64_t size,
+                                  std::uint64_t offset = 0) {
+        return cli_byte_reader_t{data, size, offset, &error_, &failed_};
     }
 
     bool parse_root_header() {
@@ -529,7 +628,7 @@ private:
         if (tables_raw_.size() < 24)
             return fail(workspace_error_code_t::malformed_image,
                         "CLI metadata tables stream is too small", "cli.tables", tables_offset_, tables_raw_.size());
-        cli_byte_reader_t reader{tables_raw_.data(), tables_raw_.size(), 0};
+        auto reader = make_reader(tables_raw_.data(), tables_raw_.size());
         std::uint32_t reserved = 0;
         if (!reader.u32(reserved, "cli.tables")) return false;
         std::uint8_t tables_major = 0;
@@ -652,40 +751,54 @@ private:
                 return false;
             cursor += table_bytes;
         }
+        for (auto& type_ref : result_.type_refs) {
+            if (type_ref.resolution_scope_tag == 2 &&
+                type_ref.resolution_scope_index > 0 &&
+                type_ref.resolution_scope_index <= result_.assembly_refs.size())
+                type_ref.assembly_ref_name = result_.assembly_refs[
+                    type_ref.resolution_scope_index - 1].name;
+        }
+        for (const auto& nested : result_.nested_classes) {
+            if (nested.nested_class_index > 0 &&
+                nested.nested_class_index <= result_.type_defs.size() &&
+                nested.enclosing_class_index > 0 &&
+                nested.enclosing_class_index <= result_.type_defs.size())
+                result_.type_defs[nested.nested_class_index - 1].is_nested = true;
+        }
         return true;
     }
 
     bool parse_single_table(std::uint8_t table_id, std::uint32_t row_count,
                              std::uint32_t row_size, std::uint64_t table_start) {
         if (!poll("cli.tables")) return false;
-        switch (static_cast<cli_table_id_t>(table_id)) {
-            case cli_table_id_t::module:
+        switch (table_id) {
+            case cli_table_module:
                 return parse_module_table(table_start, row_count, row_size);
-            case cli_table_id_t::type_ref:
+            case cli_table_type_ref:
                 return parse_type_ref_table(table_start, row_count, row_size);
-            case cli_table_id_t::type_def:
+            case cli_table_type_def:
                 return parse_type_def_table(table_start, row_count, row_size);
-            case cli_table_id_t::field:
+            case cli_table_field:
                 return parse_field_table(table_start, row_count, row_size);
-            case cli_table_id_t::method_def:
+            case cli_table_method_def:
                 return parse_method_def_table(table_start, row_count, row_size);
-            case cli_table_id_t::param:
+            case cli_table_param:
                 return parse_param_table(table_start, row_count, row_size);
-            case cli_table_id_t::member_ref:
+            case cli_table_member_ref:
                 return parse_member_ref_table(table_start, row_count, row_size);
-            case cli_table_id_t::custom_attribute:
+            case cli_table_custom_attribute:
                 return parse_custom_attribute_table(table_start, row_count, row_size);
-            case cli_table_id_t::assembly:
+            case cli_table_assembly:
                 return parse_assembly_table(table_start, row_count, row_size);
-            case cli_table_id_t::assembly_ref:
+            case cli_table_assembly_ref:
                 return parse_assembly_ref_table(table_start, row_count, row_size);
-            case cli_table_id_t::manifest_resource:
+            case cli_table_manifest_resource:
                 return parse_manifest_resource_table(table_start, row_count, row_size);
-            case cli_table_id_t::nested_class:
+            case cli_table_nested_class:
                 return parse_nested_class_table(table_start, row_count, row_size);
-            case cli_table_id_t::generic_param:
+            case cli_table_generic_param:
                 return parse_generic_param_table(table_start, row_count, row_size);
-            case cli_table_id_t::method_spec:
+            case cli_table_method_spec:
                 return parse_method_spec_table(table_start, row_count, row_size);
             default:
                 return true;
@@ -694,8 +807,9 @@ private:
 
     bool parse_module_table(std::uint64_t start, std::uint32_t count, std::uint32_t row_size) {
         for (std::uint32_t row = 0; row < count; ++row) {
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_module_row_t module;
             if (!reader.u16(module.generation, "cli.module")) return false;
             if (!read_string_index(reader, module.name, "cli.module")) return false;
@@ -711,8 +825,9 @@ private:
         result_.type_refs.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
             if (!poll("cli.type_ref")) return false;
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_type_ref_row_t type_ref;
             std::uint32_t resolution_scope_raw = 0;
             if (!read_coded_index(reader, resolution_scope_raw, coded_index_resolution_scope(), "cli.type_ref"))
@@ -738,8 +853,9 @@ private:
         result_.type_defs.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
             if (!poll("cli.type_def")) return false;
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_type_def_row_t type_def;
             if (!reader.u32(type_def.flags, "cli.type_def")) return false;
             if (!read_string_index(reader, type_def.type_name, "cli.type_def")) return false;
@@ -786,8 +902,9 @@ private:
         result_.fields.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
             if (!poll("cli.field")) return false;
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_field_row_t field;
             if (!reader.u16(field.flags, "cli.field")) return false;
             if (!read_string_index(reader, field.name, "cli.field")) return false;
@@ -807,8 +924,9 @@ private:
         result_.method_defs.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
             if (!poll("cli.method_def")) return false;
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_method_def_row_t method;
             if (!reader.u32(method.rva, "cli.method_def")) return false;
             if (!reader.u16(method.impl_flags, "cli.method_def")) return false;
@@ -834,8 +952,9 @@ private:
     bool parse_param_table(std::uint64_t start, std::uint32_t count, std::uint32_t row_size) {
         result_.params.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_param_row_t param;
             if (!reader.u16(param.flags, "cli.param")) return false;
             if (!reader.u16(param.sequence, "cli.param")) return false;
@@ -849,8 +968,9 @@ private:
         result_.member_refs.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
             if (!poll("cli.member_ref")) return false;
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_member_ref_row_t member_ref;
             std::uint32_t class_raw = 0;
             if (!read_coded_index(reader, class_raw, coded_index_member_ref_parent(), "cli.member_ref"))
@@ -882,8 +1002,9 @@ private:
         result_.custom_attributes.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
             if (!poll("cli.custom_attribute")) return false;
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_custom_attribute_row_t ca;
             std::uint32_t parent_raw = 0;
             if (!read_coded_index(reader, parent_raw, coded_index_has_custom_attribute(), "cli.custom_attribute"))
@@ -913,8 +1034,9 @@ private:
 
     bool parse_assembly_table(std::uint64_t start, std::uint32_t count, std::uint32_t row_size) {
         for (std::uint32_t row = 0; row < count; ++row) {
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_assembly_row_t assembly;
             if (!reader.u32(assembly.hash_alg_id, "cli.assembly")) return false;
             std::uint16_t major_version = 0;
@@ -941,8 +1063,9 @@ private:
     bool parse_assembly_ref_table(std::uint64_t start, std::uint32_t count, std::uint32_t row_size) {
         result_.assembly_refs.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_assembly_ref_row_t asm_ref;
             if (!reader.u16(asm_ref.major_version, "cli.assembly_ref")) return false;
             if (!reader.u16(asm_ref.minor_version, "cli.assembly_ref")) return false;
@@ -962,8 +1085,9 @@ private:
         result_.manifest_resources.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
             if (!poll("cli.manifest_resource")) return false;
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_manifest_resource_row_t resource;
             if (!reader.u32(resource.offset, "cli.manifest_resource")) return false;
             if (!reader.u32(resource.flags, "cli.manifest_resource")) return false;
@@ -985,8 +1109,9 @@ private:
     bool parse_nested_class_table(std::uint64_t start, std::uint32_t count, std::uint32_t row_size) {
         result_.nested_classes.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_nested_class_row_t nested;
             const auto type_def_rows = result_.table_counts.counts[static_cast<std::uint8_t>(cli_table_id_t::type_def)];
             if (!read_simple_index(reader, nested.nested_class_index, type_def_rows, "cli.nested_class"))
@@ -1002,8 +1127,9 @@ private:
         result_.generic_params.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
             if (!poll("cli.generic_param")) return false;
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_generic_param_row_t gp;
             if (!reader.u16(gp.number, "cli.generic_param")) return false;
             if (!reader.u16(gp.flags, "cli.generic_param")) return false;
@@ -1024,8 +1150,9 @@ private:
     bool parse_method_spec_table(std::uint64_t start, std::uint32_t count, std::uint32_t row_size) {
         result_.method_specs.reserve(count);
         for (std::uint32_t row = 0; row < count; ++row) {
-            cli_byte_reader_t reader{tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
-                                      row_size, 0};
+            auto reader = make_reader(
+                tables_raw_.data() + start + static_cast<std::size_t>(row) * row_size,
+                row_size);
             cli_method_spec_row_t spec;
             std::uint32_t method_raw = 0;
             if (!read_coded_index(reader, method_raw, coded_index_method_def_or_ref(), "cli.method_spec"))
@@ -1041,149 +1168,240 @@ private:
         return true;
     }
 
+    bool adopt_provider_error(workspace_error_t error, const char* phase) {
+        if (!failed_) {
+            if (error.code == workspace_error_code_t::none)
+                error.code = workspace_error_code_t::io_failure;
+            if (error.message.empty())
+                error.message = "CLI provider read failed";
+            if (error.phase.empty())
+                error.phase = phase;
+            error_ = std::move(error);
+            failed_ = true;
+        }
+        return false;
+    }
+
+    bool read_provider_range(std::uint64_t offset,
+                             std::uint64_t size,
+                             std::uint64_t maximum,
+                             const char* phase,
+                             std::vector<std::uint8_t>& output) {
+        if (!poll(phase))
+            return false;
+        if (size == 0 || size > maximum)
+            return fail(workspace_error_code_t::limit_exceeded,
+                "CLI provider range exceeds its read budget", phase, offset, size);
+        if (!span_within(offset, size, provider_.size()))
+            return fail(workspace_error_code_t::out_of_range,
+                "CLI provider range exceeds the module", phase, offset, size);
+        auto bytes = provider_.read_vector(offset, size, maximum, cancel_);
+        if (!bytes)
+            return adopt_provider_error(bytes.error(), phase);
+        output = bytes.take_value();
+        if (output.size() != size)
+            return fail(workspace_error_code_t::integrity_failure,
+                "CLI provider returned a short immutable range", phase, offset, size);
+        return true;
+    }
+
     bool parse_method_bodies() {
-        if (!pe_image_) return true;
-        for (std::uint32_t row = 0; row < static_cast<std::uint32_t>(result_.method_defs.size()); ++row) {
-            if (!poll("cli.method_body")) return false;
+        if (!pe_image_)
+            return true;
+        for (std::uint32_t row = 0;
+             row < static_cast<std::uint32_t>(result_.method_defs.size()); ++row) {
+            if (!poll("cli.method_body"))
+                return false;
             const auto& method_def = result_.method_defs[row];
             if (!method_def.has_body || method_def.rva == 0)
                 continue;
             auto file_offset_result = pe_image_->rva_to_file_offset(method_def.rva);
             if (!file_offset_result)
-                continue;
+                return adopt_provider_error(file_offset_result.error(), "cli.method_body");
             const auto file_offset = file_offset_result.value();
-            if (!span_within(file_offset, 1, data_.size()))
-                continue;
+            std::vector<std::uint8_t> header;
+            if (!read_provider_range(file_offset, 1, 1, "cli.method_body", header))
+                return false;
             cli_method_body_t body;
-            body.method_token = (static_cast<std::uint32_t>(cli_table_id_t::method_def) << 24) | (row + 1);
-            std::uint8_t header_byte = 0;
-            if (!require(file_offset, 1, "cli.method_body")) return false;
-            header_byte = data_[file_offset];
-            if ((header_byte & 0x03u) == cli_method_head_tiny_format) {
+            body.method_token =
+                (static_cast<std::uint32_t>(cli_table_id_t::method_def) << 24) |
+                (row + 1);
+            std::uint64_t code_size = 0;
+            bool more_sections = false;
+            if ((header[0] & 0x03u) == cli_method_head_tiny_format) {
                 body.is_fat = false;
-                body.offset = file_offset;
-                body.size = 1 + (header_byte >> 2u);
-                body.max_stack = 0;
+                body.max_stack = 8;
                 body.local_token = 0;
-                if (!span_within(file_offset, body.size, data_.size()))
-                    continue;
-                body.code_bytes.assign(data_.data() + file_offset + 1,
-                                       data_.data() + file_offset + body.size);
-            } else if ((header_byte & 0x03u) == cli_method_head_fat_format) {
-                if (!span_within(file_offset, 12, data_.size()))
-                    continue;
-                const auto flags_size = read_u16_le(data_.data() + file_offset);
+                body.offset = file_offset + 1;
+                code_size = header[0] >> 2u;
+            } else if ((header[0] & 0x03u) == cli_method_head_fat_format) {
+                if (!read_provider_range(file_offset, 12, 12,
+                        "cli.method_body", header))
+                    return false;
+                const auto flags_size = read_u16_le(header.data());
+                const auto header_dwords = static_cast<std::uint16_t>(flags_size >> 12U);
+                if (header_dwords < 3 || header_dwords > 15)
+                    return fail(workspace_error_code_t::malformed_image,
+                        "CLI fat method header size is invalid", "cli.method_body",
+                        file_offset, 2);
+                const auto header_size = static_cast<std::uint64_t>(header_dwords) * 4ULL;
+                if (header_size > header.size() &&
+                    !read_provider_range(file_offset, header_size, 60,
+                        "cli.method_body", header))
+                    return false;
                 body.is_fat = true;
-                body.max_stack = read_u16_le(data_.data() + file_offset + 2);
-                const auto code_size = read_u32_le(data_.data() + file_offset + 4);
-                body.local_token = read_u32_le(data_.data() + file_offset + 8);
-                body.offset = file_offset + 12;
-                body.size = 12ULL + code_size;
-                if (!span_within(body.offset, code_size, data_.size()))
-                    continue;
-                body.code_bytes.assign(data_.data() + body.offset,
-                                       data_.data() + body.offset + code_size);
+                body.max_stack = read_u16_le(header.data() + 2);
+                code_size = read_u32_le(header.data() + 4);
+                body.local_token = read_u32_le(header.data() + 8);
+                body.offset = file_offset + header_size;
+                more_sections = (flags_size & cli_method_head_more_sects) != 0;
                 if (body.local_token != 0) {
                     const auto local_blob_index = body.local_token & 0x00FFFFFFu;
-                    body.local_signature_blob = read_blob_heap(blob_heap_, local_blob_index);
-                }
-                if ((flags_size & cli_method_head_more_sects) != 0 && code_size > 0) {
-                    const auto aligned_code_end = (body.offset + code_size + 3u) & ~3u;
-                    if (span_within(aligned_code_end, 4, data_.size())) {
-                        if (!parse_exception_sections(aligned_code_end, body))
-                            return false;
-                    }
+                    body.local_signature_blob =
+                        read_blob_heap(blob_heap_, local_blob_index);
                 }
             } else {
-                continue;
+                return fail(workspace_error_code_t::malformed_image,
+                    "CLI method header format is invalid", "cli.method_body",
+                    file_offset, 1);
             }
-            total_code_bytes_ += body.code_bytes.size();
-            if (total_code_bytes_ > limits_.max_total_code_bytes)
+            if (code_size == 0)
+                return fail(workspace_error_code_t::malformed_image,
+                    "CLI method body contains no IL bytes", "cli.method_body",
+                    file_offset, 1);
+            if (total_code_bytes_ > limits_.max_total_code_bytes ||
+                code_size > limits_.max_total_code_bytes - total_code_bytes_)
                 return fail(workspace_error_code_t::limit_exceeded,
-                            "CLI metadata cumulative code bytes exceed limit", "cli.method_body",
-                            file_offset, body.size);
-            result_.method_bodies.push_back(std::move(body));
+                    "CLI metadata cumulative code bytes exceed limit",
+                    "cli.method_body", body.offset, code_size);
+            if (!read_provider_range(body.offset, code_size,
+                    limits_.max_total_code_bytes - total_code_bytes_,
+                    "cli.method_body", body.code_bytes))
+                return false;
+            body.size = code_size;
+            total_code_bytes_ += code_size;
+            if (more_sections) {
+                if (body.offset > (std::numeric_limits<std::uint64_t>::max)() -
+                        code_size - 3ULL)
+                    return fail(workspace_error_code_t::range_overflow,
+                        "CLI method exception section offset overflowed",
+                        "cli.method_body", body.offset, code_size);
+                const auto section_offset = (body.offset + code_size + 3ULL) & ~3ULL;
+                if (!parse_exception_sections(section_offset, body))
+                    return false;
+            }
             if (result_.method_bodies.size() >= limits_.max_method_bodies)
                 return fail(workspace_error_code_t::limit_exceeded,
-                            "CLI metadata method body count exceeds limit", "cli.method_body",
-                            file_offset, 0);
+                    "CLI metadata method body count exceeds limit",
+                    "cli.method_body", file_offset, 0);
+            result_.method_bodies.push_back(std::move(body));
         }
         return true;
     }
 
-    bool parse_exception_sections(std::uint64_t section_offset, cli_method_body_t& body) {
+    bool parse_exception_sections(std::uint64_t section_offset,
+                                  cli_method_body_t& body) {
         std::uint64_t cursor = section_offset;
-        while (span_within(cursor, 4, data_.size())) {
-            const auto flags = data_[cursor];
-            if (flags == 0)
-                break;
+        std::uint32_t section_count = 0;
+        for (;;) {
+            if (++section_count > limits_.max_exception_clauses_per_method)
+                return fail(workspace_error_code_t::limit_exceeded,
+                    "CLI method exception section count exceeds limit",
+                    "cli.method_body", cursor, 0);
+            std::vector<std::uint8_t> section;
+            if (!read_provider_range(cursor, 4, 4, "cli.method_body", section))
+                return false;
+            const auto flags = section[0];
             const bool is_fat = (flags & cli_cor_section_fat_format) != 0;
             const bool more = (flags & cli_cor_section_more_sects) != 0;
-            std::uint32_t section_size = 0;
-            if (is_fat) {
-                section_size = (static_cast<std::uint32_t>(data_[cursor + 1]) << 8) |
-                               (static_cast<std::uint32_t>(data_[cursor + 2]) << 16) |
-                               (static_cast<std::uint32_t>(flags) << 24);
-                section_size &= 0x00FFFFFFu;
-                section_size |= (static_cast<std::uint32_t>(data_[cursor + 3]) << 24);
-            } else {
-                section_size = static_cast<std::uint32_t>(data_[cursor + 1]) |
-                               (static_cast<std::uint32_t>(data_[cursor + 2]) << 8);
-            }
-            const auto data_start = cursor + (is_fat ? 4 : 4);
-            if (!span_within(data_start, section_size, data_.size()))
-                break;
-            if ((flags & cli_cor_section_eh_table) != 0) {
-                const auto clause_size = is_fat ? 24u : 12u;
-                const auto clause_count = section_size / clause_size;
-                if (clause_count > limits_.max_exception_clauses_per_method)
-                    return fail(workspace_error_code_t::limit_exceeded,
-                                "CLI method exception clause count exceeds limit", "cli.method_body",
-                                data_start, section_size);
-                for (std::uint32_t clause_index = 0; clause_index < clause_count; ++clause_index) {
-                    const auto clause_offset = data_start + static_cast<std::uint64_t>(clause_index) * clause_size;
-                    cli_exception_clause_t clause;
-                    if (is_fat) {
-                        clause.flags = read_u32_le(data_.data() + clause_offset);
-                        clause.try_offset = read_u32_le(data_.data() + clause_offset + 4);
-                        clause.try_length = read_u32_le(data_.data() + clause_offset + 8);
-                        clause.handler_offset = read_u32_le(data_.data() + clause_offset + 12);
-                        clause.handler_length = read_u32_le(data_.data() + clause_offset + 16);
-                        clause.class_token_or_filter_offset = read_u32_le(data_.data() + clause_offset + 20);
-                    } else {
-                        clause.flags = static_cast<std::uint32_t>(data_[clause_offset]) |
-                                       (static_cast<std::uint32_t>(data_[clause_offset + 1]) << 8) |
-                                       (static_cast<std::uint32_t>(data_[clause_offset + 2]) << 16);
-                        clause.try_offset = read_u32_le(data_.data() + clause_offset + 4);
-                        clause.try_length = data_[clause_offset + 8];
-                        clause.handler_offset = read_u32_le(data_.data() + clause_offset + 9);
-                        clause.handler_length = data_[clause_offset + 13];
-                        clause.class_token_or_filter_offset = read_u32_le(data_.data() + clause_offset + 16) & 0x00FFFFFFu;
-                    }
-                    clause.is_filter = clause.flags == 0x01u;
-                    clause.is_catch_all = (clause.flags == 0x00u && clause.class_token_or_filter_offset == 0u);
-                    if (clause.flags == 0x00u && clause.class_token_or_filter_offset != 0) {
-                        clause.catch_type_token = clause.class_token_or_filter_offset;
-                        const auto type_def_row = clause.class_token_or_filter_offset & 0x00FFFFFFu;
-                        if (type_def_row > 0 && type_def_row <= result_.type_defs.size()) {
-                            const auto& td = result_.type_defs[type_def_row - 1];
-                            clause.catch_type_name = td.type_namespace.empty()
-                                ? td.type_name : td.type_namespace + "." + td.type_name;
-                        }
-                    }
-                    clause.is_finally = clause.flags == 0x02u;
-                    body.exception_clauses.push_back(std::move(clause));
+            const std::uint32_t section_size = is_fat
+                ? static_cast<std::uint32_t>(section[1]) |
+                    (static_cast<std::uint32_t>(section[2]) << 8U) |
+                    (static_cast<std::uint32_t>(section[3]) << 16U)
+                : static_cast<std::uint32_t>(section[1]);
+            if (section_size < 4)
+                return fail(workspace_error_code_t::malformed_image,
+                    "CLI exception section size is invalid", "cli.method_body",
+                    cursor, section_size);
+            const auto clause_size = is_fat ? 24U : 12U;
+            const auto payload_size = section_size - 4U;
+            if ((flags & cli_cor_section_eh_table) != 0 &&
+                payload_size % clause_size != 0)
+                return fail(workspace_error_code_t::malformed_image,
+                    "CLI exception section clause payload is misaligned",
+                    "cli.method_body", cursor, section_size);
+            const auto clause_count = (flags & cli_cor_section_eh_table) != 0
+                ? payload_size / clause_size : 0U;
+            if (clause_count > limits_.max_exception_clauses_per_method ||
+                body.exception_clauses.size() >
+                    limits_.max_exception_clauses_per_method - clause_count)
+                return fail(workspace_error_code_t::limit_exceeded,
+                    "CLI method exception clause count exceeds limit",
+                    "cli.method_body", cursor, section_size);
+            const auto maximum_section_size = 4ULL +
+                static_cast<std::uint64_t>(
+                    limits_.max_exception_clauses_per_method) * 24ULL;
+            if (!read_provider_range(cursor, section_size, maximum_section_size,
+                    "cli.method_body", section))
+                return false;
+            for (std::uint32_t clause_index = 0;
+                 clause_index < clause_count; ++clause_index) {
+                const auto clause_offset = 4ULL +
+                    static_cast<std::uint64_t>(clause_index) * clause_size;
+                const auto* clause_bytes = section.data() +
+                    static_cast<std::size_t>(clause_offset);
+                cli_exception_clause_t clause;
+                if (is_fat) {
+                    clause.flags = read_u32_le(clause_bytes);
+                    clause.try_offset = read_u32_le(clause_bytes + 4);
+                    clause.try_length = read_u32_le(clause_bytes + 8);
+                    clause.handler_offset = read_u32_le(clause_bytes + 12);
+                    clause.handler_length = read_u32_le(clause_bytes + 16);
+                    clause.class_token_or_filter_offset =
+                        read_u32_le(clause_bytes + 20);
+                } else {
+                    clause.flags = read_u16_le(clause_bytes);
+                    clause.try_offset = read_u16_le(clause_bytes + 2);
+                    clause.try_length = clause_bytes[4];
+                    clause.handler_offset = read_u16_le(clause_bytes + 5);
+                    clause.handler_length = clause_bytes[7];
+                    clause.class_token_or_filter_offset =
+                        read_u32_le(clause_bytes + 8);
                 }
+                clause.is_filter = clause.flags == 0x01u;
+                clause.is_catch_all = clause.flags == 0x00u &&
+                    clause.class_token_or_filter_offset == 0u;
+                if (clause.flags == 0x00u &&
+                    clause.class_token_or_filter_offset != 0) {
+                    clause.catch_type_token =
+                        clause.class_token_or_filter_offset;
+                    const auto type_def_row =
+                        clause.class_token_or_filter_offset & 0x00FFFFFFu;
+                    if (type_def_row > 0 &&
+                        type_def_row <= result_.type_defs.size()) {
+                        const auto& type = result_.type_defs[type_def_row - 1];
+                        clause.catch_type_name = type.type_namespace.empty()
+                            ? type.type_name
+                            : type.type_namespace + "." + type.type_name;
+                    }
+                }
+                clause.is_finally = clause.flags == 0x02u;
+                body.exception_clauses.push_back(std::move(clause));
             }
             if (!more)
-                break;
-            cursor = data_start + ((section_size + 3u) & ~3u);
+                return true;
+            if (cursor > (std::numeric_limits<std::uint64_t>::max)() -
+                    section_size - 3ULL)
+                return fail(workspace_error_code_t::range_overflow,
+                    "CLI exception section chain offset overflowed",
+                    "cli.method_body", cursor, section_size);
+            cursor = (cursor + section_size + 3ULL) & ~3ULL;
         }
-        return true;
     }
 
     std::vector<std::uint8_t> data_;
     std::uint64_t metadata_offset_ = 0;
+    const byte_provider_t& provider_;
     std::shared_ptr<const pe_image_t> pe_image_;
     const cli_metadata_parse_limits_t& limits_;
     const cancellation_token_t& cancel_;
@@ -1262,11 +1480,16 @@ parse_cli_metadata(const byte_provider_t& provider,
     if (!pe_result)
         return workspace_result_t<cli_metadata_t>::failure(std::move(pe_result.error()));
     auto pe_image = pe_result.take_value();
-    if (pe_image->directories().size() <= cli_pe_cli_directory_index)
+    const auto cli_directory = std::find_if(
+        pe_image->directories().begin(), pe_image->directories().end(),
+        [](const auto& directory) {
+            return directory.index == cli_pe_cli_directory_index;
+        });
+    if (cli_directory == pe_image->directories().end())
         return workspace_result_t<cli_metadata_t>::failure(
             cli_error(workspace_error_code_t::malformed_image,
                       "PE image does not contain a CLI metadata directory", "cli.init"));
-    const auto& cli_dir = pe_image->directories()[cli_pe_cli_directory_index];
+    const auto& cli_dir = *cli_directory;
     if (cli_dir.rva == 0 || cli_dir.size == 0)
         return workspace_result_t<cli_metadata_t>::failure(
             cli_error(workspace_error_code_t::malformed_image,
@@ -1303,7 +1526,8 @@ parse_cli_metadata(const byte_provider_t& provider,
     const auto entry_point_token = read_u32_le(cli_header.data() + 20);
     const auto resources_rva = read_u32_le(cli_header.data() + 24);
     const auto resources_size = read_u32_le(cli_header.data() + 28);
-    cli_metadata_parser_t parser(metadata_result.take_value(), metadata_offset, pe_image, limits, cancel);
+    cli_metadata_parser_t parser(metadata_result.take_value(), metadata_offset,
+        provider, pe_image, limits, cancel);
     auto parsed = parser.parse();
     if (!parsed)
         return parsed;
@@ -1325,8 +1549,8 @@ build_cli_artifact(const cli_metadata_t& metadata,
     managed_artifact_t artifact;
     artifact.kind = managed_artifact_kind_t::cli_metadata;
     artifact.module_identity.kind = managed_artifact_kind_t::cli_metadata;
-    artifact.module_identity.artifact_offset = metadata.metadata_rva;
-    artifact.module_identity.artifact_size = metadata.metadata_size;
+    artifact.module_identity.artifact_offset = 0;
+    artifact.module_identity.artifact_size = provider.size();
     artifact.module_identity.module_name = metadata.module.name;
     if (metadata.assembly) {
         artifact.module_identity.assembly_name = metadata.assembly->name;
@@ -1431,17 +1655,19 @@ build_cli_artifact(const cli_metadata_t& metadata,
             if (param.sequence > 0)
                 method.parameter_names.push_back(param.name);
         }
-        for (const auto& td : metadata.type_defs) {
-            const auto type_token = (static_cast<std::uint32_t>(cli_table_id_t::type_def) << 24);
-            for (std::uint32_t mi = td.method_list_index; mi <= metadata.method_defs.size(); ++mi) {
-                if (mi == row + 1) {
-                    method.declaring_type_name = td.type_namespace.empty()
-                        ? td.type_name : td.type_namespace + "." + td.type_name;
-                    break;
-                }
-            }
-            if (!method.declaring_type_name.empty())
+        for (std::size_t type_index = 0;
+             type_index < metadata.type_defs.size(); ++type_index) {
+            const auto& type = metadata.type_defs[type_index];
+            const auto next_method_index = type_index + 1 < metadata.type_defs.size()
+                ? metadata.type_defs[type_index + 1].method_list_index
+                : static_cast<std::uint32_t>(metadata.method_defs.size() + 1);
+            if (row + 1 >= type.method_list_index &&
+                row + 1 < next_method_index) {
+                method.declaring_type_name = type.type_namespace.empty()
+                    ? type.type_name
+                    : type.type_namespace + "." + type.type_name;
                 break;
+            }
         }
         if (!md.signature_blob.empty()) {
             managed_signature_t sig;

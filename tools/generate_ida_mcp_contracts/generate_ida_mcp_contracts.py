@@ -865,7 +865,7 @@ def override_py_exec_file_contract(contract: dict[str, Any]) -> None:
     })
     annotations["extension"] = "aida_standalone_isolated_worker"
     annotations["return"] = "IsolatedPythonWorkerResult"
-    contract["adapter_symbol"] = "aida::standalone::mcp::compat::python_worker_host_t::execute"
+    contract["adapter_symbol"] = "aida::standalone::mcp::compat::adapters::py_exec_file"
     contract["description"] = (
         "Execute a workspace-relative Python script in AiDA Standalone's isolated analysis worker "
         "and return bounded stdout/stderr. Explicit unsafe approval is required. The worker has no "

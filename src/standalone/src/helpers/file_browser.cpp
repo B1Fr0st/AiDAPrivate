@@ -1490,7 +1490,9 @@ void render_hex_loading_indicator()
     bool loading = false;
     bool cancellation_requested = false;
     bool cancelled = false;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     bool archive = false;
+#endif
     std::string preview_path;
     std::string preview_error;
     {
@@ -1499,7 +1501,9 @@ void render_hex_loading_indicator()
         loading = preview.loading;
         cancellation_requested = preview.cancellation_requested;
         cancelled = preview.cancelled;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
         archive = preview.archive;
+#endif
         preview_path = preview.path;
         preview_error = preview.error;
     }

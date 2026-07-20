@@ -33,7 +33,8 @@ struct provider_output_t {
     std::vector<decompiler_diagnostic_t> diagnostics;
 };
 
-decompiler_diagnostic_t failure(const decompiler_diagnostic_code_t code, std::string key)
+decompiler_diagnostic_t failure(const decompiler_diagnostic_code_t code, std::string key,
+    std::string detail = {})
 {
     decompiler_diagnostic_t result;
     result.severity = decompiler_diagnostic_severity_t::error;
@@ -41,6 +42,12 @@ decompiler_diagnostic_t failure(const decompiler_diagnostic_code_t code, std::st
     result.localization_key = std::move(key);
     result.confidence = 100;
     result.ordinal = 1;
+    if (!detail.empty()) {
+        constexpr std::size_t detail_limit = 4096;
+        if (detail.size() > detail_limit)
+            detail.resize(detail_limit);
+        result.localization_arguments.push_back(std::move(detail));
+    }
     return result;
 }
 
@@ -138,7 +145,10 @@ std::optional<provider_output_t> execute_native(
         job.cache_key.language.language_id, &cancelled, deadline, limits, capture);
     if (output.is_error || !output.typed_artifacts) {
         diagnostics.insert(diagnostics.end(), output.typed_diagnostics.begin(), output.typed_diagnostics.end());
-        if (diagnostics.empty())
+        if (!output.error_text.empty())
+            diagnostics.push_back(failure(decompiler_diagnostic_code_t::provider_failure,
+                "decompiler.native_worker.provider_failed", output.error_text));
+        else if (diagnostics.empty())
             diagnostics.push_back(failure(decompiler_diagnostic_code_t::provider_failure,
                 "decompiler.native_worker.provider_failed"));
         return std::nullopt;

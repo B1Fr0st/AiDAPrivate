@@ -104,7 +104,118 @@ endif()
 file(GENERATE OUTPUT "${AIDA_C03_TESTLAB_INTEGRATION_DIGEST_HEADER}"
     CONTENT "#pragma once\n#define AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256 \"${_aida_c03_testlab_integration_digest}\"\n")
 
+set(AIDA_C03_MCP_PRODUCTION_CLOSURE_SOURCES
+    "${STANDALONE_ROOT}/core/analysis/analysis_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/analysis/binary_map.cpp"
+    "${STANDALONE_ROOT}/core/debugger/debugger_engine.cpp"
+    "${STANDALONE_ROOT}/core/debugger/debugger_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/debugger/thread_intel.cpp"
+    "${STANDALONE_ROOT}/core/debugger/thread_intel_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/disasm/decompile_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/disasm/disasm_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/editor/programming_language_service.cpp"
+    "${STANDALONE_ROOT}/core/mcp/mcp_client.cpp"
+    "${STANDALONE_ROOT}/core/network/api_enum_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/active_scanner.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/api_definition.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/audit_http.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/collaborator.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/cookie_jar.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/insertion_points.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/issue.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/jwt_lab.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/match_replace.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/payload_library.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/burp_logger.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/scanner_module.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/scope.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/session_handler.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/site_map.cpp"
+    "${STANDALONE_ROOT}/core/network/cert_generator.cpp"
+    "${STANDALONE_ROOT}/core/network/cloud_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/conn_pool.cpp"
+    "${STANDALONE_ROOT}/core/network/flow_serializer.cpp"
+    "${STANDALONE_ROOT}/core/network/game_protocol.cpp"
+    "${STANDALONE_ROOT}/core/network/gameproto_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/http_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/intercept/cert_profile_manager.cpp"
+    "${STANDALONE_ROOT}/core/network/intercept/diagnostics.cpp"
+    "${STANDALONE_ROOT}/core/network/intercept/instrumentation_provider.cpp"
+    "${STANDALONE_ROOT}/core/network/js_analysis_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/map_resource.cpp"
+    "${STANDALONE_ROOT}/core/network/mitm_proxy.cpp"
+    "${STANDALONE_ROOT}/core/network/net_proto_analysis.cpp"
+    "${STANDALONE_ROOT}/core/network/net_proto_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/net_security_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/network_tool_aliases_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/network_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/network/pac_resolver.cpp"
+    "${STANDALONE_ROOT}/core/network/protocol_parser.cpp"
+    "${STANDALONE_ROOT}/core/network/quic_proxy.cpp"
+    "${STANDALONE_ROOT}/core/network/server_replay.cpp"
+    "${STANDALONE_ROOT}/core/network/web_vuln_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/re/artifact_store.cpp"
+    "${STANDALONE_ROOT}/core/re/dx_hook.cpp"
+    "${STANDALONE_ROOT}/core/re/encptr.cpp"
+    "${STANDALONE_ROOT}/core/re/heap_track.cpp"
+    "${STANDALONE_ROOT}/core/re/offsets.cpp"
+    "${STANDALONE_ROOT}/core/re/re_common.cpp"
+    "${STANDALONE_ROOT}/core/re/rtti.cpp"
+    "${STANDALONE_ROOT}/core/re/sigs.cpp"
+    "${STANDALONE_ROOT}/core/re/struct_adv.cpp"
+    "${STANDALONE_ROOT}/core/re/vmt.cpp"
+    "${STANDALONE_ROOT}/core/scanner/memory_scanner.cpp"
+    "${STANDALONE_ROOT}/core/scanner/scanner_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/session/session_health.cpp"
+    "${STANDALONE_ROOT}/core/session/session_store.cpp"
+    "${STANDALONE_ROOT}/core/tools/coding_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/tools/driver_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/tools/emulation_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/tools/protected_re_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/tools/re_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/tools/script_engine.cpp"
+    "${STANDALONE_ROOT}/core/tools/session_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/tools/workflow_tools_standalone.cpp"
+    "${STANDALONE_ROOT}/core/ai/agent_registry.cpp"
+    "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
+    "${STANDALONE_ROOT}/core/ai/standalone_chat.cpp"
+    "${CMAKE_SOURCE_DIR}/src/emulation_engine.cpp"
+    "${CMAKE_SOURCE_DIR}/src/net_security.cpp")
+
+set(AIDA_C03_LICENSE_ARC_PRODUCTION_CLOSURE_SOURCES
+    "${STANDALONE_ROOT}/core/arc/plaintext_window.cpp"
+    "${STANDALONE_ROOT}/core/crypto/keys_a.cpp"
+    "${STANDALONE_ROOT}/core/crypto/keys_b.cpp"
+    "${STANDALONE_ROOT}/core/crypto/keys_c.cpp"
+    "${STANDALONE_ROOT}/core/crypto/keys_d.cpp"
+    "${STANDALONE_ROOT}/core/crypto/wb_ed25519.cpp"
+    "${STANDALONE_ROOT}/core/network/tls_exporter.cpp"
+    "${STANDALONE_ROOT}/core/runtime/arc_loader.cpp"
+    "${STANDALONE_ROOT}/core/runtime/customer_capsule.cpp"
+    "${STANDALONE_ROOT}/core/runtime/gate_tokens.cpp"
+    "${STANDALONE_ROOT}/core/runtime/license_state.cpp"
+    "${STANDALONE_ROOT}/core/runtime/standalone_license_transport.cpp"
+    "${STANDALONE_ROOT}/core/settings/settings_persistence_service.cpp")
+
+set(AIDA_C03_CAMOUFOX_AUDIT_PRODUCTION_CLOSURE_SOURCES
+    "${STANDALONE_ROOT}/core/infra/event_bus.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/audit_trail.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/camoufox_install.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/evidence_store.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/findings_db.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/vuln_taxonomy.cpp")
+
 set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
+    ${AIDA_C03_MCP_PRODUCTION_CLOSURE_SOURCES}
+    ${AIDA_C03_LICENSE_ARC_PRODUCTION_CLOSURE_SOURCES}
+    ${AIDA_C03_CAMOUFOX_AUDIT_PRODUCTION_CLOSURE_SOURCES}
+    "${STANDALONE_ROOT}/core/ai/agent_manager_service.cpp"
+    "${STANDALONE_ROOT}/core/ai/agent_task.cpp"
+    "${STANDALONE_ROOT}/core/ai/command_registry.cpp"
+    "${STANDALONE_ROOT}/core/ai/conversation_evidence_store.cpp"
+    "${STANDALONE_ROOT}/core/ai/provider_catalog.cpp"
+    "${STANDALONE_ROOT}/core/ai/provider_transforms.cpp"
+    "${STANDALONE_ROOT}/core/ai/skill_manager_service.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_budget.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_resource_metrics.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_scheduler.cpp"
@@ -144,6 +255,7 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/overlay_projection.cpp"
     "${STANDALONE_ROOT}/core/analysis/packed_analysis_store.cpp"
     "${STANDALONE_ROOT}/core/analysis/packed_string_pool.cpp"
+    "${STANDALONE_ROOT}/core/analysis/pdb_downloader.cpp"
     "${STANDALONE_ROOT}/core/analysis/provider_snapshot.cpp"
     "${STANDALONE_ROOT}/core/analysis/readers/macho_reader.cpp"
     "${STANDALONE_ROOT}/core/analysis/readers/managed/classfile_reader.cpp"
@@ -162,9 +274,29 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/symbol_type_candidates.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/workspace_schema_v9.cpp"
+    "${STANDALONE_ROOT}/core/auth/auth_store.cpp"
+    "${STANDALONE_ROOT}/core/auth/auth_http.cpp"
+    "${STANDALONE_ROOT}/core/auth/auth_codex.cpp"
+    "${STANDALONE_ROOT}/core/auth/auth_copilot.cpp"
+    "${STANDALONE_ROOT}/core/auth/auth_claude_code.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_pretty_xml_encode.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_function_db.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_arch_map.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_load_image.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_pcode_fixup.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_print_c.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_scope.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_architecture.cpp"
+    "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_code_xml_parse.cpp"
+    "${STANDALONE_ROOT}/core/mcp/calculator_tool.cpp"
+    "${STANDALONE_ROOT}/core/mcp/ida_compat_mut.cpp"
+    "${STANDALONE_ROOT}/core/mcp/ida_compat_read.cpp"
+    "${STANDALONE_ROOT}/core/mcp/mcp_standalone.cpp"
+    "${STANDALONE_ROOT}/core/mcp/mcp_standalone_tools.cpp"
     "${STANDALONE_ROOT}/core/mcp/protocol/mcp_result.cpp"
     "${STANDALONE_ROOT}/core/mcp/protocol/mcp_tool_contract.cpp"
     "${STANDALONE_ROOT}/core/mcp/protocol/schema_runtime.cpp"
+    "${STANDALONE_ROOT}/core/mcp/schema_validator.cpp"
     "${STANDALONE_ROOT}/core/mcp/registry/application_debugger_capability.cpp"
     "${STANDALONE_ROOT}/core/mcp/registry/tool_registry.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/c03_compatibility_registration.cpp"
@@ -189,11 +321,22 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/mcp/compat/handlers/stack.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/handlers/survey.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/handlers/types.cpp"
+    "${STANDALONE_ROOT}/core/debugger/source_debug_service.cpp"
     "${STANDALONE_ROOT}/core/debugger/debugger_interaction_context.cpp"
+    "${STANDALONE_ROOT}/core/network/burp/camoufox_bridge.cpp"
+    "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
+    "${STANDALONE_ROOT}/core/runtime/vm_guest_bridge.cpp"
+    "${STANDALONE_ROOT}/core/session/analysis_session.cpp"
+    "${STANDALONE_ROOT}/core/session/compaction.cpp"
+    "${STANDALONE_ROOT}/core/session/cost_calculator.cpp"
     "${STANDALONE_ROOT}/core/ui/application_action_registry.cpp"
     "${STANDALONE_ROOT}/core/ui/application_ui_runtime.cpp"
     "${STANDALONE_ROOT}/core/ui/analysis_context_menu.cpp"
+    "${STANDALONE_ROOT}/core/ui/context_menu_contract.cpp"
     "${STANDALONE_ROOT}/core/ui/imgui_capability_guard.cpp"
+    "${STANDALONE_ROOT}/core/ui/interaction_context.cpp"
+    "${STANDALONE_ROOT}/core/ui/shortcut_resolver.cpp"
+    "${STANDALONE_ROOT}/core/ui/view_registry.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/diff_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/disasm_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/document_adapter_base.cpp"
@@ -208,6 +351,8 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/workbench/workbench_persistence.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_shell_integration.cpp"
     "${STANDALONE_ROOT}/core/testlab/test_lab_features_c03_safe_headless.cpp"
+    "${CMAKE_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
+    "${CMAKE_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
 )
 list(REMOVE_DUPLICATES AIDA_C03_PRODUCTION_STANDALONE_SOURCES)
 
@@ -225,7 +370,8 @@ set(AIDA_C03_COMPILER_MATRIX_CM_02
     "${STANDALONE_ROOT}/core/analysis/workspace/analysis_workspace.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/workspace_registry.cpp"
-    "${STANDALONE_ROOT}/core/session/analysis_session.cpp")
+    "${STANDALONE_ROOT}/core/session/analysis_session.cpp"
+    "${STANDALONE_ROOT}/core/analysis/pdb_downloader.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_03
     "${STANDALONE_ROOT}/core/analysis/analysis_scheduler.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_resource_metrics.cpp"
@@ -346,6 +492,7 @@ set(AIDA_C03_COMPILER_MATRIX_CM_10
     "${STANDALONE_ROOT}/core/mcp/registry/tool_registry.cpp"
     "${STANDALONE_ROOT}/core/mcp/registry/application_debugger_capability.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_11
+    ${AIDA_C03_MCP_PRODUCTION_CLOSURE_SOURCES}
     "${STANDALONE_ROOT}/core/mcp/compat/c03_compatibility_registration.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/mcp_server_integration.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/handlers/analysis.cpp"
@@ -363,9 +510,12 @@ set(AIDA_C03_COMPILER_MATRIX_CM_11
     "${STANDALONE_ROOT}/core/mcp/compat/handlers/types.cpp"
     "${STANDALONE_ROOT}/core/mcp/ida_compat_read.cpp"
     "${STANDALONE_ROOT}/core/mcp/ida_compat_mut.cpp"
+    "${STANDALONE_ROOT}/core/mcp/calculator_tool.cpp"
+    "${STANDALONE_ROOT}/core/mcp/schema_validator.cpp"
     "${STANDALONE_ROOT}/core/mcp/mcp_standalone.cpp"
     "${STANDALONE_ROOT}/core/mcp/mcp_standalone_tools.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_12
+    "${STANDALONE_ROOT}/core/runtime/vm_guest_bridge.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/debugger_lane.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/python_worker_host.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/live_routing_integration.cpp"
@@ -373,20 +523,32 @@ set(AIDA_C03_COMPILER_MATRIX_CM_12
     "${STANDALONE_ROOT}/core/analysis/live_snapshot_provider.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/live_snapshot_provider.cpp"
     "${STANDALONE_ROOT}/core/debugger/debugger_engine.cpp"
+    "${STANDALONE_ROOT}/core/debugger/source_debug_service.cpp"
     "${STANDALONE_ROOT}/core/runtime/standalone_driver.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_13
     "${STANDALONE_ROOT}/main.cpp"
     "${STANDALONE_ROOT}/helpers/helpers.cpp"
+    "${STANDALONE_ROOT}/core/ai/agent_manager_service.cpp"
     "${STANDALONE_ROOT}/core/ai/agent_registry.cpp"
     "${STANDALONE_ROOT}/core/ai/agent_task.cpp"
+    "${STANDALONE_ROOT}/core/ai/command_registry.cpp"
+    "${STANDALONE_ROOT}/core/ai/conversation_evidence_store.cpp"
+    "${STANDALONE_ROOT}/core/ai/provider_transforms.cpp"
+    "${STANDALONE_ROOT}/core/ai/skill_manager_service.cpp"
     "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
     "${STANDALONE_ROOT}/core/ai/standalone_chat.cpp"
+    "${STANDALONE_ROOT}/core/session/compaction.cpp"
+    "${STANDALONE_ROOT}/core/session/cost_calculator.cpp"
     "${STANDALONE_ROOT}/core/debugger/thread_intel.cpp"
     "${STANDALONE_ROOT}/core/debugger/debugger_interaction_context.cpp"
     "${STANDALONE_ROOT}/core/ui/application_action_registry.cpp"
     "${STANDALONE_ROOT}/core/ui/application_ui_runtime.cpp"
     "${STANDALONE_ROOT}/core/ui/analysis_context_menu.cpp"
+    "${STANDALONE_ROOT}/core/ui/context_menu_contract.cpp"
     "${STANDALONE_ROOT}/core/ui/imgui_capability_guard.cpp"
+    "${STANDALONE_ROOT}/core/ui/interaction_context.cpp"
+    "${STANDALONE_ROOT}/core/ui/shortcut_resolver.cpp"
+    "${STANDALONE_ROOT}/core/ui/view_registry.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/diff_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/disasm_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/document_adapter_base.cpp"
@@ -408,12 +570,17 @@ set(AIDA_C03_COMPILER_MATRIX_CM_14
     "${STANDALONE_ROOT}/core/testlab/test_all_mcp.cpp"
     "${AIDA_C03_TEST_ROOT}/harness_testlab_integration.cpp"
     "${AIDA_C03_TEST_ROOT}/testlab_runtime/result_adapter.cpp"
+    "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_driver_bridge.cpp"
+    "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_emulation_bridge.cpp"
+    "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_runtime_bridges.cpp"
     "${AIDA_C03_SAFE_HEADLESS_ASSERTION_INVENTORY}"
     "${AIDA_C03_SAFE_HEADLESS_RESOURCE_POLICY_CASES}"
     "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.c"
     "${CMAKE_SOURCE_DIR}/driver/syscall.asm"
     "${STANDALONE_ROOT}/resources/aida_embedded.rc.in")
 set(AIDA_C03_COMPILER_MATRIX_CM_15
+    ${AIDA_C03_LICENSE_ARC_PRODUCTION_CLOSURE_SOURCES}
+    ${AIDA_C03_CAMOUFOX_AUDIT_PRODUCTION_CLOSURE_SOURCES}
     "${AIDA_C03_PACKAGE_VERIFIER_SOURCE}"
     "${STANDALONE_ROOT}/core/auth/auth_store.cpp"
     "${STANDALONE_ROOT}/core/auth/auth_http.cpp"
@@ -434,6 +601,9 @@ set(AIDA_C03_COMPILER_MATRIX_CM_15
     "${AIDA_C03_TEST_ROOT}/testlab_runtime/source_policy_scanner.cpp"
     "${CMAKE_SOURCE_DIR}/src/emulation_engine.cpp"
     "${STANDALONE_ROOT}/core/network/burp/camoufox_bridge.cpp"
+    "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
+    "${CMAKE_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
+    "${CMAKE_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
     "${STANDALONE_ROOT}/core/network/burp/offensive/auth_attack_engine.cpp"
     "${STANDALONE_ROOT}/core/network/burp/offensive/business_logic_engine.cpp"
     "${STANDALONE_ROOT}/core/network/burp/offensive/js_analysis_engine.cpp"
@@ -487,6 +657,8 @@ set(AIDA_C03_HARNESS_SUPPORT_SOURCES
     "${STANDALONE_ROOT}/core/analysis/workspace/xref_builder.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/zip_container.cpp"
     "${STANDALONE_ROOT}/core/testlab/test_lab_registry.cpp"
+    "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_driver_bridge.cpp"
+    "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_runtime_bridges.cpp"
     "${DEPS_DIR}/sqlite-amalgamation-3530300/sqlite3.c"
 )
 set(AIDA_C03_WORKSPACE_HARNESS_SUPPORT_SOURCES
@@ -579,6 +751,7 @@ function(aida_c03_configure_native_target target)
     target_include_directories(${target} SYSTEM PRIVATE "${DEPS_DIR}/taskflow")
     target_compile_definitions(${target} PRIVATE
         __NT__ _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE AIDA_STANDALONE
+        LZMA_API_STATIC
         GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
     )
     target_compile_options(${target} PRIVATE
@@ -882,10 +1055,12 @@ function(aida_c03_register_worker_targets application_target)
     target_compile_definitions(aida_c03_b14_native_decompiler_worker PRIVATE
         AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER=1)
     target_link_libraries(aida_c03_b14_native_decompiler_worker PRIVATE libdecomp_aida bcrypt advapi32 userenv ws2_32)
+    target_link_options(aida_c03_b14_native_decompiler_worker PRIVATE /ENTRY:wmainCRTStartup)
     set_target_properties(aida_c03_b14_native_decompiler_worker PROPERTIES
         OUTPUT_NAME "AiDA_NativeDecompilerWorker"
         RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/workers/$<CONFIG>"
         FOLDER "Workers/C03"
+        WIN32_EXECUTABLE TRUE
         AIDA_C03_PACKAGE "B14"
         AIDA_C03_SAFE_HEADLESS FALSE)
 
@@ -1289,17 +1464,44 @@ function(aida_c03_register_safe_headless_targets application_target)
         ${_aida_auth_implementation_sources})
     list(REMOVE_ITEM _aida_runtime_sources
         "${STANDALONE_ROOT}/core/testlab/test_lab_features_c03_safe_headless.cpp"
-        "${STANDALONE_ROOT}/core/workbench/workbench_shell_integration.cpp"
-        "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_ui_integration.cpp"
-        "${STANDALONE_ROOT}/core/mcp/registry/application_debugger_capability.cpp")
+        "${STANDALONE_ROOT}/core/mcp/registry/application_debugger_capability.cpp"
+        "${CMAKE_SOURCE_DIR}/src/emulation_engine.cpp")
+    list(APPEND _aida_runtime_sources
+        "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_emulation_bridge.cpp"
+        "${imgui_SOURCE_DIR}/imgui.cpp"
+        "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+        "${imgui_SOURCE_DIR}/imgui_tables.cpp"
+        "${imgui_SOURCE_DIR}/imgui_widgets.cpp")
     list(REMOVE_DUPLICATES _aida_runtime_sources)
+    aida_use_static_msvc_runtime(pcre2-8-static)
     add_library(aida_c03_safe_headless_runtime STATIC ${_aida_runtime_sources})
     aida_c03_configure_native_target(aida_c03_safe_headless_runtime)
+    target_include_directories(aida_c03_safe_headless_runtime PRIVATE
+        "${IDA_STUBS_DIR}"
+        "${CMAKE_SOURCE_DIR}/src"
+        "${STANDALONE_ROOT}/core/emulation"
+        "${CMAKE_SOURCE_DIR}/driver"
+        "${STANDALONE_ROOT}/core/arc"
+        "${STANDALONE_ROOT}/core/ai"
+        "${STANDALONE_ROOT}/core/auth"
+        "${STANDALONE_ROOT}/core/debugger"
+        "${STANDALONE_ROOT}/core/editor"
+        "${STANDALONE_ROOT}/core/network"
+        "${STANDALONE_ROOT}/core/scanner"
+        "${STANDALONE_ROOT}/core/session"
+        "${STANDALONE_ROOT}/core/tools"
+        "${sol2_SOURCE_DIR}/include")
+    target_compile_definitions(aida_c03_safe_headless_runtime PRIVATE
+        AIDA_C03_SAFE_HEADLESS_RUNTIME=1
+        CPPHTTPLIB_OPENSSL_SUPPORT)
     target_link_libraries(aida_c03_safe_headless_runtime PUBLIC
         Zydis capstone::capstone triton "${Z3_LIBRARIES}"
         nlohmann_json_schema_validator::validator libdecomp_aida
         zlibstatic libzstd_static liblzma pcre2-8
-        bcrypt crypt32 advapi32 userenv ws2_32 shell32 ole32 Shlwapi)
+        brotlidec brotlienc brotlicommon llhttp_static nghttp2_static lua54_static
+        aida_openssl_ssl_mt aida_openssl_crypto_mt
+        bcrypt crypt32 advapi32 userenv ws2_32 shell32 ole32 Shlwapi
+        cabinet cfgmgr32 dnsapi gdiplus iphlpapi ntdll Psapi setupapi version winhttp wintrust)
     set_target_properties(aida_c03_safe_headless_runtime PROPERTIES
         FOLDER "Tests/C03/SafeHeadless"
         AIDA_C03_SAFE_HEADLESS TRUE
@@ -1521,9 +1723,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         LABELS "c03;c03_safe_headless;safe-headless;C20;C21;C22")
     aida_c03_register_manifest_entry(
         TARGET aida_c03_c22_workbench_shell_lifecycle_harness PACKAGE C22
-        SOURCES
-            "${AIDA_C03_TEST_ROOT}/workbench_shell_lifecycle_harness.cpp"
-            "${STANDALONE_ROOT}/core/workbench/workbench_shell_integration.cpp")
+        SOURCES "${AIDA_C03_TEST_ROOT}/workbench_shell_lifecycle_harness.cpp")
     aida_c03_register_manifest_entry(
         TARGET aida_c03_c23_workbench_persistence_harness PACKAGE C23
         SOURCES "${AIDA_C03_TEST_ROOT}/workbench_persistence_harness.cpp")
@@ -1543,6 +1743,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         TARGET aida_c03_a06_decompiler_quality_scorer_harness PACKAGE A06 ARGS_ENTRY
         MAX_ACTIVE_PROCESSES 4
         MAX_WALL_MS 1800000
+        COMPILE_DEFINITIONS AIDA_SAFE_HEADLESS=1
         SOURCES
             "${AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT}/c03_safe_headless/decompiler_quality_pipeline_main.cpp"
             "${AIDA_C03_TEST_ROOT}/decompiler_provider_matrix/provider_matrix.cpp"
@@ -1560,7 +1761,6 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
             "${AIDA_C03_TEST_ROOT}/evidence_hash.hpp"
             "${AIDA_C03_WORKSPACE_TEST_ROOT}/workspace_fixture_builder.hpp"
-            "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_ui_integration.cpp"
         ARGUMENTS
             "."
             "scratch/quality/evidence"
@@ -1578,6 +1778,7 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${AIDA_C03_TEST_ROOT}/benchmark_sla_receipt_harness.cpp"
             "${AIDA_C03_TEST_ROOT}/benchmark_sla_receipt.cpp"
             "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
             "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         ARGUMENTS "not-run" "scratch/benchmark" "fixtures/benchmark_search_receipt.json"
         RUNTIME_FILES
@@ -1626,7 +1827,9 @@ function(aida_c03_register_safe_headless_targets application_target)
     list(REMOVE_DUPLICATES _aida_dependency_runtime)
     aida_c03_register_manifest_entry(
         TARGET aida_c03_dependency_inventory_harness PACKAGE A05 ARGS_ENTRY
-        SOURCES "${AIDA_C03_TEST_ROOT}/dependency_inventory_harness.cpp"
+        SOURCES
+            "${AIDA_C03_TEST_ROOT}/dependency_inventory_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         ARGUMENTS "."
         RUNTIME_FILES ${_aida_dependency_runtime})
 
@@ -1664,7 +1867,9 @@ function(aida_c03_register_safe_headless_targets application_target)
     endforeach()
     aida_c03_register_manifest_entry(
         TARGET aida_c03_build_packaging_integration_harness PACKAGE D06
-        SOURCES "${AIDA_C03_TEST_ROOT}/build_packaging_integration_harness.cpp"
+        SOURCES
+            "${AIDA_C03_TEST_ROOT}/build_packaging_integration_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         COMPILE_DEFINITIONS AIDA_C03_PACKAGE_FIXTURE_ADAPTERS=1
         RUNTIME_FILES ${_aida_build_packaging_runtime})
     aida_c03_register_manifest_entry(
@@ -1683,6 +1888,10 @@ function(aida_c03_register_safe_headless_targets application_target)
         "src/standalone/tests/c03/build_packaging_integration_harness.cpp"
         "src/standalone/tests/c03/auth_browser_dispatch/auth_browser_dispatch_harness.hpp"
         "src/standalone/tests/c03/auth_browser_dispatch/auth_browser_dispatch_harness.cpp"
+        "src/standalone/tests/c03/testlab_runtime/safe_headless_driver_bridge.cpp"
+        "src/standalone/tests/c03/testlab_runtime/safe_headless_emulation_bridge.cpp"
+        "src/standalone/tests/c03/testlab_runtime/safe_headless_runtime_bridges.cpp"
+        "src/standalone/src/core/anti-tamper/self_guard.hpp"
         "src/standalone/tests/c03/package_distribution_policy/package_distribution_policy_harness.ps1"
         "src/standalone/tests/c03/package_distribution_policy/policy_stage_spec.json"
         "src/standalone/src/core/testlab/test_lab_features_c03_safe_headless.cpp"
@@ -1935,10 +2144,12 @@ function(aida_c03_register_safe_headless_targets application_target)
         "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp")
     aida_c03_configure_native_target(aida_c03_b14_fake_native_decompiler_worker)
     target_link_libraries(aida_c03_b14_fake_native_decompiler_worker PRIVATE bcrypt advapi32 ws2_32)
+    target_link_options(aida_c03_b14_fake_native_decompiler_worker PRIVATE /ENTRY:wmainCRTStartup)
     set_target_properties(aida_c03_b14_fake_native_decompiler_worker PROPERTIES
         OUTPUT_NAME "fake_native_decompiler_worker"
         RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/direct/$<CONFIG>"
         FOLDER "Tests/C03/SafeHeadless/Support"
+        WIN32_EXECUTABLE TRUE
         AIDA_C03_SAFE_HEADLESS TRUE)
     add_executable(aida_c03_b24_fake_analysis_python_worker
         "${STANDALONE_ROOT}/../workers/analysis_python/fake_analysis_python_worker.cpp")
@@ -1964,6 +2175,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         TARGET aida_c03_testlab_runtime_integration_harness PACKAGE D07 TIMEOUT 180
         SOURCES
             "${AIDA_C03_TEST_ROOT}/harness_testlab_integration.cpp"
+            "${AIDA_C03_TEST_ROOT}/testlab_runtime/result_adapter.cpp"
             "${STANDALONE_ROOT}/core/testlab/test_lab_features_c03_safe_headless.cpp"
             "${imgui_SOURCE_DIR}/imgui.cpp"
             "${imgui_SOURCE_DIR}/imgui_draw.cpp"
@@ -2055,6 +2267,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         SOURCES
             "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
             "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
             "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         ARGUMENTS
             "deterministic_component"
@@ -2065,9 +2278,7 @@ function(aida_c03_register_safe_headless_targets application_target)
 
     set(_aida_managed_consumer_sources
         "${AIDA_C03_TEST_ROOT}/managed_decompiler_consumers/main.cpp"
-        "${AIDA_C03_TEST_ROOT}/managed_decompiler_consumers/managed_decompiler_consumers_harness.cpp"
-        "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_ui_integration.cpp"
-        "${STANDALONE_ROOT}/core/workbench/workbench_shell_integration.cpp")
+        "${AIDA_C03_TEST_ROOT}/managed_decompiler_consumers/managed_decompiler_consumers_harness.cpp")
     aida_c03_register_direct_test(
         TARGET aida_c03_managed_decompiler_consumers_harness PACKAGE D02 TIMEOUT 1200
         SOURCES ${_aida_managed_consumer_sources}

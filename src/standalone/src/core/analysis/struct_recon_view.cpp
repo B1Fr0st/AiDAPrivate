@@ -1,4 +1,5 @@
 #include "struct_recon_view.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -38,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -92,6 +94,17 @@ struct local_state_t {
 	bool operation_pending = false;
 	uint64_t operation_generation = 0;
 	uint64_t operation_overlay_revision = 0;
+	bool overlay_review_requested = false;
+	std::string overlay_review_workspace_id;
+	std::string overlay_review_structure_name;
+	std::string overlay_review_declaration;
+	uint64_t overlay_review_base = 0;
+	uint64_t overlay_review_generation = 0;
+	uint64_t overlay_review_analysis_revision = 0;
+	uint64_t overlay_review_overlay_revision = 0;
+	std::shared_ptr<const struct_recon::reconstructed_struct_t> overlay_review_snapshot;
+	std::weak_ptr<aida::analysis::analysis_workspace_t> overlay_review_workspace;
+	std::shared_ptr<const aida::analysis::analysis_publication_t> overlay_review_publication;
 };
 
 static local_state_t s_state;
@@ -152,8 +165,8 @@ command_result_t copy_current_declaration()
 	if (!structure || structure->fields.empty())
 		return {false, "Reconstruct or load a structure first"};
 	const std::string declaration = struct_recon::export_as_cpp(*structure);
-	if (declaration.empty())
-		return {false, "The reconstruction engine produced no declaration"};
+	if (declaration.empty() || declaration.size() > 64U * 1024U)
+		return {false, "The reconstruction declaration is empty or exceeds 64 KiB"};
 	ImGui::SetClipboardText(declaration.c_str());
 	return {true, "Generated C++ declaration copied"};
 }
@@ -164,7 +177,7 @@ command_result_t declare_and_apply_current()
 	if (!structure || structure->fields.empty())
 		return {false, "Reconstruct or load a structure first"};
 	auto context = disasm_view::capture_selected_workspace();
-	if (!context.workspace)
+	if (!context.workspace || !context.publication)
 		return {false, "Open and analyze the static or live target that owns this structure first"};
 	if (context.workspace->closing() || context.workspace->closed())
 		return {false, "The selected analysis workspace is closing"};
@@ -172,12 +185,160 @@ command_result_t declare_and_apply_current()
 	if (!address)
 		return {false, "The reconstructed base address is outside the selected workspace mapping"};
 	const std::string declaration = struct_recon::export_as_cpp(*structure);
-	if (declaration.empty() || structure->name.empty())
+	if (declaration.empty() || declaration.size() > 64U * 1024U || structure->name.empty())
 		return {false, "The reconstruction has no valid generated declaration or type name"};
-	if (!disasm_view::queue_type_declaration_and_application(context, *address,
-			declaration, structure->name))
-		return {false, "The reversible overlay rejected the atomic declaration and application request"};
-	return {true, "Queued one atomic overlay transaction; views update after its revision commits"};
+	s_state.overlay_review_workspace_id = context.workspace->identity().binary_id().to_hex();
+	s_state.overlay_review_structure_name = structure->name;
+	s_state.overlay_review_declaration = declaration;
+	s_state.overlay_review_base = structure->base_address;
+	s_state.overlay_review_generation = context.workspace->generation();
+	s_state.overlay_review_analysis_revision = context.publication->analysis_revision;
+	s_state.overlay_review_overlay_revision = context.workspace->overlay_revision();
+	s_state.overlay_review_snapshot = structure;
+	s_state.overlay_review_workspace = context.workspace;
+	s_state.overlay_review_publication = context.publication;
+	s_state.overlay_review_requested = true;
+	const auto opened = aida::ui::application_views::open_or_focus(
+		aida::ui::stable_view_id_t("view.types.struct_recon"));
+	if (!opened.ok()) {
+		s_state.overlay_review_requested = false;
+		return {false, opened.detail};
+	}
+	return {true, "Review the atomic declaration and application before committing it to the overlay"};
+}
+
+static aida::ui::action_handler_result_t stage_declare_apply_review()
+{
+	const auto result = declare_and_apply_current();
+	return result.completed
+		? aida::ui::action_handler_result_t::completed(result.detail)
+		: aida::ui::action_handler_result_t::failed(result.detail);
+}
+
+static std::uint64_t field_identity_hash(const struct_recon::struct_field_t& field)
+{
+	std::uint64_t hash = 1469598103934665603ull;
+	const auto mix = [&hash](std::uint64_t value) {
+		hash ^= value;
+		hash *= 1099511628211ull;
+	};
+	const auto mix_string = [&mix](const std::string& value) {
+		mix(value.size());
+		for (const char character : value)
+			mix(static_cast<std::uint64_t>(static_cast<unsigned char>(character)));
+	};
+	const auto mix_bytes = [&mix](const std::vector<std::uint8_t>& value) {
+		mix(value.size());
+		for (const auto byte : value) mix(byte);
+	};
+	mix_string(field.name);
+	mix(static_cast<std::uint64_t>(field.type));
+	mix(field.offset);
+	mix(static_cast<std::uint64_t>(field.size));
+	mix_string(field.comment);
+	std::uint32_t confidence_bits = 0;
+	static_assert(sizeof(confidence_bits) == sizeof(field.type_confidence));
+	std::memcpy(&confidence_bits, &field.type_confidence, sizeof(confidence_bits));
+	mix(confidence_bits);
+	mix(static_cast<std::uint64_t>(field.array_count));
+	mix(static_cast<std::uint64_t>(field.value_history.count));
+	mix(static_cast<std::uint64_t>(field.value_history.write_idx));
+	for (const auto value : field.value_history.values) mix(value);
+	mix(field.vtable_entries.size());
+	for (const auto& entry : field.vtable_entries) {
+		mix(entry.func_addr);
+		mix(static_cast<std::uint64_t>(entry.index));
+		mix_string(entry.name);
+	}
+	mix(field.accesses.size());
+	for (const auto& access : field.accesses) {
+		mix(access.instruction_addr);
+		mix(access.access_offset);
+		mix(static_cast<std::uint64_t>(access.access_size));
+		mix(access.is_write ? 1U : 0U);
+		mix_string(access.disasm_text);
+		mix(static_cast<std::uint64_t>(access.hit_count));
+		mix_string(access.source);
+		mix(access.thread_id);
+		mix(access.sample_index);
+		mix(access.capture_session_id);
+		mix(access.initial_value_captured ? 1U : 0U);
+		mix(access.initial_value);
+		mix_bytes(access.initial_bytes);
+		mix(access.value_captured ? 1U : 0U);
+		mix(access.value_after_access ? 1U : 0U);
+		mix(access.observed_value);
+		mix_bytes(access.observed_bytes);
+	}
+	return hash == 0 ? 1 : hash;
+}
+
+static void render_declare_apply_review()
+{
+	if (s_state.overlay_review_requested) {
+		s_state.overlay_review_requested = false;
+		ImGui::OpenPopup("Review Reconstructed Type Application");
+	}
+	ImGui::SetNextWindowSize(ImVec2(720.0f, 560.0f), ImGuiCond_Appearing);
+	if (!ImGui::BeginPopupModal("Review Reconstructed Type Application", nullptr,
+			ImGuiWindowFlags_NoSavedSettings))
+		return;
+	auto context = disasm_view::capture_selected_workspace();
+	const auto structure = struct_recon::capture_current_snapshot();
+	const auto review_workspace = s_state.overlay_review_workspace.lock();
+	const bool current = context.workspace && context.publication && structure &&
+		!context.workspace->closing() && !context.workspace->closed() &&
+		context.workspace->identity().binary_id().to_hex() == s_state.overlay_review_workspace_id &&
+		context.workspace == review_workspace &&
+		context.publication == s_state.overlay_review_publication &&
+		context.workspace->generation() == s_state.overlay_review_generation &&
+		context.publication->analysis_revision == s_state.overlay_review_analysis_revision &&
+		context.workspace->overlay_revision() == s_state.overlay_review_overlay_revision &&
+		structure == s_state.overlay_review_snapshot;
+	ImGui::Text("Declare %s and apply at 0x%016llX",
+		s_state.overlay_review_structure_name.c_str(),
+		static_cast<unsigned long long>(s_state.overlay_review_base));
+	ImGui::TextDisabled("Workspace generation %llu  analysis revision %llu  overlay revision %llu",
+		static_cast<unsigned long long>(s_state.overlay_review_generation),
+		static_cast<unsigned long long>(s_state.overlay_review_analysis_revision),
+		static_cast<unsigned long long>(s_state.overlay_review_overlay_revision));
+	ImGui::Separator();
+	ImGui::BeginChild("##reconstructed_type_review", ImVec2(0.0f, -44.0f), true,
+		ImGuiWindowFlags_HorizontalScrollbar);
+	ImGui::TextUnformatted(s_state.overlay_review_declaration.c_str());
+	ImGui::EndChild();
+	ImGui::BeginDisabled(!current);
+	if (ImGui::Button("Commit Declaration and Application")) {
+		const auto address = disasm_view::typed_address(context, s_state.overlay_review_base);
+		const bool queued = address && disasm_view::queue_type_declaration_and_application(
+			context, *address, s_state.overlay_review_declaration,
+			s_state.overlay_review_structure_name);
+		s_state.operation_error = !queued;
+		s_state.operation_status = queued
+			? "Atomic declaration and application queued through the reversible overlay authority"
+			: "The overlay authority rejected the transaction; no change was claimed";
+		if (queued) {
+			s_state.operation_pending = true;
+			s_state.operation_generation = s_state.overlay_review_generation;
+			s_state.operation_overlay_revision = s_state.overlay_review_overlay_revision;
+			s_state.overlay_review_snapshot.reset();
+			s_state.overlay_review_publication.reset();
+			s_state.overlay_review_workspace.reset();
+			ImGui::CloseCurrentPopup();
+		}
+	}
+	ImGui::EndDisabled();
+	ImGui::SameLine();
+	if (ImGui::Button("Cancel")) {
+		s_state.overlay_review_declaration.clear();
+		s_state.overlay_review_snapshot.reset();
+		s_state.overlay_review_publication.reset();
+		s_state.overlay_review_workspace.reset();
+		ImGui::CloseCurrentPopup();
+	}
+	if (!current)
+		ImGui::TextDisabled("The workspace, reconstruction, or overlay revision changed. Cancel and select the field again.");
+	ImGui::EndPopup();
 }
 
 static ImU32 type_color_token(struct_recon::field_type_t tp, float alpha)
@@ -294,6 +455,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = s_state;
+	render_declare_apply_review();
 	auto& sr = struct_recon::g_state;
 	const auto frame_structure = struct_recon::capture_current_snapshot();
 	const bool has_frame_structure = frame_structure && !frame_structure->fields.empty();
@@ -478,7 +640,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			? struct_recon::export_as_cpp(*frame_structure) : std::string{};
 		const std::string name = frame_structure ? frame_structure->name : std::string{};
 		const size_t field_count = frame_structure ? frame_structure->fields.size() : 0;
-		if (!cpp.empty()) {
+		if (!cpp.empty() && cpp.size() <= 64U * 1024U) {
 			ImGui::SetClipboardText(cpp.c_str());
 		}
 		diag::log_tagged_fmt("struct_recon",
@@ -493,18 +655,10 @@ void render(float pos_x, float pos_y, float width, float height,
 		const auto result = declare_and_apply_current();
 		st.operation_status = result.detail;
 		st.operation_error = !result.completed;
-		if (result.completed) {
-			auto workspace = disasm_view::capture_selected_workspace();
-			st.operation_pending = true;
-			st.operation_generation = workspace.workspace
-				? workspace.workspace->generation() : 0;
-			st.operation_overlay_revision = workspace.workspace
-				? workspace.workspace->overlay_revision() : 0;
-		}
 	}
 	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
 		ImGui::SetTooltip(has_frame_structure
-			? "Queue the generated declaration and base-address application as one reversible overlay transaction"
+			? "Review the generated declaration and base-address application before one reversible overlay transaction"
 			: "Reconstruct or load a structure before applying its type");
 	ImGui::SameLine(0.f, 6.f);
 	{
@@ -1032,8 +1186,30 @@ void render(float pos_x, float pos_y, float width, float height,
 		const int retained_size = st.context_size;
 		const std::string retained_name = st.context_name;
 		const std::string retained_struct_name = st.context_struct_name;
+		const std::uint64_t retained_field_hash = field_identity_hash(field);
+		const std::uint64_t retained_workspace_generation = workspace.workspace
+			? workspace.workspace->generation() : 0;
+		const std::uint64_t retained_analysis_revision = workspace.publication
+			? workspace.publication->analysis_revision : 0;
+		const std::string retained_workspace_id = workspace.workspace
+			? workspace.workspace->identity().binary_id().to_hex() : std::string{};
 		retained.validate_identity = [retained_field, retained_base, retained_offset,
-			retained_size, retained_name, retained_struct_name] {
+			retained_size, retained_name, retained_struct_name, workspace,
+			retained_workspace_generation, retained_analysis_revision,
+			retained_workspace_id, retained_field_hash] {
+			const auto selected = disasm_view::capture_selected_workspace();
+			if (!workspace.workspace || !workspace.publication ||
+				workspace.workspace->closing() || workspace.workspace->closed() ||
+				workspace.workspace->generation() != retained_workspace_generation ||
+				workspace.publication->analysis_revision != retained_analysis_revision ||
+				!selected.workspace || !selected.publication ||
+				selected.workspace != workspace.workspace ||
+				selected.publication != workspace.publication ||
+				selected.workspace->identity().binary_id().to_hex() != retained_workspace_id ||
+				selected.workspace->generation() != retained_workspace_generation ||
+				selected.publication->analysis_revision != retained_analysis_revision)
+				return aida::ui::capability_state_t::unavailable(
+					"The type workspace changed; select the field again");
 			const auto snapshot = struct_recon::capture_current_snapshot();
 			if (!snapshot || retained_field < 0 ||
 				retained_field >= static_cast<int>(snapshot->fields.size()) ||
@@ -1042,7 +1218,8 @@ void render(float pos_x, float pos_y, float width, float height,
 					"The reconstruction snapshot changed; select the field again");
 			const auto& candidate = snapshot->fields[static_cast<std::size_t>(retained_field)];
 			return candidate.offset == retained_offset && candidate.size == retained_size &&
-				candidate.name == retained_name
+				candidate.name == retained_name &&
+				field_identity_hash(candidate) == retained_field_hash
 				? aida::ui::capability_state_t::available()
 				: aida::ui::capability_state_t::unavailable(
 					"The retained field identity no longer matches the live reconstruction");
@@ -1105,14 +1282,24 @@ void render(float pos_x, float pos_y, float width, float height,
 			return aida::ui::action_handler_result_t::completed();
 		});
 		add_action("types.reconstruction.field.copy_access_evidence",
-			valid_field && !field.accesses.empty(),
-			"No monitored instruction access references were captured for this field", [field] {
+			valid_field && !field.accesses.empty() && field.accesses.size() <= 4096,
+			field.accesses.size() > 4096
+				? "The access evidence exceeds the bounded 4,096-entry export limit"
+				: "No monitored instruction access references were captured for this field", [field] {
+			if (field.accesses.size() > 4096)
+				return aida::ui::action_handler_result_t::failed(
+					"The access evidence exceeds the bounded 4,096-entry export limit");
 			std::string evidence;
+			evidence.reserve(64U * 1024U);
 			for (const auto& access : field.accesses) {
 				char prefix[96]{};
 				std::snprintf(prefix, sizeof(prefix), "0x%llX %s ",
 					static_cast<unsigned long long>(access.instruction_addr),
 					access.is_write ? "write" : "read");
+				const std::size_t required = std::strlen(prefix) + access.disasm_text.size() + 1;
+				if (required > 64U * 1024U - evidence.size())
+					return aida::ui::action_handler_result_t::failed(
+						"The access evidence exceeds the bounded 64 KiB export limit");
 				evidence += prefix;
 				evidence += access.disasm_text;
 				evidence.push_back('\n');
@@ -1122,19 +1309,10 @@ void render(float pos_x, float pos_y, float width, float height,
 		});
 		add_action("types.reconstruction.field.declare_apply", valid_field,
 			"The retained field is stale", [] {
-			const auto result = declare_and_apply_current();
-			st.operation_status = result.detail;
-			st.operation_error = !result.completed;
-			if (result.completed) {
-				auto selected_workspace = disasm_view::capture_selected_workspace();
-				st.operation_pending = true;
-				st.operation_generation = selected_workspace.workspace
-					? selected_workspace.workspace->generation() : 0;
-				st.operation_overlay_revision = selected_workspace.workspace
-					? selected_workspace.workspace->overlay_revision() : 0;
-			}
-			return result.completed ? aida::ui::action_handler_result_t::completed()
-				: aida::ui::action_handler_result_t::failed(result.detail);
+			const auto result = stage_declare_apply_review();
+			st.operation_status = result.message;
+			st.operation_error = !result.success;
+			return result;
 		});
 		add_action("types.reconstruction.field.rename", false,
 			"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction",
@@ -1148,10 +1326,90 @@ void render(float pos_x, float pos_y, float width, float height,
 			"The reconstruction view has no target-session-bound write and readback provider",
 			[] { return aida::ui::action_handler_result_t::failed(
 				"The reconstruction view has no target-session-bound write and readback provider"); });
-		add_action("types.reconstruction.field.send_ai", false,
-			"No evidence-review adapter currently accepts reconstruction field snapshots",
-			[] { return aida::ui::action_handler_result_t::failed(
-				"No evidence-review adapter currently accepts reconstruction field snapshots"); });
+		aida::automation_ui::entity_evidence::snapshot_t evidence;
+		evidence.workspace_id = workspace.workspace
+			? workspace.workspace->identity().binary_id().to_hex() : std::string{};
+		evidence.source_view_id = "view.types.struct_recon";
+		evidence.source_kind = "reconstructed_field";
+		evidence.entity_id = retained.entity_id;
+		evidence.display_label = retained_struct_name + "." + field_name;
+		constexpr std::size_t maximum_evidence_bytes = 64U * 1024U;
+		const auto append_evidence = [&](const std::string& value) {
+			if (value.size() > maximum_evidence_bytes - evidence.excerpt.size())
+				return false;
+			evidence.excerpt.append(value);
+			return true;
+		};
+		if (!append_evidence("Structure: ") || !append_evidence(retained_struct_name) ||
+			!append_evidence("\nField: ") || !append_evidence(field_name) ||
+			!append_evidence("\nType: ") || !append_evidence(field_type) ||
+			!append_evidence("\nOffset: ") ||
+			!append_evidence(std::to_string(retained_offset)) ||
+			!append_evidence("\nSize: ") ||
+			!append_evidence(std::to_string(retained_size)) ||
+			!append_evidence("\nCaptured accesses: ") ||
+			!append_evidence(std::to_string(field.accesses.size())))
+			evidence.excerpt.clear();
+		const std::size_t evidence_accesses = (std::min)(field.accesses.size(),
+			static_cast<std::size_t>(32));
+		for (std::size_t index = 0; index < evidence_accesses &&
+			!evidence.excerpt.empty(); ++index) {
+			const auto& access = field.accesses[index];
+			if (!append_evidence("\n") ||
+				!append_evidence(std::to_string(access.instruction_addr)) ||
+				!append_evidence(access.is_write ? " write " : " read ") ||
+				!append_evidence(access.disasm_text)) {
+				evidence.excerpt.clear();
+				break;
+			}
+		}
+		evidence.address = address_valid ? absolute : 0;
+		evidence.revision = retained_analysis_revision;
+		evidence.generation = retained_workspace_generation;
+		evidence.sensitive = true;
+		evidence.return_to_source = [workspace, retained_field, retained_base,
+			retained_offset, retained_size, retained_name, retained_struct_name,
+			retained_workspace_generation, retained_analysis_revision,
+			retained_workspace_id, retained_field_hash](std::string& reason) {
+			const auto selected = disasm_view::capture_selected_workspace();
+			if (!workspace.workspace || !workspace.publication ||
+				workspace.workspace->generation() != retained_workspace_generation ||
+				workspace.publication->analysis_revision != retained_analysis_revision ||
+				!selected.workspace || !selected.publication ||
+				selected.workspace != workspace.workspace ||
+				selected.publication != workspace.publication ||
+				selected.workspace->identity().binary_id().to_hex() != retained_workspace_id ||
+				selected.workspace->generation() != retained_workspace_generation ||
+				selected.publication->analysis_revision != retained_analysis_revision) {
+				reason = "The reconstruction workspace changed; capture the field again.";
+				return false;
+			}
+			const auto snapshot = struct_recon::capture_current_snapshot();
+			if (!snapshot || retained_field < 0 ||
+				retained_field >= static_cast<int>(snapshot->fields.size()) ||
+				snapshot->base_address != retained_base || snapshot->name != retained_struct_name) {
+				reason = "The reconstruction snapshot changed; capture the field again.";
+				return false;
+			}
+			const auto& candidate = snapshot->fields[static_cast<std::size_t>(retained_field)];
+			if (candidate.offset != retained_offset || candidate.size != retained_size ||
+				candidate.name != retained_name ||
+				field_identity_hash(candidate) != retained_field_hash) {
+				reason = "The reconstructed field identity changed; capture it again.";
+				return false;
+			}
+			const auto opened = aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.types.struct_recon"));
+			reason = opened.ok() ? std::string{} : opened.detail;
+			return opened.ok();
+		};
+		const bool evidence_available = valid_field && static_cast<bool>(workspace) &&
+			!evidence.excerpt.empty();
+		aida::automation_ui::entity_evidence::append_actions(retained,
+			std::move(evidence), evidence_available
+				? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(
+					"The retained reconstruction field or workspace is stale"));
 		aida::ui::application_ui::open_retained_entity_context_menu(
 			std::move(retained), pointer_context_request
 				? aida::ui::context_menu_open_origin_t::pointer

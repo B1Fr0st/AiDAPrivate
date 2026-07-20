@@ -27,6 +27,7 @@
 #include "ui_anim.hpp"
 #include "memory_map_view.hpp"
 #include "../scanner/memory_interaction_context.hpp"
+#include "../scanner/memory_scanner.hpp"
 #include "../ui/application_view_registry.hpp"
 #include "../ui/application_ui_runtime.hpp"
 #include "../ui/design_system.hpp"
@@ -160,8 +161,10 @@ std::uint64_t debugger_action_set_hash(
 		mix(context.extent);
 		mix(context.thread_id);
 		mix(static_cast<std::uint64_t>(context.index));
-		for (const unsigned char ch : context.primary_text) mix(ch);
-		for (const unsigned char ch : context.secondary_text) mix(ch);
+		for (const char ch : context.primary_text)
+			mix(static_cast<unsigned char>(ch));
+		for (const char ch : context.secondary_text)
+			mix(static_cast<unsigned char>(ch));
 	}
 	return hash;
 }
@@ -1569,9 +1572,7 @@ bool queue_debugger_mutation(const char* label, const char* action,
 	submission.ui_access_policy = "post_completion_only";
 	submission.failure_policy = "fail_closed";
 	submission.body = [context, result, operation = std::move(operation), advance_generation]() mutable {
-		if (context.target_pid != 0 &&
-			(driver_bridge::attached_pid() != context.target_pid ||
-			 debugger_interaction::current_stop_generation() != context.stop_generation)) {
+		if (context.target_pid != 0 && !debugger_interaction::is_current(context)) {
 			result->detail = "The target or selected stop changed before the mutation started.";
 		} else {
 			try {
@@ -1583,8 +1584,7 @@ bool queue_debugger_mutation(const char* label, const char* action,
 			}
 		}
 		if (result->verified && context.target_pid != 0 &&
-			(driver_bridge::attached_pid() != context.target_pid ||
-			 debugger_interaction::current_stop_generation() != context.stop_generation)) {
+			!debugger_interaction::is_current(context)) {
 			result->ok = false;
 			result->verified = false;
 			result->detail =
@@ -1609,7 +1609,7 @@ bool queue_debugger_mutation(const char* label, const char* action,
 		}, "mutation_completion");
 		if (!posted) {
 			if (result->verified && advance_generation)
-				debugger_interaction::advance_stop_generation();
+				debugger_interaction::invalidate_stop_generation_async();
 			g_target_mutation_pending.store(false, std::memory_order_release);
 			throw std::runtime_error("Debugger mutation completion could not be published to the UI thread");
 		}
@@ -1853,12 +1853,14 @@ build_debugger_entity_actions(const debugger_interaction::context_t& context,
 	std::snprintf(value_text, sizeof(value_text), "0x%016llX",
 		static_cast<unsigned long long>(context.value));
 	aida::automation_ui::entity_evidence::snapshot_t evidence;
-	evidence.workspace_id = "pid:" + std::to_string(context.target_pid);
+	evidence.workspace_id = "pid:" + std::to_string(context.target_pid) + ":created:" +
+		std::to_string(context.process_creation_time_100ns);
 	evidence.source_view_id = owner_view;
 	evidence.source_kind = evidence_kind;
 	evidence.entity_id = retained.entity_id;
 	evidence.display_label = context.primary_text.empty() ? evidence_kind : context.primary_text;
 	evidence.excerpt = "PID: " + std::to_string(context.target_pid) +
+		"\nProcess creation: " + std::to_string(context.process_creation_time_100ns) +
 		"\nStop generation: " + std::to_string(context.stop_generation) +
 		"\nSelected rows: " + std::to_string(action_contexts.size()) +
 		"\nThread: " + std::to_string(context.thread_id) +
@@ -1911,18 +1913,15 @@ build_debugger_entity_actions(const debugger_interaction::context_t& context,
 	return retained;
 }
 
+}
+
 void open_debugger_entity_actions(const debugger_interaction::context_t& context,
 	aida::ui::context_menu_open_origin_t origin) {
 	aida::ui::application_ui::open_retained_entity_context_menu(
 		build_debugger_entity_actions(context), origin);
 }
 
-inline void select_context(debugger_interaction::context_t context, bool open_popup) {
-	debugger_interaction::select(std::move(context));
-	if (open_popup)
-		open_debugger_entity_actions(debugger_interaction::selected(),
-			aida::ui::context_menu_open_origin_t::pointer);
-}
+namespace {
 
 inline bool context_menu_item(const char* label, const char* shortcut,
 	debugger_interaction::capability_t capability,
@@ -1939,12 +1938,93 @@ inline void request_context_mutation(pending_context_mutation_t mutation,
 	g_pending_context_mutation_open = true;
 }
 
-bool verify_patch_bytes(const code_patcher::patch_entry_t& patch, bool active) {
-	const auto& expected = active ? patch.patched_bytes : patch.original_bytes;
-	std::vector<uint8_t> readback;
-	return !expected.empty() &&
-		driver_bridge::read_memory(patch.address, expected.size(), readback) &&
-		readback == expected;
+struct patch_transaction_result_t {
+	bool ok = false;
+	bool verified = false;
+	bool rollback_attempted = false;
+	bool rollback_verified = false;
+	std::string detail;
+};
+
+bool same_patch_definition(const code_patcher::patch_entry_t& lhs,
+	const code_patcher::patch_entry_t& rhs) {
+	return lhs.address == rhs.address && lhs.original_bytes == rhs.original_bytes &&
+		lhs.patched_bytes == rhs.patched_bytes && lhs.target_pid == rhs.target_pid;
+}
+
+bool read_patch_bytes_exact(uint64_t address, const std::vector<uint8_t>& expected,
+	const debugger_interaction::context_t& context) {
+	if (expected.empty() || !debugger_interaction::is_current(context)) return false;
+	std::vector<uint8_t> observed;
+	const bool read = driver_bridge::read_memory(address, expected.size(), observed);
+	return debugger_interaction::is_current(context) && read && observed == expected;
+}
+
+patch_transaction_result_t transition_patch_exact(int index,
+	const code_patcher::patch_entry_t& expected_patch, bool target_active,
+	const debugger_interaction::context_t& context) {
+	patch_transaction_result_t result;
+	if (!debugger_interaction::is_current(context)) {
+		result.detail = "The exact debugger target changed before the patch transaction.";
+		return result;
+	}
+	std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
+	if (index < 0 || index >= static_cast<int>(code_patcher::g_state.patches.size()) ||
+		!same_patch_definition(code_patcher::g_state.patches[static_cast<size_t>(index)],
+			expected_patch)) {
+		result.detail = "The selected patch changed before execution.";
+		return result;
+	}
+	auto& patch = code_patcher::g_state.patches[static_cast<size_t>(index)];
+	if (patch.target_pid != 0 && patch.target_pid != context.target_pid) {
+		result.detail = "The patch belongs to a different target process.";
+		return result;
+	}
+	const auto& source = target_active ? patch.original_bytes : patch.patched_bytes;
+	const auto& destination = target_active ? patch.patched_bytes : patch.original_bytes;
+	if (source.empty() || destination.empty() || source.size() != destination.size()) {
+		result.detail = "The patch byte transaction is incomplete.";
+		return result;
+	}
+	if (patch.active == target_active) {
+		result.verified = read_patch_bytes_exact(patch.address, destination, context);
+		result.ok = result.verified;
+		if (!result.verified)
+			result.detail = "The recorded patch state does not match live target memory.";
+		return result;
+	}
+	if (!read_patch_bytes_exact(patch.address, source, context)) {
+		result.detail = "The live bytes or exact target identity changed before the patch write.";
+		return result;
+	}
+	if (!debugger_interaction::is_current(context)) {
+		result.detail = "The exact debugger target changed immediately before the patch write.";
+		return result;
+	}
+	const bool write_ok = driver_bridge::write_memory(patch.address, destination);
+	const bool identity_after_write = debugger_interaction::is_current(context);
+	if (write_ok && identity_after_write)
+		result.verified = read_patch_bytes_exact(patch.address, destination, context);
+	if (result.verified) {
+		patch.active = target_active;
+		code_patcher::publish_snapshot_locked();
+		result.ok = true;
+		return result;
+	}
+	result.detail = !identity_after_write
+		? "The exact debugger target changed during the patch write; success cannot be verified."
+		: "Patch write verification failed.";
+	if (!debugger_interaction::is_current(context)) return result;
+	result.rollback_attempted = true;
+	const bool rollback_write = driver_bridge::write_memory(patch.address, source);
+	const bool identity_after_rollback_write = debugger_interaction::is_current(context);
+	if (rollback_write && identity_after_rollback_write)
+		result.rollback_verified = read_patch_bytes_exact(patch.address, source, context);
+	if (result.rollback_verified)
+		result.detail += " The prior byte state was restored and verified.";
+	else
+		result.detail += " Restoration of the prior byte state could not be verified.";
+	return result;
 }
 
 void render_context_mutation_confirmation() {
@@ -2076,18 +2156,28 @@ void render_context_mutation_confirmation() {
 						result.detail = "The selected patch changed before execution.";
 						break;
 					}
-					if (mutation == pending_context_mutation_t::apply_patch) {
-						result.ok = code_patcher::apply_patch(context.index);
-						result.verified = result.ok && verify_patch_bytes(patch, true);
-						if (result.ok && !result.verified)
-							static_cast<void>(code_patcher::revert_patch(context.index));
-					} else if (mutation == pending_context_mutation_t::revert_patch) {
-						result.ok = code_patcher::revert_patch(context.index);
-						result.verified = result.ok && verify_patch_bytes(patch, false);
-					} else {
-						result.ok = code_patcher::remove_patch_exact(context.index,
-							patch.address, patch.patched_bytes);
-						result.verified = result.ok && verify_patch_bytes(patch, false);
+					const bool target_active = mutation == pending_context_mutation_t::apply_patch;
+					const auto transaction = transition_patch_exact(context.index, patch,
+						target_active, context);
+					result.ok = transaction.ok;
+					result.verified = transaction.verified;
+					result.detail = transaction.detail;
+					if (mutation == pending_context_mutation_t::remove_patch &&
+						transaction.ok && transaction.verified) {
+						std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
+						if (context.index < 0 || context.index >=
+								static_cast<int>(code_patcher::g_state.patches.size()) ||
+							!same_patch_definition(code_patcher::g_state.patches[
+								static_cast<size_t>(context.index)], patch) ||
+							code_patcher::g_state.patches[static_cast<size_t>(context.index)].active) {
+							result.ok = result.verified = false;
+							result.detail = "The patch definition changed before removal.";
+						} else {
+							code_patcher::g_state.patches.erase(code_patcher::g_state.patches.begin() +
+								static_cast<std::vector<code_patcher::patch_entry_t>::difference_type>(
+									context.index));
+							code_patcher::publish_snapshot_locked();
+						}
 					}
 					break;
 				}
@@ -2110,10 +2200,15 @@ void render_context_mutation_confirmation() {
 					for (size_t remaining = patches.size(); remaining > 0; --remaining) {
 						const size_t index = remaining - 1;
 						if (!patches[index].active) continue;
-						const bool reverted = code_patcher::revert_patch(static_cast<int>(index));
-						const bool readback = reverted && verify_patch_bytes(patches[index], false);
-						result.ok = result.ok && reverted;
-						result.verified = result.verified && readback;
+						const auto transaction = transition_patch_exact(static_cast<int>(index),
+							patches[index], false, context);
+						if (!transaction.ok || !transaction.verified) {
+							result.ok = result.verified = false;
+							result.detail = transaction.detail.empty()
+								? "A patch rollback could not be verified."
+								: transaction.detail;
+							break;
+						}
 					}
 					break;
 				}
@@ -7601,6 +7696,9 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 				runtime.driver_loaded = driver_bridge::is_loaded();
 				runtime.live_attached = driver_bridge::attached_pid() != 0;
 				runtime.target_pid = driver_bridge::attached_pid();
+				runtime.target_epoch = memory_scanner::g_state.target_epoch.load(
+					std::memory_order_acquire);
+				runtime.process_creation_time_100ns = row_context.process_creation_time_100ns;
 				memory_interaction::select(memory_interaction::capture_patch(runtime,
 					p.address, static_cast<std::uint64_t>(p.patched_size), i,
 					p.description));
@@ -7613,6 +7711,9 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 				runtime.driver_loaded = driver_bridge::is_loaded();
 				runtime.live_attached = driver_bridge::attached_pid() != 0;
 				runtime.target_pid = driver_bridge::attached_pid();
+				runtime.target_epoch = memory_scanner::g_state.target_epoch.load(
+					std::memory_order_acquire);
+				runtime.process_creation_time_100ns = row_context.process_creation_time_100ns;
 				memory_interaction::select(memory_interaction::capture_patch(runtime,
 					p.address, static_cast<std::uint64_t>(p.patched_size), i,
 					p.description));

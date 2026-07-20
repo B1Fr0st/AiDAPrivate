@@ -291,12 +291,12 @@ aida_c03_configure_signing_authority()
 function(aida_c03_require_locked_source_tree)
     set(_aida_c03_inputs
         "src/standalone/workers/native_decompiler/fake_native_decompiler_worker.cpp|15972|4323a48219411fb872594dc96e6b884039c8e8cf20c2954424a765818d6c2dc4"
-        "src/standalone/workers/native_decompiler/ghidra_native_provider.cpp|13968|468a3c8bdfd53dafd9d20a467e1014e13b8029471121cc6a77224ac3d1b475b7"
+        "src/standalone/workers/native_decompiler/ghidra_native_provider.cpp|14448|c5510daae84415346d08798c7cd11984ac5cebb862222fd3902eeef5963d8ef9"
         "src/standalone/workers/native_decompiler/ghidra_native_provider.hpp|487|524fb2f51e2e208610fa28768b6fa6b7a4b2ebd8824070ac518dff1d06b6ce55"
         "src/standalone/workers/native_decompiler/native_decompiler_worker.cpp|2825|0a39212f62ce22df7caa28e62dbaadb2adaaf6b6394690ea4e2129ab3242de1f"
         "src/standalone/workers/native_decompiler/native_worker_protocol.hpp|18353|2ebc3f2326285c4db0c4fd0d93b3314902fcc9336aba78837e544e24dc343f43"
         "src/standalone/workers/native_decompiler/native_worker_runtime.hpp|17312|110cd165d8ad644c2ce164f66a0142dee6acf3e9de9cf862412b1594c88076cf"
-        "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.cpp|126322|63a40daf0d19e61daf7398b477cf730952f3be951eb8f98186cea1ce5c2a024d"
+        "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.cpp|139452|734fb149dc1ac91580cbca1c6569d0078c33d7d843e26e8fcad7c05cce67398f"
         "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.hpp|749|d215b44be571a9577ab4fca2860ff34aa1cd864163407c76f4de0872fcbbaf79"
         "src/standalone/tests/c03/decompiler_quality_schema.cpp|115001|8dcc6359d1f7dd9bad36be742614c6b6b508c0055338be22af4700737c8e7e27"
         "src/standalone/tests/c03/decompiler_quality_schema.hpp|1266|97bc268ab39854317d24321bddce743c3c5b16340a9b9257b4422342db7b874c"

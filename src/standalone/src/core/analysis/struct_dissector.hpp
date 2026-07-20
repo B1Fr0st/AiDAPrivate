@@ -158,6 +158,47 @@ struct state_t {
 
 inline state_t g_state;
 
+struct catalog_transaction_snapshot_t {
+	std::vector<struct_def_t> structs;
+	std::vector<enum_def_t> enums;
+	std::vector<live_value_t> cached_values;
+	int active_struct = -1;
+	std::uint64_t schema_revision = 0;
+	std::uint64_t next_stable_id = 0;
+};
+
+inline catalog_transaction_snapshot_t capture_catalog_transaction() {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	return {g_state.structs, g_state.enums, g_state.cached_values,
+		g_state.active_struct, g_state.schema_revision, g_state.next_stable_id};
+}
+
+inline bool catalog_mutation_available() {
+	return !g_state.persistence_in_flight.load(std::memory_order_acquire);
+}
+
+inline bool rollback_catalog_transaction(catalog_transaction_snapshot_t snapshot,
+	std::uint64_t expected_schema_revision,
+	bool allow_persistence_in_flight = false) {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if ((!allow_persistence_in_flight &&
+		g_state.persistence_in_flight.load(std::memory_order_acquire)) ||
+		g_state.schema_revision != expected_schema_revision)
+		return false;
+	g_state.structs = std::move(snapshot.structs);
+	g_state.enums = std::move(snapshot.enums);
+	g_state.cached_values = std::move(snapshot.cached_values);
+	g_state.active_struct = snapshot.active_struct;
+	g_state.schema_revision = snapshot.schema_revision;
+	g_state.next_stable_id = snapshot.next_stable_id;
+	return true;
+}
+
+inline std::uint64_t catalog_schema_revision() {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	return g_state.schema_revision;
+}
+
 inline std::size_t field_type_size(field_type_t t);
 
 inline bool valid_index(int index, std::size_t count) {
@@ -1882,11 +1923,17 @@ inline std::string durable_schema_path() {
 inline std::string g_preview_durable_schema;
 #endif
 
-inline bool request_persistence(bool save) {
+inline bool request_persistence(bool save,
+	std::shared_ptr<catalog_transaction_snapshot_t> transactional_rollback = {},
+	std::uint64_t transactional_revision = 0) {
 	bool expected = false;
 	if (!g_state.persistence_in_flight.compare_exchange_strong(expected, true,
-		std::memory_order_acq_rel, std::memory_order_acquire))
+		std::memory_order_acq_rel, std::memory_order_acquire)) {
+		if (save && transactional_rollback)
+			static_cast<void>(rollback_catalog_transaction(
+				std::move(*transactional_rollback), transactional_revision, true));
 		return false;
+	}
 	auto cancellation = std::make_shared<std::atomic<bool>>(false);
 	{
 		std::lock_guard<std::mutex> lock(g_state.mtx);
@@ -1912,9 +1959,14 @@ inline bool request_persistence(bool save) {
 #else
 	const std::string path = durable_schema_path();
 	if (path.empty()) {
+		const bool rolled_back = !save || !transactional_rollback ||
+			rollback_catalog_transaction(std::move(*transactional_rollback),
+				transactional_revision, true);
 		std::lock_guard<std::mutex> lock(g_state.mtx);
 		g_state.persistence_error = true;
-		g_state.persistence_status = "APPDATA is unavailable for structure schema persistence";
+		g_state.persistence_status = rolled_back
+			? "APPDATA is unavailable for structure schema persistence"
+			: "APPDATA is unavailable and the exact catalog transaction could not be rolled back";
 		g_state.persistence_cancellation.reset();
 		g_state.persistence_in_flight.store(false, std::memory_order_release);
 		return false;
@@ -1934,7 +1986,8 @@ inline bool request_persistence(bool save) {
 	submission.thread_class = "bounded_task";
 	submission.domain = aida::infra::executor::domain_t::diagnostics;
 	submission.priority = 3;
-	submission.body = [save, path, payload = std::move(payload), captured_revision, cancellation] {
+	submission.body = [save, path, payload = std::move(payload), captured_revision,
+		cancellation, transactional_rollback, transactional_revision] {
 		bool success = false;
 		bool missing_catalog = false;
 		std::string error;
@@ -1960,6 +2013,12 @@ inline bool request_persistence(bool save) {
 					error = result.error.empty() ? "Structure schema load cancelled" : result.error;
 			}
 		}
+		if (!success && save && transactional_rollback &&
+			!rollback_catalog_transaction(std::move(*transactional_rollback),
+				transactional_revision, true))
+			error = error.empty()
+				? "Structure schema persistence failed and exact transaction rollback was blocked"
+				: error + "; exact transaction rollback was blocked";
 		{
 			std::lock_guard<std::mutex> lock(g_state.mtx);
 			g_state.persistence_error = !success;
@@ -1974,9 +2033,13 @@ inline bool request_persistence(bool save) {
 	};
 	const auto submitted = aida::infra::executor::submit(std::move(submission));
 	if (!submitted.submitted) {
+		const bool rolled_back = !save || !transactional_rollback ||
+			rollback_catalog_transaction(std::move(*transactional_rollback),
+				transactional_revision, true);
 		std::lock_guard<std::mutex> lock(g_state.mtx);
 		g_state.persistence_error = true;
-		g_state.persistence_status = submitted.reject_reason;
+		g_state.persistence_status = rolled_back ? submitted.reject_reason
+			: submitted.reject_reason + "; exact catalog transaction rollback was blocked";
 		g_state.persistence_cancellation.reset();
 		g_state.persistence_in_flight.store(false, std::memory_order_release);
 		return false;
@@ -2002,6 +2065,19 @@ inline bool request_persistence(bool save) {
 
 inline bool request_save_schema() {
 	return request_persistence(true);
+}
+
+inline bool request_save_schema_transactional(catalog_transaction_snapshot_t snapshot,
+	std::uint64_t expected_schema_revision) {
+	std::shared_ptr<catalog_transaction_snapshot_t> rollback;
+	try {
+		rollback = std::make_shared<catalog_transaction_snapshot_t>(std::move(snapshot));
+	} catch (const std::bad_alloc&) {
+		static_cast<void>(rollback_catalog_transaction(std::move(snapshot),
+			expected_schema_revision));
+		return false;
+	}
+	return request_persistence(true, std::move(rollback), expected_schema_revision);
 }
 
 inline bool request_load_schema() {
@@ -2073,6 +2149,7 @@ inline std::string c_field_type_locked(const field_def_t& field) {
 }
 
 inline std::string export_to_c(int struct_idx) {
+	constexpr std::size_t maximum_output = 64U * 1024U;
 	std::lock_guard<std::mutex> lk(g_state.mtx);
 	if (!valid_index(struct_idx, g_state.structs.size())) {
 		diag::log_tagged_fmt("dissector",
@@ -2131,6 +2208,8 @@ inline std::string export_to_c(int struct_idx) {
 			field->type == field_type_t::byte_array || field->type == field_type_t::padding))
 			out += "[" + std::to_string(field->size) + "]";
 		out += ";\n";
+		if (out.size() > maximum_output)
+			return {};
 		std::uint32_t span = 0;
 		checked_multiply_u32(static_cast<std::uint32_t>(field_scalar_size_locked(*field)), field->array_count, span);
 		cursor = (std::max)(cursor, field->offset + span);
@@ -2142,15 +2221,18 @@ inline std::string export_to_c(int struct_idx) {
 	if (sd.packing != 0)
 		out += "#pragma pack(pop)\n";
 	for (const auto* field : fields)
-		if (field->bit_width == 0)
+		if (field->bit_width == 0) {
 			out += "static_assert(offsetof(" + type_name + ", " +
 				c_identifier(field->name, "field_" + std::to_string(field->offset)) + ") == " +
 				std::to_string(field->offset) + ");\n";
+			if (out.size() > maximum_output)
+				return {};
+		}
 	out += "static_assert(sizeof(" + type_name + ") == " + std::to_string(sd.total_size) + ");\n";
 	diag::log_tagged_fmt("dissector",
 		"export_to_c name='%s' fields=%zu bytes=%zu",
 		sd.name.c_str(), sd.fields.size(), out.size());
-	return out;
+	return out.size() <= maximum_output ? out : std::string{};
 }
 
 }

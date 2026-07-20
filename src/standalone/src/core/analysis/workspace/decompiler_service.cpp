@@ -202,7 +202,84 @@ workspace_result_t<std::uint64_t> address_to_provider_offset(
     const address_t& address,
     const workspace_identity_t& identity,
     const pe_image_t* image,
+    const workspace_image_t* normalized_image,
     std::uint64_t size) {
+    if (identity.target_kind() != target_kind_t::live_snapshot && normalized_image) {
+        std::uint64_t target_rva = 0;
+        switch (address.space) {
+        case address_space_id_t::relative_virtual:
+            target_rva = address.value;
+            break;
+        case address_space_id_t::virtual_address:
+            if (address.value < normalized_image->image_base) {
+                return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                    workspace_error_code_t::out_of_range,
+                    "address precedes the normalized workspace image base",
+                    "decompiler.provider_offset"));
+            }
+            target_rva = address.value - normalized_image->image_base;
+            break;
+        case address_space_id_t::file_offset:
+            for (const auto& mapping : normalized_image->address_mappings) {
+                if (mapping.source_space != address_space_id_t::file_offset ||
+                    address.value < mapping.source_start)
+                    continue;
+                const auto delta = address.value - mapping.source_start;
+                if (delta <= mapping.size && size <= mapping.size - delta)
+                    return workspace_result_t<std::uint64_t>::success(address.value);
+            }
+            return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                workspace_error_code_t::out_of_range,
+                "file range is outside the normalized workspace image mappings",
+                "decompiler.provider_offset"));
+        case address_space_id_t::live_virtual:
+            return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                workspace_error_code_t::unsupported_address_space,
+                "static normalized workspace does not accept a live address",
+                "decompiler.provider_offset"));
+        }
+
+        std::optional<std::uint64_t> translated;
+        for (const auto& mapping : normalized_image->address_mappings) {
+            if (mapping.source_space != address_space_id_t::file_offset)
+                continue;
+            std::uint64_t mapping_rva = 0;
+            if (mapping.target_space == address_space_id_t::relative_virtual) {
+                mapping_rva = mapping.target_start;
+            } else if (mapping.target_space == address_space_id_t::virtual_address) {
+                if (mapping.target_start < normalized_image->image_base)
+                    continue;
+                mapping_rva = mapping.target_start - normalized_image->image_base;
+            } else {
+                continue;
+            }
+            if (target_rva < mapping_rva)
+                continue;
+            const auto delta = target_rva - mapping_rva;
+            if (delta > mapping.size || size > mapping.size - delta)
+                continue;
+            if (mapping.source_start > (std::numeric_limits<std::uint64_t>::max)() - delta) {
+                return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                    workspace_error_code_t::range_overflow,
+                    "normalized workspace provider offset overflows",
+                    "decompiler.provider_offset"));
+            }
+            const auto current = mapping.source_start + delta;
+            if (translated && *translated != current) {
+                return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "normalized workspace contains ambiguous function provider mappings",
+                    "decompiler.provider_offset"));
+            }
+            translated = current;
+        }
+        if (translated)
+            return workspace_result_t<std::uint64_t>::success(*translated);
+        return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+            workspace_error_code_t::out_of_range,
+            "function range is outside the normalized workspace image mappings",
+            "decompiler.provider_offset"));
+    }
     if (image) {
         switch (address.space) {
         case address_space_id_t::file_offset:
@@ -301,8 +378,9 @@ workspace_result_t<resolved_function_t> resolve_function(
             "function byte range exceeds the decompiler budget",
             "decompiler.resolve_function"));
     }
+    const auto normalized_image = workspace->normalized_image();
     auto provider_offset = address_to_provider_offset(
-        selected->start, workspace->identity(), image.get(), byte_size);
+        selected->start, workspace->identity(), image.get(), normalized_image.get(), byte_size);
     if (!provider_offset)
         return workspace_result_t<resolved_function_t>::failure(provider_offset.error());
     if (provider_offset.value() > workspace->provider().size() ||
@@ -499,6 +577,80 @@ workspace_error_t typed_contract_error(std::string message,
             std::to_string(static_cast<unsigned int>(diagnostic.code)) + ":" +
                 diagnostic.localization_key);
     }
+    return error;
+}
+
+std::string bounded_adapter_error_text(const std::string& value,
+                                       const std::size_t max_bytes) {
+    std::string output = value.substr(0, std::min(value.size(), max_bytes));
+    for (char& byte : output) {
+        const auto code_unit = static_cast<unsigned char>(byte);
+        if (code_unit < 0x20U || code_unit == 0x7fU)
+            byte = ' ';
+    }
+    return output;
+}
+
+workspace_error_t typed_adapter_error(
+    const ghidra_decompiler::ghidra_result_t& result,
+    const std::vector<decompiler_diagnostic_t>& diagnostics) {
+    constexpr std::size_t max_message_bytes = 2048;
+    constexpr std::size_t max_phase_bytes = 256;
+    constexpr std::size_t max_summary_bytes = 768;
+    constexpr std::size_t max_summary_diagnostics = 4;
+    std::string adapter_message = bounded_adapter_error_text(
+        result.adapter_error.message.empty() ? result.error_text : result.adapter_error.message,
+        max_message_bytes);
+    std::string message =
+        "Ghidra adapter did not produce canonical provider IR, HIR, and type graph artifacts";
+    if (!adapter_message.empty()) {
+        message.append(": ");
+        message.append(adapter_message);
+    }
+    std::string diagnostic_summary;
+    for (std::size_t index = 0;
+         index < diagnostics.size() && index < max_summary_diagnostics;
+         ++index) {
+        std::string entry = std::to_string(
+            static_cast<unsigned int>(diagnostics[index].code));
+        entry.push_back(':');
+        entry.append(bounded_adapter_error_text(
+            diagnostics[index].localization_key, max_phase_bytes));
+        std::size_t available = max_summary_bytes -
+            std::min(diagnostic_summary.size(), max_summary_bytes);
+        if (!diagnostic_summary.empty()) {
+            if (available == 0)
+                break;
+            diagnostic_summary.push_back(',');
+            --available;
+        }
+        if (entry.size() > available)
+            entry.resize(available);
+        diagnostic_summary.append(entry);
+        if (diagnostic_summary.size() >= max_summary_bytes)
+            break;
+    }
+    if (!diagnostic_summary.empty()) {
+        message.append(" [typed_diagnostics=");
+        message.append(diagnostic_summary);
+        message.push_back(']');
+    }
+    auto error = typed_contract_error(std::move(message),
+        "decompiler.typed.v2.adapter", diagnostics);
+    error.details.emplace_back("adapter_error_code",
+        std::to_string(static_cast<unsigned int>(result.adapter_error.code)));
+    if (result.adapter_error.language_family) {
+        error.details.emplace_back("adapter_language_family",
+            std::to_string(static_cast<unsigned int>(*result.adapter_error.language_family)));
+    }
+    const auto adapter_phase = bounded_adapter_error_text(
+        result.adapter_error.phase, max_phase_bytes);
+    if (!adapter_phase.empty())
+        error.details.emplace_back("adapter_error_phase", adapter_phase);
+    const auto result_message = bounded_adapter_error_text(
+        result.error_text, max_message_bytes);
+    if (!result_message.empty())
+        error.details.emplace_back("adapter_result_message", result_message);
     return error;
 }
 
@@ -947,9 +1099,27 @@ namespace {
 workspace_error_t typed_artifact_error(std::string message,
                                        const char* phase,
                                        const decompiler_service_v2_result_t& result) {
+    constexpr std::size_t max_diagnostics = 16;
+    constexpr std::size_t max_message_bytes = 2048;
+    if (!result.diagnostics.empty()) {
+        message.append(": ");
+        for (std::size_t index = 0;
+             index < result.diagnostics.size() && index < max_diagnostics;
+             ++index) {
+            if (index != 0)
+                message.append("; ");
+            const auto& diagnostic = result.diagnostics[index];
+            message.append(std::to_string(static_cast<unsigned int>(diagnostic.code)));
+            message.push_back(':');
+            message.append(diagnostic.localization_key);
+            if (message.size() >= max_message_bytes) {
+                message.resize(max_message_bytes);
+                break;
+            }
+        }
+    }
     auto error = make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
         std::move(message), phase);
-    constexpr std::size_t max_diagnostics = 16;
     for (std::size_t index = 0; index < result.diagnostics.size() && index < max_diagnostics; ++index) {
         const auto& diagnostic = result.diagnostics[index];
         error.details.emplace_back("typed_diagnostic_" + std::to_string(index),
@@ -1977,9 +2147,7 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
                     diagnostic.ordinal = 1;
                     diagnostics.push_back(std::move(diagnostic));
                 }
-                return fail(typed_contract_error(
-                    "Ghidra adapter did not produce canonical provider IR, HIR, and type graph artifacts",
-                    "decompiler.typed.v2.adapter", diagnostics));
+                return fail(typed_adapter_error(adapter_result, diagnostics));
             }
             typed_artifacts = std::make_shared<decompiler_typed_artifacts_t>(
                 decompiler_typed_artifacts_t{

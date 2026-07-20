@@ -1,4 +1,6 @@
-﻿#define WIN32_LEAN_AND_MEAN
+﻿#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <bcrypt.h>
 #include <aclapi.h>
@@ -5491,6 +5493,7 @@ static bool is_camoufox_reverse_tool_name(const std::string& name)
     static const char* const names[] = {
         "browser_lifecycle", "browser_navigation", "browser_interaction", "browser_inspect", "browser_state",
         "browser_network", "browser_hooks", "browser_instrumentation",
+        "browser_service_worker", "browser_fingerprint_spoof",
         "get_console_logs", "scripts", "search_code", "compare_env", "check_environment",
         "verify_signer_offline", "analyze_cookie_sources"
     };

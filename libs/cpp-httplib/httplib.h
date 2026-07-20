@@ -10966,6 +10966,10 @@ inline void Client::set_write_timeout(time_t sec, time_t usec) {
   cli_->set_write_timeout(sec, usec);
 }
 
+inline void Client::set_max_timeout(time_t msec) {
+  cli_->set_max_timeout(msec);
+}
+
 inline void Client::set_basic_auth(const std::string &username,
                                    const std::string &password) {
   cli_->set_basic_auth(username, password);

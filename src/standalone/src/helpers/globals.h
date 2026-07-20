@@ -1109,6 +1109,8 @@ namespace file_tabs {
 	inline std::unordered_map<std::uint64_t, std::uint64_t> exit_review_snapshot_revisions;
 	inline std::unordered_map<std::uint64_t, std::uint64_t> exit_review_resolved_revisions;
 	inline std::unordered_map<std::uint64_t, std::uint64_t> exit_review_discard_revisions;
+	inline std::unordered_map<std::uint64_t, std::uint64_t> exit_review_cleanup_requested_revisions;
+	inline std::unordered_map<std::uint64_t, std::uint64_t> exit_review_cleanup_completed_revisions;
 	inline std::uint64_t pending_recovery_discard_document = 0;
 	inline float close_confirm_anim = 0.f;
 	inline int   close_confirm_hovered = -1;
@@ -1734,6 +1736,8 @@ namespace file_tabs {
 		std::string detail;
 	};
 
+	inline std::optional<save_result_t> shell_save_as_result;
+
 	inline save_result_t verify_licensed_save_gate() {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		return {true, {}};
@@ -1747,6 +1751,64 @@ namespace file_tabs {
 			? save_result_t{true, {}}
 			: save_result_t{false, "The licensed save gate rejected the operation."};
 #endif
+	}
+
+	inline save_result_t verify_tab_save_gate(int idx, bool require_destination) {
+		if (!is_valid_tab_index(idx))
+			return {false, "The document is no longer open."};
+		const auto licensed = verify_licensed_save_gate();
+		if (!licensed.succeeded)
+			return licensed;
+		const auto& tab = tabs[tab_index(idx)];
+		if (tab.save_in_progress)
+			return {false, "A save is already in progress for this document."};
+		if (tab.recovery_operation_pending || tab.recovery_checkpoint_pending)
+			return {false, "Wait for the active recovery operation to finish before saving."};
+		if (tab.external_conflict && !tab.external_overwrite_approved)
+			return {false, "The file changed on disk. Resolve the conflict before saving."};
+		if (require_destination && tab.filepath.empty())
+			return {false, "Use Save As to choose a destination."};
+		return {true, {}};
+	}
+
+	struct save_all_preflight_t {
+		save_result_t result;
+		std::vector<std::uint64_t> documents;
+	};
+
+	inline save_all_preflight_t preflight_save_all() {
+		save_all_preflight_t output{{true, {}}, {}};
+		output.documents.reserve(tabs.size());
+		for (std::size_t index = 0; index < tabs.size(); ++index) {
+			const auto& tab = tabs[index];
+			const auto metadata = code_editor_widget::document_metadata(tab.document_id);
+			const bool dirty = metadata.found ? metadata.dirty : tab.dirty;
+			if (!dirty)
+				continue;
+			const auto gate = verify_tab_save_gate(static_cast<int>(index), true);
+			if (!gate.succeeded) {
+				output.result = {false, tab.filename + ": " + gate.detail};
+				output.documents.clear();
+				return output;
+			}
+			output.documents.push_back(tab.document_id);
+		}
+		return output;
+	}
+
+	inline bool close_operation_pending(const OpenTab& tab) noexcept {
+		return tab.save_in_progress || tab.recovery_operation_pending ||
+			tab.recovery_checkpoint_pending;
+	}
+
+	inline std::string close_operation_detail(const OpenTab& tab) {
+		if (tab.save_in_progress)
+			return "Wait for the active atomic save to finish before closing this document.";
+		if (tab.recovery_operation_pending)
+			return "Wait for the active recovery operation to finish before closing this document.";
+		if (tab.recovery_checkpoint_pending)
+			return "Wait for the active recovery checkpoint to finish before closing this document.";
+		return {};
 	}
 
 	inline std::uint64_t content_fingerprint(std::string_view content) {
@@ -2441,17 +2503,17 @@ namespace file_tabs {
 	}
 
 	inline save_result_t save_tab_to_disk_result(int idx,
-			const std::string* destination_override = nullptr) {
-		if (!is_valid_tab_index(idx)) return {false, "The document is no longer open."};
+			const std::string* destination_override = nullptr,
+			bool gate_preflight_complete = false) {
+		if (!is_valid_tab_index(idx))
+			return {false, "The document is no longer open."};
+		if (!gate_preflight_complete) {
+			const auto gate = verify_tab_save_gate(idx, destination_override == nullptr);
+			if (!gate.succeeded) return gate;
+		}
 		auto& t = tabs[tab_index(idx)];
 		const std::string destination = destination_override ? *destination_override : t.filepath;
 		if (destination.empty()) return {false, "Use Save As to choose a destination."};
-		if (t.save_in_progress)
-			return {false, "A save is already in progress for this document."};
-		if (t.recovery_operation_pending)
-			return {false, "Wait for the active recovery operation to finish before saving."};
-		if (t.external_conflict && !t.external_overwrite_approved)
-			return {false, "The file changed on disk. Resolve the conflict before saving."};
 		code_editor_widget::document_payload_snapshot_t payload;
 		try {
 			payload = code_editor_widget::document_payload(t.document_id);
@@ -2516,11 +2578,6 @@ namespace file_tabs {
 		return {true, {}};
 #else
 		const std::int64_t expected_disk_version = save_as ? 0 : t.disk_write_version;
-		const auto save_gate = verify_licensed_save_gate();
-		if (!save_gate.succeeded) {
-			t.save_in_progress = false;
-			return save_gate;
-		}
 		auto dispatch_failed = std::make_shared<std::atomic<bool>>(false);
 		auto cancelled = std::make_shared<std::atomic<bool>>(false);
 		t.save_dispatch_failed = dispatch_failed;
@@ -2676,6 +2733,248 @@ namespace file_tabs {
 
 	inline save_result_t save_tab_as(int idx, const std::string& destination) {
 		return save_tab_to_disk_result(idx, &destination);
+	}
+
+	struct save_all_item_t {
+		std::uint64_t document_id = 0;
+		std::uint64_t revision = 0;
+		std::uint64_t content_hash = 0;
+		std::uint64_t generation = 0;
+		std::int64_t expected_disk_version = 0;
+		std::string destination;
+		std::string filename;
+		std::string content;
+		aida::editor::programming_documents::text_metadata_t text_metadata;
+		std::shared_ptr<std::atomic<bool>> dispatch_failed;
+	};
+
+	inline save_result_t save_all_tabs_result() {
+		const auto gated = preflight_save_all();
+		if (!gated.result.succeeded)
+			return gated.result;
+		if (gated.documents.empty())
+			return {false, "No modified documents need saving."};
+		std::vector<save_all_item_t> items;
+		try {
+			items.reserve(gated.documents.size());
+			for (const auto document_id : gated.documents) {
+				const int index = find_document(document_id);
+				if (!is_valid_tab_index(index))
+					return {false, "A modified document closed during Save All preflight."};
+				auto& tab = tabs[tab_index(index)];
+				const auto gate = verify_tab_save_gate(index, true);
+				if (!gate.succeeded)
+					return {false, tab.filename + ": " + gate.detail};
+				auto payload = code_editor_widget::document_payload(document_id);
+				if (!payload.found || payload.read_only)
+					return {false, tab.filename +
+						": The exact editable revision could not be captured."};
+				if (payload.content.size() >
+					aida::editor::programming_documents::maximum_editable_document_bytes)
+					return {false, tab.filename +
+						": The document exceeds the bounded editable save payload."};
+				save_all_item_t item;
+				item.document_id = document_id;
+				item.revision = payload.revision;
+				item.content_hash = payload.content_hash;
+				item.expected_disk_version = tab.disk_write_version;
+				item.destination = tab.filepath;
+				item.filename = tab.filename;
+				item.content = std::move(payload.content);
+				item.text_metadata = tab.text_metadata;
+				item.dispatch_failed = std::make_shared<std::atomic<bool>>(false);
+				items.push_back(std::move(item));
+			}
+		} catch (const std::bad_alloc&) {
+			return {false, "The complete bounded Save All revision set could not be captured."};
+		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		for (auto& item : items) {
+			const int index = find_document(item.document_id);
+			if (!is_valid_tab_index(index))
+				return {false, "A modified document closed after Save All preflight."};
+			const auto result = save_tab_to_disk_result(index, nullptr, true);
+			if (!result.succeeded)
+				return result;
+		}
+		return {true, {}};
+#else
+		std::shared_ptr<std::vector<save_all_item_t>> batch;
+		try {
+			batch = std::make_shared<std::vector<save_all_item_t>>(std::move(items));
+		} catch (const std::bad_alloc&) {
+			return {false, "The complete bounded Save All batch could not be allocated."};
+		}
+		for (auto& item : *batch) {
+			const int index = find_document(item.document_id);
+			if (!is_valid_tab_index(index))
+				return {false, "A modified document closed after Save All preflight."};
+			auto& tab = tabs[tab_index(index)];
+			item.generation = ++tab.save_generation;
+			tab.save_in_progress = true;
+			tab.save_error.clear();
+			tab.save_dispatch_failed = item.dispatch_failed;
+		}
+		auto cancelled = std::make_shared<std::atomic<bool>>(false);
+		static std::atomic<std::uint64_t> save_all_serial{0};
+		const std::string task_id = "editor.save_all." +
+			std::to_string(aida::shell_platform::tick_ms()) + "." +
+			std::to_string(save_all_serial.fetch_add(1, std::memory_order_relaxed) + 1);
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "file_tabs";
+		submission.label = "file_tabs.document_save_all";
+		submission.thread_class = "blocking_file_io";
+		submission.domain = aida::infra::executor::domain_t::feature_worker;
+		submission.priority = 3;
+		submission.ui_access_policy = "immutable_document_revision_set";
+		submission.failure_policy = "retain_dirty_document_set";
+		submission.shutdown_policy = "finish_atomic_write_set";
+		submission.cancel_hook = [cancelled]() {
+			cancelled->store(true, std::memory_order_release);
+		};
+		submission.body = [batch, cancelled, task_id]() mutable {
+			struct outcome_t {
+				std::size_t item_index = 0;
+				save_result_t result;
+				std::int64_t completed_write_version = 0;
+			};
+			std::vector<outcome_t> outcomes;
+			try {
+				outcomes.reserve(batch->size());
+			} catch (const std::bad_alloc&) {
+				for (const auto& item : *batch)
+					item.dispatch_failed->store(true, std::memory_order_release);
+				return;
+			}
+			for (std::size_t item_index = 0; item_index < batch->size(); ++item_index) {
+				const auto& item = (*batch)[item_index];
+				save_result_t result;
+				try {
+					if (cancelled->load(std::memory_order_acquire))
+						result = {false, "Save All was cancelled before destination replacement."};
+					else if (item.expected_disk_version != 0 &&
+						disk_write_version(item.destination) != item.expected_disk_version)
+						result = {false, "The file changed on disk after Save All was requested."};
+					else {
+						auto encoded = aida::editor::programming_documents::encode_file_text(
+							item.content, item.text_metadata);
+						result = encoded.succeeded
+							? atomic_write_file(item.destination, encoded.bytes)
+							: save_result_t{false, encoded.detail};
+					}
+				} catch (const std::bad_alloc&) {
+					result = {false, "The bounded save payload could not be encoded."};
+				}
+				const auto completed = result.succeeded
+					? disk_write_version(item.destination) : 0;
+				outcomes.push_back({item_index, std::move(result), completed});
+			}
+			const bool posted = aida::ui_thread::post(
+				[batch, outcomes = std::move(outcomes), task_id]() mutable {
+					std::size_t failures = 0;
+					for (auto& outcome : outcomes) {
+						auto& item = (*batch)[outcome.item_index];
+						const int index = find_document(item.document_id);
+						if (!is_valid_tab_index(index))
+							continue;
+						auto& tab = tabs[tab_index(index)];
+						if (tab.save_generation != item.generation)
+							continue;
+						tab.save_in_progress = false;
+						tab.save_dispatch_failed.reset();
+						if (!outcome.result.succeeded) {
+							++failures;
+							tab.save_error = outcome.result.detail;
+							if (outcome.result.detail.find("changed on disk") != std::string::npos)
+								tab.external_conflict = true;
+							continue;
+						}
+						tab.disk_write_version = outcome.completed_write_version;
+						tab.external_observed_write_version = 0;
+						tab.text_metadata = item.text_metadata;
+						tab.external_conflict = false;
+						tab.external_overwrite_approved = false;
+						tab.base_fingerprint = item.content_hash;
+						tab.save_error.clear();
+						code_editor_widget::mark_document_saved(item.document_id,
+							item.revision, tab.filename, tab.filepath);
+						auto identity = recovery_metadata_record(tab);
+						identity.revision = item.revision;
+						identity.content_hash = item.content_hash;
+						identity.base_fingerprint = item.content_hash;
+						identity.byte_length = item.content.size();
+						identity.dirty = false;
+						identity.text = item.text_metadata;
+						schedule_confirmed_recovery_cleanup(std::move(identity),
+							item.revision);
+						const auto current_payload = code_editor_widget::document_payload(
+							item.document_id, item.revision);
+						if (current_payload.found &&
+							current_payload.content_hash == item.content_hash) {
+							tab.buffer = std::move(item.content);
+							tab.buffer_loaded = true;
+							tab.revision = item.revision;
+							tab.dirty = false;
+							tab.content_hash = item.content_hash;
+							tab.recovery = {};
+							tab.recovery_error.clear();
+							tab.recovery_probe_completed = true;
+						} else {
+							tab.dirty = true;
+							tab.content_hash = 0;
+							tab.save_error = "Saved the requested revision; newer edits remain unsaved.";
+						}
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						failures == 0 ? aida::ui::task_center::task_state_t::completed
+							: aida::ui::task_center::task_state_t::partial,
+						1.f, failures == 0 ? "Save All complete" : "Save All completed with failures",
+						failures == 0 ? "Saved the complete captured revision set."
+							: std::to_string(failures) + " document save(s) failed."));
+				}, "file_tabs", "document_save_all_result", "worker_result");
+			if (!posted)
+				for (const auto& item : *batch)
+					item.dispatch_failed->store(true, std::memory_order_release);
+		};
+		const auto submitted = aida::infra::executor::submit(std::move(submission));
+		if (!submitted.submitted) {
+			for (const auto& item : *batch) {
+				const int index = find_document(item.document_id);
+				if (!is_valid_tab_index(index)) continue;
+				auto& tab = tabs[tab_index(index)];
+				if (tab.save_generation != item.generation) continue;
+				tab.save_in_progress = false;
+				tab.save_dispatch_failed.reset();
+				tab.save_error = "Save All could not be scheduled: " + submitted.reject_reason;
+			}
+			return {false, "Save All could not be scheduled: " + submitted.reject_reason};
+		}
+		aida::ui::task_center::task_registration_t registration;
+		registration.id = task_id;
+		registration.source = "file_tabs";
+		registration.owner = "Code Editor";
+		registration.owner_view = "document.code";
+		registration.owner_action = "file.save_all";
+		registration.target = std::to_string(batch->size()) + " documents";
+		registration.label = "Save all documents";
+		registration.stage = "Encoding and atomically replacing captured revisions";
+		if (!aida::ui::task_center::register_executor_job(
+				submitted.task_id, std::move(registration))) {
+			aida::infra::executor::cancel(submitted.task_id);
+			for (const auto& item : *batch) {
+				const int index = find_document(item.document_id);
+				if (!is_valid_tab_index(index)) continue;
+				auto& tab = tabs[tab_index(index)];
+				if (tab.save_generation != item.generation) continue;
+				++tab.save_generation;
+				tab.save_in_progress = false;
+				tab.save_dispatch_failed.reset();
+				tab.save_error = "Task Center could not own Save All; cancellation was requested.";
+			}
+			return {false, "Task Center could not own Save All; cancellation was requested."};
+		}
+		return {true, "The complete captured revision set was scheduled as one Save All task."};
+#endif
 	}
 
 	inline bool save_active_to_disk() {
@@ -2846,9 +3145,8 @@ namespace file_tabs {
 		if (!is_valid_tab_index(idx)) return;
 		if (idx == active_tab)
 			snapshot_active_to_tab();
-		if (tabs[tab_index(idx)].save_in_progress) {
-			tabs[tab_index(idx)].save_error =
-				"Wait for the active atomic save to finish before closing this document.";
+		if (close_operation_pending(tabs[tab_index(idx)])) {
+			tabs[tab_index(idx)].save_error = close_operation_detail(tabs[tab_index(idx)]);
 			return;
 		}
 		normalize_document_identities();
@@ -3073,6 +3371,8 @@ namespace file_tabs {
 		exit_review_snapshot_revisions.clear();
 		exit_review_resolved_revisions.clear();
 		exit_review_discard_revisions.clear();
+		exit_review_cleanup_requested_revisions.clear();
+		exit_review_cleanup_completed_revisions.clear();
 	}
 
 	inline void finish_close_all_document(std::uint64_t document_id) {
@@ -3096,8 +3396,7 @@ namespace file_tabs {
 				pending_close_all_document_ids.pop_front();
 				continue;
 			}
-			if (tab.save_in_progress || (exit_review_requested &&
-				(tab.recovery_operation_pending || tab.recovery_checkpoint_pending)))
+			if (close_operation_pending(tab))
 				return;
 			const auto metadata = code_editor_widget::document_metadata(document_id);
 			if (metadata.found) {
@@ -3128,7 +3427,7 @@ namespace file_tabs {
 			return pending_close_all_document_ids.size();
 		snapshot_active_to_tab();
 		for (const auto& tab : tabs) {
-			if (!tab.pinned && tab.save_in_progress)
+			if (!tab.pinned && close_operation_pending(tab))
 				return 0;
 		}
 		for (const auto& tab : tabs) {
@@ -3152,7 +3451,7 @@ namespace file_tabs {
 			return;
 		}
 		auto& tab = tabs[tab_index(index)];
-		if (tab.save_in_progress) {
+		if (close_operation_pending(tab)) {
 			pending_close_idx = -1;
 			return;
 		}
@@ -3197,6 +3496,121 @@ namespace file_tabs {
 		advance_close_all();
 	}
 
+	inline void fail_exit_discard_cleanup(std::uint64_t document_id,
+		std::string detail) {
+		exit_review_cleanup_requested_revisions.erase(document_id);
+		exit_review_cleanup_completed_revisions.erase(document_id);
+		exit_review_resolved_revisions.erase(document_id);
+		exit_review_discard_revisions.erase(document_id);
+		exit_review_ready = false;
+		close_confirm_error = detail.empty()
+			? "The discarded recovery state could not be sealed." : std::move(detail);
+		const int index = find_document_index(document_id);
+		if (!is_valid_tab_index(index))
+			return;
+		auto& tab = tabs[tab_index(index)];
+		tab.recovery_operation_pending = false;
+		tab.recovery_operation_label.clear();
+		tab.recovery_dispatch_failed.reset();
+		tab.recovery_error = close_confirm_error;
+		if (std::find(pending_close_all_document_ids.begin(),
+				pending_close_all_document_ids.end(), document_id) ==
+			pending_close_all_document_ids.end())
+			pending_close_all_document_ids.push_front(document_id);
+	}
+
+	inline save_result_t begin_exit_discard_cleanup(std::uint64_t document_id,
+		std::uint64_t revision) {
+		if (!exit_review_requested || exit_review_committed)
+			return {false, "Application exit review is no longer active."};
+		const int index = find_document_index(document_id);
+		if (!is_valid_tab_index(index))
+			return {false, "The discarded document is no longer open."};
+		auto& tab = tabs[tab_index(index)];
+		const auto metadata = code_editor_widget::document_metadata(document_id);
+		if (!metadata.found || !metadata.dirty || metadata.revision != revision)
+			return {false, "The discarded document changed before recovery cleanup began."};
+		if (tab.save_in_progress || tab.recovery_operation_pending ||
+			tab.recovery_checkpoint_pending)
+			return {false, "Wait for active save and recovery operations to finish."};
+		const auto identity = recovery_metadata_record(tab);
+		const std::uint64_t generation = ++tab.recovery_operation_generation;
+		auto dispatch_failed = std::make_shared<std::atomic<bool>>(false);
+		tab.recovery_dispatch_failed = dispatch_failed;
+		tab.recovery_operation_pending = true;
+		tab.recovery_operation_label = "Sealing discarded recovery state";
+		tab.recovery_error.clear();
+		exit_review_cleanup_requested_revisions[document_id] = revision;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(identity);
+		static_cast<void>(generation);
+		static_cast<void>(dispatch_failed);
+		tab.recovery_operation_pending = false;
+		tab.recovery_operation_label.clear();
+		tab.recovery_dispatch_failed.reset();
+		exit_review_cleanup_completed_revisions[document_id] = revision;
+		return {true, {}};
+#else
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "file_tabs";
+		sub.label = "file_tabs.exit_discard_cleanup";
+		sub.thread_class = "blocking_file_io";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 3;
+		sub.generation = generation;
+		sub.shutdown_policy = "complete_before_exit_commit";
+		sub.body = [identity, document_id, revision, generation, dispatch_failed]() mutable {
+			const auto sealed = aida::editor::programming_documents::seal_clean_outcome(
+				identity, revision);
+			const bool posted = aida::ui_thread::post(
+				[document_id, revision, generation, sealed]() mutable {
+					const int current = find_document_index(document_id);
+					if (!is_valid_tab_index(current)) {
+						if (sealed.succeeded && sealed.changed)
+							exit_review_cleanup_completed_revisions[document_id] = revision;
+						else
+							fail_exit_discard_cleanup(document_id, sealed.detail);
+						return;
+					}
+					auto& target = tabs[tab_index(current)];
+					if (target.recovery_operation_generation != generation)
+						return;
+					target.recovery_operation_pending = false;
+					target.recovery_operation_label.clear();
+					target.recovery_dispatch_failed.reset();
+					const auto current_metadata =
+						code_editor_widget::document_metadata(document_id);
+					if (!sealed.succeeded || !sealed.changed) {
+						fail_exit_discard_cleanup(document_id,
+							sealed.detail.empty()
+								? "A newer recovery revision prevented discard cleanup."
+								: sealed.detail);
+						return;
+					}
+					if (!current_metadata.found || !current_metadata.dirty ||
+						current_metadata.revision != revision) {
+						fail_exit_discard_cleanup(document_id,
+							"The document changed while discarded recovery state was being sealed.");
+						return;
+					}
+					target.recovery_error.clear();
+					exit_review_cleanup_completed_revisions[document_id] = revision;
+				}, "file_tabs", "exit_discard_cleanup_result", "worker_result");
+			if (!posted)
+				dispatch_failed->store(true, std::memory_order_release);
+		};
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (!submitted.submitted) {
+			tab.recovery_operation_pending = false;
+			tab.recovery_operation_label.clear();
+			tab.recovery_dispatch_failed.reset();
+			exit_review_cleanup_requested_revisions.erase(document_id);
+			return {false, "Recovery cleanup scheduling failed: " + submitted.reject_reason};
+		}
+		return {true, {}};
+#endif
+	}
+
 	inline void poll_exit_review() {
 		if (!exit_review_requested || exit_review_committed)
 			return;
@@ -3204,6 +3618,15 @@ namespace file_tabs {
 		bool operation_pending = pending_close_after_save_document_id != 0;
 		for (std::size_t index = 0; index < tabs.size(); ++index) {
 			auto& tab = tabs[index];
+			observe_recovery_dispatch_failure(static_cast<int>(index));
+			const auto cleanup_requested =
+				exit_review_cleanup_requested_revisions.find(tab.document_id);
+			if (cleanup_requested != exit_review_cleanup_requested_revisions.end() &&
+				exit_review_cleanup_completed_revisions.find(tab.document_id) ==
+					exit_review_cleanup_completed_revisions.end() &&
+				!tab.recovery_operation_pending) {
+				fail_exit_discard_cleanup(tab.document_id, tab.recovery_error);
+			}
 			const auto metadata = code_editor_widget::document_metadata(tab.document_id);
 			if (metadata.found) {
 				tab.dirty = metadata.dirty;
@@ -3246,6 +3669,8 @@ namespace file_tabs {
 		exit_review_snapshot_revisions.clear();
 		exit_review_resolved_revisions.clear();
 		exit_review_discard_revisions.clear();
+		exit_review_cleanup_requested_revisions.clear();
+		exit_review_cleanup_completed_revisions.clear();
 		poll_exit_review();
 		return {true, {}};
 	}
@@ -3267,11 +3692,26 @@ namespace file_tabs {
 			}
 		}
 		for (const auto& discarded : exit_review_discard_revisions) {
+			const auto completed = exit_review_cleanup_completed_revisions.find(discarded.first);
+			if (completed != exit_review_cleanup_completed_revisions.end() &&
+				completed->second == discarded.second)
+				continue;
+			if (exit_review_cleanup_requested_revisions.find(discarded.first) !=
+				exit_review_cleanup_requested_revisions.end()) {
+				exit_review_ready = false;
+				return false;
+			}
+			const auto started = begin_exit_discard_cleanup(discarded.first, discarded.second);
+			if (!started.succeeded)
+				fail_exit_discard_cleanup(discarded.first, started.detail);
+			exit_review_ready = false;
+			return false;
+		}
+		for (const auto& discarded : exit_review_discard_revisions) {
 			const int index = find_document_index(discarded.first);
 			if (!is_valid_tab_index(index))
 				continue;
 			auto& tab = tabs[tab_index(index)];
-			schedule_confirmed_recovery_cleanup(tab);
 			tab.dirty = false;
 			tab.recovery = {};
 			tab.recovery_error.clear();

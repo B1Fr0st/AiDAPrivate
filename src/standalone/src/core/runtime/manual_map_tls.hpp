@@ -18,6 +18,15 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace aida {
 namespace manual_map_tls {
+#if (defined(AIDA_SAFE_HEADLESS) && AIDA_SAFE_HEADLESS == 1) || \
+    (defined(AIDA_C03_SAFE_HEADLESS_RUNTIME) && AIDA_C03_SAFE_HEADLESS_RUNTIME == 1)
+
+inline bool ensure_current_thread() noexcept
+{
+    return true;
+}
+
+#else
 namespace detail {
 
 struct layout_t
@@ -364,6 +373,8 @@ inline bool ensure_current_thread() noexcept
         FlsSetValue(fls, block);
     return true;
 }
+
+#endif
 
 }
 }

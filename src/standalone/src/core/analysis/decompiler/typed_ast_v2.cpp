@@ -1,9 +1,12 @@
 #include "typed_ast_v2.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -107,6 +110,34 @@ std::string function_name(const decompiler_entity_key_t& entity)
     }, entity.identity);
 }
 
+struct conditional_descriptor_t {
+    std::uint64_t true_successor = 0;
+    bool negated = false;
+};
+
+std::optional<conditional_descriptor_t> conditional_descriptor(const std::string& value)
+{
+    constexpr std::string_view prefix = "condition.true=";
+    constexpr std::string_view separator = ";negated=";
+    if (value.size() <= prefix.size() ||
+        value.compare(0, prefix.size(), prefix.data(), prefix.size()) != 0)
+        return std::nullopt;
+    const auto separator_offset = value.find(separator, prefix.size());
+    if (separator_offset == std::string::npos)
+        return std::nullopt;
+    conditional_descriptor_t result;
+    const char* begin = value.data() + prefix.size();
+    const char* end = value.data() + separator_offset;
+    const auto parsed = std::from_chars(begin, end, result.true_successor);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || result.true_successor == 0)
+        return std::nullopt;
+    const auto flag_offset = separator_offset + separator.size();
+    if (flag_offset + 1U != value.size() || (value[flag_offset] != '0' && value[flag_offset] != '1'))
+        return std::nullopt;
+    result.negated = value[flag_offset] == '1';
+    return result;
+}
+
 class ast_builder_t {
 public:
     ast_builder_t(
@@ -158,6 +189,12 @@ private:
         complete
     };
 
+    struct natural_loop_t {
+        std::uint64_t header = 0;
+        std::set<std::uint64_t> nodes;
+        std::set<std::uint64_t> latches;
+    };
+
     bool preflight()
     {
         if (!(hir_.entity == type_graph_.entity) || hir_.type_graph_revision != type_graph_.revision) {
@@ -179,8 +216,8 @@ private:
             fail(decompiler_diagnostic_code_t::unresolved_type, "decompiler.ast.v2.return_type");
             return false;
         }
-        if (!verify_straight_line_control_flow())
-            return false;
+        for (const auto& block : hir_.blocks)
+            blocks_.emplace(block.id, &block);
         std::size_t value_count = 0;
         for (const auto& block : hir_.blocks) {
             for (const auto& value : block.values) {
@@ -190,6 +227,7 @@ private:
                 }
                 values_.emplace(value.id, &value);
                 states_.emplace(value.id, value_state_t::unvisited);
+                use_counts_.emplace(value.id, 0);
                 if (types_.find(value.type_id) == types_.end()) {
                     fail(decompiler_diagnostic_code_t::unresolved_type, "decompiler.ast.v2.value_type", value.coordinate);
                     return false;
@@ -232,36 +270,190 @@ private:
                 return false;
             }
         }
-        return true;
+        return verify_control_flow() && analyze_control_flow();
     }
 
-    bool verify_straight_line_control_flow()
+    bool verify_control_flow()
     {
-        for (std::size_t index = 0; index < hir_.blocks.size(); ++index) {
-            const auto& block = hir_.blocks[index];
+        std::vector<std::uint64_t> entries;
+        for (const auto& block : hir_.blocks) {
             if (!block.exception_successor_ids.empty()) {
                 fail(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.v2.unproven_exception_region", block.coordinate);
                 return false;
             }
-            const bool is_first = index == 0;
-            const bool is_last = index + 1 == hir_.blocks.size();
-            if (is_first) {
-                if (!block.predecessor_ids.empty()) {
-                    fail(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.v2.non_entry_predecessor", block.coordinate);
-                    return false;
-                }
-            } else if (block.predecessor_ids.size() != 1 || block.predecessor_ids.front() != hir_.blocks[index - 1].id) {
-                fail(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.v2.non_linear_predecessor", block.coordinate);
+            if (block.predecessor_ids.empty())
+                entries.push_back(block.id);
+            if (block.successor_ids.size() > 2) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.unstructured_control_flow", block.coordinate);
                 return false;
             }
-            if (is_last) {
-                if (!block.successor_ids.empty()) {
-                    fail(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.v2.non_terminal_successor", block.coordinate);
+            for (const auto successor : block.successor_ids) {
+                const auto target = blocks_.find(successor);
+                if (target == blocks_.end() ||
+                    !std::binary_search(target->second->predecessor_ids.begin(),
+                        target->second->predecessor_ids.end(), block.id)) {
+                    fail(decompiler_diagnostic_code_t::malformed_hir,
+                        "decompiler.ast.v2.asymmetric_successor", block.coordinate);
                     return false;
                 }
-            } else if (block.successor_ids.size() != 1 || block.successor_ids.front() != hir_.blocks[index + 1].id) {
-                fail(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.v2.non_linear_successor", block.coordinate);
+            }
+            for (const auto predecessor : block.predecessor_ids) {
+                const auto source = blocks_.find(predecessor);
+                if (source == blocks_.end() ||
+                    !std::binary_search(source->second->successor_ids.begin(),
+                        source->second->successor_ids.end(), block.id)) {
+                    fail(decompiler_diagnostic_code_t::malformed_hir,
+                        "decompiler.ast.v2.asymmetric_predecessor", block.coordinate);
+                    return false;
+                }
+            }
+            std::size_t condition_count = 0;
+            std::size_t switch_count = 0;
+            bool terminal = false;
+            for (const auto& value : block.values) {
+                if (value.kind == hir_node_kind_t::conditional) {
+                    ++condition_count;
+                    const auto descriptor = conditional_descriptor(value.stable_value);
+                    if (value.operand_ids.size() != 1 || !descriptor ||
+                        !std::binary_search(block.successor_ids.begin(), block.successor_ids.end(),
+                            descriptor->true_successor)) {
+                        fail(decompiler_diagnostic_code_t::malformed_ast,
+                            "decompiler.ast.v2.unstructured_control_flow", value.coordinate);
+                        return false;
+                    }
+                } else if (value.kind == hir_node_kind_t::switch_branch) {
+                    ++switch_count;
+                } else if (value.kind == hir_node_kind_t::branch && !value.operand_ids.empty()) {
+                    fail(decompiler_diagnostic_code_t::malformed_hir,
+                        "decompiler.ast.v2.branch_payload", value.coordinate);
+                    return false;
+                }
+                if (value.kind == hir_node_kind_t::return_value ||
+                    value.kind == hir_node_kind_t::throw_value)
+                    terminal = true;
+            }
+            if ((block.successor_ids.size() == 2 && condition_count != 1) ||
+                (block.successor_ids.size() != 2 && condition_count != 0) ||
+                switch_count != 0 || (terminal && !block.successor_ids.empty())) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.unstructured_control_flow", block.coordinate);
                 return false;
+            }
+        }
+        if (entries.size() != 1) {
+            fail(decompiler_diagnostic_code_t::malformed_ast,
+                "decompiler.ast.v2.entry_block_identity");
+            return false;
+        }
+        entry_block_id_ = entries.front();
+        std::set<std::uint64_t> reachable;
+        std::vector<std::uint64_t> pending{entry_block_id_};
+        while (!pending.empty()) {
+            const auto id = pending.back();
+            pending.pop_back();
+            if (!reachable.insert(id).second)
+                continue;
+            const auto* block = blocks_.at(id);
+            pending.insert(pending.end(), block->successor_ids.begin(),
+                block->successor_ids.end());
+        }
+        if (reachable.size() != blocks_.size()) {
+            fail(decompiler_diagnostic_code_t::malformed_ast,
+                "decompiler.ast.v2.unreachable_block");
+            return false;
+        }
+        return true;
+    }
+
+    bool analyze_control_flow()
+    {
+        std::set<std::uint64_t> all;
+        for (const auto& entry : blocks_)
+            all.insert(entry.first);
+        for (const auto& entry : blocks_)
+            dominators_[entry.first] = entry.first == entry_block_id_
+                ? std::set<std::uint64_t>{entry_block_id_} : all;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& entry : blocks_) {
+                const auto id = entry.first;
+                const auto& predecessors = entry.second->predecessor_ids;
+                if (id == entry_block_id_)
+                    continue;
+                if (predecessors.empty()) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.unreachable_block", entry.second->coordinate);
+                    return false;
+                }
+                auto intersection = dominators_.at(predecessors.front());
+                for (std::size_t index = 1; index < predecessors.size(); ++index) {
+                    std::set<std::uint64_t> next;
+                    std::set_intersection(intersection.begin(), intersection.end(),
+                        dominators_.at(predecessors[index]).begin(),
+                        dominators_.at(predecessors[index]).end(),
+                        std::inserter(next, next.begin()));
+                    intersection = std::move(next);
+                }
+                intersection.insert(id);
+                if (intersection != dominators_[id]) {
+                    dominators_[id] = std::move(intersection);
+                    changed = true;
+                }
+            }
+        }
+        for (const auto& entry : blocks_) {
+            for (const auto successor : entry.second->successor_ids) {
+                if (dominators_.at(entry.first).find(successor) ==
+                    dominators_.at(entry.first).end())
+                    continue;
+                auto& loop = loops_[successor];
+                loop.header = successor;
+                loop.nodes.insert(successor);
+                loop.nodes.insert(entry.first);
+                loop.latches.insert(entry.first);
+                std::vector<std::uint64_t> pending{entry.first};
+                while (!pending.empty()) {
+                    const auto id = pending.back();
+                    pending.pop_back();
+                    for (const auto predecessor : blocks_.at(id)->predecessor_ids) {
+                        if (predecessor != successor &&
+                            dominators_.at(predecessor).find(successor) !=
+                                dominators_.at(predecessor).end() &&
+                            loop.nodes.insert(predecessor).second)
+                            pending.push_back(predecessor);
+                    }
+                }
+            }
+        }
+        std::set<std::uint64_t> all_with_exit = all;
+        all_with_exit.insert(0);
+        postdominators_[0] = {0};
+        for (const auto& entry : blocks_)
+            postdominators_[entry.first] = all_with_exit;
+        changed = true;
+        while (changed) {
+            changed = false;
+            for (auto iterator = blocks_.rbegin(); iterator != blocks_.rend(); ++iterator) {
+                const auto id = iterator->first;
+                std::vector<std::uint64_t> successors = iterator->second->successor_ids;
+                if (successors.empty())
+                    successors.push_back(0);
+                auto intersection = postdominators_.at(successors.front());
+                for (std::size_t index = 1; index < successors.size(); ++index) {
+                    std::set<std::uint64_t> next;
+                    std::set_intersection(intersection.begin(), intersection.end(),
+                        postdominators_.at(successors[index]).begin(),
+                        postdominators_.at(successors[index]).end(),
+                        std::inserter(next, next.begin()));
+                    intersection = std::move(next);
+                }
+                intersection.insert(id);
+                if (intersection != postdominators_[id]) {
+                    postdominators_[id] = std::move(intersection);
+                    changed = true;
+                }
             }
         }
         return true;
@@ -276,12 +468,15 @@ private:
                kind == hir_node_kind_t::load || kind == hir_node_kind_t::store ||
                kind == hir_node_kind_t::field || kind == hir_node_kind_t::index ||
                kind == hir_node_kind_t::call || kind == hir_node_kind_t::return_value ||
-               kind == hir_node_kind_t::throw_value || kind == hir_node_kind_t::unknown;
+               kind == hir_node_kind_t::throw_value || kind == hir_node_kind_t::unknown ||
+               kind == hir_node_kind_t::branch || kind == hir_node_kind_t::conditional ||
+               kind == hir_node_kind_t::switch_branch || kind == hir_node_kind_t::phi;
     }
 
     void initialize_ast()
     {
-        body_coordinate_ = translate_coordinate(hir_.blocks.front().coordinate, decompiler_coordinate_layer_t::typed_ast);
+        body_coordinate_ = translate_coordinate(blocks_.at(entry_block_id_)->coordinate,
+            decompiler_coordinate_layer_t::typed_ast);
         ast_.entity = hir_.entity;
         ast_.hir_hash = result_.hir_hash;
         ast_.type_graph_hash = result_.type_graph_hash;
@@ -336,33 +531,347 @@ private:
 
     bool append_statements()
     {
-        for (const auto& block : hir_.blocks) {
-            for (const auto& value : block.values) {
-                std::uint64_t statement_id = 0;
-                switch (value.kind) {
-                case hir_node_kind_t::assignment:
-                case hir_node_kind_t::store:
+        if (!append_region(entry_block_id_, 0, nullptr, body_statement_ids_, 0))
+            return false;
+        if (emitted_blocks_.size() != blocks_.size()) {
+            fail(decompiler_diagnostic_code_t::malformed_ast,
+                "decompiler.ast.v2.unstructured_control_flow");
+            return false;
+        }
+        return true;
+    }
+
+    const hir_value_t* block_condition(const hir_block_t& block) const noexcept
+    {
+        const auto iterator = std::find_if(block.values.begin(), block.values.end(),
+            [](const hir_value_t& value) { return value.kind == hir_node_kind_t::conditional; });
+        return iterator == block.values.end() ? nullptr : &*iterator;
+    }
+
+    bool emittable_statement(const hir_value_t& value) const
+    {
+        return value.kind == hir_node_kind_t::assignment ||
+            value.kind == hir_node_kind_t::store ||
+            value.kind == hir_node_kind_t::return_value ||
+            value.kind == hir_node_kind_t::throw_value ||
+            ((value.kind == hir_node_kind_t::call || value.kind == hir_node_kind_t::unknown) &&
+             use_counts_.at(value.id) == 0);
+    }
+
+    bool block_has_emittable_statements(const hir_block_t& block) const
+    {
+        return std::any_of(block.values.begin(), block.values.end(),
+            [this](const hir_value_t& value) { return emittable_statement(value); });
+    }
+
+    bool append_block_statements(const hir_block_t& block,
+                                 std::vector<std::uint64_t>& output)
+    {
+        for (const auto& value : block.values) {
+            std::uint64_t statement_id = 0;
+            switch (value.kind) {
+            case hir_node_kind_t::assignment:
+            case hir_node_kind_t::store:
+                statement_id = append_expression_statement(value);
+                break;
+            case hir_node_kind_t::return_value:
+                statement_id = append_terminal_statement(value,
+                    typed_pseudocode_ast_node_kind_t::return_statement);
+                break;
+            case hir_node_kind_t::throw_value:
+                statement_id = append_terminal_statement(value,
+                    typed_pseudocode_ast_node_kind_t::throw_statement);
+                break;
+            case hir_node_kind_t::call:
+            case hir_node_kind_t::unknown:
+                if (use_counts_.at(value.id) == 0)
                     statement_id = append_expression_statement(value);
-                    break;
-                case hir_node_kind_t::return_value:
-                    statement_id = append_terminal_statement(value, typed_pseudocode_ast_node_kind_t::return_statement);
-                    break;
-                case hir_node_kind_t::throw_value:
-                    statement_id = append_terminal_statement(value, typed_pseudocode_ast_node_kind_t::throw_statement);
-                    break;
-                case hir_node_kind_t::call:
-                case hir_node_kind_t::unknown:
-                    if (use_counts_[value.id] == 0)
-                        statement_id = append_expression_statement(value);
-                    break;
-                default:
-                    break;
-                }
-                if (failed_)
-                    return false;
-                if (statement_id != 0)
-                    body_statement_ids_.push_back(statement_id);
+                break;
+            default:
+                break;
             }
+            if (failed_)
+                return false;
+            if (statement_id != 0)
+                output.push_back(statement_id);
+        }
+        return true;
+    }
+
+    std::uint64_t append_compound(std::vector<std::uint64_t> statements,
+                                  const source_coordinate_t& coordinate)
+    {
+        return append_node(typed_pseudocode_ast_node_kind_t::compound_statement,
+            hir_.return_type_id, std::move(statements), {},
+            translate_coordinate(coordinate, decompiler_coordinate_layer_t::typed_ast),
+            aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+    }
+
+    std::uint64_t append_negation(const std::uint64_t expression,
+                                  const hir_value_t& condition)
+    {
+        return append_node(typed_pseudocode_ast_node_kind_t::unary_expression,
+            condition.type_id, {expression}, "!",
+            translate_coordinate(condition.coordinate, decompiler_coordinate_layer_t::typed_ast),
+            condition.confidence, condition.provenance);
+    }
+
+    std::uint64_t condition_expression(const hir_value_t& condition,
+                                       const std::uint64_t desired_successor)
+    {
+        const auto descriptor = conditional_descriptor(condition.stable_value);
+        if (!descriptor || condition.operand_ids.size() != 1) {
+            fail(decompiler_diagnostic_code_t::malformed_ast,
+                "decompiler.ast.v2.unstructured_control_flow", condition.coordinate);
+            return 0;
+        }
+        auto expression = build_expression(condition.operand_ids.front(), 0);
+        if (expression == 0)
+            return 0;
+        const bool negate = descriptor->negated !=
+            (desired_successor != descriptor->true_successor);
+        if (negate) {
+            expression = append_negation(expression, condition);
+            if (expression == 0)
+                return 0;
+        }
+        return expression;
+    }
+
+    std::uint64_t nearest_common_postdominator(const std::uint64_t left,
+                                               const std::uint64_t right,
+                                               const std::uint64_t current) const
+    {
+        std::set<std::uint64_t> common;
+        std::set_intersection(postdominators_.at(left).begin(), postdominators_.at(left).end(),
+            postdominators_.at(right).begin(), postdominators_.at(right).end(),
+            std::inserter(common, common.begin()));
+        common.erase(current);
+        std::uint64_t best = 0;
+        std::size_t best_depth = 0;
+        for (const auto candidate : common) {
+            const auto depth = postdominators_.at(candidate).size();
+            if (depth > best_depth || (depth == best_depth && candidate < best)) {
+                best = candidate;
+                best_depth = depth;
+            }
+        }
+        return best;
+    }
+
+    bool append_natural_loop(const natural_loop_t& loop,
+                             std::vector<std::uint64_t>& output,
+                             std::uint64_t& next)
+    {
+        const auto* header = blocks_.at(loop.header);
+        const auto* header_condition = block_condition(*header);
+        if (header_condition && header->successor_ids.size() == 2) {
+            std::uint64_t body_entry = 0;
+            std::uint64_t exit = 0;
+            for (const auto successor : header->successor_ids) {
+                if (loop.nodes.find(successor) != loop.nodes.end())
+                    body_entry = successor;
+                else
+                    exit = successor;
+            }
+            if (body_entry == 0 || exit == 0 || block_has_emittable_statements(*header)) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.unstructured_control_flow", header->coordinate);
+                return false;
+            }
+            emitted_blocks_.insert(header->id);
+            const auto condition = condition_expression(*header_condition, body_entry);
+            if (condition == 0)
+                return false;
+            std::vector<std::uint64_t> statements;
+            if (!append_region(body_entry, header->id, &loop.nodes, statements, 0))
+                return false;
+            for (const auto block : loop.nodes) {
+                if (emitted_blocks_.find(block) == emitted_blocks_.end()) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.unstructured_control_flow", header->coordinate);
+                    return false;
+                }
+            }
+            const auto body = append_compound(std::move(statements), header->coordinate);
+            const auto statement = append_node(
+                typed_pseudocode_ast_node_kind_t::while_statement,
+                hir_.return_type_id, {condition, body}, {},
+                translate_coordinate(header->coordinate, decompiler_coordinate_layer_t::typed_ast),
+                aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+            if (body == 0 || statement == 0)
+                return false;
+            output.push_back(statement);
+            next = exit;
+            return true;
+        }
+        if (loop.latches.size() == 1) {
+            const auto latch_id = *loop.latches.begin();
+            const auto* latch = blocks_.at(latch_id);
+            const auto* latch_condition = block_condition(*latch);
+            std::uint64_t exit = 0;
+            if (latch_condition && latch->successor_ids.size() == 2 &&
+                std::binary_search(latch->successor_ids.begin(), latch->successor_ids.end(),
+                    loop.header)) {
+                exit = latch->successor_ids.front() == loop.header
+                    ? latch->successor_ids.back() : latch->successor_ids.front();
+            }
+            bool external_edge = false;
+            for (const auto block_id : loop.nodes) {
+                for (const auto successor : blocks_.at(block_id)->successor_ids) {
+                    if (loop.nodes.find(successor) == loop.nodes.end() &&
+                        !(block_id == latch_id && successor == exit))
+                        external_edge = true;
+                }
+            }
+            if (exit != 0 && !external_edge && !block_has_emittable_statements(*latch)) {
+                std::vector<std::uint64_t> statements;
+                if (!append_region(loop.header, latch_id, &loop.nodes, statements, loop.header))
+                    return false;
+                if (!emitted_blocks_.insert(latch_id).second) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.unstructured_control_flow", latch->coordinate);
+                    return false;
+                }
+                const auto condition = condition_expression(*latch_condition, loop.header);
+                const auto body = append_compound(std::move(statements), header->coordinate);
+                const auto statement = append_node(
+                    typed_pseudocode_ast_node_kind_t::do_while_statement,
+                    hir_.return_type_id, {body, condition}, {},
+                    translate_coordinate(header->coordinate, decompiler_coordinate_layer_t::typed_ast),
+                    aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+                if (condition == 0 || body == 0 || statement == 0)
+                    return false;
+                for (const auto block : loop.nodes) {
+                    if (emitted_blocks_.find(block) == emitted_blocks_.end()) {
+                        fail(decompiler_diagnostic_code_t::malformed_ast,
+                            "decompiler.ast.v2.unstructured_control_flow", header->coordinate);
+                        return false;
+                    }
+                }
+                output.push_back(statement);
+                next = exit;
+                return true;
+            }
+        }
+        fail(decompiler_diagnostic_code_t::malformed_ast,
+            "decompiler.ast.v2.unstructured_control_flow", header->coordinate);
+        return false;
+    }
+
+    bool append_region(std::uint64_t current,
+                       const std::uint64_t stop,
+                       const std::set<std::uint64_t>* allowed,
+                       std::vector<std::uint64_t>& output,
+                       const std::uint64_t ignored_loop_header)
+    {
+        while (current != 0 && current != stop) {
+            if ((allowed && allowed->find(current) == allowed->end()) ||
+                emitted_blocks_.find(current) != emitted_blocks_.end()) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.unstructured_control_flow",
+                    blocks_.at(current)->coordinate);
+                return false;
+            }
+            if (current != ignored_loop_header) {
+                const auto loop = loops_.find(current);
+                if (loop != loops_.end()) {
+                    std::uint64_t next = 0;
+                    if (!append_natural_loop(loop->second, output, next))
+                        return false;
+                    current = next;
+                    continue;
+                }
+            }
+            const auto* block = blocks_.at(current);
+            emitted_blocks_.insert(current);
+            if (!append_block_statements(*block, output))
+                return false;
+            if (block->successor_ids.empty())
+                return true;
+            if (block->successor_ids.size() == 1) {
+                const auto successor = block->successor_ids.front();
+                if (successor == stop)
+                    return true;
+                if (dominators_.at(current).find(successor) != dominators_.at(current).end()) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.unstructured_control_flow", block->coordinate);
+                    return false;
+                }
+                current = successor;
+                continue;
+            }
+            const auto* condition_value = block_condition(*block);
+            if (!condition_value) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.unstructured_control_flow", block->coordinate);
+                return false;
+            }
+            const auto descriptor = conditional_descriptor(condition_value->stable_value);
+            if (!descriptor)
+                return false;
+            const auto true_successor = descriptor->true_successor;
+            const auto false_successor = block->successor_ids.front() == true_successor
+                ? block->successor_ids.back() : block->successor_ids.front();
+            const auto join = nearest_common_postdominator(
+                true_successor, false_successor, current);
+            auto condition = condition_expression(*condition_value, true_successor);
+            if (condition == 0)
+                return false;
+            std::vector<std::uint64_t> true_statements;
+            std::vector<std::uint64_t> false_statements;
+            if (true_successor != join &&
+                !append_region(true_successor, join, allowed, true_statements, 0))
+                return false;
+            if (false_successor != join &&
+                !append_region(false_successor, join, allowed, false_statements, 0))
+                return false;
+            if (true_statements.empty() && false_statements.empty()) {
+                const auto statement = append_node(
+                    typed_pseudocode_ast_node_kind_t::expression_statement,
+                    condition_value->type_id, {condition}, {},
+                    translate_coordinate(condition_value->coordinate,
+                        decompiler_coordinate_layer_t::typed_ast),
+                    condition_value->confidence, condition_value->provenance);
+                if (statement == 0)
+                    return false;
+                output.push_back(statement);
+            } else {
+                auto body_successor = true_successor;
+                if (true_statements.empty()) {
+                    condition = append_negation(condition, *condition_value);
+                    if (condition == 0)
+                        return false;
+                    std::swap(true_statements, false_statements);
+                    body_successor = false_successor;
+                }
+                const auto true_body = append_compound(std::move(true_statements),
+                    blocks_.at(body_successor)->coordinate);
+                std::vector<std::uint64_t> children{condition, true_body};
+                if (!false_statements.empty()) {
+                    const auto false_body = append_compound(std::move(false_statements),
+                        blocks_.at(false_successor)->coordinate);
+                    const auto alternate = append_node(
+                        typed_pseudocode_ast_node_kind_t::else_clause,
+                        hir_.return_type_id, {false_body}, {},
+                        translate_coordinate(blocks_.at(false_successor)->coordinate,
+                            decompiler_coordinate_layer_t::typed_ast),
+                        aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+                    if (false_body == 0 || alternate == 0)
+                        return false;
+                    children.push_back(alternate);
+                }
+                const auto statement = append_node(
+                    typed_pseudocode_ast_node_kind_t::if_statement,
+                    hir_.return_type_id, std::move(children), {},
+                    translate_coordinate(block->coordinate,
+                        decompiler_coordinate_layer_t::typed_ast),
+                    aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+                if (condition == 0 || true_body == 0 || statement == 0)
+                    return false;
+                output.push_back(statement);
+            }
+            current = join;
         }
         return true;
     }
@@ -393,21 +902,14 @@ private:
                 return 0;
             children.push_back(expression);
         } else if (value.operand_ids.empty()) {
-            if (!is_visible_text(value.stable_value)) {
-                fail(decompiler_diagnostic_code_t::malformed_hir, "decompiler.ast.v2.missing_terminal_value", value.coordinate);
+            const auto return_type = types_.find(hir_.return_type_id);
+            if (kind != typed_pseudocode_ast_node_kind_t::return_statement ||
+                return_type == types_.end() ||
+                return_type->second->kind != decompiler_type_kind_t::void_type) {
+                fail(decompiler_diagnostic_code_t::malformed_hir,
+                    "decompiler.ast.v2.missing_terminal_value", value.coordinate);
                 return 0;
             }
-            const auto literal = append_node(
-                typed_pseudocode_ast_node_kind_t::literal,
-                value.type_id,
-                {},
-                value.stable_value,
-                translate_coordinate(value.coordinate, decompiler_coordinate_layer_t::typed_ast),
-                value.confidence,
-                value.provenance);
-            if (literal == 0)
-                return 0;
-            children.push_back(literal);
         } else {
             fail(decompiler_diagnostic_code_t::malformed_hir, "decompiler.ast.v2.terminal_arity", value.coordinate);
             return 0;
@@ -562,6 +1064,8 @@ private:
         const auto operand = build_expression(value.operand_ids.front(), depth + 1);
         if (operand == 0)
             return 0;
+        if (value.stable_value == "copy")
+            return operand;
         const auto type = types_.find(value.type_id);
         return append_node(
             typed_pseudocode_ast_node_kind_t::cast_expression,
@@ -579,10 +1083,22 @@ private:
             fail(decompiler_diagnostic_code_t::malformed_hir, "decompiler.ast.v2.assignment_arity", value.coordinate);
             return 0;
         }
-        const auto left = build_expression(value.operand_ids[0], depth + 1);
+        auto left = build_expression(value.operand_ids[0], depth + 1);
         const auto right = build_expression(value.operand_ids[1], depth + 1);
         if (left == 0 || right == 0)
             return 0;
+        if (value.kind == hir_node_kind_t::store) {
+            left = append_node(
+                typed_pseudocode_ast_node_kind_t::unary_expression,
+                value.type_id,
+                {left},
+                "*",
+                translate_coordinate(value.coordinate, decompiler_coordinate_layer_t::typed_ast),
+                value.confidence,
+                value.provenance);
+            if (left == 0)
+                return 0;
+        }
         return append_node(
             typed_pseudocode_ast_node_kind_t::assignment_expression,
             value.type_id,
@@ -744,13 +1260,19 @@ private:
     typed_pseudocode_ast_v2_t ast_;
     source_coordinate_t body_coordinate_;
     std::map<std::uint64_t, const decompiler_type_node_t*> types_;
+    std::map<std::uint64_t, const hir_block_t*> blocks_;
     std::map<std::uint64_t, const hir_value_t*> values_;
     std::map<std::uint64_t, value_state_t> states_;
     std::map<std::uint64_t, std::uint64_t> expression_ids_;
     std::map<std::uint64_t, std::size_t> use_counts_;
+    std::map<std::uint64_t, std::set<std::uint64_t>> dominators_;
+    std::map<std::uint64_t, std::set<std::uint64_t>> postdominators_;
+    std::map<std::uint64_t, natural_loop_t> loops_;
+    std::set<std::uint64_t> emitted_blocks_;
     std::vector<std::uint64_t> parameter_declaration_ids_;
     std::vector<std::uint64_t> local_declaration_ids_;
     std::vector<std::uint64_t> body_statement_ids_;
+    std::uint64_t entry_block_id_ = 0;
     std::uint64_t next_node_id_ = 1;
     std::uint32_t next_diagnostic_ordinal_ = 1;
     bool failed_ = false;

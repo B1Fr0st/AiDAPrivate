@@ -79,41 +79,217 @@ namespace
         throw materialization_error_t("unsupported PE/COFF architecture");
     }
 
+    bytes_t make_cli_metadata()
+    {
+        bytes_t strings{0};
+        const auto add_string = [&](std::string_view value) {
+            require(strings.size() <= (std::numeric_limits<std::uint16_t>::max)(),
+                "CLI string heap exceeds compact fixture indexing");
+            const auto index = static_cast<std::uint16_t>(strings.size());
+            append_text(strings, value);
+            strings.push_back(0);
+            return index;
+        };
+        const auto module_name = add_string("ManagedFixture.dll");
+        const auto module_type = add_string("<Module>");
+        const auto fixture_type = add_string("ManagedFixture");
+        const auto fixture_namespace = add_string("AiDA.C03");
+        const auto method_name = add_string("Add");
+        const auto object_type = add_string("Object");
+        const auto system_namespace = add_string("System");
+        const auto runtime_assembly = add_string("mscorlib");
+
+        bytes_t blob{0, 5, 0, 2, 8, 8, 8};
+        bytes_t guid{
+            0x83, 0xa9, 0x7e, 0x42, 0x5a, 0x17, 0x3b, 0xe6,
+            0x84, 0x67, 0xd2, 0x4d, 0x10, 0x51, 0x39, 0xc0};
+        bytes_t tables;
+        const std::uint64_t valid_mask = (1ULL << 0U) | (1ULL << 1U) |
+            (1ULL << 2U) | (1ULL << 6U) | (1ULL << 32U) | (1ULL << 35U);
+        append_unsigned(tables, 0, 4, false);
+        append_unsigned(tables, 2, 1, false);
+        append_unsigned(tables, 0, 1, false);
+        append_unsigned(tables, 0, 1, false);
+        append_unsigned(tables, 1, 1, false);
+        append_unsigned(tables, valid_mask, 8, false);
+        append_unsigned(tables, 0, 8, false);
+        append_unsigned(tables, 1, 4, false);
+        append_unsigned(tables, 1, 4, false);
+        append_unsigned(tables, 2, 4, false);
+        append_unsigned(tables, 1, 4, false);
+        append_unsigned(tables, 1, 4, false);
+        append_unsigned(tables, 1, 4, false);
+
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, module_name, 2, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 2, false);
+
+        append_unsigned(tables, 6, 2, false);
+        append_unsigned(tables, object_type, 2, false);
+        append_unsigned(tables, system_namespace, 2, false);
+
+        append_unsigned(tables, 0, 4, false);
+        append_unsigned(tables, module_type, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, 0x00100101U, 4, false);
+        append_unsigned(tables, fixture_type, 2, false);
+        append_unsigned(tables, fixture_namespace, 2, false);
+        append_unsigned(tables, 5, 2, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, 1, 2, false);
+
+        append_unsigned(tables, 0x1080, 4, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0x0096, 2, false);
+        append_unsigned(tables, method_name, 2, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, 1, 2, false);
+
+        append_unsigned(tables, 0x8004, 4, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 4, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, fixture_type, 2, false);
+        append_unsigned(tables, 0, 2, false);
+
+        append_unsigned(tables, 4, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 4, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, runtime_assembly, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0, 2, false);
+
+        constexpr std::string_view version("v4.0.30319\0\0", 12);
+        constexpr std::array<std::string_view, 4> stream_names{
+            "#~", "#Strings", "#Blob", "#GUID"};
+        const std::array<const bytes_t*, 4> streams{
+            &tables, &strings, &blob, &guid};
+        const auto padded = [](std::size_t value) {
+            return (value + 3U) & ~std::size_t{3U};
+        };
+        std::size_t data_offset = 16U + padded(version.size()) + 4U;
+        for (const auto name : stream_names)
+            data_offset += 8U + padded(name.size() + 1U);
+        std::array<std::size_t, 4> stream_offsets{};
+        auto cursor = data_offset;
+        for (std::size_t index = 0; index < streams.size(); ++index) {
+            stream_offsets[index] = cursor;
+            cursor = padded(cursor + streams[index]->size());
+        }
+
+        bytes_t metadata;
+        append_unsigned(metadata, 0x424a5342, 4, false);
+        append_unsigned(metadata, 1, 2, false);
+        append_unsigned(metadata, 1, 2, false);
+        append_unsigned(metadata, 0, 4, false);
+        append_unsigned(metadata, version.size(), 4, false);
+        append_text(metadata, version);
+        metadata.resize(16U + padded(version.size()), 0);
+        append_unsigned(metadata, 0, 2, false);
+        append_unsigned(metadata, stream_names.size(), 2, false);
+        for (std::size_t index = 0; index < streams.size(); ++index) {
+            append_unsigned(metadata, stream_offsets[index], 4, false);
+            append_unsigned(metadata, streams[index]->size(), 4, false);
+            append_text(metadata, stream_names[index]);
+            metadata.push_back(0);
+            metadata.resize(padded(metadata.size()), 0);
+        }
+        require(metadata.size() == data_offset,
+            "CLI metadata stream headers are inconsistent");
+        for (std::size_t index = 0; index < streams.size(); ++index) {
+            require(metadata.size() == stream_offsets[index],
+                "CLI metadata stream offset is inconsistent");
+            metadata.insert(metadata.end(), streams[index]->begin(), streams[index]->end());
+            metadata.resize(padded(metadata.size()), 0);
+        }
+        require(metadata.size() <= 0x1080U,
+            "CLI metadata streams overlap the method-body compatibility range");
+        metadata.resize(0x1100U, 0);
+        const bytes_t method_body{0x12, 0x02, 0x03, 0x58, 0x2a};
+        std::copy(method_body.begin(), method_body.end(), metadata.begin() + 0x1080);
+        return metadata;
+    }
+
     bytes_t native_code(std::string_view architecture, std::string_view mode,
+        std::string_view endian, bool windows_x64 = false)
+    {
+        if (architecture == "x86")
+            return {0x8b, 0x44, 0x24, 0x04, 0x03, 0x44, 0x24, 0x08, 0xc3};
+        if (architecture == "x64")
+            return windows_x64 ? bytes_t{0x8d, 0x04, 0x11, 0xc3} :
+                bytes_t{0x8d, 0x04, 0x37, 0xc3};
+        if (architecture == "arm" && mode == "thumb")
+            return {0x40, 0x18, 0x70, 0x47};
+        if (architecture == "arm")
+            return endian == "big" ? bytes_t{0xe0, 0x80, 0x00, 0x01, 0xe1, 0x2f, 0xff, 0x1e} :
+                bytes_t{0x01, 0x00, 0x80, 0xe0, 0x1e, 0xff, 0x2f, 0xe1};
+        if (architecture == "aarch64" || architecture == "arm64ec" || architecture == "arm64x")
+            return endian == "big" ? bytes_t{0x0b, 0x01, 0x00, 0x00, 0xd6, 0x5f, 0x03, 0xc0} :
+                bytes_t{0x00, 0x00, 0x01, 0x0b, 0xc0, 0x03, 0x5f, 0xd6};
+        if (architecture == "mips")
+            return endian == "big" ? bytes_t{0x00, 0x85, 0x10, 0x21, 0x03, 0xe0, 0x00, 0x08,
+                                               0x00, 0x00, 0x00, 0x00} :
+                bytes_t{0x21, 0x10, 0x85, 0x00, 0x08, 0x00, 0xe0, 0x03,
+                        0x00, 0x00, 0x00, 0x00};
+        if (architecture == "ppc")
+            return endian == "big" ? bytes_t{0x7c, 0x63, 0x22, 0x14, 0x4e, 0x80, 0x00, 0x20} :
+                bytes_t{0x14, 0x22, 0x63, 0x7c, 0x20, 0x00, 0x80, 0x4e};
+        if (architecture == "riscv")
+            return {0x33, 0x05, 0xb5, 0x00, 0x67, 0x80, 0x00, 0x00};
+        throw materialization_error_t("unsupported native code architecture");
+    }
+
+    bytes_t native_fragment_code(std::string_view architecture, std::string_view mode,
         std::string_view endian)
     {
         if (architecture == "x86" || architecture == "x64")
-            return {0x55, 0x48, 0x89, 0xe5, 0x31, 0xc0, 0x5d, 0xc3};
+            return {0x31, 0xc0, 0xc3};
         if (architecture == "arm" && mode == "thumb")
             return {0x00, 0x20, 0x70, 0x47};
         if (architecture == "arm")
             return endian == "big" ? bytes_t{0xe3, 0xa0, 0x00, 0x00, 0xe1, 0x2f, 0xff, 0x1e} :
                 bytes_t{0x00, 0x00, 0xa0, 0xe3, 0x1e, 0xff, 0x2f, 0xe1};
-        if (architecture == "aarch64" || architecture == "arm64ec" || architecture == "arm64x")
+        if (architecture == "aarch64")
             return endian == "big" ? bytes_t{0xd2, 0x80, 0x00, 0x00, 0xd6, 0x5f, 0x03, 0xc0} :
                 bytes_t{0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6};
         if (architecture == "mips")
-            return endian == "big" ? bytes_t{0x24, 0x02, 0x00, 0x00, 0x03, 0xe0, 0x00, 0x08} :
-                bytes_t{0x00, 0x00, 0x02, 0x24, 0x08, 0x00, 0xe0, 0x03};
+            return endian == "big" ? bytes_t{0x24, 0x02, 0x00, 0x00, 0x03, 0xe0, 0x00, 0x08,
+                                               0x00, 0x00, 0x00, 0x00} :
+                bytes_t{0x00, 0x00, 0x02, 0x24, 0x08, 0x00, 0xe0, 0x03,
+                        0x00, 0x00, 0x00, 0x00};
         if (architecture == "ppc")
             return endian == "big" ? bytes_t{0x38, 0x60, 0x00, 0x00, 0x4e, 0x80, 0x00, 0x20} :
                 bytes_t{0x00, 0x00, 0x60, 0x38, 0x20, 0x00, 0x80, 0x4e};
         if (architecture == "riscv")
             return {0x13, 0x05, 0x00, 0x00, 0x67, 0x80, 0x00, 0x00};
-        throw materialization_error_t("unsupported native code architecture");
+        throw materialization_error_t("unsupported raw-code architecture");
     }
 
     bytes_t make_pe(const json& recipe)
     {
         const auto architecture = recipe.at("architecture").get<std::string>();
         const auto mode = recipe.at("mode").get<std::string>();
-        const bool is_64 = mode == "64" || architecture == "arm64ec" || architecture == "arm64x";
+        const bool is_64 = mode == "64" || architecture == "x64" || architecture == "aarch64" ||
+            architecture == "arm64ec" || architecture == "arm64x";
         const bool managed = recipe.value("managed", false);
         const bool ready_to_run = recipe.value("ready_to_run", false);
         const std::size_t optional_size = is_64 ? 0xf0 : 0xe0;
         const std::size_t optional = 0x98;
         const std::size_t section = optional + optional_size;
-        bytes_t bytes(0x800, 0);
+        const std::size_t raw_offset = managed ? 0x1000U : 0x200U;
+        const std::size_t raw_size = managed ? 0x2000U : 0x600U;
+        bytes_t bytes(raw_offset + raw_size, 0);
         put_text(bytes, 0, "MZ");
         put_unsigned(bytes, 0x3c, 0x80, 4, false);
         put_text(bytes, 0x80, "PE\0\0");
@@ -121,8 +297,9 @@ namespace
         put_unsigned(bytes, 0x86, 1, 2, false);
         put_unsigned(bytes, 0x88, 0x5f3759df, 4, false);
         put_unsigned(bytes, 0x94, optional_size, 2, false);
-        put_unsigned(bytes, 0x96, 0x2022, 2, false);
+        put_unsigned(bytes, 0x96, managed ? 0x2022 : 0x0022, 2, false);
         put_unsigned(bytes, optional, is_64 ? 0x20b : 0x10b, 2, false);
+        put_unsigned(bytes, optional + 4, raw_size, 4, false);
         put_unsigned(bytes, optional + 16, 0x1000, 4, false);
         put_unsigned(bytes, optional + 20, 0x1000, 4, false);
         if (is_64)
@@ -133,7 +310,7 @@ namespace
         }
         put_unsigned(bytes, optional + 32, 0x1000, 4, false);
         put_unsigned(bytes, optional + 36, 0x200, 4, false);
-        put_unsigned(bytes, optional + 56, 0x2000, 4, false);
+        put_unsigned(bytes, optional + 56, managed ? 0x3000 : 0x2000, 4, false);
         put_unsigned(bytes, optional + 60, 0x200, 4, false);
         put_unsigned(bytes, optional + 68, 3, 2, false);
         const auto directory_count = is_64 ? optional + 108 : optional + 92;
@@ -144,31 +321,91 @@ namespace
             put_unsigned(bytes, directories + 14 * 8 + 4, 72, 4, false);
         }
         put_text(bytes, section, ".text");
-        put_unsigned(bytes, section + 8, 0x600, 4, false);
+        put_unsigned(bytes, section + 8, raw_size, 4, false);
         put_unsigned(bytes, section + 12, 0x1000, 4, false);
-        put_unsigned(bytes, section + 16, 0x600, 4, false);
-        put_unsigned(bytes, section + 20, 0x200, 4, false);
+        put_unsigned(bytes, section + 16, raw_size, 4, false);
+        put_unsigned(bytes, section + 20, raw_offset, 4, false);
         put_unsigned(bytes, section + 36, 0x60000020, 4, false);
-        const auto code = native_code(architecture == "arm64ec" || architecture == "arm64x" ? "aarch64" : architecture,
-            mode, "little");
-        std::copy(code.begin(), code.end(), bytes.begin() + 0x200);
+        auto code = native_code(architecture == "arm64ec" || architecture == "arm64x" ? "aarch64" : architecture,
+            mode, "little", true);
+        if (!managed && recipe.value("id", std::string{}) == "pe32-x86") {
+            code = {0x8b, 0x44, 0x24, 0x04, 0x85, 0xc0, 0x79, 0x09,
+                    0x8b, 0x4c, 0x24, 0x08, 0x29, 0xc1, 0x89, 0xc8,
+                    0xc3, 0x03, 0x44, 0x24, 0x08, 0xc3};
+        } else if (!managed && recipe.value("id", std::string{}) == "pe32plus-x64") {
+            code = {0x8b, 0xc1, 0x85, 0xc9, 0x79, 0x05, 0x8b, 0xc2,
+                    0x2b, 0xc1, 0xc3, 0x8d, 0x04, 0x11, 0xc3};
+        }
+        std::copy(code.begin(), code.end(), bytes.begin() + static_cast<std::ptrdiff_t>(raw_offset));
+        if (!managed && recipe.value("id", std::string{}) == "pe32-x86") {
+            const bytes_t dispatch{
+                0x8b, 0x44, 0x24, 0x04, 0x83, 0xf8, 0x00, 0x74, 0x08,
+                0x83, 0xf8, 0x01, 0x74, 0x10, 0x31, 0xc0, 0xc3,
+                0x6a, 0x02, 0x6a, 0x01, 0xe8, 0xc6, 0xff, 0xff, 0xff,
+                0x83, 0xc4, 0x08, 0xc3, 0x6a, 0x02, 0x6a, 0xff,
+                0xe8, 0xb9, 0xff, 0xff, 0xff, 0x83, 0xc4, 0x08, 0xc3};
+            std::copy(dispatch.begin(), dispatch.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(raw_offset + 0x20U));
+        }
+        if (!managed) {
+            constexpr std::uint32_t export_rva = 0x1200U;
+            constexpr std::size_t export_offset = 0x400U;
+            const bool two_exports = recipe.value("id", std::string{}) == "pe32-x86";
+            const std::uint32_t export_count = two_exports ? 2U : 1U;
+            put_unsigned(bytes, directories, export_rva, 4, false);
+            put_unsigned(bytes, directories + 4, 0x100U, 4, false);
+            put_unsigned(bytes, export_offset + 12, 0x1240U, 4, false);
+            put_unsigned(bytes, export_offset + 16, 1, 4, false);
+            put_unsigned(bytes, export_offset + 20, export_count, 4, false);
+            put_unsigned(bytes, export_offset + 24, export_count, 4, false);
+            put_unsigned(bytes, export_offset + 28, 0x1260U, 4, false);
+            put_unsigned(bytes, export_offset + 32, 0x1270U, 4, false);
+            put_unsigned(bytes, export_offset + 36, 0x1280U, 4, false);
+            put_text(bytes, 0x440U, "fixture.exe");
+            put_unsigned(bytes, 0x460U, 0x1000U, 4, false);
+            put_unsigned(bytes, 0x470U, 0x1290U, 4, false);
+            put_unsigned(bytes, 0x480U, 0, 2, false);
+            put_text(bytes, 0x490U, "fixture_add");
+            if (two_exports) {
+                put_unsigned(bytes, 0x464U, 0x1020U, 4, false);
+                put_unsigned(bytes, 0x474U, 0x129cU, 4, false);
+                put_unsigned(bytes, 0x482U, 1, 2, false);
+                put_text(bytes, 0x49cU, "fixture_dispatch");
+            }
+        }
         if (managed) {
-            put_unsigned(bytes, 0x300, 72, 4, false);
-            put_unsigned(bytes, 0x304, 2, 2, false);
-            put_unsigned(bytes, 0x306, 5, 2, false);
-            put_unsigned(bytes, 0x308, 0x1180, 4, false);
-            put_unsigned(bytes, 0x30c, 0x100, 4, false);
-            put_unsigned(bytes, 0x310, 0x00020009, 4, false);
-            put_unsigned(bytes, 0x314, 0x06000001, 4, false);
-            put_text(bytes, 0x380, "BSJB");
-            put_unsigned(bytes, 0x384, 1, 2, false);
-            put_unsigned(bytes, 0x386, 1, 2, false);
-            put_unsigned(bytes, 0x38c, 12, 4, false);
-            put_text(bytes, 0x390, "v4.0.30319\0\0");
+            constexpr std::size_t method_offset = 0x1080U;
+            constexpr std::size_t cli_offset = 0x1100U;
+            constexpr std::size_t metadata_offset = 0x1180U;
+            const auto metadata = make_cli_metadata();
+            const bytes_t method_body{0x12, 0x02, 0x03, 0x58, 0x2a};
+            std::copy(method_body.begin(), method_body.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(method_offset));
+            put_unsigned(bytes, cli_offset, 72, 4, false);
+            put_unsigned(bytes, cli_offset + 4, 2, 2, false);
+            put_unsigned(bytes, cli_offset + 6, 5, 2, false);
+            put_unsigned(bytes, cli_offset + 8, metadata_offset, 4, false);
+            put_unsigned(bytes, cli_offset + 12, metadata.size(), 4, false);
+            put_unsigned(bytes, cli_offset + 16, 1, 4, false);
+            put_unsigned(bytes, cli_offset + 20, 0x06000001, 4, false);
+            std::copy(metadata.begin(), metadata.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(metadata_offset));
             if (ready_to_run) {
-                put_text(bytes, 0x420, "RTR\0");
-                put_unsigned(bytes, 0x424, 8, 2, false);
-                put_unsigned(bytes, 0x426, 0, 2, false);
+                constexpr std::size_t ready_offset = 0x1800U;
+                constexpr std::size_t compiler_offset = 0x1820U;
+                put_unsigned(bytes, cli_offset + 64, ready_offset, 4, false);
+                put_unsigned(bytes, cli_offset + 68, 28, 4, false);
+                put_text(bytes, ready_offset, "RTR\0");
+                put_unsigned(bytes, ready_offset + 4, 8, 2, false);
+                put_unsigned(bytes, ready_offset + 6, 0, 2, false);
+                put_unsigned(bytes, ready_offset + 8, 0, 4, false);
+                put_unsigned(bytes, ready_offset + 12, 1, 2, false);
+                put_unsigned(bytes, ready_offset + 14, 12, 1, false);
+                put_unsigned(bytes, ready_offset + 15, 0, 1, false);
+                put_unsigned(bytes, ready_offset + 16, 100, 4, false);
+                put_unsigned(bytes, ready_offset + 20, compiler_offset, 4, false);
+                put_unsigned(bytes, ready_offset + 24, 9, 4, false);
+                put_text(bytes, compiler_offset, "AiDA.C03\0");
             }
         }
         return bytes;
@@ -176,37 +413,42 @@ namespace
 
     bytes_t make_coff(const json& recipe)
     {
-        bytes_t bytes(0x80, 0);
+        constexpr std::size_t raw_offset = 0x50U;
+        constexpr std::size_t symbol_offset = 0x60U;
+        constexpr std::size_t string_table_offset = symbol_offset + 18U;
+        constexpr std::string_view symbol_name = "fixture_add";
+        bytes_t bytes(0x90, 0);
         put_unsigned(bytes, 0, pe_machine(recipe.at("architecture").get<std::string>()), 2, false);
         put_unsigned(bytes, 2, 1, 2, false);
         put_unsigned(bytes, 4, 0x10203040, 4, false);
-        put_unsigned(bytes, 8, 0x60, 4, false);
+        put_unsigned(bytes, 8, symbol_offset, 4, false);
         put_unsigned(bytes, 12, 1, 4, false);
         put_text(bytes, 20, ".text");
-        put_unsigned(bytes, 28, 8, 4, false);
-        put_unsigned(bytes, 36, 8, 4, false);
-        put_unsigned(bytes, 40, 0x50, 4, false);
-        put_unsigned(bytes, 56, 0x60000020, 4, false);
         const auto code = native_code(recipe.at("architecture").get<std::string>(),
-            recipe.at("mode").get<std::string>(), recipe.at("endian").get<std::string>());
-        std::copy(code.begin(), code.end(), bytes.begin() + 0x50);
-        put_text(bytes, 0x60, "fixture");
-        put_unsigned(bytes, 0x68, 0, 4, false);
-        put_unsigned(bytes, 0x6c, 1, 2, false);
-        put_unsigned(bytes, 0x6e, 0x20, 2, false);
-        bytes[0x70] = 2;
-        put_unsigned(bytes, 0x72, 4, 4, false);
+            recipe.at("mode").get<std::string>(), recipe.at("endian").get<std::string>(), true);
+        put_unsigned(bytes, 28, code.size(), 4, false);
+        put_unsigned(bytes, 36, code.size(), 4, false);
+        put_unsigned(bytes, 40, raw_offset, 4, false);
+        put_unsigned(bytes, 56, 0x60000020, 4, false);
+        std::copy(code.begin(), code.end(), bytes.begin() + raw_offset);
+        put_unsigned(bytes, symbol_offset + 4, 4, 4, false);
+        put_unsigned(bytes, symbol_offset + 8, 0, 4, false);
+        put_unsigned(bytes, symbol_offset + 12, 1, 2, false);
+        put_unsigned(bytes, symbol_offset + 14, 0x20, 2, false);
+        bytes[symbol_offset + 16] = 2;
+        put_unsigned(bytes, string_table_offset, 4U + symbol_name.size() + 1U, 4, false);
+        put_text(bytes, string_table_offset + 4U, symbol_name);
         return bytes;
     }
 
-    std::uint16_t elf_machine(std::string_view architecture)
+    std::uint16_t elf_machine(std::string_view architecture, bool is_64)
     {
         if (architecture == "x86") return 3;
         if (architecture == "x64") return 62;
         if (architecture == "arm") return 40;
         if (architecture == "aarch64") return 183;
         if (architecture == "mips") return 8;
-        if (architecture == "ppc") return 20;
+        if (architecture == "ppc") return is_64 ? 21 : 20;
         if (architecture == "riscv") return 243;
         throw materialization_error_t("unsupported ELF architecture");
     }
@@ -217,10 +459,19 @@ namespace
         const bool big = recipe.at("endian") == "big";
         const auto file_kind = recipe.value("file_kind", std::string("executable"));
         const std::uint16_t type = file_kind == "relocatable" ? 1 : file_kind == "shared" ? 3 : 2;
-        const auto machine = elf_machine(recipe.at("architecture").get<std::string>());
+        const auto machine = elf_machine(recipe.at("architecture").get<std::string>(), is_64);
         const auto header_size = is_64 ? 64U : 52U;
         const auto program_size = is_64 ? 56U : 32U;
-        bytes_t bytes(0x200, 0);
+        const auto section_size = is_64 ? 64U : 40U;
+        const auto code_offset = std::size_t{0x100};
+        const auto section_names_offset = std::size_t{0x120};
+        const auto symbol_names_offset = std::size_t{0x150};
+        const auto symbols_offset = std::size_t{0x170};
+        const auto section_offset = std::size_t{0x200};
+        const auto symbol_size = is_64 ? 24U : 16U;
+        constexpr std::size_t section_name_size = 33U;
+        constexpr std::size_t symbol_name_size = 13U;
+        bytes_t bytes(0x400, 0);
         put_text(bytes, 0, "\x7f" "ELF");
         bytes[4] = is_64 ? 2 : 1;
         bytes[5] = big ? 2 : 1;
@@ -230,15 +481,15 @@ namespace
         put_unsigned(bytes, 20, 1, 4, big);
         const auto base = is_64 ? 0x400000ULL : 0x10000ULL;
         if (is_64) {
-            put_unsigned(bytes, 24, type == 2 ? base + 0x100 : 0, 8, big);
+            put_unsigned(bytes, 24, type == 1 ? 0 : base + code_offset, 8, big);
             put_unsigned(bytes, 32, type == 1 ? 0 : header_size, 8, big);
-            put_unsigned(bytes, 40, type == 1 ? 0x140 : 0, 8, big);
+            put_unsigned(bytes, 40, section_offset, 8, big);
             put_unsigned(bytes, 52, header_size, 2, big);
             put_unsigned(bytes, 54, program_size, 2, big);
             put_unsigned(bytes, 56, type == 1 ? 0 : 1, 2, big);
-            put_unsigned(bytes, 58, 64, 2, big);
-            put_unsigned(bytes, 60, type == 1 ? 3 : 0, 2, big);
-            put_unsigned(bytes, 62, type == 1 ? 2 : 0, 2, big);
+            put_unsigned(bytes, 58, section_size, 2, big);
+            put_unsigned(bytes, 60, 5, 2, big);
+            put_unsigned(bytes, 62, 2, 2, big);
             if (type != 1) {
                 put_unsigned(bytes, 64, 1, 4, big);
                 put_unsigned(bytes, 68, 5, 4, big);
@@ -250,15 +501,15 @@ namespace
                 put_unsigned(bytes, 112, 0x1000, 8, big);
             }
         } else {
-            put_unsigned(bytes, 24, type == 2 ? base + 0x80 : 0, 4, big);
+            put_unsigned(bytes, 24, type == 1 ? 0 : base + code_offset, 4, big);
             put_unsigned(bytes, 28, type == 1 ? 0 : header_size, 4, big);
-            put_unsigned(bytes, 32, type == 1 ? 0x140 : 0, 4, big);
+            put_unsigned(bytes, 32, section_offset, 4, big);
             put_unsigned(bytes, 40, header_size, 2, big);
             put_unsigned(bytes, 42, program_size, 2, big);
             put_unsigned(bytes, 44, type == 1 ? 0 : 1, 2, big);
             put_unsigned(bytes, 46, 40, 2, big);
-            put_unsigned(bytes, 48, type == 1 ? 3 : 0, 2, big);
-            put_unsigned(bytes, 50, type == 1 ? 2 : 0, 2, big);
+            put_unsigned(bytes, 48, 5, 2, big);
+            put_unsigned(bytes, 50, 2, 2, big);
             if (type != 1) {
                 put_unsigned(bytes, 52, 1, 4, big);
                 put_unsigned(bytes, 56, 0, 4, big);
@@ -272,22 +523,62 @@ namespace
         }
         const auto code = native_code(recipe.at("architecture").get<std::string>(),
             recipe.at("mode").get<std::string>(), recipe.at("endian").get<std::string>());
-        std::copy(code.begin(), code.end(), bytes.begin() + 0x100);
-        if (type == 1) {
-            put_text(bytes, 0x120, "\0.text\0.shstrtab\0");
-            const auto section = std::size_t{0x140};
-            put_unsigned(bytes, section + 40 + 0, 1, 4, big);
-            put_unsigned(bytes, section + 40 + 4, 1, 4, big);
-            if (is_64) {
-                put_unsigned(bytes, section + 40 + 8, 6, 8, big);
-                put_unsigned(bytes, section + 40 + 24, 0x100, 8, big);
-                put_unsigned(bytes, section + 40 + 32, code.size(), 8, big);
-            } else {
-                put_unsigned(bytes, section + 40 + 8, 6, 4, big);
-                put_unsigned(bytes, section + 40 + 16, 0x100, 4, big);
-                put_unsigned(bytes, section + 40 + 20, code.size(), 4, big);
-            }
+        std::copy(code.begin(), code.end(), bytes.begin() + static_cast<std::ptrdiff_t>(code_offset));
+        put_text(bytes, section_names_offset + 1U, ".text");
+        put_text(bytes, section_names_offset + 7U, ".shstrtab");
+        put_text(bytes, section_names_offset + 17U, ".strtab");
+        put_text(bytes, section_names_offset + 25U, ".symtab");
+        put_text(bytes, symbol_names_offset + 1U, "fixture_add");
+        const auto symbol = symbols_offset + symbol_size;
+        put_unsigned(bytes, symbol, 1, 4, big);
+        if (is_64) {
+            bytes[symbol + 4U] = 0x12U;
+            put_unsigned(bytes, symbol + 6U, 1, 2, big);
+            put_unsigned(bytes, symbol + 8U, type == 1 ? 0 : base + code_offset, 8, big);
+            put_unsigned(bytes, symbol + 16U, code.size(), 8, big);
+        } else {
+            put_unsigned(bytes, symbol + 4U, type == 1 ? 0 : base + code_offset, 4, big);
+            put_unsigned(bytes, symbol + 8U, code.size(), 4, big);
+            bytes[symbol + 12U] = 0x12U;
+            put_unsigned(bytes, symbol + 14U, 1, 2, big);
         }
+        const auto write_section = [&](std::size_t index, std::uint32_t name,
+                                       std::uint32_t section_type, std::uint64_t flags,
+                                       std::uint64_t address, std::uint64_t offset,
+                                       std::uint64_t size, std::uint32_t link,
+                                       std::uint32_t info, std::uint64_t alignment,
+                                       std::uint64_t entry_size) {
+            const auto target = section_offset + index * section_size;
+            put_unsigned(bytes, target, name, 4, big);
+            put_unsigned(bytes, target + 4U, section_type, 4, big);
+            if (is_64) {
+                put_unsigned(bytes, target + 8U, flags, 8, big);
+                put_unsigned(bytes, target + 16U, address, 8, big);
+                put_unsigned(bytes, target + 24U, offset, 8, big);
+                put_unsigned(bytes, target + 32U, size, 8, big);
+                put_unsigned(bytes, target + 40U, link, 4, big);
+                put_unsigned(bytes, target + 44U, info, 4, big);
+                put_unsigned(bytes, target + 48U, alignment, 8, big);
+                put_unsigned(bytes, target + 56U, entry_size, 8, big);
+            } else {
+                put_unsigned(bytes, target + 8U, flags, 4, big);
+                put_unsigned(bytes, target + 12U, address, 4, big);
+                put_unsigned(bytes, target + 16U, offset, 4, big);
+                put_unsigned(bytes, target + 20U, size, 4, big);
+                put_unsigned(bytes, target + 24U, link, 4, big);
+                put_unsigned(bytes, target + 28U, info, 4, big);
+                put_unsigned(bytes, target + 32U, alignment, 4, big);
+                put_unsigned(bytes, target + 36U, entry_size, 4, big);
+            }
+        };
+        write_section(1U, 1U, 1U, 6U, type == 1 ? 0 : base + code_offset,
+            code_offset, code.size(), 0U, 0U, 4U, 0U);
+        write_section(2U, 7U, 3U, 0U, 0U, section_names_offset,
+            section_name_size, 0U, 0U, 1U, 0U);
+        write_section(3U, 17U, 3U, 0U, 0U, symbol_names_offset,
+            symbol_name_size, 0U, 0U, 1U, 0U);
+        write_section(4U, 25U, 2U, 0U, 0U, symbols_offset,
+            symbol_size * 2U, 3U, 1U, is_64 ? 8U : 4U, symbol_size);
         return bytes;
     }
 
@@ -305,38 +596,76 @@ namespace
     {
         const bool is_64 = recipe.at("mode") == "64";
         const bool big = recipe.at("endian") == "big";
-        bytes_t bytes(is_64 ? 0x180 : 0x100, 0);
+        const bool object = recipe.value("file_kind", std::string("executable")) == "object";
+        const auto header_size = is_64 ? 32U : 28U;
+        const auto segment_size = is_64 ? 152U : 124U;
+        const auto code_offset = is_64 ? 0x100U : 0xc0U;
+        const auto symbol_offset = is_64 ? 0x110U : 0xd0U;
+        const auto symbol_size = is_64 ? 16U : 12U;
+        const auto string_offset = symbol_offset + symbol_size;
+        const auto base = object ? 0ULL : (is_64 ? 0x100000000ULL : 0x1000ULL);
+        const auto code = native_code(recipe.at("architecture").get<std::string>(),
+            recipe.at("mode").get<std::string>(), recipe.at("endian").get<std::string>());
+        bytes_t bytes(0x180, 0);
         put_unsigned(bytes, 0, is_64 ? 0xfeedfacf : 0xfeedface, 4, big);
         put_unsigned(bytes, 4, macho_cpu(recipe.at("architecture").get<std::string>()), 4, big);
         put_unsigned(bytes, 8, 0, 4, big);
-        put_unsigned(bytes, 12, recipe.value("file_kind", std::string("executable")) == "object" ? 1 : 2, 4, big);
-        put_unsigned(bytes, 16, 1, 4, big);
-        put_unsigned(bytes, 20, is_64 ? 72 : 56, 4, big);
-        put_unsigned(bytes, 24, 0x00200000, 4, big);
+        put_unsigned(bytes, 12, object ? 1 : 2, 4, big);
+        put_unsigned(bytes, 16, 2, 4, big);
+        put_unsigned(bytes, 20, segment_size + 24, 4, big);
+        put_unsigned(bytes, 24, object ? 0 : 0x00200000, 4, big);
         if (is_64)
             put_unsigned(bytes, 28, 0, 4, big);
-        const auto command = is_64 ? 32U : 28U;
+        const auto command = header_size;
         put_unsigned(bytes, command, is_64 ? 0x19 : 1, 4, big);
-        put_unsigned(bytes, command + 4, is_64 ? 72 : 56, 4, big);
+        put_unsigned(bytes, command + 4, segment_size, 4, big);
         put_text(bytes, command + 8, "__TEXT");
         if (is_64) {
-            put_unsigned(bytes, command + 24, 0x100000000ULL, 8, big);
-            put_unsigned(bytes, command + 32, bytes.size(), 8, big);
-            put_unsigned(bytes, command + 40, 0, 8, big);
-            put_unsigned(bytes, command + 48, bytes.size(), 8, big);
+            put_unsigned(bytes, command + 24, base, 8, big);
+            put_unsigned(bytes, command + 32, code.size(), 8, big);
+            put_unsigned(bytes, command + 40, code_offset, 8, big);
+            put_unsigned(bytes, command + 48, code.size(), 8, big);
             put_unsigned(bytes, command + 56, 5, 4, big);
             put_unsigned(bytes, command + 60, 5, 4, big);
+            put_unsigned(bytes, command + 64, 1, 4, big);
         } else {
-            put_unsigned(bytes, command + 24, 0x1000, 4, big);
-            put_unsigned(bytes, command + 28, bytes.size(), 4, big);
-            put_unsigned(bytes, command + 32, 0, 4, big);
-            put_unsigned(bytes, command + 36, bytes.size(), 4, big);
+            put_unsigned(bytes, command + 24, base, 4, big);
+            put_unsigned(bytes, command + 28, code.size(), 4, big);
+            put_unsigned(bytes, command + 32, code_offset, 4, big);
+            put_unsigned(bytes, command + 36, code.size(), 4, big);
             put_unsigned(bytes, command + 40, 5, 4, big);
             put_unsigned(bytes, command + 44, 5, 4, big);
+            put_unsigned(bytes, command + 48, 1, 4, big);
         }
-        const auto code = native_code(recipe.at("architecture").get<std::string>(),
-            recipe.at("mode").get<std::string>(), recipe.at("endian").get<std::string>());
-        std::copy(code.begin(), code.end(), bytes.end() - static_cast<std::ptrdiff_t>(code.size()));
+        const auto section = command + (is_64 ? 72U : 56U);
+        put_text(bytes, section, "__text");
+        put_text(bytes, section + 16, "__TEXT");
+        put_unsigned(bytes, section + 32, base, is_64 ? 8 : 4, big);
+        if (is_64) {
+            put_unsigned(bytes, section + 40, code.size(), 8, big);
+            put_unsigned(bytes, section + 48, code_offset, 4, big);
+            put_unsigned(bytes, section + 52, 2, 4, big);
+            put_unsigned(bytes, section + 64, 0x80000400, 4, big);
+        } else {
+            put_unsigned(bytes, section + 36, code.size(), 4, big);
+            put_unsigned(bytes, section + 40, code_offset, 4, big);
+            put_unsigned(bytes, section + 44, 2, 4, big);
+            put_unsigned(bytes, section + 56, 0x80000400, 4, big);
+        }
+        const auto symtab = command + segment_size;
+        put_unsigned(bytes, symtab, 2, 4, big);
+        put_unsigned(bytes, symtab + 4, 24, 4, big);
+        put_unsigned(bytes, symtab + 8, symbol_offset, 4, big);
+        put_unsigned(bytes, symtab + 12, 1, 4, big);
+        put_unsigned(bytes, symtab + 16, string_offset, 4, big);
+        put_unsigned(bytes, symtab + 20, 14, 4, big);
+        put_unsigned(bytes, symbol_offset, 1, 4, big);
+        bytes[symbol_offset + 4] = 0x0f;
+        bytes[symbol_offset + 5] = 1;
+        put_unsigned(bytes, symbol_offset + 6, 0, 2, big);
+        put_unsigned(bytes, symbol_offset + 8, base, is_64 ? 8 : 4, big);
+        put_text(bytes, string_offset + 1, "_fixture_add");
+        std::copy(code.begin(), code.end(), bytes.begin() + static_cast<std::ptrdiff_t>(code_offset));
         return bytes;
     }
 
@@ -782,7 +1111,7 @@ namespace
         const auto format = recipe.at("format").get<std::string>();
         const auto zip64 = format == "zip64";
         std::string member_name = "fixture.bin";
-        bytes_t member = native_code("x64", "64", "little");
+        bytes_t member;
         if (format == "apk" || format == "aab") {
             member_name = "classes.dex";
             member = make_dex();
@@ -923,15 +1252,20 @@ namespace
         if (format == "dex")
             return make_dex();
         if (format == "oat") {
-            bytes_t bytes(0x100, 0);
+            const auto dex = make_dex();
+            bytes_t bytes(0x100U + dex.size(), 0);
             put_text(bytes, 0, "oat\n183\0");
             put_unsigned(bytes, 8, 0x1000, 4, false);
+            std::copy(dex.begin(), dex.end(), bytes.begin() + 0x100U);
             return bytes;
         }
         if (format == "vdex") {
-            bytes_t bytes(0x100, 0);
+            const auto dex = make_dex();
+            bytes_t bytes(0x100U + dex.size(), 0);
             put_text(bytes, 0, "vdex019\0");
             put_unsigned(bytes, 8, 1, 4, false);
+            put_unsigned(bytes, 12, dex.size(), 4, false);
+            std::copy(dex.begin(), dex.end(), bytes.begin() + 0x100U);
             return bytes;
         }
         if (format == "zip" || format == "zip64" || format == "apk" || format == "aab" ||
@@ -940,7 +1274,7 @@ namespace
         if (format == "archive" || format == "static_library" || format == "import_library")
             return make_archive(recipe);
         if (format == "raw_code")
-            return native_code(recipe.at("architecture").get<std::string>(),
+            return native_fragment_code(recipe.at("architecture").get<std::string>(),
                 recipe.at("mode").get<std::string>(), recipe.at("endian").get<std::string>());
         throw materialization_error_t("unsupported fixture format: " + format);
     }

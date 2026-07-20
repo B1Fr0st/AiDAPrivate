@@ -227,6 +227,9 @@ struct runtime_t {
     bool initialized = false;
     bool editor_focused = false;
     bool editor_text_input = false;
+	bool previous_editor_focused = false;
+	bool previous_editor_text_input = false;
+	bool editor_focus_observed_this_frame = false;
     bool editor_review_mode = false;
     code_editor_widget::review_hunk_identity_t editor_hunk_target;
     bool editor_hunk_target_explicit = false;
@@ -264,32 +267,14 @@ capability_state_t editor_selection() {
         : capability_state_t::unavailable("Select text first");
 }
 
-capability_state_t licensed_save_capability() {
-	const auto gate = file_tabs::verify_licensed_save_gate();
-	return gate.succeeded ? capability_state_t::available()
-		: capability_state_t::unavailable(gate.detail);
-}
-
 capability_state_t editor_savable() {
     const auto editor = code_editor_widget::document_state();
-    if (!editor.active)
+    if (!editor.active) {
         return capability_state_t::unavailable("Open or create a text document first");
-	const auto license_gate = licensed_save_capability();
-	if (!license_gate.enabled)
-		return license_gate;
-    if (file_tabs::is_valid_tab_index(file_tabs::active_tab)) {
-        const auto& tab = file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)];
-		if (tab.save_in_progress)
-			return capability_state_t::unavailable("A save is already in progress for this document");
-		if (tab.recovery_operation_pending)
-			return capability_state_t::unavailable("Wait for the active recovery operation to finish");
-        if (tab.external_conflict && !tab.external_overwrite_approved)
-            return capability_state_t::unavailable(
-                "The file changed on disk; resolve the editor conflict before saving");
     }
-    return editor.filepath.empty()
-        ? capability_state_t::unavailable("Use Save As to choose a path first")
-        : capability_state_t::available();
+	const auto gate = file_tabs::verify_tab_save_gate(file_tabs::active_tab, true);
+	return gate.succeeded ? capability_state_t::available()
+		: capability_state_t::unavailable(gate.detail);
 }
 
 enum class focused_edit_operation_t : std::uint8_t {
@@ -308,6 +293,18 @@ enum class focused_edit_operation_t : std::uint8_t {
 bool focused_code_editor(const interaction_context_t& context) {
 	return context.active_view == stable_view_id_t("document.code") ||
 		runtime().editor_focused;
+}
+
+bool effective_editor_focus() {
+	const auto& rt = runtime();
+	return rt.editor_focus_observed_this_frame
+		? rt.editor_focused : rt.previous_editor_focused;
+}
+
+bool effective_editor_text_input() {
+	const auto& rt = runtime();
+	return rt.editor_focus_observed_this_frame
+		? rt.editor_text_input : rt.previous_editor_text_input;
 }
 
 std::string focused_provider_action(focused_edit_operation_t operation,
@@ -337,6 +334,14 @@ std::string focused_provider_action(focused_edit_operation_t operation,
 
 capability_state_t focused_edit_capability(focused_edit_operation_t operation,
 	const interaction_context_t& context) {
+	const bool exact_editor_canvas_focus = effective_editor_focus() &&
+		!effective_editor_text_input() &&
+		context.active_view == stable_view_id_t("document.code");
+	if ((effective_editor_text_input() ||
+		(ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput)) &&
+		!exact_editor_canvas_focus)
+		return capability_state_t::unavailable(
+			"The focused text input owns this edit command");
 	if (focused_code_editor(context)) {
 		switch (operation) {
 			case focused_edit_operation_t::undo:
@@ -355,9 +360,6 @@ capability_state_t focused_edit_capability(focused_edit_operation_t operation,
 				return editor_active();
 		}
 	}
-	if (ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput)
-		return capability_state_t::unavailable(
-			"The focused text input owns this edit command");
 	const std::string provider_action = focused_provider_action(operation, context);
 	if (provider_action.empty())
 		return capability_state_t::unavailable(
@@ -367,6 +369,14 @@ capability_state_t focused_edit_capability(focused_edit_operation_t operation,
 
 action_handler_result_t execute_focused_edit(focused_edit_operation_t operation,
 	const action_invocation_t& invocation) {
+	const bool exact_editor_canvas_focus = effective_editor_focus() &&
+		!effective_editor_text_input() &&
+		invocation.context.active_view == stable_view_id_t("document.code");
+	if ((effective_editor_text_input() ||
+		(ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput)) &&
+		!exact_editor_canvas_focus)
+		return action_handler_result_t::failed(
+			"The focused text input owns this edit command");
 	if (focused_code_editor(invocation.context)) {
 		switch (operation) {
 			case focused_edit_operation_t::undo: code_editor_widget::trigger_undo(); break;
@@ -382,9 +392,6 @@ action_handler_result_t execute_focused_edit(focused_edit_operation_t operation,
 		}
 		return action_handler_result_t::completed();
 	}
-	if (ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput)
-		return action_handler_result_t::failed(
-			"The focused text input owns this edit command");
 	const std::string provider_action = focused_provider_action(operation,
 		invocation.context);
 	if (provider_action.empty())
@@ -2254,49 +2261,32 @@ void initialize(runtime_t& rt) {
         [&rt](const action_invocation_t&) {
             if (!rt.shell.save_as)
                 return action_handler_result_t::failed("Save As provider is unavailable");
+			file_tabs::shell_save_as_result.reset();
             rt.shell.save_as();
-            return action_handler_result_t::completed();
+			if (!file_tabs::shell_save_as_result)
+				return action_handler_result_t::failed(
+					"Save As provider did not return an operation result");
+			const auto result = std::move(*file_tabs::shell_save_as_result);
+			file_tabs::shell_save_as_result.reset();
+			return result.succeeded ? action_handler_result_t::completed()
+				: action_handler_result_t::failed(result.detail);
         }, [](const interaction_context_t&) {
 			const auto active = editor_active();
 			if (!active.enabled) return active;
-			return licensed_save_capability();
+			const auto gate = file_tabs::verify_tab_save_gate(file_tabs::active_tab, false);
+			return gate.succeeded ? capability_state_t::available()
+				: capability_state_t::unavailable(gate.detail);
 		});
     register_action(rt, "file.save_all", "Save All", "Save every modified code document", all_surfaces,
         [](const action_invocation_t&) {
-            file_tabs::snapshot_active_to_tab();
-            std::vector<std::string> failures;
-            for (std::size_t index = 0; index < file_tabs::tabs.size(); ++index) {
-                if (!file_tabs::tabs[index].dirty)
-                    continue;
-                const auto result = file_tabs::save_tab_to_disk_result(
-                    static_cast<int>(index));
-                if (!result.succeeded)
-                    failures.push_back(file_tabs::tabs[index].filename + ": " + result.detail);
-            }
-            if (!failures.empty()) {
-                std::string detail = std::to_string(failures.size()) +
-                    " document save operation(s) could not be scheduled";
-                for (const auto& failure : failures) detail += "\n" + failure;
-                return action_handler_result_t::failed(std::move(detail));
-            }
-            return action_handler_result_t::completed();
+			const auto result = file_tabs::save_all_tabs_result();
+			return result.succeeded ? action_handler_result_t::completed()
+				: action_handler_result_t::failed(result.detail);
         }, [](const interaction_context_t&) {
-			const auto license_gate = licensed_save_capability();
-			if (!license_gate.enabled)
-				return license_gate;
-            bool modified = false;
-            for (const auto& tab : file_tabs::tabs) {
-                if (!tab.dirty)
-                    continue;
-                modified = true;
-                if (tab.filepath.empty())
-                    return capability_state_t::unavailable(
-                        "Use Save As for untitled modified documents first");
-                if (tab.external_conflict && !tab.external_overwrite_approved)
-                    return capability_state_t::unavailable(
-                        "Resolve externally changed documents before Save All");
-            }
-            return modified
+			const auto preflight = file_tabs::preflight_save_all();
+			if (!preflight.result.succeeded)
+				return capability_state_t::unavailable(preflight.result.detail);
+			return !preflight.documents.empty()
                 ? capability_state_t::available()
                 : capability_state_t::unavailable("No modified documents need saving");
         });
@@ -2305,6 +2295,11 @@ void initialize(runtime_t& rt) {
             if (file_tabs::close_review_in_progress())
                 return action_handler_result_t::failed(
                     "Finish the current document-close review first");
+			if (!file_tabs::is_valid_tab_index(file_tabs::active_tab))
+				return action_handler_result_t::failed("No code document is open");
+			const auto& tab = file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)];
+			if (file_tabs::close_operation_pending(tab))
+				return action_handler_result_t::failed(file_tabs::close_operation_detail(tab));
             close_tab_with_confirmation(file_tabs::active_tab);
             return action_handler_result_t::completed();
         }, [](const interaction_context_t&) {
@@ -2313,7 +2308,10 @@ void initialize(runtime_t& rt) {
                     "Finish the current document-close review first");
             if (!file_tabs::is_valid_tab_index(file_tabs::active_tab))
                 return capability_state_t::unavailable("No code document is open");
-            return file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)].pinned
+			const auto& tab = file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)];
+			if (file_tabs::close_operation_pending(tab))
+				return capability_state_t::unavailable(file_tabs::close_operation_detail(tab));
+            return tab.pinned
                 ? capability_state_t::unavailable("Unpin the active document before closing it")
                 : capability_state_t::available();
         });
@@ -2323,9 +2321,9 @@ void initialize(runtime_t& rt) {
                 return action_handler_result_t::failed(
                     "Finish the current document-close review first");
             for (const auto& tab : file_tabs::tabs) {
-                if (!tab.pinned && tab.save_in_progress)
-                    return action_handler_result_t::failed(
-                        "Wait for active document saves to finish before closing all");
+				if (!tab.pinned && file_tabs::close_operation_pending(tab))
+					return action_handler_result_t::failed(
+						tab.filename + ": " + file_tabs::close_operation_detail(tab));
             }
             const std::size_t requested = file_tabs::request_close_all();
             return requested != 0
@@ -2340,9 +2338,9 @@ void initialize(runtime_t& rt) {
                 if (tab.pinned)
                     continue;
                 has_unpinned = true;
-                if (tab.save_in_progress)
-                    return capability_state_t::unavailable(
-                        "Wait for active document saves to finish before closing all");
+				if (file_tabs::close_operation_pending(tab))
+					return capability_state_t::unavailable(
+						tab.filename + ": " + file_tabs::close_operation_detail(tab));
             }
             return has_unpinned
                 ? capability_state_t::available()
@@ -2382,7 +2380,7 @@ void initialize(runtime_t& rt) {
         false, {}, "category.navigate", "Navigate");
     register_action(rt, "programming.show_problems", "Problems and Diagnostics",
         "Open the canonical diagnostics surface for editor, task, analysis, and runtime failures",
-        menu_surfaces | action_surface_t::toolbar,
+        all_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             const auto result = application_views::open_or_focus(
                 stable_view_id_t("view.diagnostics"));
@@ -3320,7 +3318,7 @@ void initialize(runtime_t& rt) {
         }, false, {}, "category.types.reconstruction", "Types / Reconstruction");
     register_action(rt, "types.reconstruction.declare_apply",
         "Declare and Apply Reconstructed Structure",
-        "Queue the generated declaration and base application as one reversible overlay transaction",
+		"Review the generated declaration and base application before one reversible overlay transaction",
         menu_surfaces,
         [](const action_invocation_t&) {
             const auto result = struct_recon_view::declare_and_apply_current();
@@ -3581,6 +3579,9 @@ void initialize(runtime_t& rt) {
     register_view("view.pseudocode", "Pseudocode", "document.pseudocode");
     register_view("view.graph", "Graph", "document.graph");
     register_view("view.binary_map", "Binary Map", "view.analysis.binary_map");
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    register_view("view.test_lab", "Test Lab", "view.test_lab", menu_surfaces);
+#endif
 
     application_views::registry().for_each_descriptor([&](const view_descriptor_t& view) {
         const std::string stable_id = compose_view_action_id(view.id);
@@ -3609,7 +3610,9 @@ void initialize(runtime_t& rt) {
             view.id.value() == "view.diagnostics" ||
             view.id.value() == "view.output")
             focus_surfaces = focus_surfaces | action_surface_t::toolbar;
-        if (view.id.value() == "view.programming.source_debug_console")
+        if (view.id.value() == "view.programming.source_debug_console" ||
+            view.id.value() == "view.analysis.references" ||
+            view.id.value() == "view.analysis.deobfuscation")
             focus_surfaces = focus_surfaces | action_surface_t::shortcut;
         register_action(rt, focus_id.c_str(), focus_label.c_str(),
             "Open this IDE view if needed, then move keyboard focus to it",
@@ -5363,15 +5366,15 @@ void initialize(runtime_t& rt) {
     register_widget_shortcut(rt, "binding.analysis.proximity.drill_keypad",
         "analysis.proximity.drill", ImGuiKey_KeypadEnter, "Keypad Enter",
         "scope.view.analysis.proximity", 40);
-	register_domain_shortcut(rt, "binding.debugger.run", "debugger.run_continue", ImGuiKey_F5, "F5", k_debugger_scope, 30);
+	register_domain_shortcut(rt, "binding.debugger.run", "debugger.run_continue", ImGuiKey_F9, "F9", k_debugger_scope, 30);
 	register_domain_shortcut(rt, "binding.debugger.pause", "debugger.pause", ImGuiKey_F6, "F6", k_debugger_scope, 30);
-	register_domain_shortcut(rt, "binding.debugger.step_over", "debugger.step_over", ImGuiKey_F10, "F10", k_debugger_scope, 30);
-	register_domain_shortcut(rt, "binding.debugger.step_into", "debugger.step_into", ImGuiKey_F11, "F11", k_debugger_scope, 30);
+	register_domain_shortcut(rt, "binding.debugger.step_over", "debugger.step_over", ImGuiKey_F8, "F8", k_debugger_scope, 30);
+	register_domain_shortcut(rt, "binding.debugger.step_into", "debugger.step_into", ImGuiKey_F7, "F7", k_debugger_scope, 30);
 	register_domain_shortcut(rt, "binding.debugger.step_out", "debugger.step_out", ImGuiMod_Shift | ImGuiKey_F11, "Shift+F11", k_debugger_scope, 30);
 	register_domain_shortcut(rt, "binding.debugger.stop", "debugger.stop", ImGuiMod_Shift | ImGuiKey_F5, "Shift+F5", k_debugger_scope, 30);
 	register_domain_shortcut(rt, "binding.debugger.restart", "debugger.restart", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_F5, "Ctrl+Shift+F5", k_debugger_scope, 30);
 	register_domain_shortcut(rt, "binding.debugger.detach", "debugger.detach", ImGuiMod_Ctrl | ImGuiKey_F2, "Ctrl+F2", k_debugger_scope, 30);
-	register_domain_shortcut(rt, "binding.debugger.toggle_breakpoint", "debugger.toggle_breakpoint_at_rip", ImGuiKey_F9, "F9", k_debugger_scope, 30);
+	register_domain_shortcut(rt, "binding.debugger.toggle_breakpoint", "debugger.toggle_breakpoint_at_rip", ImGuiKey_F2, "F2", k_debugger_scope, 30);
 	register_widget_shortcut(rt, "binding.debugger.watch.refresh_all",
 		"debugger.watch.refresh_all", ImGuiMod_Ctrl | ImGuiKey_R,
 		"Ctrl+R", "scope.view.debug.watches", 50);
@@ -5478,6 +5481,8 @@ void initialize(runtime_t& rt) {
         {"memory.entity.copy_previous", "Copy Previous Value", "Copy the retained previous memory value", "Memory"},
         {"memory.entity.copy_module_offset", "Copy Module + Offset", "Copy the retained module-relative address", "Memory"},
         {"memory.result.add_address", "Add to Address List", "Add the retained scan result to the address list", "Memory"},
+        {"memory.result.compare_selected", "Compare Selected Results", "Open the exact retained memory result pair in Comparer", "Memory"},
+        {"memory.result.export_selected", "Export Selected Results...", "Export the exact retained memory result set as bounded JSON", "Memory"},
         {"memory.entity.stage_patch", "Stage Patch in Patches View...", "Stage the retained address in the reviewed Patches workflow", "Memory"},
         {"memory.address.edit_description", "Edit Description", "Edit the retained address-list description", "Memory"},
         {"memory.address.change_type", "Change Type", "Change the retained address-list value type", "Memory"},
@@ -5650,10 +5655,10 @@ void initialize(runtime_t& rt) {
         {"analysis.graph.reset", "Reset View", "Reset graph pan and zoom", "Analysis"},
         {"analysis.graph.select_block", "Select Entire Block", "Select all instructions in the graph block", "Analysis"},
         {"analysis.graph.clear_selection", "Clear Selection", "Clear the graph text selection", "Analysis"},
-		{"analysis.graph.navigate_source", "Go to Source Block", "Navigate to the published incoming source block", "Analysis"},
-		{"analysis.graph.navigate_target", "Go to Target", "Navigate to the selected instruction's direct target", "Analysis"},
-		{"analysis.graph.collapse_reachable", "Collapse Reachable Scope", "Hide blocks reachable from the selected block", "Analysis"},
-		{"analysis.graph.expand_reachable", "Expand Reachable Scope", "Restore blocks hidden below the selected block", "Analysis"},
+		{"analysis.graph.navigate_source", "Go to Visible Source Block", "Navigate to an incoming source block present on the visible graph page", "Analysis"},
+		{"analysis.graph.navigate_target", "Go to Visible Target", "Navigate to the selected instruction's direct target when present on the visible graph page", "Analysis"},
+		{"analysis.graph.collapse_reachable", "Collapse Reachable on Visible Page", "Hide blocks reachable within the complete visible-page edge set", "Analysis"},
+		{"analysis.graph.expand_reachable", "Expand Reachable on Visible Page", "Restore blocks hidden within the complete visible-page edge set", "Analysis"},
 		{"analysis.graph.pin_node", "Pin Node Position", "Retain the selected node position across graph rebuilds", "Analysis"},
 		{"analysis.graph.unpin_node", "Unpin Node Position", "Return the selected node to automatic graph layout", "Analysis"},
 		{"analysis.graph.pin_layout", "Pin Layout", "Retain all current node positions across graph rebuilds", "Analysis"},
@@ -5717,10 +5722,10 @@ void initialize(runtime_t& rt) {
         {"analysis.binary_map.export.follow_disassembly", "Jump to Disassembly", "Open the retained export in Disassembly", "Binary Map"},
         {"analysis.binary_map.export.copy_name", "Copy Export Name", "Copy the retained export name", "Binary Map"},
         {"types.catalog.copy_name", "Copy Name", "Copy the retained catalog name", "Types"},
-        {"types.catalog.copy_c_declaration", "Copy C Declaration", "Copy the retained C declaration", "Types"},
         {"types.catalog.copy_ida_declaration", "Copy IDA-style Declaration", "Copy the retained IDA-style declaration", "Types"},
+		{"types.catalog.export_declaration", "Export Declaration", "Export the retained bounded type declaration", "Types"},
+		{"types.catalog.duplicate_to_editor", "Duplicate as Editable Copy", "Create and persist a validated editable copy", "Types"},
         {"types.catalog.open_structure_editor", "Open in Structure Editor", "Open the retained type in Structure Editor", "Types"},
-        {"types.catalog.declare_overlay", "Declare in Reversible Overlay", "Declare the retained type in the workspace overlay", "Types"},
         {"types.catalog.rename", "Rename Type...", "Rename the retained type", "Types"},
         {"types.catalog.delete", "Delete Type...", "Delete the retained type", "Types"},
         {"types.catalog.edit_enum", "Edit Enum...", "Edit the retained enum", "Types"},
@@ -5731,25 +5736,33 @@ void initialize(runtime_t& rt) {
         {"types.catalog.function.retype", "Retype Function...", "Retype the retained function", "Types"},
         {"types.catalog.copy_canonical_type", "Copy Canonical Type", "Copy the retained canonical type", "Types"},
         {"types.catalog.evidence.follow_disassembly", "Jump to Evidence Address", "Open retained type evidence", "Types"},
-        {"types.catalog.promote_global", "Promote Globally", "Promote the retained type globally", "Types"},
+        {"types.catalog.promote_global", "Review Global Promotion...", "Review the retained type before global overlay promotion", "Types"},
         {"types.reconstruction.field.follow_disassembly", "Open Field in Disassembly", "Open the retained reconstructed field", "Types"},
         {"types.reconstruction.field.copy_name", "Copy Field Name", "Copy the retained reconstructed field name", "Types"},
         {"types.reconstruction.field.copy_type", "Copy Field Type", "Copy the retained reconstructed field type", "Types"},
         {"types.reconstruction.field.copy_offset", "Copy Offset", "Copy the retained reconstructed field offset", "Types"},
         {"types.reconstruction.field.copy_absolute_address", "Copy Absolute Address", "Copy the retained reconstructed field address", "Types"},
         {"types.reconstruction.field.copy_access_evidence", "Copy Access Evidence", "Copy retained field access evidence", "Types"},
-        {"types.reconstruction.field.declare_apply", "Declare and Apply Structure", "Declare and apply the retained reconstruction", "Types"},
+        {"types.reconstruction.field.declare_apply", "Review Declaration and Application...", "Review the retained reconstruction before one atomic overlay transaction", "Types"},
         {"types.reconstruction.field.rename", "Rename Field...", "Rename the retained reconstructed field", "Types"},
         {"types.reconstruction.field.set_type", "Set Field Type...", "Retype the retained reconstructed field", "Types"},
         {"types.reconstruction.field.edit_live", "Edit Live Value...", "Edit the retained reconstructed field value", "Types"},
-        {"types.reconstruction.field.send_ai", "Send Field Evidence to AI Chat", "Attach retained field evidence to AI Chat", "Types"},
 		{"types.dissector.structure.copy_name", "Copy Structure Name", "Copy the retained structure name", "Types"},
 		{"types.dissector.structure.copy_declaration", "Copy C/C++ Declaration", "Copy the retained structure declaration", "Types"},
+		{"types.dissector.structure.export_declaration", "Export Declaration", "Export the retained bounded structure declaration", "Types"},
+		{"types.dissector.structure.duplicate", "Duplicate Structure", "Duplicate and persist the retained structure", "Types"},
+		{"types.dissector.structure.review_global_overlay", "Review Global Declaration...", "Review the retained declaration before global overlay propagation", "Types"},
 		{"types.dissector.structure.configure_layout", "Configure Layout...", "Configure retained structure kind, packing, and alignment", "Types"},
 		{"types.dissector.structure.toggle_union", "Convert Struct / Union", "Toggle the retained structure layout kind", "Types"},
 		{"types.dissector.structure.save_catalog", "Save Structure Catalog", "Atomically save the retained structure catalog", "Types"},
 		{"types.dissector.structure.load_catalog", "Load Structure Catalog", "Load and validate the durable structure catalog", "Types"},
+		{"types.dissector.enum.export_declaration", "Export Enum Declaration", "Export the retained bounded enum declaration", "Types"},
+		{"types.dissector.enum.duplicate", "Duplicate Enum", "Duplicate and persist the retained enum", "Types"},
+		{"types.dissector.enum.review_global_overlay", "Review Enum Globally...", "Review the enum before global overlay propagation", "Types"},
 		{"types.dissector.field.copy_name", "Copy Field Name", "Copy the retained dissector field name", "Types"},
+		{"types.dissector.field.export_declaration", "Export Field Declaration", "Export the retained bounded field declaration", "Types"},
+		{"types.dissector.field.duplicate", "Duplicate Field", "Duplicate and persist the retained top-level field", "Types"},
+		{"types.dissector.field.review_containing_type_global", "Review Containing Type Globally...", "Review the containing declaration before global overlay propagation", "Types"},
         {"types.dissector.field.copy_offset", "Copy Offset", "Copy the retained dissector field offset", "Types"},
         {"types.dissector.field.copy_absolute_address", "Copy Absolute Address", "Copy the retained dissector field address", "Types"},
         {"types.dissector.field.copy_current_value", "Copy Current Value", "Copy the retained live field value", "Types"},
@@ -6214,7 +6227,6 @@ void initialize(runtime_t& rt) {
         retained_menu_action("analysis.fuzzer.crash.minimize", 1),
         retained_menu_action("analysis.binary_map.function.pin", 2),
         retained_menu_action("analysis.binary_map.function.unpin", 3),
-        retained_menu_action("types.catalog.declare_overlay", 4),
         retained_menu_action("types.catalog.rename", 5),
         retained_menu_action("types.catalog.edit_enum", 6),
         retained_menu_action("types.catalog.function.retype", 7),
@@ -6260,6 +6272,20 @@ void initialize(runtime_t& rt) {
 		"types.dissector.field.move_up", 46));
 	analysis_types_modify.push_back(retained_menu_action(
 		"types.dissector.field.move_down", 47));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.catalog.duplicate_to_editor", 48));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.structure.duplicate", 49));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.field.duplicate", 50));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.structure.review_global_overlay", 51));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.field.review_containing_type_global", 52));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.enum.duplicate", 53));
+	analysis_types_modify.push_back(retained_menu_action(
+		"types.dissector.enum.review_global_overlay", 54));
     std::vector<context_menu_action_t> analysis_types_copy = {
 		retained_menu_action("types.dissector.structure.copy_name", 0),
 		retained_menu_action("types.dissector.structure.copy_declaration", 1),
@@ -6287,7 +6313,6 @@ void initialize(runtime_t& rt) {
         retained_menu_action("analysis.binary_map.import.copy_function_name", 21),
         retained_menu_action("analysis.binary_map.export.copy_name", 22),
         retained_menu_action("types.catalog.copy_name", 23),
-        retained_menu_action("types.catalog.copy_c_declaration", 24),
         retained_menu_action("types.catalog.copy_ida_declaration", 25),
         retained_menu_action("types.catalog.function.copy_signature", 26),
         retained_menu_action("types.catalog.function.copy_address", 27),
@@ -6301,11 +6326,18 @@ void initialize(runtime_t& rt) {
         retained_menu_action("types.dissector.field.copy_offset", 35),
         retained_menu_action("types.dissector.field.copy_absolute_address", 36),
         retained_menu_action("types.dissector.field.copy_current_value", 37)};
+	analysis_types_copy.push_back(retained_menu_action(
+		"types.catalog.export_declaration", 38));
+	analysis_types_copy.push_back(retained_menu_action(
+		"types.dissector.structure.export_declaration", 39));
+	analysis_types_copy.push_back(retained_menu_action(
+		"types.dissector.field.export_declaration", 40));
+	analysis_types_copy.push_back(retained_menu_action(
+		"types.dissector.enum.export_declaration", 41));
     std::vector<context_menu_action_t> analysis_types_ai = {
         retained_menu_action("analysis.binary_map.function.send_chat", 0),
         retained_menu_action("analysis.binary_map.region.send_chat", 1),
-        retained_menu_action("analysis.binary_map.global.send_chat", 2),
-        retained_menu_action("types.reconstruction.field.send_ai", 3)};
+		retained_menu_action("analysis.binary_map.global.send_chat", 2)};
     std::vector<context_menu_action_t> analysis_types_destructive = {
         retained_menu_action("memory.integrity.reader.neutralize", 0),
         retained_menu_action("memory.integrity.reader.restore", 1),
@@ -6335,10 +6367,11 @@ void initialize(runtime_t& rt) {
              retained_menu_action("debugger.source.open_disassembly", 16),
              retained_menu_action("memory.entity.open_disassembly", 17),
              retained_menu_action("memory.entity.open_hex", 18),
-             retained_menu_action("memory.crypto.show_references", 19),
-             retained_menu_action("memory.pointer.open_base_disassembly", 20),
-             retained_menu_action("memory.pointer.open_resolved_hex", 21),
-             retained_menu_action("hex.open_disassembly", 22)}),
+             retained_menu_action("memory.result.compare_selected", 19),
+             retained_menu_action("memory.crypto.show_references", 20),
+             retained_menu_action("memory.pointer.open_base_disassembly", 21),
+             retained_menu_action("memory.pointer.open_resolved_hex", 22),
+             retained_menu_action("hex.open_disassembly", 23)}),
         menu_section("section.retained.modify", context_menu_group_t::modify_run, 1,
             {retained_menu_action("task.retry", 0),
              retained_menu_action("task.request_cancel", 1),
@@ -6401,16 +6434,17 @@ void initialize(runtime_t& rt) {
              retained_menu_action("memory.entity.copy_value", 22),
              retained_menu_action("memory.entity.copy_previous", 23),
              retained_menu_action("memory.entity.copy_module_offset", 24),
-             retained_menu_action("memory.aob.copy_pattern", 25),
-             retained_menu_action("memory.aob.copy_ida_pattern", 26),
-             retained_menu_action("memory.crypto.copy_algorithm", 27),
-             retained_menu_action("memory.pointer.copy_chain", 28),
-             retained_menu_action("memory.pointer.copy_cpp", 29),
-             retained_menu_action("memory.pointer.copy_base", 30),
-             retained_menu_action("memory.pointer.copy_resolved", 31),
-             retained_menu_action("hex.copy_byte", 32),
-             retained_menu_action("hex.copy_selection", 33),
-             retained_menu_action("hex.copy_address", 34)}),
+             retained_menu_action("memory.result.export_selected", 25),
+             retained_menu_action("memory.aob.copy_pattern", 26),
+             retained_menu_action("memory.aob.copy_ida_pattern", 27),
+             retained_menu_action("memory.crypto.copy_algorithm", 28),
+             retained_menu_action("memory.pointer.copy_chain", 29),
+             retained_menu_action("memory.pointer.copy_cpp", 30),
+             retained_menu_action("memory.pointer.copy_base", 31),
+             retained_menu_action("memory.pointer.copy_resolved", 32),
+             retained_menu_action("hex.copy_byte", 33),
+             retained_menu_action("hex.copy_selection", 34),
+             retained_menu_action("hex.copy_address", 35)}),
         menu_section("section.retained.ai", context_menu_group_t::ai_evidence, 3,
             {retained_menu_action("workbench.inspector.send_chat", 0),
              retained_menu_action("workbench.inspector.add_evidence", 1),
@@ -6698,13 +6732,16 @@ void begin_frame() {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     aida::infra::executor::drain_preview_frame();
 #endif
-	aida::editor::language_service::begin_frame();
+    aida::editor::language_service::begin_frame();
 	source_debug_service::begin_frame();
 	if (rt.shell.exit_application && file_tabs::consume_exit_review_ready())
 		rt.shell.exit_application();
     rt.consumed_strokes_this_frame.clear();
-    rt.editor_focused = false;
-    rt.editor_text_input = false;
+	rt.previous_editor_focused = rt.editor_focused;
+	rt.previous_editor_text_input = rt.editor_text_input;
+	rt.editor_focused = false;
+	rt.editor_text_input = false;
+	rt.editor_focus_observed_this_frame = false;
     rt.editor.focused = rt.editor_focused;
     rt.current = active_context(rt);
 }
@@ -6802,6 +6839,10 @@ void process_global_shortcuts() {
         rt.shortcuts.cancel_pending();
         return;
     }
+    if (globals::ui::command_palette_open) {
+        rt.shortcuts.cancel_pending();
+        return;
+    }
     if (ImGui::IsPopupOpen(nullptr,
             ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
         rt.shortcuts.cancel_pending();
@@ -6840,6 +6881,7 @@ void set_editor_focus(bool focused, bool text_input_active, bool review_mode) {
         ++rt.generation;
     rt.editor_focused = focused;
     rt.editor_text_input = text_input_active;
+	rt.editor_focus_observed_this_frame = true;
     rt.editor_review_mode = effective_review_mode;
     rt.editor.focused = focused;
     rt.current = editor_context(rt);

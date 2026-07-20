@@ -170,7 +170,7 @@ bool capture_context(context_t& context)
 {
 	context = {};
 	context.pid = driver_bridge::attached_pid();
-	context.status = debugger_engine::get_status();
+	context.status = debugger_engine::g_state.status.load(std::memory_order_acquire);
 	context.stop_generation = debugger_interaction::current_stop_generation();
 	context.symbol_generation = symbol_store::g_source_line_generation.load(
 		std::memory_order_acquire);

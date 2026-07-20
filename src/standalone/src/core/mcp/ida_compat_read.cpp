@@ -1,4 +1,6 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include "ida_compat_read.hpp"
@@ -1080,6 +1082,12 @@ namespace mcp_standalone::ida_compat
             return static_cast<std::uint32_t>(*parsed);
         }
 
+        std::string func_name(const analysis_snapshot_t& s, const overlay_names_t& ov, const function_record_t& f) {
+            if (auto* n = ov.fn(f.start.value)) return *n;
+            if (f.symbol_id.has_value()) for (const auto& sy : s.symbols) if (sy.id == f.symbol_id.value()) return sy.name;
+            return "sub_" + hex_str(f.start.value);
+        }
+
         std::optional<decompiler_entity_locator_t> decompiler_locator(
             const ws_state& ws, const json& input) {
             if (input.is_string()) {
@@ -1333,12 +1341,6 @@ namespace mcp_standalone::ida_compat
             };
             if (auto address = from_ranges(image.segments)) return address;
             return from_ranges(image.sections);
-        }
-
-        std::string func_name(const analysis_snapshot_t& s, const overlay_names_t& ov, const function_record_t& f) {
-            if (auto* n = ov.fn(f.start.value)) return *n;
-            if (f.symbol_id.has_value()) for (const auto& sy : s.symbols) if (sy.id == f.symbol_id.value()) return sy.name;
-            return "sub_" + hex_str(f.start.value);
         }
 
         json func_json(const analysis_snapshot_t& s, const overlay_names_t& ov, const function_record_t& f) {
@@ -1680,6 +1682,7 @@ namespace mcp_standalone::ida_compat
             };
         }
         json callees = json::array();
+        constexpr std::size_t kMaxCalleeBytes = 64U * 1024U;
         std::size_t callee_bytes = 2;
         bool callees_truncated = false;
         if (const auto* native = std::get_if<
@@ -1704,8 +1707,8 @@ namespace mcp_standalone::ida_compat
                         callee["name"] = func_name(
                             *ws.snapshot, ws.ov_names, *target);
                     const auto serialized = callee.dump().size() + 1U;
-                    if (serialized > 64U * 1024U -
-                            (std::min)(64U * 1024U, callee_bytes)) {
+                    if (serialized > kMaxCalleeBytes -
+                            (std::min)(kMaxCalleeBytes, callee_bytes)) {
                         callees_truncated = true;
                         break;
                     }

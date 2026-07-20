@@ -7,6 +7,7 @@
 #include "aida_load_image.hpp"
 #include "aida_scope.hpp"
 #include "aida_comment_database.hpp"
+#include "aida_print_c.hpp"
 
 #include "aida_ghidra_preamble.hpp"
 
@@ -63,11 +64,17 @@ std::string lowercase_(const std::string& s)
 	return out;
 }
 
+const std::string& require_print_language(const std::string& target)
+{
+	print_c_capability_t::ensure_registered();
+	return target;
+}
+
 }
 
 architecture_t::architecture_t(const std::string& target,
                                std::ostream* err_stream)
-	: ghidra::SleighArchitecture("aida_program", target, err_stream)
+	: ghidra::SleighArchitecture("aida_program", require_print_language(target), err_stream)
 {
 }
 

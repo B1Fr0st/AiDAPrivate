@@ -23,8 +23,8 @@ namespace debugger_interaction {
 namespace {
 
 std::atomic<std::uint64_t> g_stop_generation{1};
-std::uint32_t g_target_pid = 0;
-std::uint64_t g_target_process_creation_time_100ns = 0;
+std::atomic<std::uint32_t> g_target_pid{0};
+std::atomic<std::uint64_t> g_target_process_creation_time_100ns{0};
 bool g_stopped = true;
 std::uint64_t g_stop_address = 0;
 std::uint32_t g_stop_thread = 0;
@@ -44,7 +44,8 @@ void mix_hash(std::uint64_t& hash, std::uint64_t value) noexcept {
 }
 
 void mix_hash(std::uint64_t& hash, std::string_view value) noexcept {
-	for (const unsigned char byte : value) {
+	for (const char character : value) {
+		const auto byte = static_cast<unsigned char>(character);
 		hash ^= byte;
 		hash *= 1099511628211ULL;
 	}
@@ -75,19 +76,22 @@ bool same_identity(const context_t& left, const context_t& right) noexcept {
 		left.primary_text == right.primary_text && left.secondary_text == right.secondary_text;
 }
 
-const aida::workbench::selection_context_t* focused_selection(
+const aida::workbench::selection_context_t* document_selection(
 	const aida::workbench::workbench_shell_workspace_context_t& context,
-	std::uint64_t* document_id = nullptr) noexcept {
-	const auto focused_view = std::find_if(context.persistence.views.begin(),
-		context.persistence.views.end(), [](const auto& view) { return view.focused; });
-	if (focused_view == context.persistence.views.end()) return nullptr;
+	std::uint64_t document_id) noexcept {
 	const auto found = std::find_if(context.persistence.documents.begin(),
-		context.persistence.documents.end(), [&](const auto& document) {
-			return document.id == focused_view->document;
+		context.persistence.documents.end(), [document_id](const auto& document) {
+			return document.id.value == document_id;
 		});
 	if (found == context.persistence.documents.end()) return nullptr;
-	if (document_id) *document_id = found->id.value;
 	return &found->local_state.selection;
+}
+
+std::uint64_t focused_document_id(
+	const aida::workbench::workbench_shell_workspace_context_t& context) noexcept {
+	const auto focused = std::find_if(context.persistence.views.begin(),
+		context.persistence.views.end(), [](const auto& view) { return view.focused; });
+	return focused == context.persistence.views.end() ? 0 : focused->document.value;
 }
 
 void clear_published_selection_if_owned() {
@@ -100,17 +104,24 @@ void clear_published_selection_if_owned() {
 	}
 	aida::workbench::workbench_shell_workspace_context_t current;
 	auto& runtime = aida::workbench::workbench_shell_runtime_t::instance();
-	if (runtime.workspace_context(workspace, current).ok()) {
-		std::uint64_t document_id = 0;
-		const auto* selection = focused_selection(current, &document_id);
-		if (selection && selection->kind == aida::workbench::selection_kind_t::entity &&
-			document_id == g_published_document_id &&
-			selection->entity_key == g_published_entity_key) {
-			aida::workbench::workbench_shell_workspace_context_t ignored;
-			static_cast<void>(runtime.publish_selection(workspace, {}, {},
-				aida::workbench::navigation_origin_t::user, ignored));
-		}
+	if (!runtime.workspace_context(workspace, current).ok()) return;
+	const auto* selection = document_selection(current, g_published_document_id);
+	if (!selection || selection->kind != aida::workbench::selection_kind_t::entity ||
+		selection->entity_key != g_published_entity_key) {
+		g_published_workspace.reset();
+		g_published_entity_key.clear();
+		g_published_document_id = 0;
+		return;
 	}
+	aida::workbench::workbench_shell_workspace_context_t cleared;
+	if (!runtime.publish_document_selection(workspace,
+			aida::workbench::document_id_t{g_published_document_id}, {}, {},
+			aida::workbench::navigation_origin_t::user, cleared).ok()) return;
+	const auto* cleared_selection = document_selection(cleared, g_published_document_id);
+	if (cleared_selection && cleared_selection->kind ==
+			aida::workbench::selection_kind_t::entity &&
+		cleared_selection->entity_key == g_published_entity_key)
+		return;
 	g_published_workspace.reset();
 	g_published_entity_key.clear();
 	g_published_document_id = 0;
@@ -155,8 +166,15 @@ void publish_selection(const context_t& focused,
 		return;
 	}
 	const auto previous_workspace = g_published_workspace.lock();
-	if (previous_workspace && previous_workspace != workspace_context.workspace)
+	aida::workbench::workbench_shell_workspace_context_t current_workbench_context;
+	auto& workbench_runtime = aida::workbench::workbench_shell_runtime_t::instance();
+	if (previous_workspace && (previous_workspace != workspace_context.workspace ||
+		!workbench_runtime.workspace_context(
+			workspace_context.workspace, current_workbench_context).ok() ||
+		focused_document_id(current_workbench_context) != g_published_document_id)) {
 		clear_published_selection_if_owned();
+		if (g_published_document_id != 0) return;
+	}
 	std::uint64_t set_hash = 1469598103934665603ULL;
 	for (const auto& context : contexts)
 		mix_hash(set_hash, context_hash(context));
@@ -173,14 +191,17 @@ void publish_selection(const context_t& focused,
 		cursor.position = position;
 	}
 	aida::workbench::workbench_shell_workspace_context_t output;
-	if (aida::workbench::workbench_shell_runtime_t::instance().publish_selection(
+	if (workbench_runtime.publish_selection(
 			workspace_context.workspace, selection, cursor,
 			aida::workbench::navigation_origin_t::user, output).ok()) {
 		g_published_workspace = workspace_context.workspace;
 		g_published_entity_key = std::move(selection.entity_key);
-		std::uint64_t document_id = 0;
-		static_cast<void>(focused_selection(output, &document_id));
-		g_published_document_id = document_id;
+		g_published_document_id = focused_document_id(output);
+		const auto* published = document_selection(output, g_published_document_id);
+		if (g_published_document_id == 0 || !published ||
+			published->kind != aida::workbench::selection_kind_t::entity ||
+			published->entity_key != g_published_entity_key)
+			clear_published_selection_if_owned();
 	} else {
 		clear_published_selection_if_owned();
 	}
@@ -267,8 +288,9 @@ void synchronize_target_snapshot(std::uint32_t target_pid, bool stopped,
 	}
 	const std::uint64_t process_creation_time_100ns =
 		current_process_creation_time(target_pid);
-	if (target_pid != g_target_pid ||
-		process_creation_time_100ns != g_target_process_creation_time_100ns ||
+	if (target_pid != g_target_pid.load(std::memory_order_acquire) ||
+		process_creation_time_100ns !=
+			g_target_process_creation_time_100ns.load(std::memory_order_acquire) ||
 		stopped != g_stopped ||
 		(stopped && g_stopped && target_pid != 0 &&
 			(stop_address != g_stop_address || stop_thread != g_stop_thread))) {
@@ -277,8 +299,9 @@ void synchronize_target_snapshot(std::uint32_t target_pid, bool stopped,
 		g_selected_set.clear();
 		clear_published_selection_if_owned();
 	}
-	g_target_pid = target_pid;
-	g_target_process_creation_time_100ns = process_creation_time_100ns;
+	g_target_pid.store(target_pid, std::memory_order_release);
+	g_target_process_creation_time_100ns.store(
+		process_creation_time_100ns, std::memory_order_release);
 	g_stopped = stopped;
 	g_stop_address = stop_address;
 	g_stop_thread = stop_thread;
@@ -295,13 +318,18 @@ void advance_stop_generation() {
 	clear_published_selection_if_owned();
 }
 
+void invalidate_stop_generation_async() noexcept {
+	g_stop_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
 context_t capture(kind_t kind, std::uint64_t address, std::uint64_t value,
 	int index, std::uint32_t thread_id, std::uint64_t extent,
 	std::string primary_text, std::string secondary_text) {
 	context_t context;
 	context.kind = kind;
 	context.target_pid = driver_bridge::attached_pid();
-	context.process_creation_time_100ns = g_target_process_creation_time_100ns;
+	context.process_creation_time_100ns =
+		g_target_process_creation_time_100ns.load(std::memory_order_acquire);
 	context.stop_generation = current_stop_generation();
 	context.address = address;
 	context.value = value;
@@ -371,11 +399,29 @@ void clear() {
 	clear_published_selection_if_owned();
 }
 
+bool live_target_identity_current(const context_t& context) {
+	if (context.target_pid == 0 || context.process_creation_time_100ns == 0 ||
+		context.target_pid != driver_bridge::attached_pid())
+		return false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	return context.process_creation_time_100ns == 1;
+#else
+	driver_bridge::identity::live_target_identity_t identity;
+	std::string error;
+	if (!driver_bridge::identity::capture_live_target_identity(
+			context.target_pid, 0, identity, &error))
+		return false;
+	const auto validation =
+		driver_bridge::identity::validate_attached_target_identity(identity);
+	return validation.matches && identity.process.pid == context.target_pid &&
+		identity.process.creation_time_100ns == context.process_creation_time_100ns;
+#endif
+}
+
 bool is_current(const context_t& context) {
-	return context.kind != kind_t::none && context.target_pid != 0 &&
-		context.target_pid == driver_bridge::attached_pid() &&
-		context.process_creation_time_100ns != 0 &&
-		context.process_creation_time_100ns == g_target_process_creation_time_100ns &&
+	return context.kind != kind_t::none && live_target_identity_current(context) &&
+		context.process_creation_time_100ns ==
+			g_target_process_creation_time_100ns.load(std::memory_order_acquire) &&
 		context.stop_generation == current_stop_generation();
 }
 

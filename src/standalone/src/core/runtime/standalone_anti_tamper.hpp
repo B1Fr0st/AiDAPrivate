@@ -136,10 +136,10 @@ namespace detect
             {
                 diag::log_tagged_critical_fmt("runtime_enforce",
                     "trigger_kernel_bsod reason=debug_port text_hash=0x%016llX",
-                    static_cast<unsigned long long>(state::get().code_snap.text_hash));
+                    static_cast<unsigned long long>(anti_tamper::state::get().code_snap.text_hash));
                 driver_bridge::trigger_kernel_bsod(
                     0x0002u,
-                    state::get().code_snap.text_hash
+                    anti_tamper::state::get().code_snap.text_hash
                 );
             }
             return true;

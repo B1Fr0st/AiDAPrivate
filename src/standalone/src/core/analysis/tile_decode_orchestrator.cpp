@@ -1821,6 +1821,61 @@ tile_decode_orchestrator_t::run(
         }
     }
 
+    struct retained_instruction_t final {
+        std::size_t accumulator_index = 0;
+        std::uint64_t rva = 0;
+        tile_instruction_entry_t* entry = nullptr;
+    };
+    std::optional<retained_instruction_t> retained_instruction;
+    std::vector<std::pair<std::size_t, std::uint64_t>> cross_tile_removals;
+    std::uint64_t reconciliation_visits = 0;
+    for (std::size_t accumulator_index = 0;
+         accumulator_index < accumulators.size(); ++accumulator_index) {
+        auto& accumulator = accumulators[accumulator_index];
+        for (auto& [rva, entry] : accumulator.instructions) {
+            if ((reconciliation_visits++ & 4095ULL) == 0 &&
+                cancellation.stop_requested()) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    cancellation_error(cancellation,
+                        "cross-tile instruction reconciliation cancelled"));
+            }
+            if (retained_instruction) {
+                std::uint64_t retained_end = 0;
+                if (rva < retained_instruction->rva ||
+                    !checked_add(retained_instruction->rva,
+                        retained_instruction->entry->record.length, retained_end)) {
+                    return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                        orchestrator_error(workspace_error_code_t::integrity_failure,
+                            "cross-tile instruction order is invalid", rva));
+                }
+                if (rva < retained_end) {
+                    ++stats.overlap_instruction_candidates;
+                    if (instruction_stronger(
+                            entry.record, retained_instruction->entry->record)) {
+                        cross_tile_removals.emplace_back(
+                            retained_instruction->accumulator_index,
+                            retained_instruction->rva);
+                        --total_instructions;
+                        total_operand_facts -=
+                            retained_instruction->entry->operands.size();
+                        total_target_facts -=
+                            retained_instruction->entry->targets.size();
+                    } else {
+                        cross_tile_removals.emplace_back(accumulator_index, rva);
+                        --total_instructions;
+                        total_operand_facts -= entry.operands.size();
+                        total_target_facts -= entry.targets.size();
+                        continue;
+                    }
+                }
+            }
+            retained_instruction = retained_instruction_t{
+                accumulator_index, rva, &entry};
+        }
+    }
+    for (const auto& removal : cross_tile_removals)
+        accumulators[removal.first].instructions.erase(removal.second);
+
     std::set<decoded_edge_key_t, decoded_edge_less_t> accepted_edges;
     std::set<tile_decode_cross_tile_edge_t, cross_tile_edge_less_t>
         unique_cross_tile_edges;
@@ -1938,6 +1993,7 @@ tile_decode_orchestrator_t::run(
         std::uint32_t operand_count = 0;
         std::uint32_t target_count = 0;
         std::uint32_t edge_count = 0;
+        entity_id_t coverage_source_id = 1;
 
         for (const auto& [rva, entry] : acc.instructions) {
             packed_instruction_input_t instr_input;
@@ -2152,7 +2208,7 @@ tile_decode_orchestrator_t::run(
 
         for (const auto& span : acc.coverage) {
             packed_coverage_input_t cov_input;
-            cov_input.source_id = 0;
+            cov_input.source_id = coverage_source_id++;
             cov_input.span_begin = span.start;
             cov_input.span_end = span.start;
             if (!checked_add(span.start.value, span.size,

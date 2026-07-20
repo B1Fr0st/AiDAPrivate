@@ -43,7 +43,10 @@ namespace
             throw std::runtime_error("fixture contract file cannot be opened");
         json value;
         stream >> value;
-        if (!stream || !stream.eof())
+        if (!stream)
+            throw std::runtime_error("fixture contract JSON is malformed or has trailing data");
+        stream >> std::ws;
+        if (stream.bad() || !stream.eof())
             throw std::runtime_error("fixture contract JSON is malformed or has trailing data");
         return value;
     }
@@ -97,7 +100,9 @@ void require(bool condition, std::string message)
         const std::filesystem::path& path)
     {
         auto provider = mapped_file_provider_t::open(path.u8string());
-        require(provider.has_value(), "managed fixture provider could not be opened");
+        if (!provider)
+            throw std::runtime_error("managed fixture provider could not be opened: " +
+                path.u8string() + ": " + provider.error().message);
         return provider.take_value();
     }
 
@@ -115,6 +120,8 @@ void require(bool condition, std::string message)
             static_cast<std::streamsize>(bytes.size()));
         stream.flush();
         require(static_cast<bool>(stream), "managed mutant file could not be written");
+        stream.close();
+        require(static_cast<bool>(stream), "managed mutant file could not be committed");
         return open_provider(path);
     }
 

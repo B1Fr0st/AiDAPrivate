@@ -26,6 +26,27 @@ constexpr const char* creation_phase = "arch_decoder.create";
 constexpr const char* decode_phase = "arch_decoder.decode";
 constexpr const char* format_phase = "arch_decoder.format";
 
+arch_decoder_factory_fn_t arm64ec_delegate_factory = nullptr;
+
+workspace_result_t<std::unique_ptr<arch_decoder_backend_t>> create_arm64ec_backend(
+    const arch_decoder_key_t& key,
+    const cancellation_token_t& cancellation) {
+    if (key.architecture != architecture_id_t::arm64ec ||
+        key.mode != architecture_mode_t::aarch64 ||
+        key.endian != endian_t::little ||
+        key.abi != abi_id_t::windows_arm64ec ||
+        key.address_width_bits != 64 || arm64ec_delegate_factory == nullptr) {
+        return workspace_result_t<std::unique_ptr<arch_decoder_backend_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "ARM64EC decoder factory received an incompatible key",
+                                 creation_phase));
+    }
+    auto translated = key;
+    translated.architecture = architecture_id_t::aarch64;
+    translated.abi = abi_id_t::windows_arm64;
+    return arm64ec_delegate_factory(translated, cancellation);
+}
+
 bool initialize_default_arch_decoder_registry(arch_decoder_registry_t& registry) {
     using enrollment_t = workspace_result_t<void> (*)(arch_decoder_registry_t&);
     constexpr std::array<enrollment_t, 6> enrollments{{
@@ -42,6 +63,24 @@ bool initialize_default_arch_decoder_registry(arch_decoder_registry_t& registry)
             if (!enrolled)
                 std::terminate();
         }
+        arch_decoder_key_t aarch64_key;
+        aarch64_key.architecture = architecture_id_t::aarch64;
+        aarch64_key.mode = architecture_mode_t::aarch64;
+        aarch64_key.endian = endian_t::little;
+        aarch64_key.abi = abi_id_t::windows_arm64;
+        aarch64_key.address_width_bits = 64;
+        auto aarch64 = registry.resolve(aarch64_key);
+        if (!aarch64)
+            std::terminate();
+        arm64ec_delegate_factory = aarch64.value().factory;
+        auto arm64ec = aarch64.take_value();
+        arm64ec.key.architecture = architecture_id_t::arm64ec;
+        arm64ec.key.abi = abi_id_t::windows_arm64ec;
+        arm64ec.implementation_id = "capstone.aarch64.arm64ec";
+        arm64ec.factory = &create_arm64ec_backend;
+        auto enrolled = registry.register_decoder(arm64ec);
+        if (!enrolled)
+            std::terminate();
     } catch (...) {
         std::terminate();
     }

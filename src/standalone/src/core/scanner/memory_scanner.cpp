@@ -1,4 +1,6 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #include "memory_scanner.hpp"
@@ -116,6 +118,14 @@ bool validate_target_binding(uint32_t pid, uint64_t epoch,
 		identity.process.pid == pid &&
 		identity.process.creation_time_100ns == process_creation_time_100ns &&
 		target_binding_current(pid, epoch);
+}
+
+static bool transaction_target_current(uint32_t pid, uint64_t epoch,
+	const live_target_identity_t& identity, const char* operation) {
+	return target_binding_current(pid, epoch) &&
+		g_state.observed_target_creation_time_100ns.load(std::memory_order_acquire) ==
+			identity.process.creation_time_100ns &&
+		validate_attached_identity(identity, operation) && target_binding_current(pid, epoch);
 }
 
 static std::string scanner_target_key(const live_target_identity_t& identity) {
@@ -1192,30 +1202,69 @@ static void freeze_loop() {
 		}
 		for (auto& p : snapshot) {
 			if (!st.freeze_active.load()) break;
-			if (!target_binding_current(p.pid, p.epoch) ||
-				!validate_attached_identity(p.identity, "freeze_write")) {
-				std::lock_guard<std::mutex> lk(st.address_mutex);
-				for (auto& entry : st.address_list)
-					if (entry.address == p.address && entry.target_pid == p.pid &&
-						entry.target_epoch == p.epoch &&
-						same_target_identity(entry.target_identity, p.identity))
-						entry.frozen = false;
+			std::unique_lock<std::mutex> entry_lock(st.address_mutex);
+			auto entry = std::find_if(st.address_list.begin(), st.address_list.end(),
+				[&](const address_entry_t& candidate) {
+					return candidate.address == p.address && candidate.target_pid == p.pid &&
+						candidate.target_epoch == p.epoch && candidate.frozen &&
+						candidate.freeze_value == p.bytes &&
+						same_target_identity(candidate.target_identity, p.identity);
+				});
+			if (entry == st.address_list.end()) continue;
+			auto disable_entry = [&]() { entry->frozen = false; };
+			if (!transaction_target_current(p.pid, p.epoch, p.identity,
+					"freeze_before_original_read")) {
+				disable_entry();
 				continue;
 			}
 			std::vector<uint8_t> before;
-			if (!driver_bridge::read_memory(p.address, p.bytes.size(), before) ||
-				before.size() != p.bytes.size() ||
-				!driver_bridge::write_memory(p.address, p.bytes))
+			const bool original_read = driver_bridge::read_memory(p.address, p.bytes.size(), before);
+			if (!transaction_target_current(p.pid, p.epoch, p.identity,
+					"freeze_after_original_read") || !original_read ||
+				before.size() != p.bytes.size()) {
+				disable_entry();
 				continue;
-			std::vector<uint8_t> readback;
-			if (!target_binding_current(p.pid, p.epoch) ||
-				!validate_attached_identity(p.identity, "freeze_readback") ||
-				!driver_bridge::read_memory(p.address, p.bytes.size(), readback) ||
-				readback != p.bytes) {
-				if (target_binding_current(p.pid, p.epoch) &&
-					validate_attached_identity(p.identity, "freeze_rollback"))
-					static_cast<void>(driver_bridge::write_memory(p.address, before));
 			}
+			if (!transaction_target_current(p.pid, p.epoch, p.identity,
+					"freeze_before_write")) {
+				disable_entry();
+				continue;
+			}
+			const bool write_ok = driver_bridge::write_memory(p.address, p.bytes);
+			const bool identity_after_write = transaction_target_current(p.pid, p.epoch,
+				p.identity, "freeze_after_write");
+			std::vector<uint8_t> readback;
+			bool verified = false;
+			if (write_ok && identity_after_write &&
+				transaction_target_current(p.pid, p.epoch, p.identity,
+					"freeze_before_verify_read")) {
+				const bool verify_read = driver_bridge::read_memory(p.address, p.bytes.size(), readback);
+				verified = transaction_target_current(p.pid, p.epoch, p.identity,
+					"freeze_after_verify_read") && verify_read && readback == p.bytes;
+			}
+			if (verified) continue;
+			bool rollback_verified = false;
+			if (transaction_target_current(p.pid, p.epoch, p.identity,
+					"freeze_before_rollback_write")) {
+				const bool rollback_write = driver_bridge::write_memory(p.address, before);
+				const bool identity_after_rollback_write = transaction_target_current(p.pid,
+					p.epoch, p.identity, "freeze_after_rollback_write");
+				if (rollback_write && identity_after_rollback_write &&
+					transaction_target_current(p.pid, p.epoch, p.identity,
+						"freeze_before_rollback_read")) {
+					std::vector<uint8_t> rollback_readback;
+					const bool rollback_read = driver_bridge::read_memory(p.address,
+						before.size(), rollback_readback);
+					rollback_verified = transaction_target_current(p.pid, p.epoch, p.identity,
+						"freeze_after_rollback_read") && rollback_read &&
+						rollback_readback == before;
+				}
+			}
+			diag::log_tagged_fmt("mem_scanner",
+				"freeze_transaction_failed addr=0x%llX write_ok=%d identity_after_write=%d rollback_verified=%d",
+				static_cast<unsigned long long>(p.address), static_cast<int>(write_ok),
+				static_cast<int>(identity_after_write), static_cast<int>(rollback_verified));
+			disable_entry();
 		}
 		if (!snapshot.empty()) Sleep(10);
 		else Sleep(100);
@@ -2280,9 +2329,12 @@ void freeze_address(size_t index, bool enable) {
 	if (index < st.address_list.size()) {
 		auto& e = st.address_list[index];
 		e.frozen = enable && identity_valid && e.target_pid == target_identity.process.pid &&
-			e.target_epoch == epoch && same_target_identity(e.target_identity, target_identity);
-		if (e.frozen && !e.last_value.empty())
+			e.target_epoch == epoch && !e.last_value.empty() &&
+			same_target_identity(e.target_identity, target_identity);
+		if (e.frozen)
 			e.freeze_value = e.last_value;
+		else
+			e.freeze_value.clear();
 		diag::log_tagged_fmt("mem_scanner", "freeze_address addr=0x%llX enable=%d has_value=%d",
 			static_cast<unsigned long long>(e.address), static_cast<int>(enable),
 			static_cast<int>(!e.freeze_value.empty()));
@@ -2292,14 +2344,26 @@ void freeze_address(size_t index, bool enable) {
 	}
 }
 
-void write_value(uint64_t address, value_type_t type, const std::string& value_text, bool hex) {
+write_transaction_result_t write_value_exact(uint64_t address, value_type_t type,
+	const std::string& value_text, bool hex, uint32_t expected_pid,
+	uint64_t expected_process_creation_time_100ns) {
+	write_transaction_result_t result;
 	live_target_identity_t target_identity;
 	if (!capture_attached_identity(target_identity, "write_value")) {
 		diag::log_tagged_fmt("mem_scanner", "write_value refused_not_attached addr=0x%llX",
 			static_cast<unsigned long long>(address));
-		return;
+		result.error = "No verified live target is attached.";
+		return result;
 	}
 	const uint32_t pid = target_identity.process.pid;
+	result.target_pid = pid;
+	result.process_creation_time_100ns = target_identity.process.creation_time_100ns;
+	if ((expected_pid != 0 && expected_pid != pid) ||
+		(expected_process_creation_time_100ns != 0 &&
+		 expected_process_creation_time_100ns != target_identity.process.creation_time_100ns)) {
+		result.error = "The attached process identity changed before the write transaction.";
+		return result;
+	}
 	const uint64_t epoch = observe_target_identity(target_identity);
 	{
 		std::lock_guard<std::mutex> lock(g_state.address_mutex);
@@ -2310,33 +2374,112 @@ void write_value(uint64_t address, value_type_t type, const std::string& value_t
 		if (entry != g_state.address_list.end() &&
 			(entry->target_pid != pid || entry->target_epoch != epoch ||
 				!same_target_identity(entry->target_identity, target_identity))) {
-			diag::log_tagged_fmt("mem_scanner", "write_value refused_stale_target addr=0x%llX entry_pid=%u current_pid=%u",
-				static_cast<unsigned long long>(address), entry->target_pid, pid);
-			return;
+				diag::log_tagged_fmt("mem_scanner", "write_value refused_stale_target addr=0x%llX entry_pid=%u current_pid=%u",
+					static_cast<unsigned long long>(address), entry->target_pid, pid);
+			result.error = "The address-list entry belongs to a stale target identity.";
+			return result;
 		}
 	}
 	auto bytes = parse_value(value_text, type, hex);
 	if (bytes.empty()) {
 		diag::log_tagged_fmt("mem_scanner", "write_value parse_failed addr=0x%llX text='%s' hex=%d",
 			static_cast<unsigned long long>(address), value_text.c_str(), static_cast<int>(hex));
-		return;
+		result.error = "The requested value is invalid for its type.";
+		return result;
 	}
 	std::vector<std::uint8_t> previous;
-	const bool read_ok = driver_bridge::read_memory(address, bytes.size(), previous) &&
+	if (!transaction_target_current(pid, epoch, target_identity,
+			"write_value_before_original_read")) {
+		diag::log_tagged_fmt("mem_scanner",
+			"write_value refused_identity_before_read addr=0x%llX",
+			static_cast<unsigned long long>(address));
+		result.error = "The target identity changed before the original read.";
+		return result;
+	}
+	const bool original_read = driver_bridge::read_memory(address, bytes.size(), previous);
+	const bool identity_after_original_read = transaction_target_current(pid, epoch,
+		target_identity, "write_value_after_original_read");
+	result.original_read_ok = identity_after_original_read && original_read &&
 		previous.size() == bytes.size();
-	bool ok = target_binding_current(pid, epoch) &&
-		validate_attached_identity(target_identity, "write_value_commit") &&
-		driver_bridge::write_memory(address, bytes);
+	if (result.original_read_ok) result.original_bytes = previous;
+	if (!result.original_read_ok) {
+		diag::log_tagged_fmt("mem_scanner",
+			"write_value refused_original_read addr=0x%llX read_ok=%d size=%zu expected=%zu",
+			static_cast<unsigned long long>(address), static_cast<int>(original_read),
+			previous.size(), bytes.size());
+		result.error = "The original bytes could not be read from the exact target.";
+		return result;
+	}
+	if (!transaction_target_current(pid, epoch, target_identity,
+			"write_value_before_write")) {
+		diag::log_tagged_fmt("mem_scanner",
+			"write_value refused_identity_before_write addr=0x%llX",
+			static_cast<unsigned long long>(address));
+		result.error = "The target identity changed immediately before the write.";
+		return result;
+	}
+	result.write_attempted = true;
+	const bool write_ok = driver_bridge::write_memory(address, bytes);
+	result.write_ok = write_ok;
+	const bool identity_after_write = transaction_target_current(pid, epoch, target_identity,
+		"write_value_after_write");
 	std::vector<std::uint8_t> readback;
-	ok = ok && target_binding_current(pid, epoch) &&
-		validate_attached_identity(target_identity, "write_value_readback") &&
-		driver_bridge::read_memory(address, bytes.size(), readback) && readback == bytes;
-	if (!ok && read_ok && target_binding_current(pid, epoch) &&
-		validate_attached_identity(target_identity, "write_value_rollback"))
-		static_cast<void>(driver_bridge::write_memory(address, previous));
-	diag::log_tagged_fmt("mem_scanner", "write_value addr=0x%llX size=%zu type=%s ok=%d",
+	bool verified = false;
+	if (write_ok && identity_after_write &&
+		transaction_target_current(pid, epoch, target_identity,
+			"write_value_before_verify_read")) {
+		const bool verify_read = driver_bridge::read_memory(address, bytes.size(), readback);
+		const bool identity_after_verify_read = transaction_target_current(pid, epoch,
+			target_identity, "write_value_after_verify_read");
+		result.readback_ok = identity_after_verify_read && verify_read &&
+			readback.size() == bytes.size();
+		if (result.readback_ok) result.readback_bytes = readback;
+		verified = result.readback_ok && readback == bytes;
+	}
+	result.verified = verified;
+	bool rollback_attempted = false;
+	bool rollback_verified = false;
+	if (!verified && transaction_target_current(pid, epoch, target_identity,
+			"write_value_before_rollback_write")) {
+		rollback_attempted = true;
+		result.rollback_attempted = true;
+		const bool rollback_write = driver_bridge::write_memory(address, previous);
+		result.rollback_write_ok = rollback_write;
+		const bool identity_after_rollback_write = transaction_target_current(pid, epoch,
+			target_identity, "write_value_after_rollback_write");
+		if (rollback_write && identity_after_rollback_write &&
+			transaction_target_current(pid, epoch, target_identity,
+				"write_value_before_rollback_read")) {
+			std::vector<std::uint8_t> rollback_readback;
+			const bool rollback_read = driver_bridge::read_memory(address, previous.size(),
+				rollback_readback);
+			const bool identity_after_rollback_read = transaction_target_current(pid, epoch,
+				target_identity, "write_value_after_rollback_read");
+			result.rollback_readback_ok = identity_after_rollback_read && rollback_read &&
+				rollback_readback.size() == previous.size();
+			if (result.rollback_readback_ok)
+				result.rollback_readback_bytes = rollback_readback;
+			rollback_verified = result.rollback_readback_ok &&
+				rollback_readback == previous;
+		}
+	}
+	result.rollback_verified = rollback_verified;
+	if (!verified) {
+		result.error = rollback_verified
+			? "The write could not be verified; the original bytes were restored and verified."
+			: "The write could not be verified and restoration could not be verified.";
+	}
+	diag::log_tagged_fmt("mem_scanner",
+		"write_value addr=0x%llX size=%zu type=%s write_ok=%d identity_after_write=%d verified=%d rollback_attempted=%d rollback_verified=%d",
 		static_cast<unsigned long long>(address), bytes.size(),
-		value_type_name(type), static_cast<int>(ok));
+		value_type_name(type), static_cast<int>(write_ok),
+		static_cast<int>(identity_after_write), static_cast<int>(verified),
+		static_cast<int>(rollback_attempted), static_cast<int>(rollback_verified));
+	return result;
+}
+
+void write_value(uint64_t address, value_type_t type, const std::string& value_text, bool hex) {
+	static_cast<void>(write_value_exact(address, type, value_text, hex, 0, 0));
 }
 
 std::string read_value_string(uint64_t address, value_type_t type) {

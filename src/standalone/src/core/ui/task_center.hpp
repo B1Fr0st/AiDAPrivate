@@ -162,6 +162,9 @@ void refresh();
 immutable_snapshot_ptr snapshot();
 status_summary_t status_summary();
 void clear_memory_history();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+void clear_preview_state();
+#endif
 void register_views(view_registry_t& registry);
 void render_tasks_view(const view_render_context_t& context);
 void render_diagnostics_view(const view_render_context_t& context);

@@ -3745,6 +3745,16 @@ workspace_result_t<void> configure_connection(sqlite3* database,
     return workspace_result_t<void>::success();
 }
 
+int final_passive_checkpoint(sqlite3* database) noexcept {
+    int status = sqlite3_wal_checkpoint_v2(
+        database, "main", SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+    if (status == SQLITE_INTERRUPT && sqlite3_is_interrupted(database) == 0) {
+        status = sqlite3_wal_checkpoint_v2(
+            database, "main", SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+    }
+    return status;
+}
+
 }
 
 struct workspace_database_t::connection_state_t {
@@ -3773,7 +3783,7 @@ struct workspace_database_t::connection_state_t {
         std::lock_guard<std::mutex> lock(close_mutex);
         std::lock_guard<std::timed_mutex> writer_lock(writer_mutex);
         if (writer) {
-            sqlite3_wal_checkpoint_v2(writer, "main", SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+            final_passive_checkpoint(writer);
             sqlite3_close_v2(writer);
             writer = nullptr;
         }
@@ -8249,11 +8259,13 @@ workspace_database_t::drain(std::chrono::steady_clock::time_point deadline) {
     std::lock_guard<std::mutex> lock(state_->close_mutex);
     std::lock_guard<std::timed_mutex> writer_lock(state_->writer_mutex);
     if (state_->writer) {
-        const int checkpoint_status = sqlite3_wal_checkpoint_v2(
-            state_->writer, "main", SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+        const int checkpoint_status = final_passive_checkpoint(state_->writer);
         if (checkpoint_status != SQLITE_OK && checkpoint_status != SQLITE_BUSY) {
             return workspace_result_t<void>::failure(database_error(state_->writer,
-                checkpoint_status, "final passive WAL checkpoint failed",
+                checkpoint_status,
+                "final passive WAL checkpoint failed with SQLite status " +
+                    std::to_string(checkpoint_status) + " (" +
+                    sqlite3_errstr(checkpoint_status) + ")",
                 "workspace_database.close"));
         }
         const int close_status = sqlite3_close_v2(state_->writer);

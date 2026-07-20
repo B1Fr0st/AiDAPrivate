@@ -34,7 +34,9 @@ private:
 	print_c_capability_t();
 
 public:
+	void initialize() override;
 	ghidra::PrintLanguage* buildLanguage(ghidra::Architecture* glb) override;
+	static void ensure_registered();
 };
 
 }

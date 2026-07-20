@@ -61,6 +61,7 @@ struct view_state_t
     int     throttle_ms          = 0;
     char    name[128]            = "Collection";
     char    raw_request[8192]    = {};
+    std::uint64_t raw_request_generation = 1;
     bool    use_raw_request      = false;
 
     uint64_t selected_id   = 0;
@@ -162,13 +163,29 @@ bool open_new_collection_with(const std::string& url, const std::string& host,
         reason = "Sequencer requires a URL, host, port, and non-empty request.";
         return false;
     }
+    if (url.size() >= sizeof(g_view_state.url) ||
+        network_view::human_request_editor::contains_binary_bytes(url)) {
+        reason = "Sequencer requires a valid UTF-8 text URL shorter than 1024 bytes.";
+        return false;
+    }
+    if (host.size() >= sizeof(g_view_state.host) ||
+        network_view::human_request_editor::contains_binary_bytes(host)) {
+        reason = "Sequencer requires a valid UTF-8 text host shorter than 256 bytes.";
+        return false;
+    }
+    if (raw_request.size() >= sizeof(g_view_state.raw_request) ||
+        network_view::human_request_editor::contains_binary_bytes(raw_request)) {
+        reason = "Sequencer requires a valid UTF-8 text request of at most 8191 bytes.";
+        return false;
+    }
     std::snprintf(g_view_state.url, sizeof(g_view_state.url), "%s", url.c_str());
     std::snprintf(g_view_state.host, sizeof(g_view_state.host), "%s", host.c_str());
     g_view_state.port = port;
     g_view_state.use_tls = use_tls;
-    const std::size_t count = (std::min)(raw_request.size(), sizeof(g_view_state.raw_request) - 1U);
-    std::memcpy(g_view_state.raw_request, raw_request.data(), count);
-    g_view_state.raw_request[count] = '\0';
+    std::memcpy(g_view_state.raw_request, raw_request.data(), raw_request.size());
+    g_view_state.raw_request[raw_request.size()] = '\0';
+    if (++g_view_state.raw_request_generation == 0)
+        ++g_view_state.raw_request_generation;
     g_view_state.use_raw_request = true;
     reason.clear();
     return true;
@@ -285,8 +302,13 @@ void render(float pos_x, float pos_y, float width, float height,
         request_config.stable_id = "sequencer-raw-request";
         request_config.size = ImVec2(cfg_w - 24.f, 120.f);
         request_config.max_bytes = sizeof(g_view_state.raw_request) - 1;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        request_config.semantic_parent_id = "aida.dock-window.view.network.sequencer";
+#endif
         request_editor_result = network_view::human_request_editor::render_fixed(
-            request_editor, "sequencer.raw-request", g_view_state.raw_request,
+            request_editor,
+            "sequencer.raw-request." + std::to_string(g_view_state.raw_request_generation),
+            g_view_state.raw_request,
             request_config);
     }
 

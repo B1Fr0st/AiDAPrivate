@@ -835,6 +835,17 @@ void clear_memory_history() {
     publish_locked(store, now_ms());
 }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+void clear_preview_state() {
+    state_t& store = state();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    store.records.clear();
+    store.diagnostics.clear();
+    store.next_refresh_ms.store(0, std::memory_order_release);
+    publish_locked(store, now_ms());
+}
+#endif
+
 void register_views(view_registry_t& registry) {
     view_descriptor_t tasks;
     tasks.id = stable_view_id_t("view.background_tasks");

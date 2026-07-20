@@ -669,6 +669,60 @@ bool preset_default_opens_view(workspace_preset_t preset,
     return false;
 }
 
+void draw_transition_surface(ImVec2 position, ImVec2 size,
+    workspace_preset_t preset) noexcept
+{
+    if (size.x <= 0.0f || size.y <= 0.0f || ImGui::GetCurrentContext() == nullptr)
+        return;
+    const ImVec2 maximum(position.x + size.x, position.y + size.y);
+    ImGui::SetNextWindowPos(position, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(1.0f);
+#if defined(IMGUI_HAS_DOCK)
+    if (const ImGuiViewport* viewport = ImGui::GetMainViewport())
+        ImGui::SetNextWindowViewport(viewport->ID);
+#endif
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+#if defined(IMGUI_HAS_DOCK)
+    flags |= ImGuiWindowFlags_NoDocking;
+#endif
+    ImGui::Begin("Workspace Transition###aida.workspace.transition.surface", nullptr, flags);
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    draw_list->AddLine(position, ImVec2(maximum.x, position.y),
+        ImGui::GetColorU32(ImGuiCol_CheckMark), 2.0f);
+    const char* title = "Switching workspace";
+    const char* target = descriptor_for(preset).display_name.data();
+    const char* detail = "Restoring dock layout and views";
+    const ImVec2 title_size = ImGui::CalcTextSize(title);
+    const ImVec2 target_size = ImGui::CalcTextSize(target);
+    const ImVec2 detail_size = ImGui::CalcTextSize(detail);
+    const float line_height = ImGui::GetTextLineHeight();
+    const float spacing = style.ItemSpacing.y;
+    const float block_height = line_height * 3.0f + spacing * 2.0f;
+    float y = position.y + (size.y - block_height) * 0.5f;
+    const auto centered_x = [position, size](float width) noexcept {
+        return position.x + (size.x - width) * 0.5f;
+    };
+    draw_list->AddText(ImVec2(centered_x(title_size.x), y),
+        ImGui::GetColorU32(ImGuiCol_TextDisabled), title);
+    y += line_height + spacing;
+    draw_list->AddText(ImVec2(centered_x(target_size.x), y),
+        ImGui::GetColorU32(ImGuiCol_Text), target);
+    y += line_height + spacing;
+    draw_list->AddText(ImVec2(centered_x(detail_size.x), y),
+        ImGui::GetColorU32(ImGuiCol_TextDisabled), detail);
+    ImGui::End();
+    ImGui::PopStyleVar(3);
+}
+
 }
 
 #if defined(__EMSCRIPTEN__) || defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -703,6 +757,9 @@ struct preview_state_t {
     bool locked = false;
     bool rebuild = false;
     std::uint8_t select_defaults_after_realize_frames = 0;
+    std::uint8_t transition_frames = 0;
+    ImVec2 last_position{0.0f, 0.0f};
+    ImVec2 last_size{0.0f, 0.0f};
 };
 
 void build_preview_recipe(preview_state_t& current, ImGuiID root_dockspace_id,
@@ -813,6 +870,8 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
     preview_state_t& current = preview_state();
     if (!current.initialized || current.root != root_dockspace_id)
         return;
+    current.last_position = position;
+    current.last_size = size;
 #if defined(IMGUI_HAS_DOCK)
     if (!current.root_prepared || current.rebuild) {
         current.active = current.pending;
@@ -846,6 +905,15 @@ bool surfaces_ready() noexcept
 {
     const preview_state_t& current = preview_state();
     return current.initialized && current.root_prepared;
+}
+
+void render_transition_surface() noexcept
+{
+    preview_state_t& current = preview_state();
+    if (current.transition_frames == 0)
+        return;
+    draw_transition_surface(current.last_position, current.last_size, current.pending);
+    --current.transition_frames;
 }
 
 void settle_default_selection() noexcept
@@ -1253,6 +1321,7 @@ workspace_request_result_t switch_to(workspace_preset_t preset) noexcept
     current.pending = preset;
     current.rebuild = current.layouts[preset_index(preset)].empty();
     current.root_prepared = false;
+    current.transition_frames = 2;
     return workspace_request_result_t::completed;
 }
 
@@ -1346,6 +1415,7 @@ workspace_request_result_t load_user_layout_exact(std::string_view name,
         current.active_user = std::move(selected_name);
         current.locked = lock->second;
         current.root_prepared = true;
+        current.transition_frames = 2;
         apply_preview_lock(ImGui::DockBuilderGetNode(current.root), current.locked);
     } catch (...) {
         return workspace_request_result_t::failed;
@@ -1433,6 +1503,7 @@ workspace_request_result_t delete_user_layout(std::string_view name) noexcept
             next.locked = next.layout_locks[preset_index(base_preset)];
             next.rebuild = next.layouts[preset_index(base_preset)].empty();
             next.root_prepared = false;
+            next.transition_frames = 2;
         }
         const std::string removed_identity = has_preset
             ? identity_key(base_preset, value) : std::string{};
@@ -1464,6 +1535,7 @@ workspace_request_result_t restore_builtin(workspace_preset_t preset) noexcept
     current.pending = preset;
     current.rebuild = true;
     current.root_prepared = false;
+    current.transition_frames = 2;
     return workspace_request_result_t::completed;
 }
 
@@ -1589,6 +1661,7 @@ struct state_t {
     bool rebuild_requested = false;
     bool locked = false;
     std::uint8_t select_defaults_after_realize_frames = 0;
+    std::uint8_t transition_frames = 0;
     ImVec2 last_position{0.0f, 0.0f};
     ImVec2 last_size{0.0f, 0.0f};
     ImVec2 rehome_work_position{0.0f, 0.0f};
@@ -3589,6 +3662,7 @@ void process_operation_completion() noexcept
         current.needs_default = result->use_default;
         current.rebuild_requested = result->use_default;
         current.root_prepared = false;
+        current.transition_frames = 1;
         current.recovered_from_backup = false;
         current.preserve_recovery_backup = false;
         if (result->kind == operation_kind_t::restore_preset)
@@ -3866,6 +3940,15 @@ bool surfaces_ready() noexcept
 {
     const state_t& current = state();
     return current.initialized && current.root_prepared;
+}
+
+void render_transition_surface() noexcept
+{
+    state_t& current = state();
+    if (current.transition_frames == 0)
+        return;
+    draw_transition_surface(current.last_position, current.last_size, current.pending);
+    --current.transition_frames;
 }
 
 void settle_default_selection() noexcept

@@ -13,8 +13,6 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
-#include <fstream>
-#include <iterator>
 #include <limits>
 #include <memory>
 #include <string_view>
@@ -36,6 +34,7 @@ using python_worker::wire::session_material_t;
 
 constexpr std::uint32_t k_manifest_magic = 0x4d575041U;
 constexpr std::size_t k_manifest_max_bytes = 64U * 1024U;
+constexpr std::size_t k_manifest_digest_max_bytes = 256U;
 constexpr std::size_t k_worker_max_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr std::size_t k_manifest_string_max_bytes = 4096;
 constexpr std::uint32_t k_workspace_request_id_max = 1000000;
@@ -251,15 +250,31 @@ private:
 bool read_locked_file(const std::filesystem::path& path, std::size_t maximum_bytes, handle_t& handle,
                       std::vector<std::uint8_t>& output, DWORD& error) {
     handle.reset(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
     if (!handle) {
         error = GetLastError();
         return false;
     }
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (!GetFileInformationByHandle(handle.get(), &information)) {
+        error = GetLastError();
+        return false;
+    }
+    if ((information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        error = ERROR_INVALID_NAME;
+        return false;
+    }
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(handle.get(), &size) || size.QuadPart < 0 ||
-        static_cast<std::uint64_t>(size.QuadPart) > maximum_bytes) {
-        error = size.QuadPart < 0 ? ERROR_FILE_INVALID : ERROR_FILE_TOO_LARGE;
+    if (!GetFileSizeEx(handle.get(), &size)) {
+        error = GetLastError();
+        return false;
+    }
+    if (size.QuadPart < 0) {
+        error = ERROR_FILE_INVALID;
+        return false;
+    }
+    if (static_cast<std::uint64_t>(size.QuadPart) > maximum_bytes) {
+        error = ERROR_FILE_TOO_LARGE;
         return false;
     }
     try {
@@ -273,8 +288,12 @@ bool read_locked_file(const std::filesystem::path& path, std::size_t maximum_byt
         const DWORD chunk = static_cast<DWORD>((std::min)(output.size() - offset,
             static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
         DWORD read = 0;
-        if (!ReadFile(handle.get(), output.data() + offset, chunk, &read, nullptr) || read == 0) {
+        if (!ReadFile(handle.get(), output.data() + offset, chunk, &read, nullptr)) {
             error = GetLastError();
+            return false;
+        }
+        if (read == 0) {
+            error = ERROR_HANDLE_EOF;
             return false;
         }
         offset += read;
@@ -967,6 +986,13 @@ python_worker_launch_contract_resolution_t resolve_python_worker_launch_contract
         result.error = "analysis Python worker package root is not a regular directory";
         return result;
     }
+    handle_t root_handle(CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    const auto root_path = root_handle ? final_path(root_handle.get()) : std::nullopt;
+    if (!root_path) {
+        result.error = "analysis Python worker package root cannot be canonicalized";
+        return result;
+    }
     const auto manifest_path = root / std::filesystem::path(
         std::string(k_python_worker_manifest_artifact_relative_path));
     const auto digest_path = root / std::filesystem::path(
@@ -977,18 +1003,26 @@ python_worker_launch_contract_resolution_t resolve_python_worker_launch_contract
         result.error = "analysis Python worker manifest digest is unavailable";
         return result;
     }
-    std::ifstream input(digest_path, std::ios::binary);
-    if (!input) {
-        result.error = "analysis Python worker manifest digest cannot be opened";
+    handle_t digest_file;
+    std::vector<std::uint8_t> digest_bytes;
+    DWORD error = ERROR_SUCCESS;
+    if (!read_locked_file(digest_path, k_manifest_digest_max_bytes, digest_file,
+            digest_bytes, error)) {
+        result.error = error == ERROR_FILE_TOO_LARGE
+            ? "analysis Python worker manifest digest exceeds the size limit"
+            : "analysis Python worker manifest digest cannot be read";
         return result;
     }
-    std::string encoded((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    if (!input.eof() || encoded.size() > 256U) {
-        result.error = "analysis Python worker manifest digest is invalid";
+    const auto digest_final_path = final_path(digest_file.get());
+    if (!digest_final_path || !path_within(*root_path, *digest_final_path)) {
+        result.error = "analysis Python worker manifest digest is outside the package root";
         return result;
     }
     python_worker::wire::digest_t expected_manifest_hash;
-    if (!decode_hex_digest(encoded, expected_manifest_hash)) {
+    const char* digest_data = digest_bytes.empty()
+        ? "" : reinterpret_cast<const char*>(digest_bytes.data());
+    if (!decode_hex_digest(std::string_view(digest_data, digest_bytes.size()),
+            expected_manifest_hash)) {
         result.error = "analysis Python worker manifest digest is malformed";
         return result;
     }

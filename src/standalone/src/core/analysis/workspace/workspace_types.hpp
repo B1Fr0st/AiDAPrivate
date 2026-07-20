@@ -37,7 +37,8 @@ enum class format_id_t : std::uint8_t {
     dex = 12,
     oat = 13,
     vdex = 14,
-    classfile = 15
+    classfile = 15,
+    raw_code = 16
 };
 
 enum class architecture_id_t : std::uint8_t {
@@ -654,7 +655,7 @@ inline workspace_result_t<void> validate_workspace_image(
     if (!stopped)
         return stopped;
     if (image.schema_version == 0 || image.format == format_id_t::unknown ||
-        image.format > format_id_t::classfile ||
+        image.format > format_id_t::raw_code ||
         image.architecture == architecture_id_t::unknown ||
         image.architecture > architecture_id_t::dalvik_bytecode ||
         image.architecture_mode == architecture_mode_t::unknown ||

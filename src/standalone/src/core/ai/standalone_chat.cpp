@@ -8655,7 +8655,7 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
     float cursor_after_label = text_x + ts.x + signin_gap;
     bool signin_clicked = false;
     if (signin_w > 0.f) {
-        ImGui::SetCursorPos(ImVec2(cursor_after_label - wp.x, pmin.y + 2.f - wp.y));
+        ImGui::SetCursorScreenPos(ImVec2(cursor_after_label, pmin.y + 2.f));
         ImGui::SetNextItemAllowOverlap();
         ImGui::PushID("##chat_model_pill_signin");
         ImGui::InvisibleButton("##signin_hit", ImVec2(signin_w, pill_h - 4.f));

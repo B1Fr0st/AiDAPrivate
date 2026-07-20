@@ -2947,15 +2947,6 @@ tool_result_t tool_camoufox_passthrough(const std::string& tool_name, const json
     return out;
 }
 
-struct camoufox_tool_spec_t
-{
-    const char* name;
-    const char* description;
-    std::vector<compat_param_t> params;
-    bool read_only;
-    int timeout_ms;
-};
-
 struct camoufox_action_entry_t
 {
     const char* action;
@@ -3255,10 +3246,13 @@ tool_result_t tool_browser_instrumentation(const json& params)
         actions, sizeof(actions) / sizeof(actions[0]));
 }
 
-std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
+}
+
+void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
 {
-    return {
-        {"browser_lifecycle", "Consolidated Camoufox lifecycle management. Set action to launch, close, list, new, select, or close_page.",
+    register_compat(srv, {
+        "browser_lifecycle", "camoufox_reverse",
+        "Consolidated Camoufox lifecycle management. Set action to launch, close, list, new, select, or close_page.",
             {{"action", "string", "launch|close|list|new|select|close_page", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"session_id", "string", "Browser session id", false},
@@ -3287,8 +3281,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"server_executable", "string", "Optional AiDA-owned frozen reverse-MCP executable path", false},
              {"launch_timeout_ms", "number", "Requested launch timeout in milliseconds", false},
              {"window_width", "number", "Initial browser window width", false},
-             {"window_height", "number", "Initial browser window height", false}}, false, 60000},
-        {"browser_navigation", "Consolidated Camoufox navigation operations. Set action to navigate, diagnose, matrix, reload, or wait.",
+             {"window_height", "number", "Initial browser window height", false}},
+        tool_browser_lifecycle,
+        false
+    });
+    register_compat(srv, {
+        "browser_navigation", "camoufox_reverse",
+        "Consolidated Camoufox navigation operations. Set action to navigate, diagnose, matrix, reload, or wait.",
             {{"action", "string", "navigate|diagnose|matrix|reload|wait", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"session_id", "string", "Browser session id", false},
@@ -3309,8 +3308,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"capture_url_pattern", "string", "Network capture URL glob", false},
              {"include_title", "boolean", "Return page title when available", false},
              {"publish_to_burp", "boolean", "Publish observed browser traffic to the Burp event bus; defaults to true", false},
-             {"burp_source", "string", "Source label for published browser exchanges; defaults to browser", false}}, false, 60000},
-        {"browser_interaction", "Consolidated Camoufox interaction operations. Set action to click, type, or evaluate.",
+             {"burp_source", "string", "Source label for published browser exchanges; defaults to browser", false}},
+        tool_browser_navigation,
+        false
+    });
+    register_compat(srv, {
+        "browser_interaction", "camoufox_reverse",
+        "Consolidated Camoufox interaction operations. Set action to click, type, or evaluate.",
             {{"action", "string", "click|type|evaluate", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"session_id", "string", "Browser session id", false},
@@ -3322,8 +3326,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"await_promise", "boolean", "Await promise return values", false},
              {"evaluate_timeout_ms", "number", "Python-side JavaScript evaluation timeout in milliseconds", false},
              {"call_timeout_ms", "number", "End-to-end browser tool timeout in milliseconds, capped by AiDA's browser tool limit", false},
-             {"timeout_ms", "number", "Alias for the end-to-end browser tool timeout", false}}, false, 45000},
-        {"browser_inspect", "Consolidated Camoufox inspection operations. Set action to screenshot, snapshot, or info.",
+             {"timeout_ms", "number", "Alias for the end-to-end browser tool timeout", false}},
+        tool_browser_interaction,
+        false
+    });
+    register_compat(srv, {
+        "browser_inspect", "camoufox_reverse",
+        "Consolidated Camoufox inspection operations. Set action to screenshot, snapshot, or info.",
             {{"action", "string", "screenshot|snapshot|info", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"session_id", "string", "Browser session id", false},
@@ -3332,8 +3341,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"selector", "string", "CSS selector for an element screenshot", false},
              {"save_path", "string", "Optional PNG file path", false},
              {"include_base64", "boolean", "Return bounded inline base64", false},
-             {"max_base64_chars", "number", "Maximum inline base64 characters", false}}, false, 60000},
-        {"browser_state", "Consolidated Camoufox state operations. Set action to cookies, storage, export, import, or reset.",
+             {"max_base64_chars", "number", "Maximum inline base64 characters", false}},
+        tool_browser_inspect,
+        false
+    });
+    register_compat(srv, {
+        "browser_state", "camoufox_reverse",
+        "Consolidated Camoufox state operations. Set action to cookies, storage, export, import, or reset.",
             {{"action", "string", "cookies|storage|export|import|reset", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"session_id", "string", "Browser session id", false},
@@ -3348,8 +3362,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"clear_network_capture", "boolean", "Clear network capture buffer and stop captures", false},
              {"clear_active_routes", "boolean", "Clear instrumentation routes", false},
              {"clear_cookies", "boolean", "Clear browser cookies", false},
-             {"clear_storage", "boolean", "Clear localStorage and sessionStorage", false}}, false, 45000},
-        {"browser_network", "Consolidated Camoufox network operations. Set action to capture, list, get, initiator, intercept, conditional_intercept, delay, search, or search_bodies.",
+             {"clear_storage", "boolean", "Clear localStorage and sessionStorage", false}},
+        tool_browser_state,
+        false
+    });
+    register_compat(srv, {
+        "browser_network", "camoufox_reverse",
+        "Consolidated Camoufox network operations. Set action to capture, list, get, initiator, intercept, conditional_intercept, delay, search, or search_bodies.",
             {{"action", "string", "capture|list|get|initiator|intercept|conditional_intercept|delay|search|search_bodies", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted; use payload.action for capture start, stop, clear, or status", false},
              {"session_id", "string", "Browser session id", false},
@@ -3396,8 +3415,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"burp_source", "string", "Source label for published browser exchanges; defaults to browser", false},
              {"modify_headers", "object", "Headers to add or override", false},
              {"modify_body", "string", "Replacement request body", false},
-             {"mock_response", "object", "Mock response object", false}}, false, 30000},
-        {"browser_hooks", "Consolidated Camoufox hook operations. Set action to hook, init_script, preset, or remove.",
+             {"mock_response", "object", "Mock response object", false}},
+        tool_browser_network,
+        false
+    });
+    register_compat(srv, {
+        "browser_hooks", "camoufox_reverse",
+        "Consolidated Camoufox hook operations. Set action to hook, init_script, preset, or remove.",
             {{"action", "string", "hook|init_script|preset|remove", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted", false},
              {"function_path", "string", "Path such as window.encrypt", false},
@@ -3413,8 +3437,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"script", "string", "JavaScript source", false},
              {"name", "string", "Optional script or preset name", false},
              {"preset", "string", "Built-in hook preset", false},
-             {"keep_persistent", "boolean", "Keep persistent init scripts registered", false}}, false, 45000},
-        {"browser_instrumentation", "Consolidated Camoufox instrumentation operations. Set action to manage, jsvmp, trace, list_files, or query_file.",
+             {"keep_persistent", "boolean", "Keep persistent init scripts registered", false}},
+        tool_browser_hooks,
+        false
+    });
+    register_compat(srv, {
+        "browser_instrumentation", "camoufox_reverse",
+        "Consolidated Camoufox instrumentation operations. Set action to manage, jsvmp, trace, list_files, or query_file.",
             {{"action", "string", "manage|jsvmp|trace|list_files|query_file", true},
              {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted; use payload.action for instrumentation install, status, log, stop, or reload", false},
              {"session_id", "string", "Browser session id", false},
@@ -3449,8 +3478,13 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"search_query", "string", "Trace search query", false},
              {"bucket_ms", "number", "Timeline bucket size", false},
              {"collect_values", "boolean", "Collect property values", false},
-             {"file_path", "string", "Trace JSONL path", false}}, false, 120000},
-        {"browser_service_worker", "Camoufox service-worker diagnostics. Set action to list, get_source, unregister, diagnostic_route, or diagnostic_post_message.",
+             {"file_path", "string", "Trace JSONL path", false}},
+        tool_browser_instrumentation,
+        false
+    });
+    register_compat(srv, {
+        "browser_service_worker", "camoufox_reverse",
+        "Camoufox service-worker diagnostics. Set action to list, get_source, unregister, diagnostic_route, or diagnostic_post_message.",
             {{"action", "string", "list|get_source|unregister|diagnostic_route|diagnostic_post_message", true},
              {"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id", false},
@@ -3461,8 +3495,15 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"modify_body", "string", "Replacement request body for diagnostic_route modify", false},
              {"mock_response", "object", "Mock response for diagnostic_route mock", false},
              {"payload", "object", "Diagnostic postMessage payload", false},
-             {"payload_json", "object", "Alias for diagnostic postMessage payload", false}}, false, 30000},
-        {"browser_fingerprint_spoof", "Camoufox fingerprint spoofing and verification for canvas, WebGL, audio, fonts, timezone, geolocation, screen/viewport, battery, sensors, and navigator consistency.",
+             {"payload_json", "object", "Alias for diagnostic postMessage payload", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("browser_service_worker", params, 30000);
+        },
+        false
+    });
+    register_compat(srv, {
+        "browser_fingerprint_spoof", "camoufox_reverse",
+        "Camoufox fingerprint spoofing and verification for canvas, WebGL, audio, fonts, timezone, geolocation, screen/viewport, battery, sensors, and navigator consistency.",
             {{"action", "string", "canvas_spoof|webgl_spoof|audio_spoof|font_spoof|timezone_spoof|geolocation_spoof|screen_viewport_spoof|battery_spoof|sensors_spoof|navigator_spoof|verify", true},
              {"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id", false},
@@ -3508,76 +3549,92 @@ std::vector<camoufox_tool_spec_t> camoufox_tool_specs()
              {"rtt", "number", "Navigator connection RTT", false},
              {"save_data", "boolean", "Navigator connection saveData", false},
              {"custom", "object", "Action-specific custom spoof configuration", false},
-             {"persistent", "boolean", "Persist init script across navigations", false}}, false, 45000},
-        {"get_console_logs", "Return console output collected from Camoufox pages.",
+             {"persistent", "boolean", "Persist init script across navigations", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("browser_fingerprint_spoof", params, 45000);
+        },
+        false
+    });
+    register_compat(srv, {
+        "get_console_logs", "camoufox_reverse",
+        "Return console output collected from Camoufox pages.",
             {{"session_id", "string", "Browser session id", false},
              {"page_id", "string", "Stable AiDA page id filter", false},
              {"level", "string", "Filter by log, warn, error, or info", false},
              {"keyword", "string", "Filter logs containing this text", false},
-             {"clear", "boolean", "Clear the log buffer after retrieval", false}}, true, 30000},
-        {"scripts", "List loaded scripts, get source for one script, or save a script to disk.",
+             {"clear", "boolean", "Clear the log buffer after retrieval", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("get_console_logs", params, 30000);
+        },
+        true
+    });
+    register_compat(srv, {
+        "scripts", "camoufox_reverse",
+        "List loaded scripts, get source for one script, or save a script to disk.",
             {{"action", "string", "list, get, or save", true},
              {"url", "string", "Script URL for get or save", false},
              {"save_path", "string", "Destination path for save", false},
-             {"page_id", "string", "Stable AiDA page id", false}}, false, 30000},
-        {"search_code", "Search loaded scripts for a keyword.",
+             {"page_id", "string", "Stable AiDA page id", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("scripts", params, 30000);
+        },
+        false
+    });
+    register_compat(srv, {
+        "search_code", "camoufox_reverse",
+        "Search loaded scripts for a keyword.",
             {{"keyword", "string", "Keyword to search for", true},
              {"script_url", "string", "Optional script URL to limit the search", false},
              {"context_chars", "number", "Characters of context around matches", false},
              {"context_lines", "number", "Lines of context around matches", false},
              {"max_results", "number", "Maximum matches", false},
-             {"page_id", "string", "Stable AiDA page id", false}}, true, 30000},
-        {"compare_env", "Collect browser environment fingerprint data for comparison.",
-            {{"properties", "array", "Specific properties to check", false}}, true, 65000},
-        {"check_environment", "Run reverse-MCP dependency, browser, privacy, and runtime state checks.",
-            {{"session_id", "string", "Browser session id", false}}, true, 30000},
-        {"verify_signer_offline", "Verify a candidate JavaScript signing function against captured samples offline.",
+             {"page_id", "string", "Stable AiDA page id", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("search_code", params, 30000);
+        },
+        true
+    });
+    register_compat(srv, {
+        "compare_env", "camoufox_reverse",
+        "Collect browser environment fingerprint data for comparison.",
+        {{"properties", "array", "Specific properties to check", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("compare_env", params, 65000);
+        },
+        true
+    });
+    register_compat(srv, {
+        "check_environment", "camoufox_reverse",
+        "Run reverse-MCP dependency, browser, privacy, and runtime state checks.",
+        {{"session_id", "string", "Browser session id", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("check_environment", params, 30000);
+        },
+        true
+    });
+    register_compat(srv, {
+        "verify_signer_offline", "camoufox_reverse",
+        "Verify a candidate JavaScript signing function against captured samples offline.",
             {{"signer_code", "string", "Candidate signer source", true},
              {"samples", "array", "Request/signature samples", true},
-             {"compare_params", "array", "Parameter names to compare", false}}, true, 30000},
-        {"analyze_cookie_sources", "Attribute observed cookies to HTTP headers or JavaScript writes.",
+             {"compare_params", "array", "Parameter names to compare", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("verify_signer_offline", params, 30000);
+        },
+        true
+    });
+    register_compat(srv, {
+        "analyze_cookie_sources", "camoufox_reverse",
+        "Attribute observed cookies to HTTP headers or JavaScript writes.",
             {{"name_filter", "string", "Optional cookie-name filter", false},
-             {"page_id", "string", "Stable AiDA page id", false}}, true, 30000}
-    };
+             {"page_id", "string", "Stable AiDA page id", false}},
+        [](const json& params) -> tool_result_t {
+            return tool_camoufox_passthrough("analyze_cookie_sources", params, 30000);
+        },
+        true
+    });
 }
 
-}
-
-void register_camoufox_reverse_tools(mcp_standalone::server_t& srv)
-{
-    for (const auto& spec : camoufox_tool_specs())
-    {
-        const std::string tool_name = spec.name;
-        const int timeout_ms = spec.timeout_ms;
-        auto handler = [tool_name, timeout_ms](const json& params) -> tool_result_t {
-            if (tool_name == "browser_lifecycle")
-                return tool_browser_lifecycle(params);
-            if (tool_name == "browser_navigation")
-                return tool_browser_navigation(params);
-            if (tool_name == "browser_interaction")
-                return tool_browser_interaction(params);
-            if (tool_name == "browser_inspect")
-                return tool_browser_inspect(params);
-            if (tool_name == "browser_state")
-                return tool_browser_state(params);
-            if (tool_name == "browser_network")
-                return tool_browser_network(params);
-            if (tool_name == "browser_hooks")
-                return tool_browser_hooks(params);
-            if (tool_name == "browser_instrumentation")
-                return tool_browser_instrumentation(params);
-            return tool_camoufox_passthrough(tool_name, params, timeout_ms);
-        };
-        register_compat(srv, {
-            spec.name,
-            "camoufox_reverse",
-            spec.description,
-            spec.params,
-            handler,
-            spec.read_only
-        });
-    }
-}
 void register_camoufox_tools(mcp_standalone::server_t& srv)
 {
     register_camoufox_reverse_tools(srv);

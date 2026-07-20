@@ -204,11 +204,43 @@ inline void freeze_address(std::size_t index, bool enabled)
 	entry.freeze_value = enabled ? entry.last_value : std::vector<std::uint8_t>{};
 }
 
+inline write_transaction_result_t write_value_exact(std::uint64_t address, value_type_t type,
+	const std::string& text, bool hex, std::uint32_t expected_pid,
+	std::uint64_t expected_process_creation_time_100ns)
+{
+	write_transaction_result_t result;
+	result.target_pid = expected_pid;
+	result.process_creation_time_100ns = expected_process_creation_time_100ns;
+	const auto requested = parse_value(text, type, hex);
+	if (requested.empty()) {
+		result.error = "The requested value is invalid.";
+		return result;
+	}
+	std::lock_guard<std::mutex> lock(g_state.address_mutex);
+	for (auto& entry : g_state.address_list) {
+		if (entry.address != address || entry.value_type != type) continue;
+		if (entry.last_value.size() != requested.size()) {
+			result.error = "The preview original value size does not match the requested type.";
+			return result;
+		}
+		result.original_read_ok = true;
+		result.original_bytes = entry.last_value;
+		result.write_attempted = true;
+		result.write_ok = true;
+		entry.last_value = requested;
+		result.readback_ok = true;
+		result.readback_bytes = entry.last_value;
+		result.verified = result.readback_bytes == requested;
+		if (!result.verified) result.error = "Preview value readback did not match.";
+		return result;
+	}
+	result.error = "The preview address is not present.";
+	return result;
+}
+
 inline void write_value(std::uint64_t address, value_type_t type, const std::string& text, bool hex = false)
 {
-	std::lock_guard<std::mutex> lock(g_state.address_mutex);
-	for (auto& entry : g_state.address_list)
-		if (entry.address == address) entry.last_value = parse_value(text, type, hex);
+	static_cast<void>(write_value_exact(address, type, text, hex, 0, 0));
 }
 
 inline std::string read_value_string(std::uint64_t address, value_type_t type)

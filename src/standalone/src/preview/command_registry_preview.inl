@@ -1,4 +1,5 @@
 #include "../core/ai/command_registry.hpp"
+#include "../core/ui/application_ui_runtime.hpp"
 #include "shell_preview.hpp"
 
 #include <algorithm>
@@ -30,6 +31,43 @@ std::string lower_ascii(std::string value)
 		return static_cast<char>(std::tolower(c));
 	});
 	return value;
+}
+
+std::string trim_copy(const std::string& value)
+{
+	std::size_t first = 0;
+	std::size_t last = value.size();
+	while (first < last && (value[first] == ' ' || value[first] == '\t' ||
+		value[first] == '\r' || value[first] == '\n'))
+		++first;
+	while (last > first && (value[last - 1] == ' ' || value[last - 1] == '\t' ||
+		value[last - 1] == '\r' || value[last - 1] == '\n'))
+		--last;
+	return value.substr(first, last - first);
+}
+
+int fuzzy_score(const std::string& query, const std::string& target)
+{
+	if (query.empty())
+		return 0;
+	std::size_t query_index = 0;
+	std::size_t target_index = 0;
+	int last_match = -1;
+	int gap_penalty = 0;
+	int matched = 0;
+	while (query_index < query.size() && target_index < target.size()) {
+		if (query[query_index] == target[target_index]) {
+			if (last_match >= 0)
+				gap_penalty += static_cast<int>(target_index) - last_match - 1;
+			last_match = static_cast<int>(target_index);
+			++query_index;
+			++matched;
+		}
+		++target_index;
+	}
+	if (query_index < query.size())
+		return -1;
+	return 1000 - gap_penalty - static_cast<int>(target.size()) + matched * 8;
 }
 
 std::vector<command_t>& preview_commands()
@@ -102,6 +140,28 @@ std::vector<command_t>& preview_commands()
 	return value;
 }
 
+void append_application_actions(std::vector<command_t>& result)
+{
+	const auto actions = aida::ui::application_ui::list_actions(
+		aida::ui::action_surface_t::command_palette);
+	result.reserve(result.size() + actions.size());
+	for (const auto& action : actions) {
+		if (!action.visible)
+			continue;
+		command_t command;
+		command.name = std::string("action:") + action.id;
+		command.display_name = action.label;
+		command.description = action.description;
+		command.category = action.category;
+		command.shortcut = action.shortcut;
+		command.application_action_id = action.id;
+		command.disabled_reason = action.disabled_reason;
+		command.source = command_source_t::builtin;
+		command.enabled = action.enabled;
+		result.push_back(std::move(command));
+	}
+}
+
 }
 
 bool initialize()
@@ -120,8 +180,13 @@ bool reindex()
 
 std::vector<command_t> list()
 {
-	std::lock_guard<std::mutex> lock(preview_mutex());
-	return preview_commands();
+	std::vector<command_t> result;
+	{
+		std::lock_guard<std::mutex> lock(preview_mutex());
+		result = preview_commands();
+	}
+	append_application_actions(result);
+	return result;
 }
 
 bool find(const std::string& name, command_t& out)
@@ -143,31 +208,51 @@ bool find(const std::string& name, command_t& out)
 
 std::vector<command_t> fuzzy_search(const std::string& query, int limit)
 {
-	std::lock_guard<std::mutex> lock(preview_mutex());
-	const std::string needle = lower_ascii(query);
-	std::vector<std::pair<int, command_t>> ranked;
-	for (const auto& command : preview_commands()) {
-		const std::string name = lower_ascii(command.name);
+	std::vector<command_t> available;
+	{
+		std::lock_guard<std::mutex> lock(preview_mutex());
+		available = preview_commands();
+	}
+	append_application_actions(available);
+	const std::string needle = lower_ascii(trim_copy(query));
+	if (needle.empty()) {
+		std::sort(available.begin(), available.end(), [](const command_t& lhs,
+			const command_t& rhs) { return lhs.name < rhs.name; });
+		if (limit > 0 && static_cast<int>(available.size()) > limit)
+			available.resize(static_cast<std::size_t>(limit));
+		return available;
+	}
+
+	std::vector<std::pair<int, const command_t*>> ranked;
+	ranked.reserve(available.size());
+	for (const auto& command : available) {
+		const std::string name = lower_ascii(
+			command.display_name.empty() ? command.name : command.display_name);
 		const std::string description = lower_ascii(command.description);
-		int score = 0;
-		if (needle.empty()) score = 1;
-		else if (name == needle) score = 1000;
-		else if (name.rfind(needle, 0) == 0) score = 700;
-		else if (name.find(needle) != std::string::npos) score = 500;
-		else if (description.find(needle) != std::string::npos) score = 250;
-		if (score > 0)
-			ranked.emplace_back(score, command);
+		const std::string category = lower_ascii(command.category);
+		const std::string shortcut = lower_ascii(command.shortcut);
+		int score = fuzzy_score(needle, name);
+		if (score < 0) {
+			const int description_score = fuzzy_score(needle, description);
+			const int category_score = fuzzy_score(needle, category);
+			const int shortcut_score = fuzzy_score(needle, shortcut);
+			if (description_score < 0 && category_score < 0 && shortcut_score < 0)
+				continue;
+			score = (std::max)(description_score - 200,
+				(std::max)(category_score - 120, shortcut_score - 80));
+		}
+		ranked.emplace_back(score, &command);
 	}
 	std::stable_sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
 		if (lhs.first != rhs.first) return lhs.first > rhs.first;
-		return lhs.second.name < rhs.second.name;
+		return lhs.second->name < rhs.second->name;
 	});
-	if (limit < 0) limit = 0;
 	std::vector<command_t> result;
-	const std::size_t count = (std::min)(ranked.size(), static_cast<std::size_t>(limit));
-	result.reserve(count);
-	for (std::size_t i = 0; i < count; ++i)
-		result.push_back(std::move(ranked[i].second));
+	result.reserve(ranked.size());
+	for (const auto& entry : ranked)
+		result.push_back(*entry.second);
+	if (limit > 0 && static_cast<int>(result.size()) > limit)
+		result.resize(static_cast<std::size_t>(limit));
 	return result;
 }
 

@@ -276,8 +276,38 @@ function Get-CppNamespaceRanges([string]$Source, [string]$Mask) {
 
 function Get-CppNamespaceAt([object[]]$Ranges, [int]$Index) {
     $names = @($Ranges | Where-Object { $Index -gt $_.open -and $Index -lt $_.close } |
-        Sort-Object open | ForEach-Object { [string]$_.name })
+        Sort-Object { [int]$_['open'] } | ForEach-Object { [string]$_['name'] })
     return ($names -join '::')
+}
+
+function Test-CppParameterHasTopLevelDefault([string]$Parameter, [string]$Label) {
+    $mask = Get-CppCodeMask $Parameter $Label
+    $round = 0
+    $curly = 0
+    $square = 0
+    for ($index = 0; $index -lt $mask.Length; ++$index) {
+        $character = $mask[$index]
+        switch ($character) {
+            '(' { ++$round; continue }
+            ')' { --$round; if ($round -lt 0) { throw "$Label has unbalanced parentheses" }; continue }
+            '{' { ++$curly; continue }
+            '}' { --$curly; if ($curly -lt 0) { throw "$Label has unbalanced braces" }; continue }
+            '[' { ++$square; continue }
+            ']' { --$square; if ($square -lt 0) { throw "$Label has unbalanced brackets" }; continue }
+        }
+        if ($character -ne '=' -or $round -ne 0 -or $curly -ne 0 -or $square -ne 0) {
+            continue
+        }
+        $previous = if ($index -gt 0) { $mask[$index - 1] } else { [char]0 }
+        $next = if ($index + 1 -lt $mask.Length) { $mask[$index + 1] } else { [char]0 }
+        if ($previous -in @('=', '!', '<', '>', '+', '-', '*', '/', '%', '&', '|', '^') -or
+            $next -eq '=') { continue }
+        return $true
+    }
+    if ($round -ne 0 -or $curly -ne 0 -or $square -ne 0) {
+        throw "$Label has unbalanced delimiters"
+    }
+    return $false
 }
 
 function Get-CppRegistrarDefinitions([string]$Path, [string]$Source, [string]$Mask,
@@ -312,10 +342,28 @@ function Get-CppRegistrarDefinitions([string]$Path, [string]$Source, [string]$Ma
             $namespace + '::' + $declaredName
         }
         $line = Get-LineNumber $Source $match.Index
-        $parameterCount = if ([string]::IsNullOrWhiteSpace($parameters)) {
-            0
+        $parameterParts = if ([string]::IsNullOrWhiteSpace($parameters)) {
+            @()
         } else {
-            @(Split-TopLevel $parameters).Count
+            @(Split-TopLevel $parameters)
+        }
+        $parameterCount = $parameterParts.Count
+        $requiredParameterCount = 0
+        $defaultSeen = $false
+        for ($parameterIndex = 0; $parameterIndex -lt $parameterParts.Count; ++$parameterIndex) {
+            $parameter = [string]$parameterParts[$parameterIndex]
+            if ([string]::IsNullOrWhiteSpace($parameter)) {
+                throw "Registrar definition has an empty parameter: $relative`:$line"
+            }
+            $hasDefault = Test-CppParameterHasTopLevelDefault $parameter `
+                "Registrar parameter $relative`:$line index=$parameterIndex"
+            if ($hasDefault) {
+                $defaultSeen = $true
+            } elseif ($defaultSeen) {
+                throw "Registrar definition has a non-trailing required parameter: $relative`:$line"
+            } else {
+                ++$requiredParameterCount
+            }
         }
         $definitions.Add([ordered]@{
             id = $relative + ':' + $line + ':' + $symbol
@@ -323,6 +371,7 @@ function Get-CppRegistrarDefinitions([string]$Path, [string]$Source, [string]$Ma
             bare_name = ($declaredName -split '::')[-1]
             namespace = $namespace
             parameters = ($parameters -replace '\s+', ' ').Trim()
+            minimum_parameter_count = $requiredParameterCount
             parameter_count = $parameterCount
             file = $relative
             line = $line
@@ -334,36 +383,108 @@ function Get-CppRegistrarDefinitions([string]$Path, [string]$Source, [string]$Ma
     return $definitions.ToArray()
 }
 
+function Test-CppRegistrarAcceptsArgumentCount([object]$Definition, [int]$ArgumentCount) {
+    if (!$Definition.Contains('minimum_parameter_count') -or
+        !$Definition.Contains('parameter_count')) {
+        throw "Registrar definition lacks arity metadata: $($Definition.id)"
+    }
+    $minimum = [int]$Definition['minimum_parameter_count']
+    $maximum = [int]$Definition['parameter_count']
+    if ($minimum -lt 0 -or $maximum -lt $minimum) {
+        throw "Registrar definition has invalid arity metadata: $($Definition.id)"
+    }
+    return $ArgumentCount -ge $minimum -and $ArgumentCount -le $maximum
+}
+
+function Test-CppAnonymousNamespaceSegment([string]$Segment) {
+    return [regex]::IsMatch($Segment, '^<anonymous@[0-9]+>$',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+}
+
+function Test-CppNamespaceContainsAnonymous([string]$Namespace) {
+    return [regex]::IsMatch($Namespace, '(?:^|::)<anonymous@[0-9]+>(?:::|$)',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+}
+
+function Test-CppDefinitionInjectedAtScope([object]$Definition, [string]$CallerFile,
+                                           [string]$Scope) {
+    if (![string]::Equals([string]$Definition.file, $CallerFile,
+            [StringComparison]::Ordinal)) { return $false }
+    $namespace = [string]$Definition.namespace
+    if ([string]::IsNullOrWhiteSpace($namespace)) { return $false }
+    $segments = [Collections.Generic.List[string]]::new()
+    foreach ($segment in @($namespace -split '::')) { $segments.Add($segment) }
+    while ($segments.Count -gt 0 -and
+           (Test-CppAnonymousNamespaceSegment $segments[$segments.Count - 1])) {
+        $segments.RemoveAt($segments.Count - 1)
+        if ([string]::Equals(($segments.ToArray() -join '::'), $Scope,
+                [StringComparison]::Ordinal)) { return $true }
+    }
+    return $false
+}
+
 function Resolve-CppRegistrarTarget([object]$Caller, [string]$Callee,
                                     [object[]]$Definitions, [int]$ArgumentCount) {
     $qualified = $Callee.Contains('::')
-    $prefixes = [Collections.Generic.List[string]]::new()
-    $namespace = [string]$Caller.namespace
-    while (![string]::IsNullOrWhiteSpace($namespace)) {
-        $prefixes.Add($namespace + '::' + $Callee)
-        $separator = $namespace.LastIndexOf('::', [StringComparison]::Ordinal)
-        $namespace = if ($separator -ge 0) { $namespace.Substring(0, $separator) } else { '' }
-    }
-    $prefixes.Add($Callee)
-    foreach ($candidateName in $prefixes) {
-        $matches = @($Definitions | Where-Object {
-            [string]$_.symbol -eq $candidateName -and
-            [int]$_.parameter_count -eq $ArgumentCount
-        })
-        if ($matches.Count -gt 1) {
-            throw "Ambiguous registrar definition for '$Callee' from $($Caller.id)"
+    if ($qualified) {
+        $prefixes = [Collections.Generic.List[string]]::new()
+        $namespace = [string]$Caller.namespace
+        while (![string]::IsNullOrWhiteSpace($namespace)) {
+            $prefixes.Add($namespace + '::' + $Callee)
+            $separator = $namespace.LastIndexOf('::', [StringComparison]::Ordinal)
+            $namespace = if ($separator -ge 0) { $namespace.Substring(0, $separator) } else { '' }
         }
-        if ($matches.Count -eq 1) { return $matches[0] }
+        $prefixes.Add($Callee)
+        foreach ($candidateName in $prefixes) {
+            $matches = @($Definitions | Where-Object {
+                [string]$_.symbol -eq $candidateName -and
+                (Test-CppRegistrarAcceptsArgumentCount $_ $ArgumentCount)
+            })
+            if ($matches.Count -gt 1) {
+                throw "Ambiguous registrar definition for '$Callee' from $($Caller.id)"
+            }
+            if ($matches.Count -eq 1) { return $matches[0] }
+        }
+    } else {
+        $scopes = [Collections.Generic.List[string]]::new()
+        $namespace = [string]$Caller.namespace
+        while (![string]::IsNullOrWhiteSpace($namespace)) {
+            $scopes.Add($namespace)
+            $separator = $namespace.LastIndexOf('::', [StringComparison]::Ordinal)
+            $namespace = if ($separator -ge 0) { $namespace.Substring(0, $separator) } else { '' }
+        }
+        $scopes.Add('')
+        foreach ($scope in $scopes) {
+            $candidateName = if ([string]::IsNullOrWhiteSpace($scope)) {
+                $Callee
+            } else {
+                $scope + '::' + $Callee
+            }
+            $matches = @($Definitions | Where-Object {
+                (Test-CppRegistrarAcceptsArgumentCount $_ $ArgumentCount) -and
+                ([string]$_.symbol -eq $candidateName -or
+                 (Test-CppDefinitionInjectedAtScope $_ ([string]$Caller.file) $scope)) -and
+                [string]$_.bare_name -eq $Callee
+            })
+            if ($matches.Count -gt 1) {
+                $scopeLabel = if ([string]::IsNullOrWhiteSpace($scope)) { '<global>' } else { $scope }
+                throw "Ambiguous registrar definition for '$Callee' at scope '$scopeLabel' from $($Caller.id)"
+            }
+            if ($matches.Count -eq 1) { return $matches[0] }
+        }
     }
     $bare = ($Callee -split '::')[-1]
     $fallback = if ($qualified) {
         @($Definitions | Where-Object {
             (([string]$_.symbol).EndsWith('::' + $Callee, [StringComparison]::Ordinal) -or
-            [string]$_.symbol -eq $Callee) -and [int]$_.parameter_count -eq $ArgumentCount
+            [string]$_.symbol -eq $Callee) -and
+            (Test-CppRegistrarAcceptsArgumentCount $_ $ArgumentCount)
         })
     } else {
         @($Definitions | Where-Object {
-            [string]$_.bare_name -eq $bare -and [int]$_.parameter_count -eq $ArgumentCount
+            [string]$_.bare_name -eq $bare -and
+            (Test-CppRegistrarAcceptsArgumentCount $_ $ArgumentCount) -and
+            !(Test-CppNamespaceContainsAnonymous ([string]$_.namespace))
         })
     }
     if ($fallback.Count -ne 1) {
@@ -389,6 +510,53 @@ function Test-CppRegistrarDeclaration([string]$Mask, [int]$Start, [int]$Close) {
         ')(?:\s+' + $typeToken + ')*$')
 }
 
+function Get-CppRegistrarTerminalIdentity([string]$File, [string]$Mask, [int]$Offset,
+                                          [string]$Label) {
+    if ($Offset -lt 0 -or $Offset -ge $Mask.Length) {
+        throw "$Label has an invalid source offset: $File`:$Offset"
+    }
+    $match = [regex]::Match($Mask.Substring($Offset),
+        '^(?:\.\s*|->\s*)?(?<callee>(?:[A-Za-z_]\w*::)*(?:register|replace)_[A-Za-z0-9_]+)\s*\(')
+    if (!$match.Success) {
+        throw "$Label is not anchored to a registrar call: $File`:$Offset"
+    }
+    $calleeOffset = $Offset + $match.Groups['callee'].Index
+    $open = $Mask.IndexOf('(', $calleeOffset)
+    if ($open -lt 0) {
+        throw "$Label has no registrar argument list: $File`:$Offset"
+    }
+    [void](Get-MatchingIndex $Mask $open '(' ')')
+    return [ordered]@{
+        key = $File + ':' + $calleeOffset
+        callee = [string]$match.Groups['callee'].Value
+        character_offset = $calleeOffset
+    }
+}
+
+function Get-CppPhysicalRegistrationTerminals([object]$Definition, [string]$Mask) {
+    $bodyStart = [int]$Definition.body_start + 1
+    $bodyLength = [int]$Definition.body_end - $bodyStart
+    if ($bodyLength -le 0) { return @() }
+    $terminals = [Collections.Generic.List[object]]::new()
+    $bodyMask = $Mask.Substring($bodyStart, $bodyLength)
+    foreach ($match in [regex]::Matches($bodyMask,
+        '(?:\.|->)\s*(?<callee>(?:register|replace)_tool)\s*\(')) {
+        $offset = $bodyStart + $match.Groups['callee'].Index
+        $open = $Mask.IndexOf('(', $offset)
+        if ($open -lt 0) {
+            throw "Physical registration terminal has no argument list: $($Definition.id)"
+        }
+        [void](Get-MatchingIndex $Mask $open '(' ')')
+        $terminals.Add([ordered]@{
+            key = ([string]$Definition.file) + ':' + $offset
+            callee = [string]$match.Groups['callee'].Value
+            character_offset = $offset
+            line = Get-LineNumber $Mask $offset
+        })
+    }
+    return $terminals.ToArray()
+}
+
 function Get-CppRegistrarCalls([object]$Definition, [string]$Source, [string]$Mask,
                                [object[]]$Definitions,
                                [Collections.Generic.HashSet[string]]$TerminalOffsets,
@@ -405,9 +573,7 @@ function Get-CppRegistrarCalls([object]$Definition, [string]$Source, [string]$Ma
         $callee = [string]$match.Groups['callee'].Value
         $bare = ($callee -split '::')[-1]
         $terminalKey = ([string]$Definition.file) + ':' + $absolute
-        $terminalPreviousKey = ([string]$Definition.file) + ':' + ($absolute - 1)
-        if ($TerminalOffsets.Contains($terminalKey) -or
-            $TerminalOffsets.Contains($terminalPreviousKey)) { continue }
+        if ($TerminalOffsets.Contains($terminalKey)) { continue }
         $immediatePrevious = if ($absolute -gt 0) { $Mask[$absolute - 1] } else { [char]0 }
         $previousIndex = $absolute - 1
         while ($previousIndex -ge 0 -and [char]::IsWhiteSpace($Mask[$previousIndex])) {
@@ -563,7 +729,19 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
     $sources = @{}
     $masks = @{}
     $definitions = [Collections.Generic.List[object]]::new()
+    $graphFiles = [Collections.Generic.List[object]]::new()
+    $graphFilePaths = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
     foreach ($file in $CppFiles) {
+        if ($graphFilePaths.Add([string]$file.FullName)) { $graphFiles.Add($file) }
+    }
+    $standaloneSourceRoot = Join-Path $RepositoryRoot 'src\standalone\src'
+    foreach ($file in @(Get-ChildItem -LiteralPath $standaloneSourceRoot -Recurse -File |
+        Where-Object { $_.Extension -in @('.h', '.hh', '.hpp', '.hxx', '.inl', '.ipp') } |
+        Sort-Object FullName)) {
+        if ($graphFilePaths.Add([string]$file.FullName)) { $graphFiles.Add($file) }
+    }
+    foreach ($file in @($graphFiles | Sort-Object FullName)) {
         $source = Get-Text $file.FullName
         if ($source.IndexOf('register_', [StringComparison]::Ordinal) -lt 0) { continue }
         $relative = Get-Relative $file.FullName
@@ -601,12 +779,84 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
     $queue = [Collections.Generic.Queue[object]]::new()
     $queue.Enqueue($root)
     $edges = [Collections.Generic.List[object]]::new()
+    $edgeSites = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::Ordinal)
     $registrationTerminalOffsets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $registrationTerminalEvidence = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::Ordinal)
+    $registrationProducerSites = [Collections.Generic.Dictionary[string,object]]::new(
+        [StringComparer]::Ordinal)
     foreach ($registration in $Registrations) {
         $offset = [int]$registration.source.character_offset
         if ($offset -ge 0) {
-            [void]$registrationTerminalOffsets.Add(
-                ([string]$registration.source.file) + ':' + $offset)
+            $file = [string]$registration.source.file
+            if ([string]::IsNullOrWhiteSpace([string]$registration.name)) {
+                throw "MCP registration terminal has an empty public name: $file`:$offset"
+            }
+            if (!$sources.ContainsKey($file) -or !$masks.ContainsKey($file)) {
+                throw "MCP registration terminal source is unavailable: $file`:$offset"
+            }
+            $identity = Get-CppRegistrarTerminalIdentity $file $masks[$file] $offset `
+                "MCP registration '$($registration.name)'"
+            $key = [string]$identity['key']
+            $identityCallee = [string]$identity['callee']
+            $identityOffset = [int]$identity['character_offset']
+            if ([int]$registration.source.line -ne
+                (Get-LineNumber $sources[$file] $identityOffset)) {
+                throw "MCP registration terminal line metadata is invalid: $file`:$offset"
+            }
+            $evidence = ([string]$registration.name) + "`t" + $file + "`t" +
+                [int]$registration.source.line + "`t" + $offset + "`t" +
+                ([string]$registration.source.evidence) + "`t" +
+                $identityCallee + "`t" + $identityOffset
+            $identityPrefix = $masks[$file].Substring($offset, $identityOffset - $offset)
+            $memberTerminal = $identityPrefix -match '^(?:\.|->)'
+            $producerTarget = $null
+            if (!$memberTerminal -and
+                ![string]::Equals([string]$registration.source.evidence, 'compat_initializer',
+                    [StringComparison]::Ordinal)) {
+                $owners = @($definitions | Where-Object {
+                    [string]$_.file -eq $file -and
+                    $identityOffset -gt [int]$_.body_start -and
+                    $identityOffset -lt [int]$_.body_end
+                })
+                if ($owners.Count -ne 1) {
+                    throw "MCP registration producer has $($owners.Count) enclosing registrars: $key"
+                }
+                $open = $masks[$file].IndexOf('(', $identityOffset)
+                $close = Get-MatchingIndex $masks[$file] $open '(' ')'
+                $argumentText = $sources[$file].Substring($open + 1, $close - $open - 1)
+                $argumentCount = if ([string]::IsNullOrWhiteSpace($argumentText)) {
+                    0
+                } else {
+                    @(Split-TopLevel $argumentText).Count
+                }
+                $producerTarget = Resolve-CppRegistrarTarget $owners[0] $identityCallee `
+                    $definitions.ToArray() $argumentCount
+            }
+            if ($null -ne $producerTarget) {
+                if ($registrationProducerSites.ContainsKey($key)) {
+                    throw "Duplicate MCP registration producer identity: $key"
+                }
+                $registrationProducerSites[$key] = [ordered]@{
+                    registration = $registration
+                    target_id = [string]$producerTarget.id
+                    target_symbol = [string]$producerTarget.symbol
+                    evidence = $evidence
+                }
+                continue
+            }
+            if ($registrationTerminalEvidence.ContainsKey($key)) {
+                if (![string]::Equals($registrationTerminalEvidence[$key], $evidence,
+                        [StringComparison]::Ordinal)) {
+                    throw "Conflicting MCP registration terminal identity: $key"
+                }
+                throw "Duplicate MCP registration terminal identity: $key"
+            }
+            $registrationTerminalEvidence[$key] = $evidence
+            if (!$registrationTerminalOffsets.Add($key)) {
+                throw "Duplicate MCP registration terminal offset: $key"
+            }
         }
     }
     $productionRouteEntryCall = Get-OwnedCodeCall $StandaloneToolsPath `
@@ -620,6 +870,37 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
     foreach ($key in $registrationTerminalOffsets) {
         [void]$directGraphTerminalOffsets.Add($key)
     }
+    $helperTerminalOwners = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::Ordinal)
+    $physicalTerminalDefinitionOwners = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::Ordinal)
+    $physicalTerminalsByDefinition = @{}
+    foreach ($definition in $definitions) {
+        $definitionId = [string]$definition.id
+        $definitionFile = [string]$definition.file
+        if (!$masks.ContainsKey($definitionFile)) {
+            throw "Registrar terminal source cache is unavailable: $definitionId"
+        }
+        $definitionTerminals = @(Get-CppPhysicalRegistrationTerminals $definition `
+            $masks[$definitionFile])
+        $physicalTerminalsByDefinition[$definitionId] = $definitionTerminals
+        foreach ($terminal in $definitionTerminals) {
+            $physicalKey = [string]$terminal['key']
+            if ($physicalTerminalDefinitionOwners.ContainsKey($physicalKey)) {
+                if (![string]::Equals($physicalTerminalDefinitionOwners[$physicalKey],
+                        $definitionId, [StringComparison]::Ordinal)) {
+                    throw "Physical registration terminal has multiple definition owners: $physicalKey"
+                }
+                throw "Duplicate physical registration terminal identity: $physicalKey"
+            }
+            $physicalTerminalDefinitionOwners[$physicalKey] = $definitionId
+            [void]$directGraphTerminalOffsets.Add($physicalKey)
+        }
+    }
+    $boundRegistrationProducerSites = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    $registrationProducerEdges = [Collections.Generic.Dictionary[string,object]]::new(
+        [StringComparer]::Ordinal)
     [void]$directGraphTerminalOffsets.Add(
         ([string]$productionRouteEntryCall.file) + ':' +
         [int]$productionRouteEntryCall.registrar_character_offset)
@@ -631,13 +912,37 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
         }
         $calls = @(Get-CppRegistrarCalls $caller $sources[$relative] $masks[$relative] `
             $definitions.ToArray() $directGraphTerminalOffsets @{})
-        $localTargets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($edge in $calls) {
-            $targetId = [string]$edge.callee_id
-            if (!$localTargets.Add($targetId)) {
-                throw "Registrar is invoked more than once from one parent: $targetId"
+            if (![string]::Equals([string]$edge.caller_id, [string]$caller.id,
+                    [StringComparison]::Ordinal) -or
+                ![string]::Equals([string]$edge.file, $relative,
+                    [StringComparison]::Ordinal)) {
+                throw "Registrar call-site ownership metadata is invalid: $($caller.id)"
             }
-            if ($targetId -eq [string]$root.id -or $parents.ContainsKey($targetId)) {
+            $edgeOffset = [int]$edge.character_offset
+            $edgeLine = [int]$edge.line
+            if ($edgeOffset -le [int]$caller.body_start -or
+                $edgeOffset -ge [int]$caller.body_end -or
+                $edgeLine -ne (Get-LineNumber $sources[$relative] $edgeOffset) -or
+                [string]::IsNullOrWhiteSpace([string]$edge.expression)) {
+                throw "Registrar call-site location metadata is invalid: $($caller.id)"
+            }
+            $siteKey = $relative + ':' + $edgeOffset
+            $siteEvidence = ([string]$edge.caller_id) + "`t" +
+                ([string]$edge.callee_id) + "`t" + ([string]$edge.callee_symbol) + "`t" +
+                $relative + "`t" + $edgeLine + "`t" + $edgeOffset + "`t" +
+                ([string]$edge.expression)
+            if ($edgeSites.ContainsKey($siteKey)) {
+                if (![string]::Equals([string]$edgeSites[$siteKey], $siteEvidence,
+                        [StringComparison]::Ordinal)) {
+                    throw "Conflicting registrar call-site evidence: $siteKey"
+                }
+                throw "Duplicate registrar call-site evidence: $siteKey"
+            }
+            $edgeSites[$siteKey] = $siteEvidence
+            $targetId = [string]$edge.callee_id
+            if ($targetId -eq [string]$root.id -or
+                $targetId -eq [string]$caller.id) {
                 throw "Registrar has a cycle or multiple production parents: $targetId"
             }
             $targetMatches = @($definitions | Where-Object { [string]$_.id -eq $targetId })
@@ -645,12 +950,186 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
                 throw "Resolved registrar target identity is invalid: $targetId"
             }
             $target = $targetMatches[0]
+            if (![string]::Equals([string]$edge.callee_symbol, [string]$target.symbol,
+                    [StringComparison]::Ordinal)) {
+                throw "Resolved registrar target metadata conflicts with its definition: $targetId"
+            }
+            if ($registrationProducerSites.ContainsKey($siteKey)) {
+                $producer = $registrationProducerSites[$siteKey]
+                if (![string]::Equals([string]$producer['target_id'], $targetId,
+                        [StringComparison]::Ordinal) -or
+                    ![string]::Equals([string]$producer['target_symbol'], [string]$target.symbol,
+                        [StringComparison]::Ordinal)) {
+                    throw "MCP registration producer target conflicts with its graph edge: $siteKey"
+                }
+                if ($registrationProducerEdges.ContainsKey($siteKey)) {
+                    throw "MCP registration producer graph edge is duplicated: $siteKey"
+                }
+                $registrationProducerEdges[$siteKey] = $edge
+            }
+            if ($parents.ContainsKey($targetId)) {
+                if (![string]::Equals([string]$parents[$targetId], [string]$caller.id,
+                        [StringComparison]::Ordinal)) {
+                    throw "Registrar has a cycle or multiple production parents: $targetId"
+                }
+                if (!$reachable.ContainsKey($targetId) -or !$chains.ContainsKey($targetId)) {
+                    throw "Repeated registrar target has inconsistent graph state: $targetId"
+                }
+                $edges.Add($edge)
+                continue
+            }
+            if ($reachable.ContainsKey($targetId) -or $chains.ContainsKey($targetId) -or
+                !$chains.ContainsKey([string]$caller.id)) {
+                throw "Registrar target has inconsistent graph state: $targetId"
+            }
             $parents[$targetId] = [string]$caller.id
             $chains[$targetId] = @($chains[[string]$caller.id]) + @($targetId)
             $reachable[$targetId] = $target
             $edges.Add($edge)
             $queue.Enqueue($target)
         }
+    }
+    if ($registrationProducerEdges.Count -ne $registrationProducerSites.Count) {
+        $missingProducerEdges = @($registrationProducerSites.Keys | Where-Object {
+            !$registrationProducerEdges.ContainsKey($_)
+        } | Sort-Object)
+        throw "MCP registration producers lack exact graph edges: $($missingProducerEdges -join ', ')"
+    }
+    $outgoingEdgesByRegistrar = @{}
+    foreach ($edge in $edges) {
+        $callerId = [string]$edge.caller_id
+        if (!$outgoingEdgesByRegistrar.ContainsKey($callerId)) {
+            $outgoingEdgesByRegistrar[$callerId] = [Collections.Generic.List[object]]::new()
+        }
+        $outgoingEdgesByRegistrar[$callerId].Add($edge)
+    }
+    foreach ($siteKey in @($registrationProducerSites.Keys | Sort-Object)) {
+        $producer = $registrationProducerSites[$siteKey]
+        $producerEdge = $registrationProducerEdges[$siteKey]
+        $helperId = [string]$producer['target_id']
+        if (![string]::Equals([string]$producerEdge.callee_id, $helperId,
+                [StringComparison]::Ordinal)) {
+            throw "MCP registration producer edge target is inconsistent: $siteKey"
+        }
+        $helperMatches = @($definitions | Where-Object { [string]$_.id -eq $helperId })
+        if ($helperMatches.Count -ne 1 -or !$reachable.ContainsKey($helperId)) {
+            throw "MCP registration producer helper is not uniquely reachable: $siteKey"
+        }
+        $helper = $helperMatches[0]
+        $terminalChain = [Collections.Generic.List[string]]::new()
+        $bridgeCalls = [Collections.Generic.List[object]]::new()
+        $visitedChain = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $currentId = $helperId
+        $terminalOwner = $null
+        $physicalTerminals = @()
+        while ($true) {
+            if (!$visitedChain.Add($currentId)) {
+                throw "MCP registration helper chain contains a cycle: $siteKey target=$currentId"
+            }
+            $terminalChain.Add($currentId)
+            $currentMatches = @($definitions | Where-Object { [string]$_.id -eq $currentId })
+            if ($currentMatches.Count -ne 1 -or !$reachable.ContainsKey($currentId) -or
+                !$physicalTerminalsByDefinition.ContainsKey($currentId)) {
+                throw "MCP registration helper chain target is invalid: $siteKey target=$currentId"
+            }
+            $current = $currentMatches[0]
+            $physicalTerminals = @($physicalTerminalsByDefinition[$currentId])
+            $outgoing = @(if ($outgoingEdgesByRegistrar.ContainsKey($currentId)) {
+                $outgoingEdgesByRegistrar[$currentId] | Sort-Object `
+                    @{Expression={[string]$_['file']};Ascending=$true},
+                    @{Expression={[int]$_['character_offset']};Ascending=$true},
+                    @{Expression={[string]$_['callee_id']};Ascending=$true}
+            })
+            if ($physicalTerminals.Count -gt 0) {
+                if ($outgoing.Count -ne 0) {
+                    throw "MCP registration helper has both physical and delegated terminals: $currentId"
+                }
+                $terminalOwner = $current
+                break
+            }
+            if ($outgoing.Count -ne 1) {
+                throw "MCP registration helper chain has $($outgoing.Count) delegated terminals: $currentId"
+            }
+            $bridgeEdge = $outgoing[0]
+            if (![string]::Equals([string]$bridgeEdge.caller_id, $currentId,
+                    [StringComparison]::Ordinal) -or
+                [string]::IsNullOrWhiteSpace([string]$bridgeEdge.expression)) {
+                throw "MCP registration helper bridge call identity is invalid: $currentId"
+            }
+            $nextId = [string]$bridgeEdge.callee_id
+            if ([string]::IsNullOrWhiteSpace($nextId) -or $nextId -eq $currentId) {
+                throw "MCP registration helper bridge target is invalid: $currentId"
+            }
+            $bridgeCalls.Add([ordered]@{
+                caller_id = $currentId
+                callee_id = $nextId
+                callee_symbol = [string]$bridgeEdge.callee_symbol
+                file = [string]$bridgeEdge.file
+                line = [int]$bridgeEdge.line
+                character_offset = [int]$bridgeEdge.character_offset
+                expression = [string]$bridgeEdge.expression
+            })
+            $currentId = $nextId
+        }
+        if ($null -eq $terminalOwner -or $physicalTerminals.Count -eq 0) {
+            throw "MCP registration helper chain has no physical terminal: $siteKey"
+        }
+        $chainIds = $terminalChain.ToArray()
+        $chainHash = Get-OrderedStringListSha256 $chainIds
+        $terminalBindings = [Collections.Generic.List[object]]::new()
+        $terminalOwnerEvidence = $helperId + "`t" + $chainHash
+        foreach ($terminal in @($physicalTerminals | Sort-Object {
+            [int]$_['character_offset']
+        })) {
+            $physicalKey = [string]$terminal['key']
+            if ($registrationTerminalOffsets.Contains($physicalKey)) {
+                throw "Helper physical terminal conflicts with a direct registration: $physicalKey"
+            }
+            if (!$physicalTerminalDefinitionOwners.ContainsKey($physicalKey) -or
+                ![string]::Equals($physicalTerminalDefinitionOwners[$physicalKey],
+                    [string]$terminalOwner.id, [StringComparison]::Ordinal)) {
+                throw "Helper physical terminal definition owner is invalid: $physicalKey"
+            }
+            if ($helperTerminalOwners.ContainsKey($physicalKey) -and
+                ![string]::Equals($helperTerminalOwners[$physicalKey], $terminalOwnerEvidence,
+                    [StringComparison]::Ordinal)) {
+                throw "Helper physical terminal has multiple registrar provenance owners: $physicalKey"
+            }
+            $helperTerminalOwners[$physicalKey] = $terminalOwnerEvidence
+            $terminalBindings.Add([ordered]@{
+                key = $physicalKey
+                file = [string]$terminalOwner.file
+                line = [int]$terminal['line']
+                character_offset = [int]$terminal['character_offset']
+                callee = [string]$terminal['callee']
+                owner_id = [string]$terminalOwner.id
+                owner_symbol = [string]$terminalOwner.symbol
+            })
+        }
+        $registration = $producer['registration']
+        if ($registration.source.Contains('helper_terminal_binding')) {
+            throw "MCP registration producer binding is duplicated: $siteKey"
+        }
+        $registration.source['helper_terminal_binding'] = [ordered]@{
+            producer_key = $siteKey
+            helper_id = $helperId
+            helper_symbol = [string]$helper.symbol
+            chain = $chainIds
+            chain_sha256 = $chainHash
+            bridge_calls = $bridgeCalls.ToArray()
+            terminal_owner_id = [string]$terminalOwner.id
+            terminal_owner_symbol = [string]$terminalOwner.symbol
+            terminals = $terminalBindings.ToArray()
+        }
+        if (!$boundRegistrationProducerSites.Add($siteKey)) {
+            throw "MCP registration producer was bound more than once: $siteKey"
+        }
+    }
+    if ($boundRegistrationProducerSites.Count -ne $registrationProducerSites.Count) {
+        $missingProducerSites = @($registrationProducerSites.Keys | Where-Object {
+            !$boundRegistrationProducerSites.Contains($_)
+        } | Sort-Object)
+        throw "MCP registration producers lack helper terminal bindings: $($missingProducerSites -join ', ')"
     }
 
     $standaloneToolsRelative = Get-Relative $StandaloneToolsPath
@@ -848,6 +1327,8 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
         @($generatedBindings | Where-Object { $_.branch -eq 'extension' }).Count -ne 4) {
         throw 'C03 generated per-name reachability partition is invalid'
     }
+    $generatedBindingsSorted = @($generatedBindings | Sort-Object `
+        @{ Expression = { [string]$_['name'] }; Ascending = $true })
     $generatedRouteLines = [Collections.Generic.List[string]]::new()
     foreach ($node in $generatedRouteNodes) {
         $generatedRouteLines.Add('R' + "`t" + $node.id + "`t" + $node.symbol + "`t" +
@@ -863,7 +1344,7 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
             "`t" + $operation.line + "`t" + $operation.character_offset + "`t" +
             $operation.expression)
     }
-    $generatedBindingLines = @($generatedBindings | Sort-Object name | ForEach-Object {
+    $generatedBindingLines = @($generatedBindingsSorted | ForEach-Object {
         ([string]$_.name) + "`t" + ([string]$_.branch) + "`t" +
         ([string]$_.registrar_id) + "`t" + ([string]$_.chain_sha256)
     })
@@ -926,7 +1407,8 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
         throw "Production MCP reachability did not bind every resolved registration"
     }
 
-    $registrarRows = @($reachable.Values | Sort-Object id | ForEach-Object {
+    $registrarRows = @($reachable.Values | Sort-Object `
+        @{ Expression = { [string]$_['id'] }; Ascending = $true } | ForEach-Object {
         [ordered]@{
             id = [string]$_.id
             symbol = [string]$_.symbol
@@ -939,7 +1421,13 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
             chain = @($chains[[string]$_.id])
         }
     })
-    $edgeRows = @($edges | Sort-Object caller_id, callee_id, file, line)
+    $edgeRows = @($edges | Sort-Object `
+        @{Expression={[string]$_['caller_id']};Ascending=$true},
+        @{Expression={[string]$_['callee_id']};Ascending=$true},
+        @{Expression={[string]$_['file']};Ascending=$true},
+        @{Expression={[int]$_['line']};Ascending=$true},
+        @{Expression={[int]$_['character_offset']};Ascending=$true},
+        @{Expression={[string]$_['expression']};Ascending=$true})
     $graphLines = [Collections.Generic.List[string]]::new()
     foreach ($registrar in $registrarRows) {
         $graphLines.Add('R' + "`t" + $registrar.id + "`t" + $registrar.symbol + "`t" +
@@ -983,7 +1471,7 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
             nodes = $generatedRouteNodes
             edges = $generatedRouteEdges.ToArray()
             terminal_operations = $terminalOperations.ToArray()
-            bindings = @($generatedBindings | Sort-Object name)
+            bindings = $generatedBindingsSorted
             route_sha256 = $generatedRouteHash
             binding_sha256 = $generatedBindingHash
         }
@@ -991,9 +1479,26 @@ function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrat
     }
 }
 
-function Get-SourceBlock([string]$Source, [string]$Marker, [string]$Contract) {
-    $start = $Source.IndexOf($Marker, [StringComparison]::Ordinal)
-    if ($start -lt 0) { throw "Missing source contract '$Contract': $Marker" }
+function Get-OrdinalSourceIndex([string]$Source, [string]$Marker, [int]$Occurrence,
+                                [string]$Contract) {
+    if ([string]::IsNullOrEmpty($Marker) -or $Occurrence -lt 1) {
+        throw "Invalid source contract selector '$Contract'"
+    }
+    $cursor = 0
+    for ($current = 1; $current -le $Occurrence; ++$current) {
+        $index = $Source.IndexOf($Marker, $cursor, [StringComparison]::Ordinal)
+        if ($index -lt 0) {
+            throw "Missing source contract '$Contract' occurrence $Occurrence`: $Marker"
+        }
+        if ($current -eq $Occurrence) { return $index }
+        $cursor = $index + $Marker.Length
+    }
+    throw "Invalid source contract selector state '$Contract'"
+}
+
+function Get-SourceBlock([string]$Source, [string]$Marker, [string]$Contract,
+                         [int]$Occurrence = 1) {
+    $start = Get-OrdinalSourceIndex $Source $Marker $Occurrence $Contract
     $open = $Source.IndexOf('{', $start + $Marker.Length)
     if ($open -lt 0) { throw "Missing source block '$Contract': $Marker" }
     $close = Get-MatchingIndex $Source $open '{' '}'
@@ -1032,12 +1537,12 @@ function Assert-SourceOrdered([string]$Source, [string[]]$Required, [string]$Con
 function Get-SourceContractRecord([string]$Id, [string]$Path, [string]$Source,
                                   [string]$Marker, [string]$Symbol,
                                   [string[]]$Required, [string[]]$Forbidden = @(),
-                                  [switch]$Ordered, [switch]$Block) {
+                                  [switch]$Ordered, [switch]$Block,
+                                  [int]$Occurrence = 1) {
     $scope = $Source
-    $markerIndex = $Source.IndexOf($Marker, [StringComparison]::Ordinal)
-    if ($markerIndex -lt 0) { throw "Missing source contract '$Id': $Marker" }
+    $markerIndex = Get-OrdinalSourceIndex $Source $Marker $Occurrence $Id
     if ($Block) {
-        $sourceBlock = Get-SourceBlock $Source $Marker $Id
+        $sourceBlock = Get-SourceBlock $Source $Marker $Id $Occurrence
         $scope = $sourceBlock.text
     }
     if ($Ordered) { Assert-SourceOrdered $scope $Required $Id }
@@ -1095,7 +1600,8 @@ function Split-TopLevel([string]$Text) {
 function Get-HexContextCallInventory([string]$SourceRoot) {
     $contracts = [ordered]@{
         activate = 1
-        read_live_memory = 3
+        focus_address = 3
+        request_live_memory = 3
         close = 1
         active = 1
         source_name = 1
@@ -1160,6 +1666,63 @@ function Convert-CppStrings([string]$Expression) {
         [void]$builder.Append([string]$decoded)
     }
     return $builder.ToString()
+}
+
+function Get-ModernShortcutSurface([string]$Path) {
+    $source = Get-Text $Path
+    $mask = Get-CppCodeMask $source $Path
+    $bindings = [Collections.Generic.List[object]]::new()
+    $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $pattern = '\b(register_(?:(?:global|domain|widget|document|review)_)?shortcut|register_global_chord)\s*\('
+    foreach ($match in [regex]::Matches($mask, $pattern)) {
+        $open = $match.Index + $match.Value.LastIndexOf('(')
+        $close = Get-MatchingIndex $source $open '(' ')'
+        $arguments = @(Split-TopLevel $source.Substring($open + 1, $close - $open - 1))
+        if ($arguments.Count -lt 5 -or $arguments[0].Trim() -ne 'rt') { continue }
+        $bindingId = Convert-CppStrings ([string]$arguments[1])
+        $actionId = Convert-CppStrings ([string]$arguments[2])
+        if ([string]::IsNullOrEmpty($bindingId) -or [string]::IsNullOrEmpty($actionId)) {
+            throw "Unresolved modern shortcut identity at $(Get-Relative $Path):$(Get-LineNumber $source $match.Index)"
+        }
+        if (!$identities.Add($bindingId)) { throw "Duplicate modern shortcut binding '$bindingId'" }
+        $call = $match.Groups[1].Value
+        $chordExpressions = [Collections.Generic.List[string]]::new()
+        $displayIndex = 4
+        if ($call -eq 'register_global_chord') {
+            if ($arguments.Count -lt 6) { throw "Malformed shortcut chord '$bindingId'" }
+            $chordExpressions.Add(([string]$arguments[3]).Trim())
+            $chordExpressions.Add(([string]$arguments[4]).Trim())
+            $displayIndex = 5
+        } else {
+            $chordExpressions.Add(([string]$arguments[3]).Trim())
+        }
+        $display = Convert-CppStrings ([string]$arguments[$displayIndex])
+        if ([string]::IsNullOrEmpty($display)) { throw "Unresolved shortcut display '$bindingId'" }
+        $keys = @($chordExpressions | ForEach-Object {
+            @([regex]::Matches($_, 'ImGuiKey_[A-Za-z0-9_]+') | ForEach-Object { $_.Value })
+        })
+        if ($keys.Count -ne $chordExpressions.Count) {
+            throw "Shortcut '$bindingId' does not bind exactly one key per stroke"
+        }
+        $bindings.Add([ordered]@{
+            binding_id = $bindingId
+            action_id = $actionId
+            registration = $call
+            chord_expressions = $chordExpressions.ToArray()
+            keys = $keys
+            display = $display
+            source = [ordered]@{
+                file = Get-Relative $Path
+                line = Get-LineNumber $source $match.Index
+            }
+        })
+    }
+    if ($bindings.Count -lt 50) { throw 'Canonical shortcut registry regressed below 50 bindings' }
+    return [ordered]@{
+        binding_count = $bindings.Count
+        bindings = @($bindings | Sort-Object @{ Expression = { [string]$_['binding_id'] } })
+        source_files = @($Path)
+    }
 }
 
 function Get-DefaultHints([string]$Description) {
@@ -1557,9 +2120,6 @@ function Get-C03CompatibilitySurface([string]$ContractsPath, [string]$EffectLedg
         $adapterSymbol = [string]$contract.adapter_symbol
         $adapterSymbolValid = $adapterSymbol.StartsWith(
             'aida::standalone::mcp::compat::adapters::', [StringComparison]::Ordinal)
-        if ($name -eq 'py_exec_file') {
-            $adapterSymbolValid = $adapterSymbol -eq 'aida::standalone::mcp::compat::python_worker_host_t::execute'
-        }
         if ($null -eq $contract.input_schema -or $null -eq $contract.output_schema -or
             $null -eq $contract.annotations -or !$adapterSymbolValid) {
             throw "Generated MCP contract is incomplete: $name"
@@ -1941,7 +2501,7 @@ function Get-CommandSurface([string]$Path) {
         $names.Add($match.Groups[1].Value)
     }
     foreach ($match in [regex]::Matches($builtins.text,
-        '\{\s*"([^"]+)"\s*,\s*"[^"]+"\s*,\s*center_view_t::[A-Za-z0-9_]+\s*\}')) {
+        '\{\s*"([^"]+)"\s*,\s*"[^"]+"\s*,\s*"[^"]+"\s*\}')) {
         $names.Add($match.Groups[1].Value)
     }
     $unique = @($names | Sort-Object -Unique)
@@ -2272,9 +2832,9 @@ foreach ($file in $files) {
                 $segmentStart = $declarationMatches[$declarationMatches.Count - 1].Index
                 $segment = $prefix.Substring($segmentStart)
                 $segmentMask = $prefixMask.Substring($segmentStart)
-                $nameMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.name\s*=\s*([^;]+);")
-                $descriptionMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.description\s*=\s*([^;]+);")
-                $paramsMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.params\s*=\s*([^;]+);")
+                $nameMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.name\s*=\s*?([^;]+);")
+                $descriptionMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.description\s*=\s*?([^;]+);")
+                $paramsMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.params\s*=\s*?([^;]+);")
                 $readOnlyMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.read_only\s*=\s*(true|false)\s*;")
                 if ($nameMatches.Count -gt 0 -and $descriptionMatches.Count -gt 0 -and $readOnlyMatches.Count -gt 0) {
                     $nameGroup = $nameMatches[$nameMatches.Count - 1].Groups[1]
@@ -2285,7 +2845,8 @@ foreach ($file in $files) {
                         $group = $paramsMatches[$paramsMatches.Count - 1].Groups[1]
                         $segment.Substring($group.Index, $group.Length)
                     } else { '{}' }
-                    if ($null -ne $name -and $null -ne $description) {
+                    if (![string]::IsNullOrWhiteSpace([string]$name) -and
+                        ![string]::IsNullOrWhiteSpace([string]$description)) {
                         $parameters = @(Resolve-ParameterExpression $parameterExpression $source)
                         $readOnly = $readOnlyMatches[$readOnlyMatches.Count - 1].Groups[1].Value -eq 'true'
                         $registrationArgs = @{
@@ -2586,6 +3147,7 @@ $hexHeaderPath = Join-Path $core 'editor\hex_view.hpp'
 $hexSourcePath = Join-Path $core 'editor\hex_view.cpp'
 $fileBrowserPath = Join-Path $RepositoryRoot 'src\standalone\src\helpers\file_browser.cpp'
 $mainPath = Join-Path $RepositoryRoot 'src\standalone\src\main.cpp'
+$applicationUiRuntimePath = Join-Path $core 'ui\application_ui_runtime.cpp'
 $commandRegistryPath = Join-Path $core 'ai\command_registry.cpp'
 $testLabRoot = Join-Path $core 'testlab'
 $workbenchContractsPath = Join-Path $core 'workbench\workbench_contracts.h'
@@ -2603,6 +3165,8 @@ $hexHeaderSource = Get-Text $hexHeaderPath
 $hexSource = Get-Text $hexSourcePath
 $fileBrowserSource = Get-Text $fileBrowserPath
 $mainSource = Get-Text $mainPath
+$applicationUiRuntimeSource = Get-Text $applicationUiRuntimePath
+$modernShortcutSurface = Get-ModernShortcutSurface $applicationUiRuntimePath
 $commandSurface = Get-CommandSurface $commandRegistryPath
 $testLabSurface = Get-TestLabSurface $testLabRoot
 $workbenchSurface = Get-WorkbenchSurface $workbenchContractsPath $workbenchShellPath `
@@ -2624,20 +3188,55 @@ foreach ($match in [regex]::Matches($helpersSource, '(?:ImGui::MenuItem|ImGui::B
         $uiActions.Add([ordered]@{ label = $label; line = Get-LineNumber $helpersSource $match.Index })
     }
 }
-$uiActions = @($uiActions | Sort-Object label, line -Unique)
-$shortcuts = [Collections.Generic.List[object]]::new()
-foreach ($match in [regex]::Matches($helpersSource, 'ImGuiKey_[A-Za-z0-9_]+')) {
-    $lineStart = $helpersSource.LastIndexOf("`n", $match.Index)
-    $lineEnd = $helpersSource.IndexOf("`n", $match.Index)
-    if ($lineStart -lt 0) { $lineStart = 0 } else { ++$lineStart }
-    if ($lineEnd -lt 0) { $lineEnd = $helpersSource.Length }
-    $shortcuts.Add([ordered]@{
-        key = $match.Value
-        line = Get-LineNumber $helpersSource $match.Index
-        expression = ($helpersSource.Substring($lineStart, $lineEnd - $lineStart) -replace '\s+', ' ').Trim()
-    })
+foreach ($match in [regex]::Matches($applicationUiRuntimeSource,
+    '\bregister_view\s*\(\s*("(?:\\.|[^"\\])*")\s*,\s*("(?:\\.|[^"\\])*")')) {
+    $label = Convert-CppStrings $match.Groups[2].Value
+    if ($null -ne $label) {
+        $uiActions.Add([ordered]@{ label = $label; line = Get-LineNumber $applicationUiRuntimeSource $match.Index })
+    }
 }
-$sessionMethods = @([regex]::Matches($sessionHeader, '(?m)^\s*(?:static\s+)?[A-Za-z_:][A-Za-z0-9_:<>,\s*&]*\s+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?;') |
+$uiActions = @($uiActions | Sort-Object `
+    @{ Expression = { [string]$_['label'] } },
+    @{ Expression = { [int]$_['line'] } } -Unique)
+$shortcuts = [Collections.Generic.List[object]]::new()
+$shortcutSourceFiles = [Collections.Generic.List[string]]::new()
+$shortcutRoot = Join-Path $RepositoryRoot 'src\standalone\src'
+$shortcutFiles = @(Get-ChildItem -LiteralPath $shortcutRoot -Recurse -File | Where-Object {
+    $_.Extension -in @('.cpp', '.h', '.hpp')
+} | Sort-Object FullName)
+foreach ($file in $shortcutFiles) {
+    $shortcutSource = Get-Text $file.FullName
+    if ([string]::IsNullOrEmpty($shortcutSource)) { continue }
+    if ($shortcutSource.IndexOf('ImGuiKey_', [StringComparison]::Ordinal) -lt 0) { continue }
+    $shortcutMask = Get-CppCodeMask $shortcutSource $file.FullName
+    $matches = [regex]::Matches($shortcutMask, 'ImGuiKey_[A-Za-z0-9_]+')
+    if ($matches.Count -eq 0) { continue }
+    $shortcutSourceFiles.Add($file.FullName)
+    foreach ($match in $matches) {
+        $lineStart = $shortcutSource.LastIndexOf("`n", $match.Index)
+        $lineEnd = $shortcutSource.IndexOf("`n", $match.Index)
+        if ($lineStart -lt 0) { $lineStart = 0 } else { ++$lineStart }
+        if ($lineEnd -lt 0) { $lineEnd = $shortcutSource.Length }
+        $shortcuts.Add([ordered]@{
+            key = $match.Value
+            line = Get-LineNumber $shortcutSource $match.Index
+            expression = ($shortcutSource.Substring($lineStart, $lineEnd - $lineStart) -replace '\s+', ' ').Trim()
+            source = Get-Relative $file.FullName
+        })
+    }
+}
+$requiredShortcutBindingIds = @(
+    'binding.editor.save', 'binding.editor.copy', 'binding.editor.select_all',
+    'binding.editor.next_document_or_session', 'binding.editor.previous_document_or_session',
+    'binding.global.new', 'binding.global.explorer', 'binding.global.chat',
+    'binding.global.output', 'binding.global.network', 'binding.global.debugger',
+    'binding.global.scan', 'binding.global.binary_map', 'binding.global.command_palette',
+    'binding.global.workspace_search', 'binding.global.preferences', 'binding.global.xrefs',
+    'binding.global.deobfuscation', 'binding.global.shell.maximize',
+    'binding.analysis.decompile', 'binding.output.copy_all', 'binding.output.select_all'
+)
+$sessionDeclarationSurface = [regex]::Replace($sessionHeader, '=\s*\{\s*\}', '= default_value')
+$sessionMethods = @([regex]::Matches($sessionDeclarationSurface, '(?m)^\s*(?:static\s+)?[A-Za-z_:][A-Za-z0-9_:<>,\s*&]*\s+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?;') |
     ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
 
 $sourceContracts = [Collections.Generic.List[object]]::new()
@@ -2647,6 +3246,7 @@ $contractArgs = @{
     Source = $sessionSource
     Marker = 'acquire_static_workspace(const std::string& path,'
     Symbol = 'analysis_session::acquire_static_workspace'
+    Occurrence = 2
     Required = @(
         'if (cancel.stop_requested())',
         'workspace_registry().open_static(request, cancel)',
@@ -2671,7 +3271,10 @@ $contractArgs = @{
         'snapshot->generation != workspace->generation()',
         'snapshot->overlay_revision != workspace->overlay_revision()',
         'database->load_search_products(',
-        'search_index_t::build(snapshot',
+        'persisted_products.search_index_blob.empty()',
+        'search_index_t::build(',
+        'restore_persisted_search_index(',
+        'if (cancel.stop_requested())',
         'workspace->publish_analysis_bundle(workspace->generation()'
     )
     Ordered = $true
@@ -2775,7 +3378,8 @@ $contractArgs = @{
     Id = 'live_session_identity_publication'
     Path = $sessionSourcePath
     Source = $sessionSource
-    Marker = 'bool open_attach_session(std::uint32_t pid, std::string* out_err)'
+    Marker = 'bool open_attach_session('
+    Occurrence = 2
     Symbol = 'analysis_session::open_attach_session'
     Required = @(
         'capture_live_target_identity(pid, 0, source_identity',
@@ -2816,7 +3420,8 @@ $contractArgs = @{
     Symbol = 'hex_view public API'
     Required = @(
         'void activate(const disasm_view::workspace_context_t& context);',
-        'bool read_live_memory(const disasm_view::workspace_context_t& context,',
+        'bool focus_address(const disasm_view::workspace_context_t& context,',
+        'bool request_live_memory(const disasm_view::workspace_context_t& context,',
         'void close(const disasm_view::workspace_context_t& context);',
         'bool active(const disasm_view::workspace_context_t& context);',
         'std::string source_name(const disasm_view::workspace_context_t& context);',
@@ -2887,7 +3492,8 @@ $contractArgs = @{
         'workspace_registry().select_for_ui(',
         'disasm_view::capture_workspace(workspace)',
         'hex_view::activate(context)',
-        'active_center_view = center_view_t::hex_view'
+        'aida::ui::application_views::open_or_focus(',
+        'aida::ui::stable_view_id_t("document.hex")'
     )
     Ordered = $true
     Block = $true
@@ -3016,11 +3622,12 @@ $allEvidenceFiles = @($sourceFiles + $idaCompatibility.evidence_files +
     @($mcpProductionReachability.source_files | ForEach-Object {
         Join-Path $RepositoryRoot ([string]$_).Replace('/', '\')
     }) +
-    $hexCallInventory.absolute_files + @($mcpPath, $globalsPath, $helpersPath,
+    $hexCallInventory.absolute_files + $shortcutSourceFiles.ToArray() +
+    @($mcpPath, $globalsPath, $helpersPath,
     $sessionHeaderPath, $sessionSourcePath, $workspaceRegistryPath,
     $driverIdentityPath, $driverSourcePath, $hexHeaderPath, $hexSourcePath,
     $fileBrowserPath, $calculatorToolPath, $decompilerServicePath, $mainPath,
-    $PSCommandPath) | Sort-Object -Unique)
+    $applicationUiRuntimePath, $PSCommandPath) | Sort-Object -Unique)
 $sourceHashes = [Collections.Generic.List[object]]::new()
 $sha = [Security.Cryptography.SHA256]::Create()
 try {
@@ -3282,15 +3889,24 @@ function Assert-SurfaceCompatibility([object]$Reference, [object]$Candidate,
     }) $candidateActionLabels 'UI action'
     $candidateShortcutKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($entry in @((Get-ObjectField $candidateUi 'shortcuts'))) {
-        [void]$candidateShortcutKeys.Add(
-            ([string](Get-ObjectField $entry 'key')) + "`n" +
-            ([string](Get-ObjectField $entry 'expression')))
+        [void]$candidateShortcutKeys.Add([string](Get-ObjectField $entry 'key'))
     }
     foreach ($entry in @((Get-ObjectField $referenceUi 'shortcuts'))) {
-        $key = ([string](Get-ObjectField $entry 'key')) + "`n" +
-            ([string](Get-ObjectField $entry 'expression'))
+        $key = [string](Get-ObjectField $entry 'key')
         if (!$candidateShortcutKeys.Contains($key)) {
-            throw "Removed or changed UI shortcut relative to ${ReferenceLabel}: $([string](Get-ObjectField $entry 'key'))"
+            throw "Removed UI shortcut key relative to ${ReferenceLabel}: $key"
+        }
+    }
+    $candidateBindings = Get-NamedSurfaceIndex @((Get-ObjectField $candidateUi 'shortcut_bindings')) `
+        'binding_id' 'generated canonical shortcut bindings'
+    foreach ($bindingId in $requiredShortcutBindingIds) {
+        if (!$candidateBindings.ContainsKey($bindingId)) {
+            throw "Required canonical shortcut binding '$bindingId' is absent"
+        }
+        foreach ($field in @('action_id', 'display', 'chord_expressions', 'keys', 'source')) {
+            if (!(Test-ObjectField $candidateBindings[$bindingId] $field)) {
+                throw "Canonical shortcut binding '$bindingId' lacks '$field' provenance"
+            }
         }
     }
 
@@ -3444,7 +4060,13 @@ $manifest = [ordered]@{
     ui = [ordered]@{
         center_views = $centerViews
         actions = $uiActions
-        shortcuts = @($shortcuts | Sort-Object key, line)
+        shortcuts = @($shortcuts | Sort-Object `
+            @{ Expression = { [string]$_['key'] } },
+            @{ Expression = { [string]$_['source'] } },
+            @{ Expression = { [int]$_['line'] } })
+        shortcut_binding_count = $modernShortcutSurface.binding_count
+        shortcut_bindings = $modernShortcutSurface.bindings
+        required_shortcut_binding_ids = $requiredShortcutBindingIds
     }
     session = [ordered]@{
         public_method_names = $sessionMethods

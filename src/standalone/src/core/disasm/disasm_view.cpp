@@ -3702,10 +3702,12 @@ void render(float, float, float width, float height,
                         std::lock_guard<std::mutex> lock(context.view->mutex);
                         context.view->banner_selected_line = virtual_index;
                     }
+                }
+                ImGui::PopID();
+                if (metadata_right_clicked) {
                     open_metadata_menu(virtual_index,
                         aida::ui::context_menu_open_origin_t::pointer);
                 }
-                ImGui::PopID();
                 continue;
             }
             const std::size_t row_index = virtual_index - metadata_count;
@@ -3748,6 +3750,10 @@ void render(float, float, float width, float height,
                     }
                 }
             }
+            const bool typed_pointer_request =
+                ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            const ImVec2 minimum = ImGui::GetItemRectMin();
+            const ImVec2 maximum = ImGui::GetItemRectMax();
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
             if (ImGui::IsItemVisible()) {
                 const std::string instruction_semantic_id =
@@ -3758,14 +3764,10 @@ void render(float, float, float width, float height,
                     instruction_semantic_id, "disassembly-instruction-row");
             }
 #endif
-            const bool typed_pointer_request =
-                ImGui::IsItemClicked(ImGuiMouseButton_Right);
             if (typed_pointer_request && (!selection || *selection != instruction.address)) {
                 select_address(instruction.address, context, false);
                 selection = instruction.address;
             }
-            const ImVec2 minimum = ImGui::GetItemRectMin();
-            const ImVec2 maximum = ImGui::GetItemRectMax();
             ImDrawList* draw_list = ImGui::GetWindowDrawList();
             draw_list->PushClipRect(minimum, maximum, true);
             if (selected) {
@@ -4013,12 +4015,12 @@ void render(float, float, float width, float height,
                     }
                 }
             }
+            ImGui::PopID();
             if (typed_pointer_request) {
                 open_instruction_menu(context, instruction,
                     formatted_ready ? std::optional<formatted_instruction_t>(formatted) : std::nullopt,
                     aida::ui::context_menu_open_origin_t::pointer);
             }
-            ImGui::PopID();
         }
     }
     ImGui::PopStyleVar();

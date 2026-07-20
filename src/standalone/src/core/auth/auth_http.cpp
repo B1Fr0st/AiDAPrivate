@@ -75,8 +75,12 @@ void cleanup()
 
 #else
 
+#if !defined(WIN32_LEAN_AND_MEAN)
 #define WIN32_LEAN_AND_MEAN
+#endif
+#if !defined(NOMINMAX)
 #define NOMINMAX
+#endif
 #if !defined(CERT_CHAIN_PARA_HAS_EXTRA_FIELDS)
 #define CERT_CHAIN_PARA_HAS_EXTRA_FIELDS
 #endif
@@ -2993,7 +2997,7 @@ namespace http {
 				: (transport_cancelled ? "stream_cancelled"
 					: (transport_deadline ? "stream_deadline"
 						: (body_complete ? "completed_unpoolable"
-							: "incomplete_body"));
+							: "incomplete_body")));
 			}
 			cleanup();
 			return out;

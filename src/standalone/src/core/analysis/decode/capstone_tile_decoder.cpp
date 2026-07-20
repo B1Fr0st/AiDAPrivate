@@ -78,6 +78,7 @@ bool is_capstone_tile_architecture(const arch_decoder_key_t& key) noexcept
                (key.mode == architecture_mode_t::arm_a32 ||
                 key.mode == architecture_mode_t::arm_thumb);
     case architecture_id_t::aarch64:
+    case architecture_id_t::arm64ec:
         return key.address_width_bits == 64 && key.mode == architecture_mode_t::aarch64;
     case architecture_id_t::mips:
         return (key.address_width_bits == 32 && key.mode == architecture_mode_t::mips32) ||

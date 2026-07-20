@@ -957,6 +957,19 @@ void render_new_audit_dialog(float alpha)
                 (std::max)(140.f, ImGui::GetContentRegionAvail().y * 0.34f));
             request_config.max_bytes = sizeof(s.new_raw) - 1;
             request_config.editable = !pending;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            std::string request_editor_parent =
+                aida::preview::semantics::stable_id(
+                    "aida.dialog", "dialog.network_scanner_new");
+            const auto& active_parent =
+                aida::preview::semantics::active_parent_storage();
+            if (!active_parent.empty()) {
+                request_editor_parent.push_back('.');
+                request_editor_parent.append(
+                    aida::preview::semantics::entity_token(active_parent));
+            }
+            request_config.semantic_parent_id = request_editor_parent.c_str();
+#endif
             request_editor_result = network_view::human_request_editor::render_fixed(
                 request_editor,
                 "scanner.new-request." + std::to_string(s.new_dialog_generation),
@@ -1150,7 +1163,8 @@ bool open_new_audit_with(const std::string& url, const std::string& raw_request)
     auto& s = vs();
     if (s.new_open || url.size() > max_new_audit_url_bytes ||
         raw_request.size() > max_new_audit_request_bytes ||
-        url.find('\0') != std::string::npos || raw_request.find('\0') != std::string::npos)
+        network_view::human_request_editor::contains_binary_bytes(url) ||
+        network_view::human_request_editor::contains_binary_bytes(raw_request))
         return false;
     std::memcpy(s.new_url, url.data(), url.size());
     s.new_url[url.size()] = '\0';

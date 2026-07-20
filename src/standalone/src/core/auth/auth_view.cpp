@@ -323,6 +323,16 @@ namespace auth_view {
 			bool expected = false;
 			if (!auth_snapshot_refreshing().compare_exchange_strong(expected, true, std::memory_order_acq_rel))
 				return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			try {
+				std::vector<std::pair<std::string, aida::auth::auth_info_t>> entries;
+				if (aida::auth::store::all(entries))
+					publish_auth_snapshot(entries);
+			} catch (...) {
+			}
+			auth_snapshot_refreshing().store(false, std::memory_order_release);
+			return;
+#else
 			const uint64_t start_ms = GetTickCount64();
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "auth_view";
@@ -338,11 +348,7 @@ namespace auth_view {
 						if (aida::auth::store::all(entries)) {
 							provider_count = entries.size();
 							publish_auth_snapshot(entries);
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-							success = false;
-#else
 							success = true;
-#endif
 						}
 					} catch (...) {
 					}
@@ -359,6 +365,7 @@ namespace auth_view {
 			if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 				auth_snapshot_refreshing().store(false, std::memory_order_release);
 			}
+#endif
 		}
 
 		static std::string format_relative_time(int64_t expires_unix)

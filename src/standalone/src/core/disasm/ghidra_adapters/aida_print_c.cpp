@@ -10,6 +10,8 @@
 #include "varnode.hh"
 #include "architecture.hh"
 
+#include <mutex>
+
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -22,6 +24,29 @@ print_c_capability_t::print_c_capability_t()
 {
 	name = "aida-c-language";
 	isdefault = false;
+}
+
+void print_c_capability_t::initialize()
+{
+	static std::mutex registration_mutex;
+	const std::lock_guard<std::mutex> lock(registration_mutex);
+	auto* registered = ghidra::PrintLanguageCapability::findCapability(name);
+	if (registered) {
+		if (registered != this)
+			throw ghidra::LowlevelError("AiDA print language capability name collision");
+		return;
+	}
+	ghidra::PrintLanguageCapability::initialize();
+}
+
+void print_c_capability_t::ensure_registered()
+{
+	static std::once_flag registration_once;
+	std::call_once(registration_once, [] {
+		inst_.initialize();
+	});
+	if (ghidra::PrintLanguageCapability::findCapability(inst_.name) != &inst_)
+		throw ghidra::LowlevelError("AiDA print language capability registration failed");
 }
 
 ghidra::PrintLanguage* print_c_capability_t::buildLanguage(ghidra::Architecture* glb)

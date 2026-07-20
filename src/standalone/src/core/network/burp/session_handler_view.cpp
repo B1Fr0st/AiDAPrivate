@@ -405,6 +405,9 @@ void render(float pos_x, float pos_y, float width, float height,
         request_config.stable_id = "session-handler-new-step";
         request_config.size = ImVec2(right_w - 4.f, 112.f);
         request_config.max_bytes = sizeof(st.new_step_request) - 1;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        request_config.semantic_parent_id = "aida.dock-window.view.network.session";
+#endif
         const auto request_editor_result = network_view::human_request_editor::render_fixed(
             request_editor,
             "session-handler.new-step." + std::to_string(cur.id),

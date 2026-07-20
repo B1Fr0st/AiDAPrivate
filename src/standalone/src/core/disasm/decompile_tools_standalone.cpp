@@ -1,5 +1,9 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 
 #include "standalone_compat.hpp"
@@ -300,7 +304,7 @@ void register_decompile_tools(mcp_standalone::server_t& srv)
 {
     srv.register_tool({
         "decompile_function",
-        "Decompile a function through the isolated typed provider pipeline and return pseudocode, exact source mappings, readability evidence, and recovered callees. Runs with a configurable timeout (default 30s).",
+        "Decompile a function at the given address using the Ghidra-derived decompiler and return the pseudocode text plus callee list. Runs on a worker thread with a configurable timeout (default 30s).",
         {{"address", "string", "Function entry address (hex string or integer)", true},
          {"timeout_sec", "number", "Maximum seconds to wait for decompilation (1-300, default 30)", false}},
         true,

@@ -378,9 +378,6 @@ namespace mcp_standalone
         bool wave_c_adapter_symbol_matches(std::string_view name,
                                            std::string_view adapter_symbol)
         {
-            if (name == "py_exec_file")
-                return adapter_symbol ==
-                    "aida::standalone::mcp::compat::python_worker_host_t::execute";
             return adapter_symbol ==
                 "aida::standalone::mcp::compat::adapters::" + std::string(name);
         }

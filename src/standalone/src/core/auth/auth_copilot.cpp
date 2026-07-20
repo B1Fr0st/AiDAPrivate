@@ -156,8 +156,12 @@ std::string last_error()
 
 #else
 
+#if !defined(WIN32_LEAN_AND_MEAN)
 #define WIN32_LEAN_AND_MEAN
+#endif
+#if !defined(NOMINMAX)
 #define NOMINMAX
+#endif
 #include "auth_copilot.hpp"
 
 #include "auth_store.hpp"

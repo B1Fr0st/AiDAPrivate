@@ -10008,6 +10008,8 @@ __declspec(noinline) static DWORD seh_imgui_wndproc_handler(HWND hWnd, UINT msg,
     return 0;
 }
 
+static bool g_session_exit_review_owned = false;
+
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     aida::manual_map_tls::ensure_current_thread();
@@ -10080,12 +10082,34 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     if (msg == WM_QUERYENDSESSION) {
         aida_tracer::set_wndproc_state("queryendsession", hWnd, msg, wParam, lParam);
         log_session_shutdown("WM_QUERYENDSESSION");
-        return finish("queryendsession_allow", TRUE);
+		if (file_tabs::exit_review_committed) {
+			g_session_exit_review_owned = false;
+			return finish("queryendsession_committed", TRUE);
+		}
+		const bool review_was_active = file_tabs::exit_review_requested;
+		const auto requested = file_tabs::request_exit_review();
+		if (requested.succeeded && !review_was_active)
+			g_session_exit_review_owned = true;
+		diag::log_tagged_critical_fmt("wndproc",
+			"session_close_review_request accepted=%d owned=%d reason=%.512s",
+			requested.succeeded ? 1 : 0, g_session_exit_review_owned ? 1 : 0,
+			requested.detail.c_str());
+		return finish(requested.succeeded
+			? "queryendsession_review_pending" : "queryendsession_review_rejected", FALSE);
     }
 
     if (msg == WM_ENDSESSION) {
         aida_tracer::set_wndproc_state("endsession", hWnd, msg, wParam, lParam);
         log_session_shutdown(wParam ? "WM_ENDSESSION_COMMIT" : "WM_ENDSESSION_CANCEL");
+		if (!wParam && g_session_exit_review_owned)
+			file_tabs::cancel_close_all();
+		if (wParam && file_tabs::exit_review_committed)
+			::PostMessageW(hWnd, WM_CLOSE, 0, 0);
+		else if (wParam)
+			diag::log_tagged_critical_fmt("wndproc",
+				"session_end_rejected_uncommitted hwnd=0x%llX",
+				static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hWnd)));
+		g_session_exit_review_owned = false;
         return finish("endsession", 0);
     }
 
@@ -10109,6 +10133,19 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     if (msg == WM_CLOSE ||
         (msg == WM_SYSCOMMAND && ((wParam & 0xfff0) == SC_CLOSE))) {
         const bool sys_close = (msg == WM_SYSCOMMAND);
+		if (!file_tabs::exit_review_committed) {
+			if (g_session_exit_review_owned && !file_tabs::exit_review_requested)
+				g_session_exit_review_owned = false;
+			const auto requested = file_tabs::request_exit_review();
+			diag::log_tagged_critical_fmt("wndproc",
+				"close_review_request source=%s accepted=%d reason=%.512s",
+				sys_close ? "WM_SYSCOMMAND_SC_CLOSE" : "WM_CLOSE",
+				requested.succeeded ? 1 : 0,
+				requested.detail.c_str());
+			return finish(requested.succeeded
+				? "close_review_requested" : "close_review_rejected", 0);
+		}
+		g_session_exit_review_owned = false;
         aida_shutdown_diag::mark(sys_close ? "wndproc_syscommand_close_destroy" : "wndproc_wm_close_destroy");
         aida::ui_thread::mark_window_destroying(hWnd, "wndproc", sys_close ? "syscommand_close" : "wm_close", "pre_destroy_window");
         ::SetLastError(0);

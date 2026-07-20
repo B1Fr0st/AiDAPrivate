@@ -71,6 +71,7 @@ void synchronize_target_snapshot(std::uint32_t target_pid, bool stopped,
 	std::uint64_t stop_address, std::uint32_t stop_thread);
 std::uint64_t current_stop_generation();
 void advance_stop_generation();
+void invalidate_stop_generation_async() noexcept;
 context_t capture(kind_t kind, std::uint64_t address = 0,
 	std::uint64_t value = 0, int index = -1, std::uint32_t thread_id = 0,
 	std::uint64_t extent = 0, std::string primary_text = {},
@@ -81,6 +82,7 @@ const context_t& selected();
 const std::vector<context_t>& selected_set();
 bool selected_in_set(const context_t& context);
 void clear();
+bool live_target_identity_current(const context_t& context);
 bool is_current(const context_t& context);
 capability_result_t evaluate(capability_t capability, const context_t& context);
 bool context_key_pressed();

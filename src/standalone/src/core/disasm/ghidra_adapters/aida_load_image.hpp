@@ -29,6 +29,10 @@
 
 struct DisasmFile;
 
+namespace aida::analysis::ghidra_adapter {
+class ghidra_load_image_t;
+}
+
 namespace aida_ghidra {
 
 struct region_t {
@@ -54,6 +58,10 @@ public:
 	             uint64_t load_base,
 	             std::function<bool()> cancel_check,
 	             std::vector<provider_patch_t> patches = {});
+	load_image_t(
+		std::shared_ptr<const aida::analysis::ghidra_adapter::ghidra_load_image_t> image,
+		aida::analysis::address_space_id_t address_space,
+		std::function<bool()> cancel_check);
 
 	void loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra::Address& addr) override;
 	void getReadonly(ghidra::RangeList& list) const override;
@@ -80,6 +88,9 @@ private:
 	std::shared_ptr<const aida::analysis::pe_image_t> image_;
 	std::function<bool()> cancel_check_;
 	std::vector<provider_patch_t> patches_;
+	std::shared_ptr<const aida::analysis::ghidra_adapter::ghidra_load_image_t> normalized_image_;
+	aida::analysis::address_space_id_t normalized_address_space_ =
+		aida::analysis::address_space_id_t::relative_virtual;
 };
 
 }
@@ -125,6 +136,7 @@ public:
     const std::vector<ghidra_load_range_t>& readonly_ranges() const noexcept {
         return readonly_ranges_;
     }
+    std::uint64_t max_read_bytes() const noexcept { return limits_.max_read_bytes; }
 
     workspace_result_t<ghidra_load_image_read_t> read(
         const address_t& address, std::uint64_t size,

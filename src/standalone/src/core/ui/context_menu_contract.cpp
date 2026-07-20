@@ -56,7 +56,8 @@ context_menu_registration_result_t context_menu_catalog_t::validate(
             const auto* action = actions.find(item.action);
             if (!action || !any(action->surfaces & action_surface_t::context_menu))
                 return {context_menu_status_t::invalid_descriptor,
-                        "Context menu action is not registered for context menus"};
+                        "Context menu action '" + item.action.value() +
+                            "' is not registered for context menus"};
             if (!item.label_override.empty() && !is_valid_display_label(item.label_override))
                 return {context_menu_status_t::invalid_descriptor,
                         "Context menu action label is invalid"};

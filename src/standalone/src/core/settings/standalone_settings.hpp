@@ -367,6 +367,7 @@ struct workspace_state_t
     std::string open_tabs_json;
     std::string view_visibility_json = "{}";
     std::string quick_open_mru_json = "{}";
+    std::string graph_state_json = "{}";
     int         active_tab = -1;
     std::string last_active_path;
     std::string active_view = "editor";
@@ -1568,8 +1569,11 @@ struct settings_sa_t
             workspace.open_tabs_json = json_get_string(ws, "open_tabs_json", "[]");
             workspace.view_visibility_json = json_get_string(ws, "view_visibility_json", "{}");
             workspace.quick_open_mru_json = json_get_string(ws, "quick_open_mru_json", "{}");
+            workspace.graph_state_json = json_get_string(ws, "graph_state_json", "{}");
             if (workspace.quick_open_mru_json.size() > 256U * 1024U)
                 workspace.quick_open_mru_json = "{}";
+            if (workspace.graph_state_json.size() > 256U * 1024U)
+                workspace.graph_state_json = "{}";
             workspace.active_tab = json_get_int(ws, "active_tab", -1);
             workspace.last_active_path = json_get_string(ws, "last_active_path", "");
             workspace.active_view = json_get_string(ws, "active_view", "editor");
@@ -1852,6 +1856,7 @@ struct settings_sa_t
             {"open_tabs_json", workspace.open_tabs_json},
             {"view_visibility_json", workspace.view_visibility_json},
             {"quick_open_mru_json", workspace.quick_open_mru_json},
+            {"graph_state_json", workspace.graph_state_json},
             {"active_tab", workspace.active_tab},
             {"last_active_path", workspace.last_active_path},
             {"active_view", workspace.active_view}

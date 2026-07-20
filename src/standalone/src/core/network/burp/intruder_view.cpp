@@ -54,6 +54,7 @@ struct ui_state_t
     uint64_t                                selected_job_id = 0;
     int                                     selected_result_index = -1;
     bool                                    show_new_attack = false;
+    std::uint64_t                           new_request_generation = 1;
 
     char                                    new_host[256] = "example.com";
     int                                     new_port = 443;
@@ -257,12 +258,23 @@ bool open_new_attack_with(const std::string& host, std::uint16_t port, bool use_
     }
     auto& st = ui();
     std::lock_guard<std::mutex> lock(st.mtx);
+    if (host.size() >= sizeof(st.new_host) ||
+        network_view::human_request_editor::contains_binary_bytes(host)) {
+        reason = "Intruder requires a valid UTF-8 text host shorter than 256 bytes.";
+        return false;
+    }
+    if (raw_request.size() >= sizeof(st.new_request) ||
+        network_view::human_request_editor::contains_binary_bytes(raw_request)) {
+        reason = "Intruder requires a valid UTF-8 text request of at most 65535 bytes.";
+        return false;
+    }
     std::snprintf(st.new_host, sizeof(st.new_host), "%s", host.c_str());
     st.new_port = port;
     st.new_tls = use_tls;
-    const std::size_t count = (std::min)(raw_request.size(), sizeof(st.new_request) - 1U);
-    std::memcpy(st.new_request, raw_request.data(), count);
-    st.new_request[count] = '\0';
+    std::memcpy(st.new_request, raw_request.data(), raw_request.size());
+    st.new_request[raw_request.size()] = '\0';
+    if (++st.new_request_generation == 0)
+        ++st.new_request_generation;
     st.new_positions.clear();
     st.show_new_attack = true;
     reason.clear();
@@ -642,8 +654,23 @@ void render(float pos_x, float pos_y, float width, float height,
             request_config.size = ImVec2(ImGui::GetContentRegionAvail().x, 180.f);
             request_config.max_bytes = sizeof(st.new_request) - 1;
             request_config.editable = !st.operation.pending();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            std::string request_editor_parent =
+                aida::preview::semantics::stable_id(
+                    "aida.dialog", "Intruder - New Attack");
+            const auto& active_parent =
+                aida::preview::semantics::active_parent_storage();
+            if (!active_parent.empty()) {
+                request_editor_parent.push_back('.');
+                request_editor_parent.append(
+                    aida::preview::semantics::entity_token(active_parent));
+            }
+            request_config.semantic_parent_id = request_editor_parent.c_str();
+#endif
             request_editor_result = network_view::human_request_editor::render_fixed(
-                request_editor, "intruder.new-attack", st.new_request, request_config);
+                request_editor,
+                "intruder.new-attack." + std::to_string(st.new_request_generation),
+                st.new_request, request_config);
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                                "Payload set (one per line):");
             ImGui::InputTextMultiline("##na_ps", st.new_payload_set, sizeof(st.new_payload_set),

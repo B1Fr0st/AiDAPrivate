@@ -24,7 +24,7 @@
   "contract_generation": {
     "generator": {
       "path": "tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py",
-      "sha256": "E59FBBDD91BF028CE20D99DB747BB2B6D379E8DB07BAE2E6E714178DF1F4D285"
+      "sha256": "15578745C6CC76E4C010F25B6A357E9AB7A255E4B614AAF7656E8F4B5268207D"
     },
     "reproduction_policy": "pinned_zip_data_only_byte_exact_offline",
     "artifacts": [
@@ -35,19 +35,19 @@
       "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp"
     ],
     "descriptor_artifact_sha256": {
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "29E99FDDD813A18A84A1A736B47A1DBFEC95313A1692C1B906F9111537EB0E8A",
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json": "A2495751CCC29407E8F7A1E4FEF6C1813DCA81B8D78431D60E4BCEDC3F31210C",
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "A7D25BBE02F8C7BC59F3203C6DAA08FFC4A943321445901FC06C9AC91FDE025C"
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "A6AD7B7BD9DD4431941283D203AD29C4A994FECF7412331B42E7B8F4CA484D6A",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json": "E8E4AECA80C597FAE5A9C33BCBE4BBA9B0BC0D0B67A5FBE50B338504AB06563C",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "C4DECD0F377479315D4E12F0F690A1D01536C97C7585E354AFDE21CEF3B9DFB4"
     }
   },
   "current_surface_reproduction": {
     "generator": {
       "path": "src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1",
-      "sha256": "1D34581A149A6D65DC79F76A7200436AF9A283FC10004EF290CDE5BD1563A39A"
+      "sha256": "0CE8A88409BB81E1DA365E93B73F9CD4269304459F173DBC8D7CFF60CE05DEE8"
     },
     "verifier": {
       "path": "tools/c03_authority/verify_authority_surface_ledger.py",
-      "sha256": "F759D85BD976D31C6B51203630D5E96B2EA3021FE78E59D668CDE158FB8E425C"
+      "sha256": "516AF8FDD6DA40F1867D709632C01635E9727E5E0A50DE9D24F0200D070F47C1"
     },
     "baseline": {
       "path": "src/standalone/tests/analysis_workspace/standalone_surface_baseline.json",
@@ -77,11 +77,11 @@
   },
   "current_surface_contract": {
     "mcp": {
-      "legacy_resolved_count": 331,
+      "legacy_resolved_count": 588,
       "generated_registration_count": 92,
       "generated_overlap_count": 42,
       "generated_only_count": 50,
-      "effective_registration_count": 381,
+      "effective_registration_count": 638,
       "archive_backed_count": 87,
       "proxy_local_count": 1,
       "extension_count": 4,

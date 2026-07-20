@@ -2,6 +2,7 @@
 
 #include "../ai/standalone_chat.hpp"
 #include "../disasm/disasm_view.hpp"
+#include "../editor/code_editor.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
 #include "application_view_registry.hpp"
 #include "application_ui_runtime.hpp"
@@ -78,6 +79,20 @@ struct inspector_view_snapshot_t final {
     std::vector<inspector_row_t> provenance;
 };
 
+struct programming_inspector_snapshot_t final {
+    std::uint64_t document_id = 0;
+    std::uint64_t revision = 0;
+    code_editor_widget::document_state_t document;
+    std::vector<inspector_row_t> identity;
+    std::vector<inspector_row_t> location;
+    std::vector<inspector_row_t> editing;
+};
+
+enum class inspector_source_t : std::uint8_t {
+    analysis = 0,
+    programming
+};
+
 struct state_t final {
     aida::workbench::navigator::navigator_domain_t navigator_domain =
         aida::workbench::navigator::navigator_domain_t::functions;
@@ -92,8 +107,13 @@ struct state_t final {
     bool inspector_follow_selection = true;
     bool inspector_pinned = false;
     bool inspector_live_valid = false;
+    bool programming_live_valid = false;
+    inspector_source_t inspector_live_source = inspector_source_t::analysis;
+    inspector_source_t inspector_pin_source = inspector_source_t::analysis;
     inspector_view_snapshot_t inspector_live;
     std::optional<inspector_view_snapshot_t> inspector_pin;
+    programming_inspector_snapshot_t programming_live;
+    std::optional<programming_inspector_snapshot_t> programming_pin;
     std::string inspector_handoff_status;
 };
 
@@ -204,6 +224,98 @@ inline std::uint64_t presentation_address(
 
 inline void unavailable(std::vector<inspector_row_t>& rows, const char* reason) {
     rows.push_back({"Status", "Unavailable", reason ? reason : "No provider is available."});
+}
+
+inline programming_inspector_snapshot_t capture_programming_inspector_snapshot(
+    std::uint64_t document_id, std::uint64_t revision,
+    code_editor_widget::document_state_t document) {
+    programming_inspector_snapshot_t output;
+    output.document_id = document_id;
+    output.revision = revision;
+    output.document = std::move(document);
+    if (!output.document.active || output.document_id == 0)
+        return output;
+    output.identity.push_back({"Kind", "Source document",
+        "The focused application document is owned by the programming editor."});
+    output.identity.push_back({"Language",
+        output.document.language.empty() ? "Plain text" : output.document.language,
+        "Language mode resolved by the programming document service."});
+    output.identity.push_back({"Path",
+        output.document.filepath.empty() ? "Untitled" : output.document.filepath,
+        output.document.filepath.empty()
+            ? "This document has not been assigned a file-system path."
+            : "Canonical path of the focused programming document."});
+    output.identity.push_back({"State", output.document.dirty ? "Modified" : "Saved",
+        output.document.dirty
+            ? "The focused document has changes that are not persisted."
+            : "The focused document matches its persisted revision."});
+    output.location.push_back({"Caret",
+        "Ln " + std::to_string(output.document.caret_line + 1) + ", Col " +
+            std::to_string(output.document.caret_column + 1),
+        "One-based caret location in the focused programming document."});
+    output.location.push_back({"Selection",
+        output.document.has_selection ? "Active" : "None",
+        output.document.has_selection
+            ? "The programming editor owns an active text selection."
+            : "The programming editor has no active text selection."});
+    output.location.push_back({"Lines", std::to_string(output.document.line_count),
+        "Current bounded line count reported by the programming document model."});
+    output.location.push_back({"Size", std::to_string(output.document.content_bytes) + " bytes",
+        "Current document content size reported by the programming document model."});
+    output.editing.push_back({"Mode",
+        output.document.large_file_mode ? "Large file" :
+        output.document.streamed ? "Streamed" : "Editable",
+        output.document.large_file_mode
+            ? "Large-file safeguards are active for this document."
+            : output.document.streamed
+            ? "The document is backed by the bounded streaming path."
+            : "The document is loaded in the full programming editor."});
+    output.editing.push_back({"Text editing",
+        output.document.capabilities.text_editing ? "Available" : "Read only",
+        "Capability resolved by the active programming document provider."});
+    output.editing.push_back({"Language services",
+        output.document.capabilities.language_server ? "Connected" : "Unavailable",
+        output.document.capabilities.language_server
+            ? "Language-aware navigation and diagnostics are available."
+            : "No language server is connected for this document."});
+    output.editing.push_back({"Source debugging",
+        output.document.capabilities.source_debugging ? "Available" : "Unavailable",
+        output.document.capabilities.source_debugging
+            ? "The active provider supports source-level debugging."
+            : "The active provider does not support source-level debugging."});
+    if (output.document.stream_loading)
+        output.editing.push_back({"Stream", "Loading",
+            "The bounded document stream is still loading."});
+    else if (!output.document.stream_error.empty())
+        output.editing.push_back({"Stream", "Error", output.document.stream_error});
+    return output;
+}
+
+inline bool programming_snapshot_matches(const programming_inspector_snapshot_t& snapshot,
+    std::uint64_t document_id, std::uint64_t revision,
+    const code_editor_widget::document_state_t& document) noexcept {
+    return snapshot.document_id == document_id && snapshot.revision == revision &&
+        snapshot.document.filename == document.filename &&
+        snapshot.document.filepath == document.filepath &&
+        snapshot.document.language == document.language &&
+        snapshot.document.content_bytes == document.content_bytes &&
+        snapshot.document.line_count == document.line_count &&
+        snapshot.document.active == document.active &&
+        snapshot.document.dirty == document.dirty &&
+        snapshot.document.focused == document.focused &&
+        snapshot.document.caret_line == document.caret_line &&
+        snapshot.document.caret_column == document.caret_column &&
+        snapshot.document.has_selection == document.has_selection &&
+        snapshot.document.large_file_mode == document.large_file_mode &&
+        snapshot.document.streamed == document.streamed &&
+        snapshot.document.stream_loading == document.stream_loading &&
+        snapshot.document.stream_error == document.stream_error &&
+        snapshot.document.capabilities.text_editing ==
+            document.capabilities.text_editing &&
+        snapshot.document.capabilities.language_server ==
+            document.capabilities.language_server &&
+        snapshot.document.capabilities.source_debugging ==
+            document.capabilities.source_debugging;
 }
 
 inline inspector_view_snapshot_t capture_inspector_snapshot(
@@ -1220,28 +1332,45 @@ inline void render_navigator() {
 }
 
 inline void render_inspector() {
+    const auto focused_view = aida::ui::application_views::registry().focused_instance();
+    const bool programming_focused = focused_view &&
+        focused_view->view.value() == "document.code";
+    const bool inspector_focused = focused_view &&
+        focused_view->view.value() == "view.inspector";
     std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
     aida::workbench::workbench_shell_workspace_context_t context;
     std::string failure;
-    if (!detail::selected_context(workspace, context, failure)) {
-        aida::ui::design::state_presentation_t empty;
-        empty.stable_id = "workbench.diff.no-workspace";
-        empty.state = aida::ui::design::view_state_t::empty;
-        empty.title = "No analysis workspace";
-        empty.message = failure.c_str();
-        static_cast<void>(aida::ui::design::render_state(empty, ImGui::GetContentRegionAvail()));
-        return;
-    }
-    auto& state = detail::state_for(context.workspace);
-    detail::synchronize_generation(state, context);
-    const auto* active = context.inspector_session
+    const bool analysis_available = detail::selected_context(workspace, context, failure);
+    auto& state = detail::state_for(analysis_available
+        ? context.workspace : aida::workbench::workspace_id_t{});
+    if (analysis_available)
+        detail::synchronize_generation(state, context);
+    const auto* active = analysis_available && context.inspector_session
         ? context.inspector_session->active_context() : nullptr;
-    if (!active && state.inspector_follow_selection) {
+    if (programming_focused && state.inspector_follow_selection &&
+        !state.inspector_pinned) {
+        const std::uint64_t document_id = code_editor_widget::active_document_id();
+        auto document = code_editor_widget::document_state(document_id);
+        const std::uint64_t document_revision = document.active && document_id != 0
+            ? code_editor_widget::document_revision(document_id) : 0;
+        if (!state.programming_live_valid ||
+            !detail::programming_snapshot_matches(state.programming_live, document_id,
+                document_revision, document)) {
+            state.programming_live = detail::capture_programming_inspector_snapshot(
+                document_id, document_revision, std::move(document));
+            state.programming_live_valid = state.programming_live.document.active &&
+                state.programming_live.document_id != 0;
+            state.inspector_handoff_status.clear();
+        }
+        state.inspector_live_source = detail::inspector_source_t::programming;
+    } else if (!active && state.inspector_follow_selection && !inspector_focused) {
         state.inspector_live = {};
         state.inspector_live_valid = false;
+        state.inspector_live_source = detail::inspector_source_t::analysis;
         state.inspector_handoff_status.clear();
     }
-    if (active && (state.inspector_follow_selection || !state.inspector_live_valid)) {
+    if (!programming_focused && !inspector_focused && active &&
+        (state.inspector_follow_selection || !state.inspector_live_valid)) {
         const bool same_selection = state.inspector_live_valid &&
             aida::workbench::inspector::inspector_context_equal(
                 state.inspector_live.context, *active) &&
@@ -1253,22 +1382,40 @@ inline void render_inspector() {
             state.inspector_live_valid = true;
             state.inspector_handoff_status.clear();
         }
+        state.inspector_live_source = detail::inspector_source_t::analysis;
     }
-    const auto shown_before_controls = state.inspector_pinned && state.inspector_pin
-        ? &*state.inspector_pin
-        : (state.inspector_live_valid ? &state.inspector_live : nullptr);
+    const auto selected_source = state.inspector_pinned
+        ? state.inspector_pin_source : state.inspector_live_source;
+    const auto* shown_analysis_before_controls =
+        selected_source == detail::inspector_source_t::analysis
+        ? state.inspector_pinned && state.inspector_pin
+            ? &*state.inspector_pin
+            : state.inspector_live_valid ? &state.inspector_live : nullptr
+        : nullptr;
+    const auto* shown_programming_before_controls =
+        selected_source == detail::inspector_source_t::programming
+        ? state.inspector_pinned && state.programming_pin
+            ? &*state.programming_pin
+            : state.programming_live_valid ? &state.programming_live : nullptr
+        : nullptr;
     char revision[96];
-    if (shown_before_controls) {
+    if (shown_analysis_before_controls) {
         std::snprintf(revision, sizeof(revision), "G%llu · A%llu · O%llu",
-            static_cast<unsigned long long>(shown_before_controls->analysis_generation),
-            static_cast<unsigned long long>(shown_before_controls->analysis_revision),
-            static_cast<unsigned long long>(shown_before_controls->overlay_revision));
+            static_cast<unsigned long long>(shown_analysis_before_controls->analysis_generation),
+            static_cast<unsigned long long>(shown_analysis_before_controls->analysis_revision),
+            static_cast<unsigned long long>(shown_analysis_before_controls->overlay_revision));
+    } else if (shown_programming_before_controls) {
+        std::snprintf(revision, sizeof(revision), "D%llu",
+            static_cast<unsigned long long>(shown_programming_before_controls->revision));
     } else {
         std::snprintf(revision, sizeof(revision), "No synchronized revision");
     }
     const auto controls = aida::ui::design::inspector_controls("workbench.inspector.controls",
         state.inspector_follow_selection, state.inspector_pinned,
-        state.inspector_pinned ? "Pinned snapshot" : "Global selection", revision);
+        state.inspector_pinned ? "Pinned snapshot" :
+            selected_source == detail::inspector_source_t::programming
+                ? "Focused code document" : "Global selection",
+        revision);
     if (controls.follow_changed && !controls.pin_changed && state.inspector_pinned &&
         !state.inspector_follow_selection) {
         state.inspector_pinned = false;
@@ -1276,27 +1423,76 @@ inline void render_inspector() {
     }
     if (controls.pin_changed) {
         state.inspector_handoff_status.clear();
-        if (state.inspector_pinned && state.inspector_live_valid) {
-            state.inspector_pin = state.inspector_live;
+        if (state.inspector_pinned &&
+            state.inspector_live_source == detail::inspector_source_t::programming &&
+            state.programming_live_valid) {
+            state.programming_pin = state.programming_live;
+            state.inspector_pin.reset();
+            state.inspector_pin_source = detail::inspector_source_t::programming;
             state.inspector_follow_selection = false;
+        } else if (state.inspector_pinned && state.inspector_live_valid) {
+            state.inspector_pin = state.inspector_live;
+            state.programming_pin.reset();
+            state.inspector_pin_source = detail::inspector_source_t::analysis;
+            state.inspector_follow_selection = false;
+        } else if (state.inspector_pinned) {
+            state.inspector_pinned = false;
+            state.inspector_follow_selection = true;
         } else if (!state.inspector_pinned) {
             state.inspector_pin.reset();
+            state.programming_pin.reset();
         }
     }
     if (state.inspector_follow_selection) {
         state.inspector_pinned = false;
         state.inspector_pin.reset();
+        state.programming_pin.reset();
     }
-    const auto* shown = state.inspector_pinned && state.inspector_pin
-        ? &*state.inspector_pin
-        : (state.inspector_live_valid ? &state.inspector_live : nullptr);
+    const auto source = state.inspector_pinned
+        ? state.inspector_pin_source : state.inspector_live_source;
+    const auto* shown = source == detail::inspector_source_t::analysis
+        ? state.inspector_pinned && state.inspector_pin
+            ? &*state.inspector_pin
+            : state.inspector_live_valid ? &state.inspector_live : nullptr
+        : nullptr;
+    const auto* shown_programming = source == detail::inspector_source_t::programming
+        ? state.inspector_pinned && state.programming_pin
+            ? &*state.programming_pin
+            : state.programming_live_valid ? &state.programming_live : nullptr
+        : nullptr;
     ImGui::Separator();
+    if (source == detail::inspector_source_t::programming) {
+        if (!shown_programming) {
+            aida::ui::design::state_presentation_t empty;
+            empty.stable_id = "workbench.inspector.programming.empty";
+            empty.state = aida::ui::design::view_state_t::empty;
+            empty.title = "No programming document";
+            empty.message = "Open or focus a source document to inspect its code context.";
+            static_cast<void>(aida::ui::design::render_state(empty));
+            return;
+        }
+        ImGui::TextUnformatted(shown_programming->document.filename.empty()
+            ? "Untitled" : shown_programming->document.filename.c_str());
+        if (!shown_programming->document.filepath.empty() &&
+            shown_programming->document.filepath != shown_programming->document.filename)
+            ImGui::TextDisabled("%s", shown_programming->document.filepath.c_str());
+        detail::render_inspector_section("Identity", "workbench.inspector.programming.identity",
+            shown_programming->identity, true);
+        detail::render_inspector_section("Location", "workbench.inspector.programming.location",
+            shown_programming->location, true);
+        detail::render_inspector_section("Editing", "workbench.inspector.programming.editing",
+            shown_programming->editing, true);
+        return;
+    }
     if (!shown) {
         aida::ui::design::state_presentation_t empty;
-        empty.stable_id = "workbench.inspector.empty";
+        empty.stable_id = analysis_available
+            ? "workbench.inspector.empty" : "workbench.inspector.no-workspace";
         empty.state = aida::ui::design::view_state_t::empty;
-        empty.title = "Nothing selected";
-        empty.message = "Select an instruction, symbol, address, or document to inspect it.";
+        empty.title = analysis_available ? "Nothing selected" : "No analysis workspace";
+        empty.message = analysis_available
+            ? "Select an instruction, symbol, address, or document to inspect it."
+            : failure.c_str();
         static_cast<void>(aida::ui::design::render_state(empty));
         return;
     }

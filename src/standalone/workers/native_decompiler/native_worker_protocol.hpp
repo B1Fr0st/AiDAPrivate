@@ -341,14 +341,38 @@ public:
     }
 
 private:
+    static bool terminal_pipe_error(const DWORD error) noexcept
+    {
+        return error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA ||
+            error == ERROR_PIPE_NOT_CONNECTED || error == ERROR_HANDLE_EOF;
+    }
+
     bool fill(HANDLE handle, std::uint8_t* destination, std::size_t& current, std::size_t target, DWORD& error)
     {
         while (current < target) {
             DWORD available = 0;
             if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
-                error = GetLastError();
-                failure_ = frame_failure_t::io;
-                return false;
+                const DWORD peek_error = GetLastError();
+                if (!terminal_pipe_error(peek_error)) {
+                    error = peek_error;
+                    failure_ = frame_failure_t::io;
+                    return false;
+                }
+                const DWORD wanted = static_cast<DWORD>((std::min)(
+                    target - current,
+                    static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+                DWORD read = 0;
+                const BOOL read_succeeded = ReadFile(handle, destination + current,
+                    wanted, &read, nullptr);
+                if (!read_succeeded || read == 0) {
+                    error = read_succeeded ? peek_error : GetLastError();
+                    if (error == ERROR_SUCCESS)
+                        error = peek_error;
+                    failure_ = frame_failure_t::io;
+                    return false;
+                }
+                current += read;
+                continue;
             }
             if (available == 0)
                 break;

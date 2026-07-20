@@ -848,6 +848,7 @@ void end_frame() noexcept
         return;
     render_primary_surfaces();
     workspace_layout::render_global_dock_navigator();
+    workspace_layout::render_transition_surface();
     workspace_layout::settle_default_selection();
     workspace_layout::persist_if_requested();
 }

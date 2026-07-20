@@ -1,9 +1,11 @@
 #include "memory_scanner_view.hpp"
 #include "memory_scanner.hpp"
 #include "scanner_task_center.hpp"
+#include "scanner_async_io.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
 #include "../../preview/studio_semantics.hpp"
+#include "../../preview/scan_preview_runtime.hpp"
 #else
 #include "standalone_driver.hpp"
 #include "../anti-tamper/webhook.hpp"
@@ -18,7 +20,12 @@
 #include "../ui/application_view_registry.hpp"
 #include "../ui/application_ui_runtime.hpp"
 #include "../ai/entity_evidence_handoff.hpp"
+#include "../network/burp/comparer.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #include "../helpers/helpers.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../helpers/win32_dialog.hpp"
+#endif
 #include "ui_anim.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
@@ -52,6 +59,7 @@
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
+#include <nlohmann/json.hpp>
 
 namespace memory_scanner_view {
 
@@ -129,9 +137,23 @@ bool s_value_write_close_requested = false;
 
 memory_interaction::runtime_t runtime_snapshot();
 
+bool address_entry_matches_context(const memory_scanner::address_entry_t& entry,
+	const memory_interaction::context_t& context,
+	memory_scanner::value_type_t value_type) noexcept {
+	return entry.address == context.address && entry.value_type == value_type &&
+		entry.target_pid == context.target_pid && entry.target_epoch == context.target_epoch &&
+		entry.target_identity.process.creation_time_100ns ==
+			context.process_creation_time_100ns;
+}
+
 bool request_value_write(const memory_interaction::context_t& context,
 	memory_scanner::value_type_t value_type, std::vector<std::uint8_t> expected,
 	std::string& error) {
+	if (!memory_scanner::validate_target_binding(context.target_pid, context.target_epoch,
+		context.process_creation_time_100ns)) {
+		error = "The reviewed process identity is no longer attached.";
+		return false;
+	}
 	bool idle = false;
 	if (!s_value_write_pending.compare_exchange_strong(idle, true,
 		std::memory_order_acq_rel)) {
@@ -148,8 +170,8 @@ bool request_value_write(const memory_interaction::context_t& context,
 		std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
 		if (context.index >= 0 && context.index <
 			static_cast<int>(memory_scanner::g_state.address_list.size()) &&
-			memory_scanner::g_state.address_list[static_cast<std::size_t>(context.index)].address ==
-				context.address)
+			address_entry_matches_context(memory_scanner::g_state.address_list[
+				static_cast<std::size_t>(context.index)], context, value_type))
 			memory_scanner::g_state.address_list[static_cast<std::size_t>(context.index)].last_value =
 				std::move(expected);
 	}
@@ -174,6 +196,10 @@ bool request_value_write(const memory_interaction::context_t& context,
 		result->context = context;
 		result->value_type = value_type;
 		try {
+			const auto binding_current = [&context]() {
+				return memory_scanner::validate_target_binding(context.target_pid,
+					context.target_epoch, context.process_creation_time_100ns);
+			};
 			const auto current_runtime = runtime_snapshot();
 			if (!memory_interaction::is_current(context, current_runtime))
 				result->detail = "The target or scan generation changed before the memory write.";
@@ -185,43 +211,85 @@ bool request_value_write(const memory_interaction::context_t& context,
 				else {
 					const auto& entry = memory_scanner::g_state.address_list[
 						static_cast<std::size_t>(context.index)];
-					if (entry.address != context.address || entry.value_type != value_type)
+					if (!address_entry_matches_context(entry, context, value_type))
 						result->detail = "The reviewed address-list entry changed before the write.";
 				}
 			}
 			std::vector<std::uint8_t> original;
-			if (result->detail.empty() &&
-				(!driver_bridge::read_memory(context.address, expected.size(), original) ||
-				 original.size() != expected.size()))
-				result->detail = "The original target bytes could not be captured exactly.";
-			if (result->detail.empty() && !driver_bridge::write_memory(context.address, expected))
-				result->detail = "The target rejected the reviewed memory write.";
+			if (result->detail.empty()) {
+				if (!binding_current()) {
+					result->detail = "The reviewed process identity changed before reading original bytes.";
+				} else {
+					const bool read = driver_bridge::read_memory(
+						context.address, expected.size(), original);
+					const bool identity_after_read = binding_current();
+					if (!identity_after_read)
+						result->detail = "The reviewed process identity changed while original bytes were being read.";
+					else if (!read || original.size() != expected.size())
+						result->detail = "The original target bytes could not be captured exactly.";
+				}
+			}
+			bool write_attempted = false;
+			if (result->detail.empty()) {
+				if (!binding_current()) {
+					result->detail = "The reviewed process identity changed before the memory write.";
+				} else {
+					write_attempted = true;
+					const bool written = driver_bridge::write_memory(context.address, expected);
+					const bool identity_after_write = binding_current();
+					if (!identity_after_write)
+						result->detail = "The reviewed process identity changed during the memory write.";
+					else if (!written)
+						result->detail = "The target rejected the reviewed memory write.";
+				}
+			}
 			std::vector<std::uint8_t> observed;
 			if (result->detail.empty()) {
-				result->verified = driver_bridge::read_memory(context.address,
-					expected.size(), observed) && observed == expected;
-				if (result->verified) {
-					std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
-					result->verified = context.index >= 0 && context.index <
+				if (!binding_current()) {
+					result->detail = "The reviewed process identity changed before memory-write verification.";
+				} else {
+					const bool readback = driver_bridge::read_memory(context.address,
+						expected.size(), observed);
+					const bool identity_after_readback = binding_current();
+					result->verified = readback && identity_after_readback && observed == expected;
+					if (!identity_after_readback)
+						result->detail = "The reviewed process identity changed during memory-write verification.";
+					else if (!result->verified)
+						result->detail = "Memory write verification failed.";
+				}
+			}
+			if (result->verified) {
+				std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+				result->verified = context.index >= 0 && context.index <
 						static_cast<int>(memory_scanner::g_state.address_list.size()) &&
-						memory_scanner::g_state.address_list[
-							static_cast<std::size_t>(context.index)].address == context.address &&
-						memory_scanner::g_state.address_list[
-							static_cast<std::size_t>(context.index)].value_type == value_type;
-					if (!result->verified)
-						result->detail = "The address-list identity changed while the reviewed write was in flight.";
+						address_entry_matches_context(memory_scanner::g_state.address_list[
+							static_cast<std::size_t>(context.index)], context, value_type);
+				if (!result->verified)
+					result->detail = "The address-list identity changed while the reviewed write was in flight.";
+			}
+			if (write_attempted && !result->verified) {
+				const std::string failure = result->detail.empty()
+					? "Memory write verification failed." : result->detail;
+				bool rollback_written = false;
+				bool rollback_identity_after_write = false;
+				if (binding_current()) {
+					rollback_written = driver_bridge::write_memory(context.address, original);
+					rollback_identity_after_write = binding_current();
 				}
-				if (!result->verified) {
-					const bool rolled_back = driver_bridge::write_memory(context.address, original);
-					std::vector<std::uint8_t> rollback_readback;
-					result->rollback_verified = rolled_back && driver_bridge::read_memory(
-						context.address, original.size(), rollback_readback) && rollback_readback == original;
-					const std::string failure = result->detail.empty()
-						? "Memory write verification failed." : result->detail;
-					result->detail = failure + (result->rollback_verified
-						? " Original bytes were restored and verified."
-						: " Original-byte restoration could not be verified.");
+				std::vector<std::uint8_t> rollback_readback;
+				bool rollback_read = false;
+				bool rollback_identity_after_read = false;
+				if (rollback_written && rollback_identity_after_write && binding_current()) {
+					rollback_read = driver_bridge::read_memory(context.address,
+						original.size(), rollback_readback);
+					rollback_identity_after_read = binding_current();
 				}
+				result->rollback_verified = rollback_written &&
+					rollback_identity_after_write && rollback_read &&
+					rollback_identity_after_read && rollback_readback == original;
+				result->detail = failure + (result->rollback_verified
+					? " Original bytes were restored and verified for the exact process identity."
+					: " Original-byte restoration was not attempted or could not be verified for the exact process identity.");
 			}
 			if (result->verified) {
 				std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
@@ -229,7 +297,7 @@ bool request_value_write(const memory_interaction::context_t& context,
 					static_cast<int>(memory_scanner::g_state.address_list.size())) {
 					auto& entry = memory_scanner::g_state.address_list[
 						static_cast<std::size_t>(context.index)];
-					if (entry.address == context.address && entry.value_type == value_type)
+					if (address_entry_matches_context(entry, context, value_type))
 						entry.last_value = expected;
 				}
 				result->detail = "Memory value written and read back exactly.";
@@ -375,6 +443,10 @@ memory_interaction::runtime_t runtime_snapshot_locked(std::size_t result_count) 
 	runtime.scan_target_epoch = memory_scanner::g_state.scan_target_epoch;
 	runtime.scan_process_creation_time_100ns = memory_scanner::g_state.
 		scan_target_identity.process.creation_time_100ns;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (runtime.scan_target_pid != 0 && runtime.scan_process_creation_time_100ns == 0)
+		runtime.scan_process_creation_time_100ns = runtime.process_creation_time_100ns;
+#endif
 	runtime.scan_workspace_id = memory_scanner::g_state.scan_workspace_id;
 	runtime.scan_workspace_generation = memory_scanner::g_state.scan_workspace_generation;
 	const std::uint64_t count_component = static_cast<std::uint64_t>(result_count);
@@ -399,6 +471,9 @@ bool memory_context_identity_equal(const memory_interaction::context_t& left,
 		left.process_creation_time_100ns == right.process_creation_time_100ns &&
 		left.scan_revision == right.scan_revision && left.workspace_id == right.workspace_id &&
 		left.workspace_generation == right.workspace_generation &&
+		left.owner_workspace_id == right.owner_workspace_id &&
+		left.owner_workspace_generation == right.owner_workspace_generation &&
+		left.document_id == right.document_id &&
 		left.address == right.address && left.extent == right.extent && left.index == right.index;
 }
 
@@ -412,7 +487,10 @@ std::vector<memory_interaction::context_t> memory_action_contexts(
 		contexts.front().process_creation_time_100ns == focused.process_creation_time_100ns &&
 		contexts.front().scan_revision == focused.scan_revision &&
 		contexts.front().workspace_id == focused.workspace_id &&
-		contexts.front().workspace_generation == focused.workspace_generation;
+		contexts.front().workspace_generation == focused.workspace_generation &&
+		contexts.front().owner_workspace_id == focused.owner_workspace_id &&
+		contexts.front().owner_workspace_generation == focused.owner_workspace_generation &&
+		contexts.front().document_id == focused.document_id;
 	if (!compatible || std::none_of(contexts.begin(), contexts.end(), [&](const auto& item) {
 		return memory_context_identity_equal(item, focused);
 	}))
@@ -437,10 +515,15 @@ std::uint64_t memory_action_set_hash(
 		mix(context.process_creation_time_100ns);
 		mix(context.scan_revision);
 		mix(context.workspace_generation);
+		mix(context.owner_workspace_generation);
+		mix(context.document_id);
 		mix(context.address);
 		mix(context.extent);
 		mix(static_cast<std::uint64_t>(static_cast<std::int64_t>(context.index)));
-		for (const unsigned char byte : context.workspace_id) mix(byte);
+		for (const char character : context.workspace_id)
+			mix(static_cast<unsigned char>(character));
+		for (const char character : context.owner_workspace_id)
+			mix(static_cast<unsigned char>(character));
 	}
 	return hash;
 }
@@ -451,6 +534,378 @@ std::string memory_action_entity_id(const memory_interaction::context_t& focused
 		std::to_string(contexts.size()) + ":" + std::to_string(memory_action_set_hash(contexts));
 }
 
+constexpr std::size_t kMaximumExactResultSelection = 4096;
+constexpr std::size_t kMaximumExactResultBytes = 8U * 1024U * 1024U;
+constexpr std::size_t kMaximumComparerValueBytes = 1024U * 1024U;
+constexpr std::size_t kMaximumEvidenceExcerptBytes = 12U * 1024U;
+
+struct exact_result_set_t {
+	std::vector<memory_interaction::context_t> contexts;
+	std::vector<memory_scanner::scan_result_t> results;
+	memory_scanner::value_type_t value_type = memory_scanner::value_type_t::int32_val;
+	memory_interaction::runtime_t runtime;
+	std::size_t raw_bytes = 0;
+};
+
+bool capture_exact_result_set(
+	const std::vector<memory_interaction::context_t>& contexts,
+	exact_result_set_t& output, std::string& reason) {
+	output = {};
+	if (contexts.empty() || contexts.size() > kMaximumExactResultSelection) {
+		reason = "Select between 1 and 4096 current memory results.";
+		return false;
+	}
+	const auto first = contexts.front();
+	if (first.kind != memory_interaction::kind_t::scan_result) {
+		reason = "This action requires memory scan results.";
+		return false;
+	}
+	const auto before = runtime_snapshot();
+	for (const auto& context : contexts) {
+		if (!memory_context_identity_equal(context, first) &&
+			(context.kind != first.kind || context.source != first.source ||
+			 context.target_pid != first.target_pid || context.target_epoch != first.target_epoch ||
+			 context.process_creation_time_100ns != first.process_creation_time_100ns ||
+			 context.scan_revision != first.scan_revision ||
+			 context.workspace_id != first.workspace_id ||
+			 context.workspace_generation != first.workspace_generation ||
+			 context.owner_workspace_id != first.owner_workspace_id ||
+			 context.owner_workspace_generation != first.owner_workspace_generation ||
+			 context.document_id != first.document_id)) {
+			reason = "The selected results do not share one target, scan, workspace, and document identity.";
+			return false;
+		}
+		if (!memory_interaction::is_current(context, before)) {
+			reason = "The target, scan publication, workspace, document, or selected result changed.";
+			return false;
+		}
+	}
+	auto& state = memory_scanner::g_state;
+	{
+		std::lock_guard<std::mutex> lock(state.results_mutex);
+		output.runtime = runtime_snapshot_locked(state.results.size());
+		output.value_type = state.config.value_type;
+		output.contexts = contexts;
+		output.results.reserve(contexts.size());
+		for (const auto& context : contexts) {
+			if (context.scan_revision != output.runtime.scan_revision || context.index < 0 ||
+				static_cast<std::size_t>(context.index) >= state.results.size()) {
+				reason = "The selected result set no longer exists in the current scan publication.";
+				return false;
+			}
+			const auto& result = state.results[static_cast<std::size_t>(context.index)];
+			const std::string current = memory_scanner::format_value(result.current_value,
+				output.value_type);
+			const std::string previous = memory_scanner::format_value(result.previous_value,
+				output.value_type);
+			if (result.address != context.address || current != context.value ||
+				previous != context.previous_value) {
+				reason = "A selected result changed after the context menu was opened.";
+				return false;
+			}
+			const std::size_t added = result.current_value.size() + result.previous_value.size();
+			if (added > kMaximumExactResultBytes ||
+				output.raw_bytes > kMaximumExactResultBytes - added) {
+				reason = "The exact selected result payload exceeds the 8 MiB safety limit.";
+				return false;
+			}
+			output.raw_bytes += added;
+			output.results.push_back(result);
+		}
+	}
+	const auto after = runtime_snapshot();
+	for (const auto& context : contexts) {
+		if (!memory_interaction::is_current(context, after)) {
+			reason = "The target, scan publication, workspace, or document changed while capturing results.";
+			output = {};
+			return false;
+		}
+	}
+	reason.clear();
+	return true;
+}
+
+std::string bytes_to_hex(const std::vector<std::uint8_t>& bytes) {
+	static constexpr char digits[] = "0123456789ABCDEF";
+	std::string output;
+	output.resize(bytes.size() * 2U);
+	for (std::size_t index = 0; index < bytes.size(); ++index) {
+		output[index * 2U] = digits[bytes[index] >> 4U];
+		output[index * 2U + 1U] = digits[bytes[index] & 0x0FU];
+	}
+	return output;
+}
+
+std::string exact_result_source_hint(const memory_interaction::context_t& context) {
+	if (context.source == memory_interaction::source_t::live_process)
+		return "memory:pid:" + std::to_string(context.target_pid) + ":created:" +
+			std::to_string(context.process_creation_time_100ns) + ":epoch:" +
+			std::to_string(context.target_epoch) + ":scan:" +
+			std::to_string(context.scan_revision) + ":owner:" + context.owner_workspace_id +
+			":" + std::to_string(context.owner_workspace_generation) + ":document:" +
+			std::to_string(context.document_id);
+	return "memory:workspace:" + context.workspace_id + ":generation:" +
+		std::to_string(context.workspace_generation) + ":scan:" +
+		std::to_string(context.scan_revision) + ":owner:" + context.owner_workspace_id +
+		":" + std::to_string(context.owner_workspace_generation) + ":document:" +
+		std::to_string(context.document_id);
+}
+
+bool build_exact_evidence_excerpt(const exact_result_set_t& snapshot,
+	std::string& excerpt, std::string& reason) {
+	const auto& first = snapshot.contexts.front();
+	std::ostringstream output;
+	output << "Source: " << (first.source == memory_interaction::source_t::live_process
+		? "live process" : "static binary")
+		<< "\nPID: " << first.target_pid
+		<< "\nProcess creation: " << first.process_creation_time_100ns
+		<< "\nTarget epoch: " << first.target_epoch
+		<< "\nScan revision: " << first.scan_revision
+		<< "\nWorkspace: " << first.workspace_id
+		<< "\nWorkspace generation: " << first.workspace_generation
+		<< "\nOwner workspace: " << first.owner_workspace_id
+		<< "\nOwner generation: " << first.owner_workspace_generation
+		<< "\nDocument: " << first.document_id
+		<< "\nSelected rows: " << snapshot.contexts.size();
+	for (std::size_t index = 0; index < snapshot.contexts.size(); ++index) {
+		const auto& context = snapshot.contexts[index];
+		output << "\n[" << index + 1U << "] 0x" << std::uppercase << std::hex
+			<< std::setw(16) << std::setfill('0') << context.address << std::dec
+			<< " | " << context.value << " | previous=" << context.previous_value
+			<< " | " << context.module_offset;
+		if (output.tellp() < 0 || static_cast<std::size_t>(output.tellp()) >
+			kMaximumEvidenceExcerptBytes) {
+			reason = "The complete selected result evidence exceeds the 12 KiB chat limit; export it instead.";
+			return false;
+		}
+	}
+	excerpt = output.str();
+	if (excerpt.empty() || excerpt.size() > kMaximumEvidenceExcerptBytes) {
+		reason = "The complete selected result evidence exceeds the 12 KiB chat limit; export it instead.";
+		return false;
+	}
+	reason.clear();
+	return true;
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+bool exact_scan_publication_matches(const exact_result_set_t& snapshot) {
+	if (snapshot.contexts.empty() || snapshot.results.size() != snapshot.contexts.size())
+		return false;
+	auto& state = memory_scanner::g_state;
+	std::lock_guard<std::mutex> lock(state.results_mutex);
+	const auto runtime = runtime_snapshot_locked(state.results.size());
+	const auto& first = snapshot.contexts.front();
+	if (runtime.scan_revision != first.scan_revision ||
+		runtime.scan_static_binary != (first.source == memory_interaction::source_t::static_binary))
+		return false;
+	if (first.source == memory_interaction::source_t::live_process) {
+		if (!runtime.live_attached || runtime.target_pid != first.target_pid ||
+			runtime.target_epoch != first.target_epoch ||
+			runtime.process_creation_time_100ns != first.process_creation_time_100ns ||
+			runtime.scan_target_pid != first.target_pid ||
+			runtime.scan_target_epoch != first.target_epoch ||
+			runtime.scan_process_creation_time_100ns != first.process_creation_time_100ns)
+			return false;
+	} else if (!runtime.static_loaded || runtime.scan_workspace_id != first.workspace_id ||
+		runtime.scan_workspace_generation != first.workspace_generation) {
+		return false;
+	}
+	for (std::size_t index = 0; index < snapshot.contexts.size(); ++index) {
+		const auto& context = snapshot.contexts[index];
+		if (context.index < 0 || static_cast<std::size_t>(context.index) >= state.results.size())
+			return false;
+		const auto& current = state.results[static_cast<std::size_t>(context.index)];
+		const auto& captured = snapshot.results[index];
+		if (current.address != context.address || current.address != captured.address ||
+			current.current_value != captured.current_value ||
+			current.previous_value != captured.previous_value ||
+			current.module_name != captured.module_name ||
+			current.module_offset != captured.module_offset)
+			return false;
+	}
+	return true;
+}
+#endif
+
+aida::ui::capability_state_t exact_result_action_capability(
+	const std::vector<memory_interaction::context_t>& contexts,
+	bool require_pair, bool require_chat_fit = false) {
+	exact_result_set_t snapshot;
+	std::string reason;
+	if (!capture_exact_result_set(contexts, snapshot, reason))
+		return aida::ui::capability_state_t::unavailable(reason);
+	if (require_pair && snapshot.results.size() != 2U)
+		return aida::ui::capability_state_t::unavailable(
+			"Select exactly two current scan results to compare.");
+	if (require_pair && (snapshot.results[0].current_value.empty() ||
+		snapshot.results[1].current_value.empty()))
+		return aida::ui::capability_state_t::unavailable(
+			"Both selected results must contain current bytes.");
+	if (require_pair && (snapshot.results[0].current_value.size() > kMaximumComparerValueBytes ||
+		snapshot.results[1].current_value.size() > kMaximumComparerValueBytes))
+		return aida::ui::capability_state_t::unavailable(
+			"A selected value exceeds the 1 MiB comparer slot limit.");
+	if (require_chat_fit) {
+		std::string excerpt;
+		if (!build_exact_evidence_excerpt(snapshot, excerpt, reason))
+			return aida::ui::capability_state_t::unavailable(reason);
+	}
+	return aida::ui::capability_state_t::available();
+}
+
+aida::ui::action_handler_result_t compare_exact_results(
+	const std::vector<memory_interaction::context_t>& contexts) {
+	exact_result_set_t snapshot;
+	std::string reason;
+	if (!capture_exact_result_set(contexts, snapshot, reason))
+		return aida::ui::action_handler_result_t::failed(reason);
+	if (snapshot.results.size() != 2U)
+		return aida::ui::action_handler_result_t::failed(
+			"Select exactly two current scan results to compare.");
+	for (const auto& result : snapshot.results) {
+		if (result.current_value.empty() || result.current_value.size() > kMaximumComparerValueBytes)
+			return aida::ui::action_handler_result_t::failed(
+				"Each comparer value must contain between 1 byte and 1 MiB.");
+	}
+	for (std::size_t index = 0; index < snapshot.results.size(); ++index) {
+		char label[64]{};
+		std::snprintf(label, sizeof(label), "Memory 0x%016llX current",
+			static_cast<unsigned long long>(snapshot.results[index].address));
+		if (aida::burp::comparer::add_slot_from_bytes(label,
+			snapshot.results[index].current_value,
+			exact_result_source_hint(snapshot.contexts[index])) == 0)
+			return aida::ui::action_handler_result_t::failed(
+				aida::burp::comparer::last_error().empty()
+					? "The comparer rejected a selected memory value."
+					: aida::burp::comparer::last_error());
+	}
+	const auto opened = aida::ui::application_views::open_or_focus(
+		aida::ui::stable_view_id_t("view.network.comparer"));
+	return opened.ok() ? aida::ui::action_handler_result_t::completed()
+		: aida::ui::action_handler_result_t::failed(opened.detail);
+}
+
+bool serialize_exact_results(const exact_result_set_t& snapshot,
+	std::string& payload, std::string& reason) {
+	try {
+		const auto& first = snapshot.contexts.front();
+		nlohmann::json root;
+		root["schema"] = "aida.memory.selected-results.v1";
+		root["source"] = first.source == memory_interaction::source_t::live_process
+			? "live_process" : "static_binary";
+		root["target_pid"] = first.target_pid;
+		root["target_epoch"] = first.target_epoch;
+		root["process_creation_time_100ns"] = first.process_creation_time_100ns;
+		root["scan_revision"] = first.scan_revision;
+		root["scan_workspace_id"] = first.workspace_id;
+		root["scan_workspace_generation"] = first.workspace_generation;
+		root["owner_workspace_id"] = first.owner_workspace_id;
+		root["owner_workspace_generation"] = first.owner_workspace_generation;
+		root["document_id"] = first.document_id;
+		root["value_type"] = memory_scanner::value_type_name(snapshot.value_type);
+		root["selected_count"] = snapshot.results.size();
+		root["results"] = nlohmann::json::array();
+		for (std::size_t index = 0; index < snapshot.results.size(); ++index) {
+			const auto& context = snapshot.contexts[index];
+			const auto& result = snapshot.results[index];
+			root["results"].push_back({
+				{"selection_index", context.index},
+				{"address", result.address},
+				{"address_hex", [&] { char value[24]{}; std::snprintf(value, sizeof(value),
+					"0x%016llX", static_cast<unsigned long long>(result.address)); return std::string(value); }()},
+				{"current_display", context.value},
+				{"previous_display", context.previous_value},
+				{"current_bytes_hex", bytes_to_hex(result.current_value)},
+				{"previous_bytes_hex", bytes_to_hex(result.previous_value)},
+				{"module_name", result.module_name},
+				{"module_offset", result.module_offset},
+				{"module_offset_display", context.module_offset}
+			});
+		}
+		payload = root.dump(2);
+	} catch (const std::exception& error) {
+		reason = std::string("Exact memory result serialization failed: ") + error.what();
+		return false;
+	}
+	if (payload.empty() || payload.size() > kMaximumExactResultBytes) {
+		reason = "The serialized exact result set exceeds the 8 MiB export limit.";
+		payload.clear();
+		return false;
+	}
+	reason.clear();
+	return true;
+}
+
+aida::ui::action_handler_result_t export_exact_results(
+	const std::vector<memory_interaction::context_t>& contexts) {
+	exact_result_set_t snapshot;
+	std::string reason;
+	if (!capture_exact_result_set(contexts, snapshot, reason))
+		return aida::ui::action_handler_result_t::failed(reason);
+	std::string payload;
+	if (!serialize_exact_results(snapshot, payload, reason))
+		return aida::ui::action_handler_result_t::failed(reason);
+	char path[4096] = "aida-memory-selected-results.json";
+	static const char filter[] = "JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
+	if (!win32_dialog::show_save_file_dialog(g_hwnd, "Export selected memory results",
+		filter, "json", path, sizeof(path), "memory_scanner::export_selected"))
+		return aida::ui::action_handler_result_t::completed();
+	if (!capture_exact_result_set(contexts, snapshot, reason) ||
+		!serialize_exact_results(snapshot, payload, reason))
+		return aida::ui::action_handler_result_t::failed(reason);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::scan::record("memory.results.export_selected",
+		std::to_string(snapshot.results.size()) + ":" +
+		std::to_string(memory_action_set_hash(snapshot.contexts)));
+	return aida::ui::action_handler_result_t::completed();
+#else
+	auto cancellation = std::make_shared<std::atomic<bool>>(false);
+	auto commit_gate = std::make_shared<std::atomic<std::uint8_t>>(
+		scanner_async_io::operation_reversible);
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "scanner.memory";
+	submission.label = "scanner.memory.export_selected";
+	submission.thread_class = "bounded_task";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 3;
+	submission.target_pid = snapshot.contexts.front().target_pid;
+	submission.generation = snapshot.contexts.front().scan_revision;
+	submission.cancel_hook = [cancellation, commit_gate] {
+		std::uint8_t expected = scanner_async_io::operation_reversible;
+		if (commit_gate->compare_exchange_strong(expected,
+			scanner_async_io::operation_cancelled, std::memory_order_acq_rel,
+			std::memory_order_acquire))
+			cancellation->store(true, std::memory_order_release);
+	};
+	submission.body = [snapshot = std::move(snapshot), payload = std::move(payload),
+		destination = std::string(path), cancellation, commit_gate]() mutable {
+		const auto result = scanner_async_io::atomic_replace(destination, payload, false,
+			cancellation, [&snapshot] { return exact_scan_publication_matches(snapshot); },
+			commit_gate);
+		if (!result.success)
+			throw std::runtime_error(result.error.empty()
+				? "Selected memory result export did not commit." : result.error);
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted)
+		return aida::ui::action_handler_result_t::failed(
+			submitted.reject_reason.empty() ? "The memory export worker rejected the operation."
+				: submitted.reject_reason);
+	scanner_task_center::register_executor_task(submitted, "view.memory.value_scan",
+		"memory.result.export_selected", "Export selected memory results",
+		contexts.front().target_pid, true, [cancellation, commit_gate] {
+			std::uint8_t expected = scanner_async_io::operation_reversible;
+			if (commit_gate->compare_exchange_strong(expected,
+				scanner_async_io::operation_cancelled, std::memory_order_acq_rel,
+				std::memory_order_acquire))
+				cancellation->store(true, std::memory_order_release);
+			return true;
+		});
+	return aida::ui::action_handler_result_t::completed();
+#endif
+}
+
 bool memory_action_is_explicit_batch(memory_interaction::capability_t capability) noexcept {
 	switch (capability) {
 		case memory_interaction::capability_t::copy_address:
@@ -459,6 +914,8 @@ bool memory_action_is_explicit_batch(memory_interaction::capability_t capability
 		case memory_interaction::capability_t::copy_module_offset:
 		case memory_interaction::capability_t::add_to_address_list:
 		case memory_interaction::capability_t::remove:
+		case memory_interaction::capability_t::compare_selected:
+		case memory_interaction::capability_t::export_selected:
 			return true;
 		default:
 			return false;
@@ -509,10 +966,17 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 	retained.entity_id = memory_action_entity_id(context, action_contexts);
 	retained.entity_generation = context.scan_revision;
 	retained.active_view = aida::ui::stable_view_id_t("view.memory.value_scan");
-	const auto selected_workspace = disasm_view::capture_selected_workspace();
 	const auto workspace_generation = context.workspace_generation;
 	const std::string static_workspace_id = context.workspace_id;
 	retained.validate_identity = [action_contexts, workspace_generation, static_workspace_id]() {
+		if (!action_contexts.empty() &&
+			action_contexts.front().kind == memory_interaction::kind_t::scan_result) {
+			exact_result_set_t exact;
+			std::string reason;
+			if (!capture_exact_result_set(action_contexts, exact, reason))
+				return aida::ui::capability_state_t::unavailable(reason);
+			return aida::ui::capability_state_t::available();
+		}
 		const auto current_runtime = runtime_snapshot();
 		for (const auto& item : action_contexts) {
 			if (!memory_interaction::is_current(item, current_runtime))
@@ -532,21 +996,23 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 	};
 	for (const auto& [id, capability] : actions) {
 		aida::ui::capability_state_t state;
-		if (multiple && !memory_action_is_explicit_batch(capability)) {
+		if (capability == memory_interaction::capability_t::compare_selected) {
+			state = exact_result_action_capability(action_contexts, true);
+		} else if (capability == memory_interaction::capability_t::export_selected) {
+			state = exact_result_action_capability(action_contexts, false);
+		} else if (multiple && !memory_action_is_explicit_batch(capability)) {
 			state = aida::ui::capability_state_t::unavailable(
 				"This action requires exactly one memory row.");
 		} else {
-			bool enabled = capability == memory_interaction::capability_t::copy_address ||
+			const bool copy_batch = capability == memory_interaction::capability_t::copy_address ||
 				capability == memory_interaction::capability_t::copy_value ||
 				capability == memory_interaction::capability_t::copy_previous_value ||
-				capability == memory_interaction::capability_t::copy_module_offset ? false : true;
+				capability == memory_interaction::capability_t::copy_module_offset;
+			bool enabled = !copy_batch;
 			const char* reason = nullptr;
 			for (const auto& item : action_contexts) {
 				const auto evaluated = memory_interaction::evaluate(capability, item, runtime);
-				if (capability == memory_interaction::capability_t::copy_address ||
-					capability == memory_interaction::capability_t::copy_value ||
-					capability == memory_interaction::capability_t::copy_previous_value ||
-					capability == memory_interaction::capability_t::copy_module_offset) {
+				if (copy_batch) {
 					enabled = enabled || evaluated.enabled;
 					if (!reason && !evaluated.enabled) reason = evaluated.disabled_reason;
 				} else if (!evaluated.enabled) {
@@ -559,8 +1025,17 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 				: aida::ui::capability_state_t::unavailable(
 					reason ? reason : "The memory action is unavailable.");
 		}
-		retained.actions.push_back({id, std::move(state),
-			[]() { return aida::ui::action_handler_result_t::completed(); }});
+		if (capability == memory_interaction::capability_t::compare_selected)
+			retained.actions.push_back({id, std::move(state), [action_contexts] {
+				return compare_exact_results(action_contexts);
+			}});
+		else if (capability == memory_interaction::capability_t::export_selected)
+			retained.actions.push_back({id, std::move(state), [action_contexts] {
+				return export_exact_results(action_contexts);
+			}});
+		else
+			retained.actions.push_back({id, std::move(state),
+				[]() { return aida::ui::action_handler_result_t::completed(); }});
 	}
 	const char* source_kind = context.kind == memory_interaction::kind_t::scan_result
 		? "memory_scan_result" : context.kind == memory_interaction::kind_t::address_entry
@@ -577,25 +1052,36 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 	evidence.entity_id = retained.entity_id;
 	evidence.display_label = multiple ? std::to_string(action_contexts.size()) +
 		" selected memory rows" : std::string(source_kind) + " " + address;
-	evidence.excerpt = "Source: " + std::string(context.source == memory_interaction::source_t::live_process
-		? "live process" : "static binary") + "\nPID: " + std::to_string(context.target_pid) +
-		"\nProcess creation: " + std::to_string(context.process_creation_time_100ns) +
-		"\nTarget epoch: " + std::to_string(context.target_epoch) +
-		"\nScan revision: " + std::to_string(context.scan_revision) +
-		"\nSelected rows: " + std::to_string(action_contexts.size());
-	const std::size_t evidence_limit = (std::min<std::size_t>)(action_contexts.size(), 256U);
-	for (std::size_t index = 0; index < evidence_limit; ++index) {
-		const auto& item = action_contexts[index];
-		char item_address[24]{};
-		std::snprintf(item_address, sizeof(item_address), "0x%016llX",
-			static_cast<unsigned long long>(item.address));
-		evidence.excerpt += "\n[" + std::to_string(index + 1) + "] " + item_address +
-			" | " + item.value + " | previous=" + item.previous_value +
-			" | " + item.module_offset;
+	aida::ui::capability_state_t evidence_capability;
+	if (context.kind == memory_interaction::kind_t::scan_result) {
+		exact_result_set_t exact;
+		std::string evidence_reason;
+		if (!capture_exact_result_set(action_contexts, exact, evidence_reason) ||
+			!build_exact_evidence_excerpt(exact, evidence.excerpt, evidence_reason))
+			evidence_capability = aida::ui::capability_state_t::unavailable(evidence_reason);
+		else
+			evidence_capability = aida::ui::capability_state_t::available();
+	} else {
+		evidence.excerpt = "Source: " + std::string(context.source == memory_interaction::source_t::live_process
+			? "live process" : "static binary") + "\nPID: " + std::to_string(context.target_pid) +
+			"\nProcess creation: " + std::to_string(context.process_creation_time_100ns) +
+			"\nTarget epoch: " + std::to_string(context.target_epoch) +
+			"\nScan revision: " + std::to_string(context.scan_revision) +
+			"\nSelected rows: " + std::to_string(action_contexts.size());
+		for (std::size_t index = 0; index < action_contexts.size(); ++index) {
+			const auto& item = action_contexts[index];
+			char item_address[24]{};
+			std::snprintf(item_address, sizeof(item_address), "0x%016llX",
+				static_cast<unsigned long long>(item.address));
+			evidence.excerpt += "\n[" + std::to_string(index + 1) + "] " + item_address +
+				" | " + item.value + " | previous=" + item.previous_value +
+				" | " + item.module_offset;
+		}
+		evidence_capability = context.kind != memory_interaction::kind_t::none && context.address != 0
+			? aida::ui::capability_state_t::available()
+			: aida::ui::capability_state_t::unavailable(
+				"A current retained memory entity with a resolved address is required for evidence handoff.");
 	}
-	if (action_contexts.size() > evidence_limit)
-		evidence.excerpt += "\n... " + std::to_string(action_contexts.size() - evidence_limit) +
-			" additional selected rows retained by identity.";
 	evidence.address = context.address;
 	evidence.revision = context.scan_revision;
 	evidence.generation = context.scan_revision;
@@ -629,10 +1115,7 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 		return true;
 	};
 	aida::automation_ui::entity_evidence::append_actions(retained, std::move(evidence),
-		context.kind != memory_interaction::kind_t::none && context.address != 0
-			? aida::ui::capability_state_t::available()
-			: aida::ui::capability_state_t::unavailable(
-				"A current retained memory entity with a resolved address is required for evidence handoff."));
+		std::move(evidence_capability));
 	return retained;
 }
 
@@ -645,18 +1128,40 @@ void open_memory_actions(const char* owner,
 		make_memory_actions(owner, context, runtime, actions), origin);
 }
 
-void copy_address(std::uint64_t address) {
-	char buffer[24];
-	std::snprintf(buffer, sizeof(buffer), "0x%016" PRIX64, address);
-	ImGui::SetClipboardText(buffer);
+void copy_memory_addresses(const std::vector<memory_interaction::context_t>& contexts) {
+	std::ostringstream output;
+	output << std::uppercase << std::hex << std::setfill('0');
+	for (std::size_t index = 0; index < contexts.size(); ++index) {
+		if (index != 0) output << '\n';
+		output << "0x" << std::setw(16) << contexts[index].address;
+	}
+	ImGui::SetClipboardText(output.str().c_str());
 }
 
-int find_address_index(std::uint64_t address) {
+template <typename Accessor>
+void copy_memory_text(const std::vector<memory_interaction::context_t>& contexts,
+	Accessor&& accessor) {
+	std::string output;
+	for (const auto& context : contexts) {
+		const auto& value = accessor(context);
+		if (value.empty()) continue;
+		if (!output.empty()) output.push_back('\n');
+		output.append(value);
+	}
+	ImGui::SetClipboardText(output.c_str());
+}
+
+int find_address_index(const memory_interaction::context_t& context) {
 	auto& state = memory_scanner::g_state;
 	std::lock_guard<std::mutex> lock(state.address_mutex);
-	for (std::size_t index = 0; index < state.address_list.size(); ++index)
-		if (state.address_list[index].address == address)
+	for (std::size_t index = 0; index < state.address_list.size(); ++index) {
+		const auto& entry = state.address_list[index];
+		if (entry.address == context.address && entry.target_pid == context.target_pid &&
+			entry.target_epoch == context.target_epoch &&
+			entry.target_identity.process.creation_time_100ns ==
+				context.process_creation_time_100ns)
 			return static_cast<int>(index);
+	}
 	return -1;
 }
 
@@ -2694,10 +3199,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			const auto executed = aida::ui::application_ui::execute_retained_entity_action(
 				"memory.address.remove", aida::ui::action_invocation_source_t::shortcut,
 				retained);
-			if (executed.executed()) {
-				ui.address_multi_sel.clear();
-				ui.address_multi_sel.insert(delete_idx);
-			}
+			static_cast<void>(executed);
 		}
 	}
 }
@@ -3191,10 +3693,13 @@ void process_result_context_menu() {
 	auto& ui = g_ui;
 	const auto runtime = runtime_snapshot();
 	const auto context = ui.result_context;
+	const auto action_contexts = memory_action_contexts(context);
 	uint64_t ctx_addr = context.address;
 	if (s_open_result_ctx.exchange(false))
 		open_memory_actions("memory.value_scan.result", context, runtime, {
 			{"memory.result.add_address", memory_interaction::capability_t::add_to_address_list},
+			{"memory.result.compare_selected", memory_interaction::capability_t::compare_selected},
+			{"memory.result.export_selected", memory_interaction::capability_t::export_selected},
 			{"memory.entity.open_hex", memory_interaction::capability_t::open_hex},
 			{"memory.entity.open_disassembly", memory_interaction::capability_t::open_disassembly},
 			{"memory.entity.copy_address", memory_interaction::capability_t::copy_address},
@@ -3205,29 +3710,15 @@ void process_result_context_menu() {
 			retained_origin(s_result_context_origin.load()));
 	aida::ui::application_ui::render_retained_entity_context_menu("memory.value_scan.result");
 	s_consumed_memory_action = aida::ui::application_ui::consume_retained_entity_action(
-		"memory.value_scan.result", (std::to_string(context.address) + ":" + std::to_string(context.index)).c_str());
+		"memory.value_scan.result", memory_action_entity_id(context, action_contexts).c_str());
 	if (!s_consumed_memory_action.empty()) {
-		size_t multi_count = ui.result_multi_sel.size();
-		if (context_item("Add to address list", memory_interaction::capability_t::add_to_address_list,
-			context, runtime, "Enter")) {
+		const size_t multi_count = action_contexts.size();
+		if (s_consumed_memory_action == "memory.result.add_address") {
 			diag_logf("ctx_result add_to_list count=%zu primary_addr=0x%llX",
 				multi_count, static_cast<unsigned long long>(ctx_addr));
-			std::vector<int> indices;
-			if (multi_count > 0)
-				for (int i : ui.result_multi_sel) indices.push_back(i);
-			else
-				indices.push_back(ui.selected_result);
 			std::vector<uint64_t> addresses;
-			{
-				std::lock_guard<std::mutex> lk(sc.results_mutex);
-				for (int sorted_i : indices) {
-					int src_index = sorted_i;
-					if (sorted_i >= 0 && sorted_i < static_cast<int>(ui.sorted_result_indices.size()))
-						src_index = ui.sorted_result_indices[static_cast<size_t>(sorted_i)];
-					if (src_index >= 0 && src_index < static_cast<int>(sc.results.size()))
-						addresses.push_back(sc.results[static_cast<size_t>(src_index)].address);
-				}
-			}
+			addresses.reserve(action_contexts.size());
+			for (const auto& item : action_contexts) addresses.push_back(item.address);
 			if (addresses.size() == 1) {
 				s_pending_add_addr.store(addresses[0]);
 				s_pending_add_vtype.store(static_cast<int>(sc.config.value_type));
@@ -3267,22 +3758,24 @@ void process_result_context_menu() {
 					"[scan_audit] memory_scanner ctx open_disasm");
 			}
 		}
-		if (context_item("Copy address", memory_interaction::capability_t::copy_address,
-			context, runtime, "Ctrl+C")) {
-			copy_address(ctx_addr);
+		if (s_consumed_memory_action == "memory.entity.copy_address") {
+			copy_memory_addresses(action_contexts);
 			diag_log("ctx_result copy_address");
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] memory_scanner ctx copy_address");
 		}
-		if (context_item("Copy current value", memory_interaction::capability_t::copy_value,
-			context, runtime))
-			ImGui::SetClipboardText(context.value.c_str());
-		if (context_item("Copy previous value", memory_interaction::capability_t::copy_previous_value,
-			context, runtime))
-			ImGui::SetClipboardText(context.previous_value.c_str());
-		if (context_item("Copy module + offset", memory_interaction::capability_t::copy_module_offset,
-			context, runtime))
-			ImGui::SetClipboardText(context.module_offset.c_str());
+		if (s_consumed_memory_action == "memory.entity.copy_value")
+			copy_memory_text(action_contexts, [](const auto& item) -> const std::string& {
+				return item.value;
+			});
+		if (s_consumed_memory_action == "memory.entity.copy_previous")
+			copy_memory_text(action_contexts, [](const auto& item) -> const std::string& {
+				return item.previous_value;
+			});
+		if (s_consumed_memory_action == "memory.entity.copy_module_offset")
+			copy_memory_text(action_contexts, [](const auto& item) -> const std::string& {
+				return item.module_offset;
+			});
 		if (context_item("Stage patch in Patches view...", memory_interaction::capability_t::stage_patch,
 			context, runtime)) {
 			std::string error;
@@ -3304,8 +3797,9 @@ void process_address_context_menu() {
 	auto& ui = g_ui;
 	const auto runtime = runtime_snapshot();
 	auto context = ui.address_context;
+	const auto action_contexts = memory_action_contexts(context);
 	uint64_t ctx_addr = context.address;
-	int ctx_row = find_address_index(ctx_addr);
+	int ctx_row = find_address_index(context);
 	if (ctx_row < 0)
 		context.kind = memory_interaction::kind_t::none;
 	if (s_open_address_ctx.exchange(false))
@@ -3324,9 +3818,9 @@ void process_address_context_menu() {
 			retained_origin(s_address_context_origin.load()));
 	aida::ui::application_ui::render_retained_entity_context_menu("memory.value_scan.address");
 	s_consumed_memory_action = aida::ui::application_ui::consume_retained_entity_action(
-		"memory.value_scan.address", (std::to_string(context.address) + ":" + std::to_string(context.index)).c_str());
+		"memory.value_scan.address", memory_action_entity_id(context, action_contexts).c_str());
 	if (!s_consumed_memory_action.empty()) {
-		size_t multi_count = ui.address_multi_sel.size();
+		const size_t multi_count = action_contexts.size();
 		if (context_item("Edit description", memory_interaction::capability_t::edit_description,
 			context, runtime)) {
 			diag_logf("ctx_addr edit_description row=%d", ctx_row);
@@ -3397,14 +3891,14 @@ void process_address_context_menu() {
 					"[scan_audit] address_list ctx open_disasm");
 			}
 		}
-		if (context_item("Copy address", memory_interaction::capability_t::copy_address,
-			context, runtime, "Ctrl+C")) {
-			copy_address(ctx_addr);
+		if (s_consumed_memory_action == "memory.entity.copy_address") {
+			copy_memory_addresses(action_contexts);
 			diag_log("ctx_addr copy_address");
 		}
-		if (context_item("Copy current value", memory_interaction::capability_t::copy_value,
-			context, runtime))
-			ImGui::SetClipboardText(context.value.c_str());
+		if (s_consumed_memory_action == "memory.entity.copy_value")
+			copy_memory_text(action_contexts, [](const auto& item) -> const std::string& {
+				return item.value;
+			});
 		if (context_item("Stage patch in Patches view...", memory_interaction::capability_t::stage_patch,
 			context, runtime)) {
 			std::uint64_t extent = 1;
@@ -3422,14 +3916,13 @@ void process_address_context_menu() {
 			else
 				toast_notification::push(error.c_str(), toast_notification::toast_type_t::warning, 4.f);
 		}
-		if (context_item("Remove from address list", memory_interaction::capability_t::remove,
-			context, runtime, "Delete")) {
+		if (s_consumed_memory_action == "memory.address.remove") {
 			diag_logf("ctx_addr remove row=%d multi=%zu", ctx_row, multi_count);
 			std::vector<int> to_remove;
-			if (multi_count > 0) {
-				for (int i : ui.address_multi_sel) to_remove.push_back(i);
-			} else if (ctx_row >= 0) {
-				to_remove.push_back(ctx_row);
+			to_remove.reserve(action_contexts.size());
+			for (const auto& item : action_contexts) {
+				const int current_index = find_address_index(item);
+				if (current_index >= 0) to_remove.push_back(current_index);
 			}
 			std::sort(to_remove.begin(), to_remove.end(), std::greater<int>());
 			for (int idx : to_remove)

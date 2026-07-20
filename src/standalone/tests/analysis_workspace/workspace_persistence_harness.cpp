@@ -551,9 +551,10 @@ void verify_hex_context_calls(const std::filesystem::path& root)
         std::size_t arguments;
         std::size_t occurrences = 0;
     };
-    std::array<call_contract_t, 7> contracts{{
+    std::array<call_contract_t, 8> contracts{{
         {"activate", 1},
-        {"read_live_memory", 3},
+        {"focus_address", 3},
+        {"request_live_memory", 3},
         {"close", 1},
         {"active", 1},
         {"source_name", 1},
@@ -618,7 +619,8 @@ void verify_hex_context_fallback(const std::filesystem::path& root)
 
     for (const auto signature : {
         "void activate(const disasm_view::workspace_context_t& context);",
-        "bool read_live_memory(const disasm_view::workspace_context_t& context,",
+        "bool focus_address(const disasm_view::workspace_context_t& context,",
+        "bool request_live_memory(const disasm_view::workspace_context_t& context,",
         "void close(const disasm_view::workspace_context_t& context);",
         "bool active(const disasm_view::workspace_context_t& context);",
         "std::string source_name(const disasm_view::workspace_context_t& context);",
@@ -670,7 +672,8 @@ void verify_hex_context_fallback(const std::filesystem::path& root)
         "workspace_registry().select_for_ui(",
         "disasm_view::capture_workspace(workspace)",
         "hex_view::activate(context)",
-        "active_center_view = center_view_t::hex_view"
+        "aida::ui::application_views::open_or_focus(",
+        "aida::ui::stable_view_id_t(\"document.hex\")"
     }, "hex fallback publishes only an explicit captured workspace context");
     verify_hex_context_calls(root);
 }

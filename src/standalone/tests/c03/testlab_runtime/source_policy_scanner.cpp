@@ -966,6 +966,43 @@ void verify_surface_authority(const std::filesystem::path& root,
 		"every exact replacement has source hash evidence");
 }
 
+void verify_safe_headless_driver_boundary(const std::string_view source)
+{
+	for (const auto token : std::array<std::string_view, 15>{
+			"#if !defined(AIDA_C03_SAFE_HEADLESS_RUNTIME) || AIDA_C03_SAFE_HEADLESS_RUNTIME != 1",
+			"#error AIDA_C03_SAFE_HEADLESS_RUNTIME_must_equal_1",
+			"bool is_loaded()", "bool using_kernel_driver()",
+			"bool attach(uint32_t)", "bool attach_additional(uint32_t)",
+			"bool read_memory_for(uint32_t", "enumerate_modules_for(uint32_t)",
+			"bool write_memory(uint64_t", "bool trigger_kernel_bsod(uint32_t",
+			"bool verify_cross_ring_evidence(const uint8_t*",
+			"capture_live_target_identity(std::uint32_t",
+			"validate_live_target_identity(const live_target_identity_t&)",
+			"validate_attached_target_identity(const live_target_identity_t&)",
+			"refresh_attached_target_identity(const live_target_identity_t&"})
+		require_contains(source, token,
+			"safe-headless fail-closed driver boundary");
+	for (const auto token : std::array<std::string_view, 8>{
+			"standalone_driver.cpp", "DeviceIoControl", "CreateFileW(", "OpenProcess(",
+			"ReadProcessMemory", "WriteProcessMemory", "NtReadVirtualMemory",
+			"NtWriteVirtualMemory"})
+		require_absent(source, token,
+			"safe-headless driver or process operation");
+}
+
+void verify_self_guard_odr_contract(const std::string_view source)
+{
+	for (const auto function : std::array<std::string_view, 11>{
+			"check_pid_self_impl", "check_address_self_impl", "check_binary_self_impl",
+			"check_blocklist_impl", "decoy_guard_1", "decoy_guard_2",
+			"decoy_guard_3", "decoy_guard_4", "decoy_guard_5", "decoy_guard_6",
+			"self_guard_check_impl"})
+		require_contains(source,
+			std::string("__declspec(noinline) inline self_guard_result_t ") +
+			std::string(function) + "(",
+			"anti-tamper self-guard inline ODR contract");
+}
+
 void verify_manifest_registration(const std::string_view cmake_manifest,
                                   const std::string_view path_policy,
                                   const std::string_view path_identity,
@@ -1111,6 +1148,11 @@ void verify_manifest_registration(const std::string_view cmake_manifest,
 	for (const auto input : authority_inputs)
 		require_exact_count(policy_runtime, input, 1,
 			"source policy authority runtime inventory");
+	for (const auto input : std::array<std::string_view, 2>{
+			"src/standalone/tests/c03/testlab_runtime/safe_headless_driver_bridge.cpp",
+			"src/standalone/src/core/anti-tamper/self_guard.hpp"})
+		require_exact_count(policy_runtime, input, 1,
+			"source policy safe-headless link-boundary runtime inventory");
 	for (const auto input : std::array<std::string_view, 12>{
 		"CMakeLists.txt",
 		"packaging/c03_distribution_manifest.ps1",
@@ -1134,6 +1176,30 @@ void verify_manifest_registration(const std::string_view cmake_manifest,
 		"set(AIDA_C03_HARNESS_SUPPORT_SOURCES",
 		"set(AIDA_C03_WORKSPACE_HARNESS_SUPPORT_SOURCES",
 		"C03 harness support registration");
+	const auto workspace_support_sources = slice_between(cmake_manifest,
+		"set(AIDA_C03_WORKSPACE_HARNESS_SUPPORT_SOURCES",
+		"function(aida_c03_require_sources",
+		"C03 workspace harness support registration");
+	const auto compiler_matrix_cm02 = slice_between(cmake_manifest,
+		"set(AIDA_C03_COMPILER_MATRIX_CM_02",
+		"set(AIDA_C03_COMPILER_MATRIX_CM_03",
+		"C03 CM-02 compiler matrix");
+	const auto compiler_matrix_cm06 = slice_between(cmake_manifest,
+		"set(AIDA_C03_COMPILER_MATRIX_CM_06",
+		"set(AIDA_C03_COMPILER_MATRIX_CM_07",
+		"C03 CM-06 compiler matrix");
+	const auto compiler_matrix_cm09 = slice_between(cmake_manifest,
+		"set(AIDA_C03_COMPILER_MATRIX_CM_09",
+		"set(AIDA_C03_COMPILER_MATRIX_CM_10",
+		"C03 CM-09 compiler matrix");
+	const auto compiler_matrix_cm11 = slice_between(cmake_manifest,
+		"set(AIDA_C03_COMPILER_MATRIX_CM_11",
+		"set(AIDA_C03_COMPILER_MATRIX_CM_12",
+		"C03 CM-11 compiler matrix");
+	const auto compiler_matrix_cm12 = slice_between(cmake_manifest,
+		"set(AIDA_C03_COMPILER_MATRIX_CM_12",
+		"set(AIDA_C03_COMPILER_MATRIX_CM_13",
+		"C03 CM-12 compiler matrix");
 	const auto compiler_matrix_cm15 = slice_between(cmake_manifest,
 		"set(AIDA_C03_COMPILER_MATRIX_CM_15",
 		"set(AIDA_C03_COMPILER_MATRIX_UNION)",
@@ -1142,6 +1208,129 @@ void verify_manifest_registration(const std::string_view cmake_manifest,
 		"set(AIDA_C03_COMPILER_MATRIX_CM_13",
 		"set(AIDA_C03_COMPILER_MATRIX_CM_14",
 		"C03 CM-13 compiler matrix");
+	const auto compiler_matrix_cm14 = slice_between(cmake_manifest,
+		"set(AIDA_C03_COMPILER_MATRIX_CM_14",
+		"set(AIDA_C03_COMPILER_MATRIX_CM_15",
+		"C03 CM-14 compiler matrix");
+	const auto runtime_exclusions = slice_between(cmake_manifest,
+		"list(REMOVE_ITEM _aida_runtime_sources",
+		"list(REMOVE_DUPLICATES _aida_runtime_sources)",
+		"safe-headless runtime exclusion graph");
+	const auto runtime_target = slice_between(cmake_manifest,
+		"list(REMOVE_ITEM _aida_runtime_sources",
+		"add_library(aida_c03_auth_preview_implementation STATIC",
+		"safe-headless runtime production closure");
+	for (const auto input : std::array<std::string_view, 9>{
+			"aida_pretty_xml_encode.cpp", "aida_function_db.cpp", "aida_arch_map.cpp",
+			"aida_load_image.cpp", "aida_pcode_fixup.cpp", "aida_print_c.cpp",
+			"aida_scope.cpp", "aida_architecture.cpp", "aida_code_xml_parse.cpp"}) {
+		require_exact_count(production_sources, input, 1,
+			"Ghidra adapter production source closure");
+		require_exact_count(compiler_matrix_cm06, input, 1,
+			"Ghidra adapter CM-06 coverage");
+	}
+	for (const auto input : std::array<std::string_view, 6>{
+			"ida_compat_read.cpp", "ida_compat_mut.cpp", "calculator_tool.cpp",
+			"schema_validator.cpp", "mcp_standalone.cpp", "mcp_standalone_tools.cpp"}) {
+		require_exact_count(production_sources, input, 1,
+			"MCP production backend source closure");
+		require_exact_count(compiler_matrix_cm11, input, 1,
+			"MCP production backend CM-11 coverage");
+	}
+	for (const auto input : std::array<std::string_view, 4>{
+			"core/network/burp/camoufox_bridge.cpp",
+			"core/runtime/standalone_license.cpp",
+			"src/shared/hardware_id/hardware_id_v2.cpp",
+			"src/shared/telemetry/telemetry_client.cpp"}) {
+		require_exact_count(production_sources, input, 1,
+			"security and browser production source closure");
+		require_exact_count(compiler_matrix_cm15, input, 1,
+			"security and browser CM-15 coverage");
+	}
+	require_exact_count(production_sources, "core/analysis/pdb_downloader.cpp", 1,
+		"PDB production source closure");
+	require_exact_count(compiler_matrix_cm02, "core/analysis/pdb_downloader.cpp", 1,
+		"PDB CM-02 coverage");
+	require_exact_count(harness_support_sources,
+		"testlab_runtime/safe_headless_driver_bridge.cpp", 1,
+		"driverless safe-headless support registration");
+	require_absent(production_sources, "safe_headless_driver_bridge.cpp",
+		"driverless boundary in the production source graph");
+	require_absent(workspace_support_sources, "safe_headless_driver_bridge.cpp",
+		"driverless boundary in the workspace production graph");
+	require_exact_count(compiler_matrix_cm14, "safe_headless_driver_bridge.cpp", 1,
+		"driverless boundary CM-14 coverage");
+	require_exact_count(compiler_matrix_cm12, "standalone_driver.cpp", 1,
+		"real driver compiler-only coverage");
+	require_exact_count(cmake_manifest, "standalone_driver.cpp", 1,
+		"real driver exclusion from safe-headless link graph");
+	require_exact_count(cmake_manifest, "safe_headless_driver_bridge.cpp", 3,
+		"driverless boundary support matrix and scanner staging");
+	for (const auto input : std::array<std::string_view, 2>{
+			"decompiler_ui_integration.cpp", "workbench_shell_integration.cpp"}) {
+		require_exact_count(production_sources, input, 1,
+			"single-owner production integration source");
+		require_absent(runtime_exclusions, input,
+			"production integration removed from safe-headless runtime");
+		require_exact_count(cmake_manifest, input, 2,
+			"single runtime owner plus compiler-matrix occurrence");
+	}
+	require_exact_count(compiler_matrix_cm09, "decompiler_ui_integration.cpp", 1,
+		"decompiler UI CM-09 coverage");
+	require_exact_count(compiler_matrix_cm13, "workbench_shell_integration.cpp", 1,
+		"workbench shell CM-13 coverage");
+	for (const auto token : std::array<std::string_view, 7>{
+			"aida_use_static_msvc_runtime(pcre2-8-static)",
+			"AIDA_C03_SAFE_HEADLESS_RUNTIME=1", "aida_openssl_ssl_mt",
+			"aida_openssl_crypto_mt", "LZMA_API_STATIC",
+			"cabinet cfgmgr32 dnsapi iphlpapi ntdll Psapi setupapi version winhttp wintrust",
+			"add_library(aida_c03_safe_headless_runtime STATIC"})
+		require_exact_count(cmake_manifest, token, 1,
+			"safe-headless static ABI and production library closure");
+	require_exact_count(runtime_target, "AIDA_C03_SAFE_HEADLESS_RUNTIME=1", 1,
+		"safe-headless runtime-only driver boundary definition");
+	const auto benchmark_receipt_target = slice_between(cmake_manifest,
+		"TARGET aida_c03_a06_benchmark_sla_receipt_harness",
+		"set(_aida_dependency_runtime",
+		"benchmark receipt target closure");
+	require_exact_count(benchmark_receipt_target, "decompiler_quality_schema.cpp", 1,
+		"benchmark receipt validation owner");
+	const auto dependency_target = slice_between(cmake_manifest,
+		"TARGET aida_c03_dependency_inventory_harness",
+		"set(_aida_managed_runtime_source_root",
+		"dependency inventory target closure");
+	require_exact_count(dependency_target, "evidence_hash.cpp", 1,
+		"dependency inventory evidence owner");
+	const auto packaging_target = slice_between(cmake_manifest,
+		"TARGET aida_c03_build_packaging_integration_harness",
+		"TARGET aida_c03_surface_reconciliation_harness",
+		"build packaging target closure");
+	require_exact_count(packaging_target, "evidence_hash.cpp", 1,
+		"build packaging evidence owner");
+	const auto testlab_target = slice_between(cmake_manifest,
+		"TARGET aida_c03_testlab_runtime_integration_harness",
+		"TARGET aida_c03_b14_native_worker_containment_harness",
+		"Test Lab direct target closure");
+	require_exact_count(testlab_target, "testlab_runtime/result_adapter.cpp", 1,
+		"Test Lab result envelope owner");
+	const auto benchmark_target = slice_between(cmake_manifest,
+		"TARGET aida_c03_analysis_benchmark_harness",
+		"set_tests_properties(aida_c03_analysis_benchmark_harness PROPERTIES",
+		"analysis benchmark direct target closure");
+	require_exact_count(benchmark_target, "decompiler_quality_schema.cpp", 1,
+		"analysis benchmark validation owner");
+	const auto anti_tamper_target = slice_between(cmake_manifest,
+		"TARGET aida_c03_anti_tamper_integrity_harness",
+		"get_property(_aida_manifest_targets GLOBAL PROPERTY",
+		"anti-tamper source target closure");
+	for (const auto input : std::array<std::string_view, 5>{
+			"anti_tamper_integrity_harness.cpp", "self_guard_policy_cases.cpp",
+			"prologue_policy_cases.cpp", "dma_policy_cases.cpp",
+			"passive_probe_policy_cases.cpp"})
+		require_exact_count(anti_tamper_target, input, 1,
+			"anti-tamper ordinary translation-unit registration");
+	require_absent(anti_tamper_target, "UNITY_BUILD",
+		"anti-tamper unity-build ODR workaround");
 	for (const auto input : std::array<std::string_view, 6>{
 			"core/auth/auth_store.cpp", "core/auth/auth_http.cpp",
 			"core/auth/auth_codex.cpp", "core/auth/auth_copilot.cpp",
@@ -1924,6 +2113,12 @@ int main(int argc, char** argv)
 		const auto safe_headless = read_bounded(root,
 			"src/standalone/src/core/testlab/test_lab_features_c03_safe_headless.cpp",
 			4ULL * 1024ULL * 1024ULL);
+		const auto driver_boundary = read_bounded(root,
+			"src/standalone/tests/c03/testlab_runtime/safe_headless_driver_bridge.cpp",
+			512ULL * 1024ULL);
+		const auto self_guard = read_bounded(root,
+			"src/standalone/src/core/anti-tamper/self_guard.hpp",
+			4ULL * 1024ULL * 1024ULL);
 		const auto materializer = read_bounded(root,
 			"src/standalone/tests/c03/testlab_runtime/materialize_safe_headless_manifest.py",
 			2ULL * 1024ULL * 1024ULL);
@@ -1990,6 +2185,8 @@ int main(int argc, char** argv)
 		verify_contract_source(contracts);
 		verify_browser_policy(browser);
 		verify_customer_launch_policy(deploy);
+		verify_safe_headless_driver_boundary(driver_boundary);
+		verify_self_guard_odr_contract(self_guard);
 		verify_manifest_registration(cmake_manifest, path_policy, path_identity,
 			package_integration);
 		verify_distribution_source_leak_policy(distribution_producer,
@@ -2010,6 +2207,7 @@ int main(int argc, char** argv)
 		require_clean_source(contracts, "generated MCP contract source");
 		require_clean_source(browser, "browser policy source");
 		require_clean_source(safe_headless, "safe-headless runtime source");
+		require_clean_source(driver_boundary, "safe-headless driver boundary source");
 		require_clean_source(cmake_manifest, "safe-headless CMake source");
 		require_clean_source(package_integration, "package integration CMake source");
 		require_clean_source(dependency_cmake, "dependency CMake source");

@@ -496,6 +496,10 @@ bool address_matches(
     const std::uint64_t requested,
     const std::uint64_t image_base) noexcept
 {
+    if (address.space != address_space_id_t::relative_virtual &&
+        address.space != address_space_id_t::virtual_address &&
+        address.space != address_space_id_t::live_virtual)
+        return false;
     if (address.value == requested)
         return true;
     std::uint64_t runtime = 0;
@@ -841,6 +845,51 @@ bool canonicalize_dependencies(std::vector<decompiler_dependency_version_t>& dep
         previous = dependency.name;
     }
     return true;
+}
+
+workspace_result_t<std::vector<decompiler_dependency_version_t>>
+native_dependency_identities(
+    const ui_state_t& state,
+    const decompiler_language_identity_t& language)
+{
+    if (!state.native_provider ||
+        state.native_provider->provider_name.empty() ||
+        state.native_provider->provider_version.empty() ||
+        state.native_provider->provider_binary_hash.empty() ||
+        state.native_provider->worker_build_id.empty() ||
+        state.native_provider->worker_build_hash.empty() ||
+        state.native_worker_protocol_hash.empty() ||
+        state.native_manifest_hash.empty() ||
+        state.native_worker_protocol_version != k_decompiler_worker_protocol_version ||
+        language.language_version.empty() || language.compiler_spec_id.empty() ||
+        language.language_spec_hash.empty()) {
+        return workspace_result_t<std::vector<decompiler_dependency_version_t>>::failure(
+            ui_request_error(workspace_error_code_t::provider_unavailable,
+                "production native decompiler dependency identities are unavailable",
+                "decompiler_ui.native.dependencies"));
+    }
+    std::vector<decompiler_dependency_version_t> dependencies{
+        {"aida.native.provider",
+            state.native_provider->provider_version + "|" +
+                state.native_provider->worker_build_id,
+            state.native_provider->provider_binary_hash},
+        {"aida.native.worker.manifest",
+            std::to_string(native_worker::k_native_worker_manifest_schema_version),
+            state.native_manifest_hash},
+        {"aida.native.worker.protocol",
+            std::to_string(state.native_worker_protocol_version),
+            state.native_worker_protocol_hash},
+        {"ghidra.language",
+            language.language_version + "|" + language.compiler_spec_id,
+            language.language_spec_hash}};
+    if (!canonicalize_dependencies(dependencies)) {
+        return workspace_result_t<std::vector<decompiler_dependency_version_t>>::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "production native decompiler dependency identities are invalid",
+                "decompiler_ui.native.dependencies"));
+    }
+    return workspace_result_t<std::vector<decompiler_dependency_version_t>>::success(
+        std::move(dependencies));
 }
 
 bool equal_provider_identity(
@@ -1452,8 +1501,8 @@ decompiler_ui_integration_t::build_pipeline_request(
     const std::size_t max_function_chunks,
     const cancellation_token_t& cancel) try
 {
-    if (request.function_address == 0 || max_function_bytes == 0 ||
-        max_function_chunks == 0 || request.worker_protocol_hash.empty() ||
+    if (max_function_bytes == 0 || max_function_chunks == 0 ||
+        request.worker_protocol_hash.empty() ||
         request.metadata_revision == 0 || request.type_graph_revision == 0) {
         return workspace_result_t<decompiler_pipeline_request_t>::failure(
             ui_request_error(workspace_error_code_t::invalid_argument,
@@ -1820,12 +1869,6 @@ decompiler_ui_integration_t::decompile(
                 "decompiler UI integration is not initialized",
                 "decompile"));
     }
-    if (request.function_address == 0) {
-        return workspace_result_t<decompiler_ui_result_t>::failure(
-            make_workspace_error(workspace_error_code_t::invalid_argument,
-                "decompiler UI request requires a non-zero function address",
-                "decompile"));
-    }
     if (request.provider_context && request.provider_context_factory) {
         return workspace_result_t<decompiler_ui_result_t>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
@@ -1860,7 +1903,7 @@ decompiler_ui_integration_t::decompile_native(
     }
     const auto workspace = impl_->state.workspace;
     const auto publication = workspace->analysis_publication();
-    if (function_address == 0 || !publication ||
+    if (!publication ||
         !publication->coherent_with(workspace->identity()) || !publication->snapshot ||
         !publication->snapshot->normalized_image || publication->analysis_revision == 0) {
         return workspace_result_t<decompiler_ui_result_t>::failure(
@@ -1895,20 +1938,10 @@ decompiler_ui_integration_t::decompile_native(
     request.profile = profile;
     request.cache_mode = cache_mode;
     request.provider_registration_id = "aida.decompiler.native.ghidra";
-    request.dependencies = {
-        {"aida.native.provider",
-            impl_->state.native_provider->provider_version + "|" +
-                impl_->state.native_provider->worker_build_id,
-            impl_->state.native_provider->provider_binary_hash},
-        {"aida.native.worker.manifest",
-            std::to_string(native_worker::k_native_worker_manifest_schema_version),
-            impl_->state.native_manifest_hash},
-        {"aida.native.worker.protocol",
-            std::to_string(impl_->state.native_worker_protocol_version),
-            impl_->state.native_worker_protocol_hash},
-        {"ghidra.language",
-            request.language.language_version + "|" + request.language.compiler_spec_id,
-            request.language.language_spec_hash}};
+    auto dependencies = native_dependency_identities(impl_->state, request.language);
+    if (!dependencies)
+        return workspace_result_t<decompiler_ui_result_t>::failure(dependencies.error());
+    request.dependencies = dependencies.take_value();
     request.provider_context_factory = [workspace](
         const decompiler_provider_request_t& provider_request,
         const cancellation_token_t& provider_cancel) {
@@ -2269,6 +2302,12 @@ decompiler_ui_integration_t::resolve_entity_at(
                 impl_->state.native_worker_protocol_hash;
             identity_request.metadata_revision = publication->analysis_revision;
             identity_request.type_graph_revision = publication->analysis_revision;
+            auto dependencies = native_dependency_identities(
+                impl_->state, identity_request.language);
+            if (!dependencies)
+                return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                    dependencies.error());
+            identity_request.dependencies = dependencies.take_value();
             auto identity = build_pipeline_request(
                 identity_request, *workspace,
                 impl_->state.config.max_function_bytes,

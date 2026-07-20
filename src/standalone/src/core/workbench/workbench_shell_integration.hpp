@@ -240,6 +240,14 @@ public:
         navigation_origin_t origin,
         workbench_shell_workspace_context_t& output);
 
+    workbench_error_t publish_document_selection(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        document_id_t document,
+        const selection_context_t& selection,
+        const document_local_cursor_t& cursor,
+        navigation_origin_t origin,
+        workbench_shell_workspace_context_t& output);
+
     workbench_error_t navigate_history(
         const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
         bool forward,

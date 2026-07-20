@@ -126,6 +126,51 @@ std::vector<image_range_t> executable_ranges(const workspace_image_t& image) {
     return ranges;
 }
 
+bool managed_bytecode_only_image(const workspace_image_t& image) noexcept {
+    const auto jvm = image.format == format_id_t::classfile &&
+        image.architecture == architecture_id_t::jvm_bytecode &&
+        image.architecture_mode == architecture_mode_t::jvm &&
+        image.abi == abi_id_t::jvm;
+    const auto dalvik_format = image.format == format_id_t::dex ||
+        image.format == format_id_t::oat || image.format == format_id_t::vdex;
+    const auto dalvik = dalvik_format &&
+        image.architecture == architecture_id_t::dalvik_bytecode &&
+        image.architecture_mode == architecture_mode_t::dalvik &&
+        image.abi == abi_id_t::dalvik;
+    return jvm || dalvik;
+}
+
+workspace_error_t cancellation_error(const cancellation_token_t& local,
+    const cancellation_token_t& workspace, const char* phase);
+
+workspace_result_t<std::vector<coverage_span_t>> build_managed_bytecode_coverage(
+    const workspace_image_t& image, std::uint64_t maximum_spans,
+    const cancellation_token_t& cancel) {
+    std::vector<coverage_span_t> coverage;
+    const auto ranges = executable_ranges(image);
+    coverage.reserve((std::min)(maximum_spans,
+        static_cast<std::uint64_t>(ranges.size())));
+    for (const auto& range : ranges) {
+        if (cancel.stop_requested()) {
+            return workspace_result_t<std::vector<coverage_span_t>>::failure(
+                cancellation_error(cancel, cancel, "decode_merge"));
+        }
+        if (coverage.size() >= maximum_spans) {
+            return workspace_result_t<std::vector<coverage_span_t>>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "managed bytecode coverage exceeds analysis budget", "decode_merge"));
+        }
+        coverage_span_t span;
+        span.start = rva_address(image, range.start);
+        span.size = range.end - range.start;
+        span.reason = coverage_reason_t::excluded_by_metadata;
+        span.provenance = fact_provenance_t::linear_validation;
+        span.confidence = 100;
+        coverage.push_back(std::move(span));
+    }
+    return workspace_result_t<std::vector<coverage_span_t>>::success(std::move(coverage));
+}
+
 bool executable_rva(const workspace_image_t& image, std::uint64_t rva) {
     const auto ranges = executable_ranges(image);
     const auto found = std::upper_bound(ranges.begin(), ranges.end(), rva,
@@ -384,6 +429,31 @@ workspace_result_t<void> materialize_tile_decode(
         }
         target->instruction_id = owner->second;
         snapshot.target_facts.push_back(std::move(*target));
+    }
+    std::size_t target_index = 0;
+    for (auto& instruction : snapshot.instructions) {
+        if (target_index > (std::numeric_limits<std::uint32_t>::max)()) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "tile decode target table exceeds Compact IR capacity", "decode_merge"));
+        }
+        const auto begin = target_index;
+        while (target_index < snapshot.target_facts.size() &&
+               snapshot.target_facts[target_index].instruction_id == instruction.id)
+            ++target_index;
+        const auto count = target_index - begin;
+        if (count > (std::numeric_limits<std::uint16_t>::max)()) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "tile decode target count exceeds Compact IR capacity", "decode_merge"));
+        }
+        instruction.target_fact_begin = static_cast<std::uint32_t>(begin);
+        instruction.target_fact_count = static_cast<std::uint16_t>(count);
+    }
+    if (target_index != snapshot.target_facts.size()) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "tile decode target rows are not grouped by instruction", "decode_merge"));
     }
     if (decoded.delay_slot_counts.size() != snapshot.instructions.size()) {
         return workspace_result_t<void>::failure(make_workspace_error(
@@ -985,6 +1055,7 @@ struct pe_baseline_analyzer_t::impl_t {
     std::shared_ptr<provider_snapshot_t> provider_snapshot;
     std::optional<image_layout_index_t> image_layout;
     arch_decoder_key_t decoder_key;
+    bool native_decode_applicable = true;
     std::shared_ptr<analysis_snapshot_t> draft;
     std::shared_ptr<const analysis_snapshot_t> final_snapshot;
     std::vector<function_seed_t> seeds;
@@ -1147,17 +1218,20 @@ workspace_result_t<void> pe_baseline_analyzer_t::parse_phase(const std::atomic<b
         impl_->metrics->end_phase(measurement, impl_->workspace->provider().size(), 0, 1, 1, true);
         return validated;
     }
-    impl_->decoder_key = make_arch_decoder_key(*impl_->image);
-    auto decoder = default_arch_decoder_registry().resolve(impl_->decoder_key);
-    if (!decoder) {
-        auto error = decoder.error();
-        if (error.code == workspace_error_code_t::unsupported_format) {
-            error.details.emplace_back("missing_registry_symbol",
-                "arch_decoder_registry_t::register_decoder");
-            error.details.emplace_back("missing_registry_file", "arch_decoder.hpp");
+    impl_->native_decode_applicable = !managed_bytecode_only_image(*impl_->image);
+    if (impl_->native_decode_applicable) {
+        impl_->decoder_key = make_arch_decoder_key(*impl_->image);
+        auto decoder = default_arch_decoder_registry().resolve(impl_->decoder_key);
+        if (!decoder) {
+            auto error = decoder.error();
+            if (error.code == workspace_error_code_t::unsupported_format) {
+                error.details.emplace_back("missing_registry_symbol",
+                    "arch_decoder_registry_t::register_decoder");
+                error.details.emplace_back("missing_registry_file", "arch_decoder.hpp");
+            }
+            impl_->metrics->end_phase(measurement, impl_->workspace->provider().size(), 0, 1, 1, true);
+            return workspace_result_t<void>::failure(std::move(error));
         }
-        impl_->metrics->end_phase(measurement, impl_->workspace->provider().size(), 0, 1, 1, true);
-        return workspace_result_t<void>::failure(std::move(error));
     }
     const auto& provider = impl_->workspace->provider_handle();
     provider_snapshot_options_t snapshot_options;
@@ -1216,6 +1290,14 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
             "parse phase did not retain a normalized image", "seed"));
+    }
+    if (!impl_->native_decode_applicable) {
+        impl_->seeds.clear();
+        const auto executable_bytes = impl_->executable_bytes();
+        auto progress = impl_->update_progress("seed", 0, 0, executable_bytes,
+            executable_bytes);
+        impl_->metrics->end_phase(measurement, 0, 0, 0, 1, !progress.has_value());
+        return progress;
     }
     std::map<std::pair<std::uint64_t, std::uint8_t>, function_seed_t> candidates;
     const auto add = [&](const address_t& address, function_seed_kind_t kind,
@@ -1297,8 +1379,15 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
         if (!symbol.defined || (symbol.kind != image_symbol_kind_t::function &&
             symbol.kind != image_symbol_kind_t::debug_symbol))
             continue;
+        std::optional<address_t> known_end;
+        if (symbol.size != 0) {
+            const auto start = to_rva(*impl_->image, symbol.address);
+            std::uint64_t end = 0;
+            if (start && checked_add_u64(*start, symbol.size, end))
+                known_end = rva_address(*impl_->image, end);
+        }
         auto added = add(symbol.address, function_seed_kind_t::debug_symbol,
-            fact_provenance_t::debug_symbol, 95, source++, std::nullopt, symbol.name, false);
+            fact_provenance_t::debug_symbol, 95, source++, known_end, symbol.name, false);
         if (!added)
             return added;
     }
@@ -1347,6 +1436,13 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
             "tile decode prerequisites are unavailable", "decode"));
+    }
+    if (!impl_->native_decode_applicable) {
+        const auto executable_bytes = impl_->executable_bytes();
+        auto progress = impl_->update_progress("decode", 0, 0, executable_bytes,
+            executable_bytes);
+        impl_->metrics->end_phase(measurement, 0, 0, 0, 1, !progress.has_value());
+        return progress;
     }
     auto registration = default_arch_decoder_registry().resolve(impl_->decoder_key);
     if (!registration)
@@ -1486,21 +1582,34 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
     auto active = impl_->ensure_active(runtime_cancel, "decode_merge");
     if (!active)
         return active;
-    if (!impl_->tile_result || !impl_->image_layout || !impl_->image || !impl_->draft) {
+    if (!impl_->image_layout || !impl_->image || !impl_->draft) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
             "tile decode merge prerequisites are unavailable", "decode_merge"));
     }
-    auto materialized = materialize_tile_decode(
-        *impl_->tile_result, *impl_->draft, impl_->cancellation.token());
-    if (!materialized)
-        return materialized;
-    auto coverage = build_canonical_decode_coverage(*impl_->image, *impl_->image_layout,
-        impl_->draft->instructions, impl_->settings.max_coverage_spans,
-        impl_->cancellation.token());
-    if (!coverage)
-        return workspace_result_t<void>::failure(coverage.error());
-    impl_->draft->coverage = coverage.take_value();
+    if (impl_->native_decode_applicable) {
+        if (!impl_->tile_result) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "tile decode merge publication is unavailable", "decode_merge"));
+        }
+        auto materialized = materialize_tile_decode(
+            *impl_->tile_result, *impl_->draft, impl_->cancellation.token());
+        if (!materialized)
+            return materialized;
+        auto coverage = build_canonical_decode_coverage(*impl_->image, *impl_->image_layout,
+            impl_->draft->instructions, impl_->settings.max_coverage_spans,
+            impl_->cancellation.token());
+        if (!coverage)
+            return workspace_result_t<void>::failure(coverage.error());
+        impl_->draft->coverage = coverage.take_value();
+    } else {
+        auto coverage = build_managed_bytecode_coverage(*impl_->image,
+            impl_->settings.max_coverage_spans, impl_->cancellation.token());
+        if (!coverage)
+            return workspace_result_t<void>::failure(coverage.error());
+        impl_->draft->coverage = coverage.take_value();
+    }
     impl_->tile_result.reset();
 
     impl_->metrics->set(analysis_metric_t::instructions, impl_->draft->instructions.size());
@@ -1525,10 +1634,12 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
     }
     impl_->metrics->end_phase(measurement, 0, retained.value(),
         impl_->draft->instructions.size(), 1, false);
+    const auto completed_bytes = impl_->native_decode_applicable
+        ? impl_->metrics->snapshot().value(analysis_metric_t::coverage_decoded_bytes)
+        : impl_->executable_bytes();
     return impl_->update_progress("decode", impl_->draft->instructions.size(),
         impl_->draft->instructions.size(),
-        impl_->metrics->snapshot().value(analysis_metric_t::coverage_decoded_bytes),
-        impl_->executable_bytes());
+        completed_bytes, impl_->executable_bytes());
 }
 workspace_result_t<void> pe_baseline_analyzer_t::blocks_phase(
     const std::atomic<bool>& runtime_cancel) {
@@ -1574,6 +1685,24 @@ workspace_result_t<void> pe_baseline_analyzer_t::blocks_phase(
     if (!data)
         return workspace_result_t<void>::failure(data.error());
     impl_->data_result = data.take_value();
+
+    if (!impl_->native_decode_applicable) {
+        impl_->function_result = {};
+        impl_->metrics->set(analysis_metric_t::data_candidates,
+            impl_->data_result.candidates.size());
+        impl_->metrics->add(analysis_metric_t::provider_leases,
+            impl_->data_result.provider_leases);
+        impl_->metrics->add(analysis_metric_t::mapped_bytes,
+            impl_->data_result.mapped_bytes);
+        impl_->metrics->add(analysis_metric_t::read_bytes,
+            impl_->data_result.bytes_scanned);
+        impl_->metrics->set(analysis_metric_t::blocks, 0);
+        impl_->metrics->end_phase(measurement,
+            impl_->draft->instructions.size() * sizeof(instruction_record_t),
+            0, impl_->data_result.candidates.size(), 1, false);
+        return impl_->update_progress("blocks", 0, 0,
+            impl_->data_result.bytes_scanned, impl_->data_result.bytes_scanned);
+    }
 
     auto function_limits = impl_->settings.function_limits;
     function_limits.max_seed_candidates = (std::min)(
@@ -1627,6 +1756,15 @@ workspace_result_t<void> pe_baseline_analyzer_t::functions_phase(
     auto active = impl_->ensure_active(runtime_cancel, "functions");
     if (!active)
         return active;
+    if (!impl_->native_decode_applicable) {
+        impl_->call_graph_result = {};
+        impl_->metrics->set(analysis_metric_t::functions, 0);
+        impl_->metrics->set(analysis_metric_t::thunks, 0);
+        impl_->metrics->set(analysis_metric_t::noreturn_functions, 0);
+        impl_->metrics->end_phase(measurement, 0, 0, 0, 1, false);
+        return impl_->update_progress("functions", 0, 0,
+            impl_->executable_bytes(), impl_->executable_bytes());
+    }
     auto current = snapshot_memory_bytes(*impl_->draft);
     if (!current || current.value() >= impl_->settings.max_analysis_memory_bytes) {
         return workspace_result_t<void>::failure(current

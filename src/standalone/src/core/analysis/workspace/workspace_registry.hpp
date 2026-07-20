@@ -36,10 +36,26 @@ struct load_profile_t {
     pe_artifact_kind_t artifact_kind = pe_artifact_kind_t::executable;
 };
 
+struct raw_code_profile_t {
+    std::uint32_t schema_version = 1;
+    architecture_id_t architecture = architecture_id_t::unknown;
+    architecture_mode_t architecture_mode = architecture_mode_t::unknown;
+    abi_id_t abi = abi_id_t::unknown;
+    endian_t endian = endian_t::little;
+    std::uint8_t address_width_bits = 0;
+    std::uint64_t image_base = 0;
+    std::uint64_t code_file_offset = 0;
+    std::uint64_t code_rva = 0;
+    std::uint64_t code_size = 0;
+    std::uint64_t entry_rva = 0;
+    std::string symbol_name;
+};
+
 struct open_static_workspace_request_t {
     std::string source_path;
     std::string bin_name;
     std::optional<std::string> member_path;
+    std::optional<raw_code_profile_t> raw_code_profile;
     std::vector<std::uint8_t> load_profile;
     mapped_file_provider_options_t provider_options;
     pe_parse_limits_t pe_limits;
@@ -50,6 +66,7 @@ struct open_provider_workspace_request_t {
     std::shared_ptr<const byte_provider_t> provider;
     std::string bin_name;
     std::optional<provider_member_metadata_t> member_metadata;
+    std::optional<raw_code_profile_t> raw_code_profile;
     std::vector<std::uint8_t> load_profile;
     mapped_file_provider_options_t provider_options;
     pe_parse_limits_t pe_limits;
@@ -131,6 +148,7 @@ public:
     std::optional<binary_id_t> selected_binary_id() const;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     void bind_preview_workspace(std::shared_ptr<analysis_workspace_t> workspace);
+    void clear_preview_workspaces();
 #endif
 
 private:
