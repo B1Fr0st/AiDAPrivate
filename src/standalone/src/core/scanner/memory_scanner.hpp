@@ -210,6 +210,7 @@ void reset_scan();
 void add_address(uint64_t address, const std::string& description, value_type_t type);
 void remove_address(size_t index);
 void freeze_address(size_t index, bool enable);
+bool freeze_address_exact(size_t index, bool enable, const address_entry_t& expected);
 write_transaction_result_t write_value_exact(uint64_t address, value_type_t type,
 	const std::string& value_text, bool hex, uint32_t expected_pid,
 	uint64_t expected_process_creation_time_100ns);

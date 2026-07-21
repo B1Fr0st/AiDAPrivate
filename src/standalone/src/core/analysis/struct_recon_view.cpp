@@ -1,4 +1,5 @@
 #include "struct_recon_view.hpp"
+#include "struct_dissector_view.hpp"
 #include "../ai/entity_evidence_handoff.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
@@ -14,12 +15,15 @@
 #include "../disasm/function_index.hpp"
 #include "../infra/executor.hpp"
 #include "../anti-tamper/webhook.hpp"
+#include "../../helpers/globals.h"
+#include "../../helpers/win32_dialog.hpp"
 #endif
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
 #include "ui/motion.hpp"
 #include "ui/transition.hpp"
 #include "ui/components.hpp"
+#include "ui/design_system.hpp"
 #include "ui/blur_layer.hpp"
 #include "ui/empty_state.hpp"
 #include "ui/responsive.hpp"
@@ -36,11 +40,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -105,6 +112,30 @@ struct local_state_t {
 	std::shared_ptr<const struct_recon::reconstructed_struct_t> overlay_review_snapshot;
 	std::weak_ptr<aida::analysis::analysis_workspace_t> overlay_review_workspace;
 	std::shared_ptr<const aida::analysis::analysis_publication_t> overlay_review_publication;
+	bool declaration_preview_requested = false;
+	std::string declaration_preview_name;
+	std::string declaration_preview_text;
+	std::shared_ptr<const struct_recon::reconstructed_struct_t> declaration_preview_snapshot;
+	enum class retained_edit_kind_t : std::uint8_t { none, rename, retype, live_value };
+	retained_edit_kind_t retained_edit_kind = retained_edit_kind_t::none;
+	bool retained_edit_requested = false;
+	std::shared_ptr<const struct_recon::reconstructed_struct_t> retained_edit_snapshot;
+	std::weak_ptr<aida::analysis::analysis_workspace_t> retained_edit_workspace;
+	std::shared_ptr<const aida::analysis::analysis_publication_t> retained_edit_publication;
+	std::string retained_edit_workspace_id;
+	std::uint64_t retained_edit_workspace_generation = 0;
+	std::uint64_t retained_edit_analysis_revision = 0;
+	std::uint32_t retained_edit_target_pid = 0;
+	std::uint64_t retained_edit_field_hash = 0;
+	std::uint64_t retained_edit_structure_id = 0;
+	std::uint64_t retained_edit_structure_revision = 0;
+	std::uint64_t retained_edit_field_id = 0;
+	std::uint64_t retained_edit_schema_revision = 0;
+	std::uint64_t retained_edit_base = 0;
+	std::uint64_t retained_edit_refresh_sequence = 0;
+	int retained_edit_field_index = -1;
+	char retained_edit_text[256] = {};
+	int retained_edit_type = 0;
 };
 
 static local_state_t s_state;
@@ -273,15 +304,452 @@ static std::uint64_t field_identity_hash(const struct_recon::struct_field_t& fie
 	return hash == 0 ? 1 : hash;
 }
 
+struct editable_field_binding_t {
+	int structure_index = -1;
+	int field_index = -1;
+	std::uint64_t structure_id = 0;
+	std::uint64_t structure_revision = 0;
+	std::uint64_t field_id = 0;
+	std::uint64_t schema_revision = 0;
+	std::uint64_t base_address = 0;
+	std::uint64_t refresh_sequence = 0;
+	bool live_snapshot_current = false;
+	struct_dissector::field_def_t field;
+	struct_dissector::live_value_t value;
+};
+
+static std::optional<editable_field_binding_t> find_editable_field_binding(
+	const struct_recon::reconstructed_struct_t& reconstruction,
+	const struct_recon::struct_field_t& reconstructed_field)
+{
+	auto& state = struct_dissector::g_state;
+	std::lock_guard<std::mutex> lock(state.mtx);
+	for (std::size_t structure_index = 0; structure_index < state.structs.size(); ++structure_index) {
+		const auto& structure = state.structs[structure_index];
+		if (structure.name != reconstruction.name || structure.stable_id == 0 ||
+			structure.layout_revision == 0)
+			continue;
+		for (std::size_t field_index = 0; field_index < structure.fields.size(); ++field_index) {
+			const auto& field = structure.fields[field_index];
+			if (field.stable_id == 0 || field.name != reconstructed_field.name ||
+				field.offset != reconstructed_field.offset ||
+				field.size != static_cast<std::uint32_t>(reconstructed_field.size))
+				continue;
+			if (!struct_dissector::index_fits_int(structure_index) ||
+				!struct_dissector::index_fits_int(field_index))
+				return std::nullopt;
+			editable_field_binding_t result;
+			result.structure_index = static_cast<int>(structure_index);
+			result.field_index = static_cast<int>(field_index);
+			result.structure_id = structure.stable_id;
+			result.structure_revision = structure.layout_revision;
+			result.field_id = field.stable_id;
+			result.schema_revision = state.schema_revision;
+			result.base_address = state.base_address;
+			result.refresh_sequence = state.last_completed_seq.load(std::memory_order_acquire);
+			result.field = field;
+			if (field_index < state.cached_values.size())
+				result.value = state.cached_values[field_index];
+			result.live_snapshot_current = state.active_struct == static_cast<int>(structure_index) &&
+				state.base_address == reconstruction.base_address && state.base_address != 0 &&
+				result.refresh_sequence != 0 && !result.value.raw_bytes.empty();
+			return result;
+		}
+	}
+	return std::nullopt;
+}
+
+static std::optional<std::pair<int, int>> resolve_retained_edit_binding(
+	const local_state_t& state)
+{
+	auto& catalog = struct_dissector::g_state;
+	std::lock_guard<std::mutex> lock(catalog.mtx);
+	if (catalog.schema_revision != state.retained_edit_schema_revision)
+		return std::nullopt;
+	const int structure_index = struct_dissector::structure_index_by_id_locked(
+		state.retained_edit_structure_id);
+	if (!struct_dissector::valid_index(structure_index, catalog.structs.size()))
+		return std::nullopt;
+	const auto& structure = catalog.structs[static_cast<std::size_t>(structure_index)];
+	if (structure.layout_revision != state.retained_edit_structure_revision)
+		return std::nullopt;
+	const auto found = std::find_if(structure.fields.begin(), structure.fields.end(),
+		[&state](const auto& field) { return field.stable_id == state.retained_edit_field_id; });
+	if (found == structure.fields.end())
+		return std::nullopt;
+	const auto field_index = static_cast<std::size_t>(
+		std::distance(structure.fields.begin(), found));
+	if (!struct_dissector::index_fits_int(field_index))
+		return std::nullopt;
+	return std::pair<int, int>{structure_index, static_cast<int>(field_index)};
+}
+
+static bool retained_reconstruction_is_current(const local_state_t& state,
+	std::string& reason)
+{
+	const auto workspace = disasm_view::capture_selected_workspace();
+	const auto retained_workspace = state.retained_edit_workspace.lock();
+	const auto reconstruction = struct_recon::capture_current_snapshot();
+	if (!workspace.workspace || !workspace.publication || !retained_workspace ||
+		workspace.workspace != retained_workspace ||
+		workspace.publication != state.retained_edit_publication ||
+		workspace.workspace->closing() || workspace.workspace->closed() ||
+		workspace.workspace->identity().binary_id().to_hex() != state.retained_edit_workspace_id ||
+		workspace.workspace->generation() != state.retained_edit_workspace_generation ||
+		workspace.publication->analysis_revision != state.retained_edit_analysis_revision) {
+		reason = "The selected workspace or analysis revision changed; select the field again.";
+		return false;
+	}
+	if (!reconstruction || reconstruction != state.retained_edit_snapshot ||
+		state.retained_edit_field_index < 0 ||
+		state.retained_edit_field_index >= static_cast<int>(reconstruction->fields.size())) {
+		reason = "The reconstruction generation changed; select the field again.";
+		return false;
+	}
+	const auto& field = reconstruction->fields[
+		static_cast<std::size_t>(state.retained_edit_field_index)];
+	if (field_identity_hash(field) != state.retained_edit_field_hash ||
+		reconstruction->base_address != state.retained_edit_base) {
+		reason = "The retained reconstructed field identity changed; select it again.";
+		return false;
+	}
+	if (!resolve_retained_edit_binding(state)) {
+		reason = "The editable Structure Dissector catalog changed; select the field again.";
+		return false;
+	}
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const auto process = workspace.workspace->identity().process();
+	if (state.retained_edit_kind == local_state_t::retained_edit_kind_t::live_value &&
+		(!process || process->pid != state.retained_edit_target_pid ||
+		 !driver_bridge::is_loaded() || driver_bridge::attached_pid() != process->pid)) {
+		reason = "The original attached process identity changed; select the field again.";
+		return false;
+	}
+#endif
+	reason.clear();
+	return true;
+}
+
+static aida::ui::action_handler_result_t stage_retained_field_edit(
+	local_state_t::retained_edit_kind_t kind,
+	std::shared_ptr<const struct_recon::reconstructed_struct_t> reconstruction,
+	int field_index, const editable_field_binding_t& binding,
+	const disasm_view::workspace_context_t& workspace)
+{
+	if (!reconstruction || !workspace.workspace || !workspace.publication ||
+		field_index < 0 || field_index >= static_cast<int>(reconstruction->fields.size()))
+		return aida::ui::action_handler_result_t::failed("The retained reconstruction field is stale");
+	const auto& field = reconstruction->fields[static_cast<std::size_t>(field_index)];
+	auto& state = s_state;
+	state.retained_edit_kind = kind;
+	state.retained_edit_snapshot = std::move(reconstruction);
+	state.retained_edit_workspace = workspace.workspace;
+	state.retained_edit_publication = workspace.publication;
+	state.retained_edit_workspace_id = workspace.workspace->identity().binary_id().to_hex();
+	state.retained_edit_workspace_generation = workspace.workspace->generation();
+	state.retained_edit_analysis_revision = workspace.publication->analysis_revision;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	state.retained_edit_target_pid = workspace.workspace->identity().process()
+		? workspace.workspace->identity().process()->pid : 4242;
+#else
+	state.retained_edit_target_pid = workspace.workspace->identity().process()
+		? workspace.workspace->identity().process()->pid : 0;
+#endif
+	state.retained_edit_field_hash = field_identity_hash(field);
+	state.retained_edit_structure_id = binding.structure_id;
+	state.retained_edit_structure_revision = binding.structure_revision;
+	state.retained_edit_field_id = binding.field_id;
+	state.retained_edit_schema_revision = binding.schema_revision;
+	state.retained_edit_base = state.retained_edit_snapshot->base_address;
+	state.retained_edit_refresh_sequence = binding.refresh_sequence;
+	state.retained_edit_field_index = field_index;
+	state.retained_edit_type = static_cast<int>(binding.field.type);
+	const std::string seed = kind == local_state_t::retained_edit_kind_t::rename
+		? binding.field.name : kind == local_state_t::retained_edit_kind_t::live_value
+		? binding.value.display_text : std::string{};
+	std::snprintf(state.retained_edit_text, sizeof(state.retained_edit_text), "%s", seed.c_str());
+	state.retained_edit_requested = true;
+	return aida::ui::action_handler_result_t::completed(
+		"Review the revision-bound Structure Dissector transaction before committing it");
+}
+
+static void clear_retained_field_edit()
+{
+	s_state.retained_edit_kind = local_state_t::retained_edit_kind_t::none;
+	s_state.retained_edit_snapshot.reset();
+	s_state.retained_edit_workspace.reset();
+	s_state.retained_edit_publication.reset();
+	s_state.retained_edit_text[0] = '\0';
+}
+
+static void render_retained_field_edit_review()
+{
+	if (s_state.retained_edit_requested) {
+		s_state.retained_edit_requested = false;
+		aida::ui::design::open_dialog("types.reconstruction.field.edit-review",
+			"Review Reconstructed Field Edit");
+	}
+	if (!aida::ui::design::begin_dialog("types.reconstruction.field.edit-review",
+			"Review Reconstructed Field Edit", ImVec2(620.0f, 420.0f),
+			ImVec2(440.0f, 320.0f)))
+		return;
+	std::string stale_reason;
+	const bool current = retained_reconstruction_is_current(s_state, stale_reason);
+	const auto reconstruction = s_state.retained_edit_snapshot;
+	const auto* field = reconstruction && s_state.retained_edit_field_index >= 0 &&
+		s_state.retained_edit_field_index < static_cast<int>(reconstruction->fields.size())
+		? &reconstruction->fields[static_cast<std::size_t>(s_state.retained_edit_field_index)]
+		: nullptr;
+	const char* operation = s_state.retained_edit_kind == local_state_t::retained_edit_kind_t::rename
+		? "Rename editable field" : s_state.retained_edit_kind == local_state_t::retained_edit_kind_t::retype
+		? "Retype editable field" : "Edit live field value";
+	const char* confirm_label = s_state.retained_edit_kind ==
+		local_state_t::retained_edit_kind_t::live_value
+		? "Stage verified write" : "Commit catalog edit";
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		confirm_label, "Cancel");
+	aida::ui::design::begin_dialog_body("types.reconstruction.field.edit-review.body",
+		footer_height);
+	ImGui::TextUnformatted(operation);
+	if (field && reconstruction)
+		ImGui::Text("%s.%s  +0x%llX  %u bytes", reconstruction->name.c_str(),
+			field->name.c_str(), static_cast<unsigned long long>(field->offset),
+			static_cast<unsigned int>((std::max)(field->size, 0)));
+	ImGui::TextDisabled("Workspace generation %llu  analysis revision %llu  catalog revision %llu",
+		static_cast<unsigned long long>(s_state.retained_edit_workspace_generation),
+		static_cast<unsigned long long>(s_state.retained_edit_analysis_revision),
+		static_cast<unsigned long long>(s_state.retained_edit_schema_revision));
+	ImGui::Separator();
+	ImGui::BeginDisabled(!current);
+	if (s_state.retained_edit_kind == local_state_t::retained_edit_kind_t::rename) {
+		ImGui::InputText("Field name", s_state.retained_edit_text,
+			sizeof(s_state.retained_edit_text));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item("aida.types.reconstruction-edit-name",
+			"field-edit-input", false, !current);
+#endif
+	} else if (s_state.retained_edit_kind == local_state_t::retained_edit_kind_t::retype) {
+		const char* preview = struct_dissector::field_type_name(
+			static_cast<struct_dissector::field_type_t>(s_state.retained_edit_type));
+		if (ImGui::BeginCombo("Field type", preview)) {
+			for (int index = 0; index < static_cast<int>(struct_dissector::field_type_t::COUNT); ++index) {
+				const bool selected = index == s_state.retained_edit_type;
+				if (ImGui::Selectable(struct_dissector::field_type_name(
+						static_cast<struct_dissector::field_type_t>(index)), selected))
+					s_state.retained_edit_type = index;
+				if (selected) ImGui::SetItemDefaultFocus();
+			}
+			ImGui::EndCombo();
+		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item("aida.types.reconstruction-edit-type",
+			"field-type-selector", false, !current);
+#endif
+	} else {
+		ImGui::Text("Target PID %u  address 0x%016llX", s_state.retained_edit_target_pid,
+			static_cast<unsigned long long>(s_state.retained_edit_base +
+				(field ? field->offset : 0)));
+		ImGui::InputText("New value", s_state.retained_edit_text,
+			sizeof(s_state.retained_edit_text));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item("aida.types.reconstruction-edit-live-value",
+			"live-value-input", false, !current);
+#endif
+		ImGui::TextWrapped("The Structure Dissector will revalidate the exact target, old bytes, field identity, and address before writing, then require an exact readback match.");
+	}
+	ImGui::EndDisabled();
+	if (!current)
+		ImGui::TextWrapped("%s", stale_reason.c_str());
+	aida::ui::design::end_dialog_body();
+	const bool has_non_whitespace_input = std::any_of(std::begin(s_state.retained_edit_text),
+		std::end(s_state.retained_edit_text), [](char character) {
+			return character != '\0' && !std::isspace(static_cast<unsigned char>(character));
+		});
+	const bool has_input = s_state.retained_edit_kind ==
+		local_state_t::retained_edit_kind_t::retype || has_non_whitespace_input;
+	const auto footer = aida::ui::design::dialog_footer(
+		"types.reconstruction.field.edit-review.footer", confirm_label,
+		current && has_input, false, "Cancel");
+	if (footer.confirmed) {
+		const auto resolved = resolve_retained_edit_binding(s_state);
+		bool applied = false;
+		std::string error;
+		if (!resolved) {
+			error = "The editable field revision changed before confirmation.";
+		} else if (s_state.retained_edit_kind == local_state_t::retained_edit_kind_t::live_value) {
+			struct_dissector::field_def_t editable_field;
+			struct_dissector::live_value_t value;
+			std::uint64_t base = 0;
+			{
+				auto& catalog = struct_dissector::g_state;
+				std::lock_guard<std::mutex> lock(catalog.mtx);
+				if (catalog.schema_revision == s_state.retained_edit_schema_revision &&
+					catalog.active_struct == resolved->first &&
+					catalog.base_address == s_state.retained_edit_base &&
+					catalog.last_completed_seq.load(std::memory_order_acquire) ==
+						s_state.retained_edit_refresh_sequence &&
+					struct_dissector::valid_index(resolved->second,
+						catalog.structs[static_cast<std::size_t>(resolved->first)].fields.size()) &&
+					static_cast<std::size_t>(resolved->second) < catalog.cached_values.size()) {
+					editable_field = catalog.structs[static_cast<std::size_t>(resolved->first)]
+						.fields[static_cast<std::size_t>(resolved->second)];
+					value = catalog.cached_values[static_cast<std::size_t>(resolved->second)];
+					base = catalog.base_address;
+				}
+			}
+			if (base == 0 || value.raw_bytes.empty()) {
+				error = "The live value snapshot changed; refresh and select the field again.";
+			} else {
+				const auto workspace = disasm_view::capture_selected_workspace();
+				applied = struct_dissector_view::stage_write_review(workspace,
+					resolved->first, resolved->second, editable_field, value, base,
+					s_state.retained_edit_text, error);
+			}
+		} else {
+			const auto kind = s_state.retained_edit_kind;
+			const std::string text = s_state.retained_edit_text;
+			const int type = s_state.retained_edit_type;
+			applied = struct_dissector::perform_user_catalog_edit(
+				kind == local_state_t::retained_edit_kind_t::rename
+					? "Rename reconstructed field" : "Retype reconstructed field",
+				[resolved, kind, text, type] {
+					return kind == local_state_t::retained_edit_kind_t::rename
+						? struct_dissector::rename_field(resolved->first, resolved->second, text)
+						: struct_dissector::retype_field(resolved->first, resolved->second,
+							static_cast<struct_dissector::field_type_t>(type));
+				}, error);
+		}
+		s_state.operation_error = !applied;
+		s_state.operation_status = applied
+			? s_state.retained_edit_kind == local_state_t::retained_edit_kind_t::live_value
+				? "Live mutation staged for explicit confirmation and exact readback verification."
+				: "Editable structure catalog updated and durable persistence queued."
+			: error.empty() ? "The revision-bound edit was rejected; no change was claimed." : error;
+		if (applied) {
+			{
+				auto& catalog = struct_dissector::g_state;
+				std::lock_guard<std::mutex> lock(catalog.mtx);
+				const int structure_index = struct_dissector::structure_index_by_id_locked(
+					s_state.retained_edit_structure_id);
+				if (struct_dissector::valid_index(structure_index, catalog.structs.size())) {
+					catalog.active_struct = structure_index;
+					const auto& structure = catalog.structs[static_cast<std::size_t>(structure_index)];
+					const auto found = std::find_if(structure.fields.begin(), structure.fields.end(),
+						[](const auto& candidate) {
+							return candidate.stable_id == s_state.retained_edit_field_id;
+						});
+					if (found != structure.fields.end()) {
+						const auto index = static_cast<std::size_t>(
+							std::distance(structure.fields.begin(), found));
+						if (struct_dissector::index_fits_int(index))
+							struct_dissector_view::g_ui.selected_field = static_cast<int>(index);
+					}
+				}
+			}
+			const auto opened = aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.types.dissector"));
+			if (!opened.ok()) {
+				s_state.operation_error = true;
+				s_state.operation_status = opened.detail;
+			}
+			clear_retained_field_edit();
+			ImGui::CloseCurrentPopup();
+		}
+	}
+	if (footer.cancelled) {
+		clear_retained_field_edit();
+		ImGui::CloseCurrentPopup();
+	}
+	ImGui::EndPopup();
+}
+
+static void render_declaration_preview()
+{
+	if (s_state.declaration_preview_requested) {
+		s_state.declaration_preview_requested = false;
+		aida::ui::design::open_dialog("types.reconstruction.declaration-preview",
+			"Generated Reconstruction Declaration");
+	}
+	if (!aida::ui::design::begin_dialog("types.reconstruction.declaration-preview",
+			"Generated Reconstruction Declaration", ImVec2(760.0f, 600.0f),
+			ImVec2(440.0f, 320.0f)))
+		return;
+	const auto current_snapshot = struct_recon::capture_current_snapshot();
+	const bool current = current_snapshot &&
+		current_snapshot == s_state.declaration_preview_snapshot &&
+		!s_state.declaration_preview_text.empty() &&
+		s_state.declaration_preview_text.size() <= 64U * 1024U;
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		"Copy Declaration", "Close");
+	aida::ui::design::begin_dialog_body("types.reconstruction.declaration-preview.body",
+		footer_height);
+	ImGui::Text("Generated declaration: %s", s_state.declaration_preview_name.c_str());
+	ImGui::TextDisabled("%zu bytes  bounded maximum 64 KiB",
+		s_state.declaration_preview_text.size());
+	ImGui::Separator();
+	ImGui::BeginChild("##recon_declaration_text", ImVec2(0.0f, -42.0f), true,
+		ImGuiWindowFlags_HorizontalScrollbar);
+	ImGui::TextUnformatted(s_state.declaration_preview_text.c_str());
+	ImGui::EndChild();
+	ImGui::BeginDisabled(!current);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	ImGui::BeginDisabled();
+	ImGui::Button("Export File...");
+	aida::preview::semantics::register_last_item("aida.types.reconstruction-declaration-export",
+		"declaration-export", false, true);
+	ImGui::EndDisabled();
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+		ImGui::SetTooltip("Native file selection is available in the Win32/DX11 authority");
+#else
+	if (ImGui::Button("Export File...")) {
+		char destination[32768]{};
+		std::string initial = s_state.declaration_preview_name.empty()
+			? "reconstructed_type.hpp" : s_state.declaration_preview_name + ".hpp";
+		std::snprintf(destination, sizeof(destination), "%s", initial.c_str());
+		static const char filter[] =
+			"C/C++ Header (*.h;*.hpp)\0*.h;*.hpp\0C/C++ Source (*.c;*.cpp)\0*.c;*.cpp\0All Files (*.*)\0*.*\0\0";
+		if (win32_dialog::show_save_file_dialog(g_hwnd,
+				"Export Generated Structure Declaration", filter, "hpp", destination,
+				sizeof(destination), "struct_recon_view::export_declaration")) {
+			const auto result = file_tabs::atomic_write_file(destination,
+				s_state.declaration_preview_text);
+			s_state.operation_error = !result.succeeded;
+			s_state.operation_status = result.succeeded
+				? "Generated declaration exported through an exact atomic file replacement."
+				: result.detail;
+		}
+	}
+#endif
+	ImGui::EndDisabled();
+	if (!current)
+		ImGui::TextDisabled("The reconstruction changed. Close and generate a fresh declaration preview.");
+	aida::ui::design::end_dialog_body();
+	const auto footer = aida::ui::design::dialog_footer(
+		"types.reconstruction.declaration-preview.footer", "Copy Declaration",
+		current, false, "Close");
+	if (footer.confirmed) {
+		ImGui::SetClipboardText(s_state.declaration_preview_text.c_str());
+		s_state.operation_error = false;
+		s_state.operation_status = "Generated C++ declaration copied.";
+	}
+	if (footer.cancelled) {
+		s_state.declaration_preview_snapshot.reset();
+		s_state.declaration_preview_text.clear();
+		ImGui::CloseCurrentPopup();
+	}
+	ImGui::EndPopup();
+}
+
 static void render_declare_apply_review()
 {
 	if (s_state.overlay_review_requested) {
 		s_state.overlay_review_requested = false;
-		ImGui::OpenPopup("Review Reconstructed Type Application");
+		aida::ui::design::open_dialog("types.reconstruction.overlay-review",
+			"Review Reconstructed Type Application");
 	}
-	ImGui::SetNextWindowSize(ImVec2(720.0f, 560.0f), ImGuiCond_Appearing);
-	if (!ImGui::BeginPopupModal("Review Reconstructed Type Application", nullptr,
-			ImGuiWindowFlags_NoSavedSettings))
+	if (!aida::ui::design::begin_dialog("types.reconstruction.overlay-review",
+			"Review Reconstructed Type Application", ImVec2(720.0f, 560.0f),
+			ImVec2(440.0f, 320.0f)))
 		return;
 	auto context = disasm_view::capture_selected_workspace();
 	const auto structure = struct_recon::capture_current_snapshot();
@@ -295,6 +763,10 @@ static void render_declare_apply_review()
 		context.publication->analysis_revision == s_state.overlay_review_analysis_revision &&
 		context.workspace->overlay_revision() == s_state.overlay_review_overlay_revision &&
 		structure == s_state.overlay_review_snapshot;
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		"Commit Declaration and Application", "Cancel");
+	aida::ui::design::begin_dialog_body("types.reconstruction.overlay-review.body",
+		footer_height);
 	ImGui::Text("Declare %s and apply at 0x%016llX",
 		s_state.overlay_review_structure_name.c_str(),
 		static_cast<unsigned long long>(s_state.overlay_review_base));
@@ -303,12 +775,17 @@ static void render_declare_apply_review()
 		static_cast<unsigned long long>(s_state.overlay_review_analysis_revision),
 		static_cast<unsigned long long>(s_state.overlay_review_overlay_revision));
 	ImGui::Separator();
-	ImGui::BeginChild("##reconstructed_type_review", ImVec2(0.0f, -44.0f), true,
+	ImGui::BeginChild("##reconstructed_type_review", ImVec2(0.0f, -24.0f), true,
 		ImGuiWindowFlags_HorizontalScrollbar);
 	ImGui::TextUnformatted(s_state.overlay_review_declaration.c_str());
 	ImGui::EndChild();
-	ImGui::BeginDisabled(!current);
-	if (ImGui::Button("Commit Declaration and Application")) {
+	if (!current)
+		ImGui::TextDisabled("The workspace, reconstruction, or overlay revision changed. Cancel and select the field again.");
+	aida::ui::design::end_dialog_body();
+	const auto footer = aida::ui::design::dialog_footer(
+		"types.reconstruction.overlay-review.footer",
+		"Commit Declaration and Application", current, false, "Cancel");
+	if (footer.confirmed) {
 		const auto address = disasm_view::typed_address(context, s_state.overlay_review_base);
 		const bool queued = address && disasm_view::queue_type_declaration_and_application(
 			context, *address, s_state.overlay_review_declaration,
@@ -327,17 +804,13 @@ static void render_declare_apply_review()
 			ImGui::CloseCurrentPopup();
 		}
 	}
-	ImGui::EndDisabled();
-	ImGui::SameLine();
-	if (ImGui::Button("Cancel")) {
+	if (footer.cancelled) {
 		s_state.overlay_review_declaration.clear();
 		s_state.overlay_review_snapshot.reset();
 		s_state.overlay_review_publication.reset();
 		s_state.overlay_review_workspace.reset();
 		ImGui::CloseCurrentPopup();
 	}
-	if (!current)
-		ImGui::TextDisabled("The workspace, reconstruction, or overlay revision changed. Cancel and select the field again.");
 	ImGui::EndPopup();
 }
 
@@ -456,6 +929,8 @@ void render(float pos_x, float pos_y, float width, float height,
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = s_state;
 	render_declare_apply_review();
+	render_retained_field_edit_review();
+	render_declaration_preview();
 	auto& sr = struct_recon::g_state;
 	const auto frame_structure = struct_recon::capture_current_snapshot();
 	const bool has_frame_structure = frame_structure && !frame_structure->fields.empty();
@@ -641,10 +1116,13 @@ void render(float pos_x, float pos_y, float width, float height,
 		const std::string name = frame_structure ? frame_structure->name : std::string{};
 		const size_t field_count = frame_structure ? frame_structure->fields.size() : 0;
 		if (!cpp.empty() && cpp.size() <= 64U * 1024U) {
-			ImGui::SetClipboardText(cpp.c_str());
+			st.declaration_preview_name = name;
+			st.declaration_preview_text = cpp;
+			st.declaration_preview_snapshot = frame_structure;
+			st.declaration_preview_requested = true;
 		}
 		diag::log_tagged_fmt("struct_recon",
-			"export_cpp_clipboard name='%s' fields=%zu bytes=%zu",
+			"export_cpp_review name='%s' fields=%zu bytes=%zu",
 			name.c_str(), field_count, cpp.size());
 	}
 	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !has_frame_structure)
@@ -1314,18 +1792,61 @@ void render(float pos_x, float pos_y, float width, float height,
 			st.operation_error = !result.success;
 			return result;
 		});
-		add_action("types.reconstruction.field.rename", false,
-			"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction",
-			[] { return aida::ui::action_handler_result_t::failed(
-				"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction"); });
-		add_action("types.reconstruction.field.set_type", false,
-			"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction",
-			[] { return aida::ui::action_handler_result_t::failed(
-				"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction"); });
-		add_action("types.reconstruction.field.edit_live", false,
-			"The reconstruction view has no target-session-bound write and readback provider",
-			[] { return aida::ui::action_handler_result_t::failed(
-				"The reconstruction view has no target-session-bound write and readback provider"); });
+		const auto editable_binding = valid_field
+			? find_editable_field_binding(live, field)
+			: std::optional<editable_field_binding_t>{};
+		const bool workspace_available = workspace.workspace && workspace.publication &&
+			!workspace.workspace->closing() && !workspace.workspace->closed();
+		const bool editable_available = current && workspace_available &&
+			editable_binding.has_value() &&
+			struct_dissector::catalog_mutation_available();
+		const char* editable_reason = !workspace_available
+			? "Select the analysis workspace that owns this reconstruction first"
+			: !editable_binding
+			? "Create or select the exact editable structure and field in Structure Dissector first"
+			: !struct_dissector::catalog_mutation_available()
+			? "Another Structure Dissector persistence transaction is running"
+			: "The retained reconstructed field is stale";
+		add_action("types.reconstruction.field.rename", editable_available,
+			editable_reason, [live_snapshot, retained_field, editable_binding, workspace] {
+				if (!editable_binding)
+					return aida::ui::action_handler_result_t::failed(
+						"The editable Structure Dissector field is unavailable");
+				return stage_retained_field_edit(local_state_t::retained_edit_kind_t::rename,
+					live_snapshot, retained_field, *editable_binding, workspace);
+			});
+		add_action("types.reconstruction.field.set_type", editable_available,
+			editable_reason, [live_snapshot, retained_field, editable_binding, workspace] {
+				if (!editable_binding)
+					return aida::ui::action_handler_result_t::failed(
+						"The editable Structure Dissector field is unavailable");
+				return stage_retained_field_edit(local_state_t::retained_edit_kind_t::retype,
+					live_snapshot, retained_field, *editable_binding, workspace);
+			});
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const bool process_current = static_cast<bool>(workspace.workspace);
+#else
+		const auto process = workspace.workspace ? workspace.workspace->identity().process() : nullptr;
+		const bool process_current = process && driver_bridge::is_loaded() &&
+			driver_bridge::attached_pid() != 0 && driver_bridge::attached_pid() == process->pid;
+#endif
+		const bool live_edit_available = editable_available && process_current &&
+			editable_binding->live_snapshot_current;
+		const char* live_edit_reason = !editable_binding
+			? "Create or select the exact editable structure and field in Structure Dissector first"
+			: !process_current
+			? "Attach the original process workspace before editing live memory"
+			: !editable_binding->live_snapshot_current
+			? "Refresh the exact Structure Dissector field at this reconstruction base first"
+			: editable_reason;
+		add_action("types.reconstruction.field.edit_live", live_edit_available,
+			live_edit_reason, [live_snapshot, retained_field, editable_binding, workspace] {
+				if (!editable_binding)
+					return aida::ui::action_handler_result_t::failed(
+						"The editable Structure Dissector field is unavailable");
+				return stage_retained_field_edit(local_state_t::retained_edit_kind_t::live_value,
+					live_snapshot, retained_field, *editable_binding, workspace);
+			});
 		aida::automation_ui::entity_evidence::snapshot_t evidence;
 		evidence.workspace_id = workspace.workspace
 			? workspace.workspace->identity().binary_id().to_hex() : std::string{};

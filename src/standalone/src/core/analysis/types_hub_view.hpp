@@ -1,5 +1,6 @@
 #pragma once
 
+#include "types_hub_view_api.hpp"
 #include "pdb_parser.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "symbol_store.hpp"
@@ -71,17 +72,6 @@ inline std::string studio_type_entity_id(const char* entity,
 	return aida::preview::semantics::stable_id("aida.types", source);
 }
 #endif
-
-enum class sub_tab_t : int {
-    structs = 0,
-    unions = 1,
-    enums = 2,
-    typedefs = 3,
-    functions = 4,
-    inferred = 5,
-    dissector = 6,
-    COUNT = 7
-};
 
 struct type_reference_t {
     aida::analysis::address_t address;
@@ -598,13 +588,16 @@ inline void set_sub_tab(const disasm_view::workspace_context_t& context, sub_tab
     state->selected = -1;
 }
 
-inline void set_sub_tab(sub_tab_t tab) {
+#if defined(AIDA_TYPES_HUB_VIEW_IMPLEMENTATION)
+void set_sub_tab(sub_tab_t tab) {
     set_sub_tab(disasm_view::capture_selected_workspace(), tab);
 }
+#endif
 
-inline bool stage_type_application(const disasm_view::workspace_context_t& context,
+#if defined(AIDA_TYPES_HUB_VIEW_IMPLEMENTATION)
+bool stage_type_application(const disasm_view::workspace_context_t& context,
                                    const aida::analysis::address_t& address,
-                                   std::string* error = nullptr) {
+                                   std::string* error) {
     auto state = state_for(context);
     const auto runtime = disasm_view::runtime_address(context, address);
     if (!state || !runtime) {
@@ -621,6 +614,7 @@ inline bool stage_type_application(const disasm_view::workspace_context_t& conte
     if (error) error->clear();
     return true;
 }
+#endif
 
 inline sub_tab_t active_sub_tab(const disasm_view::workspace_context_t& context) {
     auto state = state_for(context);
@@ -1754,10 +1748,11 @@ inline void render_declaration_review(const disasm_view::workspace_context_t& co
 		}
 	}
 	if (open)
-		ImGui::OpenPopup("Review Global Type Declaration");
-	ImGui::SetNextWindowSize(ImVec2(720.0f, 560.0f), ImGuiCond_Appearing);
-	if (!ImGui::BeginPopupModal("Review Global Type Declaration", nullptr,
-			ImGuiWindowFlags_NoSavedSettings))
+		aida::ui::design::open_dialog("dialog.types.global_declaration_review",
+			"Review Global Type Declaration");
+	if (!aida::ui::design::begin_dialog("dialog.types.global_declaration_review",
+			"Review Global Type Declaration", ImVec2(720.0f, 560.0f),
+			ImVec2(460.0f, 320.0f)))
 		return;
 	std::string name;
 	std::shared_ptr<const std::string> declaration;
@@ -1785,18 +1780,30 @@ inline void render_declaration_review(const disasm_view::workspace_context_t& co
 		context.publication->generation == generation &&
 		context.publication->analysis_revision == analysis_revision &&
 		context.workspace->overlay_revision() == overlay_revision;
-	ImGui::Text("Global declaration: %s", name.c_str());
-	ImGui::TextDisabled("Workspace generation %llu  analysis revision %llu  overlay revision %llu",
-		static_cast<unsigned long long>(generation),
-		static_cast<unsigned long long>(analysis_revision),
-		static_cast<unsigned long long>(overlay_revision));
-	ImGui::Separator();
-	ImGui::BeginChild("##global_type_declaration_review", ImVec2(0.0f, -44.0f), true,
-		ImGuiWindowFlags_HorizontalScrollbar);
-	ImGui::TextUnformatted(declaration ? declaration->c_str() : "");
-	ImGui::EndChild();
-	ImGui::BeginDisabled(!current);
-	if (ImGui::Button("Commit to Overlay")) {
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		"Commit to Overlay", "Cancel");
+	if (aida::ui::design::begin_dialog_body(
+			"types_global_declaration_review_body", footer_height)) {
+		ImGui::Text("Global declaration: %s", name.c_str());
+		ImGui::TextDisabled("Workspace generation %llu  analysis revision %llu  overlay revision %llu",
+			static_cast<unsigned long long>(generation),
+			static_cast<unsigned long long>(analysis_revision),
+			static_cast<unsigned long long>(overlay_revision));
+		ImGui::Separator();
+		ImGui::TextUnformatted(declaration ? declaration->c_str() : "");
+		if (!current) {
+			ImGui::Spacing();
+			aida::ui::inline_notice("types_global_declaration_review_stale",
+				"Review is stale",
+				"The workspace, analysis, or overlay revision changed. Cancel and select the type again.",
+				aida::ui::status_kind_t::warning);
+		}
+	}
+	aida::ui::design::end_dialog_body();
+	const auto footer = aida::ui::design::dialog_footer(
+		"types_global_declaration_review_footer", "Commit to Overlay",
+		current, false, "Cancel");
+	if (footer.confirmed) {
 		const bool queued = disasm_view::queue_type_declaration(context, *declaration);
 		std::lock_guard<std::mutex> lock(state->mutex);
 		state->apply_error = !queued;
@@ -1813,9 +1820,7 @@ inline void render_declaration_review(const disasm_view::workspace_context_t& co
 			ImGui::CloseCurrentPopup();
 		}
 	}
-	ImGui::EndDisabled();
-	ImGui::SameLine();
-	if (ImGui::Button("Cancel")) {
+	if (footer.cancelled) {
 		std::lock_guard<std::mutex> lock(state->mutex);
 		state->declaration_review_text.reset();
 		state->declaration_review_name.clear();
@@ -1824,8 +1829,6 @@ inline void render_declaration_review(const disasm_view::workspace_context_t& co
 		state->declaration_review_workspace_id.clear();
 		ImGui::CloseCurrentPopup();
 	}
-	if (!current)
-		ImGui::TextDisabled("The workspace, analysis, or overlay revision changed. Cancel and select the type again.");
 	ImGui::EndPopup();
 }
 
@@ -2324,11 +2327,13 @@ inline void render_subview(sub_tab_t tab, float pos_x, float pos_y,
     render(pos_x, pos_y, width, height, alpha, accent_r, accent_g, accent_b, context);
 }
 
-inline void render_subview(sub_tab_t tab, float pos_x, float pos_y,
+#if defined(AIDA_TYPES_HUB_VIEW_IMPLEMENTATION)
+void render_subview(sub_tab_t tab, float pos_x, float pos_y,
                            float width, float height, float alpha,
                            float accent_r, float accent_g, float accent_b) {
     render_subview(tab, pos_x, pos_y, width, height, alpha,
         accent_r, accent_g, accent_b, disasm_view::capture_selected_workspace());
 }
+#endif
 
 }

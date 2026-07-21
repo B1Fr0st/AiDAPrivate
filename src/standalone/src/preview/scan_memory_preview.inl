@@ -204,6 +204,25 @@ inline void freeze_address(std::size_t index, bool enabled)
 	entry.freeze_value = enabled ? entry.last_value : std::vector<std::uint8_t>{};
 }
 
+inline bool freeze_address_exact(std::size_t index, bool enabled,
+	const address_entry_t& expected)
+{
+	std::lock_guard<std::mutex> lock(g_state.address_mutex);
+	if (index >= g_state.address_list.size()) return false;
+	auto& entry = g_state.address_list[index];
+	if (entry.address != expected.address || entry.description != expected.description ||
+		entry.value_type != expected.value_type || entry.frozen != expected.frozen ||
+		entry.freeze_value != expected.freeze_value || entry.last_value != expected.last_value ||
+		entry.target_pid != expected.target_pid || entry.target_epoch != expected.target_epoch ||
+		entry.target_identity.process.creation_time_100ns !=
+			expected.target_identity.process.creation_time_100ns ||
+		(enabled && entry.last_value.empty()))
+		return false;
+	entry.frozen = enabled;
+	entry.freeze_value = enabled ? entry.last_value : std::vector<std::uint8_t>{};
+	return entry.frozen == enabled && (!enabled || !entry.freeze_value.empty());
+}
+
 inline write_transaction_result_t write_value_exact(std::uint64_t address, value_type_t type,
 	const std::string& text, bool hex, std::uint32_t expected_pid,
 	std::uint64_t expected_process_creation_time_100ns)

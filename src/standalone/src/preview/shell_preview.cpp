@@ -16,6 +16,15 @@
 ID3D11Device* g_pd3dDevice = nullptr;
 HWND g_hwnd = nullptr;
 
+namespace aida::preview::debugger
+{
+	std::vector<receipt_t> receipts;
+	std::uint64_t next_sequence = 1;
+	bool fixture_initialized = false;
+	fixture_state_t fixture_state = fixture_state_t::normal;
+	bool driver_available = true;
+}
+
 namespace aida::preview
 {
 	namespace
@@ -437,10 +446,17 @@ namespace aida::preview
 
 	void apply_save_file()
 	{
-		aida::preview::editor::save_document();
-		if (file_tabs::active_tab >= 0 && static_cast<std::size_t>(file_tabs::active_tab) < file_tabs::tabs.size())
-			file_tabs::tabs[static_cast<std::size_t>(file_tabs::active_tab)].dirty = false;
-		output_log::push(bottom_tab_t::output, "[preview] Saved active document fixture");
+		if (aida::preview::editor::save_document()) {
+			output_log::push(bottom_tab_t::output, "[preview] Saved active document fixture");
+			return;
+		}
+		std::string reason = "The retained document save was rejected";
+		const int tab_index = file_tabs::find_document(aida::preview::editor::fixture_document_id);
+		if (file_tabs::is_valid_tab_index(tab_index)) {
+			const auto& tab = file_tabs::tabs[file_tabs::tab_index(tab_index)];
+			if (!tab.save_error.empty()) reason = tab.save_error;
+		}
+		output_log::push(bottom_tab_t::output, "[preview] Save rejected: " + reason);
 	}
 
 	void apply_chat_send(const std::string& prompt)

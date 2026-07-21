@@ -13,6 +13,7 @@
 #include "session_handler_view.hpp"
 #include "session_handler.hpp"
 #include "../human_request_editor.hpp"
+#include "../network_view.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -20,6 +21,7 @@
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/components.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/studio_semantics.hpp"
 #include "../../../preview/network_preview_executor.hpp"
 #else
 #include "../../infra/executor.hpp"
@@ -81,6 +83,11 @@ struct view_state_t
     std::map<std::string, std::string>  last_run_values;
     bool                                last_run_ok = false;
     uint64_t                            last_run_macro_id = 0;
+
+    network_view::artifact_identity_t   reviewed_context;
+    bool                                reviewed_context_current = false;
+    int                                 reviewed_context_validation_frame = -120;
+    std::string                         reviewed_context_reason;
 };
 
 view_state_t& s()
@@ -91,6 +98,17 @@ view_state_t& s()
 
 const char* extract_from_combo[] = { "resp_body", "resp_headers", "resp_url" };
 const char* match_combo[]        = { "url_regex", "response_status", "response_regex" };
+
+bool request_artifact_kind(network_view::artifact_kind_t kind)
+{
+    return kind == network_view::artifact_kind_t::exchange ||
+        kind == network_view::artifact_kind_t::request ||
+        kind == network_view::artifact_kind_t::repeater_request ||
+        kind == network_view::artifact_kind_t::sitemap_request ||
+        kind == network_view::artifact_kind_t::api_request ||
+        kind == network_view::artifact_kind_t::scanner_request ||
+        kind == network_view::artifact_kind_t::intercept_request;
+}
 
 void queue_macro_update(session_handler::macro_t macro)
 {
@@ -106,6 +124,51 @@ void queue_macro_update(session_handler::macro_t macro)
     static_cast<void>(aida::infra::executor::submit(std::move(submission)));
 }
 
+void refresh_reviewed_context(view_state_t& st)
+{
+    if (!st.reviewed_context.valid()) return;
+    const int frame = ImGui::GetFrameCount();
+    if (frame - st.reviewed_context_validation_frame < 120) return;
+    st.reviewed_context_validation_frame = frame;
+    network_view::artifact_snapshot_t snapshot;
+    std::string reason;
+    st.reviewed_context_current = network_view::resolve_artifact(
+        st.reviewed_context, snapshot, reason);
+    st.reviewed_context_reason = st.reviewed_context_current
+        ? std::string() : (reason.empty() ? "The retained source is stale." : std::move(reason));
+}
+
+}
+
+bool stage_reviewed_context(const network_view::artifact_identity_t& identity,
+                            std::string& unavailable_reason)
+{
+    if (!identity.valid() || !request_artifact_kind(identity.kind) ||
+        identity.target_host.empty() || identity.target_port == 0 ||
+        identity.target_host.size() >= sizeof(s().new_step_host) || identity.raw_protocol) {
+        unavailable_reason = "Session Handling requires a current retained HTTP/1 request with a bounded target.";
+        return false;
+    }
+    network_view::artifact_snapshot_t snapshot;
+    if (!network_view::resolve_artifact(identity, snapshot, unavailable_reason)) return false;
+    if (snapshot.bytes.empty() || snapshot.bytes.size() >= sizeof(s().new_step_request) ||
+        std::find(snapshot.bytes.begin(), snapshot.bytes.end(), 0) != snapshot.bytes.end()) {
+        unavailable_reason = "Session Handling accepts a NUL-free reviewed request of at most 8191 bytes.";
+        return false;
+    }
+    auto& st = s();
+    st.reviewed_context = identity;
+    st.reviewed_context_current = true;
+    st.reviewed_context_validation_frame = ImGui::GetFrameCount();
+    st.reviewed_context_reason.clear();
+    std::memcpy(st.new_step_host, identity.target_host.data(), identity.target_host.size());
+    st.new_step_host[identity.target_host.size()] = '\0';
+    std::snprintf(st.new_step_scheme, sizeof(st.new_step_scheme), "%s", identity.use_tls ? "https" : "http");
+    st.new_step_port = identity.target_port;
+    std::memcpy(st.new_step_request, snapshot.bytes.data(), snapshot.bytes.size());
+    st.new_step_request[snapshot.bytes.size()] = '\0';
+    unavailable_reason.clear();
+    return true;
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -147,7 +210,59 @@ void render(float pos_x, float pos_y, float width, float height,
                 aida::ui::with_alpha(th.text_primary, alpha),
                 "Session handler / Macros");
 
-    const float top_y = 36.f;
+    float top_y = 36.f;
+    if (st.reviewed_context.valid()) {
+        ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + top_y));
+        const float context_height = st.reviewed_context_current ? 58.f : 76.f;
+        ImGui::BeginChild("##sh_reviewed_context", ImVec2(width - 12.f, context_height), true);
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        const ImVec2 context_min = ImGui::GetWindowPos();
+        const ImVec2 context_max(context_min.x + ImGui::GetWindowSize().x,
+                                 context_min.y + ImGui::GetWindowSize().y);
+        aida::preview::semantics::register_region(
+            "aida.network.session-handling.reviewed-context", "reviewed-network-context",
+            ImGui::GetID("##sh_reviewed_context_region"), context_min, context_max, false,
+            false, "aida.dock-window.view.network.session");
+#endif
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(
+            st.reviewed_context_current ? th.success : th.error, alpha)), "%s",
+            st.reviewed_context_current ? "CURRENT AT LAST CHECK" : "STALE REVIEWED SOURCE");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Recheck##sh_reviewed_context_recheck")) {
+            st.reviewed_context_validation_frame = -120;
+            refresh_reviewed_context(st);
+        }
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        aida::preview::semantics::register_last_item(
+            "aida.network.session-handling.reviewed-context.recheck", "revalidate-reviewed-context",
+            false, false, "aida.network.session-handling.reviewed-context");
+#endif
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear##sh_reviewed_context_clear")) {
+            st.reviewed_context = {};
+            st.reviewed_context_current = false;
+            st.reviewed_context_reason.clear();
+        }
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        aida::preview::semantics::register_last_item(
+            "aida.network.session-handling.reviewed-context.clear", "clear-reviewed-context",
+            false, false, "aida.network.session-handling.reviewed-context");
+#endif
+        ImGui::SameLine();
+        ImGui::TextUnformatted(st.reviewed_context.label.empty()
+            ? st.reviewed_context.id.c_str() : st.reviewed_context.label.c_str());
+        ImGui::TextDisabled("%s://%s:%u | rev %llu | hash %016llX | %zu bytes",
+            st.reviewed_context.use_tls ? "https" : "http",
+            st.reviewed_context.target_host.c_str(),
+            static_cast<unsigned>(st.reviewed_context.target_port),
+            static_cast<unsigned long long>(st.reviewed_context.revision),
+            static_cast<unsigned long long>(st.reviewed_context.content_hash),
+            st.reviewed_context.content_size);
+        if (!st.reviewed_context_current && !st.reviewed_context_reason.empty())
+            ImGui::TextDisabled("%s", st.reviewed_context_reason.c_str());
+        ImGui::EndChild();
+        top_y += context_height + 6.f;
+    }
     const float left_w = width * 0.42f;
     const float right_x = left_w + 8.f;
     const float right_w = width - right_x - 8.f;

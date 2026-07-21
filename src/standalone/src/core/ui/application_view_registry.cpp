@@ -24,7 +24,8 @@
 #include "../analysis/functions_panel.hpp"
 #include "../analysis/analysis_list_views.hpp"
 #include "../analysis/analysis_relationship_views.hpp"
-#include "../analysis/types_hub_view.hpp"
+#include "../analysis/types_hub_view_api.hpp"
+#include "../analysis/struct_recon_view.hpp"
 #include "../analysis/xref_db_view.hpp"
 #include "../debugger/debugger_view.hpp"
 #include "../disasm/cfg_view.hpp"
@@ -35,6 +36,7 @@
 #include "../editor/image_view.hpp"
 #include "../network/network_view.hpp"
 #include "../network/burp/project_view.hpp"
+#include "../scanner/memory_scanner_view.hpp"
 #include "../scanner/scan_hub_view.hpp"
 #include "../session/analysis_session.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -133,6 +135,8 @@ constexpr catalog_entry_t k_catalog[] = {
     AIDA_VIEW("view.analysis.fuzzer", "Analysis Fuzzer", analysis, tool_window, registry, analysis, 3, 440, 280, false, true, true),
     AIDA_VIEW("view.analysis.protection", "Protection Analysis", analysis, tool_window, registry, analysis, 4, 440, 280, false, true, true),
     AIDA_VIEW("view.memory.value_scan", "Value Scan", memory, tool_window, registry, scan, 0, 480, 280, false, true, false),
+    AIDA_VIEW("view.memory.value_scan_results", "Value Scan Results", memory, tool_window, registry, none, 0, 480, 240, false, true, false),
+    AIDA_VIEW("view.memory.address_list", "Address List", memory, tool_window, registry, none, 0, 480, 220, false, true, false),
     AIDA_VIEW("view.memory.crypto", "Crypto Scanner", memory, tool_window, registry, scan, 1, 440, 260, false, true, false),
     AIDA_VIEW("view.memory.aob", "AOB Generator", memory, tool_window, registry, scan, 2, 440, 260, false, true, true),
     AIDA_VIEW("view.memory.decrypt", "Decrypt Oracle", memory, tool_window, registry, scan, 3, 440, 260, false, true, false),
@@ -149,6 +153,8 @@ constexpr catalog_entry_t k_catalog[] = {
     AIDA_VIEW("view.types.struct_recon", "Structure Reconstruction", types, document, registry, none, 0, 560, 360, false, true, false),
 #define AIDA_DEBUG_VIEW(ID, LABEL, INDEX) AIDA_VIEW(ID, LABEL, debugger, tool_window, registry, debugger, INDEX, 420, 240, false, true, false)
     AIDA_VIEW("view.debug.cpu", "CPU", debugger, tool_window, registry, debugger, 0, 620, 380, false, true, false),
+    AIDA_VIEW("view.debug.registers", "Registers", debugger, tool_window, registry, none, 0, 380, 300, false, true, false),
+    AIDA_VIEW("view.debug.stack", "Stack", debugger, tool_window, registry, none, 0, 420, 240, false, true, false),
     AIDA_DEBUG_VIEW("view.debug.breakpoints", "Breakpoints", 1),
     AIDA_DEBUG_VIEW("view.debug.memory_map", "Memory Map", 2), AIDA_DEBUG_VIEW("view.debug.call_stack", "Call Stack", 3),
     AIDA_DEBUG_VIEW("view.debug.threads", "Threads", 4), AIDA_DEBUG_VIEW("view.debug.watches", "Watches", 5),
@@ -1340,6 +1346,22 @@ void initialize() {
                     1.f, globals::ui::accent.x, globals::ui::accent.y,
                     globals::ui::accent.z, disasm_view::capture_selected_workspace());
             };
+        else if (std::strcmp(entry.id, "view.memory.value_scan_results") == 0)
+            descriptor.render = [](const view_render_context_t&) {
+                const ImVec2 available = ImGui::GetContentRegionAvail();
+                const ImVec2 cursor = ImGui::GetCursorPos();
+                memory_scanner_view::render_results(cursor.x, cursor.y,
+                    (std::max)(available.x, 1.f), (std::max)(available.y, 1.f), 1.f,
+                    globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
+            };
+        else if (std::strcmp(entry.id, "view.memory.address_list") == 0)
+            descriptor.render = [](const view_render_context_t&) {
+                const ImVec2 available = ImGui::GetContentRegionAvail();
+                const ImVec2 cursor = ImGui::GetCursorPos();
+                memory_scanner_view::render_address_list(cursor.x, cursor.y,
+                    (std::max)(available.x, 1.f), (std::max)(available.y, 1.f), 1.f,
+                    globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
+            };
         else if (entry.category == view_category_t::memory && entry.subview == catalog_subview_t::scan)
             descriptor.render = [tab = static_cast<scan_hub_view::sub_tab_t>(entry.subview_value)](const view_render_context_t&) {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
@@ -1360,6 +1382,22 @@ void initialize() {
                 const ImVec2 available = ImGui::GetContentRegionAvail();
                 const ImVec2 cursor = ImGui::GetCursorPos();
                 struct_recon_view::render(cursor.x, cursor.y,
+                    (std::max)(available.x, 1.f), (std::max)(available.y, 1.f), 1.f,
+                    globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
+            };
+        else if (std::strcmp(entry.id, "view.debug.registers") == 0)
+            descriptor.render = [](const view_render_context_t&) {
+                const ImVec2 available = ImGui::GetContentRegionAvail();
+                const ImVec2 cursor = ImGui::GetCursorPos();
+                debugger_view::render_registers_pane(cursor.x, cursor.y,
+                    (std::max)(available.x, 1.f), (std::max)(available.y, 1.f), 1.f,
+                    globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
+            };
+        else if (std::strcmp(entry.id, "view.debug.stack") == 0)
+            descriptor.render = [](const view_render_context_t&) {
+                const ImVec2 available = ImGui::GetContentRegionAvail();
+                const ImVec2 cursor = ImGui::GetCursorPos();
+                debugger_view::render_stack_pane(cursor.x, cursor.y,
                     (std::max)(available.x, 1.f), (std::max)(available.y, 1.f), 1.f,
                     globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z);
             };

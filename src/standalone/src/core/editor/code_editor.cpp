@@ -215,6 +215,9 @@ struct document_runtime_t {
 	std::shared_ptr<std::atomic<bool>> stream_dispatch_failed;
 	std::shared_ptr<std::atomic<bool>> stream_cancel;
 	std::uint64_t stream_task_id = 0;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    std::uint64_t preview_advertised_byte_length = 0;
+#endif
     std::shared_ptr<std::atomic<bool>> find_cancel;
     std::uint64_t find_generation = 0;
 	std::uint64_t find_task_id = 0;
@@ -362,7 +365,7 @@ std::uint64_t line_hash(std::string_view text) {
 const std::string& line_at(int idx);
 
 bool large_file_mode() {
-    return s_cache.content_bytes >= LARGE_FILE_BYTES;
+    return s_cache.content_bytes > LARGE_FILE_BYTES;
 }
 
 bool large_read_only_mode() {
@@ -2297,6 +2300,9 @@ bool code_editor_widget::load_document(std::uint64_t document_id, std::uint64_t 
 	target->mapped_line_cache_bytes = 0;
     target->stream_loading = false;
     target->stream_error.clear();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    target->preview_advertised_byte_length = 0;
+#endif
     target->language_override.assign(language_override.substr(0, 64));
     target->language = resolved_language(target->filename, target->language_override);
     target->language_set = !target->filename.empty() || !target->language_override.empty();
@@ -2810,26 +2816,35 @@ bool code_editor_widget::request_streamed_document(std::uint64_t document_id,
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 bool code_editor_widget::configure_preview_stream_state(std::uint64_t document_id,
-        bool loading, bool cancellation_requested, std::string_view error) {
+        std::uint64_t advertised_byte_length, bool loading,
+        bool cancellation_requested, std::string_view error) {
     const auto found = s_document_states.find(document_id);
     if (found == s_document_states.end() || error.size() > 2048U ||
+        advertised_byte_length < LARGE_READ_ONLY_BYTES ||
         (cancellation_requested && !loading))
         return false;
     auto& document = *found->second;
     cancel_runtime_jobs(document);
+    document.preview_advertised_byte_length = advertised_byte_length;
     document.stream_loading = loading;
     document.stream_error.assign(error);
     document.stream_cancel = loading
         ? std::make_shared<std::atomic<bool>>(cancellation_requested)
         : std::shared_ptr<std::atomic<bool>>{};
-    document.read_only = loading || !error.empty();
-    document.read_only_reason = document.read_only
-        ? cancellation_requested
+    document.read_only = true;
+    document.read_only_reason = advertised_byte_length > MAXIMUM_VIEWABLE_BYTES
+        ? "This artifact exceeds the 500 MiB editor-view limit; use Hex View or Binary Map."
+        : cancellation_requested
             ? "Large-file indexing is cancelling; the document remains read-only until the worker confirms termination."
             : error.empty()
-                ? "Large-file indexing is active; the document remains read-only until publication."
+                ? loading
+                    ? "Large-file indexing is active; the document remains read-only until publication."
+                    : advertised_byte_length >=
+                            aida::editor::programming_documents::large_document_milestone_bytes
+                        ? "Files from 50 MiB through 500 MiB use a bounded indexed read-only publication; editing, replace, formatting, and AI proposals remain disabled."
+                        : "Files above 1 MiB through 50 MiB use a bounded mapped read-only publication; editing, replace, formatting, and AI proposals remain disabled."
                 : "The deterministic large-file operation failed; retry or choose Hex View/Binary Map."
-        : std::string{};
+        ;
     return true;
 }
 #endif
@@ -2917,7 +2932,15 @@ code_editor_widget::document_state_t code_editor_widget::document_state(
     result.active = document.active;
     result.dirty = document.dirty;
     result.focused = s_focused_document_id == document_id;
-    result.content_bytes = document.mapped_source
+    result.content_bytes =
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        document.preview_advertised_byte_length != 0
+        ? static_cast<std::size_t>((std::min<std::uint64_t>)(
+            document.preview_advertised_byte_length,
+            static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())))
+        :
+#endif
+        document.mapped_source
         ? static_cast<std::size_t>(document.mapped_source->byte_length)
         : document.cache.dirty ? document.serialized_content.size() : document.cache.content_bytes;
     result.line_count = document.mapped_source ? document.mapped_source->line_offsets.size()
@@ -2926,7 +2949,11 @@ code_editor_widget::document_state_t code_editor_widget::document_state(
     result.caret_column = document.selection.caret_col;
     result.large_file_mode = result.content_bytes >= LARGE_FILE_BYTES;
     result.has_selection = document.selection.has_selection();
-    result.streamed = document.mapped_source != nullptr;
+    result.streamed = document.mapped_source != nullptr
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        || document.preview_advertised_byte_length != 0
+#endif
+        ;
     result.stream_loading = document.stream_loading;
     result.stream_error = document.stream_error;
     result.capabilities.text_editing = document.active && !document.read_only;

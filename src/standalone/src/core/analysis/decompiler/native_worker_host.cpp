@@ -1620,6 +1620,7 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
     handle_t parent_read;
     handle_t child_snapshot;
     handle_t child_identity;
+    handle_t child_standard;
     DWORD error = ERROR_SUCCESS;
     app_container_t container;
     if (!container.create(verified.manifest_hash, error)) {
@@ -1657,18 +1658,38 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
     const bool managed = verified.manifest.provider.provider ==
         decompiler_provider_id_t::ilspy_cli;
     worker.native_protocol = !managed;
-    std::array<HANDLE, 4> inherited_handles{child_read.get(), child_write.get(), child_snapshot.get(), child_identity.get()};
+    std::array<HANDLE, 5> inherited_handles{
+        child_read.get(), child_write.get(), child_snapshot.get(), child_identity.get(), nullptr};
+    std::size_t inherited_handle_count = 4;
+    if (managed) {
+        SECURITY_ATTRIBUTES standard_attributes{};
+        standard_attributes.nLength = sizeof(standard_attributes);
+        standard_attributes.bInheritHandle = TRUE;
+        child_standard.reset(CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, &standard_attributes, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (!child_standard) {
+            error = GetLastError();
+            append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected,
+                "native_worker.standard_handles",
+                "detached managed worker standard handles could not be isolated",
+                error == ERROR_SUCCESS ? ERROR_INVALID_HANDLE : error);
+            return false;
+        }
+        inherited_handles[inherited_handle_count++] = child_standard.get();
+    }
     std::uint64_t mitigation_policy = PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE |
         PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE |
         PROCESS_CREATION_MITIGATION_POLICY_HEAP_TERMINATE_ALWAYS_ON |
         PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_ON |
         PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_ON |
         PROCESS_CREATION_MITIGATION_POLICY_STRICT_HANDLE_CHECKS_ALWAYS_ON |
-        PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON |
         PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON |
         PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_ON;
-    if (!managed)
-        mitigation_policy |= PROCESS_CREATION_MITIGATION_POLICY_PROHIBIT_DYNAMIC_CODE_ALWAYS_ON;
+    if (!managed) {
+        mitigation_policy |= PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON |
+            PROCESS_CREATION_MITIGATION_POLICY_PROHIBIT_DYNAMIC_CODE_ALWAYS_ON;
+    }
     DWORD child_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
     HANDLE job_list[] = {worker.job.get()};
     SECURITY_CAPABILITIES capabilities{};
@@ -1690,7 +1711,7 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
         return false;
     }
     if (!UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited_handles.data(),
-            sizeof(HANDLE) * inherited_handles.size(), nullptr, nullptr) ||
+            sizeof(HANDLE) * inherited_handle_count, nullptr, nullptr) ||
         !UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation_policy,
             sizeof(mitigation_policy), nullptr, nullptr) ||
         !UpdateProcThreadAttribute(attribute_list, 0, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, &child_policy,
@@ -1766,10 +1787,18 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
     startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
     startup.StartupInfo.wShowWindow = SW_HIDE;
+    if (managed) {
+        startup.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = child_standard.get();
+        startup.StartupInfo.hStdOutput = child_standard.get();
+        startup.StartupInfo.hStdError = child_standard.get();
+    }
     startup.lpAttributeList = attribute_list;
     PROCESS_INFORMATION process{};
+    const DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
+        (managed ? DETACHED_PROCESS : CREATE_NO_WINDOW);
     const BOOL launched = CreateProcessW(verified.worker_path.c_str(), command_line.data(), nullptr, nullptr, TRUE,
-        EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, const_cast<wchar_t*>(environment->data()),
+        creation_flags, const_cast<wchar_t*>(environment->data()),
         verified.root_path.c_str(), &startup.StartupInfo, &process);
     error = launched ? ERROR_SUCCESS : GetLastError();
     DeleteProcThreadAttributeList(attribute_list);
@@ -1788,6 +1817,7 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
     child_write.reset();
     child_snapshot.reset();
     child_identity.reset();
+    child_standard.reset();
     const auto bootstrap = wire::encode_bootstrap(worker.session, verified.manifest_hash);
     if (!wire::write_all(worker.request_pipe.get(), bootstrap.data(), bootstrap.size(), error)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::bootstrap_failed, "native_worker.bootstrap", "bootstrap could not be delivered", error, true);
@@ -1941,6 +1971,8 @@ terminal_wait_t wait_for_message(worker_instance_t& worker, const native_worker_
     worker.wait_observation = {};
     worker.wait_observation.native_protocol = worker.native_protocol;
     while (true) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return terminal_wait_t::deadline;
         if (request.cancellation_requested) {
             bool cancelled = true;
             try {
@@ -1951,8 +1983,6 @@ terminal_wait_t wait_for_message(worker_instance_t& worker, const native_worker_
             if (cancelled)
                 return terminal_wait_t::cancelled;
         }
-        if (std::chrono::steady_clock::now() >= deadline)
-            return terminal_wait_t::deadline;
         const auto state = worker.reader.poll(worker.response_pipe.get(), worker.session, worker.next_worker_sequence,
             limits.max_frame_bytes, frame, error);
         if (state == wire::read_state_t::complete) {
@@ -2107,32 +2137,81 @@ bool validate_envelope(const decompiler_worker_message_t& message, const wire::f
     }, message);
 }
 
-bool validate_managed_hello(
+enum class managed_startup_frame_kind_t : std::uint8_t {
+    invalid,
+    hello,
+    failure
+};
+
+struct managed_startup_frame_t {
+    managed_startup_frame_kind_t kind = managed_startup_frame_kind_t::invalid;
+    std::string stage;
+    std::string code;
+    bool retryable = false;
+};
+
+managed_startup_frame_t validate_managed_startup_frame(
     const wire::frame_t& frame,
     const wire::session_material_t& session,
     const verified_worker_t& verified)
 {
     try {
         if (frame.kind != wire::frame_kind_t::decompiler_contract)
-            return false;
+            return {};
         const auto value = nlohmann::json::parse(frame.payload.begin(), frame.payload.end(),
             nullptr, true, true);
-        if (!value.is_object() || value.size() != 11 ||
+        if (!value.is_object() || !value.contains("kind") ||
             value.at("schema") != "aida.c03.managed-cli.transport" ||
-            value.at("schemaVersion") != 3 || value.at("kind") != "hello" ||
+            value.at("schemaVersion") != 3 ||
             value.at("sequence") != frame.sequence ||
-            value.at("sessionNonceHash") != session.nonce_hash.to_hex() ||
-            value.at("manifestHash") != verified.manifest_hash.to_hex() ||
-            value.at("runtimeManifestHash") !=
-                verified.manifest.managed_runtime_manifest_hash.to_hex() ||
-            value.at("workerBinaryHash") != verified.manifest.worker_binary_hash.to_hex() ||
-            value.at("providerBinaryHash") != verified.manifest.provider.provider_binary_hash.to_hex() ||
-            value.at("workerBuildId") != verified.manifest.provider.worker_build_id ||
-            value.at("workerBuildHash") != verified.manifest.provider.worker_build_hash.to_hex())
-            return false;
-        return true;
+            value.at("sessionNonceHash") != session.nonce_hash.to_hex())
+            return {};
+        const auto kind = value.at("kind").get<std::string>();
+        if (kind == "hello") {
+            if (value.size() != 11 ||
+                value.at("manifestHash") != verified.manifest_hash.to_hex() ||
+                value.at("runtimeManifestHash") !=
+                    verified.manifest.managed_runtime_manifest_hash.to_hex() ||
+                value.at("workerBinaryHash") != verified.manifest.worker_binary_hash.to_hex() ||
+                value.at("providerBinaryHash") != verified.manifest.provider.provider_binary_hash.to_hex() ||
+                value.at("workerBuildId") != verified.manifest.provider.worker_build_id ||
+                value.at("workerBuildHash") != verified.manifest.provider.worker_build_hash.to_hex())
+                return {};
+            return {managed_startup_frame_kind_t::hello, {}, {}, false};
+        }
+        if (kind != "startup_failure" || value.size() != 8 ||
+            !value.at("stage").is_string() || !value.at("code").is_string() ||
+            !value.at("retryable").is_boolean())
+            return {};
+        auto stage = value.at("stage").get<std::string>();
+        auto code = value.at("code").get<std::string>();
+        constexpr std::array<std::string_view, 5> stages{
+            "transport", "runtime_identity", "module_mapping", "module_snapshot", "worker_identity"};
+        constexpr std::array<std::string_view, 38> codes{
+            "loaded_assembly_path", "framework_dependency_hash", "appcontainer_environment",
+            "environment_allowlist", "environment_policy", "windows_environment",
+            "runtime_manifest_hash", "runtime_manifest_digest", "provider_hash",
+            "runtime_integrity", "invalid_data", "bad_image", "access_denied",
+            "io_failure", "resource_limit", "unexpected", "identity_not_established",
+            "runtime_manifest_identity", "process_path_unavailable", "package_path_invalid",
+            "package_root_invalid", "apphost_identity", "repository_dependency_root",
+            "dotnet_root", "runtime_manifest_size", "framework_identity",
+            "forbidden_host_override", "identity_reentry", "identity_unavailable",
+            "package_root_unavailable", "identity_locks", "identity_changed",
+            "package_root_changed", "runtime_file_unavailable", "runtime_directory_unavailable",
+            "runtime_root_identity", "path_escape", "reparse_path"};
+        const bool valid_stage = std::any_of(stages.begin(), stages.end(), [&stage](const auto candidate) {
+            return candidate == std::string_view(stage);
+        });
+        const bool valid_code = std::any_of(codes.begin(), codes.end(), [&code](const auto candidate) {
+            return candidate == std::string_view(code);
+        });
+        if (!valid_stage || !valid_code)
+            return {};
+        return {managed_startup_frame_kind_t::failure, std::move(stage),
+            std::move(code), value.at("retryable").get<bool>()};
     } catch (...) {
-        return false;
+        return {};
     }
 }
 
@@ -2209,6 +2288,81 @@ bool send_cancel(worker_instance_t& worker, const native_worker_execution_reques
 void append_worker_failure(native_worker_execution_result_t& result, const decompiler_worker_failure_message_t& failure)
 {
     result.worker_diagnostics.insert(result.worker_diagnostics.end(), failure.diagnostics.begin(), failure.diagnostics.end());
+}
+
+std::string_view diagnostic_layer_name(const decompiler_coordinate_layer_t layer) noexcept
+{
+    switch (layer) {
+    case decompiler_coordinate_layer_t::provider_ir:
+        return "provider_ir";
+    case decompiler_coordinate_layer_t::hir:
+        return "hir";
+    case decompiler_coordinate_layer_t::typed_ast:
+        return "typed_ast";
+    case decompiler_coordinate_layer_t::document:
+        return "document";
+    }
+    return "invalid";
+}
+
+void append_worker_diagnostic_detail(std::string& detail, const decompiler_diagnostic_t& diagnostic)
+{
+    detail.append(": code=");
+    detail.append(std::to_string(static_cast<std::uint16_t>(diagnostic.code)));
+    detail.append(" severity=");
+    detail.append(std::to_string(static_cast<std::uint8_t>(diagnostic.severity)));
+    detail.append(" key=");
+    detail.append(diagnostic.localization_key.data(),
+        (std::min<std::size_t>)(diagnostic.localization_key.size(), 256U));
+    detail.append(" ordinal=");
+    detail.append(std::to_string(diagnostic.ordinal));
+    detail.append(" confidence=");
+    detail.append(std::to_string(diagnostic.confidence));
+    detail.append(" retryable=");
+    detail.push_back(diagnostic.retryable ? '1' : '0');
+    detail.append(" argument_count=");
+    detail.append(std::to_string(diagnostic.localization_arguments.size()));
+    if (!diagnostic.coordinate)
+        return;
+    const auto& coordinate = *diagnostic.coordinate;
+    detail.append(" layer=");
+    detail.append(diagnostic_layer_name(coordinate.layer));
+    detail.append(" generation=");
+    detail.append(std::to_string(coordinate.workspace_generation));
+    if (coordinate.address_range) {
+        detail.append(" address=");
+        detail.append(std::to_string(coordinate.address_range->begin.value));
+        detail.push_back('-');
+        detail.append(std::to_string(coordinate.address_range->end.value));
+    }
+    if (coordinate.token_range) {
+        detail.append(" token=");
+        detail.append(std::to_string(coordinate.token_range->begin));
+        detail.push_back('-');
+        detail.append(std::to_string(coordinate.token_range->end));
+    }
+    if (coordinate.instruction_range) {
+        detail.append(" instruction=");
+        detail.append(std::to_string(coordinate.instruction_range->first_instruction_id));
+        detail.push_back('-');
+        detail.append(std::to_string(coordinate.instruction_range->last_instruction_id));
+    }
+    if (coordinate.document_range) {
+        detail.append(" document=");
+        detail.append(std::to_string(coordinate.document_range->begin));
+        detail.push_back('-');
+        detail.append(std::to_string(coordinate.document_range->end));
+    }
+    if (coordinate.source_origin) {
+        detail.append(" source_line=");
+        detail.append(std::to_string(coordinate.source_origin->first_line));
+        detail.push_back(':');
+        detail.append(std::to_string(coordinate.source_origin->first_column));
+        detail.push_back('-');
+        detail.append(std::to_string(coordinate.source_origin->last_line));
+        detail.push_back(':');
+        detail.append(std::to_string(coordinate.source_origin->last_column));
+    }
 }
 
 }
@@ -2850,8 +3004,20 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
         return result;
     }
     if (verified->manifest.provider.provider == decompiler_provider_id_t::ilspy_cli) {
+        const auto startup = validate_managed_startup_frame(frame, worker.session, *verified);
+        if (startup.kind == managed_startup_frame_kind_t::failure) {
+            std::string detail = "managed worker rejected startup: stage=";
+            detail.append(startup.stage);
+            detail.append(" code=");
+            detail.append(startup.code);
+            append_diagnostic(result, native_worker_diagnostic_code_t::worker_failed,
+                "native_worker.managed_startup", std::move(detail),
+                ERROR_INVALID_DATA, startup.retryable);
+            terminate_worker(worker, ERROR_INVALID_DATA, result, true);
+            return result;
+        }
         if (!request.managed_request ||
-            !validate_managed_hello(frame, worker.session, *verified)) {
+            startup.kind != managed_startup_frame_kind_t::hello) {
             append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed,
                 "native_worker.managed_hello",
                 "managed worker hello violates the authenticated identity contract",
@@ -3020,7 +3186,11 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
                 return result;
             }
             append_worker_failure(result, failure);
-            append_diagnostic(result, native_worker_diagnostic_code_t::worker_failed, "native_worker.failure", "worker returned typed failure diagnostics", ERROR_SUCCESS, false);
+            std::string detail = "worker returned typed failure diagnostics";
+            if (!failure.diagnostics.empty())
+                append_worker_diagnostic_detail(detail, failure.diagnostics.front());
+            append_diagnostic(result, native_worker_diagnostic_code_t::worker_failed,
+                "native_worker.failure", std::move(detail), ERROR_SUCCESS, false);
             result.status = native_worker_execution_status_t::failed;
             const bool replacement = std::any_of(failure.diagnostics.begin(), failure.diagnostics.end(),
                 [](const decompiler_diagnostic_t& current) { return current.retryable; });

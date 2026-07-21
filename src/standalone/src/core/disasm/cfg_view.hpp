@@ -61,6 +61,9 @@
 #include "comment_dialog.hpp"
 #include "pseudocode_view.hpp"
 #include "rename_dialog.hpp"
+#include "../analysis/types_hub_view_api.hpp"
+#include "../analysis/xref_db_view.hpp"
+#include "../debugger/debugger_view.hpp"
 #include "../ai/standalone_chat.hpp"
 #include "../ui/theme.hpp"
 #include "../settings/settings_persistence_service.hpp"
@@ -3428,6 +3431,9 @@ inline void render(float, float, float width, float height,
 		const auto retained_layout = view->current_layout;
 		const auto retained_instruction = view->selected_instruction;
 		const auto retained_address = view->selected_address;
+		const auto retained_generation = context.publication->generation;
+		const auto retained_analysis_revision = context.publication->analysis_revision;
+		const auto retained_overlay_revision = context.workspace->overlay_revision();
 		menu.entity_id = "graph-block:" + std::to_string(retained_block) + ":" +
 			std::to_string(retained_instruction ? *retained_instruction : 0) + ":" +
 			std::to_string(retained_address);
@@ -3455,6 +3461,26 @@ inline void render(float, float, float width, float height,
 			disasm_view::runtime_address(context, context_block->start).value_or(
 				context_block->start.value);
 		const auto typed = disasm_view::typed_address(context, address);
+		const auto validate_retained_action = [context, view, retained_block,
+			retained_instruction, retained_address, retained_layout, retained_generation,
+			retained_analysis_revision, retained_overlay_revision]() -> std::string {
+			if (!context.workspace || context.workspace->closed() || !context.publication ||
+				!context.publication->snapshot ||
+				context.workspace->analysis_publication() != context.publication ||
+				context.workspace->generation() != retained_generation ||
+				context.workspace->analysis_revision() != retained_analysis_revision ||
+				context.workspace->overlay_revision() != retained_overlay_revision ||
+				context.publication->generation != retained_generation ||
+				context.publication->analysis_revision != retained_analysis_revision)
+				return "The graph workspace publication or overlay changed; reopen the context action";
+			if (workspace_graph_state(context) != view || !view->selected_block ||
+				*view->selected_block != retained_block ||
+				view->selected_instruction != retained_instruction ||
+				view->selected_address != retained_address ||
+				view->current_layout != retained_layout)
+				return "The selected graph block or instruction changed; reopen the context action";
+			return {};
+		};
 		menu.actions["analysis.navigate.back"].invoke = [context]() {
 			disasm_view::navigate_back(context);
 			return action_handler_result_t::completed();
@@ -3875,13 +3901,208 @@ inline void render(float, float, float width, float height,
 		};
 		unavailable("analysis.navigate.disassembly_side",
 			"Independent side documents require per-instance disassembly presentation state");
-		unavailable("analysis.navigate.callees", "Filtered outgoing-call presentation is not available in the graph snapshot");
-		unavailable("analysis.modify.retype", "Use Type Views to stage a type application for this address");
-		unavailable("analysis.modify.patch", "Use the reviewed Patch workflow from Disassembly");
-		unavailable("analysis.modify.assemble", "Use the reviewed assembler workflow from Disassembly");
-		unavailable("analysis.modify.nop", "Use the reviewed NOP workflow from Disassembly");
-		unavailable("analysis.debug.breakpoint", "Use the debugger Breakpoints workflow from Disassembly");
-		unavailable("analysis.debug.hardware_breakpoint", "Use the debugger Breakpoints workflow from Disassembly");
+		unavailable("analysis.modify.assemble",
+			"No assembler provider is registered; use reviewed Patch Bytes with explicitly assembled bytes");
+		if (typed) {
+			const auto selected_typed = *typed;
+			const auto xrefs = xref_db_view::state_for(context);
+			if (xrefs) {
+				menu.actions["analysis.navigate.callees"].invoke =
+					[context, xrefs, selected_typed, validate_retained_action]() {
+						if (const auto reason = validate_retained_action(); !reason.empty())
+							return action_handler_result_t::failed(reason);
+						if (xrefs->searching.load(std::memory_order_acquire))
+							return action_handler_result_t::failed(
+								"The bounded References query is still running; cancel or wait before requesting callees");
+						const auto opened = aida::ui::application_views::open_or_focus(
+							aida::ui::stable_view_id_t("view.analysis.references"));
+						if (!opened.ok())
+							return action_handler_result_t::failed(opened.detail.empty()
+								? "The canonical References view could not be opened" : opened.detail);
+						xref_db_view::submit_query(context, xrefs, selected_typed, false);
+						std::lock_guard<std::mutex> lock(xrefs->mutex);
+						return xrefs->error.empty()
+							? action_handler_result_t::completed()
+							: action_handler_result_t::failed(xrefs->error);
+					};
+			} else {
+				unavailable("analysis.navigate.callees",
+					"The canonical bounded References owner is unavailable for this workspace");
+			}
+			menu.actions["analysis.modify.retype"].invoke =
+				[context, selected_typed, validate_retained_action]() {
+					if (const auto reason = validate_retained_action(); !reason.empty())
+						return action_handler_result_t::failed(reason);
+					const auto opened = aida::ui::application_views::open_or_focus(
+						aida::ui::stable_view_id_t("view.types.structures"));
+					if (!opened.ok())
+						return action_handler_result_t::failed(opened.detail.empty()
+							? "The canonical Structures view could not be opened" : opened.detail);
+					std::string error;
+					if (!types_hub_view::stage_type_application(context, selected_typed, &error))
+						return action_handler_result_t::failed(error);
+					return action_handler_result_t::completed();
+				};
+			const auto extent = selected_instruction
+				? static_cast<std::uint64_t>(selected_instruction->length) : 0;
+			const bool provider_backed = extent != 0 &&
+				disasm_view::provider_offset(context, selected_typed).has_value();
+			if (provider_backed) {
+				menu.actions["analysis.modify.patch"].invoke =
+					[context, selected_typed, extent, validate_retained_action]() {
+						if (const auto reason = validate_retained_action(); !reason.empty())
+							return action_handler_result_t::failed(reason);
+						std::string error;
+						if (!disasm_view::open_static_patch_review(context, selected_typed, extent,
+								disasm_view::static_patch_mode_t::bytes, &error))
+							return action_handler_result_t::failed(error);
+						return action_handler_result_t::completed();
+					};
+				menu.actions["analysis.modify.nop"].invoke =
+					[context, selected_typed, extent, validate_retained_action]() {
+						if (const auto reason = validate_retained_action(); !reason.empty())
+							return action_handler_result_t::failed(reason);
+						std::string error;
+						if (!disasm_view::open_static_patch_review(context, selected_typed, extent,
+								disasm_view::static_patch_mode_t::nop_fill, &error))
+							return action_handler_result_t::failed(error);
+						return action_handler_result_t::completed();
+					};
+			} else {
+				unavailable("analysis.modify.patch",
+					"The selected graph instruction has no fully provider-backed byte range");
+				unavailable("analysis.modify.nop",
+					"The selected graph instruction has no fully provider-backed byte range");
+			}
+			const auto process = context.workspace->identity().process();
+			const auto breakpoint_definition_context = debugger_interaction::capture(
+				debugger_interaction::kind_t::breakpoint, address);
+			const bool debugger_matches_workspace_process = process &&
+				process->creation_time_100ns != 0 &&
+				driver_bridge::attached_pid() == process->pid &&
+				breakpoint_definition_context.target_pid == process->pid &&
+				breakpoint_definition_context.process_creation_time_100ns ==
+					process->creation_time_100ns;
+			if (debugger_matches_workspace_process) {
+				const auto pid = process->pid;
+				if (extent != 0) {
+					menu.actions["analysis.modify.patch"].invoke =
+						[address, extent, pid, breakpoint_definition_context,
+						 validate_retained_action]() {
+							if (const auto reason = validate_retained_action(); !reason.empty())
+								return action_handler_result_t::failed(reason);
+							if (driver_bridge::attached_pid() != pid ||
+								!debugger_interaction::is_current(breakpoint_definition_context))
+								return action_handler_result_t::failed(
+									"The graph workspace process identity or debugger stop changed before patch review");
+						const auto opened = aida::ui::application_views::open_or_focus(
+							aida::ui::stable_view_id_t("view.debug.patches"));
+						if (!opened.ok())
+							return action_handler_result_t::failed(opened.detail.empty()
+								? "The canonical Patches view could not be opened" : opened.detail);
+						std::string error;
+						if (!debugger_view::stage_patch_review(address, extent,
+								"Reviewed patch from Graph", &error))
+							return action_handler_result_t::failed(error);
+						return action_handler_result_t::completed();
+						};
+					menu.actions["analysis.modify.patch"].capability =
+						capability_state_t::available();
+					menu.actions["analysis.modify.nop"].invoke =
+						[address, extent, pid, breakpoint_definition_context,
+						 validate_retained_action]() {
+							if (const auto reason = validate_retained_action(); !reason.empty())
+								return action_handler_result_t::failed(reason);
+							if (driver_bridge::attached_pid() != pid ||
+								!debugger_interaction::is_current(breakpoint_definition_context))
+								return action_handler_result_t::failed(
+									"The graph workspace process identity or debugger stop changed before NOP review");
+							const auto opened = aida::ui::application_views::open_or_focus(
+								aida::ui::stable_view_id_t("view.debug.patches"));
+							if (!opened.ok())
+								return action_handler_result_t::failed(opened.detail.empty()
+									? "The canonical Patches view could not be opened" : opened.detail);
+							std::string error;
+							if (!debugger_view::stage_nop_review(address, extent, &error))
+								return action_handler_result_t::failed(error);
+							return action_handler_result_t::completed();
+						};
+					menu.actions["analysis.modify.nop"].capability =
+						capability_state_t::available();
+				} else {
+					unavailable("analysis.modify.patch",
+						"The selected graph block has no exact instruction byte range");
+					unavailable("analysis.modify.nop",
+						"The selected graph block has no exact instruction byte range");
+				}
+				const auto breakpoint_capability = debugger_view::address_mutation_capability(
+					address, true, pid);
+				if (breakpoint_capability.enabled) {
+					menu.actions["analysis.debug.breakpoint"].invoke =
+						[breakpoint_definition_context, validate_retained_action]() {
+							if (const auto reason = validate_retained_action(); !reason.empty())
+								return action_handler_result_t::failed(reason);
+							std::string error;
+							if (!debugger_view::queue_toggle_breakpoint(
+									breakpoint_definition_context, &error))
+								return action_handler_result_t::failed(error);
+							return action_handler_result_t::completed();
+						};
+					menu.actions["analysis.debug.hardware_breakpoint"].invoke =
+						[address, pid, breakpoint_definition_context,
+						 validate_retained_action]() {
+							if (const auto reason = validate_retained_action(); !reason.empty())
+								return action_handler_result_t::failed(reason);
+							const auto capability = debugger_view::address_mutation_capability(
+								address, true, pid);
+							if (!capability.enabled)
+								return action_handler_result_t::failed(capability.disabled_reason
+									? capability.disabled_reason : "Breakpoint staging is unavailable");
+							const auto opened = aida::ui::application_views::open_or_focus(
+								aida::ui::stable_view_id_t("view.debug.breakpoints"));
+							if (!opened.ok())
+								return action_handler_result_t::failed(opened.detail.empty()
+									? "The canonical Breakpoints view could not be opened" : opened.detail);
+							std::string error;
+							if (!debugger_view::stage_breakpoint_definition(
+									breakpoint_definition_context,
+									debugger_view::breakpoint_definition_mode_t::hardware_execute,
+									&error))
+								return action_handler_result_t::failed(error);
+							return action_handler_result_t::completed();
+						};
+				} else {
+					const std::string reason = breakpoint_capability.disabled_reason
+						? breakpoint_capability.disabled_reason : "Breakpoint staging is unavailable";
+					unavailable("analysis.debug.breakpoint", reason);
+					unavailable("analysis.debug.hardware_breakpoint", reason);
+				}
+			} else {
+				const std::string reason = !process
+					? "Breakpoint definitions require a process-backed debugger workspace"
+					: process->creation_time_100ns == 0
+					? "The graph workspace lacks a verified process creation identity"
+					: driver_bridge::attached_pid() == process->pid
+					? "The attached process reused the graph workspace PID with a different creation identity"
+					: "Attach the debugger to PID " + std::to_string(process->pid) +
+						" before staging a graph breakpoint";
+				unavailable("analysis.debug.breakpoint", reason);
+				unavailable("analysis.debug.hardware_breakpoint", reason);
+			}
+		} else {
+			unavailable("analysis.navigate.callees",
+				"The graph selection has no mapped workspace address");
+			unavailable("analysis.modify.retype",
+				"The graph selection has no mapped workspace address");
+			unavailable("analysis.modify.patch",
+				"The graph selection has no mapped workspace address");
+			unavailable("analysis.modify.nop",
+				"The graph selection has no mapped workspace address");
+			unavailable("analysis.debug.breakpoint",
+				"The graph selection has no mapped workspace address");
+			unavailable("analysis.debug.hardware_breakpoint",
+				"The graph selection has no mapped workspace address");
+		}
 		return menu;
 	};
 	const auto make_workspace_graph_canvas_context = [&]() {

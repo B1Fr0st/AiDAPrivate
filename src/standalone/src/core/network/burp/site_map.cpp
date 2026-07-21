@@ -43,6 +43,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -93,6 +95,39 @@ struct host_key_t
     }
 };
 
+struct tree_row_t
+{
+    enum class kind_t { host, path } kind = kind_t::path;
+    std::string host;
+    std::string path;
+    std::string display;
+    uint16_t port = 0;
+    bool tls = false;
+    bool in_scope = true;
+    bool has_children = false;
+    bool expanded = false;
+    int depth = 0;
+    size_t total_requests = 0;
+    uint64_t last_seen_ms = 0;
+    std::weak_ptr<host_node_t> host_node;
+    std::weak_ptr<path_node_t> path_node;
+};
+
+struct exchange_row_t
+{
+    uint64_t id = 0;
+    uint64_t timestamp_ms = 0;
+    std::string method;
+    std::string path;
+    int status_code = 0;
+    size_t response_size = 0;
+    uint64_t latency_ms = 0;
+};
+
+constexpr size_t kMaxCachedTreeRows = 65536;
+constexpr size_t kMaxCachedTreeTextBytes = 16u * 1024u * 1024u;
+constexpr size_t kMaxCachedExchangeRows = 65536;
+
 struct state_t
 {
     std::mutex                                       mtx;
@@ -100,6 +135,7 @@ struct state_t
     std::map<uint64_t, exchange_observed_t>          by_id;
     std::atomic<uint64_t>                            next_id{1};
     std::atomic<uint64_t>                            selected_exchange_id{0};
+    std::atomic<size_t>                              exchange_count{0};
     std::atomic<bool>                                initialized{false};
     aida::events::subscription_handle_t              exchange_sub;
     std::mutex                                       err_mtx;
@@ -114,6 +150,22 @@ struct state_t
     int                                              detail_tab = 0;
     float                                            split_left = 0.32f;
     std::set<std::string>                            expanded_paths;
+    std::map<host_key_t, std::deque<exchange_row_t>> exchange_index;
+    std::mutex                                       cache_mtx;
+    std::shared_ptr<const std::vector<tree_row_t>>   tree_rows =
+        std::make_shared<const std::vector<tree_row_t>>();
+    bool                                             tree_cache_limited = false;
+    std::string                                      tree_cache_filter;
+    std::set<std::string>                            tree_cache_expanded;
+    uint64_t                                         tree_query_revision = 1;
+    std::atomic<bool>                                tree_rebuild_dirty{true};
+    std::atomic<bool>                                tree_rebuild_inflight{false};
+    std::atomic<uint64_t>                            topology_revision{1};
+    std::atomic<bool>                                shutting_down{false};
+    std::atomic<uint64_t>                            tree_retry_after_ms{0};
+    std::atomic<uint32_t>                            tree_retry_attempt{0};
+    uint64_t                                         detail_cache_id = 0;
+    exchange_observed_t                              detail_cache;
 };
 
 state_t& s()
@@ -142,9 +194,91 @@ void split_path_segments(const std::string& path, std::vector<std::string>& out)
     }
 }
 
-void insert_into_tree(state_t& st, const exchange_observed_t& e)
+std::string bounded_display(std::string value, size_t limit)
+{
+    if (value.size() <= limit) return value;
+    value.resize(limit - 3);
+    value.append("...");
+    return value;
+}
+
+uint64_t monotonic_ms()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+exchange_row_t make_exchange_row(const exchange_observed_t& e)
+{
+    exchange_row_t row;
+    row.id = e.id;
+    row.timestamp_ms = e.timestamp_ms;
+    row.method = bounded_display(e.method.empty() ? "GET" : e.method, 32);
+    row.path = e.path;
+    if (!e.query.empty()) {
+        row.path.push_back('?');
+        row.path.append(e.query);
+    }
+    row.path = bounded_display(std::move(row.path), 1024);
+    row.status_code = e.status_code;
+    row.response_size = e.resp_body.size();
+    row.latency_ms = e.latency_ms;
+    return row;
+}
+
+void insert_exchange_index(state_t& st, const host_key_t& key, const exchange_observed_t& e)
+{
+    auto& rows = st.exchange_index[key];
+    exchange_row_t row = make_exchange_row(e);
+    const auto pos = std::upper_bound(rows.begin(), rows.end(), row,
+        [](const exchange_row_t& lhs, const exchange_row_t& rhs) {
+            if (lhs.timestamp_ms != rhs.timestamp_ms)
+                return lhs.timestamp_ms < rhs.timestamp_ms;
+            return lhs.id < rhs.id;
+        });
+    rows.insert(pos, std::move(row));
+}
+
+void remove_exchange_index(state_t& st, const exchange_observed_t& e)
+{
+    const host_key_t key{e.host, e.port, e.scheme == "https" || e.scheme == "wss"};
+    const auto index_it = st.exchange_index.find(key);
+    if (index_it == st.exchange_index.end()) return;
+    auto& rows = index_it->second;
+    if (!rows.empty() && rows.front().id == e.id) {
+        rows.pop_front();
+    } else if (!rows.empty() && rows.back().id == e.id) {
+        rows.pop_back();
+    } else {
+        const auto row_it = std::find_if(rows.begin(), rows.end(),
+            [&e](const exchange_row_t& row) { return row.id == e.id; });
+        if (row_it != rows.end()) rows.erase(row_it);
+    }
+    if (rows.empty()) st.exchange_index.erase(index_it);
+}
+
+void remove_exchange_from_leaf(state_t& st, const exchange_observed_t& e)
+{
+    const host_key_t key{e.host, e.port, e.scheme == "https" || e.scheme == "wss"};
+    const auto host = st.hosts.find(key);
+    if (host == st.hosts.end() || !host->second || !host->second->root) return;
+    std::vector<std::string> segments;
+    split_path_segments(e.path, segments);
+    auto node = host->second->root;
+    for (const auto& segment : segments) {
+        const auto child = node->children.find(segment);
+        if (child == node->children.end()) return;
+        node = child->second;
+    }
+    const auto exchange = std::find_if(node->exchanges.begin(), node->exchanges.end(),
+        [&e](const exchange_observed_t& candidate) { return candidate.id == e.id; });
+    if (exchange != node->exchanges.end()) node->exchanges.erase(exchange);
+}
+
+bool insert_into_tree(state_t& st, const exchange_observed_t& e)
 {
     host_key_t key{e.host, e.port, e.scheme == "https" || e.scheme == "wss"};
+    bool topology_changed = false;
     auto it = st.hosts.find(key);
     if (it == st.hosts.end()) {
         auto h = std::make_shared<host_node_t>();
@@ -157,6 +291,7 @@ void insert_into_tree(state_t& st, const exchange_observed_t& e)
         h->total_requests = 0;
         h->issue_count = 0;
         it = st.hosts.emplace(key, h).first;
+        topology_changed = true;
     }
     auto host = it->second;
     host->last_seen_ms = e.timestamp_ms != 0 ? e.timestamp_ms : now_ms();
@@ -177,6 +312,7 @@ void insert_into_tree(state_t& st, const exchange_observed_t& e)
             auto n = std::make_shared<path_node_t>();
             n->segment = seg;
             sit = cur->children.emplace(seg, n).first;
+            topology_changed = true;
         }
         cur = sit->second;
         cur->total_requests++;
@@ -185,36 +321,61 @@ void insert_into_tree(state_t& st, const exchange_observed_t& e)
         cur->last_status = e.status_code;
     }
 
-    cur->exchanges.push_back(e);
+    const auto exchange_pos = std::upper_bound(cur->exchanges.begin(), cur->exchanges.end(), e,
+        [](const exchange_observed_t& lhs, const exchange_observed_t& rhs) {
+            if (lhs.timestamp_ms != rhs.timestamp_ms)
+                return lhs.timestamp_ms < rhs.timestamp_ms;
+            return lhs.id < rhs.id;
+        });
+    cur->exchanges.insert(exchange_pos, e);
     if (cur->exchanges.size() > 512) {
         const auto erase_count = static_cast<decltype(cur->exchanges)::difference_type>(cur->exchanges.size() - 512);
         cur->exchanges.erase(cur->exchanges.begin(), cur->exchanges.begin() + erase_count);
     }
-    st.by_id[e.id] = e;
-    if (st.by_id.size() > 65536) {
-        st.by_id.erase(st.by_id.begin());
+    const auto existing = st.by_id.find(e.id);
+    if (existing != st.by_id.end()) {
+        remove_exchange_index(st, existing->second);
+        remove_exchange_from_leaf(st, existing->second);
     }
+    st.by_id[e.id] = e;
+    insert_exchange_index(st, key, e);
+    if (st.by_id.size() > kMaxCachedExchangeRows) {
+        const auto oldest = st.by_id.begin();
+        remove_exchange_index(st, oldest->second);
+        remove_exchange_from_leaf(st, oldest->second);
+        st.by_id.erase(oldest);
+    }
+    st.exchange_count.store(st.by_id.size());
+    return topology_changed;
 }
 
 std::string normalized_source(const exchange_observed_t& e);
 std::string source_label_for(const exchange_observed_t& e);
+void request_tree_cache_rebuild();
 
 void store_exchange(exchange_observed_t e)
 {
     auto& st = s();
-    std::lock_guard<std::mutex> lk(st.mtx);
-    if (e.id == 0) e.id = st.next_id.fetch_add(1);
-    if (e.timestamp_ms == 0) e.timestamp_ms = now_ms();
-    const std::string source = normalized_source(e);
-    const std::string label = source_label_for(e);
-    diag::log_tagged_fmt("burp", "site_map_store_exchange id=%llu source=%s source_label=%s host=%s path=%s status=%d",
-        static_cast<unsigned long long>(e.id),
-        source.c_str(),
-        label.c_str(),
-        e.host.c_str(),
-        e.path.c_str(),
-        e.status_code);
-    insert_into_tree(st, e);
+    bool topology_changed = false;
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        if (e.id == 0) e.id = st.next_id.fetch_add(1);
+        if (e.timestamp_ms == 0) e.timestamp_ms = now_ms();
+        const std::string source = normalized_source(e);
+        const std::string label = source_label_for(e);
+        diag::log_tagged_fmt("burp", "site_map_store_exchange id=%llu source=%s source_label=%s host=%s path=%s status=%d",
+            static_cast<unsigned long long>(e.id),
+            source.c_str(),
+            label.c_str(),
+            e.host.c_str(),
+            e.path.c_str(),
+            e.status_code);
+        topology_changed = insert_into_tree(st, e);
+    }
+    if (topology_changed) {
+        st.topology_revision.fetch_add(1);
+        request_tree_cache_rebuild();
+    }
 }
 
 void handle_exchange(const exchange_observed_t& evt)
@@ -257,6 +418,7 @@ std::string source_label_for(const exchange_observed_t& e)
 bool initialize()
 {
     auto& st = s();
+    st.shutting_down.store(false);
     bool expected = false;
     if (!st.initialized.compare_exchange_strong(expected, true)) return true;
     st.exchange_sub = aida::events::subscribe(kExchangeObservedEvent,
@@ -268,6 +430,8 @@ bool initialize()
 void shutdown()
 {
     auto& st = s();
+    st.shutting_down.store(true);
+    st.tree_rebuild_dirty.store(false);
     if (!st.initialized.exchange(false)) return;
     if (st.exchange_sub.valid()) aida::events::unsubscribe(st.exchange_sub);
 }
@@ -306,6 +470,13 @@ bool find_exchange(uint64_t id, exchange_observed_t& out)
     if (it == st.by_id.end()) return false;
     out = it->second;
     return true;
+}
+
+bool exchange_exists(uint64_t id)
+{
+    auto& st = s();
+    std::lock_guard<std::mutex> lk(st.mtx);
+    return st.by_id.find(id) != st.by_id.end();
 }
 
 std::vector<exchange_observed_t> list_exchanges_for(const std::string& host, uint16_t port, const std::string& path)
@@ -495,344 +666,539 @@ std::string last_error()
 
 size_t total_exchanges()
 {
-    auto& st = s();
-    std::lock_guard<std::mutex> lk(st.mtx);
-    return st.by_id.size();
+    return s().exchange_count.load();
 }
 
 void clear_all()
 {
     auto& st = s();
-    std::lock_guard<std::mutex> lk(st.mtx);
-    st.hosts.clear();
-    st.by_id.clear();
-    st.selected_host.clear();
-    st.selected_path.clear();
-    st.selected_port = 0;
-    st.selected_tls = false;
-    st.selected_exchange_id.store(0);
+    {
+        std::lock_guard<std::mutex> lk(st.mtx);
+        st.hosts.clear();
+        st.by_id.clear();
+        st.exchange_index.clear();
+        st.exchange_count.store(0);
+        st.selected_host.clear();
+        st.selected_path.clear();
+        st.selected_port = 0;
+        st.selected_tls = false;
+        st.selected_exchange_id.store(0);
+        st.topology_revision.fetch_add(1);
+    }
+    request_tree_cache_rebuild();
 }
 
 namespace {
 
-void render_tree_node(state_t& st, const std::shared_ptr<path_node_t>& node, const std::string& host,
-                      uint16_t port, bool tls, const std::string& cur_path,
-                      int depth, float alpha, int& visible_counter, float anim_time)
+void build_tree_cache(state_t& st)
 {
-    const auto& th = aida::ui::resolved();
-    if (!node) return;
-
-    const std::string label_full = cur_path;
-    const std::string& seg = node->segment;
-    const std::string display_seg = seg.empty() ? std::string("/") : seg;
-
-    const std::string filter = st.tree_filter;
-    bool matches_filter = true;
-    if (!filter.empty()) {
-        matches_filter = (label_full.find(filter) != std::string::npos) || (host.find(filter) != std::string::npos);
+    std::string filter;
+    std::set<std::string> expanded;
+    uint64_t query_revision = 0;
+    const uint64_t topology_revision = st.topology_revision.load();
+    {
+        std::lock_guard<std::mutex> cache_lk(st.cache_mtx);
+        filter = st.tree_cache_filter;
+        expanded = st.tree_cache_expanded;
+        query_revision = st.tree_query_revision;
     }
 
-    const bool has_children = !node->children.empty();
-    const bool expanded = st.expanded_paths.count(host + "|" + label_full) > 0;
-    const bool selected = (st.selected_host == host && st.selected_port == port && st.selected_path == label_full);
-
-    if (matches_filter) {
-        const float row_alpha_anim = ui_anim::render_row_entrance(visible_counter, anim_time, 0.010f);
-        const float r_alpha = alpha * row_alpha_anim;
-
-        ImGui::PushID(visible_counter);
-        const ImVec2 cursor_screen = ImGui::GetCursorScreenPos();
-        const float row_h = 22.f;
-        const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float win_w = ImGui::GetContentRegionAvail().x;
-
-        if (visible_counter & 1) {
-            dl->AddRectFilled(cursor_screen, ImVec2(cursor_screen.x + win_w, cursor_screen.y + row_h),
-                              aida::ui::with_alpha(th.hover_wash, r_alpha * 0.30f));
+    auto rows = std::make_shared<std::vector<tree_row_t>>();
+    bool limited = false;
+    size_t retained_bytes = 0;
+    const auto append = [&](tree_row_t&& row) {
+        const size_t bytes = row.host.size() + row.path.size() + row.display.size();
+        if (rows->size() >= kMaxCachedTreeRows ||
+            bytes > kMaxCachedTreeTextBytes - retained_bytes) {
+            limited = true;
+            return false;
         }
-        if (selected) {
-            dl->AddRectFilled(cursor_screen, ImVec2(cursor_screen.x + win_w, cursor_screen.y + row_h),
-                              aida::ui::with_alpha(th.selection, r_alpha), 4.f);
-        }
+        retained_bytes += bytes;
+        rows->push_back(std::move(row));
+        return true;
+    };
 
-        const float indent = static_cast<float>(depth) * 14.f;
-        const float caret_x = cursor_screen.x + indent + 4.f;
-        const float text_x = caret_x + 14.f;
+    struct pending_path_t
+    {
+        std::shared_ptr<path_node_t> node;
+        std::string path;
+        int depth = 0;
+    };
 
-        ImU32 caret_col = aida::ui::with_alpha(th.text_secondary, r_alpha);
-        if (has_children) {
-            const ImVec2 a(caret_x, cursor_screen.y + 6.f);
-            const ImVec2 b(caret_x + 8.f, cursor_screen.y + 6.f);
-            const ImVec2 c(caret_x + 4.f, cursor_screen.y + 14.f);
-            if (expanded) {
-                dl->AddTriangleFilled(a, b, c, caret_col);
-            } else {
-                const ImVec2 a2(caret_x, cursor_screen.y + 4.f);
-                const ImVec2 b2(caret_x + 8.f, cursor_screen.y + 10.f);
-                const ImVec2 c2(caret_x, cursor_screen.y + 16.f);
-                dl->AddTriangleFilled(a2, b2, c2, caret_col);
+    std::vector<std::pair<host_key_t, std::shared_ptr<host_node_t>>> hosts;
+    {
+        std::lock_guard<std::mutex> model_lk(st.mtx);
+        hosts.reserve(std::min(kMaxCachedTreeRows, st.hosts.size()));
+        for (const auto& host : st.hosts) {
+            if (hosts.size() >= kMaxCachedTreeRows) {
+                limited = true;
+                break;
             }
+            hosts.push_back(host);
         }
-
-        ImU32 txt_col = aida::ui::with_alpha(node->in_scope ? th.text_primary : th.text_dim, r_alpha);
-        dl->AddText(ImVec2(text_x, cursor_screen.y + text_oy), txt_col, display_seg.c_str());
-
-        if (node->total_requests > 0) {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%zu", node->total_requests);
-            const float bw = ImGui::CalcTextSize(buf).x + 12.f;
-            dl->AddRectFilled(ImVec2(cursor_screen.x + win_w - bw - 4.f, cursor_screen.y + 3.f),
-                              ImVec2(cursor_screen.x + win_w - 4.f, cursor_screen.y + row_h - 3.f),
-                              aida::ui::with_alpha(th.accent_dim, r_alpha * 0.6f), 4.f);
-            dl->AddText(ImVec2(cursor_screen.x + win_w - bw + 2.f, cursor_screen.y + text_oy),
-                        aida::ui::with_alpha(th.text_secondary, r_alpha), buf);
-        }
-
-        ImGui::InvisibleButton("##tree_row", ImVec2(win_w, row_h));
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-        if (ImGui::IsItemVisible()) {
-			const std::string retained = (tls ? "https:" : "http:") + host + ":" +
-				std::to_string(port) + ":" + label_full;
-            aida::preview::semantics::register_last_item(
-                semantic_site_node_id(retained), "network-site-map-node", false, false,
-                "aida.dock-window.view.network.site-map");
-        }
-#endif
-        const bool item_clicked = ImGui::IsItemClicked();
-        const bool item_right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-
-        if (item_clicked) {
-            if (has_children) {
-                const std::string ek = host + "|" + label_full;
-                if (expanded) st.expanded_paths.erase(ek);
-                else          st.expanded_paths.insert(ek);
-            }
-            st.selected_host = host;
-            st.selected_port = port;
-            st.selected_tls  = tls;
-            st.selected_path = label_full;
-        }
-
-        const bool menu_key_context = selected &&
-            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
-        const bool shift_f10_context = !menu_key_context && selected &&
-            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
-        const bool keyboard_context = menu_key_context || shift_f10_context;
-        if (item_right_clicked || keyboard_context) {
-            char url_buf[1024];
-            std::snprintf(url_buf, sizeof(url_buf), "%s://%s:%u%s", tls ? "https" : "http",
-                          host.c_str(), port, label_full.c_str());
-            aida::ui::application_ui::retained_entity_context_t context;
-            context.owner_id = "network.site_map.path";
-            context.entity_id = url_buf;
-            context.entity_generation = node->last_seen_ms;
-            context.active_view = aida::ui::stable_view_id_t("view.network.site_map");
-            const std::weak_ptr<path_node_t> retained_node = node;
-            const auto retained_last_seen = node->last_seen_ms;
-            const auto retained_requests = node->total_requests;
-            context.validate_identity = [retained_node, retained_last_seen, retained_requests] {
-                const auto live = retained_node.lock();
-                return live && live->last_seen_ms == retained_last_seen &&
-                        live->total_requests == retained_requests
-                    ? aida::ui::capability_state_t::available()
-                    : aida::ui::capability_state_t::unavailable(
-                        "The site-map path was removed or replaced; select it again");
-            };
-            const auto add = [&context](const char* id,
-                    std::function<aida::ui::action_handler_result_t()> invoke) {
-                aida::ui::application_ui::retained_entity_action_t action;
-                action.action_id = id;
-                action.capability = aida::ui::capability_state_t::available();
-                action.invoke = std::move(invoke);
-                context.actions.push_back(std::move(action));
-            };
-            const auto scheme = std::string(tls ? "https" : "http");
-            add("network.site_map.path.include", [scheme, host, port, label_full] {
-                scope::add_include_rule(scheme, host, port, label_full);
-                return aida::ui::action_handler_result_t::completed();
-            });
-            add("network.site_map.path.exclude", [scheme, host, port, label_full] {
-                scope::add_exclude_rule(scheme, host, port, label_full);
-                return aida::ui::action_handler_result_t::completed();
-            });
-            const std::string retained_url = url_buf;
-            add("network.site_map.copy_url", [retained_url] {
-                ImGui::SetClipboardText(retained_url.c_str());
-                return aida::ui::action_handler_result_t::completed();
-            });
-            aida::ui::application_ui::open_retained_entity_context_menu(
-                std::move(context), item_right_clicked
-                    ? aida::ui::context_menu_open_origin_t::pointer
-                    : menu_key_context
-                    ? aida::ui::context_menu_open_origin_t::menu_key
-                    : aida::ui::context_menu_open_origin_t::shift_f10);
-        }
-
-        ImGui::PopID();
-        ++visible_counter;
     }
-
-    if (has_children && expanded) {
-        for (const auto& c : node->children) {
-            const std::string child_path = path_join(label_full, c.first);
-            render_tree_node(st, c.second, host, port, tls, child_path, depth + 1, alpha, visible_counter, anim_time);
+    rows->reserve(hosts.size() >= kMaxCachedTreeRows / 8
+        ? kMaxCachedTreeRows : hosts.size() * 8);
+    for (const auto& kv : hosts) {
+        const std::string host_key = kv.first.host + "|HOST|" + std::to_string(kv.first.port);
+        const bool host_expanded = expanded.count(host_key) > 0;
+        std::string host_name;
+        uint16_t host_port = 0;
+        bool host_tls = false;
+        bool host_in_scope = true;
+        size_t host_requests = 0;
+        uint64_t host_last_seen = 0;
+        bool host_has_children = false;
+        std::shared_ptr<path_node_t> root;
+        std::vector<pending_path_t> first_children;
+        size_t pending_text_bytes = 0;
+        {
+            std::lock_guard<std::mutex> model_lk(st.mtx);
+            if (!kv.second) continue;
+            host_name = kv.second->host;
+            host_port = kv.second->port;
+            host_tls = kv.second->tls;
+            host_in_scope = kv.second->in_scope;
+            host_requests = kv.second->total_requests;
+            host_last_seen = kv.second->last_seen_ms;
+            root = kv.second->root;
+            if (root) {
+                host_has_children = !root->children.empty();
+                if (host_expanded) {
+                    first_children.reserve(std::min(kMaxCachedTreeRows, root->children.size()));
+                    for (auto it = root->children.begin(); it != root->children.end(); ++it) {
+                        if (first_children.size() >= kMaxCachedTreeRows) {
+                            limited = true;
+                            break;
+                        }
+                        if (it->first.size() + 1 > kMaxCachedTreeTextBytes) {
+                            limited = true;
+                            continue;
+                        }
+                        std::string child_path = path_join(std::string(), it->first);
+                        if (child_path.size() > kMaxCachedTreeTextBytes - pending_text_bytes) {
+                            limited = true;
+                            continue;
+                        }
+                        pending_text_bytes += child_path.size();
+                        first_children.push_back({it->second, std::move(child_path), 1});
+                    }
+                }
+            }
         }
+        if (host_name.size() > kMaxCachedTreeTextBytes) {
+            limited = true;
+            break;
+        }
+        char header[512];
+        std::snprintf(header, sizeof(header), "%s://%s:%u  [%zu]",
+            host_tls ? "https" : "http", host_name.c_str(), host_port, host_requests);
+        tree_row_t host_row;
+        host_row.kind = tree_row_t::kind_t::host;
+        host_row.host = host_name;
+        host_row.display = header;
+        host_row.port = host_port;
+        host_row.tls = host_tls;
+        host_row.in_scope = host_in_scope;
+        host_row.has_children = host_has_children;
+        host_row.expanded = host_expanded;
+        host_row.total_requests = host_requests;
+        host_row.last_seen_ms = host_last_seen;
+        host_row.host_node = kv.second;
+        if (!append(std::move(host_row))) break;
+        if (!host_expanded || !root) continue;
+
+        std::vector<pending_path_t> pending;
+        for (auto it = first_children.rbegin(); it != first_children.rend(); ++it)
+            pending.push_back(std::move(*it));
+
+        while (!pending.empty() && rows->size() < kMaxCachedTreeRows) {
+            pending_path_t current = std::move(pending.back());
+            pending.pop_back();
+            pending_text_bytes -= std::min(pending_text_bytes, current.path.size());
+            if (!current.node) continue;
+            const bool row_expanded = expanded.count(host_name + "|" + current.path) > 0;
+            std::string segment;
+            bool path_in_scope = true;
+            bool path_has_children = false;
+            size_t path_requests = 0;
+            uint64_t path_last_seen = 0;
+            std::vector<std::pair<std::string, std::shared_ptr<path_node_t>>> node_children;
+            const size_t occupied = std::min(kMaxCachedTreeRows,
+                rows->size() + pending.size());
+            const size_t child_capacity = kMaxCachedTreeRows - occupied;
+            {
+                std::lock_guard<std::mutex> model_lk(st.mtx);
+                segment = current.node->segment;
+                path_in_scope = current.node->in_scope;
+                path_requests = current.node->total_requests;
+                path_last_seen = current.node->last_seen_ms;
+                path_has_children = !current.node->children.empty();
+                if (row_expanded) {
+                    node_children.reserve(std::min(child_capacity, current.node->children.size()));
+                    for (const auto& child : current.node->children) {
+                        if (node_children.size() >= child_capacity) {
+                            limited = true;
+                            break;
+                        }
+                        node_children.push_back(child);
+                    }
+                }
+            }
+            const bool matches = filter.empty() || current.path.find(filter) != std::string::npos ||
+                host_name.find(filter) != std::string::npos;
+            if (matches) {
+                tree_row_t path_row;
+                path_row.kind = tree_row_t::kind_t::path;
+                path_row.host = host_name;
+                path_row.path = current.path;
+                path_row.display = segment.empty() ? "/" : segment;
+                path_row.port = host_port;
+                path_row.tls = host_tls;
+                path_row.in_scope = path_in_scope;
+                path_row.has_children = path_has_children;
+                path_row.expanded = row_expanded;
+                path_row.depth = current.depth;
+                path_row.total_requests = path_requests;
+                path_row.last_seen_ms = path_last_seen;
+                path_row.path_node = current.node;
+                if (!append(std::move(path_row))) break;
+            }
+            if (row_expanded) {
+                std::vector<pending_path_t> children;
+                const size_t available = kMaxCachedTreeRows - occupied;
+                children.reserve(std::min(available, node_children.size()));
+                for (const auto& child : node_children) {
+                    if (children.size() >= available) {
+                        limited = true;
+                        break;
+                    }
+                    if (child.first.size() + 1 >
+                        kMaxCachedTreeTextBytes - std::min(current.path.size(), kMaxCachedTreeTextBytes)) {
+                        limited = true;
+                        continue;
+                    }
+                    std::string child_path = path_join(current.path, child.first);
+                    if (child_path.size() > kMaxCachedTreeTextBytes - pending_text_bytes) {
+                        limited = true;
+                        continue;
+                    }
+                    pending_text_bytes += child_path.size();
+                    children.push_back({child.second, std::move(child_path), current.depth + 1});
+                }
+                for (auto it = children.rbegin(); it != children.rend(); ++it)
+                    pending.push_back(std::move(*it));
+            }
+        }
+        if (limited) break;
+    }
+    std::lock_guard<std::mutex> cache_lk(st.cache_mtx);
+    if (query_revision == st.tree_query_revision &&
+        topology_revision == st.topology_revision.load()) {
+        st.tree_rows = std::move(rows);
+        st.tree_cache_limited = limited;
+        st.tree_retry_attempt.store(0);
+        st.tree_retry_after_ms.store(0);
+        std::lock_guard<std::mutex> err_lk(st.err_mtx);
+        st.last_err.clear();
+    } else {
+        st.tree_rebuild_dirty.store(true);
+    }
+}
+
+void request_tree_cache_rebuild()
+{
+    auto& st = s();
+    if (st.shutting_down.load()) return;
+    st.tree_rebuild_dirty.store(true);
+    const uint64_t now = monotonic_ms();
+    if (now < st.tree_retry_after_ms.load()) return;
+    bool expected = false;
+    if (!st.tree_rebuild_inflight.compare_exchange_strong(expected, true)) return;
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "burp.site_map";
+    submission.label = "site_map.rebuild_tree_cache";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 2;
+    submission.body = [] {
+        auto& state = s();
+        state.tree_rebuild_dirty.store(false);
+        try {
+            build_tree_cache(state);
+        } catch (const std::exception& ex) {
+            state.tree_rebuild_dirty.store(true);
+            const uint32_t attempt = std::min<uint32_t>(
+                state.tree_retry_attempt.fetch_add(1), 5);
+            state.tree_retry_after_ms.store(monotonic_ms() +
+                std::min<uint64_t>(10000, 250ull << attempt));
+            {
+                std::lock_guard<std::mutex> err_lk(state.err_mtx);
+                state.last_err = std::string("Site-map index rebuild failed: ") + ex.what();
+            }
+        } catch (...) {
+            state.tree_rebuild_dirty.store(true);
+            const uint32_t attempt = std::min<uint32_t>(
+                state.tree_retry_attempt.fetch_add(1), 5);
+            state.tree_retry_after_ms.store(monotonic_ms() +
+                std::min<uint64_t>(10000, 250ull << attempt));
+            {
+                std::lock_guard<std::mutex> err_lk(state.err_mtx);
+                state.last_err = "Site-map index rebuild failed";
+            }
+        }
+        state.tree_rebuild_inflight.store(false);
+        if (state.tree_rebuild_dirty.load()) request_tree_cache_rebuild();
+    };
+    if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+        st.tree_rebuild_inflight.store(false);
+        const uint32_t attempt = std::min<uint32_t>(st.tree_retry_attempt.fetch_add(1), 5);
+        const uint64_t delay = std::min<uint64_t>(10000, 250ull << attempt);
+        st.tree_retry_after_ms.store(now + delay);
+        std::lock_guard<std::mutex> err_lk(st.err_mtx);
+        st.last_err = "Site-map index rebuild could not be scheduled";
     }
 }
 
 void render_tree(state_t& st, float width, float height, float alpha)
 {
     const auto& th = aida::ui::resolved();
-    (void)th;
 
     ImGui::PushID("##burp_sitemap_tree");
 
     ImGui::SetNextItemWidth(width - 12.f);
-    ImGui::InputTextWithHint("##sitemap_filter", "Filter host or path...", st.tree_filter, sizeof(st.tree_filter));
+    if (ImGui::InputTextWithHint("##sitemap_filter", "Filter host or path...",
+            st.tree_filter, sizeof(st.tree_filter))) {
+        {
+            std::lock_guard<std::mutex> cache_lk(st.cache_mtx);
+            st.tree_cache_filter = st.tree_filter;
+            st.tree_cache_expanded = st.expanded_paths;
+            ++st.tree_query_revision;
+        }
+        request_tree_cache_rebuild();
+    }
 
     ImGui::BeginChild("##sitemap_tree_scroll", ImVec2(width - 8.f, height - 36.f), false, ImGuiWindowFlags_NoBackground);
-
-    std::lock_guard<std::mutex> tree_lk(st.mtx);
-    std::vector<std::pair<host_key_t, std::shared_ptr<host_node_t>>> snapshot;
-    snapshot.reserve(st.hosts.size());
-    for (const auto& kv : st.hosts) snapshot.emplace_back(kv.first, kv.second);
+    std::shared_ptr<const std::vector<tree_row_t>> rows_snapshot;
+    bool cache_limited = false;
+    {
+        std::lock_guard<std::mutex> cache_lk(st.cache_mtx);
+        rows_snapshot = st.tree_rows;
+        cache_limited = st.tree_cache_limited;
+    }
+    if (!rows_snapshot) rows_snapshot = std::make_shared<const std::vector<tree_row_t>>();
+    if (st.tree_rebuild_dirty.load()) request_tree_cache_rebuild();
+    if (rows_snapshot->empty() && total_exchanges() != 0)
+        request_tree_cache_rebuild();
+    const std::string cache_error = last_error();
+    if (!cache_error.empty())
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.error), "%s",
+            cache_error.c_str());
+    if (cache_limited)
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.warning),
+            "View limit reached; filter to narrow the site map.");
 
     static float s_anim_time = 0.f;
     s_anim_time += ImGui::GetIO().DeltaTime;
-    int visible = 0;
-
-    for (const auto& kv : snapshot) {
-        const auto& h = *kv.second;
-        char header_buf[512];
-        std::snprintf(header_buf, sizeof(header_buf), "%s://%s:%u  [%zu]",
-                      h.tls ? "https" : "http", h.host.c_str(), h.port, h.total_requests);
-
-        const std::string ek = h.host + "|HOST|" + std::to_string(h.port);
-        const bool expanded = st.expanded_paths.count(ek) > 0;
-
-        ImGui::PushID(visible);
-        const ImVec2 cs = ImGui::GetCursorScreenPos();
-        const float row_h = 22.f;
-        const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const float win_w = ImGui::GetContentRegionAvail().x;
-
-        const float row_alpha_anim = ui_anim::render_row_entrance(visible, s_anim_time, 0.010f);
-        const float r_alpha = alpha * row_alpha_anim;
-
-        if (visible & 1) {
-            dl->AddRectFilled(cs, ImVec2(cs.x + win_w, cs.y + row_h),
-                              aida::ui::with_alpha(aida::ui::resolved().hover_wash, r_alpha * 0.30f));
-        }
-        const bool host_selected = (st.selected_host == h.host && st.selected_port == h.port && st.selected_path.empty());
-        if (host_selected) {
-            dl->AddRectFilled(cs, ImVec2(cs.x + win_w, cs.y + row_h),
-                              aida::ui::with_alpha(aida::ui::resolved().selection, r_alpha), 4.f);
-        }
-
-        ImU32 caret_col = aida::ui::with_alpha(aida::ui::resolved().text_secondary, r_alpha);
-        const float caret_x = cs.x + 4.f;
-        if (expanded) {
-            const ImVec2 a(caret_x, cs.y + 6.f);
-            const ImVec2 b(caret_x + 8.f, cs.y + 6.f);
-            const ImVec2 c(caret_x + 4.f, cs.y + 14.f);
-            dl->AddTriangleFilled(a, b, c, caret_col);
-        } else {
-            const ImVec2 a(caret_x, cs.y + 4.f);
-            const ImVec2 b(caret_x + 8.f, cs.y + 10.f);
-            const ImVec2 c(caret_x, cs.y + 16.f);
-            dl->AddTriangleFilled(a, b, c, caret_col);
-        }
-
-        ImU32 host_col = aida::ui::with_alpha(h.in_scope ? aida::ui::resolved().text_primary : aida::ui::resolved().text_dim, r_alpha);
-        dl->AddText(ImVec2(cs.x + 20.f, cs.y + text_oy), host_col, header_buf);
-
-        ImGui::InvisibleButton("##sitemap_host_row", ImVec2(win_w, row_h));
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-        if (ImGui::IsItemVisible()) {
-			const std::string retained = (h.tls ? "https:" : "http:") + h.host + ":" +
-				std::to_string(h.port);
-            aida::preview::semantics::register_last_item(
-                semantic_site_node_id(retained), "network-site-map-node", false, false,
-                "aida.dock-window.view.network.site-map");
-        }
-#endif
-        if (ImGui::IsItemClicked()) {
-            if (expanded) st.expanded_paths.erase(ek);
-            else          st.expanded_paths.insert(ek);
-            st.selected_host = h.host;
-            st.selected_port = h.port;
-            st.selected_tls  = h.tls;
-            st.selected_path.clear();
-        }
-        const bool host_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-        const bool host_menu_key_context = host_selected &&
-            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
-        const bool host_shift_f10_context = !host_menu_key_context && host_selected &&
-            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
-        const bool host_keyboard_context = host_menu_key_context || host_shift_f10_context;
-        if (host_pointer_context || host_keyboard_context) {
-            aida::ui::application_ui::retained_entity_context_t context;
-            context.owner_id = "network.site_map.host";
-            context.entity_id = (h.tls ? "https://" : "http://") + h.host + ":" +
-                std::to_string(h.port);
-            context.entity_generation = h.last_seen_ms;
-            context.active_view = aida::ui::stable_view_id_t("view.network.site_map");
-            const std::weak_ptr<host_node_t> retained_host = kv.second;
-            const auto retained_last_seen = h.last_seen_ms;
-            const auto retained_requests = h.total_requests;
-            context.validate_identity = [retained_host, retained_last_seen, retained_requests] {
-                const auto live = retained_host.lock();
-                return live && live->last_seen_ms == retained_last_seen &&
-                        live->total_requests == retained_requests
-                    ? aida::ui::capability_state_t::available()
-                    : aida::ui::capability_state_t::unavailable(
-                        "The site-map host was removed or replaced; select it again");
-            };
-            const auto add = [&context](const char* id,
-                    std::function<aida::ui::action_handler_result_t()> invoke) {
-                aida::ui::application_ui::retained_entity_action_t action;
-                action.action_id = id;
-                action.capability = aida::ui::capability_state_t::available();
-                action.invoke = std::move(invoke);
-                context.actions.push_back(std::move(action));
-            };
-            const auto scheme = std::string(h.tls ? "https" : "http");
-            const auto retained_host_name = h.host;
-            const auto retained_port = h.port;
-            add("network.site_map.host.include", [scheme, retained_host_name, retained_port] {
-                scope::add_include_rule(scheme, retained_host_name, retained_port, std::string());
-                return aida::ui::action_handler_result_t::completed();
-            });
-            add("network.site_map.host.exclude", [scheme, retained_host_name, retained_port] {
-                scope::add_exclude_rule(scheme, retained_host_name, retained_port, std::string());
-                return aida::ui::action_handler_result_t::completed();
-            });
-            aida::ui::application_ui::open_retained_entity_context_menu(
-                std::move(context), host_pointer_context
-                    ? aida::ui::context_menu_open_origin_t::pointer
-                    : host_menu_key_context
-                    ? aida::ui::context_menu_open_origin_t::menu_key
-                    : aida::ui::context_menu_open_origin_t::shift_f10);
-        }
-
-        ImGui::PopID();
-        ++visible;
-
-        if (expanded) {
-            for (const auto& c : h.root->children) {
-                const std::string child_path = path_join(std::string(), c.first);
-                render_tree_node(st, c.second, h.host, h.port, h.tls, child_path, 1, alpha, visible, s_anim_time);
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(rows_snapshot->size()), 22.f);
+    while (clipper.Step()) {
+        std::vector<tree_row_t> visible_rows;
+        visible_rows.reserve(static_cast<size_t>(clipper.DisplayEnd - clipper.DisplayStart));
+        {
+            std::lock_guard<std::mutex> model_lk(st.mtx);
+            for (int row_index = clipper.DisplayStart; row_index < clipper.DisplayEnd; ++row_index) {
+                tree_row_t row = (*rows_snapshot)[static_cast<size_t>(row_index)];
+                if (row.kind == tree_row_t::kind_t::host) {
+                    if (const auto live = row.host_node.lock()) {
+                        row.in_scope = live->in_scope;
+                        row.total_requests = live->total_requests;
+                        row.last_seen_ms = live->last_seen_ms;
+                        char header[512];
+                        std::snprintf(header, sizeof(header), "%s://%s:%u  [%zu]",
+                            row.tls ? "https" : "http", row.host.c_str(), row.port,
+                            row.total_requests);
+                        row.display = header;
+                    }
+                } else if (const auto live = row.path_node.lock()) {
+                    row.in_scope = live->in_scope;
+                    row.total_requests = live->total_requests;
+                    row.last_seen_ms = live->last_seen_ms;
+                }
+                visible_rows.push_back(std::move(row));
             }
+        }
+        for (int row_index = clipper.DisplayStart; row_index < clipper.DisplayEnd; ++row_index) {
+            const tree_row_t& row = visible_rows[static_cast<size_t>(row_index - clipper.DisplayStart)];
+            const bool is_host = row.kind == tree_row_t::kind_t::host;
+            const bool selected = st.selected_host == row.host && st.selected_port == row.port &&
+                st.selected_path == row.path;
+            const float r_alpha = alpha * ui_anim::render_row_entrance(
+                row_index, s_anim_time, 0.010f);
+            const ImVec2 cs = ImGui::GetCursorScreenPos();
+            const float row_h = 22.f;
+            const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
+            const float win_w = ImGui::GetContentRegionAvail().x;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+
+            if (row_index & 1)
+                dl->AddRectFilled(cs, ImVec2(cs.x + win_w, cs.y + row_h),
+                    aida::ui::with_alpha(th.hover_wash, r_alpha * 0.30f));
+            if (selected)
+                dl->AddRectFilled(cs, ImVec2(cs.x + win_w, cs.y + row_h),
+                    aida::ui::with_alpha(th.selection, r_alpha), 4.f);
+
+            const float caret_x = cs.x + static_cast<float>(row.depth) * 14.f + 4.f;
+            if (row.has_children) {
+                const ImU32 caret_col = aida::ui::with_alpha(th.text_secondary, r_alpha);
+                if (row.expanded)
+                    dl->AddTriangleFilled(ImVec2(caret_x, cs.y + 6.f),
+                        ImVec2(caret_x + 8.f, cs.y + 6.f),
+                        ImVec2(caret_x + 4.f, cs.y + 14.f), caret_col);
+                else
+                    dl->AddTriangleFilled(ImVec2(caret_x, cs.y + 4.f),
+                        ImVec2(caret_x + 8.f, cs.y + 10.f),
+                        ImVec2(caret_x, cs.y + 16.f), caret_col);
+            }
+            dl->AddText(ImVec2(caret_x + 16.f, cs.y + text_oy),
+                aida::ui::with_alpha(row.in_scope ? th.text_primary : th.text_dim, r_alpha),
+                row.display.c_str());
+            if (!is_host && row.total_requests > 0) {
+                char count[64];
+                std::snprintf(count, sizeof(count), "%zu", row.total_requests);
+                const float badge_w = ImGui::CalcTextSize(count).x + 12.f;
+                dl->AddRectFilled(ImVec2(cs.x + win_w - badge_w - 4.f, cs.y + 3.f),
+                    ImVec2(cs.x + win_w - 4.f, cs.y + row_h - 3.f),
+                    aida::ui::with_alpha(th.accent_dim, r_alpha * 0.6f), 4.f);
+                dl->AddText(ImVec2(cs.x + win_w - badge_w + 2.f, cs.y + text_oy),
+                    aida::ui::with_alpha(th.text_secondary, r_alpha), count);
+            }
+
+            ImGui::PushID(row.tls ? 1 : 0);
+            ImGui::PushID(static_cast<int>(row.port));
+            ImGui::PushID(row.host.c_str());
+            ImGui::PushID(row.path.c_str());
+            ImGui::InvisibleButton(is_host ? "##sitemap_host_row" : "##tree_row",
+                ImVec2(win_w, row_h));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            if (ImGui::IsItemVisible()) {
+                const std::string retained = (row.tls ? "https:" : "http:") + row.host + ":" +
+                    std::to_string(row.port) + (is_host ? std::string() : ":" + row.path);
+                aida::preview::semantics::register_last_item(
+                    semantic_site_node_id(retained), "network-site-map-node", false, false,
+                    "aida.dock-window.view.network.site-map");
+            }
+#endif
+            const bool clicked = ImGui::IsItemClicked();
+            const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            if (clicked) {
+                if (row.has_children) {
+                    const std::string key = is_host
+                        ? row.host + "|HOST|" + std::to_string(row.port)
+                        : row.host + "|" + row.path;
+                    if (row.expanded) st.expanded_paths.erase(key);
+                    else {
+                        if (st.expanded_paths.size() >= kMaxCachedTreeRows)
+                            st.expanded_paths.erase(st.expanded_paths.begin());
+                        st.expanded_paths.insert(key);
+                    }
+                    {
+                        std::lock_guard<std::mutex> cache_lk(st.cache_mtx);
+                        st.tree_cache_filter = st.tree_filter;
+                        st.tree_cache_expanded = st.expanded_paths;
+                        ++st.tree_query_revision;
+                    }
+                    request_tree_cache_rebuild();
+                }
+                st.selected_host = row.host;
+                st.selected_port = row.port;
+                st.selected_tls = row.tls;
+                st.selected_path = row.path;
+            }
+            const bool menu_context = selected &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+            const bool shift_context = !menu_context && selected &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+            if (pointer_context || menu_context || shift_context) {
+                aida::ui::application_ui::retained_entity_context_t context;
+                context.owner_id = is_host ? "network.site_map.host" : "network.site_map.path";
+                const std::string scheme = row.tls ? "https" : "http";
+                context.entity_id = scheme + "://" + row.host + ":" +
+                    std::to_string(row.port) + row.path;
+                context.entity_generation = row.last_seen_ms;
+                context.active_view = aida::ui::stable_view_id_t("view.network.site_map");
+                const auto retained_last_seen = row.last_seen_ms;
+                const auto retained_requests = row.total_requests;
+                if (is_host) {
+                    const auto retained = row.host_node;
+                    context.validate_identity = [retained, retained_last_seen, retained_requests] {
+                        auto& state = s();
+                        std::lock_guard<std::mutex> lk(state.mtx);
+                        const auto live = retained.lock();
+                        return live && live->last_seen_ms == retained_last_seen &&
+                                live->total_requests == retained_requests
+                            ? aida::ui::capability_state_t::available()
+                            : aida::ui::capability_state_t::unavailable(
+                                "The site-map host was removed or replaced; select it again");
+                    };
+                } else {
+                    const auto retained = row.path_node;
+                    context.validate_identity = [retained, retained_last_seen, retained_requests] {
+                        auto& state = s();
+                        std::lock_guard<std::mutex> lk(state.mtx);
+                        const auto live = retained.lock();
+                        return live && live->last_seen_ms == retained_last_seen &&
+                                live->total_requests == retained_requests
+                            ? aida::ui::capability_state_t::available()
+                            : aida::ui::capability_state_t::unavailable(
+                                "The site-map path was removed or replaced; select it again");
+                    };
+                }
+                const auto add = [&context](const char* id,
+                        std::function<aida::ui::action_handler_result_t()> invoke) {
+                    aida::ui::application_ui::retained_entity_action_t action;
+                    action.action_id = id;
+                    action.capability = aida::ui::capability_state_t::available();
+                    action.invoke = std::move(invoke);
+                    context.actions.push_back(std::move(action));
+                };
+                const std::string retained_host = row.host;
+                const uint16_t retained_port = row.port;
+                const std::string retained_path = row.path;
+                add(is_host ? "network.site_map.host.include" : "network.site_map.path.include",
+                    [scheme, retained_host, retained_port, retained_path] {
+                        scope::add_include_rule(scheme, retained_host, retained_port, retained_path);
+                        return aida::ui::action_handler_result_t::completed();
+                    });
+                add(is_host ? "network.site_map.host.exclude" : "network.site_map.path.exclude",
+                    [scheme, retained_host, retained_port, retained_path] {
+                        scope::add_exclude_rule(scheme, retained_host, retained_port, retained_path);
+                        return aida::ui::action_handler_result_t::completed();
+                    });
+                if (!is_host) {
+                    const std::string retained_url = context.entity_id;
+                    add("network.site_map.copy_url", [retained_url] {
+                        ImGui::SetClipboardText(retained_url.c_str());
+                        return aida::ui::action_handler_result_t::completed();
+                    });
+                }
+                aida::ui::application_ui::open_retained_entity_context_menu(
+                    std::move(context), pointer_context
+                        ? aida::ui::context_menu_open_origin_t::pointer
+                        : menu_context
+                        ? aida::ui::context_menu_open_origin_t::menu_key
+                        : aida::ui::context_menu_open_origin_t::shift_f10);
+            }
+            ImGui::PopID();
+            ImGui::PopID();
+            ImGui::PopID();
+            ImGui::PopID();
         }
     }
 
-    if (visible == 0) {
+    if (rows_snapshot->empty()) {
         const ImVec2 c_org = ImGui::GetWindowPos();
         const ImVec2 c_sz  = ImGui::GetWindowSize();
         const char* msg = "No traffic captured yet.";
@@ -841,7 +1207,6 @@ void render_tree(state_t& st, float width, float height, float alpha)
             ImVec2(c_org.x + (c_sz.x - sz.x) * 0.5f, c_org.y + (c_sz.y - sz.y) * 0.5f),
             aida::ui::with_alpha(aida::ui::resolved().text_dim, alpha * 0.85f), msg);
     }
-
     aida::ui::application_ui::render_retained_entity_context_menu(
         "network.site_map.path");
     aida::ui::application_ui::render_retained_entity_context_menu(
@@ -1001,6 +1366,64 @@ void render_response_block(const exchange_observed_t& e, float alpha)
     ImGui::PopID();
 }
 
+struct selected_exchange_source_t
+{
+    host_key_t host_key;
+    std::shared_ptr<path_node_t> path_node;
+    bool host_scope = true;
+    size_t count = 0;
+};
+
+selected_exchange_source_t selected_exchange_source(state_t& st)
+{
+    selected_exchange_source_t source;
+    source.host_key = {st.selected_host, st.selected_port, st.selected_tls};
+    std::lock_guard<std::mutex> lk(st.mtx);
+    if (st.selected_path.empty()) {
+        const auto index = st.exchange_index.find(source.host_key);
+        source.count = index == st.exchange_index.end() ? 0 : index->second.size();
+        return source;
+    }
+    source.host_scope = false;
+    const auto host = st.hosts.find(source.host_key);
+    if (host == st.hosts.end() || !host->second || !host->second->root) return source;
+    std::vector<std::string> segments;
+    split_path_segments(st.selected_path, segments);
+    auto node = host->second->root;
+    for (const auto& segment : segments) {
+        const auto child = node->children.find(segment);
+        if (child == node->children.end()) return source;
+        node = child->second;
+    }
+    source.path_node = std::move(node);
+    source.count = source.path_node ? source.path_node->exchanges.size() : 0;
+    return source;
+}
+
+std::vector<exchange_row_t> copy_exchange_rows(
+    state_t& st, const selected_exchange_source_t& source, int begin, int end)
+{
+    std::vector<exchange_row_t> rows;
+    if (begin < 0 || end <= begin) return rows;
+    rows.reserve(static_cast<size_t>(end - begin));
+    std::lock_guard<std::mutex> lk(st.mtx);
+    if (source.host_scope) {
+        const auto index = st.exchange_index.find(source.host_key);
+        if (index == st.exchange_index.end()) return rows;
+        const int bounded_end = std::min(end, static_cast<int>(index->second.size()));
+        for (int i = begin; i < bounded_end; ++i)
+            rows.push_back(index->second[static_cast<size_t>(i)]);
+        return rows;
+    }
+    if (!source.path_node) return rows;
+    const int bounded_end = std::min(end,
+        static_cast<int>(source.path_node->exchanges.size()));
+    for (int i = begin; i < bounded_end; ++i)
+        rows.push_back(make_exchange_row(
+            source.path_node->exchanges[static_cast<size_t>(i)]));
+    return rows;
+}
+
 void render_right_pane(state_t& st, float width, float height, float alpha)
 {
     const auto& th = aida::ui::resolved();
@@ -1026,43 +1449,7 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
 
     if (st.selected_host.empty()) return;
 
-    std::vector<exchange_observed_t> exchanges;
-    {
-        std::lock_guard<std::mutex> lk(st.mtx);
-        for (const auto& kv : st.hosts) {
-            if (kv.first.host != st.selected_host || kv.first.port != st.selected_port) continue;
-            if (st.selected_path.empty()) {
-                std::vector<std::string> all_paths;
-                collect_paths_rec(kv.second->root, std::string(), all_paths);
-                for (const auto& p : all_paths) {
-                    std::vector<std::string> segs;
-                    split_path_segments(p, segs);
-                    auto cur = kv.second->root;
-                    bool ok = true;
-                    for (const auto& seg : segs) {
-                        auto sit = cur->children.find(seg);
-                        if (sit == cur->children.end()) { ok = false; break; }
-                        cur = sit->second;
-                    }
-                    if (ok && cur) exchanges.insert(exchanges.end(), cur->exchanges.begin(), cur->exchanges.end());
-                }
-            } else {
-                std::vector<std::string> segs;
-                split_path_segments(st.selected_path, segs);
-                auto cur = kv.second->root;
-                bool ok = true;
-                for (const auto& seg : segs) {
-                    auto sit = cur->children.find(seg);
-                    if (sit == cur->children.end()) { ok = false; break; }
-                    cur = sit->second;
-                }
-                if (ok && cur) exchanges = cur->exchanges;
-            }
-        }
-    }
-    std::sort(exchanges.begin(), exchanges.end(), [](const exchange_observed_t& a, const exchange_observed_t& b) {
-        return a.timestamp_ms < b.timestamp_ms;
-    });
+    const selected_exchange_source_t exchange_source = selected_exchange_source(st);
 
     const float list_h = height * 0.45f;
     ImGui::BeginChild("##sitemap_list", ImVec2(width, list_h), false, ImGuiWindowFlags_NoBackground);
@@ -1094,14 +1481,23 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
     static float s_anim_time = 0.f;
     s_anim_time += ImGui::GetIO().DeltaTime;
 
-    int visible = 0;
-    for (int i = 0; i < static_cast<int>(exchanges.size()); ++i) {
-        const auto& e = exchanges[static_cast<size_t>(i)];
-        const float row_alpha_anim = ui_anim::render_row_entrance(visible, s_anim_time, 0.010f);
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(exchange_source.count), row_h);
+    while (clipper.Step()) {
+    const std::vector<exchange_row_t> visible_rows = copy_exchange_rows(
+        st, exchange_source, clipper.DisplayStart, clipper.DisplayEnd);
+    for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+        const size_t local_index = static_cast<size_t>(i - clipper.DisplayStart);
+        if (local_index >= visible_rows.size()) {
+            ImGui::Dummy(ImVec2(width, row_h));
+            continue;
+        }
+        const exchange_row_t& e = visible_rows[local_index];
+        const float row_alpha_anim = ui_anim::render_row_entrance(i, s_anim_time, 0.010f);
         const float r_alpha = alpha * row_alpha_anim;
         const float abs_ry = ImGui::GetCursorScreenPos().y;
 
-        if (visible & 1) {
+        if (i & 1) {
             ldl->AddRectFilled(ImVec2(lorg.x, abs_ry), ImVec2(lorg.x + width, abs_ry + row_h),
                                aida::ui::with_alpha(th.hover_wash, r_alpha * 0.30f));
         }
@@ -1150,12 +1546,10 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
         std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(e.id));
         ldl->AddText(ImVec2(lx, ty), dim, buf); lx += col_id;
 
-        ldl->AddText(ImVec2(lx, ty), txt, e.method.empty() ? "GET" : e.method.c_str());
+        ldl->AddText(ImVec2(lx, ty), txt, e.method.c_str());
         lx += col_method;
 
-        std::string p_disp = e.path;
-        if (!e.query.empty()) { p_disp.push_back('?'); p_disp.append(e.query); }
-        ldl->AddText(ImVec2(lx, ty), txt, p_disp.c_str());
+        ldl->AddText(ImVec2(lx, ty), txt, e.path.c_str());
         lx += col_path;
 
         std::snprintf(buf, sizeof(buf), "%d", e.status_code);
@@ -1166,7 +1560,7 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
         ldl->AddText(ImVec2(lx, ty), sc_col, buf);
         lx += col_status;
 
-        std::snprintf(buf, sizeof(buf), "%zu", e.resp_body.size());
+        std::snprintf(buf, sizeof(buf), "%zu", e.response_size);
         ldl->AddText(ImVec2(lx, ty), dim, buf);
         lx += col_size;
 
@@ -1174,7 +1568,7 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
         ldl->AddText(ImVec2(lx, ty), dim, buf);
 
         ImGui::PopID();
-        ++visible;
+    }
     }
 
     const bool exchange_menu_key = sel_id != 0 &&
@@ -1199,9 +1593,19 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
 
     ImGui::EndChild();
 
-    exchange_observed_t cur;
     bool have_cur = false;
-    if (sel_id != 0) have_cur = find_exchange(sel_id, cur);
+    if (sel_id != 0) {
+        if (st.detail_cache_id != sel_id) {
+            have_cur = find_exchange(sel_id, st.detail_cache);
+            st.detail_cache_id = have_cur ? sel_id : 0;
+        } else {
+            have_cur = exchange_exists(sel_id);
+            if (!have_cur) st.detail_cache_id = 0;
+        }
+    } else if (st.detail_cache_id != 0) {
+        st.detail_cache_id = 0;
+        st.detail_cache = {};
+    }
 
     ImGui::BeginChild("##sitemap_detail", ImVec2(width, height - list_h - 38.f), false, ImGuiWindowFlags_NoBackground);
     if (!have_cur) {
@@ -1213,6 +1617,7 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
             ImVec2(dorg.x + (dsz.x - sz.x) * 0.5f, dorg.y + (dsz.y - sz.y) * 0.5f),
             aida::ui::with_alpha(th.text_dim, alpha * 0.85f), msg);
     } else {
+        const exchange_observed_t& cur = st.detail_cache;
         if (ImGui::BeginTabBar("##sitemap_detail_tabs")) {
             if (ImGui::BeginTabItem("Request")) {
                 render_request_block(cur, alpha);

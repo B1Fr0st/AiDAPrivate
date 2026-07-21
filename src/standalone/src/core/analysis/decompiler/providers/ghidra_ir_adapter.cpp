@@ -816,6 +816,7 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
     std::map<const ghidra::Varnode*, std::string> input_symbols;
     std::map<const ghidra::Varnode*, std::uint64_t> defined_ids;
     std::map<const ghidra::HighVariable*, std::uint64_t> high_ids;
+    std::map<std::uint64_t, std::pair<std::uint64_t, bool>> conditional_edges;
     std::uint64_t next_value_id = 1;
     const auto associated_high = [](const ghidra::Varnode* node)
         -> const ghidra::HighVariable* {
@@ -975,6 +976,15 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
                 operation->getParent()->sizeOut() == 2) {
                 const auto true_id = static_cast<std::uint64_t>(
                     operation->getParent()->getTrueOut()->getIndex() + 1);
+                const auto inserted = conditional_edges.emplace(
+                    block->first, std::make_pair(true_id, operation->isBooleanFlip()));
+                if (!inserted.second) {
+                    extraction_result_t result;
+                    result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                        decompiler_diagnostic_code_t::malformed_provider_ir,
+                        "ghidra_ir.duplicate_conditional_edge", 1));
+                    return result;
+                }
                 value.stable_symbol = "condition.true=" + std::to_string(true_id) +
                     ";negated=" + (operation->isBooleanFlip() ? "1" : "0");
             } else {
@@ -1010,15 +1020,82 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             block->second.values.push_back(std::move(value));
         }
     }
-    for (auto& pair : blocks) {
-        auto& block = pair.second;
-        if (block.values.empty())
+    std::set<std::uint64_t> populated_blocks;
+    for (const auto& pair : blocks) {
+        if (!pair.second.values.empty())
+            populated_blocks.insert(pair.first);
+    }
+    const auto projected_targets = [&blocks, &populated_blocks](const std::uint64_t first) {
+        std::set<std::uint64_t> targets;
+        std::set<std::uint64_t> visited;
+        std::vector<std::uint64_t> pending{first};
+        while (!pending.empty()) {
+            const auto current = pending.back();
+            pending.pop_back();
+            if (!visited.insert(current).second)
+                continue;
+            const auto found = blocks.find(current);
+            if (found == blocks.end())
+                continue;
+            if (populated_blocks.find(current) != populated_blocks.end()) {
+                targets.insert(current);
+                continue;
+            }
+            pending.insert(pending.end(), found->second.successor_ids.begin(),
+                found->second.successor_ids.end());
+        }
+        return std::vector<std::uint64_t>(targets.begin(), targets.end());
+    };
+    std::map<std::uint64_t, std::vector<std::uint64_t>> projected_successors;
+    for (const auto block_id : populated_blocks) {
+        std::set<std::uint64_t> targets;
+        for (const auto successor : blocks.at(block_id).successor_ids) {
+            const auto projected = projected_targets(successor);
+            targets.insert(projected.begin(), projected.end());
+        }
+        projected_successors.emplace(block_id,
+            std::vector<std::uint64_t>(targets.begin(), targets.end()));
+    }
+    for (const auto block_id : populated_blocks) {
+        auto& block = blocks.at(block_id);
+        block.predecessor_ids.clear();
+        block.successor_ids = projected_successors.at(block_id);
+    }
+    for (const auto& source : projected_successors) {
+        for (const auto target : source.second)
+            blocks.at(target).predecessor_ids.push_back(source.first);
+    }
+    for (const auto& conditional : conditional_edges) {
+        if (populated_blocks.find(conditional.first) == populated_blocks.end())
             continue;
+        const auto targets = projected_targets(conditional.second.first);
+        if (targets.size() != 1U ||
+            !std::binary_search(projected_successors.at(conditional.first).begin(),
+                projected_successors.at(conditional.first).end(), targets.front())) {
+            extraction_result_t result;
+            result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                decompiler_diagnostic_code_t::malformed_provider_ir,
+                "ghidra_ir.conditional_edge_projection", 1));
+            return result;
+        }
+        const auto value = std::find_if(blocks.at(conditional.first).values.begin(),
+            blocks.at(conditional.first).values.end(), [](const capture_value_t& candidate) {
+                return candidate.kind == capture_value_kind_t::pcode &&
+                    candidate.pcode_opcode == ghidra::CPUI_CBRANCH;
+            });
+        if (value == blocks.at(conditional.first).values.end()) {
+            extraction_result_t result;
+            result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+                decompiler_diagnostic_code_t::malformed_provider_ir,
+                "ghidra_ir.conditional_edge_binding", 1));
+            return result;
+        }
+        value->stable_symbol = "condition.true=" + std::to_string(targets.front()) +
+            ";negated=" + (conditional.second.second ? "1" : "0");
+    }
+    for (const auto block_id : populated_blocks) {
+        auto& block = blocks.at(block_id);
         block.address = block.values.front().address;
-        block.predecessor_ids.erase(std::remove_if(block.predecessor_ids.begin(), block.predecessor_ids.end(),
-            [&blocks](const auto id) { const auto found = blocks.find(id); return found == blocks.end() || found->second.values.empty(); }), block.predecessor_ids.end());
-        block.successor_ids.erase(std::remove_if(block.successor_ids.begin(), block.successor_ids.end(),
-            [&blocks](const auto id) { const auto found = blocks.find(id); return found == blocks.end() || found->second.values.empty(); }), block.successor_ids.end());
         capture.blocks.push_back(std::move(block));
     }
     if (std::none_of(capture.blocks.begin(), capture.blocks.end(), [&capture](const auto& block) { return block.id == capture.entry_block_id; }))

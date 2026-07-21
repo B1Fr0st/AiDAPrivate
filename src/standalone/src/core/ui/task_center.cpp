@@ -1257,17 +1257,6 @@ void render_tasks_view(const view_render_context_t&) {
                         static_cast<void>(request_cancel(item.id));
                     design::tooltip_for_last_item("Request cancellation and wait for owner confirmation", nullptr,
                         "The task remains active until its owner reports a terminal state.");
-                } else if (item.focusable) {
-                    const bool invoked = components::button("Focus",
-                        components::button_kind_t::ghost, components::size_t_::sm);
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-                    static_cast<void>(aida::preview::semantics::register_last_item(
-                        "aida.task.action-focus-" +
-                            aida::preview::semantics::entity_token(item.id),
-                        "background-task-action", false, false, task_semantic_id));
-#endif
-                    if (invoked)
-                        static_cast<void>(focus(item.id));
                 } else if (item.retryable && !active_state(item.state)) {
                     const bool invoked = components::button("Retry",
                         components::button_kind_t::secondary, components::size_t_::sm);
@@ -1279,6 +1268,17 @@ void render_tasks_view(const view_render_context_t&) {
 #endif
                     if (invoked)
                         static_cast<void>(retry(item.id));
+                } else if (item.focusable) {
+                    const bool invoked = components::button("Focus",
+                        components::button_kind_t::ghost, components::size_t_::sm);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    static_cast<void>(aida::preview::semantics::register_last_item(
+                        "aida.task.action-focus-" +
+                            aida::preview::semantics::entity_token(item.id),
+                        "background-task-action", false, false, task_semantic_id));
+#endif
+                    if (invoked)
+                        static_cast<void>(focus(item.id));
                 } else ImGui::TextDisabled("-");
                 application_ui::render_retained_entity_context_menu(
                     "task-center.tasks");

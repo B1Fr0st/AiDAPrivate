@@ -1,5 +1,7 @@
 #include "ghidra_native_provider.hpp"
 
+#include <exception>
+#include <new>
 #include <utility>
 
 int wmain(int argc, wchar_t** argv)
@@ -32,7 +34,25 @@ int wmain(int argc, wchar_t** argv)
             "decompiler.native_worker.snapshot_integrity");
         return 6;
     }
-    auto result = ghidra_native_provider::produce(startup, *job);
+    ghidra_native_provider::result_t result;
+    try {
+        result = ghidra_native_provider::produce(startup, *job);
+    } catch (const std::bad_alloc&) {
+        runtime::send_failure(startup, job->job_id,
+            decompiler_diagnostic_code_t::resource_limit,
+            "decompiler.isolated_worker.provider_allocation_failed");
+        return 7;
+    } catch (const std::exception&) {
+        runtime::send_failure(startup, job->job_id,
+            decompiler_diagnostic_code_t::provider_failure,
+            "decompiler.isolated_worker.provider_exception");
+        return 7;
+    } catch (...) {
+        runtime::send_failure(startup, job->job_id,
+            decompiler_diagnostic_code_t::provider_failure,
+            "decompiler.isolated_worker.provider_unknown_exception");
+        return 7;
+    }
     if (!result.document) {
         runtime::send_failures(startup, job->job_id, std::move(result.diagnostics));
         return 7;

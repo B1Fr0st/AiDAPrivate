@@ -1580,13 +1580,68 @@ void initialize(network_view::state_t& state) {
     state.fuzz_config.payload_sets.push_back(std::move(paths));
     {
         std::lock_guard<std::mutex> lock(state.fuzz_mutex);
-        state.fuzz_results.clear();
-        state.fuzz_results.push_back({ 1, "..%2f..%2fwindows%2fwin.ini", 403, 312, 48, false, "Access denied", {}, {} });
-        state.fuzz_results.push_back({ 2, "..%252f..%252fboot.ini", 200, 941, 73, true, "[boot loader] timeout=30", {}, "timeout=30" });
-        state.fuzz_results.push_back({ 3, "....//....//etc/passwd", 404, 129, 41, false, "Not found", {}, {} });
+        state.fuzz_result_pages.clear();
+        state.fuzz_result_pending.clear();
+        state.fuzz_retained_count = 0;
+        state.fuzz_dropped_count = 0;
+        state.fuzz_retained_bytes = 0;
+        state.fuzz_pending_bytes = 0;
+        state.fuzz_maximum_payload_columns = 1;
+        state.fuzz_has_extracted_values = false;
+        state.fuzz_has_failures = false;
+
+        std::vector<network_view::state_t::fuzzer_result_t> rows;
+        rows.push_back({ 1, 403, 312, 48, false, "Access denied", {}, { 0 }, 0, {} });
+        rows.push_back({ 2, 200, 941, 73, true, "[boot loader] timeout=30", {}, { 1 }, 0, "timeout=30" });
+        rows.push_back({ 3, 404, 129, 41, false, "Not found", {}, { 2 }, 0, {} });
+
+        std::uint64_t retained_bytes = 0;
+        for (const auto& row : rows) {
+            retained_bytes += sizeof(network_view::state_t::fuzzer_result_t) +
+                static_cast<std::uint64_t>(row.payload_indices.size()) * sizeof(std::uint32_t) +
+                static_cast<std::uint64_t>(row.response_preview.size()) +
+                static_cast<std::uint64_t>(row.extracted_value.size()) +
+                static_cast<std::uint64_t>(row.error.size());
+        }
+
+        state.fuzz_payload_catalog =
+            std::make_shared<const std::vector<std::vector<std::string>>>(
+                std::vector<std::vector<std::string>>{
+                    state.fuzz_config.payload_sets.front().entries });
+        state.fuzz_result_pending = std::move(rows);
+        state.fuzz_pending_bytes = retained_bytes;
+        state.fuzz_retained_count = static_cast<std::uint64_t>(
+            state.fuzz_result_pending.size());
+        state.fuzz_retained_bytes = retained_bytes;
+        auto page = std::make_shared<const network_view::state_t::fuzzer_result_page_t>(
+            network_view::state_t::fuzzer_result_page_t{
+                state.fuzz_result_pending, state.fuzz_pending_bytes });
+        state.fuzz_maximum_payload_columns = 1;
+        state.fuzz_has_extracted_values = true;
+
+        auto snapshot = std::make_shared<network_view::state_t::fuzzer_results_snapshot_t>();
+        snapshot->pages.push_back(std::move(page));
+        snapshot->payload_catalog = state.fuzz_payload_catalog;
+        snapshot->retained_count = state.fuzz_retained_count;
+        snapshot->dropped_count = state.fuzz_dropped_count;
+        snapshot->retained_bytes = state.fuzz_retained_bytes;
+        snapshot->generation = ++state.fuzz_results_generation;
+        snapshot->maximum_payload_columns = state.fuzz_maximum_payload_columns;
+        snapshot->has_extracted_values = state.fuzz_has_extracted_values;
+        snapshot->has_failures = state.fuzz_has_failures;
+        std::atomic_store_explicit(&state.fuzz_results_snapshot,
+            std::static_pointer_cast<const network_view::state_t::fuzzer_results_snapshot_t>(snapshot),
+            std::memory_order_release);
+
+        state.fuzz_active_config = state.fuzz_config;
+        state.fuzz_task_id.clear();
+        state.fuzz_last_stage = "Completed";
+        state.fuzz_last_error.clear();
+        state.fuzz_has_selection = true;
     }
     state.fuzz_selected = 1;
     state.fuzz_running.store(false, std::memory_order_release);
+    state.fuzz_cancel_requested.store(false, std::memory_order_release);
     state.fuzz_progress.store(3, std::memory_order_release);
     state.fuzz_total.store(3, std::memory_order_release);
     state.fuzz_thread_alive.store(false, std::memory_order_release);

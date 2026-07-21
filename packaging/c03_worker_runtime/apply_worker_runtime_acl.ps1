@@ -106,6 +106,8 @@ function Get-PolicyPaths {
             'deps/AiDA_ManagedDecompilerWorker.dll',
             'deps/AiDA_ManagedDecompilerWorker.deps.json',
             'deps/AiDA_ManagedDecompilerWorker.runtimeconfig.json',
+            'deps/AiDA_ManagedRuntime.manifest.json',
+            'deps/AiDA_ManagedRuntime.manifest.sha256',
             'deps/ICSharpCode.Decompiler.dll',
             'deps/System.Collections.Immutable.dll',
             'deps/System.Reflection.Metadata.dll',
@@ -142,14 +144,25 @@ function Set-WorkerAcl {
     $denyRights = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor
         [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
         [Security.AccessControl.FileSystemRights]::TakeOwnership
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.SetAccessRuleProtection($true, $true)
-    foreach ($rule in @($acl.Access | Where-Object { $_.IdentityReference.Value -eq $Sid.Value })) {
-        [void]$acl.RemoveAccessRuleSpecific($rule)
+    $sourceAcl = Get-Acl -LiteralPath $Path
+    $acl = if ($item.PSIsContainer) {
+        [Security.AccessControl.DirectorySecurity]::new()
+    } else {
+        [Security.AccessControl.FileSecurity]::new()
+    }
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($sourceAcl.Access | Where-Object { $_.IdentityReference.Value -ne $Sid.Value })) {
+        [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $rule.IdentityReference, $rule.FileSystemRights, $rule.InheritanceFlags,
+            $rule.PropagationFlags, $rule.AccessControlType))
     }
     [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($Sid, $denyRights, $inheritance, $propagation, [Security.AccessControl.AccessControlType]::Deny))
     [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($Sid, $allowRights, $inheritance, $propagation, [Security.AccessControl.AccessControlType]::Allow))
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    if ($item.PSIsContainer) {
+        [IO.Directory]::SetAccessControl($Path, $acl)
+    } else {
+        [IO.File]::SetAccessControl($Path, $acl)
+    }
 }
 
 function Assert-WorkerAcl {
@@ -205,7 +218,7 @@ $digest = Read-Digest -Path $digestPath
 $profileName = 'AiDA.NativeWorker.' + $digest.Substring(0, 32)
 $sid = Get-AppContainerSid -ProfileName $profileName -CreateIfMissing (-not $VerifyOnly)
 $paths = Get-PolicyPaths -Root $root -SelectedPolicy $Policy
-$expectedPathCount = if ($Policy -eq 'native') { 105 } elseif ($Policy -eq 'managed') { 207 } else { 1 }
+$expectedPathCount = if ($Policy -eq 'native') { 105 } elseif ($Policy -eq 'managed') { 209 } else { 1 }
 if ($paths.Count -ne $expectedPathCount) {
     throw 'worker runtime ACL inventory violates policy'
 }

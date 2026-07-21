@@ -1737,6 +1737,9 @@ namespace file_tabs {
 	};
 
 	inline std::optional<save_result_t> shell_save_as_result;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	inline std::function<std::optional<save_result_t>(int)> preview_save_interceptor;
+#endif
 
 	inline save_result_t verify_licensed_save_gate() {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -2514,6 +2517,12 @@ namespace file_tabs {
 		auto& t = tabs[tab_index(idx)];
 		const std::string destination = destination_override ? *destination_override : t.filepath;
 		if (destination.empty()) return {false, "Use Save As to choose a destination."};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		if (preview_save_interceptor) {
+			if (auto intercepted = preview_save_interceptor(idx))
+				return *intercepted;
+		}
+#endif
 		code_editor_widget::document_payload_snapshot_t payload;
 		try {
 			payload = code_editor_widget::document_payload(t.document_id);

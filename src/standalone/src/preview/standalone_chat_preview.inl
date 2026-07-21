@@ -5,6 +5,7 @@
 #include "../core/settings/standalone_settings.hpp"
 #include "../helpers/globals.h"
 #include "command_registry_preview.inl"
+#include "editor_preview_adapter.hpp"
 #include "preview_fixture_controls.hpp"
 
 #include <limits>
@@ -17,6 +18,8 @@ std::string s_preview_session = "preview-nightfall-session";
 std::string s_preview_assistant_message;
 file_context::tracker_t s_preview_file_tracker;
 std::vector<mcp_client::server_config_t> s_preview_mcp_configs;
+aida::preview::fixture_state_t s_chat_fixture_state =
+    aida::preview::fixture_state_t::normal;
 
 struct tool_approval_t {
     std::mutex mtx;
@@ -24,11 +27,141 @@ struct tool_approval_t {
     bool pending = false;
     bool approved = false;
     bool answered = false;
+    std::uint64_t generation = 0;
     std::string tool_name;
     std::string tool_args_preview;
 };
 
 tool_approval_t s_tool_approval;
+
+void reset_preview_review_owners()
+{
+    const auto reverse = aida::automation_ui::reverse_engineering_proposal_snapshot();
+    if (reverse && reverse->pending)
+        static_cast<void>(aida::automation_ui::execute_message_action(
+            reverse->source, aida::automation_ui::message_action_t::reject_change));
+    const auto editor_proposal = aida::automation_ui::editor_proposal_snapshot();
+    if (editor_proposal.pending)
+        static_cast<void>(aida::automation_ui::execute_message_action(
+            editor_proposal.source, aida::automation_ui::message_action_t::reject_change));
+    code_editor_widget::cancel_agent_edit();
+}
+
+aida::automation_ui::message_identity_t append_fixture_assistant(std::string text,
+        std::int64_t timestamp)
+{
+    ChatMessage message;
+    message.text = std::move(text);
+    message.timestamp = timestamp;
+    message.model_id = "gpt-5.4";
+    g_chat_messages.push_back(std::move(message));
+    g_chat_scroll_to_bottom = true;
+    return aida::automation_ui::message_identity(g_chat_messages.size() - 1U);
+}
+
+void seed_tool_approval_fixture(aida::preview::fixture_state_t state)
+{
+    std::lock_guard<std::mutex> lock(s_tool_approval.mtx);
+    ++s_tool_approval.generation;
+    if (s_tool_approval.generation == 0) ++s_tool_approval.generation;
+    s_tool_approval.tool_name = "analysis.rename_symbol";
+    s_tool_approval.tool_args_preview =
+        "{\n  \"address\": \"0x140001000\",\n  \"name\": \"validate_packet_header\"\n}";
+    s_tool_approval.pending = state == aida::preview::fixture_state_t::approval_pending;
+    s_tool_approval.answered = !s_tool_approval.pending;
+    s_tool_approval.approved = state == aida::preview::fixture_state_t::approval_approved;
+}
+
+void seed_editor_proposal_fixture(aida::preview::fixture_state_t state)
+{
+    aida::preview::editor::configure_fixture(
+        aida::preview::fixture_state_t::normal, 0U);
+    const auto source = append_fixture_assistant(
+        "I prepared a revision-bound editor change for explicit per-hunk review.",
+        1784048600 + static_cast<std::int64_t>(state));
+    if (state == aida::preview::fixture_state_t::editor_proposal_error) {
+        const auto result = aida::automation_ui::stage_editor_proposal(source, {});
+        g_chat_messages.back().text = "Editor proposal rejected before publication: " + result.detail;
+        return;
+    }
+    std::string proposed = aida::preview::editor::content();
+    const std::string needle = "return text.virtual_address + 0x2D0;";
+    const auto position = proposed.find(needle);
+    if (position == std::string::npos) {
+        g_chat_messages.back().text = "Editor proposal could not resolve its deterministic base identity.";
+        return;
+    }
+    proposed.replace(position, needle.size(),
+        "return text.virtual_address + 0x2D0;\n    // Entry point validated against the retained image header.");
+    const auto staged = aida::automation_ui::stage_editor_proposal(source, proposed);
+    if (!staged.succeeded) {
+        g_chat_messages.back().text = "Editor proposal was not published: " + staged.detail;
+        return;
+    }
+    if (state == aida::preview::fixture_state_t::editor_proposal_apply_ready)
+        code_editor_widget::accept_all();
+    else if (state == aida::preview::fixture_state_t::editor_proposal_rejected)
+        static_cast<void>(aida::automation_ui::execute_message_action(
+            source, aida::automation_ui::message_action_t::reject_change));
+    else if (state == aida::preview::fixture_state_t::editor_proposal_stale) {
+        aida::preview::editor::load_fixture(
+            aida::preview::editor::default_fixture_source,
+            "unpacker.cpp", "C:/Preview/ReverseEngineering/unpacker.cpp", true);
+        static_cast<void>(aida::automation_ui::editor_proposal_snapshot());
+    }
+}
+
+std::string reverse_proposal_payload(bool stale)
+{
+    const auto context = disasm_view::capture_selected_workspace();
+    if (!context || !context.publication || !context.publication->snapshot ||
+        context.publication->snapshot->instructions.empty())
+        return {};
+    const auto& instruction = context.publication->snapshot->instructions.front();
+    const auto runtime = disasm_view::runtime_address(context, instruction.address);
+    if (!runtime) return {};
+    const std::string before = disasm_view::comment(context, instruction.address);
+    const std::string after = before ==
+            "Verified entry point from the deterministic Studio evidence fixture."
+        ? "Verified entry point from deterministic Studio evidence revision 2."
+        : "Verified entry point from the deterministic Studio evidence fixture.";
+    nlohmann::json proposal = {
+        {"schema", "aida.re-proposal/v1"},
+        {"kind", "analysis.comment"},
+        {"provenance", "Deterministic Studio analysis fixture"},
+        {"rationale", "Retain the verified entry-point evidence beside the exact instruction."},
+        {"target", {
+            {"workspace_id", context.workspace->identity().binary_id().to_hex()},
+            {"address", *runtime},
+            {"generation", context.publication->generation + (stale ? 1U : 0U)},
+            {"analysis_revision", context.publication->analysis_revision},
+            {"overlay_revision", context.workspace->overlay_revision()}
+        }},
+        {"before", before},
+        {"after", after}
+    };
+    return "```aida-proposal\n" + proposal.dump(2) + "\n```";
+}
+
+void seed_reverse_proposal_fixture(aida::preview::fixture_state_t state)
+{
+    const bool malformed = state == aida::preview::fixture_state_t::reverse_proposal_error;
+    const bool stale = state == aida::preview::fixture_state_t::reverse_proposal_stale;
+    std::string payload = malformed
+        ? "```aida-proposal\n{\"schema\":\"aida.re-proposal/v1\",\"kind\":\"analysis.comment\",\"provenance\":\"Deterministic Studio fixture\",\"rationale\":\"Exercise retained validation failure\",\"target\":{},\"before\":\"\",\"after\":\"unreachable\"}\n```"
+        : reverse_proposal_payload(stale);
+    if (payload.empty()) {
+        append_fixture_assistant(
+            "Reverse-engineering proposal unavailable because the retained analysis publication has no instruction identity.",
+            1784048700 + static_cast<std::int64_t>(state));
+        return;
+    }
+    const auto source = append_fixture_assistant(std::move(payload),
+        1784048700 + static_cast<std::int64_t>(state));
+    const auto staged = aida::automation_ui::stage_reverse_engineering_proposal(source);
+    if (!staged.succeeded && malformed)
+        g_chat_messages.back().text.append("\n\nValidation result: " + staged.detail);
+}
 
 void seed_preview_chat()
 {
@@ -68,10 +201,55 @@ namespace aida::preview {
 void configure_chat_fixture(fixture_state_t state, std::size_t cardinality)
 {
     static_cast<void>(cardinality);
+    s_chat_fixture_state = state;
+    reset_preview_review_owners();
     g_chat_messages.clear();
     g_ai_thinking_active = false;
     s_preview_busy.store(false, std::memory_order_release);
     s_preview_cancel.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(s_tool_approval.mtx);
+        s_tool_approval.pending = false;
+        s_tool_approval.answered = true;
+        s_tool_approval.approved = false;
+        s_tool_approval.tool_name.clear();
+        s_tool_approval.tool_args_preview.clear();
+    }
+    if (state == fixture_state_t::approval_pending ||
+        state == fixture_state_t::approval_approved ||
+        state == fixture_state_t::approval_rejected) {
+        seed_preview_chat();
+        seed_tool_approval_fixture(state);
+        if (state != fixture_state_t::approval_pending) {
+            ChatMessage receipt;
+            receipt.is_tool_result = true;
+            receipt.tool_name = "analysis.rename_symbol";
+            receipt.timestamp = 1784048590 + static_cast<std::int64_t>(state);
+            receipt.text = state == fixture_state_t::approval_approved
+                ? "Tool approval recorded. Execution remains represented by its separate audited activity receipt."
+                : "Tool execution denied by the operator. No analysis mutation was dispatched.";
+            g_chat_messages.push_back(std::move(receipt));
+        }
+        return;
+    }
+    if (state == fixture_state_t::editor_proposal_review ||
+        state == fixture_state_t::editor_proposal_apply_ready ||
+        state == fixture_state_t::editor_proposal_rejected ||
+        state == fixture_state_t::editor_proposal_stale ||
+        state == fixture_state_t::editor_proposal_error) {
+        seed_preview_chat();
+        seed_editor_proposal_fixture(state);
+        return;
+    }
+    if (state == fixture_state_t::reverse_proposal_review ||
+        state == fixture_state_t::reverse_proposal_apply_ready ||
+        state == fixture_state_t::reverse_proposal_rejected ||
+        state == fixture_state_t::reverse_proposal_stale ||
+        state == fixture_state_t::reverse_proposal_error) {
+        seed_preview_chat();
+        seed_reverse_proposal_fixture(state);
+        return;
+    }
     if (state == fixture_state_t::empty)
         return;
     if (state == fixture_state_t::normal || state == fixture_state_t::recovery) {
@@ -98,6 +276,23 @@ void configure_chat_fixture(fixture_state_t state, std::size_t cardinality)
     }
     g_chat_messages.push_back(std::move(message));
     g_chat_scroll_to_bottom = true;
+}
+
+void advance_chat_fixture()
+{
+    const auto proposal = aida::automation_ui::reverse_engineering_proposal_snapshot();
+    if (!proposal || !proposal->pending || proposal->applying || proposal->stale ||
+        proposal->state != aida::automation_ui::reverse_engineering_proposal_state_t::valid)
+        return;
+    aida::automation_ui::message_selection_t selection;
+    std::string reason;
+    const bool source_retained = aida::automation_ui::message_selection(
+        proposal->source, selection, reason);
+    if (source_retained &&
+        s_chat_fixture_state != fixture_state_t::reverse_proposal_rejected)
+        return;
+    static_cast<void>(aida::automation_ui::execute_message_action(
+        proposal->source, aida::automation_ui::message_action_t::reject_change));
 }
 }
 

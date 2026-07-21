@@ -307,7 +307,9 @@ bool request_streamed_document(std::uint64_t document_id, std::uint64_t revision
                                std::uint64_t byte_length);
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-bool configure_preview_stream_state(std::uint64_t document_id, bool loading,
+bool configure_preview_stream_state(std::uint64_t document_id,
+                                    std::uint64_t advertised_byte_length,
+                                    bool loading,
                                     bool cancellation_requested,
                                     std::string_view error);
 #endif

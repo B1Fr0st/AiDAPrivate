@@ -58,6 +58,28 @@
 
 namespace struct_dissector_view {
 
+struct staged_target_context_t {
+	std::uint64_t address = 0;
+	std::uint32_t target_pid = 0;
+	std::uint64_t target_epoch = 0;
+	std::uint64_t process_creation_time_100ns = 0;
+	std::uint64_t source_generation = 0;
+	bool live_process = false;
+	std::string source_view;
+	std::string source_identity;
+	std::function<bool(std::string&)> validate;
+};
+
+struct staged_target_state_t {
+	std::optional<staged_target_context_t> context;
+	std::string status;
+	bool stale = false;
+};
+
+extern staged_target_state_t g_staged_target;
+
+bool stage_target_context(staged_target_context_t context, std::string& error);
+
 struct field_anim_t {
 	aida::ui::flash_t change_flash;
 	aida::ui::flash_t write_success;
@@ -162,7 +184,105 @@ struct ui_state_t {
 		overlay_review_publication;
 };
 
-inline ui_state_t g_ui;
+extern ui_state_t g_ui;
+
+template <typename Mutation>
+inline bool apply_catalog_edit(const char* label, Mutation&& mutation) {
+	std::string error;
+	const bool applied = struct_dissector::perform_user_catalog_edit(label,
+		std::forward<Mutation>(mutation), error);
+	if (!applied && !error.empty()) {
+		g_ui.operation_error = true;
+		g_ui.operation_status = std::move(error);
+	}
+	return applied;
+}
+
+template <typename Mutation>
+inline int apply_catalog_index_edit(const char* label, Mutation&& mutation) {
+	int result = -1;
+	std::string error;
+	const bool applied = struct_dissector::perform_user_catalog_edit(label, [&] {
+		result = mutation();
+		return result;
+	}, [](int value) { return value >= 0; }, error);
+	if (!applied) {
+		result = -1;
+		if (!error.empty()) {
+			g_ui.operation_error = true;
+			g_ui.operation_status = std::move(error);
+		}
+	}
+	return result;
+}
+
+bool stage_write_review(const disasm_view::workspace_context_t& context,
+	int structure_index, int field_index,
+	const struct_dissector::field_def_t& field,
+	const struct_dissector::live_value_t& value,
+	std::uint64_t base_address, const char* text, std::string& error);
+
+void render(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+
+#if defined(AIDA_STRUCT_DISSECTOR_VIEW_IMPLEMENTATION)
+
+staged_target_state_t g_staged_target;
+ui_state_t g_ui;
+
+bool stage_target_context(staged_target_context_t context, std::string& error) {
+	if (context.address == 0 || context.source_generation == 0 ||
+		context.source_view.empty() || context.source_identity.empty() || !context.validate ||
+		(context.live_process && (context.target_pid == 0 || context.target_epoch == 0 ||
+			context.process_creation_time_100ns == 0))) {
+		error = "Structure target handoff requires an exact source identity, generation, and address.";
+		return false;
+	}
+	if (context.source_view.size() > 128U || context.source_identity.size() > 512U) {
+		error = "Structure target handoff metadata exceeds the bounded staging limit.";
+		return false;
+	}
+	std::string validation_error;
+	if (!context.validate(validation_error)) {
+		error = validation_error.empty() ? "The structure target source is stale." : validation_error;
+		return false;
+	}
+	g_staged_target.context = std::move(context);
+	g_staged_target.status = "Review the retained source identity before using this base address.";
+	g_staged_target.stale = false;
+	error.clear();
+	return true;
+}
+
+bool apply_catalog_undo() {
+	std::string label;
+	std::string error;
+	const bool applied = struct_dissector::user_catalog_undo(label, error);
+	g_ui.operation_error = !applied;
+	g_ui.operation_status = applied ? "Undid " + label : std::move(error);
+	if (applied) {
+		g_ui.selected_field = -1;
+		g_ui.editing_field = -1;
+		g_ui.validation_structure_id = 0;
+		g_ui.enum_form_refresh = true;
+	}
+	return applied;
+}
+
+bool apply_catalog_redo() {
+	std::string label;
+	std::string error;
+	const bool applied = struct_dissector::user_catalog_redo(label, error);
+	g_ui.operation_error = !applied;
+	g_ui.operation_status = applied ? "Redid " + label : std::move(error);
+	if (applied) {
+		g_ui.selected_field = -1;
+		g_ui.editing_field = -1;
+		g_ui.validation_structure_id = 0;
+		g_ui.enum_form_refresh = true;
+	}
+	return applied;
+}
 
 enum class write_review_status_t : std::uint8_t {
 	review,
@@ -202,7 +322,7 @@ inline std::atomic<std::uint64_t> g_write_running_serial{0};
 inline std::atomic<std::uint64_t> g_write_dispatch_failure{0};
 inline std::atomic<std::uint64_t> g_write_dispatch_applied{0};
 
-inline aida::ui::action_handler_result_t stage_overlay_declaration_review(
+aida::ui::action_handler_result_t stage_overlay_declaration_review(
 	std::string name, std::string declaration) {
 	const auto context = disasm_view::capture_selected_workspace();
 	if (!context.workspace || !context.publication || context.workspace->closing() ||
@@ -225,7 +345,7 @@ inline aida::ui::action_handler_result_t stage_overlay_declaration_review(
 	return aida::ui::action_handler_result_t::completed();
 }
 
-inline std::uint64_t structure_identity_locked(int structure_index) {
+std::uint64_t structure_identity_locked(int structure_index) {
 	const auto& state = struct_dissector::g_state;
 	if (!struct_dissector::valid_index(structure_index, state.structs.size()))
 		return 0;
@@ -263,7 +383,7 @@ inline std::uint64_t structure_identity_locked(int structure_index) {
 }
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-inline std::string studio_dissector_structure_id(std::uint64_t stable_id,
+std::string studio_dissector_structure_id(std::uint64_t stable_id,
 	const std::string& name) {
 	const std::string identity = stable_id != 0
 		? std::to_string(stable_id) : std::string("name:") + name;
@@ -271,7 +391,7 @@ inline std::string studio_dissector_structure_id(std::uint64_t stable_id,
 		"dissector-structure-" + aida::preview::semantics::entity_token(identity));
 }
 
-inline std::string studio_dissector_field_id(const std::string& structure_id,
+std::string studio_dissector_field_id(const std::string& structure_id,
 	const struct_dissector::field_def_t& field) {
 	const std::string identity = field.stable_id != 0
 		? std::to_string(field.stable_id)
@@ -281,7 +401,7 @@ inline std::string studio_dissector_field_id(const std::string& structure_id,
 }
 #endif
 
-inline std::optional<std::vector<std::uint8_t>> parse_preview_field_value(
+std::optional<std::vector<std::uint8_t>> parse_preview_field_value(
 	const struct_dissector::field_def_t& field, const char* text) {
 	if (!text || !*text)
 		return {};
@@ -358,7 +478,7 @@ inline std::optional<std::vector<std::uint8_t>> parse_preview_field_value(
 	return output.empty() ? std::optional<std::vector<std::uint8_t>>{} : std::move(output);
 }
 
-inline std::string format_review_bytes(const std::vector<std::uint8_t>& bytes) {
+std::string format_review_bytes(const std::vector<std::uint8_t>& bytes) {
 	std::string output;
 	const std::size_t shown = (std::min)(bytes.size(), std::size_t{64});
 	output.reserve(shown * 3 + 32);
@@ -373,7 +493,7 @@ inline std::string format_review_bytes(const std::vector<std::uint8_t>& bytes) {
 	return output;
 }
 
-inline std::string trim_enum_token(std::string value) {
+std::string trim_enum_token(std::string value) {
 	const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char ch) {
 		return std::isspace(ch) != 0;
 	});
@@ -385,7 +505,7 @@ inline std::string trim_enum_token(std::string value) {
 	return std::string(first, last);
 }
 
-inline std::string export_enum_to_c(const struct_dissector::enum_def_t& definition) {
+std::string export_enum_to_c(const struct_dissector::enum_def_t& definition) {
 	constexpr std::size_t maximum_output = 64U * 1024U;
 	if (definition.name.size() > maximum_output || definition.values.size() > 65536)
 		return {};
@@ -406,7 +526,7 @@ inline std::string export_enum_to_c(const struct_dissector::enum_def_t& definiti
 	return append("};\n") ? output : std::string{};
 }
 
-inline bool rebuild_enum_form(ui_state_t& ui, struct_dissector::enum_def_t& definition) {
+bool rebuild_enum_form(ui_state_t& ui, struct_dissector::enum_def_t& definition) {
 	ui.enum_form.clear();
 	definition = {};
 	definition.stable_id = ui.selected_enum_id;
@@ -498,7 +618,7 @@ inline bool rebuild_enum_form(ui_state_t& ui, struct_dissector::enum_def_t& defi
 	return ui.enum_form.valid();
 }
 
-inline std::optional<std::vector<std::uint8_t>> parse_field_value(
+std::optional<std::vector<std::uint8_t>> parse_field_value(
 	const struct_dissector::field_def_t& field, const char* text) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	return parse_preview_field_value(field, text);
@@ -539,7 +659,7 @@ inline std::optional<std::vector<std::uint8_t>> parse_field_value(
 #endif
 }
 
-inline bool stage_write_review(const disasm_view::workspace_context_t& context,
+bool stage_write_review(const disasm_view::workspace_context_t& context,
 	int structure_index, int field_index,
 	const struct_dissector::field_def_t& field,
 	const struct_dissector::live_value_t& value,
@@ -617,7 +737,7 @@ inline bool stage_write_review(const disasm_view::workspace_context_t& context,
 	return true;
 }
 
-inline bool submit_write_review() {
+bool submit_write_review() {
 	if (!g_write_review.visible || g_write_review.status != write_review_status_t::review)
 		return false;
 	auto workspace = g_write_review.workspace.lock();
@@ -866,7 +986,7 @@ inline bool submit_write_review() {
 	return true;
 }
 
-inline void publish_field_selection(const std::string& structure_name,
+void publish_field_selection(const std::string& structure_name,
 	const struct_dissector::field_def_t& field) {
 	auto context = disasm_view::capture_selected_workspace();
 	if (!context.workspace)
@@ -884,7 +1004,7 @@ inline void publish_field_selection(const std::string& structure_name,
 			aida::workbench::navigation_origin_t::inspector, workbench));
 }
 
-inline ImU32 type_color_token(struct_dissector::field_type_t tp, float alpha) {
+ImU32 type_color_token(struct_dissector::field_type_t tp, float alpha) {
 	const auto& th = aida::ui::resolved();
 	ImU32 base;
 	switch (tp) {
@@ -909,7 +1029,7 @@ inline ImU32 type_color_token(struct_dissector::field_type_t tp, float alpha) {
 	return aida::ui::with_alpha(base, alpha);
 }
 
-inline void render_type_glyph(ImDrawList* dl, ImVec2 center,
+void render_type_glyph(ImDrawList* dl, ImVec2 center,
                               struct_dissector::field_type_t tp, ImU32 color)
 {
 	switch (tp) {
@@ -953,9 +1073,9 @@ inline void render_type_glyph(ImDrawList* dl, ImVec2 center,
 	}
 }
 
-inline field_anim_t& fanim(int idx) { return g_ui.field_anims[idx]; }
+field_anim_t& fanim(int idx) { return g_ui.field_anims[idx]; }
 
-inline void render_write_review_modal() {
+void render_write_review_modal() {
 	const std::uint64_t running_serial = g_write_running_serial.load(std::memory_order_acquire);
 	if (running_serial == g_write_review.serial &&
 		g_write_review.status == write_review_status_t::queued)
@@ -1082,14 +1202,15 @@ inline void render_write_review_modal() {
 	ImGui::EndPopup();
 }
 
-inline void render_overlay_declaration_review() {
+void render_overlay_declaration_review() {
 	if (g_ui.overlay_review_requested) {
 		g_ui.overlay_review_requested = false;
-		ImGui::OpenPopup("Review Editable Type Declaration");
+		aida::ui::design::open_dialog("dialog.types.editable_declaration_review",
+			"Review Editable Type Declaration");
 	}
-	ImGui::SetNextWindowSize(ImVec2(720.0f, 560.0f), ImGuiCond_Appearing);
-	if (!ImGui::BeginPopupModal("Review Editable Type Declaration", nullptr,
-			ImGuiWindowFlags_NoSavedSettings))
+	if (!aida::ui::design::begin_dialog("dialog.types.editable_declaration_review",
+			"Review Editable Type Declaration", ImVec2(720.0f, 560.0f),
+			ImVec2(460.0f, 320.0f)))
 		return;
 	const auto context = disasm_view::capture_selected_workspace();
 	const auto review_workspace = g_ui.overlay_review_workspace.lock();
@@ -1102,18 +1223,30 @@ inline void render_overlay_declaration_review() {
 		context.workspace->generation() == g_ui.overlay_review_workspace_generation &&
 		context.publication->analysis_revision == g_ui.overlay_review_analysis_revision &&
 		context.workspace->overlay_revision() == g_ui.overlay_review_overlay_revision;
-	ImGui::Text("Global declaration: %s", g_ui.overlay_review_name.c_str());
-	ImGui::TextDisabled("Workspace generation %llu  analysis revision %llu  overlay revision %llu",
-		static_cast<unsigned long long>(g_ui.overlay_review_workspace_generation),
-		static_cast<unsigned long long>(g_ui.overlay_review_analysis_revision),
-		static_cast<unsigned long long>(g_ui.overlay_review_overlay_revision));
-	ImGui::Separator();
-	ImGui::BeginChild("##editable_type_declaration_review", ImVec2(0.0f, -44.0f), true,
-		ImGuiWindowFlags_HorizontalScrollbar);
-	ImGui::TextUnformatted(g_ui.overlay_review_declaration.c_str());
-	ImGui::EndChild();
-	ImGui::BeginDisabled(!current);
-	if (ImGui::Button("Commit to Overlay")) {
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		"Commit to Overlay", "Cancel");
+	if (aida::ui::design::begin_dialog_body(
+			"types_editable_declaration_review_body", footer_height)) {
+		ImGui::Text("Global declaration: %s", g_ui.overlay_review_name.c_str());
+		ImGui::TextDisabled("Workspace generation %llu  analysis revision %llu  overlay revision %llu",
+			static_cast<unsigned long long>(g_ui.overlay_review_workspace_generation),
+			static_cast<unsigned long long>(g_ui.overlay_review_analysis_revision),
+			static_cast<unsigned long long>(g_ui.overlay_review_overlay_revision));
+		ImGui::Separator();
+		ImGui::TextUnformatted(g_ui.overlay_review_declaration.c_str());
+		if (!current) {
+			ImGui::Spacing();
+			aida::ui::inline_notice("types_editable_declaration_review_stale",
+				"Review is stale",
+				"The workspace, analysis, or overlay revision changed. Cancel and select the type again.",
+				aida::ui::status_kind_t::warning);
+		}
+	}
+	aida::ui::design::end_dialog_body();
+	const auto footer = aida::ui::design::dialog_footer(
+		"types_editable_declaration_review_footer", "Commit to Overlay",
+		current, false, "Cancel");
+	if (footer.confirmed) {
 		if (disasm_view::queue_type_declaration(context,
 				g_ui.overlay_review_declaration)) {
 			g_ui.operation_error = false;
@@ -1130,21 +1263,17 @@ inline void render_overlay_declaration_review() {
 				"The overlay authority rejected the global declaration; no change was claimed";
 		}
 	}
-	ImGui::EndDisabled();
-	ImGui::SameLine();
-	if (ImGui::Button("Cancel")) {
+	if (footer.cancelled) {
 		g_ui.overlay_review_declaration.clear();
 		g_ui.overlay_review_name.clear();
 		g_ui.overlay_review_publication.reset();
 		g_ui.overlay_review_workspace.reset();
 		ImGui::CloseCurrentPopup();
 	}
-	if (!current)
-		ImGui::TextDisabled("The workspace, analysis, or overlay revision changed. Cancel and select the type again.");
 	ImGui::EndPopup();
 }
 
-inline void render(float pos_x, float pos_y, float width, float height,
+void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	struct_dissector::ensure_preview_fixture();
@@ -1168,6 +1297,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
 	auto& ui = g_ui;
 	auto& st = struct_dissector::g_state;
+	const bool catalog_shortcut_scope = ImGui::IsWindowFocused(
+		ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput &&
+		!ImGui::IsAnyItemActive();
+	if (catalog_shortcut_scope && ImGui::GetIO().KeyCtrl &&
+		ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+		if (ImGui::GetIO().KeyShift)
+			static_cast<void>(apply_catalog_redo());
+		else
+			static_cast<void>(apply_catalog_undo());
+	}
+	if (catalog_shortcut_scope && ImGui::GetIO().KeyCtrl &&
+		ImGui::IsKeyPressed(ImGuiKey_Y, false))
+		static_cast<void>(apply_catalog_redo());
 	render_overlay_declaration_review();
 	const float dt = aida::ui::clock::dt();
 	const float line_h = 36.f;
@@ -1249,8 +1391,79 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PopStyleVar(2);
 	bx += 180.f + 6.f;
 
-	ImGui::SetCursorScreenPos(ImVec2(bx, by));
-	if (aida::ui::button("Go", aida::ui::button_kind_t::secondary,
+	const bool staged_target_visible = g_staged_target.context.has_value();
+	if (g_staged_target.context) {
+		const auto staged = *g_staged_target.context;
+		const bool compact_stage = width < 760.f;
+		const float use_width = compact_stage ? 64.f : 136.f;
+		const float check_width = compact_stage ? 64.f : 78.f;
+		const float dismiss_width = compact_stage ? 30.f : 68.f;
+		g_staged_target.status = g_staged_target.stale
+			? g_staged_target.status
+			: "Exact source current at last check. Review before replacing the base address.";
+		ImGui::SetCursorScreenPos(ImVec2(bx, by));
+		if (aida::ui::button(compact_stage ? "Use" :
+			(g_staged_target.stale ? "Use Target (stale)" : "Use Target (current)"),
+			aida::ui::button_kind_t::primary,
+			aida::ui::size_t_::sm, ImVec2(use_width, 28.f), g_staged_target.stale)) {
+			std::string validation_error;
+			if (!staged.validate(validation_error)) {
+				g_staged_target.stale = true;
+				g_staged_target.status = validation_error.empty()
+					? "The retained structure target source is stale." : validation_error;
+			} else {
+				std::snprintf(ui.addr_buf, sizeof(ui.addr_buf), "%llX",
+					static_cast<unsigned long long>(staged.address));
+				ui.addr_buf_seeded = true;
+				{
+					std::lock_guard<std::mutex> lock(st.mtx);
+					st.base_address = staged.address;
+				}
+				g_staged_target.context.reset();
+			}
+		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			"aida.types.structures.staged_target.apply", "structure-target-action",
+			!g_staged_target.stale, false, "aida.dock-window.view.types.structures");
+#endif
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip("%s\n%s\nGeneration %llu  Address 0x%016llX",
+				g_staged_target.status.c_str(), staged.source_view.c_str(),
+				static_cast<unsigned long long>(staged.source_generation),
+				static_cast<unsigned long long>(staged.address));
+		bx += use_width + 6.f;
+		ImGui::SetCursorScreenPos(ImVec2(bx, by));
+		if (aida::ui::button(compact_stage ? "Check" : "Recheck",
+			aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::sm, ImVec2(check_width, 28.f))) {
+			std::string validation_error;
+			g_staged_target.stale = !staged.validate(validation_error);
+			g_staged_target.status = g_staged_target.stale
+				? (validation_error.empty() ? "The retained structure target source is stale." : validation_error)
+				: "Exact source current at last check. Review before replacing the base address.";
+		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			"aida.types.structures.staged_target.recheck", "structure-target-action",
+			true, false, "aida.dock-window.view.types.structures");
+#endif
+		bx += check_width + 6.f;
+		ImGui::SetCursorScreenPos(ImVec2(bx, by));
+		if (aida::ui::button(compact_stage ? "X" : "Dismiss", aida::ui::button_kind_t::ghost,
+			aida::ui::size_t_::sm, ImVec2(dismiss_width, 28.f)))
+			g_staged_target.context.reset();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			"aida.types.structures.staged_target.dismiss", "structure-target-action",
+			true, false, "aida.dock-window.view.types.structures");
+#endif
+		bx += dismiss_width + 6.f;
+	}
+
+	if (!staged_target_visible) {
+		ImGui::SetCursorScreenPos(ImVec2(bx, by));
+		if (aida::ui::button("Go", aida::ui::button_kind_t::secondary,
 		aida::ui::size_t_::sm, ImVec2(48.f, 28.f))) {
 		uint64_t addr = 0;
 		if (std::sscanf(ui.addr_buf, "%llx", reinterpret_cast<unsigned long long*>(&addr)) == 1) {
@@ -1269,16 +1482,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			diag::log_tagged_fmt("dissector",
 				"base_address_go_failed input='%s'", ui.addr_buf);
 		}
-	}
-	bx += 56.f;
+		}
+		bx += 56.f;
 
-	ImGui::SetCursorScreenPos(ImVec2(bx, by));
-	if (aida::ui::button("Refresh", aida::ui::button_kind_t::primary,
+		ImGui::SetCursorScreenPos(ImVec2(bx, by));
+		if (aida::ui::button("Refresh", aida::ui::button_kind_t::primary,
 		aida::ui::size_t_::sm, ImVec2(96.f, 28.f))) {
 		diag::log_tagged_fmt("dissector", "refresh_clicked manual=1");
 		struct_dissector::refresh_values();
+		}
+		bx += 102.f;
 	}
-	bx += 102.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	{
@@ -1297,6 +1511,43 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		fs_diss_base * 0.92f, ImVec2(bx, by + 4.f),
 		aida::ui::with_alpha(th.text_dim, alpha), "Auto");
 	bx += 42.f + 8.f;
+
+	std::string undo_label;
+	std::string redo_label;
+	const bool can_undo = struct_dissector::user_catalog_can_undo(&undo_label);
+	const bool can_redo = struct_dissector::user_catalog_can_redo(&redo_label);
+	ImGui::SetCursorScreenPos(ImVec2(bx, by));
+	ImGui::BeginDisabled(!can_undo);
+	if (aida::ui::button("Undo", aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(66.f, 28.f)))
+		static_cast<void>(apply_catalog_undo());
+	ImGui::EndDisabled();
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+		ImGui::SetTooltip("%s", can_undo
+			? ("Undo " + undo_label + " (Ctrl+Z)").c_str()
+			: "No catalog edit to undo (Ctrl+Z)");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::semantics::register_last_item("aida.types.dissector-undo",
+		"dissector-history-action", true, !can_undo,
+		"aida.dock-window.view.types.dissector");
+#endif
+	bx += 72.f;
+	ImGui::SetCursorScreenPos(ImVec2(bx, by));
+	ImGui::BeginDisabled(!can_redo);
+	if (aida::ui::button("Redo", aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(66.f, 28.f)))
+		static_cast<void>(apply_catalog_redo());
+	ImGui::EndDisabled();
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+		ImGui::SetTooltip("%s", can_redo
+			? ("Redo " + redo_label + " (Ctrl+Shift+Z / Ctrl+Y)").c_str()
+			: "No catalog edit to redo (Ctrl+Shift+Z / Ctrl+Y)");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::semantics::register_last_item("aida.types.dissector-redo",
+		"dissector-history-action", true, !can_redo,
+		"aida.dock-window.view.types.dissector");
+#endif
+	bx += 72.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(bx, by));
 	if (aida::ui::button("Export C", aida::ui::button_kind_t::ghost,
@@ -1334,7 +1585,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::size_t_::sm, ImVec2(104.f, 28.f))) {
 		const char* clipboard = ImGui::GetClipboardText();
 		std::string error;
-		const bool imported = clipboard && struct_dissector::deserialize_schema(clipboard, error);
+		const bool imported = clipboard && apply_catalog_edit("Import structure catalog", [&] {
+			return struct_dissector::deserialize_schema(clipboard, error);
+		});
 		ui.operation_error = !imported;
 		ui.operation_status = imported ? "Structure schema imported and validated" :
 			(error.empty() ? "Clipboard does not contain a structure schema" : error);
@@ -1385,10 +1638,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 #endif
 		ImGui::TextDisabled("Structure layout");
 		if (ImGui::Button(kind == struct_dissector::structure_kind_t::union_type ? "Convert to Struct" : "Convert to Union")) {
-			const bool applied = struct_dissector::set_structure_kind(structure_index,
-				kind == struct_dissector::structure_kind_t::union_type
-					? struct_dissector::structure_kind_t::structure
-					: struct_dissector::structure_kind_t::union_type);
+			const bool applied = apply_catalog_edit("Convert structure kind", [&] {
+				return struct_dissector::set_structure_kind(structure_index,
+					kind == struct_dissector::structure_kind_t::union_type
+						? struct_dissector::structure_kind_t::structure
+						: struct_dissector::structure_kind_t::union_type);
+			});
 			ui.operation_error = !applied;
 			ui.operation_status = applied ? "Structure kind updated" : "Structure kind change rejected";
 		}
@@ -1404,8 +1659,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ImGui::Button("Set Pack")) {
 			unsigned int value = 0;
 			const bool parsed = std::sscanf(ui.layout_pack_buf, "%u", &value) == 1 && value <= 4096;
-			const bool applied = parsed && struct_dissector::set_structure_packing(structure_index,
-				static_cast<std::uint16_t>(value));
+			const bool applied = parsed && apply_catalog_edit("Set structure packing", [&] {
+				return struct_dissector::set_structure_packing(structure_index,
+					static_cast<std::uint16_t>(value));
+			});
 			ui.operation_error = !applied;
 			ui.operation_status = applied ? "Packing updated" : "Packing must be 0 or a power of two up to 4096";
 		}
@@ -1421,8 +1678,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ImGui::Button("Set Align")) {
 			unsigned int value = 0;
 			const bool parsed = std::sscanf(ui.layout_align_buf, "%u", &value) == 1 && value <= 4096;
-			const bool applied = parsed && struct_dissector::set_structure_alignment(structure_index,
-				static_cast<std::uint16_t>(value));
+			const bool applied = parsed && apply_catalog_edit("Set structure alignment", [&] {
+				return struct_dissector::set_structure_alignment(structure_index,
+					static_cast<std::uint16_t>(value));
+			});
 			ui.operation_error = !applied;
 			ui.operation_status = applied ? "Structure alignment updated" : "Alignment must be 0 or a power of two up to 4096";
 		}
@@ -1520,7 +1779,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			confirmation.target = ui.enum_delete_name.c_str();
 			confirmation.scope = scope.c_str();
 			confirmation.effect = "Removes this enum definition from the persisted type catalog.";
-			confirmation.reversibility = "Not automatically reversible; cancel leaves the catalog unchanged.";
+			confirmation.reversibility = "Undo restores the exact retained catalog state after deletion.";
 			confirmation.prerequisite = prerequisite.c_str();
 			confirmation.confirm_label = "Delete Enum";
 			confirmation.destructive = true;
@@ -1530,8 +1789,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (result.cancelled) {
 				ui.enum_delete_review = false;
 			} else if (result.confirmed) {
-				const bool deleted = struct_dissector::delete_enum_exact(ui.enum_delete_id,
-					ui.enum_delete_name, ui.enum_delete_schema_revision);
+				const bool deleted = apply_catalog_edit("Delete enum", [&] {
+					return struct_dissector::delete_enum_exact(ui.enum_delete_id,
+						ui.enum_delete_name, ui.enum_delete_schema_revision);
+				});
 				ui.operation_error = !deleted;
 				ui.operation_status = deleted ? "Enum deleted" :
 					"Enum deletion rejected because its identity, revision, or references changed";
@@ -1713,8 +1974,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 								return aida::ui::action_handler_result_t::failed(
 									"The retained enum is stale");
 							duplicate->stable_id = 0;
-							auto rollback_state =
-								struct_dissector::capture_catalog_transaction();
 							std::uint64_t expected_revision = 0;
 							{
 								auto& state = struct_dissector::g_state;
@@ -1735,31 +1994,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 									return aida::ui::action_handler_result_t::failed(
 										"A bounded unique enum name could not be allocated");
 							}
-							if (!struct_dissector::upsert_enum_exact(*duplicate, expected_revision)) {
-								if (!struct_dissector::rollback_catalog_transaction(
-										std::move(rollback_state), expected_revision))
-									return aida::ui::action_handler_result_t::failed(
-										"Enum duplication failed and exact catalog rollback was blocked");
+							if (!apply_catalog_edit("Duplicate enum", [&] {
+								return struct_dissector::upsert_enum_exact(*duplicate, expected_revision);
+							})) {
 								return aida::ui::action_handler_result_t::failed(
 									"The enum duplicate failed exact catalog validation; no mutation was retained");
 							}
 							std::uint64_t created_id = 0;
-							std::uint64_t created_revision = 0;
 							{
 								auto& state = struct_dissector::g_state;
 								std::lock_guard<std::mutex> lock(state.mtx);
 								const auto found = std::find_if(state.enums.begin(), state.enums.end(),
 									[&](const auto& item) { return item.name == duplicate->name; });
 								if (found != state.enums.end()) created_id = found->stable_id;
-								created_revision = state.schema_revision;
 							}
-							if (created_id == 0 || !struct_dissector::request_save_schema()) {
-								if (!struct_dissector::rollback_catalog_transaction(
-										std::move(rollback_state), created_revision))
-									return aida::ui::action_handler_result_t::failed(
-										"The durable save was rejected and exact enum rollback was blocked");
+							if (created_id == 0) {
 								return aida::ui::action_handler_result_t::failed(
-									"The durable save was not queued; the enum duplicate was rolled back");
+									"The duplicated enum could not be resolved after publication");
 							}
 							return aida::ui::action_handler_result_t::completed(
 								"Enum duplicate created; durable catalog save queued");
@@ -1883,8 +2134,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					ui.enum_form.request_first_invalid_focus();
 				} else {
 					const bool creating = ui.enum_draft.stable_id == 0;
-					const bool saved = struct_dissector::upsert_enum_exact(ui.enum_draft,
-						ui.enum_draft_schema_revision);
+					const bool saved = apply_catalog_edit("Save enum", [&] {
+						return struct_dissector::upsert_enum_exact(ui.enum_draft,
+							ui.enum_draft_schema_revision);
+					});
 					ui.operation_error = !saved;
 					ui.operation_status = saved ? "Enum catalog updated" :
 						"Enum rejected because its catalog identity or references changed";
@@ -2183,7 +2436,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				target_idx = st.active_struct;
 			}
 			if (target_idx >= 0 && ui.rename_buf[0] != '\0') {
-				if (struct_dissector::rename_struct(target_idx, ui.rename_buf)) {
+				if (apply_catalog_edit("Rename structure", [&] {
+					return struct_dissector::rename_struct(target_idx, ui.rename_buf);
+				})) {
 					ui.rename_buf[0] = '\0';
 				}
 			} else {
@@ -2210,7 +2465,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::button("+", aida::ui::button_kind_t::primary,
 			aida::ui::size_t_::sm, ImVec2(28.f, 28.f))) {
 			if (ui.name_buf[0] != '\0') {
-				int new_idx = struct_dissector::create_struct(ui.name_buf);
+				int new_idx = apply_catalog_index_edit("Create structure", [&] {
+					return struct_dissector::create_struct(ui.name_buf);
+				});
 				if (new_idx >= 0) {
 					std::lock_guard<std::mutex> lk(st.mtx);
 					st.active_struct = new_idx;
@@ -2236,7 +2493,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 			}
 			std::string error;
-			if (removed_idx >= 0 && struct_dissector::remove_structure(removed_idx, error)) {
+			if (removed_idx >= 0 && apply_catalog_edit("Delete structure", [&] {
+				return struct_dissector::remove_structure(removed_idx, error);
+			})) {
 				ui.selected_field = -1;
 				ui.editing_field = -1;
 				ui.edit_target = edit_target_t::none;
@@ -2347,6 +2606,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				action.invoke = std::move(invoke);
 				retained.actions.push_back(std::move(action));
 			};
+			std::string structure_undo_label;
+			std::string structure_redo_label;
+			const bool structure_can_undo = struct_dissector::user_catalog_can_undo(
+				&structure_undo_label);
+			const bool structure_can_redo = struct_dissector::user_catalog_can_redo(
+				&structure_redo_label);
+			add_structure_action("types.dissector.catalog.undo", structure_can_undo,
+				"No current catalog edit is available to undo", [] {
+				return apply_catalog_undo()
+					? aida::ui::action_handler_result_t::completed()
+					: aida::ui::action_handler_result_t::failed(g_ui.operation_status);
+			});
+			add_structure_action("types.dissector.catalog.redo", structure_can_redo,
+				"No current catalog edit is available to redo", [] {
+				return apply_catalog_redo()
+					? aida::ui::action_handler_result_t::completed()
+					: aida::ui::action_handler_result_t::failed(g_ui.operation_status);
+			});
 			add_structure_action("types.dissector.structure.copy_name", true,
 				"The retained structure is stale", [resolve_structure] {
 					const auto index = resolve_structure();
@@ -2415,7 +2692,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					if (!resolve_structure())
 						return aida::ui::action_handler_result_t::failed(
 							"The retained structure is stale");
-					auto rollback_state = struct_dissector::capture_catalog_transaction();
 					std::string base = snapshot.name + "_copy";
 					if (base.size() > 240) base.resize(240);
 					std::string name = base;
@@ -2434,43 +2710,39 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							return aida::ui::action_handler_result_t::failed(
 								"A bounded unique structure name could not be allocated");
 					}
-					const int created = struct_dissector::create_struct(name);
-					if (created < 0)
+					int created = -1;
+					std::uint64_t created_id = 0;
+					const bool duplicated = apply_catalog_edit("Duplicate structure", [&] {
+						created = struct_dissector::create_struct(name);
+						if (created < 0)
+							return false;
+						{
+							auto& state = struct_dissector::g_state;
+							std::lock_guard<std::mutex> lock(state.mtx);
+							if (struct_dissector::valid_index(created, state.structs.size()))
+								created_id = state.structs[static_cast<std::size_t>(created)].stable_id;
+						}
+						bool complete = created_id != 0 &&
+							struct_dissector::set_structure_kind(created, snapshot.kind) &&
+							struct_dissector::set_structure_packing(created, snapshot.packing) &&
+							struct_dissector::set_structure_alignment(created,
+								snapshot.explicit_alignment);
+						for (const auto& source : snapshot.fields) {
+							if (!complete) break;
+							auto field = source;
+							field.stable_id = 0;
+							field.children.clear();
+							if (field.target_structure_id == snapshot.stable_id) {
+								field.target_structure_id = created_id;
+								field.pointer_target_struct = created;
+							}
+							complete = struct_dissector::add_field(created, field) >= 0;
+						}
+						return complete;
+					});
+					if (!duplicated)
 						return aida::ui::action_handler_result_t::failed(
 							"The mutable catalog rejected the duplicate structure");
-					std::uint64_t created_id = 0;
-					{
-						auto& state = struct_dissector::g_state;
-						std::lock_guard<std::mutex> lock(state.mtx);
-						if (struct_dissector::valid_index(created, state.structs.size()))
-							created_id = state.structs[static_cast<std::size_t>(created)].stable_id;
-					}
-					bool complete = created_id != 0 &&
-						struct_dissector::set_structure_kind(created, snapshot.kind) &&
-						struct_dissector::set_structure_packing(created, snapshot.packing) &&
-						struct_dissector::set_structure_alignment(created,
-							snapshot.explicit_alignment);
-					for (const auto& source : snapshot.fields) {
-						if (!complete) break;
-						auto field = source;
-						field.stable_id = 0;
-						field.children.clear();
-						if (field.target_structure_id == snapshot.stable_id) {
-							field.target_structure_id = created_id;
-							field.pointer_target_struct = created;
-						}
-						complete = struct_dissector::add_field(created, field) >= 0;
-					}
-					if (!complete || !struct_dissector::request_save_schema()) {
-						const bool rolled_back = struct_dissector::rollback_catalog_transaction(
-							std::move(rollback_state), struct_dissector::catalog_schema_revision());
-						if (!rolled_back)
-							return aida::ui::action_handler_result_t::failed(
-								"The duplicate failed and exact catalog rollback was blocked");
-						return aida::ui::action_handler_result_t::failed(complete
-							? "The durable catalog save was not queued; the duplicate was rolled back"
-							: "The duplicate failed layout validation and was rolled back");
-					}
 					{
 						auto& state = struct_dissector::g_state;
 						std::lock_guard<std::mutex> lock(state.mtx);
@@ -2507,10 +2779,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					if (!index)
 						return aida::ui::action_handler_result_t::failed(
 							"The retained structure is stale");
-					const bool applied = struct_dissector::set_structure_kind(
-						*index, kind == struct_dissector::structure_kind_t::union_type
-							? struct_dissector::structure_kind_t::structure
-							: struct_dissector::structure_kind_t::union_type);
+					const bool applied = apply_catalog_edit("Convert structure kind", [&] {
+						return struct_dissector::set_structure_kind(
+							*index, kind == struct_dissector::structure_kind_t::union_type
+								? struct_dissector::structure_kind_t::structure
+								: struct_dissector::structure_kind_t::union_type);
+					});
 					return applied
 						? aida::ui::action_handler_result_t::completed()
 						: aida::ui::action_handler_result_t::failed(
@@ -3060,12 +3334,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (edit_identity_valid) switch (ui.edit_target) {
 				case edit_target_t::field_name:
 					if (tgt_field >= 0 && ui.rename_buf[0] != '\0')
-						applied = struct_dissector::rename_field(mutation_struct_idx, tgt_field, ui.rename_buf);
+						applied = apply_catalog_edit("Rename field", [&] {
+							return struct_dissector::rename_field(mutation_struct_idx, tgt_field, ui.rename_buf);
+						});
 					break;
 				case edit_target_t::field_size: {
 					uint32_t nsz = 0;
 					if (std::sscanf(ui.rename_buf, "%u", &nsz) == 1 && nsz > 0)
-						applied = struct_dissector::set_field_size(mutation_struct_idx, tgt_field, nsz);
+						applied = apply_catalog_edit("Resize field", [&] {
+							return struct_dissector::set_field_size(mutation_struct_idx, tgt_field, nsz);
+						});
 					else
 						diag::log_tagged_fmt("dissector",
 							"set_field_size_input_invalid input='%s'", ui.rename_buf);
@@ -3073,51 +3351,69 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 				case edit_target_t::field_comment:
 					if (tgt_field >= 0)
-						applied = struct_dissector::set_field_comment(mutation_struct_idx, tgt_field, ui.rename_buf);
+						applied = apply_catalog_edit("Edit field comment", [&] {
+							return struct_dissector::set_field_comment(mutation_struct_idx, tgt_field, ui.rename_buf);
+						});
 					break;
 				case edit_target_t::struct_name:
 					if (active_idx >= 0 && ui.rename_buf[0] != '\0')
-						applied = struct_dissector::rename_struct(active_idx, ui.rename_buf);
+						applied = apply_catalog_edit("Rename structure", [&] {
+							return struct_dissector::rename_struct(active_idx, ui.rename_buf);
+						});
 					break;
 				case edit_target_t::array_count: {
 					unsigned long value = 0;
 					char* end = nullptr;
 					value = std::strtoul(ui.rename_buf, &end, 0);
 					if (end && *end == '\0' && value <= 1048576)
-						applied = struct_dissector::set_field_array_count(mutation_struct_idx, tgt_field,
-							static_cast<std::uint32_t>(value));
+						applied = apply_catalog_edit("Set field array count", [&] {
+							return struct_dissector::set_field_array_count(mutation_struct_idx, tgt_field,
+								static_cast<std::uint32_t>(value));
+						});
 					break;
 				}
 				case edit_target_t::nested_target:
-					applied = struct_dissector::set_field_nested_target_by_name(mutation_struct_idx,
-						tgt_field, ui.rename_buf, false);
+					applied = apply_catalog_edit("Set nested structure", [&] {
+						return struct_dissector::set_field_nested_target_by_name(mutation_struct_idx,
+							tgt_field, ui.rename_buf, false);
+					});
 					break;
 				case edit_target_t::pointer_target:
-					applied = struct_dissector::set_field_nested_target_by_name(mutation_struct_idx,
-						tgt_field, ui.rename_buf, true);
+					applied = apply_catalog_edit("Set pointer target", [&] {
+						return struct_dissector::set_field_nested_target_by_name(mutation_struct_idx,
+							tgt_field, ui.rename_buf, true);
+					});
 					break;
 				case edit_target_t::enum_reference:
-					applied = struct_dissector::set_field_enum_reference(mutation_struct_idx,
-						tgt_field, ui.rename_buf);
+					applied = apply_catalog_edit("Set field enum", [&] {
+						return struct_dissector::set_field_enum_reference(mutation_struct_idx,
+							tgt_field, ui.rename_buf);
+					});
 					break;
 				case edit_target_t::bitfield: {
 					if (std::strcmp(ui.rename_buf, "none") == 0 || std::strcmp(ui.rename_buf, "0") == 0)
-						applied = struct_dissector::set_field_bitfield(mutation_struct_idx, tgt_field, 0, 0);
+						applied = apply_catalog_edit("Clear field bitfield", [&] {
+							return struct_dissector::set_field_bitfield(mutation_struct_idx, tgt_field, 0, 0);
+						});
 					else {
 						unsigned int offset = 0;
 						unsigned int width = 0;
 						if (std::sscanf(ui.rename_buf, "%u:%u", &offset, &width) == 2 &&
 							offset <= 65535 && width <= 65535)
-							applied = struct_dissector::set_field_bitfield(mutation_struct_idx, tgt_field,
-								static_cast<std::uint16_t>(offset), static_cast<std::uint16_t>(width));
+							applied = apply_catalog_edit("Configure field bitfield", [&] {
+								return struct_dissector::set_field_bitfield(mutation_struct_idx, tgt_field,
+									static_cast<std::uint16_t>(offset), static_cast<std::uint16_t>(width));
+							});
 					}
 					break;
 				}
 				case edit_target_t::field_alignment: {
 					unsigned int alignment = 0;
 					if (std::sscanf(ui.rename_buf, "%u", &alignment) == 1 && alignment <= 4096)
-						applied = struct_dissector::set_field_alignment(mutation_struct_idx, tgt_field,
-							static_cast<std::uint16_t>(alignment));
+						applied = apply_catalog_edit("Set field alignment", [&] {
+							return struct_dissector::set_field_alignment(mutation_struct_idx, tgt_field,
+								static_cast<std::uint16_t>(alignment));
+						});
 					break;
 				}
 				default: break;
@@ -3185,6 +3481,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			const bool live_current = valid_field && driver_bridge::is_loaded() &&
 				driver_bridge::attached_pid() != 0 &&
 				driver_bridge::attached_pid() == ui.context_target_pid &&
+				active_base_address != 0 &&
 				active_base_address == ui.context_base_address &&
 				st.last_completed_seq.load(std::memory_order_acquire) == ui.context_refresh_seq;
 #endif
@@ -3271,6 +3568,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				action.invoke = std::move(invoke);
 				retained.actions.push_back(std::move(action));
 			};
+			const bool field_can_undo = struct_dissector::user_catalog_can_undo();
+			const bool field_can_redo = struct_dissector::user_catalog_can_redo();
+			add_action("types.dissector.catalog.undo", field_can_undo,
+				"No current catalog edit is available to undo", [] {
+				return apply_catalog_undo()
+					? aida::ui::action_handler_result_t::completed()
+					: aida::ui::action_handler_result_t::failed(g_ui.operation_status);
+			});
+			add_action("types.dissector.catalog.redo", field_can_redo,
+				"No current catalog edit is available to redo", [] {
+				return apply_catalog_redo()
+					? aida::ui::action_handler_result_t::completed()
+					: aida::ui::action_handler_result_t::failed(g_ui.operation_status);
+			});
 			const auto activate_retained_field = [resolve_field, retained_structure_id,
 				retained_structure_revision, retained_field_id]()
 				-> std::optional<std::pair<int, int>> {
@@ -3393,7 +3704,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					if (!resolved)
 						return aida::ui::action_handler_result_t::failed(
 							"The retained field is stale");
-					auto rollback_state = struct_dissector::capture_catalog_transaction();
 					struct_dissector::field_def_t duplicate = field_snapshot;
 					duplicate.stable_id = 0;
 					duplicate.parent_idx = -1;
@@ -3431,22 +3741,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 								structure.total_size, alignment == 0 ? 1 : alignment);
 						}
 					}
-					const int created = struct_dissector::add_field(resolved->first, duplicate);
+					const int created = apply_catalog_index_edit("Duplicate field", [&] {
+						return struct_dissector::add_field(resolved->first, duplicate);
+					});
 					if (created < 0) {
-						if (!struct_dissector::rollback_catalog_transaction(
-								std::move(rollback_state), struct_dissector::catalog_schema_revision()))
-							return aida::ui::action_handler_result_t::failed(
-								"Field duplication failed and exact catalog rollback was blocked");
 						return aida::ui::action_handler_result_t::failed(
 							"The duplicated field failed layout validation; no mutation was retained");
-					}
-					if (!struct_dissector::request_save_schema()) {
-						if (!struct_dissector::rollback_catalog_transaction(
-								std::move(rollback_state), struct_dissector::catalog_schema_revision()))
-							return aida::ui::action_handler_result_t::failed(
-								"The durable save was rejected and exact field rollback was blocked");
-						return aida::ui::action_handler_result_t::failed(
-							"The durable catalog save was not queued; the duplicate was rolled back");
 					}
 					return aida::ui::action_handler_result_t::completed(
 						"Field duplicate created; durable catalog save queued");
@@ -3479,9 +3779,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				g_ui.edit_value_buf[sizeof(g_ui.edit_value_buf) - 1] = '\0';
 				return aida::ui::action_handler_result_t::completed();
 			});
-			add_action("types.dissector.field.refresh_live_value", false,
-				"Attach the original target and reselect the field before reading live memory",
-				[] { return aida::ui::action_handler_result_t::completed(); });
+			const bool refresh_available = live_current &&
+				!st.refresh_in_flight.load(std::memory_order_acquire);
+			add_action("types.dissector.field.refresh_live_value", refresh_available,
+				live_current ? "A live-value refresh is already running"
+					: "Attach the original target and reselect the field before reading live memory",
+				[activate_retained_field] {
+					if (!activate_retained_field())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained field is stale");
+					struct_dissector::refresh_values();
+					return aida::ui::action_handler_result_t::completed(
+						"Live structure values refresh requested");
+				});
 			add_action("types.dissector.field.rename", valid_field,
 				"The retained field is stale", [open_field_edit, field_name] {
 				return open_field_edit(edit_target_t::field_name, field_name);
@@ -3513,8 +3823,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						if (!resolved)
 							return aida::ui::action_handler_result_t::failed(
 								"The retained field is stale");
-						return struct_dissector::retype_field(resolved->first, resolved->second,
-							static_cast<struct_dissector::field_type_t>(type_index))
+						return apply_catalog_edit("Retype field", [&] {
+							return struct_dissector::retype_field(resolved->first, resolved->second,
+								static_cast<struct_dissector::field_type_t>(type_index));
+						})
 							? aida::ui::action_handler_result_t::completed()
 							: aida::ui::action_handler_result_t::failed("The field type change failed layout validation");
 					});
@@ -3588,7 +3900,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				const auto resolved = activate_retained_field();
 				if (!resolved || resolved->second <= 0)
 					return aida::ui::action_handler_result_t::failed("The retained field cannot move up");
-				return struct_dissector::move_field(resolved->first, resolved->second, resolved->second - 1)
+				return apply_catalog_edit("Move field up", [&] {
+					return struct_dissector::move_field(resolved->first, resolved->second,
+						resolved->second - 1);
+				})
 					? aida::ui::action_handler_result_t::completed()
 					: aida::ui::action_handler_result_t::failed("The reordered layout failed validation");
 			});
@@ -3598,7 +3913,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				const auto resolved = activate_retained_field();
 				if (!resolved)
 					return aida::ui::action_handler_result_t::failed("The retained field is stale");
-				return struct_dissector::move_field(resolved->first, resolved->second, resolved->second + 1)
+				return apply_catalog_edit("Move field down", [&] {
+					return struct_dissector::move_field(resolved->first, resolved->second,
+						resolved->second + 1);
+				})
 					? aida::ui::action_handler_result_t::completed()
 					: aida::ui::action_handler_result_t::failed("The reordered layout failed validation");
 			});
@@ -3691,7 +4009,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::design::begin_dialog_body("sd_confirm_remove_field_body",
 				footer_height);
 			ImGui::TextUnformatted("Remove this field from the structure definition?");
-			ImGui::TextDisabled("This backend has no field-removal undo journal.");
+			ImGui::TextDisabled("The catalog edit can be restored with Undo after removal.");
 			aida::ui::design::end_dialog_body();
 			const auto footer = aida::ui::design::dialog_footer(
 				"sd_confirm_remove_field_footer", "Remove", true, true, "Cancel");
@@ -3727,7 +4045,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						}
 					}
 				}
-				if (target >= 0 && struct_dissector::remove_field(structure_index, target)) {
+				if (target >= 0 && apply_catalog_edit("Delete field", [&] {
+					return struct_dissector::remove_field(structure_index, target);
+				})) {
 					if (ui.selected_field == target) ui.selected_field = -1;
 					if (ui.editing_field == target) ui.editing_field = -1;
 				}
@@ -3799,9 +4119,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				fd.offset = off;
 				std::size_t ts = struct_dissector::field_type_size(fd.type);
 				fd.size = static_cast<uint32_t>(ts > 0 ? ts : 1);
-				const int added_index = ui.pending_insert_index >= 0
-					? struct_dissector::insert_field(active_idx, ui.pending_insert_index, fd)
-					: struct_dissector::add_field(active_idx, fd);
+				const int added_index = apply_catalog_index_edit(
+					ui.pending_insert_index >= 0 ? "Insert field" : "Add field", [&] {
+						return ui.pending_insert_index >= 0
+							? struct_dissector::insert_field(active_idx, ui.pending_insert_index, fd)
+							: struct_dissector::add_field(active_idx, fd);
+					});
 				ui.operation_error = added_index < 0;
 				ui.operation_status = added_index < 0
 					? "Field insertion failed layout validation" : "Field added";
@@ -3817,7 +4140,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (aida::ui::button("Del", aida::ui::button_kind_t::destructive,
 			aida::ui::size_t_::sm, ImVec2(64.f, 28.f))) {
 			if (ui.selected_field >= 0) {
-				struct_dissector::remove_field(active_idx, ui.selected_field);
+				static_cast<void>(apply_catalog_edit("Delete field", [&] {
+					return struct_dissector::remove_field(active_idx, ui.selected_field);
+				}));
 				ui.selected_field = -1;
 				ui.editing_field = -1;
 			} else {
@@ -3830,5 +4155,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	render_write_review_modal();
 	ImGui::EndChild();
 }
+
+#endif
 
 }

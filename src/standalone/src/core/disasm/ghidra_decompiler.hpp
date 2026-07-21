@@ -1012,6 +1012,29 @@ struct prepared_arch_t {
 	std::unique_ptr<aida_ghidra::architecture_t> arch;
 	std::ostringstream err;
 
+	static void apply_execution_mode(
+		aida_ghidra::architecture_t& architecture,
+		aida::analysis::architecture_mode_t architecture_mode,
+		uint64_t context_begin,
+		uint64_t context_size)
+	{
+		if (architecture_mode != aida::analysis::architecture_mode_t::arm_a32 &&
+			architecture_mode != aida::analysis::architecture_mode_t::arm_thumb)
+			return;
+		if (context_size == 0 || context_size > UINT64_MAX - context_begin)
+			throw ghidra::LowlevelError("ARM context range is invalid");
+		auto* context = architecture.context_database();
+		auto* code_space = architecture.getDefaultCodeSpace();
+		if (!context || !code_space)
+			throw ghidra::LowlevelError("ARM context database is unavailable");
+		const ghidra::uintm thumb_mode =
+			architecture_mode == aida::analysis::architecture_mode_t::arm_thumb ? 1U : 0U;
+		context->setVariableRegion("TMode", ghidra::Address(code_space, context_begin),
+			ghidra::Address(code_space, context_begin + context_size), thumb_mode);
+		if (context->getVariable("TMode", ghidra::Address(code_space, context_begin)) != thumb_mode)
+			throw ghidra::LowlevelError("ARM execution mode context was not applied");
+	}
+
 	prepared_arch_t(const uint8_t* data,
 	                size_t size,
 	                uint64_t base,
@@ -1019,7 +1042,9 @@ struct prepared_arch_t {
 	                std::atomic<bool>* cancel,
 	                const std::string& sleigh_id,
 	                std::vector<aida_ghidra::region_t> extra_regions = {},
-	                uint64_t total_image_size = 0)
+	                uint64_t total_image_size = 0,
+	                aida::analysis::architecture_mode_t architecture_mode =
+					aida::analysis::architecture_mode_t::unknown)
 	{
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
 			data, size, base, file_fallback, cancel);
@@ -1033,6 +1058,8 @@ struct prepared_arch_t {
 
 		ghidra::DocumentStorage store;
 		arch->init(store);
+		apply_execution_mode(*arch, architecture_mode, base,
+			total_image_size != 0 ? total_image_size : static_cast<uint64_t>(size));
 	}
 
 	prepared_arch_t(const prepared_arch_t&) = delete;
@@ -1064,6 +1091,25 @@ struct prepared_arch_t {
 		std::function<bool()> cancel_check,
 		const std::string& sleigh_id)
 	{
+#if defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
+		static_cast<void>(image);
+		static_cast<void>(address_space);
+		static_cast<void>(architecture_mode);
+		static_cast<void>(cancel_check);
+		static_cast<void>(sleigh_id);
+		throw ghidra::LowlevelError("normalized workspace decompilation is unavailable in the isolated worker");
+#else
+		if (!image)
+			throw ghidra::LowlevelError("normalized workspace load image is unavailable");
+		const auto& workspace_image = image->image();
+		const uint64_t context_begin =
+			(address_space == aida::analysis::address_space_id_t::virtual_address ||
+			 address_space == aida::analysis::address_space_id_t::live_virtual)
+				? workspace_image.image_base : 0;
+		if (workspace_image.image_size == 0 ||
+			workspace_image.image_size > UINT64_MAX - context_begin)
+			throw ghidra::LowlevelError("normalized workspace context range is invalid");
+		const uint64_t context_end = context_begin + workspace_image.image_size;
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
 			std::move(image), address_space, std::move(cancel_check));
 		arch = std::make_unique<aida_ghidra::architecture_t>(sleigh_id, &err);
@@ -1071,14 +1117,9 @@ struct prepared_arch_t {
 
 		ghidra::DocumentStorage store;
 		arch->init(store);
-		if (architecture_mode == aida::analysis::architecture_mode_t::arm_a32 ||
-			architecture_mode == aida::analysis::architecture_mode_t::arm_thumb) {
-			auto* context = arch->context_database();
-			if (!context)
-				throw ghidra::LowlevelError("ARM context database is unavailable");
-			context->setVariableDefault("TMode",
-				architecture_mode == aida::analysis::architecture_mode_t::arm_thumb ? 1 : 0);
-		}
+		apply_execution_mode(*arch, architecture_mode, context_begin,
+			workspace_image.image_size);
+#endif
 	}
 };
 
@@ -1592,7 +1633,8 @@ inline ghidra_result_t decompile_isolated_buffer(
 		return result;
 	}
 	try {
-		detail::prepared_arch_t prepared(data, size, base_addr, nullptr, cancel, sleigh_id);
+		detail::prepared_arch_t prepared(data, size, base_addr, nullptr, cancel, sleigh_id,
+			{}, 0, typed_request.language.mode);
 		result = detail::do_decompile(prepared.arch.get(), entry_addr, cancel, deadline,
 			result_limits, &typed_request);
 	} catch (ghidra::LowlevelError& error) {
@@ -1623,6 +1665,7 @@ inline ghidra_result_t decompile_isolated_regions(
 	uint64_t image_size,
 	uint64_t entry_addr,
 	const std::string& sleigh_id,
+	aida::analysis::architecture_mode_t architecture_mode,
 	std::atomic<bool>* cancel,
 	std::optional<std::chrono::steady_clock::time_point> deadline,
 	const ghidra_decompile_result_limits_t& result_limits,
@@ -1683,6 +1726,8 @@ inline ghidra_result_t decompile_isolated_regions(
 		regions.erase(regions.begin() + static_cast<std::ptrdiff_t>(entry_region));
 		detail::prepared_arch_t prepared(primary.data.data(), primary.data.size(),
 			primary.start_va, nullptr, cancel, sleigh_id, std::move(regions), image_size);
+		detail::prepared_arch_t::apply_execution_mode(*prepared.arch,
+			architecture_mode, image_base, image_size);
 		result = detail::do_decompile(prepared.arch.get(), entry_addr, cancel, deadline,
 			result_limits, &typed_request);
 	} catch (ghidra::LowlevelError& error) {

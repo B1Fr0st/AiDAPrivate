@@ -43,7 +43,8 @@ namespace aida::ui::no_target_overlay {
 
 	inline action_t render_actions(ImVec2 region_pos, ImVec2 region_size,
 		const char* title_text, const char* subtitle_text, float alpha,
-		aida::ui::empty_state::glyph_t glyph = aida::ui::empty_state::glyph_t::binary_file)
+		aida::ui::empty_state::glyph_t glyph = aida::ui::empty_state::glyph_t::binary_file,
+		const char* stable_id_override = nullptr)
 	{
 		const auto& t = aida::ui::resolved();
 		ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -74,7 +75,8 @@ namespace aida::ui::no_target_overlay {
 				run_action.enabled, false, run_action.visible}
 		};
 		aida::ui::design::state_presentation_t state;
-		state.stable_id = state_id_for_glyph(glyph);
+		state.stable_id = stable_id_override && stable_id_override[0] != '\0'
+			? stable_id_override : state_id_for_glyph(glyph);
 		state.state = aida::ui::design::view_state_t::empty;
 		state.title = title_text;
 		state.message = subtitle_text;
@@ -110,9 +112,11 @@ namespace aida::ui::no_target_overlay {
 	inline action_t render(ImVec2 region_pos, ImVec2 region_size,
 		const char* title_text, const char* subtitle_text, float alpha,
 		aida::ui::empty_state::glyph_t glyph = aida::ui::empty_state::glyph_t::binary_file,
-		bool dispatch_default_actions = true)
+		bool dispatch_default_actions = true,
+		const char* stable_id_override = nullptr)
 	{
-		action_t action = render_actions(region_pos, region_size, title_text, subtitle_text, alpha, glyph);
+		action_t action = render_actions(region_pos, region_size, title_text, subtitle_text,
+			alpha, glyph, stable_id_override);
 		if (dispatch_default_actions) dispatch_default_action(action);
 		return action;
 	}

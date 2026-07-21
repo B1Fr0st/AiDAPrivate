@@ -12,14 +12,24 @@ internal static class Program
     private static async Task<int> Main(string[] arguments)
     {
         ActiveJob? activeJob = null;
+        AuthenticatedTransport? transport = null;
+        var startupStage = "options";
+        var helloStarted = false;
         try
         {
             var options = WorkerStartupOptions.Parse(arguments);
+            startupStage = "transport";
+            transport = AuthenticatedTransport.Establish(options);
+            startupStage = "runtime_identity";
             RuntimeIdentity.Establish(options.RuntimeManifestHash);
+            startupStage = "module_mapping";
             var moduleBytes = AuthenticatedTransport.ReadModuleMapping(options.ModuleHandle, options.ModuleSize);
+            startupStage = "module_snapshot";
             MetadataAnalysis.EstablishModuleSnapshot(moduleBytes);
+            startupStage = "worker_identity";
             var workerBinaryHash = AuthenticatedTransport.HashIdentityHandle(options.IdentityHandle);
-            using var transport = AuthenticatedTransport.Establish(options);
+            startupStage = "hello";
+            helloStarted = true;
             await SendHelloAsync(transport, workerBinaryHash).ConfigureAwait(false);
 
             var requestPayload = await transport.ReceivePayloadAsync(1, CancellationToken.None).ConfigureAwait(false);
@@ -40,17 +50,89 @@ internal static class Program
             await transport.SendPayloadAsync(2, responsePayload, CancellationToken.None).ConfigureAwait(false);
             return 0;
         }
-        catch
+        catch (Exception exception)
         {
             activeJob?.Cancellation.Cancel();
+            if (transport is not null && !helloStarted)
+            {
+                try
+                {
+                    using var reportDeadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+                    await SendStartupFailureAsync(transport, startupStage, exception, reportDeadline.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+            }
             return 1;
         }
         finally
         {
+            transport?.Dispose();
             activeJob?.Cancellation.Dispose();
             MetadataAnalysis.ReleaseModuleSnapshot();
         }
     }
+
+    private static async Task SendStartupFailureAsync(AuthenticatedTransport transport, string stage,
+        Exception exception, CancellationToken cancellationToken)
+    {
+        var failure = new WorkerTransportStartupFailure(
+            TransportSchema,
+            3,
+            "startup_failure",
+            1,
+            Convert.ToHexString(transport.Session.NonceHash).ToLowerInvariant(),
+            stage,
+            StartupFailureCode(exception),
+            exception is IOException);
+        await transport.SendPayloadAsync(1, WorkerProtocol.Serialize(failure), cancellationToken).ConfigureAwait(false);
+    }
+
+    private static string StartupFailureCode(Exception exception) => exception switch
+    {
+        RuntimeIntegrityException integrity => integrity.Message switch
+        {
+            "managed runtime identity is not established" => "identity_not_established",
+            "managed runtime manifest identity is invalid" => "runtime_manifest_identity",
+            "managed worker process path is unavailable" => "process_path_unavailable",
+            "managed worker package path is invalid" => "package_path_invalid",
+            "managed worker package root is invalid" => "package_root_invalid",
+            "managed worker apphost identity is invalid" => "apphost_identity",
+            "managed worker cannot execute from a repository dependency root" => "repository_dependency_root",
+            "managed worker DOTNET_ROOT is not app-local" => "dotnet_root",
+            "managed runtime manifest package size is invalid" => "runtime_manifest_size",
+            "managed worker loaded assembly paths are not app-local" => "loaded_assembly_path",
+            "managed framework dependency copies do not match the loaded runtime" => "framework_dependency_hash",
+            "managed worker framework identity is invalid" => "framework_identity",
+            "managed worker AppContainer environment is not profile-bound" => "appcontainer_environment",
+            "managed worker environment exceeds its minimal allowlist" => "environment_allowlist",
+            "managed worker environment violates app-local runtime policy" => "environment_policy",
+            "managed worker Windows environment is not minimal" => "windows_environment",
+            "managed worker environment contains a forbidden host override" => "forbidden_host_override",
+            "managed runtime manifest hash does not match startup identity" => "runtime_manifest_hash",
+            "managed runtime manifest digest is invalid" => "runtime_manifest_digest",
+            "managed decompiler assembly hash mismatch" => "provider_hash",
+            "managed runtime identity was already established" => "identity_reentry",
+            "managed runtime identity is unavailable" => "identity_unavailable",
+            "managed runtime package root is unavailable" => "package_root_unavailable",
+            "managed runtime identity locks are unavailable" => "identity_locks",
+            "managed runtime identity changed after startup" => "identity_changed",
+            "managed runtime package root changed after startup" => "package_root_changed",
+            "managed runtime file is unavailable" => "runtime_file_unavailable",
+            "managed runtime directory is unavailable" => "runtime_directory_unavailable",
+            "managed runtime root directory identity is invalid" => "runtime_root_identity",
+            "managed runtime path escapes its trusted root" => "path_escape",
+            "managed runtime path contains a reparse component" => "reparse_path",
+            _ => "runtime_integrity"
+        },
+        InvalidDataException => "invalid_data",
+        BadImageFormatException => "bad_image",
+        UnauthorizedAccessException => "access_denied",
+        IOException => "io_failure",
+        OutOfMemoryException => "resource_limit",
+        _ => "unexpected"
+    };
 
     private static async Task SendHelloAsync(AuthenticatedTransport transport, string workerBinaryHash)
     {
@@ -209,4 +291,14 @@ internal static class Program
         internal WorkerRequest Request { get; }
         internal CancellationTokenSource Cancellation { get; } = new();
     }
+
+    private sealed record WorkerTransportStartupFailure(
+        string Schema,
+        int SchemaVersion,
+        string Kind,
+        ulong Sequence,
+        string SessionNonceHash,
+        string Stage,
+        string Code,
+        bool Retryable);
 }

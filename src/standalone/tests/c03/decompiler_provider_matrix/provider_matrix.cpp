@@ -236,6 +236,24 @@ json null_artifacts()
 
 class provider_evidence_budget_t final {
 public:
+    struct checkpoint_t final {
+        std::uint64_t raw_bytes = 0;
+        std::uint64_t encoded_bytes = 0;
+        std::uint64_t structured_encoded_bytes = 0;
+    };
+
+    checkpoint_t checkpoint() const noexcept
+    {
+        return {raw_bytes_, encoded_bytes_, structured_encoded_bytes_};
+    }
+
+    void restore(const checkpoint_t& checkpoint) noexcept
+    {
+        raw_bytes_ = checkpoint.raw_bytes;
+        encoded_bytes_ = checkpoint.encoded_bytes;
+        structured_encoded_bytes_ = checkpoint.structured_encoded_bytes;
+    }
+
     void charge_record(const std::size_t byte_size)
     {
         const auto framed = checked_add(static_cast<std::uint64_t>(byte_size), 8ULL,
@@ -1920,6 +1938,8 @@ std::vector<generation_bound_decompiler_entity_t> enumerate_entities(
         for (const auto& function : publication->snapshot->functions) {
             if (function.id == 0 || !(function.start < function.end))
                 continue;
+            if (function.provenance == fact_provenance_t::gap_recovery)
+                continue;
             decompiler_entity_locator_t locator;
             locator.address = function.start.value;
             locator.expected_kind = decompiler_entity_kind_t::native_function;
@@ -2173,18 +2193,23 @@ json candidate_cancellation(
             "no production entity was available for cancellation", 0, 0, 0,
             "provider_failure", json::array());
     const auto budget_ms = (std::min)(deadline_ms, k_cancellation_budget_ms);
-    const auto deadline = clock_t::now() + std::chrono::milliseconds(budget_ms);
-    cancellation_source_t source(deadline);
+    const auto execution_deadline = clock_t::now() +
+        std::chrono::milliseconds(deadline_ms);
+    const auto entry_deadline = clock_t::now() +
+        std::chrono::milliseconds(budget_ms);
+    cancellation_source_t source(execution_deadline);
     entities = cancellation_order(std::move(entities));
     const auto requests_before = integration->metrics().total_requests;
     const auto started = tick_ns();
     auto operation = std::async(std::launch::async,
-        [&integration, entities = std::move(entities), &source, deadline,
+        [&integration, entities = std::move(entities), &source,
+         execution_deadline,
          &evidence_budget] {
             cancellation_observation_t observation(evidence_budget);
             constexpr std::size_t max_attempts = 64;
             for (std::size_t attempt = 0;
-                 attempt < max_attempts && clock_t::now() < deadline; ++attempt) {
+                 attempt < max_attempts &&
+                 clock_t::now() < execution_deadline; ++attempt) {
                 auto result = integration->decompile_entity(
                     entities[attempt % entities.size()],
                     decompiler_ui_invocation_source_t::api_call,
@@ -2206,9 +2231,9 @@ json candidate_cancellation(
                 std::this_thread::yield();
             }
             return observation;
-        });
+    });
     bool entered = false;
-    while (clock_t::now() < deadline) {
+    while (clock_t::now() < entry_deadline) {
         if (integration->metrics().total_requests > requests_before) {
             entered = true;
             break;
@@ -2220,7 +2245,9 @@ json candidate_cancellation(
     }
     source.request_cancel();
     const auto requested = (std::max)(started, tick_ns());
-    const bool ready_by_deadline = operation.wait_until(deadline) ==
+    const auto response_deadline = clock_t::now() +
+        std::chrono::milliseconds(budget_ms);
+    const bool ready_by_deadline = operation.wait_until(response_deadline) ==
         std::future_status::ready;
     auto observation = operation.get();
     const auto ended = ended_after(requested);
@@ -2372,18 +2399,24 @@ json ghidra_cancellation(
     const auto job = make_native_job(entity, workspace, runtime,
         preparation_deadline);
     const auto budget_ms = (std::min)(deadline_ms, k_cancellation_budget_ms);
-    const auto deadline = clock_t::now() + std::chrono::milliseconds(budget_ms);
+    const auto execution_deadline = clock_t::now() +
+        std::chrono::milliseconds(deadline_ms);
+    const auto entry_deadline = clock_t::now() +
+        std::chrono::milliseconds(budget_ms);
     std::atomic_bool cancel_requested{false};
     std::atomic_bool callback_observed{false};
     const auto started = tick_ns();
     auto operation = std::async(std::launch::async,
-        [&job, &runtime, deadline, &cancel_requested, &callback_observed,
+        [&job, &runtime, execution_deadline, &cancel_requested,
+         &callback_observed,
          &evidence_budget] {
             cancellation_observation_t observation(evidence_budget);
             constexpr std::size_t max_attempts = 8;
             for (std::size_t attempt = 0;
-                 attempt < max_attempts && clock_t::now() < deadline; ++attempt) {
-                auto result = execute_native_job(job, runtime, deadline,
+                 attempt < max_attempts &&
+                 clock_t::now() < execution_deadline; ++attempt) {
+                auto result = execute_native_job(job, runtime,
+                    execution_deadline,
                     [&cancel_requested, &callback_observed] {
                         callback_observed.store(true, std::memory_order_release);
                         return cancel_requested.load(std::memory_order_acquire);
@@ -2398,9 +2431,9 @@ json ghidra_cancellation(
                 std::this_thread::yield();
             }
             return observation;
-        });
+    });
     bool entered = false;
-    while (clock_t::now() < deadline) {
+    while (clock_t::now() < entry_deadline) {
         if (callback_observed.load(std::memory_order_acquire)) {
             entered = true;
             break;
@@ -2412,7 +2445,9 @@ json ghidra_cancellation(
     }
     cancel_requested.store(true, std::memory_order_release);
     const auto requested = (std::max)(started, tick_ns());
-    const bool ready_by_deadline = operation.wait_until(deadline) ==
+    const auto response_deadline = clock_t::now() +
+        std::chrono::milliseconds(budget_ms);
+    const bool ready_by_deadline = operation.wait_until(response_deadline) ==
         std::future_status::ready;
     auto observation = operation.get();
     const auto ended = ended_after(requested);
@@ -2569,17 +2604,22 @@ json current_cancellation(
             "current AiDA cancellation entity set is empty", 0, 0, 0,
             "provider_failure", json::array());
     const auto budget_ms = (std::min)(deadline_ms, k_cancellation_budget_ms);
-    const auto deadline = clock_t::now() + std::chrono::milliseconds(budget_ms);
-    cancellation_source_t source(deadline);
+    const auto execution_deadline = clock_t::now() +
+        std::chrono::milliseconds(deadline_ms);
+    const auto entry_deadline = clock_t::now() +
+        std::chrono::milliseconds(budget_ms);
+    cancellation_source_t source(execution_deadline);
     const auto requests_before = workspace->decompiler()->snapshot().requests;
     const auto started = tick_ns();
     auto operation = std::async(std::launch::async,
-        [&workspace, entities = std::move(entities), &source, deadline,
+        [&workspace, entities = std::move(entities), &source,
+         execution_deadline,
          &evidence_budget] {
             cancellation_observation_t observation(evidence_budget);
             constexpr std::size_t max_attempts = 64;
             for (std::size_t attempt = 0;
-                 attempt < max_attempts && clock_t::now() < deadline; ++attempt) {
+                 attempt < max_attempts &&
+                 clock_t::now() < execution_deadline; ++attempt) {
                 const auto* native = std::get_if<native_decompiler_entity_identity_t>(
                     &entities[attempt % entities.size()].entity.identity);
                 if (!native)
@@ -2587,7 +2627,7 @@ json current_cancellation(
                 decompiler_request_t request;
                 request.use_memory_cache = false;
                 request.use_persistent_cache = false;
-                request.deadline = deadline;
+                request.deadline = execution_deadline;
                 request.publish_feedback = false;
                 auto result = workspace->decompiler()->decompile(native->entry,
                     std::move(request), source.token());
@@ -2604,9 +2644,9 @@ json current_cancellation(
                 std::this_thread::yield();
             }
             return observation;
-        });
+    });
     bool entered = false;
-    while (clock_t::now() < deadline) {
+    while (clock_t::now() < entry_deadline) {
         if (workspace->decompiler()->snapshot().requests > requests_before) {
             entered = true;
             break;
@@ -2618,7 +2658,9 @@ json current_cancellation(
     }
     source.request_cancel();
     const auto requested = (std::max)(started, tick_ns());
-    const bool ready_by_deadline = operation.wait_until(deadline) ==
+    const auto response_deadline = clock_t::now() +
+        std::chrono::milliseconds(budget_ms);
+    const bool ready_by_deadline = operation.wait_until(response_deadline) ==
         std::future_status::ready;
     auto observation = operation.get();
     const auto ended = ended_after(requested);
@@ -2762,48 +2804,12 @@ std::filesystem::path provider_output_path(
     throw matrix_error_t("all has no single provider output path");
 }
 
-std::uint64_t bounded_json_upper_size(const json& value,
-                                      const std::uint64_t limit)
+std::uint64_t bounded_json_size(const json& value,
+                                const std::uint64_t limit)
 {
-    const auto add = [limit](std::uint64_t& total, const std::uint64_t amount) {
-        if (amount > limit - (std::min)(total, limit)) {
-            total = limit + 1;
-            return false;
-        }
-        total += amount;
-        return total <= limit;
-    };
-    if (value.is_null())
-        return 4;
-    if (value.is_boolean())
-        return 5;
-    if (value.is_number())
-        return 32;
-    if (value.is_string()) {
-        const auto size = value.get_ref<const std::string&>().size();
-        return size > (limit - 2) / 6 ? limit + 1 : 2 + size * 6;
-    }
-    std::uint64_t total = 2;
-    if (value.is_array()) {
-        for (const auto& item : value) {
-            if (!add(total, bounded_json_upper_size(item, limit)) ||
-                !add(total, 1))
-                return limit + 1;
-        }
-        return total;
-    }
-    if (value.is_object()) {
-        for (auto iterator = value.begin(); iterator != value.end(); ++iterator) {
-            const auto key_size = iterator.key().size();
-            if (key_size > (limit - 3) / 6 ||
-                !add(total, 3 + key_size * 6) ||
-                !add(total, bounded_json_upper_size(*iterator, limit)) ||
-                !add(total, 1))
-                return limit + 1;
-        }
-        return total;
-    }
-    return limit + 1;
+    const auto serialized = value.dump();
+    return serialized.size() > limit ? limit + 1 :
+        static_cast<std::uint64_t>(serialized.size());
 }
 
 json execute_provider(
@@ -2823,6 +2829,7 @@ json execute_provider(
     std::size_t failed = 0;
     std::size_t not_applicable = 0;
     for (const auto& fixture : fixtures_input) {
+        const auto budget_checkpoint = evidence_budget.checkpoint();
         json value;
         switch (provider) {
         case provider_selection_t::candidate:
@@ -2843,10 +2850,13 @@ json execute_provider(
         const auto status = value.at("status").get<std::string>();
         if (status == "measured")
             ++measured;
-        else if (status == "failed")
+        else if (status == "failed") {
             ++failed;
-        else if (status == "not_applicable")
+            evidence_budget.restore(budget_checkpoint);
+        } else if (status == "not_applicable") {
             ++not_applicable;
+            evidence_budget.restore(budget_checkpoint);
+        }
         fixtures.push_back(std::move(value));
     }
     if (!cancellation)
@@ -2896,7 +2906,7 @@ json execute_provider(
         {"target_execution_forbidden", true},
         {"target_execution_observed", false},
         {"provider_run", std::move(provider_run)}};
-    if (bounded_json_upper_size(output, k_max_result_bytes - 1) >
+    if (bounded_json_size(output, k_max_result_bytes - 1) >
             k_max_result_bytes - 1) {
         auto& run = output["provider_run"];
         for (auto& fixture : run["fixtures"]) {
@@ -2911,7 +2921,7 @@ json execute_provider(
         run["status_reason"] =
             "raw provider evidence exceeded the 128 MiB result-file bound";
         output["measurement_eligible"] = false;
-        if (bounded_json_upper_size(output, k_max_result_bytes - 1) >
+        if (bounded_json_size(output, k_max_result_bytes - 1) >
                 k_max_result_bytes - 1)
             throw matrix_error_t("bounded provider failure evidence exceeds the result-file limit");
     }

@@ -69,6 +69,7 @@
 #include "burp/scope.hpp"
 #include "burp/cookie_jar.hpp"
 #include "burp/scanner_view.hpp"
+#include "burp/issue.hpp"
 #include "burp/recon_view.hpp"
 #include "burp/intruder_view.hpp"
 #include "burp/collaborator_view.hpp"
@@ -149,7 +150,6 @@
 #include <iterator>
 #include <limits>
 #include <memory>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -256,6 +256,10 @@ enum class network_exchange_action_t : std::uint8_t {
     intruder,
     scanner,
     comparer,
+    compare_request_response,
+    session_handling,
+    cookies,
+    match_replace,
     decoder,
     sequencer,
     camoufox,
@@ -294,9 +298,12 @@ struct intercept_runtime_snapshot_t;
 static bool execute_retained_exchange_toolbar_action(
     const char* action_id, artifact_identity_t primary,
     artifact_identity_t related, std::string& unavailable_reason);
+static void reset_common_exchange_actions();
 
 static capture_context_t s_capture_context;
 static std::atomic<std::uint64_t> s_repeater_artifact_sequence{1};
+static std::unordered_map<std::uint64_t, artifact_kind_t>
+    s_repeater_selected_artifact_kinds;
 static std::atomic<std::uint64_t> s_network_operation_sequence{1};
 static std::atomic<bool> s_accept_ui_completions{false};
 static std::mutex s_ui_completion_mutex;
@@ -1610,6 +1617,10 @@ static void bandwidth_poll_thread(state_t& state) {
 
 #ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static void run_fuzzer_thread(state_t& state);
+static void finish_fuzzer_task(state_t& state,
+                               aida::ui::task_center::task_state_t task_state,
+                               std::string stage,
+                               std::string summary);
 
 static bool start_connection_worker(state_t& state) {
     if (!state.conn_thread_done.load(std::memory_order_acquire))
@@ -1734,12 +1745,18 @@ static bool start_fuzzer_worker(state_t& state) {
                 }
             } catch (const std::exception& e) {
                 diag::log_tagged_fmt("network", "fuzzer_cpp_exception what=%s", e.what());
+                finish_fuzzer_task(g_state, aida::ui::task_center::task_state_t::failed,
+                    "Execution failed", e.what());
             } catch (...) {
                 diag::log_tagged("network", "fuzzer_unknown_exception");
+                finish_fuzzer_task(g_state, aida::ui::task_center::task_state_t::failed,
+                    "Execution failed", "Unexpected fuzzer worker failure");
             }
+            g_state.fuzz_thread_alive.store(false, std::memory_order_release);
             g_state.fuzz_thread_done.store(true, std::memory_order_release);
+            g_state.fuzz_cv.notify_all();
             diag::log_tagged("network", "fuzzer_thread_exited");
-        })) {
+        }, false)) {
         return true;
     }
     state.fuzz_thread_alive.store(false, std::memory_order_release);
@@ -1798,6 +1815,7 @@ static void request_driver_available_snapshot(bool force = false) {
 }
 
 void initialize() {
+    reset_common_exchange_actions();
     s_accept_ui_completions.store(true, std::memory_order_release);
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
     aida::preview::network::initialize(g_state);
@@ -1884,6 +1902,7 @@ void initialize() {
 
 void shutdown() {
     s_accept_ui_completions.store(false, std::memory_order_release);
+    reset_common_exchange_actions();
     {
         std::lock_guard<std::mutex> lock(s_ui_completion_mutex);
         s_ui_completions.clear();
@@ -1912,6 +1931,7 @@ void shutdown() {
     g_state.dns_thread_alive.store(false);
     g_state.dns_cv.notify_all();
 
+    g_state.fuzz_cancel_requested.store(true, std::memory_order_release);
     g_state.fuzz_running.store(false);
     g_state.fuzz_thread_alive.store(false);
     g_state.fuzz_cv.notify_all();
@@ -1932,11 +1952,31 @@ void shutdown() {
             name ? name : "<unnamed>",
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - begin));
     };
+    auto wait_done_before_dependency_teardown = [](const char* name,
+                                                   const std::atomic<bool>& done_flag) {
+        const uint64_t begin = static_cast<uint64_t>(GetTickCount64());
+        uint64_t next_report = 2500;
+        while (!done_flag.load(std::memory_order_acquire)) {
+            const uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - begin;
+            if (elapsed >= next_report) {
+                diag::log_tagged_fmt("network",
+                    "shutdown_dependency_drain_pending worker=%s elapsed_ms=%llu",
+                    name ? name : "<unnamed>",
+                    static_cast<unsigned long long>(elapsed));
+                next_report = elapsed + 2500;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        diag::log_tagged_fmt("network",
+            "shutdown_dependency_drain_done worker=%s elapsed_ms=%llu",
+            name ? name : "<unnamed>",
+            static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - begin));
+    };
     wait_done("conn", g_state.conn_thread_done);
     wait_done("capture", g_state.cap_thread_done);
     wait_done("dns", g_state.dns_thread_done);
     wait_done("bandwidth", g_state.bw_thread_done);
-    wait_done("fuzzer", g_state.fuzz_thread_done);
+    wait_done_before_dependency_teardown("fuzzer", g_state.fuzz_thread_done);
 
     aida::burp::shutdown();
 
@@ -5300,7 +5340,6 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                              float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
     static std::unordered_map<std::uint64_t, human_request_editor::state_t> request_editors;
-    static std::unordered_map<std::uint64_t, artifact_kind_t> selected_artifact_kinds;
     const auto& th = aida::ui::resolved();
     for (auto editor = request_editors.begin(); editor != request_editors.end();) {
         const bool retained = std::any_of(state.repeater_entries.begin(),
@@ -5309,13 +5348,14 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             });
         editor = retained ? std::next(editor) : request_editors.erase(editor);
     }
-    for (auto selected = selected_artifact_kinds.begin();
-         selected != selected_artifact_kinds.end();) {
+    for (auto selected = s_repeater_selected_artifact_kinds.begin();
+         selected != s_repeater_selected_artifact_kinds.end();) {
         const bool retained = std::any_of(state.repeater_entries.begin(),
             state.repeater_entries.end(), [&](const auto& entry) {
                 return entry && entry->id == selected->first;
             });
-        selected = retained ? std::next(selected) : selected_artifact_kinds.erase(selected);
+        selected = retained ? std::next(selected)
+                            : s_repeater_selected_artifact_kinds.erase(selected);
     }
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_rep", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
@@ -5356,7 +5396,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
         state.repeater_entries.push_back(std::move(rep));
         publish_repeater_request_artifacts(state);
         state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
-        selected_artifact_kinds[state.repeater_entries.back()->id] =
+        s_repeater_selected_artifact_kinds[state.repeater_entries.back()->id] =
             artifact_kind_t::repeater_request;
     }
 
@@ -5386,7 +5426,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                     diag::log_tagged_fmt("network", "repeater_tab_switched from=%d to=%d",
                         state.repeater_selected, i);
                 state.repeater_selected = i;
-                selected_artifact_kinds[
+                s_repeater_selected_artifact_kinds[
                     state.repeater_entries[static_cast<std::size_t>(i)]->id] =
                     artifact_kind_t::repeater_request;
                 publish_network_selection(repeater_artifact_identity(
@@ -5406,7 +5446,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 state.repeater_entries.erase(
                     state.repeater_entries.begin() + static_cast<ptrdiff_t>(idx));
                 request_editors.erase(removed_id);
-                selected_artifact_kinds.erase(removed_id);
+                s_repeater_selected_artifact_kinds.erase(removed_id);
                 publish_repeater_request_artifacts(state);
                 if (state.repeater_selected >= static_cast<int>(state.repeater_entries.size()))
                     state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
@@ -5451,8 +5491,12 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                                "Request");
             const auto request_identity = repeater_artifact_identity(
                 rep, artifact_kind_t::repeater_request);
-            const artifact_kind_t selected_kind = selected_artifact_kinds.count(rep.id) != 0
-                ? selected_artifact_kinds[rep.id] : artifact_kind_t::repeater_request;
+            const auto selected_kind_found =
+                s_repeater_selected_artifact_kinds.find(rep.id);
+            const artifact_kind_t selected_kind =
+                selected_kind_found != s_repeater_selected_artifact_kinds.end()
+                    ? selected_kind_found->second
+                    : artifact_kind_t::repeater_request;
             const auto selected_identity = repeater_artifact_identity(rep, selected_kind);
             if (selected_identity.valid())
                 publish_network_selection(selected_identity);
@@ -5488,11 +5532,11 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             const bool request_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
             const bool request_pointer_select = ImGui::IsItemClicked(ImGuiMouseButton_Left);
             if (request_pointer_select) {
-                selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
+                s_repeater_selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
                 publish_network_selection(request_identity, true);
             }
             if (editor_result.authority_changed) {
-                selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
+                s_repeater_selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
                 ++rep.request_revision;
                 rep.request_hash = artifact_hash(std::string_view(rep.raw_request));
                 rep.reviewed_draft = false;
@@ -5518,7 +5562,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
 #endif
             const bool request_context = request_pointer_context || request_menu_key || request_shift_f10;
             if (request_context) {
-                selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
+                s_repeater_selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
                 publish_network_selection(repeater_artifact_identity(
                     rep, artifact_kind_t::repeater_request), true);
                 const auto origin = request_pointer_context
@@ -5543,7 +5587,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                     repeater_artifact_id);
 #endif
                 if (send_repeater_request) {
-                    selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
+                    s_repeater_selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_request;
                     publish_network_selection(repeater_artifact_identity(
                         rep, artifact_kind_t::repeater_request), true);
                     human_request_editor::mark_clean(request_editor);
@@ -5652,7 +5696,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                     rep, artifact_kind_t::repeater_response);
                 if (response_identity.valid())
                     publish_network_selection(response_identity, true);
-                selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_response;
+                s_repeater_selected_artifact_kinds[rep.id] = artifact_kind_t::repeater_response;
                 open_exchange_context(
                     response_identity,
                     repeater_artifact_identity(rep, artifact_kind_t::repeater_request), origin);
@@ -8122,26 +8166,221 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 }
 
 
+static constexpr std::size_t k_fuzzer_page_size = 128;
+static constexpr std::uint64_t k_fuzzer_absolute_request_limit = 1000000;
+static constexpr std::size_t k_fuzzer_payload_set_limit = 64;
+
+struct fuzzer_template_shape_t {
+    std::string marker;
+    std::size_t positions = 0;
+    std::string error;
+};
+
+static fuzzer_template_shape_t analyze_fuzzer_template(std::string_view request) {
+    fuzzer_template_shape_t shape;
+    const std::string_view value_marker = "$value$";
+    const std::string_view fuzz_marker = "FUZZ";
+    auto count = [&](std::string_view marker) {
+        std::size_t result = 0;
+        std::size_t offset = 0;
+        while ((offset = request.find(marker, offset)) != std::string_view::npos) {
+            ++result;
+            offset += marker.size();
+        }
+        return result;
+    };
+    const std::size_t values = count(value_marker);
+    const std::size_t fuzzes = count(fuzz_marker);
+    if (values != 0 && fuzzes != 0) {
+        shape.error = "Mixed marker syntax is invalid: found " + std::to_string(values) +
+            " $value$ markers and " + std::to_string(fuzzes) + " FUZZ markers.";
+        return shape;
+    }
+    std::string residue(request);
+    std::size_t complete = 0;
+    while ((complete = residue.find(value_marker, complete)) != std::string::npos)
+        residue.erase(complete, value_marker.size());
+    std::string folded_residue = residue;
+    std::transform(folded_residue.begin(), folded_residue.end(), folded_residue.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (folded_residue.find("$value") != std::string::npos ||
+        folded_residue.find("value$") != std::string::npos) {
+        shape.error = "Malformed injection marker: use the exact case-sensitive marker $value$ or FUZZ.";
+        return shape;
+    }
+    shape.marker = values != 0 ? std::string(value_marker) : std::string(fuzz_marker);
+    shape.positions = values != 0 ? values : fuzzes;
+    if (shape.positions == 0)
+        shape.error = "Add at least one $value$ or FUZZ injection marker.";
+    else if (shape.positions > k_fuzzer_payload_set_limit)
+        shape.error = "The request has " + std::to_string(shape.positions) +
+            " injection positions; the hard limit is 64.";
+    return shape;
+}
+
+static void publish_fuzzer_results_locked(state_t& state) {
+    auto snapshot = std::make_shared<state_t::fuzzer_results_snapshot_t>();
+    snapshot->pages.reserve(state.fuzz_result_pages.size() +
+        (state.fuzz_result_pending.empty() ? 0U : 1U));
+    for (const auto& page : state.fuzz_result_pages)
+        snapshot->pages.push_back(page);
+    if (!state.fuzz_result_pending.empty())
+        snapshot->pages.push_back(std::make_shared<const state_t::fuzzer_result_page_t>(
+            state_t::fuzzer_result_page_t{state.fuzz_result_pending, state.fuzz_pending_bytes}));
+    snapshot->payload_catalog = state.fuzz_payload_catalog;
+    snapshot->retained_count = state.fuzz_retained_count;
+    snapshot->dropped_count = state.fuzz_dropped_count;
+    snapshot->retained_bytes = state.fuzz_retained_bytes;
+    snapshot->generation = ++state.fuzz_results_generation;
+    snapshot->maximum_payload_columns = state.fuzz_maximum_payload_columns;
+    snapshot->has_extracted_values = state.fuzz_has_extracted_values;
+    snapshot->has_failures = state.fuzz_has_failures;
+    std::atomic_store_explicit(&state.fuzz_results_snapshot,
+        std::static_pointer_cast<const state_t::fuzzer_results_snapshot_t>(snapshot),
+        std::memory_order_release);
+}
+
+static void clear_fuzzer_results_locked(state_t& state) {
+    state.fuzz_result_pages.clear();
+    state.fuzz_result_pending.clear();
+    state.fuzz_retained_count = 0;
+    state.fuzz_dropped_count = 0;
+    state.fuzz_retained_bytes = 0;
+    state.fuzz_pending_bytes = 0;
+    state.fuzz_payload_catalog.reset();
+    state.fuzz_maximum_payload_columns = 1;
+    state.fuzz_has_extracted_values = false;
+    state.fuzz_has_failures = false;
+    state.fuzz_has_selection = false;
+    publish_fuzzer_results_locked(state);
+}
+
 #ifndef AIDA_IMGUI_STUDIO_PREVIEW
+static constexpr std::uint64_t k_fuzzer_retained_result_limit = 32768;
+static constexpr std::uint64_t k_fuzzer_retained_byte_limit = 16ULL * 1024ULL * 1024ULL;
+static constexpr std::uint64_t k_fuzzer_decoded_payload_budget = 64ULL * 1024ULL * 1024ULL;
+static constexpr std::size_t k_fuzzer_match_input_limit = 1024ULL * 1024ULL;
+static constexpr std::size_t k_fuzzer_extract_input_limit = 65536;
+
+static void append_fuzzer_result(state_t& state, state_t::fuzzer_result_t result) {
+    std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+    const std::uint64_t result_bytes = sizeof(state_t::fuzzer_result_t) +
+        static_cast<std::uint64_t>(result.payload_indices.size()) * sizeof(std::uint32_t) +
+        static_cast<std::uint64_t>(result.response_preview.size()) +
+        static_cast<std::uint64_t>(result.extracted_value.size()) +
+        static_cast<std::uint64_t>(result.error.size());
+    while (!state.fuzz_result_pages.empty() &&
+           (state.fuzz_retained_count >= k_fuzzer_retained_result_limit ||
+            result_bytes > k_fuzzer_retained_byte_limit - state.fuzz_retained_bytes)) {
+        const std::uint64_t removed = static_cast<std::uint64_t>(
+            state.fuzz_result_pages.front()->rows.size());
+        const std::uint64_t removed_bytes = state.fuzz_result_pages.front()->retained_bytes;
+        state.fuzz_result_pages.pop_front();
+        state.fuzz_retained_count -= removed;
+        state.fuzz_dropped_count += removed;
+        state.fuzz_retained_bytes -= removed_bytes;
+    }
+    if (state.fuzz_retained_count >= k_fuzzer_retained_result_limit ||
+        result_bytes > k_fuzzer_retained_byte_limit - state.fuzz_retained_bytes) {
+        ++state.fuzz_dropped_count;
+        return;
+    }
+    state.fuzz_maximum_payload_columns = (std::max)(
+        state.fuzz_maximum_payload_columns, result.payload_indices.size());
+    state.fuzz_has_extracted_values = state.fuzz_has_extracted_values ||
+        !result.extracted_value.empty();
+    state.fuzz_has_failures = state.fuzz_has_failures || !result.error.empty();
+    state.fuzz_result_pending.push_back(std::move(result));
+    state.fuzz_pending_bytes += result_bytes;
+    state.fuzz_retained_bytes += result_bytes;
+    ++state.fuzz_retained_count;
+    if (state.fuzz_result_pending.size() == k_fuzzer_page_size) {
+        state.fuzz_result_pages.push_back(std::make_shared<const state_t::fuzzer_result_page_t>(
+            state_t::fuzzer_result_page_t{
+                std::move(state.fuzz_result_pending), state.fuzz_pending_bytes}));
+        state.fuzz_result_pending.clear();
+        state.fuzz_result_pending.reserve(k_fuzzer_page_size);
+        state.fuzz_pending_bytes = 0;
+    }
+    if (state.fuzz_result_pending.size() == 1 ||
+        state.fuzz_result_pending.size() % 32 == 0)
+        publish_fuzzer_results_locked(state);
+}
+
+static void finish_fuzzer_task(state_t& state,
+                               aida::ui::task_center::task_state_t task_state,
+                               std::string stage,
+                               std::string summary) {
+    std::string task_id;
+    {
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        publish_fuzzer_results_locked(state);
+        task_id = state.fuzz_task_id;
+        state.fuzz_last_stage = stage;
+        state.fuzz_last_error =
+            task_state == aida::ui::task_center::task_state_t::failed ||
+            task_state == aida::ui::task_center::task_state_t::partial
+                ? summary : std::string();
+    }
+    const std::uint64_t total = state.fuzz_total.load(std::memory_order_acquire);
+    const std::uint64_t progress = state.fuzz_progress.load(std::memory_order_acquire);
+    const float fraction = total == 0 ? 0.0f : static_cast<float>(
+        static_cast<double>(progress) / static_cast<double>(total));
+    if (!task_id.empty())
+        (void)aida::ui::task_center::update_task(
+            task_id, task_state, fraction, std::move(stage), std::move(summary));
+    state.fuzz_running.store(false, std::memory_order_release);
+    state.fuzz_cv.notify_all();
+}
+
 static void run_fuzzer_thread(state_t& state) {
-    auto& cfg = state.fuzz_config;
+    state_t::fuzzer_entry_t cfg;
+    std::string task_id;
+    {
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        cfg = state.fuzz_active_config;
+        task_id = state.fuzz_task_id;
+    }
 
 
-    auto load_set = [](const payload_set_t& ps) -> std::vector<std::string> {
-#ifdef AIDA_IMGUI_STUDIO_PREVIEW
-        if (!ps.entries.empty()) return ps.entries;
-#endif
+    std::uint64_t decoded_payload_bytes = 0;
+    auto append_payload = [&](std::vector<std::string>& values,
+                              std::string value,
+                              std::string& error) {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(value.size());
+        if (bytes > k_fuzzer_decoded_payload_budget - decoded_payload_bytes) {
+            error = "Decoded payload data exceeds the 64 MiB preparation budget";
+            return false;
+        }
+        decoded_payload_bytes += bytes;
+        values.push_back(std::move(value));
+        return true;
+    };
+
+    auto load_set = [&](const payload_set_t& ps, std::string& error) -> std::vector<std::string> {
         std::vector<std::string> lines;
         auto push_line = [&](std::istream& is) {
             std::string line;
             while (std::getline(is, line)) {
+                if (state.fuzz_cancel_requested.load(std::memory_order_acquire))
+                    break;
                 if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (!line.empty()) lines.push_back(std::move(line));
+                if (line.size() > 65535) {
+                    error = "A payload exceeds the 65,535-byte request-editor limit";
+                    break;
+                }
+                if (!line.empty() && !append_payload(lines, std::move(line), error))
+                    break;
+                if (lines.size() > cfg.maximum_requests) {
+                    error = "Payload set exceeds the reviewed request maximum";
+                    break;
+                }
             }
         };
         if (ps.type == 0) {
             std::ifstream f(ps.source);
-            if (f.is_open()) push_line(f);
+            if (!f.is_open()) error = "Unable to open payload wordlist: " + ps.source;
+            else push_line(f);
         } else {
             std::istringstream ss(ps.source);
             push_line(ss);
@@ -8150,179 +8389,354 @@ static void run_fuzzer_thread(state_t& state) {
     };
 
 
-    auto load_legacy_set = [&]() -> std::vector<std::string> {
+    auto load_legacy_set = [&](std::string& error) -> std::vector<std::string> {
         payload_set_t tmp;
         tmp.type   = cfg.payload_type;
         tmp.source = cfg.payload_source;
         if (cfg.payload_type == 1) {
             std::vector<std::string> nums;
-            int start_n = 0, end_n = 100;
-            if (sscanf(cfg.payload_source.c_str(), "%d-%d", &start_n, &end_n) >= 1)
-                for (int n = start_n; n <= end_n; n++)
-                    nums.push_back(std::to_string(n));
+            long long start_n = 0, end_n = 100;
+            if (sscanf(cfg.payload_source.c_str(), "%lld-%lld", &start_n, &end_n) < 1 ||
+                end_n < start_n) {
+                error = "Sequential payload range is invalid";
+                return nums;
+            }
+            nums.reserve(static_cast<std::size_t>((std::min)(cfg.maximum_requests, 4096ULL)));
+            for (long long n = start_n;;) {
+                if (nums.size() >= cfg.maximum_requests) {
+                    error = "Sequential payload range exceeds the reviewed request maximum";
+                    nums.clear();
+                    return nums;
+                }
+                if (!append_payload(nums, std::to_string(n), error)) {
+                    nums.clear();
+                    return nums;
+                }
+                if (n == end_n) break;
+                if (n == (std::numeric_limits<long long>::max)()) {
+                    error = "Sequential payload range overflowed";
+                    nums.clear();
+                    return nums;
+                }
+                ++n;
+            }
             return nums;
         } else if (cfg.payload_type == 2) {
             std::string charset = cfg.payload_source.empty()
                 ? "abcdefghijklmnopqrstuvwxyz0123456789" : cfg.payload_source;
             std::vector<std::string> v;
-            for (char c : charset) v.push_back(std::string(1, c));
+            const std::uint64_t chars = static_cast<std::uint64_t>(charset.size());
+            if (chars != 0 && chars > (std::numeric_limits<std::uint64_t>::max)() / chars) {
+                error = "Charset payload count overflowed";
+                return v;
+            }
+            const std::uint64_t pairs = chars * chars;
+            if (pairs > (std::numeric_limits<std::uint64_t>::max)() - chars) {
+                error = "Charset payload count overflowed";
+                return v;
+            }
+            const std::uint64_t count = chars + pairs;
+            if (count > cfg.maximum_requests) {
+                error = "Charset payloads exceed the reviewed request maximum";
+                return v;
+            }
+            v.reserve(static_cast<std::size_t>(count));
+            for (char c : charset)
+                if (!append_payload(v, std::string(1, c), error)) return {};
             for (char a : charset)
                 for (char b : charset)
-                    v.push_back(std::string(1, a) + b);
+                    if (!append_payload(v, std::string(1, a) + b, error)) return {};
             return v;
         }
-        return load_set(tmp);
+        return load_set(tmp, error);
     };
 
 
     auto make_request_multi = [](const std::string& tmpl,
-                                  const std::vector<std::string>& payloads) -> std::string {
-        const std::string marker = "\xc2\xa7";
-        std::string result;
-        result.reserve(tmpl.size() + 512);
+                                 const std::vector<std::string>& payloads,
+                                 std::string_view marker,
+                                 fuzzer_attack_mode_t mode,
+                                 std::size_t active_position,
+                                 std::string& result,
+                                 std::string& error) {
+        constexpr std::size_t maximum_request_bytes = 65535;
+        result.clear();
+        result.reserve((std::min)(maximum_request_bytes, tmpl.size()));
+        auto append = [&](std::string_view value) {
+            if (value.size() > maximum_request_bytes - result.size()) {
+                error = "Expanded request exceeds the 65,535-byte request limit";
+                return false;
+            }
+            result.append(value.data(), value.size());
+            return true;
+        };
         size_t pos = 0;
         size_t pi  = 0;
         while (pos < tmpl.size()) {
             size_t s = tmpl.find(marker, pos);
-            if (s == std::string::npos) { result.append(tmpl, pos, std::string::npos); break; }
-            size_t e = tmpl.find(marker, s + marker.size());
-            if (e == std::string::npos) { result.append(tmpl, pos, std::string::npos); break; }
-            result.append(tmpl, pos, s - pos);
-            if (pi < payloads.size()) result.append(payloads[pi]);
-            pi++;
-            pos = e + marker.size();
-        }
-
-        if (!payloads.empty()) {
-            size_t fp = 0;
-            const std::string fuzz_tok = "FUZZ";
-            while ((fp = result.find(fuzz_tok, fp)) != std::string::npos) {
-                result.replace(fp, fuzz_tok.size(), payloads[0]);
-                fp += payloads[0].size();
+            if (s == std::string::npos) {
+                if (!append(std::string_view(tmpl).substr(pos))) return false;
+                break;
             }
+            if (!append(std::string_view(tmpl).substr(pos, s - pos))) return false;
+            const bool selected = mode != fuzzer_attack_mode_t::sniper || pi == active_position;
+            const std::size_t payload_index = mode == fuzzer_attack_mode_t::sniper ? 0 : pi;
+            if (selected && payload_index < payloads.size() &&
+                !append(payloads[payload_index])) return false;
+            pi++;
+            pos = s + marker.size();
         }
-        return result;
+        return true;
     };
 
-
-    auto do_grep_extract = [](const std::string& body,
-                               const char* re_str,
-                               const char* grp_str) -> std::string {
-        if (!re_str || re_str[0] == '\0') return {};
-        try {
-            std::regex re(re_str);
-            std::smatch m;
-            if (std::regex_search(body, m, re)) {
-                int grp = 1;
-                if (grp_str && grp_str[0] != '\0') {
-                    char* end = nullptr;
-                    errno = 0;
-                    long v = strtol(grp_str, &end, 10);
-                    if (errno == 0 && end != grp_str && v >= 0 && v <= INT_MAX) {
-                        grp = static_cast<int>(v);
-                    }
-                }
-                if (grp >= 0 && grp < static_cast<int>(m.size()))
-                    return m[static_cast<size_t>(grp)].str();
-            }
-        } catch (...) {}
+    const std::string extract_literal(cfg.extract_literal);
+    auto do_grep_extract = [&](const std::string& body) -> std::string {
+        if (extract_literal.empty()) return {};
+        const std::string_view bounded(body.data(),
+            (std::min)(body.size(), k_fuzzer_extract_input_limit));
+        if (bounded.find(extract_literal) != std::string_view::npos)
+            return extract_literal;
         return {};
     };
 
 
-    auto check_match = [&](int sc, const std::string& body, size_t len) -> bool {
+    auto check_match = [&](int sc, std::string_view body, size_t len) -> bool {
         if (cfg.match_status > 0 && sc != cfg.match_status) return false;
         if (!cfg.match_body.empty() && body.find(cfg.match_body) == std::string::npos) return false;
-        if (cfg.match_size_op == 1 && static_cast<int>(len) != cfg.match_size) return false;
-        if (cfg.match_size_op == 2 && static_cast<int>(len) <= cfg.match_size) return false;
-        if (cfg.match_size_op == 3 && static_cast<int>(len) >= cfg.match_size) return false;
+        if (cfg.match_size_op != 0 && cfg.match_size < 0) return false;
+        const std::size_t expected_size = static_cast<std::size_t>(cfg.match_size);
+        if (cfg.match_size_op == 1 && len != expected_size) return false;
+        if (cfg.match_size_op == 2 && len <= expected_size) return false;
+        if (cfg.match_size_op == 3 && len >= expected_size) return false;
         return true;
     };
 
 
     using combo_t = std::vector<std::string>;
-    std::vector<combo_t> combos;
+    std::vector<std::vector<std::string>> sets;
+    std::string preparation_error;
+    std::uint64_t total = 0;
+    const fuzzer_template_shape_t template_shape = analyze_fuzzer_template(cfg.base_request);
+    if (!cfg.maximum_requests_reviewed)
+        preparation_error = "The maximum request count was not explicitly reviewed.";
+    if (preparation_error.empty() &&
+        (cfg.maximum_requests == 0 || cfg.maximum_requests > k_fuzzer_absolute_request_limit))
+        preparation_error = "Reviewed request maximum is " +
+            std::to_string(cfg.maximum_requests) + "; the supported range is 1 to 1,000,000.";
+    if (preparation_error.empty() && cfg.payload_sets.size() > k_fuzzer_payload_set_limit)
+        preparation_error = "Payload set count is " + std::to_string(cfg.payload_sets.size()) +
+            "; the hard limit is 64.";
+    if (extract_literal.size() > 255)
+        preparation_error = "Global extraction literal exceeds 255 bytes.";
+    if (preparation_error.empty() && !template_shape.error.empty())
+        preparation_error = template_shape.error;
+    if (preparation_error.empty() && cfg.attack_mode == fuzzer_attack_mode_t::sniper &&
+        cfg.payload_sets.size() != 1)
+        preparation_error = "Sniper requires exactly 1 payload set; " +
+            std::to_string(cfg.payload_sets.size()) + " are configured.";
+    if (preparation_error.empty() && cfg.attack_mode != fuzzer_attack_mode_t::sniper &&
+        cfg.payload_sets.size() != template_shape.positions)
+        preparation_error = "This mode requires exactly " +
+            std::to_string(template_shape.positions) + " nonempty payload sets for " +
+            std::to_string(template_shape.positions) + " injection positions; " +
+            std::to_string(cfg.payload_sets.size()) + " are configured.";
+    if (preparation_error.empty() && cfg.attack_mode == fuzzer_attack_mode_t::sniper &&
+        (cfg.payload_type < 0 || cfg.payload_type > 2))
+        preparation_error = "Sniper payload type " + std::to_string(cfg.payload_type) +
+            " is invalid; supported values are 0 to 2.";
+    if (preparation_error.empty() && cfg.attack_mode == fuzzer_attack_mode_t::sniper &&
+        cfg.payload_type != 2 && cfg.payload_source.empty())
+        preparation_error = "The Sniper payload source is empty.";
+    if (preparation_error.empty() && cfg.attack_mode != fuzzer_attack_mode_t::sniper) {
+        const auto empty_set = std::find_if(cfg.payload_sets.begin(), cfg.payload_sets.end(),
+            [](const payload_set_t& set) { return set.source.empty(); });
+        if (empty_set != cfg.payload_sets.end())
+            preparation_error = "Payload set " + std::to_string(static_cast<std::size_t>(
+                std::distance(cfg.payload_sets.begin(), empty_set)) + 1) +
+                " has an empty source; every configured set must be nonempty.";
+        const auto invalid_set = std::find_if(cfg.payload_sets.begin(), cfg.payload_sets.end(),
+            [](const payload_set_t& set) { return set.type < 0 || set.type > 1; });
+        if (preparation_error.empty() && invalid_set != cfg.payload_sets.end())
+            preparation_error = "Payload set " + std::to_string(static_cast<std::size_t>(
+                std::distance(cfg.payload_sets.begin(), invalid_set)) + 1) +
+                " has an invalid source type; supported values are 0 and 1.";
+    }
 
-    switch (cfg.attack_mode) {
+    if (preparation_error.empty()) switch (cfg.attack_mode) {
 
         case fuzzer_attack_mode_t::sniper: {
-            std::vector<std::string> payloads = cfg.payload_sets.empty()
-                ? load_legacy_set()
-                : load_set(cfg.payload_sets[0]);
-            combos.reserve(payloads.size());
-            for (auto& p : payloads) combos.push_back({ p });
+            sets.push_back(load_legacy_set(preparation_error));
+            const std::uint64_t payload_count = static_cast<std::uint64_t>(sets.front().size());
+            const std::uint64_t positions = static_cast<std::uint64_t>(template_shape.positions);
+            if (preparation_error.empty()) {
+                if (payload_count == 0)
+                    preparation_error = "The Sniper payload source produced 0 nonempty payloads.";
+                else if (positions != 0 && payload_count > cfg.maximum_requests / positions)
+                    preparation_error = "Sniper cardinality is " + std::to_string(payload_count) +
+                        " payloads x " + std::to_string(positions) +
+                        " positions, which exceeds the reviewed maximum of " +
+                        std::to_string(cfg.maximum_requests) + " requests.";
+                else
+                    total = payload_count * positions;
+            }
             break;
         }
 
         case fuzzer_attack_mode_t::pitchfork: {
-            if (cfg.payload_sets.empty()) { state.fuzz_running.store(false); return; }
-            std::vector<std::vector<std::string>> sets;
+            if (cfg.payload_sets.empty()) preparation_error = "Pitchfork requires a payload set";
             sets.reserve(cfg.payload_sets.size());
-            for (auto& ps : cfg.payload_sets) {
-                sets.push_back(load_set(ps));
-                if (sets.back().empty()) { state.fuzz_running.store(false); return; }
+            for (std::size_t set_index = 0; set_index < cfg.payload_sets.size(); ++set_index) {
+                if (!preparation_error.empty()) break;
+                sets.push_back(load_set(cfg.payload_sets[set_index], preparation_error));
+                if (sets.back().empty() && preparation_error.empty())
+                    preparation_error = "Pitchfork payload set " +
+                        std::to_string(set_index + 1) + " produced 0 nonempty payloads.";
             }
-            size_t min_len = sets[0].size();
-            for (auto& s : sets) min_len = std::min(min_len, s.size());
-            combos.reserve(min_len);
-            for (size_t i = 0; i < min_len; i++) {
-                combo_t c;
-                c.reserve(sets.size());
-                for (auto& s : sets) c.push_back(s[i]);
-                combos.push_back(std::move(c));
+            if (preparation_error.empty() && !sets.empty()) {
+                for (std::size_t set_index = 1; set_index < sets.size(); ++set_index) {
+                    if (sets[set_index].size() != sets.front().size()) {
+                        preparation_error = "Pitchfork payload cardinality mismatch: set 1 has " +
+                            std::to_string(sets.front().size()) + " nonempty payloads, but set " +
+                            std::to_string(set_index + 1) + " has " +
+                            std::to_string(sets[set_index].size()) + ".";
+                        break;
+                    }
+                }
+                if (preparation_error.empty())
+                    total = static_cast<std::uint64_t>(sets.front().size());
             }
             break;
         }
 
         case fuzzer_attack_mode_t::clusterbomb: {
-            if (cfg.payload_sets.empty()) { state.fuzz_running.store(false); return; }
-            std::vector<std::vector<std::string>> sets;
+            if (cfg.payload_sets.empty()) preparation_error = "Clusterbomb requires a payload set";
             sets.reserve(cfg.payload_sets.size());
-            for (auto& ps : cfg.payload_sets) {
-                sets.push_back(load_set(ps));
-                if (sets.back().empty()) { state.fuzz_running.store(false); return; }
+            for (std::size_t set_index = 0; set_index < cfg.payload_sets.size(); ++set_index) {
+                if (!preparation_error.empty()) break;
+                sets.push_back(load_set(cfg.payload_sets[set_index], preparation_error));
+                if (sets.back().empty() && preparation_error.empty())
+                    preparation_error = "Clusterbomb payload set " +
+                        std::to_string(set_index + 1) + " produced 0 nonempty payloads.";
             }
-
-            combos.push_back(combo_t{});
-            for (auto& s : sets) {
-                std::vector<combo_t> next;
-                next.reserve(combos.size() * s.size());
-                for (auto& base : combos)
-                    for (auto& val : s) {
-                        combo_t nc = base;
-                        nc.push_back(val);
-                        next.push_back(std::move(nc));
+            if (preparation_error.empty()) {
+                total = 1;
+                for (std::size_t set_index = 0; set_index < sets.size(); ++set_index) {
+                    const auto& set = sets[set_index];
+                    const std::uint64_t width = static_cast<std::uint64_t>(set.size());
+                    if (width != 0 && total > cfg.maximum_requests / width) {
+                        preparation_error = "Clusterbomb cardinality exceeds the reviewed maximum of " +
+                            std::to_string(cfg.maximum_requests) + " requests at set " +
+                            std::to_string(set_index + 1) + " with " +
+                            std::to_string(width) + " nonempty payloads.";
+                        break;
                     }
-                combos = std::move(next);
+                    total *= width;
+                }
             }
             break;
         }
     }
 
-    if (combos.empty()) {
-        diag::log_tagged_fmt("network", "fuzzer_no_combos attack_mode=%d sets=%zu",
-            static_cast<int>(cfg.attack_mode), cfg.payload_sets.size());
-        state.fuzz_running.store(false);
+    if (state.fuzz_cancel_requested.load(std::memory_order_acquire)) {
+        finish_fuzzer_task(state, aida::ui::task_center::task_state_t::cancelled,
+            "Cancelled", "Cancelled while loading payload sets");
+        return;
+    }
+    if (preparation_error.empty() && total == 0)
+        preparation_error = "No payload combinations were produced";
+    if (preparation_error.empty() && total > cfg.maximum_requests)
+        preparation_error = "Payload combinations exceed the reviewed request maximum";
+    if (!preparation_error.empty()) {
+        diag::log_tagged_fmt("network", "fuzzer_prepare_failed mode=%d reason=%s",
+            static_cast<int>(cfg.attack_mode), preparation_error.c_str());
+        finish_fuzzer_task(state, aida::ui::task_center::task_state_t::failed,
+            "Preparation failed", preparation_error);
         return;
     }
 
-    state.fuzz_total.store(static_cast<int>(combos.size()));
+    state.fuzz_total.store(total);
     state.fuzz_progress.store(0);
+    const auto payload_catalog =
+        std::make_shared<const std::vector<std::vector<std::string>>>(std::move(sets));
+    {
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        state.fuzz_payload_catalog = payload_catalog;
+        publish_fuzzer_results_locked(state);
+    }
+    const auto& retained_sets = *payload_catalog;
 
-    std::atomic<int> next_index{0};
-    int total   = static_cast<int>(combos.size());
+    if (!task_id.empty())
+        (void)aida::ui::task_center::update_task(task_id,
+            aida::ui::task_center::task_state_t::running, 0.0f,
+            "Sending reviewed requests", std::to_string(total) + " requests approved");
+
+    struct generated_combination_t {
+        combo_t payloads;
+        std::vector<std::uint32_t> indices;
+        std::uint32_t active_position = 0;
+    };
+    auto combination_at = [&](std::uint64_t index) {
+        generated_combination_t result;
+        result.payloads.reserve(retained_sets.size());
+        result.indices.reserve(retained_sets.size());
+        if (cfg.attack_mode == fuzzer_attack_mode_t::sniper) {
+            const std::uint64_t positions = static_cast<std::uint64_t>(template_shape.positions);
+            const std::uint64_t payload_index = index / positions;
+            result.active_position = static_cast<std::uint32_t>(index % positions);
+            result.payloads.push_back(retained_sets.front()[static_cast<std::size_t>(payload_index)]);
+            result.indices.push_back(static_cast<std::uint32_t>(payload_index));
+        } else if (cfg.attack_mode == fuzzer_attack_mode_t::pitchfork) {
+            for (const auto& set : retained_sets) {
+                result.payloads.push_back(set[static_cast<std::size_t>(index)]);
+                result.indices.push_back(static_cast<std::uint32_t>(index));
+            }
+        } else {
+            result.payloads.resize(retained_sets.size());
+            result.indices.resize(retained_sets.size());
+            for (std::size_t reverse = retained_sets.size(); reverse != 0; --reverse) {
+                const std::size_t set_index = reverse - 1;
+                const std::uint64_t width = static_cast<std::uint64_t>(retained_sets[set_index].size());
+                const std::uint64_t payload_index = index % width;
+                result.payloads[set_index] = retained_sets[set_index][static_cast<std::size_t>(payload_index)];
+                result.indices[set_index] = static_cast<std::uint32_t>(payload_index);
+                index /= width;
+            }
+        }
+        return result;
+    };
+
+    std::atomic<std::uint64_t> next_index{0};
+    std::atomic<std::uint64_t> matches{0};
+    std::atomic<std::uint64_t> request_failures{0};
+    std::atomic<std::uint64_t> last_task_update_ms{0};
+    std::atomic<bool> execution_failed{false};
+    std::mutex execution_error_mutex;
+    std::string execution_error;
     int threads = std::min(std::max(cfg.thread_count, 1), 32);
-    diag::log_tagged_fmt("network", "fuzzer_run_start host=%s:%u tls=%d mode=%d combos=%d threads=%d",
+    diag::log_tagged_fmt("network", "fuzzer_run_start host=%s:%u tls=%d mode=%d combos=%llu threads=%d",
         cfg.host.c_str(), static_cast<unsigned>(cfg.port), cfg.use_tls ? 1 : 0,
-        static_cast<int>(cfg.attack_mode), total, threads);
+        static_cast<int>(cfg.attack_mode), static_cast<unsigned long long>(total), threads);
 
     auto worker = [&]() {
-        while (state.fuzz_running.load()) {
-            int idx = next_index.fetch_add(1);
+        while (!state.fuzz_cancel_requested.load(std::memory_order_acquire)) {
+            const std::uint64_t idx = next_index.fetch_add(1, std::memory_order_acq_rel);
             if (idx >= total) break;
 
-            auto& combo       = combos[static_cast<size_t>(idx)];
-            std::string req_s = make_request_multi(cfg.base_request, combo);
+            generated_combination_t combo = combination_at(idx);
+            std::string req_s;
+            std::string request_error;
+            if (!make_request_multi(cfg.base_request, combo.payloads, template_shape.marker,
+                cfg.attack_mode, combo.active_position, req_s, request_error)) {
+                bool expected = false;
+                if (execution_failed.compare_exchange_strong(expected, true,
+                    std::memory_order_acq_rel)) {
+                    std::lock_guard<std::mutex> error_lock(execution_error_mutex);
+                    execution_error = std::move(request_error);
+                }
+                state.fuzz_cancel_requested.store(true, std::memory_order_release);
+                state.fuzz_cv.notify_all();
+                break;
+            }
             std::vector<uint8_t> raw_req(req_s.begin(), req_s.end());
 
             auto t0 = GetTickCount64();
@@ -8331,70 +8745,150 @@ static void run_fuzzer_thread(state_t& state) {
 
             state_t::fuzzer_result_t fr;
             fr.index     = idx;
-            fr.payloads  = combo;
-            fr.payload   = combo.empty() ? std::string() : combo[0];
+            fr.payload_indices = std::move(combo.indices);
+            fr.active_position = combo.active_position;
             fr.latency_ms = elapsed;
 
             if (res.success) {
                 fr.status_code  = res.exchange.response.status_code;
                 fr.response_len = res.exchange.raw_response.size();
+                const std::size_t inspection_size = (std::min)(
+                    res.exchange.raw_response.size(), k_fuzzer_match_input_limit);
                 std::string body(res.exchange.raw_response.begin(),
-                                 res.exchange.raw_response.end());
-                fr.response_preview = body.substr(0, std::min<size_t>(200, body.size()));
+                    res.exchange.raw_response.begin() + inspection_size);
+                fr.response_preview = body.substr(0, (std::min)(std::size_t{200}, body.size()));
                 fr.match = check_match(fr.status_code, body, fr.response_len);
 
 
-                if (!cfg.payload_sets.empty()) {
-                    fr.extracted_value = do_grep_extract(body,
-                        cfg.payload_sets[0].grep_regex,
-                        cfg.payload_sets[0].grep_group);
+                if (!extract_literal.empty()) {
+                    fr.extracted_value = do_grep_extract(body);
                 }
+            } else {
+                fr.error = res.error.empty() ? "Request failed without an error detail" : res.error;
+                if (fr.error.size() > 160) fr.error.resize(160);
+                request_failures.fetch_add(1, std::memory_order_acq_rel);
             }
 
-            {
-                std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-                state.fuzz_results.push_back(std::move(fr));
+            const bool matched = fr.match;
+            if (matched)
+                matches.fetch_add(1, std::memory_order_acq_rel);
+            append_fuzzer_result(state, std::move(fr));
+            const std::uint64_t completed = state.fuzz_progress.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
+            const std::uint64_t now = network_now_ms();
+            std::uint64_t prior = last_task_update_ms.load(std::memory_order_acquire);
+            if (!task_id.empty() && (completed == total || now - prior >= 200) &&
+                last_task_update_ms.compare_exchange_strong(prior, now, std::memory_order_acq_rel)) {
+                const float fraction = static_cast<float>(
+                    static_cast<double>(completed) / static_cast<double>(total));
+                (void)aida::ui::task_center::update_task(task_id,
+                    aida::ui::task_center::task_state_t::running, fraction,
+                    "Sending reviewed requests",
+                    std::to_string(completed) + " of " + std::to_string(total));
             }
-            state.fuzz_progress.fetch_add(1);
 
-            if (cfg.stop_on_match && fr.match) {
-                state.fuzz_running.store(false);
+            if (cfg.stop_on_match && matched) {
+                state.fuzz_cancel_requested.store(true, std::memory_order_release);
+                state.fuzz_cv.notify_all();
                 break;
             }
-            if (cfg.delay_ms > 0) Sleep(static_cast<DWORD>(cfg.delay_ms));
+            if (cfg.delay_ms > 0) {
+                std::unique_lock<std::mutex> delay_lock(state.fuzz_cv_mutex);
+                state.fuzz_cv.wait_for(delay_lock, std::chrono::milliseconds(cfg.delay_ms), [&state] {
+                    return state.fuzz_cancel_requested.load(std::memory_order_acquire) ||
+                           !state.fuzz_thread_alive.load(std::memory_order_acquire);
+                });
+            }
         }
     };
 
-    std::atomic<int> remaining{threads};
-    std::mutex done_mtx;
-    std::condition_variable done_cv;
-
-    for (int t = 0; t < threads; t++) {
-        const bool posted = post_network_task("fuzzer_worker", aida::infra::executor::domain_t::long_running, "long_running", [&worker, &remaining, &done_cv]() {
+    auto guarded_worker = [&]() noexcept {
+        try {
             worker();
-            if (--remaining == 0)
-                done_cv.notify_all();
-        });
-        if (!posted && --remaining == 0)
-            done_cv.notify_all();
-    }
-    {
-        std::unique_lock<std::mutex> lk(done_mtx);
-        done_cv.wait(lk, [&remaining]() { return remaining.load() == 0; });
-    }
+        } catch (const std::exception& e) {
+            bool expected = false;
+            if (execution_failed.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+                std::lock_guard<std::mutex> error_lock(execution_error_mutex);
+                execution_error = e.what();
+            }
+            state.fuzz_cancel_requested.store(true, std::memory_order_release);
+            state.fuzz_cv.notify_all();
+        } catch (...) {
+            bool expected = false;
+            if (execution_failed.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+                std::lock_guard<std::mutex> error_lock(execution_error_mutex);
+                execution_error = "Unexpected fuzzer request worker failure";
+            }
+            state.fuzz_cancel_requested.store(true, std::memory_order_release);
+            state.fuzz_cv.notify_all();
+        }
+    };
 
-    int final_progress = state.fuzz_progress.load();
-    size_t result_count = 0;
-    int match_count = 0;
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threads - 1));
+    try {
+        for (int t = 1; t < threads; ++t)
+            workers.emplace_back(guarded_worker);
+    } catch (const std::exception& e) {
+        diag::log_tagged_fmt("network", "fuzzer_worker_creation_limited requested=%d created=%zu reason=%s",
+            threads, workers.size() + 1, e.what());
+    }
+    guarded_worker();
+    for (auto& thread : workers)
+        if (thread.joinable()) thread.join();
+
+    const std::uint64_t final_progress = state.fuzz_progress.load(std::memory_order_acquire);
+    std::uint64_t retained_count = 0;
+    std::uint64_t dropped_count = 0;
     {
         std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-        result_count = state.fuzz_results.size();
-        for (auto& fr : state.fuzz_results) if (fr.match) match_count++;
+        publish_fuzzer_results_locked(state);
+        retained_count = state.fuzz_retained_count;
+        dropped_count = state.fuzz_dropped_count;
     }
-    diag::log_tagged_fmt("network", "fuzzer_run_complete combos=%d processed=%d results=%zu matches=%d",
-        total, final_progress, result_count, match_count);
+    const std::uint64_t match_count = matches.load(std::memory_order_acquire);
+    const std::uint64_t failure_count = request_failures.load(std::memory_order_acquire);
+    diag::log_tagged_fmt("network", "fuzzer_run_complete combos=%llu processed=%llu retained=%llu dropped=%llu matches=%llu failures=%llu cancelled=%d",
+        static_cast<unsigned long long>(total),
+        static_cast<unsigned long long>(final_progress),
+        static_cast<unsigned long long>(retained_count),
+        static_cast<unsigned long long>(dropped_count),
+        static_cast<unsigned long long>(match_count),
+        static_cast<unsigned long long>(failure_count),
+        state.fuzz_cancel_requested.load(std::memory_order_acquire) ? 1 : 0);
 
-    state.fuzz_running.store(false);
+    const bool stop_on_match = cfg.stop_on_match && match_count != 0;
+    const bool failed = execution_failed.load(std::memory_order_acquire);
+    const bool cancelled = state.fuzz_cancel_requested.load(std::memory_order_acquire) &&
+        !stop_on_match && !failed;
+    const std::string summary = std::to_string(final_progress) + " processed, " +
+        std::to_string(match_count) + " matched, " + std::to_string(failure_count) + " failed, " +
+        std::to_string(retained_count) + " retained" +
+        (dropped_count == 0 ? std::string() :
+            ", " + std::to_string(dropped_count) + " older results discarded");
+    if (failed) {
+        std::string failure;
+        {
+            std::lock_guard<std::mutex> error_lock(execution_error_mutex);
+            failure = execution_error;
+        }
+        finish_fuzzer_task(state,
+            final_progress == 0 ? aida::ui::task_center::task_state_t::failed
+                                : aida::ui::task_center::task_state_t::partial,
+            "Request expansion failed", failure + "; " + summary);
+    } else if (!cancelled && !stop_on_match && failure_count != 0) {
+        finish_fuzzer_task(state, aida::ui::task_center::task_state_t::partial,
+            "Completed with request failures", summary);
+    } else {
+        finish_fuzzer_task(state,
+            cancelled ? aida::ui::task_center::task_state_t::cancelled
+                      : aida::ui::task_center::task_state_t::completed,
+            cancelled ? "Cancelled after in-flight request" :
+                (stop_on_match ? "Stopped on match" : "Completed"),
+            summary);
+    }
 }
 #endif
 
@@ -8475,20 +8969,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                            "%s", hint);
 
-
         if (cfg.payload_sets.empty()) cfg.payload_sets.emplace_back();
-        auto& ps0 = cfg.payload_sets[0];
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Grep Extract:");
-        ImGui::SameLine();
-        aida::ui::input_text("##fuzz_grep0", ps0.grep_regex, sizeof(ps0.grep_regex),
-                              "regex (leave empty to skip)", false, ImVec2(280.f, 28.f));
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                           "Group:");
-        ImGui::SameLine();
-        aida::ui::input_text("##fuzz_grp0", ps0.grep_group, sizeof(ps0.grep_group),
-                              "1", false, ImVec2(60.f, 28.f));
 
     } else {
 
@@ -8496,13 +8977,20 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                            "Payload Sets");
         ImGui::SameLine();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                           "(one set per injection position S...S)");
+                           "(one set per exact $value$ or FUZZ marker)");
         ImGui::SameLine();
-        if (aida::ui::button("+", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
+        if (aida::ui::button("+", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+            ImVec2(0.f, 0.f), cfg.payload_sets.size() >= k_fuzzer_payload_set_limit))
             cfg.payload_sets.emplace_back();
+        if (cfg.payload_sets.size() >= k_fuzzer_payload_set_limit) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+                aida::ui::with_alpha(th.text_dim, alpha)),
+                "64 of 64 payload sets configured");
+        }
         ImGui::SameLine();
         if (aida::ui::button("-", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)
-            && !cfg.payload_sets.empty())
+            && cfg.payload_sets.size() > 1)
             cfg.payload_sets.pop_back();
 
         float sets_h = std::min(h * 0.35f, 200.f);
@@ -8555,17 +9043,6 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                 }
 
 
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                                   "Grep Extract:");
-                ImGui::SameLine();
-                aida::ui::input_text("##ps_grep", ps.grep_regex, sizeof(ps.grep_regex),
-                                      "regex (leave empty to skip)", false, ImVec2(260.f, 28.f));
-                ImGui::SameLine();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                                   "Group:");
-                ImGui::SameLine();
-                aida::ui::input_text("##ps_grp", ps.grep_group, sizeof(ps.grep_group), "1", false, ImVec2(60.f, 28.f));
-
                 ImGui::Unindent(12.f);
             }
 
@@ -8599,6 +9076,21 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     }
     cfg.delay_ms = std::max(0, cfg.delay_ms);
 
+    ImGui::SameLine(0.f, 18.f);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                       "Maximum requests:");
+    ImGui::SameLine();
+    std::uint64_t reviewed_maximum = cfg.maximum_requests;
+    ImGui::SetNextItemWidth(140.f);
+    if (ImGui::InputScalar("##fuzz_maximum_requests", ImGuiDataType_U64, &reviewed_maximum)) {
+        cfg.maximum_requests = (std::max)(1ULL,
+            (std::min)(reviewed_maximum, k_fuzzer_absolute_request_limit));
+        cfg.maximum_requests_reviewed = false;
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Reviewed##fuzz_maximum_reviewed", &cfg.maximum_requests_reviewed);
+
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
@@ -8625,7 +9117,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                        "Request Template");
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                       "Mark injection points with $value$  (FUZZ also accepted)");
+                       "Exact injection marker: $value$ or FUZZ (case-sensitive; do not mix)");
     ImGui::Spacing();
 
     float tmpl_h = std::min(h * 0.22f, 180.f);
@@ -8648,17 +9140,95 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
 
 
     if (!state.fuzz_running.load()) {
+        const fuzzer_template_shape_t template_shape = analyze_fuzzer_template(cfg.base_request);
+        std::string start_unavailable_reason;
+        if (cfg.host.empty() || cfg.port == 0)
+            start_unavailable_reason = "Set a valid target host and port.";
+        else if (cfg.base_request.empty() || !request_editor_result.valid ||
+            request_editor_result.has_unapplied_pretty)
+            start_unavailable_reason = "Apply a valid raw request template before starting.";
+        else if (!template_shape.error.empty())
+            start_unavailable_reason = template_shape.error;
+        else if (cfg.payload_sets.empty() || cfg.payload_sets.size() > k_fuzzer_payload_set_limit)
+            start_unavailable_reason = "Configure 1 to 64 payload sets; " +
+                std::to_string(cfg.payload_sets.size()) + " are configured.";
+        else if (cfg.attack_mode == fuzzer_attack_mode_t::sniper && cfg.payload_sets.size() != 1)
+            start_unavailable_reason = "Sniper requires exactly 1 payload set; " +
+                std::to_string(cfg.payload_sets.size()) + " are configured.";
+        else if (cfg.attack_mode != fuzzer_attack_mode_t::sniper &&
+            cfg.payload_sets.size() != template_shape.positions)
+            start_unavailable_reason = "This mode requires exactly " +
+                std::to_string(template_shape.positions) + " payload sets for " +
+                std::to_string(template_shape.positions) + " injection positions; " +
+                std::to_string(cfg.payload_sets.size()) + " are configured.";
+        else if (cfg.attack_mode == fuzzer_attack_mode_t::sniper &&
+            cfg.payload_type != 2 && cfg.payload_source.empty())
+            start_unavailable_reason = "Configure a nonempty Sniper payload source.";
+        else if (cfg.attack_mode != fuzzer_attack_mode_t::sniper &&
+            std::any_of(cfg.payload_sets.begin(), cfg.payload_sets.end(),
+                [](const payload_set_t& set) { return set.source.empty(); }))
+            start_unavailable_reason = "Every configured payload set requires a nonempty source; set " +
+                std::to_string(static_cast<std::size_t>(std::distance(
+                    cfg.payload_sets.begin(), std::find_if(cfg.payload_sets.begin(), cfg.payload_sets.end(),
+                        [](const payload_set_t& set) { return set.source.empty(); }))) + 1) +
+                " is empty.";
+        else if (cfg.maximum_requests == 0 ||
+            cfg.maximum_requests > k_fuzzer_absolute_request_limit ||
+            !cfg.maximum_requests_reviewed)
+            start_unavailable_reason = "Review a maximum request count between 1 and 1,000,000.";
         bool fuzz_can_start = !cfg.host.empty() && cfg.port > 0 &&
-            !cfg.base_request.empty() && request_editor_result.valid &&
-            !request_editor_result.has_unapplied_pretty;
+            start_unavailable_reason.empty();
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
+        const bool fuzz_worker_available =
+            state.fuzz_thread_alive.load(std::memory_order_acquire) &&
+            !state.fuzz_thread_done.load(std::memory_order_acquire);
+        const char* fuzz_worker_unavailable_reason = "Network fuzzer worker is unavailable.";
+#else
+        const bool fuzz_worker_available = false;
+        const char* fuzz_worker_unavailable_reason =
+            "Live execution requires the native network authority.";
+#endif
+        fuzz_can_start = fuzz_can_start && fuzz_worker_available;
         if (aida::ui::button("Start Fuzzer", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
                               ImVec2(0.f, 0.f), !fuzz_can_start)) {
+            const std::uint64_t generation = state.fuzz_run_generation.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
+            const std::string task_id = "network.fuzzer." + std::to_string(generation);
             {
                 std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-                state.fuzz_results.clear();
+                clear_fuzzer_results_locked(state);
+                state.fuzz_active_config = cfg;
+                state.fuzz_task_id = task_id;
+                state.fuzz_last_stage = "Loading payload sets";
+                state.fuzz_last_error.clear();
             }
             state.fuzz_progress.store(0);
             state.fuzz_total.store(0);
+            state.fuzz_cancel_requested.store(false, std::memory_order_release);
+            aida::ui::task_center::task_registration_t registration;
+            registration.id = task_id;
+            registration.source = "human";
+            registration.owner = "network";
+            registration.owner_view = "view.network.fuzzer";
+            registration.owner_action = "network.fuzzer.start";
+            registration.target = cfg.host + ":" + std::to_string(cfg.port);
+            registration.label = "Network fuzzer";
+            registration.stage = "Loading payload sets";
+            registration.started_ms = network_now_ms();
+            registration.progress = 0.0f;
+            registration.cancellation_is_safe = true;
+            registration.callbacks.cancel = [generation] {
+                if (g_state.fuzz_run_generation.load(std::memory_order_acquire) != generation)
+                    return false;
+                g_state.fuzz_cancel_requested.store(true, std::memory_order_release);
+                g_state.fuzz_cv.notify_all();
+                return true;
+            };
+            registration.callbacks.focus = [] {
+                (void)aida::ui::application_views::open_or_focus(
+                    aida::ui::stable_view_id_t("view.network.fuzzer"));
+            };
+            const bool registered = aida::ui::task_center::register_task(std::move(registration));
             diag::log_tagged_fmt("network", "fuzzer_start_clicked host=%s:%u tls=%d mode=%d threads=%d delay_ms=%d match_status=%d stop_on_match=%d sets=%zu",
                 cfg.host.c_str(), cfg.port, cfg.use_tls ? 1 : 0,
                 static_cast<int>(cfg.attack_mode), cfg.thread_count, cfg.delay_ms,
@@ -8671,24 +9241,34 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                     static_cast<int>(cfg.attack_mode), cfg.thread_count, cfg.payload_sets.size());
                 anti_tamper::webhook::write_log("net_audit", buf);
             }
-            state.fuzz_running.store(true);
-            state.fuzz_cv.notify_one();
+            if (registered) {
+                state.fuzz_running.store(true, std::memory_order_release);
+                state.fuzz_cv.notify_one();
+            } else {
+                std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+                state.fuzz_task_id.clear();
+                state.fuzz_last_stage = "Start rejected";
+                state.fuzz_last_error = "Task Center rejected the fuzzer operation before execution";
+            }
         }
         if (!fuzz_can_start) {
             ImGui::SameLine();
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                "Set host, port and request template before running.");
+                "%s", !fuzz_worker_available
+                    ? fuzz_worker_unavailable_reason
+                    : start_unavailable_reason.c_str());
         }
         ImGui::SameLine();
         if (aida::ui::button("Clear Results", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-            size_t prev = state.fuzz_results.size();
-            state.fuzz_results.clear();
-            diag::log_tagged_fmt("network", "fuzzer_results_cleared prev=%zu", prev);
+            const std::uint64_t previous = state.fuzz_retained_count;
+            clear_fuzzer_results_locked(state);
+            diag::log_tagged_fmt("network", "fuzzer_results_cleared prev=%llu",
+                static_cast<unsigned long long>(previous));
         }
     } else {
-        int prog = state.fuzz_progress.load();
-        int tot  = state.fuzz_total.load();
+        const std::uint64_t prog = state.fuzz_progress.load();
+        const std::uint64_t tot = state.fuzz_total.load();
         {
             static float fuzz_spin_time = 0.f;
             fuzz_spin_time += ImGui::GetIO().DeltaTime;
@@ -8699,62 +9279,110 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 22.f);
         }
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
-                           "Running: %d / %d", prog, tot);
-        float frac = tot > 0 ? static_cast<float>(prog) / static_cast<float>(tot) : 0.f;
+                           "Running: %llu / %llu",
+                           static_cast<unsigned long long>(prog),
+                           static_cast<unsigned long long>(tot));
+        float frac = tot > 0 ? static_cast<float>(
+            static_cast<double>(prog) / static_cast<double>(tot)) : 0.f;
         ImVec2 pb_pos = ImGui::GetCursorScreenPos();
         aida::ui::render_progress_bar(pb_pos, 320.f, 8.f, frac, false, true);
         ImGui::Dummy(ImVec2(320.f, 12.f));
         ImGui::SameLine();
         if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            diag::log_tagged_fmt("network", "fuzzer_stop_clicked progress=%d total=%d", prog, tot);
-            state.fuzz_running.store(false);
+            diag::log_tagged_fmt("network", "fuzzer_stop_clicked progress=%llu total=%llu",
+                static_cast<unsigned long long>(prog),
+                static_cast<unsigned long long>(tot));
+            std::string task_id;
+            {
+                std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+                task_id = state.fuzz_task_id;
+            }
+            if (task_id.empty() || !aida::ui::task_center::request_cancel(task_id)) {
+                state.fuzz_cancel_requested.store(true, std::memory_order_release);
+                state.fuzz_cv.notify_all();
+            }
         }
     }
 
     ImGui::Spacing();
 
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
+                       "Global extract literal (first 64 KiB of response):");
+    ImGui::SameLine();
+    aida::ui::input_text("##fuzz_extract_literal", cfg.extract_literal,
+        sizeof(cfg.extract_literal), "bounded literal match (optional)", false,
+        ImVec2(320.f, 28.f));
 
-    std::vector<state_t::fuzzer_result_t> results_copy;
+    ImGui::Spacing();
+
+    std::string last_stage;
+    std::string last_error;
     {
-        std::lock_guard<std::mutex> lk(state.fuzz_mutex);
-        results_copy = state.fuzz_results;
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        last_stage = state.fuzz_last_stage;
+        last_error = state.fuzz_last_error;
+    }
+    if (!last_error.empty()) {
+        aida::ui::pill_kind(last_error.c_str(), aida::ui::pill_kind_t::error,
+                            aida::ui::size_t_::sm, false);
+    } else if (!last_stage.empty() && !state.fuzz_running.load(std::memory_order_acquire)) {
+        aida::ui::pill_kind(last_stage.c_str(), aida::ui::pill_kind_t::neutral,
+                            aida::ui::size_t_::sm, false);
     }
 
+    ImGui::Spacing();
 
-    size_t max_cols = 1;
-    for (auto& fr : results_copy)
-        max_cols = std::max(max_cols, fr.payloads.size());
-    bool show_extract = false;
-    for (auto& fr : results_copy)
-        if (!fr.extracted_value.empty()) { show_extract = true; break; }
 
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                       "Results: %zu", results_copy.size());
+    const auto results_snapshot = std::atomic_load_explicit(
+        &state.fuzz_results_snapshot, std::memory_order_acquire);
+    const std::uint64_t retained_count = results_snapshot
+        ? results_snapshot->retained_count : 0;
+    const std::uint64_t dropped_count = results_snapshot
+        ? results_snapshot->dropped_count : 0;
+    const std::size_t max_cols = results_snapshot
+        ? results_snapshot->maximum_payload_columns : 1;
+    const bool show_extract = results_snapshot && results_snapshot->has_extracted_values;
+    const bool show_failures = results_snapshot && results_snapshot->has_failures;
 
+    if (dropped_count == 0) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                           "Results: %llu", static_cast<unsigned long long>(retained_count));
+    } else {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                           "Results: %llu retained (%llu older discarded)",
+                           static_cast<unsigned long long>(retained_count),
+                           static_cast<unsigned long long>(dropped_count));
+    }
+
+    const float c_idx = 72.f;
+    const float c_payload = 160.f;
+    const float c_status = 72.f;
+    const float c_len = 88.f;
+    const float c_time = 88.f;
+    const float c_match = 64.f;
+    const float c_extract = show_extract ? 160.f : 0.f;
+    const float c_error = show_failures ? 220.f : 0.f;
+    const float table_width = 24.f + c_idx +
+        c_payload * static_cast<float>((std::max)(std::size_t{1}, max_cols)) +
+        c_status + c_len + c_time + c_match + c_extract + c_error;
     float results_h = h - ImGui::GetCursorPosY() + y - 8.f;
+    ImGui::SetNextWindowContentSize(ImVec2(table_width, 0.f));
     ImGui::BeginChild("##fuzz_results", ImVec2(w - 4.f, results_h), false,
-                      ImGuiWindowFlags_NoBackground);
+                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_HorizontalScrollbar);
 
     ImDrawList* dl   = ImGui::GetWindowDrawList();
     ImVec2 list_org  = ImGui::GetWindowPos();
     float row_h      = 22.f;
     const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
+    const float table_left = list_org.x - ImGui::GetScrollX();
 
 
-    float c_idx     = 50.f;
-    float c_payload = std::min(180.f, (w - 50.f - 60.f - 80.f - 80.f - 50.f
-                                       - (show_extract ? 120.f : 0.f))
-                                      / static_cast<float>(std::max<size_t>(1, max_cols)));
-    float c_status  = 60.f;
-    float c_len     = 80.f;
-    float c_time    = 80.f;
-    float c_match   = 50.f;
     float cy  = list_org.y + ImGui::GetCursorPosY();
-    float cx0 = list_org.x + 8.f;
+    float cx0 = table_left + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
 
-    dl->AddRectFilled(ImVec2(list_org.x, cy - 4.f),
-                      ImVec2(list_org.x + ImGui::GetWindowSize().x, cy + row_h - 4.f),
+    dl->AddRectFilled(ImVec2(table_left, cy - 4.f),
+                      ImVec2(table_left + table_width, cy + row_h - 4.f),
                       aida::ui::with_alpha(th.panel_header, alpha));
 
     {
@@ -8770,52 +9398,75 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Length");  cx += c_len;
         dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Time");    cx += c_time;
         dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Match");   cx += c_match;
-        if (show_extract) dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Extracted");
+        if (show_extract) {
+            dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Extracted");
+            cx += c_extract;
+        }
+        if (show_failures) dl->AddText(ImVec2(cx, hdr_ty), hdr_col, "Error");
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h + 4.f);
     }
 
-    for (auto& fr : results_copy) {
-        float ry     = ImGui::GetCursorPosY();
-        float abs_ry = ImGui::GetCursorScreenPos().y;
-        bool  is_sel = (state.fuzz_selected == fr.index);
+    ImGuiListClipper result_clipper;
+    result_clipper.Begin(static_cast<int>((std::min)(retained_count,
+        static_cast<std::uint64_t>((std::numeric_limits<int>::max)()))), row_h);
+    while (result_clipper.Step()) {
+        for (int display_index = result_clipper.DisplayStart;
+             display_index < result_clipper.DisplayEnd; ++display_index) {
+            const std::size_t page_index = static_cast<std::size_t>(display_index) / k_fuzzer_page_size;
+            const std::size_t row_index = static_cast<std::size_t>(display_index) % k_fuzzer_page_size;
+            if (!results_snapshot || page_index >= results_snapshot->pages.size() ||
+                !results_snapshot->pages[page_index] ||
+                row_index >= results_snapshot->pages[page_index]->rows.size())
+                continue;
+            const auto& fr = results_snapshot->pages[page_index]->rows[row_index];
+            float ry     = ImGui::GetCursorPosY();
+            float abs_ry = ImGui::GetCursorScreenPos().y;
+            bool is_sel = state.fuzz_has_selection && state.fuzz_selected == fr.index;
 
-        if (fr.match) {
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry),
-                              ImVec2(list_org.x + w - 4.f, abs_ry + row_h),
+            if (fr.match) {
+                dl->AddRectFilled(ImVec2(table_left, abs_ry),
+                              ImVec2(table_left + table_width, abs_ry + row_h),
                               aida::ui::with_alpha(th.success_soft, alpha * 4.f));
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry), ImVec2(list_org.x + 3.f, abs_ry + row_h),
+                dl->AddRectFilled(ImVec2(table_left, abs_ry), ImVec2(table_left + 3.f, abs_ry + row_h),
                               aida::ui::with_alpha(th.success, alpha));
-        } else if (is_sel) {
-            dl->AddRectFilled(ImVec2(list_org.x, abs_ry),
-                              ImVec2(list_org.x + w - 4.f, abs_ry + row_h),
+            } else if (is_sel) {
+                dl->AddRectFilled(ImVec2(table_left, abs_ry),
+                              ImVec2(table_left + table_width, abs_ry + row_h),
                               aida::ui::with_alpha(th.selection, alpha));
-        }
+            }
 
-        ImVec2 mouse = ImGui::GetMousePos();
-        if (mouse.x >= list_org.x && mouse.x < list_org.x + w - 4.f &&
-            mouse.y >= abs_ry && mouse.y < abs_ry + row_h && ImGui::IsMouseClicked(0))
-            state.fuzz_selected = fr.index;
+            ImVec2 mouse = ImGui::GetMousePos();
+            if (mouse.x >= table_left && mouse.x < table_left + table_width &&
+                mouse.y >= abs_ry && mouse.y < abs_ry + row_h && ImGui::IsMouseClicked(0)) {
+                state.fuzz_selected = fr.index;
+                state.fuzz_has_selection = true;
+            }
 
         ImU32 txt_col = aida::ui::with_alpha(is_sel ? th.text_primary : th.text_secondary, alpha);
         float cx = cx0;
         char buf[64];
 
-        snprintf(buf, sizeof(buf), "%d", fr.index);
+        snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(fr.index));
         dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += c_idx;
 
 
         for (size_t pi = 0; pi < max_cols; pi++) {
             std::string pl;
-            if (pi < fr.payloads.size()) {
-                pl = fr.payloads[pi].size() > 28
-                    ? fr.payloads[pi].substr(0, 28) + ".." : fr.payloads[pi];
+            if (results_snapshot->payload_catalog &&
+                pi < fr.payload_indices.size() &&
+                pi < results_snapshot->payload_catalog->size() &&
+                fr.payload_indices[pi] < (*results_snapshot->payload_catalog)[pi].size()) {
+                const auto& payload = (*results_snapshot->payload_catalog)[pi][fr.payload_indices[pi]];
+                pl = payload.size() > 28 ? payload.substr(0, 28) + ".." : payload;
             }
             dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, pl.c_str()); cx += c_payload;
         }
 
 
-        ImU32 sc_col = aida::ui::with_alpha(status_code_color(fr.status_code), alpha);
-        snprintf(buf, sizeof(buf), "%d", fr.status_code);
+        ImU32 sc_col = aida::ui::with_alpha(fr.error.empty()
+            ? status_code_color(fr.status_code) : th.error, alpha);
+        if (fr.error.empty()) snprintf(buf, sizeof(buf), "%d", fr.status_code);
+        else snprintf(buf, sizeof(buf), "ERR");
         dl->AddText(ImVec2(cx, abs_ry + text_oy), sc_col, buf); cx += c_status;
 
         snprintf(buf, sizeof(buf), "%zu", fr.response_len);
@@ -8836,8 +9487,16 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
             dl->AddText(ImVec2(cx, abs_ry + text_oy),
                          aida::ui::with_alpha(th.warning, alpha), ev.c_str());
         }
+        if (show_extract) cx += c_extract;
+        if (show_failures && !fr.error.empty()) {
+            std::string error = fr.error.size() > 32
+                ? fr.error.substr(0, 32) + ".." : fr.error;
+            dl->AddText(ImVec2(cx, abs_ry + text_oy),
+                         aida::ui::with_alpha(th.error, alpha), error.c_str());
+        }
 
         ImGui::SetCursorPosY(ry + row_h);
+        }
     }
 
     ImGui::EndChild();
@@ -12089,6 +12748,10 @@ const network_exchange_action_descriptor_t k_exchange_actions[] = {
     {network_exchange_action_t::intruder, "network.exchange.intruder"},
     {network_exchange_action_t::scanner, "network.exchange.scanner"},
     {network_exchange_action_t::comparer, "network.exchange.comparer"},
+    {network_exchange_action_t::compare_request_response, "network.exchange.compare_request_response"},
+    {network_exchange_action_t::session_handling, "network.exchange.session_handling"},
+    {network_exchange_action_t::cookies, "network.exchange.cookies"},
+    {network_exchange_action_t::match_replace, "network.exchange.match_replace"},
     {network_exchange_action_t::decoder, "network.exchange.decoder"},
     {network_exchange_action_t::sequencer, "network.exchange.sequencer"},
     {network_exchange_action_t::camoufox, "network.exchange.camoufox"},
@@ -12254,6 +12917,900 @@ const artifact_identity_t* response_identity(const exchange_context_runtime_t& c
         context.related.content_size != 0 ? &context.related : nullptr;
 }
 
+bool matching_http1_pair(const artifact_identity_t& request,
+                         const artifact_identity_t& response) {
+    return request.valid() && response.valid() && request_kind(request.kind) &&
+        response_kind(response.kind) && request.kind != artifact_kind_t::http2_request &&
+        response.kind != artifact_kind_t::http2_response && !request.raw_protocol &&
+        !response.raw_protocol && !request.parent_id.empty() &&
+        request.parent_id == response.parent_id && request.source_view_id == response.source_view_id &&
+        request.source_id == response.source_id && request.session_id == response.session_id &&
+        request.target_host == response.target_host && request.target_port == response.target_port &&
+        request.use_tls == response.use_tls;
+}
+
+std::string cookie_request_path(const std::string& raw_request) {
+    std::string target = request_target(raw_request);
+    const std::size_t scheme = target.find("://");
+    if (scheme != std::string::npos) {
+        const std::size_t slash = target.find('/', scheme + 3U);
+        target = slash == std::string::npos ? "/" : target.substr(slash);
+    }
+    const std::size_t fragment = target.find('#');
+    if (fragment != std::string::npos) target.resize(fragment);
+    return target.empty() ? "/" : target;
+}
+
+enum class exchange_review_kind_t : std::uint8_t {
+    none,
+    create_issue,
+    replay,
+    remove
+};
+
+enum class exchange_remove_source_t : std::uint8_t {
+    none,
+    proxy,
+    repeater
+};
+
+struct exchange_review_state_t {
+    exchange_review_kind_t kind = exchange_review_kind_t::none;
+    artifact_identity_t primary;
+    artifact_identity_t related;
+    bool open_requested = false;
+    char issue_name[160]{};
+    char issue_description[2048]{};
+    char issue_remediation[2048]{};
+    int issue_severity = static_cast<int>(aida::burp::severity_t::info);
+    int issue_confidence = static_cast<int>(aida::burp::confidence_t::firm);
+    std::string validation_error;
+};
+
+struct exchange_remove_undo_state_t {
+    exchange_remove_source_t source = exchange_remove_source_t::none;
+    mitm_proxy::http_exchange proxy_exchange;
+    std::shared_ptr<repeater_entry_t> repeater_entry;
+    std::size_t original_index = 0;
+    bool open_requested = false;
+    bool operation_pending = false;
+    bool restored = false;
+    std::string error;
+};
+
+static exchange_review_state_t s_exchange_review;
+static exchange_remove_undo_state_t s_exchange_remove_undo;
+static std::atomic<bool> s_common_exchange_operation_pending{false};
+static std::atomic<int> s_remove_undo_completion_status{0};
+static std::array<char, 512> s_remove_undo_completion_error{};
+static constexpr std::size_t k_issue_evidence_limit = 1024U * 1024U;
+
+static bool proxy_artifact_kind(artifact_kind_t kind) {
+    return kind == artifact_kind_t::exchange || kind == artifact_kind_t::request ||
+        kind == artifact_kind_t::response;
+}
+
+static bool repeater_artifact_kind(artifact_kind_t kind) {
+    return kind == artifact_kind_t::repeater_request ||
+        kind == artifact_kind_t::repeater_response;
+}
+
+static bool proxy_exchange_matches_identity(
+    const mitm_proxy::http_exchange& exchange, const artifact_identity_t& identity) {
+    if (exchange.id != identity.source_id || exchange.timestamp != identity.timestamp ||
+        exchange.target_host != identity.target_host || exchange.target_port != identity.target_port ||
+        exchange.is_tls != identity.use_tls)
+        return false;
+    const auto& bytes = identity.kind == artifact_kind_t::response
+        ? exchange.raw_response : exchange.raw_request;
+    return bytes.size() == identity.content_size && artifact_hash(bytes) == identity.content_hash;
+}
+
+static std::string bounded_export_filename(const artifact_identity_t& identity) {
+    std::string name = identity.label.empty() ? "network-artifact" : identity.label;
+    for (char& character : name) {
+        const unsigned char value = static_cast<unsigned char>(character);
+        if (!(std::isalnum(value) || character == '-' || character == '_'))
+            character = '_';
+    }
+    if (name.size() > 96U)
+        name.resize(96U);
+    if (name.empty())
+        name = "network-artifact";
+    return name + ".bin";
+}
+
+static bool export_reviewed_artifact(const artifact_identity_t& identity,
+                                     std::string& reason) {
+    char path[MAX_PATH]{};
+    const std::string filename = bounded_export_filename(identity);
+    std::snprintf(path, sizeof(path), "%s", filename.c_str());
+    static const char k_artifact_filter[] =
+        "Network artifact (*.bin)\0*.bin\0"
+        "HTTP message (*.http)\0*.http\0"
+        "All files (*.*)\0*.*\0\0";
+    if (!win32_dialog::show_save_file_dialog(g_hwnd,
+            "Export reviewed network artifact", k_artifact_filter, "bin",
+            path, sizeof(path), "network_view::artifact_export")) {
+        reason = "Artifact export was cancelled.";
+        return false;
+    }
+    artifact_snapshot_t snapshot;
+    if (!snapshot_for(identity, snapshot, reason))
+        return false;
+    if (snapshot.bytes.size() > k_network_export_limit) {
+        reason = "The reviewed artifact exceeds the 256 MiB export safety limit.";
+        return false;
+    }
+    const std::string destination = path;
+    const std::string task_id = register_network_operation(
+        "network.exchange.save_export", "Export reviewed network artifact",
+        identity.source_view_id.c_str(), destination);
+    const bool posted = post_network_task(
+        "network_artifact_export", aida::infra::executor::domain_t::diagnostics,
+        "bounded_task",
+        [bytes = std::move(snapshot.bytes), destination, task_id]() {
+            bool success = false;
+            std::string error;
+            try {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+                aida::preview::network::record_receipt(
+                    "Network artifact export",
+                    destination + " " + std::to_string(bytes.size()) + " bytes");
+                success = true;
+#else
+                success = atomic_write_export(destination, bytes.data(), bytes.size(), error);
+#endif
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Reviewed artifact export failed";
+            }
+            if (!success && error.empty())
+                error = "Reviewed artifact export failed without a destination receipt";
+            finish_network_operation(task_id, success,
+                success ? "Completed" : "Failed",
+                success ? std::to_string(bytes.size()) +
+                    " bytes written atomically to " + destination : error);
+            enqueue_ui_completion([success, destination, error = std::move(error)] {
+                toast_notification::push(success
+                    ? "Exported reviewed artifact to " + destination
+                    : (error.empty() ? "Artifact export failed" : error),
+                    success ? toast_notification::toast_type_t::success
+                            : toast_notification::toast_type_t::error);
+            });
+        }, false);
+    if (!posted) {
+        finish_network_operation(task_id, false, "Rejected",
+            "Executor rejected reviewed artifact export");
+        reason = "The Network executor rejected the artifact export.";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+static void stage_exchange_review(exchange_review_kind_t kind,
+                                  const exchange_context_runtime_t& context) {
+    s_exchange_review = {};
+    s_exchange_review.kind = kind;
+    s_exchange_review.primary = context.primary;
+    s_exchange_review.related = context.related;
+    s_exchange_review.open_requested = true;
+    if (kind == exchange_review_kind_t::create_issue) {
+        std::snprintf(s_exchange_review.issue_name,
+            sizeof(s_exchange_review.issue_name), "Manual finding for %s",
+            context.primary.label.empty() ? "network artifact"
+                                          : context.primary.label.c_str());
+        std::snprintf(s_exchange_review.issue_description,
+            sizeof(s_exchange_review.issue_description),
+            "Reviewed network evidence retained from %s.",
+            context.primary.source_view_id.empty() ? "Network"
+                                                   : context.primary.source_view_id.c_str());
+    }
+}
+
+static bool submit_reviewed_issue(std::string& reason) {
+    artifact_snapshot_t primary;
+    if (!snapshot_for(s_exchange_review.primary, primary, reason))
+        return false;
+    artifact_snapshot_t related;
+    if (s_exchange_review.related.valid() &&
+        !snapshot_for(s_exchange_review.related, related, reason))
+        return false;
+    if (primary.bytes.size() > k_issue_evidence_limit ||
+        related.bytes.size() > k_issue_evidence_limit) {
+        reason = "Manual issue evidence is bounded to 1 MiB per retained artifact.";
+        return false;
+    }
+    const artifact_identity_t primary_identity = s_exchange_review.primary;
+    const artifact_identity_t related_identity = s_exchange_review.related;
+    aida::burp::issue_t issue;
+    issue.session_id = primary_identity.session_id;
+    issue.type_key = "manual-network-artifact";
+    issue.name = s_exchange_review.issue_name;
+    issue.description = s_exchange_review.issue_description;
+    issue.remediation = s_exchange_review.issue_remediation;
+    issue.severity = static_cast<aida::burp::severity_t>(s_exchange_review.issue_severity);
+    issue.confidence = static_cast<aida::burp::confidence_t>(s_exchange_review.issue_confidence);
+    issue.scheme = primary_identity.use_tls ? "https" : "http";
+    issue.host = primary_identity.target_host;
+    issue.port = primary_identity.target_port;
+    issue.src_exchange_id = primary_identity.source_id;
+    issue.seen_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    const artifact_identity_t* request = request_kind(primary_identity.kind)
+        ? &primary_identity
+        : request_kind(related_identity.kind) ? &related_identity : nullptr;
+    if (request) {
+        const artifact_snapshot_t& request_data = request->id == primary_identity.id
+            ? primary : related;
+        const std::string raw = artifact_text(request_data);
+        issue.path = request_target(raw);
+    }
+    aida::burp::evidence_t evidence;
+    if (request_kind(primary_identity.kind))
+        evidence.request_raw = artifact_text(primary);
+    else if (response_kind(primary_identity.kind))
+        evidence.response_raw = artifact_text(primary);
+    if (related_identity.valid()) {
+        if (request_kind(related_identity.kind))
+            evidence.request_raw = artifact_text(related);
+        else if (response_kind(related_identity.kind))
+            evidence.response_raw = artifact_text(related);
+    }
+    evidence.marker = primary_identity.id;
+    issue.evidence.push_back(std::move(evidence));
+    const std::string owner_view = primary_identity.source_view_id.empty()
+        ? "view.network.scanner" : primary_identity.source_view_id;
+    const std::string task_id = register_network_operation(
+        "network.exchange.create_issue", "Create reviewed Network issue",
+        owner_view.c_str(), issue.name);
+    const bool posted = post_network_task(
+        "network_issue_create", aida::infra::executor::domain_t::diagnostics,
+        "bounded_task", [issue = std::move(issue), task_id]() mutable {
+            bool retained = false;
+            bool persisted = false;
+            std::uint64_t issue_id = 0;
+            std::string error;
+            try {
+                issue_id = aida::burp::issue_store::add(std::move(issue));
+                retained = issue_id != 0;
+                persisted = retained && aida::burp::issue_store::save_to_disk();
+                if (!persisted)
+                    error = aida::burp::issue_store::last_error();
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Manual Network issue creation failed";
+            }
+            if (persisted) {
+                finish_network_operation(task_id, true, "Completed",
+                    "Scanner issue #" + std::to_string(issue_id) +
+                    " persisted with reviewed evidence");
+            } else if (retained) {
+                (void)aida::ui::task_center::update_task(task_id,
+                    aida::ui::task_center::task_state_t::partial, 1.0f,
+                    "Persistence failed",
+                    "Scanner issue #" + std::to_string(issue_id) +
+                    " remains in memory, but durable save failed: " +
+                    (error.empty() ? "unknown storage error" : error));
+            } else {
+                finish_network_operation(task_id, false, "Failed",
+                    error.empty() ? "Issue store rejected the finding" : error);
+            }
+            enqueue_ui_completion([retained, persisted, issue_id,
+                                   error = std::move(error)] {
+                if (retained) {
+                    (void)aida::ui::application_views::open_or_focus(
+                        aida::ui::stable_view_id_t("view.network.scanner"));
+                    toast_notification::push(
+                        persisted
+                            ? "Created Scanner issue #" + std::to_string(issue_id)
+                            : "Issue #" + std::to_string(issue_id) +
+                                " remains in memory; durable save failed",
+                        persisted ? toast_notification::toast_type_t::success
+                                  : toast_notification::toast_type_t::warning);
+                } else {
+                    toast_notification::push(error.empty()
+                        ? "Manual Network issue creation failed" : error,
+                        toast_notification::toast_type_t::error);
+                }
+            });
+        }, false);
+    if (!posted) {
+        finish_network_operation(task_id, false, "Rejected",
+            "Executor rejected manual issue creation");
+        reason = "The Network executor rejected manual issue creation.";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+static bool submit_reviewed_replay(std::string& reason) {
+    const artifact_identity_t request_identity_value =
+        request_kind(s_exchange_review.primary.kind)
+            ? s_exchange_review.primary : s_exchange_review.related;
+    artifact_snapshot_t request;
+    if (!snapshot_for(request_identity_value, request, reason))
+        return false;
+    if (request.bytes.empty() || request.bytes.size() > 65535U ||
+        request_identity_value.target_host.empty() ||
+        request_identity_value.target_port == 0) {
+        reason = "Live replay requires a bounded reviewed HTTP/1 request and verified target.";
+        return false;
+    }
+    bool expected = false;
+    if (!s_common_exchange_operation_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        reason = "Another reviewed Network artifact operation is still active.";
+        return false;
+    }
+    const std::string target = request_identity_value.target_host + ":" +
+        std::to_string(request_identity_value.target_port);
+    const std::string task_id = register_network_operation(
+        "network.exchange.replay", "Replay reviewed Network request",
+        request_identity_value.source_view_id.c_str(), target);
+    const bool posted = post_network_task(
+        "network_exchange_replay", aida::infra::executor::domain_t::external_tool,
+        "bounded_task",
+        [identity = request_identity_value, bytes = std::move(request.bytes), task_id]() {
+            bool success = false;
+            int status = 0;
+            std::uint64_t response_id = 0;
+            std::string error;
+            try {
+                auto result = mitm_proxy::repeat_request(
+                    identity.target_host, identity.target_port, identity.use_tls, bytes);
+                success = result.success;
+                status = result.exchange.response.status_code;
+                response_id = result.exchange.id;
+                error = std::move(result.error);
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Reviewed request replay failed";
+            }
+            finish_network_operation(task_id, success,
+                success ? "Completed" : "Failed",
+                success ? "Recorded replay exchange #" + std::to_string(response_id) +
+                    " with HTTP status " + std::to_string(status)
+                    : (error.empty() ? "The target returned no response" : error));
+            const bool completion_queued = enqueue_ui_completion(
+                [success, response_id, status, error = std::move(error)] {
+                s_common_exchange_operation_pending.store(false, std::memory_order_release);
+                request_proxy_runtime_snapshot(true);
+                toast_notification::push(success
+                    ? "Replay recorded as exchange #" + std::to_string(response_id) +
+                        " (HTTP " + std::to_string(status) + ")"
+                    : (error.empty() ? "Reviewed request replay failed" : error),
+                    success ? toast_notification::toast_type_t::success
+                            : toast_notification::toast_type_t::error);
+            });
+            if (!completion_queued)
+                s_common_exchange_operation_pending.store(false, std::memory_order_release);
+        }, false);
+    if (!posted) {
+        s_common_exchange_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected",
+            "Executor rejected reviewed request replay");
+        reason = "The Network executor rejected reviewed request replay.";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+static bool submit_reviewed_removal(std::string& reason) {
+    artifact_snapshot_t current;
+    if (!snapshot_for(s_exchange_review.primary, current, reason))
+        return false;
+    const artifact_identity_t identity = s_exchange_review.primary;
+    if (repeater_artifact_kind(identity.kind)) {
+        const auto found = std::find_if(g_state.repeater_entries.begin(),
+            g_state.repeater_entries.end(), [&](const auto& entry) {
+                return entry && entry->id == identity.source_id;
+            });
+        if (found == g_state.repeater_entries.end()) {
+            reason = "The reviewed Repeater tab is no longer retained.";
+            return false;
+        }
+        if ((*found)->in_progress.load(std::memory_order_acquire)) {
+            reason = "Wait for the active Repeater send to finish before removing its tab.";
+            return false;
+        }
+        const std::size_t index = static_cast<std::size_t>(
+            std::distance(g_state.repeater_entries.begin(), found));
+        s_exchange_remove_undo = {};
+        s_exchange_remove_undo.source = exchange_remove_source_t::repeater;
+        s_exchange_remove_undo.repeater_entry = *found;
+        s_exchange_remove_undo.original_index = index;
+        s_exchange_remove_undo.open_requested = true;
+        const std::string task_id = register_network_operation(
+            "network.exchange.remove", "Remove reviewed Repeater tab",
+            "view.network.repeater", identity.label);
+        g_state.repeater_entries.erase(found);
+        s_repeater_selected_artifact_kinds.erase(identity.source_id);
+        clear_stale_network_selection("view.network.repeater");
+        publish_repeater_request_artifacts(g_state);
+        g_state.repeater_selected = g_state.repeater_entries.empty() ? -1
+            : static_cast<int>((std::min)(index, g_state.repeater_entries.size() - 1U));
+        finish_network_operation(task_id, true, "Completed",
+            "Repeater tab removed; recovery is available from the receipt");
+        reason.clear();
+        return true;
+    }
+    if (!proxy_artifact_kind(identity.kind) ||
+        identity.source_view_id != "view.network.proxy") {
+        reason = "This artifact source does not expose a reversible remove operation.";
+        return false;
+    }
+    if (s_proxy_operation_pending.load(std::memory_order_acquire)) {
+        reason = "Wait for the active Proxy operation before removing reviewed history.";
+        return false;
+    }
+    bool expected = false;
+    if (!s_common_exchange_operation_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        reason = "Another reviewed Network artifact operation is still active.";
+        return false;
+    }
+    const std::string task_id = register_network_operation(
+        "network.exchange.remove", "Remove reviewed proxy exchange",
+        "view.network.proxy", identity.label);
+    const bool posted = post_network_task(
+        "network_exchange_remove", aida::infra::executor::domain_t::diagnostics,
+        "bounded_task", [identity, task_id]() {
+            bool success = false;
+            std::size_t removed_index = 0;
+            std::uint64_t previous_id = 0;
+            std::uint64_t next_id = 0;
+            mitm_proxy::http_exchange removed;
+            std::string error;
+            try {
+                std::lock_guard<std::mutex> lock(mitm_proxy::g_state.history_mutex);
+                auto found = std::find_if(mitm_proxy::g_state.history.begin(),
+                    mitm_proxy::g_state.history.end(), [&](const auto& exchange) {
+                        return exchange && proxy_exchange_matches_identity(*exchange, identity);
+                    });
+                if (found == mitm_proxy::g_state.history.end()) {
+                    error = "Proxy history changed after review; select the current exchange again";
+                } else {
+                    removed_index = static_cast<std::size_t>(
+                        std::distance(mitm_proxy::g_state.history.begin(), found));
+                    if (found != mitm_proxy::g_state.history.begin()) {
+                        const auto& previous = *(found - 1);
+                        previous_id = previous ? previous->id : 0;
+                    }
+                    if (found + 1 != mitm_proxy::g_state.history.end()) {
+                        const auto& next = *(found + 1);
+                        next_id = next ? next->id : 0;
+                    }
+                    removed = **found;
+                    mitm_proxy::g_state.history.erase(found);
+                    success = true;
+                }
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Reviewed proxy exchange removal failed";
+            }
+            if (!success) {
+                finish_network_operation(task_id, false, "Failed",
+                    error.empty() ? "Reviewed proxy exchange removal failed" : error);
+                s_common_exchange_operation_pending.store(false, std::memory_order_release);
+                enqueue_ui_completion([error] {
+                    toast_notification::push(error.empty()
+                        ? "Reviewed proxy exchange removal failed" : error,
+                        toast_notification::toast_type_t::error);
+                    request_proxy_runtime_snapshot(true);
+                });
+                return;
+            }
+            bool completion_queued = false;
+            try {
+                completion_queued = enqueue_ui_completion(
+                    [removed_index, removed]() mutable {
+                s_common_exchange_operation_pending.store(false, std::memory_order_release);
+                s_exchange_remove_undo = {};
+                s_exchange_remove_undo.source = exchange_remove_source_t::proxy;
+                s_exchange_remove_undo.proxy_exchange = std::move(removed);
+                s_exchange_remove_undo.original_index = removed_index;
+                s_exchange_remove_undo.open_requested = true;
+                s_proxy_selected_exchange_id = 0;
+                g_state.proxy_selected = -1;
+                clear_stale_network_selection("view.network.proxy");
+                request_proxy_runtime_snapshot(true);
+            });
+            } catch (...) {
+                completion_queued = false;
+            }
+            if (completion_queued) {
+                finish_network_operation(task_id, true, "Completed",
+                    "Proxy exchange removed; recovery is available from the receipt");
+                return;
+            }
+            bool rolled_back = false;
+            std::string rollback_error;
+            try {
+                std::lock_guard<std::mutex> lock(mitm_proxy::g_state.history_mutex);
+                const bool duplicate = std::any_of(mitm_proxy::g_state.history.begin(),
+                    mitm_proxy::g_state.history.end(), [&](const auto& current) {
+                        return current && current->id == removed.id;
+                    });
+                const std::size_t insertion = (std::min)(
+                    removed_index, mitm_proxy::g_state.history.size());
+                const bool previous_matches = previous_id == 0 ||
+                    (insertion > 0 && mitm_proxy::g_state.history[insertion - 1] &&
+                     mitm_proxy::g_state.history[insertion - 1]->id == previous_id);
+                const bool next_matches = next_id == 0 ||
+                    (insertion < mitm_proxy::g_state.history.size() &&
+                     mitm_proxy::g_state.history[insertion] &&
+                     mitm_proxy::g_state.history[insertion]->id == next_id);
+                if (duplicate) {
+                    rollback_error = "Removed exchange identity was reused before rollback";
+                } else if (!previous_matches || !next_matches) {
+                    rollback_error = "Proxy history ordering changed before exact rollback";
+                } else if (mitm_proxy::g_state.history.size() >=
+                           mitm_proxy::g_state.config.max_history) {
+                    rollback_error = "Proxy history reached capacity before exact rollback";
+                } else {
+                    mitm_proxy::g_state.history.insert(
+                        mitm_proxy::g_state.history.begin() +
+                            static_cast<std::ptrdiff_t>(insertion),
+                        std::make_shared<mitm_proxy::http_exchange>(removed));
+                    rolled_back = true;
+                }
+            } catch (const std::exception& exception) {
+                rollback_error = exception.what();
+            } catch (...) {
+                rollback_error = "Exact proxy removal rollback failed";
+            }
+            s_common_exchange_operation_pending.store(false, std::memory_order_release);
+            if (rolled_back) {
+                finish_network_operation(task_id, false, "Reverted",
+                    "Removal was rolled back because the recovery receipt could not be published");
+            } else {
+                (void)aida::ui::task_center::update_task(task_id,
+                    aida::ui::task_center::task_state_t::partial, 1.0f,
+                    "Recovery unavailable",
+                    "Proxy exchange was removed, but its recovery receipt could not be published and exact rollback failed: " +
+                    (rollback_error.empty() ? "unknown rollback error" : rollback_error));
+            }
+        }, false);
+    if (!posted) {
+        s_common_exchange_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected",
+            "Executor rejected reviewed proxy exchange removal");
+        reason = "The Network executor rejected reviewed proxy exchange removal.";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+static void apply_remove_undo_completion(bool success, std::string error) {
+    s_common_exchange_operation_pending.store(false, std::memory_order_release);
+    s_exchange_remove_undo.operation_pending = false;
+    s_exchange_remove_undo.restored = success;
+    s_exchange_remove_undo.error = success ? std::string() : error;
+    if (success)
+        publish_network_selection(exchange_artifact_identity(
+            s_exchange_remove_undo.proxy_exchange,
+            artifact_kind_t::request), true);
+    request_proxy_runtime_snapshot(true);
+    toast_notification::push(success
+        ? "Removed proxy exchange restored"
+        : (error.empty() ? "Proxy exchange recovery failed" : error),
+        success ? toast_notification::toast_type_t::success
+                : toast_notification::toast_type_t::error);
+}
+
+static void publish_remove_undo_completion_fallback(
+    bool success, const std::string& error) noexcept {
+    std::snprintf(s_remove_undo_completion_error.data(),
+        s_remove_undo_completion_error.size(), "%s", error.c_str());
+    s_remove_undo_completion_status.store(success ? 1 : 2,
+        std::memory_order_release);
+}
+
+static void drain_remove_undo_completion_fallback() {
+    const int status = s_remove_undo_completion_status.exchange(
+        0, std::memory_order_acq_rel);
+    if (status == 0)
+        return;
+    apply_remove_undo_completion(status == 1,
+        status == 1 ? std::string()
+                    : std::string(s_remove_undo_completion_error.data()));
+    s_remove_undo_completion_error.fill('\0');
+}
+
+static bool submit_remove_undo(std::string& reason) {
+    if (s_exchange_remove_undo.restored) {
+        reason = "The removed artifact has already been restored.";
+        return false;
+    }
+    if (s_exchange_remove_undo.source == exchange_remove_source_t::repeater) {
+        const auto entry = s_exchange_remove_undo.repeater_entry;
+        if (!entry || g_state.repeater_entries.size() >= k_max_repeater_entries) {
+            reason = "Repeater has no capacity to restore the removed tab.";
+            return false;
+        }
+        const bool duplicate = std::any_of(g_state.repeater_entries.begin(),
+            g_state.repeater_entries.end(), [&](const auto& current) {
+                return current && current->id == entry->id;
+            });
+        if (duplicate) {
+            reason = "A Repeater tab with the removed identity already exists.";
+            return false;
+        }
+        const std::size_t index = (std::min)(
+            s_exchange_remove_undo.original_index, g_state.repeater_entries.size());
+        g_state.repeater_entries.insert(
+            g_state.repeater_entries.begin() + static_cast<std::ptrdiff_t>(index), entry);
+        publish_repeater_request_artifacts(g_state);
+        g_state.repeater_selected = static_cast<int>(index);
+        s_repeater_selected_artifact_kinds[entry->id] = artifact_kind_t::repeater_request;
+        publish_network_selection(repeater_artifact_identity(
+            *entry, artifact_kind_t::repeater_request), true);
+        const std::string task_id = register_network_operation(
+            "network.exchange.remove.undo", "Restore removed Repeater tab",
+            "view.network.repeater", std::to_string(entry->id));
+        finish_network_operation(task_id, true, "Completed", "Repeater tab restored");
+        s_exchange_remove_undo.restored = true;
+        s_exchange_remove_undo.error.clear();
+        reason.clear();
+        return true;
+    }
+    if (s_exchange_remove_undo.source != exchange_remove_source_t::proxy ||
+        s_exchange_remove_undo.proxy_exchange.id == 0) {
+        reason = "No removed proxy exchange is available for recovery.";
+        return false;
+    }
+    if (s_proxy_operation_pending.load(std::memory_order_acquire)) {
+        reason = "Wait for the active Proxy operation before restoring reviewed history.";
+        return false;
+    }
+    bool expected = false;
+    if (!s_common_exchange_operation_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        reason = "Another reviewed Network artifact operation is still active.";
+        return false;
+    }
+    s_exchange_remove_undo.operation_pending = true;
+    s_remove_undo_completion_error.fill('\0');
+    s_remove_undo_completion_status.store(0, std::memory_order_release);
+    const auto exchange = s_exchange_remove_undo.proxy_exchange;
+    const std::size_t original_index = s_exchange_remove_undo.original_index;
+    const std::string task_id = register_network_operation(
+        "network.exchange.remove.undo", "Restore removed proxy exchange",
+        "view.network.proxy", std::to_string(exchange.id));
+    const bool posted = post_network_task(
+        "network_exchange_restore", aida::infra::executor::domain_t::diagnostics,
+        "bounded_task", [exchange, original_index, task_id] {
+            bool success = false;
+            std::string error;
+            try {
+                std::lock_guard<std::mutex> lock(mitm_proxy::g_state.history_mutex);
+                const bool duplicate = std::any_of(mitm_proxy::g_state.history.begin(),
+                    mitm_proxy::g_state.history.end(), [&](const auto& current) {
+                        return current && current->id == exchange.id;
+                    });
+                if (duplicate) {
+                    error = "A proxy exchange with the removed identity already exists";
+                } else if (mitm_proxy::g_state.history.size() >=
+                           mitm_proxy::g_state.config.max_history) {
+                    error = "Proxy history reached its configured capacity before recovery";
+                } else {
+                    const std::size_t index = (std::min)(
+                        original_index, mitm_proxy::g_state.history.size());
+                    mitm_proxy::g_state.history.insert(
+                        mitm_proxy::g_state.history.begin() +
+                            static_cast<std::ptrdiff_t>(index),
+                        std::make_shared<mitm_proxy::http_exchange>(exchange));
+                    std::uint64_t next = mitm_proxy::g_state.next_id.load(
+                        std::memory_order_acquire);
+                    while (next <= exchange.id &&
+                           !mitm_proxy::g_state.next_id.compare_exchange_weak(
+                               next, exchange.id + 1U, std::memory_order_acq_rel)) {
+                    }
+                    success = true;
+                }
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Proxy exchange recovery failed";
+            }
+            finish_network_operation(task_id, success,
+                success ? "Completed" : "Failed",
+                success ? "Proxy exchange restored at its reviewed position" : error);
+            const bool completion_queued = enqueue_ui_completion(
+                [success, error] {
+                    apply_remove_undo_completion(success, error);
+            });
+            if (!completion_queued)
+                publish_remove_undo_completion_fallback(success, error);
+        }, false);
+    if (!posted) {
+        s_common_exchange_operation_pending.store(false, std::memory_order_release);
+        s_exchange_remove_undo.operation_pending = false;
+        finish_network_operation(task_id, false, "Rejected",
+            "Executor rejected proxy exchange recovery");
+        reason = "The Network executor rejected proxy exchange recovery.";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+static bool blank_text(const char* value) {
+    if (!value || value[0] == '\0')
+        return true;
+    return std::all_of(value, value + std::strlen(value), [](unsigned char character) {
+        return std::isspace(character) != 0;
+    });
+}
+
+static void render_exchange_review_dialogs() {
+    drain_remove_undo_completion_fallback();
+    if (s_exchange_review.open_requested) {
+        if (s_exchange_review.kind == exchange_review_kind_t::create_issue)
+            aida::ui::design::open_dialog(
+                "dialog.network.exchange.create_issue", "Create Network issue");
+        else if (s_exchange_review.kind == exchange_review_kind_t::replay)
+            aida::ui::design::open_dialog(
+                "dialog.network.exchange.replay", "Review Network replay");
+        else if (s_exchange_review.kind == exchange_review_kind_t::remove)
+            aida::ui::design::open_dialog(
+                "dialog.network.exchange.remove", "Review Network artifact removal");
+        s_exchange_review.open_requested = false;
+    }
+    bool review_visible = false;
+    if (s_exchange_review.kind == exchange_review_kind_t::create_issue) {
+        review_visible = aida::ui::design::begin_dialog(
+            "dialog.network.exchange.create_issue", "Create Network issue",
+            ImVec2(560.f, 560.f), ImVec2(440.f, 280.f));
+    } else if (s_exchange_review.kind == exchange_review_kind_t::replay) {
+        review_visible = aida::ui::design::begin_dialog(
+            "dialog.network.exchange.replay", "Review Network replay",
+            ImVec2(560.f, 330.f), ImVec2(440.f, 280.f));
+    } else if (s_exchange_review.kind == exchange_review_kind_t::remove) {
+        review_visible = aida::ui::design::begin_dialog(
+            "dialog.network.exchange.remove", "Review Network artifact removal",
+            ImVec2(560.f, 330.f), ImVec2(440.f, 280.f));
+    }
+    if (review_visible) {
+        const bool issue = s_exchange_review.kind == exchange_review_kind_t::create_issue;
+        const char* confirm_label = issue ? "Create Issue"
+            : s_exchange_review.kind == exchange_review_kind_t::replay
+            ? "Send Request" : "Remove";
+        const float footer = aida::ui::design::dialog_footer_reserve_height(confirm_label);
+        if (aida::ui::design::begin_dialog_body("network_exchange_review_body", footer)) {
+            if (issue) {
+                ImGui::TextUnformatted("Create a persistent Scanner issue from the exact reviewed artifact.");
+                ImGui::Spacing();
+                ImGui::SetNextItemWidth(-1.f);
+                ImGui::InputText("Name", s_exchange_review.issue_name,
+                    sizeof(s_exchange_review.issue_name));
+                ImGui::SetNextItemWidth(-1.f);
+                ImGui::InputTextMultiline("Description",
+                    s_exchange_review.issue_description,
+                    sizeof(s_exchange_review.issue_description), ImVec2(-1.f, 96.f));
+                ImGui::SetNextItemWidth(-1.f);
+                ImGui::InputTextMultiline("Remediation",
+                    s_exchange_review.issue_remediation,
+                    sizeof(s_exchange_review.issue_remediation), ImVec2(-1.f, 72.f));
+                ImGui::SetNextItemWidth(180.f);
+                ImGui::Combo("Severity", &s_exchange_review.issue_severity,
+                    "Information\0Low\0Medium\0High\0Critical\0");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(180.f);
+                ImGui::Combo("Confidence", &s_exchange_review.issue_confidence,
+                    "Tentative\0Firm\0Certain\0");
+                ImGui::TextWrapped("Evidence: %s", s_exchange_review.primary.label.c_str());
+            } else if (s_exchange_review.kind == exchange_review_kind_t::replay) {
+                const auto* request = request_kind(s_exchange_review.primary.kind)
+                    ? &s_exchange_review.primary : &s_exchange_review.related;
+                ImGui::TextUnformatted("Send the exact reviewed request to its original target?");
+                ImGui::Spacing();
+                ImGui::Text("Target: %s:%u (%s)", request->target_host.c_str(),
+                    request->target_port, request->use_tls ? "TLS" : "plaintext");
+                ImGui::Text("Request: %zu bytes", request->content_size);
+                ImGui::TextWrapped("The response will be retained as a new Proxy exchange. TLS verification and pin policy remain enforced.");
+            } else {
+                ImGui::Text("Remove %s?", s_exchange_review.primary.label.c_str());
+                ImGui::Spacing();
+                ImGui::TextWrapped("%s", repeater_artifact_kind(s_exchange_review.primary.kind)
+                    ? "The whole reviewed Repeater tab, including its current request and response, will be removed."
+                    : "The whole reviewed Proxy exchange, including request, response, tags, notes, and evidence identity, will be removed.");
+                ImGui::TextWrapped("A one-step recovery receipt will remain available until it is dismissed or replaced by another removal.");
+            }
+            if (!s_exchange_review.validation_error.empty()) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+                    aida::ui::resolved().error), "%s",
+                    s_exchange_review.validation_error.c_str());
+            }
+            aida::ui::design::end_dialog_body();
+        }
+        const bool confirm_enabled = !issue || !blank_text(s_exchange_review.issue_name);
+        const auto result = aida::ui::design::dialog_footer(
+            "network_exchange_review_footer", confirm_label,
+            confirm_enabled, s_exchange_review.kind != exchange_review_kind_t::create_issue);
+        if (result.confirmed) {
+            std::string error;
+            const bool accepted = issue ? submit_reviewed_issue(error)
+                : s_exchange_review.kind == exchange_review_kind_t::replay
+                ? submit_reviewed_replay(error) : submit_reviewed_removal(error);
+            if (accepted) {
+                ImGui::CloseCurrentPopup();
+                s_exchange_review = {};
+            } else {
+                s_exchange_review.validation_error = error.empty()
+                    ? "The reviewed operation was rejected." : std::move(error);
+            }
+        } else if (result.cancelled) {
+            ImGui::CloseCurrentPopup();
+            s_exchange_review = {};
+        }
+        ImGui::EndPopup();
+    }
+
+    if (s_exchange_remove_undo.open_requested) {
+        aida::ui::design::open_dialog(
+            "dialog.network.exchange.remove_receipt", "Network removal receipt");
+        s_exchange_remove_undo.open_requested = false;
+    }
+    if (aida::ui::design::begin_dialog(
+            "dialog.network.exchange.remove_receipt", "Network removal receipt",
+            ImVec2(500.f, 270.f), ImVec2(420.f, 240.f))) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height(
+            "Undo Removal", "Close");
+        if (aida::ui::design::begin_dialog_body(
+                "network_exchange_remove_receipt_body", footer)) {
+            ImGui::TextUnformatted(s_exchange_remove_undo.restored
+                ? "The removed artifact was restored."
+                : "The reviewed artifact was removed from its owning Network store.");
+            ImGui::Spacing();
+            ImGui::TextWrapped("%s", s_exchange_remove_undo.source == exchange_remove_source_t::proxy
+                ? "Recovery restores the complete Proxy exchange at its reviewed position if its identity remains free and history has capacity."
+                : "Recovery restores the complete Repeater tab at its reviewed position if its identity remains free and Repeater has capacity.");
+            if (s_exchange_remove_undo.operation_pending)
+                ImGui::TextUnformatted("Restoring reviewed artifact...");
+            if (!s_exchange_remove_undo.error.empty()) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+                    aida::ui::resolved().error), "%s",
+                    s_exchange_remove_undo.error.c_str());
+            }
+            aida::ui::design::end_dialog_body();
+        }
+        bool can_restore = !s_exchange_remove_undo.operation_pending &&
+            !s_exchange_remove_undo.restored;
+        if (s_exchange_remove_undo.source == exchange_remove_source_t::proxy)
+            can_restore = can_restore &&
+                !s_proxy_operation_pending.load(std::memory_order_acquire);
+        if (s_exchange_remove_undo.source == exchange_remove_source_t::repeater)
+            can_restore = can_restore &&
+                g_state.repeater_entries.size() < k_max_repeater_entries;
+        const auto result = aida::ui::design::dialog_footer(
+            "network_exchange_remove_receipt_footer", "Undo Removal",
+            can_restore, false, "Close", !s_exchange_remove_undo.operation_pending);
+        if (result.confirmed) {
+            std::string error;
+            if (!submit_remove_undo(error))
+                s_exchange_remove_undo.error = error.empty()
+                    ? "The removed artifact could not be restored." : std::move(error);
+        } else if (result.cancelled) {
+            ImGui::CloseCurrentPopup();
+            s_exchange_remove_undo = {};
+        }
+        ImGui::EndPopup();
+    }
+}
+
 std::string capability_reason(network_exchange_action_t action,
                               const exchange_context_runtime_t& context) {
     if (!context.primary_current) return context.unavailable_reason.empty()
@@ -12304,6 +13861,60 @@ std::string capability_reason(network_exchange_action_t action,
             return reason;
         return {};
     }
+    case network_exchange_action_t::session_handling: {
+        if (!request) return "Session Handling requires a retained HTTP request artifact.";
+        if (request->kind == artifact_kind_t::http2_request || request->raw_protocol)
+            return "Session Handling accepts retained HTTP/1 requests only.";
+        if (request->target_host.empty() || request->target_port == 0)
+            return "The retained request has no verified target host and port.";
+        if (request->target_host.size() >= 256U || request->content_size == 0 ||
+            request->content_size >= 8192U)
+            return "Session Handling requires a bounded target and request of at most 8191 bytes.";
+        artifact_snapshot_t snapshot;
+        std::string reason;
+        if (!snapshot_for(*request, snapshot, reason))
+            return reason.empty() ? "The retained request is no longer available." : reason;
+        if (std::find(snapshot.bytes.begin(), snapshot.bytes.end(), 0) != snapshot.bytes.end())
+            return "Session Handling cannot stage a request containing embedded NUL bytes.";
+        return {};
+    }
+    case network_exchange_action_t::cookies: {
+        if (!request) return "Cookie Jar context requires a retained HTTP request artifact.";
+        if (request->kind == artifact_kind_t::http2_request || request->raw_protocol)
+            return "Cookie Jar context accepts retained HTTP/1 requests only.";
+        if (request->target_host.empty() || request->target_port == 0 ||
+            request->target_host.size() >= 256U)
+            return "The retained request has no bounded verified target.";
+        artifact_snapshot_t snapshot;
+        std::string reason;
+        if (!snapshot_for(*request, snapshot, reason))
+            return reason.empty() ? "The retained request is no longer available." : reason;
+        const std::string path = cookie_request_path(artifact_text(snapshot));
+        return path.size() <= 2048U ? std::string()
+            : "The retained request path exceeds Cookie Jar's reviewed context limit.";
+    }
+    case network_exchange_action_t::match_replace: {
+        const artifact_identity_t& source = context.primary;
+        if ((!request_kind(source.kind) && !response_kind(source.kind)) || source.raw_protocol ||
+            source.kind == artifact_kind_t::http2_request ||
+            source.kind == artifact_kind_t::http2_response)
+            return "Match and Replace context requires a retained HTTP/1 request or response.";
+        if (source.target_host.empty() || source.target_port == 0 ||
+            source.target_host.size() >= 256U)
+            return "The retained artifact has no bounded verified target.";
+        return {};
+    }
+    case network_exchange_action_t::compare_request_response:
+        if (!request || !response)
+            return "Request vs Response comparison requires both retained artifacts.";
+        if (!matching_http1_pair(*request, *response))
+            return "Request vs Response comparison requires a matching retained HTTP/1 exchange pair.";
+        if (request->content_size > 16U * 1024U * 1024U ||
+            response->content_size > 16U * 1024U * 1024U)
+            return "Comparer pair handoff is bounded to 16 MiB per retained artifact.";
+        if (aida::burp::comparer::list_slots().size() > 254U)
+            return "Comparer retains at most 256 slots; remove a slot before adding this pair.";
+        return {};
     case network_exchange_action_t::decoder: {
         if (context.primary.content_size >= sizeof(g_state.decoder_input))
             return "Decoder's reviewed input accepts at most 16383 bytes.";
@@ -12343,13 +13954,58 @@ std::string capability_reason(network_exchange_action_t action,
             return "This artifact is a raw payload and has no HTTP header/body boundary.";
         return {};
     case network_exchange_action_t::save_export:
-        return "No common reviewed file-export chooser owns network artifact paths yet; copy the artifact or use the source view's existing export.";
-    case network_exchange_action_t::create_issue:
-        return "The issue store has no reviewed human issue-editor adapter for arbitrary artifacts.";
-    case network_exchange_action_t::replay_live:
-        return "Live sending requires review in Repeater, Intruder, Scanner, Sequencer, or the protocol editor.";
+        return context.primary.content_size <= k_network_export_limit
+            ? std::string()
+            : "The selected artifact exceeds the 256 MiB export safety limit.";
+    case network_exchange_action_t::create_issue: {
+        if (context.primary.target_host.empty())
+            return "Manual Scanner issues require a retained target host.";
+        if (context.primary.content_size > k_issue_evidence_limit ||
+            (context.related.valid() && context.related.content_size > k_issue_evidence_limit))
+            return "Manual issue evidence is bounded to 1 MiB per retained artifact.";
+        return {};
+    }
+    case network_exchange_action_t::replay_live: {
+        if (!request)
+            return "Live replay requires a retained HTTP request artifact.";
+        if (request->kind == artifact_kind_t::http2_request)
+            return "HTTP/2 replay requires the protocol editor to preserve stream semantics.";
+        if (request->raw_protocol)
+            return "Raw protocol payloads require their protocol-specific sender.";
+        if (request->target_host.empty() || request->target_port == 0)
+            return "Live replay requires a verified target host and port.";
+        if (request->content_size == 0 || request->content_size > 65535U)
+            return "Live replay accepts reviewed HTTP/1 requests from 1 to 65535 bytes.";
+        if (s_common_exchange_operation_pending.load(std::memory_order_acquire))
+            return "Another reviewed Network artifact operation is still active.";
+        artifact_snapshot_t snapshot;
+        std::string reason;
+        if (!snapshot_for(*request, snapshot, reason))
+            return reason.empty() ? "The retained request is no longer available." : reason;
+        if (!intercept_editor_compatible(snapshot.bytes, reason))
+            return reason;
+        return {};
+    }
     case network_exchange_action_t::remove:
-        return "History removal has no common confirmation and undo provider.";
+        if (s_common_exchange_operation_pending.load(std::memory_order_acquire))
+            return "Another reviewed Network artifact operation is still active.";
+        if (proxy_artifact_kind(context.primary.kind) &&
+            context.primary.source_view_id == "view.network.proxy")
+            return s_proxy_operation_pending.load(std::memory_order_acquire)
+                ? "Wait for the active Proxy operation before removing reviewed history."
+                : std::string();
+        if (repeater_artifact_kind(context.primary.kind)) {
+            const auto found = std::find_if(g_state.repeater_entries.begin(),
+                g_state.repeater_entries.end(), [&](const auto& entry) {
+                    return entry && entry->id == context.primary.source_id;
+                });
+            if (found == g_state.repeater_entries.end())
+                return "The reviewed Repeater tab is no longer retained.";
+            return (*found)->in_progress.load(std::memory_order_acquire)
+                ? "Wait for the active Repeater send to finish before removing its tab."
+                : std::string();
+        }
+        return "This artifact source does not expose a reversible remove operation.";
     default:
         return {};
     }
@@ -12368,15 +14024,20 @@ bool execute_exchange_action(network_exchange_action_t action,
         action == network_exchange_action_t::fuzzer ||
         action == network_exchange_action_t::intruder ||
         action == network_exchange_action_t::scanner ||
+        action == network_exchange_action_t::compare_request_response ||
+        action == network_exchange_action_t::session_handling ||
+        action == network_exchange_action_t::cookies ||
         action == network_exchange_action_t::sequencer ||
         action == network_exchange_action_t::camoufox ||
         action == network_exchange_action_t::copy_url ||
         action == network_exchange_action_t::copy_method ||
         action == network_exchange_action_t::copy_request ||
         action == network_exchange_action_t::scope_include ||
-        action == network_exchange_action_t::scope_exclude;
+        action == network_exchange_action_t::scope_exclude ||
+        action == network_exchange_action_t::replay_live;
     const bool needs_response = action == network_exchange_action_t::copy_status ||
-        action == network_exchange_action_t::copy_response;
+        action == network_exchange_action_t::copy_response ||
+        action == network_exchange_action_t::compare_request_response;
     if (needs_request && request && !snapshot_for(*request, request_snapshot, reason)) return false;
     if (needs_response && response && !snapshot_for(*response, response_snapshot, reason)) return false;
     const std::string request_raw = request ? artifact_text(request_snapshot) : std::string();
@@ -12415,6 +14076,86 @@ bool execute_exchange_action(network_exchange_action_t action,
         return true;
     case network_exchange_action_t::comparer:
         return send_artifact_to_comparer(context.primary, reason);
+    case network_exchange_action_t::compare_request_response: {
+        if (!request || !response || !matching_http1_pair(*request, *response)) {
+            reason = "Request vs Response comparison requires a matching retained HTTP/1 exchange pair.";
+            return false;
+        }
+        if (aida::burp::comparer::list_slots().size() > 254U) {
+            reason = "Comparer retains at most 256 slots; remove a slot before adding this pair.";
+            return false;
+        }
+        const std::string request_label = (request->label.empty() ? request->id : request->label) +
+            " [Request]";
+        const std::string response_label = (response->label.empty() ? response->id : response->label) +
+            " [Response]";
+        const std::uint64_t request_slot = aida::burp::comparer::add_slot_from_bytes(
+            request_label, request_snapshot.bytes, request->id);
+        if (request_slot == 0) {
+            reason = "Comparer rejected the retained request: " + aida::burp::comparer::last_error();
+            return false;
+        }
+        const std::uint64_t response_slot = aida::burp::comparer::add_slot_from_bytes(
+            response_label, response_snapshot.bytes, response->id);
+        if (response_slot == 0) {
+            const std::string add_error = aida::burp::comparer::last_error();
+            const bool request_removed = aida::burp::comparer::remove_slot(request_slot);
+            reason = "Comparer rejected the retained response: " + add_error;
+            if (!request_removed)
+                reason += " The staged request slot remains in Comparer because rollback failed.";
+            return false;
+        }
+        const auto opened = aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.network.comparer"));
+        if (!opened.ok()) {
+            const bool response_removed = aida::burp::comparer::remove_slot(response_slot);
+            const bool request_removed = aida::burp::comparer::remove_slot(request_slot);
+            reason = opened.detail.empty() ? "The reviewed pair could not open Comparer." : opened.detail;
+            if (!request_removed || !response_removed) {
+                reason += " Comparer rollback was incomplete; ";
+                if (!request_removed && !response_removed)
+                    reason += "both staged slots remain.";
+                else if (!request_removed)
+                    reason += "the staged request slot remains.";
+                else
+                    reason += "the staged response slot remains.";
+            }
+            return false;
+        }
+        reason.clear();
+        return true;
+    }
+    case network_exchange_action_t::session_handling:
+        if (!request) {
+            reason = "Session Handling requires a retained HTTP/1 request.";
+            return false;
+        }
+        if (const auto opened = aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.network.session")); !opened.ok()) {
+            reason = opened.detail.empty() ? "The reviewed request could not open Session Handling." : opened.detail;
+            return false;
+        }
+        return aida::burp::session_handler_view::stage_reviewed_context(*request, reason);
+    case network_exchange_action_t::cookies:
+        if (!request) {
+            reason = "Cookie Jar context requires a retained HTTP/1 request.";
+            return false;
+        }
+        if (const auto opened = aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.network.cookies")); !opened.ok()) {
+            reason = opened.detail.empty() ? "The reviewed request could not open Cookie Jar." : opened.detail;
+            return false;
+        }
+        return aida::burp::cookie_jar::stage_reviewed_context(
+            *request, cookie_request_path(request_raw), reason);
+    case network_exchange_action_t::match_replace:
+        if (const auto opened = aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.network.match_replace")); !opened.ok()) {
+            reason = opened.detail.empty() ? "The reviewed artifact could not open Match and Replace." : opened.detail;
+            return false;
+        }
+        return aida::burp::match_replace_view::stage_reviewed_context(
+            context.primary, response_kind(context.primary.kind), reason);
     case network_exchange_action_t::intruder:
         if (!request || request_raw.size() >= 65536U ||
             request_raw.find('\0') != std::string::npos) {
@@ -12498,6 +14239,20 @@ bool execute_exchange_action(network_exchange_action_t action,
         return copy(http_headers_body(artifact_text(primary_snapshot)).second);
     case network_exchange_action_t::copy_artifact:
         return copy(artifact_text(primary_snapshot));
+    case network_exchange_action_t::save_export:
+        return export_reviewed_artifact(context.primary, reason);
+    case network_exchange_action_t::create_issue:
+        stage_exchange_review(exchange_review_kind_t::create_issue, context);
+        reason.clear();
+        return true;
+    case network_exchange_action_t::replay_live:
+        stage_exchange_review(exchange_review_kind_t::replay, context);
+        reason.clear();
+        return true;
+    case network_exchange_action_t::remove:
+        stage_exchange_review(exchange_review_kind_t::remove, context);
+        reason.clear();
+        return true;
     case network_exchange_action_t::chat:
         return add_artifact_to_chat(context.primary, reason);
     case network_exchange_action_t::agent:
@@ -12508,6 +14263,13 @@ bool execute_exchange_action(network_exchange_action_t action,
     }
 }
 
+}
+
+static void reset_common_exchange_actions() {
+    s_exchange_review = {};
+    s_exchange_remove_undo = {};
+    s_common_exchange_operation_pending.store(false, std::memory_order_release);
+    s_remove_undo_completion_status.store(0, std::memory_order_release);
 }
 
 static bool execute_retained_exchange_toolbar_action(
@@ -12842,6 +14604,7 @@ void open_exchange_context(artifact_identity_t primary, artifact_identity_t rela
 void render_exchange_context() {
     aida::ui::application_ui::render_retained_entity_context_menu(
         "network.exchange.artifact");
+    render_exchange_review_dialogs();
 }
 
 }

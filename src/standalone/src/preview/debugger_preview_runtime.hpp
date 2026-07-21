@@ -52,11 +52,11 @@ struct receipt_t {
 	std::uint64_t sequence = 0;
 };
 
-inline std::vector<receipt_t> receipts;
-inline std::uint64_t next_sequence = 1;
-inline bool fixture_initialized = false;
-inline fixture_state_t fixture_state = fixture_state_t::normal;
-inline bool driver_available = true;
+extern std::vector<receipt_t> receipts;
+extern std::uint64_t next_sequence;
+extern bool fixture_initialized;
+extern fixture_state_t fixture_state;
+extern bool driver_available;
 
 inline void record(std::string action, std::string detail = {}) {
 	receipts.push_back({std::move(action), std::move(detail), next_sequence++});
@@ -115,6 +115,9 @@ inline void initialize_fixture() {
 	if (fixture_initialized)
 		return;
 	fixture_initialized = true;
+	if (fixture_state == fixture_state_t::empty ||
+		fixture_state == fixture_state_t::disconnected)
+		return;
 	auto& state = debugger_engine::g_state;
 	state.status.store(debugger_engine::dbg_status_t::paused, std::memory_order_release);
 	state.target_pid = 6420;
@@ -197,27 +200,38 @@ inline void initialize_fixture() {
 }
 
 inline void apply_fixture_state(fixture_state_t requested, std::size_t cardinality) {
-	fixture_initialized = false;
-	initialize_fixture();
 	fixture_state = requested;
-	driver_available = requested != fixture_state_t::disconnected;
+	fixture_initialized = false;
 	auto& state = debugger_engine::g_state;
+	state.status.store(debugger_engine::dbg_status_t::idle, std::memory_order_release);
+	state.target_pid = 0;
+	state.active_tid = 0;
+	state.registers = {};
+	state.cached_regs = {};
+	state.cached_threads.clear();
+	state.cached_stack.clear();
+	state.cached_stack_addr = 0;
+	state.cached_dump.clear();
+	state.cached_dump_addr = 0;
+	state.cached_dump_size = 0;
+	state.cached_disasm_bytes.clear();
+	state.cached_disasm_base = 0;
+	state.breakpoints.clear();
+	state.call_stack.clear();
+	state.trace_log.clear();
+	state.memory_map.clear();
+	state.watches.clear();
+	state.strings.clear();
+	state.handles.clear();
+	state.comments.clear();
+	state.labels.clear();
+	state.bookmarks.clear();
+	state.tracing.store(false, std::memory_order_release);
+	state.strings_scanning.store(false, std::memory_order_release);
+	state.strings_cancel.store(false, std::memory_order_release);
+	initialize_fixture();
+	driver_available = requested != fixture_state_t::disconnected;
 	if (requested == fixture_state_t::empty || requested == fixture_state_t::disconnected) {
-		state.status.store(debugger_engine::dbg_status_t::idle, std::memory_order_release);
-		state.target_pid = 0;
-		state.active_tid = 0;
-		state.registers = {};
-		state.cached_regs = {};
-		state.cached_threads.clear();
-		state.cached_stack.clear();
-		state.cached_disasm_bytes.clear();
-		state.breakpoints.clear();
-		state.call_stack.clear();
-		state.trace_log.clear();
-		state.memory_map.clear();
-		state.watches.clear();
-		state.strings.clear();
-		state.handles.clear();
 		return;
 	}
 	state.target_pid = 6420;

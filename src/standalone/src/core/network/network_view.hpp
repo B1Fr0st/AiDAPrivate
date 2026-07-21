@@ -267,8 +267,6 @@ struct payload_set_t {
     std::string              source;
     int                      type = 0;
     std::vector<std::string> entries;
-    char                     grep_regex[256]  = {};
-    char                     grep_group[32]   = "1";
 };
 
 
@@ -414,34 +412,74 @@ struct state_t {
         int         match_size_op = 0;
         int         match_size = 0;
         bool        stop_on_match = false;
+        std::uint64_t maximum_requests = 10000;
+        bool        maximum_requests_reviewed = false;
+        char        extract_literal[256] = {};
         fuzzer_attack_mode_t    attack_mode = fuzzer_attack_mode_t::sniper;
         std::vector<payload_set_t> payload_sets;
     };
 
     struct fuzzer_result_t {
-        int         index = 0;
-        std::string payload;
+        std::uint64_t index = 0;
         int         status_code = 0;
         size_t      response_len = 0;
         uint64_t    latency_ms = 0;
         bool        match = false;
         std::string response_preview;
-        std::vector<std::string> payloads;
+        std::string error;
+        std::vector<std::uint32_t> payload_indices;
+        std::uint32_t active_position = 0;
         std::string extracted_value;
     };
 
+    struct fuzzer_result_page_t {
+        std::vector<fuzzer_result_t> rows;
+        std::uint64_t retained_bytes = 0;
+    };
+
+    struct fuzzer_results_snapshot_t {
+        std::vector<std::shared_ptr<const fuzzer_result_page_t>> pages;
+        std::shared_ptr<const std::vector<std::vector<std::string>>> payload_catalog;
+        std::uint64_t retained_count = 0;
+        std::uint64_t dropped_count = 0;
+        std::uint64_t retained_bytes = 0;
+        std::uint64_t generation = 0;
+        std::size_t maximum_payload_columns = 1;
+        bool has_extracted_values = false;
+        bool has_failures = false;
+    };
+
     fuzzer_entry_t                fuzz_config;
+    fuzzer_entry_t                fuzz_active_config;
     std::uint64_t                 fuzz_request_revision = 1;
     std::mutex                    fuzz_mutex;
-    std::vector<fuzzer_result_t>  fuzz_results;
+    std::deque<std::shared_ptr<const fuzzer_result_page_t>> fuzz_result_pages;
+    std::vector<fuzzer_result_t>  fuzz_result_pending;
+    std::shared_ptr<const std::vector<std::vector<std::string>>> fuzz_payload_catalog;
+    std::shared_ptr<const fuzzer_results_snapshot_t> fuzz_results_snapshot =
+        std::make_shared<const fuzzer_results_snapshot_t>();
+    std::uint64_t                 fuzz_retained_count = 0;
+    std::uint64_t                 fuzz_dropped_count = 0;
+    std::uint64_t                 fuzz_retained_bytes = 0;
+    std::uint64_t                 fuzz_pending_bytes = 0;
+    std::uint64_t                 fuzz_results_generation = 0;
+    std::size_t                   fuzz_maximum_payload_columns = 1;
+    bool                          fuzz_has_extracted_values = false;
+    bool                          fuzz_has_failures = false;
     std::atomic<bool>             fuzz_running{false};
-    std::atomic<int>              fuzz_progress{0};
-    std::atomic<int>              fuzz_total{0};
+    std::atomic<bool>             fuzz_cancel_requested{false};
+    std::atomic<std::uint64_t>    fuzz_progress{0};
+    std::atomic<std::uint64_t>    fuzz_total{0};
+    std::atomic<std::uint64_t>    fuzz_run_generation{0};
     std::atomic<bool>             fuzz_thread_done{true};
     std::mutex                    fuzz_cv_mutex;
     std::condition_variable       fuzz_cv;
     std::atomic<bool>             fuzz_thread_alive{false};
-    int                           fuzz_selected = -1;
+    std::uint64_t                 fuzz_selected = 0;
+    bool                          fuzz_has_selection = false;
+    std::string                   fuzz_task_id;
+    std::string                   fuzz_last_stage;
+    std::string                   fuzz_last_error;
 
     char                          off_target_url[1024] = {};
     char                          off_target_param[128] = {};

@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <limits>
@@ -29,6 +30,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1453,6 +1455,570 @@ inline bool set_field_enum_reference(int struct_idx, int field_idx, const std::s
 	});
 }
 
+inline bool request_save_schema();
+inline bool request_save_schema_transactional(catalog_transaction_snapshot_t snapshot,
+	std::uint64_t expected_schema_revision);
+
+struct user_catalog_edit_t {
+	catalog_transaction_snapshot_t before;
+	catalog_transaction_snapshot_t after;
+	std::string label;
+	std::uint64_t before_identity = 0;
+	std::uint64_t after_identity = 0;
+	std::uint64_t fence_revision = 0;
+	std::size_t retained_bytes = 0;
+};
+
+struct user_catalog_history_t {
+	std::deque<user_catalog_edit_t> undo;
+	std::deque<user_catalog_edit_t> redo;
+	std::size_t retained_bytes = 0;
+	std::mutex mutex;
+};
+
+inline user_catalog_history_t g_user_catalog_history;
+
+inline constexpr std::size_t user_catalog_max_snapshot_bytes = 8U * 1024U * 1024U;
+inline constexpr std::size_t user_catalog_max_history_bytes = 64U * 1024U * 1024U;
+inline constexpr std::size_t user_catalog_max_history_entries = 64;
+
+inline std::size_t catalog_definitions_retained_bytes(
+	const std::vector<struct_def_t>& structures,
+	const std::vector<enum_def_t>& enums) {
+	std::size_t total = sizeof(catalog_transaction_snapshot_t);
+	const auto add = [&total](std::size_t value) {
+		if (value > (std::numeric_limits<std::size_t>::max)() - total)
+			total = (std::numeric_limits<std::size_t>::max)();
+		else
+			total += value;
+	};
+	for (const auto& definition : structures) {
+		add(sizeof(definition) + definition.name.size());
+		for (const auto& field : definition.fields) {
+			add(sizeof(field) + field.name.size() + field.description.size() +
+				field.referenced_type_name.size() + field.children.size() * sizeof(int));
+		}
+	}
+	for (const auto& definition : enums) {
+		add(sizeof(definition) + definition.name.size());
+		for (const auto& value : definition.values)
+			add(sizeof(value) + value.name.size());
+	}
+	return total;
+}
+
+inline std::size_t catalog_snapshot_retained_bytes(const catalog_transaction_snapshot_t& snapshot) {
+	return catalog_definitions_retained_bytes(snapshot.structs, snapshot.enums);
+}
+
+inline std::uint64_t catalog_snapshot_identity(const catalog_transaction_snapshot_t& snapshot) {
+	std::uint64_t hash = 1469598103934665603ULL;
+	const auto mix = [&hash](std::uint64_t value) {
+		hash ^= value;
+		hash *= 1099511628211ULL;
+	};
+	const auto mix_text = [&mix](const std::string& value) {
+		mix(value.size());
+		for (const char character : value)
+			mix(static_cast<unsigned char>(character));
+	};
+	mix(snapshot.structs.size());
+	for (const auto& definition : snapshot.structs) {
+		mix(definition.stable_id);
+		mix_text(definition.name);
+		mix(static_cast<std::uint64_t>(definition.kind));
+		mix(definition.packing);
+		mix(definition.explicit_alignment);
+		mix(definition.total_size);
+		mix(definition.fields.size());
+		for (const auto& field : definition.fields) {
+			mix(field.stable_id);
+			mix_text(field.name);
+			mix(static_cast<std::uint64_t>(field.type));
+			mix(field.offset);
+			mix(field.size);
+			mix(field.array_count);
+			mix(static_cast<std::uint64_t>(field.parent_idx + 1));
+			mix(field.children.size());
+			for (const int child : field.children)
+				mix(static_cast<std::uint64_t>(child + 1));
+			mix(field.is_pointer ? 1 : 0);
+			mix(static_cast<std::uint64_t>(field.pointer_target_struct + 1));
+			mix(field.target_structure_id);
+			mix(field.enum_id);
+			mix_text(field.referenced_type_name);
+			mix_text(field.description);
+			mix(field.bit_offset);
+			mix(field.bit_width);
+			mix(field.explicit_alignment);
+		}
+	}
+	mix(snapshot.enums.size());
+	for (const auto& definition : snapshot.enums) {
+		mix(definition.stable_id);
+		mix_text(definition.name);
+		mix(static_cast<std::uint64_t>(definition.underlying_type));
+		mix(definition.values.size());
+		for (const auto& value : definition.values) {
+			mix_text(value.name);
+			mix(static_cast<std::uint64_t>(value.value));
+		}
+	}
+	return hash;
+}
+
+inline bool catalog_snapshot_is_bounded(const catalog_transaction_snapshot_t& snapshot) {
+	if (snapshot.structs.size() > 1024 || snapshot.enums.size() > 4096 ||
+		(!valid_index(snapshot.active_struct, snapshot.structs.size()) && snapshot.active_struct != -1))
+		return false;
+	std::set<std::uint64_t> identities;
+	std::set<std::string> structure_names;
+	std::set<std::string> enum_names;
+	for (const auto& definition : snapshot.structs) {
+		if (definition.stable_id == 0 || definition.name.empty() || definition.name.size() > 256 ||
+			definition.fields.size() > 65536 || !identities.insert(definition.stable_id).second ||
+			!structure_names.insert(definition.name).second)
+			return false;
+		for (const auto& field : definition.fields)
+			if (field.stable_id == 0 || !identities.insert(field.stable_id).second)
+				return false;
+	}
+	for (const auto& definition : snapshot.enums) {
+		if (definition.stable_id == 0 || definition.name.empty() || definition.name.size() > 256 ||
+			definition.values.size() > 65536 || !identities.insert(definition.stable_id).second ||
+			!enum_names.insert(definition.name).second)
+			return false;
+		std::set<std::string> value_names;
+		for (const auto& value : definition.values)
+			if (value.name.empty() || value.name.size() > 256 || !value_names.insert(value.name).second)
+				return false;
+	}
+	return catalog_snapshot_retained_bytes(snapshot) <= user_catalog_max_snapshot_bytes;
+}
+
+inline bool begin_user_catalog_edit(catalog_transaction_snapshot_t& before, std::string& error) {
+	if (!catalog_mutation_available()) {
+		error = "Wait for the current catalog persistence operation to finish";
+		return false;
+	}
+	try {
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		if (catalog_definitions_retained_bytes(g_state.structs, g_state.enums) >
+			user_catalog_max_snapshot_bytes) {
+			error = "The catalog exceeds the bounded 8 MiB edit-history contract";
+			return false;
+		}
+		before = {g_state.structs, g_state.enums, {},
+			g_state.active_struct, g_state.schema_revision, g_state.next_stable_id};
+		if (!catalog_snapshot_is_bounded(before)) {
+			error = "The catalog is outside the validated edit-history contract";
+			return false;
+		}
+	} catch (const std::bad_alloc&) {
+		error = "Memory allocation for the bounded catalog edit transaction failed";
+		return false;
+	}
+	error.clear();
+	return true;
+}
+
+inline bool commit_user_catalog_edit(catalog_transaction_snapshot_t before,
+	std::string label, std::string& error) {
+	catalog_transaction_snapshot_t after;
+	try {
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		after = {g_state.structs, g_state.enums, {}, g_state.active_struct,
+			g_state.schema_revision, g_state.next_stable_id};
+	} catch (const std::bad_alloc&) {
+		const auto current_revision = catalog_schema_revision();
+		const bool rolled_back = rollback_catalog_transaction(before, current_revision);
+		error = rolled_back
+			? "Memory allocation for edit history failed; the catalog edit was rolled back"
+			: "Memory allocation for edit history failed and exact rollback was blocked";
+		return false;
+	}
+	if (after.schema_revision == before.schema_revision ||
+		catalog_snapshot_identity(after) == catalog_snapshot_identity(before)) {
+		error = "The catalog edit did not publish a new state";
+		return false;
+	}
+	bool after_bounded = false;
+	try {
+		after_bounded = catalog_snapshot_is_bounded(after);
+	} catch (const std::bad_alloc&) {
+		static_cast<void>(rollback_catalog_transaction(std::move(before), after.schema_revision));
+		error = "Catalog validation allocation failed; the edit was rolled back";
+		return false;
+	}
+	if (!after_bounded) {
+		static_cast<void>(rollback_catalog_transaction(std::move(before), after.schema_revision));
+		error = "The edit exceeded the bounded 8 MiB catalog history contract and was rolled back";
+		return false;
+	}
+	before.cached_values.clear();
+	after.cached_values.clear();
+	user_catalog_edit_t entry;
+	entry.before_identity = catalog_snapshot_identity(before);
+	entry.after_identity = catalog_snapshot_identity(after);
+	entry.fence_revision = after.schema_revision;
+	entry.retained_bytes = catalog_snapshot_retained_bytes(before) +
+		catalog_snapshot_retained_bytes(after) + label.size();
+	entry.before = std::move(before);
+	entry.after = std::move(after);
+	entry.label = std::move(label);
+	try {
+		std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+		const bool divergent_undo = !g_user_catalog_history.undo.empty() &&
+			(g_user_catalog_history.undo.back().fence_revision != entry.before.schema_revision ||
+			 g_user_catalog_history.undo.back().after_identity != entry.before_identity);
+		const bool divergent_redo = g_user_catalog_history.undo.empty() &&
+			!g_user_catalog_history.redo.empty() &&
+			(g_user_catalog_history.redo.back().fence_revision != entry.before.schema_revision ||
+			 g_user_catalog_history.redo.back().before_identity != entry.before_identity);
+		if (divergent_undo || divergent_redo) {
+			g_user_catalog_history.undo.clear();
+			g_user_catalog_history.redo.clear();
+			g_user_catalog_history.retained_bytes = 0;
+		}
+		for (const auto& redo : g_user_catalog_history.redo)
+			g_user_catalog_history.retained_bytes -= (std::min)(
+				g_user_catalog_history.retained_bytes, redo.retained_bytes);
+		g_user_catalog_history.redo.clear();
+		g_user_catalog_history.retained_bytes += entry.retained_bytes;
+		g_user_catalog_history.undo.push_back(std::move(entry));
+		while (g_user_catalog_history.undo.size() > user_catalog_max_history_entries ||
+			g_user_catalog_history.retained_bytes > user_catalog_max_history_bytes) {
+			g_user_catalog_history.retained_bytes -= (std::min)(
+				g_user_catalog_history.retained_bytes,
+				g_user_catalog_history.undo.front().retained_bytes);
+			g_user_catalog_history.undo.pop_front();
+		}
+	} catch (const std::bad_alloc&) {
+		{
+			std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+			g_user_catalog_history.retained_bytes -= (std::min)(
+				g_user_catalog_history.retained_bytes, entry.retained_bytes);
+		}
+		const auto revision = catalog_schema_revision();
+		const bool rolled_back = rollback_catalog_transaction(
+			std::move(entry.before), revision);
+		error = rolled_back
+			? "Edit-history allocation failed; the catalog edit was rolled back"
+			: "Edit-history allocation failed and exact catalog rollback was blocked";
+		return false;
+	}
+	error.clear();
+	return true;
+}
+
+template <typename Mutation, typename Success>
+inline bool perform_user_catalog_edit(const std::string& label, Mutation&& mutation,
+	Success&& success, std::string& error) {
+	catalog_transaction_snapshot_t before;
+	if (!begin_user_catalog_edit(before, error))
+		return false;
+	catalog_transaction_snapshot_t persistence_rollback;
+	try {
+		persistence_rollback = before;
+	} catch (const std::bad_alloc&) {
+		error = "Memory allocation for the durable catalog transaction failed";
+		return false;
+	}
+	using result_t = std::decay_t<decltype(mutation())>;
+	std::optional<result_t> result;
+	try {
+		result.emplace(mutation());
+	} catch (const std::exception& exception) {
+		const auto current_revision = catalog_schema_revision();
+		const bool rolled_back = current_revision == before.schema_revision ||
+			rollback_catalog_transaction(std::move(before), current_revision);
+		error = rolled_back
+			? std::string("Catalog mutation failed and was rolled back: ") + exception.what()
+			: "Catalog mutation threw an exception and exact rollback was blocked";
+		return false;
+	} catch (...) {
+		const auto current_revision = catalog_schema_revision();
+		const bool rolled_back = current_revision == before.schema_revision ||
+			rollback_catalog_transaction(std::move(before), current_revision);
+		error = rolled_back
+			? "Catalog mutation failed and was rolled back"
+			: "Catalog mutation threw an exception and exact rollback was blocked";
+		return false;
+	}
+	if (!success(*result)) {
+		const auto current_revision = catalog_schema_revision();
+		if (current_revision != before.schema_revision &&
+			!rollback_catalog_transaction(std::move(before), current_revision)) {
+			error = "The catalog mutation failed and exact transaction rollback was blocked";
+			return false;
+		}
+		error = "The catalog mutation was rejected";
+		return false;
+	}
+	if (!commit_user_catalog_edit(std::move(before), label, error))
+		return false;
+	const auto published_revision = catalog_schema_revision();
+	if (!request_save_schema_transactional(std::move(persistence_rollback),
+		published_revision)) {
+		std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+		g_user_catalog_history.undo.clear();
+		g_user_catalog_history.redo.clear();
+		g_user_catalog_history.retained_bytes = 0;
+		error = "The durable catalog save was rejected and the edit transaction was rolled back";
+		return false;
+	}
+	return true;
+}
+
+template <typename Mutation>
+inline bool perform_user_catalog_edit(const std::string& label, Mutation&& mutation,
+	std::string& error) {
+	return perform_user_catalog_edit(label, std::forward<Mutation>(mutation),
+		[](const auto& result) { return static_cast<bool>(result); }, error);
+}
+
+inline bool user_catalog_can_undo(std::string* label = nullptr) {
+	if (!catalog_mutation_available())
+		return false;
+	catalog_transaction_snapshot_t current;
+	try {
+		std::lock_guard<std::mutex> state_lock(g_state.mtx);
+		current = {g_state.structs, g_state.enums, {}, g_state.active_struct,
+			g_state.schema_revision, g_state.next_stable_id};
+	} catch (const std::bad_alloc&) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+	if (g_user_catalog_history.undo.empty())
+		return false;
+	const auto& entry = g_user_catalog_history.undo.back();
+	if (entry.fence_revision != current.schema_revision ||
+		entry.after_identity != catalog_snapshot_identity(current)) {
+		g_user_catalog_history.undo.clear();
+		g_user_catalog_history.redo.clear();
+		g_user_catalog_history.retained_bytes = 0;
+		return false;
+	}
+	if (label)
+		*label = entry.label;
+	return true;
+}
+
+inline bool user_catalog_can_redo(std::string* label = nullptr) {
+	if (!catalog_mutation_available())
+		return false;
+	catalog_transaction_snapshot_t current;
+	try {
+		std::lock_guard<std::mutex> state_lock(g_state.mtx);
+		current = {g_state.structs, g_state.enums, {}, g_state.active_struct,
+			g_state.schema_revision, g_state.next_stable_id};
+	} catch (const std::bad_alloc&) {
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+	if (g_user_catalog_history.redo.empty())
+		return false;
+	const auto& entry = g_user_catalog_history.redo.back();
+	if (entry.fence_revision != current.schema_revision ||
+		entry.before_identity != catalog_snapshot_identity(current)) {
+		g_user_catalog_history.undo.clear();
+		g_user_catalog_history.redo.clear();
+		g_user_catalog_history.retained_bytes = 0;
+		return false;
+	}
+	if (label)
+		*label = entry.label;
+	return true;
+}
+
+inline bool apply_user_catalog_snapshot(const catalog_transaction_snapshot_t& target,
+	std::uint64_t expected_revision, std::uint64_t expected_identity,
+	std::uint64_t& published_revision, std::string& error) {
+	if (!catalog_mutation_available()) {
+		error = "Wait for the current catalog persistence operation to finish";
+		return false;
+	}
+	bool target_bounded = false;
+	try {
+		target_bounded = catalog_snapshot_is_bounded(target);
+	} catch (const std::bad_alloc&) {
+		error = "Memory allocation for retained catalog validation failed";
+		return false;
+	}
+	if (!target_bounded) {
+		error = "The retained catalog state is invalid or exceeds its bounds";
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	catalog_transaction_snapshot_t current;
+	catalog_transaction_snapshot_t restored;
+	try {
+		current = {g_state.structs, g_state.enums, {}, g_state.active_struct,
+			g_state.schema_revision, g_state.next_stable_id};
+		restored = target;
+	} catch (const std::bad_alloc&) {
+		error = "Memory allocation for the retained catalog state failed";
+		return false;
+	}
+	if (current.schema_revision != expected_revision ||
+		catalog_snapshot_identity(current) != expected_identity) {
+		error = "The catalog changed after this edit; stale history was rejected";
+		return false;
+	}
+	const std::uint64_t next_revision = current.schema_revision + 1;
+	for (auto& definition : restored.structs) {
+		const auto found = std::find_if(current.structs.begin(), current.structs.end(),
+			[&](const struct_def_t& item) { return item.stable_id == definition.stable_id; });
+		const std::uint64_t current_layout = found == current.structs.end()
+			? 0 : found->layout_revision;
+		definition.layout_revision = (std::max)(definition.layout_revision, current_layout) + 1;
+	}
+	g_state.structs = std::move(restored.structs);
+	g_state.enums = std::move(restored.enums);
+	g_state.active_struct = restored.active_struct;
+	g_state.cached_values.clear();
+	g_state.next_stable_id = (std::max)(current.next_stable_id, restored.next_stable_id);
+	g_state.schema_revision = next_revision;
+	for (const auto& definition : g_state.structs)
+		if (!validate_structure_locked(definition).valid()) {
+			g_state.structs = std::move(current.structs);
+			g_state.enums = std::move(current.enums);
+			g_state.cached_values = std::move(current.cached_values);
+			g_state.active_struct = current.active_struct;
+			g_state.schema_revision = current.schema_revision;
+			g_state.next_stable_id = current.next_stable_id;
+			error = "The retained edit no longer passes catalog layout validation";
+			return false;
+		}
+	published_revision = next_revision;
+	error.clear();
+	return true;
+}
+
+inline bool user_catalog_undo(std::string& label, std::string& error) {
+	user_catalog_edit_t entry;
+	try {
+		std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+		if (g_user_catalog_history.undo.empty()) {
+			error = "No catalog edit is available to undo";
+			return false;
+		}
+		try {
+			entry = g_user_catalog_history.undo.back();
+		} catch (const std::bad_alloc&) {
+			error = "Memory allocation for the retained undo state failed";
+			return false;
+		}
+	} catch (const std::bad_alloc&) {
+		error = "Memory allocation while selecting the retained undo state failed";
+		return false;
+	}
+	label = entry.label;
+	catalog_transaction_snapshot_t persistence_rollback;
+	try {
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		persistence_rollback = {g_state.structs, g_state.enums, {}, g_state.active_struct,
+			g_state.schema_revision, g_state.next_stable_id};
+	} catch (const std::bad_alloc&) {
+		error = "Memory allocation for the durable undo transaction failed";
+		return false;
+	}
+	std::uint64_t published_revision = 0;
+	if (!apply_user_catalog_snapshot(entry.before, entry.fence_revision,
+		entry.after_identity, published_revision, error))
+		return false;
+	if (!request_save_schema_transactional(std::move(persistence_rollback),
+		published_revision)) {
+		error = "The durable undo save was rejected and the catalog transaction was rolled back";
+		return false;
+	}
+	try {
+		std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+		if (g_user_catalog_history.undo.empty() ||
+			g_user_catalog_history.undo.back().fence_revision != entry.fence_revision) {
+			g_user_catalog_history.undo.clear();
+			g_user_catalog_history.redo.clear();
+			g_user_catalog_history.retained_bytes = 0;
+			error = "History changed while the undo was applied";
+			return false;
+		}
+		g_user_catalog_history.undo.pop_back();
+		entry.fence_revision = published_revision;
+		g_user_catalog_history.redo.push_back(std::move(entry));
+		if (!g_user_catalog_history.undo.empty())
+			g_user_catalog_history.undo.back().fence_revision = published_revision;
+	} catch (const std::bad_alloc&) {
+		std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+		g_user_catalog_history.undo.clear();
+		g_user_catalog_history.redo.clear();
+		g_user_catalog_history.retained_bytes = 0;
+	}
+	error.clear();
+	return true;
+}
+
+inline bool user_catalog_redo(std::string& label, std::string& error) {
+	user_catalog_edit_t entry;
+	try {
+		std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+		if (g_user_catalog_history.redo.empty()) {
+			error = "No catalog edit is available to redo";
+			return false;
+		}
+		try {
+			entry = g_user_catalog_history.redo.back();
+		} catch (const std::bad_alloc&) {
+			error = "Memory allocation for the retained redo state failed";
+			return false;
+		}
+	} catch (const std::bad_alloc&) {
+		error = "Memory allocation while selecting the retained redo state failed";
+		return false;
+	}
+	label = entry.label;
+	catalog_transaction_snapshot_t persistence_rollback;
+	try {
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		persistence_rollback = {g_state.structs, g_state.enums, {}, g_state.active_struct,
+			g_state.schema_revision, g_state.next_stable_id};
+	} catch (const std::bad_alloc&) {
+		error = "Memory allocation for the durable redo transaction failed";
+		return false;
+	}
+	std::uint64_t published_revision = 0;
+	if (!apply_user_catalog_snapshot(entry.after, entry.fence_revision,
+		entry.before_identity, published_revision, error))
+		return false;
+	if (!request_save_schema_transactional(std::move(persistence_rollback),
+		published_revision)) {
+		error = "The durable redo save was rejected and the catalog transaction was rolled back";
+		return false;
+	}
+	try {
+		std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+		if (g_user_catalog_history.redo.empty() ||
+			g_user_catalog_history.redo.back().fence_revision != entry.fence_revision) {
+			g_user_catalog_history.undo.clear();
+			g_user_catalog_history.redo.clear();
+			g_user_catalog_history.retained_bytes = 0;
+			error = "History changed while the redo was applied";
+			return false;
+		}
+		g_user_catalog_history.redo.pop_back();
+		entry.fence_revision = published_revision;
+		g_user_catalog_history.undo.push_back(std::move(entry));
+		if (!g_user_catalog_history.redo.empty())
+			g_user_catalog_history.redo.back().fence_revision = published_revision;
+	} catch (const std::bad_alloc&) {
+		std::lock_guard<std::mutex> lock(g_user_catalog_history.mutex);
+		g_user_catalog_history.undo.clear();
+		g_user_catalog_history.redo.clear();
+		g_user_catalog_history.retained_bytes = 0;
+	}
+	error.clear();
+	return true;
+}
+
 inline void refresh_values() {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	ensure_preview_fixture();
@@ -2077,7 +2643,35 @@ inline bool request_save_schema_transactional(catalog_transaction_snapshot_t sna
 			expected_schema_revision));
 		return false;
 	}
-	return request_persistence(true, std::move(rollback), expected_schema_revision);
+	try {
+		return request_persistence(true, rollback, expected_schema_revision);
+	} catch (const std::exception& exception) {
+		const bool rolled_back = rollback_catalog_transaction(std::move(*rollback),
+			expected_schema_revision, true);
+		{
+			std::lock_guard<std::mutex> lock(g_state.mtx);
+			g_state.persistence_error = true;
+			g_state.persistence_status = rolled_back
+				? std::string("Structure schema persistence failed: ") + exception.what()
+				: "Structure schema persistence failed and exact transaction rollback was blocked";
+			g_state.persistence_cancellation.reset();
+		}
+		g_state.persistence_in_flight.store(false, std::memory_order_release);
+		return false;
+	} catch (...) {
+		const bool rolled_back = rollback_catalog_transaction(std::move(*rollback),
+			expected_schema_revision, true);
+		{
+			std::lock_guard<std::mutex> lock(g_state.mtx);
+			g_state.persistence_error = true;
+			g_state.persistence_status = rolled_back
+				? "Structure schema persistence failed"
+				: "Structure schema persistence failed and exact transaction rollback was blocked";
+			g_state.persistence_cancellation.reset();
+		}
+		g_state.persistence_in_flight.store(false, std::memory_order_release);
+		return false;
+	}
 }
 
 inline bool request_load_schema() {

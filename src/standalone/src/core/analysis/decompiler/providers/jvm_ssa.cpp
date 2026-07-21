@@ -51,14 +51,24 @@ source_coordinate_t make_coordinate(const jvm_method_input_t& input,
                   bytecode_offset == (std::numeric_limits<std::uint64_t>::max)() ? bytecode_offset : bytecode_offset + instruction_length,
                   architecture_id_t::jvm_bytecode, architecture_mode_t::jvm};
     result.address_range = range;
-    for (const auto& ln : input.context.line_numbers) {
-        if (ln.start_pc <= bytecode_offset) {
+    const jvm_line_number_t* selected_line = nullptr;
+    for (const auto& line : input.context.line_numbers) {
+        if (line.start_pc <= bytecode_offset && line.line_number != 0 &&
+            (!selected_line || line.start_pc >= selected_line->start_pc))
+            selected_line = &line;
+    }
+    if (selected_line) {
+        const auto* identity = std::get_if<jvm_decompiler_entity_identity_t>(
+            &input.entity.identity);
+        if (identity && !identity->class_artifact_hash.empty()) {
             decompiler_source_origin_t origin;
+            origin.source_artifact_hash = identity->class_artifact_hash;
             origin.source_path = input.context.class_internal_name + ".java";
-            origin.first_line = ln.line_number;
-            origin.last_line = ln.line_number;
-            result.source_origin = origin;
-            break;
+            origin.first_line = selected_line->line_number;
+            origin.last_line = selected_line->line_number;
+            origin.first_column = 1;
+            origin.last_column = 1;
+            result.source_origin = std::move(origin);
         }
     }
     return result;
@@ -369,6 +379,129 @@ static void fill_unused(opcode_info_t& info, std::uint8_t opcode)
         info.length = 1;
         info.flags = flag_reserved;
     }
+}
+
+const char* hir_operator_for_opcode(std::uint8_t opcode) noexcept
+{
+    switch (opcode) {
+    case 0x60: case 0x61: case 0x62: case 0x63: return "+";
+    case 0x64: case 0x65: case 0x66: case 0x67: return "-";
+    case 0x68: case 0x69: case 0x6a: case 0x6b: return "*";
+    case 0x6c: case 0x6d: case 0x6e: case 0x6f: return "/";
+    case 0x70: case 0x71: case 0x72: case 0x73: return "%";
+    case 0x74: case 0x75: case 0x76: case 0x77: return "-";
+    case 0x78: case 0x79: return "<<";
+    case 0x7a: case 0x7b: return ">>";
+    case 0x7e: case 0x7f: return "&";
+    case 0x80: case 0x81: return "|";
+    case 0x82: case 0x83: return "^";
+    default: return nullptr;
+    }
+}
+
+const char* hir_condition_operator_for_opcode(std::uint8_t opcode) noexcept
+{
+    switch (opcode) {
+    case 0x99: case 0x9f: case 0xa5: case 0xc6: return "==";
+    case 0x9a: case 0xa0: case 0xa6: case 0xc7: return "!=";
+    case 0x9b: case 0xa1: return "<";
+    case 0x9c: case 0xa2: return ">=";
+    case 0x9d: case 0xa3: return ">";
+    case 0x9e: case 0xa4: return "<=";
+    default: return nullptr;
+    }
+}
+
+constexpr char k_renderer_identifier_escape[] = "$jvm$";
+
+bool ascii_letter(const unsigned char value) noexcept
+{
+    return (value >= static_cast<unsigned char>('A') &&
+            value <= static_cast<unsigned char>('Z')) ||
+           (value >= static_cast<unsigned char>('a') &&
+            value <= static_cast<unsigned char>('z'));
+}
+
+bool ascii_digit(const unsigned char value) noexcept
+{
+    return value >= static_cast<unsigned char>('0') &&
+           value <= static_cast<unsigned char>('9');
+}
+
+bool renderer_identifier_component(const std::string& value) noexcept
+{
+    if (value.empty() || value.find(k_renderer_identifier_escape) != std::string::npos)
+        return false;
+    const auto first = static_cast<unsigned char>(value.front());
+    if (!ascii_letter(first) && first != static_cast<unsigned char>('_') &&
+        first != static_cast<unsigned char>('$'))
+        return false;
+    for (std::size_t index = 1; index < value.size(); ++index) {
+        const auto character = static_cast<unsigned char>(value[index]);
+        if (!ascii_letter(character) && !ascii_digit(character) &&
+            character != static_cast<unsigned char>('_') &&
+            character != static_cast<unsigned char>('$'))
+            return false;
+    }
+    return true;
+}
+
+std::string render_identifier_component(const std::string& value)
+{
+    if (value.empty())
+        return {};
+    if (renderer_identifier_component(value))
+        return value;
+    static constexpr char digits[] = "0123456789ABCDEF";
+    std::string result{k_renderer_identifier_escape};
+    result.reserve(result.size() + value.size() * 2U);
+    for (const unsigned char character : value) {
+        result.push_back(digits[(character >> 4U) & 0x0fU]);
+        result.push_back(digits[character & 0x0fU]);
+    }
+    return result;
+}
+
+std::string render_qualified_class_identifier(const std::string& internal_name)
+{
+    if (internal_name.empty() || internal_name.front() == '/' ||
+        internal_name.back() == '/')
+        return {};
+    std::string result;
+    std::size_t begin = 0;
+    while (begin < internal_name.size()) {
+        const auto end = internal_name.find('/', begin);
+        const auto length = end == std::string::npos
+            ? internal_name.size() - begin
+            : end - begin;
+        const auto component = render_identifier_component(
+            internal_name.substr(begin, length));
+        if (component.empty())
+            return {};
+        if (!result.empty())
+            result.append("::");
+        result.append(component);
+        if (end == std::string::npos)
+            break;
+        begin = end + 1U;
+    }
+    return result;
+}
+
+std::string render_method_identifier(const std::string& class_name,
+                                     const std::string& method_name)
+{
+    auto method = render_identifier_component(method_name);
+    if (method.empty())
+        return {};
+    if (class_name.empty())
+        return method;
+    auto owner = render_qualified_class_identifier(class_name);
+    if (owner.empty())
+        return {};
+    owner.append("::");
+    owner.append(method);
+    return owner;
 }
 
 struct decoded_instruction_t {
@@ -878,7 +1011,7 @@ public:
         node.kind = decompiler_type_kind_t::unknown;
         node.canonical_name = "null";
         node.display_name = "null";
-        node.byte_size = 0;
+        node.byte_size = std::nullopt;
         node.alignment = 0;
         node.confidence = 100;
         node.provenance = decompiler_fact_provenance_t::bytecode_verifier;
@@ -914,7 +1047,9 @@ private:
         node.kind = kind;
         node.canonical_name = desc;
         node.display_name = desc;
-        node.byte_size = byte_size;
+        node.byte_size = byte_size == 0
+            ? std::nullopt
+            : std::optional<std::uint64_t>{byte_size};
         node.alignment = byte_size > 0 ? static_cast<std::uint32_t>(byte_size) : 1;
         node.is_signed = is_signed;
         node.confidence = 100;
@@ -1175,6 +1310,7 @@ struct ssa_value_t {
     std::vector<std::uint64_t> operand_ids;
     std::string stable_immediate;
     std::string stable_symbol;
+    std::string hir_stable_value;
     std::uint64_t bytecode_offset = 0;
     std::uint32_t instruction_length = 1;
     std::uint8_t confidence = 100;
@@ -1214,6 +1350,7 @@ public:
         for (std::size_t i = 0; i < cfg.blocks.size(); ++i) {
             states_[i].entry_frame.locals.resize(input_.context.max_locals);
         }
+        initialize_local_identifier_counts();
         setup_entry_block();
     }
 
@@ -1301,6 +1438,9 @@ private:
                     this_val.block_id = cfg_.entry_block_id;
                     this_val.local_index = 0;
                     this_val.local_name = "this";
+                    this_val.stable_symbol = this_val.local_name;
+                    this_val.hir_stable_value = render_local_identifier(
+                        *this_val.local_index, this_val.local_name);
                     all_values_.push_back(this_val);
                     entry.locals[0] = {this_val.id, false};
                     local_idx = 1;
@@ -1329,6 +1469,9 @@ private:
                         }
                         if (param_val.local_name.empty())
                             param_val.local_name = "local_" + std::to_string(local_idx);
+                        param_val.stable_symbol = param_val.local_name;
+                        param_val.hir_stable_value = render_local_identifier(
+                            *param_val.local_index, param_val.local_name);
 
                         all_values_.push_back(param_val);
                         entry.locals[local_idx] = {param_val.id, false};
@@ -1364,9 +1507,10 @@ private:
         auto& block = cfg_.blocks[bi];
         auto& state = states_[bi];
 
-        if (block.predecessor_ids.empty() && block.id != cfg_.entry_block_id) {
-            if (!block.is_exception_handler)
-                state.reachable = false;
+        if (block.predecessor_ids.empty() &&
+            block.exception_predecessor_ids.empty() &&
+            block.id != cfg_.entry_block_id) {
+            state.reachable = false;
             return false;
         }
 
@@ -1375,7 +1519,16 @@ private:
         }
 
         std::vector<frame_t> pred_frames;
-        for (auto pred_id : block.predecessor_ids) {
+        std::vector<std::uint64_t> predecessor_ids = block.predecessor_ids;
+        if (block.is_exception_handler) {
+            predecessor_ids.insert(predecessor_ids.end(),
+                block.exception_predecessor_ids.begin(),
+                block.exception_predecessor_ids.end());
+            std::sort(predecessor_ids.begin(), predecessor_ids.end());
+            predecessor_ids.erase(std::unique(predecessor_ids.begin(),
+                predecessor_ids.end()), predecessor_ids.end());
+        }
+        for (auto pred_id : predecessor_ids) {
             for (std::size_t j = 0; j < cfg_.blocks.size(); ++j) {
                 if (cfg_.blocks[j].id == pred_id && states_[j].processed && states_[j].reachable) {
                     pred_frames.push_back(states_[j].exit_frame);
@@ -1538,6 +1691,13 @@ private:
                     add_verifier_warning(inst, "iinc_local_out_of_range");
                     return;
                 }
+                if (frame.locals[idx].value_id == 0) {
+                    add_verifier_warning(inst, "iinc_uninitialized_local");
+                    return;
+                }
+                std::string local_name = lookup_local_name(idx);
+                if (local_name.empty())
+                    local_name = "local_" + std::to_string(idx);
                 ssa_value_t const_val;
                 const_val.id = next_value_id_++;
                 const_val.ir_opcode = provider_ir_opcode_t::constant;
@@ -1562,12 +1722,49 @@ private:
                 add_val.operand_ids.push_back(const_val.id);
                 add_val.type_id = types_.id_for_descriptor("I");
                 add_val.stable_symbol = "iadd";
-                add_val.local_index = idx;
+                add_val.hir_stable_value = "+";
                 all_values_.push_back(add_val);
                 values.push_back(add_val);
 
+                ssa_value_t local;
+                local.id = next_value_id_++;
+                local.ir_opcode = provider_ir_opcode_t::local;
+                local.hir_kind = hir_node_kind_t::local;
+                local.type_id = add_val.type_id;
+                local.bytecode_offset = inst.offset;
+                local.instruction_length = inst.length;
+                local.block_id = block.id;
+                local.local_index = idx;
+                local.local_name = local_name;
+                local.stable_symbol = local_name;
+                local.hir_stable_value = render_local_identifier(idx, local_name);
+                local.provenance = decompiler_fact_provenance_t::bytecode_verifier;
+                all_values_.push_back(local);
+                values.push_back(local);
+
+                ssa_value_t assignment;
+                assignment.id = next_value_id_++;
+                assignment.ir_opcode = provider_ir_opcode_t::store;
+                assignment.hir_kind = hir_node_kind_t::assignment;
+                assignment.type_id = add_val.type_id;
+                assignment.operand_ids = {local.id, add_val.id};
+                assignment.bytecode_offset = inst.offset;
+                assignment.instruction_length = inst.length;
+                assignment.block_id = block.id;
+                assignment.stable_immediate = inst.mnemonic;
+                assignment.stable_symbol = local_name;
+                assignment.provenance = decompiler_fact_provenance_t::bytecode_verifier;
+                all_values_.push_back(assignment);
+                values.push_back(assignment);
+
                 if (idx < frame.locals.size())
                     frame.locals[idx] = {add_val.id, false};
+                return;
+            }
+
+            if (idx >= frame.locals.size() ||
+                (pop_count == 2 && static_cast<std::size_t>(idx) + 1 >= frame.locals.size())) {
+                add_verifier_warning(inst, "store_local_out_of_range");
                 return;
             }
 
@@ -1575,53 +1772,105 @@ private:
                 add_verifier_warning(inst, "store_stack_underflow");
                 return;
             }
+            if (pop_count == 2 &&
+                (!frame.stack.back().cat2_top ||
+                 frame.stack[frame.stack.size() - 2].cat2_top ||
+                 frame.stack.back().value_id != frame.stack[frame.stack.size() - 2].value_id)) {
+                add_verifier_warning(inst, "store_category_2_shape");
+                return;
+            }
             std::vector<slot_t> popped;
             for (std::uint8_t i = 0; i < pop_count; ++i) {
                 popped.push_back(frame.stack.back());
                 frame.stack.pop_back();
             }
+            const std::uint64_t stored_value_id = popped.front().value_id;
+            if (stored_value_id == 0) {
+                add_verifier_warning(inst, "store_uninitialized_value");
+                return;
+            }
+            std::string local_name = lookup_local_name(idx);
+            if (local_name.empty())
+                local_name = "local_" + std::to_string(idx);
+            const bool is_category_2 = pop_count == 2;
+            const std::uint64_t local_type_id = infer_local_type(idx, is_category_2);
+            ssa_value_t local;
+            local.id = next_value_id_++;
+            local.ir_opcode = provider_ir_opcode_t::local;
+            local.hir_kind = hir_node_kind_t::local;
+            local.bytecode_offset = inst.offset;
+            local.instruction_length = inst.length;
+            local.block_id = block.id;
+            local.type_id = local_type_id;
+            local.is_category_2 = is_category_2;
+            local.local_index = idx;
+            local.local_name = local_name;
+            local.stable_symbol = local_name;
+            local.hir_stable_value = render_local_identifier(idx, local_name);
+            local.provenance = decompiler_fact_provenance_t::bytecode_verifier;
+            all_values_.push_back(local);
+            values.push_back(local);
+
             ssa_value_t val;
             val.id = next_value_id_++;
             val.ir_opcode = info.ir_opcode;
-            val.hir_kind = info.hir_kind;
+            val.hir_kind = hir_node_kind_t::assignment;
             val.bytecode_offset = inst.offset;
             val.instruction_length = inst.length;
             val.block_id = block.id;
-            val.operand_ids.push_back(popped.front().value_id);
-            val.is_category_2 = pop_count == 2;
-            val.type_id = infer_local_type(idx, val.is_category_2);
-            val.local_index = idx;
-            val.local_name = lookup_local_name(idx);
+            val.operand_ids = {local.id, stored_value_id};
+            val.is_category_2 = is_category_2;
+            val.type_id = local_type_id;
             val.stable_immediate = inst.mnemonic;
+            val.stable_symbol = local_name;
+            val.provenance = decompiler_fact_provenance_t::bytecode_verifier;
             all_values_.push_back(val);
             values.push_back(val);
             if (idx < frame.locals.size()) {
-                frame.locals[idx] = {val.id, false};
+                frame.locals[idx] = {stored_value_id, false};
                 if (val.is_category_2 && idx + 1 < frame.locals.size())
-                    frame.locals[idx + 1] = {val.id, true};
+                    frame.locals[idx + 1] = {stored_value_id, true};
             }
             return;
         }
 
         if (flags & flag_load_local) {
             std::uint16_t idx = get_local_index(inst);
-            if (idx >= frame.locals.size()) {
+            const bool is_category_2 = (flags & flag_cat2_result) != 0;
+            if (idx >= frame.locals.size() ||
+                (is_category_2 && static_cast<std::size_t>(idx) + 1 >= frame.locals.size())) {
                 add_verifier_warning(inst, "local_index_out_of_range");
                 return;
             }
+            if (frame.locals[idx].value_id == 0) {
+                add_verifier_warning(inst, "load_uninitialized_local");
+                return;
+            }
+            if (is_category_2 &&
+                (!frame.locals[idx + 1].cat2_top ||
+                 frame.locals[idx + 1].value_id != frame.locals[idx].value_id)) {
+                add_verifier_warning(inst, "load_category_2_shape");
+                return;
+            }
+            std::string local_name = lookup_local_name(idx);
+            if (local_name.empty())
+                local_name = "local_" + std::to_string(idx);
             ssa_value_t val;
             val.id = next_value_id_++;
             val.ir_opcode = info.ir_opcode;
-            val.hir_kind = info.hir_kind;
+            val.hir_kind = hir_node_kind_t::local;
             val.bytecode_offset = inst.offset;
             val.instruction_length = inst.length;
             val.block_id = block.id;
             val.operand_ids.push_back(frame.locals[idx].value_id);
-            val.is_category_2 = (flags & flag_cat2_result) != 0;
+            val.is_category_2 = is_category_2;
             val.type_id = infer_local_type(idx, val.is_category_2);
             val.local_index = idx;
-            val.local_name = lookup_local_name(idx);
+            val.local_name = local_name;
             val.stable_immediate = inst.mnemonic;
+            val.stable_symbol = local_name;
+            val.hir_stable_value = render_local_identifier(idx, local_name);
+            val.provenance = decompiler_fact_provenance_t::bytecode_verifier;
             all_values_.push_back(val);
             values.push_back(val);
             frame.stack.push_back({val.id, false});
@@ -1727,6 +1976,54 @@ private:
             }
         }
 
+        if (info.hir_kind == hir_node_kind_t::conditional) {
+            const auto* condition_operator =
+                hir_condition_operator_for_opcode(inst.opcode);
+            if (!condition_operator || operand_ids.empty() ||
+                operand_ids.size() > 2U || !inst.branch_offset.has_value()) {
+                add_verifier_warning(inst, "conditional_shape");
+                return;
+            }
+            std::reverse(operand_ids.begin(), operand_ids.end());
+            if (operand_ids.size() == 1U) {
+                ssa_value_t comparison_constant;
+                comparison_constant.id = next_value_id_++;
+                comparison_constant.ir_opcode = provider_ir_opcode_t::constant;
+                comparison_constant.hir_kind = hir_node_kind_t::literal;
+                comparison_constant.bytecode_offset = inst.offset;
+                comparison_constant.instruction_length = inst.length;
+                comparison_constant.block_id = block.id;
+                comparison_constant.provenance =
+                    decompiler_fact_provenance_t::bytecode_verifier;
+                if (inst.opcode == 0xc6 || inst.opcode == 0xc7) {
+                    comparison_constant.type_id = types_.register_null_type();
+                    comparison_constant.stable_immediate = "null";
+                } else {
+                    comparison_constant.type_id = types_.id_for_descriptor("I");
+                    comparison_constant.stable_immediate = "0";
+                }
+                all_values_.push_back(comparison_constant);
+                values.push_back(comparison_constant);
+                operand_ids.push_back(comparison_constant.id);
+            }
+            ssa_value_t comparison;
+            comparison.id = next_value_id_++;
+            comparison.ir_opcode = provider_ir_opcode_t::binary;
+            comparison.hir_kind = hir_node_kind_t::binary;
+            comparison.type_id = types_.id_for_descriptor("Z");
+            comparison.operand_ids = std::move(operand_ids);
+            comparison.stable_symbol = inst.mnemonic;
+            comparison.hir_stable_value = condition_operator;
+            comparison.bytecode_offset = inst.offset;
+            comparison.instruction_length = inst.length;
+            comparison.block_id = block.id;
+            comparison.provenance =
+                decompiler_fact_provenance_t::bytecode_verifier;
+            all_values_.push_back(comparison);
+            values.push_back(comparison);
+            operand_ids = {comparison.id};
+        }
+
         ssa_value_t val;
         val.id = next_value_id_++;
         val.ir_opcode = info.ir_opcode;
@@ -1738,7 +2035,25 @@ private:
         val.is_category_2 = cat2_result;
         val.stable_immediate = inst.mnemonic;
         val.stable_symbol = inst.mnemonic;
-        val.type_id = infer_result_type(inst, info);
+        if (info.hir_kind == hir_node_kind_t::conditional) {
+            const auto target = static_cast<std::int64_t>(inst.offset) +
+                static_cast<std::int64_t>(*inst.branch_offset);
+            const auto target_block = target < 0
+                ? cfg_.offset_to_block.end()
+                : cfg_.offset_to_block.find(static_cast<std::uint64_t>(target));
+            if (target_block == cfg_.offset_to_block.end()) {
+                add_verifier_warning(inst, "conditional_target");
+                return;
+            }
+            val.hir_stable_value = "condition.true=" +
+                std::to_string(cfg_.blocks[target_block->second].id) +
+                ";negated=0";
+            val.type_id = types_.id_for_descriptor("Z");
+        } else if (const auto* hir_operator = hir_operator_for_opcode(inst.opcode)) {
+            val.hir_stable_value = hir_operator;
+        }
+        if (val.type_id == 0)
+            val.type_id = infer_result_type(inst, info);
 
         if (flags & (flag_branch | flag_switch | flag_return | flag_throw | flag_monitor)) {
             val.confidence = 100;
@@ -1841,6 +2156,28 @@ private:
                     ops.push_back(frame.stack.back().value_id);
                     frame.stack.pop_back();
                 }
+                if (inst.opcode == 0xB2) {
+                    if (ref.class_name.empty()) {
+                        add_verifier_warning(inst, "getstatic_owner_missing");
+                        return;
+                    }
+                    ssa_value_t owner;
+                    owner.id = next_value_id_++;
+                    owner.ir_opcode = provider_ir_opcode_t::constant;
+                    owner.hir_kind = hir_node_kind_t::reference;
+                    owner.bytecode_offset = inst.offset;
+                    owner.instruction_length = inst.length;
+                    owner.block_id = block.id;
+                    owner.type_id = types_.register_class(ref.class_name);
+                    owner.stable_immediate = "class";
+                    owner.stable_symbol = ref.class_name;
+                    owner.hir_stable_value =
+                        render_qualified_class_identifier(ref.class_name);
+                    owner.provenance = decompiler_fact_provenance_t::loader_metadata;
+                    all_values_.push_back(owner);
+                    values.push_back(owner);
+                    ops.push_back(owner.id);
+                }
                 ssa_value_t val;
                 val.id = next_value_id_++;
                 val.ir_opcode = provider_ir_opcode_t::field_load;
@@ -1852,6 +2189,7 @@ private:
                 val.type_id = type_id;
                 val.is_category_2 = td.is_category_2;
                 val.stable_symbol = ref.class_name + "." + ref.name;
+                val.hir_stable_value = render_identifier_component(ref.name);
                 val.stable_immediate = ref.descriptor;
                 all_values_.push_back(val);
                 values.push_back(val);
@@ -1877,6 +2215,7 @@ private:
                 val.operand_ids = std::move(ops);
                 val.type_id = type_id;
                 val.stable_symbol = ref.class_name + "." + ref.name;
+                val.hir_stable_value = render_identifier_component(ref.name);
                 val.stable_immediate = ref.descriptor;
                 all_values_.push_back(val);
                 values.push_back(val);
@@ -1920,6 +2259,8 @@ private:
             val.type_id = return_type_id;
             val.is_category_2 = return_cat2;
             val.stable_symbol = ref.class_name + "." + ref.name;
+            val.hir_stable_value = render_method_identifier(
+                ref.class_name, ref.name);
             val.stable_immediate = ref.descriptor;
             if (inst.opcode == 0xBA) {
                 val.stable_immediate += " bootstrap=" + std::to_string(ref.bootstrap_index);
@@ -1955,6 +2296,8 @@ private:
             val.operand_ids = std::move(ops);
             val.type_id = type_id;
             val.stable_symbol = "multianewarray " + ref.class_name;
+            val.hir_stable_value =
+                render_qualified_class_identifier(ref.class_name);
             val.stable_immediate = "dims=" + std::to_string(dims);
             all_values_.push_back(val);
             values.push_back(val);
@@ -2000,6 +2343,50 @@ private:
                 return lv.name;
         }
         return {};
+    }
+
+    void initialize_local_identifier_counts()
+    {
+        std::map<std::string, std::set<std::uint16_t>> slots_by_identifier;
+        std::set<std::uint16_t> metadata_slots;
+        for (const auto& local : input_.context.local_variables) {
+            const auto identifier = render_identifier_component(local.name);
+            if (!identifier.empty()) {
+                metadata_slots.insert(local.index);
+                slots_by_identifier[identifier].insert(local.index);
+            }
+        }
+        const bool instance_method =
+            (input_.context.access_flags & jvm_acc_static) == 0;
+        for (std::uint32_t slot = 0; slot < input_.context.max_locals; ++slot) {
+            std::string identifier;
+            if (instance_method && slot == 0U)
+                identifier = "this";
+            else if (metadata_slots.find(static_cast<std::uint16_t>(slot)) ==
+                     metadata_slots.end())
+                identifier = "local_" + std::to_string(slot);
+            if (!identifier.empty())
+                slots_by_identifier[identifier].insert(
+                    static_cast<std::uint16_t>(slot));
+        }
+        for (const auto& entry : slots_by_identifier)
+            local_identifier_slot_counts_.emplace(
+                entry.first, entry.second.size());
+    }
+
+    std::string render_local_identifier(std::uint16_t idx,
+                                        const std::string& local_name) const
+    {
+        auto result = render_identifier_component(local_name);
+        if (result.empty())
+            return {};
+        const auto count = local_identifier_slot_counts_.find(result);
+        if (count != local_identifier_slot_counts_.end() && count->second > 1U) {
+            result.append(k_renderer_identifier_escape);
+            result.append("slot$");
+            result.append(std::to_string(idx));
+        }
+        return result;
     }
 
     std::uint64_t infer_local_type(std::uint16_t idx, bool is_cat2) const
@@ -2125,6 +2512,7 @@ private:
     std::vector<block_state_t> states_;
     std::vector<ssa_value_t> all_values_;
     std::vector<decompiler_unknown_t> unknowns_;
+    std::map<std::string, std::size_t> local_identifier_slot_counts_;
     std::uint64_t next_value_id_ = 1;
 
     friend struct ssa_builder_access_t;
@@ -2252,10 +2640,162 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
     hir.type_graph_revision = input.type_graph_revision;
     hir.return_type_id = types.return_type_id(input.context.method_descriptor);
 
+    std::map<std::uint64_t, const ssa_value_t*> values_by_id;
+    for (const auto& value : all_values) {
+        if (value.id == 0 || !values_by_id.emplace(value.id, &value).second) {
+            fail(decompiler_diagnostic_code_t::malformed_provider_ir,
+                "jvm_ssa.duplicate_value_id");
+            return result;
+        }
+    }
+
+    std::set<std::uint64_t> selected_value_ids;
+    std::vector<std::uint64_t> pending_value_ids;
+    const auto select_value = [&selected_value_ids, &pending_value_ids](
+            const std::uint64_t id) {
+        if (id != 0 && selected_value_ids.insert(id).second)
+            pending_value_ids.push_back(id);
+    };
+    for (const auto& value : all_values) {
+        if (value.ir_opcode == provider_ir_opcode_t::parameter || value.is_phi)
+            select_value(value.id);
+    }
+    for (const auto& state : states) {
+        for (const auto& value : state.values)
+            select_value(value.id);
+    }
+    for (std::size_t index = 0; index < pending_value_ids.size(); ++index) {
+        const auto found = values_by_id.find(pending_value_ids[index]);
+        if (found == values_by_id.end()) {
+            fail(decompiler_diagnostic_code_t::malformed_provider_ir,
+                "jvm_ssa.missing_selected_value");
+            return result;
+        }
+        for (const auto operand : found->second->operand_ids) {
+            if (values_by_id.find(operand) == values_by_id.end()) {
+                fail(decompiler_diagnostic_code_t::malformed_provider_ir,
+                    "jvm_ssa.missing_operand_value");
+                return result;
+            }
+            select_value(operand);
+        }
+    }
+
+    std::map<std::uint64_t, std::vector<const ssa_value_t*>> values_by_block;
+    for (const auto& block : cfg.blocks)
+        values_by_block.try_emplace(block.id);
+    for (const auto id : selected_value_ids) {
+        const auto* value = values_by_id.at(id);
+        values_by_block[value->block_id].push_back(value);
+    }
+    for (auto& entry : values_by_block) {
+        auto& values = entry.second;
+        std::sort(values.begin(), values.end(), [](const auto* left, const auto* right) {
+            return left->id < right->id;
+        });
+    }
+
+    std::set<std::uint64_t> populated_block_ids;
+    std::map<std::uint64_t, const cfg_block_t*> cfg_blocks_by_id;
+    for (const auto& block : cfg.blocks) {
+        cfg_blocks_by_id.emplace(block.id, &block);
+        if (!values_by_block.at(block.id).empty())
+            populated_block_ids.insert(block.id);
+    }
+    if (populated_block_ids.empty()) {
+        fail(decompiler_diagnostic_code_t::malformed_provider_ir,
+            "jvm_ssa.no_materialized_blocks");
+        return result;
+    }
+
+    const auto projected_targets = [&cfg_blocks_by_id, &populated_block_ids](
+            const std::uint64_t first) {
+        std::set<std::uint64_t> targets;
+        std::set<std::uint64_t> visited;
+        std::vector<std::uint64_t> pending{first};
+        while (!pending.empty()) {
+            const auto current = pending.back();
+            pending.pop_back();
+            if (!visited.insert(current).second)
+                continue;
+            const auto found = cfg_blocks_by_id.find(current);
+            if (found == cfg_blocks_by_id.end())
+                continue;
+            if (populated_block_ids.find(current) != populated_block_ids.end()) {
+                targets.insert(current);
+                continue;
+            }
+            pending.insert(pending.end(), found->second->successor_ids.begin(),
+                found->second->successor_ids.end());
+        }
+        return std::vector<std::uint64_t>(targets.begin(), targets.end());
+    };
+
+    std::map<std::uint64_t, std::vector<std::uint64_t>> projected_predecessors;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> projected_successors;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> projected_exception_successors;
+    for (const auto block_id : populated_block_ids)
+        projected_predecessors.try_emplace(block_id);
+    for (const auto block_id : populated_block_ids) {
+        const auto& block = *cfg_blocks_by_id.at(block_id);
+        std::set<std::uint64_t> normal_targets;
+        for (const auto successor : block.successor_ids) {
+            const auto projected = projected_targets(successor);
+            normal_targets.insert(projected.begin(), projected.end());
+        }
+        std::set<std::uint64_t> exception_targets;
+        for (const auto successor : block.exception_successor_ids) {
+            const auto projected = projected_targets(successor);
+            exception_targets.insert(projected.begin(), projected.end());
+        }
+        projected_successors.emplace(block_id,
+            std::vector<std::uint64_t>(normal_targets.begin(), normal_targets.end()));
+        projected_exception_successors.emplace(block_id,
+            std::vector<std::uint64_t>(exception_targets.begin(), exception_targets.end()));
+    }
+    for (const auto& source : projected_successors) {
+        for (const auto target : source.second)
+            projected_predecessors.at(target).push_back(source.first);
+    }
+    for (auto& entry : projected_predecessors) {
+        auto& predecessors = entry.second;
+        std::sort(predecessors.begin(), predecessors.end());
+        predecessors.erase(std::unique(predecessors.begin(), predecessors.end()),
+            predecessors.end());
+    }
+    if (populated_block_ids.find(provider_ir.entry_block_id) == populated_block_ids.end()) {
+        const auto projected_entry = projected_targets(provider_ir.entry_block_id);
+        provider_ir.entry_block_id = projected_entry.empty()
+            ? *populated_block_ids.begin()
+            : projected_entry.front();
+    }
+
+    std::set<std::uint64_t> hir_block_ids;
+    std::vector<std::uint64_t> pending_hir_blocks{provider_ir.entry_block_id};
+    while (!pending_hir_blocks.empty()) {
+        const auto block_id = pending_hir_blocks.back();
+        pending_hir_blocks.pop_back();
+        if (!hir_block_ids.insert(block_id).second)
+            continue;
+        const auto successors = projected_successors.find(block_id);
+        if (successors != projected_successors.end())
+            pending_hir_blocks.insert(pending_hir_blocks.end(),
+                successors->second.begin(), successors->second.end());
+    }
+
     std::unordered_map<std::uint64_t, std::uint64_t> value_id_remap;
     std::uint64_t new_id = 1;
-    for (const auto& v : all_values) {
-        value_id_remap[v.id] = new_id++;
+    for (const auto& block : cfg.blocks) {
+        const auto found = values_by_block.find(block.id);
+        if (found == values_by_block.end())
+            continue;
+        for (const auto* value : found->second)
+            value_id_remap.emplace(value->id, new_id++);
+    }
+    if (value_id_remap.size() != selected_value_ids.size()) {
+        fail(decompiler_diagnostic_code_t::malformed_provider_ir,
+            "jvm_ssa.value_block_binding");
+        return result;
     }
 
     auto remap = [&](std::uint64_t id) -> std::uint64_t {
@@ -2271,11 +2811,35 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
         return result;
     };
 
+    for (const auto id : selected_value_ids) {
+        const auto* value = values_by_id.at(id);
+        if (hir_block_ids.find(value->block_id) == hir_block_ids.end())
+            continue;
+        for (const auto operand : value->operand_ids) {
+            const auto dependency = values_by_id.find(operand);
+            if (dependency == values_by_id.end() ||
+                hir_block_ids.find(dependency->second->block_id) ==
+                    hir_block_ids.end()) {
+                fail(decompiler_diagnostic_code_t::malformed_hir,
+                    "jvm_ssa.hir.exception_dependency");
+                return result;
+            }
+        }
+    }
+
     for (const auto& v : all_values) {
+        if (selected_value_ids.find(v.id) == selected_value_ids.end())
+            continue;
+        if (hir_block_ids.find(v.block_id) == hir_block_ids.end())
+            continue;
         if (v.ir_opcode == provider_ir_opcode_t::parameter) {
             hir_variable_t var;
             var.id = remap(v.id);
-            var.stable_name = v.local_name.empty() ? "param_" + std::to_string(*v.local_index) : v.local_name;
+            var.stable_name = !v.hir_stable_value.empty()
+                ? v.hir_stable_value
+                : render_identifier_component(v.local_name.empty()
+                      ? "param_" + std::to_string(*v.local_index)
+                      : v.local_name);
             var.type_id = v.type_id;
             var.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::hir, v.bytecode_offset, v.instruction_length);
             var.confidence = 100;
@@ -2286,18 +2850,30 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
 
     std::set<std::uint16_t> param_locals;
     for (const auto& v : all_values) {
+        if (selected_value_ids.find(v.id) == selected_value_ids.end())
+            continue;
+        if (hir_block_ids.find(v.block_id) == hir_block_ids.end())
+            continue;
         if (v.ir_opcode == provider_ir_opcode_t::parameter && v.local_index.has_value())
             param_locals.insert(*v.local_index);
     }
 
     for (const auto& v : all_values) {
+        if (selected_value_ids.find(v.id) == selected_value_ids.end())
+            continue;
+        if (hir_block_ids.find(v.block_id) == hir_block_ids.end())
+            continue;
         if (v.local_index.has_value() && v.ir_opcode != provider_ir_opcode_t::parameter) {
             auto idx = *v.local_index;
             if (param_locals.count(idx))
                 continue;
             hir_variable_t var;
             var.id = remap(v.id);
-            var.stable_name = v.local_name.empty() ? "local_" + std::to_string(idx) : v.local_name;
+            var.stable_name = !v.hir_stable_value.empty()
+                ? v.hir_stable_value
+                : render_identifier_component(v.local_name.empty()
+                      ? "local_" + std::to_string(idx)
+                      : v.local_name);
             var.type_id = v.type_id;
             var.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::hir, v.bytecode_offset, v.instruction_length);
             var.confidence = 90;
@@ -2314,25 +2890,38 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
         }
     }
 
-    for (std::size_t bi = 0; bi < cfg.blocks.size(); ++bi) {
-        const auto& block = cfg.blocks[bi];
-        const auto& state = states[bi];
+    std::sort(hir.parameters.begin(), hir.parameters.end(), [](const auto& left,
+            const auto& right) { return left.id < right.id; });
+    std::sort(hir.locals.begin(), hir.locals.end(), [](const auto& left,
+            const auto& right) { return left.id < right.id; });
+
+    for (const auto& block : cfg.blocks) {
+        if (populated_block_ids.find(block.id) == populated_block_ids.end())
+            continue;
 
         provider_ir_block_t pblock;
         pblock.id = block.id;
-        pblock.predecessor_ids = block.predecessor_ids;
-        pblock.successor_ids = block.successor_ids;
-        pblock.exception_successor_ids = block.exception_successor_ids;
+        pblock.predecessor_ids = projected_predecessors.at(block.id);
+        pblock.successor_ids = projected_successors.at(block.id);
+        pblock.exception_successor_ids = projected_exception_successors.at(block.id);
         pblock.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::provider_ir, block.start_offset);
 
+        const bool include_hir =
+            hir_block_ids.find(block.id) != hir_block_ids.end();
         hir_block_t hblock;
         hblock.id = block.id;
-        hblock.predecessor_ids = block.predecessor_ids;
-        hblock.successor_ids = block.successor_ids;
-        hblock.exception_successor_ids = block.exception_successor_ids;
+        for (const auto predecessor : pblock.predecessor_ids) {
+            if (hir_block_ids.find(predecessor) != hir_block_ids.end())
+                hblock.predecessor_ids.push_back(predecessor);
+        }
+        for (const auto successor : pblock.successor_ids) {
+            if (hir_block_ids.find(successor) != hir_block_ids.end())
+                hblock.successor_ids.push_back(successor);
+        }
         hblock.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::hir, block.start_offset);
 
-        for (const auto& v : state.values) {
+        for (const auto* value : values_by_block.at(block.id)) {
+            const auto& v = *value;
             provider_ir_value_t pv;
             pv.id = remap(v.id);
             pv.opcode = v.ir_opcode;
@@ -2345,16 +2934,21 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
             pv.provenance = v.provenance;
             pblock.values.push_back(pv);
 
-            hir_value_t hv;
-            hv.id = pv.id;
-            hv.kind = v.hir_kind;
-            hv.type_id = pv.type_id;
-            hv.operand_ids = pv.operand_ids;
-            hv.stable_value = v.stable_symbol.empty() ? v.stable_immediate : v.stable_symbol;
-            hv.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::hir, v.bytecode_offset, v.instruction_length);
-            hv.confidence = pv.confidence;
-            hv.provenance = pv.provenance;
-            hblock.values.push_back(hv);
+            if (include_hir) {
+                hir_value_t hv;
+                hv.id = pv.id;
+                hv.kind = v.hir_kind;
+                hv.type_id = pv.type_id;
+                if (v.hir_kind != hir_node_kind_t::local)
+                    hv.operand_ids = pv.operand_ids;
+                hv.stable_value = !v.hir_stable_value.empty()
+                    ? v.hir_stable_value
+                    : (v.stable_symbol.empty() ? v.stable_immediate : v.stable_symbol);
+                hv.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::hir, v.bytecode_offset, v.instruction_length);
+                hv.confidence = pv.confidence;
+                hv.provenance = pv.provenance;
+                hblock.values.push_back(hv);
+            }
 
             if (!v.supported) {
                 decompiler_unknown_t unknown;
@@ -2364,56 +2958,34 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
                 unknown.confidence = 0;
                 unknown.provenance = decompiler_fact_provenance_t::provider_semantics;
                 provider_ir.unknowns.push_back(unknown);
-                decompiler_unknown_t hir_unknown = unknown;
-                hir_unknown.coordinate.layer = decompiler_coordinate_layer_t::hir;
-                hir.unknowns.push_back(hir_unknown);
+                if (include_hir) {
+                    decompiler_unknown_t hir_unknown = unknown;
+                    hir_unknown.coordinate.layer = decompiler_coordinate_layer_t::hir;
+                    hir.unknowns.push_back(hir_unknown);
+                }
 
                 provider_ir.diagnostics.push_back(make_diagnostic(
                     decompiler_diagnostic_severity_t::warning,
                     decompiler_diagnostic_code_t::unsupported_entity,
                     "jvm_ssa.unsupported_opcode." + std::to_string(v.bytecode_offset),
                     ordinal++));
-                hir.diagnostics.push_back(make_diagnostic(
-                    decompiler_diagnostic_severity_t::warning,
-                    decompiler_diagnostic_code_t::unsupported_entity,
-                    "jvm_ssa.unsupported_opcode." + std::to_string(v.bytecode_offset),
-                    ordinal++));
-            }
-        }
-
-        for (const auto& v : all_values) {
-            if (v.is_phi && v.block_id == block.id) {
-                provider_ir_value_t pv;
-                pv.id = remap(v.id);
-                pv.opcode = provider_ir_opcode_t::phi;
-                pv.type_id = v.type_id;
-                pv.operand_ids = remap_vec(v.operand_ids);
-                pv.stable_immediate = "phi";
-                pv.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::provider_ir, block.start_offset);
-                pv.confidence = v.confidence;
-                pv.provenance = v.provenance;
-                pblock.values.insert(pblock.values.begin(), pv);
-
-                hir_value_t hv;
-                hv.id = pv.id;
-                hv.kind = hir_node_kind_t::phi;
-                hv.type_id = pv.type_id;
-                hv.operand_ids = pv.operand_ids;
-                hv.stable_value = "phi";
-                hv.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::hir, block.start_offset);
-                hv.confidence = pv.confidence;
-                hv.provenance = pv.provenance;
-                hblock.values.insert(hblock.values.begin(), hv);
+                if (include_hir) {
+                    hir.diagnostics.push_back(make_diagnostic(
+                        decompiler_diagnostic_severity_t::warning,
+                        decompiler_diagnostic_code_t::unsupported_entity,
+                        "jvm_ssa.unsupported_opcode." + std::to_string(v.bytecode_offset),
+                        ordinal++));
+                }
             }
         }
 
         provider_ir.source_coordinates.push_back(pblock.coordinate);
-        hir.source_coordinates.push_back(hblock.coordinate);
         provider_ir.blocks.push_back(std::move(pblock));
-        hir.blocks.push_back(std::move(hblock));
+        if (include_hir) {
+            hir.source_coordinates.push_back(hblock.coordinate);
+            hir.blocks.push_back(std::move(hblock));
+        }
     }
-
-    hir.provider_ir_hash = stable_serialization_hash(provider_ir);
 
     const auto& builder_unknowns = ssa_builder_access_t::unknowns(builder);
     for (const auto& u : builder_unknowns) {
@@ -2422,6 +2994,57 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
         hir_unknown.coordinate.layer = decompiler_coordinate_layer_t::hir;
         hir.unknowns.push_back(hir_unknown);
     }
+    for (const auto& block : cfg.blocks) {
+        if (populated_block_ids.find(block.id) == populated_block_ids.end())
+            continue;
+        if (hir_block_ids.find(block.id) == hir_block_ids.end()) {
+            decompiler_unknown_t unknown;
+            unknown.reason = decompiler_unknown_reason_t::opaque_control_flow;
+            unknown.stable_token = "jvm_ssa.hir.exception_only_block." +
+                std::to_string(block.id) + "." +
+                std::to_string(block.start_offset);
+            unknown.coordinate = make_coordinate(input,
+                decompiler_coordinate_layer_t::hir, block.start_offset,
+                (std::max)(std::uint64_t{1},
+                    block.end_offset - block.start_offset));
+            unknown.confidence = 0;
+            unknown.provenance =
+                decompiler_fact_provenance_t::bytecode_verifier;
+            hir.unknowns.push_back(std::move(unknown));
+        }
+        if (hir_block_ids.find(block.id) != hir_block_ids.end() &&
+            !projected_exception_successors.at(block.id).empty()) {
+            decompiler_unknown_t unknown;
+            unknown.reason = decompiler_unknown_reason_t::opaque_control_flow;
+            unknown.stable_token = "jvm_ssa.hir.exception_edge." +
+                std::to_string(block.id) + "." +
+                std::to_string(block.start_offset);
+            unknown.coordinate = make_coordinate(input,
+                decompiler_coordinate_layer_t::hir, block.start_offset,
+                (std::max)(std::uint64_t{1},
+                    block.end_offset - block.start_offset));
+            unknown.confidence = 0;
+            unknown.provenance =
+                decompiler_fact_provenance_t::bytecode_verifier;
+            hir.unknowns.push_back(std::move(unknown));
+        }
+    }
+    for (const auto& block : cfg.blocks) {
+        if (populated_block_ids.find(block.id) != populated_block_ids.end())
+            continue;
+        decompiler_unknown_t unknown;
+        unknown.reason = decompiler_unknown_reason_t::opaque_control_flow;
+        unknown.stable_token = "jvm_ssa.block." + std::to_string(block.id) + "." +
+            std::to_string(block.start_offset);
+        unknown.coordinate = make_coordinate(input,
+            decompiler_coordinate_layer_t::provider_ir, block.start_offset,
+            (std::max)(std::uint64_t{1}, block.end_offset - block.start_offset));
+        unknown.confidence = 0;
+        unknown.provenance = decompiler_fact_provenance_t::bytecode_verifier;
+        provider_ir.unknowns.push_back(unknown);
+        unknown.coordinate.layer = decompiler_coordinate_layer_t::hir;
+        hir.unknowns.push_back(std::move(unknown));
+    }
 
     for (const auto& d : result.diagnostics) {
         provider_ir.diagnostics.push_back(d);
@@ -2429,16 +3052,26 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
     }
     auto preserved_diagnostics = result.diagnostics;
 
+    for (std::uint32_t index = 0; index < provider_ir.diagnostics.size(); ++index)
+        provider_ir.diagnostics[index].ordinal = index + 1U;
+    for (std::uint32_t index = 0; index < hir.diagnostics.size(); ++index)
+        hir.diagnostics[index].ordinal = index + 1U;
+
     const auto provider_validation = validate_provider_ir(provider_ir);
-    const auto hir_validation = validate_hir_function(hir);
     const auto type_validation = validate_type_graph(type_graph);
 
-    if (!provider_validation.valid() || !hir_validation.valid() || !type_validation.valid()) {
+    if (!provider_validation.valid() || !type_validation.valid()) {
         for (const auto& d : provider_validation.diagnostics)
             result.diagnostics.push_back(d);
-        for (const auto& d : hir_validation.diagnostics)
-            result.diagnostics.push_back(d);
         for (const auto& d : type_validation.diagnostics)
+            result.diagnostics.push_back(d);
+        return result;
+    }
+
+    hir.provider_ir_hash = stable_serialization_hash(provider_ir);
+    const auto hir_validation = validate_hir_function(hir);
+    if (!hir_validation.valid()) {
+        for (const auto& d : hir_validation.diagnostics)
             result.diagnostics.push_back(d);
         return result;
     }

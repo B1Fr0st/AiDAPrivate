@@ -27,6 +27,7 @@
 #include <sstream>
 #include <iomanip>
 #include <limits>
+#include <stdexcept>
 #include <type_traits>
 
 namespace memory_scanner {
@@ -34,6 +35,121 @@ namespace memory_scanner {
 namespace {
 
 using live_target_identity_t = driver_bridge::identity::live_target_identity_t;
+
+enum class scan_terminal_t : std::uint8_t {
+	active,
+	completed,
+	cancelled,
+	failed
+};
+
+struct scan_operation_t {
+	std::uint64_t generation = 0;
+	std::atomic<std::uint64_t> executor_task_id{0};
+	std::atomic<bool> started{false};
+	std::atomic<bool> cancellation_requested{false};
+	std::atomic<scan_terminal_t> terminal{scan_terminal_t::active};
+	std::atomic<int> published_progress_milli{-1};
+};
+
+std::atomic<std::uint64_t> g_scan_generation{0};
+std::atomic<std::uint64_t> g_active_scan_generation{0};
+std::mutex g_scan_operation_mutex;
+std::shared_ptr<scan_operation_t> g_active_scan_operation;
+
+std::shared_ptr<scan_operation_t> begin_scan_operation() {
+	auto operation = std::make_shared<scan_operation_t>();
+	operation->generation = g_scan_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	g_active_scan_generation.store(operation->generation, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> lock(g_scan_operation_mutex);
+		g_active_scan_operation = operation;
+	}
+	return operation;
+}
+
+bool owns_scan(const std::shared_ptr<scan_operation_t>& operation) {
+	return operation && operation->generation != 0 &&
+		g_active_scan_generation.load(std::memory_order_acquire) == operation->generation;
+}
+
+void publish_scan_progress(const std::shared_ptr<scan_operation_t>& operation,
+	float progress, const char* stage) {
+	if (!owns_scan(operation))
+		return;
+	const std::uint64_t task_id = operation->executor_task_id.load(std::memory_order_acquire);
+	if (task_id == 0)
+		return;
+	const int progress_milli = static_cast<int>((std::max)(0.0f,
+		(std::min)(1.0f, progress)) * 1000.0f);
+	int previous = operation->published_progress_milli.load(std::memory_order_acquire);
+	while (progress_milli < 1000 && previous >= 0 && progress_milli - previous < 5)
+		return;
+	while (!operation->published_progress_milli.compare_exchange_weak(previous,
+		progress_milli, std::memory_order_acq_rel, std::memory_order_acquire)) {
+		if (progress_milli < 1000 && previous >= 0 && progress_milli - previous < 5)
+			return;
+	}
+	scanner_task_center::update_executor_task(task_id,
+		aida::ui::task_center::task_state_t::running, progress,
+		stage ? stage : "Scanning");
+}
+
+void finish_scan_operation(const std::shared_ptr<scan_operation_t>& operation,
+	scan_terminal_t terminal, const char* detail) {
+	const scan_terminal_t requested_terminal = terminal;
+	scan_terminal_t expected = scan_terminal_t::active;
+	if (!operation->terminal.compare_exchange_strong(expected, terminal,
+			std::memory_order_acq_rel, std::memory_order_acquire)) {
+		terminal = expected;
+		if (terminal != requested_terminal)
+			detail = nullptr;
+	}
+	const bool owner = owns_scan(operation);
+	if (owner) {
+		if (terminal != scan_terminal_t::cancelled)
+			g_state.scan_progress.store(1.0f, std::memory_order_release);
+		g_state.scanning.store(false, std::memory_order_release);
+		g_state.scan_thread_done.store(true, std::memory_order_release);
+	}
+	const std::uint64_t task_id = operation->executor_task_id.load(std::memory_order_acquire);
+	if (task_id == 0)
+		return;
+	if (terminal == scan_terminal_t::cancelled) {
+		scanner_task_center::update_executor_task(task_id,
+			aida::ui::task_center::task_state_t::cancelled,
+			owner ? g_state.scan_progress.load(std::memory_order_acquire) : -1.0f, "Cancelled",
+			detail ? detail : "Scan cancelled");
+	} else if (terminal == scan_terminal_t::failed) {
+		scanner_task_center::update_executor_task(task_id,
+			aida::ui::task_center::task_state_t::failed,
+			owner ? g_state.scan_progress.load(std::memory_order_acquire) : -1.0f, "Failed",
+			detail ? detail : "Scan failed");
+	} else {
+		scanner_task_center::update_executor_task(task_id,
+			aida::ui::task_center::task_state_t::completed, 1.0f, "Completed",
+			detail ? detail : "Scan completed");
+	}
+}
+
+void publish_scan_terminal_snapshot(const std::shared_ptr<scan_operation_t>& operation) {
+	switch (operation->terminal.load(std::memory_order_acquire)) {
+	case scan_terminal_t::completed:
+		finish_scan_operation(operation, scan_terminal_t::completed, "Scan completed");
+		break;
+	case scan_terminal_t::cancelled:
+		finish_scan_operation(operation, scan_terminal_t::cancelled, "Scan cancelled");
+		break;
+	case scan_terminal_t::failed:
+		finish_scan_operation(operation, scan_terminal_t::failed, "Scan failed");
+		break;
+	case scan_terminal_t::active:
+		if (operation->started.load(std::memory_order_acquire))
+			publish_scan_progress(operation,
+				g_state.scan_progress.load(std::memory_order_acquire), "Scanning");
+		break;
+	}
+}
 
 bool same_target_identity(const live_target_identity_t& lhs, const live_target_identity_t& rhs) {
 	return lhs.process.pid == rhs.process.pid &&
@@ -556,7 +672,8 @@ static void annotate_modules(std::vector<scan_result_t>& results) {
 }
 
 
-static void first_scan_thread(scan_config_t config) {
+static void first_scan_thread(scan_config_t config,
+	const std::shared_ptr<scan_operation_t>& operation) {
 	auto& st = g_state;
 	st.scan_progress.store(0.f);
 	uint32_t target_pid = 0;
@@ -570,9 +687,7 @@ static void first_scan_thread(scan_config_t config) {
 	}
 	if (!target_binding_current(target_pid, target_epoch) ||
 		!validate_attached_identity(target_identity, "first_scan_thread_start")) {
-		st.scanning.store(false, std::memory_order_release);
-		st.scan_progress.store(1.f, std::memory_order_release);
-		return;
+		throw std::runtime_error("The attached target changed before the initial memory scan started");
 	}
 
 	auto t_start = std::chrono::steady_clock::now();
@@ -636,7 +751,6 @@ static void first_scan_thread(scan_config_t config) {
 	if (scan_regions.empty()) {
 		diag::log_tagged_fmt("mem_scanner", "first_scan_thread no_eligible_regions raw=%zu filtered=0", regions.size());
 		st.scan_progress.store(1.f);
-		st.scanning.store(false);
 		return;
 	}
 
@@ -664,16 +778,12 @@ static void first_scan_thread(scan_config_t config) {
 	if (!is_unknown && (val_sz == 0 || target_val.size() < val_sz)) {
 		diag::log_tagged_fmt("mem_scanner", "first_scan_thread invalid_target_val val_sz=%zu got=%zu text='%s'",
 			val_sz, target_val.size(), config.value_text.c_str());
-		st.scanning.store(false);
-		st.scan_progress.store(1.f);
-		return;
+		throw std::runtime_error("The initial memory scan value is invalid for the selected type");
 	}
 	if (config.scan_mode == scan_mode_t::value_between && target_val2.size() < val_sz) {
 		diag::log_tagged_fmt("mem_scanner", "first_scan_thread invalid_value2 val_sz=%zu got=%zu text2='%s'",
 			val_sz, target_val2.size(), config.value_text2.c_str());
-		st.scanning.store(false);
-		st.scan_progress.store(1.f);
-		return;
+		throw std::runtime_error("The initial memory scan upper value is invalid for the selected type");
 	}
 
 	std::vector<scan_result_t> all_results;
@@ -681,15 +791,17 @@ static void first_scan_thread(scan_config_t config) {
 	std::atomic<size_t> read_failures{0};
 	std::atomic<size_t> read_successes{0};
 	std::atomic<size_t> matched_regions{0};
+	std::atomic<size_t> worker_exceptions{0};
 
 	size_t total_bytes = 0;
 	for (const auto& r : scan_regions) total_bytes += r.size;
 	std::atomic<size_t> bytes_done{0};
 
 	auto scan_region = [&](const driver_bridge::memory_region_t& region) {
-		if (!st.scanning.load(std::memory_order_acquire) ||
+		if (!owns_scan(operation) || !st.scanning.load(std::memory_order_acquire) ||
 			!target_binding_current(target_pid, target_epoch)) {
-			st.scanning.store(false, std::memory_order_release);
+			if (owns_scan(operation))
+				st.scanning.store(false, std::memory_order_release);
 			return;
 		}
 		std::vector<uint8_t> buf;
@@ -714,7 +826,8 @@ static void first_scan_thread(scan_config_t config) {
 			end = end - val_sz + 1;
 
 		for (size_t i = 0; i < end; i += align) {
-			if ((i & 0xFFFF) == 0 && !st.scanning.load()) break;
+			if ((i & 0xFFFF) == 0 &&
+				(!owns_scan(operation) || !st.scanning.load())) break;
 			bool match = false;
 
 			if (is_unknown) {
@@ -786,8 +899,11 @@ static void first_scan_thread(scan_config_t config) {
 				std::make_move_iterator(local.end()));
 		}
 		bytes_done.fetch_add(static_cast<size_t>(region.size));
-		if (total_bytes > 0)
-			st.scan_progress.store(static_cast<float>(bytes_done.load()) / static_cast<float>(total_bytes));
+		if (total_bytes > 0) {
+			const float progress = static_cast<float>(bytes_done.load()) / static_cast<float>(total_bytes);
+			st.scan_progress.store(progress);
+			publish_scan_progress(operation, progress, "Scanning memory regions");
+		}
 	};
 
 
@@ -810,9 +926,7 @@ static void first_scan_thread(scan_config_t config) {
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-REJECT first_scan reason=%s quota=%s observed=%zu limit=%zu",
 			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
-		st.scan_progress.store(1.f);
-		st.scanning.store(false);
-		return;
+		throw std::runtime_error("The scanner worker-group capacity limit rejected the initial scan");
 	}
 	diag::log_tagged_fmt("mem_scanner",
 		"FEATURE-WORKER-GROUP-ADMIT first_scan token=%llu worker_group_size=%zu",
@@ -831,10 +945,11 @@ static void first_scan_thread(scan_config_t config) {
 				for (;;) {
 					size_t idx = next_region.fetch_add(1);
 					if (idx >= scan_regions.size()) break;
-					if (!st.scanning.load()) break;
+					if (!owns_scan(operation) || !st.scanning.load()) break;
 					try {
 						scan_region(scan_regions[idx]);
 					} catch (...) {
+						worker_exceptions.fetch_add(1, std::memory_order_acq_rel);
 						read_failures.fetch_add(1, std::memory_order_acq_rel);
 					}
 				}
@@ -850,7 +965,7 @@ static void first_scan_thread(scan_config_t config) {
 	}
 	if (workers.empty()) {
 		for (size_t idx = 0; idx < scan_regions.size(); ++idx) {
-			if (!st.scanning.load()) break;
+			if (!owns_scan(operation) || !st.scanning.load()) break;
 			scan_region(scan_regions[idx]);
 		}
 	} else {
@@ -863,6 +978,11 @@ static void first_scan_thread(scan_config_t config) {
 		"FEATURE-WORKER-GROUP-RELEASE first_scan token=%llu reason=completed",
 		static_cast<unsigned long long>(scan_admission.token()));
 	scan_admission.release("completed");
+	if (!owns_scan(operation) ||
+		operation->cancellation_requested.load(std::memory_order_acquire))
+		return;
+	if (worker_exceptions.load(std::memory_order_acquire) != 0)
+		throw std::runtime_error("One or more initial memory scan workers failed");
 
 
 	std::sort(all_results.begin(), all_results.end(),
@@ -881,9 +1001,9 @@ static void first_scan_thread(scan_config_t config) {
 
 	if (!target_binding_current(target_pid, target_epoch) ||
 		!validate_attached_identity(target_identity, "first_scan_publish")) {
-		st.scan_progress.store(1.f, std::memory_order_release);
-		st.scanning.store(false, std::memory_order_release);
-		return;
+		if (operation->cancellation_requested.load(std::memory_order_acquire))
+			return;
+		throw std::runtime_error("The attached target changed before initial scan results could be published");
 	}
 	{
 		std::lock_guard<std::mutex> lk(st.results_mutex);
@@ -905,11 +1025,11 @@ static void first_scan_thread(scan_config_t config) {
 		matched_regions.load(std::memory_order_acquire));
 
 	st.scan_progress.store(1.f);
-	st.scanning.store(false);
 }
 
 
-static void next_scan_thread(scan_mode_t mode, std::string value_text, std::string value_text2) {
+static void next_scan_thread(scan_mode_t mode, std::string value_text, std::string value_text2,
+	const std::shared_ptr<scan_operation_t>& operation) {
 	auto& st = g_state;
 	st.scan_progress.store(0.f);
 	auto t_start = std::chrono::steady_clock::now();
@@ -931,9 +1051,7 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 	}
 	if (!target_binding_current(target_pid, target_epoch) ||
 		!validate_attached_identity(target_identity, "next_scan_thread_start")) {
-		st.scanning.store(false, std::memory_order_release);
-		st.scan_progress.store(1.f, std::memory_order_release);
-		return;
+		throw std::runtime_error("The attached target changed before the refinement scan started");
 	}
 
 	diag::log_tagged_fmt("mem_scanner", "next_scan_thread enter mode=%s prev_count=%zu val='%s' val2='%s' vtype=%s",
@@ -941,9 +1059,7 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 
 	if (prev.empty()) {
 		diag::log_tagged("mem_scanner", "next_scan_thread no_prev_results");
-		st.scan_progress.store(1.f);
-		st.scanning.store(false);
-		return;
+		throw std::runtime_error("The refinement scan has no previous results");
 	}
 
 	size_t val_sz = value_type_size(vtype);
@@ -969,23 +1085,17 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 
 	if (val_sz == 0) {
 		diag::log_tagged("mem_scanner", "next_scan_thread val_sz_zero");
-		st.scanning.store(false);
-		st.scan_progress.store(1.f);
-		return;
+		throw std::runtime_error("The refinement scan value type has zero width");
 	}
 	if (needs_value && target_val.size() < val_sz) {
 		diag::log_tagged_fmt("mem_scanner", "next_scan_thread invalid_value val_sz=%zu got=%zu",
 			val_sz, target_val.size());
-		st.scanning.store(false);
-		st.scan_progress.store(1.f);
-		return;
+		throw std::runtime_error("The refinement scan value is invalid for the selected type");
 	}
 	if (mode == scan_mode_t::value_between && target_val2_bytes.size() < val_sz) {
 		diag::log_tagged_fmt("mem_scanner", "next_scan_thread invalid_value2 val_sz=%zu got=%zu",
 			val_sz, target_val2_bytes.size());
-		st.scanning.store(false);
-		st.scan_progress.store(1.f);
-		return;
+		throw std::runtime_error("The refinement scan upper value is invalid for the selected type");
 	}
 
 	{
@@ -999,8 +1109,10 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 	new_results.reserve(prev.size());
 
 	for (size_t i = 0; i < prev.size(); ++i) {
-		if (!st.scanning.load() || !target_binding_current(target_pid, target_epoch)) {
-			st.scanning.store(false, std::memory_order_release);
+		if (!owns_scan(operation) || !st.scanning.load() ||
+			!target_binding_current(target_pid, target_epoch)) {
+			if (owns_scan(operation))
+				st.scanning.store(false, std::memory_order_release);
 			break;
 		}
 
@@ -1112,13 +1224,25 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 			new_results.push_back(std::move(res));
 		}
 
-		if ((i % 1024) == 0)
-			st.scan_progress.store(static_cast<float>(i) / static_cast<float>(prev.size()));
+		if ((i % 1024) == 0) {
+			const float progress = static_cast<float>(i) / static_cast<float>(prev.size());
+			st.scan_progress.store(progress);
+			publish_scan_progress(operation, progress, "Refining scan results");
+		}
+	}
+	if (operation->cancellation_requested.load(std::memory_order_acquire))
+	{
+		std::lock_guard<std::mutex> lk(st.results_mutex);
+		if (!st.scan_history.empty())
+			st.scan_history.pop_back();
+		return;
 	}
 
 	size_t hits = new_results.size();
 	const bool publish_current = target_binding_current(target_pid, target_epoch) &&
 		validate_attached_identity(target_identity, "next_scan_publish");
+	if (!publish_current)
+		throw std::runtime_error("The attached target changed before refinement results could be published");
 	{
 		std::lock_guard<std::mutex> lk(st.results_mutex);
 		if (publish_current) {
@@ -1137,7 +1261,6 @@ static void next_scan_thread(scan_mode_t mode, std::string value_text, std::stri
 		prev.size(), hits, static_cast<unsigned long long>(dur_ms), g_state.scan_count);
 
 	st.scan_progress.store(1.f);
-	st.scanning.store(false);
 }
 
 
@@ -1743,6 +1866,11 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 
 void initialize() {
 	auto& st = g_state;
+	{
+		std::lock_guard<std::mutex> lock(g_scan_operation_mutex);
+		if (owns_scan(g_active_scan_operation))
+			g_active_scan_operation->cancellation_requested.store(true, std::memory_order_release);
+	}
 	st.scanning.store(false);
 	st.pointer_scanning.store(false);
 	for (int i = 0; i < 100 && !st.scan_thread_done.load(std::memory_order_acquire); ++i)
@@ -1815,6 +1943,11 @@ void shutdown() {
 	diag::log_tagged("mem_scanner", "shutdown enter");
 	persist_scanner_state();
 	auto& st = g_state;
+	{
+		std::lock_guard<std::mutex> lock(g_scan_operation_mutex);
+		if (owns_scan(g_active_scan_operation))
+			g_active_scan_operation->cancellation_requested.store(true, std::memory_order_release);
+	}
 	st.scanning.store(false);
 	st.pointer_scanning.store(false);
 	st.freeze_active.store(false);
@@ -1872,6 +2005,7 @@ bool first_scan(const scan_config_t& config) {
 
 	st.scanning.store(true);
 	st.scan_thread_done.store(false, std::memory_order_release);
+	auto operation = begin_scan_operation();
 	try {
 		mcp_standalone::downstream::producer_identity_t fs_id;
 		fs_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
@@ -1898,19 +2032,27 @@ bool first_scan(const scan_config_t& config) {
 		sub.priority = 3;
 		sub.target_pid = driver_bridge::attached_pid();
 		sub.lease_token = fs_admission.token();
-		sub.body = [config]() {
+		sub.generation = operation->generation;
+		sub.body = [config, operation]() {
+			operation->started.store(true, std::memory_order_release);
+			publish_scan_progress(operation, 0.0f, "Scanning memory regions");
 			try {
-				first_scan_thread(config);
+				first_scan_thread(config, operation);
+				finish_scan_operation(operation,
+					operation->cancellation_requested.load(std::memory_order_acquire)
+						? scan_terminal_t::cancelled : scan_terminal_t::completed,
+					operation->cancellation_requested.load(std::memory_order_acquire)
+						? "Initial memory scan cancelled" : "Initial memory scan completed");
 			} catch (const std::exception& ex) {
 				diag::log_tagged_fmt("mem_scanner", "first_scan worker exception err='%s'", ex.what());
-				g_state.scanning.store(false, std::memory_order_release);
-				g_state.scan_progress.store(1.f, std::memory_order_release);
+				finish_scan_operation(operation, scan_terminal_t::failed, ex.what());
+				throw;
 			} catch (...) {
 				diag::log_tagged("mem_scanner", "first_scan worker exception err='<unknown>'");
-				g_state.scanning.store(false, std::memory_order_release);
-				g_state.scan_progress.store(1.f, std::memory_order_release);
+				finish_scan_operation(operation, scan_terminal_t::failed,
+					"Initial memory scan failed with an unknown error");
+				throw;
 			}
-			g_state.scan_thread_done.store(true, std::memory_order_release);
 		};
 		const auto submitted = aida::infra::executor::submit(std::move(sub));
 		if (!submitted.submitted) {
@@ -1919,11 +2061,23 @@ bool first_scan(const scan_config_t& config) {
 			st.scanning.store(false);
 			return false;
 		}
-		scanner_task_center::register_executor_task(submitted,
+		operation->executor_task_id.store(submitted.task_id, std::memory_order_release);
+		const bool task_registered = scanner_task_center::register_executor_task(submitted,
 			"view.memory.value_scan", "memory.first_scan", "Initial memory scan",
-			driver_bridge::attached_pid(), true, []() {
+			driver_bridge::attached_pid(), true, [operation]() {
+				if (!owns_scan(operation))
+					return false;
+				operation->cancellation_requested.store(true, std::memory_order_release);
 				return !g_state.scanning.load(std::memory_order_acquire) || cancel_scan();
 			});
+		if (!task_registered) {
+			diag::log_tagged("mem_scanner", "first_scan task_center_registration_failed");
+			operation->cancellation_requested.store(true, std::memory_order_release);
+			static_cast<void>(cancel_scan());
+			static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+			return false;
+		}
+		publish_scan_terminal_snapshot(operation);
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-RELEASE first_scan_dispatch token=%llu reason=dispatched",
 			static_cast<unsigned long long>(fs_admission.token()));
@@ -1983,19 +2137,19 @@ bool first_static_scan(const scan_config_t& config,
 	st.scanning.store(true, std::memory_order_release);
 	st.scan_progress.store(0.0f, std::memory_order_release);
 	st.scan_thread_done.store(false, std::memory_order_release);
+	auto operation = begin_scan_operation();
 	aida::infra::executor::submission_t submission;
 	submission.owner_subsystem = "scanner";
 	submission.label = "scanner.static_binary_value_scan";
 	submission.thread_class = "scanner_scan";
 	submission.domain = aida::infra::executor::domain_t::feature_worker;
 	submission.priority = 3;
+	submission.generation = operation->generation;
 	submission.body = [config, provider = std::move(provider), image = std::move(image),
-		target, target2, value_size, workspace_id = std::move(workspace_id), workspace_generation]() {
-		auto finish = [] {
-			g_state.scan_progress.store(1.0f, std::memory_order_release);
-			g_state.scanning.store(false, std::memory_order_release);
-			g_state.scan_thread_done.store(true, std::memory_order_release);
-		};
+		target, target2, value_size, workspace_id = std::move(workspace_id), workspace_generation,
+		operation]() {
+		operation->started.store(true, std::memory_order_release);
+		publish_scan_progress(operation, 0.0f, "Scanning static image sections");
 		try {
 		std::vector<scan_result_t> results;
 		std::uint64_t total_bytes = 0;
@@ -2008,18 +2162,27 @@ bool first_static_scan(const scan_config_t& config,
 			 config.value_type == value_type_t::string_utf16 ||
 			 config.value_type == value_type_t::byte_array) ? 1 : config.alignment);
 		for (const auto& section : image->sections()) {
-			if (!g_state.scanning.load(std::memory_order_acquire)) break;
+			if (!owns_scan(operation) || !g_state.scanning.load(std::memory_order_acquire)) break;
 			if (section.raw_size == 0 || (config.writable_only && !section.writable) ||
 				(config.executable_exclude && section.executable)) continue;
 			auto bytes_result = provider->read_vector(section.raw_offset, section.raw_size,
 				section.raw_size);
-			if (!bytes_result) { completed += section.raw_size; continue; }
+			if (!bytes_result)
+				throw std::runtime_error("Static scan could not read section " + section.name);
 			const auto& bytes = bytes_result.value();
 			const std::size_t end = value_size != 0 && bytes.size() >= value_size
 				? bytes.size() - value_size + 1 : 0;
 			for (std::size_t offset = 0; offset < end && results.size() < 5000000;
 				offset += alignment) {
-				if ((offset & 0xFFFF) == 0 && !g_state.scanning.load(std::memory_order_acquire)) break;
+				if ((offset & 0xFFFF) == 0) {
+					if (!owns_scan(operation) || !g_state.scanning.load(std::memory_order_acquire)) break;
+					if (total_bytes != 0) {
+						const float progress = static_cast<float>(completed + offset) /
+							static_cast<float>(total_bytes);
+						g_state.scan_progress.store(progress, std::memory_order_release);
+						publish_scan_progress(operation, progress, "Scanning static image sections");
+					}
+				}
 				bool match = config.scan_mode == scan_mode_t::unknown_initial;
 				if (config.scan_mode == scan_mode_t::exact)
 					match = compare_exact(bytes.data() + offset, target.data(), value_size);
@@ -2065,32 +2228,63 @@ bool first_static_scan(const scan_config_t& config,
 					{}, section.name, static_cast<std::uint64_t>(section.virtual_address) + offset});
 			}
 			completed += section.raw_size;
-			if (total_bytes != 0) g_state.scan_progress.store(
-				static_cast<float>(completed) / static_cast<float>(total_bytes), std::memory_order_release);
+			if (total_bytes != 0) {
+				const float progress = static_cast<float>(completed) / static_cast<float>(total_bytes);
+				g_state.scan_progress.store(progress, std::memory_order_release);
+				publish_scan_progress(operation, progress, "Scanning static image sections");
+			}
+		}
+		if (operation->cancellation_requested.load(std::memory_order_acquire)) {
+			finish_scan_operation(operation, scan_terminal_t::cancelled, "Static binary scan cancelled");
+			return;
 		}
 		{
 			std::lock_guard<std::mutex> lock(g_state.results_mutex);
-			if (g_state.scan_static_binary && g_state.scan_workspace_id == workspace_id &&
-				g_state.scan_workspace_generation == workspace_generation) {
-				g_state.total_found = results.size();
-				g_state.results = std::move(results);
-				g_state.has_initial_scan = true;
-				g_state.scan_count = 1;
-			}
+			if (!owns_scan(operation) || !g_state.scan_static_binary ||
+				g_state.scan_workspace_id != workspace_id ||
+				g_state.scan_workspace_generation != workspace_generation)
+				throw std::runtime_error("The analysis workspace changed before static scan results could be published");
+			g_state.total_found = results.size();
+			g_state.results = std::move(results);
+			g_state.has_initial_scan = true;
+			g_state.scan_count = 1;
 		}
+		finish_scan_operation(operation, scan_terminal_t::completed,
+			"Static binary scan completed");
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("mem_scanner", "static_scan worker exception err='%s'", ex.what());
+			finish_scan_operation(operation, scan_terminal_t::failed, ex.what());
+			throw;
 		} catch (...) {
 			diag::log_tagged("mem_scanner", "static_scan worker exception err='<unknown>'");
+			finish_scan_operation(operation, scan_terminal_t::failed,
+				"Static binary scan failed with an unknown error");
+			throw;
 		}
-		finish();
 	};
 	const auto submitted = aida::infra::executor::submit(std::move(submission));
 	if (!submitted.submitted) {
-		st.scanning.store(false, std::memory_order_release);
+		static_cast<void>(cancel_scan());
 		st.scan_thread_done.store(true, std::memory_order_release);
 		return false;
 	}
+	operation->executor_task_id.store(submitted.task_id, std::memory_order_release);
+	const bool task_registered = scanner_task_center::register_executor_task(submitted,
+		"view.memory.value_scan", "memory.static_scan", "Static binary value scan",
+		0, true, [operation]() {
+			if (!owns_scan(operation))
+				return false;
+			operation->cancellation_requested.store(true, std::memory_order_release);
+			return !g_state.scanning.load(std::memory_order_acquire) || cancel_scan();
+		});
+	if (!task_registered) {
+		diag::log_tagged("mem_scanner", "static_scan task_center_registration_failed");
+		operation->cancellation_requested.store(true, std::memory_order_release);
+		static_cast<void>(cancel_scan());
+		static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+		return false;
+	}
+	publish_scan_terminal_snapshot(operation);
 	return true;
 }
 
@@ -2134,6 +2328,7 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 
 	st.scanning.store(true);
 	st.scan_thread_done.store(false, std::memory_order_release);
+	auto operation = begin_scan_operation();
 	try {
 		mcp_standalone::downstream::producer_identity_t ns_id;
 		ns_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
@@ -2160,19 +2355,27 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 		sub.priority = 3;
 		sub.target_pid = driver_bridge::attached_pid();
 		sub.lease_token = ns_admission.token();
-		sub.body = [mode, value_text, value_text2]() {
+		sub.generation = operation->generation;
+		sub.body = [mode, value_text, value_text2, operation]() {
+			operation->started.store(true, std::memory_order_release);
+			publish_scan_progress(operation, 0.0f, "Refining scan results");
 			try {
-				next_scan_thread(mode, value_text, value_text2);
+				next_scan_thread(mode, value_text, value_text2, operation);
+				finish_scan_operation(operation,
+					operation->cancellation_requested.load(std::memory_order_acquire)
+						? scan_terminal_t::cancelled : scan_terminal_t::completed,
+					operation->cancellation_requested.load(std::memory_order_acquire)
+						? "Refinement scan cancelled" : "Refinement scan completed");
 			} catch (const std::exception& ex) {
 				diag::log_tagged_fmt("mem_scanner", "next_scan worker exception err='%s'", ex.what());
-				g_state.scanning.store(false, std::memory_order_release);
-				g_state.scan_progress.store(1.f, std::memory_order_release);
+				finish_scan_operation(operation, scan_terminal_t::failed, ex.what());
+				throw;
 			} catch (...) {
 				diag::log_tagged("mem_scanner", "next_scan worker exception err='<unknown>'");
-				g_state.scanning.store(false, std::memory_order_release);
-				g_state.scan_progress.store(1.f, std::memory_order_release);
+				finish_scan_operation(operation, scan_terminal_t::failed,
+					"Refinement scan failed with an unknown error");
+				throw;
 			}
-			g_state.scan_thread_done.store(true, std::memory_order_release);
 		};
 		const auto submitted = aida::infra::executor::submit(std::move(sub));
 		if (!submitted.submitted) {
@@ -2181,11 +2384,23 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 			st.scanning.store(false);
 			return false;
 		}
-		scanner_task_center::register_executor_task(submitted,
+		operation->executor_task_id.store(submitted.task_id, std::memory_order_release);
+		const bool task_registered = scanner_task_center::register_executor_task(submitted,
 			"view.memory.value_scan", "memory.next_scan", "Refine memory scan",
-			driver_bridge::attached_pid(), true, []() {
+			driver_bridge::attached_pid(), true, [operation]() {
+				if (!owns_scan(operation))
+					return false;
+				operation->cancellation_requested.store(true, std::memory_order_release);
 				return !g_state.scanning.load(std::memory_order_acquire) || cancel_scan();
 			});
+		if (!task_registered) {
+			diag::log_tagged("mem_scanner", "next_scan task_center_registration_failed");
+			operation->cancellation_requested.store(true, std::memory_order_release);
+			static_cast<void>(cancel_scan());
+			static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+			return false;
+		}
+		publish_scan_terminal_snapshot(operation);
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-RELEASE next_scan_dispatch token=%llu reason=dispatched",
 			static_cast<unsigned long long>(ns_admission.token()));
@@ -2206,14 +2421,23 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 
 bool cancel_scan() {
 	auto& st = g_state;
+	std::shared_ptr<scan_operation_t> operation;
+	{
+		std::lock_guard<std::mutex> lock(g_scan_operation_mutex);
+		operation = g_active_scan_operation;
+	}
 	bool expected = true;
 	if (!st.scanning.compare_exchange_strong(expected, false,
 		std::memory_order_acq_rel, std::memory_order_acquire)) {
 		diag::log_tagged("mem_scanner", "cancel_scan refused no_active_scan");
 		return false;
 	}
+	if (owns_scan(operation))
+		operation->cancellation_requested.store(true, std::memory_order_release);
 	diag::log_tagged_fmt("mem_scanner", "cancel_scan signalled progress=%.3f",
 		static_cast<double>(st.scan_progress.load(std::memory_order_acquire)));
+	if (owns_scan(operation))
+		finish_scan_operation(operation, scan_terminal_t::cancelled, "Scan cancelled");
 	return true;
 }
 
@@ -2245,7 +2469,7 @@ void reset_scan() {
 		diag::log_tagged_fmt("mem_scanner",
 			"reset_scan cancelling active scan progress=%.3f",
 			static_cast<double>(st.scan_progress.load(std::memory_order_acquire)));
-		st.scanning.store(false, std::memory_order_release);
+		static_cast<void>(cancel_scan());
 		if (!wait_scan_worker_ready("reset_scan")) {
 			diag::log_tagged("mem_scanner", "reset_scan refused worker_still_busy");
 			return;
@@ -2342,6 +2566,34 @@ void freeze_address(size_t index, bool enable) {
 		diag::log_tagged_fmt("mem_scanner", "freeze_address out_of_range index=%zu size=%zu",
 			index, st.address_list.size());
 	}
+}
+
+bool freeze_address_exact(size_t index, bool enable, const address_entry_t& expected) {
+	auto& st = g_state;
+	live_target_identity_t target_identity;
+	const bool identity_valid = capture_attached_identity(target_identity, "freeze_address_exact");
+	const uint64_t epoch = identity_valid ? observe_target_identity(target_identity) : 0;
+	if (!identity_valid || expected.target_pid != target_identity.process.pid ||
+		expected.target_epoch != epoch ||
+		!same_target_identity(expected.target_identity, target_identity))
+		return false;
+	std::lock_guard<std::mutex> lock(st.address_mutex);
+	if (index >= st.address_list.size())
+		return false;
+	auto& entry = st.address_list[index];
+	if (entry.address != expected.address || entry.description != expected.description ||
+		entry.value_type != expected.value_type || entry.frozen != expected.frozen ||
+		entry.freeze_value != expected.freeze_value || entry.last_value != expected.last_value ||
+		entry.target_pid != expected.target_pid || entry.target_epoch != expected.target_epoch ||
+		!same_target_identity(entry.target_identity, expected.target_identity) ||
+		(enable && entry.last_value.empty()))
+		return false;
+	entry.frozen = enable;
+	if (enable)
+		entry.freeze_value = entry.last_value;
+	else
+		entry.freeze_value.clear();
+	return entry.frozen == enable && (!enable || !entry.freeze_value.empty());
 }
 
 write_transaction_result_t write_value_exact(uint64_t address, value_type_t type,

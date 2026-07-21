@@ -17,6 +17,8 @@
 #include "disasm_view.hpp"
 #include "hex_view.hpp"
 #include "../debugger/debugger_view.hpp"
+#include "pointer_scanner_view.hpp"
+#include "../analysis/struct_dissector_view.hpp"
 #include "../ui/application_view_registry.hpp"
 #include "../ui/application_ui_runtime.hpp"
 #include "../ai/entity_evidence_handoff.hpp"
@@ -37,6 +39,7 @@
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#include "../ui/no_target_overlay.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -57,6 +60,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <nlohmann/json.hpp>
@@ -66,12 +70,39 @@ namespace memory_scanner_view {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 std::string studio_memory_entity_id(const char* entity,
 	const memory_interaction::context_t& context) {
-	const std::string identity = std::to_string(static_cast<unsigned>(context.source)) + ":" +
+	const ImGuiWindow* window = ImGui::GetCurrentWindowRead();
+	const std::string_view window_name = window && window->Name ? window->Name : "";
+	std::string identity;
+	if (window_name.find("view.memory.value_scan_results") != std::string_view::npos)
+		identity = "results-pane:";
+	else if (window_name.find("view.memory.address_list") != std::string_view::npos)
+		identity = "address-list-pane:";
+	identity += std::to_string(static_cast<unsigned>(context.source)) + ":" +
 		std::to_string(context.target_pid) + ":" + std::to_string(context.address) +
 		(context.address == 0 ? ":" + std::to_string(context.index) : std::string{});
 	std::string source(entity);
 	source.push_back('-');
 	source.append(aida::preview::semantics::entity_token(identity));
+	return aida::preview::semantics::stable_id("aida.memory", source);
+}
+
+const char* studio_memory_parent_id() noexcept {
+	const ImGuiWindow* window = ImGui::GetCurrentWindowRead();
+	const std::string_view window_name = window && window->Name ? window->Name : "";
+	if (window_name.find("view.memory.value_scan_results") != std::string_view::npos)
+		return "aida.dock-window.view.memory.value-scan-results";
+	if (window_name.find("view.memory.address_list") != std::string_view::npos)
+		return "aida.dock-window.view.memory.address-list";
+	return "aida.dock-window.view.memory.value-scan";
+}
+
+std::string studio_memory_surface_id(std::string source) {
+	const ImGuiWindow* window = ImGui::GetCurrentWindowRead();
+	const std::string_view window_name = window && window->Name ? window->Name : "";
+	if (window_name.find("view.memory.value_scan_results") != std::string_view::npos)
+		source.insert(0, "results-pane-");
+	else if (window_name.find("view.memory.address_list") != std::string_view::npos)
+		source.insert(0, "address-list-pane-");
 	return aida::preview::semantics::stable_id("aida.memory", source);
 }
 #endif
@@ -115,6 +146,10 @@ std::atomic<bool> s_open_result_ctx{false};
 std::atomic<bool> s_open_address_ctx{false};
 std::atomic<int> s_result_context_origin{0};
 std::atomic<int> s_address_context_origin{0};
+const char* s_current_result_owner_view = "view.memory.value_scan";
+const char* s_current_address_owner_view = "view.memory.value_scan";
+std::string s_retained_result_owner_view = "view.memory.value_scan";
+std::string s_retained_address_owner_view = "view.memory.value_scan";
 std::atomic<bool> s_open_add_dialog{false};
 std::atomic<uint64_t> s_pending_add_addr{0};
 std::atomic<int> s_pending_add_vtype{0};
@@ -965,7 +1000,10 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 	retained.owner_id = owner;
 	retained.entity_id = memory_action_entity_id(context, action_contexts);
 	retained.entity_generation = context.scan_revision;
-	retained.active_view = aida::ui::stable_view_id_t("view.memory.value_scan");
+	const std::string source_view = std::strcmp(owner, "memory.value_scan.result") == 0
+		? s_retained_result_owner_view : std::strcmp(owner, "memory.value_scan.address") == 0
+		? s_retained_address_owner_view : std::string("view.memory.value_scan");
+	retained.active_view = aida::ui::stable_view_id_t(source_view);
 	const auto workspace_generation = context.workspace_generation;
 	const std::string static_workspace_id = context.workspace_id;
 	retained.validate_identity = [action_contexts, workspace_generation, static_workspace_id]() {
@@ -1036,6 +1074,213 @@ aida::ui::application_ui::retained_entity_context_t make_memory_actions(const ch
 		else
 			retained.actions.push_back({id, std::move(state),
 				[]() { return aida::ui::action_handler_result_t::completed(); }});
+	}
+	if (std::strcmp(owner, "memory.value_scan.address") == 0 &&
+		action_contexts.size() == 1U) {
+		std::optional<memory_scanner::address_entry_t> retained_entry;
+		const int retained_index = context.index;
+		{
+			std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+			if (retained_index >= 0 &&
+				retained_index < static_cast<int>(memory_scanner::g_state.address_list.size())) {
+				const auto& entry = memory_scanner::g_state.address_list[
+					static_cast<std::size_t>(retained_index)];
+				if (entry.address == context.address && entry.target_pid == context.target_pid &&
+					entry.target_epoch == context.target_epoch &&
+					entry.target_identity.process.creation_time_100ns ==
+						context.process_creation_time_100ns && entry.frozen == context.frozen)
+					retained_entry = entry;
+			}
+		}
+		for (auto& action : retained.actions) {
+			const bool unfreeze = action.action_id == "memory.address.unfreeze";
+			if (!unfreeze && action.action_id != "memory.address.freeze")
+				continue;
+			if (!retained_entry)
+				action.capability = aida::ui::capability_state_t::unavailable(
+					"The exact Address List entry changed before the context menu opened.");
+			else if (!unfreeze && retained_entry->last_value.empty())
+				action.capability = aida::ui::capability_state_t::unavailable(
+					"Freeze requires a current captured value for the retained Address List entry.");
+			action.invoke = [context, retained_entry, retained_index, unfreeze] {
+				if (!retained_entry || retained_index < 0)
+					return aida::ui::action_handler_result_t::failed(
+						"The retained Address List entry is unavailable.");
+				const auto current_runtime = runtime_snapshot();
+				if (!memory_interaction::is_current(context, current_runtime) ||
+					!memory_scanner::validate_target_binding(context.target_pid,
+						context.target_epoch, context.process_creation_time_100ns))
+					return aida::ui::action_handler_result_t::failed(
+						"The retained Address List entry or target identity changed.");
+				if (!memory_scanner::freeze_address_exact(
+						static_cast<std::size_t>(retained_index), !unfreeze, *retained_entry))
+					return aida::ui::action_handler_result_t::failed(
+						"The exact freeze-state transition was rejected or could not be verified.");
+				return aida::ui::action_handler_result_t::completed();
+			};
+		}
+	}
+	const bool direct_memory_row = std::strcmp(owner, "memory.value_scan.result") == 0 ||
+		std::strcmp(owner, "memory.value_scan.address") == 0;
+	if (direct_memory_row) {
+		const bool single = action_contexts.size() == 1U;
+		const auto exact_gate = [&]() {
+			if (!single)
+				return aida::ui::capability_state_t::unavailable(
+					"This workflow requires exactly one retained memory row.");
+			const auto current_runtime = runtime_snapshot();
+			if (!memory_interaction::is_current(context, current_runtime))
+				return aida::ui::capability_state_t::unavailable(
+					"The target, scan publication, workspace, or retained memory row changed.");
+			return aida::ui::capability_state_t::available();
+		};
+		const auto pointer_gate = exact_gate();
+		const bool pointer_live = context.source == memory_interaction::source_t::live_process;
+		retained.actions.push_back({"memory.entity.pointer_workflow",
+			pointer_gate.enabled && pointer_live
+				? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(pointer_gate.enabled
+					? "Pointer scanning requires a retained live-process row."
+					: pointer_gate.disabled_reason),
+			[context, source_view] {
+				const auto opened = aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.memory.pointers"));
+				if (!opened.ok()) return aida::ui::action_handler_result_t::failed(opened.detail);
+				const auto current_runtime = runtime_snapshot();
+				if (!memory_interaction::is_current(context, current_runtime))
+					return aida::ui::action_handler_result_t::failed(
+						"The retained memory row or target identity changed.");
+				pointer_scanner_view::staged_target_context_t staged;
+				staged.address = context.address;
+				staged.target_pid = context.target_pid;
+				staged.target_epoch = context.target_epoch;
+				staged.process_creation_time_100ns = context.process_creation_time_100ns;
+				staged.source_generation = context.kind == memory_interaction::kind_t::scan_result
+					? context.scan_revision : context.target_epoch;
+				staged.source_view = source_view;
+				staged.source_identity = memory_action_entity_id(context, {context});
+				staged.validate = [context](std::string& reason) {
+					const auto current = runtime_snapshot();
+					const bool valid = memory_interaction::is_current(context, current) &&
+						memory_scanner::validate_target_binding(context.target_pid,
+							context.target_epoch, context.process_creation_time_100ns);
+					if (!valid) reason = "The retained memory row, target epoch, or process identity changed.";
+					return valid;
+				};
+				std::string error;
+				if (!pointer_scanner_view::stage_target_context(std::move(staged), error))
+					return aida::ui::action_handler_result_t::failed(error);
+				return aida::ui::action_handler_result_t::completed();
+			}});
+		const auto structure_gate = exact_gate();
+		retained.actions.push_back({"memory.entity.interpret_structure", structure_gate,
+			[context, source_view] {
+				const auto opened = aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.types.structures"));
+				if (!opened.ok()) return aida::ui::action_handler_result_t::failed(opened.detail);
+				const auto current_runtime = runtime_snapshot();
+				if (!memory_interaction::is_current(context, current_runtime))
+					return aida::ui::action_handler_result_t::failed(
+						"The retained memory row or source identity changed.");
+				struct_dissector_view::staged_target_context_t staged;
+				staged.address = context.address;
+				staged.target_pid = context.target_pid;
+				staged.target_epoch = context.target_epoch;
+				staged.process_creation_time_100ns = context.process_creation_time_100ns;
+				staged.source_generation = context.kind == memory_interaction::kind_t::scan_result
+					? context.scan_revision : context.source == memory_interaction::source_t::live_process
+					? context.target_epoch : context.workspace_generation;
+				staged.live_process = context.source == memory_interaction::source_t::live_process;
+				staged.source_view = source_view;
+				staged.source_identity = memory_action_entity_id(context, {context});
+				staged.validate = [context](std::string& reason) {
+					const auto current = runtime_snapshot();
+					if (!memory_interaction::is_current(context, current)) {
+						reason = "The retained memory row, scan, target, or workspace identity changed.";
+						return false;
+					}
+					if (context.source == memory_interaction::source_t::live_process &&
+						!memory_scanner::validate_target_binding(context.target_pid,
+							context.target_epoch, context.process_creation_time_100ns)) {
+						reason = "The retained live-process identity changed.";
+						return false;
+					}
+					return true;
+				};
+				std::string error;
+				if (!struct_dissector_view::stage_target_context(std::move(staged), error))
+					return aida::ui::action_handler_result_t::failed(error);
+				return aida::ui::action_handler_result_t::completed();
+			}});
+		if (std::strcmp(owner, "memory.value_scan.result") == 0) {
+			std::optional<memory_scanner::address_entry_t> retained_entry;
+			int retained_index = -1;
+			if (single && context.source == memory_interaction::source_t::live_process) {
+				std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+				for (std::size_t index = 0; index < memory_scanner::g_state.address_list.size(); ++index) {
+					const auto& entry = memory_scanner::g_state.address_list[index];
+					if (entry.address == context.address && entry.target_pid == context.target_pid &&
+						entry.target_epoch == context.target_epoch &&
+						entry.target_identity.process.creation_time_100ns ==
+							context.process_creation_time_100ns) {
+						retained_entry = entry;
+						retained_index = static_cast<int>(index);
+						break;
+					}
+				}
+			}
+			const bool unfreeze = retained_entry && retained_entry->frozen;
+			const char* action_id = unfreeze ? "memory.result.unfreeze" : "memory.result.freeze";
+			const auto freeze_state = !single
+				? aida::ui::capability_state_t::unavailable(
+					"Freeze requires exactly one retained scan result.")
+				: context.source != memory_interaction::source_t::live_process
+				? aida::ui::capability_state_t::unavailable(
+					"Static scan results cannot be frozen.")
+				: !retained_entry
+				? aida::ui::capability_state_t::unavailable(
+					"Add this result to the Address List before freezing it.")
+				: aida::ui::capability_state_t::available();
+			retained.actions.push_back({action_id, freeze_state,
+				[context, retained_entry, retained_index, unfreeze] {
+					if (!retained_entry || retained_index < 0)
+						return aida::ui::action_handler_result_t::failed(
+							"The retained Address List entry is unavailable.");
+					const auto runtime = runtime_snapshot();
+					if (!memory_interaction::is_current(context, runtime) ||
+						!memory_scanner::validate_target_binding(context.target_pid,
+							context.target_epoch, context.process_creation_time_100ns))
+						return aida::ui::action_handler_result_t::failed(
+							"The retained scan result or target identity changed.");
+					int current_index = -1;
+					{
+						std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+						for (std::size_t index = 0; index < memory_scanner::g_state.address_list.size(); ++index) {
+							const auto& entry = memory_scanner::g_state.address_list[index];
+							if (entry.address == retained_entry->address &&
+								entry.value_type == retained_entry->value_type &&
+								entry.target_pid == retained_entry->target_pid &&
+								entry.target_epoch == retained_entry->target_epoch &&
+								entry.target_identity.process.creation_time_100ns ==
+									retained_entry->target_identity.process.creation_time_100ns &&
+								entry.description == retained_entry->description &&
+								entry.last_value == retained_entry->last_value &&
+								entry.frozen == retained_entry->frozen) {
+								current_index = static_cast<int>(index);
+								break;
+							}
+						}
+					}
+					if (current_index < 0)
+						return aida::ui::action_handler_result_t::failed(
+							"The exact Address List entry changed after the context menu opened.");
+					if (!memory_scanner::freeze_address_exact(
+							static_cast<std::size_t>(current_index), !unfreeze, *retained_entry))
+						return aida::ui::action_handler_result_t::failed(
+							"The exact freeze-state transition was rejected or could not be verified.");
+					return aida::ui::action_handler_result_t::completed();
+				}});
+		}
 	}
 	const char* source_kind = context.kind == memory_interaction::kind_t::scan_result
 		? "memory_scan_result" : context.kind == memory_interaction::kind_t::address_entry
@@ -2206,10 +2451,9 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		ImGui::InvisibleButton("##rh", ImVec2(hmax.x - hmin.x, hmax.y - hmin.y));
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		aida::preview::semantics::register_last_item(
-			aida::preview::semantics::stable_id("aida.memory",
-				std::string("result-header-") + cols[c].title),
+			studio_memory_surface_id(std::string("result-header-") + cols[c].title),
 			"memory-scan-action", false, !sort_allowed,
-			"aida.dock-window.view.memory.value-scan");
+			studio_memory_parent_id());
 #endif
 		bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
 			!ui_input_gate::popup_blocks_background_input();
@@ -2408,7 +2652,7 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		aida::preview::semantics::register_region(result_semantic_id,
 			"memory-scan-result-row", ImGui::GetID(result_semantic_id.c_str()),
 			ImVec2(ox, ry), ImVec2(row_right_edge, ry + kResultRowHeight), false, false,
-			"aida.dock-window.view.memory.value-scan");
+			studio_memory_parent_id());
 #endif
 
 		const float row_entrance = 1.f;
@@ -2530,6 +2774,7 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		}
 	}
 	if (right_click_row >= 0) {
+		s_retained_result_owner_view = s_current_result_owner_view;
 		int src_index = right_click_row;
 		if (src_index >= 0 && src_index < static_cast<int>(ui.sorted_result_indices.size()))
 			src_index = ui.sorted_result_indices[static_cast<size_t>(src_index)];
@@ -2557,6 +2802,7 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 	if (ui.result_pane_focused && memory_interaction::context_key_pressed() &&
 		ui.selected_result >= 0) {
+		s_retained_result_owner_view = s_current_result_owner_view;
 		int source_index = ui.selected_result;
 		if (source_index < static_cast<int>(ui.sorted_result_indices.size()))
 			source_index = ui.sorted_result_indices[static_cast<std::size_t>(source_index)];
@@ -2792,13 +3038,13 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	for (std::size_t c = 0; c < 5U; ++c) {
 		if (!cols[c].title || cols[c].title[0] == '\0') continue;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		const std::string header_semantic_id = aida::preview::semantics::stable_id(
-			"aida.memory", std::string("address-header-") + cols[c].title);
+		const std::string header_semantic_id = studio_memory_surface_id(
+			std::string("address-header-") + cols[c].title);
 		aida::preview::semantics::register_region(header_semantic_id,
 			"memory-scan-action", ImGui::GetID(header_semantic_id.c_str()),
 			ImVec2(cols[c].x0, tbl_y0),
 			ImVec2(cols[c].x1, tbl_y0 + kAddrTableHeaderH), false, true,
-			"aida.dock-window.view.memory.value-scan");
+			studio_memory_parent_id());
 #endif
 		dl->AddText(col_fn, col_fs,
 			ImVec2(cols[c].inner_x0, tbl_y0 + (kAddrTableHeaderH - col_fs) * 0.5f),
@@ -2889,7 +3135,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		aida::preview::semantics::register_region(address_semantic_id,
 			"memory-address-row", ImGui::GetID(address_semantic_id.c_str()),
 			ImVec2(ox, ry), ImVec2(row_right_edge, ry + kAddrRowHeight), false, false,
-			"aida.dock-window.view.memory.value-scan");
+			studio_memory_parent_id());
 #endif
 
 		bool sel = (ui.address_multi_sel.count(i) > 0) || (ui.selected_address == i);
@@ -3081,6 +3327,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		}
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			s_retained_address_owner_view = s_current_address_owner_view;
 			ctx_addr_request_row = i;
 			requested_context = memory_interaction::capture_address(runtime,
 				e.address, i, e.frozen,
@@ -3118,6 +3365,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	};
 	if (ui.address_pane_focused && memory_interaction::context_key_pressed() &&
 		ui.selected_address >= 0) {
+		s_retained_address_owner_view = s_current_address_owner_view;
 		const int selected = ui.selected_address;
 		if (const auto entry = capture_address_entry(selected)) {
 			ctx_addr_request_row = selected;
@@ -3221,8 +3469,8 @@ void render_splitter(ImDrawList* dl, float ox, float oy, float w, float a,
 	ImGui::InvisibleButton("##spl", ImVec2(a_max.x - a_min.x, a_max.y - a_min.y));
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	aida::preview::semantics::register_last_item(
-		"aida.memory.splitter", "memory-scan-action", false, false,
-		"aida.dock-window.view.memory.value-scan");
+		studio_memory_surface_id("splitter"), "memory-scan-action", false, false,
+		studio_memory_parent_id());
 #endif
 	bool hov = ImGui::IsItemHovered();
 	bool act = ImGui::IsItemActive();
@@ -3859,14 +4107,6 @@ void process_address_context_menu() {
 					"%s", vs.c_str());
 			}
 		}
-		if (context_item(context.frozen ? "Unfreeze" : "Freeze",
-			context.frozen ? memory_interaction::capability_t::unfreeze :
-				memory_interaction::capability_t::freeze,
-			context, runtime)) {
-			memory_scanner::freeze_address(static_cast<std::size_t>(ctx_row), !context.frozen);
-			context.frozen = !context.frozen;
-			ui.address_context.frozen = context.frozen;
-		}
 		if (context_item("Open in Hex view", memory_interaction::capability_t::open_hex,
 			context, runtime)) {
 			diag_logf("ctx_addr open_hex addr=0x%llX",
@@ -3936,6 +4176,47 @@ void process_address_context_menu() {
 	s_consumed_memory_action.clear();
 }
 
+}
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+void initialize_preview_fixture() {
+	static bool seeded = false;
+	if (seeded)
+		return;
+	memory_scanner::scan_config_t config;
+	config.value_text = "1337";
+	std::snprintf(g_ui.value_buf, sizeof(g_ui.value_buf), "%s", config.value_text.c_str());
+	memory_scanner::first_scan(config);
+	memory_scanner::add_address(0x00007FF7A4C42030ULL, "player_health",
+		memory_scanner::value_type_t::int32_val);
+	memory_scanner::add_address(0x00007FF7A4C42108ULL, "session_flags",
+		memory_scanner::value_type_t::int32_val);
+	seeded = true;
+}
+#endif
+
+void tick_address_auto_refresh(bool attached) {
+	auto& ui = g_ui;
+	if (!ui.auto_refresh || !attached)
+		return;
+	ui.refresh_timer += aida::ui::clock::dt();
+	if (ui.refresh_timer < ui.refresh_interval)
+		return;
+	ui.refresh_timer = 0.f;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	memory_scanner::refresh_address_list();
+#else
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "scanner";
+	submission.label = "scanner.address_list_refresh";
+	submission.thread_class = "scanner_ui_refresh";
+	submission.domain = aida::infra::executor::domain_t::diagnostics;
+	submission.priority = 4;
+	submission.target_pid = driver_bridge::attached_pid();
+	submission.body = []() { memory_scanner::refresh_address_list(); };
+	if (!aida::infra::executor::submit(std::move(submission)).submitted)
+		diag::log_tagged("value_scan", "address_list_refresh_post_failed");
+#endif
 }
 
 scan_command_state_t scan_command_capability(scan_command_t command) {
@@ -4126,16 +4407,7 @@ void render(float pos_x, float pos_y, float width, float height,
             float alpha, float, float, float)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	static bool seeded = false;
-	if (!seeded) {
-		memory_scanner::scan_config_t config;
-		config.value_text = "1337";
-		std::snprintf(g_ui.value_buf, sizeof(g_ui.value_buf), "%s", config.value_text.c_str());
-		memory_scanner::first_scan(config);
-		memory_scanner::add_address(0x00007FF7A4C42030ULL, "player_health", memory_scanner::value_type_t::int32_val);
-		memory_scanner::add_address(0x00007FF7A4C42108ULL, "session_flags", memory_scanner::value_type_t::int32_val);
-		seeded = true;
-	}
+	initialize_preview_fixture();
 #endif
 	memory_interaction::synchronize_selection(runtime_snapshot());
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
@@ -4166,28 +4438,7 @@ void render(float pos_x, float pos_y, float width, float height,
 #endif
 	bool any_target = attached_now;
 
-	if (ui.auto_refresh && attached_now) {
-		ui.refresh_timer += aida::ui::clock::dt();
-		if (ui.refresh_timer >= ui.refresh_interval) {
-			ui.refresh_timer = 0.f;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			memory_scanner::refresh_address_list();
-#else
-			aida::infra::executor::submission_t sub;
-			sub.owner_subsystem = "scanner";
-			sub.label = "scanner.address_list_refresh";
-			sub.thread_class = "scanner_ui_refresh";
-			sub.domain = aida::infra::executor::domain_t::diagnostics;
-			sub.priority = 4;
-			sub.target_pid = driver_bridge::attached_pid();
-			sub.body = []() {
-				memory_scanner::refresh_address_list();
-			};
-			if (!aida::infra::executor::submit(std::move(sub)).submitted)
-				diag::log_tagged("value_scan", "address_list_refresh_post_failed");
-#endif
-		}
-	}
+	tick_address_auto_refresh(attached_now);
 
 	if (ui.region_cache.entries.empty() && attached_now) {
 		request_region_refresh();
@@ -4256,33 +4507,102 @@ void render(float pos_x, float pos_y, float width, float height,
 
 void render_results(float pos_x, float pos_y, float width, float height,
 	float alpha, float, float, float) {
-	memory_interaction::synchronize_selection(runtime_snapshot());
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	initialize_preview_fixture();
+#endif
+	const char* previous_owner = s_current_result_owner_view;
+	s_current_result_owner_view = "view.memory.value_scan_results";
+	const auto runtime = runtime_snapshot();
+	memory_interaction::synchronize_selection(runtime);
+	bool empty = false;
+	{
+		std::lock_guard<std::mutex> lock(memory_scanner::g_state.results_mutex);
+		empty = memory_scanner::g_state.results.empty();
+	}
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
 	ImGui::BeginChild("##memory_scan_results_pane", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	ImDrawList* draw_list = ImGui::GetWindowDrawList();
 	const ImVec2 window = ImGui::GetWindowPos();
-	render_results_pane(draw_list, window.x, window.y, width, height, alpha);
+	const bool scanning = memory_scanner::g_state.scanning.load(std::memory_order_acquire);
+	const float status_height = scanning ? 40.f : 0.f;
+	if (scanning) {
+		const auto stop = aida::ui::application_ui::present_action("memory.stop_scan");
+		aida::ui::design::action_t action;
+		action.id = stop.id.c_str();
+		action.label = stop.label.c_str();
+		action.compact_label = "Stop";
+		action.tooltip = stop.enabled ? stop.description.c_str() : stop.disabled_reason.c_str();
+		action.shortcut = stop.shortcut.empty() ? nullptr : stop.shortcut.c_str();
+		action.kind = aida::ui::components::button_kind_t::destructive;
+		action.enabled = stop.enabled;
+		action.primary = true;
+		action.visible = stop.visible;
+		const int progress = static_cast<int>((std::clamp)(
+			memory_scanner::g_state.scan_progress.load(std::memory_order_acquire),
+			0.f, 1.f) * 100.f);
+		draw_list->AddRectFilled(window, ImVec2(window.x + width, window.y + status_height),
+			aida::ui::with_alpha(aida::ui::resolved().panel_header, alpha));
+		ImGui::SetCursorScreenPos(ImVec2(window.x + 8.f, window.y + 7.f));
+		const float action_width = (std::min)(160.f, (std::max)(80.f, width * 0.32f));
+		const auto invoked = aida::ui::design::render_toolbar(
+			"memory-scan-results-progress", &action, 1, action_width);
+		if (invoked.invoked && invoked.id)
+			static_cast<void>(aida::ui::application_ui::execute_action(
+				invoked.id, aida::ui::action_invocation_source_t::toolbar));
+		ImGui::SetCursorScreenPos(ImVec2(window.x + action_width + 18.f, window.y + 11.f));
+		ImGui::Text("Scanning memory... %d%%", progress);
+	}
+	if (empty && !runtime.live_attached && !runtime.static_loaded)
+		aida::ui::no_target_overlay::render(window, ImVec2(width, height),
+			"No memory target available",
+			"Attach to a running process for live scans, or open a binary for static value discovery.",
+			alpha, aida::ui::empty_state::glyph_t::memory, true,
+			"no_target.memory.value_scan_results");
+	else
+		render_results_pane(draw_list, window.x, window.y + status_height, width,
+			(std::max)(height - status_height, 1.f), alpha);
 	ImGui::EndChild();
 	process_add_dialog();
 	process_result_context_menu();
+	s_current_result_owner_view = previous_owner;
 }
 
 void render_address_list(float pos_x, float pos_y, float width, float height,
 	float alpha, float, float, float) {
-	memory_interaction::synchronize_selection(runtime_snapshot());
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	initialize_preview_fixture();
+#endif
+	const char* previous_owner = s_current_address_owner_view;
+	s_current_address_owner_view = "view.memory.address_list";
+	const auto runtime = runtime_snapshot();
+	memory_interaction::synchronize_selection(runtime);
+	tick_address_auto_refresh(runtime.live_attached);
+	bool empty = false;
+	{
+		std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+		empty = memory_scanner::g_state.address_list.empty();
+	}
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
 	ImGui::BeginChild("##memory_address_list_pane", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	ImDrawList* draw_list = ImGui::GetWindowDrawList();
 	const ImVec2 window = ImGui::GetWindowPos();
-	render_address_pane(draw_list, window.x, window.y, width, height, alpha);
+	if (empty && !runtime.live_attached)
+		aida::ui::no_target_overlay::render(window, ImVec2(width, height),
+			"No live memory target attached",
+			"Attach to a running process or launch a target to build and edit a live address list.",
+			alpha, aida::ui::empty_state::glyph_t::memory, true,
+			"no_target.memory.address_list");
+	else
+		render_address_pane(draw_list, window.x, window.y, width, height, alpha);
 	ImGui::EndChild();
 	process_add_dialog();
 	process_edit_description_dialog();
 	process_edit_value_dialog();
 	process_change_type_dialog();
 	process_address_context_menu();
+	s_current_address_owner_view = previous_owner;
 }
 
 }

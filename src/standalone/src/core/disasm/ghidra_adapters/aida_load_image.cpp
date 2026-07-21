@@ -132,8 +132,8 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 			? UINT64_MAX : offset + request_size;
 		const uint64_t read_begin = (std::max)(offset, image_begin);
 		const uint64_t read_end = (std::min)(request_end, image_end);
-		if (read_begin >= read_end)
-			return;
+		if (offset < image_begin || read_begin >= read_end)
+			throw ghidra::DataUnavailError("normalized workspace image address is not mapped");
 		uint64_t cursor = read_begin;
 		while (cursor < read_end) {
 			if (cancel_check_ && cancel_check_())
@@ -286,6 +286,8 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 	for (auto& reg : regions_) {
 		if (reg.data.empty())
 			continue;
+		if (reg.data.size() > UINT64_MAX - reg.start_va)
+			throw ghidra::LowlevelError("isolated decompiler region address overflow");
 		uint64_t reg_end = reg.start_va + reg.data.size();
 		if (offset >= reg.start_va && offset < reg_end) {
 			size_t buf_off = static_cast<size_t>(offset - reg.start_va);
@@ -307,6 +309,10 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 			std::memcpy(ptr, tmp.data(), copy_n);
 		}
 	}
+#endif
+
+#if defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
+	throw ghidra::DataUnavailError("isolated native decompiler address is not captured");
 #endif
 
 	ghidra_decompiler::g_state.last_loadfill_tick_ms.store(

@@ -142,7 +142,8 @@ std::optional<provider_output_t> execute_native(
     }
     const auto output = ghidra_decompiler::decompile_isolated_regions(
         std::move(regions), snapshot->image_base, snapshot->image_size, entry,
-        job.cache_key.language.language_id, &cancelled, deadline, limits, capture);
+        job.cache_key.language.language_id, job.cache_key.language.mode,
+        &cancelled, deadline, limits, capture);
     if (output.is_error || !output.typed_artifacts) {
         diagnostics.insert(diagnostics.end(), output.typed_diagnostics.begin(), output.typed_diagnostics.end());
         if (!output.error_text.empty())

@@ -35,8 +35,8 @@ MINIMUM_KIND_COUNTS = {
     "state": 7,
     "shortcut": 12,
 }
-EXPECTED_DIALOG_COUNT = 73
-EXPECTED_CATALOG_DESCRIPTOR_COUNT = 113
+EXPECTED_DIALOG_COUNT = 82
+EXPECTED_CATALOG_DESCRIPTOR_COUNT = 117
 EXPECTED_DYNAMIC_DESCRIPTOR_COUNT = 2
 REQUIRED_IDS = {
     "document.code", "document.disassembly", "document.hex", "document.pseudocode",
@@ -74,17 +74,7 @@ DYNAMIC_VIEW_SOURCES = {
         "diagnostics.render = render_diagnostics_view",
     ),
 }
-RAW_MODAL_OWNERS = {
-    "src/standalone/src/core/analysis/struct_recon_view.cpp": {
-        "Review Reconstructed Type Application",
-    },
-    "src/standalone/src/core/analysis/struct_dissector_view.hpp": {
-        "Review Editable Type Declaration",
-    },
-    "src/standalone/src/core/analysis/types_hub_view.hpp": {
-        "Review Global Type Declaration",
-    },
-}
+RAW_MODAL_OWNERS = {}
 
 
 def fail(errors: list[str], message: str) -> None:

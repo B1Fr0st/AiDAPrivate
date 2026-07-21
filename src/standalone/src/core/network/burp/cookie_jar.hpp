@@ -7,9 +7,15 @@
 
 #include <nlohmann/json.hpp>
 
+namespace network_view { struct artifact_identity_t; }
+
 namespace aida {
 namespace burp {
 namespace cookie_jar {
+
+bool stage_reviewed_context(const network_view::artifact_identity_t& identity,
+                            const std::string& request_path,
+                            std::string& unavailable_reason);
 
 enum class same_site_t : int
 {

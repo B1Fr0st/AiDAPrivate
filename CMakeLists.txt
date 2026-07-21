@@ -1839,6 +1839,8 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/debugger/debugger_interaction_context.cpp"
             "${STANDALONE_ROOT}/core/debugger/debugger_view.cpp"
             "${STANDALONE_ROOT}/core/disasm/pseudocode_view.cpp"
+            "${STANDALONE_ROOT}/core/analysis/struct_dissector_view.cpp"
+            "${STANDALONE_ROOT}/core/analysis/types_hub_view.cpp"
             "${STANDALONE_ROOT}/core/analysis/struct_recon_view.cpp"
             "${STANDALONE_ROOT}/core/analysis/fuzzer_view.cpp"
             "${STANDALONE_ROOT}/core/analysis/analysis_tools_standalone.cpp"

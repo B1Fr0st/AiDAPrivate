@@ -12,12 +12,16 @@
 
 #include "cookie_jar.hpp"
 #include "burp_events.hpp"
+#include "../network_view.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/design_system.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/studio_semantics.hpp"
+#endif
 #include "../../infra/event_bus.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_executor.hpp"
@@ -75,6 +79,12 @@ struct state_t
     bool                                edit_secure = false;
     bool                                edit_http_only = false;
     int                                 edit_same_site = 0;
+
+    network_view::artifact_identity_t   reviewed_context;
+    std::string                         reviewed_path;
+    bool                                reviewed_context_current = false;
+    int                                 reviewed_context_validation_frame = -120;
+    std::string                         reviewed_context_reason;
 };
 
 state_t& s()
@@ -247,6 +257,58 @@ void handle_exchange_observed(const exchange_observed_t& e)
     }
 }
 
+void refresh_reviewed_context(state_t& st)
+{
+    if (!st.reviewed_context.valid()) return;
+    const int frame = ImGui::GetFrameCount();
+    if (frame - st.reviewed_context_validation_frame < 120) return;
+    st.reviewed_context_validation_frame = frame;
+    network_view::artifact_snapshot_t snapshot;
+    std::string reason;
+    st.reviewed_context_current = network_view::resolve_artifact(
+        st.reviewed_context, snapshot, reason);
+    st.reviewed_context_reason = st.reviewed_context_current
+        ? std::string() : (reason.empty() ? "The retained source is stale." : std::move(reason));
+}
+
+bool request_artifact_kind(network_view::artifact_kind_t kind)
+{
+    return kind == network_view::artifact_kind_t::exchange ||
+        kind == network_view::artifact_kind_t::request ||
+        kind == network_view::artifact_kind_t::repeater_request ||
+        kind == network_view::artifact_kind_t::sitemap_request ||
+        kind == network_view::artifact_kind_t::api_request ||
+        kind == network_view::artifact_kind_t::scanner_request ||
+        kind == network_view::artifact_kind_t::intercept_request;
+}
+
+}
+
+bool stage_reviewed_context(const network_view::artifact_identity_t& identity,
+                            const std::string& request_path,
+                            std::string& unavailable_reason)
+{
+    if (!identity.valid() || !request_artifact_kind(identity.kind) ||
+        identity.target_host.empty() || identity.target_port == 0 ||
+        identity.target_host.size() >= sizeof(s().filter_host) || request_path.size() > 2048U ||
+        identity.raw_protocol) {
+        unavailable_reason = "Cookie Jar requires a current retained HTTP/1 target with bounded host and path metadata.";
+        return false;
+    }
+    network_view::artifact_snapshot_t snapshot;
+    if (!network_view::resolve_artifact(identity, snapshot, unavailable_reason)) return false;
+    auto& st = s();
+    st.reviewed_context = identity;
+    st.reviewed_path = request_path.empty() ? "/" : request_path;
+    st.reviewed_context_current = true;
+    st.reviewed_context_validation_frame = ImGui::GetFrameCount();
+    st.reviewed_context_reason.clear();
+    std::memcpy(st.filter_host, identity.target_host.data(), identity.target_host.size());
+    st.filter_host[identity.target_host.size()] = '\0';
+    st.selected_host_index = -1;
+    st.selected_cookie_index = -1;
+    unavailable_reason.clear();
+    return true;
 }
 
 std::string same_site_str(same_site_t s)
@@ -864,7 +926,62 @@ void render(float pos_x, float pos_y, float width, float height,
                 aida::ui::with_alpha(th.text_primary, alpha),
                 "Cookie jar");
 
-    ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + 36.f));
+    float toolbar_y = 36.f;
+    if (st.reviewed_context.valid()) {
+        ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + toolbar_y));
+        const float context_height = st.reviewed_context_current ? 58.f : 76.f;
+        ImGui::BeginChild("##cookies_reviewed_context", ImVec2(width - 12.f, context_height), true);
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        const ImVec2 context_min = ImGui::GetWindowPos();
+        const ImVec2 context_max(context_min.x + ImGui::GetWindowSize().x,
+                                 context_min.y + ImGui::GetWindowSize().y);
+        aida::preview::semantics::register_region(
+            "aida.network.cookies.reviewed-context", "reviewed-network-context",
+            ImGui::GetID("##cookies_reviewed_context_region"), context_min, context_max, false,
+            false, "aida.dock-window.view.network.cookies");
+#endif
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(
+            st.reviewed_context_current ? th.success : th.error, alpha)), "%s",
+            st.reviewed_context_current ? "CURRENT AT LAST CHECK" : "STALE FILTER CONTEXT");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Recheck##cookies_reviewed_context_recheck")) {
+            st.reviewed_context_validation_frame = -120;
+            refresh_reviewed_context(st);
+        }
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        aida::preview::semantics::register_last_item(
+            "aida.network.cookies.reviewed-context.recheck", "revalidate-reviewed-context",
+            false, false, "aida.network.cookies.reviewed-context");
+#endif
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear##cookies_reviewed_context_clear")) {
+            st.reviewed_context = {};
+            st.reviewed_path.clear();
+            st.reviewed_context_current = false;
+            st.reviewed_context_reason.clear();
+        }
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        aida::preview::semantics::register_last_item(
+            "aida.network.cookies.reviewed-context.clear", "clear-reviewed-context",
+            false, false, "aida.network.cookies.reviewed-context");
+#endif
+        ImGui::SameLine();
+        ImGui::TextUnformatted(st.reviewed_context.label.empty()
+            ? st.reviewed_context.id.c_str() : st.reviewed_context.label.c_str());
+        ImGui::TextDisabled("%s://%s:%u%s | rev %llu | hash %016llX | %zu bytes",
+            st.reviewed_context.use_tls ? "https" : "http",
+            st.reviewed_context.target_host.c_str(),
+            static_cast<unsigned>(st.reviewed_context.target_port), st.reviewed_path.c_str(),
+            static_cast<unsigned long long>(st.reviewed_context.revision),
+            static_cast<unsigned long long>(st.reviewed_context.content_hash),
+            st.reviewed_context.content_size);
+        if (!st.reviewed_context_current && !st.reviewed_context_reason.empty())
+            ImGui::TextDisabled("%s", st.reviewed_context_reason.c_str());
+        ImGui::EndChild();
+        toolbar_y += context_height + 6.f;
+    }
+
+    ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + toolbar_y));
     ImGui::PushID("burp_cookies_toolbar");
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Filter host:");
@@ -890,9 +1007,10 @@ void render(float pos_x, float pos_y, float width, float height,
     if (ImGui::Button("Clear all##cookies_clear", ImVec2(96.f, 22.f))) clear_all();
     ImGui::PopID();
 
-    ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + 68.f));
-    ImGui::BeginChild("##cookies_table", ImVec2(width - 12.f, height - 110.f), false, ImGuiWindowFlags_NoBackground);
-    render_table(st, ImGui::GetWindowPos(), width - 12.f, height - 110.f, alpha);
+    ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + toolbar_y + 32.f));
+    const float table_height = (std::max)(80.f, height - toolbar_y - 74.f);
+    ImGui::BeginChild("##cookies_table", ImVec2(width - 12.f, table_height), false, ImGuiWindowFlags_NoBackground);
+    render_table(st, ImGui::GetWindowPos(), width - 12.f, table_height, alpha);
     ImGui::EndChild();
 
     if (st.show_edit) {

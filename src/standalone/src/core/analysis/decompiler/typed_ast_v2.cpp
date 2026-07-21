@@ -105,8 +105,13 @@ std::string function_name(const decompiler_entity_key_t& entity)
         using identity_t = std::decay_t<decltype(identity)>;
         if constexpr (std::is_same_v<identity_t, native_decompiler_entity_identity_t>)
             return identity.canonical_symbol;
-        else
+        else {
+            if (identity.method_name == "<init>")
+                return "constructor";
+            if (identity.method_name == "<clinit>")
+                return "static_initializer";
             return identity.method_name;
+        }
     }, entity.identity);
 }
 

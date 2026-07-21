@@ -316,7 +316,7 @@ function(aida_c03_require_locked_source_tree)
         "src/standalone/workers/managed_decompiler/Program.cs|9701|cd1eadecd5a5436e57ffefa2dd1592b7cfbdc2d66b002dfbb74042b28d37446c"
         "src/standalone/workers/managed_decompiler/Protocol.cs|6319|e2907928f3c218c21c774a3753f98072a7dc8176a13044fc7a0568f643d711d6"
         "src/standalone/workers/managed_decompiler/ResourceBudgetGuard.cs|5609|b9b715c3a524f0c830ef94599ba7de7597bf2aa6bad8928581ec6de5f4ba35bd"
-        "src/standalone/workers/managed_decompiler/RuntimeIdentity.cs|14815|386f2129ab3321b7f2d5f32fbb63b765c98914cc91fd2cd496cf293e51b865fe"
+        "src/standalone/workers/managed_decompiler/RuntimeIdentity.cs|15889|cdc1e07f75d7458680fa5298161718d16510a0305f138c9cc0b10dfb560f389f"
         "src/standalone/workers/managed_decompiler/worker_manifest.json|2429|3a1d2d5643b0204871f636d93a5c869dfe71667f03dc75f32f6fd83f646a193d"
         "src/standalone/workers/managed_decompiler/worker_manifest.schema.json|5361|fbc0fbac75c5af1219963aee9f624b600175dd1fb621353eeb3be3df9ccd994f"
         "src/standalone/workers/analysis_python/analysis_python_worker.py|9572|493d52e9401adaa060a4f5d1435ea38dfd3ee9f0519325ea04ce651a73c83024"

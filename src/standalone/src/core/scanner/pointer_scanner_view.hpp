@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -48,6 +49,48 @@
 #include "../ui/fonts.hpp"
 
 namespace pointer_scanner_view {
+
+struct staged_target_context_t {
+	std::uint64_t address = 0;
+	std::uint32_t target_pid = 0;
+	std::uint64_t target_epoch = 0;
+	std::uint64_t process_creation_time_100ns = 0;
+	std::uint64_t source_generation = 0;
+	std::string source_view;
+	std::string source_identity;
+	std::function<bool(std::string&)> validate;
+};
+
+struct staged_target_state_t {
+	std::optional<staged_target_context_t> context;
+	std::string status;
+	bool stale = false;
+};
+
+inline staged_target_state_t g_staged_target;
+
+inline bool stage_target_context(staged_target_context_t context, std::string& error) {
+	if (context.address == 0 || context.target_pid == 0 || context.target_epoch == 0 ||
+		context.process_creation_time_100ns == 0 || context.source_generation == 0 ||
+		context.source_view.empty() || context.source_identity.empty() || !context.validate) {
+		error = "Pointer target handoff requires an exact live-process identity, source generation, and address.";
+		return false;
+	}
+	if (context.source_view.size() > 128U || context.source_identity.size() > 512U) {
+		error = "Pointer target handoff metadata exceeds the bounded staging limit.";
+		return false;
+	}
+	std::string validation_error;
+	if (!context.validate(validation_error)) {
+		error = validation_error.empty() ? "The pointer target source is stale." : validation_error;
+		return false;
+	}
+	g_staged_target.context = std::move(context);
+	g_staged_target.status = "Review the retained source identity before using this target.";
+	g_staged_target.stale = false;
+	error.clear();
+	return true;
+}
 
 struct chain_anim_t {
 	float reveal = 0.f;
@@ -884,6 +927,72 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	aida::ui::input_text("##ptr_addr", st.addr_buf, sizeof(st.addr_buf),
 		"e.g. 7FF60012A440", false, ImVec2(field_w, 32.f));
 	cy += 44.f;
+
+	if (g_staged_target.context) {
+		const auto staged = *g_staged_target.context;
+		g_staged_target.status = g_staged_target.stale
+			? g_staged_target.status
+			: "Exact source current at last check. Review before replacing the target address.";
+		const float review_height = 92.f;
+		ui_anim::render_inline_callout(dl, cx, cy, field_w, review_height,
+			g_staged_target.status.c_str(), g_staged_target.stale
+				? ui_anim::callout_kind_t::warn : ui_anim::callout_kind_t::info,
+			0.25f, 0.55f, 0.95f, a);
+		char staged_address[96]{};
+		std::snprintf(staged_address, sizeof(staged_address), "0x%016llX  PID %u",
+			static_cast<unsigned long long>(staged.address), staged.target_pid);
+		std::string source_line = staged.source_view + "  generation " +
+			std::to_string(staged.source_generation);
+		dl->AddText(body_font, body_font_size, ImVec2(cx + 10.f, cy + 24.f),
+			aida::ui::with_alpha(t.text_secondary, a), source_line.c_str());
+		dl->AddText(code_font, code_font_size, ImVec2(cx + 10.f, cy + 43.f),
+			aida::ui::with_alpha(t.text_primary, a), staged_address);
+		ImGui::SetCursorScreenPos(ImVec2(cx + 10.f, cy + 62.f));
+		if (aida::ui::button("Use Target", aida::ui::button_kind_t::primary,
+			aida::ui::size_t_::sm, ImVec2(100.f, 24.f), g_staged_target.stale)) {
+			std::string validation_error;
+			if (!staged.validate(validation_error)) {
+				g_staged_target.stale = true;
+				g_staged_target.status = validation_error.empty()
+					? "The retained pointer target source is stale." : validation_error;
+			} else {
+				std::snprintf(st.addr_buf, sizeof(st.addr_buf), "%016llX",
+					static_cast<unsigned long long>(staged.address));
+				st.config.target_address = staged.address;
+				g_staged_target.status = "Target address accepted; start the scan when ready.";
+				g_staged_target.context.reset();
+			}
+		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			"aida.memory.pointer.staged_target.apply", "memory-pointer-action",
+			!g_staged_target.stale, false, "aida.dock-window.view.memory.pointers");
+#endif
+		ImGui::SetCursorScreenPos(ImVec2(cx + 118.f, cy + 62.f));
+		if (aida::ui::button("Recheck", aida::ui::button_kind_t::secondary,
+			aida::ui::size_t_::sm, ImVec2(82.f, 24.f))) {
+			std::string validation_error;
+			g_staged_target.stale = !staged.validate(validation_error);
+			g_staged_target.status = g_staged_target.stale
+				? (validation_error.empty() ? "The retained pointer target source is stale." : validation_error)
+				: "Exact source current at last check. Review before replacing the target address.";
+		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			"aida.memory.pointer.staged_target.recheck", "memory-pointer-action",
+			true, false, "aida.dock-window.view.memory.pointers");
+#endif
+		ImGui::SetCursorScreenPos(ImVec2(cx + 208.f, cy + 62.f));
+		if (aida::ui::button("Dismiss", aida::ui::button_kind_t::ghost,
+			aida::ui::size_t_::sm, ImVec2(76.f, 24.f)))
+			g_staged_target.context.reset();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			"aida.memory.pointer.staged_target.dismiss", "memory-pointer-action",
+			true, false, "aida.dock-window.view.memory.pointers");
+#endif
+		cy += review_height + 8.f;
+	}
 
 	auto draw_label_and_value = [&](const char* lbl, int value) {
 		ImFont* lblf = aida::ui::fonts::body();

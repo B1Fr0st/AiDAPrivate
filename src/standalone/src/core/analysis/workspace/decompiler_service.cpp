@@ -18,6 +18,7 @@
 #include <mutex>
 #include <new>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 
@@ -756,7 +757,159 @@ workspace_result_t<decompiler_cache_key_t> make_cache_key(
     return workspace_result_t<decompiler_cache_key_t>::success(std::move(key));
 }
 
-json serialize_result(const decompiler_result_t& result) {
+constexpr std::uint64_t decompiler_cache_format_version = 2;
+constexpr char decompiler_document_encoding[] =
+    "base64-rfc4648-canonical";
+
+std::uint8_t base64_value(unsigned char character) noexcept {
+    if (character >= 'A' && character <= 'Z')
+        return static_cast<std::uint8_t>(character - 'A');
+    if (character >= 'a' && character <= 'z')
+        return static_cast<std::uint8_t>(character - 'a' + 26);
+    if (character >= '0' && character <= '9')
+        return static_cast<std::uint8_t>(character - '0' + 52);
+    if (character == '+')
+        return 62;
+    if (character == '/')
+        return 63;
+    return 0xff;
+}
+
+std::string encode_document_base64(std::string_view bytes,
+                                   std::uint64_t max_encoded_bytes) {
+    if (bytes.size() > (std::numeric_limits<std::size_t>::max)() - 2)
+        throw std::length_error("typed document base64 size overflows");
+    const std::size_t groups = (bytes.size() + 2) / 3;
+    if (groups > (std::numeric_limits<std::size_t>::max)() / 4)
+        throw std::length_error("typed document base64 size overflows");
+    const std::size_t encoded_size = groups * 4;
+    if (encoded_size > max_encoded_bytes)
+        throw std::length_error("encoded typed document exceeds cache budget");
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded(encoded_size, '=');
+    std::size_t source = 0;
+    std::size_t target = 0;
+    while (source + 3 <= bytes.size()) {
+        const auto first = static_cast<std::uint8_t>(bytes[source]);
+        const auto second = static_cast<std::uint8_t>(bytes[source + 1]);
+        const auto third = static_cast<std::uint8_t>(bytes[source + 2]);
+        encoded[target] = alphabet[first >> 2];
+        encoded[target + 1] = alphabet[((first & 0x03U) << 4U) | (second >> 4U)];
+        encoded[target + 2] = alphabet[((second & 0x0fU) << 2U) | (third >> 6U)];
+        encoded[target + 3] = alphabet[third & 0x3fU];
+        source += 3;
+        target += 4;
+    }
+    const std::size_t remaining = bytes.size() - source;
+    if (remaining != 0) {
+        const auto first = static_cast<std::uint8_t>(bytes[source]);
+        encoded[target] = alphabet[first >> 2];
+        encoded[target + 1] = alphabet[(first & 0x03U) << 4U];
+        if (remaining == 2) {
+            const auto second = static_cast<std::uint8_t>(bytes[source + 1]);
+            encoded[target + 1] = alphabet[((first & 0x03U) << 4U) | (second >> 4U)];
+            encoded[target + 2] = alphabet[(second & 0x0fU) << 2U];
+        }
+    }
+    return encoded;
+}
+
+std::string decode_document_base64(std::string_view encoded,
+                                   std::uint64_t expected_decoded_bytes,
+                                   std::uint64_t max_decoded_bytes,
+                                   std::uint64_t max_encoded_bytes) {
+    if (encoded.size() > max_encoded_bytes || encoded.size() % 4 != 0)
+        throw std::length_error("typed document base64 length is invalid");
+    std::size_t padding = 0;
+    if (!encoded.empty() && encoded.back() == '=') {
+        padding = 1;
+        if (encoded.size() >= 2 && encoded[encoded.size() - 2] == '=')
+            padding = 2;
+    }
+    const std::uint64_t groups = encoded.size() / 4;
+    if (groups > (std::numeric_limits<std::uint64_t>::max)() / 3)
+        throw std::length_error("typed document decoded size overflows");
+    const std::uint64_t decoded_size = groups * 3 - padding;
+    if (decoded_size != expected_decoded_bytes || decoded_size > max_decoded_bytes ||
+        decoded_size > (std::numeric_limits<std::size_t>::max)())
+        throw std::length_error("typed document decoded size is invalid");
+    std::string decoded;
+    decoded.reserve(static_cast<std::size_t>(decoded_size));
+    for (std::size_t offset = 0; offset < encoded.size(); offset += 4) {
+        const bool final_group = offset + 4 == encoded.size();
+        const unsigned char first_character =
+            static_cast<unsigned char>(encoded[offset]);
+        const unsigned char second_character =
+            static_cast<unsigned char>(encoded[offset + 1]);
+        const unsigned char third_character =
+            static_cast<unsigned char>(encoded[offset + 2]);
+        const unsigned char fourth_character =
+            static_cast<unsigned char>(encoded[offset + 3]);
+        const std::uint8_t first = base64_value(first_character);
+        const std::uint8_t second = base64_value(second_character);
+        if (first == 0xff || second == 0xff)
+            throw std::invalid_argument("typed document base64 alphabet is invalid");
+        if (third_character == '=') {
+            if (!final_group || fourth_character != '=' || padding != 2 ||
+                (second & 0x0fU) != 0)
+                throw std::invalid_argument("typed document base64 padding is non-canonical");
+            decoded.push_back(static_cast<char>((first << 2U) | (second >> 4U)));
+            continue;
+        }
+        const std::uint8_t third = base64_value(third_character);
+        if (third == 0xff)
+            throw std::invalid_argument("typed document base64 alphabet is invalid");
+        decoded.push_back(static_cast<char>((first << 2U) | (second >> 4U)));
+        decoded.push_back(static_cast<char>((second << 4U) | (third >> 2U)));
+        if (fourth_character == '=') {
+            if (!final_group || padding != 1 || (third & 0x03U) != 0)
+                throw std::invalid_argument("typed document base64 padding is non-canonical");
+            continue;
+        }
+        const std::uint8_t fourth = base64_value(fourth_character);
+        if (fourth == 0xff)
+            throw std::invalid_argument("typed document base64 alphabet is invalid");
+        decoded.push_back(static_cast<char>((third << 6U) | fourth));
+    }
+    if (decoded.size() != decoded_size)
+        throw std::length_error("typed document base64 output size is invalid");
+    return decoded;
+}
+
+std::string decode_cached_document(const json& value,
+                                   const decompiler_service_limits_t& limits) {
+    const auto& document_value = value.at("document_v2");
+    if (!value.contains("cache_format_version")) {
+        if (!document_value.is_string())
+            throw std::invalid_argument("legacy typed document is not a JSON string");
+        const auto& document = document_value.get_ref<const std::string&>();
+        if (document.size() > limits.max_result_bytes)
+            throw std::length_error("legacy typed document exceeds cache budget");
+        return document;
+    }
+    const auto& format_version = value.at("cache_format_version");
+    if (!format_version.is_number_unsigned() ||
+        format_version.get<std::uint64_t>() != decompiler_cache_format_version ||
+        !document_value.is_object() || document_value.size() != 3 ||
+        !document_value.contains("encoding") ||
+        !document_value.contains("decoded_bytes") ||
+        !document_value.contains("payload"))
+        throw std::invalid_argument("typed document cache envelope is invalid");
+    const auto& encoding = document_value.at("encoding");
+    const auto& decoded_bytes = document_value.at("decoded_bytes");
+    const auto& payload = document_value.at("payload");
+    if (!encoding.is_string() ||
+        encoding.get_ref<const std::string&>() != decompiler_document_encoding ||
+        !decoded_bytes.is_number_unsigned() || !payload.is_string())
+        throw std::invalid_argument("typed document cache encoding is invalid");
+    return decode_document_base64(payload.get_ref<const std::string&>(),
+        decoded_bytes.get<std::uint64_t>(), limits.max_result_bytes,
+        (std::min)(limits.max_result_bytes, workspace_decompiler_cache_record_limit));
+}
+
+json serialize_result(const decompiler_result_t& result,
+                      const decompiler_service_limits_t& limits) {
     json annotations = json::array();
     for (const auto& item : result.annotations) {
         annotations.push_back({{"kind", item.kind}, {"start", item.start},
@@ -769,8 +922,16 @@ json serialize_result(const decompiler_result_t& result) {
     for (const auto& item : result.callees)
         callees.push_back({item.first, item.second});
     const std::string document = serialize_pseudocode_document_v2(result.document);
-    return json{{"function_name", result.function_name},
-        {"document_v2", document}, {"pseudocode", result.pseudocode}, {"annotations", std::move(annotations)},
+    if (document.size() > limits.max_result_bytes)
+        throw std::length_error("typed document exceeds cache budget");
+    const std::uint64_t encoded_budget =
+        (std::min)(limits.max_result_bytes, workspace_decompiler_cache_record_limit);
+    json document_envelope{{"encoding", decompiler_document_encoding},
+        {"decoded_bytes", document.size()},
+        {"payload", encode_document_base64(document, encoded_budget)}};
+    return json{{"cache_format_version", decompiler_cache_format_version},
+        {"function_name", result.function_name},
+        {"document_v2", std::move(document_envelope)}, {"pseudocode", result.pseudocode}, {"annotations", std::move(annotations)},
         {"line_to_address", std::move(lines)}, {"callees", std::move(callees)},
         {"sleigh_id", result.sleigh_id}, {"elapsed_ms", result.elapsed_ms}};
 }
@@ -785,6 +946,14 @@ workspace_result_t<decompiler_result_t> deserialize_result(
     const resolved_function_t& function,
     const std::optional<decompiler_request_context_t>& context,
     const decompiler_service_limits_t& limits) {
+    const std::uint64_t serialized_budget =
+        (std::min)(limits.max_result_bytes, workspace_decompiler_cache_record_limit);
+    if (text.empty() || text.size() > serialized_budget) {
+        return workspace_result_t<decompiler_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "persistent decompiler cache exceeds the serialized record budget",
+            "decompiler.cache.read"));
+    }
     json value = json::parse(text, nullptr, false);
     if (value.is_discarded() || !value.is_object()) {
         return workspace_result_t<decompiler_result_t>::failure(make_workspace_error(
@@ -799,11 +968,13 @@ workspace_result_t<decompiler_result_t> deserialize_result(
         result.function_id = function.function.id;
         result.function_address = function.function.start;
         result.function_name = value.at("function_name").get<std::string>();
-        const auto decoded_document = deserialize_pseudocode_document_v2(
-            value.at("document_v2").get<std::string>());
+        const std::string document = decode_cached_document(value, limits);
+        const auto decoded_document = deserialize_pseudocode_document_v2(document);
         if (!decoded_document.valid())
             throw std::invalid_argument("typed document is invalid");
         result.document = *decoded_document.value;
+        if (serialize_pseudocode_document_v2(result.document) != document)
+            throw std::invalid_argument("typed document serialization is non-canonical");
         result.pseudocode = value.at("pseudocode").get<std::string>();
         result.sleigh_id = value.at("sleigh_id").get<std::string>();
         result.elapsed_ms = value.value("elapsed_ms", 0.0);
@@ -2344,7 +2515,7 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
 
     std::string result_json;
     try {
-        result_json = serialize_result(result).dump();
+        result_json = serialize_result(result, state_->limits).dump();
     } catch (const std::exception& error) {
         auto failure = make_workspace_error(workspace_error_code_t::integrity_failure,
             "native decompiler result is not valid bounded UTF-8 JSON",

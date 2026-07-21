@@ -21,12 +21,12 @@ namespace {
 constexpr std::size_t kMaximumNamedUserLayouts = 4096U;
 constexpr std::array<workspace_preset_descriptor_t, 8> kPresetDescriptors{{
     {workspace_preset_t::analysis, "analysis", "Analysis", "Disassembly, pseudocode, graph, symbols, references and inspection", 3},
-    {workspace_preset_t::debugging, "debugging", "Debugging", "Execution controls, CPU, registers, breakpoints, threads, stack and trace", 3},
-    {workspace_preset_t::memory, "memory", "Memory", "Process sessions, scans, results, memory map, hex, pointers and patches", 3},
+    {workspace_preset_t::debugging, "debugging", "Debugging", "Execution controls, CPU, registers, breakpoints, threads, stack and trace", 5},
+    {workspace_preset_t::memory, "memory", "Memory", "Process sessions, scans, results, memory map, hex, pointers and patches", 5},
     {workspace_preset_t::types_structures, "types-structures", "Types and Structures", "Type catalogs, structure layouts, live values and propagation", 3},
     {workspace_preset_t::network, "network", "Network", "Proxy history, repeater, browser, protocol streams and evidence", 3},
-    {workspace_preset_t::automation_ai, "automation-ai", "Automation and AI", "Chat, agents, skills, MCP activity, evidence review and tasks", 3},
-    {workspace_preset_t::programming, "programming", "Programming", "Project explorer, source editing, search, terminal, problems and debugging", 3},
+    {workspace_preset_t::automation_ai, "automation-ai", "Automation and AI", "Chat, agents, skills, MCP activity, evidence review and tasks", 4},
+    {workspace_preset_t::programming, "programming", "Programming", "Project explorer, source editing, search, terminal, problems and debugging", 4},
     {workspace_preset_t::safe, "safe", "Safe Layout", "Recovery workspace with Start Center, diagnostics and essential navigation", 3}
 }};
 
@@ -542,13 +542,13 @@ void select_builtin_default_tabs(workspace_preset_t preset, ImGuiID left, ImGuiI
         select_docked_window(center, "document.disassembly");
     } else if (preset == workspace_preset_t::debugging) {
         select_docked_window(left, "view.debug.threads");
-        select_docked_window(right, "view.debug.breakpoints");
-        select_docked_window(bottom, "view.debug.trace");
+        select_docked_window(right, "view.debug.registers");
+        select_docked_window(bottom, "view.debug.stack");
         select_docked_window(center, "view.debug.cpu");
     } else if (preset == workspace_preset_t::memory) {
         select_docked_window(left, "view.memory.value_scan");
         select_docked_window(right, "view.debug.memory_map");
-        select_docked_window(bottom, "view.debug.patches");
+        select_docked_window(bottom, "view.memory.address_list");
         select_docked_window(center, "document.hex");
     } else if (preset == workspace_preset_t::types_structures) {
         select_docked_window(left, "view.types.structures");
@@ -562,13 +562,13 @@ void select_builtin_default_tabs(workspace_preset_t preset, ImGuiID left, ImGuiI
         select_docked_window(center, "view.network.proxy");
     } else if (preset == workspace_preset_t::automation_ai) {
         select_docked_window(left, "view.ai.agents");
-        select_docked_window(right, "view.settings");
+        select_docked_window(right, "view.ai.evidence");
         select_docked_window(bottom, "view.background_tasks");
         select_docked_window(center, "view.ai_chat");
     } else if (preset == workspace_preset_t::programming) {
         select_docked_window(left, "view.project_explorer");
         select_docked_window(right, "view.inspector");
-        select_docked_window(bottom, "view.programming.source_debug_console");
+        select_docked_window(bottom, "view.diagnostics");
         select_docked_window(center, "document.code");
     } else {
         select_docked_window(left, "view.project_explorer");
@@ -635,12 +635,16 @@ bool preset_default_opens_view(workspace_preset_t preset,
             "view.ai_chat", "view.output", "view.background_tasks", "view.diagnostics"});
     case workspace_preset_t::debugging:
         return matches({"view.sessions", "view.debug.threads", "view.debug.modules",
-            "view.debug.call_stack", "view.debug.cpu", "view.debug.source", "document.hex",
-            "view.debug.breakpoints", "view.debug.watches", "view.debug.memory_map",
+            "view.debug.call_stack", "view.debug.cpu", "view.debug.registers", "view.debug.stack",
+            "view.debug.source", "document.hex",
+            "view.debug.breakpoints", "view.debug.watches", "view.debug.strings",
+            "view.debug.bookmarks", "view.debug.memory_map",
             "view.debug.trace", "view.terminal", "view.background_tasks", "view.diagnostics"});
     case workspace_preset_t::memory:
-        return matches({"view.sessions", "view.memory.value_scan", "view.memory.aob",
-            "document.hex", "view.memory.pointers", "view.memory.snapshots",
+        return matches({"view.sessions", "view.memory.value_scan", "view.memory.value_scan_results",
+            "view.memory.address_list", "view.memory.aob",
+            "view.memory.decrypt", "view.memory.integrity", "document.hex",
+            "view.memory.pointers", "view.memory.snapshots",
             "view.debug.memory_map", "view.types.dissector", "view.debug.patches",
             "view.debug.watches", "view.background_tasks"});
     case workspace_preset_t::types_structures:
@@ -654,14 +658,17 @@ bool preset_default_opens_view(workspace_preset_t preset,
             "view.network.capture", "view.network.logger", "view.background_tasks"});
     case workspace_preset_t::automation_ai:
         return matches({"view.sessions", "view.ai.agents", "view.ai.skills",
-            "view.project_explorer", "view.ai_chat", "document.code", "view.settings",
-            "view.background_tasks", "view.mcp_log", "view.output", "view.terminal"});
+            "view.ai.scripts", "view.project_explorer", "view.ai_chat", "document.code",
+            "view.ai.evidence", "view.ai.providers", "view.ai.mcp_marketplace",
+            "view.background_tasks", "view.mcp_log", "view.output", "view.terminal",
+            "view.diagnostics"});
     case workspace_preset_t::programming:
         return matches({"view.project_explorer", "view.programming.outline", "view.sessions",
             "view.workspace_search", "document.code", "document.disassembly",
             "view.inspector", "view.analysis.references", "view.ai_chat", "view.output",
             "view.terminal", "view.programming.references",
-            "view.programming.source_debug_console", "view.background_tasks"});
+            "view.programming.source_debug_console", "view.background_tasks",
+            "view.diagnostics"});
     case workspace_preset_t::safe:
         return matches({"view.project_explorer", "view.sessions", "view.recent",
             "document.code", "view.ai_chat", "view.diagnostics", "view.output"});
@@ -976,17 +983,18 @@ void dock_preview_named_windows(workspace_preset_t preset, ImGuiID left, ImGuiID
             "view.debug.call_stack"});
         dock(center, {"view.start_center", "view.debug.cpu", "view.debug.source",
             "document.code", "document.hex", "view.debug.cfg"});
-        dock(right, {"view.debug.breakpoints", "view.debug.watches"});
-        dock(bottom, {"view.debug.memory_map", "view.debug.trace", "view.debug.patches",
+        dock(right, {"view.debug.registers", "view.debug.breakpoints", "view.debug.watches",
+            "view.debug.strings", "view.debug.bookmarks"});
+        dock(bottom, {"view.debug.stack", "view.debug.memory_map", "view.debug.trace", "view.debug.patches",
             "view.debug.seh", "view.debug.handles", "view.terminal",
             "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::memory) {
         dock(left, {"view.sessions", "view.memory.value_scan", "view.memory.crypto",
-            "view.memory.aob"});
-        dock(center, {"view.start_center", "document.hex", "view.memory.pointers",
+            "view.memory.aob", "view.memory.decrypt", "view.memory.integrity"});
+        dock(center, {"view.start_center", "document.hex", "view.memory.value_scan_results", "view.memory.pointers",
             "view.memory.snapshots"});
         dock(right, {"view.debug.memory_map", "view.types.dissector"});
-        dock(bottom, {"view.debug.patches", "view.debug.watches",
+        dock(bottom, {"view.memory.address_list", "view.debug.patches", "view.debug.watches",
             "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::types_structures) {
         dock(left, {"view.sessions", "view.types.structures", "view.types.unions",
@@ -1009,9 +1017,10 @@ void dock_preview_named_windows(workspace_preset_t preset, ImGuiID left, ImGuiID
             "view.diagnostics"});
     } else if (preset == workspace_preset_t::automation_ai) {
         dock(left, {"view.sessions", "view.ai.agents", "view.ai.skills",
-            "view.project_explorer"});
+            "view.ai.scripts", "view.project_explorer"});
         dock(center, {"view.start_center", "view.ai_chat", "document.code"});
-        dock(right, {"view.settings"});
+        dock(right, {"view.ai.evidence", "view.ai.providers",
+            "view.ai.mcp_marketplace"});
         dock(bottom, {"view.background_tasks", "view.mcp_log", "view.output",
             "view.terminal", "view.diagnostics"});
     } else if (preset == workspace_preset_t::programming) {
@@ -2803,13 +2812,13 @@ void dock_named_windows(workspace_preset_t preset, ImGuiID left, ImGuiID center,
     } else if (preset == workspace_preset_t::debugging) {
         dock(left, {"view.sessions", "view.debug.threads", "view.debug.modules", "view.debug.call_stack"});
         dock(center, {"view.start_center", "view.debug.cpu", "view.debug.source", "document.code", "document.hex", "view.debug.cfg"});
-        dock(right, {"view.debug.breakpoints", "view.debug.watches"});
-        dock(bottom, {"view.debug.memory_map", "view.debug.trace", "view.debug.patches", "view.debug.seh", "view.debug.handles", "view.terminal", "view.background_tasks", "view.diagnostics"});
+        dock(right, {"view.debug.registers", "view.debug.breakpoints", "view.debug.watches", "view.debug.strings", "view.debug.bookmarks"});
+        dock(bottom, {"view.debug.stack", "view.debug.memory_map", "view.debug.trace", "view.debug.patches", "view.debug.seh", "view.debug.handles", "view.terminal", "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::memory) {
-        dock(left, {"view.sessions", "view.memory.value_scan", "view.memory.crypto", "view.memory.aob"});
-        dock(center, {"view.start_center", "document.hex", "view.memory.pointers", "view.memory.snapshots"});
+        dock(left, {"view.sessions", "view.memory.value_scan", "view.memory.crypto", "view.memory.aob", "view.memory.decrypt", "view.memory.integrity"});
+        dock(center, {"view.start_center", "document.hex", "view.memory.value_scan_results", "view.memory.pointers", "view.memory.snapshots"});
         dock(right, {"view.debug.memory_map", "view.types.dissector"});
-        dock(bottom, {"view.debug.patches", "view.debug.watches", "view.background_tasks", "view.diagnostics"});
+        dock(bottom, {"view.memory.address_list", "view.debug.patches", "view.debug.watches", "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::types_structures) {
         dock(left, {"view.sessions", "view.types.structures", "view.types.unions", "view.types.enums", "view.types.typedefs", "view.types.functions", "view.types.inferred"});
         dock(center, {"view.start_center", "view.types.struct_recon", "document.code", "document.hex"});
@@ -2821,9 +2830,9 @@ void dock_named_windows(workspace_preset_t preset, ImGuiID left, ImGuiID center,
         dock(right, {"view.network.decoder", "view.network.comparer", "view.network.scanner", "view.network.reports"});
         dock(bottom, {"view.network.capture", "view.network.logger", "view.network.websocket", "view.network.h2_editor", "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::automation_ai) {
-        dock(left, {"view.sessions", "view.ai.agents", "view.ai.skills", "view.project_explorer"});
+        dock(left, {"view.sessions", "view.ai.agents", "view.ai.skills", "view.ai.scripts", "view.project_explorer"});
         dock(center, {"view.start_center", "view.ai_chat", "document.code"});
-        dock(right, {"view.settings"});
+        dock(right, {"view.ai.evidence", "view.ai.providers", "view.ai.mcp_marketplace"});
         dock(bottom, {"view.background_tasks", "view.mcp_log", "view.output", "view.terminal", "view.diagnostics"});
     } else if (preset == workspace_preset_t::programming) {
         dock(left, {"view.project_explorer", "view.programming.outline", "view.sessions", "view.workspace_search"});

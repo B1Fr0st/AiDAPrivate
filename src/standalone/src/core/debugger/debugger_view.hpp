@@ -28,6 +28,11 @@ enum class patch_panel_command_t : std::uint8_t {
 	save_patchset
 };
 
+enum class breakpoint_definition_mode_t : std::uint8_t {
+	software,
+	hardware_execute
+};
+
 struct execution_capability_t {
 	bool enabled = false;
 	const char* disabled_reason = nullptr;
@@ -132,6 +137,10 @@ struct ui_state_t {
 	float    record_pulse = 0.f;
 
 	char     add_bp_addr_buf[24] = {};
+	bool     add_bp_staged = false;
+	breakpoint_definition_mode_t add_bp_staged_mode =
+		breakpoint_definition_mode_t::software;
+	debugger_interaction::context_t add_bp_staged_context;
 	char     add_watch_buf[96] = {};
 	char     add_bookmark_buf[24] = {};
 	char     add_bookmark_label_buf[64] = {};
@@ -159,6 +168,17 @@ struct ui_state_t {
 	char     bp_edit_log_buf[160] = {};
 	bool     bp_edit_auto_continue = false;
 	bool     bp_edit_popup_open = false;
+	bool     bp_edit_identity_retained = false;
+	debugger_interaction::context_t bp_edit_context;
+	std::uint64_t bp_edit_breakpoints_generation = 0;
+	std::uint64_t bp_edit_fingerprint = 0;
+	std::uint64_t bp_edit_address = 0;
+	std::uint64_t bp_edit_size = 0;
+	int      bp_edit_type = 0;
+	std::string bp_edit_name;
+	std::string bp_edit_original_condition;
+	std::string bp_edit_original_log;
+	bool     bp_edit_original_auto_continue = false;
 
 	int      handle_close_idx = -1;
 	uint64_t handle_close_value = 0;
@@ -216,15 +236,23 @@ bool stage_exact_patch_review(std::uint64_t address,
 	const std::string& description, std::string* error = nullptr);
 bool stage_nop_review(std::uint64_t address, std::uint64_t extent,
 	std::string* error = nullptr);
-bool stage_breakpoint_definition(std::uint64_t address, std::string* error = nullptr);
+bool stage_breakpoint_definition(
+	const debugger_interaction::context_t& expected_context,
+	breakpoint_definition_mode_t mode, std::string* error = nullptr);
 execution_capability_t address_mutation_capability(std::uint64_t address,
 	bool toggle_breakpoint, std::uint32_t expected_pid = 0);
 bool queue_run_to_address(std::uint64_t address, std::uint32_t expected_pid,
 	std::string* error = nullptr);
 bool queue_toggle_breakpoint(std::uint64_t address, std::uint32_t expected_pid,
 	std::string* error = nullptr);
+bool queue_toggle_breakpoint(const debugger_interaction::context_t& expected_context,
+	std::string* error = nullptr);
 
 void render_cpu_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_registers_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_stack_pane(float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b);
 void render_breakpoints_pane(float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b);
