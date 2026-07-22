@@ -306,10 +306,10 @@ namespace aida::ui::components {
 		ImVec2 a = pos;
 		ImVec2 b = ImVec2(pos.x + w, pos.y + h);
 
-		ImGui::InvisibleButton("##b", ImVec2(w, h));
+		const bool activated = ImGui::InvisibleButton("##b", ImVec2(w, h));
 		bool hovered = ImGui::IsItemHovered() && !disabled && !loading;
 		bool held    = ImGui::IsItemActive() && !disabled && !loading;
-		bool clicked = ImGui::IsItemDeactivated() && ImGui::IsItemHovered() && !disabled && !loading;
+		bool clicked = activated && !disabled && !loading;
 		bool focused = ImGui::IsItemFocused();
 
 		auto& st = detail::bstate(id);

@@ -57,8 +57,7 @@ internal static class Program
             {
                 try
                 {
-                    using var reportDeadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
-                    await SendStartupFailureAsync(transport, startupStage, exception, reportDeadline.Token).ConfigureAwait(false);
+                    SendStartupFailure(transport, startupStage, exception);
                 }
                 catch
                 {
@@ -74,8 +73,8 @@ internal static class Program
         }
     }
 
-    private static async Task SendStartupFailureAsync(AuthenticatedTransport transport, string stage,
-        Exception exception, CancellationToken cancellationToken)
+    private static void SendStartupFailure(AuthenticatedTransport transport, string stage,
+        Exception exception)
     {
         var failure = new WorkerTransportStartupFailure(
             TransportSchema,
@@ -86,7 +85,7 @@ internal static class Program
             stage,
             StartupFailureCode(exception),
             exception is IOException);
-        await transport.SendPayloadAsync(1, WorkerProtocol.Serialize(failure), cancellationToken).ConfigureAwait(false);
+        transport.SendStartupFailurePayload(WorkerProtocol.Serialize(failure));
     }
 
     private static string StartupFailureCode(Exception exception) => exception switch
@@ -105,6 +104,14 @@ internal static class Program
             "managed worker loaded assembly paths are not app-local" => "loaded_assembly_path",
             "managed framework dependency copies do not match the loaded runtime" => "framework_dependency_hash",
             "managed worker framework identity is invalid" => "framework_identity",
+            "managed worker AppContainer token cannot be opened" => "appcontainer_token_open",
+            "managed worker AppContainer token size is invalid" => "appcontainer_token_size",
+            "managed worker AppContainer token query failed" => "appcontainer_token_query",
+            "managed worker AppContainer SID is invalid" => "appcontainer_sid",
+            "managed worker AppContainer profile is unavailable" => "appcontainer_profile",
+            "managed worker AppContainer profile cannot be accessed" => "appcontainer_profile_access",
+            "managed worker AppContainer LOCALAPPDATA is not profile-bound" => "appcontainer_localappdata",
+            "managed worker AppContainer TEMP is not profile-bound" => "appcontainer_temp",
             "managed worker AppContainer environment is not profile-bound" => "appcontainer_environment",
             "managed worker environment exceeds its minimal allowlist" => "environment_allowlist",
             "managed worker environment violates app-local runtime policy" => "environment_policy",
@@ -216,13 +223,15 @@ internal static class Program
         {
             failure = Failure(job.Request, "worker_integrity_failure", "managed_cli.runtime_integrity", false);
         }
-        catch (BadImageFormatException)
+        catch (BadImageFormatException exception)
         {
-            failure = Failure(job.Request, "malformed_metadata", "managed_cli.malformed_metadata", false);
+            failure = Failure(job.Request, "malformed_metadata", "managed_cli.malformed_metadata", false,
+                MalformedMetadataArguments("bad_image", exception.Message));
         }
-        catch (InvalidDataException)
+        catch (InvalidDataException exception)
         {
-            failure = Failure(job.Request, "malformed_metadata", "managed_cli.malformed_metadata", false);
+            failure = Failure(job.Request, "malformed_metadata", "managed_cli.malformed_metadata", false,
+                MalformedMetadataArguments("invalid_data", exception.Message));
         }
         catch (FileNotFoundException)
         {
@@ -259,7 +268,21 @@ internal static class Program
             throw new InvalidDataException("managed worker cancellation violates the authenticated request contract");
     }
 
-    private static WorkerFailure Failure(WorkerRequest request, string code, string key, bool retryable)
+    private static IReadOnlyList<string> MalformedMetadataArguments(string category, string message)
+    {
+        const int maximumMessageLength = 1024;
+        var bounded = message.Replace("\0", string.Empty, StringComparison.Ordinal);
+        if (bounded.Length > maximumMessageLength)
+        {
+            bounded = bounded[..maximumMessageLength];
+            if (char.IsHighSurrogate(bounded[^1]))
+                bounded = bounded[..^1];
+        }
+        return new[] { category, bounded };
+    }
+
+    private static WorkerFailure Failure(WorkerRequest request, string code, string key, bool retryable,
+        IReadOnlyList<string>? arguments = null)
     {
         return new WorkerFailure(
             WorkerProtocol.Schema,
@@ -278,7 +301,7 @@ internal static class Program
             request.CacheIdentity,
             request.RequestBindingHash,
             request.Provider,
-            new[] { new WorkerDiagnostic("error", code, key, Array.Empty<string>(), null, 100, retryable, 1) });
+            new[] { new WorkerDiagnostic("error", code, key, arguments ?? Array.Empty<string>(), null, 100, retryable, 1) });
     }
 
     private sealed class ActiveJob

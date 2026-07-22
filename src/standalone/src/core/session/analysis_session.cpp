@@ -47,6 +47,14 @@ std::shared_ptr<analysis_session_t> make_session(
     session->last_active_steady_ms = session->session_created_ms;
     session->ui_selected = true;
     session->workspace = fixture.workspace;
+    if (fixture.workspace) {
+        const auto process = fixture.workspace->identity().process();
+        if (process) {
+            session->attached_pid = process->pid;
+            session->process_name.assign(
+                fixture.filename.begin(), fixture.filename.end());
+        }
+    }
     session->load_state = fixture.workspace
         ? session_load_state_t::ready : session_load_state_t::failed;
     if (!fixture.workspace)
@@ -113,6 +121,8 @@ session_summary_t summarize(const analysis_session_t& session, bool active) {
     summary.error = session.load_error;
     if (session.workspace) {
         summary.binary_id = session.workspace->identity().binary_id().to_hex();
+        if (const auto process = session.workspace->identity().process())
+            summary.process_creation_time_100ns = process->creation_time_100ns;
         summary.analysis_revision = session.workspace->analysis_revision();
         summary.overlay_revision = session.workspace->overlay_revision();
         summary.readiness = session.workspace->progress().readiness;

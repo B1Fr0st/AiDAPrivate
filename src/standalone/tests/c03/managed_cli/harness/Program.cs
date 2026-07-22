@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
@@ -18,6 +19,8 @@ internal static class Program
     private const string FixtureManifestRelativePath = "src/standalone/tests/c03/managed_cli/fixture_manifest.json";
     private const string ManagedContractHash = "4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6";
     private const string ManagedWorkerBuildMaterial = "aida-managed-decompiler-worker-build-v3|snapshot-bound-contract=4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6|tfm=net10.0|runtime=Microsoft.NETCore.App/10.0.9";
+    private const string GeneratedParameterTypeName = "Aida.C03.GeneratedParameterFixture";
+    private const int MaximumWireSignatureBytes = 8 * 1024;
     private static string runtimeManifestHash = string.Empty;
     private static readonly WorkerBudget StandardBudget = new(
         "balanced", 30_000, 30_000, 1UL << 30, 1_000_000,
@@ -54,6 +57,7 @@ internal static class Program
             await ValidateMandatoryRuntimeGateAsync(firstRequest).ConfigureAwait(false);
             await ValidateManifestMethodsAsync(manifest, inventory,
                 fixturePath, moduleHash, checked((ulong)moduleBytes.LongLength)).ConfigureAwait(false);
+            await ValidateParameterMetadataAsync().ConfigureAwait(false);
             await ValidateResourceLimitsAsync().ConfigureAwait(false);
             await ValidateResourceBudgetBoundsAsync(firstRequest).ConfigureAwait(false);
             await ValidateSnapshotBindingAsync(firstRequest,
@@ -159,7 +163,7 @@ internal static class Program
             {
                 await using var worker = await ManagedWorkerProcess.StartAsync(fixturePath).ConfigureAwait(false);
                 var result = await worker.DecompileAsync(request).ConfigureAwait(false);
-                ValidateMethodResult(fixtureCase, method, request, result);
+                ValidateMethodResult(manifest.Assembly, fixtureCase, method, request, result);
                 var serialized = WorkerProtocol.Serialize(result);
                 if (baseline is not null)
                     Require(string.Equals(baseline, serialized, StringComparison.Ordinal), $"managed CLI output is nondeterministic for {fixtureCase.Symbol}");
@@ -194,7 +198,185 @@ internal static class Program
             "managed CLI worker deadline response is invalid");
     }
 
-    private static void ValidateMethodResult(FixtureCase fixtureCase, MethodDescriptor method, WorkerRequest request, WorkerResult result)
+    private static async Task ValidateParameterMetadataAsync()
+    {
+        var fixture = CreateParameterMetadataFixture(ParameterFixtureKind.Valid);
+        var repeatedFixture = CreateParameterMetadataFixture(ParameterFixtureKind.Valid);
+        try
+        {
+            Require(fixture.Bytes.AsSpan().SequenceEqual(repeatedFixture.Bytes),
+                "managed CLI generated parameter fixture is nondeterministic");
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(repeatedFixture.Bytes);
+        }
+        var temporaryPath = Path.Combine(Path.GetTempPath(), $"aida-managed-cli-parameter-rows-{Guid.NewGuid():N}.dll");
+        try
+        {
+            File.WriteAllBytes(temporaryPath, fixture.Bytes);
+            ValidateParameterFixtureEncoding(temporaryPath, fixture);
+            var inventory = ReadMethodInventory(temporaryPath);
+            Require(fixture.Methods.All(entry => inventory.Methods.TryGetValue(entry.Key, out var method) && method == entry.Value),
+                "managed CLI generated parameter fixture inventory drifted");
+            var expectations = new[]
+            {
+                new ParameterIdentityExpectation("StaticNamed", new[] { "left", "right" },
+                    new[] { "left", "right" }, Array.Empty<string>()),
+                new ParameterIdentityExpectation("InstanceNamed", new[] { "this", "value", "delta" },
+                    new[] { "value", "delta" }, Array.Empty<string>()),
+                new ParameterIdentityExpectation("StoreForms", new[] { "arg_0", "shortNamed", "longNamed", "storeOnly" },
+                    new[] { "shortNamed", "longNamed", "storeOnly" },
+                    new[] { "arg_0", "shortNamed", "longNamed", "storeOnly" }),
+                new ParameterIdentityExpectation("Reordered", new[] { "first", "second" },
+                    new[] { "first", "second" }, Array.Empty<string>())
+            };
+            ulong sequence = 40_000;
+            foreach (var expectation in expectations)
+            {
+                var symbol = GeneratedParameterTypeName + "." + expectation.MethodName;
+                var method = fixture.Methods[symbol];
+                var request = CreateRequest(sequence++, "regular_file", temporaryPath, HashBytes(fixture.Bytes),
+                    checked((ulong)fixture.Bytes.LongLength), method, StandardBudget, 301, 43);
+                string? baseline = null;
+                for (var run = 0; run < 2; run++)
+                {
+                    await using var worker = await ManagedWorkerProcess.StartAsync(temporaryPath).ConfigureAwait(false);
+                    var result = await worker.DecompileAsync(request).ConfigureAwait(false);
+                    ValidateParameterIdentityResult(expectation, method, request, result);
+                    var serialized = WorkerProtocol.Serialize(result);
+                    if (baseline is not null)
+                        Require(string.Equals(baseline, serialized, StringComparison.Ordinal),
+                            $"managed CLI parameter identities are nondeterministic for {expectation.MethodName}");
+                    baseline = serialized;
+                }
+            }
+
+            var cancellationMethod = fixture.Methods[GeneratedParameterTypeName + ".StoreForms"];
+            var cancellationRequest = CreateRequest(sequence++, "regular_file", temporaryPath, HashBytes(fixture.Bytes),
+                checked((ulong)fixture.Bytes.LongLength), cancellationMethod, StandardBudget, 302, 47);
+            await using (var cancellationWorker = await ManagedWorkerProcess.StartAsync(temporaryPath).ConfigureAwait(false))
+            {
+                var cancellation = await cancellationWorker.DecompileAndCancelAsync(cancellationRequest).ConfigureAwait(false);
+                Require(cancellation.Diagnostics.Count == 1 &&
+                    string.Equals(cancellation.Diagnostics[0].Code, "cancelled", StringComparison.Ordinal),
+                    "managed CLI parameter metadata cancellation response is invalid");
+            }
+
+            var budgetRequest = CreateRequest(sequence, "regular_file", temporaryPath, HashBytes(fixture.Bytes),
+                checked((ulong)fixture.Bytes.LongLength), cancellationMethod,
+                new WorkerBudget("balanced", 5_000, 5_000, 1UL << 30,
+                    1, 1_000_000, 1_000_000, 0, false), 303, 53);
+            await using var budgetWorker = await ManagedWorkerProcess.StartAsync(temporaryPath).ConfigureAwait(false);
+            var budgetFailure = await budgetWorker.DecompileFailureAsync(budgetRequest).ConfigureAwait(false);
+            Require(budgetFailure.Diagnostics.Count == 1 &&
+                string.Equals(budgetFailure.Diagnostics[0].Code, "resource_limit", StringComparison.Ordinal),
+                "managed CLI parameter metadata resource budget was not enforced");
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(fixture.Bytes);
+            if (File.Exists(temporaryPath))
+                File.Delete(temporaryPath);
+        }
+
+        foreach (var malformed in new[]
+                 {
+                     ParameterFixtureKind.DuplicateSequence,
+                     ParameterFixtureKind.OutOfRangeSequence,
+                     ParameterFixtureKind.DuplicateReturnSequence,
+                     ParameterFixtureKind.ExcessRows
+                 })
+            await ValidateMalformedParameterMetadataAsync(malformed).ConfigureAwait(false);
+    }
+
+    private static void ValidateParameterIdentityResult(
+        ParameterIdentityExpectation expectation,
+        MethodDescriptor method,
+        WorkerRequest request,
+        WorkerResult result)
+    {
+        ValidateTerminalBinding(request, result.ModuleSource, result.EntityHash,
+            result.MetadataToken, result.WorkspaceGeneration, result.TypeGraphRevision,
+            result.Budget, result.RuntimeManifestHash, result.ContractHash,
+            result.CacheIdentity, result.RequestBindingHash, result.Provider);
+        Require(result.MetadataToken == method.Token &&
+            string.Equals(result.Identity.AssemblyIdentity, "ManagedParameterRows", StringComparison.Ordinal) &&
+            string.Equals(result.Identity.ModuleName, "ManagedParameterRows.dll", StringComparison.Ordinal) &&
+            string.Equals(result.Identity.DeclaringType, GeneratedParameterTypeName, StringComparison.Ordinal) &&
+            string.Equals(result.Identity.MethodName, expectation.MethodName, StringComparison.Ordinal) &&
+            string.Equals(result.Identity.MethodSignature, method.Signature, StringComparison.Ordinal),
+            $"managed CLI parameter metadata identity drifted for {expectation.MethodName}");
+        Require(FixedTimeHexEquals(result.Source.Sha256, HashText(result.Source.Text)),
+            $"managed CLI parameter metadata source hash drifted for {expectation.MethodName}");
+        foreach (var sourceName in expectation.SourceNames)
+            Require(result.Source.Text.Contains(sourceName, StringComparison.Ordinal),
+                $"managed CLI metadata parameter name {sourceName} was not preserved for {expectation.MethodName}");
+
+        ValidateProviderOperands(GeneratedParameterTypeName + "." + expectation.MethodName, result);
+        var values = result.Ir.Blocks.SelectMany(block => block.Values).ToArray();
+        var parameterSymbols = values.Where(value => string.Equals(value.Opcode, "parameter", StringComparison.Ordinal))
+            .Select(value => value.StableSymbol).ToHashSet(StringComparer.Ordinal);
+        Require(parameterSymbols.SetEquals(expectation.StableSymbols),
+            $"managed CLI canonical parameter identities drifted for {expectation.MethodName}");
+        Require(!parameterSymbols.Contains("returnValue") && !parameterSymbols.Contains("instanceReturn") &&
+            !parameterSymbols.Contains("storeReturn") && !parameterSymbols.Contains("reorderedReturn"),
+            $"managed CLI return Param row leaked into argument identities for {expectation.MethodName}");
+
+        if (expectation.StoreDestinations.Count != 0)
+        {
+            var byId = values.ToDictionary(value => value.Id);
+            var destinations = values.Where(value => string.Equals(value.Opcode, "store", StringComparison.Ordinal))
+                .Select(value => value.OperandIds.Count == 2 && byId.TryGetValue(value.OperandIds[0], out var destination) &&
+                    string.Equals(destination.Opcode, "parameter", StringComparison.Ordinal)
+                        ? destination.StableSymbol
+                        : string.Empty)
+                .ToArray();
+            Require(destinations.SequenceEqual(expectation.StoreDestinations, StringComparer.Ordinal),
+                $"managed CLI parameter store destinations drifted for {expectation.MethodName}");
+        }
+    }
+
+    private static async Task ValidateMalformedParameterMetadataAsync(ParameterFixtureKind kind)
+    {
+        var fixture = CreateParameterMetadataFixture(kind);
+        var temporaryPath = Path.Combine(Path.GetTempPath(), $"aida-managed-cli-parameter-{kind}-{Guid.NewGuid():N}.dll");
+        try
+        {
+            File.WriteAllBytes(temporaryPath, fixture.Bytes);
+            var method = fixture.Methods[GeneratedParameterTypeName + ".Malformed"];
+            var request = CreateRequest(41_000 + checked((ulong)kind), "regular_file", temporaryPath,
+                HashBytes(fixture.Bytes), checked((ulong)fixture.Bytes.LongLength), method,
+                StandardBudget, 401 + checked((ulong)kind), 61);
+            await using var worker = await ManagedWorkerProcess.StartAsync(temporaryPath).ConfigureAwait(false);
+            var failure = await worker.DecompileFailureAsync(request).ConfigureAwait(false);
+            var expectedMessage = kind switch
+            {
+                ParameterFixtureKind.DuplicateSequence or ParameterFixtureKind.DuplicateReturnSequence =>
+                    "method parameter sequence is duplicated",
+                ParameterFixtureKind.OutOfRangeSequence =>
+                    "method parameter sequence exceeds its signature bounds",
+                ParameterFixtureKind.ExcessRows =>
+                    "method parameter table exceeds its signature bounds",
+                _ => throw new InvalidDataException("parameter fixture malformed case is invalid")
+            };
+            Require(failure.Diagnostics.Count == 1 &&
+                string.Equals(failure.Diagnostics[0].Code, "malformed_metadata", StringComparison.Ordinal) &&
+                string.Equals(failure.Diagnostics[0].Key, "managed_cli.malformed_metadata", StringComparison.Ordinal) &&
+                failure.Diagnostics[0].Args.Count == 2 &&
+                string.Equals(failure.Diagnostics[0].Args[0], "bad_image", StringComparison.Ordinal) &&
+                string.Equals(failure.Diagnostics[0].Args[1], expectedMessage, StringComparison.Ordinal),
+                $"managed CLI malformed parameter metadata did not fail closed for {kind}");
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(fixture.Bytes);
+            if (File.Exists(temporaryPath))
+                File.Delete(temporaryPath);
+        }
+    }
+
+    private static void ValidateMethodResult(string assemblyIdentity, FixtureCase fixtureCase, MethodDescriptor method, WorkerRequest request, WorkerResult result)
     {
         ValidateTerminalBinding(request, result.ModuleSource, result.EntityHash,
             result.MetadataToken, result.WorkspaceGeneration, result.TypeGraphRevision,
@@ -202,6 +384,8 @@ internal static class Program
             result.CacheIdentity, result.RequestBindingHash, result.Provider);
         Require(result.MetadataToken == method.Token && result.Identity.GenericArity == fixtureCase.MethodGenericArity,
             $"metadata identity drifted for {fixtureCase.Symbol}");
+        Require(string.Equals(result.Identity.AssemblyIdentity, assemblyIdentity, StringComparison.Ordinal),
+            $"assembly identity drifted for {fixtureCase.Symbol}");
         Require(string.Equals(result.Identity.DeclaringType + "." + result.Identity.MethodName, fixtureCase.Symbol, StringComparison.Ordinal),
             $"symbol identity drifted for {fixtureCase.Symbol}");
         Require(string.Equals(result.Identity.MethodSignature, method.Signature, StringComparison.Ordinal),
@@ -224,8 +408,79 @@ internal static class Program
         var valueIds = result.Ir.Blocks.SelectMany(block => block.Values).Select(value => value.Id).ToHashSet();
         Require(valueIds.Count != 0 && result.Ir.Blocks.SelectMany(block => block.Values).SelectMany(value => value.OperandIds).All(valueIds.Contains),
             $"provider IR operand graph is not closed for {fixtureCase.Symbol}");
+        ValidateProviderOperands(fixtureCase.Symbol, result);
         Require(result.TokenMap.Zip(result.TokenMap.Skip(1), (left, right) => left.Token < right.Token).All(value => value),
             $"token map ordering drifted for {fixtureCase.Symbol}");
+    }
+
+    private static void ValidateProviderOperands(string symbol, WorkerResult result)
+    {
+        var values = result.Ir.Blocks.SelectMany(block => block.Values).ToArray();
+        var returnType = result.TypeGraph.Nodes.Single(node => node.Id == result.ReturnTypeId);
+        var binaryOperators = new HashSet<string>(new[]
+        {
+            "*", "/", "%", "+", "-", "<<", ">>", "<", "<=", ">", ">=", "==", "!=", "&", "^", "|", "&&", "||"
+        }, StringComparer.Ordinal);
+        foreach (var value in values)
+        {
+            switch (value.Opcode)
+            {
+                case "parameter":
+                case "local":
+                    Require(value.OperandIds.Count == 0 && !string.IsNullOrWhiteSpace(value.StableSymbol),
+                        $"provider IR variable payload is invalid for {symbol}");
+                    break;
+                case "constant":
+                case "unknown":
+                    Require(value.OperandIds.Count == 0 && !string.IsNullOrWhiteSpace(value.StableImmediate),
+                        $"provider IR leaf payload is invalid for {symbol}");
+                    break;
+                case "unary":
+                case "cast":
+                case "load":
+                    Require(value.OperandIds.Count == 1,
+                        $"provider IR unary operand arity is invalid for {symbol}");
+                    break;
+                case "binary":
+                    Require(value.OperandIds.Count == 2 && binaryOperators.Contains(value.StableImmediate),
+                        $"provider IR binary payload is invalid for {symbol}");
+                    break;
+                case "store":
+                case "field_store":
+                    Require(value.OperandIds.Count == 2,
+                        $"provider IR store operand arity is invalid for {symbol}");
+                    break;
+                case "array_load":
+                    Require(value.OperandIds.Count == 2,
+                        $"provider IR array-load operand arity is invalid for {symbol}");
+                    break;
+                case "array_store":
+                    Require(value.OperandIds.Count == 3,
+                        $"provider IR array-store operand arity is invalid for {symbol}");
+                    break;
+                case "branch":
+                    Require(value.OperandIds.Count == 0,
+                        $"provider IR branch operand arity is invalid for {symbol}");
+                    break;
+                case "conditional_branch":
+                    Require(value.OperandIds.Count == 1 && value.StableImmediate.StartsWith("condition.true=", StringComparison.Ordinal) &&
+                        value.StableImmediate.Contains(";negated=", StringComparison.Ordinal),
+                        $"provider IR conditional payload is invalid for {symbol}");
+                    break;
+                case "switch_branch":
+                    Require(value.OperandIds.Count == 1,
+                        $"provider IR switch operand arity is invalid for {symbol}");
+                    break;
+                case "return_value":
+                    Require(value.OperandIds.Count == (returnType.Kind == "void" ? 0 : 1),
+                        $"provider IR return operand arity is invalid for {symbol}");
+                    break;
+                case "throw_value":
+                    Require(value.OperandIds.Count == 1,
+                        $"provider IR throw operand arity is invalid for {symbol}");
+                    break;
+            }
+        }
     }
 
     private static void ValidateTerminalBinding(
@@ -472,6 +727,198 @@ internal static class Program
         }
     }
 
+    private static GeneratedParameterFixture CreateParameterMetadataFixture(ParameterFixtureKind kind)
+    {
+        var metadata = new MetadataBuilder();
+        var ilStream = new BlobBuilder();
+        var moduleId = new Guid("6628540c-5acf-48a6-974d-6ec4361a7932");
+        metadata.AddModule(0, metadata.GetOrAddString("ManagedParameterRows.dll"),
+            metadata.GetOrAddGuid(moduleId), default, default);
+        metadata.AddAssembly(metadata.GetOrAddString("ManagedParameterRows"), new Version(1, 0, 0, 0),
+            default, default, default, AssemblyHashAlgorithm.None);
+        var systemRuntime = metadata.AddAssemblyReference(metadata.GetOrAddString("System.Runtime"),
+            new Version(10, 0, 0, 0), default, default, default, default);
+        var objectType = metadata.AddTypeReference(systemRuntime, metadata.GetOrAddString("System"),
+            metadata.GetOrAddString("Object"));
+        var methodBodyStream = new MethodBodyStreamEncoder(ilStream);
+        var methods = new Dictionary<string, MethodDescriptor>(StringComparer.Ordinal);
+        var specifications = ParameterMethodSpecifications(kind);
+        MethodDefinitionHandle firstMethod = default;
+        foreach (var spec in specifications)
+        {
+            var code = new BlobBuilder();
+            code.WriteBytes(spec.IlBytes);
+            var bodyOffset = methodBodyStream.AddMethodBody(new InstructionEncoder(code), maxStack: 2);
+            var signature = MethodSignatureBytes(spec.IsInstance, spec.ParameterCount);
+            var firstParameter = spec.ParameterRows.Count == 0
+                ? default
+                : MetadataTokens.ParameterHandle(metadata.GetRowCount(TableIndex.Param) + 1);
+            foreach (var row in spec.ParameterRows)
+            {
+                var name = row.Name is null ? default : metadata.GetOrAddString(row.Name);
+                metadata.AddParameter(ParameterAttributes.None, name, row.Sequence);
+            }
+            var attributes = MethodAttributes.Public | MethodAttributes.HideBySig;
+            if (!spec.IsInstance)
+                attributes |= MethodAttributes.Static;
+            var method = metadata.AddMethodDefinition(attributes, MethodImplAttributes.IL,
+                metadata.GetOrAddString(spec.Name), metadata.GetOrAddBlob(signature), bodyOffset, firstParameter);
+            if (firstMethod.IsNil)
+                firstMethod = method;
+            var descriptor = new MethodDescriptor(unchecked((uint)MetadataTokens.GetToken(method)),
+                GeneratedParameterTypeName, spec.Name, Convert.ToHexString(signature), 0);
+            methods.Add(GeneratedParameterTypeName + "." + spec.Name, descriptor);
+        }
+        if (firstMethod.IsNil)
+            throw new InvalidDataException("generated parameter fixture has no methods");
+        metadata.AddTypeDefinition(default, default, metadata.GetOrAddString("<Module>"), default,
+            MetadataTokens.FieldDefinitionHandle(1), firstMethod);
+        metadata.AddTypeDefinition(TypeAttributes.Public | TypeAttributes.Class | TypeAttributes.AutoLayout |
+            TypeAttributes.BeforeFieldInit, metadata.GetOrAddString("Aida.C03"),
+            metadata.GetOrAddString("GeneratedParameterFixture"), objectType,
+            MetadataTokens.FieldDefinitionHandle(1), firstMethod);
+        var peBuilder = new ManagedPEBuilder(
+            new PEHeaderBuilder(imageCharacteristics: Characteristics.ExecutableImage | Characteristics.Dll),
+            new MetadataRootBuilder(metadata), ilStream, strongNameSignatureSize: 0,
+            flags: CorFlags.ILOnly,
+            deterministicIdProvider: _ => new BlobContentId(moduleId, 0x724f5753U + checked((uint)kind)));
+        var peImage = new BlobBuilder();
+        _ = peBuilder.Serialize(peImage);
+        return new GeneratedParameterFixture(peImage.ToArray(), methods, specifications);
+    }
+
+    private static IReadOnlyList<GeneratedParameterMethod> ParameterMethodSpecifications(ParameterFixtureKind kind)
+    {
+        if (kind == ParameterFixtureKind.Valid)
+        {
+            return new[]
+            {
+                new GeneratedParameterMethod("StaticNamed", false, 2,
+                    new[]
+                    {
+                        new GeneratedParameterRow(0, "returnValue"),
+                        new GeneratedParameterRow(1, "left"),
+                        new GeneratedParameterRow(2, "right")
+                    },
+                    new byte[] { 0x02, 0x03, 0x58, 0x2a }),
+                new GeneratedParameterMethod("InstanceNamed", true, 2,
+                    new[]
+                    {
+                        new GeneratedParameterRow(0, "instanceReturn"),
+                        new GeneratedParameterRow(1, "value"),
+                        new GeneratedParameterRow(2, "delta")
+                    },
+                    new byte[] { 0x02, 0x26, 0x03, 0x04, 0x58, 0x2a }),
+                new GeneratedParameterMethod("StoreForms", false, 4,
+                    new[]
+                    {
+                        new GeneratedParameterRow(0, "storeReturn"),
+                        new GeneratedParameterRow(1, null),
+                        new GeneratedParameterRow(2, "shortNamed"),
+                        new GeneratedParameterRow(3, "longNamed"),
+                        new GeneratedParameterRow(4, "storeOnly")
+                    },
+                    new byte[]
+                    {
+                        0x16, 0x10, 0x00,
+                        0x17, 0x10, 0x01,
+                        0x18, 0xfe, 0x0b, 0x02, 0x00,
+                        0x19, 0x10, 0x03,
+                        0x0e, 0x01, 0x26,
+                        0xfe, 0x09, 0x02, 0x00, 0x2a
+                    }),
+                new GeneratedParameterMethod("Reordered", false, 2,
+                    new[]
+                    {
+                        new GeneratedParameterRow(2, "second"),
+                        new GeneratedParameterRow(0, "reorderedReturn"),
+                        new GeneratedParameterRow(1, "first")
+                    },
+                    new byte[] { 0x02, 0x03, 0x58, 0x2a })
+            };
+        }
+
+        var rows = kind switch
+        {
+            ParameterFixtureKind.DuplicateSequence => new[]
+            {
+                new GeneratedParameterRow(0, "malformedReturn"),
+                new GeneratedParameterRow(1, "first"),
+                new GeneratedParameterRow(1, "duplicate")
+            },
+            ParameterFixtureKind.OutOfRangeSequence => new[]
+            {
+                new GeneratedParameterRow(0, "malformedReturn"),
+                new GeneratedParameterRow(1, "first"),
+                new GeneratedParameterRow(3, "outside")
+            },
+            ParameterFixtureKind.DuplicateReturnSequence => new[]
+            {
+                new GeneratedParameterRow(0, "malformedReturn"),
+                new GeneratedParameterRow(0, "duplicateReturn"),
+                new GeneratedParameterRow(1, "first")
+            },
+            ParameterFixtureKind.ExcessRows => new[]
+            {
+                new GeneratedParameterRow(0, "malformedReturn"),
+                new GeneratedParameterRow(1, "first"),
+                new GeneratedParameterRow(2, "second"),
+                new GeneratedParameterRow(2, "excess")
+            },
+            _ => throw new InvalidDataException("parameter fixture kind is invalid")
+        };
+        return new[]
+        {
+            new GeneratedParameterMethod("Malformed", false, 2, rows,
+                new byte[] { 0x02, 0x03, 0x58, 0x2a })
+        };
+    }
+
+    private static byte[] MethodSignatureBytes(bool isInstance, int parameterCount)
+    {
+        if (parameterCount < 0 || parameterCount > 0x7f)
+            throw new InvalidDataException("generated parameter signature arity is invalid");
+        var signature = new byte[checked(parameterCount + 3)];
+        signature[0] = isInstance ? (byte)0x20 : (byte)0x00;
+        signature[1] = checked((byte)parameterCount);
+        signature[2] = 0x08;
+        Array.Fill(signature, (byte)0x08, 3, parameterCount);
+        return signature;
+    }
+
+    private static void ValidateParameterFixtureEncoding(string path, GeneratedParameterFixture fixture)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var peReader = new PEReader(stream, PEStreamOptions.PrefetchMetadata);
+        Require(peReader.HasMetadata, "generated parameter fixture has no CLI metadata");
+        var reader = peReader.GetMetadataReader();
+        var methods = reader.MethodDefinitions.ToDictionary(
+            handle => reader.GetString(reader.GetMethodDefinition(handle).Name),
+            handle => reader.GetMethodDefinition(handle), StringComparer.Ordinal);
+        foreach (var spec in fixture.Specifications)
+        {
+            Require(methods.TryGetValue(spec.Name, out var method),
+                $"generated parameter fixture method is absent: {spec.Name}");
+            var signature = method.DecodeSignature(new StableSignatureTypeProvider(),
+                new GenericContext(GeneratedParameterTypeName, spec.Name));
+            Require(signature.Header.IsInstance == spec.IsInstance &&
+                ((method.Attributes & MethodAttributes.Static) != 0) != spec.IsInstance &&
+                signature.ParameterTypes.Length == spec.ParameterCount,
+                $"generated parameter fixture signature drifted: {spec.Name}");
+            var rows = method.GetParameters().Select(handle =>
+            {
+                var parameter = reader.GetParameter(handle);
+                return new GeneratedParameterRow(parameter.SequenceNumber,
+                    parameter.Name.IsNil ? null : reader.GetString(parameter.Name));
+            }).ToArray();
+            Require(rows.SequenceEqual(spec.ParameterRows),
+                $"generated parameter fixture Param rows drifted: {spec.Name}");
+            var body = peReader.GetMethodBody(method.RelativeVirtualAddress);
+            Require((body.GetILBytes() ?? Array.Empty<byte>()).SequenceEqual(spec.IlBytes),
+                $"generated parameter fixture IL encoding drifted: {spec.Name}");
+        }
+    }
+
     private static async Task ValidateConcurrentWorkspaceIsolationAsync(
         string fixturePath,
         string moduleHash,
@@ -578,7 +1025,6 @@ internal static class Program
         using var peReader = new PEReader(stream, PEStreamOptions.PrefetchMetadata);
         Require(peReader.HasMetadata, "managed CLI fixture has no metadata");
         var reader = peReader.GetMetadataReader();
-        var provider = new StableSignatureTypeProvider();
         var methods = new Dictionary<string, MethodDescriptor>(StringComparer.Ordinal);
         var typeNames = new HashSet<string>(StringComparer.Ordinal);
         var fieldNames = new HashSet<string>(StringComparer.Ordinal);
@@ -593,18 +1039,25 @@ internal static class Program
             {
                 var method = reader.GetMethodDefinition(methodHandle);
                 var methodName = reader.GetString(method.Name);
-                var signature = method.DecodeSignature(provider, new GenericContext(typeName, methodName));
                 var descriptor = new MethodDescriptor(
                     unchecked((uint)MetadataTokens.GetToken(methodHandle)),
                     typeName,
                     methodName,
-                    $"{signature.ReturnType}({string.Join(",", signature.ParameterTypes)})",
+                    MethodSignatureIdentity(reader, method),
                     checked((uint)method.GetGenericParameters().Count));
                 var symbol = typeName + "." + methodName;
                 Require(methods.TryAdd(symbol, descriptor), $"managed CLI fixture symbol is ambiguous: {symbol}");
             }
         }
         return new MethodInventory(methods, typeNames, fieldNames);
+    }
+
+    private static string MethodSignatureIdentity(MetadataReader reader, MethodDefinition method)
+    {
+        var signature = reader.GetBlobBytes(method.Signature);
+        Require(signature.Length != 0 && signature.Length <= MaximumWireSignatureBytes,
+            "managed CLI fixture method signature exceeds the wire contract");
+        return Convert.ToHexString(signature);
     }
 
     private static void ValidateManifestInventory(FixtureManifest manifest, MethodInventory inventory)
@@ -1406,6 +1859,35 @@ internal static class Program
         IReadOnlyList<string> ResourceLimits,
         bool RuntimeGate,
         bool SnapshotBinding);
+
+    private enum ParameterFixtureKind
+    {
+        Valid,
+        DuplicateSequence,
+        OutOfRangeSequence,
+        DuplicateReturnSequence,
+        ExcessRows
+    }
+
+    private sealed record GeneratedParameterRow(int Sequence, string? Name);
+
+    private sealed record GeneratedParameterMethod(
+        string Name,
+        bool IsInstance,
+        int ParameterCount,
+        IReadOnlyList<GeneratedParameterRow> ParameterRows,
+        byte[] IlBytes);
+
+    private sealed record GeneratedParameterFixture(
+        byte[] Bytes,
+        IReadOnlyDictionary<string, MethodDescriptor> Methods,
+        IReadOnlyList<GeneratedParameterMethod> Specifications);
+
+    private sealed record ParameterIdentityExpectation(
+        string MethodName,
+        IReadOnlyList<string> StableSymbols,
+        IReadOnlyList<string> SourceNames,
+        IReadOnlyList<string> StoreDestinations);
 
     private sealed record MethodDescriptor(
         uint Token,

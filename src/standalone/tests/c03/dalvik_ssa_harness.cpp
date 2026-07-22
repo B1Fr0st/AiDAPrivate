@@ -11,6 +11,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida::analysis::c03_test {
@@ -198,6 +199,157 @@ dalvik_ssa_capture_t make_base_capture(const std::string& dex_version)
     capture.strings.push_back(std::move(str));
 
     return capture;
+}
+
+dalvik_ssa_capture_t make_debug_capture(std::string source_path)
+{
+    auto capture = make_base_capture("035");
+    capture.request.source_path = std::move(source_path);
+
+    dex_debug_info_t debug_info;
+    debug_info.offset = 1;
+    debug_info.line_start = 37;
+    dex_debug_position_t first_position;
+    first_position.address = 0;
+    first_position.line = 37;
+    debug_info.positions.push_back(first_position);
+    dex_debug_position_t second_position;
+    second_position.address = 1;
+    second_position.line = 41;
+    debug_info.positions.push_back(second_position);
+
+    std::vector<dalvik_instruction_t> instructions = {
+        make_insn_lit(0, 0x12, 1, 0x0012, "const/4", 0),
+        make_insn(1, 0x0f, 1, 0x000f, "return")
+    };
+    auto code_item = make_code_item(2, 0, 0, std::move(instructions),
+        {}, {}, std::move(debug_info));
+    code_item->debug_info_offset = 1;
+    capture.code_item = std::move(code_item);
+    capture.code_units = {0x0012, 0x000f};
+    return capture;
+}
+
+bool contains_unknown(const std::vector<decompiler_unknown_t>& unknowns,
+                      const decompiler_unknown_reason_t reason,
+                      const std::string& stable_token)
+{
+    return std::any_of(unknowns.begin(), unknowns.end(),
+        [reason, &stable_token](const decompiler_unknown_t& unknown) {
+            return unknown.reason == reason &&
+                unknown.stable_token == stable_token;
+        });
+}
+
+bool contains_diagnostic(const std::vector<decompiler_diagnostic_t>& diagnostics,
+                         const decompiler_diagnostic_code_t code,
+                         const std::string& localization_key)
+{
+    return std::any_of(diagnostics.begin(), diagnostics.end(),
+        [code, &localization_key](const decompiler_diagnostic_t& diagnostic) {
+            return diagnostic.code == code &&
+                diagnostic.localization_key == localization_key;
+        });
+}
+
+void verify_debug_source_present()
+{
+    const auto capture = make_debug_capture("Fixture.smali");
+    const auto result = dalvik_ssa::normalize(capture);
+    require(result.succeeded(), "Dalvik source-file metadata failed normalization");
+
+    bool provider_source = false;
+    bool hir_source = false;
+    bool selected_line = false;
+    for (const auto& block : result.artifacts->provider_ir.blocks) {
+        if (block.coordinate.source_origin) {
+            provider_source = true;
+            require(block.coordinate.source_origin->source_path == "Fixture.smali",
+                "provider IR fabricated a Dalvik debug source path");
+        }
+        for (const auto& value : block.values) {
+            if (!value.coordinate.source_origin)
+                continue;
+            provider_source = true;
+            require(value.coordinate.source_origin->source_path == "Fixture.smali",
+                "provider IR value fabricated a Dalvik debug source path");
+            if (value.coordinate.source_origin->first_line == 41)
+                selected_line = true;
+        }
+    }
+    for (const auto& block : result.artifacts->hir.blocks) {
+        if (block.coordinate.source_origin) {
+            hir_source = true;
+            require(block.coordinate.source_origin->source_path == "Fixture.smali",
+                "HIR fabricated a Dalvik debug source path");
+        }
+        for (const auto& value : block.values) {
+            if (!value.coordinate.source_origin)
+                continue;
+            hir_source = true;
+            require(value.coordinate.source_origin->source_path == "Fixture.smali",
+                "HIR value fabricated a Dalvik debug source path");
+        }
+    }
+    require(provider_source && hir_source && selected_line,
+        "Dalvik source-file debug coordinates were not preserved");
+    require(!contains_unknown(result.artifacts->provider_ir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.source_file.absent") &&
+            !contains_unknown(result.artifacts->hir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.source_file.absent"),
+        "present Dalvik source-file metadata was reported absent");
+
+    const auto bytes = dalvik_ssa::serialize_capture(capture);
+    require(!bytes.empty(), "Dalvik source-file capture serialization failed");
+    std::vector<decompiler_diagnostic_t> diagnostics;
+    const auto restored = dalvik_ssa::deserialize_capture(bytes, diagnostics);
+    require(restored.has_value() && diagnostics.empty() &&
+            restored->request.source_path == "Fixture.smali",
+        "Dalvik source-file capture round-trip lost metadata");
+    const auto restored_result = dalvik_ssa::normalize(*restored);
+    require(restored_result.succeeded() &&
+            stable_serialization_hash(restored_result.artifacts->provider_ir) ==
+                stable_serialization_hash(result.artifacts->provider_ir) &&
+            stable_serialization_hash(restored_result.artifacts->hir) ==
+                stable_serialization_hash(result.artifacts->hir),
+        "Dalvik source-file capture round-trip changed normalized output");
+}
+
+void verify_debug_source_absent()
+{
+    const auto capture = make_debug_capture({});
+    const auto result = dalvik_ssa::normalize(capture);
+    require(result.succeeded(), "Dalvik missing-source metadata failed normalization");
+    require(contains_unknown(result.artifacts->provider_ir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.source_file.absent") &&
+            contains_unknown(result.artifacts->hir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.source_file.absent"),
+        "missing Dalvik source-file metadata was not retained as unknown");
+    require(!contains_unknown(result.artifacts->provider_ir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.debug_positions.absent") &&
+            !contains_unknown(result.artifacts->hir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.debug_positions.absent"),
+        "present Dalvik debug positions were reported absent");
+    for (const auto& coordinate : result.artifacts->provider_ir.source_coordinates)
+        require(!coordinate.source_origin,
+            "missing Dalvik source metadata produced a provider source origin");
+    for (const auto& coordinate : result.artifacts->hir.source_coordinates)
+        require(!coordinate.source_origin,
+            "missing Dalvik source metadata produced a HIR source origin");
+
+    const auto bytes = dalvik_ssa::serialize_capture(capture);
+    require(!bytes.empty(), "missing Dalvik source-file capture serialization failed");
+    std::vector<decompiler_diagnostic_t> diagnostics;
+    const auto restored = dalvik_ssa::deserialize_capture(bytes, diagnostics);
+    require(restored.has_value() && diagnostics.empty() &&
+            restored->request.source_path.empty(),
+        "missing Dalvik source-file capture round-trip fabricated metadata");
 }
 
 void verify_dex_versions()
@@ -402,15 +554,194 @@ void verify_try_catch()
 
     const auto result = dalvik_ssa::normalize(capture);
     require(result.succeeded(), "try/catch test failed to produce artifacts");
+    const auto repeated = dalvik_ssa::normalize(capture);
+    require(repeated.succeeded() &&
+            stable_serialization_hash(result.artifacts->provider_ir) ==
+                stable_serialization_hash(repeated.artifacts->provider_ir) &&
+            stable_serialization_hash(result.artifacts->hir) ==
+                stable_serialization_hash(repeated.artifacts->hir),
+        "try/catch normalization is not deterministic");
 
-    bool has_exception_edge = false;
+    std::uint64_t exception_source = 0;
+    std::uint64_t exception_handler = 0;
     for (const auto& block : result.artifacts->provider_ir.blocks) {
         if (!block.exception_successor_ids.empty()) {
-            has_exception_edge = true;
+            exception_source = block.id;
+            exception_handler = block.exception_successor_ids.front();
             break;
         }
     }
-    require(has_exception_edge, "try/catch test missing exception successor edges");
+    require(exception_source != 0 && exception_handler != 0,
+        "try/catch test missing exception successor edges");
+
+    bool handler_has_normal_predecessor = false;
+    for (const auto& block : result.artifacts->provider_ir.blocks) {
+        if (std::binary_search(block.successor_ids.begin(),
+                block.successor_ids.end(), exception_handler)) {
+            handler_has_normal_predecessor = true;
+            break;
+        }
+    }
+    require(!handler_has_normal_predecessor,
+        "try/catch fixture handler is not exception-only");
+
+    const auto hir_source = std::find_if(result.artifacts->hir.blocks.begin(),
+        result.artifacts->hir.blocks.end(),
+        [exception_source](const hir_block_t& block) {
+            return block.id == exception_source;
+        });
+    const auto hir_handler = std::find_if(result.artifacts->hir.blocks.begin(),
+        result.artifacts->hir.blocks.end(),
+        [exception_handler](const hir_block_t& block) {
+            return block.id == exception_handler;
+        });
+    require(hir_source != result.artifacts->hir.blocks.end() &&
+            hir_handler != result.artifacts->hir.blocks.end(),
+        "exception-only Dalvik handler was dropped from HIR");
+    require(std::binary_search(hir_source->exception_successor_ids.begin(),
+                hir_source->exception_successor_ids.end(), exception_handler) &&
+            std::binary_search(hir_handler->predecessor_ids.begin(),
+                hir_handler->predecessor_ids.end(), exception_source),
+        "Dalvik HIR did not preserve exception edge reciprocity");
+
+    const auto canonical = [](const std::vector<std::uint64_t>& edges) {
+        return std::is_sorted(edges.begin(), edges.end()) &&
+            std::adjacent_find(edges.begin(), edges.end()) == edges.end();
+    };
+    for (const auto& block : result.artifacts->hir.blocks) {
+        require(canonical(block.predecessor_ids) &&
+                canonical(block.successor_ids) &&
+                canonical(block.exception_successor_ids),
+            "Dalvik HIR edge ordering is not canonical");
+    }
+    for (const auto& unknown : result.artifacts->hir.unknowns) {
+        require(unknown.stable_token.rfind("dalvik.exception_edge.", 0) != 0,
+            "represented Dalvik exception edge retained an opaque unknown");
+        require(unknown.stable_token.rfind("dalvik.normal_projection.block.", 0) != 0,
+            "represented Dalvik exception handler retained an opaque unknown");
+    }
+}
+
+void verify_source_path_bounds()
+{
+    auto bounded = make_debug_capture(std::string(
+        dalvik_ssa::k_max_source_path_bytes, 's'));
+    const auto bounded_bytes = dalvik_ssa::serialize_capture(bounded);
+    require(!bounded_bytes.empty(),
+        "maximum bounded Dalvik source path was rejected");
+    std::vector<decompiler_diagnostic_t> diagnostics;
+    const auto bounded_restored = dalvik_ssa::deserialize_capture(
+        bounded_bytes, diagnostics);
+    require(bounded_restored.has_value() && diagnostics.empty() &&
+            bounded_restored->request.source_path == bounded.request.source_path,
+        "maximum bounded Dalvik source path did not round-trip");
+
+    auto malformed_bytes = bounded_bytes;
+    const auto source_offset = malformed_bytes.find(bounded.request.source_path);
+    require(source_offset != std::string::npos &&
+            source_offset >= sizeof(std::uint32_t),
+        "bounded Dalvik source path was not present in its capture payload");
+    malformed_bytes.insert(source_offset + bounded.request.source_path.size(),
+        1, 'x');
+    const auto malformed_size = static_cast<std::uint32_t>(
+        dalvik_ssa::k_max_source_path_bytes + 1U);
+    for (std::size_t index = 0; index < sizeof(malformed_size); ++index) {
+        malformed_bytes[source_offset - sizeof(malformed_size) + index] =
+            static_cast<char>(malformed_size >> (index * 8U));
+    }
+    diagnostics.clear();
+    const auto malformed_restored = dalvik_ssa::deserialize_capture(
+        malformed_bytes, diagnostics);
+    require(!malformed_restored.has_value() &&
+            contains_diagnostic(diagnostics,
+                decompiler_diagnostic_code_t::malformed_serialization,
+                "dalvik_ssa.capture.decode"),
+        "oversized serialized Dalvik source path crossed the decode boundary");
+
+    auto oversized = bounded;
+    oversized.request.source_path.push_back('x');
+    const auto oversized_result = dalvik_ssa::normalize(oversized);
+    require(!oversized_result.succeeded() &&
+            contains_diagnostic(oversized_result.diagnostics,
+                decompiler_diagnostic_code_t::invalid_contract,
+                "dalvik_ssa.source_path") &&
+            dalvik_ssa::serialize_capture(oversized).empty(),
+        "oversized Dalvik source path crossed the capture boundary");
+
+    auto embedded_null = make_debug_capture(
+        std::string("Fixture\0.smali", 14));
+    const auto embedded_null_result = dalvik_ssa::normalize(embedded_null);
+    require(!embedded_null_result.succeeded() &&
+            contains_diagnostic(embedded_null_result.diagnostics,
+                decompiler_diagnostic_code_t::invalid_contract,
+                "dalvik_ssa.source_path") &&
+            dalvik_ssa::serialize_capture(embedded_null).empty(),
+        "embedded-null Dalvik source path crossed the capture boundary");
+}
+
+void verify_unrepresented_block_unknown_retention()
+{
+    auto capture = make_base_capture("035");
+    capture.request.source_path = "Fixture.smali";
+    std::vector<dalvik_instruction_t> instructions = {
+        make_insn(0, 0x0f, 1, 0x000f, "return"),
+        make_insn_lit(1, 0x12, 1, 0x0012, "const/4", 0),
+        make_insn(2, 0x0f, 1, 0x000f, "return"),
+        make_insn(3, 0x0d, 1, 0x010d, "move-exception"),
+        make_insn(4, 0x0f, 1, 0x010f, "return")
+    };
+    dex_try_item_t try_item;
+    try_item.start_address = 1;
+    try_item.instruction_count = 2;
+    try_item.handler_offset = 0;
+    dex_catch_handler_t handler;
+    handler.relative_offset = 0;
+    handler.typed_handlers.push_back({0, 3});
+    capture.code_item = make_code_item(4, 0, 0, std::move(instructions),
+        {try_item}, {handler});
+    capture.code_units = {0x000f, 0x0012, 0x000f, 0x010d, 0x010f};
+
+    const auto result = dalvik_ssa::normalize(capture);
+    require(result.succeeded(),
+        "unreachable Dalvik block retention fixture failed normalization");
+    const auto retained = std::any_of(result.artifacts->hir.unknowns.begin(),
+        result.artifacts->hir.unknowns.end(),
+        [](const decompiler_unknown_t& unknown) {
+            return unknown.reason ==
+                    decompiler_unknown_reason_t::opaque_control_flow &&
+                unknown.stable_token.rfind(
+                    "dalvik.normal_projection.block.", 0) == 0;
+        });
+    require(retained,
+        "genuinely unrepresented Dalvik blocks lost their opaque unknowns");
+}
+
+void verify_missing_debug_unknowns()
+{
+    auto capture = make_base_capture("035");
+    capture.request.source_path = "Fixture.smali";
+    capture.code_item = make_code_item(2, 0, 0, {
+        make_insn_lit(0, 0x12, 1, 0x0012, "const/4", 0),
+        make_insn(1, 0x0f, 1, 0x000f, "return")
+    });
+    capture.code_units = {0x0012, 0x000f};
+    const auto result = dalvik_ssa::normalize(capture);
+    require(result.succeeded(),
+        "missing Dalvik debug positions failed normalization");
+    require(contains_unknown(result.artifacts->provider_ir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.debug_positions.absent") &&
+            contains_unknown(result.artifacts->hir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.debug_positions.absent"),
+        "missing Dalvik debug positions were not retained as unknown");
+    require(!contains_unknown(result.artifacts->provider_ir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.source_file.absent") &&
+            !contains_unknown(result.artifacts->hir.unknowns,
+                decompiler_unknown_reason_t::incomplete_debug_information,
+                "dalvik.source_file.absent"),
+        "present Dalvik source-file metadata was reported absent");
 }
 
 void verify_malformed_indexes()
@@ -544,7 +875,12 @@ void run_dalvik_ssa_harness()
     verify_range_invoke();
     verify_payload_alignment();
     verify_wide_registers();
+    verify_debug_source_present();
+    verify_debug_source_absent();
     verify_try_catch();
+    verify_source_path_bounds();
+    verify_unrepresented_block_unknown_retention();
+    verify_missing_debug_unknowns();
     verify_malformed_indexes();
     verify_deterministic_ssa();
 }

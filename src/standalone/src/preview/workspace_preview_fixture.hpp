@@ -4,6 +4,7 @@
 
 #include "../core/analysis/workspace/analysis_workspace.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -17,6 +18,12 @@ struct workspace_preview_fixture_t final {
     std::string display_name;
 };
 
+enum class workspace_preview_target_t : std::uint8_t {
+    static_file,
+    live_process
+};
+
+void configure_workspace_preview_target(workspace_preview_target_t target);
 const workspace_preview_fixture_t& workspace_preview_fixture();
 
 }

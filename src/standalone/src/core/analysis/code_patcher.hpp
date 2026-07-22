@@ -1,6 +1,7 @@
 #pragma once
 
 #include "standalone_driver.hpp"
+#include "standalone_driver_identity.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +25,7 @@ struct patch_entry_t {
 	bool                 active = false;
 	int64_t              timestamp = 0;
 	std::uint32_t        target_pid = 0;
+	std::uint64_t        target_process_creation_time_100ns = 0;
 };
 
 struct code_cave_t {
@@ -73,6 +75,26 @@ inline std::string format_bytes(const std::vector<uint8_t>& bytes) {
 		out += hex;
 	}
 	return out;
+}
+
+inline std::uint64_t current_target_process_creation_time(std::uint32_t pid) {
+	if (pid == 0) return 0;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	return 1;
+#else
+	driver_bridge::identity::live_target_identity_t identity;
+	std::string error;
+	return driver_bridge::identity::capture_live_target_identity(
+		pid, 0, identity, &error)
+		? identity.process.creation_time_100ns : 0;
+#endif
+}
+
+inline bool target_identity_current(std::uint32_t pid,
+	std::uint64_t process_creation_time_100ns) {
+	return pid != 0 && process_creation_time_100ns != 0 &&
+		driver_bridge::attached_pid() == pid &&
+		current_target_process_creation_time(pid) == process_creation_time_100ns;
 }
 
 inline std::string format_bytes_preview(const std::vector<uint8_t>& bytes) {
@@ -133,9 +155,12 @@ inline const bool g_preview_patch_publication_initialized = [] {
 	std::lock_guard<std::mutex> lock(g_state.mtx);
 	if (g_state.patches.empty()) {
 		g_state.patches = {
-			{0x00007FF7A4C16A32, {0x75, 0x14}, {0x90, 0x90}, "Bypass conditional branch", true, 1720946700, 0},
-			{0x00007FF7A4C1B420, {0x48, 0x85, 0xC0}, {0xB0, 0x01, 0x90}, "Force decrypt success", false, 1720946760, 0},
-			{0x00007FF7A4C208F0, {0x74, 0x05}, {0xEB, 0x05}, "Follow unpacked path", true, 1720946820, 0}
+			{0x00007FF7A4C16A32, {0x75, 0x14}, {0x90, 0x90},
+				"Bypass conditional branch", true, 1720946700, 6420, 1},
+			{0x00007FF7A4C1B420, {0x48, 0x85, 0xC0}, {0xB0, 0x01, 0x90},
+				"Force decrypt success", false, 1720946760, 6420, 1},
+			{0x00007FF7A4C208F0, {0x74, 0x05}, {0xEB, 0x05},
+				"Follow unpacked path", true, 1720946820, 6420, 1}
 		};
 		publish_snapshot_locked();
 	}
@@ -190,15 +215,23 @@ inline bool resolve_patch_index(int index, std::vector<patch_entry_t>::size_type
 }
 
 inline int create_patch(uint64_t address, const std::vector<uint8_t>& new_bytes,
-						const std::string& description) {
+						const std::string& description,
+						std::uint32_t expected_pid = 0,
+						std::uint64_t expected_process_creation_time_100ns = 0) {
 	if (!driver_bridge::is_loaded()) return -1;
 	if (new_bytes.empty()) return -1;
 
 	const std::uint32_t target_pid = driver_bridge::attached_pid();
-	if (target_pid == 0) return -1;
+	if (target_pid == 0 || (expected_pid != 0 && target_pid != expected_pid) ||
+		(expected_pid == 0) != (expected_process_creation_time_100ns == 0)) return -1;
+	const std::uint64_t target_process_creation_time_100ns =
+		expected_process_creation_time_100ns != 0
+			? expected_process_creation_time_100ns
+			: current_target_process_creation_time(target_pid);
+	if (!target_identity_current(target_pid, target_process_creation_time_100ns)) return -1;
 	std::vector<uint8_t> orig;
 	if (!driver_bridge::read_memory(address, new_bytes.size(), orig) ||
-		driver_bridge::attached_pid() != target_pid)
+		!target_identity_current(target_pid, target_process_creation_time_100ns))
 		return -1;
 
 	patch_entry_t entry;
@@ -209,6 +242,7 @@ inline int create_patch(uint64_t address, const std::vector<uint8_t>& new_bytes,
 	entry.active = false;
 	entry.timestamp = current_timestamp();
 	entry.target_pid = target_pid;
+	entry.target_process_creation_time_100ns = target_process_creation_time_100ns;
 
 	std::lock_guard<std::mutex> lk(g_state.mtx);
 	if (g_state.patches.size() >= static_cast<std::vector<patch_entry_t>::size_type>(
@@ -224,13 +258,16 @@ inline int create_patch_exact(uint64_t address,
 							 const std::vector<uint8_t>& expected_before,
 							 const std::vector<uint8_t>& new_bytes,
 							 std::uint32_t expected_pid,
+							 std::uint64_t expected_process_creation_time_100ns,
 							 const std::string& description) {
 	if (expected_pid == 0 || !driver_bridge::is_loaded() ||
-		driver_bridge::attached_pid() != expected_pid || expected_before.empty() ||
+		expected_process_creation_time_100ns == 0 ||
+		!target_identity_current(expected_pid, expected_process_creation_time_100ns) ||
+		expected_before.empty() ||
 		new_bytes.empty() || expected_before.size() != new_bytes.size()) return -1;
 	std::vector<uint8_t> current;
 	if (!driver_bridge::read_memory(address, expected_before.size(), current) ||
-		driver_bridge::attached_pid() != expected_pid ||
+		!target_identity_current(expected_pid, expected_process_creation_time_100ns) ||
 		current != expected_before) return -1;
 	patch_entry_t entry;
 	entry.address = address;
@@ -240,6 +277,7 @@ inline int create_patch_exact(uint64_t address,
 	entry.active = false;
 	entry.timestamp = current_timestamp();
 	entry.target_pid = expected_pid;
+	entry.target_process_creation_time_100ns = expected_process_creation_time_100ns;
 	std::lock_guard<std::mutex> lk(g_state.mtx);
 	if (g_state.patches.size() >= static_cast<std::vector<patch_entry_t>::size_type>(
 			(std::numeric_limits<int>::max)())) return -1;
@@ -256,11 +294,13 @@ inline bool apply_patch(int index) {
 	if (!resolve_patch_index(index, g_state.patches.size(), resolved))
 		return false;
 	auto& p = g_state.patches[resolved];
+	if (!target_identity_current(
+		p.target_pid, p.target_process_creation_time_100ns)) return false;
 	if (p.active) return true;
-	if (p.target_pid != 0 && driver_bridge::attached_pid() != p.target_pid) return false;
 	std::vector<uint8_t> current;
 	if (!driver_bridge::read_memory(p.address, p.original_bytes.size(), current) ||
-		(p.target_pid != 0 && driver_bridge::attached_pid() != p.target_pid) ||
+		!target_identity_current(p.target_pid,
+			p.target_process_creation_time_100ns) ||
 		current != p.original_bytes) return false;
 	if (!driver_bridge::write_memory(p.address, p.patched_bytes))
 		return false;
@@ -276,11 +316,13 @@ inline bool revert_patch(int index) {
 	if (!resolve_patch_index(index, g_state.patches.size(), resolved))
 		return false;
 	auto& p = g_state.patches[resolved];
+	if (!target_identity_current(
+		p.target_pid, p.target_process_creation_time_100ns)) return false;
 	if (!p.active) return true;
-	if (p.target_pid != 0 && driver_bridge::attached_pid() != p.target_pid) return false;
 	std::vector<uint8_t> current;
 	if (!driver_bridge::read_memory(p.address, p.patched_bytes.size(), current) ||
-		(p.target_pid != 0 && driver_bridge::attached_pid() != p.target_pid) ||
+		!target_identity_current(p.target_pid,
+			p.target_process_creation_time_100ns) ||
 		current != p.patched_bytes) return false;
 	if (!driver_bridge::write_memory(p.address, p.original_bytes))
 		return false;
@@ -310,7 +352,8 @@ inline bool remove_patch(int index) {
 		return false;
 	const auto& patch = g_state.patches[resolved];
 	if (patch.active && (!driver_bridge::is_loaded() ||
-		(patch.target_pid != 0 && driver_bridge::attached_pid() != patch.target_pid) ||
+		!target_identity_current(patch.target_pid,
+			patch.target_process_creation_time_100ns) ||
 		!driver_bridge::write_memory(patch.address, patch.original_bytes)))
 		return false;
 	g_state.patches.erase(g_state.patches.begin() +
@@ -329,8 +372,30 @@ inline bool remove_patch_exact(int index, uint64_t expected_address,
 	if (patch.address != expected_address || patch.patched_bytes != expected_bytes)
 		return false;
 	if (patch.active && (!driver_bridge::is_loaded() ||
-		(patch.target_pid != 0 && driver_bridge::attached_pid() != patch.target_pid) ||
+		!target_identity_current(patch.target_pid,
+			patch.target_process_creation_time_100ns) ||
 		!driver_bridge::write_memory(patch.address, patch.original_bytes)))
+		return false;
+	g_state.patches.erase(g_state.patches.begin() +
+		static_cast<std::vector<patch_entry_t>::difference_type>(resolved));
+	publish_snapshot_locked();
+	return true;
+}
+
+inline bool discard_inactive_patch_exact(int index, uint64_t expected_address,
+	const std::vector<uint8_t>& expected_bytes, std::uint32_t expected_pid,
+	std::uint64_t expected_process_creation_time_100ns) {
+	if (expected_pid == 0 || expected_process_creation_time_100ns == 0)
+		return false;
+	std::lock_guard<std::mutex> lk(g_state.mtx);
+	std::vector<patch_entry_t>::size_type resolved = 0;
+	if (!resolve_patch_index(index, g_state.patches.size(), resolved))
+		return false;
+	const auto& patch = g_state.patches[resolved];
+	if (patch.active || patch.address != expected_address ||
+		patch.patched_bytes != expected_bytes || patch.target_pid != expected_pid ||
+		patch.target_process_creation_time_100ns !=
+			expected_process_creation_time_100ns)
 		return false;
 	g_state.patches.erase(g_state.patches.begin() +
 		static_cast<std::vector<patch_entry_t>::difference_type>(resolved));

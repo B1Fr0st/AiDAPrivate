@@ -119,6 +119,101 @@ type_provenance_record_t to_provenance_record(const type_edge_candidate_t& edge)
     return record;
 }
 
+bool retain_live_function_candidates(
+    const type_graph_t& provider_graph,
+    const hir_function_t& live_hir,
+    type_seed_batch_t& provider_seed,
+    std::vector<type_seed_batch_t>& evidence,
+    std::string& error)
+{
+    if (!validate_hir_function(live_hir).valid() ||
+        live_hir.entity != provider_graph.entity ||
+        live_hir.type_graph_revision != provider_graph.revision) {
+        error = "live HIR does not match the provider type graph";
+        return false;
+    }
+
+    std::unordered_map<std::uint64_t, std::string> provider_names;
+    provider_names.reserve(provider_graph.nodes.size());
+    for (const auto& node : provider_graph.nodes)
+        provider_names.emplace(node.id, node.canonical_name);
+
+    std::unordered_set<std::string> retained;
+    retained.reserve(provider_graph.nodes.size());
+    const auto retain_type = [&provider_names, &retained, &error](const std::uint64_t id) {
+        const auto found = provider_names.find(id);
+        if (found == provider_names.end()) {
+            error = "live HIR references an absent provider type";
+            return false;
+        }
+        retained.insert(found->second);
+        return true;
+    };
+    if (!retain_type(live_hir.return_type_id))
+        return false;
+    for (const auto& parameter : live_hir.parameters) {
+        if (!retain_type(parameter.type_id))
+            return false;
+    }
+    for (const auto& local : live_hir.locals) {
+        if (!retain_type(local.type_id))
+            return false;
+    }
+    for (const auto& block : live_hir.blocks) {
+        for (const auto& value : block.values) {
+            if (!retain_type(value.type_id))
+                return false;
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<std::string>> adjacency;
+    adjacency.reserve(provider_graph.nodes.size());
+    const auto index_batch = [&retained, &adjacency](const type_seed_batch_t& batch) {
+        for (const auto& candidate : batch.candidates) {
+            if (candidate.kind == decompiler_type_kind_t::function)
+                retained.insert(candidate.canonical_name);
+            auto& targets = adjacency[candidate.canonical_name];
+            targets.reserve(targets.size() + candidate.edges.size());
+            for (const auto& edge : candidate.edges)
+                targets.push_back(edge.target_canonical_name);
+        }
+    };
+    index_batch(provider_seed);
+    for (const auto& batch : evidence)
+        index_batch(batch);
+
+    std::vector<std::string> pending(retained.begin(), retained.end());
+    std::sort(pending.begin(), pending.end());
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        const auto outgoing = adjacency.find(pending[index]);
+        if (outgoing == adjacency.end())
+            continue;
+        for (const auto& target : outgoing->second) {
+            if (retained.insert(target).second)
+                pending.push_back(target);
+        }
+    }
+
+    const auto filter = [&retained](type_seed_batch_t& batch) {
+        batch.candidates.erase(std::remove_if(batch.candidates.begin(), batch.candidates.end(),
+            [&retained](const type_candidate_t& candidate) {
+                return retained.find(candidate.canonical_name) == retained.end();
+            }), batch.candidates.end());
+    };
+    filter(provider_seed);
+    for (auto& batch : evidence)
+        filter(batch);
+    evidence.erase(std::remove_if(evidence.begin(), evidence.end(),
+        [](const type_seed_batch_t& batch) {
+            return batch.candidates.empty();
+        }), evidence.end());
+    if (provider_seed.candidates.empty()) {
+        error = "live HIR retained no provider types";
+        return false;
+    }
+    return true;
+}
+
 }
 
 type_graph_builder_t::type_graph_builder_t(decompiler_entity_key_t entity, type_graph_builder_config_t config)
@@ -192,7 +287,14 @@ void type_graph_builder_t::merge_candidates(const std::vector<type_candidate_t>&
         merged.provenance_records.push_back(candidate_record);
         merged.coordinates.push_back(candidate.coordinate);
 
-        if (!winner || strictly_higher(candidate_record, winner_record)) {
+        const bool candidate_is_function = candidate.kind == decompiler_type_kind_t::function;
+        const bool winner_is_function = winner && winner->kind == decompiler_type_kind_t::function;
+        const bool promote_function = winner && candidate_is_function &&
+            winner->kind == decompiler_type_kind_t::unknown;
+        const bool preserve_function = winner_is_function &&
+            candidate.kind == decompiler_type_kind_t::unknown;
+        if (!winner || promote_function ||
+            (!preserve_function && !promote_function && strictly_higher(candidate_record, winner_record))) {
             winner = &candidate;
             winner_record = candidate_record;
         }
@@ -740,10 +842,13 @@ type_graph_t type_graph_builder_t::build()
     return graph;
 }
 
-workspace_result_t<type_graph_t> merge_type_evidence(
+namespace {
+
+workspace_result_t<type_graph_t> merge_type_evidence_impl(
     type_graph_t provider_graph,
     std::vector<type_seed_batch_t> evidence,
-    const type_graph_builder_config_t& config)
+    const type_graph_builder_config_t& config,
+    const hir_function_t* live_hir)
 {
     const auto invalid = [](std::string message) {
         return workspace_result_t<type_graph_t>::failure(make_workspace_error(
@@ -752,7 +857,7 @@ workspace_result_t<type_graph_t> merge_type_evidence(
     };
     if (!validate_type_graph(provider_graph).valid())
         return invalid("provider type graph is invalid");
-    if (evidence.empty())
+    if (evidence.empty() && !live_hir)
         return workspace_result_t<type_graph_t>::success(std::move(provider_graph));
     try {
         std::unordered_map<std::uint64_t, const decompiler_type_node_t*> source_nodes;
@@ -794,6 +899,12 @@ workspace_result_t<type_graph_t> merge_type_evidence(
                 candidate.edges.push_back(std::move(converted));
             }
             provider_seed.candidates.push_back(std::move(candidate));
+        }
+        if (live_hir) {
+            std::string reachability_error;
+            if (!retain_live_function_candidates(
+                    provider_graph, *live_hir, provider_seed, evidence, reachability_error))
+                return invalid(std::move(reachability_error));
         }
         type_graph_builder_t builder(provider_graph.entity, config);
         builder.add_seed_batch(std::move(provider_seed));
@@ -856,6 +967,27 @@ workspace_result_t<type_graph_t> merge_type_evidence(
     } catch (...) {
         return invalid("type evidence merge failed");
     }
+}
+
+}
+
+workspace_result_t<type_graph_t> merge_type_evidence(
+    type_graph_t provider_graph,
+    std::vector<type_seed_batch_t> evidence,
+    const type_graph_builder_config_t& config)
+{
+    return merge_type_evidence_impl(
+        std::move(provider_graph), std::move(evidence), config, nullptr);
+}
+
+workspace_result_t<type_graph_t> merge_type_evidence(
+    type_graph_t provider_graph,
+    std::vector<type_seed_batch_t> evidence,
+    const hir_function_t& live_hir,
+    const type_graph_builder_config_t& config)
+{
+    return merge_type_evidence_impl(
+        std::move(provider_graph), std::move(evidence), config, &live_hir);
 }
 
 }

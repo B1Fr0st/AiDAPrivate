@@ -109,6 +109,7 @@
 #include "../core/ui/workspace_layout.hpp"
 #include "../core/ui/application_ui_runtime.hpp"
 #include "../core/ui/application_view_registry.hpp"
+#include "../core/ui/programming_tasks.hpp"
 #include "../core/ui/task_center.hpp"
 #include "../core/settings/settings_persistence_service.hpp"
 #include "../core/settings/theme_transfer_service.hpp"
@@ -5916,7 +5917,39 @@ void helpers::render_title()
 
 				char popup_id[32];
 				snprintf(popup_id, sizeof(popup_id), "##menu_%d", i);
-				if (need_open || menu_bar::open_request)
+				bool escape_closed_menu_chain = false;
+				if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+					ImGuiContext& popup_context = *GImGui;
+					const ImGuiID application_popup_id = ImGui::GetID(popup_id);
+					for (int popup_index = 0;
+						popup_index < popup_context.OpenPopupStack.Size;
+						++popup_index) {
+						const ImGuiPopupData& popup = popup_context.OpenPopupStack[popup_index];
+						if (popup.PopupId != application_popup_id || popup.Window == nullptr ||
+							(popup.Window->Flags & ImGuiWindowFlags_Modal) != 0)
+							continue;
+						bool contains_modal = false;
+						for (int descendant_index = popup_index + 1;
+							descendant_index < popup_context.OpenPopupStack.Size;
+							++descendant_index) {
+							const ImGuiWindow* descendant =
+								popup_context.OpenPopupStack[descendant_index].Window;
+							if (descendant != nullptr &&
+								(descendant->Flags & ImGuiWindowFlags_Modal) != 0) {
+								contains_modal = true;
+								break;
+							}
+						}
+						if (!contains_modal) {
+							ImGui::ClosePopupToLevel(popup_index, true);
+							menu_bar::open_menu = -1;
+							menu_bar::any_open = false;
+							escape_closed_menu_chain = true;
+						}
+						break;
+					}
+				}
+				if (!escape_closed_menu_chain && (need_open || menu_bar::open_request))
 					ImGui::OpenPopup(popup_id);
 				menu_bar::open_request = false;
 
@@ -5926,7 +5959,7 @@ void helpers::render_title()
 					ImVec2(aida::ui::scale_px(300.f, metrics.scale),
 						i == 2 || i == 13 ? aida::ui::scale_px(240.f, metrics.scale) : 0.f),
 					ImVec2(aida::ui::scale_px(440.f, metrics.scale), popup_max_height));
-				if (ImGui::BeginPopup(popup_id)) {
+				if (!escape_closed_menu_chain && ImGui::BeginPopup(popup_id)) {
 					if (keyboard_open)
 						ImGui::SetKeyboardFocusHere();
 					float mw = aida::ui::scale_px(280.f, metrics.scale);
@@ -6930,6 +6963,8 @@ void helpers::render_title()
 	aida::ui::ide_shell::end_global_chrome_surface();
 	aida::ui::ide_shell::render_primary_surfaces();
 	aida::ui::application_ui::render_action_confirmation();
+	g_render_section = "popups_programming_tasks";
+	aida::ui::programming_tasks::render_modals();
 	debugger_view::render_global_target_dialog();
 	g_render_section = "popups_workspace_management";
 	render_workspace_dialogs();

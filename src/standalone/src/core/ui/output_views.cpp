@@ -1246,8 +1246,6 @@ void render(bottom_tab_t tab, std::string_view stable_view_id,
         application_ui::open_output_context_menu(static_cast<int>(tab),
             context_menu_open_origin_t::pointer);
     application_ui::render_output_context_menu();
-    if (tab == bottom_tab_t::output)
-        programming_tasks::render_modals();
 }
 
 }

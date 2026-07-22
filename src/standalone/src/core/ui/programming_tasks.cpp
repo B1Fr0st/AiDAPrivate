@@ -12,6 +12,7 @@
 #include "../settings/settings_persistence_service.hpp"
 
 #include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -111,6 +112,9 @@ struct run_state_t {
 struct editor_state_t {
     int selected = -1;
     bool loaded = false;
+    bool creating = false;
+    std::string draft_id;
+    std::string draft_source_id;
     std::array<char, 128> name{};
     std::array<char, 8192> command{};
     std::array<char, 1024> cwd{};
@@ -123,6 +127,12 @@ struct editor_state_t {
     bool clear_dirty_on_commit = false;
     std::uint64_t settings_generation = 0;
     std::string persistence_payload;
+    bool persistence_created = false;
+    int persistence_previous_index = -1;
+    std::optional<configuration_t> persistence_previous_configuration;
+    std::string persistence_previous_selected_id;
+    std::string persistence_candidate_id;
+    std::string persistence_candidate_source_id;
     std::string validation_error;
 };
 
@@ -156,6 +166,8 @@ struct state_t {
     bool initialized = false;
     bool configuration_loading = false;
     bool configure_open = false;
+    bool focus_add_configuration = false;
+    int focus_add_assignment_frame = -1;
     bool run_review_open = false;
     editor_state_t editor;
     std::uint64_t next_run = 1;
@@ -170,6 +182,7 @@ state_t& state() {
 
 void ensure_initialized();
 const configuration_t* selected_configuration();
+bool select_configuration(int index, bool persist_selection);
 
 std::uint64_t now_ms() {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -607,13 +620,22 @@ bool persist_user_configurations(std::string& error, bool clears_editor_dirty = 
         error = "Settings persistence is busy; try again";
         return false;
     }
+    const std::string previous_payload = g_sa_settings.programming_tasks_json;
+    const std::string previous_selected_id = g_sa_settings.programming_selected_task_id;
+    const std::string selected_id = store.selected_id;
     g_sa_settings.programming_tasks_json = payload;
-    g_sa_settings.programming_selected_task_id = store.selected_id;
+    g_sa_settings.programming_selected_task_id = selected_id;
     settings_lock.unlock();
     std::uint64_t generation = 0;
     const auto requested = aida::settings_persistence::request_save(g_sa_settings,
         &generation);
     if (!aida::settings_persistence::accepted(requested)) {
+        std::lock_guard<std::recursive_mutex> rollback_lock(sa_settings_detail::io_mutex());
+        if (g_sa_settings.programming_tasks_json == payload &&
+            g_sa_settings.programming_selected_task_id == selected_id) {
+            g_sa_settings.programming_tasks_json = previous_payload;
+            g_sa_settings.programming_selected_task_id = previous_selected_id;
+        }
         error = "Task configuration persistence could not capture an immutable settings snapshot";
         return false;
     }
@@ -648,10 +670,47 @@ void ensure_initialized() {
                 store.editor.validation_error.clear();
             }
             store.editor.persistence_payload.clear();
+            store.editor.persistence_created = false;
+            store.editor.persistence_previous_index = -1;
+            store.editor.persistence_previous_configuration.reset();
+            store.editor.persistence_previous_selected_id.clear();
+            store.editor.persistence_candidate_id.clear();
+            store.editor.persistence_candidate_source_id.clear();
         } else if (!persistence.pending && persistence.failed &&
             persistence.generation >= store.editor.settings_generation) {
             store.editor.save_in_flight = false;
             if (store.editor.clear_dirty_on_commit) {
+                if (store.editor.persistence_created) {
+                    const auto created = std::find_if(store.configurations.begin(),
+                        store.configurations.end(), [&](const configuration_t& configuration) {
+                            return configuration.id == store.editor.persistence_candidate_id &&
+                                configuration.source_id ==
+                                    store.editor.persistence_candidate_source_id;
+                        });
+                    if (created != store.configurations.end())
+                        store.configurations.erase(created);
+                    store.selected_id = store.editor.persistence_previous_selected_id;
+                    store.editor.selected = -1;
+                    store.editor.creating = true;
+                    store.editor.draft_id = store.editor.persistence_candidate_id;
+                    store.editor.draft_source_id =
+                        store.editor.persistence_candidate_source_id;
+                } else if (store.editor.persistence_previous_configuration &&
+                    store.editor.persistence_previous_index >= 0 &&
+                    store.editor.persistence_previous_index <
+                        static_cast<int>(store.configurations.size())) {
+                    store.configurations[static_cast<std::size_t>(
+                        store.editor.persistence_previous_index)] =
+                            std::move(*store.editor.persistence_previous_configuration);
+                    store.selected_id = store.editor.persistence_previous_selected_id;
+                }
+                {
+                    std::lock_guard<std::recursive_mutex> settings_lock(
+                        sa_settings_detail::io_mutex());
+                    g_sa_settings.programming_tasks_json =
+                        serialize_user_configurations().dump();
+                    g_sa_settings.programming_selected_task_id = store.selected_id;
+                }
                 store.editor.dirty = true;
                 store.editor.validation_error = persistence.error.empty()
                     ? "Task configurations could not be saved" : persistence.error;
@@ -660,6 +719,12 @@ void ensure_initialized() {
                     ? "Task configuration selection could not be saved" : persistence.error;
             }
             store.editor.persistence_payload.clear();
+            store.editor.persistence_created = false;
+            store.editor.persistence_previous_index = -1;
+            store.editor.persistence_previous_configuration.reset();
+            store.editor.persistence_previous_selected_id.clear();
+            store.editor.persistence_candidate_id.clear();
+            store.editor.persistence_candidate_source_id.clear();
         }
     }
     if (!store.initialized) {
@@ -1299,8 +1364,35 @@ void load_editor(int index) {
     editor.matcher = matcher_index(config.problem_matcher);
 }
 
+void load_configuration_draft(configuration_t config) {
+    auto& editor = state().editor;
+    const bool save_in_flight = editor.save_in_flight;
+    editor = {};
+    editor.save_in_flight = save_in_flight;
+    editor.loaded = true;
+    editor.creating = true;
+    editor.draft_id = std::move(config.id);
+    editor.draft_source_id = std::move(config.source_id);
+    std::snprintf(editor.name.data(), editor.name.size(), "%s", config.name.c_str());
+    std::snprintf(editor.command.data(), editor.command.size(), "%s", config.command.c_str());
+    std::snprintf(editor.cwd.data(), editor.cwd.size(), "%s", config.cwd.c_str());
+    std::snprintf(editor.channel.data(), editor.channel.size(), "%s", config.output_channel.c_str());
+    editor.kind = config.kind == configuration_kind_t::launch ? 1 :
+        config.kind == configuration_kind_t::test ? 2 : 0;
+    editor.matcher = matcher_index(config.problem_matcher);
+    editor.dirty = true;
+}
+
 void add_user_configuration() {
     auto& store = state();
+    if (store.editor.save_in_flight) {
+        store.editor.validation_error = "Wait for task configuration persistence to finish";
+        return;
+    }
+    if (store.editor.dirty) {
+        store.editor.validation_error = "Save, revert, or discard the current configuration before creating another";
+        return;
+    }
     const std::size_t user_count = static_cast<std::size_t>(std::count_if(
         store.configurations.begin(), store.configurations.end(), [](const configuration_t& config) {
             return config.origin == configuration_origin_t::user;
@@ -1309,22 +1401,29 @@ void add_user_configuration() {
         store.editor.validation_error = "User task configurations reached the 64-entry bound";
         return;
     }
-    configuration_t config;
-    config.source_id = "config_" + std::to_string(now_ms()) + "_" +
+    const std::string source_id = "config_" + std::to_string(now_ms()) + "_" +
         std::to_string(store.next_configuration++);
-    config.id = "user." + config.source_id;
-    config.name = "New Task";
-    config.cwd = "${workspaceFolder}";
-    config.problem_matcher = "none";
-    config.origin = configuration_origin_t::user;
-    store.configurations.push_back(std::move(config));
-    store.selected_id = store.configurations.back().id;
-    load_editor(static_cast<int>(store.configurations.size()) - 1);
-    store.editor.dirty = true;
+    configuration_t draft;
+    draft.id = "user." + source_id;
+    draft.source_id = source_id;
+    draft.name = "New Task";
+    draft.cwd = "${workspaceFolder}";
+    draft.problem_matcher = "none";
+    draft.origin = configuration_origin_t::user;
+    load_configuration_draft(std::move(draft));
+    store.configuration_error.clear();
 }
 
 void duplicate_configuration(int index) {
     auto& store = state();
+    if (store.editor.save_in_flight) {
+        store.configuration_error = "Wait for task configuration persistence to finish";
+        return;
+    }
+    if (store.editor.dirty) {
+        store.configuration_error = "Save, revert, or discard the current configuration before duplicating another";
+        return;
+    }
     const std::size_t user_count = static_cast<std::size_t>(std::count_if(
         store.configurations.begin(), store.configurations.end(), [](const configuration_t& config) {
             return config.origin == configuration_origin_t::user;
@@ -1343,10 +1442,7 @@ void duplicate_configuration(int index) {
     copy.id = "user." + copy.source_id;
     copy.name = bounded(copy.name + " Copy", 127);
     copy.origin = configuration_origin_t::user;
-    store.configurations.push_back(std::move(copy));
-    store.selected_id = store.configurations.back().id;
-    load_editor(static_cast<int>(store.configurations.size()) - 1);
-    store.editor.dirty = true;
+    load_configuration_draft(std::move(copy));
     store.configure_open = true;
     store.configuration_error.clear();
 }
@@ -1354,12 +1450,14 @@ void duplicate_configuration(int index) {
 bool save_editor() {
     auto& store = state();
     auto& editor = store.editor;
-    if (editor.selected < 0 || editor.selected >= static_cast<int>(store.configurations.size())) {
+    if (!editor.creating &&
+        (editor.selected < 0 || editor.selected >= static_cast<int>(store.configurations.size()))) {
         editor.validation_error = "Select a user configuration first";
         return false;
     }
-    auto& config = store.configurations[static_cast<std::size_t>(editor.selected)];
-    if (config.origin != configuration_origin_t::user) {
+    if (!editor.creating &&
+        store.configurations[static_cast<std::size_t>(editor.selected)].origin !=
+            configuration_origin_t::user) {
         editor.validation_error = "Project configurations are read-only here; edit .aida/tasks.json in the code editor";
         return false;
     }
@@ -1383,16 +1481,60 @@ bool save_editor() {
         editor.validation_error = "Names longer than 96 bytes require an explicit Output channel";
         return false;
     }
-    config.name = bounded(name, 127);
-    config.command = bounded(command, 8192);
-    config.cwd = bounded(trim(editor.cwd.data()), 1024);
-    config.output_channel = channel;
-    config.kind = editor.kind == 1 ? configuration_kind_t::launch :
+    configuration_t candidate;
+    if (editor.creating) {
+        candidate.id = editor.draft_id;
+        candidate.source_id = editor.draft_source_id;
+        candidate.origin = configuration_origin_t::user;
+    } else {
+        candidate = store.configurations[static_cast<std::size_t>(editor.selected)];
+    }
+    candidate.name = bounded(name, 127);
+    candidate.command = bounded(command, 8192);
+    candidate.cwd = bounded(trim(editor.cwd.data()), 1024);
+    candidate.output_channel = channel;
+    candidate.kind = editor.kind == 1 ? configuration_kind_t::launch :
         editor.kind == 2 ? configuration_kind_t::test : configuration_kind_t::task;
-    config.problem_matcher = matcher_name(editor.matcher);
-    store.selected_id = config.id;
+    candidate.problem_matcher = matcher_name(editor.matcher);
+    const bool creating = editor.creating;
+    const std::string previous_selected_id = store.selected_id;
+    std::optional<configuration_t> previous_configuration;
+    if (creating) {
+        store.configurations.push_back(candidate);
+        editor.selected = static_cast<int>(store.configurations.size()) - 1;
+    } else {
+        previous_configuration = store.configurations[static_cast<std::size_t>(editor.selected)];
+        store.configurations[static_cast<std::size_t>(editor.selected)] = candidate;
+    }
+    store.selected_id = candidate.id;
     editor.dirty = true;
-    if (!persist_user_configurations(editor.validation_error)) return false;
+    if (!persist_user_configurations(editor.validation_error)) {
+        if (creating) {
+            const auto found = std::find_if(store.configurations.begin(), store.configurations.end(),
+                [&](const configuration_t& configuration) {
+                    return configuration.id == candidate.id &&
+                        configuration.source_id == candidate.source_id;
+                });
+            if (found != store.configurations.end()) store.configurations.erase(found);
+            editor.selected = -1;
+        } else if (previous_configuration) {
+            store.configurations[static_cast<std::size_t>(editor.selected)] =
+                std::move(*previous_configuration);
+        }
+        store.selected_id = previous_selected_id;
+        return false;
+    }
+    if (editor.save_in_flight) {
+        editor.persistence_created = creating;
+        editor.persistence_previous_index = creating ? -1 : editor.selected;
+        editor.persistence_previous_configuration = std::move(previous_configuration);
+        editor.persistence_previous_selected_id = previous_selected_id;
+        editor.persistence_candidate_id = candidate.id;
+        editor.persistence_candidate_source_id = candidate.source_id;
+    }
+    editor.creating = false;
+    editor.draft_id.clear();
+    editor.draft_source_id.clear();
     editor.validation_error = editor.save_in_flight ? "Saving task configuration..." : std::string{};
     return true;
 }
@@ -1430,9 +1572,16 @@ void delete_selected_configuration() {
     load_editor(-1);
 }
 
-void render_configuration_editor() {
+struct configuration_add_focus_target_t {
+    ImGuiWindow* window = nullptr;
+    ImGuiID id = 0;
+    bool valid = false;
+};
+
+configuration_add_focus_target_t render_configuration_editor() {
     auto& store = state();
     auto& editor = store.editor;
+    configuration_add_focus_target_t add_focus_target;
     if (!editor.loaded) {
         const auto found = std::find_if(store.configurations.begin(), store.configurations.end(),
             [&](const configuration_t& config) { return config.id == store.selected_id; });
@@ -1448,23 +1597,56 @@ void render_configuration_editor() {
         const std::string label = config.name + (config.origin == configuration_origin_t::project
             ? "  [Project]" : "  [User]");
         if (ImGui::Selectable((label + "###task.config." + config.id).c_str(), editor.selected == index)) {
-            store.selected_id = config.id;
-            load_editor(index);
+            if (select_configuration(index, false)) load_editor(index);
         }
     }
     ImGui::Separator();
-    if (ImGui::Button("Add User Configuration", ImVec2(-1.0f, 0.0f))) add_user_configuration();
+    const bool focus_add = store.focus_add_configuration && store.configurations.empty() &&
+        !store.configuration_loading && !editor.save_in_flight;
+    ImGuiWindow* const add_window = ImGui::GetCurrentWindow();
+    const ImGuiID add_id = add_window->GetID("Add User Configuration");
+    const int current_frame = ImGui::GetFrameCount();
+    const ImGuiContext& context_before = *GImGui;
+    const bool prior_focus_commit_completed = focus_add &&
+        store.focus_add_assignment_frame >= 0 &&
+        current_frame > store.focus_add_assignment_frame;
+    const bool focus_survived_completed_frame = prior_focus_commit_completed &&
+        context_before.NavWindow == add_window && context_before.NavId == add_id;
+    const bool explicit_tab_navigation = focus_add &&
+        ImGui::IsKeyPressed(ImGuiKey_Tab, false);
+    if ((prior_focus_commit_completed && !focus_survived_completed_frame) ||
+        explicit_tab_navigation) {
+        store.focus_add_configuration = false;
+        store.focus_add_assignment_frame = -1;
+    }
+    add_focus_target.window = add_window;
+    add_focus_target.id = add_id;
+    add_focus_target.valid = store.focus_add_configuration;
+    const bool add_activated = ImGui::Button(
+        "Add User Configuration", ImVec2(-1.0f, 0.0f));
+    if (add_activated) add_user_configuration();
+    if (add_activated && editor.creating) {
+        store.focus_add_configuration = false;
+        store.focus_add_assignment_frame = -1;
+    }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static_cast<void>(aida::preview::semantics::register_last_item(
+        "aida.dialog.programming.task.configurations.add", "dialog-action", false,
+        store.configuration_loading || editor.save_in_flight));
+#endif
     ImGui::EndChild();
     ImGui::SameLine();
     ImGui::BeginChild("##task_configuration_editor", ImVec2(0.0f, area_height), false);
-    const bool valid_selection = editor.selected >= 0 &&
+    const bool catalog_selection = editor.selected >= 0 &&
         editor.selected < static_cast<int>(store.configurations.size());
-    const bool read_only = valid_selection && store.configurations[static_cast<std::size_t>(editor.selected)].origin ==
-        configuration_origin_t::project;
+    const bool valid_selection = editor.creating || catalog_selection;
+    const bool read_only = catalog_selection &&
+        store.configurations[static_cast<std::size_t>(editor.selected)].origin ==
+            configuration_origin_t::project;
     if (!valid_selection) {
         ImGui::TextDisabled("Select a configuration or create a user configuration.");
         ImGui::EndChild();
-        return;
+        return add_focus_target;
     }
     if (read_only) {
         ImGui::TextDisabled("Project-owned: .aida/tasks.json");
@@ -1475,7 +1657,9 @@ void render_configuration_editor() {
             static_cast<void>(application_views::open_or_focus(stable_view_id_t("document.code")));
         }
     }
-    ImGui::BeginDisabled(read_only);
+    if (editor.creating)
+        ImGui::TextDisabled("Unsaved user configuration");
+    ImGui::BeginDisabled(read_only || editor.save_in_flight);
     ImGui::SetNextItemWidth(-1.0f);
     editor.dirty |= ImGui::InputText("Name", editor.name.data(), editor.name.size());
     ImGui::SetNextItemWidth(-1.0f);
@@ -1496,8 +1680,13 @@ void render_configuration_editor() {
         static_cast<void>(save_editor());
     ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::Button("Delete...")) editor.delete_requested = true;
-    if (editor.dirty && !store.configurations[static_cast<std::size_t>(editor.selected)].command.empty()) {
+    if (editor.creating) {
+        if (ImGui::Button("Discard Draft")) load_editor(-1);
+    } else if (ImGui::Button("Delete...")) {
+        editor.delete_requested = true;
+    }
+    if (!editor.creating && editor.dirty && catalog_selection &&
+        !store.configurations[static_cast<std::size_t>(editor.selected)].command.empty()) {
         ImGui::SameLine();
         if (ImGui::Button("Revert Edits")) load_editor(editor.selected);
     }
@@ -1549,6 +1738,7 @@ void render_configuration_editor() {
         }
         ImGui::EndPopup();
     }
+    return add_focus_target;
 }
 
 }
@@ -1798,6 +1988,8 @@ int configuration_index(std::string_view id) {
         static_cast<int>(std::distance(configurations.begin(), found));
 }
 
+namespace {
+
 bool select_configuration(int index, bool persist_selection) {
     auto& store = state();
     if (index < 0 || index >= static_cast<int>(store.configurations.size())) return false;
@@ -1815,6 +2007,8 @@ bool select_configuration(int index, bool persist_selection) {
     std::string error;
     if (!persist_user_configurations(error, false)) store.configuration_error = std::move(error);
     return true;
+}
+
 }
 
 void open_selected_configuration_editor() {
@@ -1998,11 +2192,10 @@ void open_configuration_context(int index, context_menu_open_origin_t origin) {
         store.configurations.begin(), store.configurations.end(), [](const configuration_t& item) {
             return item.origin == configuration_origin_t::user;
         }));
-    const std::string selection_unavailable = store.editor.save_in_flight &&
-        store.selected_id != retained.id
+    const std::string selection_unavailable = store.editor.save_in_flight
         ? "Wait for task configuration persistence before changing selection"
-        : store.editor.dirty && store.selected_id != retained.id
-            ? "Save or revert the edited configuration before changing selection"
+        : store.editor.dirty
+            ? "Save, revert, or discard the edited configuration before changing selection"
             : std::string{};
     context.actions.push_back(retained_script_action(
         "programming.configuration.duplicate", !selection_unavailable.empty()
@@ -2010,9 +2203,8 @@ void open_configuration_context(int index, context_menu_open_origin_t origin) {
                 ? "User task configurations reached the 64-entry bound" : std::string{},
         [invoke_selected] {
             return invoke_selected([](int retained_index) {
-                const auto before = state().configurations.size();
                 duplicate_configuration(retained_index);
-                return state().configurations.size() == before + 1
+                return state().editor.creating && !state().editor.draft_id.empty()
                     ? action_handler_result_t::completed()
                     : action_handler_result_t::failed(state().configuration_error.empty()
                         ? "The retained configuration could not be duplicated"
@@ -2401,12 +2593,15 @@ void render_modals() {
     if (store.configure_open) {
         design::open_dialog("programming.task.configurations",
             "Programming Task Configurations");
+        if (store.configurations.empty()) {
+            store.focus_add_configuration = true;
+            store.focus_add_assignment_frame = -1;
+        }
         store.configure_open = false;
     }
     if (design::begin_dialog("programming.task.configurations",
             "Programming Task Configurations", ImVec2(860.0f, 540.0f),
             ImVec2(620.0f, 420.0f))) {
-        const bool can_close = !store.editor.dirty && !store.editor.save_in_flight;
         const float footer_height = design::dialog_footer_reserve_height(
             "Close", nullptr);
         design::begin_dialog_body("programming_task_configurations_body",
@@ -2415,21 +2610,36 @@ void render_modals() {
         ImGui::TextDisabled("AiDA runs only configurations you define here or in .aida/tasks.json. This does not invoke RE Run Target.");
         ImGui::Separator();
         ImGui::BeginDisabled(store.configuration_loading);
-        render_configuration_editor();
+        const configuration_add_focus_target_t add_focus_target =
+            render_configuration_editor();
         ImGui::EndDisabled();
         ImGui::Separator();
         if (ImGui::Button("Reload User and Project Configurations")) {
             std::string error;
             if (!schedule_configuration_reload(true, error)) store.configuration_error = std::move(error);
         }
+        const bool can_close = !store.editor.dirty && !store.editor.save_in_flight;
         if (!can_close)
             ImGui::TextDisabled("Save, revert, or delete the edited user configuration before closing.");
         design::end_dialog_body();
         const auto footer = design::dialog_footer(
             "programming_task_configurations_footer", "Close",
-            can_close, false, nullptr);
-        if ((footer.confirmed || footer.cancelled) && can_close)
+            can_close, false, nullptr, true, false);
+        bool closing = false;
+        if ((footer.confirmed || footer.cancelled) && can_close) {
+            store.focus_add_configuration = false;
+            store.focus_add_assignment_frame = -1;
             ImGui::CloseCurrentPopup();
+            closing = true;
+        }
+        if (!closing && store.focus_add_configuration && add_focus_target.valid &&
+            add_focus_target.window && add_focus_target.id != 0 &&
+            store.configurations.empty() && !store.configuration_loading &&
+            !store.editor.save_in_flight) {
+            ImGui::FocusWindow(add_focus_target.window);
+            ImGui::SetFocusID(add_focus_target.id, add_focus_target.window);
+            store.focus_add_assignment_frame = ImGui::GetFrameCount();
+        }
         ImGui::EndPopup();
     }
     if (store.run_review_open && store.pending_run) {

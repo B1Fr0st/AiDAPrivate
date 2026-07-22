@@ -4,11 +4,14 @@
 #include "../../src/core/analysis/decompiler/decompiler_contracts.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace aida::analysis::c03_test {
 namespace {
@@ -146,6 +149,181 @@ bool has_diagnostic(const type_graph_t& graph, const std::string& key_prefix)
         if (diagnostic.localization_key.find(key_prefix) == 0)
             return true;
     return false;
+}
+
+decompiler_type_node_t provider_node(const decompiler_entity_key_t& entity,
+                                     const std::uint64_t id,
+                                     std::string canonical_name,
+                                     const decompiler_type_kind_t kind,
+                                     const std::optional<std::uint64_t> byte_size,
+                                     const std::uint32_t alignment,
+                                     const std::uint8_t confidence)
+{
+    decompiler_type_node_t node;
+    node.id = id;
+    node.kind = kind;
+    node.canonical_name = std::move(canonical_name);
+    node.display_name = node.canonical_name;
+    node.byte_size = byte_size;
+    node.alignment = alignment;
+    node.is_signed = kind == decompiler_type_kind_t::signed_integer;
+    node.confidence = confidence;
+    node.provenance = decompiler_fact_provenance_t::provider_semantics;
+    node.coordinates.push_back(make_coord(entity, 0x3000 + id));
+    return node;
+}
+
+decompiler_type_edge_t provider_edge(const std::uint64_t source,
+                                     const std::uint64_t target,
+                                     const decompiler_type_edge_kind_t kind,
+                                     std::string stable_name,
+                                     const std::uint32_t ordinal)
+{
+    decompiler_type_edge_t edge;
+    edge.source_type_id = source;
+    edge.target_type_id = target;
+    edge.kind = kind;
+    edge.stable_name = std::move(stable_name);
+    edge.ordinal = ordinal;
+    edge.confidence = 100;
+    edge.provenance = decompiler_fact_provenance_t::provider_semantics;
+    return edge;
+}
+
+type_graph_t live_provider_graph(const decompiler_entity_key_t& entity)
+{
+    type_graph_t graph;
+    graph.entity = entity;
+    graph.revision = 17;
+    graph.nodes = {
+        provider_node(entity, 1, "int32_t", decompiler_type_kind_t::signed_integer, 4, 4, 100),
+        provider_node(entity, 2, "undefined8", decompiler_type_kind_t::unknown, 8, 8, 45),
+        provider_node(entity, 3, "dead.undefined4", decompiler_type_kind_t::unknown, 4, 4, 30),
+        provider_node(entity, 4, "fixture.signature", decompiler_type_kind_t::function,
+            std::nullopt, 1, 100),
+        provider_node(entity, 5, "unknown_function", decompiler_type_kind_t::unknown,
+            std::nullopt, 1, 20),
+        provider_node(entity, 6, "int32_t*", decompiler_type_kind_t::pointer, 8, 8, 100)
+    };
+    graph.edges = {
+        provider_edge(4, 2, decompiler_type_edge_kind_t::return_type, "return", 1),
+        provider_edge(4, 1, decompiler_type_edge_kind_t::parameter, "arg0", 2),
+        provider_edge(6, 1, decompiler_type_edge_kind_t::pointee, "pointee", 3)
+    };
+    return graph;
+}
+
+hir_value_t live_hir_value(const decompiler_entity_key_t& entity,
+                           const std::uint64_t id,
+                           const hir_node_kind_t kind,
+                           const std::uint64_t type_id,
+                           std::vector<std::uint64_t> operands,
+                           std::string stable_value)
+{
+    hir_value_t value;
+    value.id = id;
+    value.kind = kind;
+    value.type_id = type_id;
+    value.operand_ids = std::move(operands);
+    value.stable_value = std::move(stable_value);
+    value.coordinate = make_coord(entity, 0x4000 + id);
+    value.confidence = 100;
+    value.provenance = decompiler_fact_provenance_t::provider_semantics;
+    return value;
+}
+
+hir_function_t live_hir_fixture(const decompiler_entity_key_t& entity)
+{
+    hir_function_t hir;
+    hir.entity = entity;
+    hir.provider_ir_hash = digest("live-hir-provider-ir");
+    hir.type_graph_revision = 17;
+    hir.return_type_id = 2;
+
+    hir_variable_t parameter;
+    parameter.id = 1;
+    parameter.stable_name = "arg0";
+    parameter.type_id = 1;
+    parameter.coordinate = make_coord(entity, 0x4000);
+    parameter.confidence = 100;
+    parameter.provenance = decompiler_fact_provenance_t::provider_semantics;
+    hir.parameters.push_back(std::move(parameter));
+
+    hir_variable_t local;
+    local.id = 1;
+    local.stable_name = "pointer_local";
+    local.type_id = 6;
+    local.coordinate = make_coord(entity, 0x4001);
+    local.confidence = 100;
+    local.provenance = decompiler_fact_provenance_t::provider_semantics;
+    hir.locals.push_back(std::move(local));
+
+    hir_block_t block;
+    block.id = 1;
+    block.coordinate = make_coord(entity, 0x4000);
+    block.values = {
+        live_hir_value(entity, 1, hir_node_kind_t::parameter, 1, {}, "arg0"),
+        live_hir_value(entity, 2, hir_node_kind_t::load, 6, {1}, "pointer_local"),
+        live_hir_value(entity, 3, hir_node_kind_t::return_value, 2, {2}, "return")
+    };
+    hir.source_coordinates.push_back(block.coordinate);
+    hir.blocks.push_back(std::move(block));
+    return hir;
+}
+
+std::vector<type_seed_batch_t> live_evidence(const decompiler_entity_key_t& entity)
+{
+    type_seed_batch_t authoritative;
+    authoritative.source = decompiler_fact_provenance_t::user_overlay;
+    authoritative.source_label = "live_authoritative";
+
+    auto function_unknown = make_candidate("fixture.signature", decompiler_type_kind_t::unknown, 0,
+        decompiler_fact_provenance_t::user_overlay, 100, entity);
+    function_unknown.byte_size.reset();
+    function_unknown.alignment = 1;
+    authoritative.candidates.push_back(std::move(function_unknown));
+
+    auto width_relabel = make_candidate("undefined8", decompiler_type_kind_t::signed_integer, 8,
+        decompiler_fact_provenance_t::loader_metadata, 100, entity);
+    width_relabel.is_signed = true;
+    authoritative.candidates.push_back(std::move(width_relabel));
+
+    auto workspace_function = make_candidate("workspace.signature", decompiler_type_kind_t::function, 0,
+        decompiler_fact_provenance_t::call_signature, 90, entity);
+    workspace_function.byte_size.reset();
+    workspace_function.alignment = 1;
+    workspace_function.edges.push_back(make_edge(decompiler_type_edge_kind_t::return_type,
+        "undefined8", "return", decompiler_fact_provenance_t::call_signature, 90));
+    workspace_function.edges.push_back(make_edge(decompiler_type_edge_kind_t::parameter,
+        "workspace.parameter", "arg0", decompiler_fact_provenance_t::call_signature, 90));
+    authoritative.candidates.push_back(std::move(workspace_function));
+
+    auto workspace_parameter = make_candidate("workspace.parameter",
+        decompiler_type_kind_t::signed_integer, 4,
+        decompiler_fact_provenance_t::call_signature, 90, entity);
+    workspace_parameter.is_signed = true;
+    authoritative.candidates.push_back(std::move(workspace_parameter));
+
+    auto disconnected_unknown = make_candidate("disconnected.evidence.unknown",
+        decompiler_type_kind_t::unknown, 0,
+        decompiler_fact_provenance_t::debug_metadata, 95, entity);
+    disconnected_unknown.byte_size.reset();
+    authoritative.candidates.push_back(std::move(disconnected_unknown));
+
+    auto disconnected_known = make_candidate("disconnected.evidence.structure",
+        decompiler_type_kind_t::structure, 64,
+        decompiler_fact_provenance_t::debug_metadata, 95, entity);
+    authoritative.candidates.push_back(std::move(disconnected_known));
+
+    type_seed_batch_t bounded_noise;
+    bounded_noise.source = decompiler_fact_provenance_t::debug_metadata;
+    bounded_noise.source_label = "disconnected_bounded_noise";
+    for (std::uint32_t index = 0; index < 64; ++index) {
+        bounded_noise.candidates.push_back(make_candidate(
+            "disconnected.noise." + std::to_string(index), decompiler_type_kind_t::structure, 32,
+            decompiler_fact_provenance_t::debug_metadata, 80, entity));
+    }
+    return {std::move(authoritative), std::move(bounded_noise)};
 }
 
 void test_conflict_and_recursive_types()
@@ -706,6 +884,149 @@ void test_multi_source_merge()
     }
 }
 
+void test_live_hir_evidence_closure()
+{
+    const auto entity = native_entity();
+    const auto provider = live_provider_graph(entity);
+    const auto hir = live_hir_fixture(entity);
+    require(validate_type_graph(provider).valid(), "live provider fixture is invalid");
+    require(validate_hir_function(hir).valid(), "live HIR fixture is invalid");
+
+    type_graph_builder_config_t config;
+    config.max_nodes = 8;
+    config.max_edges_per_node = 8;
+    config.max_total_edges = 32;
+    config.preserve_unknowns = true;
+    config.strict_conflict_reporting = true;
+
+    const auto first = merge_type_evidence(provider, live_evidence(entity), hir, config);
+    require(first.has_value(), "live HIR evidence merge failed");
+    const auto& graph = first.value();
+    require(validate_type_graph(graph).valid(), "live HIR evidence graph is invalid");
+    require(graph.revision == provider.revision, "live HIR evidence merge changed the provider revision");
+    require(graph.nodes.size() == 6, "live HIR evidence closure retained an unexpected node set");
+    require(graph.nodes.size() <= config.max_nodes && graph.edges.size() <= config.max_total_edges,
+        "live HIR evidence closure exceeded configured graph bounds");
+    require(!has_diagnostic(graph, "type_graph.bounded"),
+        "disconnected evidence consumed bounds before live filtering");
+
+    const auto* int32 = find_node(graph, "int32_t");
+    const auto* unknown_width = find_node(graph, "undefined8");
+    const auto* signature = find_node(graph, "fixture.signature");
+    const auto* pointer = find_node(graph, "int32_t*");
+    const auto* workspace_signature = find_node(graph, "workspace.signature");
+    const auto* workspace_parameter = find_node(graph, "workspace.parameter");
+    require(int32 != nullptr && int32->id == 1, "live parameter type identity was not preserved");
+    require(unknown_width != nullptr && unknown_width->id == 2,
+        "live return type identity was not preserved");
+    require(signature != nullptr && signature->id == 4,
+        "provider function identity was not preserved");
+    require(pointer != nullptr && pointer->id == 6, "live local type identity was not preserved");
+    require(workspace_signature != nullptr && workspace_parameter != nullptr,
+        "structural function evidence closure was not retained");
+
+    require(find_node(graph, "dead.undefined4") == nullptr,
+        "disconnected provider sized unknown was retained");
+    require(find_node(graph, "unknown_function") == nullptr,
+        "disconnected provider unknown function token was retained");
+    require(find_node(graph, "disconnected.evidence.unknown") == nullptr &&
+            find_node(graph, "disconnected.evidence.structure") == nullptr &&
+            find_node(graph, "disconnected.noise.0") == nullptr &&
+            find_node(graph, "disconnected.noise.63") == nullptr,
+        "disconnected evidence survived live-HIR filtering");
+
+    require(signature->kind == decompiler_type_kind_t::function &&
+            signature->provenance == decompiler_fact_provenance_t::provider_semantics,
+        "known function prototype lost to an authoritative unknown candidate");
+    require(unknown_width->kind == decompiler_type_kind_t::unknown &&
+            unknown_width->byte_size.has_value() && *unknown_width->byte_size == 8 &&
+            unknown_width->provenance == decompiler_fact_provenance_t::provider_semantics,
+        "non-function sized unknown was incorrectly relabeled or lost width provenance");
+    require(has_unknown(graph, "undefined8"), "live sized unknown is missing explicit unknown evidence");
+    require(!has_unknown(graph, "fixture.signature"),
+        "known function prototype emitted a fabricated unknown record");
+
+    require(has_edge(graph, signature->id, unknown_width->id,
+            decompiler_type_edge_kind_t::return_type, "return") &&
+            has_edge(graph, signature->id, int32->id,
+                decompiler_type_edge_kind_t::parameter, "arg0") &&
+            has_edge(graph, pointer->id, int32->id,
+                decompiler_type_edge_kind_t::pointee, "pointee"),
+        "provider type closure lost a live outgoing edge");
+    require(has_edge(graph, workspace_signature->id, unknown_width->id,
+            decompiler_type_edge_kind_t::return_type, "return") &&
+            has_edge(graph, workspace_signature->id, workspace_parameter->id,
+                decompiler_type_edge_kind_t::parameter, "arg0"),
+        "workspace function evidence closure lost an outgoing edge");
+    for (const auto& edge : graph.edges) {
+        require(std::any_of(graph.nodes.begin(), graph.nodes.end(), [&edge](const auto& node) {
+            return node.id == edge.source_type_id;
+        }), "live type graph edge has an absent source");
+        require(std::any_of(graph.nodes.begin(), graph.nodes.end(), [&edge](const auto& node) {
+            return node.id == edge.target_type_id;
+        }), "live type graph edge has an absent target");
+    }
+
+    auto reordered_evidence = live_evidence(entity);
+    std::reverse(reordered_evidence.begin(), reordered_evidence.end());
+    for (auto& batch : reordered_evidence) {
+        std::reverse(batch.candidates.begin(), batch.candidates.end());
+        for (auto& candidate : batch.candidates)
+            std::reverse(candidate.edges.begin(), candidate.edges.end());
+    }
+    const auto reordered = merge_type_evidence(provider, std::move(reordered_evidence), hir, config);
+    require(reordered.has_value(), "reordered live HIR evidence merge failed");
+    require(serialize_type_graph(graph) == serialize_type_graph(reordered.value()),
+        "live HIR evidence graph depends on evidence insertion order");
+    require(stable_serialization_hash(graph) == stable_serialization_hash(reordered.value()),
+        "live HIR evidence graph hash depends on evidence insertion order");
+}
+
+void test_live_hir_evidence_failures()
+{
+    const auto entity = native_entity();
+    const auto provider = live_provider_graph(entity);
+    const auto evidence = live_evidence(entity);
+
+    auto absent_type = live_hir_fixture(entity);
+    absent_type.return_type_id = 999;
+    const auto absent_type_result = merge_type_evidence(provider, evidence, absent_type);
+    require(!absent_type_result.has_value() &&
+            absent_type_result.error().code == workspace_error_code_t::integrity_failure &&
+            absent_type_result.error().phase == "decompiler.type_graph.merge",
+        "absent live HIR type did not fail closed with an integrity error");
+
+    auto revision_mismatch = live_hir_fixture(entity);
+    revision_mismatch.type_graph_revision = provider.revision + 1;
+    const auto revision_result = merge_type_evidence(provider, evidence, revision_mismatch);
+    require(!revision_result.has_value() &&
+            revision_result.error().code == workspace_error_code_t::integrity_failure,
+        "live HIR revision mismatch did not fail closed");
+
+    auto entity_mismatch = live_hir_fixture(entity);
+    auto mismatched_entity = entity;
+    std::get<native_decompiler_entity_identity_t>(mismatched_entity.identity).function_id += 1;
+    std::get<native_decompiler_entity_identity_t>(mismatched_entity.identity).canonical_symbol =
+        "fixture::different_function";
+    entity_mismatch.entity = mismatched_entity;
+    for (auto& parameter : entity_mismatch.parameters)
+        parameter.coordinate.entity = mismatched_entity;
+    for (auto& local : entity_mismatch.locals)
+        local.coordinate.entity = mismatched_entity;
+    for (auto& block : entity_mismatch.blocks) {
+        block.coordinate.entity = mismatched_entity;
+        for (auto& value : block.values)
+            value.coordinate.entity = mismatched_entity;
+    }
+    for (auto& coordinate : entity_mismatch.source_coordinates)
+        coordinate.entity = mismatched_entity;
+    require(validate_hir_function(entity_mismatch).valid(), "entity mismatch fixture is internally invalid");
+    const auto entity_result = merge_type_evidence(provider, evidence, entity_mismatch);
+    require(!entity_result.has_value() &&
+            entity_result.error().code == workspace_error_code_t::integrity_failure,
+        "live HIR entity mismatch did not fail closed");
+}
+
 }
 
 void run_type_graph_harness()
@@ -717,6 +1038,8 @@ void run_type_graph_harness()
     test_confidence_ordering();
     test_unknown_preservation();
     test_multi_source_merge();
+    test_live_hir_evidence_closure();
+    test_live_hir_evidence_failures();
 }
 
 }

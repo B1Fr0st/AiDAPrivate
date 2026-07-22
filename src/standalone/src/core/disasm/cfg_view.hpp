@@ -3975,46 +3975,50 @@ inline void render(float, float, float width, float height,
 					"The selected graph instruction has no fully provider-backed byte range");
 			}
 			const auto process = context.workspace->identity().process();
+			const auto debugger_mutation_context = debugger_interaction::capture(
+				debugger_interaction::kind_t::instruction, address, 0, -1, 0, extent);
 			const auto breakpoint_definition_context = debugger_interaction::capture(
 				debugger_interaction::kind_t::breakpoint, address);
 			const bool debugger_matches_workspace_process = process &&
 				process->creation_time_100ns != 0 &&
 				driver_bridge::attached_pid() == process->pid &&
+				debugger_mutation_context.target_pid == process->pid &&
+				debugger_mutation_context.process_creation_time_100ns ==
+					process->creation_time_100ns &&
+				debugger_interaction::is_current(debugger_mutation_context) &&
 				breakpoint_definition_context.target_pid == process->pid &&
 				breakpoint_definition_context.process_creation_time_100ns ==
-					process->creation_time_100ns;
+					process->creation_time_100ns &&
+				debugger_interaction::is_current(breakpoint_definition_context);
 			if (debugger_matches_workspace_process) {
-				const auto pid = process->pid;
 				if (extent != 0) {
 					menu.actions["analysis.modify.patch"].invoke =
-						[address, extent, pid, breakpoint_definition_context,
+						[extent, debugger_mutation_context,
 						 validate_retained_action]() {
 							if (const auto reason = validate_retained_action(); !reason.empty())
 								return action_handler_result_t::failed(reason);
-							if (driver_bridge::attached_pid() != pid ||
-								!debugger_interaction::is_current(breakpoint_definition_context))
+							if (!debugger_interaction::is_current(debugger_mutation_context))
 								return action_handler_result_t::failed(
 									"The graph workspace process identity or debugger stop changed before patch review");
-						const auto opened = aida::ui::application_views::open_or_focus(
-							aida::ui::stable_view_id_t("view.debug.patches"));
-						if (!opened.ok())
-							return action_handler_result_t::failed(opened.detail.empty()
-								? "The canonical Patches view could not be opened" : opened.detail);
-						std::string error;
-						if (!debugger_view::stage_patch_review(address, extent,
-								"Reviewed patch from Graph", &error))
-							return action_handler_result_t::failed(error);
-						return action_handler_result_t::completed();
+							const auto opened = aida::ui::application_views::open_or_focus(
+								aida::ui::stable_view_id_t("view.debug.patches"));
+							if (!opened.ok())
+								return action_handler_result_t::failed(opened.detail.empty()
+									? "The canonical Patches view could not be opened" : opened.detail);
+							std::string error;
+							if (!debugger_view::stage_patch_review(debugger_mutation_context, extent,
+									"Reviewed patch from Graph", &error))
+								return action_handler_result_t::failed(error);
+							return action_handler_result_t::completed();
 						};
 					menu.actions["analysis.modify.patch"].capability =
 						capability_state_t::available();
 					menu.actions["analysis.modify.nop"].invoke =
-						[address, extent, pid, breakpoint_definition_context,
+						[extent, debugger_mutation_context,
 						 validate_retained_action]() {
 							if (const auto reason = validate_retained_action(); !reason.empty())
 								return action_handler_result_t::failed(reason);
-							if (driver_bridge::attached_pid() != pid ||
-								!debugger_interaction::is_current(breakpoint_definition_context))
+							if (!debugger_interaction::is_current(debugger_mutation_context))
 								return action_handler_result_t::failed(
 									"The graph workspace process identity or debugger stop changed before NOP review");
 							const auto opened = aida::ui::application_views::open_or_focus(
@@ -4023,7 +4027,8 @@ inline void render(float, float, float width, float height,
 								return action_handler_result_t::failed(opened.detail.empty()
 									? "The canonical Patches view could not be opened" : opened.detail);
 							std::string error;
-							if (!debugger_view::stage_nop_review(address, extent, &error))
+							if (!debugger_view::stage_nop_review(
+									debugger_mutation_context, extent, &error))
 								return action_handler_result_t::failed(error);
 							return action_handler_result_t::completed();
 						};
@@ -4036,7 +4041,7 @@ inline void render(float, float, float width, float height,
 						"The selected graph block has no exact instruction byte range");
 				}
 				const auto breakpoint_capability = debugger_view::address_mutation_capability(
-					address, true, pid);
+					debugger_mutation_context, true);
 				if (breakpoint_capability.enabled) {
 					menu.actions["analysis.debug.breakpoint"].invoke =
 						[breakpoint_definition_context, validate_retained_action]() {
@@ -4049,12 +4054,12 @@ inline void render(float, float, float width, float height,
 							return action_handler_result_t::completed();
 						};
 					menu.actions["analysis.debug.hardware_breakpoint"].invoke =
-						[address, pid, breakpoint_definition_context,
+						[breakpoint_definition_context,
 						 validate_retained_action]() {
 							if (const auto reason = validate_retained_action(); !reason.empty())
 								return action_handler_result_t::failed(reason);
 							const auto capability = debugger_view::address_mutation_capability(
-								address, true, pid);
+								breakpoint_definition_context, true);
 							if (!capability.enabled)
 								return action_handler_result_t::failed(capability.disabled_reason
 									? capability.disabled_reason : "Breakpoint staging is unavailable");

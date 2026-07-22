@@ -586,22 +586,38 @@ static void refresh_patch_stage_parse_cache() {
 
 bool stage_patch_review(std::uint64_t address, std::uint64_t extent,
 	const std::string& description, std::string* error) {
-	if (address == 0) {
+	const auto context = debugger_interaction::capture(
+		debugger_interaction::kind_t::instruction, address, 0, -1, 0, extent,
+		description);
+	return stage_patch_review(context, extent, description, error);
+}
+
+bool stage_patch_review(const debugger_interaction::context_t& expected_context,
+	std::uint64_t extent, const std::string& description, std::string* error) {
+	if (expected_context.address == 0) {
 		if (error) *error = "The selected item has no usable address.";
+		return false;
+	}
+	if ((expected_context.kind != debugger_interaction::kind_t::instruction &&
+		expected_context.kind != debugger_interaction::kind_t::patch) ||
+		!debugger_interaction::is_current(expected_context)) {
+		if (error) *error =
+			"The retained patch target, process identity, address, or debugger stop changed.";
 		return false;
 	}
 	if (extent > 4096) {
 		if (error) *error = "Patch review is limited to 4096 bytes per staged item.";
 		return false;
 	}
-	g_ui.patch_stage_address = address;
+	g_ui.patch_stage_address = expected_context.address;
 	g_ui.patch_stage_extent = extent;
 	g_ui.patch_stage_bytes_buf[0] = '\0';
 	g_ui.patch_stage_parsed_bytes.clear();
 	g_ui.patch_stage_parse_valid = false;
 	g_ui.patch_stage_exact = false;
-	g_ui.patch_stage_expected_pid = 0;
-	g_ui.patch_stage_expected_stop_generation = 0;
+	g_ui.patch_stage_context = expected_context;
+	g_ui.patch_stage_context.extent = extent;
+	g_ui.patch_stage_context.primary_text = description;
 	g_ui.patch_stage_expected_before.clear();
 	std::snprintf(g_ui.patch_stage_description_buf,
 		sizeof(g_ui.patch_stage_description_buf), "%s", description.c_str());
@@ -624,14 +640,20 @@ bool stage_exact_patch_review(std::uint64_t address,
 		if (error) *error = "The proposal process is no longer the attached live patch target.";
 		return false;
 	}
-	if (!stage_patch_review(address, reviewed_after.size(), description, error))
+	const auto context = debugger_interaction::capture(
+		debugger_interaction::kind_t::instruction, address, 0, -1, 0,
+		reviewed_after.size(), description);
+	if (context.target_pid != expected_pid) {
+		if (error) *error = "The proposal process identity changed before patch review.";
+		return false;
+	}
+	if (!stage_patch_review(context, reviewed_after.size(), description, error))
 		return false;
 	const std::string bytes = code_patcher::format_bytes(reviewed_after);
 	std::snprintf(g_ui.patch_stage_bytes_buf, sizeof(g_ui.patch_stage_bytes_buf), "%s",
 		bytes.c_str());
 	refresh_patch_stage_parse_cache();
 	g_ui.patch_stage_exact = true;
-	g_ui.patch_stage_expected_pid = expected_pid;
 	g_ui.patch_stage_expected_before = expected_before;
 	g_ui.active_tab = sub_tab_t::patches;
 	return true;
@@ -639,11 +661,19 @@ bool stage_exact_patch_review(std::uint64_t address,
 
 bool stage_nop_review(std::uint64_t address, std::uint64_t extent,
 	std::string* error) {
+	const auto context = debugger_interaction::capture(
+		debugger_interaction::kind_t::instruction, address, 0, -1, 0, extent,
+		"Reviewed NOP fill");
+	return stage_nop_review(context, extent, error);
+}
+
+bool stage_nop_review(const debugger_interaction::context_t& expected_context,
+	std::uint64_t extent, std::string* error) {
 	if (extent == 0 || extent > 4096) {
 		if (error) *error = "NOP review requires a selected instruction range from 1 to 4096 bytes.";
 		return false;
 	}
-	if (!stage_patch_review(address, extent, "Reviewed NOP fill", error))
+	if (!stage_patch_review(expected_context, extent, "Reviewed NOP fill", error))
 		return false;
 	std::string bytes;
 	bytes.reserve(static_cast<std::size_t>(extent) * 3U);
@@ -2299,7 +2329,9 @@ struct patch_transaction_result_t {
 bool same_patch_definition(const code_patcher::patch_entry_t& lhs,
 	const code_patcher::patch_entry_t& rhs) {
 	return lhs.address == rhs.address && lhs.original_bytes == rhs.original_bytes &&
-		lhs.patched_bytes == rhs.patched_bytes && lhs.target_pid == rhs.target_pid;
+		lhs.patched_bytes == rhs.patched_bytes && lhs.target_pid == rhs.target_pid &&
+		lhs.target_process_creation_time_100ns ==
+			rhs.target_process_creation_time_100ns;
 }
 
 bool read_patch_bytes_exact(uint64_t address, const std::vector<uint8_t>& expected,
@@ -2328,6 +2360,12 @@ patch_transaction_result_t transition_patch_exact(int index,
 	auto& patch = code_patcher::g_state.patches[static_cast<size_t>(index)];
 	if (patch.target_pid != 0 && patch.target_pid != context.target_pid) {
 		result.detail = "The patch belongs to a different target process.";
+		return result;
+	}
+	if (patch.target_process_creation_time_100ns == 0 ||
+		patch.target_process_creation_time_100ns !=
+			context.process_creation_time_100ns) {
+		result.detail = "The patch belongs to a different process creation identity.";
 		return result;
 	}
 	const auto& source = target_active ? patch.original_bytes : patch.patched_bytes;
@@ -4986,7 +5024,7 @@ static float render_breakpoint_actions(float ox, float oy, float w) {
 	aida::ui::input_text("##bp_addr", ui.add_bp_addr_buf, sizeof(ui.add_bp_addr_buf),
 		"0x... breakpoint address",
 		false, ImVec2(input_w, control_height));
-	auto clear_staged_definition = [&ui](bool clear_address) {
+	auto clear_staged_definition = [](bool clear_address) {
 		ui.add_bp_staged = false;
 		ui.add_bp_staged_mode = breakpoint_definition_mode_t::software;
 		ui.add_bp_staged_context = {};
@@ -5027,7 +5065,7 @@ static float render_breakpoint_actions(float ox, float oy, float w) {
 		"debugger.breakpoints.actions", actions, std::size(actions), actions_w);
 	const std::string_view invoked = action.invoked && action.id
 		? std::string_view(action.id) : std::string_view();
-	auto retained_context = [&ui](breakpoint_definition_mode_t mode,
+	auto retained_context = [](breakpoint_definition_mode_t mode,
 		std::uint64_t address, std::string& error)
 		-> std::optional<debugger_interaction::context_t> {
 		if (!ui.add_bp_staged)
@@ -7867,9 +7905,6 @@ static void render_code_cave_dialog() {
 			std::string error;
 			if (stage_patch_review(cave.address, cave.size,
 					"Code cave patch in " + cave.module, &error)) {
-				g_ui.patch_stage_expected_pid = current->target_pid;
-				g_ui.patch_stage_expected_stop_generation =
-					current->target_stop_generation;
 				g_code_cave_search.dialog_error.clear();
 				ImGui::CloseCurrentPopup();
 			} else {
@@ -8340,37 +8375,70 @@ static void render_debugger_status_bar(ImVec2 pos, float width,
 
 execution_capability_t address_mutation_capability(std::uint64_t address,
 	bool toggle_breakpoint, std::uint32_t expected_pid) {
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	if (g_target_mutation_pending.load(std::memory_order_acquire))
-		return {false, "Another live-target mutation is still pending"};
-#endif
 	const auto context = debugger_interaction::capture(
 		debugger_interaction::kind_t::instruction, address);
 	if (expected_pid == 0)
 		return {false, "The analysis selection is not owned by a live process workspace"};
 	if (context.target_pid != expected_pid)
 		return {false, "Attach the debugger to the process that owns this analysis workspace"};
+	return address_mutation_capability(context, toggle_breakpoint);
+}
+
+execution_capability_t address_mutation_capability(
+	const debugger_interaction::context_t& expected_context,
+	bool toggle_breakpoint) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (g_target_mutation_pending.load(std::memory_order_acquire))
+		return {false, "Another live-target mutation is still pending"};
+#endif
+	if ((expected_context.kind != debugger_interaction::kind_t::instruction &&
+		expected_context.kind != debugger_interaction::kind_t::breakpoint) ||
+		expected_context.address == 0 ||
+		!debugger_interaction::is_current(expected_context))
+		return {false,
+			"The retained debugger target, process identity, address, or stop changed"};
 	const auto result = debugger_interaction::evaluate(toggle_breakpoint
 		? debugger_interaction::capability_t::toggle_breakpoint
-		: debugger_interaction::capability_t::run_to_address, context);
+		: debugger_interaction::capability_t::run_to_address, expected_context);
 	return {result.enabled, result.disabled_reason};
 }
 
 bool queue_run_to_address(std::uint64_t address, std::uint32_t expected_pid,
 	std::string* error) {
-	const auto capability = address_mutation_capability(address, false, expected_pid);
+	const auto context = debugger_interaction::capture(
+		debugger_interaction::kind_t::instruction, address);
+	if (context.target_pid != expected_pid) {
+		if (error) *error =
+			"Attach the debugger to the process that owns this analysis workspace";
+		return false;
+	}
+	return queue_run_to_address(context, error);
+}
+
+bool queue_run_to_address(const debugger_interaction::context_t& expected_context,
+	std::string* error) {
+	const auto capability = address_mutation_capability(expected_context, false);
 	if (!capability.enabled) {
 		if (error) *error = capability.disabled_reason
 			? capability.disabled_reason : "Run to cursor is unavailable";
 		return false;
 	}
-	const auto context = debugger_interaction::capture(
-		debugger_interaction::kind_t::instruction, address);
+	const auto context = expected_context;
 	const bool queued = queue_debugger_mutation("Run to cursor",
 		"analysis.debug.run_to_cursor", context, [context]() {
 			mutation_result_t result;
-			result.ok = result.verified =
-				debugger_engine::run_to_address(context.address, false);
+			if (!debugger_interaction::is_current(context)) {
+				result.detail =
+					"The retained Run to Cursor target changed before the final mutation.";
+				return result;
+			}
+			result.ok = debugger_engine::run_to_address(context.address, false);
+			result.verified = result.ok && debugger_interaction::is_current(context);
+			if (!result.ok)
+				result.detail = "The debugger engine rejected Run to Cursor.";
+			else if (!result.verified)
+				result.detail =
+					"The Run to Cursor target changed before its postcondition was verified.";
 			return result;
 		});
 	if (!queued && error) *error = "The debugger mutation queue rejected Run to Cursor";
@@ -8410,6 +8478,11 @@ bool queue_toggle_breakpoint(const debugger_interaction::context_t& expected_con
 	const bool queued = queue_debugger_mutation("Toggle breakpoint at analysis cursor",
 		"analysis.debug.breakpoint", context, [context]() {
 			mutation_result_t result;
+			if (!debugger_interaction::is_current(context)) {
+				result.detail =
+					"The retained breakpoint target changed before the final mutation.";
+				return result;
+			}
 			auto snapshot = debugger_engine::snapshot_breakpoints();
 			int found = -1;
 			for (std::size_t index = 0; index < snapshot.size(); ++index) {
@@ -8419,9 +8492,27 @@ bool queue_toggle_breakpoint(const debugger_interaction::context_t& expected_con
 					break;
 				}
 			}
-			result.ok = result.verified = found >= 0
+			result.ok = found >= 0
 				? debugger_engine::remove_breakpoint(found)
 				: debugger_engine::add_breakpoint(context.address) >= 0;
+			if (!result.ok) {
+				result.detail = "The debugger engine rejected the retained breakpoint toggle.";
+				return result;
+			}
+			if (!debugger_interaction::is_current(context)) {
+				result.detail =
+					"The breakpoint target changed before the final postcondition was verified.";
+				return result;
+			}
+			const auto verified_snapshot = debugger_engine::snapshot_breakpoints();
+			const bool present = std::any_of(verified_snapshot.begin(),
+				verified_snapshot.end(), [context](const auto& breakpoint) {
+					return !breakpoint.is_internal && breakpoint.address == context.address;
+				});
+			result.verified = found >= 0 ? !present : present;
+			if (!result.verified)
+				result.detail =
+					"The retained breakpoint toggle did not satisfy its final postcondition.";
 			return result;
 		});
 	if (!queued && error) *error = "The debugger mutation queue rejected the breakpoint toggle";
@@ -8810,12 +8901,8 @@ void render_global_dialogs() {
 			"The reviewed replacement must preserve the exact proposal byte range.");
 	}
 	const bool target_ready = driver_bridge::is_loaded() &&
-		driver_bridge::attached_pid() != 0 &&
-		(ui.patch_stage_expected_pid == 0 ||
-		 driver_bridge::attached_pid() == ui.patch_stage_expected_pid) &&
-		(ui.patch_stage_expected_stop_generation == 0 ||
-		 debugger_interaction::current_stop_generation() ==
-			ui.patch_stage_expected_stop_generation);
+		debugger_interaction::is_current(ui.patch_stage_context) &&
+		ui.patch_stage_context.address == ui.patch_stage_address;
 	if (!target_ready)
 		ImGui::TextDisabled("The reviewed live target or debugger stop is unavailable; cancel and capture a new patch review.");
     aida::ui::design::end_dialog_body();
@@ -8827,24 +8914,40 @@ void render_global_dialogs() {
 		const std::uint64_t extent = ui.patch_stage_extent;
 		const std::string description(ui.patch_stage_description_buf);
 		const bool exact = ui.patch_stage_exact;
-		const std::uint32_t expected_pid = ui.patch_stage_expected_pid;
 		const auto expected_before = ui.patch_stage_expected_before;
 		const auto parsed = ui.patch_stage_parsed_bytes;
-		const auto context = debugger_interaction::capture(
-			debugger_interaction::kind_t::instruction, address, 0, -1, 0,
-			extent == 0 ? static_cast<std::uint64_t>(parsed.size()) : extent,
-			description);
+		auto context = ui.patch_stage_context;
+		context.extent = extent == 0
+			? static_cast<std::uint64_t>(parsed.size()) : extent;
+		context.primary_text = description;
 		const bool queued = queue_debugger_mutation("Capture patch rollback bytes",
 			"debugger.patch_stage", context,
-			[address, parsed, description, exact, expected_pid, expected_before]() mutable {
+			[address, parsed, description, exact, context, expected_before]() mutable {
 				mutation_result_t result;
+				if (!debugger_interaction::is_current(context)) {
+					result.detail =
+						"The retained patch target changed before rollback bytes were captured.";
+					return result;
+				}
 				const int index = exact
 					? code_patcher::create_patch_exact(address, expected_before,
-						parsed, expected_pid, description)
-					: code_patcher::create_patch(address, parsed, description);
-				result.ok = result.verified = index >= 0;
+						parsed, context.target_pid,
+						context.process_creation_time_100ns, description)
+					: code_patcher::create_patch(address, parsed, description,
+						context.target_pid, context.process_creation_time_100ns);
+				result.ok = result.verified = index >= 0 &&
+					debugger_interaction::is_current(context);
+				bool discarded = true;
+				if (index >= 0 && !result.verified)
+					discarded = code_patcher::discard_inactive_patch_exact(
+						index, address, parsed, context.target_pid,
+						context.process_creation_time_100ns);
 				if (!result.verified)
-					result.detail = "Unable to capture exact rollback bytes; no patch was staged.";
+					result.detail = index < 0
+						? "Unable to capture exact rollback bytes; no patch was staged."
+						: discarded
+						? "The retained patch target changed during rollback capture; the exact inactive definition was discarded."
+						: "The retained patch target changed during rollback capture, and the exact inactive definition could not be discarded.";
 				else {
 					const bool posted = post_debugger_ui([index]() {
 						g_ui.patches_panel.selected = index;
@@ -8852,9 +8955,14 @@ void render_global_dialogs() {
 							aida::ui::stable_view_id_t("view.debug.patches"));
 					}, "patch_stage_selection");
 					if (!posted) {
-						static_cast<void>(code_patcher::remove_patch(index));
+						const bool publication_discarded =
+							code_patcher::discard_inactive_patch_exact(
+								index, address, parsed, context.target_pid,
+								context.process_creation_time_100ns);
 						result.ok = result.verified = false;
-						result.detail = "Patch staging could not publish its reviewed definition.";
+						result.detail = publication_discarded
+							? "Patch staging could not publish its reviewed definition; the exact inactive definition was discarded."
+							: "Patch staging could not publish its reviewed definition, and the exact inactive definition could not be discarded.";
 					}
 				}
 				return result;
@@ -8862,8 +8970,7 @@ void render_global_dialogs() {
 		if (queued) {
 			ui.patch_stage_open = false;
 			ui.patch_stage_exact = false;
-			ui.patch_stage_expected_pid = 0;
-			ui.patch_stage_expected_stop_generation = 0;
+			ui.patch_stage_context = {};
 			ui.patch_stage_expected_before.clear();
 			ui.patch_stage_parsed_bytes.clear();
 			ui.patch_stage_parse_valid = false;
@@ -8873,8 +8980,7 @@ void render_global_dialogs() {
 	if (footer.cancelled) {
 		ui.patch_stage_open = false;
 		ui.patch_stage_exact = false;
-		ui.patch_stage_expected_pid = 0;
-		ui.patch_stage_expected_stop_generation = 0;
+		ui.patch_stage_context = {};
 		ui.patch_stage_expected_before.clear();
 		ui.patch_stage_parsed_bytes.clear();
 		ui.patch_stage_parse_valid = false;

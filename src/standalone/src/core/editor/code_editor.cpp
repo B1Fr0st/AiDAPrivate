@@ -1,6 +1,7 @@
 #include "code_editor.hpp"
 #include "syntax_highlight.hpp"
 #include "../helpers/globals.h"
+#include "../../helpers/helpers.h"
 #include "../ui/application_ui_runtime.hpp"
 #include "../ui/task_center.hpp"
 #include "../debugger/source_debug_service.hpp"
@@ -3603,6 +3604,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     float oy = wpos.y + editor_y0;
     float bcb_x = wpos.x + pos_x;
     float bcb_y = wpos.y + pos_y + goto_bar_h;
+    const bool background_input_blocked = ui_input_gate::popup_blocks_background_input();
     {
         ImDrawList* bc_dl = ImGui::GetWindowDrawList();
         ImVec2 bc_min(bcb_x, bcb_y);
@@ -3678,7 +3680,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             float tw = bc_font->CalcTextSizeA(13.f, FLT_MAX, 0.f, sg.text.c_str()).x;
             ImVec2 chip_min(crumb_x - 4.f, crumb_y - 3.f);
             ImVec2 chip_max(crumb_x + tw + 4.f, crumb_y + 16.f);
-            bool seg_hov = chip_min.x < breadcrumb_right &&
+            bool seg_hov = !background_input_blocked && chip_min.x < breadcrumb_right &&
                 ImGui::IsMouseHoveringRect(chip_min,
                     ImVec2((std::min)(chip_max.x, breadcrumb_right), chip_max.y));
             ImU32 seg_col = sg.is_path ? th.text_secondary
@@ -3758,7 +3760,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             || globals::ui::shortcuts_dialog_open
             || globals::ui::mcp_servers_dialog_open
             || globals::ui::command_palette_open
-            || ImGui::IsPopupOpen("##aida_editor_context");
+            || ImGui::IsPopupOpen("##aida_editor_context")
+            || background_input_blocked;
         if (diff_input_blocked)
             diff_hovered = false;
         if (diff_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -3868,7 +3871,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             float bx_reject = hdr_max.x - 14.f - bw;
             float bx_accept = bx_reject - 8.f - bw;
 
-            ImVec2 mp = ImGui::GetIO().MousePos;
+            ImVec2 mp = diff_input_blocked
+                ? ImVec2(-FLT_MAX, -FLT_MAX) : ImGui::GetIO().MousePos;
             auto hdr_button = [&](const char* label, float bx, ImU32 base, bool& out) {
                 ImVec2 mn(bx, by), mx(bx + bw, by + bh);
                 bool hov = (mp.x >= mn.x && mp.x <= mx.x && mp.y >= mn.y && mp.y <= mx.y);
@@ -3983,7 +3987,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         const float sign_x = ox + diff_gutter_w + 4.f;
         const float diff_text_x = sign_x + char_w * 1.6f;
 
-        if (selected_hunk >= 0 && current_document().review_hunk_selection.focus_requested) {
+        if (selected_hunk >= 0 && current_document().review_hunk_selection.focus_requested &&
+            !diff_input_blocked) {
             const auto row = std::find_if(rows.begin(), rows.end(),
                 [selected_hunk](const vis_row_t& candidate) {
                     return candidate.is_hunk_head && candidate.hunk == selected_hunk;
@@ -4003,7 +4008,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         float diff_max_scroll = std::max(0.f, content_h - body_h + line_h);
         if (s_diff_scroll_target < 0.f) s_diff_scroll_target = 0.f;
 
-        bool body_hovered = ImGui::IsMouseHoveringRect(
+        bool body_hovered = !diff_input_blocked && ImGui::IsMouseHoveringRect(
             ImVec2(ox, body_y0), ImVec2(ox + width, body_y0 + body_h));
         if (body_hovered) {
             float wheel = ImGui::GetIO().MouseWheel;
@@ -4293,7 +4298,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         || globals::ui::shortcuts_dialog_open
         || globals::ui::mcp_servers_dialog_open
         || globals::ui::command_palette_open
-        || ImGui::IsPopupOpen("##aida_editor_context");
+        || ImGui::IsPopupOpen("##aida_editor_context")
+        || background_input_blocked;
     if (input_blocked) hovered = false;
 
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -4798,7 +4804,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
 
     if ((s_has_focus || hovered) && !input_blocked) {
-        ImVec2 mp = ImGui::GetIO().MousePos;
+        ImVec2 mp = input_blocked
+            ? ImVec2(-FLT_MAX, -FLT_MAX) : ImGui::GetIO().MousePos;
         bool in_editor = mp.x >= ox && mp.x < ox + code_w - 14.f &&
             mp.y >= oy && mp.y <= oy + editor_h;
         bool in_text = mp.x >= ox + text_x0 && mp.x < ox + code_w - 14.f && mp.y >= oy && mp.y <= oy + editor_h;
@@ -5409,7 +5416,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
 
-    if (autocomplete::popup_visible && !autocomplete::matches.empty() && s_has_focus) {
+    if (autocomplete::popup_visible && !autocomplete::matches.empty() && s_has_focus &&
+        !input_blocked) {
         const int   total = static_cast<int>(autocomplete::matches.size());
         const int   max_visible = 8;
         const float popup_w = 280.f;
@@ -5770,7 +5778,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         }
 
 
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        if (!input_blocked && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             s_find.visible = false;
             s_find_has_focus = false;
             s_has_focus = true;
@@ -5849,9 +5857,10 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             float thumb_y     = track_y0 + (scroll_range > 0.f
                 ? (s_scroll_y / scroll_range) * (track_h - thumb_h) : 0.f);
 
-            bool sb_hov = ImGui::IsMouseHoveringRect(
+            bool sb_hov = !input_blocked && ImGui::IsMouseHoveringRect(
                 ImVec2(track_x - 4.f, track_y0),
                 ImVec2(track_x + sb_w + 4.f, track_y0 + track_h));
+            if (input_blocked) s_sb_dragging = false;
 
             ImGuiID sb_hov_id = ImGui::GetID("##code_sb_hov");
             float sb_a = ImGui::GetStateStorage()->GetFloat(sb_hov_id, 0.f);
@@ -5918,9 +5927,10 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         float thumb_x   = track_x0 + (s_max_scroll_x > 0.f
             ? (s_scroll_x / s_max_scroll_x) * (track_w - thumb_w) : 0.f);
 
-        bool hsb_hov = ImGui::IsMouseHoveringRect(
+        bool hsb_hov = !input_blocked && ImGui::IsMouseHoveringRect(
             ImVec2(track_x0, track_y - 3.f),
             ImVec2(track_x0 + track_w, track_y + sb_h + 3.f));
+        if (input_blocked) s_hsb_dragging = false;
 
         ImGuiID hsb_id = ImGui::GetID("##code_hsb_hov");
         float hsb_a = ImGui::GetStateStorage()->GetFloat(hsb_id, 0.f);
@@ -5971,7 +5981,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         ImVec2 mm_min(mm_x, mm_y);
         ImVec2 mm_max(mm_x + minimap_w, mm_y + mm_h);
 
-        bool mm_hov = ImGui::IsMouseHoveringRect(mm_min, mm_max);
+        bool mm_hov = !input_blocked && ImGui::IsMouseHoveringRect(mm_min, mm_max);
         float mm_hov_v = s_minimap_hover.eased();
         if (mm_hov && s_minimap_hover.is_finished() && s_minimap_hover.progress < 1.f)
             s_minimap_hover.start(0.18f, aida::motion::ease::out_quint);

@@ -572,11 +572,13 @@ void test_exceptions()
     code.push_back(0xAC);
 
     ctx.code = code;
+    ctx.line_numbers.push_back(jvm_line_number_t{0, 100});
+    ctx.line_numbers.push_back(jvm_line_number_t{8, 101});
 
     jvm_code_exception_t exc;
     exc.start_pc = 0;
-    exc.end_pc = 7;
-    exc.handler_pc = 7;
+    exc.end_pc = 8;
+    exc.handler_pc = 8;
     exc.catch_type = 2;
     exc.catch_class_name = "java/lang/Exception";
     ctx.exceptions.push_back(exc);
@@ -592,32 +594,124 @@ void test_exceptions()
     require(has_opcode(result, provider_ir_opcode_t::return_value),
             "exceptions: missing return opcode");
 
-    bool has_exception_edge = false;
+    const provider_ir_block_t* provider_source = nullptr;
+    const provider_ir_block_t* provider_handler = nullptr;
     for (const auto& block : result.provider_ir->blocks) {
         if (!block.exception_successor_ids.empty()) {
-            has_exception_edge = true;
+            provider_source = &block;
             break;
         }
     }
-    require(has_exception_edge, "exceptions: no exception successor edges found");
-
-    bool has_handler_block = false;
+    require(provider_source != nullptr,
+            "exceptions: no provider exception successor edges found");
+    require(provider_source->exception_successor_ids.size() == 1,
+            "exceptions: provider exception successor set is not exact");
+    const auto handler_id = provider_source->exception_successor_ids.front();
     for (const auto& block : result.provider_ir->blocks) {
-        if (!block.exception_successor_ids.empty()) {
-            for (const auto& exc_succ : block.exception_successor_ids) {
-                for (const auto& target : result.provider_ir->blocks) {
-                    if (target.id == exc_succ) {
-                        has_handler_block = true;
-                        break;
-                    }
-                }
-            }
+        if (block.id == handler_id) {
+            provider_handler = &block;
+            break;
         }
     }
-    require(has_handler_block, "exceptions: no exception handler block found");
+    require(provider_handler != nullptr,
+            "exceptions: provider exception handler block is absent");
+    require(std::binary_search(provider_handler->predecessor_ids.begin(),
+                               provider_handler->predecessor_ids.end(),
+                               provider_source->id),
+            "exceptions: provider handler is missing its exceptional predecessor");
+
+    const hir_block_t* hir_source = nullptr;
+    const hir_block_t* hir_handler = nullptr;
+    for (const auto& block : result.hir->blocks) {
+        if (block.id == provider_source->id)
+            hir_source = &block;
+        if (block.id == handler_id)
+            hir_handler = &block;
+    }
+    require(hir_source != nullptr,
+            "exceptions: HIR source block is absent");
+    require(hir_handler != nullptr,
+            "exceptions: exception-only HIR handler block is absent");
+    require(hir_source->exception_successor_ids ==
+                provider_source->exception_successor_ids,
+            "exceptions: HIR did not preserve the provider exception edge");
+    require(std::binary_search(hir_handler->predecessor_ids.begin(),
+                               hir_handler->predecessor_ids.end(),
+                               hir_source->id),
+            "exceptions: HIR handler is missing its exceptional predecessor");
+    require(hir_handler->coordinate.address_range.has_value() &&
+                hir_handler->coordinate.address_range->begin.value == 8,
+            "exceptions: HIR handler coordinate is not the handler bytecode offset");
+    require(hir_handler->coordinate.source_origin.has_value() &&
+                hir_handler->coordinate.source_origin->first_line == 101,
+            "exceptions: HIR handler lost its LineNumberTable mapping");
+    require(std::none_of(result.hir->unknowns.begin(), result.hir->unknowns.end(),
+                [](const decompiler_unknown_t& unknown) {
+                    return unknown.stable_token.find(
+                               "jvm_ssa.hir.exception_only_block.") == 0 ||
+                           unknown.stable_token.find(
+                               "jvm_ssa.hir.exception_edge.") == 0;
+                }),
+            "exceptions: represented HIR exception semantics remain marked unknown");
 
     validate_determinism(input, "exceptions");
     validate_round_trip(result, "exceptions");
+}
+
+void test_malformed_exception_edges()
+{
+    jvm_method_context_t base;
+    base.class_internal_name = "com/test/MalformedExceptionTest";
+    base.method_descriptor = "()V";
+    base.access_flags = jvm_acc_public | jvm_acc_static;
+    base.max_stack = 1;
+    base.max_locals = 0;
+    base.code = bytecode({0x10, 0x01, 0xB1});
+
+    const auto reject = [&base](const std::string& method_name,
+                                const jvm_code_exception_t& exception,
+                                const std::string& reason) {
+        auto context = base;
+        context.method_name = method_name;
+        context.exceptions.push_back(exception);
+        const auto result = decompile_method(make_input(context));
+        require(!result.succeeded(),
+                "malformed_exception: invalid edge produced artifacts for " + reason);
+        require(std::any_of(result.diagnostics.begin(), result.diagnostics.end(),
+                    [&reason](const decompiler_diagnostic_t& diagnostic) {
+                        return diagnostic.code ==
+                                   decompiler_diagnostic_code_t::malformed_provider_ir &&
+                               diagnostic.localization_key.find(
+                                   "." + reason) != std::string::npos;
+                    }),
+                "malformed_exception: missing deterministic diagnostic for " + reason);
+    };
+
+    jvm_code_exception_t exception;
+    exception.start_pc = 0;
+    exception.end_pc = 0;
+    exception.handler_pc = 2;
+    reject("badRange", exception, "range");
+
+    exception.start_pc = 1;
+    exception.end_pc = 2;
+    reject("badStart", exception, "start_boundary");
+
+    exception.start_pc = 0;
+    exception.end_pc = 1;
+    reject("badEnd", exception, "end_boundary");
+
+    exception.end_pc = 2;
+    exception.handler_pc = 1;
+    reject("badHandler", exception, "handler_boundary");
+
+    exception.handler_pc = 2;
+    exception.catch_type = 1;
+    reject("badCatchType", exception, "catch_type");
+
+    exception.catch_type = 0;
+    exception.catch_class_name = "java/lang/Throwable";
+    reject("badCatchAll", exception, "catch_all_identity");
 }
 
 void test_invokedynamic()
@@ -703,6 +797,14 @@ void test_malformed_reserved_opcode()
     }
     require(found_unknown,
             "malformed_reserved: expected explicit unknown record for reserved opcode");
+    require(result.hir.has_value() &&
+                std::any_of(result.hir->unknowns.begin(), result.hir->unknowns.end(),
+                    [](const decompiler_unknown_t& unknown) {
+                        return unknown.reason ==
+                                   decompiler_unknown_reason_t::unsupported_instruction &&
+                               unknown.stable_token.find("jvm.opcode.") == 0;
+                    }),
+            "malformed_reserved: HIR lost the explicit unsupported-opcode unknown");
 }
 
 void test_malformed_truncated()
@@ -1157,6 +1259,7 @@ void run_jvm_ssa_harness()
     test_lookupswitch();
     test_jsr_legacy();
     test_exceptions();
+    test_malformed_exception_edges();
     test_invokedynamic();
     test_monitor_and_fields();
     test_array_operations();

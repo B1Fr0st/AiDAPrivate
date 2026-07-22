@@ -23,6 +23,7 @@
 namespace aida::analysis::native_worker {
 
 class native_worker_host_t;
+struct native_worker_verified_package_t;
 
 constexpr std::uint32_t k_native_worker_manifest_magic = 0x464d574eU;
 constexpr std::uint32_t k_native_worker_manifest_schema_version = 2;
@@ -286,8 +287,18 @@ public:
     std::uint64_t worker_generation() const noexcept;
 
 private:
+    native_worker_host_t(
+        native_worker_launch_contract_t contract,
+        native_worker_host_limits_t limits,
+        std::shared_ptr<const native_worker_verified_package_t> verified_package);
+
+    friend workspace_result_t<packaged_native_worker_runtime_t>
+        create_packaged_native_worker_runtime(std::filesystem::path runtime_root);
+
     native_worker_launch_contract_t contract_;
     native_worker_host_limits_t limits_;
+    std::shared_ptr<const native_worker_verified_package_t> verified_package_;
+    std::vector<native_worker_diagnostic_t> verification_diagnostics_;
     mutable std::mutex state_mutex_;
     std::condition_variable state_wake_;
     std::atomic<std::uint64_t> worker_generation_{0};

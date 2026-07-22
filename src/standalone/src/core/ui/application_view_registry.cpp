@@ -2211,7 +2211,8 @@ void render_registry_owned_windows() noexcept {
                     aida::ui::scale_px(descriptor->minimum_size.height, placement_scale)),
                 ImVec2(FLT_MAX, FLT_MAX));
         }
-        if (current.registry.consume_focus_request(id))
+        const bool focus_requested = current.registry.consume_focus_request(id);
+        if (focus_requested)
             ImGui::SetNextWindowFocus();
         const bool pinned = is_pinned(id);
         bool open = true;
@@ -2222,6 +2223,17 @@ void render_registry_owned_windows() noexcept {
         const bool content_visible = ImGui::Begin(window_name.c_str(),
             descriptor->closeable && !pinned ? &open : nullptr, placement_flags);
         ImGuiWindow* window = ImGui::GetCurrentWindow();
+        if (focus_requested && window->DockNode && window->TabId != 0) {
+            window->DockNode->SelectedTabId = window->TabId;
+            if (window->DockNode->TabBar) {
+                if (ImGuiTabItem* tab = ImGui::TabBarFindTabByID(
+                        window->DockNode->TabBar, window->TabId))
+                    ImGui::TabBarQueueFocus(window->DockNode->TabBar, tab);
+                else
+                    window->DockNode->TabBar->NextSelectedTabId = window->TabId;
+            }
+            ImGui::FocusWindow(window);
+        }
         const bool owns_visible_content = !window->DockIsActive || window->DockTabIsVisible;
         const bool window_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         if (window_focused)

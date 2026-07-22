@@ -165,4 +165,10 @@ workspace_result_t<type_graph_t> merge_type_evidence(
     std::vector<type_seed_batch_t> evidence,
     const type_graph_builder_config_t& config = {});
 
+workspace_result_t<type_graph_t> merge_type_evidence(
+    type_graph_t provider_graph,
+    std::vector<type_seed_batch_t> evidence,
+    const hir_function_t& live_hir,
+    const type_graph_builder_config_t& config = {});
+
 }

@@ -203,8 +203,7 @@ struct ui_state_t {
 	std::vector<std::uint8_t> patch_stage_parsed_bytes;
 	bool     patch_stage_parse_valid = false;
 	bool     patch_stage_exact = false;
-	std::uint32_t patch_stage_expected_pid = 0;
-	std::uint64_t patch_stage_expected_stop_generation = 0;
+	debugger_interaction::context_t patch_stage_context;
 	std::vector<std::uint8_t> patch_stage_expected_before;
 };
 
@@ -229,6 +228,9 @@ execution_capability_t patch_panel_capability(patch_panel_command_t command);
 bool execute_patch_panel_command(patch_panel_command_t command, std::string* error = nullptr);
 bool stage_patch_review(std::uint64_t address, std::uint64_t extent,
 	const std::string& description, std::string* error = nullptr);
+bool stage_patch_review(const debugger_interaction::context_t& expected_context,
+	std::uint64_t extent, const std::string& description,
+	std::string* error = nullptr);
 bool stage_exact_patch_review(std::uint64_t address,
 	const std::vector<std::uint8_t>& expected_before,
 	const std::vector<std::uint8_t>& reviewed_after,
@@ -236,12 +238,19 @@ bool stage_exact_patch_review(std::uint64_t address,
 	const std::string& description, std::string* error = nullptr);
 bool stage_nop_review(std::uint64_t address, std::uint64_t extent,
 	std::string* error = nullptr);
+bool stage_nop_review(const debugger_interaction::context_t& expected_context,
+	std::uint64_t extent, std::string* error = nullptr);
 bool stage_breakpoint_definition(
 	const debugger_interaction::context_t& expected_context,
 	breakpoint_definition_mode_t mode, std::string* error = nullptr);
 execution_capability_t address_mutation_capability(std::uint64_t address,
 	bool toggle_breakpoint, std::uint32_t expected_pid = 0);
+execution_capability_t address_mutation_capability(
+	const debugger_interaction::context_t& expected_context,
+	bool toggle_breakpoint);
 bool queue_run_to_address(std::uint64_t address, std::uint32_t expected_pid,
+	std::string* error = nullptr);
+bool queue_run_to_address(const debugger_interaction::context_t& expected_context,
 	std::string* error = nullptr);
 bool queue_toggle_breakpoint(std::uint64_t address, std::uint32_t expected_pid,
 	std::string* error = nullptr);

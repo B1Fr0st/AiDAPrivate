@@ -7,6 +7,7 @@
 #include "managed_fixture_fidelity/managed_fixture_fidelity.hpp"
 
 #include "../../src/core/analysis/readers/managed/classfile_reader.hpp"
+#include "../../src/core/analysis/readers/managed/cli_metadata_reader.hpp"
 #include "../../src/core/analysis/readers/managed/dex_reader.hpp"
 #include "../../src/core/analysis/readers/managed/managed_reader_contracts.hpp"
 #include "../../src/core/analysis/workspace/byte_provider.hpp"
@@ -14,12 +15,15 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -177,6 +181,77 @@ void require(bool condition, std::string message)
         require(!result.has_value(), "malformed DEX fixture was accepted by the production reader");
     }
 
+    void verify_cli_fixture(const materialized_fixture_t& fixture,
+        bool ready_to_run)
+    {
+        const auto bytes = load_binary(fixture.path, 8ULL * 1024ULL * 1024ULL);
+        const auto provider = open_provider(fixture.path);
+        const auto metadata = managed::parse_cli_metadata(*provider);
+        require(metadata.has_value(), "production CLI metadata reader rejected the fixture");
+        const auto artifact = managed::read_cli_metadata(*provider);
+        require(artifact.has_value() && artifact.value().valid(),
+            "production CLI artifact reader rejected the fixture");
+        const auto& parsed = metadata.value();
+        const auto& value = artifact.value();
+        require(parsed.method_defs.size() == 2U && parsed.method_bodies.size() == 2U &&
+            parsed.params.size() == 4U && value.methods.size() == 2U &&
+            value.code_ranges.size() == 2U,
+            "CLI fixture does not expose both source methods and parameter rows");
+        require(std::any_of(value.types.begin(), value.types.end(), [](const auto& type) {
+            return type.fully_qualified_name == "AiDA.C03.Corpus.ManagedFixture";
+        }), "CLI fixture namespace disagrees with its source corpus");
+        const std::array<std::pair<std::string, std::vector<std::uint8_t>>, 2>
+            expected_methods{{
+                {"Add", {0x02U, 0x16U, 0x2fU, 0x04U, 0x03U, 0x02U,
+                    0x59U, 0x2aU, 0x02U, 0x03U, 0x58U, 0x2aU}},
+                {"GuardedDivide", {0x03U, 0x2dU, 0x06U, 0x73U, 0x01U,
+                    0x00U, 0x00U, 0x0aU, 0x7aU, 0x02U, 0x03U, 0x5bU, 0x2aU}}}};
+        const std::array<std::array<std::string, 2>, 2> expected_parameters{{
+            {{"left", "right"}}, {{"value", "divisor"}}}};
+        std::set<std::string, std::less<>> identities;
+        for (std::size_t index = 0; index < expected_methods.size(); ++index) {
+            const auto& expected = expected_methods[index];
+            const auto method = std::find_if(value.methods.begin(), value.methods.end(),
+                [&](const auto& candidate) {
+                    return candidate.method_name == expected.first;
+                });
+            require(method != value.methods.end() && method->has_body &&
+                method->declaring_type_name == "AiDA.C03.Corpus.ManagedFixture" &&
+                method->parameter_names.size() == expected_parameters[index].size() &&
+                std::equal(method->parameter_names.begin(), method->parameter_names.end(),
+                    expected_parameters[index].begin()),
+                "CLI fixture method identity or parameters disagree with its source corpus");
+            const auto range = std::find_if(value.code_ranges.begin(), value.code_ranges.end(),
+                [&](const auto& candidate) {
+                    return candidate.method_token == method->metadata_token;
+                });
+            require(range != value.code_ranges.end() &&
+                range->code_bytes == expected.second &&
+                range->offset == method->code_offset &&
+                range->size == method->code_size,
+                "CLI fixture method body disagrees with its source corpus");
+            identities.insert(method->declaring_type_name + "." + method->method_name);
+        }
+        require(identities == std::set<std::string, std::less<>>{
+                "AiDA.C03.Corpus.ManagedFixture.Add",
+                "AiDA.C03.Corpus.ManagedFixture.GuardedDivide"},
+            "CLI fixture stable entity inventory is incomplete");
+        require(std::any_of(value.member_references.begin(),
+            value.member_references.end(), [](const auto& reference) {
+                return reference.kind == managed::managed_reference_kind_t::method_reference &&
+                    reference.declaring_type_name == "System.DivideByZeroException" &&
+                    reference.member_name == ".ctor";
+            }), "CLI fixture guarded divide exception constructor is absent");
+        const std::array<std::uint8_t, 4> ready_to_run_magic{'R', 'T', 'R', 0U};
+        require(bytes.size() > 0x1803U &&
+            (ready_to_run ?
+                std::equal(bytes.begin() + 0x1800U, bytes.begin() + 0x1804U,
+                    ready_to_run_magic.begin()) :
+                std::all_of(bytes.begin() + 0x1800U, bytes.begin() + 0x1804U,
+                    [](std::uint8_t byte) { return byte == 0U; })),
+            "CLI fixture ReadyToRun identity disagrees with its recipe");
+    }
+
     void verify_classfile_fixture(const materialized_fixture_t& fixture,
         const std::filesystem::path& mutant_root)
     {
@@ -189,7 +264,11 @@ void require(bool condition, std::string message)
             "production classfile artifact reader rejected the fixture");
         const auto& image = metadata.value().image;
         const auto& value = artifact.value();
+        require(image.this_class_name == "aida/c03/corpus/Fixture" &&
+            image.source_file == std::optional<std::string>{"Fixture.java"},
+            "classfile type or source-file identity disagrees with its source corpus");
         std::set<decompiler_entity_key_t> identities;
+        std::set<std::string, std::less<>> semantic_methods;
         std::size_t body_count = 0U;
         std::size_t named_body_count = 0U;
         for (std::size_t index = 0; index < value.methods.size(); ++index) {
@@ -202,28 +281,67 @@ void require(bool condition, std::string message)
             require(method.code_size != 0U && method.code_offset <= provider->size() &&
                 method.code_size <= provider->size() - method.code_offset,
                 "classfile method code range exceeds the provider");
+            require(method.declaring_type_name == "aida/c03/corpus/Fixture",
+                "classfile method declaring type disagrees with its source corpus");
+            semantic_methods.insert(method.method_name + method.method_signature);
             identities.insert(managed::build_jvm_entity_key(value,
                 static_cast<std::uint32_t>(index)));
         }
-        require(body_count >= 3U && named_body_count == 2U &&
-            identities.size() == body_count,
+        require(body_count == 3U && named_body_count == 2U &&
+            identities.size() == body_count &&
+            semantic_methods == std::set<std::string, std::less<>>{
+                "<init>()V", "add(II)I", "guardedDivide(II)I"} &&
+            value.fields.size() == 1U &&
+            value.fields.front().declaring_type_name == "aida/c03/corpus/Fixture" &&
+            value.fields.front().field_name == "bias" &&
+            value.fields.front().field_signature == "I",
             "classfile fixture does not expose distinct stable method identities");
-        bool branch = false;
-        bool invoke = false;
-        bool debug_locals = false;
+        bool constructor_semantics = false;
+        bool add_semantics = false;
+        bool divide_semantics = false;
         for (const auto& method : image.methods) {
             if (!method.code)
                 continue;
-            debug_locals = debug_locals || !method.code->local_variables.empty();
-            for (const auto& instruction : method.code->instructions) {
-                branch = branch || instruction.branch_target.has_value();
-                invoke = invoke || (instruction.opcode >= 0xb6U &&
-                    instruction.opcode <= 0xbaU);
-            }
+            const auto has_opcode = [&](std::uint8_t opcode) {
+                return std::any_of(method.code->instructions.begin(),
+                    method.code->instructions.end(), [&](const auto& instruction) {
+                        return instruction.opcode == opcode;
+                    });
+            };
+            std::set<std::uint16_t> lines;
+            for (const auto& line : method.code->line_numbers)
+                lines.insert(line.line_number);
+            std::set<std::string, std::less<>> locals;
+            for (const auto& local : method.code->local_variables)
+                locals.insert(local.name + ":" + local.descriptor);
+            if (method.name == "<init>")
+                constructor_semantics = method.descriptor == "()V" &&
+                    has_opcode(0xb7U) && has_opcode(0xb1U) &&
+                    lines == std::set<std::uint16_t>{3U} &&
+                    locals == std::set<std::string, std::less<>>{
+                        "this:Laida/c03/corpus/Fixture;"};
+            else if (method.name == "add")
+                add_semantics = method.descriptor == "(II)I" &&
+                    has_opcode(0x60U) && has_opcode(0xb2U) &&
+                    has_opcode(0xacU) && method.code->exceptions.size() == 1U &&
+                    method.code->exceptions.front().catch_class_name ==
+                        std::optional<std::string>{"java/lang/ArithmeticException"} &&
+                    lines == std::set<std::uint16_t>{6U, 9U} &&
+                    locals == std::set<std::string, std::less<>>{
+                        "left:I", "result:I", "right:I"};
+            else if (method.name == "guardedDivide")
+                divide_semantics = method.descriptor == "(II)I" &&
+                    has_opcode(0x9aU) && has_opcode(0xbbU) &&
+                    has_opcode(0xb7U) && has_opcode(0xbfU) &&
+                    has_opcode(0x6cU) && has_opcode(0xacU) &&
+                    method.code->exceptions.empty() &&
+                    lines == std::set<std::uint16_t>{15U, 17U} &&
+                    locals == std::set<std::string, std::less<>>{
+                        "divisor:I", "value:I"};
         }
-        require(branch && invoke && debug_locals &&
-            !metadata.value().all_exception_regions.empty(),
-            "classfile fixture omits branch, invoke, locals, or exception metadata");
+        require(constructor_semantics && add_semantics && divide_semantics &&
+            metadata.value().all_exception_regions.size() == 1U,
+            "classfile bytecode or debug semantics disagree with its source corpus");
 
         auto truncated = bytes;
         truncated.resize(truncated.size() - 7U);
@@ -275,7 +393,14 @@ void require(bool condition, std::string message)
         require(artifact.has_value() && artifact.value().valid(),
             "production DEX artifact reader rejected the fixture");
         const auto& value = artifact.value();
+        require(metadata.value().image.classes.size() == 1U &&
+            metadata.value().image.classes.front().class_descriptor ==
+                "Laida/c03/corpus/Fixture;" &&
+            metadata.value().image.classes.front().source_file ==
+                std::optional<std::string>{"Fixture.smali"},
+            "DEX class or source-file identity disagrees with its source corpus");
         std::set<decompiler_entity_key_t> identities;
+        std::set<std::string, std::less<>> semantic_methods;
         std::size_t body_count = 0U;
         std::size_t named_body_count = 0U;
         for (std::size_t index = 0; index < value.methods.size(); ++index) {
@@ -288,27 +413,66 @@ void require(bool condition, std::string message)
             require(method.code_size != 0U && method.code_offset <= provider->size() &&
                 method.code_size <= provider->size() - method.code_offset,
                 "DEX method code range exceeds the provider");
+            require(method.declaring_type_name == "Laida/c03/corpus/Fixture;",
+                "DEX method declaring type disagrees with its source corpus");
+            semantic_methods.insert(method.method_name + method.method_signature);
             identities.insert(managed::build_dalvik_entity_key(value,
                 static_cast<std::uint32_t>(index)));
         }
-        require(body_count >= 3U && named_body_count == 2U &&
-            identities.size() == body_count,
+        require(body_count == 3U && named_body_count == 2U &&
+            identities.size() == body_count &&
+            semantic_methods == std::set<std::string, std::less<>>{
+                "<init>()V", "add(II)I", "guardedDivide(II)I"},
             "DEX fixture does not expose distinct stable method identities");
-        bool debug = false;
-        bool tries = false;
-        bool instructions = false;
+        bool constructor_semantics = false;
+        bool add_semantics = false;
+        bool divide_semantics = false;
+        const auto& dex_image = metadata.value().image;
         for (const auto& definition : metadata.value().image.classes) {
-            for (const auto& method : definition.direct_methods) {
-                if (!method.code)
+            for (const auto& encoded : definition.direct_methods) {
+                if (!encoded.code || encoded.method_index >= dex_image.methods.size())
                     continue;
-                debug = debug || method.code->debug_info.has_value();
-                tries = tries || !method.code->tries.empty();
-                instructions = instructions || !method.code->instructions.empty();
+                const auto& method = dex_image.methods[encoded.method_index];
+                const auto& code = *encoded.code;
+                std::set<std::uint8_t> opcodes;
+                for (const auto& instruction : code.instructions)
+                    opcodes.insert(instruction.opcode);
+                std::vector<std::string> parameter_names;
+                if (code.debug_info) {
+                    for (const auto& name_index :
+                        code.debug_info->parameter_name_string_indices) {
+                        require(name_index && *name_index < dex_image.strings.size(),
+                            "DEX debug parameter name exceeds the string table");
+                        parameter_names.push_back(dex_image.strings[*name_index].value);
+                    }
+                }
+                if (method.name == "<init>")
+                    constructor_semantics = method.descriptor == "()V" &&
+                        code.debug_info && code.debug_info->line_start == 4U &&
+                        parameter_names.empty() &&
+                        opcodes == std::set<std::uint8_t>{0x0eU, 0x70U};
+                else if (method.name == "add")
+                    add_semantics = method.descriptor == "(II)I" &&
+                        code.debug_info && code.debug_info->line_start == 10U &&
+                        parameter_names == std::vector<std::string>{"left", "right"} &&
+                        opcodes == std::set<std::uint8_t>{0x0fU, 0x12U, 0x90U} &&
+                        code.tries.size() == 1U &&
+                        code.catch_handlers.size() == 1U &&
+                        code.catch_handlers.front().typed_handlers.size() == 1U &&
+                        code.catch_handlers.front().typed_handlers.front().first == 2U;
+                else if (method.name == "guardedDivide")
+                    divide_semantics = method.descriptor == "(II)I" &&
+                        code.debug_info && code.debug_info->line_start == 23U &&
+                        parameter_names == std::vector<std::string>{"value", "divisor"} &&
+                        opcodes == std::set<std::uint8_t>{
+                            0x0fU, 0x22U, 0x27U, 0x39U, 0x70U, 0x93U} &&
+                        code.tries.empty() && code.catch_handlers.empty();
             }
         }
-        require(debug && tries && instructions && fidelity.dex.code_item_count == 3U &&
+        require(constructor_semantics && add_semantics && divide_semantics &&
+            fidelity.dex.code_item_count == 3U &&
             fidelity.dex.debug_info_count == 3U,
-            "DEX fixture omits instructions, tries, or debug metadata");
+            "DEX bytecode or debug semantics disagree with its source corpus");
 
         auto checksum = bytes;
         checksum[8U] ^= 1U;
@@ -414,6 +578,8 @@ void require(bool condition, std::string message)
         const std::filesystem::path& output_root)
     {
         const auto mutant_root = output_root / "managed-fixture-fidelity";
+        verify_cli_fixture(fixture_by_id(fixtures, "cli-x64"), false);
+        verify_cli_fixture(fixture_by_id(fixtures, "readytorun-x64"), true);
         verify_classfile_fixture(
             fixture_by_id(fixtures, "classfile-jvm"), mutant_root);
         verify_dex_fixture(fixture_by_id(fixtures, "dex-dalvik"), mutant_root);
@@ -438,6 +604,24 @@ bool run_fixture_materializer_harness(const std::filesystem::path& repository_ro
                 source.at("path").get<std::string>(), 16ULL * 1024ULL * 1024ULL);
             require(observed.ok && observed.sha256 == source.at("sha256").get<std::string>(),
                 observed.ok ? std::string(source_name) + " hash binding mismatch" : observed.error);
+        }
+        const std::set<std::string, std::less<>> expected_source_files{
+            "source_corpus/native_fixture.c", "source_corpus/managed_fixture.cs",
+            "source_corpus/Fixture.java", "source_corpus/Fixture.smali"};
+        require(ground_truth.contains("source_files") &&
+            ground_truth.at("source_files").is_object() &&
+            ground_truth.at("source_files").size() == expected_source_files.size(),
+            "ground-truth source hash inventory is incomplete");
+        for (const auto& source_path : expected_source_files) {
+            require(ground_truth.at("source_files").contains(source_path) &&
+                ground_truth.at("source_files").at(source_path).is_string(),
+                "ground-truth source hash binding is absent");
+            const auto observed = sha256_evidence_file(
+                fixture_root / std::filesystem::u8path(source_path),
+                4ULL * 1024ULL * 1024ULL);
+            require(observed.ok && observed.sha256 ==
+                    ground_truth.at("source_files").at(source_path).get<std::string>(),
+                observed.ok ? "ground-truth source hash binding mismatch" : observed.error);
         }
         const auto malformed_result = validate_malformed_case_manifest(manifest, malformed);
         require(malformed_result.valid, malformed_result.summary());

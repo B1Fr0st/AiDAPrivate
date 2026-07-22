@@ -39,6 +39,12 @@ internal static class MetadataAnalysis
     private const long MaximumModuleBytes = 256L * 1024L * 1024L;
     private const int MaximumSourceBytes = 8 * 1024 * 1024;
     private const int MaximumMetadataEntries = 1_048_576;
+    private const int MaximumWireIdentityBytes = 4 * 1024;
+    private const int MaximumWireSignatureBytes = 8 * 1024;
+    private const int MaximumRendererIdentifierBytes = 8 * 1024;
+    private const byte MetadataTypeConfidence = 100;
+    private const byte OpcodeTypeConfidence = 100;
+    private const byte ConservativeFallbackTypeConfidence = 50;
     private const string ManagedContractHash = "4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6";
     private const string ManagedWorkerBuildId = "aida-managed-decompiler-worker-v3";
     private const string ManagedWorkerBuildHash = "4dd8c0d095629437387a4b631fd9ac3c3cb8e840f6b7af277ccc2ad49d4bc3b7";
@@ -253,20 +259,23 @@ internal static class MetadataAnalysis
         CancellationToken cancellationToken)
     {
         var provider = new StableSignatureTypeProvider();
-        var tokenMap = BuildTokenMap(reader, peReader, declaringTypes, provider, resourceBudget, cancellationToken);
+        var tokenMap = BuildTokenMap(reader, peReader, declaringTypes, resourceBudget, cancellationToken);
         var method = reader.GetMethodDefinition(methodHandle);
-        var identity = BuildIdentity(reader, methodHandle, declaringTypes, provider);
+        var identity = BuildIdentity(reader, methodHandle, declaringTypes);
         var signature = method.DecodeSignature(provider, new GenericContext(identity.DeclaringType, identity.MethodName));
+        var parameterIdentities = BuildParameterIdentities(reader, method, signature, resourceBudget, cancellationToken);
         var instructions = DecodeInstructions(peReader, method.RelativeVirtualAddress, resourceBudget, cancellationToken);
         var unknowns = new List<WorkerUnknown>();
         var diagnostics = new List<WorkerDiagnostic>();
-        var typeNames = new SortedSet<string>(StringComparer.Ordinal) { "System.Object", signature.ReturnType };
+        var typeEvidence = new Dictionary<string, byte>(StringComparer.Ordinal);
+        AddTypeEvidence(typeEvidence, new TypeEvidence("System.Object", ConservativeFallbackTypeConfidence));
+        AddTypeEvidence(typeEvidence, new TypeEvidence(signature.ReturnType, MetadataTypeConfidence));
         foreach (var parameter in signature.ParameterTypes)
-            typeNames.Add(parameter);
+            AddTypeEvidence(typeEvidence, new TypeEvidence(parameter, MetadataTypeConfidence));
         foreach (var instruction in instructions)
         {
             resourceBudget.Checkpoint(cancellationToken);
-            typeNames.Add(InstructionTypeName(instruction.Opcode));
+            AddTypeEvidence(typeEvidence, InstructionTypeEvidence(instruction.Opcode));
             if (instruction.Opcode == 0xffff)
                 unknowns.Add(new WorkerUnknown("malformed_input", $"il.invalid_opcode.{instruction.Offset:x4}", instruction.Offset, 0, 0, "loader_metadata"));
             else if (ToProviderOpcode(instruction.Opcode) == "unknown")
@@ -276,9 +285,11 @@ internal static class MetadataAnalysis
         if (checked((ulong)instructions.Count) > request.Budget.MaxProviderIrNodes)
             throw new ResourceLimitException(ResourceLimitKind.ProviderIrNodes);
 
-        var typeGraph = BuildTypeGraph(typeNames, request.TypeGraphRevision);
+        var typeGraph = BuildTypeGraph(typeEvidence, request.TypeGraphRevision);
         var typeIds = typeGraph.Nodes.ToDictionary(node => node.CanonicalName, node => node.Id, StringComparer.Ordinal);
-        var blocks = BuildBlocks(instructions, peReader, method.RelativeVirtualAddress, typeIds, signature.ReturnType, unknowns, resourceBudget, cancellationToken);
+        var blocks = BuildBlocks(reader, provider, new GenericContext(identity.DeclaringType, identity.MethodName),
+            parameterIdentities, instructions, peReader, method.RelativeVirtualAddress, typeIds, signature.ReturnType, unknowns,
+            request.Budget.MaxProviderIrNodes, resourceBudget, cancellationToken);
         if (blocks.Count == 0)
         {
             blocks = new List<WorkerIrBlock>
@@ -296,28 +307,75 @@ internal static class MetadataAnalysis
             new WorkerIr(blocks[0].Id, blocks), unknowns, diagnostics);
     }
 
+    private static MethodParameterIdentities BuildParameterIdentities(
+        MetadataReader reader,
+        MethodDefinition method,
+        MethodSignature<string> signature,
+        ResourceBudgetGuard resourceBudget,
+        CancellationToken cancellationToken)
+    {
+        resourceBudget.Checkpoint(cancellationToken);
+        var parameterCount = signature.ParameterTypes.Length;
+        if (parameterCount > MaximumMetadataEntries)
+            throw new ResourceLimitException(ResourceLimitKind.Memory);
+        var isStatic = (method.Attributes & System.Reflection.MethodAttributes.Static) != 0;
+        if (isStatic == signature.Header.IsInstance)
+            throw new BadImageFormatException("method static attribute conflicts with its signature instance flag");
+        resourceBudget.EnsureAllocationFits(checked((ulong)(parameterCount + 1) * 64UL), cancellationToken);
+        var names = new string[parameterCount];
+        var instanceOffset = signature.Header.IsInstance ? 1 : 0;
+        for (var index = 0; index < names.Length; index++)
+        {
+            resourceBudget.Checkpoint(cancellationToken);
+            names[index] = $"arg_{checked(index + instanceOffset)}";
+        }
+
+        var seenSequences = new bool[checked(parameterCount + 1)];
+        var rowCount = 0;
+        foreach (var handle in method.GetParameters())
+        {
+            resourceBudget.Checkpoint(cancellationToken);
+            rowCount = checked(rowCount + 1);
+            if (rowCount > parameterCount + 1 || rowCount > MaximumMetadataEntries)
+                throw new BadImageFormatException("method parameter table exceeds its signature bounds");
+            var parameter = reader.GetParameter(handle);
+            var sequence = parameter.SequenceNumber;
+            if (sequence < 0 || sequence > parameterCount)
+                throw new BadImageFormatException("method parameter sequence exceeds its signature bounds");
+            if (seenSequences[sequence])
+                throw new BadImageFormatException("method parameter sequence is duplicated");
+            seenSequences[sequence] = true;
+            if (sequence == 0 || parameter.Name.IsNil)
+                continue;
+            var name = reader.GetString(parameter.Name);
+            if (string.IsNullOrEmpty(name))
+                continue;
+            names[sequence - 1] = RenderIdentifierComponent(RequireWireIdentity(name, "parameter name"));
+        }
+        return new MethodParameterIdentities(signature.Header.IsInstance, names);
+    }
+
     private static WorkerIdentity BuildIdentity(
         MetadataReader reader,
         MethodDefinitionHandle handle,
-        IReadOnlyDictionary<MethodDefinitionHandle, string> declaringTypes,
-        StableSignatureTypeProvider provider)
+        IReadOnlyDictionary<MethodDefinitionHandle, string> declaringTypes)
     {
         var method = reader.GetMethodDefinition(handle);
-        var methodName = reader.GetString(method.Name);
-        var declaringType = declaringTypes.TryGetValue(handle, out var resolved) ? resolved : "<unknown>";
-        var signature = method.DecodeSignature(provider, new GenericContext(declaringType, methodName));
-        var parameters = string.Join(",", signature.ParameterTypes);
+        var methodName = RequireWireIdentity(reader.GetString(method.Name), "method name");
+        if (!declaringTypes.TryGetValue(handle, out var resolved))
+            throw new InvalidDataException("method declaring type identity is unavailable");
+        var declaringType = RequireWireIdentity(resolved, "method declaring type");
         var genericArity = checked((uint)method.GetGenericParameters().Count);
         var assemblyIdentity = GetAssemblyIdentity(reader);
-        var moduleName = reader.GetString(reader.GetModuleDefinition().Name);
-        return new WorkerIdentity(assemblyIdentity, moduleName, declaringType, methodName, $"{signature.ReturnType}({parameters})", genericArity);
+        var moduleName = RequireWireIdentity(reader.GetString(reader.GetModuleDefinition().Name), "module name");
+        var methodSignature = GetMethodSignatureIdentity(reader, method);
+        return new WorkerIdentity(assemblyIdentity, moduleName, declaringType, methodName, methodSignature, genericArity);
     }
 
     private static IReadOnlyList<WorkerTokenMap> BuildTokenMap(
         MetadataReader reader,
         PEReader peReader,
         IReadOnlyDictionary<MethodDefinitionHandle, string> declaringTypes,
-        StableSignatureTypeProvider provider,
         ResourceBudgetGuard resourceBudget,
         CancellationToken cancellationToken)
     {
@@ -325,7 +383,7 @@ internal static class MetadataAnalysis
         foreach (var handle in reader.MethodDefinitions)
         {
             resourceBudget.Checkpoint(cancellationToken);
-            var identity = BuildIdentity(reader, handle, declaringTypes, provider);
+            var identity = BuildIdentity(reader, handle, declaringTypes);
             var method = reader.GetMethodDefinition(handle);
             var token = unchecked((uint)MetadataTokens.GetToken(handle));
             var attributes = GetAttributeTypeNames(reader, method.GetCustomAttributes(), declaringTypes, resourceBudget, cancellationToken);
@@ -377,30 +435,42 @@ internal static class MetadataAnalysis
         };
     }
 
-    private static WorkerTypeGraph BuildTypeGraph(IEnumerable<string> names, ulong revision)
+    private static void AddTypeEvidence(IDictionary<string, byte> evidence, TypeEvidence candidate)
     {
-        var ordered = names.Where(name => !string.IsNullOrWhiteSpace(name))
-            .Distinct(StringComparer.Ordinal)
-            .OrderBy(name => name == "System.Object" ? 0 : 1)
-            .ThenBy(name => name, StringComparer.Ordinal)
+        if (string.IsNullOrWhiteSpace(candidate.Name) || candidate.Confidence is 0 or > 100)
+            throw new InvalidDataException("managed type evidence is invalid");
+        if (!evidence.TryGetValue(candidate.Name, out var existing) || existing < candidate.Confidence)
+            evidence[candidate.Name] = candidate.Confidence;
+    }
+
+    private static WorkerTypeGraph BuildTypeGraph(IReadOnlyDictionary<string, byte> evidence, ulong revision)
+    {
+        var ordered = evidence
+            .OrderBy(entry => entry.Key == "System.Object" ? 0 : 1)
+            .ThenBy(entry => entry.Key, StringComparer.Ordinal)
             .ToList();
         var nodes = new List<WorkerTypeNode>(ordered.Count);
         for (var index = 0; index < ordered.Count; index++)
         {
-            var name = ordered[index];
+            var name = ordered[index].Key;
             nodes.Add(new WorkerTypeNode((ulong)index + 1, TypeKind(name), name, name, PrimitiveByteSize(name), 0,
-                IsSignedInteger(name), name == "System.Object" ? (byte)0 : (byte)100));
+                IsSignedInteger(name), ordered[index].Value));
         }
         return new WorkerTypeGraph(revision, nodes, Array.Empty<WorkerTypeEdge>());
     }
 
     private static List<WorkerIrBlock> BuildBlocks(
+        MetadataReader reader,
+        StableSignatureTypeProvider signatureProvider,
+        GenericContext genericContext,
+        MethodParameterIdentities parameterIdentities,
         IReadOnlyList<IlInstruction> instructions,
         PEReader peReader,
         int rva,
         IReadOnlyDictionary<string, ulong> typeIds,
         string returnType,
         List<WorkerUnknown> unknowns,
+        ulong maximumNodes,
         ResourceBudgetGuard resourceBudget,
         CancellationToken cancellationToken)
     {
@@ -461,7 +531,7 @@ internal static class MetadataAnalysis
                 block.Successors.Add(blockByOffset[target]);
             if ((IsConditionalBranch(terminal.Opcode) || terminal.Opcode == 0x0045) && terminal.NextOffset < ilLength)
                 block.Successors.Add(BlockForOffset(blocks, terminal.NextOffset));
-            else if (!TerminatesControlFlow(terminal.Opcode) && terminal.NextOffset < ilLength)
+            else if (!TerminatesBlock(terminal.Opcode) && terminal.NextOffset < ilLength)
                 block.Successors.Add(BlockForOffset(blocks, terminal.NextOffset));
         }
 
@@ -485,23 +555,82 @@ internal static class MetadataAnalysis
                 blocks[(int)successor - 1].Predecessors.Add(block.Id);
         }
 
-        ulong valueId = 1;
+        var instructionIds = instructions.Select((instruction, index) => (instruction.Offset, Id: checked((ulong)index + 1)))
+            .ToDictionary(entry => entry.Offset, entry => entry.Id);
+        var argumentIds = BuildCanonicalSlotIds(instructions, instructionIds, true, parameterIdentities,
+            resourceBudget, cancellationToken);
+        var localIds = BuildCanonicalSlotIds(instructions, instructionIds, false, parameterIdentities,
+            resourceBudget, cancellationToken);
+        ulong valueId = checked((ulong)instructions.Count + 1);
         var result = new List<WorkerIrBlock>(blocks.Count);
         foreach (var block in blocks)
         {
             resourceBudget.Checkpoint(cancellationToken);
-            var values = new List<WorkerIrValue>(block.Instructions.Count);
+            var values = new List<WorkerIrValue>(block.Instructions.Count + 4);
+            var stack = new List<ulong>();
             foreach (var instruction in block.Instructions)
             {
                 resourceBudget.Checkpoint(cancellationToken);
                 var opcode = ToProviderOpcode(instruction.Opcode);
-                var typeName = opcode == "return_value" ? returnType : InstructionTypeName(instruction.Opcode);
+                var typeName = opcode == "return_value" ? returnType : InstructionTypeEvidence(instruction.Opcode).Name;
                 if (!typeIds.TryGetValue(typeName, out var typeId))
                     typeId = typeIds["System.Object"];
-                var stableImmediate = $"IL_{instruction.Offset:x4}|{instruction.Name}|{instruction.OperandText}";
-                values.Add(new WorkerIrValue(valueId++, opcode, typeId, Array.Empty<ulong>(), stableImmediate,
-                    instruction.Symbol, instruction.Offset, instruction.MetadataToken, opcode == "unknown" ? (byte)40 : (byte)100,
+                var shape = StackShape(reader, signatureProvider, genericContext, instruction, returnType);
+                var operands = PopOperands(stack, shape.PopCount, block.Id, instruction, typeIds["System.Object"],
+                    values, unknowns, ref valueId, maximumNodes, resourceBudget, cancellationToken);
+                IReadOnlyList<ulong> semanticOperands = opcode == "unknown" ? Array.Empty<ulong>() : operands;
+                var stableImmediate = StableImmediate(reader, instruction, opcode);
+                var stableSymbol = StableSymbol(reader, parameterIdentities, instruction, opcode);
+
+                if (IsSlotStore(instruction.Opcode))
+                {
+                    var slot = SlotIndex(instruction);
+                    var slots = IsArgumentInstruction(instruction.Opcode) ? argumentIds : localIds;
+                    if (!slots.TryGetValue(slot, out var destination))
+                    {
+                        destination = valueId++;
+                        slots.Add(slot, destination);
+                        RequireNodeBudget(valueId - 1, maximumNodes);
+                        values.Add(new WorkerIrValue(destination,
+                            IsArgumentInstruction(instruction.Opcode) ? "parameter" : "local",
+                            typeIds["System.Object"], Array.Empty<ulong>(), string.Empty,
+                            IsArgumentInstruction(instruction.Opcode) ? parameterIdentities.ResolveSlot(slot) : $"local_{slot}",
+                            instruction.Offset, 0, 60, "provider_semantics"));
+                    }
+                    semanticOperands = new[] { destination, operands[0] };
+                }
+
+                if (IsRelationalBranch(instruction.Opcode))
+                {
+                    var comparisonId = valueId++;
+                    RequireNodeBudget(comparisonId, maximumNodes);
+                    values.Add(new WorkerIrValue(comparisonId, "binary", typeIds["System.Object"], operands,
+                        RelationalOperator(instruction.Opcode), string.Empty, instruction.Offset, 0, 100, "provider_semantics"));
+                    semanticOperands = new[] { comparisonId };
+                }
+
+                if (opcode == "conditional_branch")
+                {
+                    var target = instruction.BranchTargets.Count == 1
+                        ? blockByOffset[instruction.BranchTargets[0]]
+                        : throw new BadImageFormatException("conditional branch target is invalid");
+                    stableImmediate = $"condition.true={target};negated={(IsFalseBranch(instruction.Opcode) ? 1 : 0)}";
+                }
+
+                var currentId = instructionIds[instruction.Offset];
+                values.Add(new WorkerIrValue(currentId, opcode, typeId, semanticOperands, stableImmediate,
+                    stableSymbol, instruction.Offset, instruction.MetadataToken, opcode == "unknown" ? (byte)40 : (byte)100,
                     opcode == "unknown" ? "provider_semantics" : "loader_metadata"));
+
+                if (shape.ClearStack)
+                    stack.Clear();
+                else if (instruction.Opcode == 0x0025)
+                {
+                    stack.Add(currentId);
+                    stack.Add(currentId);
+                }
+                else if (shape.PushCount != 0)
+                    stack.Add(currentId);
             }
             result.Add(new WorkerIrBlock(block.Id,
                 block.Predecessors.OrderBy(id => id).ToArray(),
@@ -510,8 +639,554 @@ internal static class MetadataAnalysis
                 values,
                 block.Start));
         }
+        RequireNodeBudget(valueId - 1, maximumNodes);
+        return CanonicalizeValueIds(result, maximumNodes, resourceBudget, cancellationToken);
+    }
+
+    private static List<WorkerIrBlock> CanonicalizeValueIds(
+        IReadOnlyList<WorkerIrBlock> blocks,
+        ulong maximumNodes,
+        ResourceBudgetGuard resourceBudget,
+        CancellationToken cancellationToken)
+    {
+        var remap = new Dictionary<ulong, ulong>();
+        foreach (var block in blocks)
+        {
+            resourceBudget.Checkpoint(cancellationToken);
+            foreach (var value in block.Values)
+            {
+                resourceBudget.Checkpoint(cancellationToken);
+                if (value.Id == 0)
+                    throw new InvalidDataException("managed provider IR value identity is invalid");
+                var canonicalId = checked((ulong)remap.Count + 1);
+                RequireNodeBudget(canonicalId, maximumNodes);
+                if (!remap.TryAdd(value.Id, canonicalId))
+                    throw new InvalidDataException("managed provider IR value identity is duplicated");
+            }
+        }
+
+        var result = new List<WorkerIrBlock>(blocks.Count);
+        foreach (var block in blocks)
+        {
+            resourceBudget.Checkpoint(cancellationToken);
+            var values = new List<WorkerIrValue>(block.Values.Count);
+            foreach (var value in block.Values)
+            {
+                resourceBudget.Checkpoint(cancellationToken);
+                var operandIds = new ulong[value.OperandIds.Count];
+                for (var index = 0; index < operandIds.Length; index++)
+                {
+                    if (!remap.TryGetValue(value.OperandIds[index], out var operandId))
+                        throw new InvalidDataException("managed provider IR operand identity is unavailable");
+                    operandIds[index] = operandId;
+                }
+                values.Add(new WorkerIrValue(
+                    remap[value.Id],
+                    value.Opcode,
+                    value.TypeId,
+                    operandIds,
+                    value.StableImmediate,
+                    value.StableSymbol,
+                    value.IlOffset,
+                    value.MetadataToken,
+                    value.Confidence,
+                    value.Provenance));
+            }
+            result.Add(new WorkerIrBlock(
+                block.Id,
+                block.PredecessorIds,
+                block.SuccessorIds,
+                block.ExceptionSuccessorIds,
+                values,
+                block.StartOffset));
+        }
         return result;
     }
+
+    private static Dictionary<int, ulong> BuildCanonicalSlotIds(
+        IReadOnlyList<IlInstruction> instructions,
+        IReadOnlyDictionary<int, ulong> instructionIds,
+        bool arguments,
+        MethodParameterIdentities parameterIdentities,
+        ResourceBudgetGuard resourceBudget,
+        CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<int, ulong>();
+        foreach (var instruction in instructions)
+        {
+            resourceBudget.Checkpoint(cancellationToken);
+            if (IsSlotLoad(instruction.Opcode) && IsArgumentInstruction(instruction.Opcode) == arguments)
+            {
+                var slot = SlotIndex(instruction);
+                if (arguments)
+                    _ = parameterIdentities.ResolveSlot(slot);
+                result.TryAdd(slot, instructionIds[instruction.Offset]);
+            }
+        }
+        return result;
+    }
+
+    private static StackTransition StackShape(
+        MetadataReader reader,
+        StableSignatureTypeProvider provider,
+        GenericContext genericContext,
+        IlInstruction instruction,
+        string returnType)
+    {
+        var opcode = instruction.Opcode;
+        if (IsSlotLoad(opcode) || opcode is 0x0014 or >= 0x0015 and <= 0x0023 or 0x0072 or 0x00d0 or 0xfe06 or 0xfe1c)
+            return new StackTransition(0, 1, false);
+        if (IsSlotStore(opcode) || opcode == 0x0026)
+            return new StackTransition(1, 0, false);
+        if (opcode == 0x0025)
+            return new StackTransition(1, 2, false);
+        if (opcode is 0x0065 or 0x0066 or >= 0x0067 and <= 0x006e or 0x0074 or 0x0075 or 0x0076 or 0x0079 or 0x008c or 0x00a5)
+            return new StackTransition(1, 1, false);
+        if (opcode is >= 0x0058 and <= 0x0064)
+            return new StackTransition(2, 1, false);
+        if (opcode is >= 0x0046 and <= 0x0050)
+            return new StackTransition(1, 1, false);
+        if (opcode is >= 0x0051 and <= 0x0057 or 0x00df)
+            return new StackTransition(2, 0, false);
+        if (opcode is >= 0x0090 and <= 0x009a or 0x00a3 or 0x008f)
+            return new StackTransition(2, 1, false);
+        if (opcode is >= 0x009b and <= 0x00a4)
+            return new StackTransition(3, 0, false);
+        if (opcode is 0x007b or 0x007c)
+            return new StackTransition(1, 1, false);
+        if (opcode is 0x007e or 0x007f)
+            return new StackTransition(0, 1, false);
+        if (opcode == 0x007d)
+            return new StackTransition(2, 0, false);
+        if (opcode == 0x0080)
+            return new StackTransition(1, 0, false);
+        if (opcode is 0x0028 or 0x0029 or 0x006f or 0x0073)
+            return CallStackShape(reader, provider, genericContext, instruction);
+        if (opcode == 0xfe07)
+            return new StackTransition(1, 1, false);
+        if (opcode is 0x002b or 0x0038)
+            return new StackTransition(0, 0, false);
+        if (opcode is 0x002c or 0x002d or 0x0039 or 0x003a or 0x0045)
+            return new StackTransition(1, 0, false);
+        if (IsRelationalBranch(opcode))
+            return new StackTransition(2, 0, false);
+        if (opcode is 0x00dd or 0x00de)
+            return new StackTransition(0, 0, true);
+        if (opcode == 0x002a)
+            return new StackTransition(returnType == "System.Void" ? 0 : 1, 0, false);
+        if (opcode == 0x007a)
+            return new StackTransition(1, 0, false);
+        if (opcode is 0xfe1a or 0x00dc or 0xfe11 or 0x0027)
+            return new StackTransition(opcode == 0xfe11 ? 1 : 0, 0, false);
+        return new StackTransition(0, 0, false);
+    }
+
+    private static StackTransition CallStackShape(
+        MetadataReader reader,
+        StableSignatureTypeProvider provider,
+        GenericContext genericContext,
+        IlInstruction instruction)
+    {
+        var handle = MetadataTokens.EntityHandle(unchecked((int)instruction.MetadataToken));
+        MethodSignature<string> signature;
+        if (instruction.Opcode == 0x0029)
+        {
+            if (handle.Kind != HandleKind.StandaloneSignature)
+                throw new BadImageFormatException("calli does not reference a standalone signature");
+            signature = reader.GetStandaloneSignature((StandaloneSignatureHandle)handle).DecodeMethodSignature(provider, genericContext);
+            return new StackTransition(checked(signature.ParameterTypes.Length + (signature.Header.IsInstance ? 1 : 0) + 1),
+                signature.ReturnType == "System.Void" ? 0 : 1, false);
+        }
+        while (handle.Kind == HandleKind.MethodSpecification)
+            handle = reader.GetMethodSpecification((MethodSpecificationHandle)handle).Method;
+        signature = handle.Kind switch
+        {
+            HandleKind.MethodDefinition => reader.GetMethodDefinition((MethodDefinitionHandle)handle).DecodeSignature(provider, genericContext),
+            HandleKind.MemberReference => reader.GetMemberReference((MemberReferenceHandle)handle).DecodeMethodSignature(provider, genericContext),
+            _ => throw new BadImageFormatException("call target does not reference a method signature")
+        };
+        var receiver = instruction.Opcode == 0x0073 ? 0 : signature.Header.IsInstance ? 1 : 0;
+        return new StackTransition(checked(signature.ParameterTypes.Length + receiver),
+            instruction.Opcode == 0x0073 || signature.ReturnType != "System.Void" ? 1 : 0, false);
+    }
+
+    private static IReadOnlyList<ulong> PopOperands(
+        List<ulong> stack,
+        int count,
+        ulong blockId,
+        IlInstruction instruction,
+        ulong unknownTypeId,
+        List<WorkerIrValue> values,
+        List<WorkerUnknown> unknowns,
+        ref ulong nextValueId,
+        ulong maximumNodes,
+        ResourceBudgetGuard resourceBudget,
+        CancellationToken cancellationToken)
+    {
+        var reverse = new List<ulong>(count);
+        for (var index = 0; index < count; index++)
+        {
+            resourceBudget.Checkpoint(cancellationToken);
+            if (stack.Count != 0)
+            {
+                var last = stack.Count - 1;
+                reverse.Add(stack[last]);
+                stack.RemoveAt(last);
+                continue;
+            }
+            var id = nextValueId++;
+            RequireNodeBudget(id, maximumNodes);
+            var token = $"cli.stack_input.block_{blockId}.IL_{instruction.Offset:x4}.{count - index - 1}";
+            values.Add(new WorkerIrValue(id, "unknown", unknownTypeId, Array.Empty<ulong>(), token,
+                string.Empty, instruction.Offset, 0, 0, "provider_semantics"));
+            unknowns.Add(new WorkerUnknown("opaque_control_flow", token, instruction.Offset,
+                instruction.MetadataToken, 0, "provider_semantics"));
+            reverse.Add(id);
+        }
+        reverse.Reverse();
+        return reverse;
+    }
+
+    private static void RequireNodeBudget(ulong id, ulong maximumNodes)
+    {
+        if (id == 0 || id > maximumNodes)
+            throw new ResourceLimitException(ResourceLimitKind.ProviderIrNodes);
+    }
+
+    private static bool IsArgumentInstruction(ushort opcode) =>
+        opcode is >= 0x0002 and <= 0x0005 or 0x000e or 0x000f or 0x0010 or >= 0xfe09 and <= 0xfe0b;
+
+    private static bool IsSlotLoad(ushort opcode) =>
+        opcode is >= 0x0002 and <= 0x0009 or 0x000e or 0x000f or 0x0011 or 0x0012 or
+            0xfe09 or 0xfe0a or 0xfe0c or 0xfe0d;
+
+    private static bool IsSlotStore(ushort opcode) =>
+        opcode is >= 0x000a and <= 0x000d or 0x0010 or 0x0013 or 0xfe0b or 0xfe0e;
+
+    private static int SlotIndex(IlInstruction instruction)
+    {
+        var opcode = instruction.Opcode;
+        if (opcode is >= 0x0002 and <= 0x0005)
+            return opcode - 0x0002;
+        if (opcode is >= 0x0006 and <= 0x0009)
+            return opcode - 0x0006;
+        if (opcode is >= 0x000a and <= 0x000d)
+            return opcode - 0x000a;
+        var separator = instruction.OperandText.IndexOf(':');
+        if (separator < 0 || !int.TryParse(instruction.OperandText[(separator + 1)..], NumberStyles.None,
+                CultureInfo.InvariantCulture, out var slot) || slot < 0)
+            throw new BadImageFormatException("CLI variable slot operand is invalid");
+        return slot;
+    }
+
+    private static bool IsRelationalBranch(ushort opcode) =>
+        opcode is >= 0x002e and <= 0x0037 or >= 0x003b and <= 0x0044;
+
+    private static bool IsFalseBranch(ushort opcode) => opcode is 0x002c or 0x0039;
+
+    private static string RelationalOperator(ushort opcode) => opcode switch
+    {
+        0x002e or 0x003b => "==",
+        0x0033 or 0x0040 => "!=",
+        0x002f or 0x0034 or 0x003c or 0x0041 => ">=",
+        0x0030 or 0x0035 or 0x003d or 0x0042 => ">",
+        0x0031 or 0x0036 or 0x003e or 0x0043 => "<=",
+        0x0032 or 0x0037 or 0x003f or 0x0044 => "<",
+        _ => throw new BadImageFormatException("CLI relational branch opcode is invalid")
+    };
+
+    private static string StableImmediate(MetadataReader reader, IlInstruction instruction, string opcode)
+    {
+        if (opcode is "parameter" or "local" or "return_value" or "throw_value" or "call")
+            return string.Empty;
+        if (opcode == "binary")
+            return BinaryOperator(instruction.Opcode);
+        if (opcode == "unary")
+            return instruction.Opcode == 0x0065 ? "-" : "~";
+        if (instruction.Opcode == 0x0025)
+            return "copy";
+        if (opcode == "constant")
+            return ConstantText(reader, instruction);
+        if (opcode == "cast")
+            return "cast";
+        if (opcode == "store")
+            return "=";
+        if (opcode == "load")
+            return "*";
+        if (opcode == "branch")
+            return instruction.Symbol;
+        if (opcode == "switch_branch")
+            return instruction.Symbol;
+        if (opcode == "unknown")
+            return $"unknown_IL_{instruction.Offset:x4}_{instruction.Opcode:x4}";
+        return string.Empty;
+    }
+
+    private static string StableSymbol(
+        MetadataReader reader,
+        MethodParameterIdentities parameterIdentities,
+        IlInstruction instruction,
+        string opcode)
+    {
+        if (opcode == "parameter")
+            return parameterIdentities.ResolveSlot(SlotIndex(instruction));
+        if (opcode == "local")
+            return $"local_{SlotIndex(instruction)}";
+        if (opcode == "call")
+            return ResolveCallableSymbol(reader, instruction);
+        if (opcode is "field_load" or "field_store")
+            return ResolveFieldSymbol(reader, instruction);
+        return string.Empty;
+    }
+
+    private static string ResolveCallableSymbol(MetadataReader reader, IlInstruction instruction)
+    {
+        var handle = RequireMetadataEntityHandle(instruction.MetadataToken, "call target");
+        if (instruction.Opcode == 0x0029)
+        {
+            if (handle.Kind != HandleKind.StandaloneSignature)
+                throw new BadImageFormatException("calli target is not a standalone signature");
+            var signature = reader.GetBlobBytes(reader.GetStandaloneSignature((StandaloneSignatureHandle)handle).Signature);
+            RequireMetadataSignature(signature, "calli signature");
+            return "indirect_call";
+        }
+        if (handle.Kind == HandleKind.MethodSpecification)
+        {
+            var specification = reader.GetMethodSpecification((MethodSpecificationHandle)handle);
+            RequireMetadataSignature(reader.GetBlobBytes(specification.Signature), "method specification signature");
+            _ = specification.DecodeSignature(new StableSignatureTypeProvider(), new GenericContext(string.Empty, string.Empty));
+            handle = specification.Method;
+        }
+        return handle.Kind switch
+        {
+            HandleKind.MethodDefinition => ResolveMethodDefinitionSymbol(reader, (MethodDefinitionHandle)handle),
+            HandleKind.MemberReference => ResolveMethodReferenceSymbol(reader, (MemberReferenceHandle)handle),
+            _ => throw new BadImageFormatException("call target does not reference a CLI method")
+        };
+    }
+
+    private static string ResolveFieldSymbol(MetadataReader reader, IlInstruction instruction)
+    {
+        var handle = RequireMetadataEntityHandle(instruction.MetadataToken, "field target");
+        return handle.Kind switch
+        {
+            HandleKind.FieldDefinition => ResolveFieldDefinitionSymbol(reader, (FieldDefinitionHandle)handle),
+            HandleKind.MemberReference => ResolveFieldReferenceSymbol(reader, (MemberReferenceHandle)handle),
+            _ => throw new BadImageFormatException("field target does not reference a CLI field")
+        };
+    }
+
+    private static string ResolveMethodDefinitionSymbol(MetadataReader reader, MethodDefinitionHandle handle)
+    {
+        var definition = reader.GetMethodDefinition(handle);
+        RequireMetadataSignature(reader.GetBlobBytes(definition.Signature), "method definition signature");
+        _ = definition.DecodeSignature(new StableSignatureTypeProvider(), new GenericContext(string.Empty, string.Empty));
+        return AppendRendererMember(RenderTypeDefinitionIdentifier(reader, definition.GetDeclaringType()),
+            RequireWireIdentity(reader.GetString(definition.Name), "method symbol"));
+    }
+
+    private static string ResolveMethodReferenceSymbol(MetadataReader reader, MemberReferenceHandle handle)
+    {
+        var reference = reader.GetMemberReference(handle);
+        if (reference.GetKind() != MemberReferenceKind.Method)
+            throw new BadImageFormatException("call target member reference is not a method");
+        RequireMetadataSignature(reader.GetBlobBytes(reference.Signature), "method reference signature");
+        _ = reference.DecodeMethodSignature(new StableSignatureTypeProvider(), new GenericContext(string.Empty, string.Empty));
+        return AppendRendererMember(RenderMemberReferenceOwner(reader, reference.Parent),
+            RequireWireIdentity(reader.GetString(reference.Name), "method reference symbol"));
+    }
+
+    private static string ResolveFieldDefinitionSymbol(MetadataReader reader, FieldDefinitionHandle handle)
+    {
+        var definition = reader.GetFieldDefinition(handle);
+        RequireMetadataSignature(reader.GetBlobBytes(definition.Signature), "field definition signature");
+        _ = definition.DecodeSignature(new StableSignatureTypeProvider(), new GenericContext(string.Empty, string.Empty));
+        return AppendRendererMember(RenderTypeDefinitionIdentifier(reader, definition.GetDeclaringType()),
+            RequireWireIdentity(reader.GetString(definition.Name), "field symbol"));
+    }
+
+    private static string ResolveFieldReferenceSymbol(MetadataReader reader, MemberReferenceHandle handle)
+    {
+        var reference = reader.GetMemberReference(handle);
+        if (reference.GetKind() != MemberReferenceKind.Field)
+            throw new BadImageFormatException("field target member reference is not a field");
+        RequireMetadataSignature(reader.GetBlobBytes(reference.Signature), "field reference signature");
+        _ = reference.DecodeFieldSignature(new StableSignatureTypeProvider(), new GenericContext(string.Empty, string.Empty));
+        return AppendRendererMember(RenderMemberReferenceOwner(reader, reference.Parent),
+            RequireWireIdentity(reader.GetString(reference.Name), "field reference symbol"));
+    }
+
+    private static string RenderMemberReferenceOwner(MetadataReader reader, EntityHandle parent)
+    {
+        return parent.Kind switch
+        {
+            HandleKind.TypeDefinition => RenderTypeDefinitionIdentifier(reader, (TypeDefinitionHandle)parent),
+            HandleKind.TypeReference => RenderTypeReferenceIdentifier(reader, (TypeReferenceHandle)parent),
+            HandleKind.TypeSpecification => RenderTypeSpecificationIdentifier(reader, (TypeSpecificationHandle)parent),
+            HandleKind.MethodDefinition => RenderTypeDefinitionIdentifier(reader,
+                reader.GetMethodDefinition((MethodDefinitionHandle)parent).GetDeclaringType()),
+            HandleKind.ModuleReference => RenderIdentifierComponent(RequireWireIdentity(
+                reader.GetString(reader.GetModuleReference((ModuleReferenceHandle)parent).Name), "module reference symbol")),
+            _ => throw new BadImageFormatException("member reference has an unsupported declaring scope")
+        };
+    }
+
+    private static string RenderTypeDefinitionIdentifier(MetadataReader reader, TypeDefinitionHandle handle)
+    {
+        var names = new List<string>();
+        var visited = new HashSet<int>();
+        string @namespace;
+        while (true)
+        {
+            if (handle.IsNil || !visited.Add(MetadataTokens.GetRowNumber(handle)) || visited.Count > reader.TypeDefinitions.Count)
+                throw new BadImageFormatException("type definition declaring scope is invalid");
+            var definition = reader.GetTypeDefinition(handle);
+            names.Add(RequireWireIdentity(reader.GetString(definition.Name), "type definition symbol"));
+            var declaringType = definition.GetDeclaringType();
+            if (declaringType.IsNil)
+            {
+                @namespace = reader.GetString(definition.Namespace);
+                break;
+            }
+            handle = declaringType;
+        }
+        names.Reverse();
+        return RenderQualifiedTypeIdentifier(@namespace, names);
+    }
+
+    private static string RenderTypeReferenceIdentifier(MetadataReader reader, TypeReferenceHandle handle)
+    {
+        var names = new List<string>();
+        var visited = new HashSet<int>();
+        string @namespace;
+        while (true)
+        {
+            if (handle.IsNil || !visited.Add(MetadataTokens.GetRowNumber(handle)) || visited.Count > reader.TypeReferences.Count)
+                throw new BadImageFormatException("type reference resolution scope is invalid");
+            var reference = reader.GetTypeReference(handle);
+            names.Add(RequireWireIdentity(reader.GetString(reference.Name), "type reference symbol"));
+            if (reference.ResolutionScope.Kind == HandleKind.TypeReference)
+            {
+                handle = (TypeReferenceHandle)reference.ResolutionScope;
+                continue;
+            }
+            if (reference.ResolutionScope.IsNil)
+                throw new BadImageFormatException("type reference resolution scope is absent");
+            @namespace = reader.GetString(reference.Namespace);
+            break;
+        }
+        names.Reverse();
+        return RenderQualifiedTypeIdentifier(@namespace, names);
+    }
+
+    private static string RenderTypeSpecificationIdentifier(MetadataReader reader, TypeSpecificationHandle handle)
+    {
+        var specification = reader.GetTypeSpecification(handle);
+        var signature = reader.GetBlobBytes(specification.Signature);
+        RequireMetadataSignature(signature, "type specification signature");
+        var identity = specification.DecodeSignature(new StableSignatureTypeProvider(), new GenericContext(string.Empty, string.Empty));
+        return RenderIdentifierComponent(RequireWireIdentity(identity, "type specification symbol"));
+    }
+
+    private static string RenderQualifiedTypeIdentifier(string @namespace, IReadOnlyList<string> names)
+    {
+        if (names.Count == 0)
+            throw new BadImageFormatException("type symbol has no name");
+        var components = new List<string>();
+        if (!string.IsNullOrEmpty(@namespace))
+        {
+            foreach (var component in @namespace.Split('.', StringSplitOptions.None))
+            {
+                if (component.Length == 0)
+                    throw new BadImageFormatException("type namespace contains an empty component");
+                components.Add(RenderIdentifierComponent(RequireWireIdentity(component, "namespace symbol")));
+            }
+        }
+        foreach (var name in names)
+            components.Add(RenderIdentifierComponent(name));
+        return RequireRendererIdentifier(string.Join("::", components));
+    }
+
+    private static string AppendRendererMember(string owner, string member)
+    {
+        if (string.IsNullOrEmpty(owner))
+            throw new BadImageFormatException("member symbol has no declaring type");
+        return RequireRendererIdentifier($"{owner}::{RenderIdentifierComponent(member)}");
+    }
+
+    private static string RenderIdentifierComponent(string value)
+    {
+        if (value == ".ctor")
+            return "$ctor";
+        if (value == ".cctor")
+            return "$cctor";
+        var valid = value.Length != 0 && !value.Contains("$cli$", StringComparison.Ordinal) &&
+            IsRendererIdentifierStart(value[0]);
+        for (var index = 1; valid && index < value.Length; index++)
+            valid = IsRendererIdentifierContinuation(value[index]);
+        if (valid)
+            return RequireRendererIdentifier(value);
+        var bytes = Encoding.UTF8.GetBytes(value);
+        if (bytes.Length == 0 || bytes.Length > MaximumWireIdentityBytes)
+            throw new InvalidDataException("metadata identifier component exceeds the renderer contract");
+        return RequireRendererIdentifier("$cli$" + Convert.ToHexString(bytes));
+    }
+
+    private static bool IsRendererIdentifierStart(char value) =>
+        value is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or '_' or '$';
+
+    private static bool IsRendererIdentifierContinuation(char value) =>
+        IsRendererIdentifierStart(value) || value is >= '0' and <= '9';
+
+    private static string RequireRendererIdentifier(string value)
+    {
+        if (string.IsNullOrEmpty(value) || Encoding.UTF8.GetByteCount(value) > MaximumRendererIdentifierBytes)
+            throw new InvalidDataException("metadata identifier exceeds the renderer contract");
+        return value;
+    }
+
+    private static EntityHandle RequireMetadataEntityHandle(uint token, string field)
+    {
+        if (token == 0)
+            throw new BadImageFormatException($"{field} metadata token is absent");
+        try
+        {
+            var handle = MetadataTokens.EntityHandle(unchecked((int)token));
+            if (handle.IsNil)
+                throw new BadImageFormatException($"{field} metadata token is nil");
+            return handle;
+        }
+        catch (ArgumentException exception)
+        {
+            throw new BadImageFormatException($"{field} metadata token is invalid", exception);
+        }
+    }
+
+    private static void RequireMetadataSignature(byte[] signature, string field)
+    {
+        if (signature.Length == 0 || signature.Length > MaximumWireSignatureBytes)
+            throw new BadImageFormatException($"{field} is invalid");
+    }
+
+    private static string BinaryOperator(ushort opcode) => opcode switch
+    {
+        0x0058 => "+", 0x0059 => "-", 0x005a => "*", 0x005b or 0x005c => "/",
+        0x005d or 0x005e => "%", 0x005f => "&", 0x0060 => "|", 0x0061 => "^",
+        0x0062 => "<<", 0x0063 or 0x0064 => ">>",
+        _ => throw new BadImageFormatException("CLI binary opcode is invalid")
+    };
+
+    private static string ConstantText(MetadataReader reader, IlInstruction instruction) => instruction.Opcode switch
+    {
+        0x0014 => "null",
+        0x0015 => "-1",
+        >= 0x0016 and <= 0x001e => (instruction.Opcode - 0x0016).ToString(CultureInfo.InvariantCulture),
+        0x0072 when instruction.MetadataToken != 0 => System.Text.Json.JsonSerializer.Serialize(
+            reader.GetUserString(MetadataTokens.UserStringHandle(unchecked((int)(instruction.MetadataToken & 0x00ffffffU))))),
+        _ => instruction.OperandText.Contains(':')
+            ? instruction.OperandText[(instruction.OperandText.IndexOf(':') + 1)..]
+            : instruction.Symbol.Length != 0 ? instruction.Symbol : $"IL_{instruction.Offset:x4}"
+    };
 
     private static ulong BlockForOffset(IReadOnlyList<BlockBuilder> blocks, int offset)
     {
@@ -602,7 +1277,7 @@ internal static class MetadataAnalysis
             case IlOperandKind.ShortBranch:
             {
                 var delta = unchecked((sbyte)ReadByte(bytes, ref offset));
-                var target = checked(offset + delta);
+                var target = ResolveRelativeTarget(offset, delta, bytes.Length);
                 targets = new[] { target };
                 symbol = $"IL_{target:x4}";
                 return $"branch:{symbol}";
@@ -610,7 +1285,7 @@ internal static class MetadataAnalysis
             case IlOperandKind.Branch:
             {
                 var delta = ReadInt32(bytes, ref offset);
-                var target = checked(offset + delta);
+                var target = ResolveRelativeTarget(offset, delta, bytes.Length);
                 targets = new[] { target };
                 symbol = $"IL_{target:x4}";
                 return $"branch:{symbol}";
@@ -626,7 +1301,7 @@ internal static class MetadataAnalysis
                 var baseOffset = offset;
                 var resolved = new int[count];
                 for (var index = 0; index < deltas.Length; index++)
-                    resolved[index] = checked(baseOffset + deltas[index]);
+                    resolved[index] = ResolveRelativeTarget(baseOffset, deltas[index], bytes.Length);
                 targets = resolved;
                 symbol = string.Join(",", resolved.Select(target => $"IL_{target:x4}"));
                 return $"switch:{symbol}";
@@ -638,6 +1313,14 @@ internal static class MetadataAnalysis
             default:
                 throw new BadImageFormatException($"unsupported IL operand at {instructionOffset:x4}");
         }
+    }
+
+    private static int ResolveRelativeTarget(int baseOffset, int delta, int ilLength)
+    {
+        var target = checked((long)baseOffset + delta);
+        if (target < 0 || target >= ilLength)
+            throw new BadImageFormatException("branch target lies outside the IL byte stream");
+        return checked((int)target);
     }
 
     private static byte ReadByte(ReadOnlySpan<byte> bytes, ref int offset)
@@ -685,7 +1368,9 @@ internal static class MetadataAnalysis
             0x0045 => IlOperandKind.Switch,
             0x00dd => IlOperandKind.Branch,
             0x00de => IlOperandKind.ShortBranch,
-            0x0027 or 0x0028 or 0x0029 or 0x006f or 0x0072 or 0x0073 or >= 0x0074 and <= 0x0080 or 0x008c or 0x008d or 0x008f or 0x00a3 or 0x00a4 or 0x00a5 or 0x00c2 or 0x00c6 or 0x00d0 => IlOperandKind.Token,
+            0x0027 or 0x0028 or 0x0029 or 0x006f or >= 0x0070 and <= 0x0075 or 0x0079 or
+                >= 0x007b and <= 0x0081 or 0x008c or 0x008d or 0x008f or >= 0x00a3 and <= 0x00a5 or
+                0x00c2 or 0x00c6 or 0x00d0 => IlOperandKind.Token,
             >= 0xfe06 and <= 0xfe07 => IlOperandKind.Token,
             >= 0xfe09 and <= 0xfe0e => IlOperandKind.UInt16,
             0xfe12 or 0xfe19 => IlOperandKind.Byte,
@@ -743,14 +1428,15 @@ internal static class MetadataAnalysis
     private static string ToProviderOpcode(ushort opcode) => opcode switch
     {
         >= 0x0002 and <= 0x0005 or 0x000e or 0x000f or >= 0xfe09 and <= 0xfe0a => "parameter",
-        >= 0x0006 and <= 0x000d or >= 0x0011 and <= 0x0012 or >= 0xfe0c and <= 0xfe0d => "local",
-        0x0010 or 0x0013 or 0xfe0b or 0xfe0e => "store",
+        >= 0x0006 and <= 0x0009 or >= 0x0011 and <= 0x0012 or >= 0xfe0c and <= 0xfe0d => "local",
+        >= 0x000a and <= 0x000d or 0x0010 or 0x0013 or 0xfe0b or 0xfe0e => "store",
         0x0014 or >= 0x0015 and <= 0x0023 or 0x0072 or 0x00d0 => "constant",
-        0x0025 => "copy",
+        0x0025 => "cast",
         0x0065 or 0x0066 => "unary",
         >= 0x0058 and <= 0x0064 => "binary",
         >= 0x0067 and <= 0x006e or 0x0074 or 0x0075 or 0x0076 or 0x0079 or 0x008c or 0x00a5 => "cast",
-        >= 0x0046 and <= 0x0050 or 0x009a or 0x00a3 => "array_load",
+        >= 0x0046 and <= 0x0050 => "load",
+        >= 0x0090 and <= 0x009a or 0x00a3 => "array_load",
         >= 0x009b and <= 0x00a4 => "array_store",
         >= 0x007b and <= 0x007c or 0x007e or 0x007f => "field_load",
         0x007d or 0x0080 => "field_store",
@@ -763,15 +1449,16 @@ internal static class MetadataAnalysis
         _ => "unknown"
     };
 
-    private static string InstructionTypeName(ushort opcode) => opcode switch
+    private static TypeEvidence InstructionTypeEvidence(ushort opcode) => opcode switch
     {
-        0x0015 or 0x0016 or 0x0017 or 0x0018 or 0x0019 or 0x001a or 0x001b or 0x001c or 0x001d or 0x001e or 0x001f or 0x0020 => "System.Int32",
-        0x0021 => "System.Int64",
-        0x0022 => "System.Single",
-        0x0023 => "System.Double",
-        0x0014 => "System.Object",
-        0x0072 => "System.String",
-        _ => "System.Object"
+        0x0015 or 0x0016 or 0x0017 or 0x0018 or 0x0019 or 0x001a or 0x001b or 0x001c or 0x001d or 0x001e or 0x001f or 0x0020 =>
+            new TypeEvidence("System.Int32", OpcodeTypeConfidence),
+        0x0021 => new TypeEvidence("System.Int64", OpcodeTypeConfidence),
+        0x0022 => new TypeEvidence("System.Single", OpcodeTypeConfidence),
+        0x0023 => new TypeEvidence("System.Double", OpcodeTypeConfidence),
+        0x0014 => new TypeEvidence("System.Object", OpcodeTypeConfidence),
+        0x0072 => new TypeEvidence("System.String", OpcodeTypeConfidence),
+        _ => new TypeEvidence("System.Object", ConservativeFallbackTypeConfidence)
     };
 
     private static string TypeKind(string name) => name switch
@@ -802,10 +1489,23 @@ internal static class MetadataAnalysis
     private static string GetAssemblyIdentity(MetadataReader reader)
     {
         if (!reader.IsAssembly)
-            return reader.GetString(reader.GetModuleDefinition().Name);
-        var definition = reader.GetAssemblyDefinition();
-        var name = reader.GetString(definition.Name);
-        return $"{name}, Version={definition.Version}";
+            return RequireWireIdentity(reader.GetString(reader.GetModuleDefinition().Name), "assembly identity");
+        return RequireWireIdentity(reader.GetString(reader.GetAssemblyDefinition().Name), "assembly identity");
+    }
+
+    private static string GetMethodSignatureIdentity(MetadataReader reader, MethodDefinition method)
+    {
+        var signature = reader.GetBlobBytes(method.Signature);
+        if (signature.Length == 0 || signature.Length > MaximumWireSignatureBytes)
+            throw new InvalidDataException("method signature identity exceeds the wire contract");
+        return Convert.ToHexString(signature);
+    }
+
+    private static string RequireWireIdentity(string value, string field)
+    {
+        if (string.IsNullOrEmpty(value) || Encoding.UTF8.GetByteCount(value) > MaximumWireIdentityBytes || value.Contains('\0'))
+            throw new InvalidDataException($"{field} exceeds the wire contract");
+        return value;
     }
 
     internal static string GetTypeDefinitionName(MetadataReader reader, TypeDefinitionHandle handle)
@@ -841,6 +1541,34 @@ internal static class MetadataAnalysis
         if (left is null || right is null || !IsLowerHexDigest(left) || !IsLowerHexDigest(right))
             return false;
         return CryptographicOperations.FixedTimeEquals(Convert.FromHexString(left), Convert.FromHexString(right));
+    }
+
+    private readonly record struct TypeEvidence(string Name, byte Confidence);
+
+    private readonly record struct StackTransition(int PopCount, int PushCount, bool ClearStack);
+
+    private sealed class MethodParameterIdentities
+    {
+        private readonly bool isInstance;
+        private readonly IReadOnlyList<string> explicitNames;
+
+        internal MethodParameterIdentities(bool isInstance, IReadOnlyList<string> explicitNames)
+        {
+            this.isInstance = isInstance;
+            this.explicitNames = explicitNames;
+        }
+
+        internal string ResolveSlot(int slot)
+        {
+            if (slot < 0)
+                throw new BadImageFormatException("CLI argument slot is invalid");
+            if (isInstance && slot == 0)
+                return "this";
+            var parameterIndex = slot - (isInstance ? 1 : 0);
+            if ((uint)parameterIndex >= (uint)explicitNames.Count)
+                throw new BadImageFormatException("CLI argument slot exceeds the method signature");
+            return explicitNames[parameterIndex];
+        }
     }
 
     private sealed class BlockBuilder
@@ -923,7 +1651,7 @@ internal sealed class StableSignatureTypeProvider : ISignatureTypeProvider<strin
         PrimitiveTypeCode.UIntPtr => "System.UIntPtr",
         PrimitiveTypeCode.Object => "System.Object",
         PrimitiveTypeCode.TypedReference => "System.TypedReference",
-        _ => "System.Object"
+        _ => throw new BadImageFormatException("CLI primitive type code is unsupported")
     };
 
     public string GetSZArrayType(string elementType) => $"{elementType}[]";

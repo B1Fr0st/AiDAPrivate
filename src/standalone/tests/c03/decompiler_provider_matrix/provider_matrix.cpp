@@ -79,6 +79,10 @@ constexpr std::uint64_t k_cancellation_budget_ms = 250;
 constexpr std::array<std::string_view, 10> k_fact_fields{
     "entities", "calls", "fields", "locals", "parameters", "cfg_edges",
     "control_structures", "exception_regions", "types", "source_coordinates"};
+constexpr std::array<std::string_view, 10> k_metric_names{
+    "typed_entities", "calls", "fields", "locals", "parameters", "cfg",
+    "control_structures", "exception_regions", "type_correctness", "source_coordinates"};
+constexpr std::string_view k_owned_fact_prefix = "aida-owned-v1:";
 
 struct matrix_error_t final : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -492,6 +496,32 @@ std::string qualified_fact_text(const std::string_view owner,
     return output;
 }
 
+std::string owned_fact_text(const std::string_view owner,
+                            const std::string_view value)
+{
+    if (owner.empty())
+        return bounded_fact_text(value);
+    const auto owner_length = std::to_string(owner.size());
+    auto size = checked_sum(static_cast<std::uint64_t>(k_owned_fact_prefix.size()),
+        static_cast<std::uint64_t>(owner_length.size()),
+        "provider owned fact size overflowed");
+    size = checked_sum(size, 1ULL, "provider owned fact size overflowed");
+    size = checked_sum(size, static_cast<std::uint64_t>(owner.size()),
+        "provider owned fact size overflowed");
+    size = checked_sum(size, static_cast<std::uint64_t>(value.size()),
+        "provider owned fact size overflowed");
+    if (size > k_max_contract_text_bytes)
+        throw matrix_error_t("provider owned fact exceeds its text bound");
+    std::string output;
+    output.reserve(static_cast<std::size_t>(size));
+    output.append(k_owned_fact_prefix);
+    output.append(owner_length);
+    output.push_back(':');
+    output.append(owner);
+    output.append(value);
+    return output;
+}
+
 std::string coordinate_fact(const source_coordinate_t& coordinate)
 {
     std::ostringstream stream;
@@ -546,6 +576,9 @@ public:
         for (const auto field : k_fact_fields)
             facts_.emplace(std::string(field),
                 std::set<std::string, std::less<>>{});
+        for (const auto metric : k_metric_names)
+            unknowns_.emplace(std::string(metric),
+                std::set<std::string, std::less<>>{});
     }
 
     void add(const std::string_view field, const std::string_view value,
@@ -567,172 +600,239 @@ public:
         if (existing == confidence_.end()) {
             charge_confidence(value);
             confidence_.emplace(std::string(value), bounded);
-        } else if (existing->second < bounded) {
+        } else if (existing->second > bounded) {
             existing->second = bounded;
         }
     }
 
-    void unknown(const std::string_view value)
+    void add_owned(const std::string_view field, const std::string_view owner,
+                   const std::string_view value, const double confidence)
     {
         if (value.empty())
             return;
-        if (value.size() > k_max_contract_text_bytes)
-            throw matrix_error_t("provider explicit unknown exceeds its text bound");
-        if (unknowns_.find(value) == unknowns_.end()) {
-            charge_fact_like(value);
-            unknowns_.insert(std::string(value));
-        }
+        add(field, owned_fact_text(owner, value), confidence);
     }
 
-    void coordinate(const source_coordinate_t& value, const double confidence = 1.0)
+    void unavailable(const std::string_view stage, const std::string_view value)
     {
-        add("source_coordinates", coordinate_fact(value), confidence);
+        append_unknown(value, decompiler_unknown_reason_t::provider_abstained,
+            stage);
+    }
+
+    void coordinate(const std::string_view owner, const source_coordinate_t& value,
+                    const double confidence = 1.0)
+    {
+        add_owned("source_coordinates", owner, coordinate_fact(value), confidence);
     }
 
     void provider_ir(const provider_ir_t& value)
     {
-        add("entities", entity_fact(value.entity), 1.0);
+        const auto owner = entity_fact(value.entity);
+        add("entities", owner, 1.0);
         for (const auto& coordinate_value : value.source_coordinates)
-            coordinate(coordinate_value);
+            coordinate(owner, coordinate_value);
         for (const auto& block : value.blocks) {
-            coordinate(block.coordinate);
+            coordinate(owner, block.coordinate);
             for (const auto successor : block.successor_ids)
-                add("cfg_edges", "block:" + std::to_string(block.id) + "->block:" +
+                add_owned("cfg_edges", owner,
+                    "block:" + std::to_string(block.id) + "->block:" +
                     std::to_string(successor), 1.0);
             for (const auto successor : block.exception_successor_ids) {
-                add("cfg_edges", "block:" + std::to_string(block.id) + "=>exception:" +
+                add_owned("cfg_edges", owner,
+                    "block:" + std::to_string(block.id) + "=>exception:" +
                     std::to_string(successor), 1.0);
-                add("exception_regions", "block:" + std::to_string(block.id) + "=>" +
+                add_owned("exception_regions", owner,
+                    "block:" + std::to_string(block.id) + "=>" +
                     std::to_string(successor), 1.0);
             }
             for (const auto& node : block.values) {
                 const auto confidence = static_cast<double>(node.confidence) / 100.0;
-                coordinate(node.coordinate, confidence);
+                coordinate(owner, node.coordinate, confidence);
                 if (node.opcode == provider_ir_opcode_t::call ||
                     node.opcode == provider_ir_opcode_t::indirect_call)
-                    add("calls", node.stable_symbol.empty() ? node.stable_immediate : node.stable_symbol,
+                    add_owned("calls", owner,
+                        node.stable_symbol.empty() ? node.stable_immediate : node.stable_symbol,
                         confidence);
                 if (node.opcode == provider_ir_opcode_t::field_load ||
                     node.opcode == provider_ir_opcode_t::field_store)
-                    add("fields", node.stable_symbol.empty() ? node.stable_immediate : node.stable_symbol,
+                    add_owned("fields", owner,
+                        node.stable_symbol.empty() ? node.stable_immediate : node.stable_symbol,
                         confidence);
             }
         }
-        append_unknowns(value.unknowns);
+        append_unknowns(value.unknowns, "provider_ir");
     }
 
     void hir(const hir_function_t& value)
     {
-        add("entities", entity_fact(value.entity), 1.0);
+        const auto owner = entity_fact(value.entity);
+        for (const auto field : std::array<std::string_view, 4>{
+                 "calls", "fields", "cfg_edges", "exception_regions"})
+            erase_owned(field, owner);
+        auto& signature_types = signature_type_ids_[owner];
+        if (value.return_type_id != 0)
+            signature_types.insert(value.return_type_id);
+        add("entities", owner, 1.0);
+        add_owned("types", owner, "arity:" + std::to_string(value.parameters.size()), 1.0);
         for (const auto& variable : value.parameters) {
-            add("parameters", variable.stable_name,
+            if (variable.type_id != 0)
+                signature_types.insert(variable.type_id);
+            add_owned("parameters", owner, variable.stable_name,
                 static_cast<double>(variable.confidence) / 100.0);
-            coordinate(variable.coordinate, static_cast<double>(variable.confidence) / 100.0);
+            coordinate(owner, variable.coordinate,
+                static_cast<double>(variable.confidence) / 100.0);
         }
         for (const auto& variable : value.locals) {
-            add("locals", variable.stable_name,
+            add_owned("locals", owner, variable.stable_name,
                 static_cast<double>(variable.confidence) / 100.0);
-            coordinate(variable.coordinate, static_cast<double>(variable.confidence) / 100.0);
+            coordinate(owner, variable.coordinate,
+                static_cast<double>(variable.confidence) / 100.0);
         }
         for (const auto& coordinate_value : value.source_coordinates)
-            coordinate(coordinate_value);
+            coordinate(owner, coordinate_value);
         for (const auto& block : value.blocks) {
+            const bool returns = std::any_of(block.values.begin(), block.values.end(),
+                [](const hir_value_t& node) { return node.kind == hir_node_kind_t::return_value; });
+            const bool throws = std::any_of(block.values.begin(), block.values.end(),
+                [](const hir_value_t& node) { return node.kind == hir_node_kind_t::throw_value; });
             for (const auto successor : block.successor_ids)
-                add("cfg_edges", "block:" + std::to_string(block.id) + "->block:" +
+                add_owned("cfg_edges", owner,
+                    "block:" + std::to_string(block.id) + "->block:" +
                     std::to_string(successor), 1.0);
             for (const auto successor : block.exception_successor_ids) {
-                add("cfg_edges", "block:" + std::to_string(block.id) + "=>exception:" +
+                add_owned("cfg_edges", owner,
+                    "block:" + std::to_string(block.id) + "=>exception:" +
                     std::to_string(successor), 1.0);
-                add("exception_regions", "block:" + std::to_string(block.id) + "=>" +
+                add_owned("exception_regions", owner,
+                    "try:block:" + std::to_string(block.id) + "=>handler:block:" +
                     std::to_string(successor), 1.0);
             }
+            if (block.successor_ids.empty() && returns)
+                add_owned("cfg_edges", owner,
+                    "block:" + std::to_string(block.id) + "->return", 1.0);
+            else if (block.successor_ids.empty() && throws)
+                add_owned("cfg_edges", owner,
+                    "block:" + std::to_string(block.id) + "->exit", 1.0);
             for (const auto& node : block.values) {
                 const auto confidence = static_cast<double>(node.confidence) / 100.0;
-                coordinate(node.coordinate, confidence);
+                coordinate(owner, node.coordinate, confidence);
                 if (node.kind == hir_node_kind_t::call)
-                    add("calls", node.stable_value, confidence);
+                    add_owned("calls", owner, node.stable_value, confidence);
                 if (node.kind == hir_node_kind_t::field)
-                    add("fields", node.stable_value, confidence);
+                    add_owned("fields", owner, node.stable_value, confidence);
             }
         }
-        append_unknowns(value.unknowns);
+        append_unknowns(value.unknowns, "hir");
     }
 
     void type_graph(const type_graph_t& value)
     {
+        const auto owner = entity_fact(value.entity);
+        auto reachable = signature_type_ids_[owner];
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& edge : value.edges) {
+                if (reachable.find(edge.source_type_id) != reachable.end() &&
+                    reachable.insert(edge.target_type_id).second)
+                    changed = true;
+            }
+        }
         for (const auto& node : value.nodes) {
-            add("types", node.canonical_name.empty() ? node.display_name : node.canonical_name,
-                static_cast<double>(node.confidence) / 100.0);
+            if (reachable.find(node.id) != reachable.end() &&
+                node.kind != decompiler_type_kind_t::unknown)
+                add_owned("types", owner,
+                    node.canonical_name.empty() ? node.display_name : node.canonical_name,
+                    static_cast<double>(node.confidence) / 100.0);
             for (const auto& coordinate_value : node.coordinates)
-                coordinate(coordinate_value, static_cast<double>(node.confidence) / 100.0);
+                coordinate(owner, coordinate_value,
+                    static_cast<double>(node.confidence) / 100.0);
         }
         for (const auto& edge : value.edges) {
             if (edge.kind == decompiler_type_edge_kind_t::member)
-                add("fields", edge.stable_name,
+                add_owned("fields", owner, edge.stable_name,
                     static_cast<double>(edge.confidence) / 100.0);
         }
-        append_unknowns(value.unknowns);
+        append_unknowns(value.unknowns, "type_graph");
     }
 
     void ast(const typed_pseudocode_ast_v2_t& value)
     {
-        add("entities", entity_fact(value.entity), 1.0);
+        ast_seen_ = true;
+        const auto owner = entity_fact(value.entity);
+        std::map<std::uint64_t, const typed_pseudocode_ast_node_t*> nodes;
+        for (const auto& node : value.nodes)
+            nodes.emplace(node.id, &node);
+        add("entities", owner, 1.0);
         for (const auto& coordinate_value : value.source_coordinates)
-            coordinate(coordinate_value);
+            coordinate(owner, coordinate_value);
         for (const auto& node : value.nodes) {
             const auto confidence = static_cast<double>(node.confidence) / 100.0;
-            coordinate(node.coordinate, confidence);
+            coordinate(owner, node.coordinate, confidence);
             switch (node.kind) {
             case typed_pseudocode_ast_node_kind_t::if_statement:
-                add("control_structures", "if", confidence); break;
+                add_owned("control_structures", owner, "if", confidence); break;
             case typed_pseudocode_ast_node_kind_t::else_clause:
-                add("control_structures", "else", confidence); break;
+                add_owned("control_structures", owner, "else", confidence); break;
             case typed_pseudocode_ast_node_kind_t::while_statement:
-                add("control_structures", "while", confidence); break;
+                add_owned("control_structures", owner, "while", confidence); break;
             case typed_pseudocode_ast_node_kind_t::do_while_statement:
-                add("control_structures", "do_while", confidence); break;
+                add_owned("control_structures", owner, "do_while", confidence); break;
             case typed_pseudocode_ast_node_kind_t::for_statement:
-                add("control_structures", "for", confidence); break;
+                add_owned("control_structures", owner, "for", confidence); break;
             case typed_pseudocode_ast_node_kind_t::switch_statement:
-                add("control_structures", "switch", confidence); break;
+                add_owned("control_structures", owner, "switch", confidence); break;
             case typed_pseudocode_ast_node_kind_t::switch_case:
-                add("control_structures", "case", confidence); break;
+                add_owned("control_structures", owner, "case", confidence); break;
             case typed_pseudocode_ast_node_kind_t::break_statement:
-                add("control_structures", "break", confidence); break;
+                add_owned("control_structures", owner, "break", confidence); break;
             case typed_pseudocode_ast_node_kind_t::continue_statement:
-                add("control_structures", "continue", confidence); break;
+                add_owned("control_structures", owner, "continue", confidence); break;
             case typed_pseudocode_ast_node_kind_t::return_statement:
-                add("control_structures", "return", confidence); break;
+                add_owned("control_structures", owner, "return", confidence); break;
             case typed_pseudocode_ast_node_kind_t::throw_statement:
-                add("control_structures", "throw", confidence);
-                add("exception_regions", "throw:" + std::to_string(node.id), confidence); break;
+                add_owned("control_structures", owner, "throw", confidence);
+                add_owned("exception_regions", owner,
+                    "throw:" + std::to_string(node.id), confidence); break;
             case typed_pseudocode_ast_node_kind_t::try_statement:
-                add("control_structures", "try", confidence);
-                add("exception_regions", "try:" + std::to_string(node.id), confidence); break;
+                add_owned("control_structures", owner, "try", confidence);
+                add_owned("exception_regions", owner,
+                    "try:" + std::to_string(node.id), confidence); break;
             case typed_pseudocode_ast_node_kind_t::catch_clause:
-                add("control_structures", "catch", confidence);
-                add("exception_regions", "catch:" + std::to_string(node.id), confidence); break;
+                add_owned("control_structures", owner, "catch", confidence);
+                add_owned("exception_regions", owner,
+                    "catch:" + std::to_string(node.id), confidence); break;
             case typed_pseudocode_ast_node_kind_t::finally_clause:
-                add("control_structures", "finally", confidence);
-                add("exception_regions", "finally:" + std::to_string(node.id), confidence); break;
+                add_owned("control_structures", owner, "finally", confidence);
+                add_owned("exception_regions", owner,
+                    "finally:" + std::to_string(node.id), confidence); break;
             case typed_pseudocode_ast_node_kind_t::call_expression:
-                add("calls", node.stable_text, confidence); break;
+                if (!node.child_ids.empty()) {
+                    const auto callee = nodes.find(node.child_ids.front());
+                    if (callee != nodes.end() &&
+                        (callee->second->kind == typed_pseudocode_ast_node_kind_t::identifier ||
+                         callee->second->kind == typed_pseudocode_ast_node_kind_t::member_expression))
+                        add_owned("calls", owner, callee->second->stable_text, confidence);
+                }
+                break;
             case typed_pseudocode_ast_node_kind_t::member_expression:
-                add("fields", node.stable_text, confidence); break;
+                add_owned("fields", owner, node.stable_text, confidence); break;
             default:
                 break;
             }
         }
-        append_unknowns(value.unknowns);
+        append_unknowns(value.unknowns, "ast");
     }
 
     void document(const decompiler_document_t& value)
     {
-        ast(value.ast);
+        if (!ast_seen_)
+            ast(value.ast);
+        const auto owner = entity_fact(value.entity);
         for (const auto& mapping : value.source_maps)
             for (const auto& coordinate_value : mapping.coordinates)
-                coordinate(coordinate_value);
-        append_unknowns(value.unknowns);
+                coordinate(owner, coordinate_value);
+        append_unknowns(value.unknowns, "document");
     }
 
     json facts_json() const
@@ -757,13 +857,33 @@ public:
 
     json unknowns_json() const
     {
-        json output = json::array();
-        for (const auto& unknown_value : unknowns_)
-            output.push_back(unknown_value);
+        json output = json::object();
+        for (const auto metric : k_metric_names) {
+            output[std::string(metric)] = json::array();
+            for (const auto& unknown_value : unknowns_.at(std::string(metric)))
+                output[std::string(metric)].push_back(unknown_value);
+        }
         return output;
     }
 
 private:
+    void erase_owned(const std::string_view field, const std::string_view owner)
+    {
+        if (owner.empty())
+            return;
+        const auto prefix = owned_fact_text(owner, {});
+        auto& values = facts_.at(std::string(field));
+        for (auto iterator = values.begin(); iterator != values.end();) {
+            if (iterator->size() >= prefix.size() &&
+                iterator->compare(0, prefix.size(), prefix) == 0) {
+                confidence_.erase(*iterator);
+                iterator = values.erase(iterator);
+            } else {
+                ++iterator;
+            }
+        }
+    }
+
     void charge_fact_like(const std::string_view value)
     {
         const auto encoded = checked_sum(encoded_string_upper(value), 1ULL,
@@ -790,23 +910,122 @@ private:
         confidence_encoded_bytes_ += encoded;
     }
 
-    void append_unknowns(const std::vector<decompiler_unknown_t>& values)
+    static bool stage_affects(const std::string_view stage,
+                              const std::string_view metric) noexcept
+    {
+        if (stage == "provider_ir")
+            return metric == "typed_entities" || metric == "calls" ||
+                metric == "fields" || metric == "cfg" ||
+                metric == "control_structures" || metric == "exception_regions" ||
+                metric == "type_correctness" || metric == "source_coordinates";
+        if (stage == "hir")
+            return true;
+        if (stage == "type_graph")
+            return metric == "fields" || metric == "locals" ||
+                metric == "parameters" || metric == "type_correctness" ||
+                metric == "source_coordinates";
+        if (stage == "ast" || stage == "document")
+            return metric == "typed_entities" || metric == "calls" ||
+                metric == "fields" || metric == "control_structures" ||
+                metric == "exception_regions" || metric == "type_correctness" ||
+                metric == "source_coordinates";
+        return false;
+    }
+
+    static bool reason_affects(const decompiler_unknown_reason_t reason,
+                               const std::string_view metric) noexcept
+    {
+        switch (reason) {
+        case decompiler_unknown_reason_t::unsupported_instruction:
+            return metric == "calls" || metric == "fields" || metric == "locals" ||
+                metric == "parameters" || metric == "cfg" ||
+                metric == "control_structures" || metric == "exception_regions" ||
+                metric == "type_correctness" || metric == "source_coordinates";
+        case decompiler_unknown_reason_t::unsupported_metadata:
+            return metric == "typed_entities" || metric == "fields" ||
+                metric == "locals" || metric == "parameters" ||
+                metric == "exception_regions" || metric == "type_correctness" ||
+                metric == "source_coordinates";
+        case decompiler_unknown_reason_t::unresolved_reference:
+            return metric == "typed_entities" || metric == "calls" ||
+                metric == "fields" || metric == "type_correctness";
+        case decompiler_unknown_reason_t::opaque_control_flow:
+            return metric == "cfg" || metric == "control_structures" ||
+                metric == "exception_regions" || metric == "source_coordinates";
+        case decompiler_unknown_reason_t::incomplete_debug_information:
+            return metric == "type_correctness";
+        case decompiler_unknown_reason_t::conflicting_type_evidence:
+            return metric == "fields" || metric == "locals" ||
+                metric == "parameters" || metric == "type_correctness";
+        case decompiler_unknown_reason_t::bounded_analysis_limit:
+        case decompiler_unknown_reason_t::semantic_timeout:
+        case decompiler_unknown_reason_t::malformed_input:
+        case decompiler_unknown_reason_t::provider_abstained:
+            return true;
+        }
+        return true;
+    }
+
+    void append_unknown(const std::string_view value,
+                        const decompiler_unknown_reason_t reason,
+                        const std::string_view stage)
+    {
+        if (value.empty())
+            return;
+        if (value.size() > k_max_contract_text_bytes)
+            throw matrix_error_t("provider explicit unknown exceeds its text bound");
+        if (!unknown_origins_.emplace(std::string(value), reason).second)
+            return;
+        bool assigned = false;
+        for (const auto metric : k_metric_names) {
+            if (!stage_affects(stage, metric) || !reason_affects(reason, metric))
+                continue;
+            auto& values = unknowns_.at(std::string(metric));
+            if (values.find(value) == values.end()) {
+                charge_fact_like(value);
+                values.insert(std::string(value));
+            }
+            assigned = true;
+        }
+        if (assigned)
+            return;
+        for (const auto metric : k_metric_names) {
+            if (!stage_affects(stage, metric))
+                continue;
+            auto& values = unknowns_.at(std::string(metric));
+            if (values.find(value) == values.end()) {
+                charge_fact_like(value);
+                values.insert(std::string(value));
+            }
+            assigned = true;
+        }
+        if (!assigned)
+            throw matrix_error_t("provider explicit unknown has no metric domain");
+    }
+
+    void append_unknowns(const std::vector<decompiler_unknown_t>& values,
+                         const std::string_view stage)
     {
         for (const auto& value : values) {
             if (!value.stable_token.empty())
-                unknown(value.stable_token);
+                append_unknown(value.stable_token, value.reason, stage);
             else
-                unknown("reason:" + std::to_string(static_cast<std::uint8_t>(value.reason)));
+                append_unknown("reason:" +
+                    std::to_string(static_cast<std::uint8_t>(value.reason)),
+                    value.reason, stage);
         }
     }
 
     provider_evidence_budget_t* provider_budget_ = nullptr;
     std::map<std::string, std::set<std::string, std::less<>>, std::less<>> facts_;
     std::map<std::string, double, std::less<>> confidence_;
-    std::set<std::string, std::less<>> unknowns_;
+    std::map<std::string, std::set<std::string, std::less<>>, std::less<>> unknowns_;
+    std::map<std::string, decompiler_unknown_reason_t, std::less<>> unknown_origins_;
+    std::map<std::string, std::set<std::uint64_t>, std::less<>> signature_type_ids_;
     std::uint64_t fact_and_unknown_items_ = 0;
     std::uint64_t fact_and_unknown_encoded_bytes_ = 0;
     std::uint64_t confidence_encoded_bytes_ = 0;
+    bool ast_seen_ = false;
 };
 
 class readability_accumulator_t final {
@@ -1984,6 +2203,29 @@ struct workspace_unit_t final {
     std::vector<generation_bound_decompiler_entity_t> entities;
 };
 
+struct scheduled_entity_t final {
+    const workspace_unit_t* unit = nullptr;
+    const generation_bound_decompiler_entity_t* entity = nullptr;
+};
+
+std::vector<scheduled_entity_t> scheduled_entities(
+    const std::vector<workspace_unit_t>& units, const bool native_only,
+    const bool reverse)
+{
+    std::vector<scheduled_entity_t> output;
+    for (const auto& unit : units) {
+        for (const auto& entity : unit.entities) {
+            if (native_only && entity.entity.kind !=
+                    decompiler_entity_kind_t::native_function)
+                continue;
+            output.push_back({&unit, &entity});
+        }
+    }
+    if (reverse)
+        std::reverse(output.begin(), output.end());
+    return output;
+}
+
 std::vector<workspace_unit_t> make_workspace_units(
     const provider_fixture_t& fixture,
     const std::string& label,
@@ -2033,7 +2275,8 @@ json base_fixture_json(const provider_fixture_t& fixture,
 }
 
 json make_run_json(std::string run_id, const std::uint64_t started,
-                   const std::uint64_t ended, std::string cache_state,
+                   const std::uint64_t ended, std::string schedule,
+                   std::string cache_state,
                    json artifacts, const fact_accumulator_t& facts,
                    const readability_accumulator_t& readability,
                    json diagnostics)
@@ -2042,6 +2285,7 @@ json make_run_json(std::string run_id, const std::uint64_t started,
         {"execution_witness_sha256", ""},
         {"started_tick_ns", started}, {"ended_tick_ns", ended},
         {"duration_ns", ended >= started ? ended - started : 0},
+        {"schedule", std::move(schedule)},
         {"cache_state", std::move(cache_state)}, {"outcome", "success"},
         {"artifacts", std::move(artifacts)}, {"facts", facts.facts_json()},
         {"confidence", facts.confidence_json()},
@@ -2279,15 +2523,16 @@ json run_candidate_fixture(
         auto fixture_json = base_fixture_json(fixture, "measured",
             "two cache-bypassed production typed-pipeline runs completed");
         for (std::uint32_t ordinal = 1; ordinal <= 2; ++ordinal) {
+            const bool reverse = ordinal == 2;
             const auto started = tick_ns();
             stage_bundles_t bundles(evidence_budget);
             fact_accumulator_t facts(evidence_budget);
             readability_accumulator_t readability(evidence_budget);
             diagnostic_accumulator_t diagnostics(evidence_budget,
                 diagnostic_scope_t::run);
-            for (const auto& unit : units) {
-                for (const auto& entity : unit.entities) {
-                    auto result = unit.integration->decompile_entity(entity,
+            for (const auto scheduled : scheduled_entities(units, false, reverse)) {
+                    auto result = scheduled.unit->integration->decompile_entity(
+                        *scheduled.entity,
                         decompiler_ui_invocation_source_t::api_call,
                         decompiler_profile_id_t::balanced,
                         decompiler_pipeline_cache_mode_t::bypass);
@@ -2338,12 +2583,12 @@ json run_candidate_fixture(
                     facts.document(*value.document);
                     readability.append(*value.document, value.readability);
                     append_diagnostics(diagnostics, value.diagnostics);
-                }
             }
             const auto ended = ended_after(started);
             const auto run_id = "aida_typed_pipeline:" + fixture.id + ":" +
                 std::to_string(ordinal) + ":" + std::to_string(started);
             fixture_json["runs"].push_back(make_run_json(run_id, started, ended,
+                reverse ? "reverse_entity_order" : "forward_entity_order",
                 "cache_bypass", bundles.artifacts(true, true, true, true, true, false),
                 facts, readability, diagnostics.finish()));
         }
@@ -2489,19 +2734,18 @@ json run_ghidra_fixture(
         auto fixture_json = base_fixture_json(fixture, "measured",
             "two direct verified native-worker PrintC runs completed");
         for (std::uint32_t ordinal = 1; ordinal <= 2; ++ordinal) {
+            const bool reverse = ordinal == 2;
             const auto started = tick_ns();
             stage_bundles_t bundles(evidence_budget);
             fact_accumulator_t facts(evidence_budget);
             readability_accumulator_t readability(evidence_budget);
             diagnostic_accumulator_t diagnostics(evidence_budget,
                 diagnostic_scope_t::run);
-            for (const auto& unit : units) {
-                const auto natives = native_entities(unit.entities);
-                for (const auto& entity : natives) {
+            for (const auto scheduled : scheduled_entities(units, true, reverse)) {
                     const auto deadline = clock_t::now() +
                         std::chrono::milliseconds(deadline_ms);
-                    const auto job = make_native_job(entity,
-                        *unit.scope->workspace(), runtime, deadline);
+                    const auto job = make_native_job(*scheduled.entity,
+                        *scheduled.unit->scope->workspace(), runtime, deadline);
                     auto result = execute_native_job(job, runtime, deadline,
                         [] { return false; });
                     append_diagnostics(diagnostics, result.worker_diagnostics);
@@ -2564,12 +2808,12 @@ json run_ghidra_fixture(
                     facts.document(*result.document);
                     readability.append(*result.document);
                     observed_roles.insert("native");
-                }
             }
             const auto ended = ended_after(started);
             const auto run_id = "ghidra_printc:" + fixture.id + ":" +
                 std::to_string(ordinal) + ":" + std::to_string(started);
             fixture_json["runs"].push_back(make_run_json(run_id, started, ended,
+                reverse ? "reverse_entity_order" : "forward_entity_order",
                 "cache_bypass", bundles.artifacts(true, true, true, true, true, true),
                 facts, readability, diagnostics.finish()));
         }
@@ -2700,20 +2944,19 @@ json run_current_fixture(
         auto fixture_json = base_fixture_json(fixture, "measured",
             "two cache-disabled current AiDA in-process runs completed");
         for (std::uint32_t ordinal = 1; ordinal <= 2; ++ordinal) {
+            const bool reverse = ordinal == 2;
             const auto started = tick_ns();
             stage_bundles_t bundles(evidence_budget);
             fact_accumulator_t facts(evidence_budget);
             readability_accumulator_t readability(evidence_budget);
             diagnostic_accumulator_t diagnostics(evidence_budget,
                 diagnostic_scope_t::run);
-            for (const auto& unit : units) {
-                const auto service = unit.scope->workspace()->decompiler();
+            for (const auto scheduled : scheduled_entities(units, true, reverse)) {
+                const auto service = scheduled.unit->scope->workspace()->decompiler();
                 if (!service)
                     throw matrix_error_t("current AiDA decompiler service is unavailable");
-                const auto natives = native_entities(unit.entities);
-                for (const auto& entity : natives) {
                     const auto* native = std::get_if<native_decompiler_entity_identity_t>(
-                        &entity.entity.identity);
+                        &scheduled.entity->entity.identity);
                     if (!native)
                         throw matrix_error_t("current AiDA received an invalid native entity");
                     decompiler_request_t request;
@@ -2733,17 +2976,20 @@ json run_current_fixture(
                     bundles.ast.append(serialize_typed_pseudocode_ast(document.ast));
                     bundles.document.append(serialize_decompiler_document(document));
                     facts.document(document);
-                    facts.unknown("provider_ir:not_exposed_by_aida_current_public_api");
-                    facts.unknown("hir:not_exposed_by_aida_current_public_api");
-                    facts.unknown("type_graph:not_exposed_by_aida_current_public_api");
+                    facts.unavailable("provider_ir",
+                        "provider_ir:not_exposed_by_aida_current_public_api");
+                    facts.unavailable("hir",
+                        "hir:not_exposed_by_aida_current_public_api");
+                    facts.unavailable("type_graph",
+                        "type_graph:not_exposed_by_aida_current_public_api");
                     readability.append(document);
                     append_diagnostics(diagnostics, document.diagnostics);
-                }
             }
             const auto ended = ended_after(started);
             const auto run_id = "aida_current:" + fixture.id + ":" +
                 std::to_string(ordinal) + ":" + std::to_string(started);
             fixture_json["runs"].push_back(make_run_json(run_id, started, ended,
+                reverse ? "reverse_entity_order" : "forward_entity_order",
                 "cache_bypass", bundles.artifacts(false, false, false, true, true, false),
                 facts, readability, diagnostics.finish()));
         }
@@ -2901,7 +3147,7 @@ json execute_provider(
         {"cancellation", std::move(*cancellation)},
         {"launch_audit", launch_audit_json(identity, observed_roles)}};
     json output{{"schema", "aida.c03.decompiler-provider-results"},
-        {"schema_version", 2}, {"evidence_class", "measured_provider_output"},
+        {"schema_version", 3}, {"evidence_class", "measured_provider_output"},
         {"measurement_eligible", complete}, {"analysis_mode", "static_only"},
         {"target_execution_forbidden", true},
         {"target_execution_observed", false},

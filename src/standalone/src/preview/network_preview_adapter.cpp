@@ -10,6 +10,8 @@
 #include "../core/network/burp/sequencer.hpp"
 #include "../core/network/burp/session_handler.hpp"
 #include "../core/runtime/standalone_driver.hpp"
+#include "../core/ui/application_view_registry.hpp"
+#include "../core/ui/task_center.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -29,10 +31,15 @@ network_view::state_t* s_current_state = nullptr;
 fixture_state_t s_pending_fixture = fixture_state_t::normal;
 std::size_t s_pending_cardinality = 0;
 bool s_pending_fixture_valid = false;
+fixture_state_t s_pending_fuzzer_fixture = fixture_state_t::fuzzer_completed;
+std::size_t s_pending_fuzzer_cardinality = 0;
+bool s_pending_fuzzer_fixture_valid = false;
 }
 
 static void apply_fixture(network_view::state_t& state, fixture_state_t fixture,
     std::size_t cardinality);
+static void apply_fuzzer_fixture(network_view::state_t& state, fixture_state_t fixture,
+    std::size_t cardinality, bool publish_task);
 
 namespace {
 
@@ -1436,6 +1443,284 @@ const std::string& receipt() {
     return s_receipt;
 }
 
+static std::vector<std::string> fuzzer_payloads(std::size_t cardinality) {
+    const std::size_t bounded = cardinality == 0
+        ? 3U : (std::min<std::size_t>)((std::max<std::size_t>)(cardinality, 1U), 16U);
+    std::vector<std::string> payloads;
+    payloads.reserve(bounded);
+    constexpr const char* retained[] = {
+        "..%2f..%2fwindows%2fwin.ini",
+        "..%252f..%252fboot.ini",
+        "....//....//etc/passwd"
+    };
+    for (std::size_t index = 0; index < bounded; ++index) {
+        if (index < 3U)
+            payloads.emplace_back(retained[index]);
+        else
+            payloads.emplace_back("probe-" + std::to_string(index + 1U));
+    }
+    return payloads;
+}
+
+static void configure_fuzzer_authority(network_view::state_t& state,
+                                       std::size_t cardinality) {
+    state.fuzz_config = network_view::state_t::fuzzer_entry_t{};
+    state.fuzz_config.host = "sandbox.aidapro.net";
+    state.fuzz_config.port = 443;
+    state.fuzz_config.use_tls = true;
+    state.fuzz_config.base_request =
+        "GET /api/files/FUZZ HTTP/1.1\r\nHost: sandbox.aidapro.net\r\nAccept: application/json\r\n\r\n";
+    state.fuzz_config.attack_mode = network_view::fuzzer_attack_mode_t::pitchfork;
+    network_view::payload_set_t paths;
+    paths.name = "Traversal probes";
+    paths.type = 1;
+    paths.entries = fuzzer_payloads(cardinality);
+    for (std::size_t index = 0; index < paths.entries.size(); ++index) {
+        if (index != 0)
+            paths.source.push_back('\n');
+        paths.source += paths.entries[index];
+    }
+    state.fuzz_config.maximum_requests = static_cast<std::uint64_t>(paths.entries.size());
+    state.fuzz_config.maximum_requests_reviewed = true;
+    state.fuzz_config.payload_sets.push_back(std::move(paths));
+    ++state.fuzz_request_revision;
+    if (state.fuzz_request_revision == 0)
+        state.fuzz_request_revision = 1;
+}
+
+static void publish_fuzzer_fixture_results(network_view::state_t& state,
+                                           std::size_t completed) {
+    std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+    state.fuzz_result_pages.clear();
+    state.fuzz_result_pending.clear();
+    state.fuzz_retained_count = 0;
+    state.fuzz_dropped_count = 0;
+    state.fuzz_retained_bytes = 0;
+    state.fuzz_pending_bytes = 0;
+    state.fuzz_maximum_payload_columns = 1;
+    state.fuzz_has_extracted_values = false;
+    state.fuzz_has_failures = false;
+    state.fuzz_has_selection = false;
+    const auto& entries = state.fuzz_config.payload_sets.front().entries;
+    const std::size_t bounded = (std::min)(completed, entries.size());
+    std::vector<network_view::state_t::fuzzer_result_t> rows;
+    rows.reserve(bounded);
+    for (std::size_t index = 0; index < bounded; ++index) {
+        network_view::state_t::fuzzer_result_t row;
+        row.index = static_cast<std::uint64_t>(index + 1U);
+        row.status_code = index == 1U ? 200 : index % 3U == 0U ? 403 : 404;
+        row.response_len = index == 1U ? 941U : 129U + index * 17U;
+        row.latency_ms = 41U + static_cast<std::uint64_t>(index * 9U);
+        row.match = index == 1U;
+        row.response_preview = row.match ? "[boot loader] timeout=30" :
+            row.status_code == 403 ? "Access denied" : "Not found";
+        row.payload_indices.push_back(static_cast<std::uint32_t>(index));
+        if (row.match)
+            row.extracted_value = "timeout=30";
+        rows.push_back(std::move(row));
+    }
+    std::uint64_t retained_bytes = 0;
+    for (const auto& row : rows) {
+        retained_bytes += sizeof(network_view::state_t::fuzzer_result_t) +
+            static_cast<std::uint64_t>(row.payload_indices.size()) * sizeof(std::uint32_t) +
+            static_cast<std::uint64_t>(row.response_preview.size()) +
+            static_cast<std::uint64_t>(row.extracted_value.size()) +
+            static_cast<std::uint64_t>(row.error.size());
+    }
+    state.fuzz_payload_catalog =
+        std::make_shared<const std::vector<std::vector<std::string>>>(
+            std::vector<std::vector<std::string>>{entries});
+    state.fuzz_result_pending = std::move(rows);
+    state.fuzz_pending_bytes = retained_bytes;
+    state.fuzz_retained_count = static_cast<std::uint64_t>(
+        state.fuzz_result_pending.size());
+    state.fuzz_retained_bytes = retained_bytes;
+    state.fuzz_has_extracted_values = std::any_of(
+        state.fuzz_result_pending.begin(), state.fuzz_result_pending.end(),
+        [](const auto& row) { return !row.extracted_value.empty(); });
+    state.fuzz_has_failures = std::any_of(
+        state.fuzz_result_pending.begin(), state.fuzz_result_pending.end(),
+        [](const auto& row) { return !row.error.empty(); });
+    if (!state.fuzz_result_pending.empty()) {
+        state.fuzz_has_selection = true;
+        state.fuzz_selected = state.fuzz_result_pending.front().index;
+    }
+    auto snapshot = std::make_shared<network_view::state_t::fuzzer_results_snapshot_t>();
+    if (!state.fuzz_result_pending.empty()) {
+        snapshot->pages.push_back(
+            std::make_shared<const network_view::state_t::fuzzer_result_page_t>(
+                network_view::state_t::fuzzer_result_page_t{
+                    state.fuzz_result_pending, state.fuzz_pending_bytes}));
+    }
+    snapshot->payload_catalog = state.fuzz_payload_catalog;
+    snapshot->retained_count = state.fuzz_retained_count;
+    snapshot->dropped_count = state.fuzz_dropped_count;
+    snapshot->retained_bytes = state.fuzz_retained_bytes;
+    snapshot->generation = ++state.fuzz_results_generation;
+    snapshot->maximum_payload_columns = state.fuzz_maximum_payload_columns;
+    snapshot->has_extracted_values = state.fuzz_has_extracted_values;
+    snapshot->has_failures = state.fuzz_has_failures;
+    std::atomic_store_explicit(&state.fuzz_results_snapshot,
+        std::static_pointer_cast<const network_view::state_t::fuzzer_results_snapshot_t>(snapshot),
+        std::memory_order_release);
+    state.fuzz_active_config = state.fuzz_config;
+}
+
+static bool publish_fuzzer_fixture_task(network_view::state_t& state,
+                                        fixture_state_t fixture,
+                                        std::uint64_t progress,
+                                        std::uint64_t total) {
+    const std::uint64_t generation = state.fuzz_run_generation.fetch_add(
+        1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = "network.fuzzer.preview." + std::to_string(generation);
+    {
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        state.fuzz_task_id = task_id;
+    }
+    aida::ui::task_center::task_registration_t registration;
+    registration.id = task_id;
+    registration.source = "Studio fixture";
+    registration.owner = "network";
+    registration.owner_view = "view.network.fuzzer";
+    registration.owner_action = "network.fuzzer.start";
+    registration.target = state.fuzz_config.host + ":" + std::to_string(state.fuzz_config.port);
+    registration.label = "Network fuzzer";
+    registration.stage = "Loading payload sets";
+    registration.started_ms = monotonic_ms();
+    registration.progress = total == 0 ? 0.0f : static_cast<float>(
+        static_cast<double>(progress) / static_cast<double>(total));
+    registration.cancellation_is_safe = true;
+    registration.callbacks.cancel = [generation] {
+        if (!s_current_state ||
+            s_current_state->fuzz_run_generation.load(std::memory_order_acquire) != generation)
+            return false;
+        s_current_state->fuzz_cancel_requested.store(true, std::memory_order_release);
+        s_current_state->fuzz_cv.notify_all();
+        return true;
+    };
+    registration.callbacks.focus = [] {
+        static_cast<void>(aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.network.fuzzer")));
+    };
+    if (!aida::ui::task_center::register_task(std::move(registration))) {
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        state.fuzz_task_id.clear();
+        return false;
+    }
+    using task_state = aida::ui::task_center::task_state_t;
+    const float fraction = total == 0 ? 0.0f : static_cast<float>(
+        static_cast<double>(progress) / static_cast<double>(total));
+    bool updated = true;
+    if (fixture == fixture_state_t::fuzzer_loading)
+        updated = aida::ui::task_center::update_task(task_id, task_state::running,
+            0.0f, "Loading payload sets", "Preparing the reviewed payload catalog");
+    else if (fixture == fixture_state_t::fuzzer_running)
+        updated = aida::ui::task_center::update_task(task_id, task_state::running,
+            fraction, "Sending reviewed requests", std::to_string(progress) + " of " + std::to_string(total));
+    else if (fixture == fixture_state_t::fuzzer_cancelling)
+        updated = aida::ui::task_center::update_task(task_id, task_state::cancellation_requested,
+            fraction, "Cancellation requested", "Waiting for the in-flight request boundary");
+    else if (fixture == fixture_state_t::fuzzer_cancelled)
+        updated = aida::ui::task_center::update_task(task_id, task_state::cancelled,
+            fraction, "Cancelled after in-flight request", std::to_string(progress) + " processed");
+    else if (fixture == fixture_state_t::fuzzer_error)
+        updated = aida::ui::task_center::update_task(task_id, task_state::failed,
+            fraction, "Execution failed", "Deterministic Fuzzer worker failure before request execution");
+    else if (fixture == fixture_state_t::fuzzer_completed)
+        updated = aida::ui::task_center::update_task(task_id, task_state::completed,
+            1.0f, "Completed", std::to_string(total) + " processed, " +
+                std::to_string(total > 1U ? 1U : 0U) + " matched");
+    return updated;
+}
+
+static void apply_fuzzer_fixture(network_view::state_t& state, fixture_state_t fixture,
+                                 std::size_t cardinality, bool publish_task) {
+    configure_fuzzer_authority(state, cardinality);
+    const std::uint64_t total = state.fuzz_config.maximum_requests;
+    std::uint64_t progress = 0;
+    bool running = false;
+    bool cancelling = false;
+    std::string stage;
+    std::string error;
+    if (fixture == fixture_state_t::fuzzer_loading) {
+        running = true;
+        stage = "Loading payload sets";
+    } else if (fixture == fixture_state_t::fuzzer_running) {
+        progress = (std::min<std::uint64_t>)(1U, total);
+        running = true;
+        stage = "Sending reviewed requests";
+    } else if (fixture == fixture_state_t::fuzzer_cancelling) {
+        progress = (std::min<std::uint64_t>)(2U, total);
+        running = true;
+        cancelling = true;
+        stage = "Cancellation requested";
+    } else if (fixture == fixture_state_t::fuzzer_cancelled) {
+        progress = (std::min<std::uint64_t>)(2U, total);
+        cancelling = true;
+        stage = "Cancelled after in-flight request";
+    } else if (fixture == fixture_state_t::fuzzer_error) {
+        stage = "Execution failed";
+        error = "Deterministic Fuzzer worker failure before request execution";
+    } else if (fixture == fixture_state_t::fuzzer_completed) {
+        progress = total;
+        stage = "Completed";
+    } else if (fixture == fixture_state_t::fuzzer_ready) {
+        stage = "Ready";
+    }
+    const bool empty = fixture == fixture_state_t::fuzzer_empty;
+    publish_fuzzer_fixture_results(state, empty ? 0U : static_cast<std::size_t>(progress));
+    state.fuzz_progress.store(progress, std::memory_order_release);
+    state.fuzz_total.store(empty ? 0U : total, std::memory_order_release);
+    state.fuzz_cancel_requested.store(cancelling, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        state.fuzz_last_stage = std::move(stage);
+        state.fuzz_last_error = std::move(error);
+        if (!publish_task || fixture == fixture_state_t::fuzzer_empty ||
+            fixture == fixture_state_t::fuzzer_ready)
+            state.fuzz_task_id.clear();
+    }
+    if (publish_task) {
+        state.active_tab = network_view::sub_tab_t::fuzzer;
+        state.prev_tab = state.active_tab;
+    }
+    if (publish_task && fixture != fixture_state_t::fuzzer_empty &&
+        fixture != fixture_state_t::fuzzer_ready &&
+        !publish_fuzzer_fixture_task(state, fixture, progress, total)) {
+        running = false;
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        state.fuzz_last_stage = "Start rejected";
+        state.fuzz_last_error = "Task Center rejected the deterministic Fuzzer fixture";
+    }
+    state.fuzz_thread_alive.store(running, std::memory_order_release);
+    state.fuzz_thread_done.store(!running, std::memory_order_release);
+    state.fuzz_running.store(running, std::memory_order_release);
+    record_receipt("Network Fuzzer fixture", state.fuzz_last_error.empty()
+        ? state.fuzz_last_stage : state.fuzz_last_error);
+}
+
+static void settle_active_fuzzer_fixture_task(network_view::state_t& state) {
+    if (!state.fuzz_running.load(std::memory_order_acquire))
+        return;
+    std::string task_id;
+    {
+        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
+        task_id = state.fuzz_task_id;
+    }
+    state.fuzz_cancel_requested.store(true, std::memory_order_release);
+    state.fuzz_cv.notify_all();
+    if (!task_id.empty())
+        static_cast<void>(aida::ui::task_center::update_task(task_id,
+            aida::ui::task_center::task_state_t::interrupted,
+            state.fuzz_total.load(std::memory_order_acquire) == 0 ? 0.0f :
+                static_cast<float>(static_cast<double>(state.fuzz_progress.load(std::memory_order_acquire)) /
+                    static_cast<double>(state.fuzz_total.load(std::memory_order_acquire))),
+            "Fixture superseded", "A newer deterministic Fuzzer state replaced this fixture"));
+    state.fuzz_thread_alive.store(false, std::memory_order_release);
+    state.fuzz_thread_done.store(true, std::memory_order_release);
+    state.fuzz_running.store(false, std::memory_order_release);
+}
+
 void initialize(network_view::state_t& state) {
     s_current_state = &state;
     state.active = true;
@@ -1567,85 +1852,7 @@ void initialize(network_view::state_t& state) {
     state.pcap_written_count.store(428, std::memory_order_release);
     state.pcap_last_error.clear();
 
-    state.fuzz_config.host = "sandbox.aidapro.net";
-    state.fuzz_config.port = 443;
-    state.fuzz_config.use_tls = true;
-    state.fuzz_config.base_request = "GET /api/files/FUZZ HTTP/1.1\r\nHost: sandbox.aidapro.net\r\nAccept: application/json\r\n\r\n";
-    state.fuzz_config.payload_sets.clear();
-    network_view::payload_set_t paths;
-    paths.name = "Traversal probes";
-    paths.source = "AiDA curated payloads";
-    paths.type = 0;
-    paths.entries = { "..%2f..%2fwindows%2fwin.ini", "..%252f..%252fboot.ini", "....//....//etc/passwd" };
-    state.fuzz_config.payload_sets.push_back(std::move(paths));
-    {
-        std::lock_guard<std::mutex> lock(state.fuzz_mutex);
-        state.fuzz_result_pages.clear();
-        state.fuzz_result_pending.clear();
-        state.fuzz_retained_count = 0;
-        state.fuzz_dropped_count = 0;
-        state.fuzz_retained_bytes = 0;
-        state.fuzz_pending_bytes = 0;
-        state.fuzz_maximum_payload_columns = 1;
-        state.fuzz_has_extracted_values = false;
-        state.fuzz_has_failures = false;
-
-        std::vector<network_view::state_t::fuzzer_result_t> rows;
-        rows.push_back({ 1, 403, 312, 48, false, "Access denied", {}, { 0 }, 0, {} });
-        rows.push_back({ 2, 200, 941, 73, true, "[boot loader] timeout=30", {}, { 1 }, 0, "timeout=30" });
-        rows.push_back({ 3, 404, 129, 41, false, "Not found", {}, { 2 }, 0, {} });
-
-        std::uint64_t retained_bytes = 0;
-        for (const auto& row : rows) {
-            retained_bytes += sizeof(network_view::state_t::fuzzer_result_t) +
-                static_cast<std::uint64_t>(row.payload_indices.size()) * sizeof(std::uint32_t) +
-                static_cast<std::uint64_t>(row.response_preview.size()) +
-                static_cast<std::uint64_t>(row.extracted_value.size()) +
-                static_cast<std::uint64_t>(row.error.size());
-        }
-
-        state.fuzz_payload_catalog =
-            std::make_shared<const std::vector<std::vector<std::string>>>(
-                std::vector<std::vector<std::string>>{
-                    state.fuzz_config.payload_sets.front().entries });
-        state.fuzz_result_pending = std::move(rows);
-        state.fuzz_pending_bytes = retained_bytes;
-        state.fuzz_retained_count = static_cast<std::uint64_t>(
-            state.fuzz_result_pending.size());
-        state.fuzz_retained_bytes = retained_bytes;
-        auto page = std::make_shared<const network_view::state_t::fuzzer_result_page_t>(
-            network_view::state_t::fuzzer_result_page_t{
-                state.fuzz_result_pending, state.fuzz_pending_bytes });
-        state.fuzz_maximum_payload_columns = 1;
-        state.fuzz_has_extracted_values = true;
-
-        auto snapshot = std::make_shared<network_view::state_t::fuzzer_results_snapshot_t>();
-        snapshot->pages.push_back(std::move(page));
-        snapshot->payload_catalog = state.fuzz_payload_catalog;
-        snapshot->retained_count = state.fuzz_retained_count;
-        snapshot->dropped_count = state.fuzz_dropped_count;
-        snapshot->retained_bytes = state.fuzz_retained_bytes;
-        snapshot->generation = ++state.fuzz_results_generation;
-        snapshot->maximum_payload_columns = state.fuzz_maximum_payload_columns;
-        snapshot->has_extracted_values = state.fuzz_has_extracted_values;
-        snapshot->has_failures = state.fuzz_has_failures;
-        std::atomic_store_explicit(&state.fuzz_results_snapshot,
-            std::static_pointer_cast<const network_view::state_t::fuzzer_results_snapshot_t>(snapshot),
-            std::memory_order_release);
-
-        state.fuzz_active_config = state.fuzz_config;
-        state.fuzz_task_id.clear();
-        state.fuzz_last_stage = "Completed";
-        state.fuzz_last_error.clear();
-        state.fuzz_has_selection = true;
-    }
-    state.fuzz_selected = 1;
-    state.fuzz_running.store(false, std::memory_order_release);
-    state.fuzz_cancel_requested.store(false, std::memory_order_release);
-    state.fuzz_progress.store(3, std::memory_order_release);
-    state.fuzz_total.store(3, std::memory_order_release);
-    state.fuzz_thread_alive.store(false, std::memory_order_release);
-    state.fuzz_thread_done.store(true, std::memory_order_release);
+    apply_fuzzer_fixture(state, fixture_state_t::fuzzer_completed, 3U, false);
 
     {
         std::lock_guard<std::mutex> lock(state.ws_mutex);
@@ -1708,6 +1915,9 @@ void initialize(network_view::state_t& state) {
     record_receipt("Network preview initialized", "36 authoritative routes mounted");
     if (s_pending_fixture_valid)
         apply_fixture(state, s_pending_fixture, s_pending_cardinality);
+    if (s_pending_fuzzer_fixture_valid)
+        apply_fuzzer_fixture(state, s_pending_fuzzer_fixture,
+            s_pending_fuzzer_cardinality, true);
 }
 
 static void apply_fixture(network_view::state_t& state, fixture_state_t fixture,
@@ -1776,14 +1986,29 @@ static void apply_fixture(network_view::state_t& state, fixture_state_t fixture,
 }
 
 void configure_fixture(fixture_state_t fixture, std::size_t cardinality) {
+    if (s_current_state)
+        settle_active_fuzzer_fixture_task(*s_current_state);
     s_pending_fixture = fixture;
     s_pending_cardinality = (std::min<std::size_t>)(cardinality, 10000U);
     s_pending_fixture_valid = true;
+    s_pending_fuzzer_fixture_valid = false;
+    if (s_current_state)
+        initialize(*s_current_state);
+}
+
+void configure_fuzzer_fixture(fixture_state_t fixture, std::size_t cardinality) {
+    if (s_current_state)
+        settle_active_fuzzer_fixture_task(*s_current_state);
+    s_pending_fuzzer_fixture = fixture;
+    s_pending_fuzzer_cardinality = (std::min<std::size_t>)(cardinality, 16U);
+    s_pending_fuzzer_fixture_valid = true;
+    s_pending_fixture_valid = false;
     if (s_current_state)
         initialize(*s_current_state);
 }
 
 void shutdown(network_view::state_t& state) {
+    settle_active_fuzzer_fixture_task(state);
     if (s_current_state == &state)
         s_current_state = nullptr;
     state.conn_polling.store(false, std::memory_order_release);
@@ -1801,5 +2026,8 @@ void shutdown(network_view::state_t& state) {
 namespace aida::preview {
 void configure_network_fixture(fixture_state_t fixture, std::size_t cardinality) {
     network::configure_fixture(fixture, cardinality);
+}
+void configure_network_fuzzer_fixture(fixture_state_t fixture, std::size_t cardinality) {
+    network::configure_fuzzer_fixture(fixture, cardinality);
 }
 }

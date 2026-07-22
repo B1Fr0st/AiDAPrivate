@@ -1929,9 +1929,18 @@ bool open_selected_patch_review(static_patch_mode_t mode, std::string* error) {
     if (process && driver_bridge::attached_pid() == process->pid) {
         if (mode == static_patch_mode_t::assembly)
             return fail("No reusable standalone assembler provider is registered; use reviewed Patch Bytes or NOP Fill.");
+        const auto debugger_context = debugger_interaction::capture(
+            debugger_interaction::kind_t::instruction, runtime, 0, -1, 0,
+            static_cast<std::uint64_t>(found->length));
+        if (process->creation_time_100ns == 0 ||
+            debugger_context.target_pid != process->pid ||
+            debugger_context.process_creation_time_100ns !=
+                process->creation_time_100ns ||
+            !debugger_interaction::is_current(debugger_context))
+            return fail("The disassembly workspace process identity or debugger stop changed before patch review.");
         const bool opened = mode == static_patch_mode_t::nop_fill
-            ? debugger_view::stage_nop_review(runtime, found->length, error)
-            : debugger_view::stage_patch_review(runtime, found->length,
+            ? debugger_view::stage_nop_review(debugger_context, found->length, error)
+            : debugger_view::stage_patch_review(debugger_context, found->length,
                 "Reviewed patch from Disassembly shortcut", error);
         if (opened)
             aida::ui::application_views::open_or_focus(
@@ -2752,14 +2761,19 @@ auto make_instruction_menu(const workspace_context_t& context,
             };
         menu.actions["analysis.modify.bookmark"].capability = capability_state_t::available();
     }
-    menu.actions["analysis.navigate.graph"].invoke = [context, runtime]() {
-        goto_address(runtime, context);
-        aida::ui::application_views::open_or_focus(
-            aida::ui::stable_view_id_t("document.graph"));
-        return action_handler_result_t::completed();
-    };
     const auto function = enclosing_function_start(runtime, context);
     if (function != 0) {
+        menu.actions["analysis.navigate.graph"].invoke = [context, runtime]() {
+            goto_address(runtime, context);
+            const auto opened = aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("document.graph"));
+            return opened.ok()
+                ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(opened.detail.empty()
+                    ? "The Graph document could not be opened or focused"
+                    : opened.detail);
+        };
+        menu.actions["analysis.navigate.graph"].capability = capability_state_t::available();
         auto decompile = [context, function]() {
             pseudocode_view::request_decompile(context, function, false);
             aida::ui::application_views::open_or_focus(
@@ -2775,6 +2789,9 @@ auto make_instruction_menu(const workspace_context_t& context,
             return action_handler_result_t::completed();
         };
         menu.actions["analysis.navigate.callers"].capability = capability_state_t::available();
+    } else {
+        unavailable("analysis.navigate.graph",
+            "No recovered function contains the selected instruction");
     }
     const auto process = context.workspace->identity().process();
     if (instruction.length != 0 && file_offset) {
@@ -2804,11 +2821,20 @@ auto make_instruction_menu(const workspace_context_t& context,
         unavailable("analysis.modify.nop",
             "The selected instruction has no fully provider-backed byte range");
     }
-    if (process && driver_bridge::attached_pid() == process->pid) {
+    const auto debugger_context = debugger_interaction::capture(
+        debugger_interaction::kind_t::instruction, runtime, 0, -1, 0,
+        static_cast<std::uint64_t>(instruction.length));
+    const bool debugger_matches_workspace = process &&
+        process->creation_time_100ns != 0 &&
+        debugger_context.target_pid == process->pid &&
+        debugger_context.process_creation_time_100ns == process->creation_time_100ns &&
+        debugger_interaction::is_current(debugger_context);
+    if (debugger_matches_workspace) {
         menu.actions["analysis.modify.patch"].invoke =
-            [runtime, extent = static_cast<std::uint64_t>(instruction.length)]() {
+            [debugger_context,
+             extent = static_cast<std::uint64_t>(instruction.length)]() {
                 std::string error;
-                if (!debugger_view::stage_patch_review(runtime, extent,
+                if (!debugger_view::stage_patch_review(debugger_context, extent,
                         "Reviewed patch from Disassembly", &error))
                     return action_handler_result_t::failed(error);
                 aida::ui::application_views::open_or_focus(
@@ -2818,9 +2844,10 @@ auto make_instruction_menu(const workspace_context_t& context,
         menu.actions["analysis.modify.patch"].capability = capability_state_t::available();
         if (instruction.length != 0) {
             menu.actions["analysis.modify.nop"].invoke =
-                [runtime, extent = static_cast<std::uint64_t>(instruction.length)]() {
+                [debugger_context,
+                 extent = static_cast<std::uint64_t>(instruction.length)]() {
                     std::string error;
-                    if (!debugger_view::stage_nop_review(runtime, extent, &error))
+                    if (!debugger_view::stage_nop_review(debugger_context, extent, &error))
                         return action_handler_result_t::failed(error);
                     aida::ui::application_views::open_or_focus(
                         aida::ui::stable_view_id_t("view.debug.patches"));
@@ -2829,12 +2856,12 @@ auto make_instruction_menu(const workspace_context_t& context,
             menu.actions["analysis.modify.nop"].capability = capability_state_t::available();
         }
         const auto breakpoint_capability = debugger_view::address_mutation_capability(
-            runtime, true, process->pid);
+            debugger_context, true);
         if (breakpoint_capability.enabled) {
             menu.actions["analysis.debug.breakpoint"].invoke =
-                [runtime, pid = process->pid]() {
+                [debugger_context]() {
                     std::string error;
-                    if (!debugger_view::queue_toggle_breakpoint(runtime, pid, &error))
+                    if (!debugger_view::queue_toggle_breakpoint(debugger_context, &error))
                         return action_handler_result_t::failed(error);
                     return action_handler_result_t::completed();
                 };

@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #if defined(_MSC_VER)
@@ -17,6 +18,7 @@
 #pragma warning(disable: 4099)
 #endif
 #include "funcdata.hh"
+#include "database.hh"
 #include "fspec.hh"
 #include "opcodes.hh"
 #include "type.hh"
@@ -92,6 +94,84 @@ std::string bounded_utf8(const std::string_view input)
         index += length;
     }
     return output;
+}
+
+std::string address_symbol(const std::uint64_t address)
+{
+    std::ostringstream stream;
+    stream << "sub_" << std::hex << address;
+    return stream.str();
+}
+
+std::string symbol_name(const ghidra::Symbol* symbol)
+{
+    if (!symbol || symbol->isNameUndefined())
+        return {};
+    auto result = bounded_utf8(symbol->getDisplayName());
+    if (result.empty())
+        result = bounded_utf8(symbol->getName());
+    return result;
+}
+
+std::string varnode_symbol_name(const ghidra::Varnode* node)
+{
+    if (!node || node->isAnnotation())
+        return {};
+    if (const auto* high = node->getHigh()) {
+        auto result = symbol_name(high->getSymbol());
+        if (!result.empty())
+            return result;
+    }
+    const auto* entry = node->getSymbolEntry();
+    return entry ? symbol_name(entry->getSymbol()) : std::string{};
+}
+
+bool unknown_datatype(const ghidra::Datatype* type)
+{
+    return !type || type->getMetatype() == ghidra::TYPE_UNKNOWN;
+}
+
+std::uint8_t datatype_confidence(const ghidra::Datatype* type)
+{
+    return unknown_datatype(type) ? std::uint8_t{50} : std::uint8_t{100};
+}
+
+std::string datatype_name(const ghidra::Datatype* type)
+{
+    if (!type)
+        return "unknown";
+    auto result = bounded_utf8(type->getName());
+    if (result.empty())
+        result = bounded_utf8(type->getDisplayName());
+    if (!result.empty())
+        return result;
+    const auto size = type->getSize() > 0 ? static_cast<std::uint64_t>(type->getSize()) : 0U;
+    const auto bits = size <= (std::numeric_limits<std::uint64_t>::max)() / 8U ? size * 8U : 0U;
+    switch (type->getMetatype()) {
+    case ghidra::TYPE_VOID: return "void";
+    case ghidra::TYPE_BOOL: return "bool";
+    case ghidra::TYPE_INT: return bits == 0 ? "signed_integer" : "int" + std::to_string(bits) + "_t";
+    case ghidra::TYPE_UINT: return bits == 0 ? "unsigned_integer" : "uint" + std::to_string(bits) + "_t";
+    case ghidra::TYPE_FLOAT: return bits == 0 ? "floating_point" : "float" + std::to_string(bits);
+    case ghidra::TYPE_PTR: return bits == 0 ? "pointer" : "pointer" + std::to_string(bits);
+    case ghidra::TYPE_ARRAY: return "array";
+    case ghidra::TYPE_STRUCT: return "structure";
+    case ghidra::TYPE_UNION: return "union";
+    case ghidra::TYPE_CODE: return "function";
+    default: return bits == 0 ? "unknown" : "undefined" + std::to_string(size);
+    }
+}
+
+const ghidra::Datatype* stronger_datatype(const ghidra::Datatype* current,
+                                          const ghidra::Datatype* candidate)
+{
+    if (!candidate)
+        return current;
+    if (!current)
+        return candidate;
+    if (unknown_datatype(current) != unknown_datatype(candidate))
+        return unknown_datatype(current) ? candidate : current;
+    return candidate->typeOrder(*current) < 0 ? candidate : current;
 }
 
 struct artifact_reader_t {
@@ -405,7 +485,10 @@ hir_semantics_t hir_semantics(const capture_value_t& value,
         break;
     case ghidra::CPUI_CALL:
     case ghidra::CPUI_CALLIND:
-        result.supported = !value.operand_ids.empty();
+        result.operands.clear();
+        if (value.operand_ids.size() > 1)
+            result.operands.assign(value.operand_ids.begin() + 1, value.operand_ids.end());
+        result.supported = !value.operand_ids.empty() && !value.stable_symbol.empty();
         break;
     case ghidra::CPUI_RETURN:
         result.operands.clear();
@@ -447,6 +530,145 @@ hir_semantics_t hir_semantics(const capture_value_t& value,
             "_" + std::to_string(value.id);
     }
     return result;
+}
+
+bool generated_local_name(const std::string_view value) noexcept
+{
+    constexpr std::string_view prefix = "local_";
+    if (value.size() <= prefix.size() || value.substr(0, prefix.size()) != prefix)
+        return false;
+    for (std::size_t index = prefix.size(); index < value.size(); ++index) {
+        if (value[index] < '0' || value[index] > '9')
+            return false;
+    }
+    return true;
+}
+
+bool native_liveness_root(const capture_value_t& value,
+                          const provider_ir_opcode_t opcode,
+                          const bool exception_block) noexcept
+{
+    if (exception_block && value.kind == capture_value_kind_t::pcode) {
+        switch (value.pcode_opcode) {
+        case ghidra::CPUI_INT_DIV:
+        case ghidra::CPUI_INT_SDIV:
+        case ghidra::CPUI_INT_REM:
+        case ghidra::CPUI_INT_SREM:
+            return true;
+        default:
+            break;
+        }
+    }
+    switch (opcode) {
+    case provider_ir_opcode_t::parameter:
+    case provider_ir_opcode_t::load:
+    case provider_ir_opcode_t::store:
+    case provider_ir_opcode_t::field_store:
+    case provider_ir_opcode_t::array_store:
+    case provider_ir_opcode_t::call:
+    case provider_ir_opcode_t::indirect_call:
+    case provider_ir_opcode_t::branch:
+    case provider_ir_opcode_t::conditional_branch:
+    case provider_ir_opcode_t::switch_branch:
+    case provider_ir_opcode_t::return_value:
+    case provider_ir_opcode_t::throw_value:
+    case provider_ir_opcode_t::monitor_enter:
+    case provider_ir_opcode_t::monitor_exit:
+        return true;
+    case provider_ir_opcode_t::local:
+        return !value.stable_symbol.empty() && !generated_local_name(value.stable_symbol);
+    case provider_ir_opcode_t::unknown:
+        return value.kind == capture_value_kind_t::pcode &&
+            (value.pcode_opcode == ghidra::CPUI_CALLOTHER ||
+             value.pcode_opcode == ghidra::CPUI_INDIRECT ||
+             value.pcode_opcode == ghidra::CPUI_NEW);
+    case provider_ir_opcode_t::constant:
+    case provider_ir_opcode_t::copy:
+    case provider_ir_opcode_t::unary:
+    case provider_ir_opcode_t::binary:
+    case provider_ir_opcode_t::cast:
+    case provider_ir_opcode_t::field_load:
+    case provider_ir_opcode_t::array_load:
+    case provider_ir_opcode_t::phi:
+        return false;
+    }
+    return true;
+}
+
+std::unordered_set<std::uint64_t> native_live_value_ids(const capture_t& capture)
+{
+    std::unordered_map<std::uint64_t, const capture_value_t*> values;
+    std::size_t value_count = 0;
+    for (const auto& block : capture.blocks)
+        value_count += block.values.size();
+    values.reserve(value_count);
+    for (const auto& block : capture.blocks) {
+        for (const auto& value : block.values)
+            values.emplace(value.id, &value);
+    }
+
+    std::unordered_set<std::uint64_t> live;
+    live.reserve(value_count);
+    std::vector<std::uint64_t> pending;
+    pending.reserve(value_count);
+    const auto seed = [&live, &pending](const std::uint64_t id) {
+        if (id != 0 && live.insert(id).second)
+            pending.push_back(id);
+    };
+    for (const auto& block : capture.blocks) {
+        const bool exception_block = !block.exception_successor_ids.empty();
+        bool has_root = false;
+        std::uint64_t last_id = 0;
+        for (const auto& value : block.values) {
+            bool supported = false;
+            const auto opcode = provider_opcode(value, supported);
+            if (native_liveness_root(value, opcode, exception_block)) {
+                seed(value.id);
+                has_root = true;
+            }
+            last_id = (std::max)(last_id, value.id);
+        }
+        if (!has_root)
+            seed(last_id);
+    }
+    while (!pending.empty()) {
+        const auto id = pending.back();
+        pending.pop_back();
+        const auto value = values.find(id);
+        if (value == values.end())
+            continue;
+        bool supported = false;
+        const auto opcode = provider_opcode(*value->second, supported);
+        const auto semantics = hir_semantics(*value->second, opcode, supported);
+        if (!semantics.supported)
+            continue;
+        for (const auto operand : semantics.operands)
+            seed(operand);
+    }
+    return live;
+}
+
+void retain_live_native_hir(const std::unordered_set<std::uint64_t>& live,
+                            hir_function_t& hir)
+{
+    std::unordered_set<std::uint64_t> live_types;
+    live_types.reserve(live.size() + hir.parameters.size() + 1U);
+    live_types.insert(hir.return_type_id);
+    for (const auto& parameter : hir.parameters)
+        live_types.insert(parameter.type_id);
+    for (auto& block : hir.blocks) {
+        block.values.erase(std::remove_if(block.values.begin(), block.values.end(),
+            [&live](const hir_value_t& value) {
+                return live.find(value.id) == live.end();
+            }), block.values.end());
+        for (const auto& value : block.values)
+            live_types.insert(value.type_id);
+    }
+    hir.locals.erase(std::remove_if(hir.locals.begin(), hir.locals.end(),
+        [&live_types](const hir_variable_t& local) {
+            return generated_local_name(local.stable_name) &&
+                live_types.find(local.type_id) == live_types.end();
+        }), hir.locals.end());
 }
 
 bool sorted_unique(std::vector<std::uint64_t>& ids)
@@ -498,7 +720,7 @@ extraction_result_t normalize(const capture_t& capture)
     type_graph.entity = capture.request.entity;
     type_graph.revision = capture.request.type_graph_revision;
     for (const auto& type : types) {
-        if (type.id == 0 || type_ids.find(type.id) != type_ids.end()) {
+        if (type.id == 0 || type.confidence > 100 || type_ids.find(type.id) != type_ids.end()) {
             fail(decompiler_diagnostic_code_t::malformed_type_graph, "ghidra_ir.capture.type_id");
             return result;
         }
@@ -512,8 +734,9 @@ extraction_result_t normalize(const capture_t& capture)
         node.byte_size = type.byte_size;
         node.alignment = type.alignment == 0 ? 1U : type.alignment;
         node.is_signed = type.is_signed;
-        node.confidence = type.kind == decompiler_type_kind_t::unknown ? 50U : 100U;
-        node.provenance = decompiler_fact_provenance_t::provider_semantics;
+        node.confidence = type.kind == decompiler_type_kind_t::unknown
+            ? (std::min)(type.confidence, std::uint8_t{50}) : type.confidence;
+        node.provenance = type.provenance;
         node.coordinates.push_back(coordinate(capture.request, decompiler_coordinate_layer_t::provider_ir,
             std::get<native_decompiler_entity_identity_t>(capture.request.entity.identity).entry.value));
         type_graph.nodes.push_back(std::move(node));
@@ -523,7 +746,7 @@ extraction_result_t normalize(const capture_t& capture)
         const auto source = type_ids.find(type.id);
         for (const auto& edge : type.edges) {
             const auto target = type_ids.find(edge.target_type_id);
-            if (source == type_ids.end() || target == type_ids.end()) {
+            if (source == type_ids.end() || target == type_ids.end() || edge.confidence > 100) {
                 fail(decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.capture.type_edge");
                 return result;
             }
@@ -534,8 +757,8 @@ extraction_result_t normalize(const capture_t& capture)
             normalized.stable_name = edge.stable_name.empty() ? "ghidra.type.edge." + std::to_string(edge_ordinal) : edge.stable_name;
             normalized.byte_offset = edge.byte_offset;
             normalized.ordinal = edge_ordinal++;
-            normalized.confidence = 100;
-            normalized.provenance = decompiler_fact_provenance_t::provider_semantics;
+            normalized.confidence = edge.confidence;
+            normalized.provenance = edge.provenance;
             type_graph.edges.push_back(std::move(normalized));
         }
     }
@@ -543,6 +766,17 @@ extraction_result_t normalize(const capture_t& capture)
     if (return_type == type_ids.end()) {
         fail(decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.capture.return_type");
         return result;
+    }
+    if (capture.request.function_type_id != 0) {
+        const auto function_type = type_ids.find(capture.request.function_type_id);
+        const auto source_type = std::find_if(types.begin(), types.end(), [&capture](const capture_type_t& type) {
+            return type.id == capture.request.function_type_id;
+        });
+        if (function_type == type_ids.end() || source_type == types.end() ||
+            source_type->kind != decompiler_type_kind_t::function) {
+            fail(decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.capture.function_type");
+            return result;
+        }
     }
 
     std::vector<capture_block_t> blocks = capture.blocks;
@@ -566,6 +800,7 @@ extraction_result_t normalize(const capture_t& capture)
         fail(decompiler_diagnostic_code_t::malformed_provider_ir, "ghidra_ir.capture.entry");
         return result;
     }
+    const auto live_native_values = native_live_value_ids(capture);
 
     provider_ir_t provider_ir;
     provider_ir.provider = capture.request.provider;
@@ -599,7 +834,8 @@ extraction_result_t normalize(const capture_t& capture)
         std::sort(hir_block.successor_ids.begin(), hir_block.successor_ids.end());
         std::sort(hir_block.exception_successor_ids.begin(), hir_block.exception_successor_ids.end());
         for (const auto& value : block.values) {
-            if (value.id == 0 || value.id <= previous_value_id || type_ids.find(value.type_id) == type_ids.end()) {
+            if (value.id == 0 || value.id <= previous_value_id || value.confidence > 100 ||
+                type_ids.find(value.type_id) == type_ids.end()) {
                 fail(decompiler_diagnostic_code_t::malformed_provider_ir, "ghidra_ir.capture.value");
                 return result;
             }
@@ -614,20 +850,23 @@ extraction_result_t normalize(const capture_t& capture)
             provider_value.stable_immediate = value.stable_immediate;
             provider_value.stable_symbol = value.stable_symbol;
             provider_value.coordinate = coordinate(capture.request, decompiler_coordinate_layer_t::provider_ir, value.address);
-            provider_value.confidence = supported ? 100U : 50U;
-            provider_value.provenance = decompiler_fact_provenance_t::provider_semantics;
+            provider_value.confidence = supported ? value.confidence : (std::min)(value.confidence, std::uint8_t{50});
+            provider_value.provenance = value.provenance;
             provider_block.values.push_back(provider_value);
             const auto semantics = hir_semantics(value, opcode, supported);
-            hir_value_t hir_value;
-            hir_value.id = value.id;
-            hir_value.kind = semantics.kind;
-            hir_value.type_id = provider_value.type_id;
-            hir_value.operand_ids = semantics.operands;
-            hir_value.stable_value = semantics.stable_value;
-            hir_value.coordinate = coordinate(capture.request, decompiler_coordinate_layer_t::hir, value.address);
-            hir_value.confidence = semantics.supported ? provider_value.confidence : 0U;
-            hir_value.provenance = provider_value.provenance;
-            hir_block.values.push_back(std::move(hir_value));
+            const bool live_hir_value = live_native_values.find(value.id) != live_native_values.end();
+            if (live_hir_value) {
+                hir_value_t hir_value;
+                hir_value.id = value.id;
+                hir_value.kind = semantics.kind;
+                hir_value.type_id = provider_value.type_id;
+                hir_value.operand_ids = semantics.operands;
+                hir_value.stable_value = semantics.stable_value;
+                hir_value.coordinate = coordinate(capture.request, decompiler_coordinate_layer_t::hir, value.address);
+                hir_value.confidence = semantics.supported ? provider_value.confidence : 0U;
+                hir_value.provenance = provider_value.provenance;
+                hir_block.values.push_back(std::move(hir_value));
+            }
             if (!semantics.supported) {
                 decompiler_unknown_t provider_unknown;
                 provider_unknown.reason = decompiler_unknown_reason_t::unsupported_instruction;
@@ -636,13 +875,35 @@ extraction_result_t normalize(const capture_t& capture)
                 provider_unknown.confidence = 0;
                 provider_unknown.provenance = decompiler_fact_provenance_t::provider_semantics;
                 provider_ir.unknowns.push_back(provider_unknown);
-                decompiler_unknown_t hir_unknown = provider_unknown;
-                hir_unknown.coordinate.layer = decompiler_coordinate_layer_t::hir;
-                hir.unknowns.push_back(std::move(hir_unknown));
                 provider_ir.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::warning,
                     decompiler_diagnostic_code_t::unsupported_provider, "ghidra_ir.unsupported_pcode", provider_diagnostic_ordinal++));
-                hir.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::warning,
-                    decompiler_diagnostic_code_t::unsupported_provider, "ghidra_ir.unsupported_pcode", hir_diagnostic_ordinal++));
+                if (live_hir_value) {
+                    decompiler_unknown_t hir_unknown = provider_unknown;
+                    hir_unknown.coordinate.layer = decompiler_coordinate_layer_t::hir;
+                    hir.unknowns.push_back(std::move(hir_unknown));
+                    hir.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::warning,
+                        decompiler_diagnostic_code_t::unsupported_provider, "ghidra_ir.unsupported_pcode", hir_diagnostic_ordinal++));
+                }
+            }
+            if (value.unresolved_reference) {
+                decompiler_unknown_t provider_unknown;
+                provider_unknown.reason = decompiler_unknown_reason_t::unresolved_reference;
+                provider_unknown.stable_token = "ghidra.call.unresolved." + std::to_string(value.id);
+                provider_unknown.coordinate = provider_value.coordinate;
+                provider_unknown.confidence = 0;
+                provider_unknown.provenance = value.provenance;
+                provider_ir.unknowns.push_back(provider_unknown);
+                provider_ir.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::warning,
+                    decompiler_diagnostic_code_t::unresolved_symbol, "ghidra_ir.unresolved_call_target",
+                    provider_diagnostic_ordinal++));
+                if (live_hir_value) {
+                    decompiler_unknown_t hir_unknown = provider_unknown;
+                    hir_unknown.coordinate.layer = decompiler_coordinate_layer_t::hir;
+                    hir.unknowns.push_back(std::move(hir_unknown));
+                    hir.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::warning,
+                        decompiler_diagnostic_code_t::unresolved_symbol, "ghidra_ir.unresolved_call_target",
+                        hir_diagnostic_ordinal++));
+                }
             }
         }
         provider_ir.source_coordinates.push_back(provider_block.coordinate);
@@ -657,7 +918,7 @@ extraction_result_t normalize(const capture_t& capture)
     std::uint64_t local_id = 1;
     for (const auto& high : highs) {
         const auto type = type_ids.find(high.type_id);
-        if (high.id == 0 || type == type_ids.end()) {
+        if (high.id == 0 || high.confidence > 100 || type == type_ids.end()) {
             fail(decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.capture.high_variable");
             return result;
         }
@@ -666,13 +927,14 @@ extraction_result_t normalize(const capture_t& capture)
         variable.stable_name = high.stable_name.empty() ? "high_" + std::to_string(high.id) : high.stable_name;
         variable.type_id = type->second;
         variable.coordinate = coordinate(capture.request, decompiler_coordinate_layer_t::hir, high.address);
-        variable.confidence = 100;
-        variable.provenance = decompiler_fact_provenance_t::provider_semantics;
+        variable.confidence = high.confidence;
+        variable.provenance = high.provenance;
         if (high.parameter)
             hir.parameters.push_back(std::move(variable));
         else
             hir.locals.push_back(std::move(variable));
     }
+    retain_live_native_hir(live_native_values, hir);
     hir.provider_ir_hash = stable_serialization_hash(provider_ir);
 
     const auto provider_validation = validate_provider_ir(provider_ir);
@@ -695,8 +957,13 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
     if (auto* native = std::get_if<native_decompiler_entity_identity_t>(
             &capture.request.entity.identity)) {
         native->canonical_symbol = bounded_utf8(native->canonical_symbol);
-        if (native->canonical_symbol.empty())
-            native->canonical_symbol = "sub_" + std::to_string(native->entry.value);
+        if (native->canonical_symbol.empty()) {
+            native->canonical_symbol = bounded_utf8(function.getDisplayName());
+            if (native->canonical_symbol.empty())
+                native->canonical_symbol = bounded_utf8(function.getName());
+            if (native->canonical_symbol.empty())
+                native->canonical_symbol = address_symbol(native->entry.value);
+        }
     }
     const auto* native_entity = std::get_if<native_decompiler_entity_identity_t>(
         &capture.request.entity.identity);
@@ -722,24 +989,28 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         return address < runtime_entry ? native_entity->entry.value : normalized;
     };
     std::map<const ghidra::Datatype*, std::uint64_t> types;
+    std::uint64_t next_type_id = 1;
     std::function<std::uint64_t(const ghidra::Datatype*)> ensure_type;
-    ensure_type = [&capture, &types, &ensure_type](const ghidra::Datatype* type) {
+    ensure_type = [&capture, &types, &next_type_id, &ensure_type](const ghidra::Datatype* type) {
         if (!type)
             return std::uint64_t{0};
         const auto found = types.find(type);
         if (found != types.end())
             return found->second;
-        const auto id = static_cast<std::uint64_t>(types.size() + 1U);
+        const auto id = next_type_id++;
         types.emplace(type, id);
         capture_type_t value;
         value.id = id;
         value.kind = type_kind(type);
-        value.canonical_name = bounded_utf8(type->getName());
+        value.canonical_name = datatype_name(type);
         value.display_name = bounded_utf8(type->getDisplayName());
+        if (value.display_name.empty())
+            value.display_name = value.canonical_name;
         if (type->getSize() > 0)
             value.byte_size = static_cast<std::uint64_t>(type->getSize());
         value.alignment = type->getAlignment() > 0 ? static_cast<std::uint32_t>(type->getAlignment()) : 1U;
         value.is_signed = type->getMetatype() == ghidra::TYPE_INT;
+        value.confidence = datatype_confidence(type);
         capture.types.push_back(std::move(value));
         const auto append_edge = [&](const ghidra::Datatype* target,
                                      const decompiler_type_edge_kind_t kind,
@@ -795,10 +1066,25 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             const auto* prototype = code->getPrototype();
             if (prototype) {
                 append_edge(prototype->getOutputType(), decompiler_type_edge_kind_t::return_type, "return");
+                std::string signature = datatype_name(prototype->getOutputType()) + "(";
                 for (ghidra::int4 index = 0; index < prototype->numParams(); ++index) {
                     const auto* parameter = prototype->getParam(index);
                     append_edge(parameter ? parameter->getType() : nullptr,
                         decompiler_type_edge_kind_t::parameter, "parameter." + std::to_string(index));
+                    if (index != 0)
+                        signature.push_back(',');
+                    signature += datatype_name(parameter ? parameter->getType() : nullptr);
+                }
+                if (prototype->isDotdotdot()) {
+                    if (prototype->numParams() != 0)
+                        signature.push_back(',');
+                    signature += "...";
+                }
+                signature.push_back(')');
+                auto& source = capture.types.at(static_cast<std::size_t>(id - 1U));
+                if (source.canonical_name == "code" || source.canonical_name == "function") {
+                    source.canonical_name = bounded_utf8(signature);
+                    source.display_name = source.canonical_name;
                 }
             }
             return id;
@@ -808,14 +1094,92 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
                 "dependency." + std::to_string(index));
         return id;
     };
-    capture.request.return_type_id = ensure_type(function.getFuncProto().getOutputType());
+    std::map<std::string, std::uint64_t> prototype_types;
+    const auto type_name_for_id = [&capture](const std::uint64_t id) {
+        if (id == 0 || id > capture.types.size())
+            return std::string{"unknown"};
+        return capture.types.at(static_cast<std::size_t>(id - 1U)).canonical_name;
+    };
+    const auto append_prototype = [&capture, &ensure_type, &next_type_id, &prototype_types,
+                                   &type_name_for_id](const ghidra::FuncProto& prototype,
+                                                     std::string identity,
+                                                     const ghidra::Datatype* output_override = nullptr) {
+        const auto* output_type = output_override ? output_override : prototype.getOutputType();
+        const auto return_type_id = ensure_type(output_type);
+        if (return_type_id == 0)
+            return std::uint64_t{0};
+        std::vector<std::pair<std::uint64_t, std::string>> parameters;
+        parameters.reserve(static_cast<std::size_t>((std::max)(prototype.numParams(), ghidra::int4{0})));
+        std::uint8_t confidence = prototype.hasInputErrors() || prototype.hasOutputErrors()
+            ? std::uint8_t{50} : std::uint8_t{100};
+        confidence = (std::min)(confidence, datatype_confidence(output_type));
+        std::string signature = type_name_for_id(return_type_id) + "(";
+        for (ghidra::int4 index = 0; index < prototype.numParams(); ++index) {
+            const auto* parameter = prototype.getParam(index);
+            const auto* parameter_type = parameter ? parameter->getType() : nullptr;
+            const auto parameter_type_id = ensure_type(parameter_type);
+            confidence = (std::min)(confidence, datatype_confidence(parameter_type));
+            if (index != 0)
+                signature.push_back(',');
+            signature += parameter_type_id == 0 ? "unknown" : type_name_for_id(parameter_type_id);
+            if (parameter_type_id != 0) {
+                auto name = parameter ? bounded_utf8(parameter->getName()) : std::string{};
+                if (name.empty())
+                    name = "parameter." + std::to_string(index);
+                parameters.emplace_back(parameter_type_id, std::move(name));
+            }
+        }
+        if (prototype.isDotdotdot()) {
+            if (prototype.numParams() != 0)
+                signature.push_back(',');
+            signature += "...";
+        }
+        signature.push_back(')');
+        identity = bounded_utf8(identity);
+        if (identity.empty())
+            identity = "function";
+        const auto canonical_name = bounded_utf8(identity + ":" + signature);
+        if (const auto found = prototype_types.find(canonical_name); found != prototype_types.end())
+            return found->second;
+        const auto id = next_type_id++;
+        prototype_types.emplace(canonical_name, id);
+        capture_type_t value;
+        value.id = id;
+        value.kind = decompiler_type_kind_t::function;
+        value.canonical_name = canonical_name;
+        value.display_name = bounded_utf8(identity + " " + signature);
+        value.alignment = 1;
+        value.confidence = confidence;
+        value.provenance = decompiler_fact_provenance_t::call_signature;
+        value.edges.push_back({return_type_id, decompiler_type_edge_kind_t::return_type, "return",
+            std::nullopt, confidence, decompiler_fact_provenance_t::call_signature});
+        for (std::size_t index = 0; index < parameters.size(); ++index) {
+            value.edges.push_back({parameters[index].first, decompiler_type_edge_kind_t::parameter,
+                parameters[index].second, std::nullopt, confidence,
+                decompiler_fact_provenance_t::call_signature});
+        }
+        capture.types.push_back(std::move(value));
+        return id;
+    };
+    const auto* recovered_return_type = function.getFuncProto().getOutputType();
+    const auto* void_type = function.getArch() && function.getArch()->types
+        ? function.getArch()->types->getTypeVoid() : nullptr;
+    struct call_site_capture_t {
+        std::string stable_symbol;
+        const ghidra::Datatype* result_type = nullptr;
+        std::uint8_t confidence = 50;
+        bool unresolved_reference = true;
+    };
     std::map<std::uint64_t, capture_block_t> blocks;
     std::map<const ghidra::PcodeOp*, std::uint64_t> operation_ids;
     std::map<std::uint64_t, std::vector<const ghidra::PcodeOp*>> operations_by_block;
     std::map<const ghidra::Varnode*, std::uint64_t> input_ids;
     std::map<const ghidra::Varnode*, std::string> input_symbols;
+    std::map<const ghidra::Varnode*, const ghidra::Datatype*> input_types;
+    std::map<const ghidra::PcodeOp*, call_site_capture_t> call_sites;
     std::map<const ghidra::Varnode*, std::uint64_t> defined_ids;
     std::map<const ghidra::HighVariable*, std::uint64_t> high_ids;
+    std::map<std::uint64_t, std::set<std::uint64_t>> high_value_ids;
     std::map<std::uint64_t, std::pair<std::uint64_t, bool>> conditional_edges;
     std::uint64_t next_value_id = 1;
     const auto associated_high = [](const ghidra::Varnode* node)
@@ -833,6 +1197,33 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         if (!high)
             return definition_facing ? node->getTypeDefFacing() : node->getType();
         return definition_facing ? node->getHighTypeDefFacing() : high->getType();
+    };
+    const auto read_type = [&associated_high, &value_type](const ghidra::Varnode* node,
+                                                           const ghidra::PcodeOp* operation) {
+        if (!node || node->isAnnotation() || !operation)
+            return value_type(node, false);
+        const auto* high = associated_high(node);
+        const auto* facing = high ? node->getHighTypeReadFacing(operation)
+                                  : node->getTypeReadFacing(operation);
+        return stronger_datatype(value_type(node, false), facing);
+    };
+    const auto formal_parameter = [&function, &associated_high](const ghidra::Varnode* node)
+        -> const ghidra::ProtoParameter* {
+        if (!node)
+            return nullptr;
+        const auto* high = associated_high(node);
+        const auto* input = high && high->isInput() ? high->getInputVarnode() :
+            (node->isInput() ? node : nullptr);
+        if (!input)
+            return nullptr;
+        const auto& prototype = function.getFuncProto();
+        for (ghidra::int4 index = 0; index < prototype.numParams(); ++index) {
+            const auto* parameter = prototype.getParam(index);
+            if (parameter && parameter->getSize() == input->getSize() &&
+                parameter->getAddress() == input->getAddr())
+                return parameter;
+        }
+        return nullptr;
     };
     const auto& graph = function.getBasicBlocks();
     for (ghidra::int4 index = 0; index < graph.getSize(); ++index) {
@@ -858,21 +1249,83 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             continue;
         operation_ids.emplace(operation, 0);
         operations_by_block[block_id].push_back(operation);
-        if (operation->code() == ghidra::CPUI_CALL && operation->numInput() > 0) {
+        if ((operation->code() == ghidra::CPUI_CALL || operation->code() == ghidra::CPUI_CALLIND) &&
+            operation->numInput() > 0) {
             const auto* target = operation->getIn(0);
             const auto* specification = function.getCallSpecs(operation);
-            if (target && specification) {
-                auto name = bounded_utf8(specification->getName());
-                if (name.empty())
-                    name = "sub_" + std::to_string(specification->getEntryAddress().getOffset());
-                input_symbols[target] = std::move(name);
+            call_site_capture_t site;
+            const bool direct = operation->code() == ghidra::CPUI_CALL;
+            const auto target_symbol = varnode_symbol_name(target);
+            if (specification) {
+                site.result_type = specification->getOutputType();
+                if (const auto* callee = specification->getFuncdata()) {
+                    site.stable_symbol = bounded_utf8(callee->getDisplayName());
+                    if (site.stable_symbol.empty())
+                        site.stable_symbol = bounded_utf8(callee->getName());
+                    site.unresolved_reference = false;
+                }
+                if (site.stable_symbol.empty())
+                    site.stable_symbol = bounded_utf8(specification->getName());
+                if (site.stable_symbol.empty() && !specification->getEntryAddress().isInvalid())
+                    site.stable_symbol = address_symbol(specification->getEntryAddress().getOffset());
             }
+            if (direct) {
+                if (site.stable_symbol.empty() && !target_symbol.empty())
+                    site.stable_symbol = target_symbol;
+                if (site.stable_symbol.empty() && target && target->isConstant())
+                    site.stable_symbol = address_symbol(target->getOffset());
+                site.unresolved_reference = !target || site.stable_symbol.empty();
+            } else if (site.unresolved_reference) {
+                if (!target_symbol.empty())
+                    site.stable_symbol = "*" + target_symbol;
+                if (site.stable_symbol.empty())
+                    site.stable_symbol = "indirect@" + address_symbol(
+                        code_coordinate(operation->getSeqNum().getAddr().getOffset()));
+            }
+            site.confidence = site.unresolved_reference ? std::uint8_t{50} : std::uint8_t{100};
+            if (site.result_type)
+                site.confidence = (std::min)(site.confidence, datatype_confidence(site.result_type));
+            if (specification)
+                (void)append_prototype(*specification, site.stable_symbol);
+            if (target) {
+                if (!target_symbol.empty())
+                    input_symbols[target] = target_symbol;
+                else if (direct && !site.stable_symbol.empty())
+                    input_symbols[target] = site.stable_symbol;
+            }
+            call_sites.emplace(operation, std::move(site));
+        }
+        if (operation->code() == ghidra::CPUI_RETURN && operation->numInput() > 1 &&
+            !function.getFuncProto().isOutputLocked()) {
+            recovered_return_type = stronger_datatype(recovered_return_type,
+                read_type(operation->getIn(1), operation));
+        }
+        for (ghidra::int4 index = 0; index < operation->numInput(); ++index) {
+            const auto* input = operation->getIn(index);
+            if (!input || input->isAnnotation())
+                continue;
+            const auto candidate = read_type(input, operation);
+            const auto found = input_types.find(input);
+            if (found == input_types.end())
+                input_types.emplace(input, candidate);
+            else
+                found->second = stronger_datatype(found->second, candidate);
         }
     }
     if (operation_ids.empty()) {
         extraction_result_t result;
         result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
             decompiler_diagnostic_code_t::provider_failure, "ghidra_ir.empty_pcode", 1));
+        return result;
+    }
+    capture.request.return_type_id = ensure_type(recovered_return_type);
+    capture.request.function_type_id = append_prototype(function.getFuncProto(),
+        native_entity ? native_entity->canonical_symbol : bounded_utf8(function.getDisplayName()),
+        recovered_return_type);
+    if (capture.request.return_type_id == 0 || capture.request.function_type_id == 0) {
+        extraction_result_t result;
+        result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.function_prototype", 1));
         return result;
     }
     const auto entry_block = operations_by_block.begin()->first;
@@ -902,43 +1355,81 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             }
         }
     }
-    const auto collect_high = [&capture, &high_ids, &ensure_type, &associated_high,
-                               native_entity, &code_coordinate, runtime_entry](
-                               const ghidra::Varnode* node) {
+    const auto collect_high = [&capture, &high_ids, &high_value_ids, &ensure_type, &associated_high,
+                               &formal_parameter, native_entity, &code_coordinate, runtime_entry](
+                               const ghidra::Varnode* node,
+                               const std::uint64_t value_id) {
+        if (!node || node->isAnnotation() || node->isConstant())
+            return true;
         const auto* high = associated_high(node);
         if (!high)
             return true;
-        if (high_ids.find(high) != high_ids.end())
+        if (const auto found = high_ids.find(high); found != high_ids.end()) {
+            high_value_ids[found->second].insert(value_id);
             return true;
-        const auto type_id = ensure_type(high->getType());
+        }
+        const bool is_parameter = high->isInput();
+        const auto* parameter = is_parameter ? formal_parameter(node) : nullptr;
+        const auto* recovered_type = parameter ? parameter->getType() : high->getType();
+        const auto type_id = ensure_type(recovered_type);
         if (type_id == 0)
             return false;
         const auto id = static_cast<std::uint64_t>(high_ids.size() + 1U);
         high_ids.emplace(high, id);
+        high_value_ids[id].insert(value_id);
         capture_high_variable_t variable;
         variable.id = id;
-        variable.parameter = high->isInput();
-        variable.stable_name = "high_" + std::to_string(id);
+        variable.parameter = is_parameter;
+        variable.stable_name = symbol_name(high->getSymbol());
+        if (variable.stable_name.empty() && parameter)
+            variable.stable_name = bounded_utf8(parameter->getName());
+        if (variable.stable_name.empty()) {
+            variable.stable_name = (is_parameter ? "parameter_" : "local_") + std::to_string(id);
+            variable.confidence = (std::min)(datatype_confidence(recovered_type), std::uint8_t{75});
+        } else {
+            variable.confidence = datatype_confidence(recovered_type);
+        }
+        variable.provenance = parameter ? decompiler_fact_provenance_t::call_signature
+                                        : decompiler_fact_provenance_t::provider_semantics;
         variable.type_id = type_id;
         variable.address = native_entity ? native_entity->entry.value : code_coordinate(runtime_entry);
         capture.high_variables.push_back(std::move(variable));
         return true;
     };
-    for (const auto& pair : input_ids) {
+    std::vector<std::pair<const ghidra::Varnode*, std::uint64_t>> ordered_inputs(input_ids.begin(), input_ids.end());
+    std::sort(ordered_inputs.begin(), ordered_inputs.end(), [](const auto& left, const auto& right) {
+        return left.second < right.second;
+    });
+    for (const auto& pair : ordered_inputs) {
         const auto* input = pair.first;
         capture_value_t value;
         value.id = pair.second;
         value.kind = input->isConstant() ? capture_value_kind_t::constant :
             (input->isInput() ? capture_value_kind_t::parameter : capture_value_kind_t::local);
-        value.type_id = ensure_type(value_type(input, false));
-        if (value.type_id == 0)
-            value.type_id = ensure_type(input->getType());
+        const auto* parameter = formal_parameter(input);
+        const auto input_type = input_types.find(input);
+        const ghidra::Datatype* recovered_type = parameter ? parameter->getType()
+            : (input_type != input_types.end() ? input_type->second : value_type(input, false));
+        value.type_id = ensure_type(recovered_type);
+        if (value.type_id == 0) {
+            recovered_type = input->getType();
+            value.type_id = ensure_type(recovered_type);
+        }
         value.address = native_entity ? native_entity->entry.value : code_coordinate(runtime_entry);
         value.stable_immediate = input->isConstant() ? std::to_string(input->getOffset()) : std::string{};
-        if (const auto symbol = input_symbols.find(input); symbol != input_symbols.end())
+        if (const auto symbol = input_symbols.find(input); symbol != input_symbols.end()) {
             value.stable_symbol = symbol->second;
+            value.provenance = decompiler_fact_provenance_t::call_signature;
+        } else {
+            value.stable_symbol = varnode_symbol_name(input);
+            if (value.stable_symbol.empty() && parameter)
+                value.stable_symbol = bounded_utf8(parameter->getName());
+            value.provenance = parameter ? decompiler_fact_provenance_t::call_signature
+                                         : decompiler_fact_provenance_t::provider_semantics;
+        }
+        value.confidence = datatype_confidence(recovered_type);
         entry->second.values.push_back(std::move(value));
-        if (!collect_high(input)) {
+        if (!collect_high(input, pair.second)) {
             extraction_result_t result;
             result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
                 decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.input_varnode_type", 1));
@@ -962,9 +1453,17 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
                     decompiler_diagnostic_code_t::malformed_provider_ir, "ghidra_ir.output_varnode_binding", 1));
                 return result;
             }
-            value.type_id = ensure_type(output ? value_type(output, true) : function.getFuncProto().getOutputType());
-            if (value.type_id == 0)
-                value.type_id = ensure_type(output ? output->getTypeDefFacing() : function.getFuncProto().getOutputType());
+            const auto call_site = call_sites.find(operation);
+            const ghidra::Datatype* operation_type = output ? value_type(output, true) : nullptr;
+            if (!operation_type && call_site != call_sites.end())
+                operation_type = call_site->second.result_type;
+            if (!operation_type && operation->code() == ghidra::CPUI_RETURN)
+                operation_type = recovered_return_type;
+            if (!operation_type)
+                operation_type = void_type;
+            value.type_id = ensure_type(operation_type);
+            if (value.type_id == 0 && output)
+                value.type_id = ensure_type(output->getTypeDefFacing());
             if (value.type_id == 0) {
                 extraction_result_t result;
                 result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
@@ -987,31 +1486,39 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
                 }
                 value.stable_symbol = "condition.true=" + std::to_string(true_id) +
                     ";negated=" + (operation->isBooleanFlip() ? "1" : "0");
+            } else if (call_site != call_sites.end()) {
+                value.stable_symbol = call_site->second.stable_symbol;
+                value.confidence = call_site->second.confidence;
+                value.provenance = decompiler_fact_provenance_t::call_signature;
+                value.unresolved_reference = call_site->second.unresolved_reference;
             } else {
                 value.stable_symbol = ghidra::get_opname(operation->code());
+                value.confidence = datatype_confidence(operation_type);
             }
             for (ghidra::int4 index = 0; index < operation->numInput(); ++index) {
                 const auto* input = operation->getIn(index);
                 if (!input)
                     continue;
+                std::uint64_t input_value_id = 0;
                 if (const auto defined = defined_ids.find(input); defined != defined_ids.end()) {
-                    value.operand_ids.push_back(defined->second);
+                    input_value_id = defined->second;
                 } else if (const auto input_id = input_ids.find(input); input_id != input_ids.end()) {
-                    value.operand_ids.push_back(input_id->second);
+                    input_value_id = input_id->second;
                 } else {
                     extraction_result_t result;
                     result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
                         decompiler_diagnostic_code_t::malformed_provider_ir, "ghidra_ir.input_varnode_binding", 1));
                     return result;
                 }
-                if (!collect_high(input)) {
+                value.operand_ids.push_back(input_value_id);
+                if (!collect_high(input, input_value_id)) {
                     extraction_result_t result;
                     result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
                         decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.input_varnode_type", 1));
                     return result;
                 }
             }
-            if (!collect_high(output)) {
+            if (!collect_high(output, value_id)) {
                 extraction_result_t result;
                 result.diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
                     decompiler_diagnostic_code_t::unresolved_type, "ghidra_ir.output_varnode_high_type", 1));
@@ -1100,6 +1607,19 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
     }
     if (std::none_of(capture.blocks.begin(), capture.blocks.end(), [&capture](const auto& block) { return block.id == capture.entry_block_id; }))
         capture.entry_block_id = capture.blocks.empty() ? 0 : capture.blocks.front().id;
+    const auto live_values = native_live_value_ids(capture);
+    capture.high_variables.erase(std::remove_if(
+        capture.high_variables.begin(), capture.high_variables.end(),
+        [&high_value_ids, &live_values](const capture_high_variable_t& variable) {
+            if (variable.parameter || !generated_local_name(variable.stable_name))
+                return false;
+            const auto bindings = high_value_ids.find(variable.id);
+            return bindings == high_value_ids.end() ||
+                std::none_of(bindings->second.begin(), bindings->second.end(),
+                    [&live_values](const std::uint64_t value_id) {
+                        return live_values.find(value_id) != live_values.end();
+                    });
+        }), capture.high_variables.end());
     return normalize(capture);
 }
 

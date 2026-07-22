@@ -20,13 +20,19 @@ namespace {
 constexpr std::uint32_t k_artifact_magic = 0x53534444U;
 constexpr std::uint32_t k_artifact_version = 1;
 constexpr std::uint32_t k_capture_magic = 0x32434444U;
-constexpr std::uint32_t k_capture_version = 1;
+constexpr std::uint32_t k_capture_version = 2;
 constexpr std::size_t k_artifact_max_bytes = 32U * 1024U * 1024U;
 constexpr std::uint32_t k_no_register = 0xFFFFFFFFU;
 constexpr std::size_t k_max_blocks = 1U << 20;
 constexpr std::size_t k_max_values = 1U << 22;
 constexpr std::size_t k_max_types = 1U << 20;
 constexpr char k_renderer_identifier_escape[] = "$dalvik$";
+
+bool source_path_within_contract(const std::string& value) noexcept
+{
+    return value.size() <= k_max_source_path_bytes &&
+        value.find('\0') == std::string::npos;
+}
 
 bool ascii_letter(const unsigned char value) noexcept
 {
@@ -254,10 +260,11 @@ source_coordinate_t make_coordinate_with_debug(const dalvik_ssa_request_t& reque
         }
         const auto* identity = std::get_if<dalvik_decompiler_entity_identity_t>(
             &request.entity.identity);
-        if (selected_position && identity && !identity->dex_hash.empty()) {
+        if (selected_position && identity && !identity->dex_hash.empty() &&
+            !request.source_path.empty()) {
             decompiler_source_origin_t origin;
             origin.source_artifact_hash = identity->dex_hash;
-            origin.source_path = "dalvik:" + request.dex_version;
+            origin.source_path = request.source_path;
             origin.first_line = static_cast<std::uint32_t>(selected_position->line);
             origin.last_line = static_cast<std::uint32_t>(selected_position->line);
             origin.first_column = 1;
@@ -2039,6 +2046,10 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
         fail(decompiler_diagnostic_code_t::invalid_contract, "dalvik_ssa.entity");
         return result;
     }
+    if (!source_path_within_contract(capture.request.source_path)) {
+        fail(decompiler_diagnostic_code_t::invalid_contract, "dalvik_ssa.source_path");
+        return result;
+    }
 
     const auto& code_item = *capture.code_item;
     if (code_item.registers_size == 0) {
@@ -2188,18 +2199,25 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
         }
         pending_hir_blocks.insert(pending_hir_blocks.end(),
             block->second->successor_ids.begin(), block->second->successor_ids.end());
+        pending_hir_blocks.insert(pending_hir_blocks.end(),
+            block->second->exception_successor_ids.begin(),
+            block->second->exception_successor_ids.end());
     }
 
     std::map<std::uint64_t, std::vector<std::uint64_t>> hir_predecessor_ids;
     std::map<std::uint64_t, std::vector<std::uint64_t>> hir_successor_ids;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> hir_exception_successor_ids;
     for (const auto block_id : hir_block_ids) {
         hir_predecessor_ids.try_emplace(block_id);
         hir_successor_ids.try_emplace(block_id);
+        hir_exception_successor_ids.try_emplace(block_id);
     }
     for (const auto block_id : hir_block_ids) {
         const auto block = blocks_by_id.find(block_id);
         const auto successor_entry = hir_successor_ids.find(block_id);
-        if (block == blocks_by_id.end() || successor_entry == hir_successor_ids.end()) {
+        const auto exception_entry = hir_exception_successor_ids.find(block_id);
+        if (block == blocks_by_id.end() || successor_entry == hir_successor_ids.end() ||
+            exception_entry == hir_exception_successor_ids.end()) {
             fail(decompiler_diagnostic_code_t::malformed_provider_ir,
                 "dalvik_ssa.normal_projection_block");
             return result;
@@ -2217,13 +2235,30 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
             successors.push_back(successor);
             predecessor_entry->second.push_back(block_id);
         }
+        auto& exception_successors = exception_entry->second;
+        for (const auto successor : block->second->exception_successor_ids) {
+            if (hir_block_ids.find(successor) == hir_block_ids.end())
+                continue;
+            const auto predecessor_entry = hir_predecessor_ids.find(successor);
+            if (predecessor_entry == hir_predecessor_ids.end()) {
+                fail(decompiler_diagnostic_code_t::malformed_provider_ir,
+                    "dalvik_ssa.exception_projection_successor");
+                return result;
+            }
+            exception_successors.push_back(successor);
+            predecessor_entry->second.push_back(block_id);
+        }
     }
-    for (auto& entry : hir_predecessor_ids) {
-        auto& predecessors = entry.second;
-        std::sort(predecessors.begin(), predecessors.end());
-        predecessors.erase(std::unique(predecessors.begin(), predecessors.end()),
-            predecessors.end());
-    }
+    const auto canonicalize_edge_lists = [](auto& lists) {
+        for (auto& entry : lists) {
+            auto& edges = entry.second;
+            std::sort(edges.begin(), edges.end());
+            edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+        }
+    };
+    canonicalize_edge_lists(hir_predecessor_ids);
+    canonicalize_edge_lists(hir_successor_ids);
+    canonicalize_edge_lists(hir_exception_successor_ids);
 
     const auto rpo = compute_reverse_postorder(blocks, entry_id);
     const auto dom = compute_dominators(blocks, rpo, entry_id);
@@ -2415,6 +2450,34 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
     hir.type_graph_revision = type_graph.revision;
     hir.return_type_id = return_type_id;
 
+    const auto append_debug_unknown = [&](const char* stable_token) {
+        decompiler_unknown_t provider_unknown;
+        provider_unknown.reason =
+            decompiler_unknown_reason_t::incomplete_debug_information;
+        provider_unknown.stable_token = stable_token;
+        provider_unknown.coordinate = make_coordinate(capture.request,
+            decompiler_coordinate_layer_t::provider_ir, 0);
+        provider_unknown.confidence = 0;
+        provider_unknown.provenance =
+            decompiler_fact_provenance_t::loader_metadata;
+        provider_ir.unknowns.push_back(std::move(provider_unknown));
+
+        decompiler_unknown_t hir_unknown;
+        hir_unknown.reason =
+            decompiler_unknown_reason_t::incomplete_debug_information;
+        hir_unknown.stable_token = stable_token;
+        hir_unknown.coordinate = make_coordinate(capture.request,
+            decompiler_coordinate_layer_t::hir, 0);
+        hir_unknown.confidence = 0;
+        hir_unknown.provenance =
+            decompiler_fact_provenance_t::loader_metadata;
+        hir.unknowns.push_back(std::move(hir_unknown));
+    };
+    if (!code_item.debug_info || code_item.debug_info->positions.empty())
+        append_debug_unknown("dalvik.debug_positions.absent");
+    if (capture.request.source_path.empty())
+        append_debug_unknown("dalvik.source_file.absent");
+
     std::uint64_t param_var_id = 1;
     for (const auto& var : variables) {
         if (!var.is_parameter) continue;
@@ -2465,6 +2528,8 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
         if (hir_included) {
             hblock.predecessor_ids = hir_predecessor_ids.at(block.id);
             hblock.successor_ids = hir_successor_ids.at(block.id);
+            hblock.exception_successor_ids =
+                hir_exception_successor_ids.at(block.id);
         }
         hblock.coordinate = make_coordinate_with_debug(capture.request,
             decompiler_coordinate_layer_t::hir, block.start_offset,
@@ -2845,16 +2910,6 @@ dalvik_ssa_result_t normalize(const dalvik_ssa_capture_t& capture)
             hir.unknowns.push_back(std::move(unknown));
             continue;
         }
-        for (const auto successor : block.exception_successor_ids) {
-            decompiler_unknown_t unknown;
-            unknown.reason = decompiler_unknown_reason_t::opaque_control_flow;
-            unknown.stable_token = "dalvik.exception_edge." +
-                std::to_string(block.id) + "." + std::to_string(successor);
-            unknown.coordinate = coordinate;
-            unknown.confidence = 0;
-            unknown.provenance = decompiler_fact_provenance_t::bytecode_verifier;
-            hir.unknowns.push_back(std::move(unknown));
-        }
     }
 
     std::set<std::uint64_t> hir_value_ids;
@@ -2990,7 +3045,8 @@ std::string serialize_capture(const dalvik_ssa_capture_t& capture)
         capture.request.language.language_spec_hash.empty() ||
         capture.request.language.architecture != architecture_id_t::dalvik_bytecode ||
         capture.request.language.mode != architecture_mode_t::dalvik ||
-        capture.request.workspace_generation == 0 || capture.request.type_graph_revision == 0)
+        capture.request.workspace_generation == 0 || capture.request.type_graph_revision == 0 ||
+        !source_path_within_contract(capture.request.source_path))
         return {};
     writer_t writer;
     writer.u32(k_capture_magic);
@@ -3002,6 +3058,7 @@ std::string serialize_capture(const dalvik_ssa_capture_t& capture)
     writer.u64(capture.request.type_graph_revision);
     writer.u64(capture.request.return_type_id);
     writer.string(capture.request.dex_version);
+    writer.string(capture.request.source_path);
     const auto& code = *capture.code_item;
     writer.u32(code.offset);
     writer.u16(code.registers_size);
@@ -3124,7 +3181,8 @@ std::optional<dalvik_ssa_capture_t> deserialize_capture(
         reader.u64(capture.request.workspace_generation) &&
         reader.u64(capture.request.type_graph_revision) &&
         reader.u64(capture.request.return_type_id) &&
-        reader.string(capture.request.dex_version) && reader.u32(code.offset) &&
+        reader.string(capture.request.dex_version) &&
+        reader.string(capture.request.source_path) && reader.u32(code.offset) &&
         reader.u16(code.registers_size) && reader.u16(code.ins_size) &&
         reader.u16(code.outs_size) && reader.u16(code.tries_size) &&
         reader.u32(code.debug_info_offset) && reader.u32(code.instruction_count) &&
@@ -3216,6 +3274,7 @@ std::optional<dalvik_ssa_capture_t> deserialize_capture(
         capture.request.language.architecture != architecture_id_t::dalvik_bytecode ||
         capture.request.language.mode != architecture_mode_t::dalvik ||
         capture.request.workspace_generation == 0 || capture.request.type_graph_revision == 0 ||
+        !source_path_within_contract(capture.request.source_path) ||
         code.instruction_count != capture.code_units.size()) {
         diagnostics.push_back(diagnostic(decompiler_diagnostic_severity_t::error,
             decompiler_diagnostic_code_t::malformed_serialization,

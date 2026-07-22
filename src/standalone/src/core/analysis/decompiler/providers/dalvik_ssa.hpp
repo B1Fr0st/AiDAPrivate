@@ -3,6 +3,7 @@
 #include "../decompiler_contracts.hpp"
 #include "../workspace/dex_image.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -10,6 +11,8 @@
 #include <vector>
 
 namespace aida::analysis::dalvik_ssa {
+
+inline constexpr std::size_t k_max_source_path_bytes = 4096U;
 
 enum class dalvik_ssa_value_kind_t : std::uint8_t {
     register_def = 1,
@@ -116,6 +119,7 @@ struct dalvik_ssa_request_t {
     std::uint64_t type_graph_revision = 0;
     std::uint64_t return_type_id = 0;
     std::string dex_version;
+    std::string source_path;
 };
 
 struct dalvik_ssa_capture_t {

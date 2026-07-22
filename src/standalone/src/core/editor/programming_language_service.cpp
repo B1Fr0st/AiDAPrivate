@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <condition_variable>
 #include <filesystem>
 #include <mutex>
 #include <sstream>
@@ -261,6 +262,15 @@ struct provider_publication_t {
     std::vector<std::shared_ptr<const provider_t>> providers;
 };
 
+struct query_task_lifecycle_t {
+    std::mutex mutex;
+    std::condition_variable condition;
+    unsigned admission = 0;
+    bool cancellation_pending = false;
+    std::string task_center_id;
+    std::atomic<bool> terminal_published{false};
+};
+
 struct request_slot_t {
     std::mutex mutex;
     std::atomic<std::uint64_t> generation{0};
@@ -269,6 +279,85 @@ struct request_slot_t {
     std::shared_ptr<std::atomic<bool>> dispatch_failed;
     std::shared_ptr<const query_result_t> publication;
     std::shared_ptr<const query_result_t> terminal_failure;
+    std::shared_ptr<query_task_lifecycle_t> task_lifecycle;
+};
+
+void publish_query_task_terminal(const std::shared_ptr<query_task_lifecycle_t>& lifecycle,
+    result_state_t result_state, const std::string& summary) noexcept
+{
+    try {
+        if (!lifecycle)
+            return;
+        std::string task_center_id;
+        {
+            std::lock_guard<std::mutex> lock(lifecycle->mutex);
+            if (lifecycle->admission != 1U || lifecycle->task_center_id.empty()) {
+                if (result_state == result_state_t::cancelled)
+                    lifecycle->cancellation_pending = true;
+                return;
+            }
+            task_center_id = lifecycle->task_center_id;
+        }
+        bool expected = false;
+        if (!lifecycle->terminal_published.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return;
+        ui::task_center::task_state_t task_state = ui::task_center::task_state_t::failed;
+        float progress = -1.0f;
+        std::string stage = "Language query failed";
+        switch (result_state) {
+        case result_state_t::ready:
+            task_state = ui::task_center::task_state_t::completed;
+            progress = 1.0f;
+            stage = "Results ready";
+            break;
+        case result_state_t::empty:
+            task_state = ui::task_center::task_state_t::completed;
+            progress = 1.0f;
+            stage = "Query completed with no matches";
+            break;
+        case result_state_t::unavailable:
+            task_state = ui::task_center::task_state_t::completed;
+            progress = 1.0f;
+            stage = "Provider reported the capability unavailable";
+            break;
+        case result_state_t::cancelled:
+            task_state = ui::task_center::task_state_t::cancelled;
+            stage = "Language query cancelled";
+            break;
+        case result_state_t::error:
+            break;
+        case result_state_t::loading:
+            task_state = ui::task_center::task_state_t::interrupted;
+            stage = "Language query ended without a terminal provider result";
+            break;
+        }
+        static_cast<void>(ui::task_center::update_task(task_center_id,
+            task_state, progress, std::move(stage), summary));
+    } catch (...) {
+    }
+}
+
+class query_task_terminal_guard_t {
+public:
+    explicit query_task_terminal_guard_t(std::shared_ptr<query_task_lifecycle_t> lifecycle)
+        : lifecycle_(std::move(lifecycle)) {}
+
+    ~query_task_terminal_guard_t()
+    {
+        publish_query_task_terminal(lifecycle_, state_, summary_);
+    }
+
+    void set(result_state_t state, std::string summary)
+    {
+        state_ = state;
+        summary_ = std::move(summary);
+    }
+
+private:
+    std::shared_ptr<query_task_lifecycle_t> lifecycle_;
+    result_state_t state_ = result_state_t::error;
+    std::string summary_ = "Language query execution failed before publishing a provider result";
 };
 
 struct service_state_t {
@@ -597,6 +686,9 @@ void publish_provider_snapshot(std::vector<std::shared_ptr<const provider_t>> pr
         const std::uint64_t task_id = slot.task_id.load(std::memory_order_acquire);
         if (task_id != 0)
             static_cast<void>(aida::infra::executor::cancel(task_id));
+        publish_query_task_terminal(std::atomic_load_explicit(&slot.task_lifecycle,
+            std::memory_order_acquire), result_state_t::cancelled,
+            "Language query was cancelled because its provider was replaced or removed");
     }
 }
 
@@ -901,6 +993,9 @@ void synchronize_workspace(std::string workspace_root)
         const std::uint64_t task_id = request.task_id.load(std::memory_order_acquire);
         if (task_id != 0)
             static_cast<void>(aida::infra::executor::cancel(task_id));
+        publish_query_task_terminal(std::atomic_load_explicit(&request.task_lifecycle,
+            std::memory_order_acquire), result_state_t::cancelled,
+            "Language query was cancelled because the workspace root changed");
     }
     std::atomic_store_explicit(&store.index_ownership_failure,
         std::shared_ptr<const std::string>{}, std::memory_order_release);
@@ -1045,11 +1140,15 @@ request_result_t request(query_t query)
     std::uint64_t generation = 0;
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
     auto dispatch_failed = std::make_shared<std::atomic<bool>>(false);
+    auto task_lifecycle = std::make_shared<query_task_lifecycle_t>();
+    std::shared_ptr<query_task_lifecycle_t> previous_task_lifecycle;
     {
         std::unique_lock<std::mutex> lock(slot.mutex, std::try_to_lock);
         if (!lock.owns_lock())
             return {false, 0, "Language query state is being published; retry without blocking the UI"};
         const auto previous_cancelled = std::atomic_load_explicit(&slot.cancelled,
+            std::memory_order_acquire);
+        previous_task_lifecycle = std::atomic_load_explicit(&slot.task_lifecycle,
             std::memory_order_acquire);
         if (previous_cancelled)
             previous_cancelled->store(true, std::memory_order_release);
@@ -1063,10 +1162,16 @@ request_result_t request(query_t query)
             std::memory_order_release);
         std::atomic_store_explicit(&slot.terminal_failure,
             std::shared_ptr<const query_result_t>{}, std::memory_order_release);
+        std::atomic_store_explicit(&slot.task_lifecycle, task_lifecycle,
+            std::memory_order_release);
         slot.task_id.store(0, std::memory_order_release);
         std::atomic_store_explicit(&slot.publication,
             loading_result(query, *provider, request_id, generation),
             std::memory_order_release);
+    }
+    if (previous_task_lifecycle) {
+        publish_query_task_terminal(previous_task_lifecycle, result_state_t::cancelled,
+            "Language query was superseded by a newer request for the same capability");
     }
     aida::infra::executor::submission_t submission;
     submission.owner_subsystem = "programming.language-service";
@@ -1075,11 +1180,33 @@ request_result_t request(query_t query)
     submission.domain = aida::infra::executor::domain_t::feature_worker;
     submission.priority = 3;
     submission.generation = generation;
-    submission.cancel_hook = [cancelled] {
+    submission.cancel_hook = [cancelled, task_lifecycle] {
         cancelled->store(true, std::memory_order_release);
+        bool publish_terminal = false;
+        {
+            std::lock_guard<std::mutex> lock(task_lifecycle->mutex);
+            task_lifecycle->cancellation_pending = true;
+            publish_terminal = task_lifecycle->admission == 1U;
+        }
+        if (publish_terminal) {
+            publish_query_task_terminal(task_lifecycle, result_state_t::cancelled,
+                "Language query was cancelled by the executor");
+        }
     };
     submission.body = [provider, query = std::move(query), cancelled,
-        request_id, generation, workspace_epoch]() mutable {
+        request_id, generation, workspace_epoch, task_lifecycle]() mutable {
+        {
+            std::unique_lock<std::mutex> lock(task_lifecycle->mutex);
+            task_lifecycle->condition.wait(lock, [&task_lifecycle] {
+                return task_lifecycle->admission != 0;
+            });
+            if (task_lifecycle->admission != 1U)
+                return;
+        }
+        static_cast<void>(ui::task_center::update_task(task_lifecycle->task_center_id,
+            ui::task_center::task_state_t::running, -1.0f,
+            "Executing bounded provider query"));
+        query_task_terminal_guard_t terminal(task_lifecycle);
         query_result_t result;
         try {
             result = provider->execute(query, *cancelled);
@@ -1127,14 +1254,18 @@ request_result_t request(query_t query)
                 std::atomic_load_explicit(&target.cancelled,
                     std::memory_order_acquire) != cancelled ||
                 std::atomic_load_explicit(&target.terminal_failure,
-                    std::memory_order_acquire))
+                    std::memory_order_acquire)) {
+                terminal.set(result_state_t::cancelled,
+                    "Language query was superseded before its provider result could be published");
                 return;
+            }
             target.task_id.store(0, std::memory_order_release);
             std::atomic_store_explicit(&target.publication,
                 std::shared_ptr<const query_result_t>(publication),
                 std::memory_order_release);
             published = true;
         }
+        terminal.set(publication->state, publication->status);
         if (published && query.kind == capability_kind_t::definition &&
             publication->state == result_state_t::ready &&
             publication->symbols.size() == 1) {
@@ -1167,8 +1298,23 @@ request_result_t request(query_t query)
             }
         }
     };
-    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    aida::infra::executor::submit_result_t submitted;
+    try {
+        submitted = aida::infra::executor::submit(std::move(submission));
+    } catch (const std::exception& exception) {
+        submitted.submitted = false;
+        submitted.reject_reason = std::string("Language query submission failed: ") +
+            exception.what();
+    } catch (...) {
+        submitted.submitted = false;
+        submitted.reject_reason = "Language query submission failed with an unknown exception";
+    }
     if (!submitted.submitted) {
+        {
+            std::lock_guard<std::mutex> lock(task_lifecycle->mutex);
+            task_lifecycle->admission = 2U;
+        }
+        task_lifecycle->condition.notify_one();
         dispatch_failed->store(true, std::memory_order_release);
         const std::string rejection_reason = submitted.reject_reason.empty()
             ? "The language query executor rejected the request"
@@ -1182,40 +1328,71 @@ request_result_t request(query_t query)
         failure->provider_name = provider->display_name();
         failure->provider_generation = provider->generation();
         failure->status = rejection_reason;
-        if (slot.generation.load(std::memory_order_acquire) == generation)
+        std::lock_guard<std::mutex> slot_lock(slot.mutex);
+        if (slot.generation.load(std::memory_order_acquire) == generation &&
+            std::atomic_load_explicit(&slot.task_lifecycle,
+                std::memory_order_acquire) == task_lifecycle) {
             std::atomic_store_explicit(&slot.terminal_failure,
                 std::shared_ptr<const query_result_t>(std::move(failure)),
                 std::memory_order_release);
+            std::atomic_store_explicit(&slot.task_lifecycle,
+                std::shared_ptr<query_task_lifecycle_t>{}, std::memory_order_release);
+        }
         return {false, 0, rejection_reason};
     }
     {
-        std::unique_lock<std::mutex> lock(slot.mutex, std::try_to_lock);
-        if (lock.owns_lock() &&
-            slot.generation.load(std::memory_order_acquire) == generation) {
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        if (slot.generation.load(std::memory_order_acquire) == generation &&
+            std::atomic_load_explicit(&slot.task_lifecycle,
+                std::memory_order_acquire) == task_lifecycle) {
             const auto publication = std::atomic_load_explicit(&slot.publication,
                 std::memory_order_acquire);
             if (publication && publication->state == result_state_t::loading)
                 slot.task_id.store(submitted.task_id, std::memory_order_release);
         }
     }
-    ui::task_center::task_registration_t registration;
-    registration.id = "programming.language-query." + std::to_string(submitted.task_id);
-    registration.owner = "programming.language-service";
-    registration.owner_view = requested_kind == capability_kind_t::document_symbols ||
-        requested_kind == capability_kind_t::workspace_symbols
-        ? "view.programming.outline" : "view.programming.references";
-    registration.owner_action = capability_action_id(requested_kind);
-    registration.label = capability_name(requested_kind);
-    registration.stage = "Querying " + provider->display_name();
-    registration.affected_entity = requested_file;
-    registration.cancellation_is_safe = true;
-    registration.callbacks.cancel = [requested_kind, task_id = submitted.task_id] {
-        const bool owner_cancelled = cancel_request(requested_kind);
-        const bool executor_cancelled = aida::infra::executor::cancel(task_id);
-        return owner_cancelled || executor_cancelled;
-    };
-    if (!ui::task_center::try_register_executor_job(submitted.task_id,
-            std::move(registration))) {
+    bool task_registered = false;
+    try {
+        ui::task_center::task_registration_t registration;
+        registration.id = "programming.language-query." + std::to_string(submitted.task_id);
+        registration.owner = "programming.language-service";
+        registration.owner_view = requested_kind == capability_kind_t::document_symbols ||
+            requested_kind == capability_kind_t::workspace_symbols
+            ? "view.programming.outline" : "view.programming.references";
+        registration.owner_action = capability_action_id(requested_kind);
+        registration.label = capability_name(requested_kind);
+        registration.stage = "Querying " + provider->display_name();
+        registration.affected_entity = requested_file;
+        registration.cancellation_is_safe = true;
+        registration.callbacks.cancel = [requested_kind, task_id = submitted.task_id,
+            task_lifecycle] {
+            const bool owner_cancelled = cancel_request(requested_kind);
+            const bool executor_cancelled = aida::infra::executor::cancel(task_id);
+            if (owner_cancelled || executor_cancelled) {
+                publish_query_task_terminal(task_lifecycle, result_state_t::cancelled,
+                    "Language query cancellation was accepted by its owner");
+            }
+            return owner_cancelled || executor_cancelled;
+        };
+        task_lifecycle->task_center_id = registration.id;
+        task_registered = ui::task_center::try_register_executor_job(submitted.task_id,
+            std::move(registration));
+    } catch (...) {
+        task_registered = false;
+    }
+    bool publish_pending_cancellation = false;
+    {
+        std::lock_guard<std::mutex> lock(task_lifecycle->mutex);
+        task_lifecycle->admission = task_registered ? 1U : 2U;
+        publish_pending_cancellation = task_registered &&
+            task_lifecycle->cancellation_pending;
+    }
+    task_lifecycle->condition.notify_one();
+    if (publish_pending_cancellation) {
+        publish_query_task_terminal(task_lifecycle, result_state_t::cancelled,
+            "Language query was cancelled before its owner completed admission");
+    }
+    if (!task_registered) {
         dispatch_failed->store(true, std::memory_order_release);
         cancelled->store(true, std::memory_order_release);
         static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
@@ -1228,11 +1405,16 @@ request_result_t request(query_t query)
         failure->provider_name = provider->display_name();
         failure->provider_generation = provider->generation();
         failure->status = "Task Center rejected language-query ownership; the executor job was cancelled";
-        if (slot.generation.load(std::memory_order_acquire) == generation) {
+        std::lock_guard<std::mutex> slot_lock(slot.mutex);
+        if (slot.generation.load(std::memory_order_acquire) == generation &&
+            std::atomic_load_explicit(&slot.task_lifecycle,
+                std::memory_order_acquire) == task_lifecycle) {
             slot.task_id.store(0, std::memory_order_release);
             std::atomic_store_explicit(&slot.terminal_failure,
                 std::shared_ptr<const query_result_t>(std::move(failure)),
                 std::memory_order_release);
+            std::atomic_store_explicit(&slot.task_lifecycle,
+                std::shared_ptr<query_task_lifecycle_t>{}, std::memory_order_release);
         }
         return {false, 0, "Task Center rejected language-query ownership"};
     }
@@ -1251,6 +1433,8 @@ bool cancel_request(capability_kind_t kind)
         return false;
     cancelled->store(true, std::memory_order_release);
     const std::uint64_t task_id = slot.task_id.load(std::memory_order_acquire);
+    const auto task_lifecycle = std::atomic_load_explicit(&slot.task_lifecycle,
+        std::memory_order_acquire);
     if (task_id != 0)
         static_cast<void>(aida::infra::executor::cancel(task_id));
     slot.generation.fetch_add(1, std::memory_order_acq_rel);
@@ -1265,6 +1449,9 @@ bool cancel_request(capability_kind_t kind)
             std::shared_ptr<const query_result_t>(std::move(cancelled_result)),
             std::memory_order_release);
     }
+    lock.unlock();
+    publish_query_task_terminal(task_lifecycle, result_state_t::cancelled,
+        "Language query cancellation was accepted by its owner");
     return true;
 }
 
@@ -1544,6 +1731,9 @@ void shutdown() noexcept
         if (task_id != 0)
             static_cast<void>(aida::infra::executor::cancel(task_id));
         slot.task_id.store(0, std::memory_order_release);
+        publish_query_task_terminal(std::atomic_load_explicit(&slot.task_lifecycle,
+            std::memory_order_acquire), result_state_t::cancelled,
+            "Language query was cancelled during language-service shutdown");
     }
     std::shared_ptr<code_index::manager_t> manager;
     {

@@ -130,7 +130,7 @@ void clear_published_selection_if_owned() {
 std::uint64_t current_process_creation_time(std::uint32_t pid) {
 	if (pid == 0) return 0;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	return 1;
+	return aida::preview::debugger::process_creation_time_100ns;
 #else
 	static int cached_frame = -1;
 	static std::uint32_t cached_pid = 0;
@@ -404,7 +404,8 @@ bool live_target_identity_current(const context_t& context) {
 		context.target_pid != driver_bridge::attached_pid())
 		return false;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	return context.process_creation_time_100ns == 1;
+	return context.process_creation_time_100ns ==
+		aida::preview::debugger::process_creation_time_100ns;
 #else
 	driver_bridge::identity::live_target_identity_t identity;
 	std::string error;

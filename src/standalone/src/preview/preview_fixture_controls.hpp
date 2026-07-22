@@ -38,13 +38,26 @@ enum class fixture_state_t : std::uint8_t {
     size_stream_cancelling,
     size_stream_error,
     size_stream_ready,
-    size_rejected
+    size_rejected,
+    fuzzer_empty,
+    fuzzer_ready,
+    fuzzer_loading,
+    fuzzer_running,
+    fuzzer_cancelling,
+    fuzzer_cancelled,
+    fuzzer_error,
+    fuzzer_completed,
+    analysis_mutation_current,
+    analysis_mutation_stale_stop,
+    analysis_mutation_pid_reuse
 };
 
 void configure_debugger_fixture(fixture_state_t state, std::size_t cardinality);
 void configure_network_fixture(fixture_state_t fixture, std::size_t cardinality);
+void configure_network_fuzzer_fixture(fixture_state_t fixture, std::size_t cardinality);
 void configure_chat_fixture(fixture_state_t state, std::size_t cardinality);
 void configure_programming_fixture(fixture_state_t state, std::size_t cardinality);
+void configure_analysis_mutation_fixture(fixture_state_t state);
 void advance_chat_fixture();
 
 }

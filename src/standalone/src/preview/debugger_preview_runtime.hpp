@@ -57,6 +57,7 @@ extern std::uint64_t next_sequence;
 extern bool fixture_initialized;
 extern fixture_state_t fixture_state;
 extern bool driver_available;
+extern std::uint64_t process_creation_time_100ns;
 
 inline void record(std::string action, std::string detail = {}) {
 	receipts.push_back({std::move(action), std::move(detail), next_sequence++});

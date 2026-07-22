@@ -10,5 +10,12 @@ public final class Fixture {
         }
     }
 
+    public static int guardedDivide(int value, int divisor) {
+        if (divisor == 0) {
+            throw new ArithmeticException();
+        }
+        return value / divisor;
+    }
+
     public static int bias;
 }

@@ -93,11 +93,28 @@ internal sealed class AuthenticatedTransport : IDisposable
     private const int BootstrapBytes = 104;
     private const int FrameAuthenticatedHeaderBytes = 52;
     private const int FrameHeaderBytes = 84;
+    private const int MaximumStartupFailurePayloadBytes = 512;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly FileStream input;
     private readonly FileStream output;
     private readonly WorkerSession session;
     private bool disposed;
+
+    private sealed class AuthenticatedFrame(byte[] header, byte[] payload) : IDisposable
+    {
+        internal byte[] Header { get; } = header;
+        internal byte[] Payload { get; } = payload;
+        private bool disposed;
+
+        public void Dispose()
+        {
+            if (disposed)
+                return;
+            disposed = true;
+            CryptographicOperations.ZeroMemory(Header);
+            CryptographicOperations.ZeroMemory(Payload);
+        }
+    }
 
     private AuthenticatedTransport(FileStream input, FileStream output, WorkerSession session)
     {
@@ -242,40 +259,59 @@ internal sealed class AuthenticatedTransport : IDisposable
 
     internal async Task SendPayloadAsync(ulong sequence, string payload, CancellationToken cancellationToken)
     {
+        using var frame = CreateAuthenticatedFrame(sequence, payload, MaximumPayloadBytes);
+        await output.WriteAsync(frame.Header, cancellationToken).ConfigureAwait(false);
+        await output.WriteAsync(frame.Payload, cancellationToken).ConfigureAwait(false);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    internal void SendStartupFailurePayload(string payload)
+    {
+        using var frame = CreateAuthenticatedFrame(1, payload, MaximumStartupFailurePayloadBytes);
+        output.Write(frame.Header, 0, frame.Header.Length);
+        output.Write(frame.Payload, 0, frame.Payload.Length);
+        output.Flush();
+    }
+
+    private AuthenticatedFrame CreateAuthenticatedFrame(ulong sequence, string payload, int maximumPayloadBytes)
+    {
         ObjectDisposedException.ThrowIf(disposed, this);
-        if (sequence == 0 || string.IsNullOrEmpty(payload))
+        if (sequence == 0 || string.IsNullOrEmpty(payload) || maximumPayloadBytes <= 0 ||
+            maximumPayloadBytes > MaximumPayloadBytes)
             throw new InvalidDataException("managed worker response frame is invalid");
         var payloadBytes = StrictUtf8.GetBytes(payload);
-        if (payloadBytes.Length > MaximumPayloadBytes)
-        {
-            CryptographicOperations.ZeroMemory(payloadBytes);
-            throw new InvalidDataException("managed worker response exceeds the frame limit");
-        }
-
         var header = new byte[FrameHeaderBytes];
-        BinaryPrimitives.WriteUInt32LittleEndian(header, FrameMagic);
-        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(4), FrameVersion);
-        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(6), ContractFrameKind);
-        BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(8), sequence);
-        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(16), checked((uint)payloadBytes.Length));
-        session.NonceHash.CopyTo(header.AsSpan(20));
-        var authenticated = GC.AllocateUninitializedArray<byte>(checked(FrameAuthenticatedHeaderBytes + payloadBytes.Length));
-        header.AsSpan(0, FrameAuthenticatedHeaderBytes).CopyTo(authenticated);
-        payloadBytes.CopyTo(authenticated.AsSpan(FrameAuthenticatedHeaderBytes));
-        var tag = HMACSHA256.HashData(session.Key, authenticated);
-        tag.CopyTo(header.AsSpan(FrameAuthenticatedHeaderBytes));
-        CryptographicOperations.ZeroMemory(authenticated);
-        CryptographicOperations.ZeroMemory(tag);
+        byte[]? authenticated = null;
+        byte[]? tag = null;
         try
         {
-            await output.WriteAsync(header, cancellationToken).ConfigureAwait(false);
-            await output.WriteAsync(payloadBytes, cancellationToken).ConfigureAwait(false);
-            await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+            if (payloadBytes.Length > maximumPayloadBytes)
+                throw new InvalidDataException("managed worker response exceeds the frame limit");
+            BinaryPrimitives.WriteUInt32LittleEndian(header, FrameMagic);
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(4), FrameVersion);
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(6), ContractFrameKind);
+            BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(8), sequence);
+            BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(16), checked((uint)payloadBytes.Length));
+            session.NonceHash.CopyTo(header.AsSpan(20));
+            authenticated = GC.AllocateUninitializedArray<byte>(checked(FrameAuthenticatedHeaderBytes + payloadBytes.Length));
+            header.AsSpan(0, FrameAuthenticatedHeaderBytes).CopyTo(authenticated);
+            payloadBytes.CopyTo(authenticated.AsSpan(FrameAuthenticatedHeaderBytes));
+            tag = HMACSHA256.HashData(session.Key, authenticated);
+            tag.CopyTo(header.AsSpan(FrameAuthenticatedHeaderBytes));
+            return new AuthenticatedFrame(header, payloadBytes);
         }
-        finally
+        catch
         {
             CryptographicOperations.ZeroMemory(header);
             CryptographicOperations.ZeroMemory(payloadBytes);
+            throw;
+        }
+        finally
+        {
+            if (authenticated is not null)
+                CryptographicOperations.ZeroMemory(authenticated);
+            if (tag is not null)
+                CryptographicOperations.ZeroMemory(tag);
         }
     }
 

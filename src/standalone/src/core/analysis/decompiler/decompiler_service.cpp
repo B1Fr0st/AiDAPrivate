@@ -1230,7 +1230,8 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
         provider_stage.provider_cpu_ms = provider_result.elapsed_cpu_ms;
         provider_stage.provider_peak_memory_bytes = provider_result.peak_memory_bytes;
 
-        if (!request.type_evidence.empty()) {
+        if (!request.type_evidence.empty() &&
+            request.entity.kind != decompiler_entity_kind_t::native_function) {
             auto merged_types = type_graph::merge_type_evidence(
                 std::move(provider_stage.provider_type_graph), request.type_evidence);
             if (!merged_types) {
@@ -1318,7 +1319,23 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             result.diagnostics = std::move(diagnostics);
             return finish(hir_nodes(hir) > budget->max_hir_nodes
                 ? decompiler_pipeline_status_t::resource_limit
-                : decompiler_pipeline_status_t::normalization_failed);
+                 : decompiler_pipeline_status_t::normalization_failed);
+        }
+
+        if (request.entity.kind == decompiler_entity_kind_t::native_function) {
+            auto merged_types = type_graph::merge_type_evidence(
+                std::move(type_graph), request.type_evidence, hir);
+            if (!merged_types) {
+                diagnostics.push_back(pipeline_diagnostic(
+                    decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::malformed_type_graph,
+                    "decompiler.pipeline.type_evidence.rejected"));
+                result.diagnostics = std::move(diagnostics);
+                return finish(merged_types.error().code == workspace_error_code_t::limit_exceeded
+                    ? decompiler_pipeline_status_t::resource_limit
+                    : decompiler_pipeline_status_t::normalization_failed);
+            }
+            type_graph = merged_types.take_value();
         }
 
         auto semantic_queries = result.provider_stage->semantic_queries;

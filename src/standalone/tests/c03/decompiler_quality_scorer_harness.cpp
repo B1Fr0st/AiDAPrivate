@@ -345,6 +345,12 @@ bool run_decompiler_quality_scorer_harness(const quality_harness_paths_t& paths,
         request.run_id = "c03-quality-" + run_identity.sha256.substr(0, 24);
         request.ended_utc = utc_now();
         const auto score = score_decompiler_quality(request);
+        if (!score.ok) {
+            write_json_atomic(paths.evidence_root /
+                "decompiler_quality_failed_receipt.json", score.receipt);
+            write_json_atomic(paths.evidence_root /
+                "decompiler_quality_failed_validation.json", score.validation.to_json());
+        }
         require(score.ok, score.error);
         write_json_atomic(paths.evidence_root /
             "decompiler_quality_receipt.json", score.receipt);

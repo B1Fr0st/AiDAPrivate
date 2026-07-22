@@ -7,14 +7,19 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace aida::analysis::c03
 {
@@ -22,6 +27,7 @@ namespace
 {
     constexpr std::array<std::string_view, 10> k_metrics{"typed_entities", "calls", "fields", "locals",
         "parameters", "cfg", "control_structures", "exception_regions", "type_correctness", "source_coordinates"};
+    constexpr std::string_view k_owned_fact_prefix = "aida-owned-v1:";
 
     struct scorer_error_t : std::runtime_error
     {
@@ -156,6 +162,12 @@ namespace
         return std::string(metric);
     }
 
+    bool supplemental_metric(const std::string_view metric) noexcept
+    {
+        return metric == "fields" || metric == "locals" ||
+            metric == "parameters" || metric == "exception_regions";
+    }
+
     std::set<std::string, std::less<>> metric_facts(const json& facts, std::string_view metric)
     {
         require(facts.is_object(), "provider or ground-truth facts must be an object");
@@ -163,6 +175,553 @@ namespace
         const auto found = facts.find(field);
         require(found != facts.end(), "provider or ground-truth facts omit required metric field: " + field);
         return strings(*found, field);
+    }
+
+    std::set<std::string, std::less<>> metric_unknowns(const json& unknowns,
+        std::string_view metric)
+    {
+        require_closed(unknowns, {"typed_entities", "calls", "fields", "locals", "parameters",
+            "cfg", "control_structures", "exception_regions", "type_correctness", "source_coordinates"},
+            "metric-domain explicit unknowns");
+        const auto found = unknowns.find(std::string(metric));
+        require(found != unknowns.end(), "metric-domain explicit unknowns omit required metric");
+        return strings(*found, "metric-domain explicit unknowns");
+    }
+
+    std::string ascii_lower(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+        return value;
+    }
+
+    std::string trim_ascii(std::string value)
+    {
+        const auto nonspace = [](const unsigned char character) { return !std::isspace(character); };
+        const auto begin = std::find_if(value.begin(), value.end(), nonspace);
+        const auto end = std::find_if(value.rbegin(), value.rend(), nonspace).base();
+        return begin < end ? std::string(begin, end) : std::string{};
+    }
+
+    struct owned_fact_t
+    {
+        std::string owner;
+        std::string value;
+    };
+
+    owned_fact_t decode_owned_fact(const std::string_view raw)
+    {
+        if (raw.substr(0, k_owned_fact_prefix.size()) != k_owned_fact_prefix)
+            return {{}, std::string(raw)};
+        const auto length_begin = raw.data() + k_owned_fact_prefix.size();
+        const auto colon = raw.find(':', k_owned_fact_prefix.size());
+        require(colon != std::string_view::npos && colon != k_owned_fact_prefix.size(),
+            "owned semantic fact has an invalid owner length");
+        std::size_t owner_size = 0;
+        const auto parsed = std::from_chars(length_begin, raw.data() + colon, owner_size);
+        require(parsed.ec == std::errc{} && parsed.ptr == raw.data() + colon &&
+            owner_size <= raw.size() - colon - 1U,
+            "owned semantic fact has an invalid owner extent");
+        const auto owner_begin = colon + 1U;
+        return {std::string(raw.substr(owner_begin, owner_size)),
+            std::string(raw.substr(owner_begin + owner_size))};
+    }
+
+    std::string identifier_leaf(std::string value)
+    {
+        value = trim_ascii(std::move(value));
+        const auto encoded_jvm_name = ascii_lower(value);
+        if (encoded_jvm_name.size() >= 17U &&
+            encoded_jvm_name.compare(encoded_jvm_name.size() - 17U, 17U,
+                "$jvm$3c696e69743e") == 0)
+            return "constructor";
+        const auto arrow = value.rfind("->");
+        if (arrow != std::string::npos)
+            value.erase(0, arrow + 2U);
+        const auto scope = value.rfind("::");
+        if (scope != std::string::npos)
+            value.erase(0, scope + 2U);
+        const auto open = value.find('(');
+        if (open != std::string::npos)
+            value.erase(open);
+        const auto type_suffix = value.find(':');
+        if (type_suffix != std::string::npos)
+            value.erase(type_suffix);
+        while (!value.empty() && (value.front() == '_' || value.front() == 'L')) {
+            if (value.front() == 'L' && value.find('/') == std::string::npos &&
+                value.find('.') == std::string::npos)
+                break;
+            value.erase(value.begin());
+        }
+        while (!value.empty() && value.back() == ';')
+            value.pop_back();
+        const auto separator = value.find_last_of("./$");
+        if (separator != std::string::npos)
+            value.erase(0, separator + 1U);
+        value = ascii_lower(std::move(value));
+        if (value == "<init>" || value == "$jvm$3c696e69743e")
+            return "constructor";
+        return value;
+    }
+
+    std::string variable_leaf(std::string value)
+    {
+        value = trim_ascii(std::move(value));
+        const auto type_suffix = value.rfind(':');
+        if (type_suffix != std::string::npos &&
+            (type_suffix == 0 || value[type_suffix - 1U] != ':'))
+            value.erase(type_suffix);
+        const auto descriptor_close = value.rfind(')');
+        const auto separator = value.rfind('.');
+        if (separator != std::string::npos &&
+            (descriptor_close == std::string::npos || separator > descriptor_close))
+            value.erase(0, separator + 1U);
+        return identifier_leaf(std::move(value));
+    }
+
+    std::set<std::string, std::less<>> target_symbols(const json& truth)
+    {
+        const auto& facts = truth.at("facts");
+        const auto symbols = facts.find("symbols");
+        const auto entities = facts.find("entities");
+        require(symbols != facts.end() && entities != facts.end(),
+            "ground-truth facts omit callable symbols or entities");
+        std::set<std::string, std::less<>> symbol_names;
+        for (const auto& value : strings(*symbols, "ground-truth symbols")) {
+            const auto normalized = identifier_leaf(value);
+            require(!normalized.empty(), "ground-truth symbol cannot be normalized");
+            symbol_names.insert(normalized);
+        }
+        std::set<std::string, std::less<>> output;
+        for (const auto& value : strings(*entities, "ground-truth entities")) {
+            const auto normalized = identifier_leaf(value);
+            if (symbol_names.find(normalized) != symbol_names.end())
+                output.insert(normalized);
+        }
+        if (output.empty())
+            output = std::move(symbol_names);
+        return output;
+    }
+
+    std::string inferred_owner(const std::string_view raw,
+        const std::set<std::string, std::less<>>& targets)
+    {
+        std::string value(raw);
+        const auto type_suffix = value.rfind(':');
+        if (type_suffix != std::string::npos)
+            value.erase(type_suffix);
+        std::vector<std::string> parts;
+        std::string current;
+        for (std::size_t index = 0; index < value.size(); ++index) {
+            if (value[index] == '.' || (value[index] == ':' && index + 1U < value.size() &&
+                    value[index + 1U] == ':')) {
+                if (!current.empty()) {
+                    parts.push_back(current);
+                    current.clear();
+                }
+                if (value[index] == ':')
+                    ++index;
+            } else {
+                current.push_back(value[index]);
+            }
+        }
+        if (!current.empty())
+            parts.push_back(std::move(current));
+        if (parts.size() >= 2U) {
+            const auto candidate = identifier_leaf(parts[parts.size() - 2U]);
+            if (targets.find(candidate) != targets.end())
+                return candidate;
+        }
+        if (targets.size() == 1U)
+            return *targets.begin();
+        return {};
+    }
+
+    std::string semantic_owner(const owned_fact_t& fact,
+        const std::set<std::string, std::less<>>& targets)
+    {
+        if (!fact.owner.empty())
+            return identifier_leaf(fact.owner);
+        const auto separator = fact.value.find(':');
+        if (separator != std::string::npos) {
+            const auto candidate = identifier_leaf(fact.value.substr(0, separator));
+            if (targets.find(candidate) != targets.end())
+                return candidate;
+        }
+        return inferred_owner(fact.value, targets);
+    }
+
+    std::string owned_semantic_token(const std::string& owner,
+        const std::string_view token)
+    {
+        return (owner.empty() ? std::string("global") : owner) + "|" +
+            std::string(token);
+    }
+
+    struct semantic_projection_t
+    {
+        std::set<std::string, std::less<>> facts;
+        std::map<std::string, double, std::less<>> confidence;
+    };
+
+    void add_semantic(semantic_projection_t& output, std::string fact,
+        const double confidence)
+    {
+        if (fact.empty())
+            return;
+        output.facts.insert(fact);
+        const auto found = output.confidence.find(fact);
+        if (found == output.confidence.end())
+            output.confidence.emplace(std::move(fact), confidence);
+        else
+            found->second = std::min(found->second, confidence);
+    }
+
+    double raw_confidence(const json& output, const std::string& fact)
+    {
+        const auto found = output.at("confidence").find(fact);
+        require(found != output.at("confidence").end() && found->is_number(),
+            "provider confidence lacks semantic source fact: " + fact);
+        const auto value = found->get<double>();
+        require(std::isfinite(value) && value >= 0.0 && value <= 1.0,
+            "provider semantic source confidence is invalid");
+        return value;
+    }
+
+    std::string variable_token(const owned_fact_t& fact,
+        const std::set<std::string, std::less<>>& targets, const bool expected)
+    {
+        const auto name = variable_leaf(fact.value);
+        auto owner = fact.owner.empty() ? inferred_owner(fact.value, targets) :
+            identifier_leaf(fact.owner);
+        if (expected && owner.empty() && targets.size() == 1U)
+            owner = *targets.begin();
+        return owner.empty() ? name : owner + "|" + name;
+    }
+
+    std::string call_token(const owned_fact_t& fact,
+        const std::set<std::string, std::less<>>& targets)
+    {
+        auto edge = fact.value.find("->");
+        while (edge != std::string::npos) {
+            const auto caller = identifier_leaf(fact.value.substr(0, edge));
+            const auto callee = identifier_leaf(fact.value.substr(edge + 2U));
+            if (!caller.empty() && !callee.empty() && targets.find(caller) != targets.end())
+                return caller + "->" + callee;
+            edge = fact.value.find("->", edge + 2U);
+        }
+        const auto caller = fact.owner.empty() ?
+            (targets.size() == 1U ? *targets.begin() : std::string{}) :
+            identifier_leaf(fact.owner);
+        const auto callee = identifier_leaf(fact.value);
+        if (caller.empty() || callee.empty())
+            return "unresolved-call:" + ascii_lower(fact.value);
+        return caller + "->" + callee;
+    }
+
+    struct semantic_edge_t
+    {
+        std::string owner;
+        std::string source;
+        std::string target;
+        bool exception = false;
+    };
+
+    std::optional<semantic_edge_t> semantic_edge(const std::string& raw,
+        const std::set<std::string, std::less<>>& targets)
+    {
+        auto fact = decode_owned_fact(raw);
+        auto delimiter = fact.value.find("=>");
+        const bool explicit_exception = delimiter != std::string::npos;
+        if (!explicit_exception)
+            delimiter = fact.value.find("->");
+        if (delimiter == std::string::npos)
+            return std::nullopt;
+        const auto delimiter_size = 2U;
+        auto left = fact.value.substr(0, delimiter);
+        auto right = fact.value.substr(delimiter + delimiter_size);
+        auto owner = identifier_leaf(fact.owner);
+        if (owner.empty()) {
+            const auto owner_separator = left.find(':');
+            if (owner_separator != std::string::npos) {
+                const auto candidate = identifier_leaf(left.substr(0, owner_separator));
+                if (targets.find(candidate) != targets.end()) {
+                    owner = candidate;
+                    left.erase(0, owner_separator + 1U);
+                }
+            }
+            if (owner.empty() && targets.size() == 1U)
+                owner = *targets.begin();
+        }
+        const auto source = ascii_lower(left);
+        const auto target = ascii_lower(right);
+        const bool named_exception = target.find("exception") != std::string::npos ||
+            target.find("handler") != std::string::npos || target.find("catch") != std::string::npos;
+        return semantic_edge_t{std::move(owner), source, target,
+            explicit_exception || named_exception};
+    }
+
+    semantic_projection_t graph_projection(const std::set<std::string, std::less<>>& values,
+        const std::set<std::string, std::less<>>& targets, const json* output)
+    {
+        struct graph_t
+        {
+            std::vector<semantic_edge_t> edges;
+            double confidence = 1.0;
+        };
+        std::map<std::string, graph_t, std::less<>> graphs;
+        for (const auto& raw : values) {
+            const auto edge = semantic_edge(raw, targets);
+            if (!edge)
+                continue;
+            if (output && !edge->owner.empty() &&
+                targets.find(edge->owner) == targets.end())
+                continue;
+            auto& graph = graphs[edge->owner];
+            graph.edges.push_back(*edge);
+            if (output)
+                graph.confidence = std::min(graph.confidence, raw_confidence(*output, raw));
+        }
+        semantic_projection_t result;
+        for (const auto& [owner, graph] : graphs) {
+            std::map<std::string, std::uint64_t, std::less<>> indegree;
+            std::map<std::string, std::uint64_t, std::less<>> outdegree;
+            std::uint64_t exception_edges = 0;
+            for (const auto& edge : graph.edges) {
+                ++outdegree[edge.source];
+                ++indegree[edge.target];
+                indegree.try_emplace(edge.source, 0);
+                outdegree.try_emplace(edge.target, 0);
+                if (edge.exception)
+                    ++exception_edges;
+            }
+            const auto prefix = owner.empty() ? std::string("global|") : owner + "|";
+            const auto branches = std::count_if(outdegree.begin(), outdegree.end(),
+                [](const auto& value) { return value.second > 1U; });
+            const auto joins = std::count_if(indegree.begin(), indegree.end(),
+                [](const auto& value) { return value.second > 1U; });
+            const auto exits = std::count_if(outdegree.begin(), outdegree.end(),
+                [](const auto& value) { return value.second == 0U; });
+            for (const auto& token : std::array<std::string, 7>{
+                     prefix + "edges:" + std::to_string(graph.edges.size()),
+                     prefix + "normal_edges:" + std::to_string(graph.edges.size() - exception_edges),
+                     prefix + "exception_edges:" + std::to_string(exception_edges),
+                     prefix + "nodes:" + std::to_string(outdegree.size()),
+                     prefix + "branches:" + std::to_string(branches),
+                     prefix + "joins:" + std::to_string(joins),
+                     prefix + "exits:" + std::to_string(exits)})
+                add_semantic(result, token, graph.confidence);
+        }
+        return result;
+    }
+
+    std::set<std::string, std::less<>> type_atoms(const owned_fact_t& fact)
+    {
+        auto value = ascii_lower(fact.value);
+        std::set<std::string, std::less<>> output;
+        if (value.rfind("arity:", 0) == 0) {
+            output.insert(value);
+            return output;
+        }
+        const auto open = value.find('(');
+        const auto close = open == std::string::npos ? std::string::npos : value.find(')', open + 1U);
+        if (open != std::string::npos && close != std::string::npos) {
+            const auto parameters = value.substr(open + 1U, close - open - 1U);
+            const auto arity = parameters.empty() ? 0U :
+                static_cast<unsigned>(std::count(parameters.begin(), parameters.end(), ',')) + 1U;
+            output.insert("arity:" + std::to_string(arity));
+        }
+        const auto add_type = [&output](const std::string_view token) {
+            output.insert("type:" + std::string(token));
+        };
+        const auto contains = [&value](const std::string_view token) {
+            return value.find(token) != std::string::npos;
+        };
+        if (contains("system.int64") || contains("int64_t") || value == "j") add_type("int64");
+        else if (contains("system.int32") || contains("int32_t") || value == "i" || value == "int" || contains("int(int")) add_type("int32");
+        if (contains("system.boolean") || value == "bool" || value == "z") add_type("bool");
+        if (contains("system.void") || value == "void" || value == "v") add_type("void");
+        if (value == "b" || contains("system.byte")) add_type("int8");
+        if (value == "s" || contains("system.int16")) add_type("int16");
+        if (value == "c" || contains("system.char")) add_type("char16");
+        if (value == "f" || contains("system.single") || value == "float") add_type("float32");
+        if (value == "d" || contains("system.double") || value == "double") add_type("float64");
+        if (output.empty()) {
+            const auto normalized = identifier_leaf(value);
+            if (!normalized.empty())
+                add_type(normalized);
+        }
+        return output;
+    }
+
+    std::string basename_lower(std::string value)
+    {
+        std::replace(value.begin(), value.end(), '\\', '/');
+        const auto separator = value.find_last_of('/');
+        if (separator != std::string::npos)
+            value.erase(0, separator + 1U);
+        return ascii_lower(std::move(value));
+    }
+
+    void add_expected_coordinate(semantic_projection_t& output, const std::string& raw,
+        const std::set<std::string, std::less<>>& targets,
+        const bool include_source_file)
+    {
+        const auto first = raw.find(':');
+        const auto second = first == std::string::npos ? std::string::npos : raw.find(':', first + 1U);
+        const auto third = second == std::string::npos ? std::string::npos : raw.find(':', second + 1U);
+        if (first == std::string::npos || second == std::string::npos || third == std::string::npos)
+            return;
+        auto owner = identifier_leaf(raw.substr(0, first));
+        if (targets.find(owner) == targets.end() && targets.size() == 1U)
+            owner = *targets.begin();
+        if (owner.empty())
+            owner = "global";
+        add_semantic(output, owner + "|coordinate", 1.0);
+        if (include_source_file)
+            add_semantic(output, owner + "|source_file:" +
+                basename_lower(raw.substr(second + 1U, third - second - 1U)), 1.0);
+    }
+
+    void add_observed_coordinate(semantic_projection_t& output, const std::string& raw,
+        const json& provider_output, const bool include_source_file)
+    {
+        const auto decoded = decode_owned_fact(raw);
+        auto owner = identifier_leaf(decoded.owner);
+        if (owner.empty())
+            owner = "global";
+        const auto confidence = raw_confidence(provider_output, raw);
+        add_semantic(output, owner + "|coordinate", confidence);
+        if (decoded.value.rfind("address:", 0) == 0 ||
+            decoded.value.rfind("instruction:", 0) == 0 ||
+            decoded.value.rfind("document:", 0) == 0)
+            return;
+        if (!include_source_file)
+            return;
+        const auto last = decoded.value.rfind(':');
+        if (last == std::string::npos)
+            return;
+        const auto fourth = decoded.value.rfind(':', last - 1U);
+        const auto third = fourth == std::string::npos ? std::string::npos :
+            decoded.value.rfind(':', fourth - 1U);
+        const auto second = third == std::string::npos ? std::string::npos :
+            decoded.value.rfind(':', third - 1U);
+        if (second == std::string::npos)
+            return;
+        add_semantic(output, owner + "|source_file:" +
+            basename_lower(decoded.value.substr(0, second)), confidence);
+    }
+
+    semantic_projection_t project_expected(const json& truth, const std::string_view metric)
+    {
+        semantic_projection_t output;
+        const auto targets = target_symbols(truth);
+        if (metric == "typed_entities") {
+            for (const auto& target : targets)
+                add_semantic(output, target, 1.0);
+            return output;
+        }
+        const auto raw = metric_facts(truth.at("facts"), metric);
+        if (metric == "cfg")
+            return graph_projection(raw, targets, nullptr);
+        if (metric == "source_coordinates") {
+            const auto architecture = truth.at("architecture_identity").get<std::string>();
+            const bool include_source_file = architecture == "jvm" || architecture == "dalvik";
+            for (const auto& value : raw)
+                add_expected_coordinate(output, value, targets, include_source_file);
+            return output;
+        }
+        for (const auto& value : raw) {
+            const owned_fact_t fact{{}, value};
+            if (metric == "calls")
+                add_semantic(output, call_token(fact, targets), 1.0);
+            else if (metric == "fields")
+                add_semantic(output, identifier_leaf(value), 1.0);
+            else if (metric == "locals" || metric == "parameters")
+                add_semantic(output, variable_token(fact, targets, true), 1.0);
+            else if (metric == "control_structures")
+                add_semantic(output, ascii_lower(value), 1.0);
+            else if (metric == "exception_regions") {
+                const auto lower = ascii_lower(value);
+                const auto owner = semantic_owner(fact, targets);
+                if (lower.find("throw") != std::string::npos)
+                    add_semantic(output, owned_semantic_token(owner, "throw"), 1.0);
+                if (lower.find("catch") != std::string::npos || lower.find("exception") != std::string::npos ||
+                    lower.find("->") != std::string::npos || lower.find("=>") != std::string::npos)
+                    add_semantic(output, owned_semantic_token(owner, "exception_edge"), 1.0);
+                if (lower.find("try") != std::string::npos)
+                    add_semantic(output, owned_semantic_token(owner, "try"), 1.0);
+                if (lower.find("finally") != std::string::npos)
+                    add_semantic(output, owned_semantic_token(owner, "finally"), 1.0);
+            } else if (metric == "type_correctness") {
+                const auto owner = semantic_owner(fact, targets);
+                for (const auto& atom : type_atoms(fact))
+                    add_semantic(output, owned_semantic_token(owner, atom), 1.0);
+            }
+        }
+        return output;
+    }
+
+    semantic_projection_t project_observed(const json& provider_output, const json& truth,
+        const std::string_view metric)
+    {
+        semantic_projection_t output;
+        const auto targets = target_symbols(truth);
+        const auto raw = metric_facts(provider_output.at("facts"), metric);
+        if (metric == "cfg")
+            return graph_projection(raw, targets, &provider_output);
+        if (metric == "source_coordinates") {
+            const auto architecture = truth.at("architecture_identity").get<std::string>();
+            const bool include_source_file = architecture == "jvm" || architecture == "dalvik";
+            for (const auto& value : raw) {
+                const auto decoded = decode_owned_fact(value);
+                const auto owner = identifier_leaf(decoded.owner);
+                if (!owner.empty() && targets.find(owner) == targets.end())
+                    continue;
+                add_observed_coordinate(output, value, provider_output,
+                    include_source_file);
+            }
+            return output;
+        }
+        for (const auto& value : raw) {
+            const auto fact = decode_owned_fact(value);
+            const auto confidence = raw_confidence(provider_output, value);
+            const auto owner = identifier_leaf(fact.owner);
+            if (!owner.empty() && targets.find(owner) == targets.end())
+                continue;
+            if (metric == "typed_entities") {
+                const auto entity = identifier_leaf(fact.value);
+                if (targets.find(entity) != targets.end())
+                    add_semantic(output, entity, confidence);
+            }
+            else if (metric == "calls")
+                add_semantic(output, call_token(fact, targets), confidence);
+            else if (metric == "fields")
+                add_semantic(output, identifier_leaf(fact.value), confidence);
+            else if (metric == "locals" || metric == "parameters")
+                add_semantic(output, variable_token(fact, targets, false), confidence);
+            else if (metric == "control_structures")
+                add_semantic(output, ascii_lower(fact.value), confidence);
+            else if (metric == "exception_regions") {
+                const auto lower = ascii_lower(fact.value);
+                const auto owner = semantic_owner(fact, targets);
+                if (lower.find("throw") != std::string::npos)
+                    add_semantic(output, owned_semantic_token(owner, "throw"), confidence);
+                if (lower.find("catch") != std::string::npos || lower.find("exception") != std::string::npos ||
+                    lower.find("->") != std::string::npos || lower.find("=>") != std::string::npos)
+                    add_semantic(output, owned_semantic_token(owner, "exception_edge"), confidence);
+                if (lower.find("try") != std::string::npos)
+                    add_semantic(output, owned_semantic_token(owner, "try"), confidence);
+                if (lower.find("finally") != std::string::npos)
+                    add_semantic(output, owned_semantic_token(owner, "finally"), confidence);
+            } else if (metric == "type_correctness") {
+                const auto owner = semantic_owner(fact, targets);
+                for (const auto& atom : type_atoms(fact))
+                    add_semantic(output, owned_semantic_token(owner, atom), confidence);
+            }
+        }
+        return output;
     }
 
     json normalized_ground_truth_records(const json& ground_truth)
@@ -314,7 +873,6 @@ namespace
         json readability;
         json diagnostics;
         json determinism_runs;
-        json normalized_outputs;
         json cancellation;
         json identity;
     };
@@ -360,6 +918,64 @@ namespace
         require(hash.sha256 == artifact.at("sha256").get<std::string>(),
             std::string(label) + " raw artifact hash differs from its payload");
         return hash.sha256;
+    }
+
+    std::uint64_t read_bundle_u64(const std::vector<std::uint8_t>& bytes,
+        std::size_t& offset, std::string_view label)
+    {
+        require(offset <= bytes.size() && bytes.size() - offset >= 8U,
+            std::string(label) + " canonical bundle is truncated");
+        std::uint64_t value = 0;
+        for (std::uint32_t shift = 0; shift < 64U; shift += 8U)
+            value |= static_cast<std::uint64_t>(bytes[offset++]) << shift;
+        return value;
+    }
+
+    std::string canonical_bundle_hash(const json& artifact, std::string_view label)
+    {
+        const auto payload = decode_hex_payload(artifact.at("payload").get_ref<const std::string&>());
+        constexpr std::string_view magic = "AIDA-C03-CANONICAL-BUNDLE-V2";
+        require(payload.size() >= magic.size() + 8U &&
+            std::equal(magic.begin(), magic.end(), payload.begin()),
+            std::string(label) + " raw artifact is not a canonical provider bundle");
+        std::size_t offset = magic.size();
+        const auto count = read_bundle_u64(payload, offset, label);
+        require(count != 0 && count <= 4096U,
+            std::string(label) + " canonical bundle record count is invalid");
+        std::vector<std::string> record_hashes;
+        record_hashes.reserve(static_cast<std::size_t>(count));
+        for (std::uint64_t index = 0; index < count; ++index) {
+            const auto size = read_bundle_u64(payload, offset, label);
+            require(size != 0 && size <= payload.size() - offset,
+                std::string(label) + " canonical bundle record extent is invalid");
+            const auto hash = sha256_evidence_bytes(payload.data() + offset,
+                static_cast<std::size_t>(size));
+            require(hash.ok, hash.error);
+            record_hashes.push_back(hash.sha256);
+            offset += static_cast<std::size_t>(size);
+        }
+        require(offset == payload.size(),
+            std::string(label) + " canonical bundle contains trailing data");
+        std::sort(record_hashes.begin(), record_hashes.end());
+        const auto hash = canonical_json_sha256(json(record_hashes));
+        require(hash.ok, hash.error);
+        return hash.sha256;
+    }
+
+    json canonical_diagnostics(const json& diagnostics)
+    {
+        require(diagnostics.is_array(), "provider diagnostics must be an array");
+        std::vector<std::pair<std::string, json>> rows;
+        rows.reserve(diagnostics.size());
+        for (const auto& diagnostic : diagnostics)
+            rows.emplace_back(diagnostic.dump(), diagnostic);
+        std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+            return left.first < right.first;
+        });
+        json output = json::array();
+        for (auto& row : rows)
+            output.push_back(std::move(row.second));
+        return output;
     }
 
     void validate_execution_witness(const json& value, std::string_view label)
@@ -522,6 +1138,8 @@ namespace
         std::map<std::string, json, std::less<>> outputs;
         std::array<json, 2> deterministic_outputs{json::array(), json::array()};
         std::array<json, 2> deterministic_source_maps{json::array(), json::array()};
+        std::array<std::set<std::string, std::less<>>, 2> deterministic_schedules;
+        std::array<std::set<std::string, std::less<>>, 2> deterministic_cache_states;
         std::set<std::string, std::less<>> run_ids;
         std::uint64_t unsupported = 0;
         for (const auto& fixture : fixtures) {
@@ -565,8 +1183,13 @@ namespace
                 const auto duration = measured_run.at("duration_ns").get<std::uint64_t>();
                 require(ended > started && ended - started == duration,
                     "provider run timing is non-monotonic or self-inconsistent");
+                const auto schedule = require_text(measured_run, "schedule", "provider measured run");
+                const auto cache_state = require_text(measured_run, "cache_state", "provider measured run");
+                deterministic_schedules[run_index].insert(schedule);
+                deterministic_cache_states[run_index].insert(cache_state);
                 validate_execution_witness(measured_run, "provider measured run");
                 const auto& artifacts = measured_run.at("artifacts");
+                json canonical_artifacts = json::object();
                 for (const std::string_view artifact_name : {"provider_ir", "hir", "type_graph",
                          "ast", "document", "printc"}) {
                     const auto& raw = artifacts.at(std::string(artifact_name));
@@ -575,16 +1198,20 @@ namespace
                         require(forbidden_artifact_hashes.find(artifact_hash) ==
                                 forbidden_artifact_hashes.end(),
                             "raw provider stage copies source, ground-truth, receipt, or target-artifact evidence");
+                        canonical_artifacts[std::string(artifact_name)] =
+                            canonical_bundle_hash(raw, artifact_name);
                     } else {
                         require(raw.is_null(), "provider emitted a raw artifact outside its measured contract");
+                        canonical_artifacts[std::string(artifact_name)] = nullptr;
                     }
                 }
                 json deterministic = {{"outcome", measured_run.at("outcome")},
-                    {"artifacts", measured_run.at("artifacts")}, {"facts", measured_run.at("facts")},
+                    {"canonical_artifacts", std::move(canonical_artifacts)},
+                    {"facts", measured_run.at("facts")},
                     {"confidence", measured_run.at("confidence")},
                     {"explicit_unknowns", measured_run.at("explicit_unknowns")},
                     {"readability", measured_run.at("readability")},
-                    {"diagnostics", measured_run.at("diagnostics")}};
+                    {"diagnostics", canonical_diagnostics(measured_run.at("diagnostics"))}};
                 const auto output_hash = canonical_json_sha256(deterministic);
                 require(output_hash.ok, output_hash.error);
                 output_hashes[run_index] = output_hash.sha256;
@@ -609,6 +1236,14 @@ namespace
         }
         for (const auto& id : selected_ids)
             require(outputs.find(id) != outputs.end(), "provider omitted selected fixture: " + id);
+        for (std::size_t run_index = 0; run_index < 2; ++run_index) {
+            require(deterministic_schedules[run_index].size() == 1U &&
+                deterministic_cache_states[run_index].size() == 1U,
+                "provider determinism run does not use one corpus-wide schedule and cache state");
+        }
+        require(*deterministic_schedules[0].begin() != *deterministic_schedules[1].begin() ||
+            *deterministic_cache_states[0].begin() != *deterministic_cache_states[1].begin(),
+            "provider determinism runs do not vary schedule or cache state");
         json metrics = json::object();
         for (const auto metric : k_metrics) {
             std::set<std::string, std::less<>> expected;
@@ -618,18 +1253,23 @@ namespace
             for (const auto& id : selected_ids) {
                 const auto& expected_record = truth.at(id);
                 const auto& output = outputs.at(id);
-                for (const auto& fact : metric_facts(expected_record.at("facts"), metric))
+                const auto expected_semantics = project_expected(expected_record, metric);
+                if (supplemental_metric(metric) && expected_semantics.facts.empty())
+                    continue;
+                for (const auto& fact : expected_semantics.facts)
                     expected.insert(id + "\n" + fact);
                 if (output.is_null())
                     continue;
-                for (const auto& fact : metric_facts(output.at("facts"), metric)) {
+                const auto observed_semantics = project_observed(output, expected_record, metric);
+                for (const auto& fact : observed_semantics.facts) {
                     const auto scoped = id + "\n" + fact;
                     observed.insert(scoped);
-                    const auto found = output.at("confidence").find(fact);
-                    require(found != output.at("confidence").end(), "provider confidence lacks fact: " + fact);
-                    confidence[scoped] = *found;
+                    const auto found = observed_semantics.confidence.find(fact);
+                    require(found != observed_semantics.confidence.end(),
+                        "semantic provider fact lacks confidence: " + fact);
+                    confidence[scoped] = found->second;
                 }
-                for (const auto& unknown : strings(output.at("explicit_unknowns"), "explicit_unknowns"))
+                for (const auto& unknown : metric_unknowns(output.at("explicit_unknowns"), metric))
                     unknowns.insert(id + "\n" + unknown);
             }
             metrics[std::string(metric)] = score_metric(expected, observed,
@@ -710,13 +1350,11 @@ namespace
                 output_hash.ok ? source_hash.error : output_hash.error);
             score.determinism_runs.push_back({{"run_id", score.provider + "-run-" +
                     std::to_string(run_index + 1U)},
-                {"schedule", "bounded_provider_matrix"}, {"cache_state", "cache_bypass"},
+                {"schedule", *deterministic_schedules[run_index].begin()},
+                {"cache_state", *deterministic_cache_states[run_index].begin()},
                 {"normalized_ast_sha256", output_hash.sha256},
                 {"source_map_sha256", source_hash.sha256}, {"outcome", "success"}});
         }
-        score.normalized_outputs = json::object();
-        for (const auto& pair : outputs)
-            score.normalized_outputs[pair.first] = pair.second.is_null() ? json() : pair.second.at("facts");
         std::set<std::string, std::less<>> launch_hashes;
         std::set<std::string, std::less<>> artifact_hashes;
         for (const auto& pair : materialized)

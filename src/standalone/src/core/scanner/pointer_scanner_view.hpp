@@ -160,6 +160,15 @@ inline std::uint64_t mix_identity(std::uint64_t hash, const std::string& value) 
 	return hash;
 }
 
+inline std::uint32_t attached_target_pid() {
+	if (!is_process_attached())
+		return 0;
+	const std::uint64_t pid = get_attached_pid();
+	if (pid == 0 || pid > (std::numeric_limits<std::uint32_t>::max)())
+		return 0;
+	return static_cast<std::uint32_t>(pid);
+}
+
 inline std::uint64_t chain_identity_value(const pointer_scanner::pointer_chain_t& chain) {
 	std::uint64_t hash = 1469598103934665603ULL;
 	hash = mix_identity(hash, static_cast<std::uint64_t>(chain.module_index + 1));
@@ -184,7 +193,7 @@ inline std::string studio_pointer_entity_id(const char* entity,
 	const auto workspace = disasm_view::capture_selected_workspace();
 	const std::string workspace_id = workspace.workspace
 		? workspace.workspace->identity().binary_id().to_hex() : std::string("none");
-	const std::string identity = std::to_string(driver_bridge::attached_pid()) + ":" +
+	const std::string identity = std::to_string(attached_target_pid()) + ":" +
 		workspace_id + ":" +
 		chain_identity_key(chain) + ":" + std::to_string(step);
 	std::string source(entity);
@@ -890,11 +899,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddLine(ImVec2(cfg_x + config_panel_w, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h),
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
+	const bool live_now = detail::attached_target_pid() != 0;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	bool live_now = true;
 	bool static_pe_now = false;
 #else
-	bool live_now = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 	bool static_pe_now = function_index::detail::static_pe_active();
 #endif
 	float cy = cfg_y + 18.f;
@@ -1290,9 +1298,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			st.selected_result = static_cast<int>(i);
 			detail::request_chain_resolution(disasm_view::capture_selected_workspace(), chain);
 			memory_interaction::runtime_t runtime;
-			runtime.driver_loaded = driver_bridge::is_loaded();
-			runtime.live_attached = driver_bridge::attached_pid() != 0;
-			runtime.target_pid = driver_bridge::attached_pid();
+			runtime.target_pid = detail::attached_target_pid();
+			runtime.driver_loaded = runtime.target_pid != 0;
+			runtime.live_attached = runtime.driver_loaded;
 			const std::uint64_t base = detail::chain_base_address(chain).value_or(0);
 			memory_interaction::select(memory_interaction::capture_pointer_chain(runtime,
 				base, static_cast<std::uint64_t>(chain.offsets.size()), static_cast<int>(i),
@@ -1431,7 +1439,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			const auto workspace_generation = workspace.workspace ? workspace.workspace->generation() : 0;
 			const auto map_generation = view.map_generation;
 			const auto result_generation = view.result_generation;
-			const auto target_pid = driver_bridge::attached_pid();
+			const auto target_pid = detail::attached_target_pid();
 			aida::ui::application_ui::retained_entity_context_t retained;
 			retained.owner_id = "memory.pointer.chain";
 			retained.entity_id = detail::chain_identity_key(chain);
@@ -1441,7 +1449,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				map_generation, result_generation, target_pid]() {
 				if (!workspace.workspace || workspace.workspace->generation() != workspace_generation)
 					return aida::ui::capability_state_t::unavailable("The pointer workspace generation changed.");
-				if (driver_bridge::attached_pid() != target_pid || g_view.map_generation != map_generation ||
+				if (detail::attached_target_pid() != target_pid || g_view.map_generation != map_generation ||
 					g_view.result_generation != result_generation)
 					return aida::ui::capability_state_t::unavailable("The target, pointer map, or results changed.");
 				std::lock_guard<std::mutex> lock(pointer_scanner::g_state.results_mutex);
@@ -1543,7 +1551,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			evidence.return_to_source = [chain_text, workspace, workspace_generation,
 				map_generation, result_generation, target_pid](std::string& reason) {
 			if (!workspace.workspace || workspace.workspace->generation() != workspace_generation ||
-				driver_bridge::attached_pid() != target_pid ||
+				detail::attached_target_pid() != target_pid ||
 				g_view.map_generation != map_generation ||
 				g_view.result_generation != result_generation) {
 				reason = "The target, pointer map, results, or workspace generation changed; capture the chain again.";

@@ -1641,7 +1641,7 @@ void validate_preview_overlay_history(
         "preview overlay probe state restoration");
 }
 
-workspace_preview_fixture_t make_fixture() {
+workspace_preview_fixture_t make_fixture(bool live_process) {
     workspace_preview_fixture_t fixture;
     fixture.session_id = "as_aida_preview_0001";
     fixture.source_path = "C:\\Samples\\suspicious_payload.exe";
@@ -1663,6 +1663,16 @@ workspace_preview_fixture_t make_fixture() {
     input.architecture_mode = analysis::architecture_mode_t::x86_64;
     input.abi = analysis::abi_id_t::windows_x64;
     input.image_base = 0x0000000140000000ULL;
+    if (live_process) {
+        input.target_kind = analysis::target_kind_t::live_snapshot;
+        input.image_base = 0x00007FF7A4C00000ULL;
+        input.process = analysis::process_identity_t{
+            6420, 1, "c:\\samples\\suspicious_payload.exe"};
+        input.module = analysis::module_identity_t{
+            0x00007FF7A4C00000ULL, 0x001A0000ULL, "suspicious_payload.exe",
+            "c:\\samples\\suspicious_payload.exe",
+            std::optional<analysis::sha256_digest_t>{content_hash}};
+    }
     auto identity = analysis::workspace_identity_t::create_preview(
         binary_id, std::move(input));
     auto pe = analysis::pe_image_t::create_preview();
@@ -1676,7 +1686,7 @@ workspace_preview_fixture_t make_fixture() {
     if (created) {
         fixture.workspace = created.take_value();
         auto overlay = analysis::overlay_journal_t::open_preview(fixture.workspace);
-        if (overlay) {
+        if (overlay && !live_process) {
             validate_preview_overlay_history(fixture.workspace, overlay.value());
             static constexpr std::array<const char*, 12> analyst_notes{{
                 "Program entry; initializes the staged analysis pipeline",
@@ -1733,7 +1743,7 @@ workspace_preview_fixture_t make_fixture() {
                 seeded_presentation->workspace_bookmarks.size() == 3 &&
                 fixture.workspace->overlay_revision() == seeded.value().revision,
                 "preview overlay seeded publication");
-        } else {
+        } else if (!overlay) {
             preview_fixture_failure("preview overlay open", overlay.error());
         }
         static_cast<void>(fixture.workspace->update_view_state([](auto& view) {
@@ -1750,9 +1760,20 @@ workspace_preview_fixture_t make_fixture() {
 
 }
 
+workspace_preview_target_t& configured_workspace_target() {
+    static workspace_preview_target_t target = workspace_preview_target_t::static_file;
+    return target;
+}
+
+void configure_workspace_preview_target(workspace_preview_target_t target) {
+    configured_workspace_target() = target;
+}
+
 const workspace_preview_fixture_t& workspace_preview_fixture() {
-    static const workspace_preview_fixture_t fixture = make_fixture();
-    return fixture;
+    static const workspace_preview_fixture_t static_fixture = make_fixture(false);
+    static const workspace_preview_fixture_t live_fixture = make_fixture(true);
+    return configured_workspace_target() == workspace_preview_target_t::live_process
+        ? live_fixture : static_fixture;
 }
 
 }

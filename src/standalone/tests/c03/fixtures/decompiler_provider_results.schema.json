@@ -1,11 +1,11 @@
 {
-  "$id": "aida.c03.decompiler-provider-results.v2",
+  "$id": "aida.c03.decompiler-provider-results.v3",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema", "schema_version", "evidence_class", "measurement_eligible", "analysis_mode", "target_execution_forbidden", "target_execution_observed", "provider_run"],
   "properties": {
     "schema": {"const": "aida.c03.decompiler-provider-results"},
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "evidence_class": {"const": "measured_provider_output"},
     "measurement_eligible": {"type": "boolean"},
     "analysis_mode": {"const": "static_only"},
@@ -92,6 +92,23 @@
       }
     },
     "stringSet": {"type": "array", "maxItems": 65536, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 65536}},
+    "metricUnknowns": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["typed_entities", "calls", "fields", "locals", "parameters", "cfg", "control_structures", "exception_regions", "type_correctness", "source_coordinates"],
+      "properties": {
+        "typed_entities": {"$ref": "#/$defs/stringSet"},
+        "calls": {"$ref": "#/$defs/stringSet"},
+        "fields": {"$ref": "#/$defs/stringSet"},
+        "locals": {"$ref": "#/$defs/stringSet"},
+        "parameters": {"$ref": "#/$defs/stringSet"},
+        "cfg": {"$ref": "#/$defs/stringSet"},
+        "control_structures": {"$ref": "#/$defs/stringSet"},
+        "exception_regions": {"$ref": "#/$defs/stringSet"},
+        "type_correctness": {"$ref": "#/$defs/stringSet"},
+        "source_coordinates": {"$ref": "#/$defs/stringSet"}
+      }
+    },
     "readability": {
       "type": "object",
       "additionalProperties": false,
@@ -120,13 +137,14 @@
     "run": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["run_id", "execution_witness_sha256", "started_tick_ns", "ended_tick_ns", "duration_ns", "cache_state", "outcome", "artifacts", "facts", "confidence", "explicit_unknowns", "readability", "diagnostics"],
+      "required": ["run_id", "execution_witness_sha256", "started_tick_ns", "ended_tick_ns", "duration_ns", "schedule", "cache_state", "outcome", "artifacts", "facts", "confidence", "explicit_unknowns", "readability", "diagnostics"],
       "properties": {
         "run_id": {"type": "string", "minLength": 1, "maxLength": 65536},
         "execution_witness_sha256": {"$ref": "#/$defs/sha256"},
         "started_tick_ns": {"type": "integer", "minimum": 1},
         "ended_tick_ns": {"type": "integer", "minimum": 1},
         "duration_ns": {"type": "integer", "minimum": 1},
+        "schedule": {"enum": ["forward_entity_order", "reverse_entity_order"]},
         "cache_state": {"const": "cache_bypass"},
         "outcome": {"const": "success"},
         "artifacts": {
@@ -144,7 +162,7 @@
         },
         "facts": {"$ref": "#/$defs/facts"},
         "confidence": {"type": "object", "maxProperties": 65536, "propertyNames": {"minLength": 1, "maxLength": 65536}, "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}},
-        "explicit_unknowns": {"$ref": "#/$defs/stringSet"},
+        "explicit_unknowns": {"$ref": "#/$defs/metricUnknowns"},
         "readability": {"$ref": "#/$defs/readability"},
         "diagnostics": {"type": "array", "maxItems": 65536, "items": {"$ref": "#/$defs/diagnostic"}}
       }
@@ -166,7 +184,10 @@
         "runs": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/run"}}
       },
       "allOf": [
-        {"if": {"properties": {"status": {"const": "measured"}}}, "then": {"properties": {"runs": {"minItems": 2, "maxItems": 2}}}},
+        {"if": {"properties": {"status": {"const": "measured"}}}, "then": {"properties": {"runs": {"minItems": 2, "maxItems": 2, "allOf": [
+          {"contains": {"type": "object", "required": ["schedule"], "properties": {"schedule": {"const": "forward_entity_order"}}}},
+          {"contains": {"type": "object", "required": ["schedule"], "properties": {"schedule": {"const": "reverse_entity_order"}}}}
+        ]}}}},
         {"if": {"properties": {"status": {"enum": ["not_applicable", "failed"]}}}, "then": {"properties": {"runs": {"maxItems": 0}}}}
       ]
     },

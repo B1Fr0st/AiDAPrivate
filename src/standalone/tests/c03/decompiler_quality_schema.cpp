@@ -603,8 +603,14 @@ const json& decompiler_quality_thresholds()
 {
     static const json thresholds = {
         {"threshold_schema", "aida.c03.decompiler-quality-thresholds"},
-        {"threshold_schema_version", 2},
-        {"scorer_revision", 2},
+        {"threshold_schema_version", 3},
+        {"scorer_revision", 3},
+        {"semantic_contract", {
+            {"revision", 1},
+            {"provider_execution_ground_truth_independent", true},
+            {"entity_owned_facts", true},
+            {"metric_domain_explicit_unknowns", true},
+            {"determinism_schedules", json::array({"forward_entity_order", "reverse_entity_order"})}}},
         {"metric_f1_min", {
             {"typed_entities", 0.70}, {"calls", 0.70}, {"fields", 0.70}, {"locals", 0.65},
             {"parameters", 0.75}, {"cfg", 0.80}, {"control_structures", 0.70},
@@ -855,8 +861,8 @@ contract_validation_result_t validate_decompiler_provider_results(const json& ev
         "aida.c03.decompiler-provider-results")
         result.reject("/schema", "schema_identity", "provider result schema identity is invalid");
     if (!evidence.contains("schema_version") || !is_nonnegative_integer(evidence.at("schema_version")) ||
-        evidence.at("schema_version").get<std::uint64_t>() != 2)
-        result.reject("/schema_version", "schema_version", "provider result schema version must be 2");
+        evidence.at("schema_version").get<std::uint64_t>() != 3)
+        result.reject("/schema_version", "schema_version", "provider result schema version must be 3");
     if (!evidence.contains("evidence_class") || evidence.at("evidence_class") !=
         "measured_provider_output")
         result.reject("/evidence_class", "evidence_class", "provider result evidence class is invalid");
@@ -1055,7 +1061,7 @@ contract_validation_result_t validate_decompiler_provider_results(const json& ev
         charge_provider_structured(1536ULL, path);
         require_closed_object(result, measured_run, path,
             {"run_id", "execution_witness_sha256", "started_tick_ns", "ended_tick_ns",
-             "duration_ns", "cache_state", "outcome", "artifacts", "facts", "confidence",
+             "duration_ns", "schedule", "cache_state", "outcome", "artifacts", "facts", "confidence",
              "explicit_unknowns", "readability", "diagnostics"});
         require_string(result, measured_run, path, "run_id");
         require_sha256(result, measured_run, path, "execution_witness_sha256");
@@ -1065,6 +1071,12 @@ contract_validation_result_t validate_decompiler_provider_results(const json& ev
                 result.reject(path + "/" + std::string(field), "positive_integer_required",
                     "expected a positive integer");
         }
+        const json* schedule = require_field(result, measured_run, path, "schedule");
+        if (schedule && (!schedule->is_string() ||
+                (schedule->get<std::string>() != "forward_entity_order" &&
+                 schedule->get<std::string>() != "reverse_entity_order")))
+            result.reject(path + "/schedule", "execution_schedule",
+                "measured run schedule must be a supported production entity order");
         if (!measured_run.contains("cache_state") || measured_run.at("cache_state") != "cache_bypass")
             result.reject(path + "/cache_state", "cache_state", "measured runs must bypass caches");
         if (!measured_run.contains("outcome") || measured_run.at("outcome") != "success")
@@ -1165,9 +1177,28 @@ contract_validation_result_t validate_decompiler_provider_results(const json& ev
         }
         const json* unknowns = require_field(result, measured_run, path, "explicit_unknowns");
         if (unknowns) {
-            const auto found = string_set(result, *unknowns,
-                path + "/explicit_unknowns", false);
-            charge_fact_values(found, path + "/explicit_unknowns");
+            std::set<std::string, std::less<>> allowed;
+            for (const auto metric : kQualityMetrics)
+                allowed.emplace(metric);
+            require_closed_object(result, *unknowns, path + "/explicit_unknowns",
+                {"typed_entities", "calls", "fields", "locals", "parameters", "cfg",
+                 "control_structures", "exception_regions", "type_correctness", "source_coordinates"});
+            if (unknowns->is_object()) {
+                for (const auto metric : kQualityMetrics) {
+                    const auto values_path = path + "/explicit_unknowns/" + std::string(metric);
+                    const json* values = require_field(result, *unknowns,
+                        path + "/explicit_unknowns", metric);
+                    if (!values)
+                        continue;
+                    const auto found = string_set(result, *values, values_path, false);
+                    charge_fact_values(found, values_path);
+                }
+                for (auto iterator = unknowns->begin(); iterator != unknowns->end(); ++iterator) {
+                    if (allowed.find(iterator.key()) == allowed.end())
+                        result.reject(path + "/explicit_unknowns/" + iterator.key(),
+                            "unknown_metric_domain", "explicit unknown metric domain is invalid");
+                }
+            }
         }
         const json* readability = require_field(result, measured_run, path, "readability");
         if (readability) {
@@ -1237,6 +1268,18 @@ contract_validation_result_t validate_decompiler_provider_results(const json& ev
                         "fixture run cardinality does not match its status");
                 for (std::size_t run_index = 0; run_index < runs->size(); ++run_index)
                     validate_run((*runs)[run_index], path + "/runs/" + std::to_string(run_index));
+                if (fixture_status == "measured" && runs->size() == 2U &&
+                    (*runs)[0].is_object() && (*runs)[1].is_object() &&
+                    (*runs)[0].contains("schedule") && (*runs)[1].contains("schedule") &&
+                    (*runs)[0].at("schedule").is_string() && (*runs)[1].at("schedule").is_string()) {
+                    const std::set<std::string, std::less<>> schedules{
+                        (*runs)[0].at("schedule").get<std::string>(),
+                        (*runs)[1].at("schedule").get<std::string>()};
+                    if (schedules != std::set<std::string, std::less<>>{
+                            "forward_entity_order", "reverse_entity_order"})
+                        result.reject(path + "/runs", "schedule_variation",
+                            "measured determinism runs must execute both entity orders");
+                }
             } else if (runs) {
                 result.reject(path + "/runs", "array_required", "expected an array");
             }
@@ -1642,6 +1685,8 @@ contract_validation_result_t validate_decompiler_quality_receipt(const json& rec
             if (runs->size() < 2)
                 result.reject("/determinism/runs", "min_items", "determinism requires at least two runs");
             std::set<std::string, std::less<>> schedule_cache_pairs;
+            std::set<std::string, std::less<>> schedules;
+            std::set<std::string, std::less<>> cache_states;
             std::string ast_hash;
             std::string source_map_hash;
             for (std::size_t index = 0; index < runs->size(); ++index) {
@@ -1656,8 +1701,11 @@ contract_validation_result_t validate_decompiler_quality_receipt(const json& rec
                 if (run.contains("outcome") && is_nonempty_string(run.at("outcome")) && run.at("outcome").get<std::string>() != "success")
                     result.reject(path + "/outcome", "determinism_incomplete", "determinism proof requires successful runs");
                 if (run.contains("schedule") && run.contains("cache_state") && is_nonempty_string(run.at("schedule")) &&
-                    is_nonempty_string(run.at("cache_state")))
+                    is_nonempty_string(run.at("cache_state"))) {
                     schedule_cache_pairs.insert(run.at("schedule").get<std::string>() + "\n" + run.at("cache_state").get<std::string>());
+                    schedules.insert(run.at("schedule").get<std::string>());
+                    cache_states.insert(run.at("cache_state").get<std::string>());
+                }
                 if (run.contains("normalized_ast_sha256") && is_sha256(run.at("normalized_ast_sha256"))) {
                     const auto& current = run.at("normalized_ast_sha256").get_ref<const std::string&>();
                     if (ast_hash.empty()) ast_hash = current;
@@ -1672,6 +1720,11 @@ contract_validation_result_t validate_decompiler_quality_receipt(const json& rec
             if (runs->size() >= 2 && schedule_cache_pairs.size() < 2)
                 result.reject("/determinism/runs", "insufficient_schedule_cache_variation",
                     "determinism requires distinct schedule or cache-state evidence");
+            if (runs->size() >= 2 && (schedules != std::set<std::string, std::less<>>{
+                    "forward_entity_order", "reverse_entity_order"} ||
+                cache_states != std::set<std::string, std::less<>>{"cache_bypass"}))
+                result.reject("/determinism/runs", "determinism_schedule_contract",
+                    "determinism must bind both production entity orders with cache bypass");
         } else if (runs) {
             result.reject("/determinism/runs", "array_required", "expected an array");
         }

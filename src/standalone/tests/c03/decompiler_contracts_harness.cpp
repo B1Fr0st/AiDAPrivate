@@ -1,8 +1,10 @@
 #include "decompiler_contracts_harness.hpp"
 #include "assertion_telemetry/assertion_telemetry.hpp"
 #include "../../src/core/analysis/decompiler/decompiler_contracts.hpp"
+#include "../../src/core/analysis/decompiler/typed_ast_v2.hpp"
 #include "../../workers/native_decompiler/native_worker_runtime.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -252,6 +254,249 @@ hir_function_t hir(const decompiler_entity_key_t& entity, const provider_ir_t& p
     result.unknowns.push_back(unknown(entity));
     result.diagnostics.push_back(diagnostic(entity, decompiler_coordinate_layer_t::hir));
     return result;
+}
+
+source_coordinate_t exception_coordinate(
+    const decompiler_entity_key_t& entity,
+    const decompiler_coordinate_layer_t layer,
+    const std::uint64_t offset)
+{
+    auto result = coordinate(entity, layer);
+    result.address_range = decompiler_address_range_t{
+        address(0x1000 + offset * 0x10), address(0x1004 + offset * 0x10)};
+    result.instruction_range = decompiler_instruction_range_t{
+        100 + offset, 101 + offset};
+    return result;
+}
+
+type_graph_t exception_type_graph(const decompiler_entity_key_t& entity)
+{
+    decompiler_type_node_t void_type;
+    void_type.id = 1;
+    void_type.kind = decompiler_type_kind_t::void_type;
+    void_type.canonical_name = "void";
+    void_type.display_name = "void";
+    void_type.confidence = 100;
+    void_type.provenance = decompiler_fact_provenance_t::provider_semantics;
+    void_type.coordinates.push_back(exception_coordinate(entity,
+        decompiler_coordinate_layer_t::hir, 0));
+    type_graph_t result;
+    result.entity = entity;
+    result.revision = 23;
+    result.nodes.push_back(std::move(void_type));
+    return result;
+}
+
+hir_value_t exception_call(
+    const decompiler_entity_key_t& entity,
+    const std::uint64_t id,
+    std::string value,
+    const std::uint64_t block_offset)
+{
+    hir_value_t result;
+    result.id = id;
+    result.kind = hir_node_kind_t::call;
+    result.type_id = 1;
+    result.stable_value = std::move(value);
+    result.coordinate = exception_coordinate(entity,
+        decompiler_coordinate_layer_t::hir, block_offset);
+    result.confidence = 100;
+    result.provenance = decompiler_fact_provenance_t::bytecode_verifier;
+    return result;
+}
+
+hir_value_t exception_return(
+    const decompiler_entity_key_t& entity,
+    const std::uint64_t id,
+    const std::uint64_t block_offset)
+{
+    hir_value_t result;
+    result.id = id;
+    result.kind = hir_node_kind_t::return_value;
+    result.type_id = 1;
+    result.coordinate = exception_coordinate(entity,
+        decompiler_coordinate_layer_t::hir, block_offset);
+    result.confidence = 100;
+    result.provenance = decompiler_fact_provenance_t::bytecode_verifier;
+    return result;
+}
+
+hir_function_t exception_hir(
+    const decompiler_entity_key_t& entity,
+    const bool second_handler = false)
+{
+    hir_block_t protected_block;
+    protected_block.id = 1;
+    protected_block.successor_ids = {2};
+    protected_block.exception_successor_ids = second_handler
+        ? std::vector<std::uint64_t>{3, 4}
+        : std::vector<std::uint64_t>{3};
+    protected_block.values.push_back(exception_call(entity, 1,
+        "may_throw", 1));
+    protected_block.coordinate = exception_coordinate(entity,
+        decompiler_coordinate_layer_t::hir, 1);
+
+    hir_block_t continuation;
+    continuation.id = 2;
+    continuation.predecessor_ids = second_handler
+        ? std::vector<std::uint64_t>{1, 3, 4}
+        : std::vector<std::uint64_t>{1, 3};
+    continuation.values.push_back(exception_return(entity, 2, 2));
+    continuation.coordinate = exception_coordinate(entity,
+        decompiler_coordinate_layer_t::hir, 2);
+
+    hir_block_t handler;
+    handler.id = 3;
+    handler.predecessor_ids = {1};
+    handler.successor_ids = {2};
+    handler.values.push_back(exception_call(entity, 3,
+        "recover_primary", 3));
+    handler.coordinate = exception_coordinate(entity,
+        decompiler_coordinate_layer_t::hir, 3);
+
+    hir_function_t result;
+    result.entity = entity;
+    result.provider_ir_hash = digest("exception-provider-ir");
+    result.type_graph_revision = 23;
+    result.return_type_id = 1;
+    result.blocks = {std::move(protected_block), std::move(continuation),
+        std::move(handler)};
+    if (second_handler) {
+        hir_block_t alternate_handler;
+        alternate_handler.id = 4;
+        alternate_handler.predecessor_ids = {1};
+        alternate_handler.successor_ids = {2};
+        alternate_handler.values.push_back(exception_call(entity, 4,
+            "recover_alternate", 4));
+        alternate_handler.coordinate = exception_coordinate(entity,
+            decompiler_coordinate_layer_t::hir, 4);
+        result.blocks.push_back(std::move(alternate_handler));
+    }
+    return result;
+}
+
+const typed_pseudocode_ast_node_t* first_ast_node(
+    const typed_pseudocode_ast_v2_t& ast_value,
+    const typed_pseudocode_ast_node_kind_t kind)
+{
+    const auto found = std::find_if(ast_value.nodes.begin(), ast_value.nodes.end(),
+        [kind](const typed_pseudocode_ast_node_t& node) {
+            return node.kind == kind;
+        });
+    return found == ast_value.nodes.end() ? nullptr : &*found;
+}
+
+bool has_diagnostic(
+    const typed_ast_v2_build_result_t& result,
+    const std::string& localization_key)
+{
+    return std::any_of(result.diagnostics.begin(), result.diagnostics.end(),
+        [&localization_key](const decompiler_diagnostic_t& diagnostic_value) {
+            return diagnostic_value.localization_key == localization_key;
+        });
+}
+
+void verify_exception_ast_contract(const decompiler_entity_key_t& entity,
+                                   const bool second_handler)
+{
+    const auto types = exception_type_graph(entity);
+    const auto hir_value = exception_hir(entity, second_handler);
+    const auto first = build_typed_ast_v2(hir_value, types);
+    const auto second = build_typed_ast_v2(hir_value, types);
+    require(first.succeeded() && second.succeeded(),
+        "typed AST rejected a valid exception-only handler region");
+    require(serialize_typed_ast_v2(*first.ast) ==
+            serialize_typed_ast_v2(*second.ast) &&
+        stable_serialization_hash(*first.ast) ==
+            stable_serialization_hash(*second.ast),
+        "typed AST exception structure was nondeterministic");
+    const auto* try_node = first_ast_node(*first.ast,
+        typed_pseudocode_ast_node_kind_t::try_statement);
+    require(try_node != nullptr && try_node->child_ids.size() ==
+            (second_handler ? 3U : 2U),
+        "typed AST lost the try body or a handler");
+    const auto catch_count = static_cast<std::size_t>(std::count_if(first.ast->nodes.begin(),
+        first.ast->nodes.end(), [](const typed_pseudocode_ast_node_t& node) {
+            return node.kind == typed_pseudocode_ast_node_kind_t::catch_clause &&
+                node.stable_text == "unknown_exception";
+        }));
+    require(catch_count == (second_handler ? 2U : 1U),
+        "typed AST did not preserve every explicit-unknown handler");
+    const auto unknown_count = static_cast<std::size_t>(std::count_if(first.ast->unknowns.begin(),
+        first.ast->unknowns.end(), [](const decompiler_unknown_t& value) {
+            return value.reason == decompiler_unknown_reason_t::unresolved_reference &&
+                value.stable_token.find("exception.handler_type.block_") == 0;
+        }));
+    require(unknown_count == (second_handler ? 2U : 1U),
+        "typed AST did not preserve unresolved handler types explicitly");
+    require(try_node->coordinate.layer ==
+            decompiler_coordinate_layer_t::typed_ast &&
+        try_node->coordinate.address_range.has_value() &&
+        try_node->coordinate.address_range->begin.value == 0x1010,
+        "typed AST try coordinate lost the protected-region anchor");
+    const auto* catch_node = first_ast_node(*first.ast,
+        typed_pseudocode_ast_node_kind_t::catch_clause);
+    require(catch_node != nullptr && catch_node->coordinate.address_range.has_value() &&
+            catch_node->coordinate.address_range->begin.value == 0x1030 &&
+            catch_node->provenance ==
+                decompiler_fact_provenance_t::bytecode_verifier,
+        "typed AST catch lost the handler coordinate or provenance");
+    require(validate_typed_ast_v2_semantics(*first.ast, types).valid(),
+        "typed AST exception structure failed semantic validation");
+}
+
+void verify_exception_ast_rejections()
+{
+    const auto entity = jvm_entity();
+    const auto types = exception_type_graph(entity);
+
+    auto asymmetric = exception_hir(entity);
+    asymmetric.blocks[2].predecessor_ids.clear();
+    const auto asymmetric_result = build_typed_ast_v2(asymmetric, types);
+    require(!asymmetric_result.succeeded() && has_diagnostic(asymmetric_result,
+            "decompiler.ast.v2.asymmetric_predecessor"),
+        "typed AST accepted an asymmetric exceptional predecessor");
+
+    auto missing = exception_hir(entity);
+    missing.blocks[0].exception_successor_ids = {99};
+    const auto missing_result = build_typed_ast_v2(missing, types);
+    require(!missing_result.succeeded(),
+        "typed AST accepted a missing exceptional target");
+
+    auto ambiguous_edge = exception_hir(entity);
+    ambiguous_edge.blocks[0].exception_successor_ids = {2, 3};
+    const auto ambiguous_edge_result = build_typed_ast_v2(ambiguous_edge, types);
+    require(!ambiguous_edge_result.succeeded() &&
+            has_diagnostic(ambiguous_edge_result,
+                "decompiler.ast.v2.ambiguous_exception_edge"),
+        "typed AST accepted one target as both normal and exceptional");
+
+    auto overlap = exception_hir(entity);
+    overlap.blocks[1].exception_successor_ids = {3, 4};
+    overlap.blocks[2].predecessor_ids = {1, 2};
+    hir_block_t overlap_handler;
+    overlap_handler.id = 4;
+    overlap_handler.predecessor_ids = {2};
+    overlap_handler.values.push_back(exception_return(entity, 4, 4));
+    overlap_handler.coordinate = exception_coordinate(entity,
+        decompiler_coordinate_layer_t::hir, 4);
+    overlap.blocks.push_back(std::move(overlap_handler));
+    const auto overlap_result = build_typed_ast_v2(overlap, types);
+    require(!overlap_result.succeeded() && has_diagnostic(overlap_result,
+            "decompiler.ast.v2.ambiguous_exception_overlap"),
+        "typed AST accepted an ambiguous overlapping exception region");
+
+    typed_ast_v2_build_request_t bounded_request;
+    bounded_request.limits.max_ast_nodes = 5;
+    const auto bounded_result = build_typed_ast_v2(exception_hir(entity),
+        types, bounded_request);
+    require(!bounded_result.succeeded() &&
+            std::any_of(bounded_result.diagnostics.begin(),
+                bounded_result.diagnostics.end(),
+                [](const decompiler_diagnostic_t& value) {
+                    return value.code == decompiler_diagnostic_code_t::resource_limit;
+                }),
+        "typed AST exception structuring ignored the AST node budget");
 }
 
 typed_pseudocode_ast_v2_t ast(const decompiler_entity_key_t& entity, const hir_function_t& hir_value, const type_graph_t& types)
@@ -670,6 +915,10 @@ void run_decompiler_contracts_harness()
     const auto decoded_hir = deserialize_hir_function(hir_bytes);
     require(decoded_hir.valid(), "HIR decode failed");
     require(stable_serialization_hash(hir_value) == stable_serialization_hash(*decoded_hir.value), "HIR hash drifted");
+
+    verify_exception_ast_contract(jvm_entity(), false);
+    verify_exception_ast_contract(dalvik_entity(), true);
+    verify_exception_ast_rejections();
 
     const auto ast_value = ast(native, hir_value, types);
     const auto ast_bytes = serialize_typed_pseudocode_ast(ast_value);

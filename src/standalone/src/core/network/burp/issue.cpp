@@ -1,7 +1,9 @@
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW) && !defined(__EMSCRIPTEN__)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <shlobj.h>
+#endif
 
 #ifdef small
 #undef small
@@ -9,7 +11,11 @@
 
 #include "issue.hpp"
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW) || defined(__EMSCRIPTEN__)
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #include "../../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -145,6 +151,9 @@ bool validate_loaded_issue(issue_t& issue, const char* source, std::string& reas
 
 std::string resolve_appdata_dir()
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW) || defined(__EMSCRIPTEN__)
+    return "/aida-preview/state";
+#else
     PWSTR known = nullptr;
     std::string out;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &known)) && known) {
@@ -162,6 +171,7 @@ std::string resolve_appdata_dir()
     }
     if (out.empty()) out = "C:\\Users\\Public";
     return out;
+#endif
 }
 
 std::string normalize_case(std::string s)
@@ -618,9 +628,15 @@ bool import_json(const nlohmann::json& doc, bool replace_existing)
 std::string storage_path()
 {
     diag::log_tagged_fmt("issue", "storage_path entry");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW) || defined(__EMSCRIPTEN__)
+    std::string dir = resolve_appdata_dir();
+    ensure_dir(dir);
+    std::string path = dir + "/scanner-issues.json";
+#else
     std::string dir = resolve_appdata_dir() + "\\AiDA\\Standalone\\burp";
     ensure_dir(dir);
     std::string path = dir + "\\issues.json";
+#endif
     diag::log_tagged_fmt("issue", "storage_path result=%s", path.c_str());
     return path;
 }
@@ -654,7 +670,26 @@ bool save_to_disk()
         const std::string out = doc.dump(2);
         f.write(out.data(), static_cast<std::streamsize>(out.size()));
         f.close();
+        if (!f) {
+            diag::log_tagged_fmt("issue", "save_to_disk write_failed path=%s", tmp_path.c_str());
+            set_err("issue_store.save: write failed");
+            std::error_code remove_error;
+            std::filesystem::remove(tmp_path, remove_error);
+            return false;
+        }
         diag::log_tagged_fmt("issue", "save_to_disk written bytes=%zu", out.size());
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW) || defined(__EMSCRIPTEN__)
+        std::error_code replace_error;
+        std::filesystem::rename(tmp_path, path, replace_error);
+        if (replace_error) {
+            diag::log_tagged_fmt("issue", "save_to_disk replace_failed error=%s tmp=%s path=%s",
+                replace_error.message().c_str(), tmp_path.c_str(), path.c_str());
+            set_err("issue_store.save: replace failed");
+            std::error_code remove_error;
+            std::filesystem::remove(tmp_path, remove_error);
+            return false;
+        }
+#else
         const std::wstring tmp_w = std::filesystem::path(tmp_path).wstring();
         const std::wstring path_w = std::filesystem::path(path).wstring();
         if (!MoveFileExW(tmp_w.c_str(), path_w.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -666,6 +701,7 @@ bool save_to_disk()
             std::filesystem::remove(tmp_path, ec);
             return false;
         }
+#endif
         diag::log_tagged_fmt("issue", "save_to_disk ok path=%s", path.c_str());
         s.last_save_ms.store(now_ms(), std::memory_order_release);
         uint64_t cur = s.unsaved_changes.load(std::memory_order_acquire);

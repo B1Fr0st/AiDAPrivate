@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include "imgui/imgui_internal.h"
 
 namespace aida::ui::design {
 
@@ -1079,8 +1080,12 @@ dialog_result_t dialog_footer(const char* stable_id, const char* confirm_label,
             ImGui::SameLine(0.f, m.spacing_sm);
     }
     const auto kind = destructive ? components::button_kind_t::destructive : components::button_kind_t::primary;
+    if (!confirm_on_enter)
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNavDefaultFocus, true);
     if (components::button(safe(confirm_label), kind, components::size_t_::sm,
         ImVec2(confirm_width, m.control_height), !confirm_enabled)) result.confirmed = true;
+    if (!confirm_on_enter)
+        ImGui::PopItemFlag();
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     const std::string confirm_semantic = aida::preview::semantics::stable_id(
         aida::preview::semantics::stable_id("aida.dialog-action", safe(stable_id)),

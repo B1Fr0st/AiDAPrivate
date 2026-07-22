@@ -1999,6 +1999,23 @@ capability_state_t analysis_selection_capability() {
         : capability_state_t::unavailable("Select an instruction, function, graph node, pseudocode line, reference, or typed address first");
 }
 
+capability_state_t analysis_graph_capability() {
+    const auto selection = analysis_selection_capability();
+    if (!selection.enabled)
+        return selection;
+    const auto context = selected_analysis_context();
+    const auto address = selected_analysis_address(context);
+    if (!address)
+        return capability_state_t::unavailable(
+            "The analysis selection no longer has an address");
+    const auto runtime = disasm_view::runtime_address(context, *address)
+        .value_or(address->value);
+    return disasm_view::enclosing_function_start(runtime, context) != 0
+        ? capability_state_t::available()
+        : capability_state_t::unavailable(
+            "No recovered function contains the selected address");
+}
+
 capability_state_t analysis_history_capability(bool forward) {
     const auto workspace = analysis_workspace_capability();
     if (!workspace.enabled)
@@ -2093,8 +2110,7 @@ std::optional<std::uint64_t> selected_analysis_direct_target(
 }
 
 struct analysis_debug_location_t {
-    std::uint64_t address = 0;
-    std::uint32_t pid = 0;
+    debugger_interaction::context_t debugger_context;
 };
 
 std::optional<analysis_debug_location_t> selected_analysis_debug_location() {
@@ -2107,7 +2123,14 @@ std::optional<analysis_debug_location_t> selected_analysis_debug_location() {
     const auto runtime = disasm_view::runtime_address(context, *selected);
     if (!runtime)
         return std::nullopt;
-    return analysis_debug_location_t{*runtime, process->pid};
+    const auto debugger_context = debugger_interaction::capture(
+        debugger_interaction::kind_t::instruction, *runtime);
+    if (process->creation_time_100ns == 0 ||
+        debugger_context.target_pid != process->pid ||
+        debugger_context.process_creation_time_100ns != process->creation_time_100ns ||
+        !debugger_interaction::is_current(debugger_context))
+        return std::nullopt;
+    return analysis_debug_location_t{debugger_context};
 }
 
 capability_state_t analysis_debug_mutation_capability(bool toggle_breakpoint) {
@@ -2119,7 +2142,7 @@ capability_state_t analysis_debug_mutation_capability(bool toggle_breakpoint) {
         return capability_state_t::unavailable(
             "Select an address in a live process-backed analysis workspace");
     const auto capability = debugger_view::address_mutation_capability(
-        location->address, toggle_breakpoint, location->pid);
+        location->debugger_context, toggle_breakpoint);
     return capability.enabled
         ? capability_state_t::available()
         : capability_state_t::unavailable(capability.disabled_reason
@@ -2956,7 +2979,7 @@ void initialize(runtime_t& rt) {
 
     register_action(rt, "analysis.navigate.back", "Analysis Back",
         "Restore the previous global analysis document and exact selection",
-        all_surfaces,
+        all_surfaces | action_surface_t::toolbar,
         retained_or_handler("analysis.navigate.back", [](const action_invocation_t&) {
             const auto context = selected_analysis_context();
             disasm_view::navigate_back(context);
@@ -2967,7 +2990,7 @@ void initialize(runtime_t& rt) {
         "category.analysis.navigate", "Analysis / Navigate");
     register_action(rt, "analysis.navigate.forward", "Analysis Forward",
         "Restore the next global analysis document and exact selection",
-        all_surfaces,
+        all_surfaces | action_surface_t::toolbar,
         retained_or_handler("analysis.navigate.forward", [](const action_invocation_t&) {
             const auto context = selected_analysis_context();
             disasm_view::navigate_forward(context);
@@ -2978,7 +3001,7 @@ void initialize(runtime_t& rt) {
         "category.analysis.navigate", "Analysis / Navigate");
     register_action(rt, "analysis.navigate.goto", "Go to Address...",
         "Open the canonical Disassembly address or symbol navigation field",
-        menu_surfaces,
+        menu_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             const auto context = selected_analysis_context();
             const auto opened = open_analysis_view("document.disassembly");
@@ -2992,7 +3015,7 @@ void initialize(runtime_t& rt) {
         false, {}, "category.analysis.navigate", "Analysis / Navigate");
     register_action(rt, "analysis.modify.rebase", "Rebase Analysis Image...",
         "Set the presentation image base for the selected static analysis workspace",
-        all_surfaces,
+        all_surfaces | action_surface_t::toolbar,
         [](const action_invocation_t&) {
             std::string error;
             return disasm_view::request_rebase(selected_analysis_context(), &error)
@@ -3058,7 +3081,7 @@ void initialize(runtime_t& rt) {
         "category.analysis.navigate", "Analysis / Navigate");
     register_action(rt, "analysis.navigate.graph", "Open Selection in Graph",
         "Build and focus the control-flow graph for the selected function",
-        all_surfaces,
+        all_surfaces | action_surface_t::toolbar,
         retained_or_handler("analysis.navigate.graph", [](const action_invocation_t&) {
             const auto context = selected_analysis_context();
             const auto address = selected_analysis_address(context);
@@ -3071,7 +3094,7 @@ void initialize(runtime_t& rt) {
             cfg_view::build_cfg(context, function);
             return open_analysis_view("document.graph");
         }), retained_or_capability("analysis.navigate.graph",
-            [](const interaction_context_t&) { return analysis_selection_capability(); }),
+            [](const interaction_context_t&) { return analysis_graph_capability(); }),
         false, retained_check_state("analysis.navigate.graph"),
         "category.analysis.navigate", "Analysis / Navigate");
     register_action(rt, "analysis.toggle_graph_text", "Toggle Graph / Text View",
@@ -3125,7 +3148,7 @@ void initialize(runtime_t& rt) {
         "category.analysis.navigate", "Analysis / Navigate");
     register_action(rt, "analysis.navigate.xrefs", "Cross References to Selection",
         "Open references for the selected analysis address",
-        all_surfaces,
+        all_surfaces | action_surface_t::toolbar,
         retained_or_handler("analysis.navigate.xrefs", [](const action_invocation_t&) {
             const auto context = selected_analysis_context();
             const auto address = selected_analysis_address(context);
@@ -3143,7 +3166,7 @@ void initialize(runtime_t& rt) {
         "category.analysis.navigate", "Analysis / Navigate");
     register_action(rt, "analysis.modify.rename", "Rename Analysis Symbol...",
         "Rename the selected address through the reversible analysis overlay",
-        all_surfaces,
+        all_surfaces | action_surface_t::toolbar,
         retained_or_handler("analysis.modify.rename", [](const action_invocation_t&) {
             const auto context = selected_analysis_context();
             const auto address = selected_analysis_address(context);
@@ -3198,7 +3221,7 @@ void initialize(runtime_t& rt) {
                     "The analysis selection is not owned by a live process workspace");
             std::string error;
             return debugger_view::queue_toggle_breakpoint(
-                location->address, location->pid, &error)
+                location->debugger_context, &error)
                 ? action_handler_result_t::completed()
                 : action_handler_result_t::failed(error);
         }), retained_or_capability("analysis.debug.breakpoint",
@@ -3216,7 +3239,7 @@ void initialize(runtime_t& rt) {
                     "The analysis selection is not owned by a live process workspace");
             std::string error;
             return debugger_view::queue_run_to_address(
-                location->address, location->pid, &error)
+                location->debugger_context, &error)
                 ? action_handler_result_t::completed()
                 : action_handler_result_t::failed(error);
         }, [](const interaction_context_t&) {
@@ -3265,7 +3288,7 @@ void initialize(runtime_t& rt) {
         }, true, {}, "category.analysis.modify", "Analysis / Modify");
     register_action(rt, "analysis.modify.patch", "Patch Bytes or Instruction...",
         "Open the reviewed runtime or reversible static-overlay patch workflow at the selected instruction",
-        all_surfaces,
+        all_surfaces | action_surface_t::toolbar,
         retained_or_handler("analysis.modify.patch", [](const action_invocation_t&) {
             std::string error;
             return disasm_view::open_selected_patch_review(
@@ -3517,7 +3540,7 @@ void initialize(runtime_t& rt) {
         }, false, {}, "category.view", "View");
     register_action(rt, "analysis.decompile_or_focus_pseudocode", "Decompile / Focus Pseudocode",
         "Decompile the active analysis selection or focus its existing Pseudocode document",
-        menu_surfaces,
+        menu_surfaces | action_surface_t::toolbar,
         [&rt](const action_invocation_t&) {
             return rt.shell.decompile_or_focus_pseudocode
                 ? rt.shell.decompile_or_focus_pseudocode()

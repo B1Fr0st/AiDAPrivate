@@ -737,6 +737,61 @@ std::string cp_class_name(const std::vector<jvm_constant_pool_entry_t>& cp, std:
     return {};
 }
 
+bool validate_exception_table(const jvm_method_input_t& input,
+                              const std::vector<instruction_t>& instructions,
+                              std::vector<decompiler_diagnostic_t>& diagnostics)
+{
+    if (input.context.exceptions.empty())
+        return true;
+    if (instructions.empty())
+        return false;
+
+    std::set<std::uint64_t> instruction_offsets;
+    for (const auto& instruction : instructions)
+        instruction_offsets.insert(instruction.offset);
+
+    const auto code_size = static_cast<std::uint64_t>(input.context.code.size());
+    std::uint32_t ordinal = static_cast<std::uint32_t>(diagnostics.size() + 1U);
+    bool valid = true;
+    const auto reject = [&diagnostics, &ordinal, &valid](
+            const std::size_t index, const std::string& reason) {
+        diagnostics.push_back(make_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::malformed_provider_ir,
+            "jvm_ssa.cfg.exception_table." + std::to_string(index) + "." + reason,
+            ordinal++));
+        valid = false;
+    };
+
+    for (std::size_t index = 0; index < input.context.exceptions.size(); ++index) {
+        const auto& exception = input.context.exceptions[index];
+        if (exception.start_pc >= exception.end_pc || exception.end_pc > code_size)
+            reject(index, "range");
+        if (instruction_offsets.find(exception.start_pc) == instruction_offsets.end())
+            reject(index, "start_boundary");
+        if (exception.end_pc != code_size &&
+            instruction_offsets.find(exception.end_pc) == instruction_offsets.end())
+            reject(index, "end_boundary");
+        if (instruction_offsets.find(exception.handler_pc) == instruction_offsets.end())
+            reject(index, "handler_boundary");
+        if (exception.catch_type == 0) {
+            if (exception.catch_class_name.has_value() &&
+                !exception.catch_class_name->empty())
+                reject(index, "catch_all_identity");
+        } else {
+            const auto class_name = cp_class_name(input.context.constant_pool,
+                exception.catch_type);
+            if (class_name.empty()) {
+                reject(index, "catch_type");
+            } else if (exception.catch_class_name.has_value() &&
+                       *exception.catch_class_name != class_name) {
+                reject(index, "catch_identity");
+            }
+        }
+    }
+    return valid;
+}
+
 struct name_and_type_t {
     std::string name;
     std::string descriptor;
@@ -1149,9 +1204,12 @@ cfg_t build_cfg(const std::vector<instruction_t>& instructions,
             leaders.insert(inst.offset + inst.length);
     }
 
+    const auto code_end = instructions.back().offset + instructions.back().length;
     for (const auto& exc : exceptions) {
-        if (exc.handler_pc < instructions.back().offset + instructions.back().length)
-            leaders.insert(exc.handler_pc);
+        leaders.insert(exc.start_pc);
+        if (exc.end_pc < code_end)
+            leaders.insert(exc.end_pc);
+        leaders.insert(exc.handler_pc);
     }
 
     std::vector<std::uint64_t> sorted_leaders(leaders.begin(), leaders.end());
@@ -1269,6 +1327,9 @@ cfg_t build_cfg(const std::vector<instruction_t>& instructions,
         std::sort(block.exception_successor_ids.begin(), block.exception_successor_ids.end());
         last = std::unique(block.exception_successor_ids.begin(), block.exception_successor_ids.end());
         block.exception_successor_ids.erase(last, block.exception_successor_ids.end());
+        std::sort(block.exception_predecessor_ids.begin(), block.exception_predecessor_ids.end());
+        last = std::unique(block.exception_predecessor_ids.begin(), block.exception_predecessor_ids.end());
+        block.exception_predecessor_ids.erase(last, block.exception_predecessor_ids.end());
     }
 
     for (auto& block : cfg.blocks) {
@@ -2606,6 +2667,9 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
         }
     }
 
+    if (!validate_exception_table(input, instructions, result.diagnostics))
+        return result;
+
     auto cfg = build_cfg(instructions, input.context.exceptions, result.diagnostics);
     if (cfg.blocks.empty()) {
         fail(decompiler_diagnostic_code_t::malformed_provider_ir, "jvm_ssa.cfg_empty");
@@ -2757,6 +2821,10 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
         for (const auto target : source.second)
             projected_predecessors.at(target).push_back(source.first);
     }
+    for (const auto& source : projected_exception_successors) {
+        for (const auto target : source.second)
+            projected_predecessors.at(target).push_back(source.first);
+    }
     for (auto& entry : projected_predecessors) {
         auto& predecessors = entry.second;
         std::sort(predecessors.begin(), predecessors.end());
@@ -2781,6 +2849,11 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
         if (successors != projected_successors.end())
             pending_hir_blocks.insert(pending_hir_blocks.end(),
                 successors->second.begin(), successors->second.end());
+        const auto exception_successors = projected_exception_successors.find(block_id);
+        if (exception_successors != projected_exception_successors.end())
+            pending_hir_blocks.insert(pending_hir_blocks.end(),
+                exception_successors->second.begin(),
+                exception_successors->second.end());
     }
 
     std::unordered_map<std::uint64_t, std::uint64_t> value_id_remap;
@@ -2918,6 +2991,10 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
             if (hir_block_ids.find(successor) != hir_block_ids.end())
                 hblock.successor_ids.push_back(successor);
         }
+        for (const auto successor : pblock.exception_successor_ids) {
+            if (hir_block_ids.find(successor) != hir_block_ids.end())
+                hblock.exception_successor_ids.push_back(successor);
+        }
         hblock.coordinate = make_coordinate(input, decompiler_coordinate_layer_t::hir, block.start_offset);
 
         for (const auto* value : values_by_block.at(block.id)) {
@@ -3000,23 +3077,7 @@ jvm_ssa_result_t decompile_method(const jvm_method_input_t& input)
         if (hir_block_ids.find(block.id) == hir_block_ids.end()) {
             decompiler_unknown_t unknown;
             unknown.reason = decompiler_unknown_reason_t::opaque_control_flow;
-            unknown.stable_token = "jvm_ssa.hir.exception_only_block." +
-                std::to_string(block.id) + "." +
-                std::to_string(block.start_offset);
-            unknown.coordinate = make_coordinate(input,
-                decompiler_coordinate_layer_t::hir, block.start_offset,
-                (std::max)(std::uint64_t{1},
-                    block.end_offset - block.start_offset));
-            unknown.confidence = 0;
-            unknown.provenance =
-                decompiler_fact_provenance_t::bytecode_verifier;
-            hir.unknowns.push_back(std::move(unknown));
-        }
-        if (hir_block_ids.find(block.id) != hir_block_ids.end() &&
-            !projected_exception_successors.at(block.id).empty()) {
-            decompiler_unknown_t unknown;
-            unknown.reason = decompiler_unknown_reason_t::opaque_control_flow;
-            unknown.stable_token = "jvm_ssa.hir.exception_edge." +
+            unknown.stable_token = "jvm_ssa.hir.unreachable_block." +
                 std::to_string(block.id) + "." +
                 std::to_string(block.start_offset);
             unknown.coordinate = make_coordinate(input,

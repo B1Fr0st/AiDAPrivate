@@ -79,6 +79,43 @@ namespace
         throw materialization_error_t("unsupported PE/COFF architecture");
     }
 
+    std::string_view semantic_profile(const json& recipe)
+    {
+        require(recipe.contains("semantic_profile") &&
+            recipe.at("semantic_profile").is_string(),
+            "fixture recipe omits its semantic profile");
+        const auto& value = recipe.at("semantic_profile").get_ref<const std::string&>();
+        require(value == "native_conditional_dispatch" ||
+            value == "native_conditional_add" || value == "native_sum" ||
+            value == "native_zero" || value == "managed_cli" ||
+            value == "managed_cli_readytorun" || value == "jvm_fixture" ||
+            value == "dalvik_fixture", "fixture recipe semantic profile is unsupported");
+        return value;
+    }
+
+    std::string_view native_symbol(const json& recipe)
+    {
+        const auto profile = semantic_profile(recipe);
+        require(profile == "native_conditional_dispatch" ||
+            profile == "native_conditional_add" || profile == "native_sum",
+            "native symbol requested for a non-native semantic profile");
+        return profile == "native_sum" ? std::string_view{"fixture_sum"} :
+            std::string_view{"fixture_add"};
+    }
+
+    bytes_t conditional_add_code(std::string_view architecture)
+    {
+        if (architecture == "x86")
+            return {0x8b, 0x44, 0x24, 0x04, 0x85, 0xc0, 0x79, 0x09,
+                    0x8b, 0x4c, 0x24, 0x08, 0x29, 0xc1, 0x89, 0xc8,
+                    0xc3, 0x03, 0x44, 0x24, 0x08, 0xc3};
+        if (architecture == "x64")
+            return {0x8b, 0xc1, 0x85, 0xc9, 0x79, 0x05, 0x8b, 0xc2,
+                    0x2b, 0xc1, 0xc3, 0x8d, 0x04, 0x11, 0xc3};
+        throw materialization_error_t(
+            "conditional-add semantic profile requires x86 or x64");
+    }
+
     bytes_t make_cli_metadata()
     {
         bytes_t strings{0};
@@ -93,19 +130,27 @@ namespace
         const auto module_name = add_string("ManagedFixture.dll");
         const auto module_type = add_string("<Module>");
         const auto fixture_type = add_string("ManagedFixture");
-        const auto fixture_namespace = add_string("AiDA.C03");
-        const auto method_name = add_string("Add");
+        const auto fixture_namespace = add_string("AiDA.C03.Corpus");
+        const auto add_name = add_string("Add");
+        const auto divide_name = add_string("GuardedDivide");
         const auto object_type = add_string("Object");
+        const auto divide_by_zero_type = add_string("DivideByZeroException");
         const auto system_namespace = add_string("System");
         const auto runtime_assembly = add_string("mscorlib");
+        const auto constructor_name = add_string(".ctor");
+        const auto left_name = add_string("left");
+        const auto right_name = add_string("right");
+        const auto value_name = add_string("value");
+        const auto divisor_name = add_string("divisor");
 
-        bytes_t blob{0, 5, 0, 2, 8, 8, 8};
+        bytes_t blob{0, 5, 0, 2, 8, 8, 8, 3, 0x20, 0, 1};
         bytes_t guid{
             0x83, 0xa9, 0x7e, 0x42, 0x5a, 0x17, 0x3b, 0xe6,
             0x84, 0x67, 0xd2, 0x4d, 0x10, 0x51, 0x39, 0xc0};
         bytes_t tables;
         const std::uint64_t valid_mask = (1ULL << 0U) | (1ULL << 1U) |
-            (1ULL << 2U) | (1ULL << 6U) | (1ULL << 32U) | (1ULL << 35U);
+            (1ULL << 2U) | (1ULL << 6U) | (1ULL << 8U) | (1ULL << 10U) |
+            (1ULL << 32U) | (1ULL << 35U);
         append_unsigned(tables, 0, 4, false);
         append_unsigned(tables, 2, 1, false);
         append_unsigned(tables, 0, 1, false);
@@ -114,8 +159,10 @@ namespace
         append_unsigned(tables, valid_mask, 8, false);
         append_unsigned(tables, 0, 8, false);
         append_unsigned(tables, 1, 4, false);
-        append_unsigned(tables, 1, 4, false);
         append_unsigned(tables, 2, 4, false);
+        append_unsigned(tables, 2, 4, false);
+        append_unsigned(tables, 2, 4, false);
+        append_unsigned(tables, 4, 4, false);
         append_unsigned(tables, 1, 4, false);
         append_unsigned(tables, 1, 4, false);
         append_unsigned(tables, 1, 4, false);
@@ -128,6 +175,9 @@ namespace
 
         append_unsigned(tables, 6, 2, false);
         append_unsigned(tables, object_type, 2, false);
+        append_unsigned(tables, system_namespace, 2, false);
+        append_unsigned(tables, 6, 2, false);
+        append_unsigned(tables, divide_by_zero_type, 2, false);
         append_unsigned(tables, system_namespace, 2, false);
 
         append_unsigned(tables, 0, 4, false);
@@ -146,9 +196,32 @@ namespace
         append_unsigned(tables, 0x1080, 4, false);
         append_unsigned(tables, 0, 2, false);
         append_unsigned(tables, 0x0096, 2, false);
-        append_unsigned(tables, method_name, 2, false);
+        append_unsigned(tables, add_name, 2, false);
         append_unsigned(tables, 1, 2, false);
         append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, 0x10a0, 4, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 0x0096, 2, false);
+        append_unsigned(tables, divide_name, 2, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, 3, 2, false);
+
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, left_name, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 2, 2, false);
+        append_unsigned(tables, right_name, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 1, 2, false);
+        append_unsigned(tables, value_name, 2, false);
+        append_unsigned(tables, 0, 2, false);
+        append_unsigned(tables, 2, 2, false);
+        append_unsigned(tables, divisor_name, 2, false);
+
+        append_unsigned(tables, 17, 2, false);
+        append_unsigned(tables, constructor_name, 2, false);
+        append_unsigned(tables, 7, 2, false);
 
         append_unsigned(tables, 0x8004, 4, false);
         append_unsigned(tables, 1, 2, false);
@@ -213,11 +286,8 @@ namespace
             metadata.insert(metadata.end(), streams[index]->begin(), streams[index]->end());
             metadata.resize(padded(metadata.size()), 0);
         }
-        require(metadata.size() <= 0x1080U,
-            "CLI metadata streams overlap the method-body compatibility range");
-        metadata.resize(0x1100U, 0);
-        const bytes_t method_body{0x12, 0x02, 0x03, 0x58, 0x2a};
-        std::copy(method_body.begin(), method_body.end(), metadata.begin() + 0x1080);
+        require(metadata.size() <= 0x680U,
+            "CLI metadata streams overlap the ReadyToRun metadata range");
         return metadata;
     }
 
@@ -280,10 +350,20 @@ namespace
     {
         const auto architecture = recipe.at("architecture").get<std::string>();
         const auto mode = recipe.at("mode").get<std::string>();
+        const auto profile = semantic_profile(recipe);
         const bool is_64 = mode == "64" || architecture == "x64" || architecture == "aarch64" ||
             architecture == "arm64ec" || architecture == "arm64x";
         const bool managed = recipe.value("managed", false);
         const bool ready_to_run = recipe.value("ready_to_run", false);
+        if (managed) {
+            require(profile == (ready_to_run ? "managed_cli_readytorun" :
+                "managed_cli"),
+                "managed PE semantic profile disagrees with its ReadyToRun identity");
+        } else {
+            require(profile == "native_conditional_dispatch" ||
+                profile == "native_conditional_add" || profile == "native_sum",
+                "native PE semantic profile is invalid");
+        }
         const std::size_t optional_size = is_64 ? 0xf0 : 0xe0;
         const std::size_t optional = 0x98;
         const std::size_t section = optional + optional_size;
@@ -300,7 +380,8 @@ namespace
         put_unsigned(bytes, 0x96, managed ? 0x2022 : 0x0022, 2, false);
         put_unsigned(bytes, optional, is_64 ? 0x20b : 0x10b, 2, false);
         put_unsigned(bytes, optional + 4, raw_size, 4, false);
-        put_unsigned(bytes, optional + 16, 0x1000, 4, false);
+        put_unsigned(bytes, optional + 16,
+            !managed || ready_to_run ? 0x1000 : 0, 4, false);
         put_unsigned(bytes, optional + 20, 0x1000, 4, false);
         if (is_64)
             put_unsigned(bytes, optional + 24, 0x140000000ULL, 8, false);
@@ -326,18 +407,20 @@ namespace
         put_unsigned(bytes, section + 16, raw_size, 4, false);
         put_unsigned(bytes, section + 20, raw_offset, 4, false);
         put_unsigned(bytes, section + 36, 0x60000020, 4, false);
-        auto code = native_code(architecture == "arm64ec" || architecture == "arm64x" ? "aarch64" : architecture,
-            mode, "little", true);
-        if (!managed && recipe.value("id", std::string{}) == "pe32-x86") {
-            code = {0x8b, 0x44, 0x24, 0x04, 0x85, 0xc0, 0x79, 0x09,
-                    0x8b, 0x4c, 0x24, 0x08, 0x29, 0xc1, 0x89, 0xc8,
-                    0xc3, 0x03, 0x44, 0x24, 0x08, 0xc3};
-        } else if (!managed && recipe.value("id", std::string{}) == "pe32plus-x64") {
-            code = {0x8b, 0xc1, 0x85, 0xc9, 0x79, 0x05, 0x8b, 0xc2,
-                    0x2b, 0xc1, 0xc3, 0x8d, 0x04, 0x11, 0xc3};
+        bytes_t code;
+        if (!managed) {
+            code = profile == "native_conditional_dispatch" ||
+                    profile == "native_conditional_add" ?
+                conditional_add_code(architecture) :
+                native_code(architecture == "arm64ec" || architecture == "arm64x" ?
+                    "aarch64" : architecture, mode, "little", true);
+        } else if (ready_to_run) {
+            code = conditional_add_code("x64");
         }
-        std::copy(code.begin(), code.end(), bytes.begin() + static_cast<std::ptrdiff_t>(raw_offset));
-        if (!managed && recipe.value("id", std::string{}) == "pe32-x86") {
+        if (!code.empty())
+            std::copy(code.begin(), code.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(raw_offset));
+        if (!managed && profile == "native_conditional_dispatch") {
             const bytes_t dispatch{
                 0x8b, 0x44, 0x24, 0x04, 0x83, 0xf8, 0x00, 0x74, 0x08,
                 0x83, 0xf8, 0x01, 0x74, 0x10, 0x31, 0xc0, 0xc3,
@@ -350,7 +433,7 @@ namespace
         if (!managed) {
             constexpr std::uint32_t export_rva = 0x1200U;
             constexpr std::size_t export_offset = 0x400U;
-            const bool two_exports = recipe.value("id", std::string{}) == "pe32-x86";
+            const bool two_exports = profile == "native_conditional_dispatch";
             const std::uint32_t export_count = two_exports ? 2U : 1U;
             put_unsigned(bytes, directories, export_rva, 4, false);
             put_unsigned(bytes, directories + 4, 0x100U, 4, false);
@@ -365,7 +448,7 @@ namespace
             put_unsigned(bytes, 0x460U, 0x1000U, 4, false);
             put_unsigned(bytes, 0x470U, 0x1290U, 4, false);
             put_unsigned(bytes, 0x480U, 0, 2, false);
-            put_text(bytes, 0x490U, "fixture_add");
+            put_text(bytes, 0x490U, native_symbol(recipe));
             if (two_exports) {
                 put_unsigned(bytes, 0x464U, 0x1020U, 4, false);
                 put_unsigned(bytes, 0x474U, 0x129cU, 4, false);
@@ -375,12 +458,20 @@ namespace
         }
         if (managed) {
             constexpr std::size_t method_offset = 0x1080U;
+            constexpr std::size_t divide_method_offset = 0x10a0U;
             constexpr std::size_t cli_offset = 0x1100U;
             constexpr std::size_t metadata_offset = 0x1180U;
             const auto metadata = make_cli_metadata();
-            const bytes_t method_body{0x12, 0x02, 0x03, 0x58, 0x2a};
-            std::copy(method_body.begin(), method_body.end(),
+            const bytes_t add_method_body{
+                0x32, 0x02, 0x16, 0x2f, 0x04, 0x03, 0x02,
+                0x59, 0x2a, 0x02, 0x03, 0x58, 0x2a};
+            const bytes_t divide_method_body{
+                0x36, 0x03, 0x2d, 0x06, 0x73, 0x01, 0x00,
+                0x00, 0x0a, 0x7a, 0x02, 0x03, 0x5b, 0x2a};
+            std::copy(add_method_body.begin(), add_method_body.end(),
                 bytes.begin() + static_cast<std::ptrdiff_t>(method_offset));
+            std::copy(divide_method_body.begin(), divide_method_body.end(),
+                bytes.begin() + static_cast<std::ptrdiff_t>(divide_method_offset));
             put_unsigned(bytes, cli_offset, 72, 4, false);
             put_unsigned(bytes, cli_offset + 4, 2, 2, false);
             put_unsigned(bytes, cli_offset + 6, 5, 2, false);
@@ -416,7 +507,9 @@ namespace
         constexpr std::size_t raw_offset = 0x50U;
         constexpr std::size_t symbol_offset = 0x60U;
         constexpr std::size_t string_table_offset = symbol_offset + 18U;
-        constexpr std::string_view symbol_name = "fixture_add";
+        require(semantic_profile(recipe) == "native_sum",
+            "COFF fixture semantic profile must describe fixture_sum");
+        const auto symbol_name = native_symbol(recipe);
         bytes_t bytes(0x90, 0);
         put_unsigned(bytes, 0, pe_machine(recipe.at("architecture").get<std::string>()), 2, false);
         put_unsigned(bytes, 2, 1, 2, false);
@@ -455,6 +548,8 @@ namespace
 
     bytes_t make_elf(const json& recipe)
     {
+        require(semantic_profile(recipe) == "native_sum",
+            "ELF fixture semantic profile must describe fixture_sum");
         const bool is_64 = recipe.at("mode") == "64";
         const bool big = recipe.at("endian") == "big";
         const auto file_kind = recipe.value("file_kind", std::string("executable"));
@@ -528,7 +623,7 @@ namespace
         put_text(bytes, section_names_offset + 7U, ".shstrtab");
         put_text(bytes, section_names_offset + 17U, ".strtab");
         put_text(bytes, section_names_offset + 25U, ".symtab");
-        put_text(bytes, symbol_names_offset + 1U, "fixture_add");
+        put_text(bytes, symbol_names_offset + 1U, native_symbol(recipe));
         const auto symbol = symbols_offset + symbol_size;
         put_unsigned(bytes, symbol, 1, 4, big);
         if (is_64) {
@@ -594,6 +689,8 @@ namespace
 
     bytes_t make_macho_thin(const json& recipe)
     {
+        require(semantic_profile(recipe) == "native_sum",
+            "Mach-O fixture semantic profile must describe fixture_sum");
         const bool is_64 = recipe.at("mode") == "64";
         const bool big = recipe.at("endian") == "big";
         const bool object = recipe.value("file_kind", std::string("executable")) == "object";
@@ -664,7 +761,7 @@ namespace
         bytes[symbol_offset + 5] = 1;
         put_unsigned(bytes, symbol_offset + 6, 0, 2, big);
         put_unsigned(bytes, symbol_offset + 8, base, is_64 ? 8 : 4, big);
-        put_text(bytes, string_offset + 1, "_fixture_add");
+        put_text(bytes, string_offset + 1, "_fixture_sum");
         std::copy(code.begin(), code.end(), bytes.begin() + static_cast<std::ptrdiff_t>(code_offset));
         return bytes;
     }
@@ -792,8 +889,10 @@ namespace
         return payload;
     }
 
-    bytes_t make_classfile()
+    bytes_t make_classfile(const json& recipe)
     {
+        require(semantic_profile(recipe) == "jvm_fixture",
+            "classfile fixture semantic profile must describe the JVM source corpus");
         classfile_pool_t pool;
         const auto fixture_name = pool.utf8("aida/c03/corpus/Fixture");
         const auto fixture_class = pool.class_ref(fixture_name);
@@ -864,7 +963,7 @@ namespace
             static_cast<std::uint8_t>(bias_reference), 0x60U, 0x3dU,
             0x1cU, 0xacU, 0x57U, 0x03U, 0xacU};
         const auto add_payload = make_jvm_code(2U, 3U, add_code,
-            {{0U, 10U, 10U, arithmetic_class}}, {{0U, 7U}, {10U, 9U}},
+            {{0U, 10U, 10U, arithmetic_class}}, {{0U, 6U}, {10U, 9U}},
             {{0U, 13U, left_name, integer_descriptor, 0U},
              {0U, 13U, right_name, integer_descriptor, 1U},
              {7U, 3U, result_name, integer_descriptor, 2U}},
@@ -946,10 +1045,12 @@ namespace
         return offset;
     }
 
-    bytes_t make_dex()
+    bytes_t make_dex(const json& recipe)
     {
+        require(semantic_profile(recipe) == "dalvik_fixture",
+            "DEX fixture semantic profile must describe the Dalvik source corpus");
         const std::array<std::string_view, 14> strings{
-            "<init>", "Fixture.java", "I", "III", "Lcom/aida/Fixture;",
+            "<init>", "Fixture.smali", "I", "III", "Laida/c03/corpus/Fixture;",
             "Ljava/lang/ArithmeticException;", "Ljava/lang/Object;", "V",
             "add", "divisor", "guardedDivide", "left", "right", "value"};
         constexpr std::uint32_t string_ids_offset = 112U;
@@ -1015,7 +1116,7 @@ namespace
         }
 
         const auto debug_info_offset = static_cast<std::uint32_t>(output.size());
-        const std::array<std::uint8_t, 4> constructor_debug{1U, 0U, 0x0eU, 0U};
+        const std::array<std::uint8_t, 4> constructor_debug{4U, 0U, 0x0eU, 0U};
         output.insert(output.end(), constructor_debug.begin(), constructor_debug.end());
         const auto add_debug_offset = static_cast<std::uint32_t>(output.size());
         const std::array<std::uint8_t, 9> add_debug{
@@ -1023,7 +1124,7 @@ namespace
         output.insert(output.end(), add_debug.begin(), add_debug.end());
         const auto divide_debug_offset = static_cast<std::uint32_t>(output.size());
         const std::array<std::uint8_t, 9> divide_debug{
-            20U, 2U, 14U, 10U, 0x0eU, 1U, 8U, 0x0eU, 0U};
+            23U, 2U, 14U, 10U, 0x0eU, 1U, 8U, 0x0eU, 0U};
         output.insert(output.end(), divide_debug.begin(), divide_debug.end());
 
         const auto constructor_code_offset = append_dex_code_item(output,
@@ -1114,10 +1215,10 @@ namespace
         bytes_t member;
         if (format == "apk" || format == "aab") {
             member_name = "classes.dex";
-            member = make_dex();
+            member = make_dex(recipe);
         } else if (format == "jar") {
             member_name = "aida/c03/corpus/Fixture.class";
-            member = make_classfile();
+            member = make_classfile(recipe);
         } else if (format == "ipa") {
             member_name = "Payload/Fixture.app/Fixture";
             json nested = recipe;
@@ -1248,11 +1349,11 @@ namespace
         if (format == "macho_fat")
             return make_macho_fat(recipe);
         if (format == "classfile")
-            return make_classfile();
+            return make_classfile(recipe);
         if (format == "dex")
-            return make_dex();
+            return make_dex(recipe);
         if (format == "oat") {
-            const auto dex = make_dex();
+            const auto dex = make_dex(recipe);
             bytes_t bytes(0x100U + dex.size(), 0);
             put_text(bytes, 0, "oat\n183\0");
             put_unsigned(bytes, 8, 0x1000, 4, false);
@@ -1260,7 +1361,7 @@ namespace
             return bytes;
         }
         if (format == "vdex") {
-            const auto dex = make_dex();
+            const auto dex = make_dex(recipe);
             bytes_t bytes(0x100U + dex.size(), 0);
             put_text(bytes, 0, "vdex019\0");
             put_unsigned(bytes, 8, 1, 4, false);
@@ -1274,8 +1375,12 @@ namespace
         if (format == "archive" || format == "static_library" || format == "import_library")
             return make_archive(recipe);
         if (format == "raw_code")
+        {
+            require(semantic_profile(recipe) == "native_zero",
+                "raw-code fixture semantic profile must describe fragment");
             return native_fragment_code(recipe.at("architecture").get<std::string>(),
                 recipe.at("mode").get<std::string>(), recipe.at("endian").get<std::string>());
+        }
         throw materialization_error_t("unsupported fixture format: " + format);
     }
 
@@ -1340,6 +1445,115 @@ namespace
         return left.contains(std::string(field)) && right.contains(std::string(field)) &&
             left.at(std::string(field)).is_string() && right.at(std::string(field)).is_string() &&
             left.at(std::string(field)) == right.at(std::string(field));
+    }
+
+    std::set<std::string, std::less<>> semantic_strings(
+        const json& value, std::string_view label)
+    {
+        require(value.is_array(), std::string(label) + " must be an array");
+        std::set<std::string, std::less<>> result;
+        for (const auto& item : value) {
+            require(item.is_string() && !item.get_ref<const std::string&>().empty() &&
+                result.insert(item.get<std::string>()).second,
+                std::string(label) + " contains an invalid or duplicate value");
+        }
+        return result;
+    }
+
+    std::string_view semantic_source(std::string_view profile)
+    {
+        if (profile == "native_conditional_dispatch" ||
+            profile == "native_conditional_add" || profile == "native_sum" ||
+            profile == "native_zero")
+            return "source_corpus/native_fixture.c";
+        if (profile == "managed_cli" || profile == "managed_cli_readytorun")
+            return "source_corpus/managed_fixture.cs";
+        if (profile == "jvm_fixture")
+            return "source_corpus/Fixture.java";
+        if (profile == "dalvik_fixture")
+            return "source_corpus/Fixture.smali";
+        throw materialization_error_t("semantic profile has no bound source corpus");
+    }
+
+    std::set<std::string, std::less<>> semantic_entities(
+        const json& recipe, std::string_view profile)
+    {
+        if (profile == "native_conditional_dispatch")
+            return {"fixture_add", "fixture_dispatch"};
+        if (profile == "native_conditional_add")
+            return {"fixture_add"};
+        if (profile == "native_sum") {
+            const auto& format = recipe.at("format").get_ref<const std::string&>();
+            return format == "macho_thin" || format == "macho_fat" ||
+                    format == "ipa" ?
+                std::set<std::string, std::less<>>{"_fixture_sum"} :
+                std::set<std::string, std::less<>>{"fixture_sum"};
+        }
+        if (profile == "native_zero")
+            return {"fragment"};
+        if (profile == "managed_cli" || profile == "managed_cli_readytorun")
+            return {"AiDA.C03.Corpus.ManagedFixture.Add",
+                "AiDA.C03.Corpus.ManagedFixture.GuardedDivide"};
+        if (profile == "jvm_fixture")
+            return {"aida.c03.corpus.Fixture.<init>",
+                "aida.c03.corpus.Fixture.add",
+                "aida.c03.corpus.Fixture.guardedDivide"};
+        if (profile == "dalvik_fixture")
+            return {"Laida/c03/corpus/Fixture;-><init>()V",
+                "Laida/c03/corpus/Fixture;->add(II)I",
+                "Laida/c03/corpus/Fixture;->guardedDivide(II)I"};
+        throw materialization_error_t("semantic profile has no typed entity contract");
+    }
+
+    void validate_semantic_contract(const json& recipe, const json& truth,
+        const json& ground_truth)
+    {
+        const auto profile = semantic_profile(recipe);
+        const auto source = semantic_source(profile);
+        require(truth.contains("source") && truth.at("source").is_string() &&
+            std::string_view(truth.at("source").get_ref<const std::string&>()) == source &&
+            ground_truth.contains("source_files") &&
+            ground_truth.at("source_files").is_object() &&
+            ground_truth.at("source_files").contains(std::string(source)) &&
+            ground_truth.at("source_files").at(std::string(source)).is_string() &&
+            is_canonical_sha256(ground_truth.at("source_files").at(
+                std::string(source)).get_ref<const std::string&>()),
+            "fixture recipe, truth, and source hash binding disagree");
+        require(truth.contains("facts") && truth.at("facts").is_object(),
+            "fixture ground truth omits semantic facts");
+        const auto& facts = truth.at("facts");
+        require(facts.contains("entities") &&
+            semantic_strings(facts.at("entities"), "typed entities") ==
+                semantic_entities(recipe, profile),
+            "fixture typed entities disagree with its source semantic profile");
+        require(facts.contains("control_structures"),
+            "fixture ground truth omits control structures");
+        const auto controls = semantic_strings(
+            facts.at("control_structures"), "control structures");
+        const auto require_controls = [&](std::initializer_list<std::string_view> values) {
+            for (const auto value : values)
+                require(controls.find(std::string(value)) != controls.end(),
+                    "fixture ground truth omits a source control structure");
+        };
+        if (profile == "native_conditional_dispatch")
+            require_controls({"if", "switch", "return"});
+        else if (profile == "native_conditional_add")
+            require_controls({"if", "return"});
+        else if (profile == "managed_cli" ||
+                 profile == "managed_cli_readytorun")
+            require_controls({"conditional", "if", "throw", "return"});
+        else if (profile == "jvm_fixture" || profile == "dalvik_fixture")
+            require_controls({"try", "catch", "if", "throw", "return"});
+        else
+            require_controls({"return"});
+        require(facts.contains("source_coordinates") &&
+            !facts.at("source_coordinates").empty(),
+            "fixture ground truth omits source coordinates");
+        for (const auto& coordinate : facts.at("source_coordinates"))
+            require(coordinate.is_string() &&
+                coordinate.get_ref<const std::string&>().find(source) !=
+                    std::string::npos,
+                "fixture source coordinate is not bound to its source corpus");
     }
 
     bytes_t read_bounded(const std::filesystem::path& path, std::uint64_t maximum)
@@ -1502,6 +1716,7 @@ corpus_materialization_result_t materialize_c03_corpus(const json& manifest,
                 require(equal_text(fixture, recipe, field) && equal_text(fixture, truth, field),
                     "fixture identity disagrees with recipe or ground truth: " + id);
             }
+            validate_semantic_contract(recipe, truth, ground_truth);
             const auto bytes = build_artifact(recipe);
             require(!bytes.empty(), "materialized artifact is empty: " + id);
             const auto maximum = fixture.at("resource_limits").at("max_input_bytes").get<std::uint64_t>();

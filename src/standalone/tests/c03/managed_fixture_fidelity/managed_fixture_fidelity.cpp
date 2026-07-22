@@ -244,6 +244,44 @@ managed_fixture_fidelity_result_t validate_c03_dex_fidelity(
         !table_valid(layout.method_count, method_offset, 8U) ||
         !table_valid(layout.class_count, class_offset, 32U))
         return failure("DEX fixture identifier table range is invalid");
+    if (layout.string_count != 14U || layout.type_count != 5U ||
+        layout.proto_count != 2U || field_count != 0U ||
+        layout.method_count != 5U || layout.class_count != 1U)
+        return failure("DEX fixture semantic table cardinality is invalid");
+    const std::array<std::string_view, 14> expected_strings{
+        "<init>", "Fixture.smali", "I", "III",
+        "Laida/c03/corpus/Fixture;", "Ljava/lang/ArithmeticException;",
+        "Ljava/lang/Object;", "V", "add", "divisor", "guardedDivide",
+        "left", "right", "value"};
+    for (std::size_t index = 0; index < expected_strings.size(); ++index) {
+        const auto data = le32(bytes, string_offset + index * 4U);
+        const auto expected = expected_strings[index];
+        if (!span_within(data, expected.size() + 2U, bytes.size()) ||
+            bytes[data] != static_cast<std::uint8_t>(expected.size()) ||
+            !std::equal(expected.begin(), expected.end(), bytes.begin() + data + 1U) ||
+            bytes[data + 1U + expected.size()] != 0U)
+            return failure("DEX fixture string identity disagrees with its source corpus");
+    }
+    const std::array<std::uint32_t, 5> expected_types{2U, 4U, 5U, 6U, 7U};
+    for (std::size_t index = 0; index < expected_types.size(); ++index) {
+        if (le32(bytes, type_offset + index * 4U) != expected_types[index])
+            return failure("DEX fixture type identity disagrees with its source corpus");
+    }
+    const std::array<std::array<std::uint32_t, 3>, 5> expected_methods{{
+        {{1U, 1U, 0U}}, {{1U, 0U, 8U}}, {{1U, 0U, 10U}},
+        {{2U, 1U, 0U}}, {{3U, 1U, 0U}}}};
+    for (std::size_t index = 0; index < expected_methods.size(); ++index) {
+        const auto base = method_offset + index * 8U;
+        if (le16(bytes, base) != expected_methods[index][0] ||
+            le16(bytes, base + 2U) != expected_methods[index][1] ||
+            le32(bytes, base + 4U) != expected_methods[index][2])
+            return failure("DEX fixture method identity disagrees with its source corpus");
+    }
+    if (le32(bytes, class_offset) != 1U ||
+        le32(bytes, class_offset + 8U) != 3U ||
+        le32(bytes, class_offset + 16U) != 1U ||
+        le32(bytes, class_offset + 24U) == 0U)
+        return failure("DEX fixture class identity disagrees with its source corpus");
     const auto observed_signature = c03_dex_sha1(bytes, 32U);
     if (!std::equal(observed_signature.begin(), observed_signature.end(),
             bytes.begin() + 12))
@@ -321,8 +359,16 @@ managed_fixture_fidelity_result_t validate_c03_dex_fidelity(
     }
     if (layout.string_data_offset == 0U || layout.debug_info_offset == 0U ||
         layout.code_item_offset == 0U || layout.class_data_offset == 0U ||
-        layout.code_item_count < 2U || layout.debug_info_count < 2U)
+        layout.code_item_count != 3U || layout.debug_info_count != 3U)
         return failure("DEX fixture omits required method-bearing data items");
+    const std::array<std::uint8_t, 22> expected_debug{
+        4U, 0U, 0x0eU, 0U,
+        10U, 2U, 12U, 13U, 0x0eU, 1U, 3U, 0x0eU, 0U,
+        23U, 2U, 14U, 10U, 0x0eU, 1U, 8U, 0x0eU, 0U};
+    if (!span_within(layout.debug_info_offset, expected_debug.size(), bytes.size()) ||
+        !std::equal(expected_debug.begin(), expected_debug.end(),
+            bytes.begin() + layout.debug_info_offset))
+        return failure("DEX fixture debug coordinates disagree with its source corpus");
     result.valid = true;
     return result;
 }

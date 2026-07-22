@@ -1113,6 +1113,7 @@ capture_dalvik_entity_input(
                 "managed.binding.dalvik"));
     const auto& method = image.value().methods[*binding.method_index];
     std::shared_ptr<const dex_code_item_t> code;
+    std::string source_path;
     std::uint64_t visited_methods = 0;
     for (const auto& cls : image.value().classes) {
         if ((visited_methods & 255U) == 0 && cancel.stop_requested())
@@ -1124,6 +1125,8 @@ capture_dalvik_entity_input(
                     stop_error(cancel, "managed.binding.dalvik"));
             if (encoded.method_index == *binding.method_index) {
                 code = encoded.code;
+                if (cls.source_file)
+                    source_path = *cls.source_file;
                 break;
             }
         }
@@ -1135,6 +1138,8 @@ capture_dalvik_entity_input(
                     stop_error(cancel, "managed.binding.dalvik"));
             if (encoded.method_index == *binding.method_index) {
                 code = encoded.code;
+                if (cls.source_file)
+                    source_path = *cls.source_file;
                 break;
             }
         }
@@ -1145,6 +1150,16 @@ capture_dalvik_entity_input(
         return workspace_result_t<std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t>>::failure(
             binding_error(workspace_error_code_t::unsupported_format,
                 "Dalvik method has no code item",
+                "managed.binding.dalvik"));
+    if (source_path.size() > dalvik_ssa::k_max_source_path_bytes)
+        return workspace_result_t<std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t>>::failure(
+            binding_error(workspace_error_code_t::limit_exceeded,
+                "Dalvik source file metadata exceeds the capture budget",
+                "managed.binding.dalvik"));
+    if (source_path.find('\0') != std::string::npos)
+        return workspace_result_t<std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t>>::failure(
+            binding_error(workspace_error_code_t::malformed_image,
+                "Dalvik source file metadata contains an embedded null",
                 "managed.binding.dalvik"));
     const auto byte_count = static_cast<std::uint64_t>(code->instruction_count) * 2ULL;
     if (byte_count > publication.managed_artifacts->reader_limits.max_code_bytes)
@@ -1184,6 +1199,7 @@ capture_dalvik_entity_input(
         capture->request.workspace_generation = binding.generation;
         capture->request.type_graph_revision = binding.type_graph_revision;
         capture->request.dex_version = image.value().managed_identity.version;
+        capture->request.source_path = std::move(source_path);
         capture->code_item = code;
         capture->code_units.reserve(code->instruction_count);
         for (std::size_t index = 0; index < bytes.value().size(); index += 2)

@@ -13,6 +13,7 @@
 #include <aclapi.h>
 #include <objbase.h>
 #include <sddl.h>
+#include <shlobj.h>
 #include <userenv.h>
 
 #include <nlohmann/json.hpp>
@@ -22,9 +23,11 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
@@ -35,6 +38,7 @@
 #pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 
 namespace aida::analysis::native_worker {
 namespace {
@@ -830,7 +834,9 @@ std::optional<managed_runtime_package_t> verify_managed_runtime_package(
     }
 }
 
-struct verified_worker_t {
+}
+
+struct native_worker_verified_package_t {
     native_worker_manifest_t manifest;
     sha256_digest_t manifest_hash;
     std::wstring root_path;
@@ -839,8 +845,11 @@ struct verified_worker_t {
     std::optional<managed_runtime_package_t> managed_runtime;
 };
 
-std::optional<verified_worker_t> verify_worker(const native_worker_launch_contract_t& contract,
-                                                native_worker_execution_result_t& result)
+namespace {
+
+std::optional<native_worker_verified_package_t> verify_worker(
+    const native_worker_launch_contract_t& contract,
+    native_worker_execution_result_t& result)
 {
     if (contract.approved_root.empty() || contract.manifest_path.empty() || contract.expected_manifest_hash.empty()) {
         append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request, "native_worker.verify", "launch contract is incomplete");
@@ -914,7 +923,7 @@ std::optional<verified_worker_t> verify_worker(const native_worker_launch_contra
         append_diagnostic(result, native_worker_diagnostic_code_t::worker_path_rejected, "native_worker.worker_path", "worker is not a regular disk-backed file", GetLastError());
         return std::nullopt;
     }
-    verified_worker_t verified;
+    native_worker_verified_package_t verified;
     verified.manifest = std::move(*decoded.value);
     verified.manifest_hash = manifest_hash;
     verified.root_path = *root_path;
@@ -973,52 +982,112 @@ std::wstring quote_argument(const std::wstring& value)
     return result;
 }
 
-std::optional<std::vector<wchar_t>> minimal_environment(
-    const std::optional<std::wstring>& dotnet_root,
-    const std::wstring& app_container_local_app_data)
+std::optional<std::wstring> canonical_host_local_app_data()
 {
-    std::wstring system_root(32768, L'\0');
-    const UINT written = GetWindowsDirectoryW(system_root.data(),
-        static_cast<UINT>(system_root.size()));
-    if (written == 0 || written >= static_cast<UINT>(system_root.size()))
+    PWSTR known_path = nullptr;
+    const HRESULT status = SHGetKnownFolderPath(
+        FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &known_path);
+    if (FAILED(status) || !known_path) {
+        if (known_path)
+            CoTaskMemFree(known_path);
+        DWORD error = HRESULT_FACILITY(status) == FACILITY_WIN32
+            ? HRESULT_CODE(status)
+            : ERROR_PATH_NOT_FOUND;
+        if (error == ERROR_SUCCESS)
+            error = ERROR_PATH_NOT_FOUND;
+        SetLastError(error);
         return std::nullopt;
-    system_root.resize(written);
-    if (app_container_local_app_data.empty())
-        return std::nullopt;
-    if (dotnet_root && (dotnet_root->empty() ||
-        dotnet_root->find(L'=') != std::wstring::npos))
-        return std::nullopt;
-    std::wstring app_container_temp = app_container_local_app_data;
-    if (app_container_temp.back() != L'\\' && app_container_temp.back() != L'/')
-        app_container_temp.push_back(L'\\');
-    app_container_temp.append(L"Temp");
-    std::vector<std::wstring> entries{
-        L"COMPlus_EnableDiagnostics=0",
-        L"DOTNET_CLI_TELEMETRY_OPTOUT=1",
-        L"DOTNET_EnableDiagnostics=0",
-        L"DOTNET_MULTILEVEL_LOOKUP=0",
-        L"DOTNET_NOLOGO=1",
-        L"DOTNET_ROLL_FORWARD=Disable",
-        L"DOTNET_ROLL_FORWARD_TO_PRERELEASE=0",
-        L"DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1",
-        L"LOCALAPPDATA=" + app_container_local_app_data,
-        L"PATH=" + system_root + L"\\System32",
-        L"SystemRoot=" + system_root,
-        L"TEMP=" + app_container_temp,
-        L"TMP=" + app_container_temp,
-        L"WINDIR=" + system_root};
-    if (dotnet_root)
-        entries.push_back(L"DOTNET_ROOT=" + *dotnet_root);
-    std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
-        return _wcsicmp(left.c_str(), right.c_str()) < 0;
-    });
-    std::wstring block;
-    for (const auto& entry : entries) {
-        block.append(entry);
-        block.push_back(L'\0');
     }
-    block.push_back(L'\0');
-    return std::vector<wchar_t>(block.begin(), block.end());
+    constexpr std::size_t maximum_path_characters = 32768;
+    const std::size_t length = wcsnlen_s(known_path, maximum_path_characters);
+    if (length == 0 || length == maximum_path_characters) {
+        CoTaskMemFree(known_path);
+        SetLastError(length == 0 ? ERROR_PATH_NOT_FOUND : ERROR_INVALID_DATA);
+        return std::nullopt;
+    }
+    std::optional<std::wstring> result;
+    try {
+        result.emplace(known_path, length);
+    } catch (const std::bad_alloc&) {
+        CoTaskMemFree(known_path);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return std::nullopt;
+    } catch (const std::length_error&) {
+        CoTaskMemFree(known_path);
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return std::nullopt;
+    }
+    CoTaskMemFree(known_path);
+    SetLastError(ERROR_SUCCESS);
+    return result;
+}
+
+std::optional<std::vector<wchar_t>> minimal_environment(
+    const std::optional<std::wstring>& dotnet_root)
+{
+    try {
+        std::wstring system_root(32768, L'\0');
+        const UINT written = GetWindowsDirectoryW(system_root.data(),
+            static_cast<UINT>(system_root.size()));
+        if (written == 0) {
+            if (GetLastError() == ERROR_SUCCESS)
+                SetLastError(ERROR_PATH_NOT_FOUND);
+            return std::nullopt;
+        }
+        if (written >= static_cast<UINT>(system_root.size())) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return std::nullopt;
+        }
+        system_root.resize(written);
+        if (dotnet_root && dotnet_root->empty()) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return std::nullopt;
+        }
+        const auto local_app_data = canonical_host_local_app_data();
+        if (!local_app_data)
+            return std::nullopt;
+        std::wstring temp = *local_app_data;
+        while (!temp.empty() && (temp.back() == L'\\' || temp.back() == L'/'))
+            temp.pop_back();
+        if (temp.empty()) {
+            SetLastError(ERROR_PATH_NOT_FOUND);
+            return std::nullopt;
+        }
+        temp.append(L"\\Temp");
+        std::vector<std::wstring> entries{
+            L"COMPlus_EnableDiagnostics=0",
+            L"DOTNET_CLI_TELEMETRY_OPTOUT=1",
+            L"DOTNET_EnableDiagnostics=0",
+            L"DOTNET_MULTILEVEL_LOOKUP=0",
+            L"DOTNET_NOLOGO=1",
+            L"DOTNET_ROLL_FORWARD=Disable",
+            L"DOTNET_ROLL_FORWARD_TO_PRERELEASE=0",
+            L"DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1",
+            L"LOCALAPPDATA=" + *local_app_data,
+            L"PATH=" + system_root + L"\\System32",
+            L"SystemRoot=" + system_root,
+            L"TEMP=" + temp,
+            L"TMP=" + temp,
+            L"WINDIR=" + system_root};
+        if (dotnet_root)
+            entries.push_back(L"DOTNET_ROOT=" + *dotnet_root);
+        std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+            return _wcsicmp(left.c_str(), right.c_str()) < 0;
+        });
+        std::wstring block;
+        for (const auto& entry : entries) {
+            block.append(entry);
+            block.push_back(L'\0');
+        }
+        block.push_back(L'\0');
+        SetLastError(ERROR_SUCCESS);
+        return std::vector<wchar_t>(block.begin(), block.end());
+    } catch (const std::bad_alloc&) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+    } catch (const std::length_error&) {
+        SetLastError(ERROR_FILENAME_EXCED_RANGE);
+    }
+    return std::nullopt;
 }
 
 class app_container_t final {
@@ -1068,24 +1137,15 @@ public:
                 error = ERROR_PATH_NOT_FOUND;
             return false;
         }
-        try {
-            local_app_data_.assign(profile_path);
-        } catch (...) {
-            CoTaskMemFree(profile_path);
-            error = ERROR_NOT_ENOUGH_MEMORY;
-            return false;
-        }
         CoTaskMemFree(profile_path);
         error = ERROR_SUCCESS;
         return true;
     }
 
     PSID sid() const noexcept { return sid_; }
-    const std::wstring& local_app_data() const noexcept { return local_app_data_; }
 
 private:
     PSID sid_ = nullptr;
-    std::wstring local_app_data_;
 };
 
 constexpr ACCESS_MASK k_app_container_runtime_read_execute =
@@ -1280,7 +1340,7 @@ bool ensure_app_container_runtime_path_acl(const std::filesystem::path& path,
         required_access, error);
 }
 
-bool collect_native_spec_acl_inventory(const verified_worker_t& verified,
+bool collect_native_spec_acl_inventory(const native_worker_verified_package_t& verified,
                                        std::vector<std::filesystem::path>& files,
                                        std::array<std::filesystem::path, 2>& directories,
                                        DWORD& error)
@@ -1334,7 +1394,7 @@ bool collect_native_spec_acl_inventory(const verified_worker_t& verified,
     return true;
 }
 
-bool ensure_app_container_runtime_access(verified_worker_t& verified,
+bool ensure_app_container_runtime_access(const native_worker_verified_package_t& verified,
                                          PSID app_container_sid,
                                          DWORD& error)
 {
@@ -1572,7 +1632,6 @@ struct worker_instance_t {
     handle_t process;
     handle_t request_pipe;
     handle_t response_pipe;
-    std::vector<handle_t> runtime_identity_locks;
     wire::session_material_t session;
     wire::frame_reader_t reader;
     std::uint64_t next_host_sequence = 1;
@@ -1610,7 +1669,8 @@ bool create_pipe_pair(handle_t& child_end, handle_t& parent_end, bool child_read
     return true;
 }
 
-bool launch_worker(verified_worker_t& verified, const native_worker_execution_request_t& request,
+bool launch_worker(const native_worker_verified_package_t& verified,
+                   const native_worker_execution_request_t& request,
                    const native_worker_host_limits_t& host_limits, worker_instance_t& worker,
                    native_worker_execution_result_t& result)
 {
@@ -1775,8 +1835,7 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
     }
     const auto environment = minimal_environment(managed
         ? std::optional<std::wstring>{verified.managed_runtime->dotnet_root}
-        : std::nullopt,
-        container.local_app_data());
+        : std::nullopt);
     if (!environment) {
         DeleteProcThreadAttributeList(attribute_list);
         SecureZeroMemory(attributes.data(), attributes.size());
@@ -1824,19 +1883,42 @@ bool launch_worker(verified_worker_t& verified, const native_worker_execution_re
         TerminateJobObject(worker.job.get(), ERROR_CANCELLED);
         return false;
     }
-    if (verified.managed_runtime)
-        worker.runtime_identity_locks = std::move(verified.managed_runtime->locked_files);
     return true;
 }
 
 void terminate_worker(worker_instance_t& worker, DWORD exit_code, native_worker_execution_result_t& result, bool replacement)
 {
-    if (worker.job)
-        TerminateJobObject(worker.job.get(), exit_code);
-    if (worker.process)
-        WaitForSingleObject(worker.process.get(), 1000);
-    result.worker_terminated = true;
+    bool termination_enforced = false;
+    DWORD termination_error = ERROR_SUCCESS;
+    if (worker.process) {
+        const DWORD process_state = WaitForSingleObject(worker.process.get(), 0);
+        if (process_state == WAIT_OBJECT_0)
+            termination_enforced = true;
+        else if (process_state == WAIT_FAILED)
+            termination_error = GetLastError();
+    }
+    if (!termination_enforced && worker.job) {
+        if (TerminateJobObject(worker.job.get(), exit_code))
+            termination_enforced = true;
+        else
+            termination_error = GetLastError();
+    }
+    if (!termination_enforced && worker.process) {
+        if (TerminateProcess(worker.process.get(), exit_code))
+            termination_enforced = true;
+        else
+            termination_error = GetLastError();
+    }
+    worker.request_pipe.reset();
+    worker.response_pipe.reset();
+    worker.job.reset();
+    worker.process.reset();
+    result.worker_terminated = termination_enforced;
     result.worker_replaced = replacement;
+    if (!termination_enforced)
+        append_diagnostic(result, native_worker_diagnostic_code_t::worker_failed,
+            "native_worker.terminate", "worker termination could not be enforced",
+            termination_error == ERROR_SUCCESS ? ERROR_PROCESS_ABORTED : termination_error, true);
     if (replacement)
         append_diagnostic(result, native_worker_diagnostic_code_t::worker_replaced, "native_worker.replace",
             "worker generation was invalidated and will not be reused", exit_code, true);
@@ -2153,7 +2235,7 @@ struct managed_startup_frame_t {
 managed_startup_frame_t validate_managed_startup_frame(
     const wire::frame_t& frame,
     const wire::session_material_t& session,
-    const verified_worker_t& verified)
+    const native_worker_verified_package_t& verified)
 {
     try {
         if (frame.kind != wire::frame_kind_t::decompiler_contract)
@@ -2187,8 +2269,11 @@ managed_startup_frame_t validate_managed_startup_frame(
         auto code = value.at("code").get<std::string>();
         constexpr std::array<std::string_view, 5> stages{
             "transport", "runtime_identity", "module_mapping", "module_snapshot", "worker_identity"};
-        constexpr std::array<std::string_view, 38> codes{
-            "loaded_assembly_path", "framework_dependency_hash", "appcontainer_environment",
+        constexpr std::array<std::string_view, 46> codes{
+            "loaded_assembly_path", "framework_dependency_hash", "appcontainer_token_open",
+            "appcontainer_token_size", "appcontainer_token_query",
+            "appcontainer_sid", "appcontainer_profile", "appcontainer_profile_access",
+            "appcontainer_localappdata", "appcontainer_temp", "appcontainer_environment",
             "environment_allowlist", "environment_policy", "windows_environment",
             "runtime_manifest_hash", "runtime_manifest_digest", "provider_hash",
             "runtime_integrity", "invalid_data", "bad_image", "access_denied",
@@ -2777,13 +2862,27 @@ workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_work
         launch_contract.approved_root = runtime_root;
         launch_contract.manifest_path = manifest_path;
         launch_contract.expected_manifest_hash = manifest_hash;
-        auto host = std::make_shared<native_worker_host_t>(std::move(launch_contract));
         native_worker_launch_contract_t managed_launch_contract;
         managed_launch_contract.approved_root = runtime_root;
         managed_launch_contract.manifest_path = managed_manifest_path;
         managed_launch_contract.expected_manifest_hash = managed_manifest_hash;
+        native_worker_execution_result_t native_runtime_verification;
+        auto verified_native = verify_worker(
+            launch_contract, native_runtime_verification);
+        if (!verified_native) {
+            std::string detail =
+                "native decompiler runtime failed package verification";
+            if (!native_runtime_verification.diagnostics.empty()) {
+                detail.append(": ");
+                detail.append(native_runtime_verification.diagnostics.front().detail);
+            }
+            return failure(workspace_error_code_t::integrity_failure,
+                std::move(detail), "native_worker.runtime.native", ERROR_CRC);
+        }
         native_worker_execution_result_t managed_runtime_verification;
-        if (!verify_worker(managed_launch_contract, managed_runtime_verification)) {
+        auto verified_managed = verify_worker(
+            managed_launch_contract, managed_runtime_verification);
+        if (!verified_managed) {
             std::string detail = "managed decompiler app-local runtime failed package verification";
             if (!managed_runtime_verification.diagnostics.empty()) {
                 detail.append(": ");
@@ -2793,8 +2892,18 @@ workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_work
                 std::move(detail),
                 "native_worker.runtime.managed_runtime", ERROR_CRC);
         }
-        auto managed_host = std::make_shared<native_worker_host_t>(
-            std::move(managed_launch_contract));
+        std::shared_ptr<const native_worker_verified_package_t> native_package =
+            std::make_shared<native_worker_verified_package_t>(
+                std::move(*verified_native));
+        std::shared_ptr<const native_worker_verified_package_t> managed_package =
+            std::make_shared<native_worker_verified_package_t>(
+                std::move(*verified_managed));
+        auto host = std::shared_ptr<native_worker_host_t>(
+            new native_worker_host_t(std::move(launch_contract), {},
+                std::move(native_package)));
+        auto managed_host = std::shared_ptr<native_worker_host_t>(
+            new native_worker_host_t(std::move(managed_launch_contract), {},
+                std::move(managed_package)));
         packaged_native_worker_runtime_t result;
         result.native_host = host;
         result.provider_host = std::make_shared<native_worker_provider_host_t>(
@@ -2831,6 +2940,32 @@ bool native_worker_snapshot_t::valid() const noexcept
 native_worker_host_t::native_worker_host_t(native_worker_launch_contract_t contract, native_worker_host_limits_t limits)
     : contract_(std::move(contract)), limits_(limits)
 {
+    native_worker_execution_result_t verification;
+    auto verified = verify_worker(contract_, verification);
+    verification_diagnostics_ = std::move(verification.diagnostics);
+    if (verified)
+        verified_package_ = std::make_shared<native_worker_verified_package_t>(
+            std::move(*verified));
+}
+
+native_worker_host_t::native_worker_host_t(
+    native_worker_launch_contract_t contract,
+    native_worker_host_limits_t limits,
+    std::shared_ptr<const native_worker_verified_package_t> verified_package)
+    : contract_(std::move(contract)), limits_(limits),
+      verified_package_(std::move(verified_package))
+{
+    if (!verified_package_ ||
+        verified_package_->manifest_hash != contract_.expected_manifest_hash) {
+        verified_package_.reset();
+        native_worker_execution_result_t verification;
+        append_diagnostic(verification,
+            native_worker_diagnostic_code_t::worker_identity_mismatch,
+            "native_worker.verify",
+            "preverified worker identity does not match the launch contract",
+            ERROR_CRC);
+        verification_diagnostics_ = std::move(verification.diagnostics);
+    }
 }
 
 native_worker_host_t::~native_worker_host_t()
@@ -2966,9 +3101,12 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
             "native route cannot carry a managed request", ERROR_INVALID_DATA);
         return result;
     }
-    auto verified = verify_worker(contract_, result);
-    if (!verified)
+    const auto verified = verified_package_;
+    if (!verified) {
+        result.diagnostics = verification_diagnostics_;
         return result;
+    }
+    result.manifest_hash = verified->manifest_hash;
     if (!compatible_worker_provider(request.cache_key.provider, verified->manifest.provider)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::worker_identity_mismatch,
             "native_worker.request_identity",
@@ -2985,14 +3123,26 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
         return result;
     }
     result.worker_process_id = worker.process_id;
-    const auto startup_deadline = std::chrono::steady_clock::now() + limits_.startup_timeout;
+    const auto startup_timeout_deadline = std::chrono::steady_clock::now() + limits_.startup_timeout;
+    const auto startup_deadline = (std::min)(startup_timeout_deadline, queue_deadline);
     wire::frame_t frame;
     DWORD error = ERROR_SUCCESS;
-    const auto hello_wait = wait_for_message(worker, native_worker_execution_request_t{}, limits_, startup_deadline, frame, error);
+    const auto hello_wait = wait_for_message(worker, request, limits_, startup_deadline, frame, error);
     if (hello_wait != terminal_wait_t::message) {
-        if (hello_wait == terminal_wait_t::deadline) {
+        DWORD termination_code = ERROR_CANCELLED;
+        if (hello_wait == terminal_wait_t::cancelled) {
+            result.status = native_worker_execution_status_t::cancelled;
+            append_diagnostic(result, native_worker_diagnostic_code_t::cancelled,
+                "native_worker.hello", "worker startup was cancelled before an authenticated hello",
+                ERROR_CANCELLED, true);
+        } else if (hello_wait == terminal_wait_t::deadline) {
+            result.status = native_worker_execution_status_t::deadline_exceeded;
+            termination_code = WAIT_TIMEOUT;
             append_diagnostic(result, native_worker_diagnostic_code_t::deadline_exceeded, "native_worker.hello",
-                "worker did not provide an authenticated hello before the startup deadline", error, true);
+                queue_deadline <= startup_timeout_deadline
+                    ? "request deadline expired before an authenticated worker hello"
+                    : "worker did not provide an authenticated hello before the startup deadline",
+                WAIT_TIMEOUT, true);
         } else if (hello_wait == terminal_wait_t::exited) {
             append_worker_exit(result, worker, "native_worker.hello",
                 "worker exited before providing an authenticated hello");
@@ -3000,7 +3150,7 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
             append_protocol_failure(result, worker.reader.failure(), "native_worker.hello", error,
                 &worker.wait_observation);
         }
-        terminate_worker(worker, ERROR_CANCELLED, result, true);
+        terminate_worker(worker, termination_code, result, true);
         return result;
     }
     if (verified->manifest.provider.provider == decompiler_provider_id_t::ilspy_cli) {
@@ -3123,25 +3273,11 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
         return result;
     }
     const auto deadline = effective_deadline(request);
-    bool cancel_sent = false;
     while (true) {
         const auto terminal = wait_for_message(worker, request, limits_, deadline, frame, error);
         if (terminal == terminal_wait_t::cancelled || terminal == terminal_wait_t::deadline) {
             const bool is_deadline = terminal == terminal_wait_t::deadline;
-            if (!cancel_sent) {
-                send_cancel(worker, request, limits_, is_deadline ? "deadline_exceeded" : "cancelled");
-                cancel_sent = true;
-            }
-            const auto grace_deadline = std::chrono::steady_clock::now() + limits_.cancellation_grace;
-            wire::frame_t ignored;
-            const auto grace = wait_for_message(worker, native_worker_execution_request_t{}, limits_, grace_deadline, ignored, error);
-            if (grace == terminal_wait_t::message) {
-                const auto decoded = deserialize_decompiler_worker_message(
-                    std::string(reinterpret_cast<const char*>(ignored.payload.data()), ignored.payload.size()));
-                if (decoded.valid() && decoded.value && validate_envelope(*decoded.value, ignored, worker.session) &&
-                    std::holds_alternative<decompiler_worker_failure_message_t>(*decoded.value))
-                    append_worker_failure(result, std::get<decompiler_worker_failure_message_t>(*decoded.value));
-            }
+            send_cancel(worker, request, limits_, is_deadline ? "deadline_exceeded" : "cancelled");
             result.status = is_deadline ? native_worker_execution_status_t::deadline_exceeded : native_worker_execution_status_t::cancelled;
             append_diagnostic(result, is_deadline ? native_worker_diagnostic_code_t::deadline_exceeded : native_worker_diagnostic_code_t::cancelled,
                 "native_worker.cancel", is_deadline ? "worker exceeded its deadline" : "worker cancellation was requested", ERROR_CANCELLED, true);
@@ -3499,7 +3635,11 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
                         diagnostic.severity = decompiler_diagnostic_severity_t::error;
                         diagnostic.code = decompiler_diagnostic_code_t::malformed_serialization;
                         diagnostic.localization_key = "decompiler.managed_host.response_decode";
-                        diagnostic.localization_arguments = {decoded.error().stable_code()};
+                        auto decode_detail = decoded.error().message;
+                        if (decode_detail.size() > 512U)
+                            decode_detail.resize(512U);
+                        diagnostic.localization_arguments = {
+                            decoded.error().stable_code(), std::move(decode_detail)};
                         diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1);
                         result.diagnostics.push_back(std::move(diagnostic));
                     } else if (decoded.value().failure) {

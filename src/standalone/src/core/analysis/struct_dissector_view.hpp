@@ -124,6 +124,10 @@ struct ui_state_t {
 	char  enum_name_buf[257] = {};
 	char  enum_values_buf[8192] = {};
 	int   editing_field = -1;
+	bool  edit_value_focus_requested = false;
+	std::uint64_t edit_value_structure_id = 0;
+	std::uint64_t edit_value_structure_revision = 0;
+	std::uint64_t edit_value_field_id = 0;
 	int   pending_insert_index = -1;
 	int   add_type = 0;
 	int   selected_struct = -1;
@@ -2889,13 +2893,62 @@ void render(float pos_x, float pos_y, float width, float height,
 			return;
 		}
 
-		const float col_offset_w = 92.f;
-		const float col_glyph_w  = 28.f;
-		const float col_name_w   = 260.f;
-		const float col_type_w   = 144.f;
-		const float col_value_w  = std::max(200.f, rw - col_offset_w - col_glyph_w
-		                          - col_name_w - col_type_w - 180.f - 12.f);
-		const float col_desc_w   = 180.f;
+		struct field_table_layout_t {
+			float offset = 0.f;
+			float glyph = 0.f;
+			float name = 0.f;
+			float type = 0.f;
+			float value = 0.f;
+			float description = 0.f;
+			bool show_glyph = false;
+			bool show_type = false;
+			bool show_description = false;
+		};
+		const float table_content_w = std::max(1.f, rw - 16.f);
+		field_table_layout_t table_layout;
+		if (table_content_w >= 984.f) {
+			table_layout.offset = 92.f;
+			table_layout.glyph = 28.f;
+			table_layout.name = 260.f;
+			table_layout.type = 144.f;
+			table_layout.description = std::clamp(table_content_w * 0.18f, 180.f, 240.f);
+			table_layout.value = table_content_w - table_layout.offset - table_layout.glyph -
+				table_layout.name - table_layout.type - table_layout.description;
+			table_layout.show_glyph = true;
+			table_layout.show_type = true;
+			table_layout.show_description = true;
+		} else if (table_content_w >= 704.f) {
+			table_layout.offset = 78.f;
+			table_layout.glyph = 24.f;
+			table_layout.name = std::clamp(table_content_w * 0.27f, 150.f, 220.f);
+			table_layout.type = std::clamp(table_content_w * 0.18f, 104.f, 140.f);
+			table_layout.value = table_content_w - table_layout.offset - table_layout.glyph -
+				table_layout.name - table_layout.type;
+			table_layout.show_glyph = true;
+			table_layout.show_type = true;
+		} else if (table_content_w >= 238.f) {
+			table_layout.offset = std::clamp(table_content_w * 0.16f, 58.f, 72.f);
+			table_layout.glyph = 20.f;
+			const float desired_name = std::clamp(table_content_w * 0.31f, 104.f, 150.f);
+			table_layout.name = std::max(64.f,
+				std::min(desired_name, table_content_w - table_layout.offset -
+					table_layout.glyph - 96.f));
+			table_layout.value = std::max(1.f,
+				table_content_w - table_layout.offset - table_layout.glyph -
+				table_layout.name);
+			table_layout.show_glyph = true;
+		} else {
+			table_layout.offset = std::min(58.f, table_content_w * 0.24f);
+			const float identity_and_value_w = table_content_w - table_layout.offset;
+			table_layout.name = identity_and_value_w * 0.45f;
+			table_layout.value = identity_and_value_w - table_layout.name;
+		}
+		const float col_offset_w = table_layout.offset;
+		const float col_glyph_w = table_layout.glyph;
+		const float col_name_w = table_layout.name;
+		const float col_type_w = table_layout.type;
+		const float col_value_w = table_layout.value;
+		const float col_desc_w = table_layout.description;
 
 		float hdr_y = ry_start;
 		ImU32 hdr_bg = aida::ui::with_alpha(th.panel_header, alpha * 0.9f);
@@ -2907,16 +2960,28 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (!head_em) head_em = ImGui::GetFont();
 		ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
 		const float fs_dh = fs_diss_base * 0.95f;
+		auto draw_clipped_text = [dl](ImFont* font, float size, const ImVec2& position,
+			ImU32 color, const char* text, float width) {
+			if (!text || width <= 1.f) return;
+			const ImVec4 clip(position.x, position.y, position.x + std::max(1.f, width - 4.f),
+				position.y + ImGui::GetTextLineHeightWithSpacing());
+			dl->AddText(font, size, position, color, text, nullptr, 0.f, &clip);
+		};
 		float hx = rx + 8.f;
-		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Offset");
-		hx += col_offset_w + col_glyph_w;
-		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Name");
+		draw_clipped_text(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Offset", col_offset_w);
+		hx += col_offset_w;
+		if (table_layout.show_glyph) hx += col_glyph_w;
+		draw_clipped_text(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Name", col_name_w);
 		hx += col_name_w;
-		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Type");
-		hx += col_type_w;
-		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Value");
+		if (table_layout.show_type) {
+			draw_clipped_text(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Type", col_type_w);
+			hx += col_type_w;
+		}
+		draw_clipped_text(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Value", col_value_w);
 		hx += col_value_w;
-		dl->AddText(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc, "Description");
+		if (table_layout.show_description)
+			draw_clipped_text(head_em, fs_dh, ImVec2(hx, hdr_y + 9.f), hc,
+				"Description", col_desc_w);
 
 		float table_y = ry_start + line_h;
 		float table_h = rh - line_h - line_h - 8.f;
@@ -3068,19 +3133,23 @@ void render(float pos_x, float pos_y, float width, float height,
 					const float fs_drow_body = fs_diss_base * 1.00f;
 					char off_str[16];
 					std::snprintf(off_str, sizeof(off_str), "+0x%03X", f.offset);
-					dl->AddText(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
-						aida::ui::with_alpha(th.text_address, alpha * entrance), off_str);
+					draw_clipped_text(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
+						aida::ui::with_alpha(th.text_address, alpha * entrance), off_str,
+						col_offset_w);
 					fx += col_offset_w;
 
 					ImU32 type_c = type_color_token(f.type, alpha * entrance);
-					render_type_glyph(dl, ImVec2(fx + col_glyph_w * 0.5f, row_y + line_h * 0.5f),
-						f.type, type_c);
-					fx += col_glyph_w;
+					if (table_layout.show_glyph) {
+						render_type_glyph(dl, ImVec2(fx + col_glyph_w * 0.5f,
+							row_y + line_h * 0.5f), f.type, type_c);
+						fx += col_glyph_w;
+					}
 
 					float name_x = fx;
-					dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
+					draw_clipped_text(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
 						fs_drow_body, ImVec2(fx, row_y + 9.f),
-						aida::ui::with_alpha(th.text_primary, alpha * entrance), f.name.c_str());
+						aida::ui::with_alpha(th.text_primary, alpha * entrance), f.name.c_str(),
+						col_name_w);
 					if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 						ImVec2 mp = ImGui::GetMousePos();
 						if (mp.x >= name_x && mp.x <= name_x + col_name_w &&
@@ -3092,20 +3161,22 @@ void render(float pos_x, float pos_y, float width, float height,
 					}
 					fx += col_name_w;
 
-					float type_x = fx;
-					dl->AddText(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
-						type_c, struct_dissector::field_type_name(f.type));
-					if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-						ImVec2 mp = ImGui::GetMousePos();
-						if (mp.x >= type_x && mp.x <= type_x + col_type_w &&
-							mp.y >= row_y && mp.y <= row_y + line_h) {
-							ctx_open_request = true;
-							ctx_open_field = fi;
-							ctx_open_origin =
-								aida::ui::context_menu_open_origin_t::pointer;
+					if (table_layout.show_type) {
+						float type_x = fx;
+						draw_clipped_text(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
+							type_c, struct_dissector::field_type_name(f.type), col_type_w);
+						if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+							ImVec2 mp = ImGui::GetMousePos();
+							if (mp.x >= type_x && mp.x <= type_x + col_type_w &&
+								mp.y >= row_y && mp.y <= row_y + line_h) {
+								ctx_open_request = true;
+								ctx_open_field = fi;
+								ctx_open_origin =
+									aida::ui::context_menu_open_origin_t::pointer;
+							}
 						}
+						fx += col_type_w;
 					}
-					fx += col_type_w;
 
 					if (row.has_value) {
 						const auto& cv = row.value;
@@ -3123,15 +3194,25 @@ void render(float pos_x, float pos_y, float width, float height,
 						fa.has_last = true;
 
 						ImU32 val_col = aida::ui::with_alpha(th.text_primary, alpha * entrance);
-						dl->AddText(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
-							val_col, cv.display_text.c_str());
+						draw_clipped_text(code_font, fs_drow_meta, ImVec2(fx, row_y + 9.f),
+							val_col, cv.display_text.c_str(), col_value_w);
 
+						const bool edit_value_identity_current =
+							ui.edit_value_structure_id == active_structure_id &&
+							ui.edit_value_structure_revision == active_layout_revision &&
+							ui.edit_value_field_id == f.stable_id;
+						if (ui.editing_field == fi && !edit_value_identity_current) {
+							ui.editing_field = -1;
+							ui.edit_value_focus_requested = false;
+						}
 						if (ui.editing_field == fi) {
+							const float editor_width = col_value_w -
+								std::min(8.f, col_value_w * 0.2f);
 							float ring_pulse = sinf(ui.edit_ring_phase * 6.f) * 0.5f + 0.5f;
 							ImU32 ring = aida::ui::with_alpha(th.accent_hover,
 								alpha * (0.45f + ring_pulse * 0.45f));
-							dl->AddRect(ImVec2(fx - 2.f, row_y + 1.f),
-								ImVec2(fx + col_value_w - 4.f, row_y + line_h - 1.f),
+							dl->AddRect(ImVec2(fx, row_y + 1.f),
+								ImVec2(fx + col_value_w, row_y + line_h - 1.f),
 								ring, 5.f, 0, 1.5f);
 
 							ImGui::SetCursorScreenPos(ImVec2(fx, row_y + 1.f));
@@ -3141,13 +3222,29 @@ void render(float pos_x, float pos_y, float width, float height,
 								aida::ui::with_alpha(th.text_primary, alpha)));
 							ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
 							ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.f, 2.f));
-							ImGui::PushItemWidth(col_value_w - 8.f);
+							ImGui::PushItemWidth(editor_width);
+							const std::string edit_widget_identity =
+								std::to_string(active_structure_id) + ":" +
+								std::to_string(f.stable_id);
+							ImGui::PushID(edit_widget_identity.c_str());
+							if (ui.edit_value_focus_requested) {
+								ImGui::SetKeyboardFocusHere();
+								ui.edit_value_focus_requested = false;
+							}
 							bool committed = ImGui::InputText("##sd_edit_val", ui.edit_value_buf,
 								sizeof(ui.edit_value_buf),
 								ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+							const std::string editor_semantic_id =
+								aida::preview::semantics::stable_id(live_semantic_id, "input");
+							aida::preview::semantics::register_last_item(editor_semantic_id,
+								"dissector-live-value-input", true, false, live_semantic_id);
+#endif
+							ImGui::PopID();
 							ImGui::PopItemWidth();
 							ImGui::PopStyleVar(2);
 							ImGui::PopStyleColor(2);
+							const bool cancelled = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
 							if (committed) {
 								std::string stage_error;
 								const auto context = disasm_view::capture_selected_workspace();
@@ -3157,7 +3254,8 @@ void render(float pos_x, float pos_y, float width, float height,
 										toast_notification::toast_type_t::error, 5.f);
 								ui.editing_field = -1;
 							}
-							if (!ImGui::IsItemActive() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+							if (cancelled || (!ImGui::IsItemActive() &&
+								ImGui::IsMouseClicked(ImGuiMouseButton_Left)))
 								ui.editing_field = -1;
 						}
 
@@ -3167,6 +3265,10 @@ void render(float pos_x, float pos_y, float width, float height,
 							if (mp.x >= fx && mp.x <= fx + col_value_w &&
 								mp.y >= row_y && mp.y <= row_y + line_h) {
 								ui.editing_field = fi;
+								ui.edit_value_focus_requested = true;
+								ui.edit_value_structure_id = active_structure_id;
+								ui.edit_value_structure_revision = active_layout_revision;
+								ui.edit_value_field_id = f.stable_id;
 								ui.edit_base_address = active_base_address;
 								std::strncpy(ui.edit_value_buf, cv.display_text.c_str(),
 											 sizeof(ui.edit_value_buf) - 1);
@@ -3176,25 +3278,27 @@ void render(float pos_x, float pos_y, float width, float height,
 					}
 					fx += col_value_w;
 
-					float desc_x = fx;
-					if (!f.description.empty()) {
-						dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-							fs_drow_meta, ImVec2(fx, row_y + 9.f),
-							aida::ui::with_alpha(th.text_dim, alpha * entrance),
-							f.description.c_str());
-					} else {
-						dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-							fs_drow_meta, ImVec2(fx, row_y + 9.f),
-							aida::ui::with_alpha(th.text_dim, alpha * entrance * 0.55f),
-							"(comment)");
-					}
-					if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-						ImVec2 mp = ImGui::GetMousePos();
-						if (mp.x >= desc_x && mp.x <= desc_x + col_desc_w &&
-							mp.y >= row_y && mp.y <= row_y + line_h) {
-							pending_edit.target = edit_target_t::field_comment;
-							pending_edit.field_idx = fi;
-							pending_edit.seed_text = f.description;
+					if (table_layout.show_description) {
+						float desc_x = fx;
+						if (!f.description.empty()) {
+							draw_clipped_text(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
+								fs_drow_meta, ImVec2(fx, row_y + 9.f),
+								aida::ui::with_alpha(th.text_dim, alpha * entrance),
+								f.description.c_str(), col_desc_w);
+						} else {
+							draw_clipped_text(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
+								fs_drow_meta, ImVec2(fx, row_y + 9.f),
+								aida::ui::with_alpha(th.text_dim, alpha * entrance * 0.55f),
+								"(comment)", col_desc_w);
+						}
+						if (row_hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+							ImVec2 mp = ImGui::GetMousePos();
+							if (mp.x >= desc_x && mp.x <= desc_x + col_desc_w &&
+								mp.y >= row_y && mp.y <= row_y + line_h) {
+								pending_edit.target = edit_target_t::field_comment;
+								pending_edit.field_idx = fi;
+								pending_edit.seed_text = f.description;
+							}
 						}
 					}
 				}
@@ -3766,12 +3870,17 @@ void render(float pos_x, float pos_y, float width, float height,
 			add_action("types.dissector.field.edit_live_value",
 				live_current && !value_snapshot.raw_bytes.empty(),
 				"Attach the original target and reselect the field before editing live memory",
-				[activate_retained_field, value_snapshot] {
+				[activate_retained_field, value_snapshot, retained_structure_id,
+					retained_structure_revision, retained_field_id] {
 				const auto resolved = activate_retained_field();
 				if (!resolved)
 					return aida::ui::action_handler_result_t::failed(
 						"The retained field is stale");
 				g_ui.editing_field = resolved->second;
+				g_ui.edit_value_focus_requested = true;
+				g_ui.edit_value_structure_id = retained_structure_id;
+				g_ui.edit_value_structure_revision = retained_structure_revision;
+				g_ui.edit_value_field_id = retained_field_id;
 				g_ui.edit_base_address = g_ui.context_base_address;
 				std::strncpy(g_ui.edit_value_buf,
 					value_snapshot.display_text.c_str(),

@@ -200,6 +200,14 @@ private:
         std::set<std::uint64_t> latches;
     };
 
+    struct exception_region_t {
+        std::uint64_t entry = 0;
+        std::uint64_t continuation = 0;
+        std::set<std::uint64_t> protected_blocks;
+        std::vector<std::uint64_t> handler_entries;
+        std::map<std::uint64_t, std::set<std::uint64_t>> handler_blocks;
+    };
+
     bool preflight()
     {
         if (!(hir_.entity == type_graph_.entity) || hir_.type_graph_revision != type_graph_.revision) {
@@ -275,18 +283,54 @@ private:
                 return false;
             }
         }
-        return verify_control_flow() && analyze_control_flow();
+        return verify_control_flow() && analyze_exception_regions() && analyze_control_flow();
     }
 
     bool verify_control_flow()
     {
+        for (const auto& entry : blocks_) {
+            normal_predecessors_.try_emplace(entry.first);
+            exception_predecessors_.try_emplace(entry.first);
+        }
+        for (const auto& block : hir_.blocks) {
+            for (const auto successor : block.successor_ids) {
+                if (std::binary_search(block.exception_successor_ids.begin(),
+                        block.exception_successor_ids.end(), successor)) {
+                    fail(decompiler_diagnostic_code_t::malformed_hir,
+                        "decompiler.ast.v2.ambiguous_exception_edge", block.coordinate);
+                    return false;
+                }
+                normal_predecessors_.at(successor).push_back(block.id);
+            }
+            for (const auto successor : block.exception_successor_ids) {
+                if (successor == block.id) {
+                    fail(decompiler_diagnostic_code_t::malformed_hir,
+                        "decompiler.ast.v2.exception_self_edge", block.coordinate);
+                    return false;
+                }
+                exception_predecessors_.at(successor).push_back(block.id);
+                exception_handler_entries_.insert(successor);
+            }
+        }
+        for (auto& entry : normal_predecessors_)
+            std::sort(entry.second.begin(), entry.second.end());
+        for (auto& entry : exception_predecessors_)
+            std::sort(entry.second.begin(), entry.second.end());
+
         std::vector<std::uint64_t> entries;
         for (const auto& block : hir_.blocks) {
-            if (!block.exception_successor_ids.empty()) {
-                fail(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.v2.unproven_exception_region", block.coordinate);
+            std::vector<std::uint64_t> expected_predecessors;
+            std::set_union(normal_predecessors_.at(block.id).begin(),
+                normal_predecessors_.at(block.id).end(),
+                exception_predecessors_.at(block.id).begin(),
+                exception_predecessors_.at(block.id).end(),
+                std::back_inserter(expected_predecessors));
+            if (expected_predecessors != block.predecessor_ids) {
+                fail(decompiler_diagnostic_code_t::malformed_hir,
+                    "decompiler.ast.v2.asymmetric_predecessor", block.coordinate);
                 return false;
             }
-            if (block.predecessor_ids.empty())
+            if (expected_predecessors.empty())
                 entries.push_back(block.id);
             if (block.successor_ids.size() > 2) {
                 fail(decompiler_diagnostic_code_t::malformed_ast,
@@ -303,13 +347,13 @@ private:
                     return false;
                 }
             }
-            for (const auto predecessor : block.predecessor_ids) {
-                const auto source = blocks_.find(predecessor);
-                if (source == blocks_.end() ||
-                    !std::binary_search(source->second->successor_ids.begin(),
-                        source->second->successor_ids.end(), block.id)) {
+            for (const auto successor : block.exception_successor_ids) {
+                const auto target = blocks_.find(successor);
+                if (target == blocks_.end() ||
+                    !std::binary_search(target->second->predecessor_ids.begin(),
+                        target->second->predecessor_ids.end(), block.id)) {
                     fail(decompiler_diagnostic_code_t::malformed_hir,
-                        "decompiler.ast.v2.asymmetric_predecessor", block.coordinate);
+                        "decompiler.ast.v2.asymmetric_exception_successor", block.coordinate);
                     return false;
                 }
             }
@@ -362,6 +406,8 @@ private:
             const auto* block = blocks_.at(id);
             pending.insert(pending.end(), block->successor_ids.begin(),
                 block->successor_ids.end());
+            pending.insert(pending.end(), block->exception_successor_ids.begin(),
+                block->exception_successor_ids.end());
         }
         if (reachable.size() != blocks_.size()) {
             fail(decompiler_diagnostic_code_t::malformed_ast,
@@ -371,21 +417,180 @@ private:
         return true;
     }
 
+    bool analyze_exception_regions()
+    {
+        std::set<std::uint64_t> protected_blocks;
+        for (const auto& entry : blocks_) {
+            if (!entry.second->exception_successor_ids.empty())
+                protected_blocks.insert(entry.first);
+        }
+        for (const auto handler : exception_handler_entries_) {
+            if (protected_blocks.find(handler) != protected_blocks.end()) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.ambiguous_exception_overlap",
+                    blocks_.at(handler)->coordinate);
+                return false;
+            }
+        }
+        for (const auto block_id : protected_blocks) {
+            const auto* block = blocks_.at(block_id);
+            for (const auto successor : block->successor_ids) {
+                if (protected_blocks.find(successor) != protected_blocks.end() &&
+                    block->exception_successor_ids !=
+                        blocks_.at(successor)->exception_successor_ids) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.ambiguous_exception_overlap",
+                        block->coordinate);
+                    return false;
+                }
+            }
+        }
+
+        std::set<std::uint64_t> unassigned = protected_blocks;
+        std::set<std::uint64_t> claimed_handler_blocks;
+        while (!unassigned.empty()) {
+            const auto seed = *unassigned.begin();
+            const auto handler_entries = blocks_.at(seed)->exception_successor_ids;
+            std::set<std::uint64_t> component;
+            std::vector<std::uint64_t> pending{seed};
+            while (!pending.empty()) {
+                const auto current = pending.back();
+                pending.pop_back();
+                if (unassigned.find(current) == unassigned.end() ||
+                    blocks_.at(current)->exception_successor_ids != handler_entries ||
+                    !component.insert(current).second)
+                    continue;
+                unassigned.erase(current);
+                for (const auto successor : blocks_.at(current)->successor_ids) {
+                    if (protected_blocks.find(successor) != protected_blocks.end())
+                        pending.push_back(successor);
+                }
+                for (const auto predecessor : normal_predecessors_.at(current)) {
+                    if (protected_blocks.find(predecessor) != protected_blocks.end())
+                        pending.push_back(predecessor);
+                }
+            }
+
+            std::vector<std::uint64_t> entries;
+            std::set<std::uint64_t> continuations;
+            for (const auto block_id : component) {
+                const auto& predecessors = normal_predecessors_.at(block_id);
+                if (block_id == entry_block_id_ ||
+                    std::any_of(predecessors.begin(), predecessors.end(),
+                        [&component](const std::uint64_t predecessor) {
+                            return component.find(predecessor) == component.end();
+                        }))
+                    entries.push_back(block_id);
+                for (const auto successor : blocks_.at(block_id)->successor_ids) {
+                    if (component.find(successor) == component.end())
+                        continuations.insert(successor);
+                }
+            }
+            if (entries.size() != 1 || continuations.size() > 1) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.ambiguous_exception_region",
+                    blocks_.at(seed)->coordinate);
+                return false;
+            }
+
+            exception_region_t region;
+            region.entry = entries.front();
+            region.continuation = continuations.empty() ? 0 : *continuations.begin();
+            region.protected_blocks = std::move(component);
+            region.handler_entries = handler_entries;
+            if (exception_handler_entries_.find(region.continuation) !=
+                    exception_handler_entries_.end()) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.ambiguous_exception_continuation",
+                    blocks_.at(region.entry)->coordinate);
+                return false;
+            }
+
+            for (const auto handler : region.handler_entries) {
+                const auto owner = handler_region_owners_.emplace(handler, region.entry);
+                if (!owner.second) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.shared_exception_handler",
+                        blocks_.at(handler)->coordinate);
+                    return false;
+                }
+                std::set<std::uint64_t> handler_blocks;
+                std::vector<std::uint64_t> handler_pending{handler};
+                while (!handler_pending.empty()) {
+                    const auto current = handler_pending.back();
+                    handler_pending.pop_back();
+                    if (current == region.continuation)
+                        continue;
+                    if (protected_blocks.find(current) != protected_blocks.end() ||
+                        (current != handler && exception_handler_entries_.find(current) !=
+                            exception_handler_entries_.end()) ||
+                        claimed_handler_blocks.find(current) != claimed_handler_blocks.end()) {
+                        fail(decompiler_diagnostic_code_t::malformed_ast,
+                            "decompiler.ast.v2.ambiguous_exception_handler_body",
+                            blocks_.at(current)->coordinate);
+                        return false;
+                    }
+                    if (!handler_blocks.insert(current).second)
+                        continue;
+                    handler_pending.insert(handler_pending.end(),
+                        blocks_.at(current)->successor_ids.begin(),
+                        blocks_.at(current)->successor_ids.end());
+                }
+                for (const auto block_id : handler_blocks) {
+                    const auto& predecessors = normal_predecessors_.at(block_id);
+                    if (std::any_of(predecessors.begin(), predecessors.end(),
+                            [&handler_blocks](const std::uint64_t predecessor) {
+                                return handler_blocks.find(predecessor) ==
+                                    handler_blocks.end();
+                            })) {
+                        fail(decompiler_diagnostic_code_t::malformed_ast,
+                            "decompiler.ast.v2.ambiguous_exception_handler_merge",
+                            blocks_.at(block_id)->coordinate);
+                        return false;
+                    }
+                }
+                claimed_handler_blocks.insert(handler_blocks.begin(),
+                    handler_blocks.end());
+                region.handler_blocks.emplace(handler, std::move(handler_blocks));
+            }
+            const auto inserted = exception_regions_.emplace(region.entry,
+                std::move(region));
+            if (!inserted.second) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.ambiguous_exception_region",
+                    blocks_.at(seed)->coordinate);
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool analyze_control_flow()
     {
         std::set<std::uint64_t> all;
         for (const auto& entry : blocks_)
             all.insert(entry.first);
+        std::set<std::uint64_t> normal_roots = exception_handler_entries_;
+        normal_roots.insert(entry_block_id_);
+        for (const auto& entry : blocks_) {
+            if (normal_predecessors_.at(entry.first).empty() &&
+                normal_roots.find(entry.first) == normal_roots.end()) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.unreachable_block",
+                    entry.second->coordinate);
+                return false;
+            }
+        }
         for (const auto& entry : blocks_)
-            dominators_[entry.first] = entry.first == entry_block_id_
-                ? std::set<std::uint64_t>{entry_block_id_} : all;
+            dominators_[entry.first] = normal_roots.find(entry.first) !=
+                normal_roots.end() ? std::set<std::uint64_t>{entry.first} : all;
         bool changed = true;
         while (changed) {
             changed = false;
             for (const auto& entry : blocks_) {
                 const auto id = entry.first;
-                const auto& predecessors = entry.second->predecessor_ids;
-                if (id == entry_block_id_)
+                const auto& predecessors = normal_predecessors_.at(id);
+                if (normal_roots.find(id) != normal_roots.end())
                     continue;
                 if (predecessors.empty()) {
                     fail(decompiler_diagnostic_code_t::malformed_ast,
@@ -422,7 +627,7 @@ private:
                 while (!pending.empty()) {
                     const auto id = pending.back();
                     pending.pop_back();
-                    for (const auto predecessor : blocks_.at(id)->predecessor_ids) {
+                    for (const auto predecessor : normal_predecessors_.at(id)) {
                         if (predecessor != successor &&
                             dominators_.at(predecessor).find(successor) !=
                                 dominators_.at(predecessor).end() &&
@@ -612,6 +817,44 @@ private:
             aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
     }
 
+    std::uint8_t block_set_confidence(
+        const std::set<std::uint64_t>& block_ids) const
+    {
+        std::uint8_t result = 100;
+        for (const auto block_id : block_ids) {
+            for (const auto& value : blocks_.at(block_id)->values)
+                result = std::min(result, value.confidence);
+        }
+        return result;
+    }
+
+    decompiler_fact_provenance_t block_set_provenance(
+        const std::set<std::uint64_t>& block_ids) const
+    {
+        std::optional<decompiler_fact_provenance_t> result;
+        for (const auto block_id : block_ids) {
+            for (const auto& value : blocks_.at(block_id)->values) {
+                if (!result)
+                    result = value.provenance;
+                else if (*result != value.provenance)
+                    return decompiler_fact_provenance_t::provider_semantics;
+            }
+        }
+        return result.value_or(decompiler_fact_provenance_t::provider_semantics);
+    }
+
+    std::uint64_t append_exception_compound(
+        std::vector<std::uint64_t> statements,
+        const source_coordinate_t& coordinate,
+        const std::set<std::uint64_t>& block_ids)
+    {
+        return append_node(typed_pseudocode_ast_node_kind_t::compound_statement,
+            hir_.return_type_id, std::move(statements), {},
+            translate_coordinate(coordinate,
+                decompiler_coordinate_layer_t::typed_ast),
+            block_set_confidence(block_ids), block_set_provenance(block_ids));
+    }
+
     std::uint64_t append_negation(const std::uint64_t expression,
                                   const hir_value_t& condition)
     {
@@ -662,6 +905,90 @@ private:
             }
         }
         return best;
+    }
+
+    bool append_exception_region(const exception_region_t& region,
+                                 std::vector<std::uint64_t>& output,
+                                 std::uint64_t& next)
+    {
+        std::vector<std::uint64_t> protected_statements;
+        if (!append_region(region.entry, region.continuation,
+                &region.protected_blocks, protected_statements, 0, region.entry))
+            return false;
+        for (const auto block_id : region.protected_blocks) {
+            if (emitted_blocks_.find(block_id) == emitted_blocks_.end()) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.unstructured_exception_region",
+                    blocks_.at(block_id)->coordinate);
+                return false;
+            }
+        }
+        const auto protected_body = append_exception_compound(
+            std::move(protected_statements), blocks_.at(region.entry)->coordinate,
+            region.protected_blocks);
+        if (protected_body == 0)
+            return false;
+        std::vector<std::uint64_t> children{protected_body};
+        for (const auto handler : region.handler_entries) {
+            const auto handler_blocks = region.handler_blocks.find(handler);
+            if (handler_blocks == region.handler_blocks.end() ||
+                handler_blocks->second.empty()) {
+                fail(decompiler_diagnostic_code_t::malformed_ast,
+                    "decompiler.ast.v2.missing_exception_handler_body",
+                    blocks_.at(handler)->coordinate);
+                return false;
+            }
+            std::vector<std::uint64_t> handler_statements;
+            if (!append_region(handler, region.continuation,
+                    &handler_blocks->second, handler_statements, 0, 0))
+                return false;
+            for (const auto block_id : handler_blocks->second) {
+                if (emitted_blocks_.find(block_id) == emitted_blocks_.end()) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.unstructured_exception_handler",
+                        blocks_.at(block_id)->coordinate);
+                    return false;
+                }
+            }
+            const auto handler_body = append_exception_compound(
+                std::move(handler_statements), blocks_.at(handler)->coordinate,
+                handler_blocks->second);
+            const auto handler_clause = append_node(
+                typed_pseudocode_ast_node_kind_t::catch_clause,
+                hir_.return_type_id,
+                {handler_body},
+                "unknown_exception",
+                translate_coordinate(blocks_.at(handler)->coordinate,
+                    decompiler_coordinate_layer_t::typed_ast),
+                block_set_confidence(handler_blocks->second),
+                block_set_provenance(handler_blocks->second));
+            if (handler_body == 0 || handler_clause == 0)
+                return false;
+            children.push_back(handler_clause);
+
+            decompiler_unknown_t unknown;
+            unknown.reason = decompiler_unknown_reason_t::unresolved_reference;
+            unknown.stable_token = "exception.handler_type.block_" +
+                std::to_string(handler);
+            unknown.coordinate = blocks_.at(handler)->coordinate;
+            unknown.confidence = 0;
+            unknown.provenance = decompiler_fact_provenance_t::provider_semantics;
+            generated_unknowns_.push_back(std::move(unknown));
+        }
+        const auto statement = append_node(
+            typed_pseudocode_ast_node_kind_t::try_statement,
+            hir_.return_type_id,
+            std::move(children),
+            {},
+            translate_coordinate(blocks_.at(region.entry)->coordinate,
+                decompiler_coordinate_layer_t::typed_ast),
+            block_set_confidence(region.protected_blocks),
+            decompiler_fact_provenance_t::provider_semantics);
+        if (statement == 0)
+            return false;
+        output.push_back(statement);
+        next = region.continuation;
+        return true;
     }
 
     bool append_natural_loop(const natural_loop_t& loop,
@@ -768,7 +1095,8 @@ private:
                        const std::uint64_t stop,
                        const std::set<std::uint64_t>* allowed,
                        std::vector<std::uint64_t>& output,
-                       const std::uint64_t ignored_loop_header)
+                       const std::uint64_t ignored_loop_header,
+                       const std::uint64_t ignored_exception_entry = 0)
     {
         while (current != 0 && current != stop) {
             if ((allowed && allowed->find(current) == allowed->end()) ||
@@ -777,6 +1105,32 @@ private:
                     "decompiler.ast.v2.unstructured_control_flow",
                     blocks_.at(current)->coordinate);
                 return false;
+            }
+            if (current != ignored_exception_entry) {
+                const auto exception_region = exception_regions_.find(current);
+                if (exception_region != exception_regions_.end()) {
+                    if (allowed &&
+                        (std::any_of(exception_region->second.protected_blocks.begin(),
+                             exception_region->second.protected_blocks.end(),
+                             [allowed](const std::uint64_t block_id) {
+                                 return allowed->find(block_id) == allowed->end();
+                             }) ||
+                         (exception_region->second.continuation != 0 &&
+                          exception_region->second.continuation != stop &&
+                          allowed->find(exception_region->second.continuation) ==
+                              allowed->end()))) {
+                        fail(decompiler_diagnostic_code_t::malformed_ast,
+                            "decompiler.ast.v2.ambiguous_exception_region_scope",
+                            blocks_.at(current)->coordinate);
+                        return false;
+                    }
+                    std::uint64_t next = 0;
+                    if (!append_exception_region(exception_region->second, output,
+                            next))
+                        return false;
+                    current = next;
+                    continue;
+                }
             }
             if (current != ignored_loop_header) {
                 const auto loop = loops_.find(current);
@@ -1240,6 +1594,7 @@ private:
         };
         append_unknowns(hir_.unknowns);
         append_unknowns(type_graph_.unknowns);
+        append_unknowns(generated_unknowns_);
         result_.diagnostics = ast_.diagnostics;
         result_.unknowns = ast_.unknowns;
     }
@@ -1270,10 +1625,16 @@ private:
     std::map<std::uint64_t, value_state_t> states_;
     std::map<std::uint64_t, std::uint64_t> expression_ids_;
     std::map<std::uint64_t, std::size_t> use_counts_;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> normal_predecessors_;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> exception_predecessors_;
     std::map<std::uint64_t, std::set<std::uint64_t>> dominators_;
     std::map<std::uint64_t, std::set<std::uint64_t>> postdominators_;
     std::map<std::uint64_t, natural_loop_t> loops_;
+    std::map<std::uint64_t, exception_region_t> exception_regions_;
+    std::map<std::uint64_t, std::uint64_t> handler_region_owners_;
+    std::set<std::uint64_t> exception_handler_entries_;
     std::set<std::uint64_t> emitted_blocks_;
+    std::vector<decompiler_unknown_t> generated_unknowns_;
     std::vector<std::uint64_t> parameter_declaration_ids_;
     std::vector<std::uint64_t> local_declaration_ids_;
     std::vector<std::uint64_t> body_statement_ids_;

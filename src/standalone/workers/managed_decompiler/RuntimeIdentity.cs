@@ -15,7 +15,14 @@ internal static class RuntimeIdentity
     private const uint TokenQuery = 0x0008;
     private const int TokenAppContainerSid = 31;
     private const int ErrorInsufficientBuffer = 122;
-    private const string AppContainerEnvironmentFailure = "managed worker AppContainer environment is not profile-bound";
+    private const string AppContainerTokenOpenFailure = "managed worker AppContainer token cannot be opened";
+    private const string AppContainerTokenSizeInvalid = "managed worker AppContainer token size is invalid";
+    private const string AppContainerTokenQueryFailure = "managed worker AppContainer token query failed";
+    private const string AppContainerSidInvalid = "managed worker AppContainer SID is invalid";
+    private const string AppContainerProfileUnavailable = "managed worker AppContainer profile is unavailable";
+    private const string AppContainerProfileInaccessible = "managed worker AppContainer profile cannot be accessed";
+    private const string AppContainerLocalAppDataFailure = "managed worker AppContainer LOCALAPPDATA is not profile-bound";
+    private const string AppContainerTempFailure = "managed worker AppContainer TEMP is not profile-bound";
     internal const string DecompilerAssemblySha256 = "bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345";
     internal const string TargetFramework = ".NETCoreApp,Version=v10.0";
     internal const string RuntimeVersion = "10.0.9";
@@ -189,16 +196,17 @@ internal static class RuntimeIdentity
             throw new RuntimeIntegrityException("managed worker Windows environment is not minimal");
         var profileLocalAppData = CurrentAppContainerLocalAppData();
         var configuredLocalAppData = CanonicalDirectory(Environment.GetEnvironmentVariable("LOCALAPPDATA") ?? string.Empty,
-            profileLocalAppData, AppContainerEnvironmentFailure);
+            profileLocalAppData, AppContainerLocalAppDataFailure);
+        if (!string.Equals(configuredLocalAppData, profileLocalAppData, StringComparison.OrdinalIgnoreCase))
+            throw new RuntimeIntegrityException(AppContainerLocalAppDataFailure);
         var expectedTemp = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.Combine(profileLocalAppData, "Temp")));
         var configuredTemp = CanonicalProspectiveDirectory(Environment.GetEnvironmentVariable("TEMP") ?? string.Empty,
-            profileLocalAppData, AppContainerEnvironmentFailure);
+            profileLocalAppData, AppContainerTempFailure);
         var configuredTmp = CanonicalProspectiveDirectory(Environment.GetEnvironmentVariable("TMP") ?? string.Empty,
-            profileLocalAppData, AppContainerEnvironmentFailure);
-        if (!string.Equals(configuredLocalAppData, profileLocalAppData, StringComparison.OrdinalIgnoreCase) ||
-            !string.Equals(configuredTemp, expectedTemp, StringComparison.OrdinalIgnoreCase) ||
+            profileLocalAppData, AppContainerTempFailure);
+        if (!string.Equals(configuredTemp, expectedTemp, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(configuredTmp, expectedTemp, StringComparison.OrdinalIgnoreCase))
-            throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
+            throw new RuntimeIntegrityException(AppContainerTempFailure);
         foreach (var forbidden in new[]
         {
             "COREHOST_TRACE", "COREHOST_TRACEFILE", "DOTNET_ADDITIONAL_DEPS", "DOTNET_HOST_PATH",
@@ -321,38 +329,29 @@ internal static class RuntimeIdentity
         try
         {
             if (!OpenProcessToken(GetCurrentProcess(), TokenQuery, out token) || token == 0)
-                throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
+                throw new RuntimeIntegrityException(AppContainerTokenOpenFailure);
             if (GetTokenInformation(token, TokenAppContainerSid, 0, 0, out var informationSize) ||
                 Marshal.GetLastPInvokeError() != ErrorInsufficientBuffer ||
                 informationSize < (uint)IntPtr.Size || informationSize > 4096)
-                throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
+                throw new RuntimeIntegrityException(AppContainerTokenSizeInvalid);
             tokenInformation = Marshal.AllocHGlobal(checked((int)informationSize));
             if (!GetTokenInformation(token, TokenAppContainerSid, tokenInformation,
                     informationSize, out var returnedSize) ||
                 returnedSize < (uint)IntPtr.Size || returnedSize > informationSize)
-                throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
+                throw new RuntimeIntegrityException(AppContainerTokenQueryFailure);
             var appContainerSid = Marshal.ReadIntPtr(tokenInformation);
             if (appContainerSid == 0 || !IsValidSid(appContainerSid) ||
                 !ConvertSidToStringSidW(appContainerSid, out sidText) || sidText == 0)
-                throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
+                throw new RuntimeIntegrityException(AppContainerSidInvalid);
             var sid = Marshal.PtrToStringUni(sidText);
-            if (string.IsNullOrWhiteSpace(sid) || GetAppContainerFolderPath(sid, out folderPath) < 0 || folderPath == 0)
-                throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
+            if (string.IsNullOrWhiteSpace(sid))
+                throw new RuntimeIntegrityException(AppContainerSidInvalid);
+            if (GetAppContainerFolderPath(sid, out folderPath) < 0 || folderPath == 0)
+                throw new RuntimeIntegrityException(AppContainerProfileUnavailable);
             var path = Marshal.PtrToStringUni(folderPath);
             if (string.IsNullOrWhiteSpace(path))
-                throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
-            try
-            {
-                return CanonicalRootDirectory(path, AppContainerEnvironmentFailure);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
-            }
-            catch (IOException)
-            {
-                throw new RuntimeIntegrityException(AppContainerEnvironmentFailure);
-            }
+                throw new RuntimeIntegrityException(AppContainerProfileUnavailable);
+            return CanonicalAppContainerProfileRoot(path);
         }
         finally
         {
@@ -365,6 +364,45 @@ internal static class RuntimeIdentity
             if (token != 0)
                 _ = CloseHandle(token);
         }
+    }
+
+    private static string CanonicalAppContainerProfileRoot(string path)
+    {
+        string full;
+        FileAttributes attributes;
+        try
+        {
+            full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+            attributes = File.GetAttributes(full);
+        }
+        catch (FileNotFoundException)
+        {
+            throw new RuntimeIntegrityException(AppContainerProfileUnavailable);
+        }
+        catch (DirectoryNotFoundException)
+        {
+            throw new RuntimeIntegrityException(AppContainerProfileUnavailable);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            throw new RuntimeIntegrityException(AppContainerProfileInaccessible);
+        }
+        catch (IOException)
+        {
+            throw new RuntimeIntegrityException(AppContainerProfileInaccessible);
+        }
+        catch (ArgumentException)
+        {
+            throw new RuntimeIntegrityException(AppContainerProfileInaccessible);
+        }
+        catch (NotSupportedException)
+        {
+            throw new RuntimeIntegrityException(AppContainerProfileInaccessible);
+        }
+        if ((attributes & FileAttributes.Directory) == 0 ||
+            (attributes & FileAttributes.ReparsePoint) != 0)
+            throw new RuntimeIntegrityException(AppContainerProfileInaccessible);
+        return full;
     }
 
     private static void RejectReparseComponents(string path, string trustedRoot)

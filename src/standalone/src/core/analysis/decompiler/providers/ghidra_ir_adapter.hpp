@@ -25,6 +25,8 @@ struct capture_type_edge_t {
     decompiler_type_edge_kind_t kind = decompiler_type_edge_kind_t::alias;
     std::string stable_name;
     std::optional<std::uint64_t> byte_offset;
+    std::uint8_t confidence = 100;
+    decompiler_fact_provenance_t provenance = decompiler_fact_provenance_t::provider_semantics;
 };
 
 struct capture_type_t {
@@ -36,6 +38,8 @@ struct capture_type_t {
     std::uint32_t alignment = 1;
     bool is_signed = false;
     std::vector<capture_type_edge_t> edges;
+    std::uint8_t confidence = 100;
+    decompiler_fact_provenance_t provenance = decompiler_fact_provenance_t::provider_semantics;
 };
 
 struct capture_value_t {
@@ -47,6 +51,9 @@ struct capture_value_t {
     std::uint64_t address = 0;
     std::string stable_immediate;
     std::string stable_symbol;
+    std::uint8_t confidence = 100;
+    decompiler_fact_provenance_t provenance = decompiler_fact_provenance_t::provider_semantics;
+    bool unresolved_reference = false;
 };
 
 struct capture_block_t {
@@ -64,6 +71,8 @@ struct capture_high_variable_t {
     std::string stable_name;
     std::uint64_t type_id = 0;
     std::uint64_t address = 0;
+    std::uint8_t confidence = 100;
+    decompiler_fact_provenance_t provenance = decompiler_fact_provenance_t::provider_semantics;
 };
 
 struct capture_request_t {
@@ -73,6 +82,7 @@ struct capture_request_t {
     std::uint64_t workspace_generation = 0;
     std::uint64_t type_graph_revision = 0;
     std::uint64_t return_type_id = 0;
+    std::uint64_t function_type_id = 0;
 };
 
 struct capture_t {

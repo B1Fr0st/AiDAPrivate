@@ -6,6 +6,9 @@
 #include "../helpers/helpers.h"
 #include "editor_preview_adapter.hpp"
 #include "debugger_preview_runtime.hpp"
+#include "workspace_preview_fixture.hpp"
+#include "../core/debugger/debugger_interaction_context.hpp"
+#include "../core/session/analysis_session.hpp"
 #include "../core/ui/clock.hpp"
 #include "../core/ui/application_view_registry.hpp"
 #include <algorithm>
@@ -23,6 +26,7 @@ namespace aida::preview::debugger
 	bool fixture_initialized = false;
 	fixture_state_t fixture_state = fixture_state_t::normal;
 	bool driver_available = true;
+	std::uint64_t process_creation_time_100ns = 1;
 }
 
 namespace aida::preview
@@ -513,9 +517,45 @@ namespace aida::preview
 
 	void configure_debugger_fixture(fixture_state_t state, std::size_t cardinality)
 	{
+		debugger::process_creation_time_100ns = 1;
 		debugger::apply_fixture_state(state, cardinality);
 		debugger_engine::preview_last_error() = state == fixture_state_t::error
 			? "The debug target terminated while reading thread context" : std::string{};
+	}
+
+	void configure_analysis_mutation_fixture(fixture_state_t state)
+	{
+		if (state == fixture_state_t::analysis_mutation_current) {
+			debugger::process_creation_time_100ns = 1;
+			debugger::apply_fixture_state(fixture_state_t::normal, 0U);
+			configure_workspace_preview_target(workspace_preview_target_t::live_process);
+			while (analysis_session::session_count() != 0U)
+				if (!analysis_session::close_session(0U))
+					break;
+			const auto& fixture = workspace_preview_fixture();
+			static_cast<void>(analysis_session::open_session(fixture.source_path));
+			debugger_interaction::synchronize_target_snapshot(6420, true,
+				debugger_engine::g_state.registers.rip,
+				debugger_engine::g_state.active_tid);
+			record(shell_action_t::attach_process,
+				"analysis mutation current pid=6420 creation=1");
+			return;
+		}
+		if (state == fixture_state_t::analysis_mutation_stale_stop) {
+			debugger_interaction::advance_stop_generation();
+			record(shell_action_t::attach_process,
+				"analysis mutation stale stop generation=" +
+					std::to_string(debugger_interaction::current_stop_generation()));
+			return;
+		}
+		if (state == fixture_state_t::analysis_mutation_pid_reuse) {
+			debugger::process_creation_time_100ns = 2;
+			debugger_interaction::synchronize_target_snapshot(6420, true,
+				debugger_engine::g_state.registers.rip,
+				debugger_engine::g_state.active_tid);
+			record(shell_action_t::attach_process,
+				"analysis mutation reused pid=6420 creation=2");
+		}
 	}
 }
 
