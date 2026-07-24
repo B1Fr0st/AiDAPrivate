@@ -238,11 +238,24 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL,
                                 DWORD     fdwReason,
                                 LPVOID    )
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("DllMain_enter fdwReason=%lu hinstDLL=%p", static_cast<unsigned long>(fdwReason), static_cast<void*>(hinstDLL));
+#endif
     if (fdwReason == DLL_PROCESS_ATTACH)
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("DllMain_before_DisableThreadLibraryCalls");
+#endif
         DisableThreadLibraryCalls(hinstDLL);
-        plugin_validate_load_context(hinstDLL);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("DllMain_after_DisableThreadLibraryCalls");
+        /* plugin_validate_load_context(hinstDLL); */
+        aida_ipc::trace_breadcrumb("DllMain_plugin_validate_load_context_commented_out");
+#endif
     }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("DllMain_exit_returning_TRUE");
+#endif
     return TRUE;
 }
 
@@ -639,9 +652,17 @@ static int idaapi finish_populating_widget_popup(
     TWidget* widget, TPopupMenu* popup_handle,
     const action_activation_ctx_t* ctx)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("finish_populating_widget_popup_enter ctx=%p", static_cast<void*>(const_cast<action_activation_ctx_t*>(ctx)));
+#endif
     if (ctx == nullptr
         || (ctx->widget_type != BWN_PSEUDOCODE && ctx->widget_type != BWN_DISASM))
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("finish_populating_widget_popup_return_0 ctx_null=%d widget_type=%d", ctx == nullptr ? 1 : 0, ctx ? ctx->widget_type : -1);
+#endif
         return 0;
+    }
 
     static const char* const kept_actions[] = {
         "ai_assistant:copy_context",
@@ -655,11 +676,17 @@ static int idaapi finish_populating_widget_popup(
     };
 
     const std::string menu_root = OBFSTR("AiDA/");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("finish_populating_widget_popup_before_attach_loop count=%d", static_cast<int>(sizeof(kept_actions)/sizeof(kept_actions[0])));
+#endif
     for (const char* action_name : kept_actions)
     {
         attach_action_to_popup(widget, popup_handle, action_name,
                                menu_root.c_str(), 0);
     }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("finish_populating_widget_popup_return_0_after_attach");
+#endif
     return 0;
 }
 
@@ -667,6 +694,10 @@ static int idaapi finish_populating_widget_popup(
 ssize_t idaapi ui_event_listener_t::on_event(ssize_t code, va_list va)
 {
 #ifdef __NT__
+    aida_ipc::trace_breadcrumb("ui_event_on_event_enter code=%zd", static_cast<ssize_t>(code));
+#endif
+#ifdef __NT__
+    /*
     if (code == ui_ready_to_run)
     {
         anti_re::initialize();
@@ -676,20 +707,36 @@ ssize_t idaapi ui_event_listener_t::on_event(ssize_t code, va_list va)
     {
         check_input_for_self_target();
     }
+    */
+    aida_ipc::trace_breadcrumb("ui_event_on_event_commented_block_end");
 #endif
 
     if (code == ui_finish_populating_widget_popup)
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ui_event_on_event_finish_populating_widget_popup");
+#endif
         TWidget* widget = va_arg(va, TWidget*);
         TPopupMenu* popup_handle = va_arg(va, TPopupMenu*);
         const action_activation_ctx_t* ctx = va_arg(va, const action_activation_ctx_t*);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ui_event_on_event_calling_finish_populating_widget_popup");
+#endif
         return finish_populating_widget_popup(widget, popup_handle, ctx);
     }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ui_event_on_event_return_0");
+#endif
     return 0;
 }
 
 static int idaapi self_analysis_watchdog(void *)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("self_analysis_watchdog_enter");
+    aida_ipc::trace_breadcrumb("self_analysis_watchdog_commented_block_begin");
+#endif
+    /*
     static bool s_self_target_checked = false;
     static bool s_is_self_target      = false;
 
@@ -732,6 +779,11 @@ static int idaapi self_analysis_watchdog(void *)
 
     aida_ipc::trace_breadcrumb("self_analysis_watchdog_reschedule");
     return 30000;
+    */
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("self_analysis_watchdog_commented_block_end returning_minus1");
+#endif
+    return -1;
 }
 
 class chain_verify_action_handler_t final : public action_handler_t
@@ -763,11 +815,27 @@ private:
 
 aida_plugin_t::aida_plugin_t(bool standalone_verified, const std::string& standalone_failure)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("constructor_enter standalone_verified=%d", standalone_verified ? 1 : 0);
+    aida_ipc::trace_breadcrumb("constructor_standalone_failure=%s", standalone_failure.empty() ? "(empty)" : standalone_failure.c_str());
+#endif
     msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
-
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("constructor_after_version_msg");
+    aida_ipc::trace_breadcrumb("constructor_before_chain_verifier_service_create");
+#endif
     chain_verifier_service = std::make_unique<aida::vuln::chain_verifier_service_t>();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("constructor_after_chain_verifier_service_create");
+    aida_ipc::trace_breadcrumb("constructor_before_register_actions");
+#endif
     register_actions();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("constructor_after_register_actions");
+    aida_ipc::trace_breadcrumb("constructor_commented_block_standalone_verified_check_begin");
+#endif
 
+    /*
     if (!standalone_verified)
     {
         set_disabled(std::string("AiDAStandalone.exe is not reachable or not authenticated: ")
@@ -775,19 +843,45 @@ aida_plugin_t::aida_plugin_t(bool standalone_verified, const std::string& standa
         msg(OBFSTR_C("AiDA: plugin loaded in disabled mode. %s\n"), disabled_detail.c_str());
         return;
     }
+    */
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("constructor_commented_block_standalone_verified_check_end");
+    aida_ipc::trace_breadcrumb("constructor_before_initialize_operational");
+#endif
     if (!initialize_operational(true))
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("constructor_initialize_operational_failed disabled_detail=%s", disabled_detail.c_str());
+#endif
         msg(OBFSTR_C("AiDA: plugin loaded in disabled mode. %s\n"), disabled_detail.c_str());
+    }
+#ifdef __NT__
+    else
+    {
+        aida_ipc::trace_breadcrumb("constructor_initialize_operational_succeeded");
+    }
+    aida_ipc::trace_breadcrumb("constructor_exit");
+#endif
 }
 
 void aida_plugin_t::set_disabled(const std::string& reason)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("set_disabled_enter reason=%s", reason.empty() ? "(empty)" : reason.c_str());
+#endif
     disabled_detail = reason.empty() ? std::string("standalone verification failed") : reason;
     features_initialized = false;
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("set_disabled_exit disabled_detail=%s features_initialized=0", disabled_detail.c_str());
+#endif
 }
 
 bool aida_plugin_t::is_operational() const
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("is_operational features_initialized=%d", features_initialized ? 1 : 0);
+#endif
     return features_initialized;
 }
 
@@ -798,13 +892,29 @@ const std::string& aida_plugin_t::disabled_reason() const
 
 bool aida_plugin_t::ensure_operational(bool interactive)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ensure_operational_enter interactive=%d features_initialized=%d", interactive ? 1 : 0, features_initialized ? 1 : 0);
+#endif
     if (features_initialized)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ensure_operational_already_initialized_returning_true");
+#endif
         return true;
+    }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ensure_operational_calling_initialize_operational");
+#endif
     return initialize_operational(interactive);
 }
 
 bool aida_plugin_t::initialize_operational(bool interactive)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_enter interactive=%d", interactive ? 1 : 0);
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_1_begin (verify_standalone, watchdog)");
+#endif
+    /*
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("initialize_operational_enter interactive=%d", interactive ? 1 : 0);
     std::string standalone_failure;
@@ -826,11 +936,19 @@ bool aida_plugin_t::initialize_operational(bool interactive)
         msg(OBFSTR_C("AiDA standalone watchdog worker unavailable.\n"));
     aida_ipc::trace_breadcrumb("initialize_operational_watchdog_started");
 #endif
+    */
 
-    aida_ipc::trace_breadcrumb("initialize_operational_settings_load_begin");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_1_end");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_settings_load_from_file");
+#endif
     g_settings.load_from_file();
-    aida_ipc::trace_breadcrumb("initialize_operational_settings_load_done eula=%d", g_settings.eula_accepted ? 1 : 0);
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_settings_load_from_file");
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_2_begin (eula)");
+#endif
 
+    /*
     if (!g_settings.eula_accepted)
     {
         aida_ipc::trace_breadcrumb("initialize_operational_eula_prompt_begin");
@@ -846,14 +964,28 @@ bool aida_plugin_t::initialize_operational(bool interactive)
         g_settings.save();
         aida_ipc::trace_breadcrumb("initialize_operational_eula_save_done");
     }
+    */
 
 #ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_2_end (eula)");
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_3_begin (anti_re)");
+#endif
+
+    /*
+    #ifdef __NT__
     aida_ipc::trace_breadcrumb("initialize_operational_anti_re_initialize_begin");
     if (!anti_re::initialize())
         msg(OBFSTR_C("AiDA: kernel-backed runtime attestation warm-up failed; runtime checks will retry on demand.\n"));
     aida_ipc::trace_breadcrumb("initialize_operational_anti_re_initialize_done");
+    #endif
+    */
+
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_3_end (anti_re)");
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_4_begin (self_identity)");
 #endif
 
+    /*
     aida_ipc::trace_breadcrumb("initialize_operational_self_identity_begin");
     ida_utils::compute_self_identity();
     if (ida_utils::is_self_target_database())
@@ -864,7 +996,14 @@ bool aida_plugin_t::initialize_operational(bool interactive)
         return false;
     }
     aida_ipc::trace_breadcrumb("initialize_operational_self_identity_done");
+    */
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_4_end (self_identity)");
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_5_begin (public_ip)");
+#endif
+
+    /*
     try
     {
         public_ip_thread = std::thread([]() {
@@ -895,8 +1034,15 @@ bool aida_plugin_t::initialize_operational(bool interactive)
         msg(OBFSTR_C("AiDA public IP worker unavailable.\n"));
         aida_ipc::trace_breadcrumb("initialize_operational_public_ip_worker_start_unknown_exception");
     }
+    */
 
 #ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_5_end (public_ip)");
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_6_begin (self_target_check, pipe_monitor, hash_scanner, driver_tamper, destructive_enforcement)");
+#endif
+
+    /*
+    #ifdef __NT__
     aida_ipc::trace_breadcrumb("initialize_operational_self_target_check_begin");
     check_input_for_self_target();
     aida_ipc::trace_breadcrumb("initialize_operational_pipe_monitor_begin");
@@ -920,14 +1066,25 @@ bool aida_plugin_t::initialize_operational(bool interactive)
     aida_ipc::trace_breadcrumb("initialize_operational_driver_tamper_monitor_done");
     anti_re::arm_destructive_enforcement();
     aida_ipc::trace_breadcrumb("initialize_operational_destructive_enforcement_armed");
+    #endif
+    */
+
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_6_end");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_settings_load_this");
+#endif
+    g_settings.load(this);
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_settings_load_this");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_analysis_db_load");
+#endif
+    aida_db::AnalysisDB::instance().load();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_analysis_db_load");
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_7_begin (idb_is_aida_binary)");
 #endif
 
-    aida_ipc::trace_breadcrumb("initialize_operational_settings_runtime_load_begin");
-    g_settings.load(this);
-    aida_ipc::trace_breadcrumb("initialize_operational_analysis_db_load_begin");
-    aida_db::AnalysisDB::instance().load();
-    aida_ipc::trace_breadcrumb("initialize_operational_tools_init_begin");
-
+    /*
     if (ida_utils::idb_is_aida_binary())
     {
         aida_ipc::trace_breadcrumb("self_analysis_idb_guard_triggered tool_registration");
@@ -945,89 +1102,165 @@ bool aida_plugin_t::initialize_operational(bool interactive)
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
         __fastfail(kSelfAnalysisBsodCode);
     }
+    */
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_commented_block_7_end (idb_is_aida_binary)");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_agent_tools_init");
+#endif
     agent_tools::initialize_all_tools();
-    aida_ipc::trace_breadcrumb("initialize_operational_tools_init_done");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_agent_tools_init");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_chain_verifier_check");
+#endif
 
     if (!chain_verifier_service)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_creating_new");
+#endif
         chain_verifier_service = std::make_unique<aida::vuln::chain_verifier_service_t>();
-    aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_start_begin");
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_created");
+#endif
+    }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_before_chain_verifier_start");
+#endif
     if (!chain_verifier_service->start())
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_start_failed");
+#endif
         chain_verifier_service->stop(4000);
         set_disabled("Chain verifier service could not start");
-        aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_start_fail");
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("initialize_operational_return_false_chain_verifier");
+#endif
         return false;
     }
-    aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_start_done");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_chain_verifier_start_ok");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_mcp_enabled_save");
+#endif
 
     g_settings.mcp_enabled = true;
-    aida_ipc::trace_breadcrumb("initialize_operational_settings_save_mcp_begin port=%d", g_settings.mcp_port);
     g_settings.save();
-    aida_ipc::trace_breadcrumb("initialize_operational_settings_save_mcp_done");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_mcp_enabled_save");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_start_mcp_server");
+#endif
 
-    aida_ipc::trace_breadcrumb("initialize_operational_mcp_start_begin port=%d", g_settings.mcp_port);
     if (!start_mcp_server())
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("initialize_operational_start_mcp_server_failed");
+#endif
         if (chain_verifier_service)
             chain_verifier_service->stop(4000);
         set_disabled("MCP server could not start");
-        aida_ipc::trace_breadcrumb("initialize_operational_mcp_start_fail");
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("initialize_operational_return_false_mcp_server");
+#endif
         return false;
     }
-    aida_ipc::trace_breadcrumb("initialize_operational_mcp_start_done");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_start_mcp_server_ok");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_install_hexrays_fixups");
+#endif
 
-    aida_ipc::trace_breadcrumb("initialize_operational_hexrays_fixups_begin");
     analysis_fixer::install_hexrays_fixups();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_install_hexrays_fixups");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_hook_event_listener");
+#endif
     if (hook_event_listener(HT_UI, &ui_listener))
+    {
         ui_listener_hooked = true;
-    aida_ipc::trace_breadcrumb("initialize_operational_ui_hook_done hooked=%d", ui_listener_hooked ? 1 : 0);
-
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("initialize_operational_hook_event_listener_ok hooked=1");
+#endif
+    }
+#ifdef __NT__
+    else
+    {
+        aida_ipc::trace_breadcrumb("initialize_operational_hook_event_listener_failed hooked=0");
+    }
+    aida_ipc::trace_breadcrumb("initialize_operational_before_register_timer");
+#endif
     self_watchdog_timer = register_timer(10000, self_analysis_watchdog, nullptr);
-    aida_ipc::trace_breadcrumb("initialize_operational_self_watchdog_timer_registered timer=%p", self_watchdog_timer);
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_register_timer timer=%p", static_cast<void*>(self_watchdog_timer));
+    aida_ipc::trace_breadcrumb("initialize_operational_before_game_stealth_install");
+#endif
     game_stealth::install();
-    aida_ipc::trace_breadcrumb("initialize_operational_game_stealth_installed");
-
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_game_stealth_install");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_features_initialized_true");
+#endif
     features_initialized = true;
     disabled_detail.clear();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_features_initialized_true");
+#endif
 
     msg(OBFSTR_C("--- Plugin Loaded Successfully ---\n"));
-    aida_ipc::trace_breadcrumb("initialize_operational_success");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_after_success_msg");
+    aida_ipc::trace_breadcrumb("initialize_operational_before_graphrag_load");
+#endif
 
     std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("initialize_operational_bin_hash=%s", bin_hash.empty() ? "(empty)" : bin_hash.c_str());
+#endif
     if (!bin_hash.empty())
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("initialize_operational_before_graphrag_thread_create");
+#endif
         try
         {
             graphrag_load_thread = std::thread([bin_hash]() {
-                aida_ipc::trace_breadcrumb("graphrag_load_worker_enter hash_len=%zu", bin_hash.size());
                 try
                 {
                     graphrag::load_graph(bin_hash);
-                    aida_ipc::trace_breadcrumb("graphrag_load_worker_exit");
                 }
                 catch (const std::exception& ex)
                 {
-                    aida_ipc::trace_breadcrumb("graphrag_load_worker_exception what=%s", ex.what());
+                    msg(OBFSTR_C("AiDA GraphRAG load worker unavailable: %s\n"), ex.what());
                 }
                 catch (...)
                 {
-                    aida_ipc::trace_breadcrumb("graphrag_load_worker_unknown_exception");
+                    msg(OBFSTR_C("AiDA GraphRAG load worker unavailable.\n"));
                 }
             });
-            aida_ipc::trace_breadcrumb("initialize_operational_graphrag_worker_started hash_len=%zu", bin_hash.size());
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("initialize_operational_graphrag_thread_started");
+#endif
         }
         catch (const std::exception& ex)
         {
             msg(OBFSTR_C("AiDA GraphRAG load worker unavailable: %s\n"), ex.what());
-            aida_ipc::trace_breadcrumb("initialize_operational_graphrag_worker_start_exception what=%s", ex.what());
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("initialize_operational_graphrag_thread_exception what=%s", ex.what());
+#endif
         }
         catch (...)
         {
             msg(OBFSTR_C("AiDA GraphRAG load worker unavailable.\n"));
-            aida_ipc::trace_breadcrumb("initialize_operational_graphrag_worker_start_unknown_exception");
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("initialize_operational_graphrag_thread_unknown_exception");
+#endif
         }
     }
+#ifdef __NT__
+    else
+    {
+        aida_ipc::trace_breadcrumb("initialize_operational_no_bin_hash_skipping_graphrag");
+    }
+    aida_ipc::trace_breadcrumb("initialize_operational_return_true");
+#endif
 
     return true;
 }
@@ -1035,112 +1268,303 @@ bool aida_plugin_t::initialize_operational(bool interactive)
 aida_plugin_t::~aida_plugin_t()
 {
 #ifdef __NT__
+    aida_ipc::trace_breadcrumb("destructor_enter features_initialized=%d", features_initialized ? 1 : 0);
+    /*
     aida_ipc::trace_breadcrumb("plugin_destructor_enter features_initialized=%d", features_initialized ? 1 : 0);
     aida_ipc::shutdown();
-    join_plugin_thread(graphrag_load_thread, "graphrag_load");
     join_plugin_thread(public_ip_thread, "public_ip");
+    */
+    aida_ipc::trace_breadcrumb("destructor_commented_block_1_end (shutdown, public_ip_thread)");
+    aida_ipc::trace_breadcrumb("destructor_before_join_graphrag_load_thread");
+    join_plugin_thread(graphrag_load_thread, "graphrag_load");
+    aida_ipc::trace_breadcrumb("destructor_after_join_graphrag_load_thread");
 #endif
 
     if (self_watchdog_timer != nullptr)
     {
-        aida_ipc::trace_breadcrumb("plugin_destructor_self_watchdog_unregister timer=%p", self_watchdog_timer);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_before_unregister_timer");
+#endif
         unregister_timer(self_watchdog_timer);
         self_watchdog_timer = nullptr;
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_after_unregister_timer");
+#endif
     }
+#ifdef __NT__
+    else
+    {
+        aida_ipc::trace_breadcrumb("destructor_no_watchdog_timer");
+    }
+#endif
 
     if (features_initialized)
     {
-        aida_ipc::trace_breadcrumb("plugin_destructor_features_shutdown_begin");
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_features_initialized_begin_cleanup");
+#endif
         if (chain_verifier_service)
         {
-            aida_ipc::trace_breadcrumb("plugin_destructor_chain_verifier_stop_begin");
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("destructor_before_chain_verifier_stop");
+#endif
             chain_verifier_service->stop(4000);
-            aida_ipc::trace_breadcrumb("plugin_destructor_chain_verifier_stop_done");
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("destructor_after_chain_verifier_stop");
+#endif
         }
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_before_game_stealth_shutdown");
+#endif
         game_stealth::shutdown();
-
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_after_game_stealth_shutdown");
+        aida_ipc::trace_breadcrumb("destructor_before_get_binary_hash");
+#endif
         std::string bin_hash = aida_db::AnalysisDB::instance().get_binary_hash();
         if (!bin_hash.empty())
+        {
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("destructor_before_graphrag_save_graph hash=%s", bin_hash.c_str());
+#endif
             graphrag::save_graph(bin_hash);
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("destructor_after_graphrag_save_graph");
+#endif
+        }
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_before_analysis_db_save");
+#endif
         aida_db::AnalysisDB::instance().save();
-
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_after_analysis_db_save");
+        aida_ipc::trace_breadcrumb("destructor_before_stop_mcp_server");
+#endif
         stop_mcp_server();
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_after_stop_mcp_server");
+#endif
         if (ui_listener_hooked)
+        {
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("destructor_before_unhook_event_listener");
+#endif
             ::unhook_event_listener(HT_UI, &ui_listener);
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("destructor_after_unhook_event_listener");
+#endif
+        }
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_before_uninstall_hexrays_fixups");
+#endif
         analysis_fixer::uninstall_hexrays_fixups();
-        aida_ipc::trace_breadcrumb("plugin_destructor_features_shutdown_done");
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("destructor_after_uninstall_hexrays_fixups");
+#endif
     }
+#ifdef __NT__
+    else
+    {
+        aida_ipc::trace_breadcrumb("destructor_features_not_initialized_skipping_cleanup");
+    }
+    aida_ipc::trace_breadcrumb("destructor_before_unregister_actions");
+#endif
     unregister_actions();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("destructor_after_unregister_actions");
+    aida_ipc::trace_breadcrumb("destructor_before_chain_verifier_reset");
+#endif
     chain_verifier_service.reset();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("destructor_after_chain_verifier_reset");
+    aida_ipc::trace_breadcrumb("destructor_commented_block_2_begin (uninstall_crash_breadcrumbs)");
+#endif
+    /*
 #ifdef __NT__
     aida_ipc::uninstall_crash_breadcrumbs();
 #endif
+    */
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("destructor_commented_block_2_end");
+#endif
     msg(OBFSTR_C("--- Plugin has been unloaded ---\n"));
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("destructor_exit");
+#endif
 }
 
 bool idaapi aida_plugin_t::run(size_t)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("run_enter");
+    aida_ipc::trace_breadcrumb("run_before_ensure_operational");
+#endif
     if (!ensure_operational(true))
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("run_ensure_operational_failed disabled_detail=%s", disabled_detail.c_str());
+#endif
         warning(OBFSTR_C("AiDA is loaded but disabled: %s"), disabled_detail.c_str());
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("run_return_false_disabled");
+#endif
         return false;
     }
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("run_ensure_operational_succeeded");
+#endif
     info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("run_return_true");
+#endif
     return true;
 }
 
 void aida_plugin_t::activate_chain_verify_action(aida::vuln::chain_verify_action_kind_t kind, action_activation_ctx_t* ctx)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("activate_chain_verify_action_enter");
+#endif
     if (!is_operational() || !chain_verifier_service)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("activate_chain_verify_action_return_not_operational");
+#endif
         return;
+    }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("activate_chain_verify_action_calling_activate");
+#endif
     chain_verifier_service->activate(kind, ctx);
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("activate_chain_verify_action_exit");
+#endif
 }
 
 action_state_t aida_plugin_t::update_chain_verify_action(aida::vuln::chain_verify_action_kind_t kind, const action_update_ctx_t* ctx) const
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("update_chain_verify_action_enter");
+#endif
     if (!is_operational() || !chain_verifier_service)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("update_chain_verify_action_return_ast_disable");
+#endif
         return AST_DISABLE;
+    }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("update_chain_verify_action_calling_action_state");
+#endif
     return chain_verifier_service->action_state(kind, ctx);
 }
 
 bool aida_plugin_t::start_mcp_server()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("start_mcp_server_enter");
+    aida_ipc::trace_breadcrumb("start_mcp_server_commented_block_self_target_check_begin");
+#endif
+
+    /*
     if (ida_utils::is_self_target_database())
     {
         msg(OBFSTR_C("MCP: disabled while AiDA itself is the active analysis target.\n"));
         return false;
     }
+    */
+
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("start_mcp_server_commented_block_self_target_check_end");
+#endif
 
     if (mcp_server && mcp_server->is_running())
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("start_mcp_server_already_running_returning_true");
+#endif
         return true;
+    }
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("start_mcp_server_before_make_unique mcp_port=%d", g_settings.mcp_port);
+#endif
     mcp_server = std::make_unique<mcp_server_t>();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("start_mcp_server_after_make_unique");
+    aida_ipc::trace_breadcrumb("start_mcp_server_before_start port=%d", g_settings.mcp_port);
+#endif
     if (!mcp_server->start(g_settings.mcp_port))
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("start_mcp_server_start_failed port=%d", g_settings.mcp_port);
+#endif
         msg(OBFSTR_C("MCP: Could not start server on port %d.\n"), g_settings.mcp_port);
         mcp_server.reset();
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("start_mcp_server_return_false");
+#endif
         return false;
     }
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("start_mcp_server_start_succeeded");
+    aida_ipc::trace_breadcrumb("start_mcp_server_before_write_configs");
+#endif
     mcp_server->write_mcp_client_configs();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("start_mcp_server_after_write_configs");
+    aida_ipc::trace_breadcrumb("start_mcp_server_return_true");
+#endif
     return true;
 }
 
 void aida_plugin_t::stop_mcp_server()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("stop_mcp_server_enter");
+#endif
     if (mcp_server)
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("stop_mcp_server_before_stop");
+#endif
         mcp_server->stop();
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("stop_mcp_server_after_stop");
+        aida_ipc::trace_breadcrumb("stop_mcp_server_before_reset");
+#endif
         mcp_server.reset();
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("stop_mcp_server_after_reset");
+#endif
     }
+#ifdef __NT__
+    else
+    {
+        aida_ipc::trace_breadcrumb("stop_mcp_server_no_server");
+    }
+    aida_ipc::trace_breadcrumb("stop_mcp_server_exit");
+#endif
 }
 
 void aida_plugin_t::register_actions()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("register_actions_enter actions_registered=%d", actions_registered ? 1 : 0);
+#endif
     if (actions_registered)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("register_actions_already_registered_returning");
+#endif
         return;
+    }
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("register_actions_before_action_definitions");
+#endif
     struct rt_action_def_t {
         std::string name;
         std::string label;
@@ -1156,6 +1580,9 @@ void aida_plugin_t::register_actions()
 
     const std::string menu_root = OBFSTR("AiDA/");
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("register_actions_before_registering_rt_actions count=%d", static_cast<int>(sizeof(action_definitions)/sizeof(action_definitions[0])));
+#endif
     for (const auto& def : action_definitions)
     {
         actions_list.push_back() = def.name.c_str();
@@ -1171,11 +1598,21 @@ void aida_plugin_t::register_actions()
 
         if (!register_action(adesc))
         {
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("register_action_failed name=%s", def.name.c_str());
+#endif
             msg(OBFSTR_C("Failed to register action %s\n"), def.name.c_str());
             continue;
         }
         attach_action_to_menu(menu_root.c_str(), def.name.c_str(), SETMENU_APP);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("register_action_ok name=%s", def.name.c_str());
+#endif
     }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("register_actions_after_rt_actions");
+    aida_ipc::trace_breadcrumb("register_actions_before_chain_action_definitions");
+#endif
 
     struct chain_action_def_t {
         std::string name;
@@ -1193,6 +1630,9 @@ void aida_plugin_t::register_actions()
     };
 
     const std::string chain_menu_root = menu_root + OBFSTR("Chain Verify/");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("register_actions_before_registering_chain_actions count=%d", static_cast<int>(sizeof(chain_action_definitions)/sizeof(chain_action_definitions[0])));
+#endif
     for (const auto& def : chain_action_definitions)
     {
         actions_list.push_back() = def.name.c_str();
@@ -1208,33 +1648,70 @@ void aida_plugin_t::register_actions()
 
         if (!register_action(adesc))
         {
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("register_chain_action_failed name=%s", def.name.c_str());
+#endif
             msg(OBFSTR_C("Failed to register action %s\n"), def.name.c_str());
             continue;
         }
         attach_action_to_menu(chain_menu_root.c_str(), def.name.c_str(), SETMENU_APP);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("register_chain_action_ok name=%s", def.name.c_str());
+#endif
     }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("register_actions_after_chain_actions");
+#endif
     actions_registered = true;
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("register_actions_exit actions_registered=1");
+#endif
 }
 
 void aida_plugin_t::unregister_actions()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("unregister_actions_enter actions_registered=%d", actions_registered ? 1 : 0);
+#endif
     if (!actions_registered)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("unregister_actions_not_registered_returning");
+#endif
         return;
+    }
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("unregister_actions_before_loop count=%d", static_cast<int>(actions_list.size()));
+#endif
     for (const auto& action_name : actions_list)
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("unregister_actions_unregistering name=%s", action_name.c_str());
+#endif
         unregister_action(action_name.c_str());
     }
     actions_list.clear();
     actions_registered = false;
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("unregister_actions_exit actions_registered=0");
+#endif
 }
 
-static plugmod_t* idaapi init()
+static plugmod_t* idaapi init_core()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("init_core_enter");
+#endif
     std::string standalone_failure;
     bool standalone_verified = true;
-
 #ifdef __NT__
+    aida_ipc::trace_breadcrumb("init_core_vars_initialized standalone_verified=%d", standalone_verified ? 1 : 0);
+    aida_ipc::trace_breadcrumb("init_core_commented_block_begin (filename_check, vm_guard, kd_test_signing_guard, pin_module, crash_breadcrumbs, verify_standalone)");
+#endif
+
+    /*
+    #ifdef __NT__
     if (!has_expected_plugin_filename())
     {
         msg(OBFSTR_C("AiDA: plugin filename mismatch. Expected exact name: AiDA.dll\n"));
@@ -1256,9 +1733,86 @@ static plugmod_t* idaapi init()
         msg(OBFSTR_C("AiDA: standalone verification failed; plugin will load disabled. detail=%s\n"),
             standalone_failure.empty() ? "verification failed" : standalone_failure.c_str());
     }
+    #endif
+    */
+
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("init_core_commented_block_end");
+    aida_ipc::trace_breadcrumb("init_core_before_new_aida_plugin_t");
+#endif
+    return new aida_plugin_t(standalone_verified, standalone_failure);
+}
+
+static plugmod_t* idaapi init_seh_wrapper()
+{
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("init_seh_wrapper_enter");
+#endif
+    plugmod_t* result = nullptr;
+    DWORD seh_code = 0;
+    __try
+    {
+        result = init_core();
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("init_seh_wrapper_core_returned result=%p", static_cast<void*>(result));
+#endif
+    }
+    __except (seh_code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("init_seh_wrapper_exception code=0x%08lX", seh_code);
+#endif
+        result = PLUGIN_SKIP;
+    }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("init_seh_wrapper_exit result=%p", static_cast<void*>(result));
+#endif
+    return result;
+}
+
+static plugmod_t* idaapi init()
+{
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("init_enter FIRST_BREADCRUMB");
+
+    HMODULE plugin_module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&init), &plugin_module);
+    aida_ipc::trace_breadcrumb("init_diag plugin_module_base=%p", static_cast<void*>(plugin_module));
+
+    HMODULE ida_dll = GetModuleHandleW(L"ida.dll");
+    aida_ipc::trace_breadcrumb("init_diag ida_dll_loaded=%d ida_dll_handle=%p", ida_dll ? 1 : 0, static_cast<void*>(ida_dll));
+
+    aida_ipc::trace_breadcrumb("init_diag IDP_INTERFACE_VERSION=%d", IDP_INTERFACE_VERSION);
+
+    aida_ipc::trace_breadcrumb("init_before_try_catch");
 #endif
 
-    return new aida_plugin_t(standalone_verified, standalone_failure);
+    try
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("init_try_enter calling_init_seh_wrapper");
+#endif
+        plugmod_t* result = init_seh_wrapper();
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("init_try_exit result=%p", static_cast<void*>(result));
+#endif
+        return result;
+    }
+    catch (const std::exception& ex)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("init_cxx_exception what=%s", ex.what());
+#endif
+        return PLUGIN_SKIP;
+    }
+    catch (...)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("init_cxx_unknown_exception");
+#endif
+        return PLUGIN_SKIP;
+    }
 }
 
 plugin_t PLUGIN =

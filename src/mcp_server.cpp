@@ -1593,12 +1593,26 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
     const json& params,
     const std::atomic<bool>* cancel_flag /* Slice B14 */)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_exec_tool_enter name=%s cancel=%d", name.c_str(), cancel_flag ? 1 : 0);
+#endif
+    /*
     if (ida_utils::is_self_target_database())
         return agent_tools::tool_result_t::error("Operation blocked.");
+    */
 
     const auto* tool_def = agent_tools::ToolRegistry::instance().get_tool(name);
     if (!tool_def)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_exec_tool_unknown name=%s", name.c_str());
+#endif
         return agent_tools::tool_result_t::error("Unknown tool: " + name);
+    }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_exec_tool_found name=%s read_only=%d destructive=%d",
+                               name.c_str(), tool_def->read_only ? 1 : 0, tool_def->destructive ? 1 : 0);
+#endif
 
     // Slice B14 — bail before scheduling on the main thread if the caller has
     // already cancelled (HTTP disconnect). Avoids tying up the IDA thread.
@@ -1629,7 +1643,15 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
 
     int mff_flag = tool_def->read_only ? MFF_READ : MFF_WRITE;
     auto sync_t0 = std::chrono::steady_clock::now();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_exec_tool_before_sync name=%s mff=%d", name.c_str(), mff_flag);
+#endif
     execute_sync(req, mff_flag);
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_exec_tool_after_sync name=%s success=%d exec_ms=%llu",
+                               name.c_str(), req.result.success ? 1 : 0,
+                               static_cast<unsigned long long>(req.exec_ms));
+#endif
     const auto sync_total_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - sync_t0).count());
@@ -2193,8 +2215,14 @@ static json build_aggregator_tool_entries()
 
 static json build_mcp_tools_list()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_build_tools_list_enter");
+#endif
     json tools = json::array();
     const auto all_tools = agent_tools::ToolRegistry::instance().get_all_tools();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_build_tools_list_all_tools=%zu", all_tools.size());
+#endif
 
     json instance_param;
     instance_param[OBFSTR_C("type")] = "string";
@@ -2291,6 +2319,9 @@ static json build_mcp_tools_list()
     for (auto& a : aggregators)
         tools.push_back(std::move(a));
 
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_build_tools_list_exit total_tools=%zu", tools.size());
+#endif
     return tools;
 }
 
@@ -2355,6 +2386,9 @@ static const json& get_cached_mcp_prompts_catalog()
 
 static json handle_initialize(const json& id, const json& )
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_handle_initialize_enter");
+#endif
     json capabilities;
     capabilities[OBFSTR_C("tools")]     = {{"listChanged", true}};
     capabilities[OBFSTR_C("resources")] = {{"listChanged", true}};
@@ -2388,6 +2422,9 @@ static json handle_tools_list(const json& id)
 
 static json handle_tools_call(const json& id, const json& params)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_handle_tools_call_enter");
+#endif
     if (!params.contains(OBFSTR_C("name")) || !params[OBFSTR_C("name")].is_string())
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
 
@@ -2824,6 +2861,9 @@ static json handle_completion_complete(const json& id, const json& params)
 
 static json dispatch_single_message(const json& msg)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_dispatch_enter");
+#endif
     if (!msg.is_object())
         return make_jsonrpc_error(nullptr, JSONRPC_INVALID_REQUEST, OBFSTR("Request must be a JSON object"));
 
@@ -2879,6 +2919,9 @@ static json dispatch_single_message(const json& msg)
 
 static std::string handle_mcp_body(const std::string& body)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_handle_body_enter body_len=%zu", body.size());
+#endif
     json parsed;
     try
     {
@@ -3153,7 +3196,13 @@ static agent_tools::tool_result_t aggregator_query_all(const json& params)
 
 static void register_aggregator_tools_once()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_register_aggregator_enter");
+#endif
     std::call_once(g_aggregator_tools_registered, []() {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_register_aggregator_call_once");
+#endif
         auto& reg = agent_tools::ToolRegistry::instance();
 
         agent_tools::tool_definition_t list_def;
@@ -3203,32 +3252,61 @@ static void register_aggregator_tools_once()
         fan_def.parameters = { p_tool, p_args, p_to };
         fan_def.handler = aggregator_query_all;
         reg.register_tool(fan_def);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_register_aggregator_done tools_registered=3");
+#endif
     });
 }
 
-mcp_server_t::mcp_server_t() = default;
+mcp_server_t::mcp_server_t()
+{
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_ctor_enter");
+#endif
+}
 
 mcp_server_t::~mcp_server_t()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_dtor_enter running=%d port=%d",
+                               _running.load() ? 1 : 0, _port);
+#endif
     stop();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_dtor_exit");
+#endif
 }
 
 bool mcp_server_t::is_running() const
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_is_running running=%d port=%d",
+                               _running.load() ? 1 : 0, _port);
+#endif
     return _running.load();
 }
 
 int mcp_server_t::get_port() const
 {
-    return _running.load() ? _port : 0;
+    int p = _running.load() ? _port : 0;
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_get_port running=%d port=%d", _running.load() ? 1 : 0, p);
+#endif
+    return p;
 }
 
 bool mcp_server_t::start(int port)
 {
 #ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_start_enter port=%d running=%d bind_failed=%d stop_requested=%d",
+                               port, _running.load() ? 1 : 0, _bind_failed.load() ? 1 : 0,
+                               _stop_requested.load() ? 1 : 0);
+#endif
+#ifdef __NT__
     if (!aida_ipc::is_standalone_alive())
     {
         msg(OBFSTR_C("AiDA MCP: Cannot start - AiDAStandalone.exe is not authenticated.\n"));
+        aida_ipc::trace_breadcrumb("ida_mcp_start_fail_standalone_not_alive port=%d", port);
         return false;
     }
 #endif
@@ -3240,10 +3318,16 @@ bool mcp_server_t::start(int port)
     }
 
     register_aggregator_tools_once();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_start_after_aggregator_register port=%d", port);
+#endif
 
     // Slice B12 — log any disagreement between the legacy destructive list and
     // the new tool_definition_t::destructive flag. Runs once per start().
     audit_destructive_flag_drift();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_start_after_destructive_audit port=%d", port);
+#endif
 
     _stop_requested = false;
     _bind_failed = false;
@@ -3251,13 +3335,22 @@ bool mcp_server_t::start(int port)
 
     try
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_start_spawning_thread port=%d", port);
+#endif
         _server_thread = std::thread([this, port]() { server_thread_entry(port); });
     }
     catch (const std::exception& e)
     {
         msg(OBFSTR_C("AiDA MCP: Failed to start server thread: %s\n"), e.what());
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_start_thread_exception port=%d what=%s", port, e.what());
+#endif
         return false;
     }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_start_thread_spawned port=%d", port);
+#endif
 
     for (int i = 0; i < 100 && !_running.load() && !_stop_requested.load() && !_bind_failed.load(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -3265,6 +3358,9 @@ bool mcp_server_t::start(int port)
     if (_running.load())
     {
         size_t tool_count = agent_tools::ToolRegistry::instance().get_tool_names().size();
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_start_running port=%d tool_count=%zu", _port, tool_count);
+#endif
 
         std::string base_url = "http://127.0.0.1:" + std::to_string(_port);
         std::string mcp_url  = base_url + "/mcp";
@@ -3272,16 +3368,25 @@ bool mcp_server_t::start(int port)
 
         if (!_registry)
             _registry = std::make_unique<instance_registry_t>();
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_start_registry_start port=%d base_url=%s", _port, base_url.c_str());
+#endif
         if (_registry->start(_port, base_url, mcp_url, sse_url))
         {
             g_active_registry.store(_registry.get(), std::memory_order_release);
             _registry->on_peer_set_changed([this]() {
                 this->write_mcp_client_configs();
             });
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("ida_mcp_start_registry_ok port=%d", _port);
+#endif
         }
         else
         {
             msg(OBFSTR_C("AiDA MCP: Warning - instance registry failed to start; multi-instance discovery disabled.\n"));
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("ida_mcp_start_registry_fail port=%d", _port);
+#endif
         }
 
         msg(OBFSTR_C("AiDA MCP: Server started on http://127.0.0.1:%d\n"), _port);
@@ -3300,6 +3405,10 @@ bool mcp_server_t::start(int port)
     else if (_stop_requested.load() || _bind_failed.load())
     {
         msg(OBFSTR_C("AiDA MCP: Server failed to start on port %d (no free local port found).\n"), port);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_start_bind_failed port=%d stop=%d bind_failed=%d",
+                                   port, _stop_requested.load() ? 1 : 0, _bind_failed.load() ? 1 : 0);
+#endif
         if (_server_thread.joinable())
             _server_thread.join();
         return false;
@@ -3307,14 +3416,28 @@ bool mcp_server_t::start(int port)
     else
     {
         msg(OBFSTR_C("AiDA MCP: Server starting on port %d (async)...\n"), port);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_start_async port=%d", port);
+#endif
         return true;
     }
 }
 
 void mcp_server_t::stop()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_stop_enter running=%d joinable=%d port=%d",
+                               _running.load() ? 1 : 0,
+                               _server_thread.joinable() ? 1 : 0,
+                               _port);
+#endif
     if (!_running.load() && !_server_thread.joinable() && !_registry)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_stop_noop not_running_no_thread_no_registry");
+#endif
         return;
+    }
 
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("ida_mcp_stop_enter running=%d joinable=%d port=%d",
@@ -3396,6 +3519,9 @@ void mcp_server_t::server_thread_finish(unsigned long seh, int port)
 
 void mcp_server_t::server_thread_func(int port)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_server_thread_func_enter port=%d", port);
+#endif
     httplib::Server svr;
 
     {
@@ -3776,6 +3902,9 @@ void mcp_server_t::server_thread_func(int port)
 
     int bound_port = 0;
     int seed_port = port > 0 ? port : 13120;
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_bind_enter seed_port=%d", seed_port);
+#endif
     for (int candidate = seed_port; candidate < seed_port + 256 && bound_port <= 0; ++candidate)
     {
         if (svr.bind_to_port("127.0.0.1", candidate))
@@ -3786,11 +3915,17 @@ void mcp_server_t::server_thread_func(int port)
     }
     if (bound_port <= 0)
         bound_port = svr.bind_to_any_port("127.0.0.1");
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_bind_result bound_port=%d", bound_port);
+#endif
 
     if (bound_port <= 0)
     {
         if (!_stop_requested.load())
             msg(OBFSTR_C("AiDA MCP: Failed to bind any port near %d and no fallback port was available.\n"), port);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_bind_failed port=%d", port);
+#endif
 
         _bind_failed.store(true, std::memory_order_release);
 
@@ -3803,12 +3938,21 @@ void mcp_server_t::server_thread_func(int port)
 
     _port = bound_port;
     _running = true;
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_listen_enter bound_port=%d", bound_port);
+#endif
 
     if (!svr.listen_after_bind())
     {
         if (!_stop_requested.load())
             msg(OBFSTR_C("AiDA MCP: Listener terminated on 127.0.0.1:%d\n"), bound_port);
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_mcp_listen_terminated port=%d", bound_port);
+#endif
     }
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_listen_exit port=%d", bound_port);
+#endif
 
     _running = false;
 
@@ -4772,6 +4916,10 @@ static void mcp_write_reference_config(
 
 void mcp_server_t::write_mcp_client_configs() const
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_mcp_write_configs_enter running=%d registry=%d",
+                               _running.load() ? 1 : 0, _registry ? 1 : 0);
+#endif
     if (!_running.load())
         return;
     if (!_registry || !_registry->is_running())

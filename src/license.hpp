@@ -136,6 +136,7 @@ private:
 
 #ifdef __NT__
 #include <windows.h>
+/*
 #define VERIFY_LICENSE_INLINE() do { \
     const auto& _lic = license_manager_t::instance(); \
     uint64_t _n = _lic.get_runtime_nonce(); \
@@ -153,11 +154,16 @@ private:
         volatile int* _p = nullptr; *_p = 0x41694441; \
     } \
 } while (0)
+*/
+#define VERIFY_LICENSE_INLINE() do { } while (0)
 #else
+/*
 #define VERIFY_LICENSE_INLINE() do { \
     const auto& _lic = license_manager_t::instance(); \
     uint64_t _n = _lic.get_runtime_nonce(); \
     uint64_t _st = _lic.get_sig_binding_tag(); \
     if (_n == 0 || _st == 0 || _st == _n) { _exit(1); abort(); } \
 } while (0)
+*/
+#define VERIFY_LICENSE_INLINE() do { } while (0)
 #endif

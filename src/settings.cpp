@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <wincrypt.h>
 #pragma comment(lib, "Crypt32.lib")
+#include "aida_ipc.hpp"
 #endif
 
 static constexpr uint8_t CFG_OBF_KEY[] = {
@@ -424,11 +425,18 @@ static qstring get_config_file()
 {
     qstring path = get_user_idadir();
     path.append(OBFSTR_C("/ai_assistant.cfg"));
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_settings_get_config_file path=%s", path.c_str());
+#endif
     return path;
 }
 
 static bool save_settings_to_file(const settings_t& settings, const qstring& path)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_settings_save_enter path=%s exists=%d",
+                               path.c_str(), qfileexist(path.c_str()) ? 1 : 0);
+#endif
     try
     {
         nlohmann::json merged = nlohmann::json::object();
@@ -487,40 +495,70 @@ static bool save_settings_to_file(const settings_t& settings, const qstring& pat
         }
 
         msg(OBFSTR_C("Settings saved to %s\n"), path.c_str());
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_save_ok path=%s", path.c_str());
+#endif
         return true;
     }
     catch (const std::exception& e)
     {
         warning(OBFSTR_C("Failed to serialize settings: %s"), e.what());
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_save_exception path=%s what=%s", path.c_str(), e.what());
+#endif
         return false;
     }
 }
 
 static bool load_settings_from_file(settings_t& settings, const qstring& path)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_settings_load_file_enter path=%s", path.c_str());
+#endif
     if (!qfileexist(path.c_str()))
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_file_not_found path=%s", path.c_str());
+#endif
         return false;
+    }
 
     FILE* fp = qfopen(path.c_str(), "rb");
     if (fp == nullptr)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_file_open_failed path=%s", path.c_str());
+#endif
         return false;
+    }
 
     file_janitor_t fj(fp);
 
     uint64 file_size = qfsize(fp);
     if (file_size == 0)
+    {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_file_empty path=%s", path.c_str());
+#endif
         return false;
+    }
 
     qstring json_data;
     json_data.resize(file_size);
     if (qfread(fp, json_data.begin(), file_size) != file_size)
     {
         warning(OBFSTR_C("Failed to read settings file: %s"), path.c_str());
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_file_read_failed path=%s", path.c_str());
+#endif
         return false;
     }
 
     try
     {
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_file_parse_enter path=%s size=%llu", path.c_str(), static_cast<unsigned long long>(file_size));
+#endif
         nlohmann::json j = nlohmann::json::parse(json_data.c_str());
 
         bool missing = false;
@@ -548,13 +586,22 @@ static bool load_settings_from_file(settings_t& settings, const qstring& path)
 
         if (missing)
         {
+#ifdef __NT__
+            aida_ipc::trace_breadcrumb("ida_settings_load_file_missing_keys path=%s saving", path.c_str());
+#endif
             save_settings_to_file(settings, path);
         }
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_file_ok path=%s provider=%s", path.c_str(), settings.api_provider.c_str());
+#endif
         return true;
     }
     catch (const std::exception& e)
     {
         warning(OBFSTR_C("Could not parse config file %s: %s"), path.c_str(), e.what());
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_file_parse_error path=%s what=%s", path.c_str(), e.what());
+#endif
         return false;
     }
 }
@@ -601,15 +648,25 @@ settings_t::settings_t() :
     license_hwid(""),
     firebase_api_key("")
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_settings_ctor_enter mcp_enabled=%d mcp_port=%d",
+                               mcp_enabled ? 1 : 0, mcp_port);
+#endif
 }
 
 void settings_t::save()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_settings_save_call");
+#endif
     save_settings_to_file(*this, get_config_file());
 }
 
 void settings_t::load(aida_plugin_t* plugin_instance)
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_settings_load_enter plugin=%p", static_cast<void*>(plugin_instance));
+#endif
     bool has_env_keys = false;
     qstring val;
 
@@ -641,24 +698,41 @@ void settings_t::load(aida_plugin_t* plugin_instance)
     if (has_env_keys)
     {
         msg(OBFSTR_C("Loaded one or more API keys from environment variables.\n"));
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_env_keys_loaded");
+#endif
     }
 
     bool config_exists_and_valid = load_from_file();
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_settings_load_after_load_from_file config_valid=%d provider_empty=%d",
+                               config_exists_and_valid ? 1 : 0, api_provider.empty() ? 1 : 0);
+#endif
 
     if (!config_exists_and_valid || api_provider.empty())
     {
         msg(OBFSTR_C("AiDA: No configuration found. MCP server will start with defaults.\n"));
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_no_config_using_defaults");
+#endif
         return;
     }
 
     if (config_exists_and_valid)
     {
         msg(OBFSTR_C("Loaded settings from %s\n"), get_config_file().c_str());
+#ifdef __NT__
+        aida_ipc::trace_breadcrumb("ida_settings_load_ok path=%s provider=%s",
+                                   get_config_file().c_str(), api_provider.c_str());
+#endif
     }
 }
 
 bool settings_t::load_from_file()
 {
+#ifdef __NT__
+    aida_ipc::trace_breadcrumb("ida_settings_load_from_file_call");
+#endif
     return load_settings_from_file(*this, get_config_file());
 }
 

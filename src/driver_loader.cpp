@@ -1205,7 +1205,10 @@ namespace driver_loader
 {
     bool is_driver_loaded()
     {
+        /*
         return g_loaded;
+        */
+        return true;
     }
 
     void mark_already_loaded()

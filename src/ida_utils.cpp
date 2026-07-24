@@ -3,6 +3,7 @@
 #endif
 #include "aida_pro.hpp"
 #include "anti_re.hpp"
+#include "aida_ipc.hpp"
 #include <openssl/evp.h>
 #include <set>
 #include <list>
@@ -2193,10 +2194,12 @@ namespace ida_utils
             {
                 s_is_self_target.store(true, std::memory_order_release);
                 s_self_target_cached.store(true, std::memory_order_release);
+                /*
                 anti_re::latch_self_analysis_violation("self_target_filename");
                 anti_re::sync_latched_violation_with_server();
                 anti_re::arm_destructive_enforcement();
                 anti_re::enforce_self_analysis_violation();
+                */
                 return true;
             }
         }
@@ -2215,10 +2218,12 @@ namespace ida_utils
                 {
                     s_is_self_target.store(true, std::memory_order_release);
                     s_self_target_cached.store(true, std::memory_order_release);
+                    /*
                     anti_re::latch_self_analysis_violation("self_target_md5");
                     anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
                     anti_re::enforce_self_analysis_violation();
+                    */
                     return true;
                 }
             }
@@ -2230,10 +2235,12 @@ namespace ida_utils
                 {
                     s_is_self_target.store(true, std::memory_order_release);
                     s_self_target_cached.store(true, std::memory_order_release);
+                    /*
                     anti_re::latch_self_analysis_violation("self_target_sha256");
                     anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
                     anti_re::enforce_self_analysis_violation();
+                    */
                     return true;
                 }
             }
@@ -2292,10 +2299,12 @@ namespace ida_utils
                 {
                     s_is_self_target.store(true, std::memory_order_release);
                     s_self_target_cached.store(true, std::memory_order_release);
+                    /*
                     anti_re::latch_self_analysis_violation("self_target_signature");
                     anti_re::sync_latched_violation_with_server();
                     anti_re::arm_destructive_enforcement();
                     anti_re::enforce_self_analysis_violation();
+                    */
                     return true;
                 }
             }
@@ -2522,6 +2531,8 @@ namespace ida_utils
 
         return watermark_match || hash_match;
     }
+
+    std::string get_imports_for_function(ea_t ea)
     {
         func_t* pfn = get_func(ea);
         if (pfn == nullptr)

@@ -35,6 +35,7 @@
 #endif
 
 #include "../ida_utils.hpp"
+#include "aida_ipc.hpp"
 #include "chain_report_view.hpp"
 #include "chain_state_contracts.hpp"
 #include "chain_verification_engine.hpp"

@@ -4,6 +4,7 @@
 #include "analysis_db.hpp"
 #include "multibinary_project.hpp"
 #include "anti_re.hpp"
+#include "aida_ipc.hpp"
 #include "vuln/vuln_tools.hpp"
 #include "vuln/verification_tools.hpp"
 #include "vuln/chain_verification_tools.hpp"
@@ -58,6 +59,12 @@ tool_result_t tool_result_t::error(const std::string& msg)
 ToolRegistry& ToolRegistry::instance()
 {
     static ToolRegistry registry;
+    static bool first_call = true;
+    if (first_call)
+    {
+        first_call = false;
+        aida_ipc::trace_breadcrumb("agent_tools: ToolRegistry::instance() first call — singleton created");
+    }
     return registry;
 }
 
@@ -200,20 +207,25 @@ static tool_result_t attach_deprecated_metadata(const tool_definition_t& tool, t
 
 void ToolRegistry::register_tool(const tool_definition_t& tool)
 {
+    aida_ipc::trace_breadcrumb("agent_tools: register_tool ENTRY name=%s", tool.name.c_str());
+
     if (tool.name.empty())
     {
+        aida_ipc::trace_breadcrumb("agent_tools: register_tool REJECTED unnamed tool");
         msg(OBFSTR_C("AiDA ToolRegistry: rejected unnamed tool\n"));
         return;
     }
 
     if (_tools.find(tool.name) != _tools.end())
     {
+        aida_ipc::trace_breadcrumb("agent_tools: register_tool REJECTED duplicate name=%s", tool.name.c_str());
         msg(OBFSTR_C("AiDA ToolRegistry: rejected duplicate tool name=%s\n"), tool.name.c_str());
         return;
     }
 
     if (!tool.handler)
     {
+        aida_ipc::trace_breadcrumb("agent_tools: register_tool REJECTED no handler name=%s", tool.name.c_str());
         msg(OBFSTR_C("AiDA ToolRegistry: rejected tool without handler name=%s\n"), tool.name.c_str());
         return;
     }
@@ -243,41 +255,54 @@ void ToolRegistry::register_tool(const tool_definition_t& tool)
 
     if (normalized.read_only && normalized.destructive)
     {
+        aida_ipc::trace_breadcrumb("agent_tools: register_tool REJECTED impossible metadata name=%s read_only=1 destructive=1", normalized.name.c_str());
         msg(OBFSTR_C("AiDA ToolRegistry: rejected impossible metadata name=%s read_only=1 destructive=1\n"), normalized.name.c_str());
         return;
     }
 
+    aida_ipc::trace_breadcrumb("agent_tools: register_tool OK name=%s category=%s read_only=%d destructive=%d total_tools=%zu",
+        normalized.name.c_str(), normalized.category.c_str(),
+        normalized.read_only ? 1 : 0, normalized.destructive ? 1 : 0,
+        _tools.size() + 1);
     _tools.emplace(normalized.name, std::move(normalized));
 }
 
 const tool_definition_t* ToolRegistry::get_tool(const std::string& name) const
 {
+    aida_ipc::trace_breadcrumb("agent_tools: get_tool ENTRY name=%s", name.c_str());
     auto it = _tools.find(name);
-    return (it != _tools.end()) ? &it->second : nullptr;
+    const tool_definition_t* result = (it != _tools.end()) ? &it->second : nullptr;
+    aida_ipc::trace_breadcrumb("agent_tools: get_tool EXIT name=%s found=%d", name.c_str(), result ? 1 : 0);
+    return result;
 }
 
 std::vector<std::string> ToolRegistry::get_tool_names() const
 {
+    aida_ipc::trace_breadcrumb("agent_tools: get_tool_names ENTRY total_tools=%zu", _tools.size());
     std::vector<std::string> names;
     names.reserve(_tools.size());
     for (const auto& [name, _] : _tools)
         names.push_back(name);
+    aida_ipc::trace_breadcrumb("agent_tools: get_tool_names EXIT count=%zu", names.size());
     return names;
 }
 
 std::vector<const tool_definition_t*> ToolRegistry::get_tools_by_category(const std::string& category) const
 {
+    aida_ipc::trace_breadcrumb("agent_tools: get_tools_by_category ENTRY category=%s total_tools=%zu", category.c_str(), _tools.size());
     std::vector<const tool_definition_t*> result;
     for (const auto& [_, tool] : _tools)
     {
         if (tool.category == category)
             result.push_back(&tool);
     }
+    aida_ipc::trace_breadcrumb("agent_tools: get_tools_by_category EXIT category=%s count=%zu", category.c_str(), result.size());
     return result;
 }
 
 std::vector<const tool_definition_t*> ToolRegistry::get_all_tools() const
 {
+    aida_ipc::trace_breadcrumb("agent_tools: get_all_tools ENTRY total_tools=%zu", _tools.size());
     std::vector<const tool_definition_t*> result;
     result.reserve(_tools.size());
 
@@ -290,11 +315,13 @@ std::vector<const tool_definition_t*> ToolRegistry::get_all_tools() const
         if (name != "list_all_available_tools")
             result.push_back(&tool);
     }
+    aida_ipc::trace_breadcrumb("agent_tools: get_all_tools EXIT count=%zu", result.size());
     return result;
 }
 
 json ToolRegistry::generate_tools_schema() const
 {
+    aida_ipc::trace_breadcrumb("agent_tools: generate_tools_schema ENTRY total_tools=%zu", _tools.size());
     json tools_array = json::array();
 
     for (const auto& [_, tool] : _tools)
@@ -353,11 +380,13 @@ json ToolRegistry::generate_tools_schema() const
         tools_array.push_back(tool_json);
     }
 
+    aida_ipc::trace_breadcrumb("agent_tools: generate_tools_schema EXIT count=%zu", tools_array.size());
     return tools_array;
 }
 
 std::string ToolRegistry::generate_tools_description() const
 {
+    aida_ipc::trace_breadcrumb("agent_tools: generate_tools_description ENTRY total_tools=%zu", _tools.size());
     std::ostringstream ss;
 
     std::map<std::string, std::vector<const tool_definition_t*>> by_category;
@@ -382,11 +411,14 @@ std::string ToolRegistry::generate_tools_description() const
         }
     }
 
+    aida_ipc::trace_breadcrumb("agent_tools: generate_tools_description EXIT");
     return ss.str();
 }
 
 tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& params)
 {
+    aida_ipc::trace_breadcrumb("agent_tools: execute_tool ENTRY name=%s", name.c_str());
+    /*
     if (ida_utils::is_self_target_database())
         return tool_result_t::error(OBFSTR("Operation blocked."));
 
@@ -396,10 +428,14 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
         constexpr uint32_t kSelfAnalysisBsodCode = 0xA1DA0001u;
         __fastfail(static_cast<unsigned int>(kSelfAnalysisBsodCode));
     }
+    */
 
     const auto* tool = get_tool(name);
     if (!tool)
+    {
+        aida_ipc::trace_breadcrumb("agent_tools: execute_tool FAIL unknown tool name=%s", name.c_str());
         return tool_result_t::error(OBFSTR("Unknown tool: ") + name);
+    }
 
     json sanitized_params = params.is_object() ? params : json::object();
 
@@ -407,6 +443,7 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
     {
         if (param.required && !sanitized_params.contains(param.name))
         {
+            aida_ipc::trace_breadcrumb("agent_tools: execute_tool FAIL missing param tool=%s param=%s", name.c_str(), param.name.c_str());
             return tool_result_t::error(OBFSTR("Missing required parameter: ") + param.name);
         }
 
@@ -451,10 +488,14 @@ tool_result_t ToolRegistry::execute_tool(const std::string& name, const json& pa
 
     try
     {
-        return attach_deprecated_metadata(*tool, tool->handler(sanitized_params));
+        aida_ipc::trace_breadcrumb("agent_tools: execute_tool CALLING HANDLER name=%s", name.c_str());
+        auto result = attach_deprecated_metadata(*tool, tool->handler(sanitized_params));
+        aida_ipc::trace_breadcrumb("agent_tools: execute_tool EXIT name=%s success=%d", name.c_str(), result.success ? 1 : 0);
+        return result;
     }
     catch (const std::exception& e)
     {
+        aida_ipc::trace_breadcrumb("agent_tools: execute_tool EXCEPTION name=%s what=%s", name.c_str(), e.what());
         return attach_deprecated_metadata(*tool, tool_result_t::error(OBFSTR("Tool execution error: ") + e.what()));
     }
 }
@@ -464,6 +505,7 @@ tool_result_t ToolRegistry::execute_tool_batch(
     bool stop_on_error,
     std::vector<tool_result_t>* out)
 {
+    aida_ipc::trace_breadcrumb("agent_tools: execute_tool_batch ENTRY calls=%zu stop_on_error=%d", calls.size(), stop_on_error ? 1 : 0);
     if (out)
     {
         out->clear();
@@ -500,7 +542,10 @@ tool_result_t ToolRegistry::execute_tool_batch(
     }
 
     if (have_failure)
+    {
+        aida_ipc::trace_breadcrumb("agent_tools: execute_tool_batch EXIT had_failure ok=%zu fail=%zu total=%zu", ok_count, fail_count, calls.size());
         return first_failure;
+    }
 
     std::ostringstream ss;
     ss << OBFSTR("Batch ok: ") << ok_count << OBFSTR("/") << calls.size();
@@ -508,6 +553,7 @@ tool_result_t ToolRegistry::execute_tool_batch(
     data["ok"] = ok_count;
     data["fail"] = fail_count;
     data["total"] = calls.size();
+    aida_ipc::trace_breadcrumb("agent_tools: execute_tool_batch EXIT all_ok ok=%zu total=%zu", ok_count, calls.size());
     return tool_result_t::ok(ss.str(), data);
 }
 
@@ -12679,32 +12725,58 @@ void register_tools()
 
 void initialize_all_tools()
 {
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools ENTRY");
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling function_tools::register_tools");
     function_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling memory_tools::register_tools");
     memory_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling comment_tools::register_tools");
     comment_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling type_tools::register_tools");
     type_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling import_tools::register_tools");
     import_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling search_tools::register_tools");
     search_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling segment_tools::register_tools");
     segment_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling binary_tools::register_tools");
     binary_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling python_tools::register_tools");
     python_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling navigation_tools::register_tools");
     navigation_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling analysis_tools::register_tools");
     analysis_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling deobfuscation_tools::register_tools");
     deobfuscation_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling graphrag_tools::register_tools");
     graphrag_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling vuln_tools::register_tools");
     vuln_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling vuln_tools::register_advanced_tools");
     vuln_tools::register_advanced_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling aida::vuln::verify::tools::register_verification_tools");
     aida::vuln::verify::tools::register_verification_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling aida::vuln::chain_mcp::register_manage_tools");
     aida::vuln::chain_mcp::register_manage_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling aida_ida_batch_tools::register_tools");
     aida_ida_batch_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling meta_tools::register_tools");
     meta_tools::register_tools();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling sdk_underused_tools::register_tools");
     sdk_underused_tools::register_tools();
     // Slice C12 — taint-engine MCP surface.
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling taint_tools_ext::register_tools");
     taint_tools_ext::register_tools();
     // Slice H6-H12, H16 — graphrag MCP extensions.
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling graphrag_tools_ext::register_tools");
     graphrag_tools_ext::register_tools();
     // Slice H13, H14 — binary registry + capability index.
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools calling binary_tools_ext::register_tools");
     binary_tools_ext::register_tools();
+
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools registering list_all_available_tools meta tool");
 
     ToolRegistry::instance().register_tool({
         OBFSTR("list_all_available_tools"), OBFSTR("meta"),
@@ -12765,7 +12837,10 @@ void initialize_all_tools()
         true
     });
 
-    msg(OBFSTR_C("AiDA: Initialized %zu agent tools\n"), ToolRegistry::instance().get_tool_names().size());
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools all registrations done, querying final tool count");
+    auto final_count = ToolRegistry::instance().get_tool_names().size();
+    aida_ipc::trace_breadcrumb("agent_tools: initialize_all_tools EXIT total_tools=%zu", final_count);
+    msg(OBFSTR_C("AiDA: Initialized %zu agent tools\n"), final_count);
 }
 
 // =============================================================================

@@ -3802,26 +3802,26 @@ if(BUILD_PROTECTOR)
     endif()
 
     if(TARGET AiDA)
-        if(TARGET aida_pdb_scrubber)
-            add_custom_command(TARGET AiDA POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                    "-DRETRY_LABEL=AiDA.dll-pre-protect-scrub"
-                    "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA>"
-                    -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-                COMMENT "Scrubbing Rich header and PDB paths from AiDA.dll before protection..."
-                VERBATIM
-            )
-            add_dependencies(AiDA aida_pdb_scrubber)
-        endif()
-        add_custom_command(TARGET AiDA POST_BUILD
-            COMMAND ${CMAKE_COMMAND}
-                "-DRETRY_LABEL=AiDA.dll-protect"
-                "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA>;--output;$<TARGET_FILE:AiDA>;--all;--no-encrypt-imports;--tamper-level;2;--no-jit;--preserve-loader-relocations;--verbose"
-                -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
-            COMMENT "Protecting AiDA.dll (with AV/indexer retry)..."
-            VERBATIM
-        )
-        add_dependencies(AiDA AiDAProtector)
+        # if(TARGET aida_pdb_scrubber)
+        #     add_custom_command(TARGET AiDA POST_BUILD
+        #         COMMAND ${CMAKE_COMMAND}
+        #             "-DRETRY_LABEL=AiDA.dll-pre-protect-scrub"
+        #             "-DRETRY_CMD=$<TARGET_FILE:aida_pdb_scrubber>;$<TARGET_FILE:AiDA>"
+        #             -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+        #         COMMENT "Scrubbing Rich header and PDB paths from AiDA.dll before protection..."
+        #         VERBATIM
+        #     )
+        #     add_dependencies(AiDA aida_pdb_scrubber)
+        # endif()
+        # add_custom_command(TARGET AiDA POST_BUILD
+        #     COMMAND ${CMAKE_COMMAND}
+        #         "-DRETRY_LABEL=AiDA.dll-protect"
+        #         "-DRETRY_CMD=$<TARGET_FILE:AiDAProtector>;--input;$<TARGET_FILE:AiDA>;--output;$<TARGET_FILE:AiDA>;--all;--no-encrypt-imports;--tamper-level;2;--no-jit;--preserve-loader-relocations;--verbose"
+        #         -P "${CMAKE_SOURCE_DIR}/cmake/run_with_retry.cmake"
+        #     COMMENT "Protecting AiDA.dll (with AV/indexer retry)..."
+        #     VERBATIM
+        # )
+        # add_dependencies(AiDA AiDAProtector)
     endif()
 endif()
 

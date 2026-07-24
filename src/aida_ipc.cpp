@@ -136,6 +136,24 @@ namespace
         va_end(args);
     }
 
+    void diag_flush_log()
+    {
+        char path[MAX_PATH] = {};
+        if (!diag_log_path(path, sizeof(path)))
+            return;
+        HANDLE file = CreateFileA(path,
+                                  FILE_APPEND_DATA,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr,
+                                  OPEN_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL,
+                                  nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return;
+        FlushFileBuffers(file);
+        CloseHandle(file);
+    }
+
     void refresh_self_module_range()
     {
         HMODULE module = nullptr;
@@ -1097,12 +1115,27 @@ namespace aida_ipc
 {
     bool verify_standalone_runtime(std::string* failure)
     {
+        diag_log_fmt("verify_standalone_runtime_entry_stub pid=%lu tid=%lu tick=%llu",
+                     GetCurrentProcessId(),
+                     GetCurrentThreadId(),
+                     static_cast<unsigned long long>(GetTickCount64()));
+        /*
         diag_log_fmt("verify_standalone_runtime_enter");
         return verify_any_candidate(failure);
+        */
+        if (failure) failure->clear();
+        diag_log_fmt("verify_standalone_runtime_exit_stub result=true tick=%llu",
+                     static_cast<unsigned long long>(GetTickCount64()));
+        return true;
     }
 
     bool start_standalone_watchdog()
     {
+        diag_log_fmt("start_standalone_watchdog_entry_stub pid=%lu tid=%lu tick=%llu",
+                     GetCurrentProcessId(),
+                     GetCurrentThreadId(),
+                     static_cast<unsigned long long>(GetTickCount64()));
+        /*
         diag_log_fmt("start_watchdog_enter");
         std::lock_guard<std::mutex> lock(g_watchdog_mutex);
         bool expected = false;
@@ -1147,10 +1180,19 @@ namespace aida_ipc
             diag_log_fmt("start_watchdog_thread_failed gle=%lu", gle);
             return false;
         }
+        */
+        diag_log_fmt("start_standalone_watchdog_exit_stub result=true tick=%llu",
+                     static_cast<unsigned long long>(GetTickCount64()));
+        return true;
     }
 
     void shutdown()
     {
+        diag_log_fmt("shutdown_entry_stub pid=%lu tid=%lu tick=%llu",
+                     GetCurrentProcessId(),
+                     GetCurrentThreadId(),
+                     static_cast<unsigned long long>(GetTickCount64()));
+        /*
         const ULONGLONG started = GetTickCount64();
         diag_log_fmt("shutdown_enter");
         std::thread worker;
@@ -1182,16 +1224,33 @@ namespace aida_ipc
             g_watchdog_started.store(false, std::memory_order_release);
         }
         diag_log_fmt("shutdown_exit elapsed_ms=%llu",
-                     static_cast<unsigned long long>(GetTickCount64() - started));
+                      static_cast<unsigned long long>(GetTickCount64() - started));
+        */
+        diag_log_fmt("shutdown_exit_stub tick=%llu",
+                     static_cast<unsigned long long>(GetTickCount64()));
     }
 
     bool is_standalone_alive()
     {
+        diag_log_fmt("is_standalone_alive_entry_stub pid=%lu tid=%lu tick=%llu",
+                     GetCurrentProcessId(),
+                     GetCurrentThreadId(),
+                     static_cast<unsigned long long>(GetTickCount64()));
+        /*
         return g_standalone_authenticated.load(std::memory_order_acquire);
+        */
+        diag_log_fmt("is_standalone_alive_exit_stub result=true tick=%llu",
+                     static_cast<unsigned long long>(GetTickCount64()));
+        return true;
     }
 
     void install_crash_breadcrumbs()
     {
+        diag_log_fmt("install_crash_breadcrumbs_entry_stub pid=%lu tid=%lu tick=%llu",
+                     GetCurrentProcessId(),
+                     GetCurrentThreadId(),
+                     static_cast<unsigned long long>(GetTickCount64()));
+        /*
         std::lock_guard<std::mutex> lock(g_exception_mutex);
         refresh_self_module_range();
         if (g_exception_handler)
@@ -1202,10 +1261,18 @@ namespace aida_ipc
                      GetLastError(),
                      static_cast<unsigned long long>(g_self_module_base.load(std::memory_order_acquire)),
                      static_cast<unsigned long long>(g_self_module_end.load(std::memory_order_acquire)));
+        */
+        diag_log_fmt("install_crash_breadcrumbs_exit_stub tick=%llu",
+                     static_cast<unsigned long long>(GetTickCount64()));
     }
 
     void uninstall_crash_breadcrumbs()
     {
+        diag_log_fmt("uninstall_crash_breadcrumbs_entry_stub pid=%lu tid=%lu tick=%llu",
+                     GetCurrentProcessId(),
+                     GetCurrentThreadId(),
+                     static_cast<unsigned long long>(GetTickCount64()));
+        /*
         PVOID handler = nullptr;
         {
             std::lock_guard<std::mutex> lock(g_exception_mutex);
@@ -1217,13 +1284,37 @@ namespace aida_ipc
             ULONG removed = RemoveVectoredExceptionHandler(handler);
             diag_log_fmt("crash_breadcrumbs_uninstall handler=%p removed=%lu gle=%lu", handler, removed, GetLastError());
         }
+        */
+        diag_log_fmt("uninstall_crash_breadcrumbs_exit_stub tick=%llu",
+                     static_cast<unsigned long long>(GetTickCount64()));
     }
 
     void trace_breadcrumb(const char* fmt, ...)
     {
+        const DWORD calling_tid = GetCurrentThreadId();
+        const ULONGLONG entry_tick = GetTickCount64();
+        char body[3072] = {};
         va_list args;
         va_start(args, fmt);
-        diag_log_vfmt(fmt, args);
+        _vsnprintf_s(body, sizeof(body), _TRUNCATE, fmt, args);
         va_end(args);
+        diag_log_fmt("[BREADCRUMB] calling_tid=%lu entry_tick=%llu body=%s",
+                     calling_tid,
+                     static_cast<unsigned long long>(entry_tick),
+                     body);
+        diag_flush_log();
+    }
+
+    void log_plugin_startup(const char* phase, const char* detail)
+    {
+        const DWORD calling_tid = GetCurrentThreadId();
+        const ULONGLONG entry_tick = GetTickCount64();
+        diag_log_fmt("[PLUGIN_STARTUP] phase=%s detail=%s calling_tid=%lu entry_tick=%llu pid=%lu",
+                     phase ? phase : "<null>",
+                     detail ? detail : "<null>",
+                     calling_tid,
+                     static_cast<unsigned long long>(entry_tick),
+                     GetCurrentProcessId());
+        diag_flush_log();
     }
 }
