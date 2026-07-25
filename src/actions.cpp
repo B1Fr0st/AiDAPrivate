@@ -202,24 +202,32 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
 
         replace_wait_box(OBFSTR_C("Exporting function %zu of %zu..."), i + 1, func_qty);
 
-        func_t* pfn = getn_func(i);
-        if (pfn == nullptr)
+        func_entry_info_t fn_info;
+        if (!get_func_entry_info_by_num(&fn_info, i))
+            continue;
+        const ea_t func_start = fn_info.start_ea;
+        const ea_t func_end = fn_info.end_ea;
+        if (func_start == BADADDR || func_end == BADADDR || func_start >= func_end)
             continue;
 
         qstring func_name;
-        get_func_name(&func_name, pfn->start_ea);
+        get_func_name(&func_name, func_start);
 
         qfprintf(fp, OBFSTR_C("==================================================\n"));
-        qfprintf(fp, OBFSTR_C("Function: %s (0x%a)\n"), func_name.c_str(), pfn->start_ea);
+        qfprintf(fp, OBFSTR_C("Function: %s (0x%a)\n"), func_name.c_str(), func_start);
         qfprintf(fp, OBFSTR_C("==================================================\n\n"));
 
         qfprintf(fp, OBFSTR_C("--- Decompiled C/C++ Code ---\n"));
-        if (hexrays_available && ida_utils::is_safely_decompilable(pfn))
+        const uint64 func_flags = fn_info.get_flags();
+        segment_info_t seg_info;
+        const bool in_external_segment = get_segment_info(&seg_info, func_start) && seg_info.get_type() == SEG_XTRN;
+        const bool safely_decompilable = (func_flags & (FUNC_TAIL | FUNC_THUNK | FUNC_OUTLINE)) == 0 && !in_external_segment;
+        if (hexrays_available && safely_decompilable)
         {
             try
             {
                 hexrays_failure_t hf;
-                cfuncptr_t cfunc = decompile(pfn, &hf, DECOMP_NO_WAIT);
+                cfuncptr_t cfunc = decompile_function(func_start, &hf, DECOMP_NO_WAIT);
                 if (cfunc != nullptr)
                 {
                     qstring code_qstr;
@@ -253,7 +261,7 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
 
         qfprintf(fp, OBFSTR_C("--- Disassembly ---\n"));
         text_t disasm_text;
-        gen_disasm_text(disasm_text, pfn->start_ea, pfn->end_ea, false);
+        gen_disasm_text(disasm_text, func_start, func_end, false);
         for (const twinline_t& tw_line : disasm_text)
         {
             qstring clean_line;
@@ -264,7 +272,7 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
 
         qfprintf(fp, OBFSTR_C("--- Referenced Strings ---\n"));
         std::set<qstring> found_strings;
-        func_item_iterator_t fii(pfn);
+        function_item_iterator_t fii(func_start);
         for (bool ok = fii.first(); ok; ok = fii.next_head())
         {
             xrefblk_t xb;

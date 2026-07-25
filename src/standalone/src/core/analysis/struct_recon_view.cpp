@@ -1786,7 +1786,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			return aida::ui::action_handler_result_t::completed();
 		});
 		add_action("types.reconstruction.field.declare_apply", valid_field,
-			"The retained field is stale", [] {
+			"The retained field is stale", [&st] {
 			const auto result = stage_declare_apply_review();
 			st.operation_status = result.message;
 			st.operation_error = !result.success;
@@ -1826,7 +1826,8 @@ void render(float pos_x, float pos_y, float width, float height,
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		const bool process_current = static_cast<bool>(workspace.workspace);
 #else
-		const auto process = workspace.workspace ? workspace.workspace->identity().process() : nullptr;
+		const auto process = workspace.workspace ? workspace.workspace->identity().process()
+			: std::optional<aida::analysis::process_identity_t>{};
 		const bool process_current = process && driver_bridge::is_loaded() &&
 			driver_bridge::attached_pid() != 0 && driver_bridge::attached_pid() == process->pid;
 #endif

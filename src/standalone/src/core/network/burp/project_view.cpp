@@ -6,7 +6,7 @@
 #else
 #include "project.hpp"
 #include "../../infra/executor.hpp"
-#include "../../infra/ui_thread_dispatcher.hpp"
+#include "../../ui/ui_thread_dispatcher.hpp"
 #endif
 #include <algorithm>
 #include <atomic>

@@ -57,10 +57,10 @@
     { "path": "packaging/c03_worker_runtime/distribution_manifest_spec.schema.json", "size_bytes": 7212, "sha256": "9f2649e41ef59d4a74c4c06dfa840aa846e6cf6ca461f05f05c23576b951cf7a", "component": "package-authority", "usage": "build_only", "license": "AiDA-Proprietary" },
     { "path": "packaging/c03_worker_runtime/fail_distribution.cmake", "size_bytes": 286, "sha256": "41bdc9628b17ea27f38d37d3196a2611a5a20dc9d6ef602b781c625abd797fda", "component": "package-authority", "usage": "build_only", "license": "AiDA-Proprietary" },
     { "path": "packaging/c03_camoufox_reverse_mcp_build.lock.json", "size_bytes": 2797, "sha256": "ae513d4afe67806293a7fde3c9fee1b1ecaa9eda4865e9fb08193bd2150f30b5", "component": "camoufox-reverse-mcp", "usage": "build_only", "license": "AiDA-Proprietary" },
-    { "path": "tools/build_camoufox_reverse_mcp_exe.ps1", "size_bytes": 115185, "sha256": "38e636f2d6b815ab041a09bbaf5c98feb0dd2b0923b22709927ed3d323add085", "component": "camoufox-reverse-mcp", "usage": "build_only", "license": "AiDA-Proprietary" },
+    { "path": "tools/build_camoufox_reverse_mcp_exe.ps1", "size_bytes": 115674, "sha256": "e19dfe347c3b921527a71619e463bd628e03b9d56164a0efa7a083844801c42e", "component": "camoufox-reverse-mcp", "usage": "build_only", "license": "AiDA-Proprietary" },
     { "path": ".deps/.camoufox-reverse-mcp-build-venv/Lib/site-packages/pyinstaller-6.21.0.dist-info/licenses/COPYING.txt", "size_bytes": 32138, "sha256": "dcf75fdb959db1e3b41c0f8505069d2ece781b5ec6b3d0a4d30975cfc6580245", "component": "pyinstaller", "usage": "build_only", "license": "GPL-2.0-or-later-with-bootloader-exception" },
     { "path": "camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe", "size_bytes": 783360, "sha256": "768937fa6a6df581d0cdc88ecffe1cf651ffebe1ad1d5667a5f75100e96acfe0", "component": "camoufox", "usage": "production", "license": "MPL-2.0-and-third-party" },
-    { "path": ".deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe", "size_bytes": 78209511, "sha256": "2443649a43c92b048b7f013434d169889b41f494f391359d9cc72111c6e0ee4c", "component": "camoufox-reverse-mcp", "usage": "production", "license": "MIT-and-runtime-graph" }
+    { "path": ".deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe", "size_bytes": 85397351, "sha256": "47c03cb7fa0edc04a70f2068d9c644e1f4b9e12a843d33bfe93611c62c5a606b", "component": "camoufox-reverse-mcp", "usage": "production", "license": "MIT-and-runtime-graph" }
   ],
   "dependencies": [
     { "id": "zydis", "version": "4.1.1", "usage": "production", "license": "MIT", "components": ["Zydis"], "source_paths": [".deps/zydis-4.1.1/LICENSE"], "ships_to_customer": true },
@@ -172,7 +172,7 @@
       "browser_sha256": "768937fa6a6df581d0cdc88ecffe1cf651ffebe1ad1d5667a5f75100e96acfe0",
       "reverse_mcp_source_path": ".deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe",
       "reverse_mcp_relative_path": "deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe",
-      "reverse_mcp_sha256": "2443649a43c92b048b7f013434d169889b41f494f391359d9cc72111c6e0ee4c",
+      "reverse_mcp_sha256": "47c03cb7fa0edc04a70f2068d9c644e1f4b9e12a843d33bfe93611c62c5a606b",
       "offline_build_lock": "packaging/c03_camoufox_reverse_mcp_build.lock.json",
       "developer_source_shipped": false,
       "loose_python_shipped": false,

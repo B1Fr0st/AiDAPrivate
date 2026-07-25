@@ -1,6 +1,7 @@
 #include "output_views.hpp"
 
 #include "application_ui_runtime.hpp"
+#include "application_view_registry.hpp"
 #include "design_system.hpp"
 #include "programming_tasks.hpp"
 #include "task_center.hpp"
@@ -1007,7 +1008,7 @@ operation_result_t export_all(bottom_tab_t tab) {
     registration.affected_entity = export_state->path;
     registration.callbacks.focus = [tab] {
         static_cast<void>(aida::ui_thread::post([tab] {
-            static_cast<void>(application_views::open_or_focus(stable_view_id_t(
+            static_cast<void>(aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(
                 terminal_tab(tab) ? "view.terminal" : "view.output")));
         }, "output_export", "output_export_focus", "task_center_callback"));
     };

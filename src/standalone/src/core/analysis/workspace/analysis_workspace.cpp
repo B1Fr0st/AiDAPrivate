@@ -4433,12 +4433,32 @@ workspace_result_t<void> analysis_workspace_t::update_view_state(
     workspace_view_state_t next = view_state_;
     mutation(next);
     constexpr std::size_t maximum_bookmarks = 65536;
+    constexpr std::size_t maximum_navigation_entries = 4096;
+    const auto trim_navigation = [](std::vector<address_t>& entries) {
+        constexpr std::size_t maximum_entries = 4096;
+        if (entries.size() > maximum_entries)
+            entries.erase(entries.begin(),
+                          entries.begin() + static_cast<std::ptrdiff_t>(
+                              entries.size() - maximum_entries));
+    };
+    trim_navigation(next.navigation_back);
+    trim_navigation(next.navigation_forward);
     if (next.bookmarks.size() > maximum_bookmarks)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::limit_exceeded,
                                  "workspace view state exceeds its limits",
                                  "workspace_view"));
     if ((next.selection && !valid_workspace_address(*next.selection, *identity_)) ||
+        next.navigation_back.size() > maximum_navigation_entries ||
+        next.navigation_forward.size() > maximum_navigation_entries ||
+        !std::all_of(next.navigation_back.begin(), next.navigation_back.end(),
+                     [&](const auto& address) {
+                         return valid_workspace_address(address, *identity_);
+                     }) ||
+        !std::all_of(next.navigation_forward.begin(), next.navigation_forward.end(),
+                     [&](const auto& address) {
+                         return valid_workspace_address(address, *identity_);
+                     }) ||
         !std::all_of(next.bookmarks.begin(), next.bookmarks.end(),
                      [&](const auto& address) {
                          return valid_workspace_address(address, *identity_);

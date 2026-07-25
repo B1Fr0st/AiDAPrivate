@@ -34,6 +34,7 @@
 #include "core/runtime/diagnostic_exception_scope.hpp"
 #include "core/runtime/manual_map_tls.hpp"
 #include "core/anti-tamper/orchestrator.hpp"
+#include "core/anti-tamper/anti_hook.hpp"
 #include "core/anti-tamper/hv_preflight.hpp"
 #include "core/anti-tamper/mcp_posture.hpp"
 #include "core/anti-tamper/enforcement.hpp"
@@ -1996,10 +1997,10 @@ static void merge_icon_font(ImGuiIO& io, float pixel_size)
     icon_cfg.PixelSnapH = true;
     icon_cfg.GlyphMinAdvanceX = pixel_size * 0.92f;
     icon_cfg.GlyphOffset = ImVec2(0.f, pixel_size * 0.05f);
-    icon_cfg.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+    icon_cfg.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
     diag::log_tagged_critical_fmt("fonts",
         "merge_icon_config builder_flags=0x%X",
-        icon_cfg.FontBuilderFlags);
+        icon_cfg.FontLoaderFlags);
     void* icon_data_copy = IM_ALLOC(ide_icon_font_size);
     diag::log_tagged_critical_fmt("fonts",
         "merge_icon_alloc_post ptr=0x%llX bytes=%u",
@@ -2025,15 +2026,15 @@ static void rebuild_fonts(float dpi_scale)
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
         io.Fonts ? io.Fonts->Fonts.Size : -1,
-        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
-        io.Fonts ? io.Fonts->FontBuilderFlags : 0U);
+        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontLoader)) : 0ULL,
+        io.Fonts ? io.Fonts->FontLoaderFlags : 0U);
     io.Fonts->Clear();
     diag::log_tagged_critical_fmt("fonts",
         "rebuild_fonts_clear_post atlas=0x%llX count=%d builder=0x%llX flags=0x%X",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts)),
         io.Fonts ? io.Fonts->Fonts.Size : -1,
-        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
-        io.Fonts ? io.Fonts->FontBuilderFlags : 0U);
+        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontLoader)) : 0ULL,
+        io.Fonts ? io.Fonts->FontLoaderFlags : 0U);
 
     const auto font_policy = aida::ui::fonts::policy_for_dpi(dpi_scale);
     const float screen_factor = 1.0f;
@@ -2058,8 +2059,8 @@ static void rebuild_fonts(float dpi_scale)
 
     auto cfg_ui_smooth = [&](float multiply) {
         ImFontConfig c{};
-        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
-        if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
+        c.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
+        if (enable_lcd) c.FontLoaderFlags |= lcd_flag_value;
         c.PixelSnapH = false;
         c.OversampleH = 3;
         c.OversampleV = 1;
@@ -2068,8 +2069,8 @@ static void rebuild_fonts(float dpi_scale)
     };
     auto cfg_ui_hinted = [&](float multiply) {
         ImFontConfig c{};
-        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
-        if (enable_lcd) c.FontBuilderFlags |= lcd_flag_value;
+        c.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+        if (enable_lcd) c.FontLoaderFlags |= lcd_flag_value;
         c.PixelSnapH = false;
         c.OversampleH = 3;
         c.OversampleV = 1;
@@ -2078,7 +2079,7 @@ static void rebuild_fonts(float dpi_scale)
     };
     auto cfg_mono = [&](float multiply) {
         ImFontConfig c{};
-        c.FontBuilderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
+        c.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_LightHinting;
         c.PixelSnapH = true;
         c.OversampleH = 2;
         c.OversampleV = 1;
@@ -2213,18 +2214,18 @@ static void rebuild_fonts(float dpi_scale)
         "rebuild_fonts_build_pre default=0x%llX atlas_count=%d config_count=%d builder=0x%llX flags=0x%X",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.FontDefault)),
         io.Fonts ? io.Fonts->Fonts.Size : -1,
-        io.Fonts ? io.Fonts->ConfigData.Size : -1,
-        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontBuilderIO)) : 0ULL,
-        io.Fonts ? io.Fonts->FontBuilderFlags : 0U);
+        io.Fonts ? io.Fonts->Sources.Size : -1,
+        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->FontLoader)) : 0ULL,
+        io.Fonts ? io.Fonts->FontLoaderFlags : 0U);
     io.Fonts->Build();
     diag::log_tagged_critical_fmt("fonts",
         "rebuild_fonts_build_post atlas_count=%d tex_alpha=0x%llX tex_rgba=0x%llX tex_w=%d tex_h=%d use_colors=%d",
         io.Fonts ? io.Fonts->Fonts.Size : -1,
-        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->TexPixelsAlpha8)) : 0ULL,
-        io.Fonts ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->TexPixelsRGBA32)) : 0ULL,
-        io.Fonts ? io.Fonts->TexWidth : 0,
-        io.Fonts ? io.Fonts->TexHeight : 0,
-        (io.Fonts && io.Fonts->TexPixelsUseColors) ? 1 : 0);
+        (io.Fonts && io.Fonts->TexData && io.Fonts->TexData->Format == ImTextureFormat_Alpha8) ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->TexData->Pixels)) : 0ULL,
+        (io.Fonts && io.Fonts->TexData && io.Fonts->TexData->Format == ImTextureFormat_RGBA32) ? static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(io.Fonts->TexData->Pixels)) : 0ULL,
+        (io.Fonts && io.Fonts->TexData) ? io.Fonts->TexData->Width : 0,
+        (io.Fonts && io.Fonts->TexData) ? io.Fonts->TexData->Height : 0,
+        (io.Fonts && io.Fonts->TexData && io.Fonts->TexData->UseColors) ? 1 : 0);
     extern bool g_imgui_dx11_initialized;
     if (g_imgui_dx11_initialized) {
         diag::log_tagged_critical("fonts", "rebuild_fonts_dx11_invalidate_pre");
@@ -7461,7 +7462,7 @@ int main(int, char**)
                     const uint64_t ph_tick = static_cast<uint64_t>(GetTickCount64());
                     startup_log_critical_fmt("prologue_hash_fetch_pre tick=%llu",
                         static_cast<unsigned long long>(ph_tick));
-                    anti_hook::fetch_server_prologue_hashes(server_host, lic_key, sess_token);
+                    anti_tamper::anti_hook::fetch_server_prologue_hashes(server_host, lic_key, sess_token);
                     startup_log_critical_fmt("prologue_hash_fetch_post elapsed_ms=%llu",
                         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - ph_tick));
                     crash_log_write("prologue_hash_fetch_done");

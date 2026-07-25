@@ -456,7 +456,8 @@ static uint64_t add_fixture_snapshot(const char* name, uint64_t address, const s
 
     uint64_t id = snap.id;
     std::lock_guard<std::mutex> lk(snapshot_diff::g_state.mutex);
-    snapshot_diff::g_state.snapshots.push_back(std::move(snap));
+    snapshot_diff::g_state.snapshots.push_back(
+        std::make_shared<const snapshot_diff::snapshot_t>(std::move(snap)));
     return id;
 }
 
@@ -1691,8 +1692,8 @@ static void test_snapshot_take(HANDLE hf, std::atomic<int>& passed, std::atomic<
         std::lock_guard<std::mutex> lk(snapshot_diff::g_state.mutex);
         snap_count = snapshot_diff::g_state.snapshots.size();
         if (snap_count > 0) {
-            regions = snapshot_diff::g_state.snapshots.back().regions.size();
-            bytes = snapshot_diff::g_state.snapshots.back().total_bytes;
+            regions = snapshot_diff::g_state.snapshots.back()->regions.size();
+            bytes = snapshot_diff::g_state.snapshots.back()->total_bytes;
         }
     }
 
@@ -1764,8 +1765,9 @@ static void test_snapshot_compare(HANDLE hf, std::atomic<int>& passed, std::atom
     bool scratch_change = false;
     {
         std::lock_guard<std::mutex> lk(snapshot_diff::g_state.mutex);
-        changes = snapshot_diff::g_state.diff.changes.size();
-        for (auto& c : snapshot_diff::g_state.diff.changes) {
+        const auto diff = snapshot_diff::g_state.published_diff;
+        changes = diff ? diff->changes.size() : 0;
+        for (const auto& c : diff ? diff->changes : std::vector<snapshot_diff::changed_region_t>{}) {
             if (g_anchor.addr_scratch >= c.address && g_anchor.addr_scratch < c.address + c.size) {
                 scratch_change = true;
                 break;

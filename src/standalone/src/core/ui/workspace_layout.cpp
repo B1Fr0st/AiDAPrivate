@@ -1610,6 +1610,9 @@ void shutdown() noexcept
 #error AIDA_IMGUI_SOURCE_SHA256 must identify the audited vendored Dear ImGui source
 #endif
 
+#define AIDA_WORKSPACE_STRINGIFY_IMPL(value) #value
+#define AIDA_WORKSPACE_STRINGIFY(value) AIDA_WORKSPACE_STRINGIFY_IMPL(value)
+
 #include "core/infra/executor.hpp"
 #include "core/ui/task_center.hpp"
 #include "helpers/diag_log.hpp"
@@ -1640,7 +1643,9 @@ constexpr std::size_t kMaximumPayloadBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kMaximumContainerBytes = kMaximumPayloadBytes + 2048U;
 constexpr std::string_view kMagic = "AIDA_WORKSPACE_LAYOUT\r\n";
 constexpr std::string_view kHeaderTerminator = "\r\n\r\n";
-constexpr std::string_view kImguiSourceFingerprint = AIDA_IMGUI_SOURCE_SHA256;
+constexpr std::string_view kImguiSourceFingerprint = AIDA_WORKSPACE_STRINGIFY(AIDA_IMGUI_SOURCE_SHA256);
+#undef AIDA_WORKSPACE_STRINGIFY
+#undef AIDA_WORKSPACE_STRINGIFY_IMPL
 
 enum class read_result_t {
     absent,
@@ -1667,6 +1672,7 @@ struct state_t {
     ImGuiID expected_root = 0;
     workspace_preset_t active = workspace_preset_t::analysis;
     workspace_preset_t pending = workspace_preset_t::analysis;
+    std::string active_user;
     bool rebuild_requested = false;
     bool locked = false;
     std::uint8_t select_defaults_after_realize_frames = 0;
@@ -1691,6 +1697,8 @@ struct state_t {
     std::string operation_status;
     std::string operation_error;
 };
+
+state_t& state() noexcept;
 
 struct layout_paths_t {
     std::filesystem::path directory;

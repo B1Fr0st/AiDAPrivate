@@ -9,7 +9,7 @@ set(AIDA_C03_NOTICE_LEDGER "${AIDA_C03_DEPENDENCY_ROOT}/licenses/c03/THIRD_PARTY
 set(AIDA_C03_WORKER_MANIFEST_SCHEMA "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_worker_manifest.schema.json")
 set(AIDA_C03_WORKER_MANIFEST_SCHEMA_SHA256 "8c9bd6e9a2f5003af5bf55fd2e75fb7b60fbf8294e7f1613beca6242924e7f6a")
 set(AIDA_C03_WORKER_MANIFEST_LOCK "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_worker_manifest.lock.json")
-set(AIDA_C03_WORKER_MANIFEST_LOCK_SHA256 "ad9cea1dd2659e4a280d0cccaaf06f1fd2f7cb6d26bc3f2f8a40ffd8f26dc0b9")
+set(AIDA_C03_WORKER_MANIFEST_LOCK_SHA256 "8e171b037714479edcbbf4eb4d101d6b910d16f61c2270cdbee3a6a8ae0d57c6")
 set(AIDA_C03_NATIVE_WORKER_MANIFEST_SCHEMA "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_native_worker_manifest.schema.json")
 set(AIDA_C03_NATIVE_WORKER_MANIFEST_SCHEMA_SHA256 "32ed5de9fde31039518946d6c28f7681675398466959daa2eb100e5d16746655")
 set(AIDA_C03_NATIVE_WORKER_MANIFEST_CONTRACT "${AIDA_C03_DEPENDENCY_ROOT}/packaging/c03_native_worker_manifest.json")
@@ -93,7 +93,7 @@ set(AIDA_C03_CAMOUFOX_EXECUTABLE_SHA256 "768937fa6a6df581d0cdc88ecffe1cf651ffebe
 set(AIDA_C03_CAMOUFOX_EXECUTABLE_SOURCE_RELATIVE_PATH "camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe")
 set(AIDA_C03_CAMOUFOX_EXECUTABLE_PACKAGE_RELATIVE_PATH "deps/camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe")
 set(AIDA_C03_CAMOUFOX_REVERSE_MCP_EXECUTABLE "${AIDA_C03_DEPENDENCY_ROOT}/.deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe")
-set(AIDA_C03_CAMOUFOX_REVERSE_MCP_EXECUTABLE_SHA256 "2443649a43c92b048b7f013434d169889b41f494f391359d9cc72111c6e0ee4c")
+set(AIDA_C03_CAMOUFOX_REVERSE_MCP_EXECUTABLE_SHA256 "47c03cb7fa0edc04a70f2068d9c644e1f4b9e12a843d33bfe93611c62c5a606b")
 set(AIDA_C03_CAMOUFOX_REVERSE_MCP_SOURCE_RELATIVE_PATH ".deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe")
 set(AIDA_C03_CAMOUFOX_REVERSE_MCP_PACKAGE_RELATIVE_PATH "deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe")
 set(AIDA_C03_LOCKED_PRODUCTION_LINK_DENYLIST lmdb unicorn remill)
@@ -291,32 +291,32 @@ aida_c03_configure_signing_authority()
 function(aida_c03_require_locked_source_tree)
     set(_aida_c03_inputs
         "src/standalone/workers/native_decompiler/fake_native_decompiler_worker.cpp|15972|4323a48219411fb872594dc96e6b884039c8e8cf20c2954424a765818d6c2dc4"
-        "src/standalone/workers/native_decompiler/ghidra_native_provider.cpp|14448|c5510daae84415346d08798c7cd11984ac5cebb862222fd3902eeef5963d8ef9"
+        "src/standalone/workers/native_decompiler/ghidra_native_provider.cpp|14485|957cd67191f7f9cc66f7a70e707a363359cf6f391c8ba18849d73f9bb62b81ff"
         "src/standalone/workers/native_decompiler/ghidra_native_provider.hpp|487|524fb2f51e2e208610fa28768b6fa6b7a4b2ebd8824070ac518dff1d06b6ce55"
-        "src/standalone/workers/native_decompiler/native_decompiler_worker.cpp|2825|0a39212f62ce22df7caa28e62dbaadb2adaaf6b6394690ea4e2129ab3242de1f"
-        "src/standalone/workers/native_decompiler/native_worker_protocol.hpp|18353|2ebc3f2326285c4db0c4fd0d93b3314902fcc9336aba78837e544e24dc343f43"
+        "src/standalone/workers/native_decompiler/native_decompiler_worker.cpp|3607|a23299baf5419a9a588e665c027ba7ddd912d4568e1c63353e6812beaf3a70ee"
+        "src/standalone/workers/native_decompiler/native_worker_protocol.hpp|19449|f2fce206cf9a724a3ecd30d3bb2e212cc1684316f79ff344f9290d75554d3c5b"
         "src/standalone/workers/native_decompiler/native_worker_runtime.hpp|17312|110cd165d8ad644c2ce164f66a0142dee6acf3e9de9cf862412b1594c88076cf"
-        "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.cpp|139452|734fb149dc1ac91580cbca1c6569d0078c33d7d843e26e8fcad7c05cce67398f"
+        "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.cpp|153020|8c98b11dcd3da335dd54865250ca418672741680855f93b742c3cebcc65f531f"
         "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.hpp|749|d215b44be571a9577ab4fca2860ff34aa1cd864163407c76f4de0872fcbbaf79"
-        "src/standalone/tests/c03/decompiler_quality_schema.cpp|115001|8dcc6359d1f7dd9bad36be742614c6b6b508c0055338be22af4700737c8e7e27"
+        "src/standalone/tests/c03/decompiler_quality_schema.cpp|118581|eafcb0518ebb473086aab90e5df60460cc904f06cdffb2fc82a3cbf31f860d2b"
         "src/standalone/tests/c03/decompiler_quality_schema.hpp|1266|97bc268ab39854317d24321bddce743c3c5b16340a9b9257b4422342db7b874c"
-        "src/standalone/tests/c03/fixtures/decompiler_provider_results.schema.json|10352|2639cf30efba36143c8b7778264b714e7d3f50c09b3f68ae00d5786433c8427d"
-        "src/standalone/tests/c03/decompiler_quality_scorer.cpp|59912|6c5fdaafb2ea80985911e8d1e11a085c351dda2eaed3d589254c38a923a8dddd"
+        "src/standalone/tests/c03/fixtures/decompiler_provider_results.schema.json|11573|38d3d3be4c46f5e696184aec557e4505c51dad8a2dd99ac4c3e80eacb0a7a73b"
+        "src/standalone/tests/c03/decompiler_quality_scorer.cpp|90411|1b9a84e5f4c90d6eeb7f180055e8368dc5cb35cc3559e56a6044a11da35a5aae"
         "src/standalone/tests/c03/decompiler_quality_scorer.hpp|1480|9db0b310ca88f0a43c886819f3b4542834f621dcee6af7e498a8f50252fea28c"
-        "src/standalone/tests/c03/decompiler_quality_scorer_harness.cpp|24897|d72d6bfa2e0381a4065e36bf5d9800981c2931610da9275da394c78d7db53648"
+        "src/standalone/tests/c03/decompiler_quality_scorer_harness.cpp|25200|8cae4056d77fc0dc83ba26dfd968a265896f38fcaedbc07e35f1137e688bb595"
         "src/standalone/tests/c03/decompiler_quality_scorer_harness.hpp|644|f116aa31bbe209d973c4d045f46f68f1a127ec424ec81279bc3d527153dbdf65"
         "cmake/c03_safe_headless/decompiler_quality_pipeline_main.cpp|5501|2cd9b2aa17aa25cabb0c2f9bb4d1705957174826613aa69e9d05f3072bb41b66"
         "src/standalone/workers/managed_decompiler/AssemblyInfo.cs|98|69ebe8ec7e9a518093d43e9e6909724562fa55ae8083a71701e55411f1a4ef76"
-        "src/standalone/workers/managed_decompiler/AuthenticatedTransport.cs|15277|f7fffeab2540b2458326efcb68096313701f2b95087e2978c1bf80a3971b8437"
+        "src/standalone/workers/managed_decompiler/AuthenticatedTransport.cs|16671|8d160f6aaa64de4dd860317ab95d216cd71dbceb922041902e9d1c2aa83ca8e5"
         "src/standalone/workers/managed_decompiler/ManagedDecompilerWorker.csproj|2314|f7992aa2e7b25db9b470c02c02993487c9e3ef2931d4334c8e87f43584dd26b4"
         "src/standalone/workers/managed_decompiler/materialize_manifest.py|24064|5689c68cd750fe0681f0074ebdfbb9c5da6e5cce9727af443e017c1c8085e061"
-        "src/standalone/workers/managed_decompiler/MetadataAnalysis.cs|45140|2680d1302872a13b76bc8c19dc914b00e96a38760cc6c2d3fe5ec69614459b99"
+        "src/standalone/workers/managed_decompiler/MetadataAnalysis.cs|81712|b793e20b48a504aba599b91289e456ee8cc89bc375ca63ef326b190d6f2d8a80"
         "src/standalone/workers/managed_decompiler/NuGet.Config|976|b1d2ede9a75cfdb8db9a59cde826c8506470818be9a63952d30d624f225f9c09"
         "src/standalone/workers/managed_decompiler/packages.lock.json|1043|dd128ba62401441e4541ba352be13a6cd100d1b7ece51c80ce0025ccbb2c1b54"
-        "src/standalone/workers/managed_decompiler/Program.cs|9701|cd1eadecd5a5436e57ffefa2dd1592b7cfbdc2d66b002dfbb74042b28d37446c"
+        "src/standalone/workers/managed_decompiler/Program.cs|16016|c8da9bba2989c253e039095d76b319714f41c26eb4b14b6dba29a109041ba590"
         "src/standalone/workers/managed_decompiler/Protocol.cs|6319|e2907928f3c218c21c774a3753f98072a7dc8176a13044fc7a0568f643d711d6"
         "src/standalone/workers/managed_decompiler/ResourceBudgetGuard.cs|5609|b9b715c3a524f0c830ef94599ba7de7597bf2aa6bad8928581ec6de5f4ba35bd"
-        "src/standalone/workers/managed_decompiler/RuntimeIdentity.cs|15889|cdc1e07f75d7458680fa5298161718d16510a0305f138c9cc0b10dfb560f389f"
+        "src/standalone/workers/managed_decompiler/RuntimeIdentity.cs|26652|9041445703a512bccbabbc4ac8d42cc7fce56101ea97ee3812df8b51fa96fce5"
         "src/standalone/workers/managed_decompiler/worker_manifest.json|2429|3a1d2d5643b0204871f636d93a5c869dfe71667f03dc75f32f6fd83f646a193d"
         "src/standalone/workers/managed_decompiler/worker_manifest.schema.json|5361|fbc0fbac75c5af1219963aee9f624b600175dd1fb621353eeb3be3df9ccd994f"
         "src/standalone/workers/analysis_python/analysis_python_worker.py|9572|493d52e9401adaa060a4f5d1435ea38dfd3ee9f0519325ea04ce651a73c83024"

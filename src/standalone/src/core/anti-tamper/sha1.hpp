@@ -13,7 +13,7 @@ __forceinline uint32_t rotl32(uint32_t x, int n)
     return (x << n) | (x >> (32 - n));
 }
 
-__declspec(noinline) void hash(const void* data, size_t len, uint8_t out[20])
+inline __declspec(noinline) void hash(const void* data, size_t len, uint8_t out[20])
 {
     uint32_t h0 = 0x67452301;
     uint32_t h1 = 0xEFCDAB89;
@@ -95,7 +95,7 @@ __declspec(noinline) void hash(const void* data, size_t len, uint8_t out[20])
     }
 }
 
-__declspec(noinline) void hash_32(const void* data, size_t len, uint8_t out[32])
+inline __declspec(noinline) void hash_32(const void* data, size_t len, uint8_t out[32])
 {
     uint8_t digest[20];
     hash(data, len, digest);

@@ -2270,6 +2270,15 @@ void render_static_patch_workflow() {
 
 namespace {
 
+constexpr std::size_t kWorkspaceNavigationHistoryLimit = 4096;
+
+void trim_workspace_navigation(std::vector<aida::analysis::address_t>& entries) {
+    if (entries.size() > kWorkspaceNavigationHistoryLimit)
+        entries.erase(entries.begin(),
+            entries.begin() + static_cast<std::ptrdiff_t>(
+                entries.size() - kWorkspaceNavigationHistoryLimit));
+}
+
 bool publish_workbench_selection(const workspace_context_t& context,
                                  const aida::analysis::address_t& destination,
                                  bool record_history) {
@@ -2310,6 +2319,72 @@ void synchronize_workspace_selection(const workspace_context_t& context,
     std::lock_guard<std::mutex> lock(context.view->mutex);
     context.view->selection = destination;
     context.view->scroll_to_selection = reveal;
+}
+
+void synchronize_workspace_navigation(const workspace_context_t& context,
+                                      const aida::analysis::address_t& destination,
+                                      bool reveal,
+                                      bool record_navigation,
+                                      bool clear_forward) {
+    if (!context.workspace || !context.view)
+        return;
+    std::optional<aida::analysis::address_t> current;
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        current = context.view->selection;
+    }
+    const auto updated = context.workspace->update_view_state(
+        [&](aida::analysis::workspace_view_state_t& state) {
+            const auto previous = state.selection ? state.selection : current;
+            if (record_navigation && previous && *previous != destination) {
+                state.navigation_back.push_back(*previous);
+                trim_workspace_navigation(state.navigation_back);
+            }
+            if (clear_forward)
+                state.navigation_forward.clear();
+            state.selection = destination;
+        });
+    if (!updated)
+        return;
+    if (context.model) {
+        context.model->presentation_selection_revision.store(
+            context.workspace->view_state().revision, std::memory_order_release);
+    }
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    context.view->selection = destination;
+    context.view->scroll_to_selection = reveal;
+}
+
+std::optional<aida::analysis::address_t> navigate_workspace_history(
+    const workspace_context_t& context,
+    bool forward) {
+    if (!context.workspace || !context.view)
+        return {};
+    std::optional<aida::analysis::address_t> destination;
+    const auto updated = context.workspace->update_view_state(
+        [&](aida::analysis::workspace_view_state_t& state) {
+            auto& source = forward ? state.navigation_forward : state.navigation_back;
+            auto& target = forward ? state.navigation_back : state.navigation_forward;
+            if (source.empty())
+                return;
+            destination = source.back();
+            source.pop_back();
+            if (state.selection && *state.selection != *destination) {
+                target.push_back(*state.selection);
+                trim_workspace_navigation(target);
+            }
+            state.selection = *destination;
+        });
+    if (!updated || !destination)
+        return {};
+    if (context.model) {
+        context.model->presentation_selection_revision.store(
+            context.workspace->view_state().revision, std::memory_order_release);
+    }
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    context.view->selection = *destination;
+    context.view->scroll_to_selection = true;
+    return destination;
 }
 
 std::optional<aida::analysis::address_t> history_selection(
@@ -2369,7 +2444,7 @@ void goto_address(const aida::analysis::address_t& destination,
     }
     if (!publish_workbench_selection(context, destination, true))
         return;
-    synchronize_workspace_selection(context, destination, true);
+    synchronize_workspace_navigation(context, destination, true, true, true);
 }
 
 void goto_address(std::uint64_t value, const workspace_context_t& context) {
@@ -2391,10 +2466,11 @@ bool request_goto(const workspace_context_t& context) {
 void navigate_back(const workspace_context_t& context) {
     if (!context.workspace)
         return;
+    const auto local_destination = navigate_workspace_history(context, false);
     aida::workbench::workbench_shell_workspace_context_t workbench;
     const auto result = aida::workbench::workbench_shell_runtime_t::instance()
         .navigate_history(context.workspace, false, workbench);
-    if (!result)
+    if (!result || local_destination)
         return;
     if (const auto destination = history_selection(context, workbench))
         synchronize_workspace_selection(context, *destination, true);
@@ -2403,10 +2479,11 @@ void navigate_back(const workspace_context_t& context) {
 void navigate_forward(const workspace_context_t& context) {
     if (!context.workspace)
         return;
+    const auto local_destination = navigate_workspace_history(context, true);
     aida::workbench::workbench_shell_workspace_context_t workbench;
     const auto result = aida::workbench::workbench_shell_runtime_t::instance()
         .navigate_history(context.workspace, true, workbench);
-    if (!result)
+    if (!result || local_destination)
         return;
     if (const auto destination = history_selection(context, workbench))
         synchronize_workspace_selection(context, *destination, true);

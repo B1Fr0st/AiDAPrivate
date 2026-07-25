@@ -9,7 +9,7 @@ namespace fnv1a {
 constexpr uint64_t kOffset = 0xcbf29ce484222325ULL;
 constexpr uint64_t kPrime  = 0x100000001b3ULL;
 
-__declspec(noinline) uint64_t hash(const void* data, size_t len)
+inline __declspec(noinline) uint64_t hash(const void* data, size_t len)
 {
     const auto* p = static_cast<const uint8_t*>(data);
     uint64_t h = kOffset;
@@ -21,7 +21,7 @@ __declspec(noinline) uint64_t hash(const void* data, size_t len)
     return h;
 }
 
-__declspec(noinline) void hash_32(const void* data, size_t len, uint8_t out[32])
+inline __declspec(noinline) void hash_32(const void* data, size_t len, uint8_t out[32])
 {
     const auto* p = static_cast<const uint8_t*>(data);
     uint64_t h = kOffset;

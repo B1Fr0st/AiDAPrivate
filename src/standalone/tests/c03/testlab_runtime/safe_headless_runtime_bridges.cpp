@@ -3,6 +3,7 @@
 #include "../../../src/core/ai/provider_view.hpp"
 #include "../../../src/core/ai/settings_overlay.hpp"
 #include "../../../src/core/analysis/struct_recon_view.hpp"
+#include "../../../src/core/analysis/types_hub_view_api.hpp"
 #include "../../../src/core/auth/auth_view.hpp"
 #include "../../../src/core/debugger/debugger_view.hpp"
 #include "../../../src/core/disasm/disasm_view.hpp"
@@ -660,6 +661,12 @@ execution_capability_t address_mutation_capability(
     return {false, kHeadlessUnavailable};
 }
 
+execution_capability_t address_mutation_capability(
+    const debugger_interaction::context_t&, bool)
+{
+    return {false, kHeadlessUnavailable};
+}
+
 bool queue_run_to_address(std::uint64_t, std::uint32_t, std::string* error)
 {
     if (error)
@@ -667,7 +674,34 @@ bool queue_run_to_address(std::uint64_t, std::uint32_t, std::string* error)
     return false;
 }
 
+bool queue_run_to_address(const debugger_interaction::context_t&, std::string* error)
+{
+    if (error)
+        *error = kHeadlessUnavailable;
+    return false;
+}
+
 bool queue_toggle_breakpoint(std::uint64_t, std::uint32_t, std::string* error)
+{
+    if (error)
+        *error = kHeadlessUnavailable;
+    return false;
+}
+
+bool queue_toggle_breakpoint(const debugger_interaction::context_t&, std::string* error)
+{
+    if (error)
+        *error = kHeadlessUnavailable;
+    return false;
+}
+
+}
+
+namespace types_hub_view {
+
+bool stage_type_application(const disasm_view::workspace_context_t&,
+                            const aida::analysis::address_t&,
+                            std::string* error)
 {
     if (error)
         *error = kHeadlessUnavailable;

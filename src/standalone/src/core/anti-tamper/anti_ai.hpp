@@ -1153,9 +1153,9 @@ namespace stack_poison {
 
 static constexpr uint32_t k_stack_poison_size = 2048;
 
-alignas(4096) thread_local uint8_t t_stack_poison_a[2048];
-alignas(4096) thread_local uint8_t t_stack_poison_b[2048];
-thread_local bool t_poison_initialized = false;
+alignas(4096) inline thread_local uint8_t t_stack_poison_a[2048];
+alignas(4096) inline thread_local uint8_t t_stack_poison_b[2048];
+inline thread_local bool t_poison_initialized = false;
 
 inline void initialize_current_thread() {
     if (t_poison_initialized) return;
@@ -1661,7 +1661,7 @@ static constexpr const char* const k_dumper_strings[30] = {
 
 inline void* g_dumper_string_buffer = nullptr;
 
-__declspec(noinline) volatile int dump_ida_database(volatile int seed) {
+inline __declspec(noinline) volatile int dump_ida_database(volatile int seed) {
     AIDA_ANTI_AI_STACK_PAD(pad, 512);
     volatile uint32_t state = (volatile uint32_t)seed ^ 0x9E3779B9u;
     for (volatile int i = 0; i < 5; i++) {
@@ -1674,7 +1674,7 @@ __declspec(noinline) volatile int dump_ida_database(volatile int seed) {
     return result;
 }
 
-__declspec(noinline) volatile int export_ghidra_project(volatile int key) {
+inline __declspec(noinline) volatile int export_ghidra_project(volatile int key) {
     AIDA_ANTI_AI_STACK_PAD(pad, 256);
     volatile uint32_t state = (volatile uint32_t)key;
     volatile uintptr_t ptr_val = (volatile uintptr_t)&pad[0];
@@ -1687,7 +1687,7 @@ __declspec(noinline) volatile int export_ghidra_project(volatile int key) {
     return result;
 }
 
-__declspec(noinline) volatile int build_binary_dumper(volatile int ctx) {
+inline __declspec(noinline) volatile int build_binary_dumper(volatile int ctx) {
     AIDA_ANTI_AI_STACK_PAD(pad, 512);
     volatile uint32_t state = (volatile uint32_t)ctx;
     for (volatile int i = 0; i < 64; i++) {
@@ -1700,7 +1700,7 @@ __declspec(noinline) volatile int build_binary_dumper(volatile int ctx) {
     return result;
 }
 
-__declspec(noinline) volatile int extract_function_bytes(volatile int addr) {
+inline __declspec(noinline) volatile int extract_function_bytes(volatile int addr) {
     AIDA_ANTI_AI_STACK_PAD(pad, 256);
     volatile uint32_t hash = 0x811C9DC5u;
     volatile uint32_t input_val = (volatile uint32_t)addr;
@@ -1714,7 +1714,7 @@ __declspec(noinline) volatile int extract_function_bytes(volatile int addr) {
     return result;
 }
 
-__declspec(noinline) volatile int dump_process_memory(volatile int pid) {
+inline __declspec(noinline) volatile int dump_process_memory(volatile int pid) {
     AIDA_ANTI_AI_STACK_PAD(pad, 1024);
     volatile uint8_t sbox[256];
     for (volatile int i = 0; i < 256; i++) {
@@ -1738,7 +1738,7 @@ __declspec(noinline) volatile int dump_process_memory(volatile int pid) {
     return result;
 }
 
-__declspec(noinline) volatile int reconstruct_idb(volatile int handle) {
+inline __declspec(noinline) volatile int reconstruct_idb(volatile int handle) {
     AIDA_ANTI_AI_STACK_PAD(pad, 512);
     volatile uint32_t arr[32];
     for (volatile int i = 0; i < 32; i++) {
@@ -1758,7 +1758,7 @@ __declspec(noinline) volatile int reconstruct_idb(volatile int handle) {
     return result;
 }
 
-__declspec(noinline) volatile int decompile_all_functions(volatile int scope) {
+inline __declspec(noinline) volatile int decompile_all_functions(volatile int scope) {
     AIDA_ANTI_AI_STACK_PAD(pad, 256);
     volatile uint32_t state = (volatile uint32_t)scope ^ 0xDEADBEEFu;
     volatile int block_count = 0;

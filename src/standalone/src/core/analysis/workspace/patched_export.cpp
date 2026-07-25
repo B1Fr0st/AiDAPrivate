@@ -179,6 +179,7 @@ workspace_result_t<patched_export_result_t> patched_export_t::export_copy(
     revision_lock.unlock();
     std::vector<export_patch_t> patches;
     patches.reserve(operations.size());
+    const auto& source_provider = workspace->source_provider();
     for (const auto& operation : operations) {
         if (operation.bytes.empty())
             continue;
@@ -186,7 +187,7 @@ workspace_result_t<patched_export_result_t> patched_export_t::export_copy(
         if (!offset)
             return workspace_result_t<patched_export_result_t>::failure(offset.error());
         auto span = validate_span(offset.value(), operation.bytes.size(),
-                                  workspace->provider().size(), "patched_export");
+                                  source_provider.size(), "patched_export");
         if (!span)
             return workspace_result_t<patched_export_result_t>::failure(span.error());
         patches.push_back({offset.value(), operation.bytes});
@@ -247,7 +248,7 @@ workspace_result_t<patched_export_result_t> patched_export_t::export_copy(
     export_result.overlay_revision = overlay_revision;
     std::vector<std::uint8_t> buffer(static_cast<std::size_t>(options.chunk_size));
     std::size_t patch_index = 0;
-    for (std::uint64_t offset = 0; offset < workspace->provider().size();) {
+    for (std::uint64_t offset = 0; offset < source_provider.size();) {
         if (cancel.stop_requested()) {
             cleanup();
             auto error = make_workspace_error(cancel.deadline_exceeded()
@@ -258,10 +259,10 @@ workspace_result_t<patched_export_result_t> patched_export_t::export_copy(
             error.cancellation = !error.deadline;
             return workspace_result_t<patched_export_result_t>::failure(std::move(error));
         }
-        const std::uint64_t remaining = workspace->provider().size() - offset;
+        const std::uint64_t remaining = source_provider.size() - offset;
         const std::size_t request = static_cast<std::size_t>((std::min<std::uint64_t>)(
             remaining, options.chunk_size));
-        auto read = workspace->provider().read_exact(offset, buffer.data(), request, cancel);
+        auto read = source_provider.read_exact(offset, buffer.data(), request, cancel);
         if (!read) {
             cleanup();
             return workspace_result_t<patched_export_result_t>::failure(read.error());

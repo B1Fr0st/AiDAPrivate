@@ -47,6 +47,9 @@ public:
 	explicit fixture_root_t(const std::filesystem::path& scratch_root) {
 		std::error_code error;
 		const auto parent = std::filesystem::absolute(scratch_root, error).lexically_normal();
+		if (error)
+			throw std::runtime_error("Test Lab scratch root is unavailable");
+		std::filesystem::create_directories(parent, error);
 		if (error || !std::filesystem::is_directory(parent, error) || error)
 			throw std::runtime_error("Test Lab scratch root is unavailable");
 		const DWORD parent_attributes = GetFileAttributesW(parent.c_str());
@@ -714,24 +717,40 @@ void malformed_manifest_matrix(const fixture_root_t& fixture, const json& valid)
 	}
 }
 
+void phase(std::string_view name) {
+	std::cerr << "testlab_phase=" << name << std::endl;
+}
+
 }
 
 bool run_testlab_integration_harness(const testlab_integration_paths_t& paths, std::string& failure) {
 	try {
+		phase("assertion_telemetry_contract_begin");
 		assertion_telemetry::fixtures::validate_assertion_telemetry_contract();
+		phase("result_pipe_failures_begin");
 		validate_result_pipe_failures();
+		phase("outcome_contract_begin");
 		validate_testlab_outcome_contract();
+		phase("paths_begin");
 		require(!paths.fake_adapter_path.empty() && !paths.scratch_root.empty(),
 			"Test Lab integration paths are incomplete");
+		phase("fixture_root_begin");
 		fixture_root_t fixture(paths.scratch_root);
+		phase("materialize_manifest_begin");
 		std::string manifest_hash;
 		const auto manifest_json = materialize_manifest(fixture, paths.fake_adapter_path, manifest_hash);
+		phase("load_manifest_begin");
 		const auto loaded = load_manifest(fixture.path(), fixture.path() / L"manifest.json", manifest_hash);
+		phase("outcome_matrix_begin");
 		validate_outcome_matrix(fixture, loaded);
+		phase("assertion_result_matrix_begin");
 		validate_assertion_result_matrix(fixture, loaded);
+		phase("malformed_manifest_matrix_begin");
 		malformed_manifest_matrix(fixture, manifest_json);
+		phase("wrong_hash_begin");
 		const auto wrong_hash = load_manifest(fixture.path(), fixture.path() / L"manifest.json", std::string(64, '0'));
 		require(!wrong_hash.accepted, "stale manifest package hash was accepted");
+		phase("complete");
 		failure.clear();
 		return true;
 	} catch (const std::exception& error) {

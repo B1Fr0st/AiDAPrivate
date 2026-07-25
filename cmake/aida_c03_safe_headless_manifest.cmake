@@ -1377,7 +1377,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         _aida_authority_archive_sha256
         "${_aida_authority_archive}"
         "pinned ida-pro-mcp archive")
-    if(NOT _aida_authority_archive_sha256 STREQUAL "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7")
+    if(NOT _aida_authority_archive_sha256 STREQUAL "77FB255DEF04BA8ABD3D6BFA306916FA27597CF369D2863C4614ECFFEA288F0C")
         message(FATAL_ERROR "AiDA C03 pinned ida-pro-mcp archive SHA-256 is invalid")
     endif()
     set(_aida_authority_repository_files
@@ -2051,8 +2051,8 @@ function(aida_c03_register_safe_headless_targets application_target)
         VERBATIM)
     add_custom_command(OUTPUT "${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"
         COMMAND ${CMAKE_COMMAND}
-            -DAIDA_C03_DIGEST_FILE="${AIDA_C03_SAFE_HEADLESS_DIGEST}"
-            -DAIDA_C03_HEADER_FILE="${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"
+            "-DAIDA_C03_DIGEST_FILE=${AIDA_C03_SAFE_HEADLESS_DIGEST}"
+            "-DAIDA_C03_HEADER_FILE=${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"
             -P "${AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT}/c03_safe_headless/write_digest_header.cmake"
         DEPENDS
             "${AIDA_C03_SAFE_HEADLESS_MANIFEST}"

@@ -34,6 +34,13 @@ using wave_c_debugger_response_result_t =
     wave_c_compat::debugger_adapter_result_t<
         wave_c_compat::debugger_adapter_response_t>;
 
+std::string hex_addr(std::uint64_t value)
+{
+    std::ostringstream stream;
+    stream << "0x" << std::uppercase << std::hex << value;
+    return stream.str();
+}
+
 std::optional<std::uint64_t> wave_c_address_value(const json& value)
 {
     if (value.is_number_unsigned())

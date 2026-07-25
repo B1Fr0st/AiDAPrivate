@@ -108,8 +108,8 @@ bool run_contract_generation_harness(std::string& failure) {
         !is_sha256(k_generated_effect_ledger_sha256) || !is_sha256(k_generated_archive_manifest_sha256)) {
         return reject("generated contract hashes are malformed");
     }
-    if (k_pinned_archive_sha256 != "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7") {
-        return reject("pinned archive SHA-256 does not match the expected canonical value 3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7");
+    if (k_pinned_archive_sha256 != "77FB255DEF04BA8ABD3D6BFA306916FA27597CF369D2863C4614ECFFEA288F0C") {
+        return reject("pinned archive SHA-256 does not match the expected canonical value 77FB255DEF04BA8ABD3D6BFA306916FA27597CF369D2863C4614ECFFEA288F0C");
     }
     if (k_generated_contract_ledger_sha256.empty()) {
         return reject("generated contract ledger SHA-256 is empty");

@@ -116,7 +116,7 @@ __forceinline bool constant_time_compare(const uint8_t* a, const uint8_t* b, siz
     return diff == 0;
 }
 
-__declspec(noinline) uint32_t compute_crc32c(const void* data, size_t len)
+inline __declspec(noinline) uint32_t compute_crc32c(const void* data, size_t len)
 {
     uint32_t crc = 0xFFFFFFFFu;
     const auto* p = static_cast<const uint8_t*>(data);
@@ -134,7 +134,7 @@ __declspec(noinline) uint32_t compute_crc32c(const void* data, size_t len)
     return crc ^ 0xFFFFFFFFu;
 }
 
-__declspec(noinline) void compute_crc32c_32(const void* data, size_t len, uint8_t out[32])
+inline __declspec(noinline) void compute_crc32c_32(const void* data, size_t len, uint8_t out[32])
 {
     uint32_t h = compute_crc32c(data, len);
     for (int i = 0; i < 8; ++i)
@@ -144,7 +144,7 @@ __declspec(noinline) void compute_crc32c_32(const void* data, size_t len, uint8_
     }
 }
 
-__declspec(noinline) void compute_aes_gmac_32(const void* data, size_t len, uint8_t out[32])
+inline __declspec(noinline) void compute_aes_gmac_32(const void* data, size_t len, uint8_t out[32])
 {
     uint8_t key[16] = {};
     uint8_t iv[12] = {};
@@ -158,7 +158,7 @@ __declspec(noinline) void compute_aes_gmac_32(const void* data, size_t len, uint
         out[i] = out[i % 16] ^ out[(i + 5) % 16] ^ 0xA5u;
 }
 
-__declspec(noinline) void compute_hash_by_algo(hash_algo_t algo,
+inline __declspec(noinline) void compute_hash_by_algo(hash_algo_t algo,
                                                  const void* data, size_t len,
                                                  uint8_t out[32])
 {
@@ -369,7 +369,7 @@ inline bool report_evidence_to_sentinel(const cross_ring_evidence_t& evidence)
         static_cast<uint32_t>(sizeof(evidence)));
 }
 
-__declspec(noinline) void capture_modified_bytes(
+inline __declspec(noinline) void capture_modified_bytes(
     const uint8_t* expected_region, const uint8_t* live_region,
     size_t region_size, uint8_t* out_bytes, uint32_t* out_len)
 {
@@ -390,7 +390,7 @@ __declspec(noinline) void capture_modified_bytes(
     *out_len = captured;
 }
 
-__declspec(noinline) void capture_live_region_snapshot_seh(
+inline __declspec(noinline) void capture_live_region_snapshot_seh(
     uint64_t region_base, size_t snapshot_size, uint8_t out_snapshot[256])
 {
     __try
@@ -403,7 +403,7 @@ __declspec(noinline) void capture_live_region_snapshot_seh(
     }
 }
 
-__declspec(noinline) void handle_hash_mismatch(
+inline __declspec(noinline) void handle_hash_mismatch(
     uint32_t detecting_checker_id,
     uint32_t target_checker_id,
     uint64_t region_base,
@@ -466,7 +466,7 @@ __declspec(noinline) void handle_hash_mismatch(
     }
 }
 
-__declspec(noinline) void checker_loop(uint32_t checker_id)
+inline __declspec(noinline) void checker_loop(uint32_t checker_id)
 {
     auto& s = state();
 

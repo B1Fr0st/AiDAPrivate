@@ -2267,9 +2267,21 @@ materialize_projected_provider(
             make_workspace_error(workspace_error_code_t::provider_unavailable,
                                  "immutable overlay source provider is unavailable",
                                  "overlay_journal.provider"));
+    constexpr std::uint64_t workspace_overlay_spill_limit =
+        1ULL * 1024ULL * 1024ULL * 1024ULL;
+    if (source->size() > workspace_overlay_spill_limit)
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "projected provider exceeds the workspace spill budget",
+                                 "overlay_journal.provider"));
     if (patches.empty()) {
-        auto snapshot = provider_snapshot_t::capture(
-            source, prepared.new_generation, cancel);
+        provider_snapshot_options_t snapshot_options;
+        snapshot_options.max_materialized_bytes = workspace_overlay_spill_limit;
+        auto snapshot = source->identity().immutable_snapshot
+            ? provider_snapshot_t::capture(
+                source, prepared.new_generation, cancel)
+            : provider_snapshot_t::materialize(
+                source, snapshot_options, cancel);
         if (!snapshot)
             return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
                 snapshot.error());
@@ -2289,13 +2301,6 @@ materialize_projected_provider(
                                      "overlay_journal.provider"));
         }
     }
-    constexpr std::uint64_t workspace_overlay_spill_limit =
-        1ULL * 1024ULL * 1024ULL * 1024ULL;
-    if (source->size() > workspace_overlay_spill_limit)
-        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
-            make_workspace_error(workspace_error_code_t::limit_exceeded,
-                                 "projected provider exceeds the workspace spill budget",
-                                 "overlay_journal.provider"));
     spill_provider_options_t options;
     options.max_spill_bytes = source->size();
     options.write_chunk_bytes = 1ULL * 1024ULL * 1024ULL;

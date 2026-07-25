@@ -20,11 +20,13 @@ target_include_directories(DAG_DISPATCH_TEST PRIVATE
     "${CMAKE_SOURCE_DIR}/src/standalone/src/core/anti-tamper"
     "${CMAKE_SOURCE_DIR}/src/standalone/src/core"
     "${CMAKE_SOURCE_DIR}/src/standalone/src/core/arc"
+    "${CMAKE_SOURCE_DIR}/src/standalone/src/core/runtime"
     "${CMAKE_SOURCE_DIR}/src/standalone/src/helpers"
     "${CMAKE_SOURCE_DIR}/src/standalone/src"
     "${CMAKE_SOURCE_DIR}/src"
     "${CMAKE_SOURCE_DIR}/src/shared"
     "${CMAKE_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/libs"
     "${CMAKE_SOURCE_DIR}/.deps/taskflow"
     "${CMAKE_BINARY_DIR}/generated"
 )

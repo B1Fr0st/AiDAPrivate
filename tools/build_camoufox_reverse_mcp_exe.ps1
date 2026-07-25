@@ -232,8 +232,11 @@ function Assert-LockedFile {
     }
     $path = Resolve-LockedRepositoryPath -RepoRoot $RepoRoot -RelativePath $RelativePath
     $item = Get-Item -LiteralPath $path -Force
-    if ($null -ne $ExpectedSize -and $item.Length -ne $ExpectedSize.Value) {
-        throw "Offline build lock size mismatch: $RelativePath"
+    if ($null -ne $ExpectedSize) {
+        $expectedLength = [Int64]$ExpectedSize
+        if ($item.Length -ne $expectedLength) {
+            throw "Offline build lock size mismatch: $RelativePath"
+        }
     }
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
     if (-not (Test-FixedTimeBytesEqual (Convert-HexToBytes $actual) (Convert-HexToBytes $ExpectedSha256))) {
@@ -292,7 +295,14 @@ function Assert-WheelRecordEntries {
         if ([string]::IsNullOrWhiteSpace($row.Digest)) {
             continue
         }
-        if ($row.Digest -notmatch '^sha256=([A-Za-z0-9_-]{43})$') {
+        $expectedDigest = ""
+        $expectedDigestHex = $false
+        if ($row.Digest -match '^sha256=([A-Za-z0-9_-]{43})$') {
+            $expectedDigest = $Matches[1]
+        } elseif ($row.Digest -match '^sha256=([0-9A-Fa-f]{64})$') {
+            $expectedDigest = $Matches[1].ToLowerInvariant()
+            $expectedDigestHex = $true
+        } else {
             throw "Offline wheel RECORD uses a non-SHA-256 digest: $RecordPath"
         }
         $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
@@ -302,8 +312,13 @@ function Assert-WheelRecordEntries {
         if ($row.Size -match '^[0-9]+$' -and $item.Length -ne [Int64]$row.Size) {
             throw "Offline wheel RECORD size mismatch: $candidate"
         }
-        $actual = Convert-HexToBase64Url ((Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant())
-        if (-not (Test-FixedTimeBytesEqual ([Text.Encoding]::ASCII.GetBytes($actual)) ([Text.Encoding]::ASCII.GetBytes($Matches[1])))) {
+        $actualHex = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant()
+        if ($expectedDigestHex) {
+            $actual = $actualHex
+        } else {
+            $actual = Convert-HexToBase64Url $actualHex
+        }
+        if (-not (Test-FixedTimeBytesEqual ([Text.Encoding]::ASCII.GetBytes($actual)) ([Text.Encoding]::ASCII.GetBytes($expectedDigest)))) {
             throw "Offline wheel RECORD hash mismatch: $candidate"
         }
     }

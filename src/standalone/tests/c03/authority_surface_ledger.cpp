@@ -41,7 +41,7 @@ using names_t = std::set<std::string>;
 constexpr std::uintmax_t k_maximum_manifest_bytes = 32ULL * 1024ULL * 1024ULL;
 constexpr std::uintmax_t k_maximum_source_bytes = 16ULL * 1024ULL * 1024ULL;
 constexpr std::string_view k_expected_pinned_archive_sha256 =
-    "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7";
+    "77FB255DEF04BA8ABD3D6BFA306916FA27597CF369D2863C4614ECFFEA288F0C";
 
 authority_surface_ledger_result_t fail(std::string failure) {
     return {false, std::move(failure)};
@@ -2863,7 +2863,7 @@ void verify_authority_cmake_integration(const std::filesystem::path& root) {
              "_aida_python_sha256", "_aida_system_powershell_sha256",
              "${_aida_system_root}/System32/WindowsPowerShell/v1.0/powershell.exe",
              "set(_aida_authority_archive \"C:/Users/ruar1337/ida-pro-mcp.zip\")",
-             "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7",
+             "77FB255DEF04BA8ABD3D6BFA306916FA27597CF369D2863C4614ECFFEA288F0C",
              "CMAKE_CONFIGURE_DEPENDS", "${_aida_python_executable}",
              "${_aida_system_powershell}", "${_aida_authority_archive}",
              "foreach(_aida_authority_file IN LISTS _aida_authority_repository_files)",

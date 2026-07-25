@@ -35,11 +35,17 @@ if(MSVC)
         if(_aida_heavy_pool LESS 2)
             set(_aida_heavy_pool 2)
         endif()
+        set(AIDA_LINK_POOL_SIZE "1" CACHE STRING "Maximum concurrent MSVC link jobs for memory-heavy Ninja builds")
+        if(NOT AIDA_LINK_POOL_SIZE MATCHES "^[1-9][0-9]*$")
+            set(AIDA_LINK_POOL_SIZE "1" CACHE STRING "Maximum concurrent MSVC link jobs for memory-heavy Ninja builds" FORCE)
+        endif()
         set_property(GLOBAL PROPERTY JOB_POOLS
             aida_compile=${_aida_logical_cpus}
             aida_heavy_compile=${_aida_heavy_pool}
-            aida_serial_compile=1)
+            aida_serial_compile=1
+            aida_link=${AIDA_LINK_POOL_SIZE})
         set(CMAKE_JOB_POOL_COMPILE aida_compile)
+        set(CMAKE_JOB_POOL_LINK aida_link)
     endif()
 
     foreach(_aida_flagset
@@ -734,7 +740,9 @@ set(zstd_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/zstd")
 add_subdirectory("${zstd_SOURCE_DIR}" "${zstd_BINARY_DIR}")
 
 set(BUILD_SHARED_LIBS_SAVED_XZ "${BUILD_SHARED_LIBS}")
+set(BUILD_TESTING_SAVED_XZ "${BUILD_TESTING}")
 set(BUILD_SHARED_LIBS OFF)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(XZ_THREADS no CACHE STRING "" FORCE)
 set(XZ_NLS OFF CACHE BOOL "" FORCE)
 set(XZ_TOOL_XZ OFF CACHE BOOL "" FORCE)
@@ -747,6 +755,7 @@ set(xz_SOURCE_DIR "${DEPS_DIR}/xz-5.8.3")
 set(xz_BINARY_DIR "${CMAKE_BINARY_DIR}/.deps/xz")
 add_subdirectory("${xz_SOURCE_DIR}" "${xz_BINARY_DIR}")
 set(BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS_SAVED_XZ}")
+set(BUILD_TESTING "${BUILD_TESTING_SAVED_XZ}" CACHE BOOL "" FORCE)
 target_include_directories(liblzma PUBLIC
     $<BUILD_INTERFACE:${xz_SOURCE_DIR}/src/liblzma/api>
     $<INSTALL_INTERFACE:include>)
@@ -2193,10 +2202,7 @@ if(WIN32)
             GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
             AIDA_DEEP_STEAL=1
             AIDA_STANDALONE
-            AIDA_IMGUI_SOURCE_SHA256="${AIDA_IMGUI_SOURCE_SHA256}"
-            AIDA_IMGUI_LOCK_SHA256="${AIDA_IMGUI_LOCK_SHA256}"
-            AIDA_IMGUI_SOURCE_COMMIT="${AIDA_IMGUI_SOURCE_COMMIT}"
-            AIDA_IMGUI_SOURCE_TREE="${AIDA_IMGUI_SOURCE_TREE}"
+            AIDA_IMGUI_SOURCE_SHA256=${AIDA_IMGUI_SOURCE_SHA256}
         )
         if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
             target_compile_definitions(AiDAStandalone PRIVATE AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE)
@@ -2928,7 +2934,13 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/settings"
             "${STANDALONE_ROOT}"
             "${CMAKE_CURRENT_SOURCE_DIR}/driver"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs"
             "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/shared"
+        )
+
+        target_include_directories(AiDA_ARC SYSTEM PRIVATE
+            "${DEPS_DIR}/taskflow"
         )
 
         target_compile_definitions(AiDA_ARC PRIVATE
@@ -3320,6 +3332,7 @@ if(WIN32)
             $<$<COMPILE_LANGUAGE:C,CXX>:/guard:cf>
             $<$<COMPILE_LANGUAGE:C,CXX>:/Qspectre>
             $<$<COMPILE_LANGUAGE:CXX>:/sdl>
+            $<$<COMPILE_LANGUAGE:CXX>:/wd4996>
         )
         target_link_options(AiDA PRIVATE
             /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /CETCOMPAT /guard:cf

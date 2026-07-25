@@ -4,7 +4,9 @@
 #if !defined(WIN32_LEAN_AND_MEAN)
 #define WIN32_LEAN_AND_MEAN
 #endif
+#if !defined(CPPHTTPLIB_OPENSSL_SUPPORT)
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
 #include "standalone_license.hpp"
 
 #include "standalone_settings.hpp"

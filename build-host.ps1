@@ -212,6 +212,14 @@ function Write-Summary {
 }
 
 $steps = New-Object System.Collections.Generic.List[object]
+$BuildParallelArg = ""
+if (-not [string]::IsNullOrWhiteSpace($env:AIDA_BUILD_JOBS)) {
+    $BuildJobs = 0
+    if (-not [int]::TryParse($env:AIDA_BUILD_JOBS, [ref]$BuildJobs) -or $BuildJobs -lt 1) {
+        throw "AIDA_BUILD_JOBS must be a positive integer"
+    }
+    $BuildParallelArg = " --parallel $BuildJobs"
+}
 
 if ($Drivers) {
     $driverParts = @(
@@ -238,10 +246,10 @@ if ($Drivers) {
     $steps.Add((New-Step "driver-stamps" "cmake -E remove build-ninja\whoswho_encrypted.stamp build-ninja\sentinel_encrypted.stamp build-ninja\windmapper_encrypted.stamp" "driver-stamps.log" (Join-Path $env:TEMP "aida_driver_stamps_out.txt")))
 }
 
-$steps.Add((New-Step "build" "cmake --build --preset $Preset" "build.log" (Join-Path $env:TEMP "aida_build_out.txt")))
+$steps.Add((New-Step "build" "cmake --build --preset $Preset$BuildParallelArg" "build.log" (Join-Path $env:TEMP "aida_build_out.txt")))
 
 if (-not $SkipVerify) {
-    $steps.Add((New-Step "verify" "cmake --build --preset $Preset" "verify.log" (Join-Path $env:TEMP "aida_build_verify_out.txt")))
+    $steps.Add((New-Step "verify" "cmake --build --preset $Preset$BuildParallelArg" "verify.log" (Join-Path $env:TEMP "aida_build_verify_out.txt")))
 }
 
 if ($PlanOnly) {

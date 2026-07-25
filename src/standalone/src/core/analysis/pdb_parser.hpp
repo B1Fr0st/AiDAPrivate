@@ -27,6 +27,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <OleAuto.h>
 #include "../../helpers/diag_log.hpp"
 #include "../infra/win_thread.hpp"
 #include "../mcp/downstream_producer_governor.hpp"

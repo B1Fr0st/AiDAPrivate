@@ -348,7 +348,9 @@ function(aida_c03_register_native_worker_package)
         AIDA_C03_PACKAGE_OUTPUTS "${AIDA_C03_NATIVE_WORKER_PACKAGE_OUTPUTS}"
         AIDA_C03_GHIDRA_SPEC_AUTHORITY "deps/AiDA_GhidraSpecs.manifest.json;deps/AiDA_GhidraSpecs.manifest.sha256;exact-51-file-mirrors"
         AIDA_C03_FINAL_BYTE_ORDERING "verified-ghidra-specs;worker-target;finalizers;copy;protect;direct-protector-verify;offline-wintrust-receipts;manifest;verify;appcontainer-acl;acl-receipt;verify-acl")
-    add_dependencies("${_aida_c03_APPLICATION_TARGET}" ${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET})
+    if(AIDA_C03_SIGNING_AUTHORITY_AVAILABLE)
+        add_dependencies("${_aida_c03_APPLICATION_TARGET}" ${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET})
+    endif()
     set_property(TARGET "${_aida_c03_APPLICATION_TARGET}" PROPERTY
         AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET "${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET}")
 endfunction()
@@ -562,7 +564,9 @@ function(aida_c03_register_managed_worker_package)
         AIDA_C03_APP_LOCAL_RUNTIME "Microsoft.NETCore.App-${AIDA_C03_MANAGED_RUNTIME_VERSION};${AIDA_C03_MANAGED_RUNTIME_TFM};win-x64;exact-193-file-inventory"
         AIDA_C03_CUSTOMER_SDK_SHIPMENT "forbidden"
         AIDA_C03_FINAL_BYTE_ORDERING "offline-build;finalizers;copy-framework-dependent-application;copy-pinned-framework-dependencies;protect;direct-protector-verify;offline-wintrust-receipts;materialize-app-local-runtime;verify-runtime;manifest-v3;verify;appcontainer-acl;acl-receipt;verify-acl")
-    add_dependencies("${_aida_c03_APPLICATION_TARGET}" ${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET})
+    if(AIDA_C03_SIGNING_AUTHORITY_AVAILABLE)
+        add_dependencies("${_aida_c03_APPLICATION_TARGET}" ${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET})
+    endif()
     set_property(TARGET "${_aida_c03_APPLICATION_TARGET}" PROPERTY
         AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET "${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET}")
     set(AIDA_C03_MANAGED_WORKER_PACKAGE_OUTPUTS "${_aida_c03_outputs}" PARENT_SCOPE)

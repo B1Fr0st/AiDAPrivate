@@ -37,7 +37,7 @@ __forceinline uint64_t merge_round(uint64_t acc, uint64_t val)
     return acc;
 }
 
-__declspec(noinline) uint64_t hash(const void* data, size_t len, uint64_t seed = 0)
+inline __declspec(noinline) uint64_t hash(const void* data, size_t len, uint64_t seed = 0)
 {
     const auto* p = static_cast<const uint8_t*>(data);
     const uint64_t length = static_cast<uint64_t>(len);
@@ -112,7 +112,7 @@ __declspec(noinline) uint64_t hash(const void* data, size_t len, uint64_t seed =
     return h64;
 }
 
-__declspec(noinline) void hash_32(const void* data, size_t len, uint8_t out[32])
+inline __declspec(noinline) void hash_32(const void* data, size_t len, uint8_t out[32])
 {
     uint64_t h = hash(data, len, 0);
     memcpy(out, &h, 8);

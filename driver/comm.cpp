@@ -4131,7 +4131,7 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                 last_heartbeat_dioctl_result_ = hb_result;
                 last_heartbeat_bytes_ = hb_bytes;
                 last_heartbeat_response_ = hb.response;
-    last_heartbeat_error_.store(hb_result ? 0 : hb_err, std::memory_order_release);
+                last_heartbeat_error_.store(hb_result ? 0 : hb_err, std::memory_order_release);
                 capture_heartbeat_security_snapshot(8, hb_ioctl, hb.magic);
 
                 bool hb_ok = hb_result && hb_bytes >= sizeof(hb) && hb.response != 0;
@@ -4149,78 +4149,15 @@ bool voyager::device_t::send_request_in_lock(DWORD control_code, void* input, DW
                 }
 
                 if (hb_ok) {
-            last_heartbeat_tsc_.store(__rdtsc(), std::memory_order_release);
+                    last_heartbeat_tsc_.store(__rdtsc(), std::memory_order_release);
                     last_bridge_whoswho_tsc_ = hb.whoswho_tsc;
                     last_bridge_sentinel_tsc_ = hb.sentinel_tsc;
                     if (hb.sentinel_tsc != 0 && first_sentinel_ready_tsc_ == 0)
                         first_sentinel_ready_tsc_ = hb.sentinel_tsc;
                     out_error = ERROR_SUCCESS;
                     log_security_snapshot(ok_label, hb_ioctl, hb_ioctl, 0);
-    return true;
-}
-
-bool voyager::device_t::register_usermode_hash(
-    std::uint64_t text_base, std::uint32_t text_size,
-    std::uint64_t reloc_delta,
-    const std::uint8_t sha256[32],
-    const detail::reloc_mask_entry_abi_t* mask_entries,
-    std::uint32_t mask_count) noexcept
-{
-    SPOOF_FUNC;
-
-    if (!is_connected()) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return false;
-    }
-
-    if (mask_count > detail::MAX_RELOC_MASK_ENTRIES_ABI) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return false;
-    }
-
-    auto buffer = std::make_unique<detail::usermode_hash_register_t>();
-    std::memset(buffer.get(), 0, sizeof(*buffer));
-    buffer->text_base = text_base;
-    buffer->text_size = text_size;
-    buffer->mask_count = mask_count;
-    buffer->reloc_delta = reloc_delta;
-
-    if (sha256) {
-        std::memcpy(buffer->expected_sha256, sha256, 32);
-    }
-
-    if (mask_count > 0 && mask_entries) {
-        std::memcpy(buffer->mask_entries, mask_entries,
-                    mask_count * sizeof(detail::reloc_mask_entry_abi_t));
-    }
-
-    if (!send_request(ioctl_codes::RUHS(), buffer.get(),
-                      static_cast<DWORD>(sizeof(*buffer)))) {
-        return false;
-    }
-
-    return buffer->result != 0;
-}
-
-bool voyager::device_t::verify_cross_ring_evidence(
-    const detail::cross_ring_evidence_abi_t& evidence) noexcept
-{
-    SPOOF_FUNC;
-
-    if (!is_connected()) {
-        SetLastError(ERROR_INVALID_HANDLE);
-        return false;
-    }
-
-    detail::cross_ring_evidence_abi_t buf = evidence;
-
-    if (!send_request(ioctl_codes::XREV(), &buf,
-                      static_cast<DWORD>(sizeof(buf)))) {
-        return false;
-    }
-
-    return true;
-}
+                    return true;
+                }
 
                 out_error = effective_hb_err;
                 log_security_snapshot(fail_label, hb_ioctl, hb_ioctl, effective_hb_err);
@@ -4619,6 +4556,69 @@ bool voyager::device_t::verify_cross_ring_evidence(
     }
 
     return result != FALSE;
+}
+
+bool voyager::device_t::register_usermode_hash(
+    std::uint64_t text_base, std::uint32_t text_size,
+    std::uint64_t reloc_delta,
+    const std::uint8_t sha256[32],
+    const detail::reloc_mask_entry_abi_t* mask_entries,
+    std::uint32_t mask_count) noexcept
+{
+    SPOOF_FUNC;
+
+    if (!is_connected()) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    if (mask_count > detail::MAX_RELOC_MASK_ENTRIES_ABI) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    auto buffer = std::make_unique<detail::usermode_hash_register_t>();
+    std::memset(buffer.get(), 0, sizeof(*buffer));
+    buffer->text_base = text_base;
+    buffer->text_size = text_size;
+    buffer->mask_count = mask_count;
+    buffer->reloc_delta = reloc_delta;
+
+    if (sha256) {
+        std::memcpy(buffer->expected_sha256, sha256, 32);
+    }
+
+    if (mask_count > 0 && mask_entries) {
+        std::memcpy(buffer->mask_entries, mask_entries,
+                    mask_count * sizeof(detail::reloc_mask_entry_abi_t));
+    }
+
+    if (!send_request(ioctl_codes::RUHS(), buffer.get(),
+                      static_cast<DWORD>(sizeof(*buffer)))) {
+        return false;
+    }
+
+    return buffer->result != 0;
+}
+
+bool voyager::device_t::verify_cross_ring_evidence(
+    const detail::cross_ring_evidence_abi_t& evidence) noexcept
+{
+    SPOOF_FUNC;
+
+    if (!is_connected()) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    detail::cross_ring_evidence_abi_t buf = evidence;
+
+    if (!send_request(ioctl_codes::XREV(), &buf,
+                      static_cast<DWORD>(sizeof(buf)))) {
+        return false;
+    }
+
+    return true;
 }
 
 

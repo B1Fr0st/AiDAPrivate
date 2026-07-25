@@ -2,7 +2,9 @@
 #include "../../../preview/network_preview_platform.hpp"
 #include "../../../preview/studio_semantics.hpp"
 #else
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #endif
 

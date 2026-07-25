@@ -86,7 +86,7 @@
 #pragma warning(pop)
 #endif
 
-#if defined(_MSC_VER) && !defined(__HAS_INT128__)
+#if defined(_MSC_VER) && !__HAS_INT128__
 inline uint128 operator<<(const uint128 &x, int cnt)
 {
     if (cnt == 0)

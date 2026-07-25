@@ -1,6 +1,6 @@
 #include "anti_tamper_integrity_harness.hpp"
 
-#include "../../../../src/core/anti-tamper/orchestrator.hpp"
+#include "../../../../src/core/anti-tamper/dma_preflight_policy.hpp"
 
 namespace aida::c03::security
 {

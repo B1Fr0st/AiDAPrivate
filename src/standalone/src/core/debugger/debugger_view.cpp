@@ -5024,7 +5024,7 @@ static float render_breakpoint_actions(float ox, float oy, float w) {
 	aida::ui::input_text("##bp_addr", ui.add_bp_addr_buf, sizeof(ui.add_bp_addr_buf),
 		"0x... breakpoint address",
 		false, ImVec2(input_w, control_height));
-	auto clear_staged_definition = [](bool clear_address) {
+	auto clear_staged_definition = [&ui](bool clear_address) {
 		ui.add_bp_staged = false;
 		ui.add_bp_staged_mode = breakpoint_definition_mode_t::software;
 		ui.add_bp_staged_context = {};
@@ -5065,7 +5065,7 @@ static float render_breakpoint_actions(float ox, float oy, float w) {
 		"debugger.breakpoints.actions", actions, std::size(actions), actions_w);
 	const std::string_view invoked = action.invoked && action.id
 		? std::string_view(action.id) : std::string_view();
-	auto retained_context = [](breakpoint_definition_mode_t mode,
+	auto retained_context = [&ui](breakpoint_definition_mode_t mode,
 		std::uint64_t address, std::string& error)
 		-> std::optional<debugger_interaction::context_t> {
 		if (!ui.add_bp_staged)

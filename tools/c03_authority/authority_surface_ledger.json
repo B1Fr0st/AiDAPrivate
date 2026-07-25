@@ -17,14 +17,14 @@
       "path": "C:/Users/ruar1337/ida-pro-mcp.zip",
       "version": "2.0.0",
       "license": "MIT",
-      "sha256": "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7",
+      "sha256": "77FB255DEF04BA8ABD3D6BFA306916FA27597CF369D2863C4614ECFFEA288F0C",
       "inspection_mode": "zip_data_only_no_archive_code_execution"
     }
   },
   "contract_generation": {
     "generator": {
       "path": "tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py",
-      "sha256": "15578745C6CC76E4C010F25B6A357E9AB7A255E4B614AAF7656E8F4B5268207D"
+      "sha256": "46A519878A4DA55AD8FC844572A0062FE02D0401266743B12B91A00F1A8655DD"
     },
     "reproduction_policy": "pinned_zip_data_only_byte_exact_offline",
     "artifacts": [
@@ -35,9 +35,9 @@
       "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp"
     ],
     "descriptor_artifact_sha256": {
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "A6AD7B7BD9DD4431941283D203AD29C4A994FECF7412331B42E7B8F4CA484D6A",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "DD084F655A1EA9B81D173D8C4E4ABE040F218E25448C05EB2DA48441A09177A8",
       "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json": "E8E4AECA80C597FAE5A9C33BCBE4BBA9B0BC0D0B67A5FBE50B338504AB06563C",
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "C4DECD0F377479315D4E12F0F690A1D01536C97C7585E354AFDE21CEF3B9DFB4"
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "98CD62E0F3BCB32C59D89679F5D49F03647631A7A2F884A548EDE6E7CBA42B5F"
     }
   },
   "current_surface_reproduction": {

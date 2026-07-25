@@ -3897,7 +3897,7 @@ static void test_fuzzer_state(HANDLE hf, std::atomic<int>& passed, std::atomic<i
         corpus_size_stat = fuzzer_engine::g_state.stats.corpus_size;
         edge_coverage = fuzzer_engine::g_state.stats.edge_coverage;
         corpus_size = fuzzer_engine::g_state.corpus.size();
-        crashes_size = fuzzer_engine::g_state.crashes.size();
+        crashes_size = static_cast<std::size_t>(fuzzer_engine::g_state.stats.total_crashes);
         unique_crashes_size = fuzzer_engine::g_state.unique_crashes.size();
         rate_history_size = fuzzer_engine::g_state.stats.exec_rate_history.size();
         setup_error = fuzzer_engine::g_state.setup_error;
@@ -4825,8 +4825,9 @@ static void test_type_recovery_semantic_cfg_cc_binding(HANDLE hf, std::atomic<in
     semantic_request.derive_workspace_evidence = false;
     semantic_request.decompiler_evidence = {type_evidence};
     const auto semantic = aida::analysis::fuse_semantic_evidence(*workspace, semantic_request);
+    const aida::analysis::cancellation_token_t quality_cancel;
     const auto calling_convention = aida::analysis::analyze_calling_convention(
-        *workspace, selected_function->start.value);
+        *workspace, selected_function->start.value, quality_cancel);
     if (!semantic || !calling_convention) {
         log_msg(hf, "quality_types", "FAIL -- semantic=%d cc=%d semantic_error=%s cc_error=%s",
             semantic ? 1 : 0, calling_convention ? 1 : 0,
@@ -4842,7 +4843,7 @@ static void test_type_recovery_semantic_cfg_cc_binding(HANDLE hf, std::atomic<in
     request.semantic_result = &semantic.value();
     request.cfg_result = &*selected_cfg;
     request.calling_convention_result = &calling_convention.value();
-    const auto recovered = aida::analysis::recover_types(*workspace, request);
+    const auto recovered = aida::analysis::recover_types(*workspace, request, quality_cancel);
     const bool semantic_consumed = recovered && std::any_of(recovered.value().evidence.begin(), recovered.value().evidence.end(),
         [](const auto& evidence) { return evidence.detail == "semantic_type"; });
     const bool cfg_consumed = recovered && std::any_of(recovered.value().evidence.begin(), recovered.value().evidence.end(),

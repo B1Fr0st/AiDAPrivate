@@ -431,7 +431,7 @@ bool compute_file_identity(const std::filesystem::path& path, file_identity_t& i
 		error = nt_error("BCryptCreateHash", status);
 		return false;
 	}
-	std::array<std::uint8_t, 1024 * 1024> buffer{};
+	std::vector<std::uint8_t> buffer(1024 * 1024);
 	std::uint64_t consumed = 0;
 	while (consumed < identity.size) {
 		if (g_cancellation_requested.load(std::memory_order_acquire) || (cancellation && cancellation())) {

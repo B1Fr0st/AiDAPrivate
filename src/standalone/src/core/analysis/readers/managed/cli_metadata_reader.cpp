@@ -982,16 +982,18 @@ private:
                             start + static_cast<std::size_t>(row) * row_size, row_size);
             if (!read_string_index(reader, member_ref.name, "cli.member_ref")) return false;
             if (!read_blob_index(reader, member_ref.signature_blob, "cli.member_ref")) return false;
+            member_ref.reference_kind = !member_ref.signature_blob.empty() &&
+                    ((member_ref.signature_blob.front() & 0x0fu) == 0x06u)
+                ? managed_reference_kind_t::field_reference
+                : managed_reference_kind_t::method_reference;
             if (member_ref.class_tag == 0 && member_ref.class_index <= result_.type_defs.size()) {
                 const auto& td = result_.type_defs[member_ref.class_index - 1];
                 member_ref.declaring_type_name = td.type_namespace.empty()
                     ? td.type_name : td.type_namespace + "." + td.type_name;
-                member_ref.reference_kind = managed_reference_kind_t::type_reference;
             } else if (member_ref.class_tag == 1 && member_ref.class_index <= result_.type_refs.size()) {
                 const auto& tr = result_.type_refs[member_ref.class_index - 1];
                 member_ref.declaring_type_name = tr.type_namespace.empty()
                     ? tr.type_name : tr.type_namespace + "." + tr.type_name;
-                member_ref.reference_kind = managed_reference_kind_t::type_reference;
             }
             result_.member_refs.push_back(std::move(member_ref));
         }

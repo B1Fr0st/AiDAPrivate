@@ -7,7 +7,14 @@
 #include "aida_ipc.hpp"
 #include "vuln/vuln_tools.hpp"
 #include "vuln/verification_tools.hpp"
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
 #include "vuln/chain_verification_tools.hpp"
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 #include "vuln/vuln_signatures.hpp"
 // Slice C12 — bring in taint engine public surface for taint_tools_ext.
 #include "vuln/taint_engine.hpp"
@@ -29,6 +36,177 @@ using json = nlohmann::json;
 
 namespace agent_tools
 {
+
+static func_t* get_func(ea_t ea)
+{
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    func_t* fn = ::get_func(ea);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    return fn;
+}
+
+static func_t* getn_func(size_t n)
+{
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    func_t* fn = ::getn_func(n);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    return fn;
+}
+
+static segment_t* getseg(ea_t ea)
+{
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    segment_t* seg = ::getseg(ea);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    return seg;
+}
+
+static segment_t* getnseg(int n)
+{
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    segment_t* seg = ::getnseg(n);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    return seg;
+}
+
+static segment_t* get_segm_by_name(const char* name)
+{
+    ea_t ea = ::get_segment_ea_by_name(name);
+    return ea == BADADDR ? nullptr : getseg(ea);
+}
+
+static ssize_t aida_get_segm_name(qstring* out, const segment_t* seg, int flags = 0)
+{
+    return seg != nullptr ? ::get_segment_name(out, seg->start_ea, flags) : -1;
+}
+
+static bool aida_func_contains(const func_t* pfn, ea_t ea)
+{
+    return pfn != nullptr && ::function_contains(pfn->start_ea, ea);
+}
+
+static void aida_reanalyze_function(func_t* pfn, ea_t ea1 = 0, ea_t ea2 = BADADDR, bool analyze_parents = false)
+{
+    if (pfn != nullptr)
+        ::reanalyze_function_ea(pfn->start_ea, ea1, ea2, analyze_parents);
+}
+
+static ea_t aida_calc_thunk_func_target(func_t* pfn, ea_t* fptr)
+{
+    if (pfn == nullptr)
+        return BADADDR;
+    func_entry_info_t fi;
+    if (!::get_func_entry_info(&fi, pfn->start_ea))
+        return BADADDR;
+    return ::calc_thunk_function_target(&fi, fptr);
+}
+
+static cfuncptr_t aida_decompile_func(func_t* pfn, hexrays_failure_t* hf = nullptr, int decomp_flags = 0)
+{
+    if (pfn == nullptr)
+        return cfuncptr_t(nullptr);
+    return ::decompile_function(pfn->start_ea, hf, decomp_flags);
+}
+
+static cfuncptr_t decompile(func_t* pfn, hexrays_failure_t* hf = nullptr, int decomp_flags = 0)
+{
+    return aida_decompile_func(pfn, hf, decomp_flags);
+}
+
+static asize_t aida_get_frame_size(const func_t* pfn)
+{
+    return pfn != nullptr ? ::get_frame_size_ea(pfn->start_ea) : 0;
+}
+
+static bool aida_get_func_frame(tinfo_t* out, const func_t* pfn)
+{
+    return pfn != nullptr && ::get_func_frame_ea(out, pfn->start_ea);
+}
+
+static bool aida_set_func_cmt(const func_t* pfn, const char* cmt, bool repeatable)
+{
+    return pfn != nullptr && ::set_func_cmt_ea(pfn->start_ea, cmt, repeatable);
+}
+
+static bool aida_define_stkvar(func_t* pfn, const char* name, sval_t off, const tinfo_t& tif)
+{
+    return pfn != nullptr && ::define_stkvar_ea(pfn->start_ea, name, off, tif);
+}
+
+static bool aida_add_segm_ex(segment_t* seg, const char* name, const char* sclass, int flags)
+{
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    bool ok = ::add_segm_ex(seg, name, sclass, flags);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    return ok;
+}
+
+class func_item_iterator_t
+{
+    function_item_iterator_t impl_;
+
+public:
+    func_item_iterator_t() = default;
+    explicit func_item_iterator_t(func_t* pfn, ea_t ea = BADADDR)
+    {
+        set(pfn, ea);
+    }
+
+    bool set(func_t* pfn, ea_t ea = BADADDR)
+    {
+        return impl_.set(pfn != nullptr ? pfn->start_ea : BADADDR, ea);
+    }
+
+    bool first()
+    {
+        return impl_.first();
+    }
+
+    ea_t current() const
+    {
+        return impl_.current();
+    }
+
+    bool next_addr()
+    {
+        return impl_.next_addr();
+    }
+
+    bool next_head()
+    {
+        return impl_.next_head();
+    }
+
+    bool next_code()
+    {
+        return impl_.next_code();
+    }
+};
 
 static std::string current_module_graph_key()
 {
@@ -647,7 +825,7 @@ std::string get_pseudocode(ea_t ea)
 
     try
     {
-        cfuncptr_t cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+        cfuncptr_t cfunc = aida_decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
         if (!cfunc)
             return "// Decompilation failed";
 
@@ -858,7 +1036,7 @@ tool_result_t decompile_function(const json& params)
 
     try
     {
-        cfuncptr_t cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
+        cfuncptr_t cfunc = aida_decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
         if (!cfunc)
         {
             result["code"] = "// Decompilation failed";
@@ -941,7 +1119,7 @@ tool_result_t disassemble_function(const json& params)
     result["name"] = func_name.c_str();
     result["size"] = pfn->end_ea - pfn->start_ea;
 
-    result["frame_size"] = get_frame_size(pfn);
+    result["frame_size"] = aida_get_frame_size(pfn);
     result["local_vars_size"] = pfn->frsize;
     result["saved_regs_size"] = pfn->frregs;
     result["args_size"] = pfn->argsize;
@@ -1098,7 +1276,7 @@ tool_result_t get_stack_frame(const json& params)
         return tool_result_t::error(OBFSTR("No function at address"));
 
     tinfo_t frame_tif;
-    if (!get_func_frame(&frame_tif, pfn))
+    if (!aida_get_func_frame(&frame_tif, pfn))
         return tool_result_t::error(OBFSTR("No stack frame available"));
 
     udt_type_data_t udt;
@@ -1122,7 +1300,7 @@ tool_result_t get_stack_frame(const json& params)
 
     json result;
     result["function"] = helpers::format_address(pfn->start_ea);
-    result["frame_size"] = get_frame_size(pfn);
+    result["frame_size"] = aida_get_frame_size(pfn);
     result["local_vars_size"] = pfn->frsize;
     result["variables"] = vars;
 
@@ -1844,7 +2022,7 @@ tool_result_t set_function_comment(const json& params)
     std::string comment = params["comment"].get<std::string>();
     bool repeatable = params.value("repeatable", false);
 
-    if (!set_func_cmt(pfn, comment.c_str(), repeatable))
+    if (!aida_set_func_cmt(pfn, comment.c_str(), repeatable))
         return tool_result_t::error(OBFSTR("Failed to set function comment"));
 
     return tool_result_t::ok(OBFSTR("Function comment set"));
@@ -2327,7 +2505,7 @@ tool_result_t create_stack_var(const json& params)
     if (!parse_decl(&mt, nullptr, nullptr, (type_str + " x;").c_str(), PT_SIL | PT_VAR))
         mt = tinfo_t(BT_INT64);
 
-    if (!define_stkvar(pfn, var_name.c_str(), offset, mt))
+    if (!aida_define_stkvar(pfn, var_name.c_str(), offset, mt))
         return tool_result_t::error(OBFSTR("Failed to create stack variable"));
 
     return tool_result_t::ok(OBFSTR("Stack variable created: ") + var_name);
@@ -3177,7 +3355,7 @@ static int segment_bitness_bits(const segment_t& seg)
 static qstring get_safe_segment_name(const segment_t* seg)
 {
     qstring name;
-    if (get_visible_segm_name(&name, seg) <= 0 || name.empty())
+    if (seg == nullptr || get_segment_name(&name, seg->start_ea, 1) <= 0 || name.empty())
         name = "<unnamed>";
     return name;
 }
@@ -3185,7 +3363,7 @@ static qstring get_safe_segment_name(const segment_t* seg)
 static qstring get_safe_segment_class(const segment_t* seg)
 {
     qstring sclass;
-    if (get_segm_class(&sclass, seg) <= 0 || sclass.empty())
+    if (seg == nullptr || get_segment_class(&sclass, seg->start_ea) <= 0 || sclass.empty())
         sclass = "unknown";
     return sclass;
 }
@@ -3212,8 +3390,11 @@ tool_result_t list_segments(const json&)
 {
     json segments = json::array();
 
-    for (segment_t* seg = get_first_seg(); seg != nullptr; seg = get_next_seg(seg->start_ea))
+    for (ea_t seg_ea = get_first_segment_ea(); seg_ea != BADADDR; seg_ea = get_next_segment_ea(seg_ea))
     {
+        segment_t* seg = getseg(seg_ea);
+        if (seg == nullptr)
+            continue;
         if (seg->end_ea <= seg->start_ea)
             continue;
 
@@ -3298,7 +3479,7 @@ tool_result_t create_segment(const json& params)
         seg.type = SEG_DATA;
     }
 
-    if (!add_segm_ex(&seg, name.c_str(), sclass.c_str(), ADDSEG_QUIET | ADDSEG_NOSREG))
+    if (!aida_add_segm_ex(&seg, name.c_str(), sclass.c_str(), ADDSEG_QUIET | ADDSEG_NOSREG))
         return tool_result_t::error(OBFSTR("Failed to create segment at ") +
                                     helpers::format_address(aligned_start) + OBFSTR("-") +
                                     helpers::format_address(aligned_end));
@@ -3528,7 +3709,7 @@ tool_result_t binary_fingerprint(const json&)
         if (is_thunk)
         {
             ea_t fptr = BADADDR;
-            ea_t target = calc_thunk_func_target(pfn, &fptr);
+            ea_t target = aida_calc_thunk_func_target(pfn, &fptr);
             if (target != BADADDR)
                 ej["thunk_target"] = helpers::format_address(target);
         }
@@ -3547,7 +3728,7 @@ tool_result_t binary_fingerprint(const json&)
         if (!s)
             continue;
         qstring name;
-        get_segm_name(&name, s);
+        aida_get_segm_name(&name, s);
         json sj;
         sj["name"]  = std::string(name.c_str());
         sj["start"] = helpers::format_address(s->start_ea);
@@ -3858,7 +4039,7 @@ tool_result_t get_current_address(const json&)
     if (seg)
     {
         qstring segname;
-        if (get_segm_name(&segname, seg) > 0)
+        if (aida_get_segm_name(&segname, seg) > 0)
             data["segment"] = std::string(segname.c_str());
     }
 
@@ -4067,7 +4248,7 @@ tool_result_t get_address_info(const json& params)
     if (seg)
     {
         qstring segname;
-        get_segm_name(&segname, seg);
+        aida_get_segm_name(&segname, seg);
         data["segment"] = std::string(segname.c_str());
         data["segment_start"] = helpers::format_address(seg->start_ea);
         data["segment_end"] = helpers::format_address(seg->end_ea);
@@ -4281,7 +4462,7 @@ tool_result_t detect_obfuscation_patterns(const json& params)
         {
             for (bool xok = xb.first_to(item, XREF_ALL); xok; xok = xb.next_to())
             {
-                if (xb.iscode && func_contains(pfn, xb.from))
+                if (xb.iscode && aida_func_contains(pfn, xb.from))
                 {
                     has_incoming = true;
                     break;
@@ -4355,13 +4536,13 @@ tool_result_t analyze_control_flow(const json& params)
         if (is_basic_block_end(insn, false))
         {
             ea_t fall = item + insn.size;
-            if (fall < pfn->end_ea && func_contains(pfn, fall))
+            if (fall < pfn->end_ea && aida_func_contains(pfn, fall))
                 block_starts.insert(fall);
 
             xrefblk_t xb;
             for (bool xok = xb.first_from(item, XREF_ALL); xok; xok = xb.next_from())
             {
-                if (xb.iscode && func_contains(pfn, xb.to))
+                if (xb.iscode && aida_func_contains(pfn, xb.to))
                     block_starts.insert(xb.to);
             }
         }
@@ -4396,7 +4577,7 @@ tool_result_t analyze_control_flow(const json& params)
         xrefblk_t xb;
         for (bool xok = xb.first_from(last_insn, XREF_ALL); xok; xok = xb.next_from())
         {
-            if (xb.iscode && func_contains(pfn, xb.to))
+            if (xb.iscode && aida_func_contains(pfn, xb.to))
             {
                 ++edge_count;
                 successors.push_back(helpers::format_address(xb.to));
@@ -4410,7 +4591,7 @@ tool_result_t analyze_control_flow(const json& params)
         if (decode_insn(&last, last_insn) > 0)
         {
             fall = last_insn + last.size;
-            if (fall < pfn->end_ea && func_contains(pfn, fall) && !is_basic_block_end(last, true))
+            if (fall < pfn->end_ea && aida_func_contains(pfn, fall) && !is_basic_block_end(last, true))
             {
                 ++edge_count;
                 successors.push_back(helpers::format_address(fall));
@@ -4493,11 +4674,11 @@ tool_result_t get_function_complexity(const json& params)
         if (is_basic_block_end(insn, false))
         {
             ea_t fall = item + insn.size;
-            if (func_contains(pfn, fall)) { block_starts.insert(fall); ++edge_count; }
+            if (aida_func_contains(pfn, fall)) { block_starts.insert(fall); ++edge_count; }
             xrefblk_t xb;
             for (bool xok = xb.first_from(item, XREF_ALL); xok; xok = xb.next_from())
             {
-                if (xb.iscode && func_contains(pfn, xb.to))
+                if (xb.iscode && aida_func_contains(pfn, xb.to))
                 {
                     block_starts.insert(xb.to);
                     ++edge_count;
@@ -5624,7 +5805,7 @@ tool_result_t detect_hooks(const json& params)
         {
             h["target"] = helpers::format_address(hook_target);
             segment_t* ts = getseg(hook_target);
-            if (ts) { qstring sn; if (get_segm_name(&sn, ts) && !sn.empty()) h["target_segment"] = sn.c_str(); }
+            if (ts) { qstring sn; if (aida_get_segm_name(&sn, ts) && !sn.empty()) h["target_segment"] = sn.c_str(); }
             qstring tn;
             if (get_name(&tn, hook_target) && !tn.empty()) h["target_name"] = tn.c_str();
         }
@@ -6399,7 +6580,7 @@ tool_result_t nop_junk_instructions(const json& params)
             bool has_incoming = false;
             for (bool xok = xb.first_to(item, XREF_ALL); xok; xok = xb.next_to())
             {
-                if (xb.iscode && func_contains(pfn, xb.from))
+                if (xb.iscode && aida_func_contains(pfn, xb.from))
                 {
                     has_incoming = true;
                     break;
@@ -6522,7 +6703,7 @@ tool_result_t nop_junk_instructions(const json& params)
     }
 
     if (nops_patched > 0)
-        reanalyze_function(pfn);
+        aida_reanalyze_function(pfn);
 
     result["patches"]               = std::move(patches);
     result["nops_patched"]          = nops_patched;
@@ -6671,7 +6852,7 @@ tool_result_t resolve_opaque_predicates(const json& params)
     }
 
     if (!dry_run && count > 0)
-        reanalyze_function(pfn);
+        aida_reanalyze_function(pfn);
 
     result["resolved"]  = std::move(resolved);
     result["count"]     = count;
@@ -6839,7 +7020,7 @@ tool_result_t patch_anti_debug(const json& params)
     }
 
     if (!dry_run && total_patched > 0 && pfn)
-        reanalyze_function(pfn);
+        aida_reanalyze_function(pfn);
 
     result["patches"]       = std::move(patches);
     result["total_patched"] = total_patched;
@@ -7078,7 +7259,7 @@ tool_result_t rebuild_function(const json& params)
 
     if (pfn)
     {
-        reanalyze_function(pfn);
+        aida_reanalyze_function(pfn);
         result["new_start"] = helpers::format_address(pfn->start_ea);
         result["new_end"]   = helpers::format_address(pfn->end_ea);
         result["new_size"]  = pfn->end_ea - pfn->start_ea;
@@ -7151,7 +7332,7 @@ tool_result_t identify_protector(const json& params)
         if (!seg) continue;
 
         qstring sname;
-        get_segm_name(&sname, seg);
+        aida_get_segm_name(&sname, seg);
 
         for (int k = 0; section_sigs[k].name; ++k)
         {
@@ -7241,7 +7422,7 @@ tool_result_t identify_protector(const json& params)
         if (!seg) continue;
 
         qstring sname;
-        get_segm_name(&sname, seg);
+        aida_get_segm_name(&sname, seg);
         if (sname != ".rdata" && sname != ".data" && sname != ".rsrc") continue;
 
         ea_t seg_end = std::min(seg->end_ea, seg->start_ea + static_cast<ea_t>(0x100000));
@@ -7277,7 +7458,7 @@ tool_result_t identify_protector(const json& params)
         if (!seg || seg->size() == 0) continue;
 
         qstring sname;
-        get_segm_name(&sname, seg);
+        aida_get_segm_name(&sname, seg);
 
         size_t sample_size = std::min(static_cast<size_t>(seg->size()), static_cast<size_t>(4096));
         int freq[256] = {0};
@@ -7379,13 +7560,13 @@ tool_result_t deobfuscate_control_flow(const json& params)
         if (is_basic_block_end(insn, false))
         {
             ea_t fall = item + insn.size;
-            if (func_contains(pfn, fall))
+            if (aida_func_contains(pfn, fall))
                 all_block_starts.insert(fall);
 
             xrefblk_t xb;
             for (bool xok = xb.first_from(item, XREF_ALL); xok; xok = xb.next_from())
             {
-                if (xb.iscode && func_contains(pfn, xb.to))
+                if (xb.iscode && aida_func_contains(pfn, xb.to))
                 {
                     all_block_starts.insert(xb.to);
                     if (xb.to <= item)
@@ -7575,7 +7756,7 @@ tool_result_t reconstruct_imports(const json& params)
         if (!seg) continue;
 
         qstring sname;
-        get_segm_name(&sname, seg);
+        aida_get_segm_name(&sname, seg);
 
         bool is_iat = (sname == ".idata" || sname == ".rdata" || sname == "IAT");
         if (!is_iat) continue;
@@ -7649,7 +7830,7 @@ tool_result_t reconstruct_imports(const json& params)
         if (target_seg)
         {
             qstring seg_name;
-            get_segm_name(&seg_name, target_seg);
+            aida_get_segm_name(&seg_name, target_seg);
 
             if (target_seg->perm & SEGPERM_EXEC)
             {
@@ -12337,7 +12518,7 @@ tool_result_t list_entry_points_enriched(const json& params)
         if (is_thunk)
         {
             ea_t fptr = BADADDR;
-            ea_t target = calc_thunk_func_target(pfn, &fptr);
+            ea_t target = aida_calc_thunk_func_target(pfn, &fptr);
             j["thunk_target"] = ea_to_json(target);
             j["thunk_function_pointer"] = ea_to_json(fptr);
         }
@@ -12480,7 +12661,7 @@ tool_result_t classify_thunks_and_guards(const json& params)
         if ((pfn->flags & FUNC_THUNK) != 0)
         {
             ea_t fptr = BADADDR;
-            ea_t target = calc_thunk_func_target(pfn, &fptr);
+            ea_t target = aida_calc_thunk_func_target(pfn, &fptr);
             json t;
             t["ea"] = helpers::format_address(pfn->start_ea);
             t["target"] = ea_to_json(target);
@@ -13722,7 +13903,7 @@ namespace
         try
         {
             hexrays_failure_t hf;
-            cfuncptr_t cfunc = decompile_func(pfn, &hf, DECOMP_NO_WAIT);
+            cfuncptr_t cfunc = aida_decompile_func(pfn, &hf, DECOMP_NO_WAIT);
             if (cfunc != nullptr)
             {
                 switch_collector_t vis(&tables);
