@@ -977,7 +977,10 @@ def override_read_struct_contract(contract: dict[str, Any]) -> None:
         },
         "required": ["address", "size", "requested_size", "complete", "hex", "ascii", "fields", "struct"],
     }
-    contract["output_schema"] = {"oneOf": [legacy_output_schema, live_output_schema]}
+    contract["output_schema"] = {
+        "type": "object",
+        "oneOf": [legacy_output_schema, live_output_schema],
+    }
 
     annotations = contract["annotations"]
     annotations["parameters"] = [

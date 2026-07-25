@@ -46,9 +46,9 @@ struct contract_descriptor_t {
 };
 
 inline constexpr std::string_view k_pinned_archive_sha256 = "77FB255DEF04BA8ABD3D6BFA306916FA27597CF369D2863C4614ECFFEA288F0C";
-inline constexpr std::string_view k_generated_contract_ledger_sha256 = "DD084F655A1EA9B81D173D8C4E4ABE040F218E25448C05EB2DA48441A09177A8";
+inline constexpr std::string_view k_generated_contract_ledger_sha256 = "6890A3CA0FB52E7FD91B414583C508B1955A141B410808A151DD6E1559938B70";
 inline constexpr std::string_view k_generated_effect_ledger_sha256 = "E8E4AECA80C597FAE5A9C33BCBE4BBA9B0BC0D0B67A5FBE50B338504AB06563C";
-inline constexpr std::string_view k_generated_archive_manifest_sha256 = "98CD62E0F3BCB32C59D89679F5D49F03647631A7A2F884A548EDE6E7CBA42B5F";
+inline constexpr std::string_view k_generated_archive_manifest_sha256 = "5C8459ECB79DCCCCA299D1D4AC1A207A626362A2119F29CE25807B140B4A9A5D";
 inline constexpr std::size_t k_archive_tool_count = 88;
 inline constexpr std::size_t k_compatibility_tool_count = 88;
 inline constexpr std::size_t k_aida_extension_count = 4;

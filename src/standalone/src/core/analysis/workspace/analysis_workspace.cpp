@@ -3970,7 +3970,7 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
     }
     if (persisted_revision == 0 || persisted_revision <= expected_current ||
         persisted_revision == (std::numeric_limits<std::uint64_t>::max)() ||
-        persisted_generation <= source->generation ||
+        persisted_generation < source->generation ||
         persisted_generation == (std::numeric_limits<std::uint64_t>::max)())
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::revision_conflict,

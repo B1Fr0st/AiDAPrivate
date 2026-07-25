@@ -24,7 +24,7 @@
   "contract_generation": {
     "generator": {
       "path": "tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py",
-      "sha256": "46A519878A4DA55AD8FC844572A0062FE02D0401266743B12B91A00F1A8655DD"
+      "sha256": "778045A0C79894B6BE933A9E85178C0443677884B704B93BFDF5B3B75973F6CF"
     },
     "reproduction_policy": "pinned_zip_data_only_byte_exact_offline",
     "artifacts": [
@@ -35,9 +35,9 @@
       "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp"
     ],
     "descriptor_artifact_sha256": {
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "DD084F655A1EA9B81D173D8C4E4ABE040F218E25448C05EB2DA48441A09177A8",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "6890A3CA0FB52E7FD91B414583C508B1955A141B410808A151DD6E1559938B70",
       "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json": "E8E4AECA80C597FAE5A9C33BCBE4BBA9B0BC0D0B67A5FBE50B338504AB06563C",
-      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "98CD62E0F3BCB32C59D89679F5D49F03647631A7A2F884A548EDE6E7CBA42B5F"
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "5C8459ECB79DCCCCA299D1D4AC1A207A626362A2119F29CE25807B140B4A9A5D"
     }
   },
   "current_surface_reproduction": {
