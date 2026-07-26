@@ -1,13 +1,23 @@
 #pragma once
 
 #include "overlay_projection.hpp"
+#include "workspace/pe_baseline_analyzer.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace aida {
 namespace analysis {
+
+class analysis_workspace_t;
+struct analysis_snapshot_t;
+class byte_provider_t;
+class analysis_metrics_t;
+class cancellation_token_t;
 
 enum class reanalysis_stage_t : std::uint8_t {
     none = 0,
@@ -97,6 +107,32 @@ public:
     static reanalysis_scope_t merge_scopes(
         const reanalysis_scope_t& lhs,
         const reanalysis_scope_t& rhs);
+};
+
+struct incremental_reanalysis_executor_settings_t final {
+    baseline_analysis_settings_t baseline_settings;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+};
+
+struct incremental_reanalysis_executor_result_t final {
+    bool ok = false;
+    bool fallback_to_full = false;
+    std::shared_ptr<const analysis_snapshot_t> merged_snapshot;
+    std::shared_ptr<analysis_metrics_t> metrics;
+    std::string detail;
+
+    explicit operator bool() const noexcept { return ok; }
+};
+
+class incremental_reanalysis_executor_t final {
+public:
+    static incremental_reanalysis_executor_result_t execute(
+        std::shared_ptr<analysis_workspace_t> workspace,
+        const reanalysis_scope_t& scope,
+        const projection_invalidation_set_t& invalidation,
+        std::shared_ptr<const byte_provider_t> projected_provider,
+        incremental_reanalysis_executor_settings_t settings,
+        const cancellation_token_t& cancel = {});
 };
 
 }

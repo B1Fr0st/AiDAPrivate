@@ -12,6 +12,58 @@ namespace aida::analysis {
 
 constexpr std::uint32_t k_pseudocode_readability_schema_version = 2;
 
+struct readability_transform_settings_t {
+    bool enable_variable_renaming = true;
+    bool enable_expression_simplification = true;
+    bool enable_temporary_coalescing = true;
+    bool enable_loop_counter_naming = true;
+    bool enable_api_call_naming = true;
+    bool enable_type_based_naming = true;
+    bool enable_string_reference_naming = true;
+    bool enable_constant_folding = true;
+    bool enable_identity_simplification = true;
+    bool enable_cast_simplification = true;
+    bool enable_comparison_normalization = true;
+    bool enable_compound_assignment_marking = true;
+    bool enable_double_negation_simplification = true;
+    bool enable_single_use_inlining = true;
+    bool enable_copy_propagation = true;
+    bool enable_dead_store_elimination = true;
+    std::size_t max_transform_iterations = 4;
+    std::size_t max_expression_depth = 256;
+};
+
+struct readability_transform_metrics_t {
+    std::uint64_t variables_renamed = 0;
+    std::uint64_t loop_counters_named = 0;
+    std::uint64_t api_call_names_applied = 0;
+    std::uint64_t type_based_names_applied = 0;
+    std::uint64_t string_reference_names_applied = 0;
+    std::uint64_t constants_folded = 0;
+    std::uint64_t identities_simplified = 0;
+    std::uint64_t casts_simplified = 0;
+    std::uint64_t double_negations_simplified = 0;
+    std::uint64_t comparisons_normalized = 0;
+    std::uint64_t compound_assignments_marked = 0;
+    std::uint64_t temporaries_inlined = 0;
+    std::uint64_t copies_propagated = 0;
+    std::uint64_t dead_stores_eliminated = 0;
+    std::uint64_t nodes_removed = 0;
+};
+
+struct readability_transform_result_t {
+    bool transformed = false;
+    readability_transform_metrics_t metrics;
+    std::vector<decompiler_diagnostic_t> diagnostics;
+
+    bool succeeded() const noexcept;
+};
+
+readability_transform_result_t apply_readability_transforms(
+    typed_pseudocode_ast_v2_t& ast,
+    const type_graph_t& type_graph,
+    const readability_transform_settings_t& settings = {});
+
 enum class pseudocode_baseline_provider_t : std::uint8_t {
     ghidra_printc = 1,
     aida_current = 2

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "triton_z3_adapter.hpp"
+#include "pseudocode_readability.hpp"
 
 #include <cstdint>
 #include <memory>

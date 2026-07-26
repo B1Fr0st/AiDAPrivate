@@ -40,6 +40,10 @@
 #include <utility>
 #include <vector>
 
+#include <cstdio>
+#include <functional>
+#include <process.h>
+
 namespace aida::auth::c03_test {
 
 static_assert(std::is_same_v<decltype(codex::last_error()), std::string>);
@@ -53,11 +57,34 @@ static_assert(std::is_same_v<decltype(copilot::refresh_token(
 static_assert(std::is_same_v<decltype(claude_code::refresh_token(
     std::declval<const http::cancel_cb_t&>(), 1)), bool>);
 
+struct harness_log_t {
+    using clock_t = std::chrono::steady_clock;
+    static unsigned long pid() { return static_cast<unsigned long>(_getpid()); }
+    static unsigned long tid() { return static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id())); }
+    static std::uint64_t epoch_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(clock_t::now().time_since_epoch()).count(); }
+    static unsigned long win32_error() {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        return GetLastError();
+#else
+        return 0;
+#endif
+    }
+    static void emit(const char* test, const char* phase, const char* status, std::uint64_t elapsed_ms, const std::string& detail = {}) {
+        std::fprintf(stderr, "[C03-HARNESS] test=%s phase=%s status=%s elapsed=%llums pid=%lu tid=%lu errno=%d gle=%lu detail=%s\n",
+            test, phase, status, static_cast<unsigned long long>(elapsed_ms), pid(), tid(), static_cast<int>(errno), win32_error(),
+            detail.empty() ? "-" : detail.c_str());
+        std::fflush(stderr);
+    }
+};
+
 namespace {
 
 void require(bool condition, const char* message)
 {
-    if (!condition) throw std::runtime_error(message);
+    if (!condition) {
+        harness_log_t::emit("auth_browser_dispatch", "assertion", "fail", 0, message);
+        throw std::runtime_error(message);
+    }
 }
 
 struct fake_browser_t {
@@ -1191,25 +1218,92 @@ void test_refresh_cancellation_scope()
 
 bool run_auth_browser_dispatch_harness(std::string& failure)
 {
+    const auto harness_start = harness_log_t::epoch_ms();
+    harness_log_t::emit("auth_browser_dispatch", "harness", "enter", 0);
     try {
-        test_canonical_urls();
-		test_preview_fail_closed_paths();
-		test_provider_model_response_semantics();
-        test_allocation_submission_and_fault_terminals();
-		test_global_cap_cancellation_deadline_and_generation();
-		test_provider_snapshot_races();
-		test_provider_terminal_claims_and_owned_errors();
-		test_real_provider_listener_routing();
-		test_listener_state_raii_and_cancel_pending();
-		test_http_framing_completeness_and_limits();
-		test_refresh_cancellation_scope();
-		test_shutdown_cancel_pending();
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_canonical_urls", "enter", 0);
+            test_canonical_urls();
+            harness_log_t::emit("auth_browser_dispatch", "test_canonical_urls", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_preview_fail_closed_paths", "enter", 0);
+            test_preview_fail_closed_paths();
+            harness_log_t::emit("auth_browser_dispatch", "test_preview_fail_closed_paths", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_provider_model_response_semantics", "enter", 0);
+            test_provider_model_response_semantics();
+            harness_log_t::emit("auth_browser_dispatch", "test_provider_model_response_semantics", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_allocation_submission_and_fault_terminals", "enter", 0);
+            test_allocation_submission_and_fault_terminals();
+            harness_log_t::emit("auth_browser_dispatch", "test_allocation_submission_and_fault_terminals", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_global_cap_cancellation_deadline_and_generation", "enter", 0);
+            test_global_cap_cancellation_deadline_and_generation();
+            harness_log_t::emit("auth_browser_dispatch", "test_global_cap_cancellation_deadline_and_generation", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_provider_snapshot_races", "enter", 0);
+            test_provider_snapshot_races();
+            harness_log_t::emit("auth_browser_dispatch", "test_provider_snapshot_races", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_provider_terminal_claims_and_owned_errors", "enter", 0);
+            test_provider_terminal_claims_and_owned_errors();
+            harness_log_t::emit("auth_browser_dispatch", "test_provider_terminal_claims_and_owned_errors", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_real_provider_listener_routing", "enter", 0);
+            test_real_provider_listener_routing();
+            harness_log_t::emit("auth_browser_dispatch", "test_real_provider_listener_routing", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_listener_state_raii_and_cancel_pending", "enter", 0);
+            test_listener_state_raii_and_cancel_pending();
+            harness_log_t::emit("auth_browser_dispatch", "test_listener_state_raii_and_cancel_pending", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_http_framing_completeness_and_limits", "enter", 0);
+            test_http_framing_completeness_and_limits();
+            harness_log_t::emit("auth_browser_dispatch", "test_http_framing_completeness_and_limits", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_refresh_cancellation_scope", "enter", 0);
+            test_refresh_cancellation_scope();
+            harness_log_t::emit("auth_browser_dispatch", "test_refresh_cancellation_scope", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("auth_browser_dispatch", "test_shutdown_cancel_pending", "enter", 0);
+            test_shutdown_cancel_pending();
+            harness_log_t::emit("auth_browser_dispatch", "test_shutdown_cancel_pending", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
         reset_browser_operation_fixture();
         failure.clear();
+        harness_log_t::emit("auth_browser_dispatch", "harness", "pass", harness_log_t::epoch_ms() - harness_start);
         return true;
     } catch (const std::exception& ex) {
+        const auto elapsed = harness_log_t::epoch_ms() - harness_start;
+        harness_log_t::emit("auth_browser_dispatch", "harness", "fail", elapsed, ex.what());
         failure = ex.what();
     } catch (...) {
+        const auto elapsed = harness_log_t::epoch_ms() - harness_start;
+        harness_log_t::emit("auth_browser_dispatch", "harness", "fail", elapsed, "unknown auth browser dispatch harness failure");
         failure = "unknown auth browser dispatch harness failure";
     }
     reset_browser_operation_fixture();
@@ -1220,10 +1314,16 @@ bool run_auth_browser_dispatch_harness(std::string& failure)
 
 int main()
 {
+    const auto main_start = aida::auth::c03_test::harness_log_t::epoch_ms();
+    aida::auth::c03_test::harness_log_t::emit("auth_browser_dispatch", "main", "enter", 0);
     std::string failure;
     if (!aida::auth::c03_test::run_auth_browser_dispatch_harness(failure)) {
+        const auto elapsed = aida::auth::c03_test::harness_log_t::epoch_ms() - main_start;
+        aida::auth::c03_test::harness_log_t::emit("auth_browser_dispatch", "main", "fail", elapsed, failure);
         std::cerr << failure << '\n';
         return 1;
     }
+    const auto elapsed = aida::auth::c03_test::harness_log_t::epoch_ms() - main_start;
+    aida::auth::c03_test::harness_log_t::emit("auth_browser_dispatch", "main", "pass", elapsed);
     return 0;
 }

@@ -15,9 +15,25 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$script:HarnessStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Get-HarnessElapsedMs {
+    return [long]$script:HarnessStopwatch.ElapsedMilliseconds
+}
+
+function Write-HarnessLog {
+    param([string]$Test, [string]$Phase, [string]$Status, [long]$ElapsedMs = 0, [string]$Detail = '-')
+    $line = "[C03-HARNESS] test=$Test phase=$Phase status=$Status elapsed=${ElapsedMs}ms pid=$PID detail=$Detail"
+    [Console]::Error.WriteLine($line)
+    [Console]::Error.Flush()
+}
+
 function Require {
     param([bool]$Condition, [string]$Message)
-    if (-not $Condition) { throw $Message }
+    if (-not $Condition) {
+        Write-HarnessLog -Test 'package_distribution_policy' -Phase 'assertion' -Status 'fail' -ElapsedMs (Get-HarnessElapsedMs) -Detail $Message
+        throw $Message
+    }
 }
 
 function Convert-ArgumentPath {
@@ -27,6 +43,7 @@ function Convert-ArgumentPath {
 
 function Read-CompleteGeneration {
     param([string]$PointerPath)
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'read_complete_generation' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('pointer_path=' + $PointerPath)
     $pointerItem = Get-Item -LiteralPath $PointerPath -Force -ErrorAction Stop
     Require (-not $pointerItem.PSIsContainer -and $pointerItem.Length -gt 0 -and
         $pointerItem.Length -le 65536) 'complete generation pointer size is invalid'
@@ -59,7 +76,7 @@ function Read-CompleteGeneration {
     Require ($manifestHash -ceq [string]$pointer.manifest_sha256 -and
         [IO.File]::ReadAllText($digestPath, [Text.Encoding]::ASCII) -ceq ($manifestHash + "`n")) `
         'complete generation manifest/digest binding is invalid'
-    return [pscustomobject]@{
+    $result = [pscustomobject]@{
         id = [string]$pointer.generation_id
         package_root = $packageRoot
         manifest_path = $manifestPath
@@ -67,6 +84,8 @@ function Read-CompleteGeneration {
         manifest_sha256 = $manifestHash
         pointer_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $PointerPath).Hash.ToLowerInvariant()
     }
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'read_complete_generation' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('generation_id=' + $result.id)
+    return $result
 }
 
 function Read-BoundedText {
@@ -85,8 +104,15 @@ function Invoke-Child {
     & $Executable @Arguments 1> $stdout 2> $stderr
     $exitCode = $LASTEXITCODE
     $output = (Read-BoundedText -Path $stdout) + (Read-BoundedText -Path $stderr)
+    if ($exitCode -ne $ExpectedExit) {
+        Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_child' -Status 'fail' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('executable=' + $Executable + ' expected_exit=' + $ExpectedExit + ' actual_exit=' + $exitCode + ' output=' + $output)
+    }
     Require ($exitCode -eq $ExpectedExit) ('child process exit mismatch: ' + $exitCode + ' output=' + $output)
     if ($ExpectedMarker) {
+        $markerFound = $output.IndexOf($ExpectedMarker, [StringComparison]::Ordinal) -ge 0
+        if (-not $markerFound) {
+            Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_child' -Status 'fail' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('executable=' + $Executable + ' expected_marker=' + $ExpectedMarker + ' not_found output=' + $output)
+        }
         Require ($output.IndexOf($ExpectedMarker, [StringComparison]::Ordinal) -ge 0) ('child process marker missing: ' + $ExpectedMarker + ' output=' + $output)
     }
     return $output
@@ -98,11 +124,16 @@ function Invoke-TerminatedChild {
     [IO.Directory]::CreateDirectory($capture) | Out-Null
     $stdout = Join-Path $capture 'stdout.txt'
     $stderr = Join-Path $capture 'stderr.txt'
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_terminated_child' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('executable=' + $Executable)
     $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -PassThru `
         -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     Require ($process.WaitForExit(120000)) 'terminated publication child exceeded its deadline'
     $process.WaitForExit()
+    if ($process.ExitCode -eq 0) {
+        Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_terminated_child' -Status 'fail' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('executable=' + $Executable + ' unexpected_success_exit=0')
+    }
     Require ($process.ExitCode -ne 0) 'publication termination checkpoint returned success'
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_terminated_child' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('executable=' + $Executable)
 }
 
 function New-CaseRoot {
@@ -186,15 +217,18 @@ function New-PePostProcessFixture {
 
 function Invoke-PolicyCase {
     param([string]$Root, [string]$Marker, [string[]]$Limits = @())
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_policy_case' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('root=' + $Root + ' marker=' + $Marker)
     $report = Join-Path $script:ReportRoot (([IO.Path]::GetFileName($Root)) + '.json')
     $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
         '-File', (Convert-ArgumentPath $Producer), '-PackageRoot', (Convert-ArgumentPath $Root),
         '-PolicyFixtureReport', (Convert-ArgumentPath $report), '-Force') + $Limits
     Invoke-Child -Executable $PowerShellExecutable -Arguments $arguments -ExpectedExit 1 -ExpectedMarker $Marker | Out-Null
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_policy_case' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('root=' + $Root + ' marker=' + $Marker)
 }
 
 function Invoke-AcceptedPolicyCase {
     param([string]$Root, [string[]]$Limits = @())
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_accepted_policy_case' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('root=' + $Root)
     $report = Join-Path $script:ReportRoot (([IO.Path]::GetFileName($Root)) + '-' +
         [Guid]::NewGuid().ToString('N') + '.json')
     $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
@@ -202,8 +236,10 @@ function Invoke-AcceptedPolicyCase {
         '-PolicyFixtureReport', (Convert-ArgumentPath $report), '-Force') + $Limits
     Invoke-Child -Executable $PowerShellExecutable -Arguments $arguments -ExpectedExit 0 `
         -ExpectedMarker 'aida.c03.package-policy-fixture.v1' | Out-Null
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'invoke_accepted_policy_case' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs) -Detail ('root=' + $Root)
 }
 
+Write-HarnessLog -Test 'package_distribution_policy' -Phase 'input_validation' -Status 'enter' -ElapsedMs 0
 foreach ($inputPath in @($PowerShellExecutable, $Producer, $ContractVerifier,
         $ProductionVerifier, $StageSpec, $PathBytePolicy, $AuthorityLock,
         $ProtectorTool, $ProtectorVerifier)) {
@@ -211,15 +247,21 @@ foreach ($inputPath in @($PowerShellExecutable, $Producer, $ContractVerifier,
 }
 $scratch = [IO.Path]::GetFullPath($ScratchRoot)
 [IO.Directory]::CreateDirectory($scratch) | Out-Null
+Write-HarnessLog -Test 'package_distribution_policy' -Phase 'input_validation' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
 $script:WorkRoot = Join-Path $scratch ('run-' + [Guid]::NewGuid().ToString('N'))
 $script:ReportRoot = Join-Path $script:WorkRoot 'reports'
 [IO.Directory]::CreateDirectory($script:ReportRoot) | Out-Null
 $junction = $null
 $symlink = $null
 
-try {
-    Invoke-Child -Executable $ContractVerifier -Arguments @() -ExpectedExit 0 -ExpectedMarker 'verified package contract fixtures' | Out-Null
+Write-HarnessLog -Test 'package_distribution_policy' -Phase 'harness' -Status 'enter' -ElapsedMs 0 -Detail ('scratch=' + $scratch)
 
+try {
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'contract_verifier' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
+    Invoke-Child -Executable $ContractVerifier -Arguments @() -ExpectedExit 0 -ExpectedMarker 'verified package contract fixtures' | Out-Null
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'contract_verifier' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
+
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'pe_post_process' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
     $peFixtureRoot = New-CaseRoot 'pe-post-process'
     foreach ($peCase in @(
         @('clean', 0, '"schema":"aida.c03.pe-post-process-measurement"'),
@@ -237,7 +279,9 @@ try {
             '--deadline-ms', '120000') -ExpectedExit ([int]$peCase[1]) `
             -ExpectedMarker ([string]$peCase[2]) | Out-Null
     }
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'pe_post_process' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
 
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'utf8_path_byte_policy' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
     $pathPolicy = Get-Content -LiteralPath $PathBytePolicy -Raw -Encoding UTF8 | ConvertFrom-Json
     Require ($pathPolicy.schema -ceq 'aida.c03.utf8-path-byte-policy.v1' -and
         [int]$pathPolicy.maximum_relative_path_bytes -eq 32768 -and
@@ -257,7 +301,9 @@ try {
             Invoke-PolicyCase -Root $root -Marker 'AIDA_C03_PACKAGE_POLICY_PATH_POLICY'
         }
     }
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'utf8_path_byte_policy' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
 
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'valid_hardlink_cases' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
     $valid = New-CaseRoot 'valid'
     $validFile = Join-Path $valid 'allowed.bin'
     [IO.File]::WriteAllBytes($validFile, [byte[]](1, 2, 3, 4))
@@ -303,7 +349,9 @@ try {
     Invoke-Child -Executable $PowerShellExecutable -Arguments $rawArguments -ExpectedExit 1 -ExpectedMarker 'AIDA_C03_PACKAGE_POLICY_RAW_ABSOLUTE_PATH' | Out-Null
     $rawArguments[8] = (Convert-ArgumentPath $valid) + ' '
     Invoke-Child -Executable $PowerShellExecutable -Arguments $rawArguments -ExpectedExit 1 -ExpectedMarker 'AIDA_C03_PACKAGE_POLICY_RAW_ABSOLUTE_PATH' | Out-Null
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'valid_hardlink_cases' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
 
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'path_policy_edge_cases' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
     foreach ($case in @(
         @('unicode', 'payload-' + [char]0x394 + '.bin'),
         @('control', "payload`t.bin"),
@@ -341,7 +389,9 @@ try {
     Invoke-PolicyCase -Root $byteLimit -Marker 'AIDA_C03_PACKAGE_POLICY_RESOURCE_PATH_BUFFER_LIMIT' -Limits @('-FixtureMaximumInventoryPathBytes', '1')
     Invoke-PolicyCase -Root $byteLimit -Marker 'AIDA_C03_PACKAGE_POLICY_RESOURCE_FILE_BYTES_LIMIT' -Limits @('-FixtureMaximumEntryBytes', '1')
     Invoke-PolicyCase -Root $byteLimit -Marker 'AIDA_C03_PACKAGE_POLICY_RESOURCE_TOTAL_BYTES_LIMIT' -Limits @('-FixtureMaximumAggregateBytes', '1')
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'path_policy_edge_cases' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
 
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'reparse_point_cases' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
     $reparseTarget = New-CaseRoot 'reparse-target'
     [IO.File]::WriteAllText((Join-Path $reparseTarget 'target.bin'), 'target')
     $reparseRoot = New-CaseRoot 'reparse-root'
@@ -353,7 +403,9 @@ try {
     New-Item -ItemType SymbolicLink -Path $symlink -Target $reparseTarget -ErrorAction Stop | Out-Null
     Invoke-PolicyCase -Root $reparseRoot -Marker 'AIDA_C03_PACKAGE_POLICY_REPARSE_POINT'
     Remove-Item -LiteralPath $symlink -Force
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'reparse_point_cases' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
 
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'staging_and_generation' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
     $source = New-CaseRoot 'developer-source'
     [IO.Directory]::CreateDirectory((Join-Path $source 'resources')) | Out-Null
     [IO.File]::WriteAllText((Join-Path $source 'AiDAStandalone.exe'), 'protected-fixture')
@@ -531,6 +583,9 @@ try {
         $concurrentFinal.manifest_sha256 -ceq $stableGeneration.manifest_sha256) `
         'concurrent readers observed a torn or mixed generation'
 
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'staging_and_generation' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
+
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'signing_authority' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
     $signingFixtureRoot = New-CaseRoot 'signing-authority-point-of-use'
     $signingArtifact = Join-Path $signingFixtureRoot 'artifact.exe'
     $signingProvider = Join-Path $signingFixtureRoot 'fixture-signing-provider.exe'
@@ -625,7 +680,13 @@ try {
         '--deadline-ms', '120000')
     Invoke-Child -Executable $ProductionVerifier -Arguments $productionArguments -ExpectedExit 1 `
         -ExpectedMarker 'unable to lock required file' | Out-Null
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'signing_authority' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'harness' -Status 'pass' -ElapsedMs (Get-HarnessElapsedMs)
+} catch {
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'harness' -Status 'fail' -ElapsedMs (Get-HarnessElapsedMs) -Detail $_.Exception.Message
+    throw
 } finally {
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'cleanup' -Status 'enter' -ElapsedMs (Get-HarnessElapsedMs)
     foreach ($reparsePath in @($symlink, $junction)) {
         if ($reparsePath -and ([IO.Directory]::Exists($reparsePath) -or [IO.File]::Exists($reparsePath))) {
             Remove-Item -LiteralPath $reparsePath -Force -ErrorAction Stop
@@ -634,6 +695,8 @@ try {
     if ([IO.Directory]::Exists($script:WorkRoot)) {
         Remove-Item -LiteralPath $script:WorkRoot -Recurse -Force
     }
+    Write-HarnessLog -Test 'package_distribution_policy' -Phase 'cleanup' -Status 'exit' -ElapsedMs (Get-HarnessElapsedMs)
 }
 
+Write-HarnessLog -Test 'package_distribution_policy' -Phase 'harness' -Status 'exit' -ElapsedMs (Get-HarnessElapsedMs)
 [Console]::Out.WriteLine('aida.c03.package-distribution-policy.v1')

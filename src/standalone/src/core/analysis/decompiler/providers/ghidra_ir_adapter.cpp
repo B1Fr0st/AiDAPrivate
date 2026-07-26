@@ -481,7 +481,9 @@ hir_semantics_t hir_semantics(const capture_value_t& value,
         result.supported = select({1}) && value.operand_ids.size() == 2;
         break;
     case ghidra::CPUI_BRANCHIND:
-        result.supported = false;
+        result.kind = hir_node_kind_t::switch_branch;
+        result.stable_value = "switch";
+        result.supported = select({0}) && value.operand_ids.size() == 1;
         break;
     case ghidra::CPUI_CALL:
     case ghidra::CPUI_CALLIND:
@@ -497,7 +499,9 @@ hir_semantics_t hir_semantics(const capture_value_t& value,
         result.supported = result.operands.size() <= 1;
         break;
     case ghidra::CPUI_MULTIEQUAL:
-        result.supported = false;
+        result.kind = hir_node_kind_t::phi;
+        result.stable_value = "phi";
+        result.supported = !value.operand_ids.empty();
         break;
     case ghidra::CPUI_CAST:
     case ghidra::CPUI_INT_ZEXT:
@@ -505,7 +509,9 @@ hir_semantics_t hir_semantics(const capture_value_t& value,
         result.supported = select({0}) && value.operand_ids.size() == 1;
         break;
     case ghidra::CPUI_SUBPIECE:
-        result.supported = false;
+        result.kind = hir_node_kind_t::cast;
+        result.stable_value = "subpiece";
+        result.supported = select({0}) && value.operand_ids.size() == 2;
         break;
     case ghidra::CPUI_PTRADD:
     case ghidra::CPUI_PTRSUB:

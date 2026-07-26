@@ -237,7 +237,7 @@ def main():
     parser.add_argument("--policy-cases", required=True, type=pathlib.Path)
     parser.add_argument("--approved-root", required=True, type=pathlib.Path)
     parser.add_argument("--output", required=True, type=pathlib.Path)
-    parser.add_argument("--digest", required=True, type=pathlib.Path)
+    parser.add_argument("--digest", required=False, type=pathlib.Path, default=None)
     parser.add_argument("--build-identity", required=True)
     parser.add_argument("--contract-identity", required=True)
     args = parser.parse_args()
@@ -250,9 +250,12 @@ def main():
     require_non_reparse_chain(requested_root)
     root = requested_root.resolve(strict=True)
     output = args.output.absolute()
-    digest_output = args.digest.absolute()
-    if output.name != "manifest.json" or digest_output.name != "manifest.sha256" or output.parent.resolve(strict=True) != root or digest_output.parent.resolve(strict=True) != root:
-        fail("manifest outputs must use canonical names directly under the approved root")
+    if output.name != "manifest.json" or output.parent.resolve(strict=True) != root:
+        fail("manifest output must use the canonical name directly under the approved root")
+    if args.digest is not None:
+        digest_output = args.digest.absolute()
+        if digest_output.name != "manifest.sha256" or digest_output.parent.resolve(strict=True) != root:
+            fail("manifest digest output must use the canonical name directly under the approved root")
     inventory = load_json(args.inventory)
     records = load_json(args.target_records)
     exact_keys(inventory, {"schema", "version", "defaults", "entries"}, "inventory")
@@ -381,7 +384,8 @@ def main():
     }
     data = canonical_bytes(manifest)
     atomic_write(output, data)
-    atomic_write(digest_output, hashlib.sha256(data).hexdigest().encode("ascii") + b"\n")
+    if args.digest is not None:
+        atomic_write(digest_output, hashlib.sha256(data).hexdigest().encode("ascii") + b"\n")
 
 
 if __name__ == "__main__":

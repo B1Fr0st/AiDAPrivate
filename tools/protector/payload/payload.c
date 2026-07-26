@@ -71,6 +71,7 @@ typedef uint32_t (__stdcall *rtl_add_func_t)(void*, uint32_t, uint64_t);
 typedef long (__stdcall *ldr_load_t)(uint16_t*, uint32_t*, unicode_string_t*, void**);
 typedef int (__stdcall *vp_t)(void*, size_t, uint32_t, uint32_t*);
 typedef void* (__stdcall *ll_t)(const char*);
+typedef void* (__stdcall *ll_ex_w_t)(const uint16_t*, void*, uint32_t);
 typedef void* (__stdcall *gpa_t)(void*, const char*);
 typedef uint32_t (__stdcall *get_env_w_t)(const uint16_t*, uint16_t*, uint32_t);
 typedef void* (__stdcall *create_file_w_t)(const uint16_t*, uint32_t, uint32_t, void*, uint32_t, uint32_t, void*);
@@ -78,6 +79,7 @@ typedef int (__stdcall *write_file_t)(void*, const void*, uint32_t, uint32_t*, v
 typedef int (__stdcall *close_handle_t)(void*);
 typedef uint32_t (__stdcall *get_u32_t)(void);
 typedef uint64_t (__stdcall *get_u64_t)(void);
+typedef uint32_t (__stdcall *get_module_file_name_w_t)(void*, uint16_t*, uint32_t);
 typedef void* (__stdcall *open_process_t)(uint32_t, int, uint32_t);
 typedef int (__stdcall *query_full_process_image_name_w_t)(void*, uint32_t, uint16_t*, uint32_t*);
 
@@ -92,7 +94,10 @@ typedef struct resolved_s {
     ldr_load_t LdrLoadDll;
     vp_t VirtualProtect;
     ll_t LoadLibraryA;
+    ll_ex_w_t LoadLibraryExW;
     gpa_t GetProcAddress;
+    get_module_file_name_w_t GetModuleFileNameW;
+    get_u32_t GetLastError;
 } resolved_t;
 
 typedef struct packed_header_s {
@@ -193,7 +198,10 @@ APL_STATIC_ASSERT(resource_fixup_key, offsetof(resource_fixup_t, rolling_key) ==
 #define HASH_LDRLOAD        0x34223840c85e30dfULL
 #define HASH_VIRTUALPROTECT 0xed1006223abbbd53ULL
 #define HASH_LOADLIBRARYA   0x69d265fe6b1c110fULL
+#define HASH_LOADLIBRARYEXW 0x8e5777f11905ab62ULL
 #define HASH_GETPROCADDR    0x578960f1fc7fff25ULL
+#define HASH_GETMODULEFILENAMEW 0x586cd84759fd3bdbULL
+#define HASH_GETLASTERROR   0xe0746e00b47c0477ULL
 #define HASH_NTQUERYINFOPROC 0x32ca9e4b50ffedaaULL
 #define HASH_NTGETCONTEXTTHREAD 0x60b61d0af197a950ULL
 #define HASH_NTQUERYSYSINFO 0xcac033026619e14aULL
@@ -208,7 +216,7 @@ APL_STATIC_ASSERT(resource_fixup_key, offsetof(resource_fixup_t, rolling_key) ==
 #define HASH_GETTICK64      0x228a6fe4178f3b37ULL
 #define HASH_OPENPROCESS    0x050d20e18d7fd1b6ULL
 #define HASH_QUERYFULLPROCESSIMAGENAMEW 0xb8858b47bc6d29e4ULL
-#define HASH_LIBZ3_DLL      0x0D92950913CC7E73ULL
+#define HASH_LIBZ3_DLL      0x43208291A20A37E9ULL
 
 #define IMG_MAGIC           0x41504B44u
 #define IMG_VERSION_LEGACY  0x00020000u
@@ -236,6 +244,7 @@ APL_STATIC_ASSERT(resource_fixup_key, offsetof(resource_fixup_t, rolling_key) ==
 #define APL_OPEN_ALWAYS     4u
 #define APL_FILE_NORMAL     0x00000080u
 #define APL_PROCESS_QUERY_LIMITED_INFORMATION 0x00001000u
+#define APL_LOAD_WITH_ALTERED_SEARCH_PATH 0x00000008u
 
 #define APL_EVENT_UNPACK_ENTER          0x1001u
 #define APL_EVENT_RESOLVE_FAIL          0x1002u
@@ -275,6 +284,9 @@ APL_STATIC_ASSERT(resource_fixup_key, offsetof(resource_fixup_t, rolling_key) ==
 #define APL_EVENT_IMPORT_SLOT_PROTECT   0x300Fu
 #define APL_EVENT_IMPORT_SLOT_WRITE     0x3010u
 #define APL_EVENT_IMPORT_SLOT_RESTORE   0x3011u
+#define APL_EVENT_IMPORT_NAME_CHUNK      0x3012u
+#define APL_EVENT_IMPORT_SIDECAR_PATH    0x3013u
+#define APL_EVENT_IMPORT_SIDECAR_LOAD    0x3014u
 
 #define APL_EVENT_LARGE_PAGES_OK        0x4001u
 #define APL_EVENT_LARGE_PAGES_FALLBACK  0x4002u
@@ -1942,15 +1954,27 @@ static int resolve_all(resolved_t* r) {
     r->LdrLoadDll = (ldr_load_t)resolve_export(r->ntdll, HASH_LDRLOAD, 0, 0, 0);
     r->VirtualProtect = (vp_t)resolve_export(r->kernel32, HASH_VIRTUALPROTECT, 0, 0, 0);
     r->LoadLibraryA = (ll_t)resolve_export(r->kernel32, HASH_LOADLIBRARYA, 0, 0, 0);
+    r->LoadLibraryExW = (ll_ex_w_t)resolve_export(r->kernel32, HASH_LOADLIBRARYEXW, 0, 0, 0);
     r->GetProcAddress = (gpa_t)resolve_export(r->kernel32, HASH_GETPROCADDR, 0, 0, 0);
+    r->GetModuleFileNameW = (get_module_file_name_w_t)resolve_export(r->kernel32, HASH_GETMODULEFILENAMEW, 0, 0, 0);
+    r->GetLastError = (get_u32_t)resolve_export(r->kernel32, HASH_GETLASTERROR, 0, 0, 0);
     if (r->VirtualProtect == 0 && r->kernelbase != 0) {
         r->VirtualProtect = (vp_t)resolve_export(r->kernelbase, HASH_VIRTUALPROTECT, 0, 0, 0);
     }
     if (r->LoadLibraryA == 0 && r->kernelbase != 0) {
         r->LoadLibraryA = (ll_t)resolve_export(r->kernelbase, HASH_LOADLIBRARYA, 0, 0, 0);
     }
+    if (r->LoadLibraryExW == 0 && r->kernelbase != 0) {
+        r->LoadLibraryExW = (ll_ex_w_t)resolve_export(r->kernelbase, HASH_LOADLIBRARYEXW, 0, 0, 0);
+    }
     if (r->GetProcAddress == 0 && r->kernelbase != 0) {
         r->GetProcAddress = (gpa_t)resolve_export(r->kernelbase, HASH_GETPROCADDR, 0, 0, 0);
+    }
+    if (r->GetModuleFileNameW == 0 && r->kernelbase != 0) {
+        r->GetModuleFileNameW = (get_module_file_name_w_t)resolve_export(r->kernelbase, HASH_GETMODULEFILENAMEW, 0, 0, 0);
+    }
+    if (r->GetLastError == 0 && r->kernelbase != 0) {
+        r->GetLastError = (get_u32_t)resolve_export(r->kernelbase, HASH_GETLASTERROR, 0, 0, 0);
     }
     return r->NtProtectVirtualMemory != 0
         && r->NtAllocateVirtualMemory != 0
@@ -1967,6 +1991,7 @@ typedef struct payload_log_apis_s {
     get_u32_t GetCurrentProcessId;
     get_u32_t GetCurrentThreadId;
     get_u64_t GetTickCount64;
+    get_module_file_name_w_t GetModuleFileNameW;
 } payload_log_apis_t;
 
 static void* payload_resolve_kernel_export(void* kernel32_local, void* kernelbase_local, uint64_t hash) {
@@ -1994,6 +2019,7 @@ static int payload_resolve_log_apis(payload_log_apis_t* out) {
     out->GetCurrentProcessId = (get_u32_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_GETPID);
     out->GetCurrentThreadId = (get_u32_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_GETTID);
     out->GetTickCount64 = (get_u64_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_GETTICK64);
+    out->GetModuleFileNameW = (get_module_file_name_w_t)payload_resolve_kernel_export(kernel32_local, kernelbase_local, HASH_GETMODULEFILENAMEW);
     return out->GetEnvironmentVariableW != 0
         && out->CreateFileW != 0
         && out->WriteFile != 0
@@ -2080,6 +2106,23 @@ static void payload_append_log_name(uint16_t* path, size_t* p, size_t cap) {
     payload_wput(path, p, cap, 'g');
 }
 
+static void payload_append_debug_log_name(uint16_t* path, size_t* p, size_t cap) {
+    payload_wput(path, p, cap, 'a');
+    payload_wput(path, p, cap, 'i');
+    payload_wput(path, p, cap, 'd');
+    payload_wput(path, p, cap, 'a');
+    payload_wput(path, p, cap, '_');
+    payload_wput(path, p, cap, 'd');
+    payload_wput(path, p, cap, 'e');
+    payload_wput(path, p, cap, 'b');
+    payload_wput(path, p, cap, 'u');
+    payload_wput(path, p, cap, 'g');
+    payload_wput(path, p, cap, '.');
+    payload_wput(path, p, cap, 'l');
+    payload_wput(path, p, cap, 'o');
+    payload_wput(path, p, cap, 'g');
+}
+
 static int payload_build_log_path(const payload_log_apis_t* api, uint16_t* path, size_t cap) {
     uint16_t env_name[8];
     payload_make_temp_env(env_name, 8, 0);
@@ -2122,6 +2165,30 @@ static int payload_build_log_path(const payload_log_apis_t* api, uint16_t* path,
     return 1;
 }
 
+static int payload_build_module_debug_log_path(const payload_log_apis_t* api, uint16_t* path, size_t cap) {
+    if (api == 0 || api->GetModuleFileNameW == 0 || path == 0 || cap < 64u) {
+        return 0;
+    }
+    mem_set(path, 0, cap * sizeof(uint16_t));
+    uint32_t got = api->GetModuleFileNameW(0, path, (uint32_t)cap);
+    if (got == 0u || got >= (uint32_t)cap) {
+        return 0;
+    }
+    size_t p = (size_t)got;
+    while (p > 0u && path[p - 1u] != (uint16_t)'\\' && path[p - 1u] != (uint16_t)'/') {
+        --p;
+    }
+    if (p == 0u || p + 24u >= cap) {
+        return 0;
+    }
+    payload_append_debug_log_name(path, &p, cap);
+    if (p + 1u >= cap) {
+        return 0;
+    }
+    path[p] = 0;
+    return 1;
+}
+
 static void payload_aput(char* s, size_t* p, size_t cap, char ch) {
     if (*p + 1u < cap) {
         s[*p] = ch;
@@ -2154,6 +2221,19 @@ static void payload_append_hex64(char* s, size_t* p, size_t cap, uint64_t v, uin
     }
 }
 
+static void payload_write_event_line(const payload_log_apis_t* api, const uint16_t* path, const char* line, uint32_t len) {
+    if (api == 0 || path == 0 || line == 0 || len == 0u) {
+        return;
+    }
+    void* h = api->CreateFileW(path, APL_FILE_APPEND_DATA, APL_FILE_SHARE_ALL, 0, APL_OPEN_ALWAYS, APL_FILE_NORMAL, 0);
+    if (h == 0 || h == (void*)(intptr_t)-1) {
+        return;
+    }
+    uint32_t written = 0;
+    api->WriteFile(h, line, len, &written, 0);
+    api->CloseHandle(h);
+}
+
 static void payload_log_event_impl(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c, int force) {
     payload_log_apis_t api;
     if (!payload_resolve_log_apis(&api)) {
@@ -2165,10 +2245,6 @@ static void payload_log_event_impl(uint32_t event_id, uint64_t a, uint64_t b, ui
     uint16_t path[384];
     mem_set(path, 0, sizeof(path));
     if (!payload_build_log_path(&api, path, 384)) {
-        return;
-    }
-    void* h = api.CreateFileW(path, APL_FILE_APPEND_DATA, APL_FILE_SHARE_ALL, 0, APL_OPEN_ALWAYS, APL_FILE_NORMAL, 0);
-    if (h == 0 || h == (void*)(intptr_t)-1) {
         return;
     }
     char line[448];
@@ -2223,9 +2299,14 @@ static void payload_log_event_impl(uint32_t event_id, uint64_t a, uint64_t b, ui
     payload_append_hex64(line, &p, sizeof(line), c, 16u);
     payload_aput(line, &p, sizeof(line), '\r');
     payload_aput(line, &p, sizeof(line), '\n');
-    uint32_t written = 0;
-    api.WriteFile(h, line, (uint32_t)p, &written, 0);
-    api.CloseHandle(h);
+    payload_write_event_line(&api, path, line, (uint32_t)p);
+    if (force) {
+        uint16_t module_path[384];
+        mem_set(module_path, 0, sizeof(module_path));
+        if (payload_build_module_debug_log_path(&api, module_path, 384)) {
+            payload_write_event_line(&api, module_path, line, (uint32_t)p);
+        }
+    }
 }
 
 static void payload_log_event(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c) {
@@ -2234,6 +2315,176 @@ static void payload_log_event(uint32_t event_id, uint64_t a, uint64_t b, uint64_
 
 static void payload_log_event_force(uint32_t event_id, uint64_t a, uint64_t b, uint64_t c) {
     payload_log_event_impl(event_id, a, b, c, 1);
+}
+
+static uint64_t payload_pack_ascii_chunk(const uint8_t* s, uint32_t len, uint32_t chunk) {
+    uint64_t out = 0u;
+    if (s == 0) {
+        return 0u;
+    }
+    uint32_t off = chunk * 8u;
+    for (uint32_t i = 0u; i < 8u && off + i < len; ++i) {
+        out |= ((uint64_t)s[off + i]) << (i * 8u);
+    }
+    return out;
+}
+
+static void payload_log_import_name_chunks(uint32_t import_index, uint64_t dll_hash, const uint8_t* name, uint32_t len) {
+    uint32_t chunks = (len + 7u) / 8u;
+    if (chunks == 0u) {
+        payload_log_event_force(APL_EVENT_IMPORT_NAME_CHUNK, ((uint64_t)import_index << 32), dll_hash, 0u);
+        return;
+    }
+    if (chunks > 12u) {
+        chunks = 12u;
+    }
+    for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
+        payload_log_event_force(APL_EVENT_IMPORT_NAME_CHUNK,
+                                ((uint64_t)import_index << 32) | ((uint64_t)chunk << 16) | (uint64_t)len,
+                                dll_hash,
+                                payload_pack_ascii_chunk(name, len, chunk));
+    }
+}
+
+static int payload_find_import_dll_name(const uint8_t* pool, uint32_t pool_size, uint64_t dll_hash,
+                                        const uint8_t** out_name, uint32_t* out_len, uint32_t* out_off) {
+    if (out_name != 0) {
+        *out_name = 0;
+    }
+    if (out_len != 0) {
+        *out_len = 0u;
+    }
+    if (out_off != 0) {
+        *out_off = 0u;
+    }
+    if (pool == 0 || pool_size == 0u || dll_hash == 0u) {
+        return 0;
+    }
+    uint32_t off = 0u;
+    while (off < pool_size) {
+        uint32_t nl = 0u;
+        while (off + nl < pool_size && pool[off + nl] != 0u) {
+            ++nl;
+        }
+        if (off + nl >= pool_size) {
+            return 0;
+        }
+        if (nl > 0u && fnv1a64_a_upper((const char*)(pool + off), nl) == dll_hash) {
+            if (out_name != 0) {
+                *out_name = pool + off;
+            }
+            if (out_len != 0) {
+                *out_len = nl;
+            }
+            if (out_off != 0) {
+                *out_off = off;
+            }
+            return 1;
+        }
+        off += nl + 1u;
+    }
+    return 0;
+}
+
+static uint64_t payload_hash_wide_path(const uint16_t* s, size_t cap) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    if (s == 0) {
+        return h;
+    }
+    for (size_t i = 0u; i < cap && s[i] != 0u; ++i) {
+        h ^= (uint64_t)(uint8_t)(s[i] & 0xFFu);
+        h *= 0x100000001b3ULL;
+        h ^= (uint64_t)(uint8_t)((s[i] >> 8) & 0xFFu);
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static size_t payload_wide_len(const uint16_t* s, size_t cap) {
+    size_t n = 0u;
+    if (s == 0) {
+        return 0u;
+    }
+    while (n < cap && s[n] != 0u) {
+        ++n;
+    }
+    return n;
+}
+
+static void payload_append_z3_sidecar_suffix(uint16_t* path, size_t* p, size_t cap) {
+    payload_wput(path, p, cap, 'd');
+    payload_wput(path, p, cap, 'e');
+    payload_wput(path, p, cap, 'p');
+    payload_wput(path, p, cap, 's');
+    payload_wput(path, p, cap, '\\');
+    payload_wput(path, p, cap, 'z');
+    payload_wput(path, p, cap, '3');
+    payload_wput(path, p, cap, '\\');
+    payload_wput(path, p, cap, 'l');
+    payload_wput(path, p, cap, 'i');
+    payload_wput(path, p, cap, 'b');
+    payload_wput(path, p, cap, 'z');
+    payload_wput(path, p, cap, '3');
+    payload_wput(path, p, cap, '.');
+    payload_wput(path, p, cap, 'd');
+    payload_wput(path, p, cap, 'l');
+    payload_wput(path, p, cap, 'l');
+}
+
+static int payload_build_z3_sidecar_path(const resolved_t* r, uint16_t* path, size_t cap) {
+    if (r == 0 || r->GetModuleFileNameW == 0 || path == 0 || cap < 96u) {
+        return 0;
+    }
+    mem_set(path, 0, cap * sizeof(uint16_t));
+    uint32_t got = r->GetModuleFileNameW(0, path, (uint32_t)cap);
+    if (got == 0u || got >= (uint32_t)cap) {
+        return 0;
+    }
+    size_t p = (size_t)got;
+    while (p > 0u && path[p - 1u] != (uint16_t)'\\' && path[p - 1u] != (uint16_t)'/') {
+        --p;
+    }
+    if (p == 0u || p + 24u >= cap) {
+        return 0;
+    }
+    payload_append_z3_sidecar_suffix(path, &p, cap);
+    if (p + 1u >= cap) {
+        return 0;
+    }
+    path[p] = 0;
+    return 1;
+}
+
+static void* payload_try_load_z3_sidecar(const resolved_t* r, uint32_t import_index,
+                                         const uint8_t* dll_name, uint32_t dll_name_len) {
+    payload_log_import_name_chunks(import_index, HASH_LIBZ3_DLL, dll_name, dll_name_len);
+    if (r == 0 || r->LoadLibraryExW == 0 || r->GetModuleFileNameW == 0) {
+        uint64_t api_bits = 0u;
+        if (r != 0 && r->LoadLibraryExW != 0) {
+            api_bits |= 1u;
+        }
+        if (r != 0 && r->GetModuleFileNameW != 0) {
+            api_bits |= 2u;
+        }
+        payload_log_event_force(APL_EVENT_IMPORT_SIDECAR_LOAD, ((uint64_t)import_index << 32) | 0x10u,
+                                HASH_LIBZ3_DLL, api_bits);
+        return 0;
+    }
+    uint16_t sidecar_path[512];
+    mem_set(sidecar_path, 0, sizeof(sidecar_path));
+    if (!payload_build_z3_sidecar_path(r, sidecar_path, 512)) {
+        payload_log_event_force(APL_EVENT_IMPORT_SIDECAR_LOAD, ((uint64_t)import_index << 32) | 0x11u,
+                                HASH_LIBZ3_DLL, 0u);
+        return 0;
+    }
+    size_t path_len = payload_wide_len(sidecar_path, 512);
+    uint64_t path_hash = payload_hash_wide_path(sidecar_path, 512);
+    payload_log_event_force(APL_EVENT_IMPORT_SIDECAR_PATH, import_index, path_hash, (uint64_t)path_len);
+    void* mod = r->LoadLibraryExW(sidecar_path, 0, APL_LOAD_WITH_ALTERED_SEARCH_PATH);
+    uint32_t gle = (mod == 0 && r->GetLastError != 0) ? r->GetLastError() : 0u;
+    payload_log_event_force(APL_EVENT_IMPORT_SIDECAR_LOAD, ((uint64_t)import_index << 32) | 0x12u,
+                            (uint64_t)(uintptr_t)mod, (uint64_t)gle);
+    return mod;
 }
 
 static uint8_t* find_packed_section(uint8_t* image_base, uint32_t* out_size) {
@@ -2626,41 +2877,7 @@ static int rebuild_iat(uint8_t* image_base, const uint8_t master[32],
             free_scratch(r, work);
             return 0;
         }
-        uint32_t off = 0;
-        int found_pool_name = 0;
-        while (off < pool_size) {
-            size_t nl = 0;
-            while (off + nl < pool_size && pool_local[off + nl] != 0u) {
-                uint8_t c = pool_local[off + nl];
-                int ok_ch = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-                            c == '.' || c == '-' || c == '_';
-                if (!ok_ch) {
-                    payload_log_event_force(APL_EVENT_IMPORT_FAIL,
-                                            ((uint64_t)6u << 48) | (uint64_t)i,
-                                            off + (uint32_t)nl,
-                                            c);
-                    mem_set(work, 0, work_size);
-                    free_scratch(r, work);
-                    return 0;
-                }
-                ++nl;
-            }
-            if (off + nl >= pool_size) {
-                payload_log_event_force(APL_EVENT_IMPORT_FAIL,
-                                        ((uint64_t)7u << 48) | (uint64_t)i,
-                                        off,
-                                        pool_size);
-                mem_set(work, 0, work_size);
-                free_scratch(r, work);
-                return 0;
-            }
-            if (nl > 0u && fnv1a64_a_upper((const char*)(pool_local + off), nl) == e->dll_hash) {
-                found_pool_name = 1;
-                break;
-            }
-            off += (uint32_t)(nl + 1u);
-        }
-        if (!found_pool_name) {
+        if (!payload_find_import_dll_name(pool_local, pool_size, e->dll_hash, 0, 0, 0)) {
             payload_log_event_force(APL_EVENT_IMPORT_FAIL,
                                     ((uint64_t)8u << 48) | (uint64_t)i,
                                     e->iat_rva,
@@ -2689,49 +2906,50 @@ static int rebuild_iat(uint8_t* image_base, const uint8_t master[32],
         if (mod == 0) {
             mod = find_module(e->dll_hash);
         }
-        if (mod == 0 && e->dll_hash != HASH_LIBZ3_DLL) {
-            uint32_t off = 0;
-            while (off + 1 < pool_size) {
-                size_t nl = 0;
-                while (off + nl < pool_size && pool_local[off + nl] != 0) {
-                    ++nl;
-                }
-                if (nl > 0) {
-                    uint64_t dh = fnv1a64_a_upper((const char*)(pool_local + off), nl);
-                    if (dh == e->dll_hash) {
-                        const char* dll_name = (const char*)(pool_local + off);
-                        char host_name[96];
-                        size_t host_len = 0;
-                        const char* load_name = dll_name;
-                        uint64_t load_hash = e->dll_hash;
-                        if (resolve_apiset_host(dll_name, nl, host_name, sizeof(host_name), &host_len)) {
-                            uint64_t host_hash = fnv1a64_a_upper(host_name, host_len);
-                            payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, host_hash);
-                            mod = find_module(host_hash);
-                            load_name = host_name;
-                            load_hash = host_hash;
-                        } else if (env_is_apiset_name(dll_name, nl) &&
-                                   set_kernelbase_name(host_name, sizeof(host_name), &host_len)) {
-                            payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, HASH_KERNELBASE);
-                            mod = find_module(HASH_KERNELBASE);
-                            load_name = host_name;
-                            load_hash = HASH_KERNELBASE;
-                        } else if (env_is_apiset_name(dll_name, nl)) {
-                            payload_log_event_force(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, 0u);
-                        }
-                        if (mod == 0 && r->LoadLibraryA != 0) {
-                            payload_log_event(APL_EVENT_IMPORT_LOAD_ENTER, i, e->dll_hash, load_hash);
-                            mod = r->LoadLibraryA(load_name);
-                            payload_log_event(APL_EVENT_IMPORT_LOAD_EXIT, i, e->dll_hash, (uint64_t)(uintptr_t)mod);
-                        }
-                        break;
-                    }
-                }
-                off += (uint32_t)(nl + 1u);
+        const uint8_t* dll_name_u8 = 0;
+        uint32_t dll_name_len = 0u;
+        int have_dll_name = payload_find_import_dll_name(pool_local, pool_size, e->dll_hash,
+                                                         &dll_name_u8, &dll_name_len, 0);
+        if (mod == 0 && e->dll_hash == HASH_LIBZ3_DLL && have_dll_name) {
+            mod = payload_try_load_z3_sidecar(r, i, dll_name_u8, dll_name_len);
+        }
+        if (mod == 0 && e->dll_hash != HASH_LIBZ3_DLL && have_dll_name) {
+            const char* dll_name = (const char*)dll_name_u8;
+            char host_name[96];
+            size_t host_len = 0;
+            const char* load_name = dll_name;
+            uint64_t load_hash = e->dll_hash;
+            if (resolve_apiset_host(dll_name, dll_name_len, host_name, sizeof(host_name), &host_len)) {
+                uint64_t host_hash = fnv1a64_a_upper(host_name, host_len);
+                payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, host_hash);
+                mod = find_module(host_hash);
+                load_name = host_name;
+                load_hash = host_hash;
+            } else if (env_is_apiset_name(dll_name, dll_name_len) &&
+                       set_kernelbase_name(host_name, sizeof(host_name), &host_len)) {
+                payload_log_event(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, HASH_KERNELBASE);
+                mod = find_module(HASH_KERNELBASE);
+                load_name = host_name;
+                load_hash = HASH_KERNELBASE;
+            } else if (env_is_apiset_name(dll_name, dll_name_len)) {
+                payload_log_event_force(APL_EVENT_IMPORT_APISET_RESULT, i, e->dll_hash, 0u);
+            }
+            if (mod == 0 && r->LoadLibraryA != 0) {
+                payload_log_event(APL_EVENT_IMPORT_LOAD_ENTER, i, e->dll_hash, load_hash);
+                mod = r->LoadLibraryA(load_name);
+                payload_log_event(APL_EVENT_IMPORT_LOAD_EXIT, i, e->dll_hash, (uint64_t)(uintptr_t)mod);
             }
         }
         if (mod == 0) {
             ++missing_mod;
+            if (have_dll_name) {
+                payload_log_import_name_chunks(i, e->dll_hash, dll_name_u8, dll_name_len);
+            } else {
+                payload_log_event_force(APL_EVENT_IMPORT_NAME_CHUNK,
+                                        ((uint64_t)i << 32) | 0xFFFFu,
+                                        e->dll_hash,
+                                        pool_size);
+            }
             payload_log_event_force(APL_EVENT_IMPORT_MISSING_MOD,
                                     i,
                                     e->dll_hash,

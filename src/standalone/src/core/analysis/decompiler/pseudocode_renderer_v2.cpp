@@ -382,6 +382,12 @@ private:
         case typed_pseudocode_ast_node_kind_t::throw_statement:
             rendered = render_terminal(*value, "throw");
             break;
+        case typed_pseudocode_ast_node_kind_t::goto_statement:
+            rendered = render_goto(*value);
+            break;
+        case typed_pseudocode_ast_node_kind_t::label_statement:
+            rendered = render_label(*value);
+            break;
         case typed_pseudocode_ast_node_kind_t::try_statement:
             rendered = render_try(*value);
             break;
@@ -572,6 +578,35 @@ private:
         if (!value.child_ids.empty() && (!emit_space(value) || !render_expression(value.child_ids.front(), 1)))
             return false;
         return emit(";", decompiler_document_token_kind_t::punctuation, value) && emit_newline(value);
+    }
+
+    bool render_goto(const typed_pseudocode_ast_node_t& value)
+    {
+        if (!emit_annotation(value) || !emit_indent(value) || !emit("goto", decompiler_document_token_kind_t::keyword, value) ||
+            !emit_space(value))
+            return false;
+        if (!identifier_text(value.stable_text)) {
+            fail(decompiler_diagnostic_code_t::unresolved_symbol, "decompiler.renderer.v2.goto_label", &value);
+            return false;
+        }
+        if (!emit(value.stable_text, decompiler_document_token_kind_t::identifier, value) ||
+            !emit(";", decompiler_document_token_kind_t::punctuation, value))
+            return false;
+        return emit_newline(value);
+    }
+
+    bool render_label(const typed_pseudocode_ast_node_t& value)
+    {
+        if (!emit_annotation(value) || !emit_indent(value))
+            return false;
+        if (!identifier_text(value.stable_text)) {
+            fail(decompiler_diagnostic_code_t::unresolved_symbol, "decompiler.renderer.v2.label_name", &value);
+            return false;
+        }
+        if (!emit(value.stable_text, decompiler_document_token_kind_t::identifier, value) ||
+            !emit(":", decompiler_document_token_kind_t::punctuation, value))
+            return false;
+        return emit_newline(value);
     }
 
     bool render_try(const typed_pseudocode_ast_node_t& value)

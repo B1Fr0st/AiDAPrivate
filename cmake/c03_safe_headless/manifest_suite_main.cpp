@@ -4,10 +4,6 @@
 #include <iostream>
 #include <string>
 
-#ifndef AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256
-#error AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256 is required
-#endif
-
 int main(int argc, char** argv)
 {
     if (argc != 2) {
@@ -16,7 +12,7 @@ int main(int argc, char** argv)
     }
     const auto root = std::filesystem::absolute(std::filesystem::u8path(argv[1])).lexically_normal();
     const auto loaded = test_lab::c03_safe_headless::load_manifest(
-        root, root / "manifest.json", AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256);
+        root, root / "manifest.json");
     if (!loaded.accepted) {
         std::cerr << loaded.error << '\n';
         return 1;

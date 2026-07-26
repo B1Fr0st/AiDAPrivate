@@ -1610,12 +1610,17 @@ std::map<std::uint64_t, std::set<std::uint64_t>> compute_dominance_frontiers(
         if (block.predecessor_ids.size() < 2) continue;
         for (const auto pred : block.predecessor_ids) {
             auto runner = pred;
+            std::size_t frontier_steps = 0;
+            const std::size_t max_frontier_steps = blocks.size() + 1;
             while (runner != 0 && dom.count(runner) && dom.at(runner) != block.id) {
+                if (++frontier_steps > max_frontier_steps)
+                    break;
                 df[runner].insert(block.id);
                 auto it = dom.find(runner);
                 if (it == dom.end()) break;
                 runner = it->second;
                 if (runner == block.id) break;
+                if (dom.count(runner) && dom.at(runner) == runner) break;
             }
         }
     }

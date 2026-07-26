@@ -10,6 +10,9 @@
 #include "pseudocode_renderer_v2.hpp"
 #include "typed_ast_v2.hpp"
 
+#include "../workspace/decompiler_service.hpp"
+#include "../../../helpers/diag_log.hpp"
+
 #include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
 #include "../../disasm/ghidra_adapters/aida_load_image.hpp"
 
@@ -1206,6 +1209,42 @@ bool result_has_complete_source_map(const decompiler_pipeline_result_t& result) 
     return expected == document.rendered_text.size();
 }
 
+decompiler_ui_result_t map_workspace_decompiler_result(
+    const decompiler_result_t& ws_result,
+    const decompiler_pipeline_request_t& pipeline_request)
+{
+    decompiler_ui_result_t ui_result;
+    ui_result.status = decompiler_pipeline_status_t::completed;
+    ui_result.elapsed_ms = static_cast<std::uint64_t>(ws_result.elapsed_ms);
+    ui_result.rendered_text = ws_result.pseudocode;
+    ui_result.document = std::make_shared<const decompiler_document_t>(ws_result.document);
+    ui_result.language_id = pipeline_request.language.language_id;
+    ui_result.workspace_generation = pipeline_request.workspace_generation;
+    ui_result.analysis_revision = pipeline_request.analysis_revision;
+    ui_result.overlay_revision = pipeline_request.cache_identity.overlay_revision;
+    ui_result.used_legacy_fallback = true;
+    if (const auto* native = std::get_if<native_decompiler_entity_identity_t>(
+            &ws_result.document.entity.identity))
+        ui_result.function_symbol = native->canonical_symbol;
+    for (const auto& source_map : ws_result.document.source_maps) {
+        for (const auto& coordinate : source_map.coordinates) {
+            ui_result.source_mappings.push_back(
+                map_source_mapping(source_map, coordinate));
+        }
+    }
+    return ui_result;
+}
+
+bool pipeline_result_is_failure(const decompiler_pipeline_result_t& result) noexcept
+{
+    if (result.status != decompiler_pipeline_status_t::completed)
+        return true;
+    if (!result.rendered_stage)
+        return true;
+    const auto& document = result.rendered_stage->document;
+    return document.rendered_text.empty() || document.ast.nodes.empty();
+}
+
 workspace_result_t<decompiler_pipeline_request_t> build_managed_pipeline_request(
     const analysis_workspace_t& workspace,
     decompiler_entity_key_t entity,
@@ -1776,6 +1815,9 @@ decompiler_ui_integration_t::execute_pipeline(
     }
     auto pipeline_result = impl_->state.service->decompile(pipeline_request, cancel);
     if (!publication_matches_request(*impl_->state.workspace, pipeline_request)) {
+        ::diag::log_tagged_fmt("decompiler", "typed_pipeline path=primary status=stale_generation workspace_generation=%llu current_generation=%llu",
+            static_cast<unsigned long long>(pipeline_request.workspace_generation),
+            static_cast<unsigned long long>(impl_->state.workspace->generation()));
         decompiler_ui_result_t ui_result;
         ui_result.status = decompiler_pipeline_status_t::stale_generation;
         ui_result.elapsed_ms = pipeline_result.elapsed_wall_clock_ms;
@@ -1794,6 +1836,9 @@ decompiler_ui_integration_t::execute_pipeline(
         return workspace_result_t<decompiler_ui_result_t>::success(std::move(ui_result));
     }
     if (pipeline_result.succeeded()) {
+        ::diag::log_tagged_fmt("decompiler", "typed_pipeline path=primary status=completed elapsed_ms=%llu cache_hit=%d",
+            static_cast<unsigned long long>(pipeline_result.elapsed_wall_clock_ms),
+            pipeline_result.cache_hit_stage.has_value() ? 1 : 0);
         if (impl_->state.config.reject_null_ast && result_has_null_ast(pipeline_result)) {
             impl_->increment_metric(&decompiler_ui_integration_metrics_t::rejected_null_ast);
             decompiler_ui_result_t ui_result;
@@ -1836,6 +1881,8 @@ decompiler_ui_integration_t::execute_pipeline(
         if (pipeline_result.cache_hit_stage)
             impl_->increment_metric(&decompiler_ui_integration_metrics_t::cache_hits);
     } else {
+        ::diag::log_tagged_fmt("decompiler", "typed_pipeline path=primary status=failed pipeline_status=%u",
+            static_cast<unsigned int>(pipeline_result.status));
         switch (pipeline_result.status) {
         case decompiler_pipeline_status_t::provider_failed:
         case decompiler_pipeline_status_t::provider_crashed:
@@ -1856,6 +1903,41 @@ decompiler_ui_integration_t::execute_pipeline(
     ui_result.workspace_generation = pipeline_request.workspace_generation;
     ui_result.analysis_revision = pipeline_request.analysis_revision;
     ui_result.overlay_revision = pipeline_request.cache_identity.overlay_revision;
+    if (impl_->state.config.legacy_fallback_enabled &&
+        pipeline_result_is_failure(pipeline_result) &&
+        !cancel.stop_requested()) {
+        const auto workspace = impl_->state.workspace;
+        auto ws_decompiler = workspace ? workspace->decompiler() : nullptr;
+        if (ws_decompiler) {
+            const auto* native_identity = std::get_if<
+                native_decompiler_entity_identity_t>(
+                    &pipeline_request.entity.identity);
+            if (native_identity) {
+                ::diag::log_tagged_fmt("decompiler", "legacy_fallback reason=typed_pipeline_failed pipeline_status=%u",
+                    static_cast<unsigned int>(pipeline_result.status));
+                decompiler_request_t ws_request;
+                ws_request.use_memory_cache = true;
+                ws_request.use_persistent_cache = false;
+                ws_request.publish_feedback = false;
+                ws_request.deadline = pipeline_request.deadline;
+                auto ws_result = ws_decompiler->decompile(
+                    native_identity->entry, ws_request, cancel);
+                if (ws_result && !ws_result.value().pseudocode.empty() &&
+                    ws_result.value().document.rendered_text ==
+                        ws_result.value().pseudocode) {
+                    auto fallback_result = map_workspace_decompiler_result(
+                        ws_result.value(), pipeline_request);
+                    impl_->increment_metric(
+                        &decompiler_ui_integration_metrics_t::completed);
+                    ::diag::log_tagged_fmt("decompiler", "legacy_fallback path=workspace_service status=completed elapsed_ms=%llu",
+                        static_cast<unsigned long long>(ws_result.value().elapsed_ms));
+                    return workspace_result_t<decompiler_ui_result_t>::success(
+                        std::move(fallback_result));
+                }
+                ::diag::log_tagged_fmt("decompiler", "legacy_fallback path=workspace_service status=failed");
+            }
+        }
+    }
     return workspace_result_t<decompiler_ui_result_t>::success(std::move(ui_result));
 }
 

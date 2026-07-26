@@ -7,6 +7,7 @@
 
 #include "../analysis/decompiler/decompiler_ui_integration.hpp"
 #include "../analysis/workspace/analysis_workspace.hpp"
+#include "../analysis/workspace/decompiler_service.hpp"
 #include "../analysis/workspace/compact_ir.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
 #include "../analysis/workspace/search_index.hpp"
@@ -36,6 +37,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "../../helpers/diag_log.hpp"
 
 namespace mcp_standalone::ida_compat
 {
@@ -1606,6 +1609,9 @@ namespace mcp_standalone::ida_compat
                 ? decompiler_pipeline_cache_mode_t::read_write
                 : decompiler_pipeline_cache_mode_t::bypass,
             cancellation.token());
+        ::diag::log_tagged_fmt("decompiler", "mcp_tool_decompile typed_pipeline invoked entity_kind=%u generation=%llu",
+            static_cast<unsigned int>(binding.entity.kind),
+            static_cast<unsigned long long>(binding.generation));
         if (!result) {
             const auto& error = result.error();
             const std::string code = error.deadline ? "DEADLINE_EXCEEDED" :
@@ -1620,6 +1626,9 @@ namespace mcp_standalone::ida_compat
             d.analysis_revision != binding.analysis_revision ||
             d.overlay_revision != binding.overlay_revision ||
             d.document->entity != binding.entity) {
+            ::diag::log_tagged_fmt("decompiler", "mcp_tool_decompile typed_pipeline status=failed pipeline_status=%u used_legacy_fallback=%d",
+                static_cast<unsigned int>(d.status),
+                d.used_legacy_fallback ? 1 : 0);
             json diagnostics = json::array();
             for (const auto& diagnostic : d.diagnostics) {
                 diagnostics.push_back({
@@ -1641,6 +1650,10 @@ namespace mcp_standalone::ida_compat
         constexpr std::size_t kMaxPseudocodeBytes = 512 * 1024;
         const bool pseudocode_truncated =
             d.rendered_text.size() > kMaxPseudocodeBytes;
+        ::diag::log_tagged_fmt("decompiler", "mcp_tool_decompile typed_pipeline status=completed pseudocode_bytes=%zu used_legacy_fallback=%d cache_hit=%d",
+            d.rendered_text.size(),
+            d.used_legacy_fallback ? 1 : 0,
+            d.cache_hit_stage.has_value() ? 1 : 0);
         const auto entity_locator = decompiler_entity_locator_text(ws, binding);
         if (!entity_locator)
             return adapter_error(ctx,
@@ -1666,7 +1679,8 @@ namespace mcp_standalone::ida_compat
             {"analysis_revision", binding.analysis_revision},
             {"overlay_revision", binding.overlay_revision},
             {"source_mappings", std::move(source_mappings)},
-            {"source_mappings_truncated", source_mappings_truncated}};
+            {"source_mappings_truncated", source_mappings_truncated},
+            {"used_legacy_fallback", d.used_legacy_fallback}};
         if (const auto prototype = decompiler_entity_prototype(binding.entity))
             j["prototype"] = *prototype;
         else

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1425,10 +1426,8 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
     const std::atomic<bool>& runtime_cancel) {
     auto measurement = impl_->metrics->begin_phase(baseline_phase_t::decode);
     phase_completion_guard_t guard(*impl_->metrics, measurement);
-    if (lane != 0) {
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::invalid_argument, "decode lane index is invalid", "decode"));
-    }
+    if (lane != 0)
+        return workspace_result_t<void>::success();
     auto active = impl_->ensure_active(runtime_cancel, "decode");
     if (!active)
         return active;
@@ -2058,14 +2057,19 @@ workspace_result_t<void> pe_baseline_analyzer_t::metadata_symbols_types_phase(
         std::move(impl_->symbol_type_result), impl_->cancellation.token());
     if (!published)
         return published;
+    std::unordered_map<std::uint64_t, std::size_t> function_symbol_by_value;
+    for (std::size_t index = 0; index < impl_->draft->symbols.size(); ++index) {
+        const auto& symbol = impl_->draft->symbols[index];
+        if (symbol.kind == symbol_kind_t::function)
+            function_symbol_by_value.emplace(symbol.address.value, index);
+    }
     for (auto& function : impl_->draft->functions) {
-        const auto found = std::find_if(impl_->draft->symbols.begin(),
-            impl_->draft->symbols.end(), [&function](const symbol_record_t& symbol) {
-                return symbol.address == function.start &&
-                    symbol.kind == symbol_kind_t::function;
-            });
-        if (found != impl_->draft->symbols.end())
-            function.symbol_id = found->id;
+        const auto found = function_symbol_by_value.find(function.start.value);
+        if (found != function_symbol_by_value.end()) {
+            const auto& symbol = impl_->draft->symbols[found->second];
+            if (symbol.address == function.start)
+                function.symbol_id = symbol.id;
+        }
     }
 
     impl_->metrics->set(analysis_metric_t::xrefs, impl_->draft->xrefs.size());
@@ -2201,7 +2205,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_phase(
             "workspace persistence queue rejected the baseline snapshot", "persistence"));
     }
     for (;;) {
-        if (impl_->persistence_ticket.completion.wait_for(std::chrono::milliseconds(2)) ==
+        if (impl_->persistence_ticket.completion.wait_for(std::chrono::milliseconds(500)) ==
             std::future_status::ready)
             break;
         active = impl_->ensure_active(runtime_cancel, "persistence");

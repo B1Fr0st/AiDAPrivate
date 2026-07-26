@@ -2852,6 +2852,8 @@ auto make_instruction_menu(const workspace_context_t& context,
         };
         menu.actions["analysis.navigate.graph"].capability = capability_state_t::available();
         auto decompile = [context, function]() {
+            ::diag::log_tagged_fmt("decompiler", "disasm_view decompile_action typed_pipeline path=primary function=0x%llX",
+                static_cast<unsigned long long>(function));
             pseudocode_view::request_decompile(context, function, false);
             aida::ui::application_views::open_or_focus(
                 aida::ui::stable_view_id_t("document.pseudocode"));

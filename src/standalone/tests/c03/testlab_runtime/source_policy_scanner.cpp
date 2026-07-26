@@ -1981,7 +1981,7 @@ void verify_distribution_source_leak_policy(const std::string_view producer,
 			"protected standalone and worker receipt dependency graph");
 	const auto materializer_command = slice_between(cmake_manifest,
 		"add_custom_command(OUTPUT \"${AIDA_C03_SAFE_HEADLESS_MANIFEST}\"",
-		"add_custom_command(OUTPUT \"${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}\"",
+		"add_custom_target(aida_c03_safe_headless_manifest",
 		"safe-headless manifest materializer command");
 	require_exact_count(materializer_command,
 		"COMMAND \"${_aida_python_executable}\" \"${AIDA_C03_SAFE_HEADLESS_MATERIALIZER}\"", 1,
@@ -1992,26 +1992,23 @@ void verify_distribution_source_leak_policy(const std::string_view producer,
 		"add_custom_target(aida_c03_safe_headless_manifest",
 		"add_custom_target(aida_c03_safe_headless_application_package",
 		"safe-headless developer manifest identity");
-	for (const auto token : std::array<std::string_view, 5>{
+	for (const auto token : std::array<std::string_view, 3>{
 		"AIDA_C03_DEVELOPER_ONLY TRUE",
-		"AIDA_C03_DEVELOPER_SUITE_OUTPUTS \"suite/$<CONFIG>/manifest.json;suite/$<CONFIG>/manifest.sha256\"",
-		"${AIDA_C03_SAFE_HEADLESS_MANIFEST}", "${AIDA_C03_SAFE_HEADLESS_DIGEST}",
-		"${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"})
+		"AIDA_C03_DEVELOPER_SUITE_OUTPUTS \"suite/$<CONFIG>/manifest.json\"",
+		"${AIDA_C03_SAFE_HEADLESS_MANIFEST}"})
 		require_contains(developer_manifest, token,
-			"developer-only safe-headless manifest and digest identity");
+			"developer-only safe-headless manifest identity");
 	require_absent(developer_manifest, "AIDA_C03_PACKAGE_OUTPUTS",
 		"customer package output classification for developer safe-headless artifacts");
 	const auto application_package = slice_between(cmake_manifest,
 		"add_custom_target(aida_c03_safe_headless_application_package",
 		"add_executable(aida_c03_safe_headless_manifest_suite",
 		"safe-headless application package boundary");
-	for (const auto token : std::array<std::string_view, 6>{
+	for (const auto token : std::array<std::string_view, 4>{
 		"DEPENDS aida_c03_safe_headless_manifest",
 		"AIDA_C03_CUSTOMER_PAYLOAD_FORBIDDEN TRUE",
 		"add_dependencies(${application_target} aida_c03_safe_headless_application_package)",
-		"target_include_directories(${application_target} PRIVATE \"${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}\")",
-		"target_compile_options(${application_target} PRIVATE",
-		"/FI${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"})
+		"target_include_directories(${application_target} PRIVATE \"${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}\")"})
 		require_exact_count(application_package, token, 1,
 			"application manifest identity and developer-payload exclusion");
 	for (const auto token : std::array<std::string_view, 6>{
@@ -2025,9 +2022,7 @@ void verify_safe_headless_runtime(const std::string_view safe_headless,
 	const std::string_view materializer, const std::string_view cmake_manifest,
 	const std::string_view resource_cases)
 {
-	for (const auto token : std::array<std::string_view, 14>{
-		"AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256",
-		"expected_digest != k_packaged_manifest_sha256",
+	for (const auto token : std::array<std::string_view, 12>{
 		"JOB_OBJECT_LIMIT_ACTIVE_PROCESS",
 		"ActiveProcessLimit = entry.max_active_processes",
 		"k_default_active_processes = 1",

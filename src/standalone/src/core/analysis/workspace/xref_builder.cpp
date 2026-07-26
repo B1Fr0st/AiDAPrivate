@@ -6,6 +6,7 @@
 #include <new>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace aida::analysis {
@@ -47,18 +48,6 @@ std::optional<std::uint64_t> to_rva(const workspace_image_t& image,
 bool valid_address(const address_t& address) noexcept {
     return address.space <= address_space_id_t::live_virtual &&
            workspace_architecture_mode_matches(address.architecture, address.mode);
-}
-
-bool import_target(const workspace_image_t& image, const address_t& target) noexcept {
-    const auto target_rva = to_rva(image, target);
-    if (!target_rva)
-        return false;
-    for (const auto& imported : image.imports) {
-        const auto import_rva = to_rva(image, imported.address);
-        if (import_rva && *import_rva == *target_rva)
-            return true;
-    }
-    return false;
 }
 
 std::uint8_t operand_access(const instruction_record_t& instruction,
@@ -155,68 +144,92 @@ workspace_result_t<xref_build_result_t> build_impl(
         result.xrefs.push_back(std::move(value));
         return workspace_result_t<void>::success();
     };
-    std::uint64_t checks = 0;
-    for (const auto& instruction : instructions) {
-        if (++checks >= limits.cancellation_check_interval) {
-            checks = 0;
-            if (cancel.stop_requested())
-                return workspace_result_t<xref_build_result_t>::failure(stop_error(cancel));
-        }
-        std::uint64_t operand_end = 0;
-        std::uint64_t target_end = 0;
-        if (!checked_add_u64(instruction.operand_fact_begin,
-                instruction.operand_fact_count, operand_end) || operand_end > operands.size() ||
-            !checked_add_u64(instruction.target_fact_begin,
-                instruction.target_fact_count, target_end) || target_end > targets.size()) {
-            return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
-                workspace_error_code_t::integrity_failure,
-                "instruction fact range is invalid", "xrefs"));
-        }
-        for (std::uint64_t index = instruction.target_fact_begin; index < target_end; ++index) {
-            const auto& target = targets[static_cast<std::size_t>(index)];
-            if (!valid_address(instruction.address) || !valid_address(target.target) ||
-                (target.instruction_id != 0 && target.instruction_id != instruction.id)) {
-                return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
-                    workspace_error_code_t::integrity_failure,
-                    "xref target fact is invalid", "xrefs"));
-            }
-            const bool imported_call = target.kind == target_kind_record_t::call &&
-                import_target(image, target.target);
-            const auto append_kind = [&](xref_kind_t kind) -> workspace_result_t<void> {
-                xref_record_t xref;
-                xref.source = instruction.address;
-                xref.target = target.target;
-                xref.kind = kind;
-                xref.provenance = imported_call
-                    ? fact_provenance_t::relocation : instruction.provenance;
-                xref.confidence = imported_call
-                    ? (std::min)(instruction.confidence, static_cast<std::uint8_t>(95))
-                    : instruction.confidence;
-                return append_xref(std::move(xref));
-            };
-            workspace_result_t<void> appended = workspace_result_t<void>::success();
-            if (target.kind == target_kind_record_t::call) {
-                appended = append_kind(xref_kind_t::call);
-            } else if (target.kind == target_kind_record_t::branch ||
-                       target.kind == target_kind_record_t::fallthrough) {
-                appended = append_kind(xref_kind_t::code);
-            } else {
-                const auto access = operand_access(instruction, target, operands);
-                if ((access & 1U) != 0) {
-                    appended = append_kind(xref_kind_t::read);
-                    if (!appended)
-                        return workspace_result_t<xref_build_result_t>::failure(appended.error());
-                }
-                if ((access & 2U) != 0) {
-                    appended = append_kind(xref_kind_t::write);
-                } else if ((access & 1U) == 0) {
-                    appended = append_kind(xref_kind_t::address);
-                }
-            }
-            if (!appended)
-                return workspace_result_t<xref_build_result_t>::failure(appended.error());
-        }
+    std::unordered_set<std::uint64_t> import_rvas;
+    import_rvas.reserve(image.imports.size());
+    for (const auto& imported : image.imports) {
+        const auto import_rva = to_rva(image, imported.address);
+        if (import_rva)
+            import_rvas.insert(*import_rva);
     }
+    struct chunk_output_t {
+        std::vector<xref_record_t> xrefs;
+        std::optional<workspace_error_t> error;
+    };
+    auto process_chunk = [&](std::size_t begin, std::size_t end) -> chunk_output_t {
+        chunk_output_t output;
+        std::uint64_t checks = 0;
+        for (std::size_t i = begin; i < end; ++i) {
+            const auto& instruction = instructions[i];
+            if (++checks >= limits.cancellation_check_interval) {
+                checks = 0;
+                if (cancel.stop_requested()) {
+                    output.error = stop_error(cancel);
+                    return output;
+                }
+            }
+            std::uint64_t operand_end = 0;
+            std::uint64_t target_end = 0;
+            if (!checked_add_u64(instruction.operand_fact_begin,
+                    instruction.operand_fact_count, operand_end) || operand_end > operands.size() ||
+                !checked_add_u64(instruction.target_fact_begin,
+                    instruction.target_fact_count, target_end) || target_end > targets.size()) {
+                output.error = make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "instruction fact range is invalid", "xrefs");
+                return output;
+            }
+            for (std::uint64_t index = instruction.target_fact_begin; index < target_end; ++index) {
+                const auto& target = targets[static_cast<std::size_t>(index)];
+                if (!valid_address(instruction.address) || !valid_address(target.target) ||
+                    (target.instruction_id != 0 && target.instruction_id != instruction.id)) {
+                    output.error = make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "xref target fact is invalid", "xrefs");
+                    return output;
+                }
+                const auto target_rva = to_rva(image, target.target);
+                const bool imported_call = target.kind == target_kind_record_t::call &&
+                    target_rva && import_rvas.count(*target_rva) > 0;
+                auto make_xref = [&](xref_kind_t kind) {
+                    xref_record_t xref;
+                    xref.source = instruction.address;
+                    xref.target = target.target;
+                    xref.kind = kind;
+                    xref.provenance = imported_call
+                        ? fact_provenance_t::relocation : instruction.provenance;
+                    xref.confidence = imported_call
+                        ? (std::min)(instruction.confidence, static_cast<std::uint8_t>(95))
+                        : instruction.confidence;
+                    return xref;
+                };
+                if (target.kind == target_kind_record_t::call) {
+                    output.xrefs.push_back(make_xref(xref_kind_t::call));
+                } else if (target.kind == target_kind_record_t::branch ||
+                           target.kind == target_kind_record_t::fallthrough) {
+                    output.xrefs.push_back(make_xref(xref_kind_t::code));
+                } else {
+                    const auto access = operand_access(instruction, target, operands);
+                    if ((access & 1U) != 0)
+                        output.xrefs.push_back(make_xref(xref_kind_t::read));
+                    if ((access & 2U) != 0) {
+                        output.xrefs.push_back(make_xref(xref_kind_t::write));
+                    } else if ((access & 1U) == 0) {
+                        output.xrefs.push_back(make_xref(xref_kind_t::address));
+                    }
+                }
+            }
+        }
+        return output;
+    };
+    auto chunk_output = process_chunk(0, instructions.size());
+    if (chunk_output.error)
+        return workspace_result_t<xref_build_result_t>::failure(*chunk_output.error);
+    for (auto& xref : chunk_output.xrefs) {
+        auto appended = append_xref(std::move(xref));
+        if (!appended)
+            return workspace_result_t<xref_build_result_t>::failure(appended.error());
+    }
+    std::uint64_t checks = 0;
     for (const auto& pointer : data.pointer_facts) {
         if (++checks >= limits.cancellation_check_interval) {
             checks = 0;

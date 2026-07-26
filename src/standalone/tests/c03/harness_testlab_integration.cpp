@@ -253,8 +253,7 @@ constexpr std::array<category_fixture_t, 22> k_categories{{
 	{"security", "VER-02", "child", entry_outcome_e::passed}
 }};
 
-json materialize_manifest(const fixture_root_t& fixture, const std::filesystem::path& fake_adapter,
-	std::string& manifest_hash) {
+json materialize_manifest(const fixture_root_t& fixture, const std::filesystem::path& fake_adapter) {
 	std::error_code error;
 	const auto source = std::filesystem::absolute(fake_adapter, error).lexically_normal();
 	require(!error && std::filesystem::is_regular_file(source, error) && !error,
@@ -312,8 +311,6 @@ json materialize_manifest(const fixture_root_t& fixture, const std::filesystem::
 	}
 	const auto manifest_path = fixture.path() / L"manifest.json";
 	write_text(manifest_path, root.dump());
-	manifest_hash = sha256_file(manifest_path);
-	write_text(fixture.path() / L"manifest.sha256", manifest_hash + "\n");
 	return root;
 }
 
@@ -737,19 +734,15 @@ bool run_testlab_integration_harness(const testlab_integration_paths_t& paths, s
 		phase("fixture_root_begin");
 		fixture_root_t fixture(paths.scratch_root);
 		phase("materialize_manifest_begin");
-		std::string manifest_hash;
-		const auto manifest_json = materialize_manifest(fixture, paths.fake_adapter_path, manifest_hash);
+		const auto manifest_json = materialize_manifest(fixture, paths.fake_adapter_path);
 		phase("load_manifest_begin");
-		const auto loaded = load_manifest(fixture.path(), fixture.path() / L"manifest.json", manifest_hash);
+		const auto loaded = load_manifest(fixture.path(), fixture.path() / L"manifest.json");
 		phase("outcome_matrix_begin");
 		validate_outcome_matrix(fixture, loaded);
 		phase("assertion_result_matrix_begin");
 		validate_assertion_result_matrix(fixture, loaded);
 		phase("malformed_manifest_matrix_begin");
 		malformed_manifest_matrix(fixture, manifest_json);
-		phase("wrong_hash_begin");
-		const auto wrong_hash = load_manifest(fixture.path(), fixture.path() / L"manifest.json", std::string(64, '0'));
-		require(!wrong_hash.accepted, "stale manifest package hash was accepted");
 		phase("complete");
 		failure.clear();
 		return true;

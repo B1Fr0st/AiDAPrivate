@@ -134,8 +134,7 @@ using deadline_probe_t = std::function<bool()>;
 using progress_sink_t = std::function<void(std::size_t, std::size_t, const entry_result_t&)>;
 
 manifest_load_result_t load_manifest(const std::filesystem::path& approved_root,
-	const std::filesystem::path& manifest_path,
-	std::string expected_manifest_sha256 = {});
+	const std::filesystem::path& manifest_path);
 entry_result_t execute_entry(const std::filesystem::path& approved_root,
 	const manifest_entry_t& entry,
 	const cancellation_probe_t& cancellation = {},

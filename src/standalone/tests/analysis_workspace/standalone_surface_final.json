@@ -9775,7 +9775,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2707,
+                                                         "line":  2721,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -9911,7 +9911,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2708,
+                                                         "line":  2722,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10037,7 +10037,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2709,
+                                                         "line":  2723,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10153,7 +10153,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2710,
+                                                         "line":  2724,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10269,7 +10269,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2711,
+                                                         "line":  2725,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10376,7 +10376,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2712,
+                                                         "line":  2726,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10497,7 +10497,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2713,
+                                                         "line":  2727,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10620,7 +10620,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2714,
+                                                         "line":  2728,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10746,7 +10746,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2715,
+                                                         "line":  2729,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10855,7 +10855,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2716,
+                                                         "line":  2730,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -10967,7 +10967,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2717,
+                                                         "line":  2731,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -11094,7 +11094,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2718,
+                                                         "line":  2732,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -11220,7 +11220,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2719,
+                                                         "line":  2733,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -11344,7 +11344,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2720,
+                                                         "line":  2734,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -11461,7 +11461,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2721,
+                                                         "line":  2735,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -11609,7 +11609,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2722,
+                                                         "line":  2736,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -11822,7 +11822,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2723,
+                                                         "line":  2737,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -11947,7 +11947,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2724,
+                                                         "line":  2738,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -12086,7 +12086,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2725,
+                                                         "line":  2739,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -12217,7 +12217,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2726,
+                                                         "line":  2740,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -12348,7 +12348,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2727,
+                                                         "line":  2741,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -12470,7 +12470,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2728,
+                                                         "line":  2742,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -12582,7 +12582,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2729,
+                                                         "line":  2743,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -12707,7 +12707,7 @@
                                           "visibility_effective":  "external_visible",
                                           "source":  {
                                                          "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                                         "line":  2730,
+                                                         "line":  2744,
                                                          "character_offset":  -1,
                                                          "evidence":  "source_resolved_ida_compat_registration"
                                                      },
@@ -62398,7 +62398,7 @@
                                  },
                                  {
                                      "key":  "ImGuiKey_C",
-                                     "line":  4157,
+                                     "line":  4159,
                                      "expression":  "(ImGui::IsKeyPressed(ImGuiKey_C, false) ||",
                                      "source":  "src/standalone/src/core/disasm/disasm_view.cpp"
                                  },
@@ -62722,7 +62722,7 @@
                                  },
                                  {
                                      "key":  "ImGuiKey_Enter",
-                                     "line":  3422,
+                                     "line":  3424,
                                      "expression":  "ImGui::IsKeyPressed(ImGuiKey_Enter, false);",
                                      "source":  "src/standalone/src/core/disasm/disasm_view.cpp"
                                  },
@@ -62878,19 +62878,19 @@
                                  },
                                  {
                                      "key":  "ImGuiKey_Escape",
-                                     "line":  3399,
+                                     "line":  3401,
                                      "expression":  "escape_consumed = ImGui::IsKeyPressed(ImGuiKey_Escape, false);",
                                      "source":  "src/standalone/src/core/disasm/disasm_view.cpp"
                                  },
                                  {
                                      "key":  "ImGuiKey_Escape",
-                                     "line":  3438,
+                                     "line":  3440,
                                      "expression":  "} else if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {",
                                      "source":  "src/standalone/src/core/disasm/disasm_view.cpp"
                                  },
                                  {
                                      "key":  "ImGuiKey_Escape",
-                                     "line":  4184,
+                                     "line":  4186,
                                      "expression":  "if (!escape_consumed \u0026\u0026 ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {",
                                      "source":  "src/standalone/src/core/disasm/disasm_view.cpp"
                                  },
@@ -63730,7 +63730,7 @@
                                  },
                                  {
                                      "key":  "ImGuiKey_Insert",
-                                     "line":  4158,
+                                     "line":  4160,
                                      "expression":  "ImGui::IsKeyPressed(ImGuiKey_Insert, false));",
                                      "source":  "src/standalone/src/core/disasm/disasm_view.cpp"
                                  },
@@ -71238,7 +71238,7 @@
                                                        "descriptor_artifacts":  {
                                                                                     "contracts":  {
                                                                                                       "path":  "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json",
-                                                                                                      "sha256":  "DD084F655A1EA9B81D173D8C4E4ABE040F218E25448C05EB2DA48441A09177A8"
+                                                                                                      "sha256":  "6890A3CA0FB52E7FD91B414583C508B1955A141B410808A151DD6E1559938B70"
                                                                                                   },
                                                                                     "effects":  {
                                                                                                     "path":  "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json",
@@ -71246,7 +71246,7 @@
                                                                                                 },
                                                                                     "archive_manifest":  {
                                                                                                              "path":  "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json",
-                                                                                                             "sha256":  "98CD62E0F3BCB32C59D89679F5D49F03647631A7A2F884A548EDE6E7CBA42B5F"
+                                                                                                             "sha256":  "5C8459ECB79DCCCCA299D1D4AC1A207A626362A2119F29CE25807B140B4A9A5D"
                                                                                                          }
                                                                                 },
                                                        "registration_source":  "src/standalone/src/core/mcp/compat/c03_compatibility_registration.cpp",
@@ -71354,7 +71354,7 @@
                                    },
                                    {
                                        "file":  "src/standalone/src/core/testlab/test_lab_features_c03_safe_headless.cpp",
-                                       "sha256":  "c61d5fd3f2a77fbc5d99defacdd4e8aa1697b59a18d5a98c2fd666a5cd9012e1"
+                                       "sha256":  "3faf222854f56cde42b3cf44bd3b6d021148cfb24e981c7ec93dd57337cde926"
                                    },
                                    {
                                        "file":  "src/standalone/src/core/testlab/test_lab_features_hv_detect.cpp",
@@ -71598,11 +71598,11 @@
                                    },
                                    {
                                        "file":  "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json",
-                                       "sha256":  "dd084f655a1ea9b81d173d8c4e4abe040f218e25448c05eb2da48441a09177a8"
+                                       "sha256":  "6890a3ca0fb52e7fd91b414583c508b1955a141b410808a151dd6e1559938b70"
                                    },
                                    {
                                        "file":  "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json",
-                                       "sha256":  "98cd62e0f3bcb32c59d89679f5d49f03647631a7a2f884a548ede6e7cba42b5f"
+                                       "sha256":  "5c8459ecb79dcccca299d1d4ac1a207a626362a2119f29ce25807b140b4a9a5d"
                                    },
                                    {
                                        "file":  "src/standalone/tests/mcp_compat/signature_handlers_harness.cpp",
@@ -71770,7 +71770,7 @@
                                    },
                                    {
                                        "file":  "src/standalone/src/core/disasm/disasm_view.cpp",
-                                       "sha256":  "626bb9a504ad779ac2e7c87197eaf3e19da5bb449524cf106d3fa83fee1f4577"
+                                       "sha256":  "1e084a3ab4cc0826ec33a4299bdee3e8d26979ff995541a7b113edc0834f8c2e"
                                    },
                                    {
                                        "file":  "src/standalone/src/core/mcp/calculator_tool.cpp",
@@ -71926,7 +71926,7 @@
                                    },
                                    {
                                        "file":  "src/standalone/src/core/analysis/workspace/decompiler_service.cpp",
-                                       "sha256":  "709d373f54b837b8353bd0b9434aaf468b6fc018316ebcf60b5d2875066d4f76"
+                                       "sha256":  "c60f576cbe8bcba441cbe685d24b8dab2820f4a42bdfdf428711715edb1073c0"
                                    },
                                    {
                                        "file":  "src/standalone/src/core/debugger/seh_view.hpp",
@@ -72102,7 +72102,7 @@
                                    },
                                    {
                                        "file":  "src/standalone/src/core/mcp/ida_compat_read.cpp",
-                                       "sha256":  "eb70fcfba885c81b295ba92f8def014f70da00175f9506cc1c05982a4d88cefb"
+                                       "sha256":  "93e98b8c96a34e614639062800fb14063f1954f88b1584c7ce2b39943a367f4b"
                                    },
                                    {
                                        "file":  "src/standalone/src/core/mcp/ida_compat_mut.cpp",

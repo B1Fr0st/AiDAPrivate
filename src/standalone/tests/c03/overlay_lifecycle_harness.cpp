@@ -4,17 +4,35 @@
 #include "../../src/core/analysis/workspace/search_index.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <process.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace aida::analysis::c03_test {
+
+struct harness_log_t {
+    using clock_t = std::chrono::steady_clock;
+    static unsigned long pid() { return static_cast<unsigned long>(_getpid()); }
+    static unsigned long tid() { return static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id())); }
+    static std::uint64_t epoch_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(clock_t::now().time_since_epoch()).count(); }
+    static void emit(const char* test, const char* phase, const char* status, std::uint64_t elapsed_ms, const std::string& detail = {}) {
+        std::fprintf(stderr, "[C03-HARNESS] test=%s phase=%s status=%s elapsed=%llums pid=%lu tid=%lu errno=%d detail=%s\n",
+            test, phase, status, static_cast<unsigned long long>(elapsed_ms), pid(), tid(), static_cast<int>(errno),
+            detail.empty() ? "-" : detail.c_str());
+        std::fflush(stderr);
+    }
+};
 
 namespace {
 
@@ -22,8 +40,10 @@ using namespace test_fixture;
 
 void require(bool condition, const char* message)
 {
-    if (!condition)
+    if (!condition) {
+        harness_log_t::emit("overlay_lifecycle", "assertion", "fail", 0, message);
         throw fixture_error_t(message);
+    }
 }
 
 address_t fixture_address(
@@ -213,6 +233,8 @@ void restore_persisted_publication(
 
 void run_overlay_lifecycle_harness()
 {
+    const auto harness_start = harness_log_t::epoch_ms();
+    harness_log_t::emit("overlay_lifecycle", "harness", "enter", 0, "fixture=overlay_lifecycle");
     fixture_root_t root("overlay_lifecycle");
     const auto first_path = write_bytes_fixture(
         root.path() / "first" / "overlay.exe",
@@ -225,6 +247,8 @@ void run_overlay_lifecycle_harness()
     std::shared_ptr<analysis_workspace_t> reopened;
     std::string first_database_path;
     try {
+        const auto setup_start = harness_log_t::epoch_ms();
+        harness_log_t::emit("overlay_lifecycle", "fixture_setup", "enter", 0);
         first = open_workspace(first_path, "overlay-first.exe");
         second = open_workspace(second_path, "overlay-second.exe");
         install_services(first);
@@ -232,8 +256,12 @@ void run_overlay_lifecycle_harness()
         analyze_workspace(first, 1);
         analyze_workspace(second, 1);
         first_database_path = first->database()->path();
+        harness_log_t::emit("overlay_lifecycle", "fixture_setup", "pass", harness_log_t::epoch_ms() - setup_start);
 
+        const auto bounded_start = harness_log_t::epoch_ms();
+        harness_log_t::emit("overlay_lifecycle", "verify_bounded_failures", "enter", 0);
         verify_bounded_failures(first);
+        harness_log_t::emit("overlay_lifecycle", "verify_bounded_failures", "pass", harness_log_t::epoch_ms() - bounded_start);
         const auto before = first->snapshot();
         require(before && before->baseline_complete,
                 "overlay fixture baseline was not complete");
@@ -255,6 +283,8 @@ void run_overlay_lifecycle_harness()
         const auto original_byte = provider_byte(
             first->source_provider(), file_offset);
 
+        const auto transaction_start = harness_log_t::epoch_ms();
+        harness_log_t::emit("overlay_lifecycle", "overlay_transaction", "enter", 0);
         overlay_transaction_request_t request;
         request.expected_revision = 0;
         request.idempotency_key = "overlay-lifecycle-byte-patch";
@@ -291,6 +321,7 @@ void run_overlay_lifecycle_harness()
                                   coverage_reason_t::decoded),
                 "selective publication did not preserve exact coverage state");
         verify_persisted_candidate(first);
+        harness_log_t::emit("overlay_lifecycle", "overlay_transaction", "pass", harness_log_t::epoch_ms() - transaction_start);
 
         require(second->generation() == second_generation &&
                 second->analysis_revision() == second_analysis_revision &&
@@ -301,6 +332,8 @@ void run_overlay_lifecycle_harness()
                     second_counts,
                 "overlay mutation crossed the workspace isolation boundary");
 
+        const auto undo_redo_start = harness_log_t::epoch_ms();
+        harness_log_t::emit("overlay_lifecycle", "undo_redo", "enter", 0);
         const auto undone = first->overlay()->undo(
             first->overlay_revision());
         require(undone && undone.value().committed &&
@@ -315,12 +348,15 @@ void run_overlay_lifecycle_harness()
                 provider_byte(first->provider(), file_offset) == 0x90,
                 "overlay redo did not restore projected patch bytes");
         verify_persisted_candidate(first);
+        harness_log_t::emit("overlay_lifecycle", "undo_redo", "pass", harness_log_t::epoch_ms() - undo_redo_start);
 
         const auto persisted_generation = first->generation();
         const auto persisted_revision = first->overlay_revision();
         close_workspace(first);
         first.reset();
 
+        const auto reopen_start = harness_log_t::epoch_ms();
+        harness_log_t::emit("overlay_lifecycle", "warm_reopen", "enter", 0);
         reopened = open_workspace(first_path, "overlay-first.exe");
         install_services(reopened);
         require(reopened->generation() == persisted_generation &&
@@ -337,7 +373,10 @@ void run_overlay_lifecycle_harness()
         reopened.reset();
         close_workspace(second, true);
         second.reset();
+        harness_log_t::emit("overlay_lifecycle", "warm_reopen", "pass", harness_log_t::epoch_ms() - reopen_start);
+        harness_log_t::emit("overlay_lifecycle", "harness", "pass", harness_log_t::epoch_ms() - harness_start);
     } catch (...) {
+        harness_log_t::emit("overlay_lifecycle", "harness", "fail", harness_log_t::epoch_ms() - harness_start, "exception propagated from test body");
         try {
             if (reopened)
                 close_workspace(reopened, true);
@@ -357,11 +396,17 @@ void run_overlay_lifecycle_harness()
 
 int main()
 {
+    const auto main_start = aida::analysis::c03_test::harness_log_t::epoch_ms();
+    aida::analysis::c03_test::harness_log_t::emit("overlay_lifecycle", "main", "enter", 0);
     try {
         aida::analysis::c03_test::run_overlay_lifecycle_harness();
+        const auto elapsed = aida::analysis::c03_test::harness_log_t::epoch_ms() - main_start;
+        aida::analysis::c03_test::harness_log_t::emit("overlay_lifecycle", "main", "pass", elapsed);
         std::cout << "overlay_lifecycle_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& exception) {
+        const auto elapsed = aida::analysis::c03_test::harness_log_t::epoch_ms() - main_start;
+        aida::analysis::c03_test::harness_log_t::emit("overlay_lifecycle", "main", "fail", elapsed, exception.what());
         std::cerr << exception.what() << '\n';
         return 1;
     }

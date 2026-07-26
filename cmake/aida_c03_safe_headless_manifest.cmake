@@ -89,20 +89,7 @@ set(AIDA_C03_SAFE_HEADLESS_MATERIALIZER "${AIDA_C03_TEST_ROOT}/testlab_runtime/m
 set(AIDA_C03_SAFE_HEADLESS_RESOURCE_POLICY_CASES "${AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT}/c03_safe_headless/target_resource_policy_cases.json")
 set(AIDA_C03_SAFE_HEADLESS_RECORDS "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}/target-records-$<CONFIG>.json")
 set(AIDA_C03_SAFE_HEADLESS_MANIFEST "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}/manifest.json")
-set(AIDA_C03_SAFE_HEADLESS_DIGEST "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}/manifest.sha256")
-set(AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}/manifest_digest.hpp")
-set(AIDA_C03_TESTLAB_INTEGRATION_DIGEST_HEADER
-    "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}/testlab_integration_manifest_digest.hpp")
 file(MAKE_DIRECTORY "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}")
-set(_aida_c03_testlab_integration_digest
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-string(LENGTH "${_aida_c03_testlab_integration_digest}" _aida_c03_testlab_integration_digest_length)
-if(NOT _aida_c03_testlab_integration_digest_length EQUAL 64 OR
-   NOT _aida_c03_testlab_integration_digest MATCHES "^[0-9a-f]+$")
-    message(FATAL_ERROR "AiDA C03 Test Lab integration digest fixture is malformed")
-endif()
-file(GENERATE OUTPUT "${AIDA_C03_TESTLAB_INTEGRATION_DIGEST_HEADER}"
-    CONTENT "#pragma once\n#define AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256 \"${_aida_c03_testlab_integration_digest}\"\n")
 
 set(AIDA_C03_MCP_PRODUCTION_CLOSURE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/analysis_tools_standalone.cpp"
@@ -842,6 +829,21 @@ function(aida_c03_stage_runtime_tree source_root relative_root output)
     set(${output} "${_aida_relatives}" PARENT_SCOPE)
 endfunction()
 
+function(aida_c03_copy_z3_runtime_dlls target)
+    set(_aida_z3_dlls)
+    foreach(_aida_z3_dll_name IN LISTS AIDA_Z3_RUNTIME_DLL_NAMES)
+        list(APPEND _aida_z3_dlls "${Z3_INSTALL_DIR}/bin/${_aida_z3_dll_name}")
+    endforeach()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_aida_z3_dlls}
+            "$<TARGET_FILE_DIR:${target}>"
+        COMMAND_EXPAND_LISTS
+        COMMENT "Staging Z3 runtime DLLs for ${target}..."
+        VERBATIM
+    )
+endfunction()
+
 function(aida_c03_register_manifest_entry)
     cmake_parse_arguments(PARSE_ARGV 0 _aida "ARGS_ENTRY" "TARGET;PACKAGE;ENTRY_DEFINITION;OUTPUT_NAME;MAX_ACTIVE_PROCESSES;MAX_WALL_MS" "SOURCES;ARGUMENTS;RUNTIME_FILES;LINK_LIBRARIES;INCLUDE_DIRECTORIES;COMPILE_DEFINITIONS;SOURCE_RECORDS")
     if(_aida_UNPARSED_ARGUMENTS OR _aida_KEYWORDS_MISSING_VALUES OR
@@ -938,6 +940,7 @@ function(aida_c03_register_manifest_entry)
     set_property(GLOBAL APPEND PROPERTY AIDA_C03_MANIFEST_TARGETS "${_aida_TARGET}")
     set_property(GLOBAL APPEND PROPERTY AIDA_C03_COMPILER_MATRIX_HARNESS_INPUTS
         ${_aida_SOURCES} "${_aida_adapter}" "${AIDA_C03_TEST_ROOT}/testlab_runtime/result_adapter.cpp")
+    aida_c03_copy_z3_runtime_dlls(${_aida_TARGET})
 endfunction()
 
 function(aida_c03_register_direct_test)
@@ -986,6 +989,9 @@ function(aida_c03_register_direct_test)
         RESOURCE_LOCK "aida_c03_safe_headless_direct")
     set_property(GLOBAL APPEND PROPERTY AIDA_C03_DIRECT_TARGETS "${_aida_TARGET}")
     set_property(GLOBAL APPEND PROPERTY AIDA_C03_COMPILER_MATRIX_HARNESS_INPUTS ${_aida_SOURCES})
+    if(NOT _aida_NO_SHARED_RUNTIME)
+        aida_c03_copy_z3_runtime_dlls(${_aida_TARGET})
+    endif()
 endfunction()
 
 function(aida_c03_register_worker_targets application_target)
@@ -2028,7 +2034,7 @@ function(aida_c03_register_safe_headless_targets application_target)
     string(SHA256 _aida_build_identity
         "aida-c03-safe-headless|${_aida_contract_identity}|${_aida_assertion_inventory_identity}|${_aida_materializer_identity}|${_aida_resource_policy_cases_identity}|${_aida_root_cmake_identity}|${_aida_manifest_cmake_identity}|${_aida_dependency_cmake_identity}|${_aida_package_cmake_identity}|${_aida_authority_identity}")
     string(TOLOWER "${_aida_build_identity}" _aida_build_identity)
-    add_custom_command(OUTPUT "${AIDA_C03_SAFE_HEADLESS_MANIFEST}" "${AIDA_C03_SAFE_HEADLESS_DIGEST}"
+    add_custom_command(OUTPUT "${AIDA_C03_SAFE_HEADLESS_MANIFEST}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}/scratch"
         COMMAND "${_aida_python_executable}" "${AIDA_C03_SAFE_HEADLESS_MATERIALIZER}"
@@ -2037,7 +2043,6 @@ function(aida_c03_register_safe_headless_targets application_target)
             --policy-cases "${AIDA_C03_SAFE_HEADLESS_RESOURCE_POLICY_CASES}"
             --approved-root "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}"
             --output "${AIDA_C03_SAFE_HEADLESS_MANIFEST}"
-            --digest "${AIDA_C03_SAFE_HEADLESS_DIGEST}"
             --build-identity "${_aida_build_identity}"
             --contract-identity "${_aida_contract_identity}"
         DEPENDS
@@ -2049,26 +2054,14 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${AIDA_C03_SAFE_HEADLESS_MATERIALIZER}"
             "${AIDA_C03_SAFE_HEADLESS_RESOURCE_POLICY_CASES}"
         VERBATIM)
-    add_custom_command(OUTPUT "${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"
-        COMMAND ${CMAKE_COMMAND}
-            "-DAIDA_C03_DIGEST_FILE=${AIDA_C03_SAFE_HEADLESS_DIGEST}"
-            "-DAIDA_C03_HEADER_FILE=${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"
-            -P "${AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT}/c03_safe_headless/write_digest_header.cmake"
-        DEPENDS
-            "${AIDA_C03_SAFE_HEADLESS_MANIFEST}"
-            "${AIDA_C03_SAFE_HEADLESS_DIGEST}"
-            "${AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT}/c03_safe_headless/write_digest_header.cmake"
-        VERBATIM)
     add_custom_target(aida_c03_safe_headless_manifest
         DEPENDS
-            "${AIDA_C03_SAFE_HEADLESS_MANIFEST}"
-            "${AIDA_C03_SAFE_HEADLESS_DIGEST}"
-            "${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}")
+            "${AIDA_C03_SAFE_HEADLESS_MANIFEST}")
     set_target_properties(aida_c03_safe_headless_manifest PROPERTIES
         FOLDER "Tests/C03/SafeHeadless"
         AIDA_C03_SAFE_HEADLESS TRUE
         AIDA_C03_DEVELOPER_ONLY TRUE
-        AIDA_C03_DEVELOPER_SUITE_OUTPUTS "suite/$<CONFIG>/manifest.json;suite/$<CONFIG>/manifest.sha256"
+        AIDA_C03_DEVELOPER_SUITE_OUTPUTS "suite/$<CONFIG>/manifest.json"
         AIDA_C03_ASSERTION_INVENTORY_SHA256 "${_aida_assertion_inventory_identity}"
         AIDA_C03_AUTHORITY_SURFACE_IDENTITY "${_aida_authority_identity}"
         AIDA_C03_AUTHORITY_LEDGER_SHA256 "${_aida_authority_ledger_sha256}"
@@ -2100,8 +2093,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         LABELS "c03;c03_safe_headless;safe-headless;package")
     add_dependencies(${application_target} aida_c03_safe_headless_application_package)
     target_include_directories(${application_target} PRIVATE "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}")
-    target_compile_options(${application_target} PRIVATE
-        "$<$<COMPILE_LANGUAGE:C,CXX>:/FI${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}>")
 
     add_executable(aida_c03_safe_headless_manifest_suite
         "${AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT}/c03_safe_headless/manifest_suite_main.cpp"
@@ -2112,7 +2103,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         "${imgui_SOURCE_DIR}/imgui_widgets.cpp")
     aida_c03_configure_native_target(aida_c03_safe_headless_manifest_suite)
     target_include_directories(aida_c03_safe_headless_manifest_suite PRIVATE "${imgui_SOURCE_DIR}")
-    target_compile_options(aida_c03_safe_headless_manifest_suite PRIVATE "/FI${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}")
     target_link_libraries(aida_c03_safe_headless_manifest_suite PRIVATE
         aida_c03_safe_headless_runtime bcrypt advapi32 userenv)
     add_dependencies(aida_c03_safe_headless_manifest_suite aida_c03_safe_headless_manifest)
@@ -2121,6 +2111,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         FOLDER "Tests/C03/SafeHeadless/Direct"
         AIDA_C03_SAFE_HEADLESS TRUE
         LABELS "c03;c03_safe_headless;safe-headless;manifest-suite")
+    aida_c03_copy_z3_runtime_dlls(aida_c03_safe_headless_manifest_suite)
     add_test(NAME aida_c03_safe_headless_manifest_suite
         COMMAND $<TARGET_FILE:aida_c03_safe_headless_manifest_suite> "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}")
     set_tests_properties(aida_c03_safe_headless_manifest_suite PROPERTIES
@@ -2187,8 +2178,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         INCLUDE_DIRECTORIES "${imgui_SOURCE_DIR}"
         LINK_LIBRARIES bcrypt advapi32 userenv
         DEPENDS aida_c03_testlab_fake_safe_headless_adapter)
-    target_compile_options(aida_c03_testlab_runtime_integration_harness PRIVATE
-        "/FI${AIDA_C03_TESTLAB_INTEGRATION_DIGEST_HEADER}")
     aida_c03_register_direct_test(
         TARGET aida_c03_b14_native_worker_containment_harness PACKAGE B14 TIMEOUT 180
         SOURCES "${AIDA_C03_TEST_ROOT}/native_worker_protocol_harness.cpp"
@@ -2369,8 +2358,6 @@ function(aida_c03_register_safe_headless_targets application_target)
     set(AIDA_C03_SAFE_HEADLESS_TARGETS "${_aida_manifest_targets}" PARENT_SCOPE)
     set(AIDA_C03_SAFE_HEADLESS_DIRECT_TARGETS "${_aida_direct_targets}" PARENT_SCOPE)
     set(AIDA_C03_SAFE_HEADLESS_MANIFEST "${AIDA_C03_SAFE_HEADLESS_MANIFEST}" PARENT_SCOPE)
-    set(AIDA_C03_SAFE_HEADLESS_DIGEST "${AIDA_C03_SAFE_HEADLESS_DIGEST}" PARENT_SCOPE)
-    set(AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER "${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}" PARENT_SCOPE)
     set(AIDA_C03_COMPILER_MATRIX_CM_15 "${AIDA_C03_COMPILER_MATRIX_CM_15}" PARENT_SCOPE)
     set(AIDA_C03_COMPILER_MATRIX_UNION "${AIDA_C03_COMPILER_MATRIX_UNION}" PARENT_SCOPE)
 endfunction()

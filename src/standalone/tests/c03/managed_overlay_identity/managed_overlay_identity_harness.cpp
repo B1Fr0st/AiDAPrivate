@@ -13,18 +13,36 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <memory>
+#include <process.h>
 #include <string>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace aida::analysis::c03_test {
+
+struct harness_log_t {
+    using clock_t = std::chrono::steady_clock;
+    static unsigned long pid() { return static_cast<unsigned long>(_getpid()); }
+    static unsigned long tid() { return static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id())); }
+    static std::uint64_t epoch_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(clock_t::now().time_since_epoch()).count(); }
+    static void emit(const char* test, const char* phase, const char* status, std::uint64_t elapsed_ms, const std::string& detail = {}) {
+        std::fprintf(stderr, "[C03-HARNESS] test=%s phase=%s status=%s elapsed=%llums pid=%lu tid=%lu errno=%d detail=%s\n",
+            test, phase, status, static_cast<unsigned long long>(elapsed_ms), pid(), tid(), static_cast<int>(errno),
+            detail.empty() ? "-" : detail.c_str());
+        std::fflush(stderr);
+    }
+};
 
 namespace {
 
@@ -35,8 +53,10 @@ void require(bool condition, const std::string& message)
 {
     assertion_telemetry::record_assertion(
         condition, message, __FILE__, __LINE__);
-    if (!condition)
+    if (!condition) {
+        harness_log_t::emit("managed_overlay_identity", "assertion", "fail", 0, message);
         throw fixture_error_t(message);
+    }
 }
 
 sha256_digest_t digest(const std::string& value)
@@ -1026,14 +1046,39 @@ void verify_journal_idempotency_recovery_and_isolation()
 
 int run_managed_overlay_identity_harness()
 {
+    const auto harness_start = harness_log_t::epoch_ms();
+    harness_log_t::emit("managed_overlay_identity", "harness", "enter", 0);
     try {
-        verify_locator_and_serialization_contract();
-        verify_allowlist_history_projection_and_reanalysis();
-        verify_schema_migration_and_corruption_guards();
-        verify_journal_idempotency_recovery_and_isolation();
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("managed_overlay_identity", "verify_locator_and_serialization_contract", "enter", 0);
+            verify_locator_and_serialization_contract();
+            harness_log_t::emit("managed_overlay_identity", "verify_locator_and_serialization_contract", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("managed_overlay_identity", "verify_allowlist_history_projection_and_reanalysis", "enter", 0);
+            verify_allowlist_history_projection_and_reanalysis();
+            harness_log_t::emit("managed_overlay_identity", "verify_allowlist_history_projection_and_reanalysis", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("managed_overlay_identity", "verify_schema_migration_and_corruption_guards", "enter", 0);
+            verify_schema_migration_and_corruption_guards();
+            harness_log_t::emit("managed_overlay_identity", "verify_schema_migration_and_corruption_guards", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("managed_overlay_identity", "verify_journal_idempotency_recovery_and_isolation", "enter", 0);
+            verify_journal_idempotency_recovery_and_isolation();
+            harness_log_t::emit("managed_overlay_identity", "verify_journal_idempotency_recovery_and_isolation", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+        harness_log_t::emit("managed_overlay_identity", "harness", "pass", harness_log_t::epoch_ms() - harness_start);
         std::cout << "managed overlay identity harness passed\n";
         return 0;
     } catch (const std::exception& error) {
+        const auto elapsed = harness_log_t::epoch_ms() - harness_start;
+        harness_log_t::emit("managed_overlay_identity", "harness", "fail", elapsed, error.what());
         assertion_telemetry::record_exception(error.what());
         std::cerr << "managed overlay identity harness failed: "
                   << error.what() << '\n';

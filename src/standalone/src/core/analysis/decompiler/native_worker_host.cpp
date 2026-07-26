@@ -3278,6 +3278,29 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
         if (terminal == terminal_wait_t::cancelled || terminal == terminal_wait_t::deadline) {
             const bool is_deadline = terminal == terminal_wait_t::deadline;
             send_cancel(worker, request, limits_, is_deadline ? "deadline_exceeded" : "cancelled");
+            auto saved_cancel = request.cancellation_requested;
+            request.cancellation_requested = [] { return false; };
+            const auto grace_deadline = std::chrono::steady_clock::now() + limits_.cancellation_grace;
+            while (std::chrono::steady_clock::now() < grace_deadline) {
+                const auto grace_terminal = wait_for_message(worker, request, limits_, grace_deadline, frame, error);
+                if (grace_terminal == terminal_wait_t::message) {
+                    const auto decoded = deserialize_decompiler_worker_message(
+                        std::string(reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size()));
+                    if (decoded.valid() && decoded.value && validate_envelope(*decoded.value, frame, worker.session)) {
+                        if (std::holds_alternative<decompiler_worker_failure_message_t>(*decoded.value)) {
+                            const auto& failure = std::get<decompiler_worker_failure_message_t>(*decoded.value);
+                            if (failure.job_id == request.job_id)
+                                append_worker_failure(result, failure);
+                        }
+                    }
+                    break;
+                }
+                if (grace_terminal == terminal_wait_t::exited ||
+                    grace_terminal == terminal_wait_t::deadline ||
+                    grace_terminal == terminal_wait_t::protocol_failure)
+                    break;
+            }
+            request.cancellation_requested = saved_cancel;
             result.status = is_deadline ? native_worker_execution_status_t::deadline_exceeded : native_worker_execution_status_t::cancelled;
             append_diagnostic(result, is_deadline ? native_worker_diagnostic_code_t::deadline_exceeded : native_worker_diagnostic_code_t::cancelled,
                 "native_worker.cancel", is_deadline ? "worker exceeded its deadline" : "worker cancellation was requested", ERROR_CANCELLED, true);

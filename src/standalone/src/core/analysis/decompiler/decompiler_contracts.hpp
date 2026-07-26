@@ -221,7 +221,9 @@ enum class typed_pseudocode_ast_node_kind_t : std::uint16_t {
     index_expression = 25,
     identifier = 26,
     literal = 27,
-    unknown_expression = 28
+    unknown_expression = 28,
+    goto_statement = 29,
+    label_statement = 30
 };
 
 enum class decompiler_document_token_kind_t : std::uint8_t {

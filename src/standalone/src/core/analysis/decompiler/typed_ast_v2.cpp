@@ -41,7 +41,9 @@ bool is_statement_kind(const typed_pseudocode_ast_node_kind_t kind) noexcept
            kind == typed_pseudocode_ast_node_kind_t::continue_statement ||
            kind == typed_pseudocode_ast_node_kind_t::return_statement ||
            kind == typed_pseudocode_ast_node_kind_t::throw_statement ||
-           kind == typed_pseudocode_ast_node_kind_t::try_statement;
+           kind == typed_pseudocode_ast_node_kind_t::try_statement ||
+           kind == typed_pseudocode_ast_node_kind_t::goto_statement ||
+           kind == typed_pseudocode_ast_node_kind_t::label_statement;
 }
 
 bool is_visible_text(const std::string& value) noexcept
@@ -140,6 +142,56 @@ std::optional<conditional_descriptor_t> conditional_descriptor(const std::string
     if (flag_offset + 1U != value.size() || (value[flag_offset] != '0' && value[flag_offset] != '1'))
         return std::nullopt;
     result.negated = value[flag_offset] == '1';
+    return result;
+}
+
+struct switch_case_entry_t {
+    std::string value;
+    std::uint64_t target_block = 0;
+};
+
+struct switch_descriptor_t {
+    std::vector<switch_case_entry_t> cases;
+    std::uint64_t default_target = 0;
+};
+
+std::optional<switch_descriptor_t> switch_descriptor(const std::string& value)
+{
+    constexpr std::string_view case_prefix = "case.";
+    constexpr std::string_view default_prefix = "default=";
+    if (value.empty() || value.find(case_prefix) == std::string::npos)
+        return std::nullopt;
+    switch_descriptor_t result;
+    std::size_t pos = 0;
+    while (pos < value.size()) {
+        const auto sep = value.find(';', pos);
+        const std::string token = sep == std::string::npos
+            ? value.substr(pos) : value.substr(pos, sep - pos);
+        if (token.compare(0, case_prefix.size(), case_prefix.data(), case_prefix.size()) == 0) {
+            const auto eq = token.find('=', case_prefix.size());
+            if (eq == std::string::npos)
+                return std::nullopt;
+            switch_case_entry_t entry;
+            entry.value = token.substr(case_prefix.size(), eq - case_prefix.size());
+            const auto begin = token.data() + eq + 1;
+            const auto end = token.data() + token.size();
+            const auto parsed = std::from_chars(begin, end, entry.target_block);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || entry.target_block == 0)
+                return std::nullopt;
+            result.cases.push_back(std::move(entry));
+        } else if (token.compare(0, default_prefix.size(), default_prefix.data(), default_prefix.size()) == 0) {
+            const auto begin = token.data() + default_prefix.size();
+            const auto end = token.data() + token.size();
+            const auto parsed = std::from_chars(begin, end, result.default_target);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || result.default_target == 0)
+                return std::nullopt;
+        }
+        if (sep == std::string::npos)
+            break;
+        pos = sep + 1;
+    }
+    if (result.cases.empty())
+        return std::nullopt;
     return result;
 }
 
@@ -332,11 +384,6 @@ private:
             }
             if (expected_predecessors.empty())
                 entries.push_back(block.id);
-            if (block.successor_ids.size() > 2) {
-                fail(decompiler_diagnostic_code_t::malformed_ast,
-                    "decompiler.ast.v2.unstructured_control_flow", block.coordinate);
-                return false;
-            }
             for (const auto successor : block.successor_ids) {
                 const auto target = blocks_.find(successor);
                 if (target == blocks_.end() ||
@@ -373,6 +420,11 @@ private:
                     }
                 } else if (value.kind == hir_node_kind_t::switch_branch) {
                     ++switch_count;
+                    if (value.operand_ids.empty()) {
+                        fail(decompiler_diagnostic_code_t::malformed_hir,
+                            "decompiler.ast.v2.switch_selector", value.coordinate);
+                        return false;
+                    }
                 } else if (value.kind == hir_node_kind_t::branch && !value.operand_ids.empty()) {
                     fail(decompiler_diagnostic_code_t::malformed_hir,
                         "decompiler.ast.v2.branch_payload", value.coordinate);
@@ -382,12 +434,22 @@ private:
                     value.kind == hir_node_kind_t::throw_value)
                     terminal = true;
             }
-            if ((block.successor_ids.size() == 2 && condition_count != 1) ||
-                (block.successor_ids.size() != 2 && condition_count != 0) ||
-                switch_count != 0 || (terminal && !block.successor_ids.empty())) {
-                fail(decompiler_diagnostic_code_t::malformed_ast,
-                    "decompiler.ast.v2.unstructured_control_flow", block.coordinate);
-                return false;
+            const bool has_switch = switch_count > 0;
+            if (has_switch) {
+                if (condition_count != 0 || block.successor_ids.size() < 2 ||
+                    (terminal && !block.successor_ids.empty())) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.unstructured_control_flow", block.coordinate);
+                    return false;
+                }
+            } else {
+                if ((block.successor_ids.size() == 2 && condition_count != 1) ||
+                    (block.successor_ids.size() != 2 && condition_count != 0) ||
+                    (terminal && !block.successor_ids.empty())) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.unstructured_control_flow", block.coordinate);
+                    return false;
+                }
             }
         }
         if (entries.size() != 1) {
@@ -585,8 +647,11 @@ private:
             dominators_[entry.first] = normal_roots.find(entry.first) !=
                 normal_roots.end() ? std::set<std::uint64_t>{entry.first} : all;
         bool changed = true;
-        while (changed) {
+        std::size_t dom_iterations = 0;
+        const std::size_t max_dom_iterations = blocks_.size() + 1;
+        while (changed && dom_iterations < max_dom_iterations) {
             changed = false;
+            ++dom_iterations;
             for (const auto& entry : blocks_) {
                 const auto id = entry.first;
                 const auto& predecessors = normal_predecessors_.at(id);
@@ -643,8 +708,11 @@ private:
         for (const auto& entry : blocks_)
             postdominators_[entry.first] = all_with_exit;
         changed = true;
-        while (changed) {
+        std::size_t pdom_iterations = 0;
+        const std::size_t max_pdom_iterations = blocks_.size() + 1;
+        while (changed && pdom_iterations < max_pdom_iterations) {
             changed = false;
+            ++pdom_iterations;
             for (auto iterator = blocks_.rbegin(); iterator != blocks_.rend(); ++iterator) {
                 const auto id = iterator->first;
                 std::vector<std::uint64_t> successors = iterator->second->successor_ids;
@@ -741,12 +809,41 @@ private:
 
     bool append_statements()
     {
+        precompute_goto_targets();
         if (!append_region(entry_block_id_, 0, nullptr, body_statement_ids_, 0))
             return false;
         if (emitted_blocks_.size() != blocks_.size()) {
-            fail(decompiler_diagnostic_code_t::malformed_ast,
-                "decompiler.ast.v2.unstructured_control_flow");
-            return false;
+            const std::size_t total_blocks = blocks_.size();
+            std::size_t safety_iterations = 0;
+            for (const auto& entry : blocks_) {
+                if (emitted_blocks_.find(entry.first) != emitted_blocks_.end())
+                    continue;
+                if (++safety_iterations > total_blocks) {
+                    for (const auto& remaining : blocks_) {
+                        if (emitted_blocks_.find(remaining.first) == emitted_blocks_.end()) {
+                            emit_label_if_needed(remaining.first, body_statement_ids_);
+                            emitted_blocks_.insert(remaining.first);
+                            if (!append_block_statements(*remaining.second, body_statement_ids_))
+                                return false;
+                            if (!remaining.second->successor_ids.empty()) {
+                                for (std::size_t i = 1; i < remaining.second->successor_ids.size(); ++i)
+                                    emit_goto(remaining.second->successor_ids[i],
+                                        body_statement_ids_, remaining.second->coordinate);
+                            }
+                        }
+                    }
+                    break;
+                }
+                emit_label_if_needed(entry.first, body_statement_ids_);
+                emitted_blocks_.insert(entry.first);
+                if (!append_block_statements(*entry.second, body_statement_ids_))
+                    return false;
+                if (!entry.second->successor_ids.empty()) {
+                    for (std::size_t i = 1; i < entry.second->successor_ids.size(); ++i)
+                        emit_goto(entry.second->successor_ids[i],
+                            body_statement_ids_, entry.second->coordinate);
+                }
+            }
         }
         return true;
     }
@@ -755,6 +852,13 @@ private:
     {
         const auto iterator = std::find_if(block.values.begin(), block.values.end(),
             [](const hir_value_t& value) { return value.kind == hir_node_kind_t::conditional; });
+        return iterator == block.values.end() ? nullptr : &*iterator;
+    }
+
+    const hir_value_t* block_switch_value(const hir_block_t& block) const noexcept
+    {
+        const auto iterator = std::find_if(block.values.begin(), block.values.end(),
+            [](const hir_value_t& value) { return value.kind == hir_node_kind_t::switch_branch; });
         return iterator == block.values.end() ? nullptr : &*iterator;
     }
 
@@ -907,6 +1011,383 @@ private:
         return best;
     }
 
+    std::uint64_t immediate_postdominator(const std::uint64_t block_id) const
+    {
+        const auto& pdoms = postdominators_.at(block_id);
+        std::uint64_t best = 0;
+        std::size_t best_depth = 0;
+        for (const auto candidate : pdoms) {
+            if (candidate == block_id)
+                continue;
+            const auto depth = postdominators_.at(candidate).size();
+            if (depth > best_depth || (depth == best_depth && candidate < best)) {
+                best = candidate;
+                best_depth = depth;
+            }
+        }
+        return best;
+    }
+
+    const typed_pseudocode_ast_node_t* node_by_id(const std::uint64_t id) const noexcept
+    {
+        if (id == 0 || id > ast_.nodes.size())
+            return nullptr;
+        return &ast_.nodes[id - 1];
+    }
+
+    std::string label_for_block(const std::uint64_t block_id)
+    {
+        auto existing = block_labels_.find(block_id);
+        if (existing != block_labels_.end())
+            return existing->second;
+        std::string label = "label_" + std::to_string(block_id);
+        block_labels_.emplace(block_id, label);
+        return label;
+    }
+
+    std::uint64_t emit_goto(const std::uint64_t target_block,
+                            std::vector<std::uint64_t>& output,
+                            const source_coordinate_t& coordinate)
+    {
+        goto_target_blocks_.insert(target_block);
+        const auto label = label_for_block(target_block);
+        const auto id = append_node(
+            typed_pseudocode_ast_node_kind_t::goto_statement,
+            hir_.return_type_id, {}, label,
+            translate_coordinate(coordinate, decompiler_coordinate_layer_t::typed_ast),
+            aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+        if (id != 0)
+            output.push_back(id);
+        return id;
+    }
+
+    void emit_label_if_needed(const std::uint64_t block_id,
+                              std::vector<std::uint64_t>& output)
+    {
+        if (goto_target_blocks_.find(block_id) == goto_target_blocks_.end())
+            return;
+        const auto label = label_for_block(block_id);
+        const auto id = append_node(
+            typed_pseudocode_ast_node_kind_t::label_statement,
+            hir_.return_type_id, {}, label,
+            translate_coordinate(blocks_.at(block_id)->coordinate,
+                decompiler_coordinate_layer_t::typed_ast),
+            aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+        if (id != 0)
+            output.push_back(id);
+    }
+
+    void precompute_goto_targets()
+    {
+        for (const auto& entry : blocks_) {
+            const auto* block = entry.second;
+            const bool has_switch = block_switch_value(*block) != nullptr;
+            if (!has_switch && block->successor_ids.size() > 2) {
+                for (const auto successor : block->successor_ids)
+                    goto_target_blocks_.insert(successor);
+            }
+            if (!has_switch && block->successor_ids.size() == 2 &&
+                !block_condition(*block)) {
+                for (const auto successor : block->successor_ids)
+                    goto_target_blocks_.insert(successor);
+            }
+            if (normal_predecessors_.at(entry.first).size() > 2)
+                goto_target_blocks_.insert(entry.first);
+        }
+    }
+
+    bool append_switch(const hir_block_t& header,
+                       std::vector<std::uint64_t>& output,
+                       std::uint64_t& next)
+    {
+        const auto* switch_value = block_switch_value(header);
+        if (!switch_value || switch_value->operand_ids.empty()) {
+            fail(decompiler_diagnostic_code_t::malformed_ast,
+                "decompiler.ast.v2.unstructured_control_flow", header.coordinate);
+            return false;
+        }
+        emitted_blocks_.insert(header.id);
+        if (!append_block_statements(header, output))
+            return false;
+        const auto selector = build_expression(switch_value->operand_ids.front(), 0);
+        if (selector == 0)
+            return false;
+        const auto merge = immediate_postdominator(header.id);
+        const auto descriptor = switch_descriptor(switch_value->stable_value);
+        std::vector<std::uint64_t> switch_children{selector};
+        std::set<std::uint64_t> handled_successors;
+        if (descriptor) {
+            for (const auto& entry : descriptor->cases) {
+                if (!std::binary_search(header.successor_ids.begin(),
+                        header.successor_ids.end(), entry.target_block))
+                    continue;
+                if (emitted_blocks_.find(entry.target_block) != emitted_blocks_.end())
+                    continue;
+                handled_successors.insert(entry.target_block);
+                const auto case_literal = append_node(
+                    typed_pseudocode_ast_node_kind_t::literal,
+                    switch_value->type_id, {}, entry.value,
+                    translate_coordinate(switch_value->coordinate,
+                        decompiler_coordinate_layer_t::typed_ast),
+                    switch_value->confidence, switch_value->provenance);
+                if (case_literal == 0)
+                    return false;
+                std::vector<std::uint64_t> case_children{case_literal};
+                if (entry.target_block != merge) {
+                    if (!append_region(entry.target_block, merge,
+                            nullptr, case_children, 0))
+                        return false;
+                }
+                emit_switch_break_if_needed(entry.target_block, merge, case_children);
+                const auto case_node = append_node(
+                    typed_pseudocode_ast_node_kind_t::switch_case,
+                    hir_.return_type_id, std::move(case_children), "case",
+                    translate_coordinate(blocks_.at(entry.target_block)->coordinate,
+                        decompiler_coordinate_layer_t::typed_ast),
+                    aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+                if (case_node == 0)
+                    return false;
+                switch_children.push_back(case_node);
+            }
+            if (descriptor->default_target != 0 &&
+                std::binary_search(header.successor_ids.begin(),
+                    header.successor_ids.end(), descriptor->default_target) &&
+                emitted_blocks_.find(descriptor->default_target) == emitted_blocks_.end()) {
+                handled_successors.insert(descriptor->default_target);
+                std::vector<std::uint64_t> default_children;
+                if (descriptor->default_target != merge) {
+                    if (!append_region(descriptor->default_target, merge,
+                            nullptr, default_children, 0))
+                        return false;
+                }
+                const auto default_node = append_node(
+                    typed_pseudocode_ast_node_kind_t::switch_case,
+                    hir_.return_type_id, std::move(default_children), "default",
+                    translate_coordinate(blocks_.at(descriptor->default_target)->coordinate,
+                        decompiler_coordinate_layer_t::typed_ast),
+                    aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+                if (default_node == 0)
+                    return false;
+                switch_children.push_back(default_node);
+            }
+        } else {
+            for (std::size_t index = 0; index < header.successor_ids.size(); ++index) {
+                const auto target = header.successor_ids[index];
+                if (emitted_blocks_.find(target) != emitted_blocks_.end())
+                    continue;
+                handled_successors.insert(target);
+                if (index + 1 == header.successor_ids.size()) {
+                    std::vector<std::uint64_t> default_children;
+                    if (target != merge) {
+                        if (!append_region(target, merge,
+                                nullptr, default_children, 0))
+                            return false;
+                    }
+                    const auto default_node = append_node(
+                        typed_pseudocode_ast_node_kind_t::switch_case,
+                        hir_.return_type_id, std::move(default_children), "default",
+                        translate_coordinate(blocks_.at(target)->coordinate,
+                            decompiler_coordinate_layer_t::typed_ast),
+                        aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+                    if (default_node == 0)
+                        return false;
+                    switch_children.push_back(default_node);
+                } else {
+                    const auto case_literal = append_node(
+                        typed_pseudocode_ast_node_kind_t::literal,
+                        switch_value->type_id, {}, std::to_string(index),
+                        translate_coordinate(switch_value->coordinate,
+                            decompiler_coordinate_layer_t::typed_ast),
+                        switch_value->confidence, switch_value->provenance);
+                    if (case_literal == 0)
+                        return false;
+                    std::vector<std::uint64_t> case_children{case_literal};
+                    if (target != merge) {
+                        if (!append_region(target, merge,
+                                nullptr, case_children, 0))
+                            return false;
+                    }
+                    emit_switch_break_if_needed(target, merge, case_children);
+                    const auto case_node = append_node(
+                        typed_pseudocode_ast_node_kind_t::switch_case,
+                        hir_.return_type_id, std::move(case_children), "case",
+                        translate_coordinate(blocks_.at(target)->coordinate,
+                            decompiler_coordinate_layer_t::typed_ast),
+                        aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+                    if (case_node == 0)
+                        return false;
+                    switch_children.push_back(case_node);
+                }
+            }
+        }
+        for (const auto successor : header.successor_ids) {
+            if (handled_successors.find(successor) == handled_successors.end() &&
+                emitted_blocks_.find(successor) == emitted_blocks_.end()) {
+                emit_goto(successor, switch_children, header.coordinate);
+            }
+        }
+        const auto switch_node = append_node(
+            typed_pseudocode_ast_node_kind_t::switch_statement,
+            hir_.return_type_id, std::move(switch_children), {},
+            translate_coordinate(header.coordinate,
+                decompiler_coordinate_layer_t::typed_ast),
+            aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+        if (switch_node == 0)
+            return false;
+        output.push_back(switch_node);
+        next = merge;
+        return true;
+    }
+
+    void emit_switch_break_if_needed(const std::uint64_t case_target,
+                                     const std::uint64_t merge,
+                                     std::vector<std::uint64_t>& case_children)
+    {
+        if (merge == 0 || case_children.size() <= 1)
+            return;
+        const auto* last_stmt = node_by_id(case_children.back());
+        if (last_stmt && (
+            last_stmt->kind == typed_pseudocode_ast_node_kind_t::return_statement ||
+            last_stmt->kind == typed_pseudocode_ast_node_kind_t::throw_statement ||
+            last_stmt->kind == typed_pseudocode_ast_node_kind_t::break_statement ||
+            last_stmt->kind == typed_pseudocode_ast_node_kind_t::goto_statement))
+            return;
+        const auto* block = blocks_.at(case_target);
+        bool exits_to_merge = false;
+        for (const auto successor : block->successor_ids) {
+            if (successor == merge) {
+                exits_to_merge = true;
+                break;
+            }
+        }
+        if (!exits_to_merge && block->successor_ids.size() == 1) {
+            std::set<std::uint64_t> visited;
+            std::vector<std::uint64_t> pending{block->successor_ids.front()};
+            std::size_t bfs_iterations = 0;
+            const std::size_t max_bfs_iterations = blocks_.size() + 1;
+            while (!pending.empty() && bfs_iterations < max_bfs_iterations) {
+                ++bfs_iterations;
+                const auto id = pending.back();
+                pending.pop_back();
+                if (!visited.insert(id).second || id == merge)
+                    continue;
+                const auto* next_block = blocks_.at(id);
+                for (const auto successor : next_block->successor_ids) {
+                    if (successor == merge) {
+                        exits_to_merge = true;
+                        break;
+                    }
+                    pending.push_back(successor);
+                }
+                if (exits_to_merge)
+                    break;
+            }
+        }
+        if (!exits_to_merge)
+            return;
+        const auto break_id = append_node(
+            typed_pseudocode_ast_node_kind_t::break_statement,
+            hir_.return_type_id, {}, {},
+            translate_coordinate(block->coordinate,
+                decompiler_coordinate_layer_t::typed_ast),
+            aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+        if (break_id != 0)
+            case_children.push_back(break_id);
+    }
+
+    bool try_for_loop_conversion(const natural_loop_t& loop,
+                                 const hir_value_t& header_condition,
+                                 const std::uint64_t body_entry,
+                                 const std::uint64_t exit,
+                                 const std::uint64_t true_successor,
+                                 std::vector<std::uint64_t>& output,
+                                 std::uint64_t& next)
+    {
+        if (loop.latches.size() != 1)
+            return false;
+        const auto latch_id = *loop.latches.begin();
+        const auto* latch = blocks_.at(latch_id);
+        if (latch->successor_ids.size() != 1 ||
+            latch->successor_ids.front() != loop.header)
+            return false;
+        if (block_has_emittable_statements(*latch)) {
+            std::size_t emittable_count = 0;
+            const hir_value_t* increment_value = nullptr;
+            for (const auto& value : latch->values) {
+                if (emittable_statement(value)) {
+                    ++emittable_count;
+                    if (value.kind == hir_node_kind_t::assignment)
+                        increment_value = &value;
+                }
+            }
+            if (emittable_count != 1 || !increment_value)
+                return false;
+            if (output.empty())
+                return false;
+            const auto* init_stmt = node_by_id(output.back());
+            if (!init_stmt ||
+                init_stmt->kind != typed_pseudocode_ast_node_kind_t::expression_statement ||
+                init_stmt->child_ids.size() != 1)
+                return false;
+            const auto* init_expr = node_by_id(init_stmt->child_ids[0]);
+            if (!init_expr ||
+                init_expr->kind != typed_pseudocode_ast_node_kind_t::assignment_expression ||
+                init_expr->child_ids.size() != 2)
+                return false;
+            const auto* init_lhs = node_by_id(init_expr->child_ids[0]);
+            if (!init_lhs)
+                return false;
+            const auto increment_expr = build_expression(increment_value->id, 0);
+            if (increment_expr == 0)
+                return false;
+            const auto* incr_node = node_by_id(increment_expr);
+            if (!incr_node ||
+                incr_node->kind != typed_pseudocode_ast_node_kind_t::assignment_expression ||
+                incr_node->child_ids.size() != 2)
+                return false;
+            const auto* incr_lhs = node_by_id(incr_node->child_ids[0]);
+            if (!incr_lhs ||
+                incr_lhs->kind != init_lhs->kind ||
+                incr_lhs->stable_text != init_lhs->stable_text)
+                return false;
+            const auto init_expr_id = init_stmt->child_ids[0];
+            output.pop_back();
+            emitted_blocks_.insert(latch_id);
+            emitted_blocks_.insert(loop.header);
+            const auto condition = condition_expression(header_condition, true_successor);
+            if (condition == 0)
+                return false;
+            std::vector<std::uint64_t> statements;
+            if (!append_region(body_entry, latch_id, &loop.nodes, statements, 0))
+                return false;
+            for (const auto block : loop.nodes) {
+                if (block == latch_id)
+                    continue;
+                if (emitted_blocks_.find(block) == emitted_blocks_.end()) {
+                    fail(decompiler_diagnostic_code_t::malformed_ast,
+                        "decompiler.ast.v2.unstructured_control_flow",
+                        blocks_.at(loop.header)->coordinate);
+                    return false;
+                }
+            }
+            const auto body = append_compound(std::move(statements),
+                blocks_.at(loop.header)->coordinate);
+            const auto statement = append_node(
+                typed_pseudocode_ast_node_kind_t::for_statement,
+                hir_.return_type_id,
+                {init_expr_id, condition, increment_expr, body}, {},
+                translate_coordinate(blocks_.at(loop.header)->coordinate,
+                    decompiler_coordinate_layer_t::typed_ast),
+                aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
+            if (body == 0 || statement == 0)
+                return false;
+            output.push_back(statement);
+            next = exit;
+            return true;
+        }
+        return false;
+    }
+
     bool append_exception_region(const exception_region_t& region,
                                  std::vector<std::uint64_t>& output,
                                  std::uint64_t& next)
@@ -1011,6 +1492,16 @@ private:
                     "decompiler.ast.v2.unstructured_control_flow", header->coordinate);
                 return false;
             }
+            {
+                std::uint64_t for_next = 0;
+                if (try_for_loop_conversion(loop, *header_condition,
+                        body_entry, exit, body_entry, output, for_next)) {
+                    next = for_next;
+                    return true;
+                }
+                if (failed_)
+                    return false;
+            }
             emitted_blocks_.insert(header->id);
             const auto condition = condition_expression(*header_condition, body_entry);
             if (condition == 0)
@@ -1086,8 +1577,6 @@ private:
                 return true;
             }
         }
-        fail(decompiler_diagnostic_code_t::malformed_ast,
-            "decompiler.ast.v2.unstructured_control_flow", header->coordinate);
         return false;
     }
 
@@ -1098,13 +1587,25 @@ private:
                        const std::uint64_t ignored_loop_header,
                        const std::uint64_t ignored_exception_entry = 0)
     {
+        std::set<std::uint64_t> local_visited;
+        std::size_t region_iterations = 0;
+        const std::size_t max_region_iterations = blocks_.size() * 2 + 1;
         while (current != 0 && current != stop) {
+            if (++region_iterations > max_region_iterations) {
+                if (current != 0 && current != stop)
+                    emit_goto(current, output, blocks_.at(current)->coordinate);
+                break;
+            }
+            emit_label_if_needed(current, output);
+            if (local_visited.count(current)) {
+                emit_goto(current, output, blocks_.at(current)->coordinate);
+                return true;
+            }
+            local_visited.insert(current);
             if ((allowed && allowed->find(current) == allowed->end()) ||
                 emitted_blocks_.find(current) != emitted_blocks_.end()) {
-                fail(decompiler_diagnostic_code_t::malformed_ast,
-                    "decompiler.ast.v2.unstructured_control_flow",
-                    blocks_.at(current)->coordinate);
-                return false;
+                emit_goto(current, output, blocks_.at(current)->coordinate);
+                return true;
             }
             if (current != ignored_exception_entry) {
                 const auto exception_region = exception_regions_.find(current);
@@ -1136,13 +1637,47 @@ private:
                 const auto loop = loops_.find(current);
                 if (loop != loops_.end()) {
                     std::uint64_t next = 0;
-                    if (!append_natural_loop(loop->second, output, next))
-                        return false;
+                    const auto saved_emitted = emitted_blocks_;
+                    const auto output_size = output.size();
+                    const auto diag_count = result_.diagnostics.size();
+                    if (!append_natural_loop(loop->second, output, next)) {
+                        if (failed_) {
+                            failed_ = false;
+                            result_.diagnostics.resize(diag_count);
+                            emitted_blocks_ = saved_emitted;
+                            output.resize(output_size);
+                        }
+                        const auto* header_block = blocks_.at(current);
+                        if (emitted_blocks_.find(current) != emitted_blocks_.end()) {
+                            emit_goto(current, output, header_block->coordinate);
+                            return true;
+                        }
+                        emitted_blocks_.insert(current);
+                        if (!append_block_statements(*header_block, output))
+                            return false;
+                        if (header_block->successor_ids.empty())
+                            return true;
+                        for (std::size_t i = 1; i < header_block->successor_ids.size(); ++i)
+                            emit_goto(header_block->successor_ids[i], output,
+                                header_block->coordinate);
+                        const auto fallthrough = header_block->successor_ids.front();
+                        if (fallthrough == stop)
+                            return true;
+                        current = fallthrough;
+                        continue;
+                    }
                     current = next;
                     continue;
                 }
             }
             const auto* block = blocks_.at(current);
+            if (block_switch_value(*block)) {
+                std::uint64_t next = 0;
+                if (!append_switch(*block, output, next))
+                    return false;
+                current = next;
+                continue;
+            }
             emitted_blocks_.insert(current);
             if (!append_block_statements(*block, output))
                 return false;
@@ -1153,18 +1688,30 @@ private:
                 if (successor == stop)
                     return true;
                 if (dominators_.at(current).find(successor) != dominators_.at(current).end()) {
-                    fail(decompiler_diagnostic_code_t::malformed_ast,
-                        "decompiler.ast.v2.unstructured_control_flow", block->coordinate);
-                    return false;
+                    emit_goto(successor, output, block->coordinate);
+                    return true;
                 }
                 current = successor;
                 continue;
             }
+            if (block->successor_ids.size() > 2) {
+                for (std::size_t i = 1; i < block->successor_ids.size(); ++i)
+                    emit_goto(block->successor_ids[i], output, block->coordinate);
+                const auto fallthrough = block->successor_ids.front();
+                if (fallthrough == stop)
+                    return true;
+                current = fallthrough;
+                continue;
+            }
             const auto* condition_value = block_condition(*block);
             if (!condition_value) {
-                fail(decompiler_diagnostic_code_t::malformed_ast,
-                    "decompiler.ast.v2.unstructured_control_flow", block->coordinate);
-                return false;
+                for (std::size_t i = 1; i < block->successor_ids.size(); ++i)
+                    emit_goto(block->successor_ids[i], output, block->coordinate);
+                const auto fallthrough = block->successor_ids.front();
+                if (fallthrough == stop)
+                    return true;
+                current = fallthrough;
+                continue;
             }
             const auto descriptor = conditional_descriptor(condition_value->stable_value);
             if (!descriptor)
@@ -1634,6 +2181,8 @@ private:
     std::map<std::uint64_t, std::uint64_t> handler_region_owners_;
     std::set<std::uint64_t> exception_handler_entries_;
     std::set<std::uint64_t> emitted_blocks_;
+    std::set<std::uint64_t> goto_target_blocks_;
+    std::map<std::uint64_t, std::string> block_labels_;
     std::vector<decompiler_unknown_t> generated_unknowns_;
     std::vector<std::uint64_t> parameter_declaration_ids_;
     std::vector<std::uint64_t> local_declaration_ids_;
@@ -1685,6 +2234,8 @@ std::string typed_ast_v2_node_layout(const typed_pseudocode_ast_node_kind_t kind
     case typed_pseudocode_ast_node_kind_t::try_statement: return "body_then_catches_or_finally";
     case typed_pseudocode_ast_node_kind_t::catch_clause: return "body";
     case typed_pseudocode_ast_node_kind_t::finally_clause: return "body";
+    case typed_pseudocode_ast_node_kind_t::goto_statement: return "empty";
+    case typed_pseudocode_ast_node_kind_t::label_statement: return "empty";
     case typed_pseudocode_ast_node_kind_t::assignment_expression: return "left_right";
     case typed_pseudocode_ast_node_kind_t::unary_expression: return "operand";
     case typed_pseudocode_ast_node_kind_t::binary_expression: return "left_right";
@@ -1830,6 +2381,14 @@ decompiler_contract_validation_t validate_typed_ast_v2_semantics(
         case typed_pseudocode_ast_node_kind_t::continue_statement:
             if (!node.child_ids.empty())
                 append_semantic_error(result, &node, "decompiler.ast.v2.empty_statement", ordinal);
+            break;
+        case typed_pseudocode_ast_node_kind_t::goto_statement:
+            if (!node.child_ids.empty() || !is_visible_text(node.stable_text))
+                append_semantic_error(result, &node, "decompiler.ast.v2.goto_layout", ordinal);
+            break;
+        case typed_pseudocode_ast_node_kind_t::label_statement:
+            if (!node.child_ids.empty() || !is_visible_text(node.stable_text))
+                append_semantic_error(result, &node, "decompiler.ast.v2.label_layout", ordinal);
             break;
         case typed_pseudocode_ast_node_kind_t::return_statement:
         case typed_pseudocode_ast_node_kind_t::throw_statement:

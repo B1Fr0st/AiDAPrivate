@@ -87,6 +87,7 @@ struct decompiler_ui_result_t {
     std::vector<decompiler_ui_diagnostic_t> diagnostics;
     std::uint64_t elapsed_ms = 0;
     std::optional<decompiler_cache_stage_t> cache_hit_stage;
+    bool used_legacy_fallback = false;
     bool succeeded() const noexcept {
         return status == decompiler_pipeline_status_t::completed && document &&
                !rendered_text.empty();
@@ -103,6 +104,7 @@ struct decompiler_ui_integration_config_t {
     bool preserve_shortcuts = true;
     bool preserve_source_mappings = true;
     bool preserve_diagnostics = true;
+    bool legacy_fallback_enabled = true;
     std::size_t max_managed_capture_cache_entries = 16;
     std::uint64_t max_managed_capture_bytes = 64ULL << 20;
     readers::managed::managed_reader_limits_t managed_reader_limits = {};

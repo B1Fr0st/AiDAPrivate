@@ -4,6 +4,7 @@
 #include "calling_convention.hpp"
 #include "semantic_fusion.hpp"
 #include "type_recovery.hpp"
+#include "../decompiler/pseudocode_readability.hpp"
 #include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
 #include "../../disasm/ghidra_adapters/aida_function_db.hpp"
 #include "../../disasm/ghidra_adapters/aida_load_image.hpp"
@@ -23,6 +24,8 @@
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
+
+#include "../../../helpers/diag_log.hpp"
 
 namespace aida::analysis {
 
@@ -1230,6 +1233,22 @@ decompiler_service_v2_result_t decompiler_service_t::render_typed_pseudocode_v2(
     append_v2_diagnostics(result, result.ast_build.diagnostics);
     if (!result.ast_build.succeeded())
         return result;
+    if (hir.entity.kind == decompiler_entity_kind_t::native_function) {
+        readability_transform_settings_t readability_settings;
+        auto readability_result = apply_readability_transforms(
+            *result.ast_build.ast, type_graph, readability_settings);
+        append_v2_diagnostics(result, readability_result.diagnostics);
+        if (readability_result.succeeded()) {
+            ::diag::log_tagged_fmt("decompiler", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u",
+                static_cast<unsigned int>(readability_result.metrics.variables_renamed),
+                static_cast<unsigned int>(readability_result.metrics.constants_folded),
+                static_cast<unsigned int>(readability_result.metrics.identities_simplified),
+                static_cast<unsigned int>(readability_result.metrics.temporaries_inlined),
+                static_cast<unsigned int>(readability_result.metrics.dead_stores_eliminated));
+        } else {
+            ::diag::log_tagged_fmt("decompiler", "readability_transforms status=warning_no_transform continuing_with_unmodified_ast");
+        }
+    }
     result.rendering = render_pseudocode_v2(*result.ast_build.ast, type_graph, request.renderer);
     append_v2_diagnostics(result, result.rendering->diagnostics);
     return result;
@@ -2274,6 +2293,9 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
     auto adapter = prepare_adapter_inputs(function.value(), cancel);
     if (!adapter)
         return fail(adapter.error());
+    ::diag::log_tagged_fmt("decompiler", "workspace_service pipeline=typed stage=adapter_ready function_id=%u entry_va=0x%llX",
+        static_cast<unsigned int>(function.value().function.id),
+        static_cast<unsigned long long>(function.value().entry_va));
     current = ensure_request_current(state_, workspace, function.value(), request.context,
         cancel, workspace_cancel, deadline_token, "decompiler.adapter");
     if (!current)
@@ -2392,6 +2414,8 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
             ++state_->memory_cache_hits;
             ++state_->completed;
             append_history_locked(*state_, *cached);
+            ::diag::log_tagged_fmt("decompiler", "workspace_service pipeline=typed stage=memory_cache_hit function_id=%u",
+                static_cast<unsigned int>(function.value().function.id));
             return workspace_result_t<decompiler_result_t>::success(std::move(*cached));
         }
     }
@@ -2438,6 +2462,8 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
                     insert_cache_locked(*state_, cache_key.value(), std::move(cache_result));
                 }
                 append_history_locked(*state_, cached);
+                ::diag::log_tagged_fmt("decompiler", "workspace_service pipeline=typed stage=persistent_cache_hit function_id=%u",
+                    static_cast<unsigned int>(function.value().function.id));
                 return workspace_result_t<decompiler_result_t>::success(std::move(cached));
             }
             auto invalidation = state_->database->invalidate_decompiler_cache(
@@ -2471,6 +2497,8 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
     auto rendered = render_provider_document_v2(typed_artifacts->provider_ir,
         typed_artifacts->hir, typed_artifacts->type_graph);
     if (!rendered.succeeded()) {
+        ::diag::log_tagged_fmt("decompiler", "workspace_service pipeline=typed stage=render status=failed function_id=%u",
+            static_cast<unsigned int>(function.value().function.id));
         return fail(typed_artifact_error(
             "decompiler provider artifacts could not be lowered to a typed V2 document",
             "decompiler.typed.v2.lower", rendered));
@@ -2494,6 +2522,11 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
     result.overlay_revision = function.value().overlay_revision;
     result.elapsed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - render_started).count();
+    ::diag::log_tagged_fmt("decompiler", "workspace_service pipeline=typed stage=document_ready function_id=%u pseudocode_bytes=%zu token_count=%zu source_map_count=%zu",
+        static_cast<unsigned int>(function.value().function.id),
+        result.pseudocode.size(),
+        result.document.tokens.size(),
+        result.document.source_maps.size());
     if (result.function_name.empty()) {
         return fail(make_workspace_error(workspace_error_code_t::integrity_failure,
             "typed decompiler document does not identify its function",
@@ -2571,6 +2604,9 @@ workspace_result_t<decompiler_result_t> decompiler_service_t::decompile(
         append_history_locked(*state_, result);
         ++state_->completed;
     }
+    ::diag::log_tagged_fmt("decompiler", "workspace_service pipeline=typed stage=completed function_id=%u pseudocode_bytes=%zu",
+        static_cast<unsigned int>(result.function_id),
+        result.pseudocode.size());
     return workspace_result_t<decompiler_result_t>::success(std::move(result));
 }
 

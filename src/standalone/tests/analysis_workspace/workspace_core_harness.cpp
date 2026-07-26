@@ -12,16 +12,34 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <process.h>
 #include <set>
 #include <string>
 #include <thread>
 #include <tuple>
 #include <vector>
+
+struct harness_log_t {
+    using clock_t = std::chrono::steady_clock;
+    static unsigned long pid() { return static_cast<unsigned long>(_getpid()); }
+    static unsigned long tid() { return static_cast<unsigned long>(std::hash<std::thread::id>{}(std::this_thread::get_id())); }
+    static std::uint64_t epoch_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(clock_t::now().time_since_epoch()).count(); }
+    static void emit(const char* test, const char* phase, const char* status, std::uint64_t elapsed_ms, const std::string& detail = {}) {
+        std::fprintf(stderr, "[C03-HARNESS] test=%s phase=%s status=%s elapsed=%llums pid=%lu tid=%lu errno=%d detail=%s\n",
+            test, phase, status, static_cast<unsigned long long>(elapsed_ms), pid(), tid(), static_cast<int>(errno),
+            detail.empty() ? "-" : detail.c_str());
+        std::fflush(stderr);
+    }
+};
 
 namespace {
 
@@ -1391,73 +1409,200 @@ void verify_same_base_module_replacement_rejection(const std::filesystem::path& 
 
 int main()
 {
+    const auto harness_start = harness_log_t::epoch_ms();
+    harness_log_t::emit("workspace_core", "main", "enter", 0);
     try {
         fixture_root_t root("core");
         const auto path = write_fixture(root.path(), "one", "fixture.exe", 42);
-        const auto serial = analyze_once(path, 1);
-        const auto parallel = analyze_once(path, 2);
-        if (!(serial == parallel) || serial.instructions == 0 || serial.functions == 0)
-            throw fixture_error_t("baseline output changed with worker count or was empty");
-        verify_format_and_member_detection(root.path());
-        verify_architecture_decoder_matrix(root.path());
-        const auto normalized_path = write_bytes_fixture(root.path() / "normalized" / "baseline.elf",
-            minimal_elf(architecture_id_t::x86_64, architecture_mode_t::x86_64,
-                endian_t::little, {0xC3}, 0x75));
-        const auto normalized_serial = analyze_once(normalized_path, 1);
-        const auto normalized_parallel = analyze_once(normalized_path, 4);
-        if (!(normalized_serial == normalized_parallel) || normalized_serial.instructions == 0 ||
-            normalized_serial.blocks == 0 || normalized_serial.functions == 0)
-            throw fixture_error_t("normalized baseline changed with deterministic worker count");
-        verify_normalized_baseline_facts(normalized_path);
-        verify_pe32(write_fixture32(root.path(), "x86", "fixture32.exe", 0x2A));
-        verify_rejected(root.path() / "truncated.exe",
-            hostile_pe64(hostile_pe_variant_t::truncated_headers), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "raw_overflow.exe",
-            hostile_pe64(hostile_pe_variant_t::raw_span_overflow), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "raw_overlap.exe",
-            hostile_pe64(hostile_pe_variant_t::raw_section_overlap), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "virtual_overlap.exe",
-            hostile_pe64(hostile_pe_variant_t::virtual_section_overlap), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "raw_virtual_gap.exe",
-            hostile_pe64(hostile_pe_variant_t::raw_virtual_directory_gap), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "directory_out_of_file.exe",
-            hostile_pe64(hostile_pe_variant_t::out_of_file_directory), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "impossible_sections.exe",
-            hostile_pe64(hostile_pe_variant_t::impossible_section_count), workspace_error_code_t::limit_exceeded);
-        verify_rejected(root.path() / "invalid_dos.exe",
-            hostile_pe64(hostile_pe_variant_t::invalid_dos_magic), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "invalid_pe_sig.exe",
-            hostile_pe64(hostile_pe_variant_t::invalid_pe_signature), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "zero_section_align.exe",
-            hostile_pe64(hostile_pe_variant_t::zero_section_alignment), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "import_self_ref.exe",
-            hostile_pe64(hostile_pe_variant_t::import_self_reference), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "overlay.exe",
-            hostile_pe64(hostile_pe_variant_t::overlay_beyond_last_section), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "zero_size_image.exe",
-            hostile_pe64(hostile_pe_variant_t::zero_size_of_image), workspace_error_code_t::malformed_pe);
-        verify_rejected(root.path() / "corrupt_opt_magic.exe",
-            hostile_pe64(hostile_pe_variant_t::corrupt_optional_header_magic), workspace_error_code_t::malformed_pe);
-        verify_cancellation(root.path());
-        verify_partial_service_recovery(root.path());
-        verify_shared_acquisition(root.path());
-        verify_provider_identity_mismatch(root.path());
-        verify_parser_limit_identity_divergence(path);
-        verify_cross_workspace_publication(root.path());
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "baseline_serial_parallel", "enter", 0);
+            const auto serial = analyze_once(path, 1);
+            const auto parallel = analyze_once(path, 2);
+            if (!(serial == parallel) || serial.instructions == 0 || serial.functions == 0)
+                throw fixture_error_t("baseline output changed with worker count or was empty");
+            harness_log_t::emit("workspace_core", "baseline_serial_parallel", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "format_and_member_detection", "enter", 0);
+            verify_format_and_member_detection(root.path());
+            harness_log_t::emit("workspace_core", "format_and_member_detection", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "architecture_decoder_matrix", "enter", 0);
+            verify_architecture_decoder_matrix(root.path());
+            harness_log_t::emit("workspace_core", "architecture_decoder_matrix", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "normalized_baseline", "enter", 0);
+            const auto normalized_path = write_bytes_fixture(root.path() / "normalized" / "baseline.elf",
+                minimal_elf(architecture_id_t::x86_64, architecture_mode_t::x86_64,
+                    endian_t::little, {0xC3}, 0x75));
+            const auto normalized_serial = analyze_once(normalized_path, 1);
+            const auto normalized_parallel = analyze_once(normalized_path, 4);
+            if (!(normalized_serial == normalized_parallel) || normalized_serial.instructions == 0 ||
+                normalized_serial.blocks == 0 || normalized_serial.functions == 0)
+                throw fixture_error_t("normalized baseline changed with deterministic worker count");
+            verify_normalized_baseline_facts(normalized_path);
+            harness_log_t::emit("workspace_core", "normalized_baseline", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "pe32_and_rejected_fixtures", "enter", 0);
+            verify_pe32(write_fixture32(root.path(), "x86", "fixture32.exe", 0x2A));
+            verify_rejected(root.path() / "truncated.exe",
+                hostile_pe64(hostile_pe_variant_t::truncated_headers), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "raw_overflow.exe",
+                hostile_pe64(hostile_pe_variant_t::raw_span_overflow), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "raw_overlap.exe",
+                hostile_pe64(hostile_pe_variant_t::raw_section_overlap), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "virtual_overlap.exe",
+                hostile_pe64(hostile_pe_variant_t::virtual_section_overlap), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "raw_virtual_gap.exe",
+                hostile_pe64(hostile_pe_variant_t::raw_virtual_directory_gap), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "directory_out_of_file.exe",
+                hostile_pe64(hostile_pe_variant_t::out_of_file_directory), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "impossible_sections.exe",
+                hostile_pe64(hostile_pe_variant_t::impossible_section_count), workspace_error_code_t::limit_exceeded);
+            verify_rejected(root.path() / "invalid_dos.exe",
+                hostile_pe64(hostile_pe_variant_t::invalid_dos_magic), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "invalid_pe_sig.exe",
+                hostile_pe64(hostile_pe_variant_t::invalid_pe_signature), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "zero_section_align.exe",
+                hostile_pe64(hostile_pe_variant_t::zero_section_alignment), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "import_self_ref.exe",
+                hostile_pe64(hostile_pe_variant_t::import_self_reference), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "overlay.exe",
+                hostile_pe64(hostile_pe_variant_t::overlay_beyond_last_section), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "zero_size_image.exe",
+                hostile_pe64(hostile_pe_variant_t::zero_size_of_image), workspace_error_code_t::malformed_pe);
+            verify_rejected(root.path() / "corrupt_opt_magic.exe",
+                hostile_pe64(hostile_pe_variant_t::corrupt_optional_header_magic), workspace_error_code_t::malformed_pe);
+            harness_log_t::emit("workspace_core", "pe32_and_rejected_fixtures", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "cancellation", "enter", 0);
+            verify_cancellation(root.path());
+            harness_log_t::emit("workspace_core", "cancellation", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "partial_service_recovery", "enter", 0);
+            verify_partial_service_recovery(root.path());
+            harness_log_t::emit("workspace_core", "partial_service_recovery", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "shared_acquisition", "enter", 0);
+            verify_shared_acquisition(root.path());
+            harness_log_t::emit("workspace_core", "shared_acquisition", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "provider_identity_mismatch", "enter", 0);
+            verify_provider_identity_mismatch(root.path());
+            harness_log_t::emit("workspace_core", "provider_identity_mismatch", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "parser_limit_identity_divergence", "enter", 0);
+            verify_parser_limit_identity_divergence(path);
+            harness_log_t::emit("workspace_core", "parser_limit_identity_divergence", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "cross_workspace_publication", "enter", 0);
+            verify_cross_workspace_publication(root.path());
+            harness_log_t::emit("workspace_core", "cross_workspace_publication", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
         const auto contract_path = write_bytes_fixture(
             root.path() / "analysis-contract.exe", analysis_contract_pe64(0x66));
-        verify_analysis_contract_fixture(contract_path);
-        verify_deterministic_budget(contract_path);
-        verify_feature_pool_saturation(root.path());
-        verify_nonzero_fairness_metrics(root.path());
-        verify_frozen_persistence_publication_metrics(root.path());
-        verify_content_identity_rebinding(root.path());
-        verify_persistence_source_identity_reopen(root.path());
-        verify_live_header_mismatch_rejection();
-        verify_same_base_module_replacement_rejection(root.path());
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "analysis_contract_fixture", "enter", 0);
+            verify_analysis_contract_fixture(contract_path);
+            harness_log_t::emit("workspace_core", "analysis_contract_fixture", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "deterministic_budget", "enter", 0);
+            verify_deterministic_budget(contract_path);
+            harness_log_t::emit("workspace_core", "deterministic_budget", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "feature_pool_saturation", "enter", 0);
+            verify_feature_pool_saturation(root.path());
+            harness_log_t::emit("workspace_core", "feature_pool_saturation", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "nonzero_fairness_metrics", "enter", 0);
+            verify_nonzero_fairness_metrics(root.path());
+            harness_log_t::emit("workspace_core", "nonzero_fairness_metrics", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "frozen_persistence_publication_metrics", "enter", 0);
+            verify_frozen_persistence_publication_metrics(root.path());
+            harness_log_t::emit("workspace_core", "frozen_persistence_publication_metrics", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "content_identity_rebinding", "enter", 0);
+            verify_content_identity_rebinding(root.path());
+            harness_log_t::emit("workspace_core", "content_identity_rebinding", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "persistence_source_identity_reopen", "enter", 0);
+            verify_persistence_source_identity_reopen(root.path());
+            harness_log_t::emit("workspace_core", "persistence_source_identity_reopen", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "live_header_mismatch_rejection", "enter", 0);
+            verify_live_header_mismatch_rejection();
+            harness_log_t::emit("workspace_core", "live_header_mismatch_rejection", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        {
+            const auto phase_start = harness_log_t::epoch_ms();
+            harness_log_t::emit("workspace_core", "same_base_module_replacement_rejection", "enter", 0);
+            verify_same_base_module_replacement_rejection(root.path());
+            harness_log_t::emit("workspace_core", "same_base_module_replacement_rejection", "pass", harness_log_t::epoch_ms() - phase_start);
+        }
+
+        harness_log_t::emit("workspace_core", "main", "pass", harness_log_t::epoch_ms() - harness_start);
         std::cout << "workspace_core_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+        const auto elapsed = harness_log_t::epoch_ms() - harness_start;
+        harness_log_t::emit("workspace_core", "main", "fail", elapsed, error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

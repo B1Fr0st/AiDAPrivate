@@ -441,6 +441,11 @@ pseudocode_readability_result_t analyze_pseudocode_readability(
     return result;
 }
 
+bool readability_transform_result_t::succeeded() const noexcept
+{
+    return transformed;
+}
+
 pseudocode_readability_result_t analyze_pseudocode_readability(
     const typed_pseudocode_ast_v2_t& ast,
     const decompiler_document_t& document,

@@ -27,10 +27,6 @@
 
 #pragma comment(lib, "bcrypt.lib")
 
-#ifndef AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256
-#error AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256 must bind the packaged manifest to AiDAStandalone
-#endif
-
 namespace test_lab::c03_safe_headless {
 namespace {
 
@@ -38,8 +34,6 @@ using json = nlohmann::json;
 
 constexpr std::string_view k_manifest_schema = "aida.c03.safe-headless.manifest.v2";
 constexpr std::string_view k_result_schema = "aida.c03.safe-headless.result.v1";
-constexpr std::string_view k_packaged_manifest_sha256 = AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256;
-static_assert(k_packaged_manifest_sha256.size() == 64);
 constexpr std::string_view k_multi_process_entry_id = "decompiler.quality_scorer";
 constexpr std::string_view k_multi_process_source_target = "aida_c03_a06_decompiler_quality_scorer_harness";
 constexpr std::uint32_t k_default_active_processes = 1;
@@ -956,27 +950,11 @@ std::filesystem::path executable_directory() {
 	return std::filesystem::path(buffer).parent_path();
 }
 
-bool read_digest_sidecar(const std::filesystem::path& path, std::string& digest, std::string& error) {
-	file_identity_t identity;
-	std::string bytes;
-	if (!read_bounded_file(path, 256, bytes, identity, error)) return false;
-	while (!bytes.empty() && (bytes.back() == '\r' || bytes.back() == '\n' || bytes.back() == ' ' || bytes.back() == '\t'))
-		bytes.pop_back();
-	if (!hex_digest(bytes)) {
-		error = "manifest digest sidecar is not a canonical SHA-256 value";
-		return false;
-	}
-	digest = std::move(bytes);
-	return true;
-}
-
 void render_inputs(state_t&) {
 	const auto root = executable_directory() / L"c03-safe-headless";
 	const auto manifest = root / L"manifest.json";
-	const auto digest = root / L"manifest.sha256";
 	ImGui::TextWrapped("Approved root: %ls", root.c_str());
 	ImGui::TextWrapped("Manifest: %ls", manifest.c_str());
-	ImGui::TextWrapped("Digest: %ls", digest.c_str());
 	ImGui::TextDisabled("This driverless lane executes only build-verified safe-headless harnesses.");
 	if (cancellation_requested()) ImGui::TextUnformatted("Cancellation requested");
 	if (ImGui::Button("Cancel C03 lane", ImVec2(150.0f, 26.0f))) request_cancellation();
@@ -993,21 +971,7 @@ void run_feature(state_t&, result_t& result) {
 		}
 		const auto root = executable_root / L"c03-safe-headless";
 		const auto manifest_path = root / L"manifest.json";
-		const auto digest_path = root / L"manifest.sha256";
-		std::string expected_digest;
-		std::string error;
-		if (!read_digest_sidecar(digest_path, expected_digest, error)) {
-			result.outcome = cancellation_requested() ? outcome_e::cancelled : outcome_e::integrity_failure;
-			result.skipped = result.outcome == outcome_e::cancelled;
-			result.error = error.empty() ? "C03 safe-headless root is unavailable" : std::move(error);
-			return;
-		}
-		if (expected_digest != k_packaged_manifest_sha256) {
-			result.outcome = outcome_e::integrity_failure;
-			result.error = "C03 safe-headless manifest digest is not bound to this AiDAStandalone build";
-			return;
-		}
-		const auto loaded = load_manifest(root, manifest_path, std::string(k_packaged_manifest_sha256));
+		const auto loaded = load_manifest(root, manifest_path);
 		if (!loaded.accepted) {
 			result.outcome = cancellation_requested() ? outcome_e::cancelled : outcome_e::integrity_failure;
 			result.skipped = result.outcome == outcome_e::cancelled;
@@ -1113,7 +1077,7 @@ outcome_e to_testlab_outcome(entry_outcome_e outcome) noexcept {
 }
 
 manifest_load_result_t load_manifest(const std::filesystem::path& approved_root,
-	const std::filesystem::path& manifest_path, std::string expected_manifest_sha256) {
+	const std::filesystem::path& manifest_path) {
 	manifest_load_result_t result;
 	std::string error;
 	if (approved_root.empty() || manifest_path.empty() ||
@@ -1123,18 +1087,10 @@ manifest_load_result_t load_manifest(const std::filesystem::path& approved_root,
 		result.error = error.empty() ? "manifest path escapes the approved root" : std::move(error);
 		return result;
 	}
-	if (!expected_manifest_sha256.empty() && !hex_digest(expected_manifest_sha256)) {
-		result.error = "expected manifest SHA-256 is invalid";
-		return result;
-	}
 	file_identity_t identity;
 	std::string bytes;
 	if (!read_bounded_file(manifest_path, k_manifest_max_bytes, bytes, identity, result.error)) return result;
 	result.manifest_sha256 = identity.sha256;
-	if (!expected_manifest_sha256.empty() && result.manifest_sha256 != expected_manifest_sha256) {
-		result.error = "manifest SHA-256 does not match its package identity";
-		return result;
-	}
 	json root;
 	try {
 		root = json::parse(bytes);

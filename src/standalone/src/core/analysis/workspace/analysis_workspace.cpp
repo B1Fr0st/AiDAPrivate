@@ -6,6 +6,7 @@
 #include "live_snapshot_provider.hpp"
 #include "search_index.hpp"
 #include "../overlay_projection.hpp"
+#include "../incremental_reanalysis.hpp"
 
 #include <algorithm>
 #include <array>
@@ -3868,6 +3869,7 @@ analysis_workspace_t::publish_projected_generation(
     std::atomic_store_explicit(
         &publication_state_->publication, replacement,
         std::memory_order_release);
+
     return workspace_result_t<std::size_t>::success(retired_index_entries);
 }
 
