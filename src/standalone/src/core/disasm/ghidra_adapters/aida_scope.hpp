@@ -51,14 +51,14 @@ protected:
 		cache_->addSymbolInternal(sym);
 	}
 	ghidra::SymbolEntry* addMapInternal(ghidra::Symbol* sym, ghidra::uint4 exfl,
-	                                    const ghidra::Address& addr, ghidra::int4 off,
-	                                    ghidra::int4 sz, const ghidra::RangeList& uselim) override
+		const ghidra::Address& addr, ghidra::int4 off, ghidra::int4 sz,
+		const ghidra::RangeList& uselim) override
 	{
 		return cache_->addMapInternal(sym, exfl, addr, off, sz, uselim);
 	}
 	ghidra::SymbolEntry* addDynamicMapInternal(ghidra::Symbol* sym, ghidra::uint4 exfl,
-	                                           ghidra::uint8 hash, ghidra::int4 off,
-	                                           ghidra::int4 sz, const ghidra::RangeList& uselim) override
+		ghidra::uint8 hash, ghidra::int4 off, ghidra::int4 sz,
+		const ghidra::RangeList& uselim) override
 	{
 		return cache_->addDynamicMapInternal(sym, exfl, hash, off, sz, uselim);
 	}
@@ -88,9 +88,9 @@ public:
 	void adjustCaches() override { cache_->adjustCaches(); }
 	ghidra::SymbolEntry* findAddr(const ghidra::Address& addr, const ghidra::Address& usepoint) const override;
 	ghidra::SymbolEntry* findContainer(const ghidra::Address& addr, ghidra::int4 size,
-	                                   const ghidra::Address& usepoint) const override;
+	                                const ghidra::Address& usepoint) const override;
 	ghidra::SymbolEntry* findClosestFit(const ghidra::Address& addr, ghidra::int4 size,
-	                                    const ghidra::Address& usepoint) const override
+	                                 const ghidra::Address& usepoint) const override
 	{
 		return cache_->findClosestFit(addr, size, usepoint);
 	}

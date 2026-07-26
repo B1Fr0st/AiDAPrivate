@@ -1568,10 +1568,31 @@ __declspec(noinline) inline bool initialize_honeypot_seh(DWORD* out_exception_co
 inline bool initialize()
 {
     webhook::write_log("init", "initialize_ENTRY before state::get");
-    static std::mutex s_initialize_mtx;
-    std::lock_guard<std::mutex> init_lk(s_initialize_mtx);
     auto& rt = state::get();
+    if (rt.initialized.load(std::memory_order_acquire)) {
+        if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver() &&
+            !rt.driver_hardening_done.load(std::memory_order_acquire))
+        {
+            webhook::write_log("init", "initialize_already_initialized_driver_hardening_retry");
+            return ensure_driver_hardening("initialize_retry");
+        }
+        webhook::write_log("init", "initialize_already_initialized_returning_true");
+        return true;
+    }
+    static std::atomic<bool> s_initialize_in_progress{false};
+    if (s_initialize_in_progress.load(std::memory_order_acquire)) {
+        webhook::write_log("init", "initialize_already_in_progress_returning_false");
+        return false;
+    }
+    static std::recursive_mutex s_initialize_mtx;
+    std::lock_guard<std::recursive_mutex> init_lk(s_initialize_mtx);
+    s_initialize_in_progress.store(true, std::memory_order_release);
     webhook::write_log("init", "initialize_state_get_OK");
+
+    struct in_progress_guard_t {
+        std::atomic<bool>& flag;
+        ~in_progress_guard_t() { flag.store(false, std::memory_order_release); }
+    } in_progress_guard{ s_initialize_in_progress };
 
     if (rt.initialized.load(std::memory_order_acquire)) {
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver() &&

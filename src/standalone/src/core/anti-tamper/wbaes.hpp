@@ -18,8 +18,6 @@
 #include <mutex>
 #include <string>
 
-#include "blake3.hpp"
-
 #pragma comment(lib, "bcrypt.lib")
 
 namespace anti_tamper {
@@ -585,7 +583,41 @@ inline bool gcm_decrypt(
 
 inline void compute_table_hash(const white_box_table_t& tbl, uint8_t out[32])
 {
-    blake3::hash(reinterpret_cast<const uint8_t*>(&tbl), sizeof(white_box_table_t), out);
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(st) || !hAlg)
+    {
+        std::memset(out, 0, 32);
+        return;
+    }
+
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    st = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(st) || !hHash)
+    {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        std::memset(out, 0, 32);
+        return;
+    }
+
+    st = BCryptHashData(hHash,
+        const_cast<PUCHAR>(reinterpret_cast<const unsigned char*>(&tbl)),
+        static_cast<ULONG>(sizeof(white_box_table_t)), 0);
+    if (!BCRYPT_SUCCESS(st))
+    {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        std::memset(out, 0, 32);
+        return;
+    }
+
+    st = BCryptFinishHash(hHash, out, 32, 0);
+
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    if (!BCRYPT_SUCCESS(st))
+        std::memset(out, 0, 32);
 }
 
 inline bool is_fallback_mode()

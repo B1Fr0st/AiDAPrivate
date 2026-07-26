@@ -151,7 +151,7 @@ ghidra::SymbolEntry* scope_t::findAddr(const ghidra::Address& addr, const ghidra
 }
 
 ghidra::SymbolEntry* scope_t::findContainer(const ghidra::Address& addr, ghidra::int4 size,
-                                            const ghidra::Address& usepoint) const
+                                         const ghidra::Address& usepoint) const
 {
 	auto entry = cache_->findClosestFit(addr, size, usepoint);
 	if (!entry) {

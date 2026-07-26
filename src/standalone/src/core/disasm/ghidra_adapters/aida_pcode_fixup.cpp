@@ -46,7 +46,7 @@ void pcode_fixup_preprocessor_t::fixup_shared_return_jump_to_imports(ghidra::Fun
 			continue;
 
 		ghidra::Address from = op->getAddr();
-		func->getOverride().insertFlowOverride(from, ghidra::Override::CALL_RETURN);
+		func->getOverride().insertFlowOverride(from, ghidra::Override::stringToType("callreturn"));
 	}
 }
 

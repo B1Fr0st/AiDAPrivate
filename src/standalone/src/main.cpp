@@ -6953,16 +6953,20 @@ int main(int, char**)
         return 0;
     }
     aida_early_startup::mark("single_instance_gate_acquired");
+    aida_early_startup::mark("post_gate_main_enter_pre");
     startup_log_critical_fmt("main_enter pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     crash_log_write("main_enter");
+    aida_early_startup::mark("post_gate_main_enter_done");
 
+    aida_early_startup::mark("post_gate_taskflow_pool_query_pre");
     const int taskflow_general_pool_size = aida::infra::taskflow_runtime::general_pool_size();
     const int taskflow_service_pool_size = aida::infra::taskflow_runtime::service_pool_size();
     const int taskflow_critical_pool_size = aida::infra::taskflow_runtime::domain_pool(
         aida::infra::taskflow_runtime::executor_domain_t::critical).configured_pool_size;
+    aida_early_startup::mark("post_gate_taskflow_pool_query_done");
     startup_log_critical_fmt("taskflow_runtime_initialize_pre pid=%lu tid=%lu tick=%llu general_pool_size=%d service_pool_size=%d critical_pool_size=%d",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -6970,7 +6974,9 @@ int main(int, char**)
         taskflow_general_pool_size,
         taskflow_service_pool_size,
         taskflow_critical_pool_size);
+    aida_early_startup::mark("post_gate_taskflow_initialize_pre");
     aida::infra::taskflow_runtime::initialize();
+    aida_early_startup::mark("post_gate_taskflow_initialize_done");
     const auto taskflow_init_snapshot = aida::infra::taskflow_runtime::active_snapshot();
     startup_log_critical_fmt("taskflow_runtime_initialize_post pid=%lu tid=%lu tick=%llu accepting=%d shutdown=%d total_active=%u work_pending=%llu service_pending=%llu critical_pending=%llu",
         GetCurrentProcessId(),
@@ -6983,23 +6989,27 @@ int main(int, char**)
         static_cast<unsigned long long>(taskflow_init_snapshot.service_queue_pending),
         static_cast<unsigned long long>(taskflow_init_snapshot.critical_queue_pending));
     crash_log_write("taskflow_runtime_init_ok");
+    aida_early_startup::mark("post_gate_taskflow_runtime_init_ok");
     phase0_post_wer_configuration_logging("post_taskflow_runtime_init");
     aida::diagnostics::metadata_ring::emit(
         aida::diagnostics::metadata_ring::breadcrumb_category_t::startup_shutdown,
         "standalone_startup_begin", "phase0_complete", true);
     aida::diagnostics::wer::log_wer_correlation("startup");
 
+    aida_early_startup::mark("post_gate_tracer_start_pre");
     startup_log_critical_fmt("tracer_start_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     aida_tracer::start();
+    aida_early_startup::mark("post_gate_tracer_start_done");
     startup_log_critical_fmt("tracer_start_post pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
 
     {
+        aida_early_startup::mark("post_gate_hwid_collect_pre");
         const uint64_t hwid_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("hwid_collect_pre pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -7058,19 +7068,27 @@ int main(int, char**)
         }
     }
 
-    run_phase_1_2_self_tests();
+    aida_early_startup::mark("post_gate_hwid_collect_done");
 
+    aida_early_startup::mark("post_gate_phase_1_2_self_tests_pre");
+    run_phase_1_2_self_tests();
+    aida_early_startup::mark("post_gate_phase_1_2_self_tests_done");
+
+    aida_early_startup::mark("post_gate_arc_import_cache_prime_pre");
     startup_log_critical_fmt("arc_import_cache_prime_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     arc_loader::prime_import_cache();
+    aida_early_startup::mark("post_gate_arc_import_cache_prime_done");
     startup_log_critical_fmt("arc_import_cache_prime_post pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     crash_log_write("arc_import_cache_primed");
+    aida_early_startup::mark("post_gate_arc_import_cache_primed");
 
+    aida_early_startup::mark("post_gate_unhandled_exception_filter_set_pre");
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
         if (ep && ep->ExceptionRecord &&
             ep->ExceptionRecord->ExceptionCode == STATUS_SINGLE_STEP &&
@@ -7275,8 +7293,10 @@ int main(int, char**)
         return EXCEPTION_CONTINUE_SEARCH;
     });
     crash_log_write("exception_filter_set");
+    aida_early_startup::mark("post_gate_exception_filter_set");
 
     {
+        aida_early_startup::mark("post_gate_re_tool_preflight_pre");
         const uint64_t re_tool_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("re_tool_preflight_pre pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -7288,6 +7308,7 @@ int main(int, char**)
             re_result.ida_detected ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - re_tool_tick));
         crash_log_write("re_tool_preflight_done");
+        aida_early_startup::mark("post_gate_re_tool_preflight_done");
         if (re_result.re_tool_detected) {
             startup_log_critical_fmt("re_tool_preflight_refuse sig=%.32ws pid=%lu tid=%lu tick=%llu",
                 re_result.detected_sig ? re_result.detected_sig : L"<null>",
@@ -7299,6 +7320,7 @@ int main(int, char**)
     }
 
     {
+        aida_early_startup::mark("post_gate_hv_preflight_pre");
         const uint64_t hv_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("hv_preflight_run_pre pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
@@ -7312,6 +7334,7 @@ int main(int, char**)
             anti_tamper::hv_preflight::g_vbs_enabled ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hv_tick));
         crash_log_write("hv_preflight_done");
+        aida_early_startup::mark("post_gate_hv_preflight_done");
         if (r.result != anti_tamper::hv_preflight::result_t::allow)
         {
             startup_log_critical_fmt("hv_preflight_refuse_ui_enter result=%u pid=%lu tid=%lu tick=%llu",
@@ -7324,12 +7347,14 @@ int main(int, char**)
     }
 
     {
+        aida_early_startup::mark("post_gate_settings_load_pre");
         const uint64_t settings_tick = static_cast<uint64_t>(GetTickCount64());
         startup_log_critical_fmt("settings_load_pre pid=%lu tid=%lu tick=%llu",
             GetCurrentProcessId(),
             GetCurrentThreadId(),
             static_cast<unsigned long long>(settings_tick));
         bool settings_loaded = g_sa_settings.load();
+        aida_early_startup::mark("post_gate_settings_load_done");
         g_sa_settings.editor_line_numbers   = true;
         g_sa_settings.editor_word_wrap      = true;
         g_sa_settings.editor_minimap        = true;
@@ -7340,6 +7365,7 @@ int main(int, char**)
         g_sa_settings.auto_save_enabled     = true;
         crash_log_fmt("startup_settings_loaded=%d", settings_loaded ? 1 : 0);
         try {
+            aida_early_startup::mark("post_gate_mcp_posture_scan_pre");
             auto mcp_report = anti_tamper::mcp_posture::scan_startup_posture(g_sa_settings);
             startup_log_critical_fmt("mcp_posture_scan_post trusted=%d denied=%d latched=%d files=%zu servers=%zu suspicious=%zu summary_hash=0x%016llX elapsed_ms=%llu",
                 mcp_report.trusted ? 1 : 0,
@@ -7350,6 +7376,7 @@ int main(int, char**)
                 mcp_report.suspicious,
                 static_cast<unsigned long long>(mcp_report.summary_hash),
                 static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
+            aida_early_startup::mark("post_gate_mcp_posture_scan_done");
             if (!mcp_report.trusted)
                 show_mcp_posture_refuse_ui_and_exit(mcp_report);
         } catch (const std::exception& e) {
@@ -7377,6 +7404,7 @@ int main(int, char**)
         }
         std::string ban_reason;
         std::string ban_message;
+        aida_early_startup::mark("post_gate_startup_ban_check_pre");
         if (standalone_license::startup_ban_check(g_sa_settings, ban_reason, ban_message)) {
             startup_log_critical_fmt("startup_ban_refuse reason_hash=0x%016llX reason_len=%zu elapsed_ms=%llu",
                 static_cast<unsigned long long>(diag_fnv1a64(ban_reason.data(), ban_reason.size())),
@@ -7389,8 +7417,10 @@ int main(int, char**)
             settings_loaded ? 1 : 0,
             static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - settings_tick));
         crash_log_write("startup_ban_check_passed");
+        aida_early_startup::mark("post_gate_startup_ban_check_done");
 
         {
+            aida_early_startup::mark("post_gate_re_tool_hash_preflight_pre");
             const uint64_t hash_tick = static_cast<uint64_t>(GetTickCount64());
             std::string server_host = "https://aidapro.net";
             std::string lic_key = g_sa_settings.license_key;
@@ -7400,7 +7430,9 @@ int main(int, char**)
                 !sess_token.empty() ? 1 : 0,
                 static_cast<unsigned long long>(hash_tick));
             if (!lic_key.empty() && !sess_token.empty()) {
+                aida_early_startup::mark("post_gate_re_tool_hash_fetch_pre");
                 auto hashes = re_tool_preflight::fetch_re_tool_hashes(server_host, lic_key, sess_token);
+                aida_early_startup::mark("post_gate_re_tool_hash_fetch_done");
                 startup_log_critical_fmt("re_tool_hash_preflight_post count=%zu elapsed_ms=%llu",
                     hashes.size(),
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
@@ -7419,7 +7451,9 @@ int main(int, char**)
                     }
                     re_tool_preflight::push_hashes_to_kernel(hashes);
                 }
+                aida_early_startup::mark("post_gate_werfault_hash_fetch_pre");
                 auto wf_hashes = re_tool_preflight::fetch_werfault_hashes(server_host, lic_key, sess_token);
+                aida_early_startup::mark("post_gate_werfault_hash_fetch_done");
                 startup_log_critical_fmt("werfault_hash_preflight_post count=%zu elapsed_ms=%llu",
                     wf_hashes.size(),
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
@@ -7432,6 +7466,7 @@ int main(int, char**)
                     const uint64_t ce_hash_tick = static_cast<uint64_t>(GetTickCount64());
                     startup_log_critical_fmt("ce_driver_hash_refresh_pre tick=%llu",
                         static_cast<unsigned long long>(ce_hash_tick));
+                    aida_early_startup::mark("post_gate_ce_driver_hash_refresh_pre");
                     try {
                         re_tool_preflight::refresh_ce_driver_hashes();
                     } catch (...) {
@@ -7440,6 +7475,7 @@ int main(int, char**)
                     }
                     startup_log_critical_fmt("ce_driver_hash_refresh_post elapsed_ms=%llu",
                         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - ce_hash_tick));
+                    aida_early_startup::mark("post_gate_ce_driver_hash_refresh_done");
                     crash_log_write("ce_driver_hash_refresh_done");
                 }
 
@@ -7447,6 +7483,7 @@ int main(int, char**)
                     const uint64_t wf_hash_tick = static_cast<uint64_t>(GetTickCount64());
                     startup_log_critical_fmt("werfault_hash_refresh_pre tick=%llu",
                         static_cast<unsigned long long>(wf_hash_tick));
+                    aida_early_startup::mark("post_gate_werfault_hash_refresh_pre");
                     try {
                         re_tool_preflight::refresh_werfault_hashes();
                     } catch (...) {
@@ -7455,6 +7492,7 @@ int main(int, char**)
                     }
                     startup_log_critical_fmt("werfault_hash_refresh_post elapsed_ms=%llu",
                         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - wf_hash_tick));
+                    aida_early_startup::mark("post_gate_werfault_hash_refresh_done");
                     crash_log_write("werfault_hash_refresh_done");
                 }
 
@@ -7462,7 +7500,9 @@ int main(int, char**)
                     const uint64_t ph_tick = static_cast<uint64_t>(GetTickCount64());
                     startup_log_critical_fmt("prologue_hash_fetch_pre tick=%llu",
                         static_cast<unsigned long long>(ph_tick));
+                    aida_early_startup::mark("post_gate_prologue_hash_fetch_pre");
                     anti_tamper::anti_hook::fetch_server_prologue_hashes(server_host, lic_key, sess_token);
+                    aida_early_startup::mark("post_gate_prologue_hash_fetch_done");
                     startup_log_critical_fmt("prologue_hash_fetch_post elapsed_ms=%llu",
                         static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - ph_tick));
                     crash_log_write("prologue_hash_fetch_done");
@@ -7472,13 +7512,18 @@ int main(int, char**)
                     static_cast<unsigned long long>(static_cast<uint64_t>(GetTickCount64()) - hash_tick));
             }
             crash_log_write("re_tool_hash_preflight_done");
+            aida_early_startup::mark("post_gate_re_tool_hash_preflight_done");
         }
     }
 
+    aida_early_startup::mark("post_gate_appusermodelid_pre");
     HRESULT aumid_hr = ::SetCurrentProcessExplicitAppUserModelID(L"AiDA.Standalone.IDE");
     startup_log_critical_fmt("appusermodelid hr=0x%08lX",
         static_cast<unsigned long>(aumid_hr));
 
+    aida_early_startup::mark("post_gate_appusermodelid_done");
+
+    aida_early_startup::mark("post_gate_dpi_awareness_pre");
     startup_log_critical_fmt("dpi_awareness_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -7487,25 +7532,32 @@ int main(int, char**)
     startup_log_critical_fmt("dpi_awareness_post last_err=%lu",
         static_cast<unsigned long>(GetLastError()));
     crash_log_write("dpi_awareness_set");
+    aida_early_startup::mark("post_gate_dpi_awareness_done");
 
+    aida_early_startup::mark("post_gate_window_identity_generate_pre");
     aida_preflight::generate_window_class_name(g_aidaClassName, 128);
     aida_preflight::generate_window_title(g_aidaWindowTitle, 128);
     startup_log_critical_fmt("window_identity_generated class_len=%zu title_len=%zu pid=%lu tid=%lu",
         wcslen(g_aidaClassName), wcslen(g_aidaWindowTitle),
         GetCurrentProcessId(), GetCurrentThreadId());
 
+    aida_early_startup::mark("post_gate_window_identity_generate_done");
+
+    aida_early_startup::mark("post_gate_register_class_pre");
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, g_aidaClassName, nullptr };
     startup_log_critical_fmt("register_class_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     ATOM class_atom = ::RegisterClassExW(&wc);
+    aida_early_startup::mark("post_gate_register_class_done");
     startup_log_critical_fmt("register_class_post atom=%u last_err=%lu",
         static_cast<unsigned>(class_atom),
         static_cast<unsigned long>(GetLastError()));
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
     int screen_h = GetSystemMetrics(SM_CYSCREEN);
     crash_log_fmt("screen=%dx%d", screen_w, screen_h);
+    aida_early_startup::mark("post_gate_create_window_pre");
     startup_log_critical_fmt("create_window_pre screen_w=%d screen_h=%d pid=%lu tid=%lu tick=%llu",
         screen_w,
         screen_h,
@@ -7526,7 +7578,8 @@ int main(int, char**)
                                   nullptr,
                                   nullptr,
                                   wc.hInstance,
-                                  nullptr);
+                                   nullptr);
+    aida_early_startup::mark("post_gate_create_window_done");
     g_hwnd = hwnd;
     {
         aida::diagnostics::observer::observer_config_t obs_cfg;
@@ -7579,6 +7632,7 @@ int main(int, char**)
         }
     }
     crash_log_write("creating_d3d");
+    aida_early_startup::mark("post_gate_create_d3d_pre");
     startup_log_critical_fmt("create_d3d_pre hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
         GetCurrentProcessId(),
@@ -7586,6 +7640,7 @@ int main(int, char**)
         static_cast<unsigned long long>(GetTickCount64()));
     if (!CreateDeviceD3D(hwnd))
     {
+        aida_early_startup::mark("post_gate_create_d3d_FAILED");
         startup_log_critical_fmt("create_d3d_failed hwnd=0x%llX last_err=%lu",
             static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(hwnd)),
             static_cast<unsigned long>(GetLastError()));
@@ -7599,6 +7654,7 @@ int main(int, char**)
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pd3dDeviceContext)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_pSwapChain)),
         static_cast<unsigned long>(GetLastError()));
+    aida_early_startup::mark("post_gate_create_d3d_done");
     crash_log_fmt("d3d_ok device=%p ctx=%p swapchain=%p", g_pd3dDevice, g_pd3dDeviceContext, g_pSwapChain);
 
     startup_log_critical_fmt("show_window_pre hwnd=0x%llX pid=%lu tid=%lu tick=%llu",
@@ -7606,6 +7662,7 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
+    aida_early_startup::mark("post_gate_show_window_pre");
     ::ShowWindow(hwnd, SW_SHOW);
     aida::manual_map_tls::ensure_current_thread();
     if (!aida::ui_thread::require_owner("dwm", "startup_window_attributes", "show_window"))
@@ -7652,6 +7709,7 @@ int main(int, char**)
 
     IMGUI_CHECKVERSION();
     aida::manual_map_tls::ensure_current_thread();
+    aida_early_startup::mark("post_gate_imgui_context_create_pre");
     startup_log_critical_fmt("imgui_context_create_pre pid=%lu tid=%lu tick=%llu",
         GetCurrentProcessId(),
         GetCurrentThreadId(),
@@ -7659,6 +7717,7 @@ int main(int, char**)
     if (!aida::ui_thread::require_owner("imgui", "create_context", "startup"))
         return 1;
     ImGui::CreateContext();
+    aida_early_startup::mark("post_gate_imgui_context_create_done");
     aida::manual_map_tls::ensure_current_thread();
     startup_log_critical_fmt("imgui_context_create_post ctx=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(ImGui::GetCurrentContext())));

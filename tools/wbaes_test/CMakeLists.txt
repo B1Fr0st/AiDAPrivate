@@ -3,6 +3,13 @@ add_executable(WBAES_TEST
     wbaes_payload_c.c
 )
 
+target_include_directories(WBAES_TEST PRIVATE
+    "${CMAKE_BINARY_DIR}/generated"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/standalone/src/core/anti-tamper"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/standalone/src/core"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/protector"
+)
+
 target_compile_definitions(WBAES_TEST PRIVATE
     _CRT_SECURE_NO_WARNINGS
     NOMINMAX

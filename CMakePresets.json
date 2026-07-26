@@ -12,7 +12,7 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_C_COMPILER": "cl",
         "CMAKE_CXX_COMPILER": "cl",
-        "CMAKE_MAKE_PROGRAM": "C:/Users/ruar1337/Downloads/ninja-win/ninja.exe",
+        "CMAKE_MAKE_PROGRAM": "C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
         "AIDA_ENABLE_LTCG": "OFF",
         "AIDA_FAST_LINK":   "ON",
         "AIDA_REGENERATE_LEGACY_DRIVER_MAPPER_FROM_BINARY": "ON",
