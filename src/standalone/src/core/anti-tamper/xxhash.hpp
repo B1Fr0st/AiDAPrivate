@@ -24,9 +24,9 @@ __forceinline uint64_t mul64(uint64_t a, uint64_t b)
 
 __forceinline uint64_t round_accum(uint64_t acc, uint64_t input)
 {
-    acc = mul64(acc + mul64(input, kPrime2), kPrime1);
-    acc ^= rotl64(acc, 31) * kPrime1;
-    return acc + kPrime4;
+    acc += mul64(input, kPrime2);
+    acc = rotl64(acc, 31);
+    return mul64(acc, kPrime1);
 }
 
 __forceinline uint64_t merge_round(uint64_t acc, uint64_t val)

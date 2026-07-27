@@ -69,6 +69,7 @@
 #include "skills.hpp"
 #include "../analysis/stealth_engine.hpp"
 #include "../anti-tamper/mcp_posture.hpp"
+#include "../anti-tamper/init_guard.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../testlab/test_all_features.hpp"
 #include "../ui/components.hpp"
@@ -2512,6 +2513,7 @@ __declspec(noinline) static DWORD seh_standalone_license_initialize(settings_sa_
     __try {
         out_ok = standalone_license::initialize(s);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::init_guard::mark_seh_abort(GetExceptionCode(), "seh_standalone_license_initialize");
         return GetExceptionCode();
     }
     return 0;

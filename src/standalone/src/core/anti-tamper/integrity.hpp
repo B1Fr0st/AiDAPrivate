@@ -456,48 +456,31 @@ namespace detail {
         return static_cast<uint64_t>((q.QuadPart * 1000ULL) / f.QuadPart);
     }
 
-    static __forceinline uint8_t aes_compute_rcon(int round) {
-        if (round <= 0) return 0;
-        volatile uint64_t tsc = __rdtsc();
-        volatile uint8_t noise = static_cast<uint8_t>(tsc & 0xFF);
-        uint8_t r = 1;
-        for (int j = 1; j < round; ++j) {
-            uint8_t hi = r & 0x80u;
-            r = static_cast<uint8_t>(r << 1);
-            if (hi) r ^= 0x1Bu;
-        }
-        volatile uint8_t masked = r ^ noise;
-        return static_cast<uint8_t>(masked ^ noise);
+    __forceinline __m128i aes128_expand_key_round(__m128i key, __m128i keygened)
+    {
+        keygened = _mm_shuffle_epi32(keygened, 0xFF);
+        __m128i tmp = _mm_slli_si128(key, 4);
+        key = _mm_xor_si128(key, tmp);
+        tmp = _mm_slli_si128(tmp, 4);
+        key = _mm_xor_si128(key, tmp);
+        tmp = _mm_slli_si128(tmp, 4);
+        key = _mm_xor_si128(key, tmp);
+        return _mm_xor_si128(key, keygened);
     }
 
     inline void aes128_expand_key(const uint8_t key[16], __m128i round_keys[11])
     {
         round_keys[0] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key));
-        auto exp = [&](__m128i k, __m128i ka) {
-            ka = _mm_shuffle_epi32(ka, 0xFF);
-            __m128i t = _mm_slli_si128(k, 4);
-            k = _mm_xor_si128(k, t);
-            t = _mm_slli_si128(t, 4);
-            k = _mm_xor_si128(k, t);
-            t = _mm_slli_si128(t, 4);
-            k = _mm_xor_si128(k, t);
-            return _mm_xor_si128(k, ka);
-        };
-        auto keygen_rcon = [&](__m128i prev_key, int round) -> __m128i {
-            uint8_t rcon = aes_compute_rcon(round);
-            __m128i keygened = exp(prev_key, _mm_aeskeygenassist_si128(prev_key, 0));
-            return _mm_xor_si128(keygened, _mm_set1_epi32(static_cast<int>(rcon) << 24));
-        };
-        round_keys[1]  = keygen_rcon(round_keys[0], 1);
-        round_keys[2]  = keygen_rcon(round_keys[1], 2);
-        round_keys[3]  = keygen_rcon(round_keys[2], 3);
-        round_keys[4]  = keygen_rcon(round_keys[3], 4);
-        round_keys[5]  = keygen_rcon(round_keys[4], 5);
-        round_keys[6]  = keygen_rcon(round_keys[5], 6);
-        round_keys[7]  = keygen_rcon(round_keys[6], 7);
-        round_keys[8]  = keygen_rcon(round_keys[7], 8);
-        round_keys[9]  = keygen_rcon(round_keys[8], 9);
-        round_keys[10] = keygen_rcon(round_keys[9], 10);
+        round_keys[1] = aes128_expand_key_round(round_keys[0], _mm_aeskeygenassist_si128(round_keys[0], 0x01));
+        round_keys[2] = aes128_expand_key_round(round_keys[1], _mm_aeskeygenassist_si128(round_keys[1], 0x02));
+        round_keys[3] = aes128_expand_key_round(round_keys[2], _mm_aeskeygenassist_si128(round_keys[2], 0x04));
+        round_keys[4] = aes128_expand_key_round(round_keys[3], _mm_aeskeygenassist_si128(round_keys[3], 0x08));
+        round_keys[5] = aes128_expand_key_round(round_keys[4], _mm_aeskeygenassist_si128(round_keys[4], 0x10));
+        round_keys[6] = aes128_expand_key_round(round_keys[5], _mm_aeskeygenassist_si128(round_keys[5], 0x20));
+        round_keys[7] = aes128_expand_key_round(round_keys[6], _mm_aeskeygenassist_si128(round_keys[6], 0x40));
+        round_keys[8] = aes128_expand_key_round(round_keys[7], _mm_aeskeygenassist_si128(round_keys[7], 0x80));
+        round_keys[9] = aes128_expand_key_round(round_keys[8], _mm_aeskeygenassist_si128(round_keys[8], 0x1B));
+        round_keys[10] = aes128_expand_key_round(round_keys[9], _mm_aeskeygenassist_si128(round_keys[9], 0x36));
     }
 
     __forceinline __m128i aes128_encrypt_block(const __m128i round_keys[11], __m128i in)

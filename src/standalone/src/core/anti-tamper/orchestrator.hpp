@@ -56,6 +56,7 @@
 #include "preflight.hpp"
 #include "dma_preflight_policy.hpp"
 #include "cross_verification_ring.hpp"
+#include "init_guard.hpp"
 #include "reloc_mask.hpp"
 
 #include "obfuscation.hpp"
@@ -1579,33 +1580,48 @@ inline bool initialize()
         webhook::write_log("init", "initialize_already_initialized_returning_true");
         return true;
     }
-    static std::atomic<bool> s_initialize_in_progress{false};
-    if (s_initialize_in_progress.load(std::memory_order_acquire)) {
-        webhook::write_log("init", "initialize_already_in_progress_returning_false");
-        return false;
+    if (!init_guard::begin("anti_tamper::initialize")) {
+        webhook::write_log_critical_fmt("init",
+            "initialize_already_in_progress_waiting pid=%lu tid=%lu owner_current=%d",
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            init_guard::owner_is_current_thread() ? 1 : 0);
+        const bool wait_ok = init_guard::wait_for_completion("anti_tamper::initialize", 90000);
+        if (wait_ok && driver_bridge::is_loaded() && driver_bridge::using_kernel_driver() &&
+            !rt.driver_hardening_done.load(std::memory_order_acquire))
+        {
+            webhook::write_log("init", "initialize_wait_done_driver_hardening_retry");
+            return ensure_driver_hardening("initialize_wait_done");
+        }
+        return wait_ok;
     }
-    static std::recursive_mutex s_initialize_mtx;
-    std::lock_guard<std::recursive_mutex> init_lk(s_initialize_mtx);
-    s_initialize_in_progress.store(true, std::memory_order_release);
     webhook::write_log("init", "initialize_state_get_OK");
 
     struct in_progress_guard_t {
-        std::atomic<bool>& flag;
-        ~in_progress_guard_t() { flag.store(false, std::memory_order_release); }
-    } in_progress_guard{ s_initialize_in_progress };
+        bool completed = false;
+        ~in_progress_guard_t()
+        {
+            init_guard::finish(completed ? "return_true" : "scope_exit", state::get().initialized.load(std::memory_order_acquire));
+        }
+    } in_progress_guard{};
 
     if (rt.initialized.load(std::memory_order_acquire)) {
         if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver() &&
             !rt.driver_hardening_done.load(std::memory_order_acquire))
         {
             webhook::write_log("init", "initialize_already_initialized_driver_hardening_retry");
-            return ensure_driver_hardening("initialize_retry");
+            const bool hardening_ok = ensure_driver_hardening("initialize_retry");
+            if (hardening_ok)
+                in_progress_guard.completed = true;
+            return hardening_ok;
         }
         webhook::write_log("init", "initialize_already_initialized_returning_true");
+        in_progress_guard.completed = true;
         return true;
     }
     webhook::write_log("init", "initialize_not_yet_initialized");
 
+    init_guard::set_phase("ensure_kat_passed");
     uint64_t kat_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "ensure_kat_passed_pre pid=%lu tid=%lu tick=%llu",
@@ -1626,6 +1642,7 @@ inline bool initialize()
     }
     webhook::write_log("init", "crypto_kat_ok");
 
+    init_guard::set_phase("syscall_initialize");
     uint64_t syscall_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "syscall_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -1648,6 +1665,7 @@ inline bool initialize()
     anti_emulation::set_timing_canary_fn(&execute_vm_protected_timing_canary);
 
     {
+        init_guard::set_phase("anti_emulation_preflight");
         uint64_t anti_emu_tick = GetTickCount64();
         webhook::write_log_critical_fmt("init",
             "anti_emulation_preflight_pre pid=%lu tid=%lu tick=%llu",
@@ -2005,6 +2023,7 @@ inline bool initialize()
     }
 
     {
+        init_guard::set_phase("preflight_checks");
         uint64_t preflight_tick = GetTickCount64();
         webhook::write_log_critical_fmt("init",
             "preflight_checks_pre pid=%lu tid=%lu tick=%llu",
@@ -2019,6 +2038,7 @@ inline bool initialize()
     }
 
     {
+        init_guard::set_phase("cross_ring_initialize");
         uint64_t cross_ring_tick = GetTickCount64();
         webhook::write_log_critical_fmt("init",
             "cross_ring_initialize_pre pid=%lu tid=%lu tick=%llu text_base=0x%llX text_size=0x%X",
@@ -2050,6 +2070,7 @@ inline bool initialize()
         }
     }
 
+    init_guard::set_phase("snapshot_iat");
     uint64_t snapshot_iat_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "snapshot_iat_call_pre pid=%lu tid=%lu tick=%llu prior_entries=%zu base=0x%llX module_end=0x%llX",
@@ -2068,6 +2089,7 @@ inline bool initialize()
     webhook::write_log("init", "snapshot_iat_ok");
     webhook::write_log_critical("init", "snapshot_iat_ok_log_post");
 
+    init_guard::set_phase("block_chain_build");
     uint64_t block_chain_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "block_chain_build_pre pid=%lu tid=%lu tick=%llu prior_blocks=%zu base=0x%llX size=0x%X",
@@ -2093,6 +2115,7 @@ inline bool initialize()
     webhook::write_log("init", "block_chain_ok");
     webhook::write_log_critical("init", "block_chain_ok_log_post");
 
+    init_guard::set_phase("token_chain_initialize");
     uint64_t token_chain_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "token_chain_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -2118,6 +2141,7 @@ inline bool initialize()
     webhook::write_log("init", "token_chain_ok");
     webhook::write_log_critical("init", "token_chain_ok_log_post");
 
+    init_guard::set_phase("startup_security_scans");
     {
         uint64_t anti_debug_tick = GetTickCount64();
         webhook::write_log_critical_fmt("init",
@@ -2169,6 +2193,7 @@ inline bool initialize()
     webhook::write_log("init", "anti_hook_ok");
     webhook::write_log_critical("init", "anti_hook_ok_log_post");
 
+    init_guard::set_phase("self_function_registration");
     {
         anti_hook::register_self_function("anti_hook::scan_impl",
             reinterpret_cast<void*>(&anti_hook::scan_impl));
@@ -2218,6 +2243,7 @@ inline bool initialize()
 
     webhook::write_log_critical("init", "ambient_tool_posture_enforcement_removed");
 
+    init_guard::set_phase("anti_vm_scan");
     {
         uint64_t anti_vm_tick = GetTickCount64();
         webhook::write_log_critical_fmt("init",
@@ -2252,6 +2278,7 @@ inline bool initialize()
     webhook::write_log("init", "anti_vm_ok");
     webhook::write_log_critical("init", "anti_vm_ok_log_post");
 
+    init_guard::set_phase("virtualizer_initialize");
     uint64_t virtualizer_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "virtualizer_initialize_pre pid=%lu tid=%lu tick=%llu text_base=0x%llX text_size=0x%X text_hash=0x%016llX",
@@ -2304,6 +2331,7 @@ inline bool initialize()
             static_cast<unsigned long long>(GetTickCount64() - anti_emu_nested_tick));
     }
 
+    init_guard::set_phase("ghost_code_encrypt");
     uint64_t ghost_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "ghost_veh_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -2392,6 +2420,7 @@ inline bool initialize()
         webhook::write_log("init", "code_encrypt_functions_registered");
     }
 
+    init_guard::set_phase("metamorphic_cloakwork");
     uint64_t metamorphic_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "metamorphic_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -2421,6 +2450,7 @@ inline bool initialize()
     webhook::write_log("init", "cloakwork_ok");
     webhook::write_log_critical("init", "cloakwork_ok_log_post");
 
+    init_guard::set_phase("ai_deception_layers");
     uint64_t ai_deception_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "ai_deception_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -2526,6 +2556,7 @@ inline bool initialize()
             static_cast<unsigned long long>(GetTickCount64() - honeypot_tick));
     }
 
+    init_guard::set_phase("packer_build_verify");
     {
         packer::build_protection_status_t packer_status{};
         webhook::write_log_critical_fmt("init",
@@ -2666,6 +2697,7 @@ inline bool initialize()
         webhook::write_log("init", dbg);
     }
 
+    init_guard::set_phase("nanomites_initialize");
     uint64_t nanomites_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "nanomites_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -2696,6 +2728,7 @@ inline bool initialize()
         webhook::write_log("init", dbg);
     }
 
+    init_guard::set_phase("binary_protocol_initialize");
     uint64_t binary_protocol_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "binary_protocol_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -2716,6 +2749,7 @@ inline bool initialize()
         return false;
     }
 
+    init_guard::set_phase("server_pages_initialize");
     uint64_t server_pages_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "server_pages_initialize_pre pid=%lu tid=%lu tick=%llu",
@@ -2751,6 +2785,7 @@ inline bool initialize()
     }
 #endif
 
+    init_guard::set_phase("driver_hardening");
     if (driver_bridge::is_loaded() && driver_bridge::using_kernel_driver())
     {
         if (!ensure_driver_hardening("initialize"))
@@ -2780,6 +2815,7 @@ inline bool initialize()
         webhook::write_log("init", anti_tamper::tpm_attest::last_error());
     }
 
+    init_guard::set_phase("code_snapshot_resnap");
     {
         uint64_t resnap_tick = GetTickCount64();
         webhook::write_log_critical_fmt("init",
@@ -2821,6 +2857,7 @@ inline bool initialize()
         }
     }
 
+    init_guard::set_phase("periodic_integrity_start");
     uint64_t periodic_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
         "periodic_integrity_start_pre pid=%lu tid=%lu tick=%llu",
@@ -2874,6 +2911,7 @@ inline bool initialize()
         webhook::write_log("init", "periodic_integrity_started");
     }
 
+    init_guard::set_phase("start_monitors");
     try
     {
         uint64_t monitors_tick = GetTickCount64();
@@ -2916,6 +2954,7 @@ inline bool initialize()
         webhook::write_log_critical("init", "start_monitors_unknown_exception_degraded_verified");
     }
 
+    init_guard::set_phase("re_detect_initialize");
     try
     {
         uint64_t re_detect_tick = GetTickCount64();
@@ -2943,6 +2982,7 @@ inline bool initialize()
         return false;
     }
 
+    init_guard::set_phase("self_guard_initialize");
     {
         uint64_t self_guard_tick = GetTickCount64();
         webhook::write_log_critical_fmt("init",
@@ -2974,6 +3014,7 @@ inline bool initialize()
 
     webhook::write_log("init", "deferred_anti_dump_until_arc_loaded");
 
+    in_progress_guard.completed = true;
     return true;
 }
 

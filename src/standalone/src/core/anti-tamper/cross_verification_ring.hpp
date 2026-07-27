@@ -97,23 +97,74 @@ constexpr uint32_t kPageSize = 4096;
 constexpr uint64_t kBaseSleepMs = 3000;
 constexpr uint64_t kJitterRangeMs = 2000;
 
-static const uint32_t kDefaultTopology[8][3] = {
-    {2, 4, 6},
-    {3, 5, 7},
-    {4, 6, 0},
-    {5, 7, 1},
-    {6, 0, 2},
-    {7, 1, 3},
-    {0, 2, 4},
-    {1, 3, 5},
-};
-
 __forceinline bool constant_time_compare(const uint8_t* a, const uint8_t* b, size_t len)
 {
     uint8_t diff = 0;
     for (size_t i = 0; i < len; ++i)
         diff |= a[i] ^ b[i];
     return diff == 0;
+}
+
+inline void hex_encode_bytes(char* out, size_t out_cap, const uint8_t* data, size_t len)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t pos = 0;
+    if (!out || out_cap == 0)
+        return;
+    for (size_t i = 0; i < len && pos + 2 < out_cap; ++i)
+    {
+        out[pos++] = hex[(data[i] >> 4) & 0xF];
+        out[pos++] = hex[data[i] & 0xF];
+    }
+    out[pos < out_cap ? pos : out_cap - 1] = '\0';
+}
+
+inline void log_kat_failure_u32(uint32_t algo, uint32_t computed, uint32_t expected)
+{
+    webhook::write_log_critical_fmt("cross_ring",
+        "cross_ring_algo_kat_failure algo=%u computed=0x%08X expected=0x%08X",
+        algo,
+        computed,
+        expected);
+    diag::log_tagged_critical_fmt("cross_ring",
+        "cross_ring_algo_kat_failure algo=%u computed=0x%08X expected=0x%08X",
+        algo,
+        computed,
+        expected);
+}
+
+inline void log_kat_failure_u64(uint32_t algo, uint64_t computed, uint64_t expected)
+{
+    webhook::write_log_critical_fmt("cross_ring",
+        "cross_ring_algo_kat_failure algo=%u computed=0x%016llX expected=0x%016llX",
+        algo,
+        static_cast<unsigned long long>(computed),
+        static_cast<unsigned long long>(expected));
+    diag::log_tagged_critical_fmt("cross_ring",
+        "cross_ring_algo_kat_failure algo=%u computed=0x%016llX expected=0x%016llX",
+        algo,
+        static_cast<unsigned long long>(computed),
+        static_cast<unsigned long long>(expected));
+}
+
+inline void log_kat_failure_bytes(uint32_t algo, const uint8_t* computed, const uint8_t* expected, size_t len)
+{
+    char computed_hex[129] = {};
+    char expected_hex[129] = {};
+    hex_encode_bytes(computed_hex, sizeof(computed_hex), computed, len);
+    hex_encode_bytes(expected_hex, sizeof(expected_hex), expected, len);
+    webhook::write_log_critical_fmt("cross_ring",
+        "cross_ring_algo_kat_failure algo=%u computed=%s expected=%s len=%zu",
+        algo,
+        computed_hex,
+        expected_hex,
+        len);
+    diag::log_tagged_critical_fmt("cross_ring",
+        "cross_ring_algo_kat_failure algo=%u computed=%s expected=%s len=%zu",
+        algo,
+        computed_hex,
+        expected_hex,
+        len);
 }
 
 inline __declspec(noinline) uint32_t compute_crc32c(const void* data, size_t len)
@@ -219,17 +270,26 @@ inline bool verify_hash_algorithm(hash_algo_t algo)
     case hash_algo_t::crc32c:
     {
         uint32_t h = compute_crc32c(tv, hash_test_vectors::kTestVectorLen);
-        return h == hash_test_vectors::kExpectedCRC32C;
+        bool ok = h == hash_test_vectors::kExpectedCRC32C;
+        if (!ok)
+            log_kat_failure_u32(static_cast<uint32_t>(algo), h, hash_test_vectors::kExpectedCRC32C);
+        return ok;
     }
     case hash_algo_t::fnv1a_64:
     {
         uint64_t h = fnv1a::hash(tv, hash_test_vectors::kTestVectorLen);
-        return h == hash_test_vectors::kExpectedFNV1a64;
+        bool ok = h == hash_test_vectors::kExpectedFNV1a64;
+        if (!ok)
+            log_kat_failure_u64(static_cast<uint32_t>(algo), h, hash_test_vectors::kExpectedFNV1a64);
+        return ok;
     }
     case hash_algo_t::xxhash_64:
     {
         uint64_t h = xxhash::hash(tv, hash_test_vectors::kTestVectorLen, 0);
-        return h == hash_test_vectors::kExpectedXXHash64;
+        bool ok = h == hash_test_vectors::kExpectedXXHash64;
+        if (!ok)
+            log_kat_failure_u64(static_cast<uint32_t>(algo), h, hash_test_vectors::kExpectedXXHash64);
+        return ok;
     }
     case hash_algo_t::siphash_2_4:
     {
@@ -237,13 +297,19 @@ inline bool verify_hash_algorithm(hash_algo_t algo)
             tv, hash_test_vectors::kTestVectorLen,
             hash_test_vectors::kSipHashTestK0,
             hash_test_vectors::kSipHashTestK1);
-        return h == hash_test_vectors::kExpectedSipHash;
+        bool ok = h == hash_test_vectors::kExpectedSipHash;
+        if (!ok)
+            log_kat_failure_u64(static_cast<uint32_t>(algo), h, hash_test_vectors::kExpectedSipHash);
+        return ok;
     }
     case hash_algo_t::sha256:
     {
         uint8_t digest[32] = {};
         integrity::sha256::hash(tv, hash_test_vectors::kTestVectorLen, digest);
-        return constant_time_compare(digest, hash_test_vectors::kExpectedSHA256, 32);
+        bool ok = constant_time_compare(digest, hash_test_vectors::kExpectedSHA256, 32);
+        if (!ok)
+            log_kat_failure_bytes(static_cast<uint32_t>(algo), digest, hash_test_vectors::kExpectedSHA256, 32);
+        return ok;
     }
     case hash_algo_t::sha1:
     {
@@ -255,7 +321,10 @@ inline bool verify_hash_algorithm(hash_algo_t algo)
             sha1_expected[i] = static_cast<uint8_t>(
                 hash_test_vectors::kExpectedSHA1[i % 20] ^
                 hash_test_vectors::kExpectedSHA1[(i + 3) % 20] ^ 0xA5);
-        return constant_time_compare(digest, sha1_expected, 32);
+        bool ok = constant_time_compare(digest, sha1_expected, 32);
+        if (!ok)
+            log_kat_failure_bytes(static_cast<uint32_t>(algo), digest, sha1_expected, 32);
+        return ok;
     }
     case hash_algo_t::aes_gmac:
     {
@@ -264,13 +333,19 @@ inline bool verify_hash_algorithm(hash_algo_t algo)
             hash_test_vectors::kAESGMAC_TestKey,
             hash_test_vectors::kAESGMAC_TestIV,
             tv, hash_test_vectors::kTestVectorLen, tag);
-        return constant_time_compare(tag, hash_test_vectors::kExpectedAESGMAC, 16);
+        bool ok = constant_time_compare(tag, hash_test_vectors::kExpectedAESGMAC, 16);
+        if (!ok)
+            log_kat_failure_bytes(static_cast<uint32_t>(algo), tag, hash_test_vectors::kExpectedAESGMAC, 16);
+        return ok;
     }
     case hash_algo_t::blake3:
     {
         uint8_t digest[32] = {};
         blake3::hash(tv, hash_test_vectors::kTestVectorLen, digest);
-        return constant_time_compare(digest, hash_test_vectors::kExpectedBLAKE3, 32);
+        bool ok = constant_time_compare(digest, hash_test_vectors::kExpectedBLAKE3, 32);
+        if (!ok)
+            log_kat_failure_bytes(static_cast<uint32_t>(algo), digest, hash_test_vectors::kExpectedBLAKE3, 32);
+        return ok;
     }
     default:
         return false;
@@ -328,34 +403,71 @@ inline void assign_regions(uint64_t text_base, uint32_t text_size)
     auto& s = state();
 
     uint32_t total_pages = (text_size + kPageSize - 1) / kPageSize;
-    uint32_t pages_per_checker = total_pages / kCheckerCount;
+    uint32_t active_count = s.active_count;
+    if (active_count == 0)
+        active_count = 1;
+    uint32_t pages_per_checker = total_pages / active_count;
     if (pages_per_checker == 0) pages_per_checker = 1;
 
     for (uint32_t i = 0; i < kCheckerCount; ++i)
     {
-        uint64_t region_base = text_base + static_cast<uint64_t>(i * pages_per_checker) * kPageSize;
-        uint64_t region_end = text_base + static_cast<uint64_t>((i + 1) * pages_per_checker) * kPageSize;
-        if (i == kCheckerCount - 1)
+        memset(&s.entries[i], 0, sizeof(s.entries[i]));
+        s.entries[i].checker_id = i;
+        s.entries[i].hash_algo_id = static_cast<uint32_t>(i);
+        for (uint32_t j = 0; j < 3; ++j)
+            s.entries[i].verification_targets[j] = 0xFFFFFFFFu;
+        if (!s.algo_verified[i])
+        {
+            diag::log_tagged_critical_fmt("cross_ring",
+                "assign_region_skip_checker id=%u reason=algo_not_verified active=%u",
+                i,
+                s.active_checkers.load(std::memory_order_acquire));
+            continue;
+        }
+    }
+
+    for (uint32_t active_index = 0; active_index < s.active_count; ++active_index)
+    {
+        uint32_t checker_id = s.active_ids[active_index];
+        if (checker_id >= kCheckerCount)
+            continue;
+
+        uint64_t region_base = text_base + static_cast<uint64_t>(active_index * pages_per_checker) * kPageSize;
+        uint64_t region_end = text_base + static_cast<uint64_t>((active_index + 1) * pages_per_checker) * kPageSize;
+        if (active_index == s.active_count - 1)
             region_end = text_base + text_size;
         if (region_end > text_base + text_size)
             region_end = text_base + text_size;
 
-        s.entries[i].checker_id = i;
-        s.entries[i].hash_algo_id = static_cast<uint32_t>(i);
-        s.entries[i].region_base = region_base;
-        s.entries[i].region_size = region_end - region_base;
-        s.entries[i].last_verified_tick = 0;
-        s.entries[i]._pad = 0;
+        s.entries[checker_id].region_base = region_base;
+        s.entries[checker_id].region_size = region_end > region_base ? region_end - region_base : 0;
+        s.entries[checker_id].last_verified_tick = 0;
+        s.entries[checker_id]._pad = 0;
 
         for (uint32_t j = 0; j < 3; ++j)
-            s.entries[i].verification_targets[j] = kDefaultTopology[i][j];
+            s.entries[checker_id].verification_targets[j] = s.topology[checker_id][j];
 
-        compute_hash_by_algo(static_cast<hash_algo_t>(i),
+        diag::log_tagged_critical_fmt("cross_ring",
+            "assign_region_checker id=%u active_index=%u active_count=%u base=0x%llX size=0x%llX algo=%u target0=%u target1=%u target2=%u",
+            checker_id,
+            active_index,
+            s.active_count,
+            static_cast<unsigned long long>(s.entries[checker_id].region_base),
+            static_cast<unsigned long long>(s.entries[checker_id].region_size),
+            s.entries[checker_id].hash_algo_id,
+            s.entries[checker_id].verification_targets[0],
+            s.entries[checker_id].verification_targets[1],
+            s.entries[checker_id].verification_targets[2]);
+
+        if (s.entries[checker_id].region_size == 0)
+            continue;
+
+        compute_hash_by_algo(static_cast<hash_algo_t>(checker_id),
             reinterpret_cast<const void*>(region_base),
             static_cast<size_t>(region_end - region_base),
-            s.entries[i].expected_hash);
+            s.entries[checker_id].expected_hash);
 
-        memcpy(s.entries[i].live_hash, s.entries[i].expected_hash, 32);
+        memcpy(s.entries[checker_id].live_hash, s.entries[checker_id].expected_hash, 32);
     }
 }
 

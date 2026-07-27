@@ -64,10 +64,10 @@ __forceinline void compress(
     uint32_t state[16];
     memcpy(state, chaining, 32);
     memcpy(state + 8, kIV, 32);
-    state[12] ^= static_cast<uint32_t>(counter);
-    state[13] ^= static_cast<uint32_t>(counter >> 32);
-    state[14] ^= block_len;
-    state[15] ^= flags;
+    state[12] = static_cast<uint32_t>(counter);
+    state[13] = static_cast<uint32_t>(counter >> 32);
+    state[14] = block_len;
+    state[15] = flags;
 
     uint32_t m[16];
     memcpy(m, block_words, 64);

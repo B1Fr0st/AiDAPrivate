@@ -5963,6 +5963,7 @@ __declspec(noinline) static DWORD seh_init_standalone_chat()
     __try {
         init_standalone_chat();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::init_guard::mark_seh_abort(GetExceptionCode(), "seh_init_standalone_chat");
         aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_init_standalone_chat");
         startup_log_critical_fmt("seh_init_standalone_chat_exception code=0x%08X elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
@@ -6417,6 +6418,7 @@ __declspec(noinline) static DWORD seh_anti_tamper_initialize(bool& out_result)
     __try {
         cpp_anti_tamper_initialize(out_result);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        anti_tamper::init_guard::mark_seh_abort(GetExceptionCode(), "seh_anti_tamper_initialize");
         aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_anti_tamper_initialize");
         startup_log_critical_fmt("seh_anti_tamper_initialize_exception code=0x%08X result=%d elapsed_ms=%llu last_err=%lu",
             GetExceptionCode(),
