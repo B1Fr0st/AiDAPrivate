@@ -1011,6 +1011,20 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 struct prepared_arch_t {
 	std::unique_ptr<aida_ghidra::architecture_t> arch;
 	std::ostringstream err;
+	double init_ms = 0.0;
+
+	void record_init_ms(std::chrono::steady_clock::time_point started,
+	                    const char* sleigh_id,
+	                    uint64_t image_bytes)
+	{
+		init_ms = std::chrono::duration<double, std::milli>(
+			std::chrono::steady_clock::now() - started).count();
+		diag::log_tagged_fmt("dec",
+			"arch_init_ms=%.2f sleigh=%s image_bytes=%llu",
+			init_ms,
+			(sleigh_id && sleigh_id[0] != '\0') ? sleigh_id : "<unknown>",
+			static_cast<unsigned long long>(image_bytes));
+	}
 
 	static void apply_execution_mode(
 		aida_ghidra::architecture_t& architecture,
@@ -1046,6 +1060,7 @@ struct prepared_arch_t {
 	                aida::analysis::architecture_mode_t architecture_mode =
 					aida::analysis::architecture_mode_t::unknown)
 	{
+		const auto init_started = std::chrono::steady_clock::now();
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
 			data, size, base, file_fallback, cancel);
 		if (total_image_size != 0)
@@ -1060,6 +1075,8 @@ struct prepared_arch_t {
 		arch->init(store);
 		apply_execution_mode(*arch, architecture_mode, base,
 			total_image_size != 0 ? total_image_size : static_cast<uint64_t>(size));
+		record_init_ms(init_started, sleigh_id.c_str(),
+			total_image_size != 0 ? total_image_size : static_cast<uint64_t>(size));
 	}
 
 	prepared_arch_t(const prepared_arch_t&) = delete;
@@ -1073,6 +1090,7 @@ struct prepared_arch_t {
 		const std::string& sleigh_id,
 		std::vector<aida_ghidra::provider_patch_t> patches = {})
 	{
+		const auto init_started = std::chrono::steady_clock::now();
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
 			std::move(provider), std::move(image), load_base,
 			std::move(cancel_check),
@@ -1082,6 +1100,7 @@ struct prepared_arch_t {
 
 		ghidra::DocumentStorage store;
 		arch->init(store);
+		record_init_ms(init_started, sleigh_id.c_str(), 0);
 	}
 
 	prepared_arch_t(
@@ -1109,7 +1128,7 @@ struct prepared_arch_t {
 		if (workspace_image.image_size == 0 ||
 			workspace_image.image_size > UINT64_MAX - context_begin)
 			throw ghidra::LowlevelError("normalized workspace context range is invalid");
-		const uint64_t context_end = context_begin + workspace_image.image_size;
+		const auto init_started = std::chrono::steady_clock::now();
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
 			std::move(image), address_space, std::move(cancel_check));
 		arch = std::make_unique<aida_ghidra::architecture_t>(sleigh_id, &err);
@@ -1119,6 +1138,7 @@ struct prepared_arch_t {
 		arch->init(store);
 		apply_execution_mode(*arch, architecture_mode, context_begin,
 			workspace_image.image_size);
+		record_init_ms(init_started, sleigh_id.c_str(), workspace_image.image_size);
 #endif
 	}
 };
@@ -1594,6 +1614,58 @@ inline ghidra_result_t decompile_buffer(const uint8_t* data, size_t size,
 	return result;
 }
 
+namespace detail {
+
+inline bool validate_isolated_region_layout(std::vector<aida_ghidra::region_t>& regions,
+                                            uint64_t image_base,
+                                            uint64_t image_size,
+                                            ghidra_result_t& result)
+{
+	std::sort(regions.begin(), regions.end(), [](const auto& left, const auto& right) {
+		return left.start_va < right.start_va;
+	});
+	uint64_t prior_end = image_base;
+	for (std::size_t index = 0; index < regions.size(); ++index) {
+		const auto& region = regions[index];
+		if (region.data.empty() || region.start_va < image_base ||
+			region.start_va < prior_end || region.start_va - image_base >= image_size ||
+			region.data.size() > image_size - (region.start_va - image_base)) {
+			result.is_error = true;
+			result.error_text = "isolated decompiler regions are malformed or overlap";
+			return false;
+		}
+		prior_end = region.start_va + region.data.size();
+	}
+	return true;
+}
+
+inline std::size_t find_isolated_entry_region(const std::vector<aida_ghidra::region_t>& regions,
+                                              uint64_t entry_addr) noexcept
+{
+	for (std::size_t index = 0; index < regions.size(); ++index) {
+		const auto& region = regions[index];
+		if (entry_addr >= region.start_va && entry_addr - region.start_va < region.data.size())
+			return index;
+	}
+	return regions.size();
+}
+
+inline void finalize_isolated_result(ghidra_result_t& result,
+                                     const ghidra_decompile_result_limits_t& result_limits)
+{
+	if (!result.is_error && !result.typed_artifacts) {
+		result.is_error = true;
+		result.complete = false;
+		result.error_text = "isolated decompilation completed without typed provider artifacts";
+	} else if (!result.is_error && !decompile_result_within_limits(result, result_limits)) {
+		result.is_error = true;
+		result.complete = false;
+		result.error_text = "isolated decompilation result exceeds configured limits";
+	}
+}
+
+}
+
 inline ghidra_result_t decompile_isolated_buffer(
 	const uint8_t* data,
 	size_t size,
@@ -1647,15 +1719,7 @@ inline ghidra_result_t decompile_isolated_buffer(
 		result.is_error = true;
 		result.error_text = "isolated decompilation failed";
 	}
-	if (!result.is_error && !result.typed_artifacts) {
-		result.is_error = true;
-		result.complete = false;
-		result.error_text = "isolated decompilation completed without typed provider artifacts";
-	} else if (!result.is_error && !detail::decompile_result_within_limits(result, result_limits)) {
-		result.is_error = true;
-		result.complete = false;
-		result.error_text = "isolated decompilation result exceeds configured limits";
-	}
+	detail::finalize_isolated_result(result, result_limits);
 	return result;
 }
 
@@ -1687,24 +1751,9 @@ inline ghidra_result_t decompile_isolated_regions(
 		result.error_text = "isolated region decompiler input violates the typed provider contract";
 		return result;
 	}
-	std::sort(regions.begin(), regions.end(), [](const auto& left, const auto& right) {
-		return left.start_va < right.start_va;
-	});
-	std::size_t entry_region = regions.size();
-	uint64_t prior_end = image_base;
-	for (std::size_t index = 0; index < regions.size(); ++index) {
-		const auto& region = regions[index];
-		if (region.data.empty() || region.start_va < image_base ||
-			region.start_va < prior_end || region.start_va - image_base >= image_size ||
-			region.data.size() > image_size - (region.start_va - image_base)) {
-			result.is_error = true;
-			result.error_text = "isolated decompiler regions are malformed or overlap";
-			return result;
-		}
-		prior_end = region.start_va + region.data.size();
-		if (entry_addr >= region.start_va && entry_addr - region.start_va < region.data.size())
-			entry_region = index;
-	}
+	if (!detail::validate_isolated_region_layout(regions, image_base, image_size, result))
+		return result;
+	const std::size_t entry_region = detail::find_isolated_entry_region(regions, entry_addr);
 	if (entry_region == regions.size()) {
 		result.is_error = true;
 		result.error_text = "isolated decompiler entry is not captured";
@@ -1740,15 +1789,259 @@ inline ghidra_result_t decompile_isolated_regions(
 		result.is_error = true;
 		result.error_text = "isolated region decompilation failed";
 	}
-	if (!result.is_error && !result.typed_artifacts) {
-		result.is_error = true;
-		result.complete = false;
-		result.error_text = "isolated decompilation completed without typed provider artifacts";
-	} else if (!result.is_error && !detail::decompile_result_within_limits(result, result_limits)) {
-		result.is_error = true;
-		result.complete = false;
-		result.error_text = "isolated decompilation result exceeds configured limits";
+	detail::finalize_isolated_result(result, result_limits);
+	return result;
+}
+
+struct arch_pool_key_t {
+	std::string language_id;
+	std::string compiler_spec_id;
+	aida::analysis::architecture_mode_t architecture_mode =
+		aida::analysis::architecture_mode_t::unknown;
+	aida::analysis::endian_t endian = aida::analysis::endian_t::little;
+	aida::analysis::sha256_digest_t snapshot_hash;
+
+	bool matches(const arch_pool_key_t& other) const noexcept
+	{
+		return language_id == other.language_id &&
+			compiler_spec_id == other.compiler_spec_id &&
+			architecture_mode == other.architecture_mode && endian == other.endian &&
+			snapshot_hash.constant_time_equal(other.snapshot_hash);
 	}
+};
+
+struct arch_session_entry_t {
+	arch_pool_key_t key;
+	std::unique_ptr<detail::prepared_arch_t> prepared;
+	std::atomic<bool> loader_cancel{false};
+	std::vector<std::pair<uint64_t, uint64_t>> captured_ranges;
+	uint64_t image_base = 0;
+	uint64_t image_size = 0;
+	uint64_t jobs_completed = 0;
+	double arch_init_ms = 0.0;
+
+	bool captures(uint64_t address) const noexcept
+	{
+		for (const auto& range : captured_ranges) {
+			if (address >= range.first && address < range.second)
+				return true;
+		}
+		return false;
+	}
+};
+
+namespace detail {
+
+inline void reset_arch_session_entry(arch_session_entry_t& entry)
+{
+	if (!entry.prepared || !entry.prepared->arch)
+		return;
+	auto& arch = *entry.prepared->arch;
+	ghidra::Scope* global_scope = arch.symboltab->getGlobalScope();
+	if (!global_scope)
+		return;
+	std::vector<ghidra::FunctionSymbol*> functions;
+	for (ghidra::MapIterator it = global_scope->begin(); it != global_scope->end(); ++it) {
+		const ghidra::SymbolEntry* sym_entry = *it;
+		if (!sym_entry)
+			continue;
+		if (auto* function_symbol = dynamic_cast<ghidra::FunctionSymbol*>(sym_entry->getSymbol()))
+			functions.push_back(function_symbol);
+	}
+	for (auto* function_symbol : functions) {
+		try {
+			if (ghidra::Funcdata* fd = function_symbol->getFunction())
+				arch.clearAnalysis(fd);
+		} catch (...) {
+		}
+		try {
+			global_scope->removeSymbol(function_symbol);
+		} catch (...) {
+		}
+	}
+	if (!functions.empty()) {
+		diag::log_tagged_fmt("dec",
+			"arch_session_reset functions_removed=%zu jobs_completed=%llu",
+			functions.size(),
+			static_cast<unsigned long long>(entry.jobs_completed));
+	}
+}
+
+struct loader_cancel_bridge_t {
+	std::shared_ptr<std::atomic<bool>> stop;
+	std::shared_ptr<std::atomic<bool>> done;
+	bool submitted = false;
+};
+
+inline loader_cancel_bridge_t start_loader_cancel_bridge(std::atomic<bool>* source,
+                                                         std::atomic<bool>* sink)
+{
+	loader_cancel_bridge_t bridge;
+	if (!source || !sink)
+		return bridge;
+	bridge.stop = std::make_shared<std::atomic<bool>>(false);
+	bridge.done = std::make_shared<std::atomic<bool>>(false);
+	aida::infra::executor::submission_t bridge_sub;
+	bridge_sub.owner_subsystem = "disasm";
+	bridge_sub.label = "disasm.ghidra.loader_cancel_bridge";
+	bridge_sub.thread_class = "bounded_task";
+	bridge_sub.domain = aida::infra::executor::domain_t::diagnostics;
+	bridge_sub.priority = 3;
+	auto stop = bridge.stop;
+	auto done = bridge.done;
+	bridge_sub.body = [source, sink, stop, done]() {
+		while (!stop->load(std::memory_order_acquire)) {
+			if (source->load(std::memory_order_acquire)) {
+				sink->store(true, std::memory_order_release);
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		done->store(true, std::memory_order_release);
+	};
+	bridge.submitted = aida::infra::executor::submit(std::move(bridge_sub)).submitted;
+	if (!bridge.submitted) {
+		bridge.stop.reset();
+		bridge.done.reset();
+		diag::log_tagged_fmt("dec", "loader_cancel_bridge_post_failed");
+	}
+	return bridge;
+}
+
+inline void stop_loader_cancel_bridge(loader_cancel_bridge_t& bridge)
+{
+	if (!bridge.submitted || !bridge.stop || !bridge.done)
+		return;
+	bridge.stop->store(true, std::memory_order_release);
+	const auto wait_started = std::chrono::steady_clock::now();
+	while (!bridge.done->load(std::memory_order_acquire) &&
+	       std::chrono::steady_clock::now() - wait_started < std::chrono::milliseconds(100)) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+
+}
+
+struct arch_session_entry_create_t {
+	std::unique_ptr<arch_session_entry_t> entry;
+	std::string error_text;
+	bool ok = false;
+};
+
+inline arch_session_entry_create_t make_arch_session_entry(
+	std::vector<aida_ghidra::region_t> regions,
+	uint64_t image_base,
+	uint64_t image_size,
+	arch_pool_key_t key)
+{
+	arch_session_entry_create_t output;
+	if (regions.empty() || image_size == 0 || key.language_id.empty()) {
+		output.error_text = "isolated region decompiler input violates the typed provider contract";
+		return output;
+	}
+	ghidra_result_t layout_result;
+	if (!detail::validate_isolated_region_layout(regions, image_base, image_size, layout_result)) {
+		output.error_text = std::move(layout_result.error_text);
+		return output;
+	}
+	if (!g_state.initialized.load(std::memory_order_acquire) && !init()) {
+		output.error_text = "dependency_blocked: ghidra decompiler not initialized; " + init_diagnostics();
+		return output;
+	}
+	auto entry = std::make_unique<arch_session_entry_t>();
+	entry->key = std::move(key);
+	entry->image_base = image_base;
+	entry->image_size = image_size;
+	entry->captured_ranges.reserve(regions.size());
+	for (const auto& region : regions) {
+		if (region.data.size() > UINT64_MAX - region.start_va)
+			continue;
+		entry->captured_ranges.emplace_back(region.start_va, region.start_va + region.data.size());
+	}
+	try {
+		entry->prepared = std::make_unique<detail::prepared_arch_t>(
+			nullptr, 0, 0,
+			nullptr, &entry->loader_cancel, entry->key.language_id,
+			std::move(regions), image_size);
+		detail::prepared_arch_t::apply_execution_mode(*entry->prepared->arch,
+			entry->key.architecture_mode, image_base, image_size);
+		entry->arch_init_ms = entry->prepared->init_ms;
+	} catch (ghidra::LowlevelError& error) {
+		output.error_text = error.explain;
+		return output;
+	} catch (ghidra::DecoderError& error) {
+		output.error_text = error.explain;
+		return output;
+	} catch (...) {
+		output.error_text = "isolated region decompilation failed";
+		return output;
+	}
+	output.entry = std::move(entry);
+	output.ok = true;
+	return output;
+}
+
+inline ghidra_result_t decompile_isolated_regions_reusing(
+	arch_session_entry_t& entry,
+	uint64_t entry_addr,
+	std::atomic<bool>* cancel,
+	std::optional<std::chrono::steady_clock::time_point> deadline,
+	const ghidra_decompile_result_limits_t& result_limits,
+	const aida::analysis::ghidra_ir_adapter::capture_request_t& typed_request)
+{
+	active_decompile_guard_t active_guard(cancel);
+	ghidra_result_t result;
+	result.function_addr = entry_addr;
+	if (active_guard.was_shutting_down) {
+		result.is_error = true;
+		result.error_text = "decompiler is shutting down";
+		return result;
+	}
+	if (!entry.prepared || !entry.prepared->arch || entry.image_size == 0 ||
+		entry_addr < entry.image_base || entry_addr - entry.image_base >= entry.image_size ||
+		entry.key.language_id.empty() ||
+		!detail::valid_decompile_result_limits(result_limits) ||
+		!aida::analysis::validate_decompiler_entity_key(typed_request.entity).valid()) {
+		result.is_error = true;
+		result.error_text = "isolated region decompiler input violates the typed provider contract";
+		return result;
+	}
+	if (!entry.captures(entry_addr)) {
+		result.is_error = true;
+		result.error_text = "isolated decompiler entry is not captured";
+		return result;
+	}
+	if (!g_state.initialized.load(std::memory_order_acquire) && !init()) {
+		result.is_error = true;
+		result.error_text = "dependency_blocked: ghidra decompiler not initialized; " + init_diagnostics();
+		return result;
+	}
+	if ((cancel && cancel->load(std::memory_order_acquire)) ||
+		(deadline && std::chrono::steady_clock::now() >= *deadline)) {
+		result.is_error = true;
+		result.error_text = "cancelled";
+		return result;
+	}
+	detail::reset_arch_session_entry(entry);
+	entry.loader_cancel.store(false, std::memory_order_release);
+	auto bridge = detail::start_loader_cancel_bridge(cancel, &entry.loader_cancel);
+	try {
+		result = detail::do_decompile(entry.prepared->arch.get(), entry_addr, cancel, deadline,
+			result_limits, &typed_request);
+	} catch (ghidra::LowlevelError& error) {
+		result.is_error = true;
+		result.error_text = error.explain;
+	} catch (ghidra::DecoderError& error) {
+		result.is_error = true;
+		result.error_text = error.explain;
+	} catch (...) {
+		result.is_error = true;
+		result.error_text = "isolated region decompilation failed";
+	}
+	detail::stop_loader_cancel_bridge(bridge);
+	detail::reset_arch_session_entry(entry);
+	++entry.jobs_completed;
+	detail::finalize_isolated_result(result, result_limits);
 	return result;
 }
 

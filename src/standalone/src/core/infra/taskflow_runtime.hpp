@@ -525,6 +525,12 @@ inline pool_t& domain_pool(executor_domain_t d) {
     }
 }
 
+inline bool below_normal_priority_pool(const pool_t& p) {
+    return &p == &domain_pool(executor_domain_t::feature_worker) ||
+           &p == &domain_pool(executor_domain_t::external_tool) ||
+           &p == &domain_pool(executor_domain_t::long_running);
+}
+
 inline std::uint64_t filetime_to_100ns(const FILETIME& ft)
 {
     ULARGE_INTEGER v{};
@@ -681,6 +687,8 @@ inline void worker_interface_t::scheduler_prologue(tf::Worker& worker) {
     const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
     if (!p)
         return;
+    if (below_normal_priority_pool(*p))
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     if (!tls_ready) {
         diag::log_tagged_fmt(safe_log_tag(*p),
             "taskflow_worker_tls_unavailable phase=worker_start pool=%s worker_id=%zu tid=%lu",
@@ -749,6 +757,13 @@ inline void initialize_pool(pool_t& p, int pool_size) {
             pool_size,
             TF_VERSION,
             static_cast<unsigned long>(GetCurrentThreadId()));
+        if (below_normal_priority_pool(p)) {
+            diag::log_tagged_fmt(safe_log_tag(p),
+                "taskflow_pool_thread_priority pool=%s workers=%zu priority=below_normal tid=%lu",
+                safe_pool_name(p),
+                p.worker_count.load(std::memory_order_acquire),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
     } catch (const std::exception& ex) {
         p.executor.reset();
         p.active_snapshots.clear();

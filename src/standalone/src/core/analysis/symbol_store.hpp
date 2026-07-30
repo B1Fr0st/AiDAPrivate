@@ -3,9 +3,11 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -36,6 +38,19 @@
 extern settings_sa_t g_settings;
 
 namespace symbol_store {
+
+inline constexpr size_t kMaximumModules = 4096;
+inline constexpr size_t kMaximumPaths = 4096;
+inline constexpr size_t kMaximumPathBytes = 1024 * 1024;
+inline constexpr size_t kMaximumSymbols = 4 * 1024 * 1024;
+inline constexpr size_t kMaximumStructs = 1024 * 1024;
+inline constexpr size_t kMaximumEnums = 1024 * 1024;
+inline constexpr size_t kMaximumMembers = 4 * 1024 * 1024;
+inline constexpr size_t kMaximumSourceLines = 4 * 1024 * 1024;
+inline constexpr size_t kMaximumSourceFiles = 1024 * 1024;
+inline constexpr size_t kMaximumUtf8Bytes = 512ULL * 1024ULL * 1024ULL;
+inline constexpr size_t kMaximumStringBytes = 64 * 1024;
+inline constexpr size_t kMaximumResolvedNameBytes = 128 * 1024;
 
 struct module_symbols_t {
 	std::string                               module_name;
@@ -385,19 +400,6 @@ public:
 	}
 
 private:
-	static constexpr size_t kMaximumModules = 4096;
-	static constexpr size_t kMaximumPaths = 4096;
-	static constexpr size_t kMaximumPathBytes = 1024 * 1024;
-	static constexpr size_t kMaximumSymbols = 4 * 1024 * 1024;
-	static constexpr size_t kMaximumStructs = 1024 * 1024;
-	static constexpr size_t kMaximumEnums = 1024 * 1024;
-	static constexpr size_t kMaximumMembers = 4 * 1024 * 1024;
-	static constexpr size_t kMaximumSourceLines = 4 * 1024 * 1024;
-	static constexpr size_t kMaximumSourceFiles = 1024 * 1024;
-	static constexpr size_t kMaximumUtf8Bytes = 512ULL * 1024ULL * 1024ULL;
-	static constexpr size_t kMaximumStringBytes = 64 * 1024;
-	static constexpr size_t kMaximumResolvedNameBytes = 128 * 1024;
-
 	struct module_budget_t {
 		size_t symbols = 0;
 		size_t structs = 0;
@@ -625,6 +627,644 @@ private:
 	std::string cache_dir_;
 	std::atomic<uint64_t> revision_{0};
 };
+
+struct pdb_module_persist_header_t {
+	std::string                    module_name;
+	uint64_t                       base = 0;
+	uint64_t                       size = 0;
+	std::array<uint8_t, 16>        pdb_guid{};
+	uint32_t                       pdb_age = 0;
+	std::string                    pdb_path;
+	uint64_t                       pdb_file_size = 0;
+	uint64_t                       pdb_volume_serial = 0;
+	std::array<uint8_t, 16>        pdb_file_id{};
+	uint64_t                       pdb_last_write_100ns = 0;
+	uint32_t                       symbol_count = 0;
+	uint32_t                       struct_count = 0;
+	uint32_t                       enum_count = 0;
+	uint32_t                       source_line_count = 0;
+};
+
+inline constexpr uint32_t kPdbModulePersistMagic = 0x4D424450;
+inline constexpr uint32_t kPdbSourceLinesPersistMagic = 0x53424450;
+inline constexpr uint32_t kPdbModulePersistVersion = 1;
+inline constexpr size_t kMaximumPdbModulePersistBytes = 256ULL * 1024ULL * 1024ULL;
+
+class pdb_persist_writer_t {
+public:
+	pdb_persist_writer_t() { buffer_.reserve(1024 * 1024); }
+
+	bool ok() const noexcept { return ok_; }
+	size_t size() const noexcept { return buffer_.size(); }
+	const std::vector<uint8_t>& data() const noexcept { return buffer_; }
+
+	bool u8(uint8_t value) { return raw(&value, sizeof(value)); }
+	bool u32(uint32_t value) { return raw(&value, sizeof(value)); }
+	bool u64(uint64_t value) { return raw(&value, sizeof(value)); }
+	bool i32(int32_t value) { return raw(&value, sizeof(value)); }
+	bool i64(int64_t value) { return raw(&value, sizeof(value)); }
+
+	bool raw(const void* data, size_t count) {
+		if (!ok_ || count > kMaximumPdbModulePersistBytes - buffer_.size()) {
+			ok_ = false;
+			return false;
+		}
+		const auto* first = static_cast<const uint8_t*>(data);
+		try {
+			buffer_.insert(buffer_.end(), first, first + count);
+		} catch (...) {
+			ok_ = false;
+			return false;
+		}
+		return true;
+	}
+
+	bool text(const std::string& value) {
+		if (!ok_ || value.size() > kMaximumStringBytes ||
+			value.find('\0') != std::string::npos ||
+			value.size() > kMaximumUtf8Bytes - utf8_bytes_) {
+			ok_ = false;
+			return false;
+		}
+		if (!u32(static_cast<uint32_t>(value.size())))
+			return false;
+		if (!value.empty() && !raw(value.data(), value.size()))
+			return false;
+		utf8_bytes_ += value.size();
+		return true;
+	}
+
+private:
+	std::vector<uint8_t> buffer_;
+	size_t utf8_bytes_ = 0;
+	bool ok_ = true;
+};
+
+class pdb_persist_reader_t {
+public:
+	pdb_persist_reader_t(const uint8_t* data, size_t size) : data_(data), size_(size) {}
+	explicit pdb_persist_reader_t(const std::vector<uint8_t>& bytes)
+		: data_(bytes.data()), size_(bytes.size()) {}
+
+	bool ok() const noexcept { return ok_; }
+	size_t remaining() const noexcept { return size_ - cursor_; }
+	bool eof() const noexcept { return cursor_ == size_; }
+
+	bool u8(uint8_t& value) { return raw(&value, sizeof(value)); }
+	bool u32(uint32_t& value) { return raw(&value, sizeof(value)); }
+	bool u64(uint64_t& value) { return raw(&value, sizeof(value)); }
+	bool i32(int32_t& value) { return raw(&value, sizeof(value)); }
+	bool i64(int64_t& value) { return raw(&value, sizeof(value)); }
+
+	bool raw(void* output, size_t count) {
+		if (!ok_ || count > size_ - cursor_) {
+			ok_ = false;
+			return false;
+		}
+		if (count != 0)
+			std::memcpy(output, data_ + cursor_, count);
+		cursor_ += count;
+		return true;
+	}
+
+	bool text(std::string& value) {
+		uint32_t length = 0;
+		if (!u32(length) || length > kMaximumStringBytes ||
+			length > kMaximumUtf8Bytes - utf8_bytes_ ||
+			length > size_ - cursor_) {
+			ok_ = false;
+			return false;
+		}
+		if (length == 0) {
+			value.clear();
+			return true;
+		}
+		try {
+			value.assign(reinterpret_cast<const char*>(data_ + cursor_),
+				static_cast<size_t>(length));
+		} catch (...) {
+			ok_ = false;
+			return false;
+		}
+		if (value.find('\0') != std::string::npos) {
+			ok_ = false;
+			return false;
+		}
+		cursor_ += length;
+		utf8_bytes_ += length;
+		return true;
+	}
+
+private:
+	const uint8_t* data_ = nullptr;
+	size_t size_ = 0;
+	size_t cursor_ = 0;
+	size_t utf8_bytes_ = 0;
+	bool ok_ = true;
+};
+
+namespace pdb_persist_detail {
+
+inline bool count_fits(uint32_t count, size_t maximum, size_t min_record_bytes,
+	const pdb_persist_reader_t& reader) {
+	return count <= maximum &&
+		(min_record_bytes == 0 || count <= reader.remaining() / min_record_bytes);
+}
+
+inline bool serialize_symbols(pdb_persist_writer_t& writer, const pdb_parser::pdb_info_t& pdb) {
+	if (pdb.symbols.size() > kMaximumSymbols)
+		return false;
+	if (!writer.u32(static_cast<uint32_t>(pdb.symbols.size())))
+		return false;
+	for (const auto& symbol : pdb.symbols) {
+		if (!writer.text(symbol.name) || !writer.u64(symbol.rva) ||
+			!writer.u32(symbol.type_index) || !writer.u32(symbol.size) ||
+			!writer.u8(symbol.is_function ? 1 : 0))
+			return false;
+	}
+	return true;
+}
+
+inline bool serialize_structs(pdb_persist_writer_t& writer, const pdb_parser::pdb_info_t& pdb) {
+	if (pdb.structs.size() > kMaximumStructs)
+		return false;
+	if (!writer.u32(static_cast<uint32_t>(pdb.structs.size())))
+		return false;
+	size_t members = 0;
+	for (const auto& structure : pdb.structs) {
+		if (structure.members.size() > kMaximumMembers - members)
+			return false;
+		members += structure.members.size();
+		if (!writer.text(structure.name) || !writer.u64(structure.size) ||
+			!writer.u32(structure.type_index) ||
+			!writer.u8(structure.is_union ? 1 : 0) ||
+			!writer.u32(static_cast<uint32_t>(structure.members.size())))
+			return false;
+		for (const auto& member : structure.members) {
+			if (!writer.text(member.name) || !writer.text(member.type_name) ||
+				!writer.u64(member.offset) || !writer.u64(member.size) ||
+				!writer.u32(member.type_index) ||
+				!writer.i32(static_cast<int32_t>(member.bit_offset)) ||
+				!writer.i32(static_cast<int32_t>(member.bit_size)) ||
+				!writer.u8(member.is_pointer ? 1 : 0) ||
+				!writer.i32(static_cast<int32_t>(member.pointer_depth)) ||
+				!writer.u8(member.is_array ? 1 : 0) ||
+				!writer.i32(static_cast<int32_t>(member.array_count)))
+				return false;
+		}
+	}
+	return true;
+}
+
+inline bool serialize_enums(pdb_persist_writer_t& writer, const pdb_parser::pdb_info_t& pdb) {
+	if (pdb.enums.size() > kMaximumEnums)
+		return false;
+	if (!writer.u32(static_cast<uint32_t>(pdb.enums.size())))
+		return false;
+	size_t members = 0;
+	for (const auto& enumeration : pdb.enums) {
+		if (enumeration.members.size() > kMaximumMembers - members)
+			return false;
+		members += enumeration.members.size();
+		if (!writer.text(enumeration.name) || !writer.u32(enumeration.type_index) ||
+			!writer.u32(static_cast<uint32_t>(enumeration.members.size())))
+			return false;
+		for (const auto& member : enumeration.members) {
+			if (!writer.text(member.name) || !writer.i64(member.value))
+				return false;
+		}
+	}
+	return true;
+}
+
+inline bool write_source_line_fields(pdb_persist_writer_t& writer,
+	const pdb_parser::source_line_table_t& source) {
+	if (source.files.size() > kMaximumSourceFiles ||
+		source.lines.size() > kMaximumSourceLines)
+		return false;
+	if (!writer.u64(source.generation) ||
+		!writer.u8(static_cast<uint8_t>(source.state)) ||
+		!writer.text(source.detail) ||
+		!writer.u32(static_cast<uint32_t>(source.files.size())))
+		return false;
+	for (const auto& file : source.files) {
+		if (!writer.text(file.file_path) || !writer.text(file.object_path))
+			return false;
+	}
+	if (!writer.u32(static_cast<uint32_t>(source.lines.size())))
+		return false;
+	for (const auto& line : source.lines) {
+		if (!writer.u64(line.rva) || !writer.u32(line.line) ||
+			!writer.u32(line.file_index))
+			return false;
+	}
+	return true;
+}
+
+inline bool serialize_source_lines(pdb_persist_writer_t& writer,
+	const pdb_parser::source_line_table_t* source) {
+	if (!source)
+		return writer.u8(0);
+	return writer.u8(1) && write_source_line_fields(writer, *source);
+}
+
+inline bool read_source_line_fields(pdb_persist_reader_t& reader,
+	pdb_parser::source_line_table_t& source) {
+	uint8_t state = 0;
+	uint32_t file_count = 0;
+	if (!reader.u64(source.generation) || !reader.u8(state) || state > 6 ||
+		!reader.text(source.detail) || !reader.u32(file_count) ||
+		!count_fits(file_count, kMaximumSourceFiles, 8, reader))
+		return false;
+	source.state = static_cast<pdb_parser::source_line_state_t>(state);
+	try {
+		source.files.reserve(file_count);
+	} catch (...) {
+		return false;
+	}
+	for (uint32_t index = 0; index < file_count; ++index) {
+		pdb_parser::source_file_t file;
+		if (!reader.text(file.file_path) || !reader.text(file.object_path))
+			return false;
+		try {
+			source.files.push_back(std::move(file));
+		} catch (...) {
+			return false;
+		}
+	}
+	uint32_t line_count = 0;
+	if (!reader.u32(line_count) ||
+		!count_fits(line_count, kMaximumSourceLines, 16, reader))
+		return false;
+	try {
+		source.lines.reserve(line_count);
+	} catch (...) {
+		return false;
+	}
+	for (uint32_t index = 0; index < line_count; ++index) {
+		pdb_parser::source_line_t line;
+		if (!reader.u64(line.rva) || !reader.u32(line.line) ||
+			!reader.u32(line.file_index))
+			return false;
+		if (line.line == 0 || line.file_index >= source.files.size())
+			return false;
+		try {
+			source.lines.push_back(line);
+		} catch (...) {
+			return false;
+		}
+	}
+	return true;
+}
+
+inline bool rebuild_source_line_indexes(pdb_parser::source_line_table_t& source) {
+	for (size_t index = 0; index < source.lines.size(); ++index) {
+		const auto& line = source.lines[index];
+		source.line_by_rva.try_emplace(line.rva, index);
+		const auto key = pdb_parser::detail::source_file_line_key(
+			pdb_parser::detail::source_path_key(source.files[line.file_index].file_path),
+			line.line);
+		if (key.empty())
+			continue;
+		try {
+			source.lines_by_file_line[key].push_back(index);
+		} catch (...) {
+			return false;
+		}
+	}
+	return true;
+}
+
+inline bool deserialize_source_lines(pdb_persist_reader_t& reader, pdb_parser::pdb_info_t& pdb,
+	uint32_t& line_count_out) {
+	uint8_t has_source = 0;
+	if (!reader.u8(has_source) || has_source > 1)
+		return false;
+	line_count_out = 0;
+	if (has_source == 0)
+		return true;
+	std::shared_ptr<pdb_parser::source_line_table_t> source_owner;
+	try {
+		source_owner = std::make_shared<pdb_parser::source_line_table_t>();
+	} catch (...) {
+		return false;
+	}
+	if (!read_source_line_fields(reader, *source_owner) ||
+		!rebuild_source_line_indexes(*source_owner))
+		return false;
+	line_count_out = static_cast<uint32_t>(source_owner->lines.size());
+	pdb.source_lines = std::shared_ptr<const pdb_parser::source_line_table_t>(
+		std::move(source_owner));
+	return true;
+}
+
+inline bool deserialize_symbols(pdb_persist_reader_t& reader, pdb_parser::pdb_info_t& pdb,
+	uint32_t& count_out) {
+	uint32_t count = 0;
+	if (!reader.u32(count) ||
+		!count_fits(count, kMaximumSymbols, 21, reader))
+		return false;
+	try {
+		pdb.symbols.reserve(count);
+	} catch (...) {
+		return false;
+	}
+	for (uint32_t index = 0; index < count; ++index) {
+		pdb_parser::pdb_symbol_t symbol;
+		uint8_t is_function = 0;
+		if (!reader.text(symbol.name) || !reader.u64(symbol.rva) ||
+			!reader.u32(symbol.type_index) || !reader.u32(symbol.size) ||
+			!reader.u8(is_function) || is_function > 1)
+			return false;
+		symbol.is_function = is_function != 0;
+		try {
+			pdb.symbols.push_back(std::move(symbol));
+		} catch (...) {
+			return false;
+		}
+	}
+	count_out = count;
+	return true;
+}
+
+inline bool deserialize_structs(pdb_persist_reader_t& reader, pdb_parser::pdb_info_t& pdb,
+	size_t& members_total, uint32_t& count_out) {
+	uint32_t count = 0;
+	if (!reader.u32(count) ||
+		!count_fits(count, kMaximumStructs, 21, reader))
+		return false;
+	try {
+		pdb.structs.reserve(count);
+	} catch (...) {
+		return false;
+	}
+	for (uint32_t index = 0; index < count; ++index) {
+		pdb_parser::struct_def_t structure;
+		uint8_t is_union = 0;
+		uint32_t member_count = 0;
+		if (!reader.text(structure.name) || !reader.u64(structure.size) ||
+			!reader.u32(structure.type_index) || !reader.u8(is_union) ||
+			is_union > 1 || !reader.u32(member_count) ||
+			member_count > kMaximumMembers - members_total ||
+			!count_fits(member_count, kMaximumMembers, 46, reader))
+			return false;
+		structure.is_union = is_union != 0;
+		try {
+			structure.members.reserve(member_count);
+		} catch (...) {
+			return false;
+		}
+		for (uint32_t member_index = 0; member_index < member_count; ++member_index) {
+			pdb_parser::struct_member_t member;
+			int32_t bit_offset = 0;
+			int32_t bit_size = 0;
+			uint8_t is_pointer = 0;
+			int32_t pointer_depth = 0;
+			uint8_t is_array = 0;
+			int32_t array_count = 0;
+			if (!reader.text(member.name) || !reader.text(member.type_name) ||
+				!reader.u64(member.offset) || !reader.u64(member.size) ||
+				!reader.u32(member.type_index) || !reader.i32(bit_offset) ||
+				!reader.i32(bit_size) || !reader.u8(is_pointer) || is_pointer > 1 ||
+				!reader.i32(pointer_depth) || !reader.u8(is_array) || is_array > 1 ||
+				!reader.i32(array_count))
+				return false;
+			member.bit_offset = bit_offset;
+			member.bit_size = bit_size;
+			member.is_pointer = is_pointer != 0;
+			member.pointer_depth = pointer_depth;
+			member.is_array = is_array != 0;
+			member.array_count = array_count;
+			try {
+				structure.members.push_back(std::move(member));
+			} catch (...) {
+				return false;
+			}
+		}
+		members_total += member_count;
+		try {
+			pdb.structs.push_back(std::move(structure));
+		} catch (...) {
+			return false;
+		}
+	}
+	count_out = count;
+	return true;
+}
+
+inline bool deserialize_enums(pdb_persist_reader_t& reader, pdb_parser::pdb_info_t& pdb,
+	size_t& members_total, uint32_t& count_out) {
+	uint32_t count = 0;
+	if (!reader.u32(count) ||
+		!count_fits(count, kMaximumEnums, 12, reader))
+		return false;
+	try {
+		pdb.enums.reserve(count);
+	} catch (...) {
+		return false;
+	}
+	for (uint32_t index = 0; index < count; ++index) {
+		pdb_parser::enum_def_t enumeration;
+		uint32_t member_count = 0;
+		if (!reader.text(enumeration.name) || !reader.u32(enumeration.type_index) ||
+			!reader.u32(member_count) ||
+			member_count > kMaximumMembers - members_total ||
+			!count_fits(member_count, kMaximumMembers, 12, reader))
+			return false;
+		try {
+			enumeration.members.reserve(member_count);
+		} catch (...) {
+			return false;
+		}
+		for (uint32_t member_index = 0; member_index < member_count; ++member_index) {
+			pdb_parser::enum_member_t member;
+			if (!reader.text(member.name) || !reader.i64(member.value))
+				return false;
+			try {
+				enumeration.members.push_back(std::move(member));
+			} catch (...) {
+				return false;
+			}
+		}
+		members_total += member_count;
+		try {
+			pdb.enums.push_back(std::move(enumeration));
+		} catch (...) {
+			return false;
+		}
+	}
+	count_out = count;
+	return true;
+}
+
+}
+
+inline std::optional<std::vector<uint8_t>> serialize_module(
+	const pdb_module_persist_header_t& header, const module_symbols_t& module,
+	bool include_source_lines = true) {
+	if (header.module_name.empty() || header.module_name != module.module_name ||
+		header.module_name.size() > 4096 ||
+		header.module_name.find('\0') != std::string::npos ||
+		header.base != module.base || header.size != module.size ||
+		(module.size != 0 && module.base > UINT64_MAX - module.size) ||
+		header.symbol_count != module.pdb.symbols.size() ||
+		header.struct_count != module.pdb.structs.size() ||
+		header.enum_count != module.pdb.enums.size() ||
+		header.symbol_count > kMaximumSymbols ||
+		header.struct_count > kMaximumStructs ||
+		header.enum_count > kMaximumEnums)
+		return std::nullopt;
+	const uint64_t source_line_count = module.pdb.source_lines
+		? static_cast<uint64_t>(module.pdb.source_lines->lines.size()) : 0;
+	if (header.source_line_count != source_line_count ||
+		header.source_line_count > kMaximumSourceLines)
+		return std::nullopt;
+	const pdb_parser::source_line_table_t* embedded_source =
+		(include_source_lines && module.pdb.source_lines)
+		? module.pdb.source_lines.get() : nullptr;
+	pdb_persist_writer_t writer;
+	if (!writer.u32(kPdbModulePersistMagic) ||
+		!writer.u32(kPdbModulePersistVersion) ||
+		!writer.text(header.module_name) ||
+		!writer.u64(header.base) || !writer.u64(header.size) ||
+		!writer.raw(header.pdb_guid.data(), header.pdb_guid.size()) ||
+		!writer.u32(header.pdb_age) ||
+		!writer.text(header.pdb_path) ||
+		!writer.u64(header.pdb_file_size) ||
+		!writer.u64(header.pdb_volume_serial) ||
+		!writer.raw(header.pdb_file_id.data(), header.pdb_file_id.size()) ||
+		!writer.u64(header.pdb_last_write_100ns) ||
+		!writer.u32(header.symbol_count) ||
+		!writer.u32(header.struct_count) ||
+		!writer.u32(header.enum_count) ||
+		!writer.u32(header.source_line_count) ||
+		!writer.text(module.pdb.file_path) ||
+		!writer.text(module.pdb.module_name) ||
+		!writer.u8(module.pdb.loaded ? 1 : 0) ||
+		!pdb_persist_detail::serialize_symbols(writer, module.pdb) ||
+		!pdb_persist_detail::serialize_structs(writer, module.pdb) ||
+		!pdb_persist_detail::serialize_enums(writer, module.pdb) ||
+		!pdb_persist_detail::serialize_source_lines(writer, embedded_source) ||
+		!writer.ok())
+		return std::nullopt;
+	return writer.data();
+}
+
+inline std::optional<std::vector<uint8_t>> serialize_module_source_lines(
+	const pdb_parser::source_line_table_t& source) {
+	pdb_persist_writer_t writer;
+	if (!writer.u32(kPdbSourceLinesPersistMagic) ||
+		!writer.u32(kPdbModulePersistVersion) ||
+		!pdb_persist_detail::write_source_line_fields(writer, source) ||
+		!writer.ok())
+		return std::nullopt;
+	return writer.data();
+}
+
+inline std::optional<std::shared_ptr<const pdb_parser::source_line_table_t>>
+	deserialize_module_source_lines(pdb_persist_reader_t& reader) {
+	if (reader.remaining() > kMaximumPdbModulePersistBytes)
+		return std::nullopt;
+	uint32_t magic = 0;
+	uint32_t version = 0;
+	if (!reader.u32(magic) || magic != kPdbSourceLinesPersistMagic ||
+		!reader.u32(version) || version != kPdbModulePersistVersion)
+		return std::nullopt;
+	std::shared_ptr<pdb_parser::source_line_table_t> source_owner;
+	try {
+		source_owner = std::make_shared<pdb_parser::source_line_table_t>();
+	} catch (...) {
+		return std::nullopt;
+	}
+	if (!pdb_persist_detail::read_source_line_fields(reader, *source_owner) ||
+		!pdb_persist_detail::rebuild_source_line_indexes(*source_owner) ||
+		!reader.eof())
+		return std::nullopt;
+	return std::shared_ptr<const pdb_parser::source_line_table_t>(
+		std::move(source_owner));
+}
+
+inline std::optional<module_symbols_t> deserialize_module(
+	pdb_persist_reader_t& reader, pdb_module_persist_header_t* header_out = nullptr) {
+	if (reader.remaining() > kMaximumPdbModulePersistBytes)
+		return std::nullopt;
+	uint32_t magic = 0;
+	uint32_t version = 0;
+	pdb_module_persist_header_t header;
+	if (!reader.u32(magic) || magic != kPdbModulePersistMagic ||
+		!reader.u32(version) || version != kPdbModulePersistVersion ||
+		!reader.text(header.module_name) ||
+		header.module_name.empty() || header.module_name.size() > 4096 ||
+		!reader.u64(header.base) || !reader.u64(header.size) ||
+		!reader.raw(header.pdb_guid.data(), header.pdb_guid.size()) ||
+		!reader.u32(header.pdb_age) ||
+		!reader.text(header.pdb_path) ||
+		!reader.u64(header.pdb_file_size) ||
+		!reader.u64(header.pdb_volume_serial) ||
+		!reader.raw(header.pdb_file_id.data(), header.pdb_file_id.size()) ||
+		!reader.u64(header.pdb_last_write_100ns) ||
+		!reader.u32(header.symbol_count) ||
+		!reader.u32(header.struct_count) ||
+		!reader.u32(header.enum_count) ||
+		!reader.u32(header.source_line_count))
+		return std::nullopt;
+	if (header.symbol_count > kMaximumSymbols ||
+		header.struct_count > kMaximumStructs ||
+		header.enum_count > kMaximumEnums ||
+		header.source_line_count > kMaximumSourceLines ||
+		(header.size != 0 && header.base > UINT64_MAX - header.size))
+		return std::nullopt;
+	module_symbols_t module;
+	uint8_t pdb_loaded = 0;
+	if (!reader.text(module.pdb.file_path) ||
+		!reader.text(module.pdb.module_name) ||
+		!reader.u8(pdb_loaded) || pdb_loaded > 1)
+		return std::nullopt;
+	module.pdb.loaded = pdb_loaded != 0;
+	uint32_t symbol_count = 0;
+	uint32_t struct_count = 0;
+	uint32_t enum_count = 0;
+	uint32_t source_line_count = 0;
+	size_t members_total = 0;
+	if (!pdb_persist_detail::deserialize_symbols(reader, module.pdb, symbol_count) ||
+		!pdb_persist_detail::deserialize_structs(reader, module.pdb, members_total,
+			struct_count) ||
+		!pdb_persist_detail::deserialize_enums(reader, module.pdb, members_total,
+			enum_count) ||
+		!pdb_persist_detail::deserialize_source_lines(reader, module.pdb,
+			source_line_count))
+		return std::nullopt;
+	if (symbol_count != header.symbol_count ||
+		struct_count != header.struct_count ||
+		enum_count != header.enum_count ||
+		(module.pdb.source_lines && source_line_count != header.source_line_count) ||
+		!reader.eof())
+		return std::nullopt;
+	module.module_name = header.module_name;
+	module.base = header.base;
+	module.size = header.size;
+	module.pdb_path = header.pdb_path;
+	module.pdb_file_size = header.pdb_file_size;
+	try {
+		for (size_t index = 0; index < module.pdb.symbols.size(); ++index) {
+			module.pdb.symbol_by_name[module.pdb.symbols[index].name] = index;
+			module.pdb.symbol_by_rva[module.pdb.symbols[index].rva] = index;
+		}
+		for (size_t index = 0; index < module.pdb.structs.size(); ++index) {
+			if (module.pdb.structs[index].name.empty())
+				continue;
+			module.pdb.struct_by_name[module.pdb.structs[index].name] = index;
+			module.pdb.struct_by_ti[module.pdb.structs[index].type_index] = index;
+		}
+	} catch (...) {
+		return std::nullopt;
+	}
+	module.parse_completed = true;
+	module.parse_progress = 1.0f;
+	if (header_out)
+		*header_out = std::move(header);
+	return module;
+}
 
 inline state_t g_state;
 inline std::atomic<uint64_t> g_load_generation{1};

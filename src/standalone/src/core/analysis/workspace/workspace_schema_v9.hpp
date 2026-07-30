@@ -16,8 +16,17 @@ struct sqlite3;
 namespace aida::analysis {
 
 inline constexpr std::uint32_t workspace_schema_v9_version = 9;
+inline constexpr std::uint32_t workspace_schema_v10_version = 10;
 inline constexpr std::uint32_t packed_page_magic = 0x5041434BU;
 inline constexpr std::uint32_t packed_page_blob_version = 2;
+inline constexpr std::uint32_t packed_page_blob_version_v3 = 3;
+inline constexpr std::uint32_t packed_page_frame_magic = 0x3346505AU;
+inline constexpr std::uint32_t packed_page_frame_header_size = 16;
+inline constexpr std::uint32_t packed_page_codec_raw = 0;
+inline constexpr std::uint32_t packed_page_codec_zstd = 1;
+inline constexpr std::uint32_t packed_page_zstd_level_default = 3;
+inline constexpr std::uint32_t packed_page_compress_min_content_bytes = 4096;
+inline constexpr std::uint32_t packed_page_zstd_min_frame = 13;
 inline constexpr std::uint32_t packed_page_header_size = 64;
 inline constexpr std::uint32_t packed_page_max_payload = 1U << 20;
 inline constexpr std::uint64_t packed_generation_max_payload_bytes = 16ULL << 30;
@@ -42,6 +51,15 @@ inline constexpr std::uint32_t managed_publication_max_artifacts = 65536;
 inline constexpr std::uint32_t managed_publication_max_methods = 1U << 24;
 inline constexpr std::uint32_t managed_publication_max_strings = 1U << 25;
 inline constexpr std::uint32_t managed_publication_max_single_string_bytes = 16U << 20;
+inline constexpr std::uint64_t pdb_symbol_module_max_uncompressed_bytes = 268435456ULL;
+inline constexpr std::uint64_t pdb_symbol_modules_max_rows = 64;
+inline constexpr std::uint64_t pdb_symbol_modules_max_stored_bytes = 1ULL << 30;
+inline constexpr std::uint64_t pdb_symbol_modules_max_total_uncompressed_bytes = 4ULL << 30;
+inline constexpr std::uint32_t pdb_symbol_module_max_symbols = 4194304;
+inline constexpr std::uint32_t pdb_symbol_module_max_structs = 1048576;
+inline constexpr std::uint32_t pdb_symbol_module_max_enums = 1048576;
+inline constexpr std::uint32_t pdb_symbol_module_max_name_bytes = 1024;
+inline constexpr std::uint32_t pdb_symbol_module_max_path_bytes = 32768;
 
 enum class packed_page_type_t : std::uint32_t {
     instructions = 1,
@@ -90,6 +108,7 @@ struct packed_page_row_t {
     std::uint32_t page_count = 0;
     std::uint32_t page_type = 0;
     std::uint32_t payload_length = 0;
+    std::uint32_t logical_length = 0;
     std::uint32_t checksum = 0;
     std::vector<std::uint8_t> payload;
 };
@@ -135,6 +154,27 @@ struct packed_generation_staging_row_t {
     std::uint64_t address_value_min = 0;
     std::uint64_t address_value_max = 0;
     std::vector<std::uint8_t> payload;
+};
+
+struct pdb_symbol_module_record_t {
+    std::string module_key;
+    std::string module_name;
+    std::uint64_t base = 0;
+    std::uint64_t size = 0;
+    std::array<std::uint8_t, 16> pdb_guid{};
+    std::uint32_t pdb_age = 0;
+    std::string pdb_path;
+    std::optional<std::uint64_t> pdb_file_size;
+    std::optional<std::uint64_t> pdb_volume_serial;
+    std::optional<std::array<std::uint8_t, 16>> pdb_file_id;
+    std::optional<std::uint64_t> pdb_last_write_100ns;
+    std::uint32_t symbol_count = 0;
+    std::uint32_t struct_count = 0;
+    std::uint32_t enum_count = 0;
+    std::vector<std::uint8_t> payload;
+    std::optional<std::vector<std::uint8_t>> source_lines;
+    std::uint64_t created_utc_ms = 0;
+    std::uint64_t updated_utc_ms = 0;
 };
 
 struct decompiler_pipeline_cache_v1_row_t {
@@ -226,6 +266,7 @@ struct fixed_width_address_t {
 };
 
 workspace_result_t<void> create_schema_v9(sqlite3* database);
+workspace_result_t<void> create_schema_v10(sqlite3* database);
 workspace_result_t<void> ensure_managed_overlay_identity_schema_v9(
     sqlite3* database);
 
@@ -328,6 +369,23 @@ workspace_result_t<void> delete_packed_generation_staging(
     sqlite3* database, std::uint64_t generation);
 
 workspace_result_t<void> gc_packed_generation_staging(sqlite3* database);
+
+workspace_result_t<bool> write_pdb_symbol_module(
+    sqlite3* database, const pdb_symbol_module_record_t& record,
+    const packed_stop_predicate_t& stop_requested = {});
+
+using pdb_symbol_module_visitor_t = std::function<workspace_result_t<void>(
+    pdb_symbol_module_record_t)>;
+
+workspace_result_t<void> visit_pdb_symbol_modules(
+    sqlite3* database, const pdb_symbol_module_visitor_t& visitor,
+    const packed_stop_predicate_t& stop_requested = {});
+
+workspace_result_t<std::vector<pdb_symbol_module_record_t>>
+    read_pdb_symbol_modules(sqlite3* database,
+                            const packed_stop_predicate_t& stop_requested = {});
+
+workspace_result_t<void> delete_pdb_symbol_modules(sqlite3* database);
 
 workspace_result_t<void> write_pipeline_cache_v1(
     sqlite3* database, const decompiler_pipeline_cache_v1_row_t& record);

@@ -13,8 +13,6 @@
 #include <new>
 #include <optional>
 #include <stdexcept>
-#include <system_error>
-#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -1071,63 +1069,28 @@ workspace_result_t<void> run_scan_shards(std::size_t shard_count,
     scan_shared_state_t& shared, F&& shard_fn) {
     if (shard_count == 0)
         return workspace_result_t<void>::success();
-    const std::size_t worker_count = (std::min<std::size_t>)(
-        static_cast<std::size_t>((std::max<std::uint32_t>)(1U, parallel_worker_count())),
-        shard_count);
     std::vector<shard_slot_t> slots(shard_count);
-    std::atomic<std::size_t> next{0};
-    std::vector<std::thread> threads;
-    threads.reserve(worker_count);
-    std::exception_ptr spawn_exception;
-    try {
-        for (std::size_t worker = 0; worker < worker_count; ++worker) {
-            threads.emplace_back([&] {
-                for (;;) {
-                    if (shared.stop_scheduling.load(std::memory_order_acquire))
-                        return;
-                    const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
-                    if (index >= shard_count)
-                        return;
-                    try {
-                        auto result = shard_fn(index);
-                        if (!result) {
-                            slots[index].error = std::move(result.error());
-                            shared.stop_scheduling.store(true, std::memory_order_release);
-                            return;
-                        }
-                    } catch (...) {
-                        slots[index].exception = std::current_exception();
-                        shared.stop_scheduling.store(true, std::memory_order_release);
-                        return;
-                    }
+    const auto schedule_gate = [&shared] {
+        return !shared.stop_scheduling.load(std::memory_order_acquire);
+    };
+    parallel_executor_t::run_gated(shard_count, parallel_worker_count(),
+        "analysis.string_discovery", schedule_gate, [&](std::size_t index) {
+            try {
+                auto result = shard_fn(index);
+                if (!result) {
+                    slots[index].error = std::move(result.error());
+                    shared.stop_scheduling.store(true, std::memory_order_release);
                 }
-            });
-        }
-    } catch (...) {
-        spawn_exception = std::current_exception();
-    }
-    for (auto& thread : threads)
-        thread.join();
+            } catch (...) {
+                slots[index].exception = std::current_exception();
+                shared.stop_scheduling.store(true, std::memory_order_release);
+            }
+        });
     for (auto& slot : slots) {
         if (slot.exception)
             std::rethrow_exception(slot.exception);
         if (slot.error)
             return workspace_result_t<void>::failure(std::move(*slot.error));
-    }
-    if (spawn_exception) {
-        try {
-            std::rethrow_exception(spawn_exception);
-        } catch (const std::system_error&) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "string discovery exceeded available thread resources",
-                "string_discovery"));
-        } catch (const std::resource_error&) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "string discovery exceeded available thread resources",
-                "string_discovery"));
-        }
     }
     return workspace_result_t<void>::success();
 }

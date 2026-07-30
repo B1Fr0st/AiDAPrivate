@@ -150,6 +150,12 @@ packed_store_result_t<packed_string_id_t> packed_string_pool_builder_t::intern(s
     return packed_store_result_t<packed_string_id_t>::success(id);
 }
 
+void packed_string_pool_builder_t::reserve(std::size_t string_estimate)
+{
+    values_.reserve(string_estimate);
+    index_.reserve(string_estimate);
+}
+
 packed_store_result_t<packed_string_pool_t> packed_string_pool_builder_t::freeze() const
 {
     return packed_string_pool_t::build_preserving_order(values_);

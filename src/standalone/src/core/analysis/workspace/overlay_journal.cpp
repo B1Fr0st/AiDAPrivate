@@ -8,6 +8,7 @@
 #include "decompiler_service.hpp"
 #include "../decompiler/decompiler_ui_integration.hpp"
 #include "../decompiler/managed_entity_binding.hpp"
+#include "../../../helpers/diag_log.hpp"
 
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
@@ -2311,9 +2312,19 @@ materialize_projected_provider(
                                      "overlay_journal.provider"));
         }
     }
+    const auto label = workspace.identity().binary_id().to_hex() +
+        "-overlay-g" + std::to_string(prepared.new_generation) +
+        "-r" + std::to_string(prepared.revision);
     spill_provider_options_t options;
     options.max_spill_bytes = source->size();
-    options.write_chunk_bytes = 1ULL * 1024ULL * 1024ULL;
+    options.write_chunk_bytes = 16ULL * 1024ULL * 1024ULL;
+    options.expected_total_bytes = source->size();
+    options.progress_sink = [label](std::uint64_t streamed, std::uint64_t total) {
+        ::diag::log_tagged_fmt("overlay_journal",
+            "materialize_projected_provider spill_progress label='%s' streamed=%llu total=%llu",
+            label.c_str(), static_cast<unsigned long long>(streamed),
+            static_cast<unsigned long long>(total));
+    };
     options.mapped_window_cache.window_bytes = 4ULL * 1024ULL * 1024ULL;
     options.mapped_window_cache.max_lease_bytes = 4ULL * 1024ULL * 1024ULL;
     options.mapped_window_cache.max_cached_window_bytes =
@@ -2321,9 +2332,6 @@ materialize_projected_provider(
     options.mapped_window_cache.max_global_mapped_window_bytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
     std::uint64_t cursor = 0;
-    const auto label = workspace.identity().binary_id().to_hex() +
-        "-overlay-g" + std::to_string(prepared.new_generation) +
-        "-r" + std::to_string(prepared.revision);
     auto storage = spill_provider_t::from_stream(
         label,
         [source, patches = std::move(patches),

@@ -13,11 +13,20 @@ struct decode_work_item_t final {
     std::uint32_t shard_index = 0;
 };
 
+struct decode_worker_pool_statistics_t final {
+    std::uint64_t completion_push_count = 0;
+    std::uint64_t steal_count = 0;
+    std::uint64_t backpressure_wait_count = 0;
+    std::uint64_t inline_drain_count = 0;
+    std::uint64_t max_queue_depth_seen = 0;
+};
+
 class decode_worker_pool_t final {
 public:
     static constexpr std::uint32_t maximum_shard_slots = 64;
 
     using lease_hook_t = bool (*)(void* context, std::uint32_t worker_index);
+    using completion_signal_t = void (*)(void* context);
 
     static workspace_result_t<std::unique_ptr<decode_worker_pool_t>> create(
         std::uint32_t worker_count,
@@ -46,6 +55,9 @@ public:
 
     void set_lease_hook(lease_hook_t hook, void* context) noexcept;
     void clear_lease_hook() noexcept;
+    void set_completion_signal(completion_signal_t signal, void* context) noexcept;
+    void clear_completion_signal() noexcept;
+    decode_worker_pool_statistics_t statistics() const noexcept;
 
 private:
     struct worker_state_t;

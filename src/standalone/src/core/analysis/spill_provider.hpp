@@ -14,6 +14,8 @@ namespace aida::analysis {
 struct spill_provider_options_t final {
     std::uint64_t max_spill_bytes = 1024ULL * 1024ULL * 1024ULL;
     std::uint64_t write_chunk_bytes = 1024ULL * 1024ULL;
+    std::uint64_t expected_total_bytes = 0;
+    std::function<void(std::uint64_t streamed, std::uint64_t total)> progress_sink{};
     mapped_window_cache_options_t mapped_window_cache{};
 };
 

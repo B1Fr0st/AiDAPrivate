@@ -205,7 +205,8 @@ void architecture_t::buildAction(ghidra::DocumentStorage& store)
 	allacts.resetDefaults();
 	if (rawptr_) {
 		allacts.cloneGroup("decompile", "decompile-deuglified");
-		allacts.removeFromGroup("decompile-deuglified", "fixateglobals");
+		if (!keep_fixateglobals_)
+			allacts.removeFromGroup("decompile-deuglified", "fixateglobals");
 		allacts.setCurrent("decompile-deuglified");
 	}
 }
@@ -302,6 +303,67 @@ inline ghidra::Datatype* resolve_named_primitive(ghidra::TypeFactory* types, con
 		return types->getBase(8, ghidra::TYPE_FLOAT);
 	if (name == "HRESULT" || name == "NTSTATUS")
 		return types->getBase(4, ghidra::TYPE_INT);
+	if (name == "BOOL")
+		return types->getBase(4, ghidra::TYPE_INT);
+	if (name == "BOOLEAN")
+		return types->getBase(1, ghidra::TYPE_UINT);
+	if (name == "WCHAR" || name == "TCHAR")
+		return types->getBase(2, ghidra::TYPE_UINT);
+	if (name == "SSIZE_T" || name == "LONG_PTR" || name == "LPARAM" || name == "LRESULT")
+		return types->getBase(8, ghidra::TYPE_INT);
+	if (name == "ULONG_PTR" || name == "DWORD_PTR" || name == "WPARAM")
+		return types->getBase(8, ghidra::TYPE_UINT);
+	if (name == "KIRQL")
+		return types->getBase(1, ghidra::TYPE_UINT);
+	if (name == "ACCESS_MASK")
+		return types->getBase(4, ghidra::TYPE_UINT);
+	if (name == "HANDLE" || name == "HMODULE" || name == "HINSTANCE" || name == "HWND" ||
+		name == "HDC" || name == "HKEY" || name == "HMENU" || name == "HBRUSH" ||
+		name == "HBITMAP" || name == "HGDIOBJ" || name == "PVOID" || name == "LPVOID" ||
+		name == "LPCVOID") {
+		ghidra::Datatype* void_type = types->getTypeVoid();
+		if (!void_type) return nullptr;
+		int ptr_size = types->getSizeOfPointer();
+		if (ptr_size <= 0) ptr_size = 8;
+		return types->getTypePointer(ptr_size, void_type, 1);
+	}
+	if (name == "PHANDLE" || name == "LPHANDLE") {
+		ghidra::Datatype* void_type = types->getTypeVoid();
+		if (!void_type) return nullptr;
+		int ptr_size = types->getSizeOfPointer();
+		if (ptr_size <= 0) ptr_size = 8;
+		ghidra::Datatype* vp = types->getTypePointer(ptr_size, void_type, 1);
+		if (!vp) return nullptr;
+		return types->getTypePointer(ptr_size, vp, 1);
+	}
+	if (name == "LPSTR" || name == "LPCSTR" || name == "PCHAR") {
+		ghidra::Datatype* char_type = types->getBase(1, ghidra::TYPE_INT);
+		if (!char_type) return nullptr;
+		int ptr_size = types->getSizeOfPointer();
+		if (ptr_size <= 0) ptr_size = 8;
+		return types->getTypePointer(ptr_size, char_type, 1);
+	}
+	if (name == "LPWSTR" || name == "LPCWSTR" || name == "PWCHAR") {
+		ghidra::Datatype* wchar_type = types->getBase(2, ghidra::TYPE_UINT);
+		if (!wchar_type) return nullptr;
+		int ptr_size = types->getSizeOfPointer();
+		if (ptr_size <= 0) ptr_size = 8;
+		return types->getTypePointer(ptr_size, wchar_type, 1);
+	}
+	if (name == "LPBYTE") {
+		ghidra::Datatype* byte_type = types->getBase(1, ghidra::TYPE_UINT);
+		if (!byte_type) return nullptr;
+		int ptr_size = types->getSizeOfPointer();
+		if (ptr_size <= 0) ptr_size = 8;
+		return types->getTypePointer(ptr_size, byte_type, 1);
+	}
+	if (name == "LPDWORD" || name == "PULONG") {
+		ghidra::Datatype* dword_type = types->getBase(4, ghidra::TYPE_UINT);
+		if (!dword_type) return nullptr;
+		int ptr_size = types->getSizeOfPointer();
+		if (ptr_size <= 0) ptr_size = 8;
+		return types->getTypePointer(ptr_size, dword_type, 1);
+	}
 	return nullptr;
 }
 
@@ -1060,6 +1122,513 @@ void architecture_t::apply_pdb_types()
 		static_cast<long long>(dur_ms));
 }
 
+namespace {
+
+struct parsed_proto_param_t {
+	parsed_type_ref_t type;
+	std::string       name;
+};
+
+struct parsed_signature_t {
+	bool                        valid = false;
+	bool                        has_return_type = false;
+	parsed_type_ref_t           return_type;
+	std::vector<parsed_proto_param_t> params;
+	bool                        varargs = false;
+	std::string                 calling_convention;
+};
+
+inline bool proto_ident_char(char c)
+{
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		(c >= '0' && c <= '9') || c == '_';
+}
+
+inline bool read_msvc_scoped_name(const std::string& s, size_t& i, std::vector<std::string>& scopes)
+{
+	while (true) {
+		std::string ident;
+		while (i < s.size() && proto_ident_char(s[i]))
+			ident.push_back(s[i++]);
+		if (ident.empty())
+			return false;
+		scopes.push_back(std::move(ident));
+		if (i < s.size() && s[i] == '@') {
+			++i;
+			if (i < s.size() && s[i] == '@') {
+				++i;
+				return true;
+			}
+			continue;
+		}
+		return false;
+	}
+}
+
+inline bool read_msvc_type(const std::string& s, size_t& i, parsed_type_ref_t& out)
+{
+	if (i >= s.size())
+		return false;
+	const char c = s[i];
+	switch (c) {
+	case 'X': ++i; out.base_name = "void"; return true;
+	case 'D': ++i; out.base_name = "char"; return true;
+	case 'E': ++i; out.base_name = "unsigned char"; return true;
+	case 'F': ++i; out.base_name = "short"; return true;
+	case 'G': ++i; out.base_name = "unsigned short"; return true;
+	case 'H': ++i; out.base_name = "int"; return true;
+	case 'I': ++i; out.base_name = "unsigned int"; return true;
+	case 'J': ++i; out.base_name = "long"; return true;
+	case 'K': ++i; out.base_name = "unsigned long"; return true;
+	case 'M': ++i; out.base_name = "float"; return true;
+	case 'N': ++i; out.base_name = "double"; return true;
+	case 'O': ++i; out.base_name = "double"; return true;
+	default: break;
+	}
+	if (c == '_') {
+		if (i + 1 >= s.size())
+			return false;
+		const char n = s[i + 1];
+		i += 2;
+		switch (n) {
+		case 'N': out.base_name = "bool"; return true;
+		case 'J': out.base_name = "__int64"; return true;
+		case 'K': out.base_name = "unsigned __int64"; return true;
+		case 'L': out.base_name = "long long"; return true;
+		case 'W': out.base_name = "wchar_t"; return true;
+		default: return false;
+		}
+	}
+	if (c == 'U' || c == 'V' || c == 'W') {
+		++i;
+		if (c == 'W') {
+			if (i >= s.size() || s[i] < '0' || s[i] > '9')
+				return false;
+			++i;
+		}
+		std::vector<std::string> scopes;
+		if (!read_msvc_scoped_name(s, i, scopes))
+			return false;
+		std::string name = scopes.front();
+		for (size_t k = 1; k < scopes.size(); ++k) {
+			name += "::";
+			name += scopes[k];
+		}
+		out.base_name = name;
+		return true;
+	}
+	if (c == 'P' || c == 'A') {
+		++i;
+		if (c == 'P' && i < s.size() && s[i] == 'E')
+			++i;
+		if (i >= s.size())
+			return false;
+		const char cv = s[i];
+		if (cv != 'A' && cv != 'B' && cv != 'C' && cv != 'D')
+			return false;
+		++i;
+		if (i < s.size() && s[i] == '6')
+			return false;
+		parsed_type_ref_t inner;
+		if (!read_msvc_type(s, i, inner))
+			return false;
+		if (inner.is_array)
+			return false;
+		out = inner;
+		out.pointer_depth = inner.pointer_depth + 1;
+		return true;
+	}
+	return false;
+}
+
+inline parsed_signature_t parse_msvc_signature(const std::string& s)
+{
+	parsed_signature_t sig;
+	if (s.size() < 6 || s[0] != '?')
+		return sig;
+	if (s[1] == '?' || s[1] == '$')
+		return sig;
+	size_t i = 1;
+	std::vector<std::string> scopes;
+	if (!read_msvc_scoped_name(s, i, scopes))
+		return sig;
+	if (i >= s.size())
+		return sig;
+	const char frame = s[i];
+	if (frame == 'Y') {
+		++i;
+	} else if (frame == 'Q' || frame == 'R' || frame == 'S') {
+		++i;
+		if (i >= s.size() || (s[i] != 'A' && s[i] != 'B'))
+			return sig;
+		++i;
+	} else {
+		return sig;
+	}
+	if (i >= s.size())
+		return sig;
+	const char conv = s[i++];
+	switch (conv) {
+	case 'A':
+	case 'B': sig.calling_convention = "cdecl"; break;
+	case 'C': sig.calling_convention = "fastcall"; break;
+	case 'E': sig.calling_convention = "thiscall"; break;
+	case 'G': sig.calling_convention = "stdcall"; break;
+	default: return sig;
+	}
+	if (!read_msvc_type(s, i, sig.return_type))
+		return sig;
+	sig.has_return_type = true;
+	if (i >= s.size())
+		return sig;
+	if (s[i] == 'X') {
+		parsed_type_ref_t void_marker;
+		if (!read_msvc_type(s, i, void_marker))
+			return sig;
+	} else {
+		while (i < s.size() && s[i] != 'Z') {
+			parsed_proto_param_t param;
+			if (!read_msvc_type(s, i, param.type))
+				return sig;
+			sig.params.push_back(std::move(param));
+		}
+	}
+	if (i >= s.size() || s[i] != 'Z')
+		return sig;
+	++i;
+	if (i < s.size() && s[i] == 'Z') {
+		sig.varargs = true;
+		++i;
+	}
+	if (i != s.size())
+		return sig;
+	sig.valid = true;
+	return sig;
+}
+
+inline bool is_type_keyword_word(const std::string& s)
+{
+	static const std::unordered_set<std::string> words = {
+		"void", "char", "short", "int", "long", "float", "double",
+		"bool", "signed", "unsigned", "wchar_t", "__int64"
+	};
+	return words.find(s) != words.end();
+}
+
+inline bool is_type_modifier_word(const std::string& s)
+{
+	static const std::unordered_set<std::string> words = {
+		"const", "volatile", "unsigned", "signed", "long", "short",
+		"struct", "enum", "union", "class"
+	};
+	return words.find(s) != words.end();
+}
+
+inline std::string last_word_of(const std::string& s)
+{
+	size_t e = s.size();
+	while (e > 0 && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+	size_t b = e;
+	while (b > 0 && !std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+	return s.substr(b, e - b);
+}
+
+inline void strip_leading_qualifiers(std::string& s)
+{
+	while (true) {
+		std::string t = trim_spaces(s);
+		const char* prefixes[] = { "const ", "volatile ", "struct ", "enum ", "union ", "class " };
+		bool stripped = false;
+		for (const char* p : prefixes) {
+			const size_t n = std::strlen(p);
+			if (t.size() > n && t.compare(0, n, p) == 0) {
+				s = trim_spaces(t.substr(n));
+				stripped = true;
+				break;
+			}
+		}
+		if (!stripped) {
+			s = t;
+			return;
+		}
+	}
+}
+
+inline void normalize_parsed_ref(parsed_type_ref_t& ref)
+{
+	while (ref.base_name.size() > 6 &&
+		ref.base_name.compare(ref.base_name.size() - 6, 6, " const") == 0) {
+		ref.base_name = trim_spaces(ref.base_name.substr(0, ref.base_name.size() - 6));
+	}
+}
+
+inline std::vector<std::string> split_top_level_commas(const std::string& s)
+{
+	std::vector<std::string> parts;
+	int depth = 0;
+	size_t begin = 0;
+	for (size_t i = 0; i < s.size(); ++i) {
+		const char c = s[i];
+		if (c == '(' || c == '[' || c == '{')
+			++depth;
+		else if (c == ')' || c == ']' || c == '}')
+			--depth;
+		else if (c == ',' && depth == 0) {
+			parts.push_back(s.substr(begin, i - begin));
+			begin = i + 1;
+		}
+	}
+	parts.push_back(s.substr(begin));
+	return parts;
+}
+
+inline bool parse_cdecl_param(const std::string& raw, parsed_proto_param_t& out, bool& varargs)
+{
+	std::string p = trim_spaces(raw);
+	if (p == "...") {
+		varargs = true;
+		return true;
+	}
+	if (p.empty())
+		return false;
+	strip_leading_qualifiers(p);
+	if (p.empty())
+		return false;
+	size_t b = p.size();
+	while (b > 0 && proto_ident_char(p[b - 1]))
+		--b;
+	const std::string trailing = p.substr(b);
+	const std::string prefix = trim_spaces(p.substr(0, b));
+	if (!trailing.empty() && !prefix.empty() && !is_type_keyword_word(trailing) &&
+		(prefix.back() == '*' || prefix.back() == ']' ||
+		 !is_type_modifier_word(last_word_of(prefix)))) {
+		out.name = trailing;
+		p = prefix;
+	}
+	out.type = parse_pdb_type_name(p);
+	normalize_parsed_ref(out.type);
+	return !out.type.base_name.empty();
+}
+
+inline parsed_signature_t parse_cdecl_signature(const std::string& s)
+{
+	parsed_signature_t sig;
+	const size_t lp = s.find('(');
+	if (lp == std::string::npos)
+		return sig;
+	const size_t rp = s.rfind(')');
+	if (rp == std::string::npos || rp < lp)
+		return sig;
+	const std::string tail = trim_spaces(s.substr(rp + 1));
+	if (!tail.empty() && tail != "const" && tail != "noexcept")
+		return sig;
+	if (s.find('<') != std::string::npos)
+		return sig;
+	const std::string head = trim_spaces(s.substr(0, lp));
+	if (head.empty())
+		return sig;
+	std::vector<std::string> tokens;
+	{
+		std::string cur;
+		for (const char c : head) {
+			if (std::isspace(static_cast<unsigned char>(c))) {
+				if (!cur.empty()) {
+					tokens.push_back(cur);
+					cur.clear();
+				}
+			} else {
+				cur.push_back(c);
+			}
+		}
+		if (!cur.empty())
+			tokens.push_back(cur);
+	}
+	if (tokens.empty())
+		return sig;
+	const std::string& name = tokens.back();
+	for (const char c : name) {
+		if (!proto_ident_char(c) && c != ':' && c != '~')
+			return sig;
+	}
+	std::vector<std::string> return_tokens;
+	for (size_t k = 0; k + 1 < tokens.size(); ++k) {
+		const std::string& t = tokens[k];
+		if (t == "__cdecl") { sig.calling_convention = "cdecl"; continue; }
+		if (t == "__stdcall") { sig.calling_convention = "stdcall"; continue; }
+		if (t == "__fastcall") { sig.calling_convention = "fastcall"; continue; }
+		if (t == "__thiscall") { sig.calling_convention = "thiscall"; continue; }
+		if (t == "__vectorcall" || t == "__clrcall")
+			return sig;
+		return_tokens.push_back(t);
+	}
+	if (!return_tokens.empty()) {
+		std::string joined = return_tokens.front();
+		for (size_t k = 1; k < return_tokens.size(); ++k) {
+			joined.push_back(' ');
+			joined += return_tokens[k];
+		}
+		strip_leading_qualifiers(joined);
+		sig.return_type = parse_pdb_type_name(joined);
+		normalize_parsed_ref(sig.return_type);
+		sig.has_return_type = !sig.return_type.base_name.empty();
+	}
+	const std::string params_str = s.substr(lp + 1, rp - lp - 1);
+	const std::string trimmed_params = trim_spaces(params_str);
+	if (!trimmed_params.empty() && trimmed_params != "void") {
+		const auto parts = split_top_level_commas(params_str);
+		for (size_t k = 0; k < parts.size(); ++k) {
+			parsed_proto_param_t param;
+			bool varargs_here = false;
+			if (!parse_cdecl_param(parts[k], param, varargs_here))
+				return sig;
+			if (varargs_here) {
+				if (k + 1 != parts.size())
+					return sig;
+				sig.varargs = true;
+				continue;
+			}
+			sig.params.push_back(std::move(param));
+		}
+	}
+	sig.valid = true;
+	return sig;
+}
+
+inline parsed_signature_t parse_symbol_signature(const std::string& display_name)
+{
+	if (display_name.empty())
+		return {};
+	if (display_name[0] == '?')
+		return parse_msvc_signature(display_name);
+	if (display_name.find('(') != std::string::npos)
+		return parse_cdecl_signature(display_name);
+	return {};
+}
+
+inline ghidra::Datatype* resolve_proto_param_type(ghidra::TypeFactory* types,
+                                                  const parsed_type_ref_t& ref)
+{
+	if (!types)
+		return nullptr;
+	ghidra::Datatype* base = resolve_named_primitive(types, ref.base_name);
+	if (!base)
+		base = resolve_named_lookup(types, ref.base_name);
+	if (!base)
+		return nullptr;
+	return apply_pointer_and_array(types, base, ref);
+}
+
+struct symbol_proto_job_t {
+	architecture_t*               arch = nullptr;
+	ghidra::Funcdata*             fd = nullptr;
+	const parsed_signature_t*     sig = nullptr;
+	ghidra::ProtoModel*           cc_model = nullptr;
+	bool                          unresolved = false;
+	bool                          applied = false;
+};
+
+__declspec(noinline) static bool call_apply_symbol_proto(symbol_proto_job_t* job)
+{
+	try {
+		if (!job || !job->arch || !job->fd || !job->sig)
+			return false;
+		ghidra::TypeFactory* types = job->arch->types;
+		if (!types)
+			return false;
+		ghidra::FuncProto& fp = job->fd->getFuncProto();
+		ghidra::Datatype* return_type = nullptr;
+		if (job->sig->has_return_type) {
+			return_type = resolve_proto_param_type(types, job->sig->return_type);
+			if (!return_type) {
+				job->unresolved = true;
+				return false;
+			}
+		}
+		std::vector<ghidra::Datatype*> param_types;
+		std::vector<std::string> param_names;
+		param_types.reserve(job->sig->params.size());
+		param_names.reserve(job->sig->params.size());
+		for (const auto& param : job->sig->params) {
+			ghidra::Datatype* t = resolve_proto_param_type(types, param.type);
+			if (!t) {
+				job->unresolved = true;
+				return false;
+			}
+			param_types.push_back(t);
+			param_names.push_back(param.name);
+		}
+		if (job->cc_model)
+			fp.setModel(job->cc_model);
+		if (!fp.hasModel())
+			return false;
+		const auto model_it = job->arch->protoModels.find(fp.getModelName());
+		if (model_it == job->arch->protoModels.end() || !model_it->second)
+			return false;
+		ghidra::PrototypePieces pieces;
+		pieces.model = model_it->second;
+		pieces.outtype = return_type ? return_type : fp.getOutputType();
+		if (!pieces.outtype)
+			return false;
+		pieces.intypes = std::move(param_types);
+		pieces.innames = std::move(param_names);
+		while (pieces.innames.size() < pieces.intypes.size())
+			pieces.innames.emplace_back();
+		pieces.firstVarArgSlot = job->sig->varargs
+			? static_cast<ghidra::int4>(pieces.intypes.size()) : -1;
+		fp.updateAllTypes(pieces);
+		if (fp.hasInputErrors())
+			return false;
+		fp.setInputLock(true);
+		fp.setOutputLock(true);
+		fp.setModelLock(true);
+		job->applied = true;
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+__declspec(noinline) static DWORD seh_apply_symbol_proto(symbol_proto_job_t* job)
+{
+	__try {
+		return call_apply_symbol_proto(job) ? 0u : 0xC0000FFEu;
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return GetExceptionCode();
+	}
+}
+
+struct symbol_cc_job_t {
+	ghidra::Funcdata*   fd = nullptr;
+	ghidra::ProtoModel* model = nullptr;
+	bool                applied = false;
+};
+
+__declspec(noinline) static bool call_apply_symbol_cc(symbol_cc_job_t* job)
+{
+	try {
+		if (!job || !job->fd || !job->model)
+			return false;
+		ghidra::FuncProto& fp = job->fd->getFuncProto();
+		fp.setModel(job->model);
+		fp.setModelLock(true);
+		job->applied = true;
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+__declspec(noinline) static DWORD seh_apply_symbol_cc(symbol_cc_job_t* job)
+{
+	__try {
+		return call_apply_symbol_cc(job) ? 0u : 0xC0000FFEu;
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return GetExceptionCode();
+	}
+}
+
+}
+
 __declspec(noinline) static void call_set_noreturn(ghidra::Funcdata* fd)
 {
 	fd->getFuncProto().setNoReturn(true);
@@ -1127,37 +1696,108 @@ void architecture_t::apply_pdb_function_prototypes()
 
 	auto t_start = std::chrono::steady_clock::now();
 
-	std::vector<std::pair<uint64_t, std::string>> targets;
+	struct proto_target_t {
+		uint64_t                 address = 0;
+		std::string              name;
+		std::string              calling_convention;
+		bool                     is_noreturn = false;
+		parsed_signature_t       signature;
+	};
+	std::vector<proto_target_t> targets;
 	targets.reserve(symbol_db_.symbols.size());
 	for (auto& s : symbol_db_.symbols) {
 		if (s.kind != symbol_kind_t::function && s.kind != symbol_kind_t::export_)
 			continue;
 		if (s.module_name.empty()) continue;
 		if (s.address == 0) continue;
-		if (!s.is_noreturn) continue;
-		std::string nm = !s.display_name.empty() ? s.display_name : s.name;
-		targets.emplace_back(s.address, nm);
+		proto_target_t target;
+		target.address = s.address;
+		target.name = !s.display_name.empty() ? s.display_name : s.name;
+		target.calling_convention = s.calling_convention;
+		target.is_noreturn = s.is_noreturn;
+		target.signature = parse_symbol_signature(target.name);
+		targets.push_back(std::move(target));
+	}
+
+	size_t proto_attempted = 0;
+	for (const auto& t : targets) {
+		if (t.signature.valid || !t.calling_convention.empty())
+			++proto_attempted;
 	}
 
 	diag::log_tagged_critical_fmt("dec_pdb",
-		"apply_pdb_function_prototypes_enter candidates=%zu",
-		targets.size());
+		"apply_pdb_function_prototypes_enter candidates=%zu proto_candidates=%zu",
+		targets.size(), proto_attempted);
 
 	size_t applied = 0;
 	size_t not_found = 0;
 	size_t failed_set = 0;
+	size_t proto_applied = 0;
+	size_t proto_failed = 0;
+	size_t proto_unresolved = 0;
+	size_t cc_applied = 0;
 
 	tl_current_apply_stage = "func_proto";
-	for (auto& kv : targets) {
-		tl_current_apply_name = kv.second;
-		ghidra::Funcdata* fd = seh_query_function(gscope, space, kv.first);
+	for (auto& t : targets) {
+		tl_current_apply_name = t.name;
+		ghidra::Funcdata* fd = seh_query_function(gscope, space, t.address);
 		if (!fd) { ++not_found; continue; }
+		if (t.signature.valid) {
+			ghidra::ProtoModel* model = nullptr;
+			if (!t.signature.calling_convention.empty())
+				model = proto_model_from_cc(t.signature.calling_convention);
+			if (!model && !t.calling_convention.empty())
+				model = proto_model_from_cc(t.calling_convention);
+			symbol_proto_job_t job;
+			job.arch = this;
+			job.fd = fd;
+			job.sig = &t.signature;
+			job.cc_model = model;
+			const DWORD code = seh_apply_symbol_proto(&job);
+			if (code != 0 || !job.applied) {
+				if (job.unresolved)
+					++proto_unresolved;
+				else
+					++proto_failed;
+				if (code != 0 && code != 0xC0000FFEu) {
+					diag::log_tagged_critical_fmt("dec_pdb",
+						"apply_pdb_function_prototypes_seh_fault stage=func_proto_apply name=%s addr=0x%llx code=0x%08X",
+						t.name.c_str(),
+						static_cast<unsigned long long>(t.address),
+						code);
+				}
+			} else {
+				++proto_applied;
+			}
+		} else if (!t.calling_convention.empty()) {
+			ghidra::ProtoModel* model = proto_model_from_cc(t.calling_convention);
+			if (model) {
+				symbol_cc_job_t job;
+				job.fd = fd;
+				job.model = model;
+				const DWORD code = seh_apply_symbol_cc(&job);
+				if (code != 0 || !job.applied) {
+					++proto_failed;
+					if (code != 0 && code != 0xC0000FFEu) {
+						diag::log_tagged_critical_fmt("dec_pdb",
+							"apply_pdb_function_prototypes_seh_fault stage=func_proto_cc name=%s addr=0x%llx code=0x%08X",
+							t.name.c_str(),
+							static_cast<unsigned long long>(t.address),
+							code);
+					}
+				} else {
+					++cc_applied;
+				}
+			}
+		}
+		if (!t.is_noreturn)
+			continue;
 		DWORD code = seh_set_noreturn(fd);
 		if (code != 0) {
 			diag::log_tagged_critical_fmt("dec_pdb",
 				"apply_pdb_function_prototypes_seh_fault stage=func_proto name=%s addr=0x%llx code=0x%08X",
-				kv.second.c_str(),
-				static_cast<unsigned long long>(kv.first),
+				t.name.c_str(),
+				static_cast<unsigned long long>(t.address),
 				code);
 			++failed_set;
 			continue;
@@ -1172,8 +1812,9 @@ void architecture_t::apply_pdb_function_prototypes()
 	auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
 
 	diag::log_tagged_critical_fmt("dec_pdb",
-		"apply_pdb_function_prototypes_exit candidates=%zu applied=%zu not_found=%zu failed_set=%zu duration_ms=%lld",
+		"apply_pdb_function_prototypes_exit candidates=%zu applied=%zu not_found=%zu failed_set=%zu proto_attempted=%zu proto_applied=%zu proto_failed=%zu proto_unresolved=%zu cc_applied=%zu duration_ms=%lld",
 		targets.size(), applied, not_found, failed_set,
+		proto_attempted, proto_applied, proto_failed, proto_unresolved, cc_applied,
 		static_cast<long long>(dur_ms));
 }
 

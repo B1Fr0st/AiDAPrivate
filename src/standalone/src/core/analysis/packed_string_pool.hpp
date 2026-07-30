@@ -162,6 +162,7 @@ class packed_string_pool_builder_t final {
 public:
     packed_store_result_t<packed_string_id_t> intern(std::string_view value);
     packed_store_result_t<packed_string_pool_t> freeze() const;
+    void reserve(std::size_t string_estimate);
     std::uint32_t size() const noexcept;
 
 private:

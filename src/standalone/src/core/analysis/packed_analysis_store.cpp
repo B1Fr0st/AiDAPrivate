@@ -1464,6 +1464,720 @@ std::uint32_t packed_analysis_shard_t::local_string_count() const noexcept
     return impl_ ? impl_->strings.size() : 0;
 }
 
+std::uint32_t packed_analysis_shard_t::instruction_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->instructions.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::operand_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->operands.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::edge_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->edges.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::string_record_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->string_records.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::symbol_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->symbols.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::address_expression_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->address_expressions.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::basic_block_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->basic_blocks.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::function_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->functions.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::function_chunk_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->function_chunks.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::target_fact_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->target_facts.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::xref_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->xrefs.size()) : 0;
+}
+
+std::uint32_t packed_analysis_shard_t::coverage_count() const noexcept
+{
+    return impl_ ? static_cast<std::uint32_t>(impl_->coverage_spans.size()) : 0;
+}
+
+const packed_string_pool_t& packed_analysis_shard_t::string_pool() const noexcept
+{
+    return impl_ ? impl_->strings : empty_string_pool();
+}
+
+packed_size_accounting_t packed_analysis_shard_t::size_accounting() const noexcept
+{
+    if (!impl_)
+        return {};
+    const auto string_size = impl_->strings.size_accounting();
+    std::uint64_t instruction_payload = 0;
+    std::uint64_t instruction_reserved = 0;
+    std::uint64_t operand_payload = 0;
+    std::uint64_t operand_reserved = 0;
+    std::uint64_t edge_payload = 0;
+    std::uint64_t edge_reserved = 0;
+    std::uint64_t string_payload = 0;
+    std::uint64_t string_reserved = 0;
+    std::uint64_t symbol_payload = 0;
+    std::uint64_t symbol_reserved = 0;
+    std::uint64_t address_expression_payload = 0;
+    std::uint64_t address_expression_reserved = 0;
+    std::uint64_t basic_block_payload = 0;
+    std::uint64_t basic_block_reserved = 0;
+    std::uint64_t function_payload = 0;
+    std::uint64_t function_reserved = 0;
+    std::uint64_t function_chunk_payload = 0;
+    std::uint64_t function_chunk_reserved = 0;
+    std::uint64_t target_fact_payload = 0;
+    std::uint64_t target_fact_reserved = 0;
+    std::uint64_t xref_payload = 0;
+    std::uint64_t xref_reserved = 0;
+    std::uint64_t coverage_payload = 0;
+    std::uint64_t coverage_reserved = 0;
+    add_vector_accounting(impl_->instructions, instruction_payload, instruction_reserved);
+    add_vector_accounting(impl_->operands, operand_payload, operand_reserved);
+    add_vector_accounting(impl_->edges, edge_payload, edge_reserved);
+    add_vector_accounting(impl_->string_records, string_payload, string_reserved);
+    add_vector_accounting(impl_->symbols, symbol_payload, symbol_reserved);
+    add_vector_accounting(impl_->address_expressions, address_expression_payload,
+                          address_expression_reserved);
+    add_vector_accounting(impl_->basic_blocks, basic_block_payload, basic_block_reserved);
+    add_vector_accounting(impl_->functions, function_payload, function_reserved);
+    add_vector_accounting(impl_->function_chunks, function_chunk_payload,
+                          function_chunk_reserved);
+    add_vector_accounting(impl_->target_facts, target_fact_payload, target_fact_reserved);
+    add_vector_accounting(impl_->xrefs, xref_payload, xref_reserved);
+    add_vector_accounting(impl_->coverage_spans, coverage_payload, coverage_reserved);
+    const auto payload = string_size.payload_bytes + instruction_payload + operand_payload +
+        edge_payload + string_payload + symbol_payload + address_expression_payload +
+        basic_block_payload + function_payload + function_chunk_payload + target_fact_payload +
+        xref_payload + coverage_payload;
+    const auto reserved = string_size.reserved_bytes + instruction_reserved + operand_reserved +
+        edge_reserved + string_reserved + symbol_reserved + address_expression_reserved +
+        basic_block_reserved + function_reserved + function_chunk_reserved +
+        target_fact_reserved + xref_reserved + coverage_reserved;
+    return packed_size_accounting_t{string_size.payload_bytes, instruction_payload,
+                                    operand_payload, edge_payload, string_payload, symbol_payload,
+                                    address_expression_payload, basic_block_payload,
+                                    function_payload, function_chunk_payload, target_fact_payload,
+                                    xref_payload, coverage_payload, payload, reserved};
+}
+
+packed_store_result_t<void> packed_analysis_shard_t::validate() const
+{
+    if (!impl_) {
+        return packed_store_result_t<void>::failure(make_error(
+            packed_store_error_code_t::invalid_shard, "shard"));
+    }
+    const auto& data = *impl_;
+    const auto valid_pool = data.strings.validate();
+    if (!valid_pool) {
+        auto error = valid_pool.error();
+        error.shard = data.shard;
+        return packed_store_result_t<void>::failure(error);
+    }
+    for (std::size_t index = 0; index < data.strings.size(); ++index) {
+        const auto id = packed_string_id_t::from_value(static_cast<std::uint32_t>(index + 1U));
+        if (!data.strings.lookup(id)) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_string_pool, "shard", data.shard,
+                id.value()));
+        }
+    }
+    const auto translate_string = [&](packed_string_id_t local,
+                                      bool required) -> packed_store_result_t<void> {
+        if (!local.valid()) {
+            if (required) {
+                return packed_store_result_t<void>::failure(make_error(
+                    packed_store_error_code_t::invalid_string_id, "shard", data.shard,
+                    local.value()));
+            }
+            return packed_store_result_t<void>::success();
+        }
+        if (!data.strings.lookup(local)) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::invalid_string_id, "shard", data.shard,
+                local.value()));
+        }
+        return packed_store_result_t<void>::success();
+    };
+
+    const auto valid_instruction_count =
+        ensure_count<instruction_row_t>(data.instructions.size(), "instruction");
+    if (!valid_instruction_count)
+        return valid_instruction_count;
+    const auto valid_operand_count =
+        ensure_count<operand_row_t>(data.operands.size(), "operand");
+    if (!valid_operand_count)
+        return valid_operand_count;
+    const auto valid_edge_count = ensure_count<edge_row_t>(data.edges.size(), "edge");
+    if (!valid_edge_count)
+        return valid_edge_count;
+    const auto valid_string_count =
+        ensure_count<string_row_t>(data.string_records.size(), "string");
+    if (!valid_string_count)
+        return valid_string_count;
+    const auto valid_symbol_count = ensure_count<symbol_row_t>(data.symbols.size(), "symbol");
+    if (!valid_symbol_count)
+        return valid_symbol_count;
+    const auto valid_address_expression_count = ensure_count<address_expression_row_t>(
+        data.address_expressions.size(), "address_expression");
+    if (!valid_address_expression_count)
+        return valid_address_expression_count;
+    const auto valid_basic_block_count =
+        ensure_count<basic_block_row_t>(data.basic_blocks.size(), "basic_block");
+    if (!valid_basic_block_count)
+        return valid_basic_block_count;
+    const auto valid_function_count =
+        ensure_count<function_row_t>(data.functions.size(), "function");
+    if (!valid_function_count)
+        return valid_function_count;
+    const auto valid_function_chunk_count =
+        ensure_count<function_chunk_row_t>(data.function_chunks.size(), "function_chunk");
+    if (!valid_function_chunk_count)
+        return valid_function_chunk_count;
+    const auto valid_target_fact_count =
+        ensure_count<target_fact_row_t>(data.target_facts.size(), "target_fact");
+    if (!valid_target_fact_count)
+        return valid_target_fact_count;
+    const auto valid_xref_count = ensure_count<xref_row_t>(data.xrefs.size(), "xref");
+    if (!valid_xref_count)
+        return valid_xref_count;
+    const auto valid_coverage_count =
+        ensure_count<coverage_row_t>(data.coverage_spans.size(), "coverage");
+    if (!valid_coverage_count)
+        return valid_coverage_count;
+
+    std::unordered_set<entity_id_t> instruction_sources;
+    instruction_sources.reserve(data.instructions.size());
+    for (const auto& draft : data.instructions) {
+        const auto valid_input = validate_instruction_input(draft.input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::instruction,
+                                                 data.shard, draft.input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!instruction_sources.insert(draft.input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "instruction", data.shard,
+                id.value().value()));
+        }
+        const auto mnemonic = translate_string(draft.mnemonic, false);
+        if (!mnemonic)
+            return mnemonic;
+    }
+    std::unordered_set<entity_id_t> operand_sources;
+    operand_sources.reserve(data.operands.size());
+    for (const auto& input : data.operands) {
+        const auto valid_input = validate_operand_input(input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::operand,
+                                                 data.shard, input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!operand_sources.insert(input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "operand", data.shard,
+                id.value().value()));
+        }
+        const auto instruction = resolve_reference(input.instruction, data.shard, "operand");
+        if (!instruction)
+            return packed_store_result_t<void>::failure(instruction.error());
+        const auto expression =
+            resolve_reference(input.address_expression, data.shard, "operand");
+        if (!expression)
+            return packed_store_result_t<void>::failure(expression.error());
+    }
+    std::unordered_set<entity_id_t> edge_sources;
+    edge_sources.reserve(data.edges.size());
+    for (const auto& input : data.edges) {
+        const auto valid_input = validate_edge_input(input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::edge,
+                                                 data.shard, input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!edge_sources.insert(input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "edge", data.shard,
+                id.value().value()));
+        }
+        const auto source = resolve_reference(input.source_entity, data.shard, "edge");
+        if (!source)
+            return packed_store_result_t<void>::failure(source.error());
+        if (input.target_entity.has_value()) {
+            const auto resolved = resolve_reference(*input.target_entity, data.shard, "edge");
+            if (!resolved)
+                return packed_store_result_t<void>::failure(resolved.error());
+        }
+    }
+    std::unordered_set<entity_id_t> string_sources;
+    string_sources.reserve(data.string_records.size());
+    for (const auto& draft : data.string_records) {
+        const auto valid_input = validate_string_input(draft.input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::string,
+                                                 data.shard, draft.input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!string_sources.insert(draft.input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "string", data.shard,
+                id.value().value()));
+        }
+        const auto value = translate_string(draft.value, true);
+        if (!value)
+            return value;
+    }
+    std::unordered_set<entity_id_t> symbol_sources;
+    symbol_sources.reserve(data.symbols.size());
+    for (const auto& draft : data.symbols) {
+        const auto valid_input = validate_symbol_input(draft.input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::symbol,
+                                                 data.shard, draft.input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!symbol_sources.insert(draft.input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "symbol", data.shard,
+                id.value().value()));
+        }
+        const auto name = translate_string(draft.name, true);
+        if (!name)
+            return name;
+    }
+    std::unordered_set<entity_id_t> address_expression_sources;
+    address_expression_sources.reserve(data.address_expressions.size());
+    for (const auto& input : data.address_expressions) {
+        const auto valid_input = validate_address_expression_input(input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::address_expression,
+                                                 data.shard, input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!address_expression_sources.insert(input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "address_expression",
+                data.shard, id.value().value()));
+        }
+        const auto instruction =
+            resolve_reference(input.instruction, data.shard, "address_expression");
+        if (!instruction)
+            return packed_store_result_t<void>::failure(instruction.error());
+    }
+    std::unordered_set<entity_id_t> basic_block_sources;
+    basic_block_sources.reserve(data.basic_blocks.size());
+    for (const auto& input : data.basic_blocks) {
+        const auto valid_input = validate_basic_block_input(input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::basic_block,
+                                                 data.shard, input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!basic_block_sources.insert(input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "basic_block", data.shard,
+                id.value().value()));
+        }
+    }
+    std::unordered_set<entity_id_t> function_sources;
+    function_sources.reserve(data.functions.size());
+    for (const auto& draft : data.functions) {
+        const auto valid_input = validate_function_input(draft.input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::function,
+                                                 data.shard, draft.input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!function_sources.insert(draft.input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "function", data.shard,
+                id.value().value()));
+        }
+        const auto name = translate_string(draft.name, false);
+        if (!name)
+            return name;
+        const auto entry_block =
+            resolve_reference(draft.input.entry_block, data.shard, "function");
+        if (!entry_block)
+            return packed_store_result_t<void>::failure(entry_block.error());
+        const auto symbol = resolve_reference(draft.input.symbol, data.shard, "function");
+        if (!symbol)
+            return packed_store_result_t<void>::failure(symbol.error());
+    }
+    std::unordered_set<entity_id_t> function_chunk_sources;
+    function_chunk_sources.reserve(data.function_chunks.size());
+    for (const auto& input : data.function_chunks) {
+        const auto valid_input = validate_function_chunk_input(input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::function_chunk,
+                                                 data.shard, input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!function_chunk_sources.insert(input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "function_chunk", data.shard,
+                id.value().value()));
+        }
+        const auto function = resolve_reference(input.function, data.shard, "function_chunk");
+        if (!function)
+            return packed_store_result_t<void>::failure(function.error());
+    }
+    std::unordered_set<entity_id_t> target_fact_sources;
+    target_fact_sources.reserve(data.target_facts.size());
+    for (const auto& input : data.target_facts) {
+        const auto valid_input = validate_target_fact_input(input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::target_fact,
+                                                 data.shard, input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!target_fact_sources.insert(input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "target_fact", data.shard,
+                id.value().value()));
+        }
+        const auto instruction = resolve_reference(input.instruction, data.shard, "target_fact");
+        if (!instruction)
+            return packed_store_result_t<void>::failure(instruction.error());
+        const auto operand = resolve_reference(input.operand, data.shard, "target_fact");
+        if (!operand)
+            return packed_store_result_t<void>::failure(operand.error());
+        const auto expression =
+            resolve_reference(input.address_expression, data.shard, "target_fact");
+        if (!expression)
+            return packed_store_result_t<void>::failure(expression.error());
+    }
+    std::unordered_set<entity_id_t> xref_sources;
+    xref_sources.reserve(data.xrefs.size());
+    for (const auto& input : data.xrefs) {
+        const auto valid_input = validate_xref_input(input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::xref,
+                                                 data.shard, input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!xref_sources.insert(input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "xref", data.shard,
+                id.value().value()));
+        }
+        const auto source = resolve_reference(input.source_entity, data.shard, "xref");
+        if (!source)
+            return packed_store_result_t<void>::failure(source.error());
+        const auto target = resolve_reference(input.target_entity, data.shard, "xref");
+        if (!target)
+            return packed_store_result_t<void>::failure(target.error());
+    }
+    std::unordered_set<entity_id_t> coverage_sources;
+    coverage_sources.reserve(data.coverage_spans.size());
+    for (const auto& input : data.coverage_spans) {
+        const auto valid_input = validate_coverage_input(input, data.shard);
+        if (!valid_input)
+            return valid_input;
+        const auto id = packed_entity_id_t::make(packed_entity_domain_t::coverage,
+                                                 data.shard, input.source_id);
+        if (!id)
+            return packed_store_result_t<void>::failure(id.error());
+        if (!coverage_sources.insert(input.source_id).second) {
+            return packed_store_result_t<void>::failure(make_error(
+                packed_store_error_code_t::duplicate_packed_id, "coverage", data.shard,
+                id.value().value()));
+        }
+    }
+    return packed_store_result_t<void>::success();
+}
+
+void packed_analysis_shard_t::release() noexcept
+{
+    impl_.reset();
+}
+
+namespace {
+
+std::optional<packed_entity_id_t> shard_row_id(packed_entity_domain_t domain,
+                                               std::uint16_t shard,
+                                               entity_id_t source_id) noexcept
+{
+    const auto id = packed_entity_id_t::make(domain, shard, source_id);
+    if (!id)
+        return std::nullopt;
+    return id.value();
+}
+
+}
+
+std::optional<packed_instruction_view_t>
+packed_analysis_shard_t::instruction(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->instructions.size())
+        return std::nullopt;
+    const auto& draft = impl_->instructions[index];
+    const auto id = shard_row_id(packed_entity_domain_t::instruction, impl_->shard,
+                                 draft.input.source_id);
+    if (!id)
+        return std::nullopt;
+    std::string_view mnemonic;
+    if (draft.mnemonic.valid()) {
+        const auto value = impl_->strings.lookup(draft.mnemonic);
+        if (!value)
+            return std::nullopt;
+        mnemonic = *value;
+    }
+    return packed_instruction_view_t{*id, draft.input.address, draft.input.length,
+                                     draft.input.mnemonic_id, mnemonic, draft.input.opcode_id,
+                                     draft.input.flow_flags, 0, 0, draft.input.provenance,
+                                     draft.input.confidence, draft.input.coverage,
+                                     draft.input.stable_source_id};
+}
+
+std::optional<packed_operand_view_t> packed_analysis_shard_t::operand(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->operands.size())
+        return std::nullopt;
+    const auto& input = impl_->operands[index];
+    const auto id = shard_row_id(packed_entity_domain_t::operand, impl_->shard, input.source_id);
+    const auto instruction = resolve_reference(input.instruction, impl_->shard, "operand");
+    const auto expression = resolve_reference(input.address_expression, impl_->shard, "operand");
+    if (!id || !instruction || !expression)
+        return std::nullopt;
+    return packed_operand_view_t{*id, instruction.value(), expression.value(),
+                                 input.operand_index, input.decoder_operand_id, input.kind,
+                                 input.access, input.visibility, input.encoding,
+                                 input.memory_type, input.access_width, input.bit_width,
+                                 input.access_width_bits, input.access_count,
+                                 input.element_width_bits, input.element_count,
+                                 input.address_width_bits, input.reg, input.segment_reg,
+                                 input.base_reg, input.index_reg, input.scale, input.relative,
+                                 input.signed_value, input.has_displacement,
+                                 input.has_resolved_expression_value, input.displacement,
+                                 input.immediate, input.resolved_expression_value,
+                                 input.address_components, input.address_expression_kind,
+                                 input.address_resolution};
+}
+
+std::optional<packed_edge_view_t> packed_analysis_shard_t::edge(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->edges.size())
+        return std::nullopt;
+    const auto& input = impl_->edges[index];
+    const auto id = shard_row_id(packed_entity_domain_t::edge, impl_->shard, input.source_id);
+    const auto source = resolve_reference(input.source_entity, impl_->shard, "edge");
+    if (!id || !source)
+        return std::nullopt;
+    std::optional<packed_entity_id_t> target_entity;
+    if (input.target_entity.has_value()) {
+        const auto resolved = resolve_reference(*input.target_entity, impl_->shard, "edge");
+        if (!resolved)
+            return std::nullopt;
+        target_entity = resolved.value();
+    }
+    return packed_edge_view_t{*id, source.value(), target_entity, input.source, input.target,
+                              input.kind, input.provenance, input.confidence};
+}
+
+std::optional<packed_string_view_t> packed_analysis_shard_t::string(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->string_records.size())
+        return std::nullopt;
+    const auto& draft = impl_->string_records[index];
+    const auto id = shard_row_id(packed_entity_domain_t::string, impl_->shard,
+                                 draft.input.source_id);
+    if (!id)
+        return std::nullopt;
+    const auto value = impl_->strings.lookup(draft.value);
+    if (!value)
+        return std::nullopt;
+    return packed_string_view_t{*id, draft.input.address, draft.input.byte_length,
+                                draft.input.encoding, *value, draft.input.provenance,
+                                draft.input.confidence};
+}
+
+std::optional<packed_symbol_view_t> packed_analysis_shard_t::symbol(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->symbols.size())
+        return std::nullopt;
+    const auto& draft = impl_->symbols[index];
+    const auto id = shard_row_id(packed_entity_domain_t::symbol, impl_->shard,
+                                 draft.input.source_id);
+    if (!id)
+        return std::nullopt;
+    const auto name = impl_->strings.lookup(draft.name);
+    if (!name)
+        return std::nullopt;
+    return packed_symbol_view_t{*id, draft.input.address, *name, draft.input.kind,
+                                draft.input.provenance, draft.input.confidence};
+}
+
+std::optional<packed_address_expression_view_t>
+packed_analysis_shard_t::address_expression(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->address_expressions.size())
+        return std::nullopt;
+    const auto& input = impl_->address_expressions[index];
+    const auto id = shard_row_id(packed_entity_domain_t::address_expression, impl_->shard,
+                                 input.source_id);
+    const auto instruction =
+        resolve_reference(input.instruction, impl_->shard, "address_expression");
+    if (!id || !instruction)
+        return std::nullopt;
+    return packed_address_expression_view_t{*id, instruction.value(), input.base_reg,
+                                            input.index_reg, input.scale, input.displacement,
+                                            input.segment_reg, input.address_components,
+                                            input.kind, input.resolution, input.provenance,
+                                            input.confidence};
+}
+
+std::optional<packed_basic_block_view_t>
+packed_analysis_shard_t::basic_block(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->basic_blocks.size())
+        return std::nullopt;
+    const auto& input = impl_->basic_blocks[index];
+    const auto id = shard_row_id(packed_entity_domain_t::basic_block, impl_->shard,
+                                 input.source_id);
+    if (!id)
+        return std::nullopt;
+    return packed_basic_block_view_t{*id, input.start_address, input.end_address,
+                                     input.instruction_begin, input.instruction_count,
+                                     input.predecessor_count, input.successor_count, input.flags,
+                                     input.provenance, input.confidence};
+}
+
+std::optional<packed_function_view_t> packed_analysis_shard_t::function(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->functions.size())
+        return std::nullopt;
+    const auto& draft = impl_->functions[index];
+    const auto id = shard_row_id(packed_entity_domain_t::function, impl_->shard,
+                                 draft.input.source_id);
+    const auto entry_block =
+        resolve_reference(draft.input.entry_block, impl_->shard, "function");
+    const auto symbol = resolve_reference(draft.input.symbol, impl_->shard, "function");
+    if (!id || !entry_block || !symbol)
+        return std::nullopt;
+    std::string_view name;
+    if (draft.name.valid()) {
+        const auto value = impl_->strings.lookup(draft.name);
+        if (!value)
+            return std::nullopt;
+        name = *value;
+    }
+    return packed_function_view_t{*id, draft.input.start_address, draft.input.end_address,
+                                  entry_block.value(), symbol.value(), name,
+                                  draft.input.chunk_count, draft.input.flags,
+                                  draft.input.return_type_id, draft.input.provenance,
+                                  draft.input.confidence};
+}
+
+std::optional<packed_function_chunk_view_t>
+packed_analysis_shard_t::function_chunk(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->function_chunks.size())
+        return std::nullopt;
+    const auto& input = impl_->function_chunks[index];
+    const auto id = shard_row_id(packed_entity_domain_t::function_chunk, impl_->shard,
+                                 input.source_id);
+    const auto function = resolve_reference(input.function, impl_->shard, "function_chunk");
+    if (!id || !function)
+        return std::nullopt;
+    return packed_function_chunk_view_t{*id, function.value(), input.start_address,
+                                        input.end_address, input.block_begin, input.block_count,
+                                        input.flags, input.provenance, input.confidence};
+}
+
+std::optional<packed_target_fact_view_t>
+packed_analysis_shard_t::target_fact(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->target_facts.size())
+        return std::nullopt;
+    const auto& input = impl_->target_facts[index];
+    const auto id = shard_row_id(packed_entity_domain_t::target_fact, impl_->shard,
+                                 input.source_id);
+    const auto instruction = resolve_reference(input.instruction, impl_->shard, "target_fact");
+    const auto operand = resolve_reference(input.operand, impl_->shard, "target_fact");
+    const auto expression =
+        resolve_reference(input.address_expression, impl_->shard, "target_fact");
+    if (!id || !instruction || !operand || !expression)
+        return std::nullopt;
+    return packed_target_fact_view_t{*id, instruction.value(), operand.value(),
+                                     expression.value(), input.target, input.kind,
+                                     input.resolution, input.operand_index,
+                                     input.access_width_bits, input.access_count, input.direct,
+                                     input.is_external, input.provenance, input.confidence};
+}
+
+std::optional<packed_xref_view_t> packed_analysis_shard_t::xref(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->xrefs.size())
+        return std::nullopt;
+    const auto& input = impl_->xrefs[index];
+    const auto id = shard_row_id(packed_entity_domain_t::xref, impl_->shard, input.source_id);
+    const auto source = resolve_reference(input.source_entity, impl_->shard, "xref");
+    const auto target = resolve_reference(input.target_entity, impl_->shard, "xref");
+    if (!id || !source || !target)
+        return std::nullopt;
+    return packed_xref_view_t{*id, source.value(), target.value(), input.source_address,
+                              input.target_address, input.kind, input.is_direct,
+                              input.provenance, input.confidence};
+}
+
+std::optional<packed_coverage_view_t> packed_analysis_shard_t::coverage(std::size_t index) const
+{
+    if (!impl_ || index >= impl_->coverage_spans.size())
+        return std::nullopt;
+    const auto& input = impl_->coverage_spans[index];
+    const auto id = shard_row_id(packed_entity_domain_t::coverage, impl_->shard,
+                                 input.source_id);
+    if (!id)
+        return std::nullopt;
+    return packed_coverage_view_t{*id, input.span_begin, input.span_end, input.reason,
+                                  input.undecodable_count, input.provenance, input.confidence};
+}
+
+packed_analysis_shard_compatibility_view_t
+packed_analysis_shard_t::compatibility_view() const noexcept
+{
+    return packed_analysis_shard_compatibility_view_t(this);
+}
+
+
 packed_analysis_shard_builder_t::packed_analysis_shard_builder_t(std::uint16_t shard)
     : impl_(std::make_unique<impl_t>(shard))
 {
@@ -1761,6 +2475,12 @@ packed_store_result_t<packed_analysis_shard_t> packed_analysis_shard_builder_t::
     impl_->finalized = true;
     return packed_store_result_t<packed_analysis_shard_t>::success(
         packed_analysis_shard_t(std::move(shard_impl)));
+}
+
+void packed_analysis_shard_builder_t::reserve_strings(std::size_t string_estimate)
+{
+    if (impl_ && !impl_->finalized)
+        impl_->strings.reserve(string_estimate);
 }
 
 std::uint16_t packed_analysis_shard_builder_t::shard_id() const noexcept
@@ -3100,6 +3820,257 @@ packed_analysis_compatibility_view_t::coverage(std::size_t index) const
     if (!store_)
         return std::nullopt;
     const auto view = store_->coverage(index);
+    if (!view)
+        return std::nullopt;
+    coverage_span_t result;
+    result.start = view->span_begin;
+    result.size = view->span_end.value >= view->span_begin.value
+        ? view->span_end.value - view->span_begin.value : 0;
+    result.reason = view->reason;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    result.detail_code = view->undecodable_count;
+    return result;
+}
+
+packed_analysis_shard_compatibility_view_t::packed_analysis_shard_compatibility_view_t(
+    const packed_analysis_shard_t* shard) noexcept
+    : shard_(shard)
+{
+}
+
+std::optional<instruction_record_t>
+packed_analysis_shard_compatibility_view_t::instruction(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->instruction(index);
+    if (!view)
+        return std::nullopt;
+    instruction_record_t result;
+    result.id = view->id.value();
+    result.address = view->address;
+    result.length = view->length;
+    result.mnemonic_id = view->mnemonic_id;
+    result.opcode_id = view->opcode_id;
+    result.flow_flags = view->flow_flags;
+    result.operand_fact_begin = view->first_operand;
+    result.operand_fact_count = view->operand_count;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    result.coverage = view->coverage;
+    result.stable_source_id = view->stable_source_id;
+    return result;
+}
+
+std::optional<operand_fact_t>
+packed_analysis_shard_compatibility_view_t::operand(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->operand(index);
+    if (!view)
+        return std::nullopt;
+    operand_fact_t result;
+    result.id = view->id.value();
+    result.instruction_id = view->instruction_id.value();
+    result.address_expression_id = view->address_expression_id.value();
+    result.operand_index = view->operand_index;
+    result.decoder_operand_id = view->decoder_operand_id;
+    result.kind = view->kind;
+    result.access = view->access;
+    result.visibility = view->visibility;
+    result.encoding = view->encoding;
+    result.memory_type = view->memory_type;
+    result.access_width = view->access_width;
+    result.bit_width = view->bit_width;
+    result.access_width_bits = view->access_width_bits;
+    result.access_count = view->access_count;
+    result.element_width_bits = view->element_width_bits;
+    result.element_count = view->element_count;
+    result.address_width_bits = view->address_width_bits;
+    result.reg = view->reg;
+    result.segment_reg = view->segment_reg;
+    result.base_reg = view->base_reg;
+    result.index_reg = view->index_reg;
+    result.scale = view->scale;
+    result.relative = view->relative;
+    result.signed_value = view->signed_value;
+    result.has_displacement = view->has_displacement;
+    result.has_resolved_expression_value = view->has_resolved_expression_value;
+    result.displacement = view->displacement;
+    result.immediate = view->immediate;
+    result.resolved_expression_value = view->resolved_expression_value;
+    result.address_components = view->address_components;
+    result.address_expression = view->address_expression_kind;
+    result.address_resolution = view->address_resolution;
+    return result;
+}
+
+std::optional<edge_record_t>
+packed_analysis_shard_compatibility_view_t::edge(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->edge(index);
+    if (!view)
+        return std::nullopt;
+    edge_record_t result;
+    result.id = view->id.value();
+    result.source_entity = view->source_entity.value();
+    if (view->target_entity.has_value())
+        result.target_entity = view->target_entity->value();
+    result.source = view->source;
+    result.target = view->target;
+    result.kind = view->kind;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<string_record_t>
+packed_analysis_shard_compatibility_view_t::string(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->string(index);
+    if (!view)
+        return std::nullopt;
+    string_record_t result;
+    result.id = view->id.value();
+    result.address = view->address;
+    result.byte_length = view->byte_length;
+    result.encoding = view->encoding;
+    result.value.assign(view->value.data(), view->value.size());
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<symbol_record_t>
+packed_analysis_shard_compatibility_view_t::symbol(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->symbol(index);
+    if (!view)
+        return std::nullopt;
+    symbol_record_t result;
+    result.id = view->id.value();
+    result.address = view->address;
+    result.name.assign(view->name.data(), view->name.size());
+    result.kind = view->kind;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<basic_block_record_t>
+packed_analysis_shard_compatibility_view_t::basic_block(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->basic_block(index);
+    if (!view)
+        return std::nullopt;
+    basic_block_record_t result;
+    result.id = view->id.value();
+    result.start = view->start_address;
+    result.end = view->end_address;
+    result.first_instruction = view->instruction_begin;
+    result.instruction_count = view->instruction_count;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<function_record_t>
+packed_analysis_shard_compatibility_view_t::function(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->function(index);
+    if (!view)
+        return std::nullopt;
+    function_record_t result;
+    result.id = view->id.value();
+    result.start = view->start_address;
+    result.end = view->end_address;
+    result.chunk_count = view->chunk_count;
+    if (view->symbol_id.valid())
+        result.symbol_id = view->symbol_id.value();
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<function_chunk_record_t>
+packed_analysis_shard_compatibility_view_t::function_chunk(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->function_chunk(index);
+    if (!view)
+        return std::nullopt;
+    function_chunk_record_t result;
+    result.id = view->id.value();
+    result.function_id = view->function_id.value();
+    result.start = view->start_address;
+    result.end = view->end_address;
+    result.first_block = view->block_begin;
+    result.block_count = view->block_count;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<target_fact_t>
+packed_analysis_shard_compatibility_view_t::target_fact(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->target_fact(index);
+    if (!view)
+        return std::nullopt;
+    target_fact_t result;
+    result.instruction_id = view->instruction_id.value();
+    result.operand_fact_id = view->operand_id.value();
+    result.address_expression_id = view->address_expression_id.value();
+    result.target = view->target;
+    result.kind = view->kind;
+    result.resolution = view->resolution;
+    result.operand_index = view->operand_index;
+    result.access_width_bits = view->access_width_bits;
+    result.access_count = view->access_count;
+    result.direct = view->direct;
+    result.is_external = view->is_external;
+    return result;
+}
+
+std::optional<xref_record_t>
+packed_analysis_shard_compatibility_view_t::xref(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->xref(index);
+    if (!view)
+        return std::nullopt;
+    xref_record_t result;
+    result.id = view->id.value();
+    result.source = view->source_address;
+    result.target = view->target_address;
+    result.kind = view->kind;
+    result.provenance = view->provenance;
+    result.confidence = view->confidence;
+    return result;
+}
+
+std::optional<coverage_span_t>
+packed_analysis_shard_compatibility_view_t::coverage(std::size_t index) const
+{
+    if (!shard_)
+        return std::nullopt;
+    const auto view = shard_->coverage(index);
     if (!view)
         return std::nullopt;
     coverage_span_t result;

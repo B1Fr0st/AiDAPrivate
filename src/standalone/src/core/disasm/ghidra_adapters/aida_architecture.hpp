@@ -35,6 +35,7 @@ private:
 	std::vector<std::string> warnings_;
 	function_db_t symbol_db_;
 	bool rawptr_ = true;
+	bool keep_fixateglobals_ = false;
 	bool owns_loader_ = false;
 
 	void load_registers_(const ghidra::Translate* translate);
@@ -64,6 +65,9 @@ public:
 
 	void set_rawptr(bool v) { rawptr_ = v; }
 	bool rawptr() const { return rawptr_; }
+
+	void set_keep_fixateglobals(bool v) { keep_fixateglobals_ = v; }
+	bool keep_fixateglobals() const { return keep_fixateglobals_; }
 
 protected:
 	ghidra::Translate* buildTranslator(ghidra::DocumentStorage& store) override;

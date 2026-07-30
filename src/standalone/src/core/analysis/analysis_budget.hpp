@@ -87,6 +87,29 @@ struct analysis_budget_t final {
     std::uint64_t max_cache_bytes = analysis_gibibyte;
 };
 
+struct host_memory_envelope_t final {
+    std::uint64_t total_phys = 0;
+    std::uint64_t avail_phys = 0;
+    std::uint64_t reserve_os_bytes = 0;
+    std::uint64_t usable_bytes = 0;
+};
+
+host_memory_envelope_t host_memory_envelope() noexcept;
+
+struct adaptive_analysis_budget_fields_t final {
+    std::uint64_t max_analysis_memory_bytes = 8ULL * analysis_gibibyte;
+    std::uint64_t packed_staging_memory_budget_bytes = 768ULL * analysis_mebibyte;
+    std::uint64_t packed_generation_quota_bytes = 8ULL * analysis_gibibyte;
+    std::uint64_t window_cache_per_file_bytes = 384ULL * analysis_mebibyte;
+    std::uint64_t window_cache_global_bytes = analysis_gibibyte;
+    std::uint64_t pdb_persistence_total_bytes = 384ULL * analysis_mebibyte;
+    std::uint64_t reopen_range_budget_bytes = 1536ULL * analysis_mebibyte;
+    bool low_memory = false;
+};
+
+adaptive_analysis_budget_fields_t adaptive_analysis_budget_fields(
+    const host_memory_envelope_t& envelope) noexcept;
+
 enum class analysis_reservation_state_t : std::uint8_t {
     queued = 1,
     active = 2

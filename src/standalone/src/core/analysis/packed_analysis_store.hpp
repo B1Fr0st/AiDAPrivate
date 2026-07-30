@@ -478,6 +478,8 @@ struct packed_size_accounting_t final {
     std::uint64_t reserved_bytes = 0;
 };
 
+class packed_analysis_shard_compatibility_view_t;
+
 class packed_analysis_shard_t final {
 public:
     packed_analysis_shard_t(packed_analysis_shard_t&&) noexcept;
@@ -491,6 +493,38 @@ public:
     std::uint16_t shard_id() const noexcept;
     std::uint32_t local_string_count() const noexcept;
 
+    std::uint32_t instruction_count() const noexcept;
+    std::uint32_t operand_count() const noexcept;
+    std::uint32_t edge_count() const noexcept;
+    std::uint32_t string_record_count() const noexcept;
+    std::uint32_t symbol_count() const noexcept;
+    std::uint32_t address_expression_count() const noexcept;
+    std::uint32_t basic_block_count() const noexcept;
+    std::uint32_t function_count() const noexcept;
+    std::uint32_t function_chunk_count() const noexcept;
+    std::uint32_t target_fact_count() const noexcept;
+    std::uint32_t xref_count() const noexcept;
+    std::uint32_t coverage_count() const noexcept;
+    const packed_string_pool_t& string_pool() const noexcept;
+    packed_size_accounting_t size_accounting() const noexcept;
+    packed_store_result_t<void> validate() const;
+
+    std::optional<packed_instruction_view_t> instruction(std::size_t index) const;
+    std::optional<packed_operand_view_t> operand(std::size_t index) const;
+    std::optional<packed_edge_view_t> edge(std::size_t index) const;
+    std::optional<packed_string_view_t> string(std::size_t index) const;
+    std::optional<packed_symbol_view_t> symbol(std::size_t index) const;
+    std::optional<packed_address_expression_view_t> address_expression(std::size_t index) const;
+    std::optional<packed_basic_block_view_t> basic_block(std::size_t index) const;
+    std::optional<packed_function_view_t> function(std::size_t index) const;
+    std::optional<packed_function_chunk_view_t> function_chunk(std::size_t index) const;
+    std::optional<packed_target_fact_view_t> target_fact(std::size_t index) const;
+    std::optional<packed_xref_view_t> xref(std::size_t index) const;
+    std::optional<packed_coverage_view_t> coverage(std::size_t index) const;
+    packed_analysis_shard_compatibility_view_t compatibility_view() const noexcept;
+
+    void release() noexcept;
+
 private:
     struct impl_t;
     explicit packed_analysis_shard_t(std::unique_ptr<impl_t> impl) noexcept;
@@ -499,6 +533,29 @@ private:
 
     friend class packed_analysis_shard_builder_t;
     friend class packed_analysis_store_t;
+};
+
+class packed_analysis_shard_compatibility_view_t final {
+public:
+    std::optional<instruction_record_t> instruction(std::size_t index) const;
+    std::optional<operand_fact_t> operand(std::size_t index) const;
+    std::optional<edge_record_t> edge(std::size_t index) const;
+    std::optional<string_record_t> string(std::size_t index) const;
+    std::optional<symbol_record_t> symbol(std::size_t index) const;
+    std::optional<basic_block_record_t> basic_block(std::size_t index) const;
+    std::optional<function_record_t> function(std::size_t index) const;
+    std::optional<function_chunk_record_t> function_chunk(std::size_t index) const;
+    std::optional<target_fact_t> target_fact(std::size_t index) const;
+    std::optional<xref_record_t> xref(std::size_t index) const;
+    std::optional<coverage_span_t> coverage(std::size_t index) const;
+
+private:
+    explicit packed_analysis_shard_compatibility_view_t(
+        const packed_analysis_shard_t* shard) noexcept;
+
+    const packed_analysis_shard_t* shard_ = nullptr;
+
+    friend class packed_analysis_shard_t;
 };
 
 class packed_analysis_shard_builder_t final {
@@ -525,6 +582,7 @@ public:
     packed_store_result_t<void> add_coverage(const packed_coverage_input_t& input);
     packed_store_result_t<packed_analysis_shard_t> finalize() &&;
 
+    void reserve_strings(std::size_t string_estimate);
     std::uint16_t shard_id() const noexcept;
     bool finalized() const noexcept;
 

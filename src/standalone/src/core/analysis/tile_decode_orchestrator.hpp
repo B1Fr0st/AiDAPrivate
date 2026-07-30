@@ -15,6 +15,8 @@
 
 namespace aida::analysis {
 
+class decode_worker_pool_t;
+
 enum class tile_decode_pass_t : std::uint8_t {
     recursive = 0,
     gap = 1
@@ -196,11 +198,23 @@ struct tile_decode_orchestrator_statistics_t final {
     std::uint64_t attempted_bytes = 0;
     std::uint64_t accepted_tiles = 0;
     std::uint64_t lane_wall_ns = 0;
+    std::uint64_t recursive_phase_wall_ns = 0;
+    std::uint64_t gap_phase_wall_ns = 0;
+    std::uint64_t reconcile_phase_wall_ns = 0;
+    std::uint64_t edges_phase_wall_ns = 0;
+    std::uint64_t build_phase_wall_ns = 0;
+    std::uint64_t apply_stall_count = 0;
+    std::uint64_t worker_completion_push_count = 0;
+    std::uint64_t worker_steal_count = 0;
+    std::uint64_t worker_backpressure_wait_count = 0;
+    std::uint64_t worker_inline_drain_count = 0;
+    std::uint64_t worker_max_queue_depth = 0;
     decode_frontier_snapshot_t frontier;
 };
 
 struct tile_decode_orchestration_result_t final {
     std::unique_ptr<packed_analysis_store_t> packed_store;
+    std::vector<packed_analysis_shard_t> packed_shards;
     std::vector<std::uint8_t> delay_slot_counts;
     std::vector<coverage_span_t> coverage;
     std::vector<tile_decode_cross_tile_edge_t> cross_tile_edges;
@@ -248,10 +262,33 @@ public:
         decode_lane_seed_exchange_t* lane_exchange = nullptr,
         std::uint32_t lane_id = 0) const;
 
+    workspace_result_t<tile_decode_orchestration_result_t> run_shared(
+        const provider_snapshot_t& snapshot,
+        const image_layout_index_t& layout,
+        const executable_decode_partition_t& partition,
+        std::vector<tile_decode_seed_t> seeds,
+        tile_decode_executor_t& executor,
+        const cancellation_token_t& cancellation = {},
+        decode_worker_pool_t* shared_pool = nullptr) const;
+
     const tile_decode_orchestrator_limits_t& limits() const noexcept { return limits_; }
 
 private:
     explicit tile_decode_orchestrator_t(tile_decode_orchestrator_limits_t limits) noexcept;
+
+    workspace_result_t<tile_decode_orchestration_result_t> run_impl(
+        const provider_snapshot_t& snapshot,
+        const image_layout_index_t& layout,
+        const executable_decode_partition_t* precomputed_partition,
+        std::vector<tile_decode_seed_t> seeds,
+        tile_decode_executor_t& executor,
+        const cancellation_token_t& cancellation,
+        const decode_tile_range_t* tile_range,
+        decode_lane_seed_exchange_t* lane_exchange,
+        std::uint32_t lane_id,
+        decode_worker_pool_t* shared_pool,
+        bool tile_only_shard_formula,
+        bool publish_unmerged_shards) const;
 
     tile_decode_orchestrator_limits_t limits_;
 };

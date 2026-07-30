@@ -1,9 +1,26 @@
 #include "metadata_provenance.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <sstream>
 
 namespace aida::analysis::type_graph {
+
+namespace {
+
+void log_conflict_resolution(const std::string& canonical_name, const std::string& field_name,
+                             const type_provenance_record_t& winner,
+                             const type_provenance_record_t& loser)
+{
+    diag::log_tagged_fmt("type_graph",
+        "provenance_conflict resolved type=%s field=%s winner=%s(conf=%u) loser=%s(conf=%u)",
+        canonical_name.c_str(), field_name.c_str(),
+        provenance_label(winner.source).c_str(), static_cast<unsigned>(winner.confidence),
+        provenance_label(loser.source).c_str(), static_cast<unsigned>(loser.confidence));
+}
+
+}
 
 std::uint32_t provenance_priority(decompiler_fact_provenance_t provenance) noexcept
 {
@@ -62,12 +79,16 @@ void provenance_journal_t::record(const std::string& canonical_name, const std::
     if (!bucket.empty()) {
         const auto& existing = bucket.front();
         if (!same_authority(existing, record) || existing.source != record.source) {
-            if (strictly_higher(existing, record))
+            if (strictly_higher(existing, record)) {
                 conflict_count_++;
-            else if (strictly_higher(record, existing))
+                log_conflict_resolution(canonical_name, field_name, existing, record);
+            } else if (strictly_higher(record, existing)) {
                 conflict_count_++;
-            else if (existing.source != record.source)
+                log_conflict_resolution(canonical_name, field_name, record, existing);
+            } else if (existing.source != record.source) {
                 conflict_count_++;
+                log_conflict_resolution(canonical_name, field_name, existing, record);
+            }
         }
     }
     bucket.push_back(record);

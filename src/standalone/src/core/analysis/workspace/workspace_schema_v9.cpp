@@ -5,6 +5,8 @@
 
 #include <sqlite3.h>
 
+#include <zstd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -129,6 +131,14 @@ public:
         if (status != SQLITE_OK)
             return workspace_result_t<void>::failure(
                 schema_v9_error(database_, status, "v9 bind_blob failed", phase_));
+        return workspace_result_t<void>::success();
+    }
+
+    workspace_result_t<void> bind_null(int index) {
+        const int status = sqlite3_bind_null(statement_, index);
+        if (status != SQLITE_OK)
+            return workspace_result_t<void>::failure(
+                schema_v9_error(database_, status, "v9 bind_null failed", phase_));
         return workspace_result_t<void>::success();
     }
 
@@ -379,6 +389,285 @@ workspace_result_t<void> copy_blob_v9(
     if (publish_stop_requested_v9(stop_requested))
         return workspace_result_t<void>::failure(cancelled_read_error_v9(phase));
     return workspace_result_t<void>::success();
+}
+
+std::uint32_t read_u32_le_v9(const std::uint8_t* data) noexcept {
+    return static_cast<std::uint32_t>(data[0]) |
+           (static_cast<std::uint32_t>(data[1]) << 8U) |
+           (static_cast<std::uint32_t>(data[2]) << 16U) |
+           (static_cast<std::uint32_t>(data[3]) << 24U);
+}
+
+std::uint64_t read_u64_le_v9(const std::uint8_t* data) noexcept {
+    std::uint64_t value = 0;
+    for (std::size_t index = 0; index < 8; ++index)
+        value |= static_cast<std::uint64_t>(data[index]) << (index * 8);
+    return value;
+}
+
+void append_u64_le_v9(std::vector<std::uint8_t>& output, std::uint64_t value) {
+    for (unsigned shift = 0; shift < 64; shift += 8)
+        output.push_back(static_cast<std::uint8_t>(value >> shift));
+}
+
+workspace_error_t cancelled_pdb_error_v10(const char* phase) {
+    auto error = make_workspace_error(workspace_error_code_t::cancelled,
+                                      "pdb symbol module operation was cancelled",
+                                      phase);
+    error.cancellation = true;
+    return error;
+}
+
+workspace_result_t<bool> column_exists_v9(sqlite3* database, const char* table,
+                                          const char* column) {
+    const std::string sql = std::string("PRAGMA table_info(") + table + ")";
+    v9_statement_t statement;
+    auto result = statement.prepare(database, sql.c_str(),
+                                    "workspace_schema_v10.column_exists");
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    for (;;) {
+        const int status = sqlite3_step(statement.get());
+        if (status == SQLITE_DONE)
+            return workspace_result_t<bool>::success(false);
+        if (status != SQLITE_ROW) {
+            return workspace_result_t<bool>::failure(schema_v9_error(
+                database, status, "unable to inspect table columns",
+                "workspace_schema_v10.column_exists"));
+        }
+        if (column_text_v9(statement.get(), 1) == column)
+            return workspace_result_t<bool>::success(true);
+    }
+}
+
+std::optional<std::uint64_t> packed_page_frame_content_length_v9(
+    const std::uint8_t* payload, std::size_t size) noexcept {
+    if (!payload ||
+        size < packed_record_page_prefix_size + packed_page_frame_header_size)
+        return std::nullopt;
+    const std::uint32_t magic =
+        read_u32_le_v9(payload + packed_record_page_prefix_size);
+    const std::uint32_t codec =
+        read_u32_le_v9(payload + packed_record_page_prefix_size + 4);
+    if (magic != packed_page_frame_magic || codec != packed_page_codec_zstd)
+        return std::nullopt;
+    return read_u64_le_v9(payload + packed_record_page_prefix_size + 8);
+}
+
+class zstd_cctx_v10_t final {
+public:
+    zstd_cctx_v10_t() = default;
+    ~zstd_cctx_v10_t() {
+        if (context_)
+            ZSTD_freeCCtx(context_);
+    }
+    zstd_cctx_v10_t(const zstd_cctx_v10_t&) = delete;
+    zstd_cctx_v10_t& operator=(const zstd_cctx_v10_t&) = delete;
+
+    workspace_result_t<void> initialize(int level, const char* phase) {
+        context_ = ZSTD_createCCtx();
+        if (!context_) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "unable to allocate a zstd compression context", phase));
+        }
+        size_t status = ZSTD_CCtx_setParameter(
+            context_, ZSTD_c_compressionLevel, level);
+        if (ZSTD_isError(status)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "zstd compression level is unsupported", phase));
+        }
+        status = ZSTD_CCtx_setParameter(context_, ZSTD_c_checksumFlag, 1);
+        if (ZSTD_isError(status)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::persistence_failure,
+                "unable to enable the zstd frame checksum", phase));
+        }
+        status = ZSTD_CCtx_setParameter(context_, ZSTD_c_nbWorkers, 0);
+        if (ZSTD_isError(status)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::persistence_failure,
+                "unable to pin zstd to single-threaded compression", phase));
+        }
+        return workspace_result_t<void>::success();
+    }
+
+    ZSTD_CCtx* get() noexcept { return context_; }
+
+private:
+    ZSTD_CCtx* context_ = nullptr;
+};
+
+workspace_result_t<std::vector<std::uint8_t>> seal_pdb_payload_v10(
+    const std::uint8_t* content, std::size_t content_size, std::uint32_t& codec,
+    const packed_stop_predicate_t& stop_requested) {
+    codec = packed_page_codec_raw;
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            cancelled_pdb_error_v10("workspace_schema_v10.seal_pdb_payload"));
+    if (!content && content_size != 0) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "pdb payload content is null with a non-zero size",
+                                 "workspace_schema_v10.seal_pdb_payload"));
+    }
+    std::vector<std::uint8_t> stored;
+    if (content_size >= packed_page_compress_min_content_bytes) {
+        zstd_cctx_v10_t context;
+        auto initialized = context.initialize(
+            static_cast<int>(packed_page_zstd_level_default),
+            "workspace_schema_v10.seal_pdb_payload");
+        if (!initialized)
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                initialized.error());
+        const std::size_t bound = ZSTD_compressBound(content_size);
+        if (ZSTD_isError(bound)) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "pdb payload compression bound could not be computed",
+                                     "workspace_schema_v10.seal_pdb_payload"));
+        }
+        std::vector<std::uint8_t> compressed;
+        try {
+            compressed.resize(bound);
+        } catch (const std::bad_alloc&) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                     "pdb payload compression allocation failed",
+                                     "workspace_schema_v10.seal_pdb_payload"));
+        }
+        const std::size_t produced = ZSTD_compress2(
+            context.get(), compressed.data(), compressed.size(),
+            content, content_size);
+        if (ZSTD_isError(produced)) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "pdb payload compression failed",
+                                     "workspace_schema_v10.seal_pdb_payload"));
+        }
+        if (produced + packed_page_frame_header_size < content_size) {
+            codec = packed_page_codec_zstd;
+            compressed.resize(produced);
+            stored = std::move(compressed);
+        }
+    }
+    if (codec == packed_page_codec_raw && content_size != 0)
+        stored.assign(content, content + content_size);
+    std::vector<std::uint8_t> framed;
+    try {
+        framed.reserve(packed_page_frame_header_size + stored.size() +
+                       sizeof(std::uint32_t));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "pdb payload frame allocation failed",
+                                 "workspace_schema_v10.seal_pdb_payload"));
+    }
+    append_u32_le_v9(framed, packed_page_frame_magic);
+    append_u32_le_v9(framed, codec);
+    append_u64_le_v9(framed, static_cast<std::uint64_t>(content_size));
+    framed.insert(framed.end(), stored.begin(), stored.end());
+    auto checksum = crc32c_cancellable(framed.data(), framed.size(), stop_requested);
+    if (!checksum)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            checksum.error());
+    append_u32_le_v9(framed, checksum.value());
+    return workspace_result_t<std::vector<std::uint8_t>>::success(
+        std::move(framed));
+}
+
+workspace_result_t<std::vector<std::uint8_t>> open_pdb_payload_v10(
+    const std::uint8_t* blob, std::size_t blob_size,
+    std::uint32_t expected_codec, std::uint64_t expected_uncompressed_bytes,
+    const packed_stop_predicate_t& stop_requested) {
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            cancelled_pdb_error_v10("workspace_schema_v10.open_pdb_payload"));
+    static const std::uint64_t maximum_stored_bytes =
+        packed_page_frame_header_size +
+        ZSTD_compressBound(pdb_symbol_module_max_uncompressed_bytes) +
+        sizeof(std::uint32_t);
+    if (!blob ||
+        blob_size < packed_page_frame_header_size + sizeof(std::uint32_t) ||
+        static_cast<std::uint64_t>(blob_size) > maximum_stored_bytes) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "pdb payload blob shape is invalid",
+                                 "workspace_schema_v10.open_pdb_payload"));
+    }
+    const std::uint32_t magic = read_u32_le_v9(blob);
+    const std::uint32_t codec = read_u32_le_v9(blob + 4);
+    const std::uint64_t content_length = read_u64_le_v9(blob + 8);
+    if (magic != packed_page_frame_magic || codec != expected_codec ||
+        (codec != packed_page_codec_raw && codec != packed_page_codec_zstd) ||
+        content_length != expected_uncompressed_bytes ||
+        content_length > pdb_symbol_module_max_uncompressed_bytes ||
+        (codec == packed_page_codec_zstd && content_length == 0)) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "pdb payload frame header is invalid",
+                                 "workspace_schema_v10.open_pdb_payload"));
+    }
+    if ((codec == packed_page_codec_raw &&
+         blob_size != packed_page_frame_header_size +
+             static_cast<std::size_t>(content_length) + sizeof(std::uint32_t)) ||
+        (codec == packed_page_codec_zstd &&
+         static_cast<std::uint64_t>(blob_size) >
+             packed_page_frame_header_size + ZSTD_compressBound(content_length) +
+                 sizeof(std::uint32_t))) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "pdb payload stored length is inconsistent",
+                                 "workspace_schema_v10.open_pdb_payload"));
+    }
+    const std::uint32_t expected_checksum =
+        read_u32_le_v9(blob + blob_size - sizeof(std::uint32_t));
+    auto computed_checksum = crc32c_cancellable(
+        blob, blob_size - sizeof(std::uint32_t), stop_requested);
+    if (!computed_checksum)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            computed_checksum.error());
+    if (computed_checksum.value() != expected_checksum) {
+        auto error = make_workspace_error(workspace_error_code_t::integrity_failure,
+                                          "pdb payload checksum verification failed",
+                                          "workspace_schema_v10.open_pdb_payload");
+        error.details.emplace_back("expected_checksum",
+                                   std::to_string(computed_checksum.value()));
+        error.details.emplace_back("actual_checksum",
+                                   std::to_string(expected_checksum));
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            std::move(error));
+    }
+    const std::uint8_t* stored = blob + packed_page_frame_header_size;
+    const std::size_t stored_size =
+        blob_size - packed_page_frame_header_size - sizeof(std::uint32_t);
+    if (codec == packed_page_codec_raw) {
+        return workspace_result_t<std::vector<std::uint8_t>>::success(
+            std::vector<std::uint8_t>(stored, stored + stored_size));
+    }
+    std::vector<std::uint8_t> output;
+    try {
+        output.resize(static_cast<std::size_t>(content_length));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "pdb payload decompression allocation failed",
+                                 "workspace_schema_v10.open_pdb_payload"));
+    }
+    const std::size_t produced = ZSTD_decompress(
+        output.data(), output.size(), stored, stored_size);
+    if (ZSTD_isError(produced) || produced != content_length) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "pdb payload decompression failed verification",
+                                 "workspace_schema_v10.open_pdb_payload"));
+    }
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            cancelled_pdb_error_v10("workspace_schema_v10.open_pdb_payload"));
+    return workspace_result_t<std::vector<std::uint8_t>>::success(
+        std::move(output));
 }
 
 workspace_result_t<void> create_snapshot_extension_slot_v9(
@@ -671,7 +960,7 @@ workspace_result_t<void> validate_staged_generation_v9(
     v9_statement_t statement;
     auto result = statement.prepare(database, R"SQL(
 SELECT p.generation,p.page_index,p.page_count,p.page_type,p.payload_length,p.checksum,p.payload,
-       i.domain,i.ordinal_begin,i.count,i.address_value_min,i.address_value_max
+       i.domain,i.ordinal_begin,i.count,i.address_value_min,i.address_value_max,p.logical_length
 FROM packed_pages p
 JOIN packed_page_index i ON i.generation=p.generation AND i.page_index=p.page_index
 WHERE p.generation=?1
@@ -727,6 +1016,22 @@ ORDER BY p.page_index
             sqlite3_column_int64(statement.get(), 10));
         const auto address_value_max = static_cast<std::uint64_t>(
             sqlite3_column_int64(statement.get(), 11));
+        std::uint32_t logical_length = 0;
+        if (sqlite3_column_type(statement.get(), 12) != SQLITE_NULL) {
+            const auto declared_logical_length =
+                sqlite3_column_int64(statement.get(), 12);
+            if (declared_logical_length <
+                    static_cast<std::int64_t>(packed_record_page_prefix_size) ||
+                declared_logical_length >
+                    static_cast<std::int64_t>(packed_page_max_payload)) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "staged packed page logical length is invalid",
+                        "workspace_schema_v9.publish_packed_generation"));
+            }
+            logical_length = static_cast<std::uint32_t>(declared_logical_length);
+        }
         const void* blob = sqlite3_column_blob(statement.get(), 6);
         const int blob_size = sqlite3_column_bytes(statement.get(), 6);
         if (page_generation != generation.generation ||
@@ -751,6 +1056,8 @@ ORDER BY p.page_index
         page.header.generation = page_generation;
         page.header.analysis_revision = generation.analysis_revision;
         page.header.overlay_revision = generation.overlay_revision;
+        page.header.version = logical_length != 0
+            ? packed_page_blob_version_v3 : packed_page_blob_version;
         page.header.page_type = page_type;
         page.header.page_index = page_index;
         page.header.page_count = page_count;
@@ -765,10 +1072,26 @@ ORDER BY p.page_index
         auto verified = packed_page_codec_t::verify_page(page, stop_requested);
         if (!verified)
             return verified;
+        if (logical_length != 0) {
+            const auto frame_content_length = packed_page_frame_content_length_v9(
+                page.payload.data(), page.payload.size());
+            if (!frame_content_length ||
+                *frame_content_length + packed_record_page_prefix_size !=
+                    logical_length) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "staged packed page logical length does not match its frame",
+                        "workspace_schema_v9.publish_packed_generation"));
+            }
+        }
         auto prefix = packed_record_page_prefix_t::decode(
             page.payload.data(), page.payload.size());
         const auto domain_index = static_cast<std::size_t>(page_type);
         std::uint64_t next_domain_ordinal = 0;
+        const std::uint64_t logical_bytes = logical_length != 0
+            ? static_cast<std::uint64_t>(logical_length)
+            : static_cast<std::uint64_t>(page.payload.size());
         if (!prefix || ordinal_begin != prefix->ordinal_begin ||
             record_count != prefix->record_count ||
             address_value_min != prefix->address_value_min ||
@@ -776,7 +1099,7 @@ ORDER BY p.page_index
             prefix->ordinal_begin != next_domain_ordinals[domain_index] ||
             !checked_add_u64(next_domain_ordinals[domain_index],
                              prefix->record_count, next_domain_ordinal) ||
-            !checked_add_u64(observed_payload_bytes, page.payload.size(),
+            !checked_add_u64(observed_payload_bytes, logical_bytes,
                              observed_payload_bytes) ||
             observed_payload_bytes > packed_generation_max_payload_bytes ||
             !checked_add_u64(observed_records, prefix->record_count,
@@ -1368,6 +1691,58 @@ END;
     return workspace_result_t<void>::success();
 }
 
+workspace_result_t<void> create_schema_v10(sqlite3* database) {
+    if (!database) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "schema v10 migration requires an open database",
+            "workspace_schema_v10.migrate"));
+    }
+    auto base = create_schema_v9(database);
+    if (!base)
+        return base;
+    auto has_logical_length = column_exists_v9(
+        database, "packed_pages", "logical_length");
+    if (!has_logical_length)
+        return workspace_result_t<void>::failure(has_logical_length.error());
+    if (!has_logical_length.value()) {
+        auto altered = exec_sql_v9(database,
+            "ALTER TABLE packed_pages ADD COLUMN logical_length INTEGER",
+            "workspace_schema_v10.logical_length");
+        if (!altered)
+            return altered;
+    }
+    auto created = exec_sql_v9(database, R"SQL(
+CREATE TABLE IF NOT EXISTS pdb_symbol_modules(
+    module_key TEXT PRIMARY KEY,
+    module_name TEXT NOT NULL,
+    base INTEGER NOT NULL CHECK(base >= 0),
+    size INTEGER NOT NULL CHECK(size > 0),
+    pdb_guid BLOB NOT NULL CHECK(length(pdb_guid) = 16),
+    pdb_age INTEGER NOT NULL CHECK(pdb_age >= 0),
+    pdb_path TEXT NOT NULL,
+    pdb_file_size INTEGER,
+    pdb_volume_serial INTEGER,
+    pdb_file_id BLOB,
+    pdb_last_write_100ns INTEGER,
+    symbol_count INTEGER NOT NULL CHECK(symbol_count BETWEEN 0 AND 4194304),
+    struct_count INTEGER NOT NULL CHECK(struct_count BETWEEN 0 AND 1048576),
+    enum_count INTEGER NOT NULL CHECK(enum_count BETWEEN 0 AND 1048576),
+    payload_codec INTEGER NOT NULL CHECK(payload_codec IN (0,1)),
+    payload_uncompressed_bytes INTEGER NOT NULL CHECK(payload_uncompressed_bytes BETWEEN 0 AND 268435456),
+    payload BLOB NOT NULL,
+    source_lines_codec INTEGER CHECK(source_lines_codec IS NULL OR source_lines_codec IN (0,1)),
+    source_lines_uncompressed_bytes INTEGER CHECK(source_lines_uncompressed_bytes IS NULL OR source_lines_uncompressed_bytes BETWEEN 0 AND 268435456),
+    source_lines BLOB,
+    created_utc_ms INTEGER NOT NULL,
+    updated_utc_ms INTEGER NOT NULL
+);
+)SQL", "workspace_schema_v10.pdb_symbol_modules");
+    if (!created)
+        return created;
+    return workspace_result_t<void>::success();
+}
+
 workspace_result_t<void> write_packed_generation(
     sqlite3* database, const packed_generation_record_t& record) {
     if (record.generation == 0 || record.committed || record.shard_count == 0 ||
@@ -1495,7 +1870,8 @@ workspace_result_t<void> write_packed_page(
         row.page_type > static_cast<std::uint32_t>(packed_page_last_data_type) ||
         row.payload.size() < packed_record_page_prefix_size ||
         row.payload.size() > packed_page_max_payload ||
-        row.payload_length != row.payload.size()) {
+        row.payload_length != row.payload.size() ||
+        row.logical_length != 0) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "packed page metadata exceeds its bounded invariants",
@@ -1572,8 +1948,8 @@ workspace_result_t<std::vector<packed_page_row_t>>
     }
     v9_statement_t statement;
     result = statement.prepare(database, committed_only
-        ? "SELECT p.generation,p.page_index,p.page_count,p.page_type,p.payload_length,p.checksum,length(p.payload),p.payload FROM packed_pages p JOIN packed_generations g ON g.generation=p.generation AND g.committed=1 WHERE p.generation=?1 ORDER BY p.page_index"
-        : "SELECT generation,page_index,page_count,page_type,payload_length,checksum,length(payload),payload FROM packed_pages WHERE generation=?1 ORDER BY page_index",
+        ? "SELECT p.generation,p.page_index,p.page_count,p.page_type,p.payload_length,p.checksum,length(p.payload),p.payload,p.logical_length FROM packed_pages p JOIN packed_generations g ON g.generation=p.generation AND g.committed=1 WHERE p.generation=?1 ORDER BY p.page_index"
+        : "SELECT generation,page_index,page_count,page_type,payload_length,checksum,length(payload),payload,logical_length FROM packed_pages WHERE generation=?1 ORDER BY page_index",
         "workspace_schema_v9.read_packed_pages");
     if (!result)
         return workspace_result_t<std::vector<packed_page_row_t>>::failure(result.error());
@@ -1613,6 +1989,22 @@ workspace_result_t<std::vector<packed_page_row_t>>
         const auto declared_length = sqlite3_column_int64(statement.get(), 6);
         const void* payload = sqlite3_column_blob(statement.get(), 7);
         const int payload_bytes = sqlite3_column_bytes(statement.get(), 7);
+        std::uint32_t logical_length = 0;
+        if (sqlite3_column_type(statement.get(), 8) != SQLITE_NULL) {
+            const auto declared_logical_length =
+                sqlite3_column_int64(statement.get(), 8);
+            if (declared_logical_length <
+                    static_cast<std::int64_t>(packed_record_page_prefix_size) ||
+                declared_logical_length >
+                    static_cast<std::int64_t>(packed_page_max_payload)) {
+                return workspace_result_t<std::vector<packed_page_row_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                                         "packed page logical length is malformed",
+                                         "workspace_schema_v9.read_packed_pages"));
+            }
+            logical_length = static_cast<std::uint32_t>(declared_logical_length);
+        }
+        row.logical_length = logical_length;
         if (rows.size() >= packed_generation_max_pages ||
             declared_length < 0 || payload_bytes < 0 ||
             static_cast<std::uint64_t>(declared_length) > packed_page_max_payload ||
@@ -2439,8 +2831,8 @@ workspace_result_t<void> stage_packed_generation_stream_atomic(
 
     v9_statement_t page_statement;
     result = page_statement.prepare(database, R"SQL(
-INSERT INTO packed_pages(generation,page_index,page_count,page_type,payload_length,checksum,payload)
-VALUES(?1,?2,?3,?4,?5,?6,?7)
+INSERT INTO packed_pages(generation,page_index,page_count,page_type,payload_length,checksum,payload,logical_length)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
 )SQL", "workspace_schema_v9.stream_atomic.page");
     if (!result)
         return fail(std::move(result));
@@ -2478,6 +2870,9 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
             page.payload.size() < packed_record_page_prefix_size ||
             page.payload.size() > packed_page_max_payload ||
             page.payload_length != page.payload.size() ||
+            (page.logical_length != 0 &&
+             (page.logical_length < packed_record_page_prefix_size ||
+              page.logical_length > packed_page_max_payload)) ||
             index.generation != generation.generation ||
             index.page_index != page.page_index ||
             index.domain != static_cast<std::uint16_t>(page.page_type)) {
@@ -2491,6 +2886,8 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
         verified_page.header.generation = page.generation;
         verified_page.header.analysis_revision = generation.analysis_revision;
         verified_page.header.overlay_revision = generation.overlay_revision;
+        verified_page.header.version = page.logical_length != 0
+            ? packed_page_blob_version_v3 : packed_page_blob_version;
         verified_page.header.page_type = page.page_type;
         verified_page.header.page_index = page.page_index;
         verified_page.header.page_count = page.page_count;
@@ -2503,10 +2900,27 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
             sink_failure = verified;
             return sink_failure;
         }
+        if (page.logical_length != 0) {
+            const auto frame_content_length = packed_page_frame_content_length_v9(
+                page.payload.data(), page.payload.size());
+            if (!frame_content_length ||
+                *frame_content_length + packed_record_page_prefix_size !=
+                    page.logical_length) {
+                sink_failure = workspace_result_t<void>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed stream page logical length does not match its frame",
+                        "workspace_schema_v9.stream_atomic"));
+                return sink_failure;
+            }
+        }
         auto prefix = packed_record_page_prefix_t::decode(
             page.payload.data(), page.payload.size());
         const auto domain_index = static_cast<std::size_t>(page.page_type);
         std::uint64_t next_domain_ordinal = 0;
+        const std::uint64_t logical_bytes = page.logical_length != 0
+            ? static_cast<std::uint64_t>(page.logical_length)
+            : static_cast<std::uint64_t>(page.payload.size());
         if (!prefix || index.ordinal_begin != prefix->ordinal_begin ||
             index.count != prefix->record_count ||
             index.address_value_min != prefix->address_value_min ||
@@ -2514,7 +2928,7 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
             prefix->ordinal_begin != next_domain_ordinals[domain_index] ||
             !checked_add_u64(next_domain_ordinals[domain_index],
                              prefix->record_count, next_domain_ordinal) ||
-            !checked_add_u64(observed_payload_bytes, page.payload.size(),
+            !checked_add_u64(observed_payload_bytes, logical_bytes,
                              observed_payload_bytes) ||
             observed_payload_bytes > descriptor.payload_quota_bytes ||
             !checked_add_u64(observed_records, prefix->record_count,
@@ -2535,6 +2949,12 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
         result = page_statement.bind_int(5, page.payload_length); if (!result) { sink_failure = result; return sink_failure; }
         result = page_statement.bind_int(6, static_cast<std::int64_t>(page.checksum)); if (!result) { sink_failure = result; return sink_failure; }
         result = page_statement.bind_blob(7, page.payload.data(), page.payload.size()); if (!result) { sink_failure = result; return sink_failure; }
+        if (page.logical_length != 0) {
+            result = page_statement.bind_int(8, static_cast<std::int64_t>(page.logical_length));
+        } else {
+            result = page_statement.bind_null(8);
+        }
+        if (!result) { sink_failure = result; return sink_failure; }
         result = page_statement.step_done(); if (!result) { sink_failure = result; return sink_failure; }
         result = page_statement.reset(); if (!result) { sink_failure = result; return sink_failure; }
 
@@ -2631,7 +3051,7 @@ workspace_result_t<void> visit_packed_domain_pages(
     v9_statement_t statement;
     auto result = statement.prepare(database, R"SQL(
 SELECT p.generation,p.page_index,p.page_count,p.page_type,p.payload_length,p.checksum,p.payload,
-       i.domain,i.ordinal_begin,i.count,i.address_value_min,i.address_value_max
+       i.domain,i.ordinal_begin,i.count,i.address_value_min,i.address_value_max,p.logical_length
 FROM packed_pages p
 JOIN packed_page_index i ON i.generation=p.generation AND i.page_index=p.page_index
 JOIN packed_generations g ON g.generation=p.generation AND g.committed=1
@@ -2686,10 +3106,28 @@ ORDER BY p.page_index
         index.page_index = page.page_index;
         index.address_value_min = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 10));
         index.address_value_max = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 11));
+        std::uint32_t logical_length = 0;
+        if (sqlite3_column_type(statement.get(), 12) != SQLITE_NULL) {
+            const auto declared_logical_length =
+                sqlite3_column_int64(statement.get(), 12);
+            if (declared_logical_length <
+                    static_cast<std::int64_t>(packed_record_page_prefix_size) ||
+                declared_logical_length >
+                    static_cast<std::int64_t>(packed_page_max_payload)) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                                         "packed domain page logical length is invalid",
+                                         "workspace_schema_v9.visit_domain"));
+            }
+            logical_length = static_cast<std::uint32_t>(declared_logical_length);
+        }
+        page.logical_length = logical_length;
         packed_page_t verified_page;
         verified_page.header.generation = page.generation;
         verified_page.header.analysis_revision = manifest.value()->analysis_revision;
         verified_page.header.overlay_revision = manifest.value()->overlay_revision;
+        verified_page.header.version = logical_length != 0
+            ? packed_page_blob_version_v3 : packed_page_blob_version;
         verified_page.header.page_type = page.page_type;
         verified_page.header.page_index = page.page_index;
         verified_page.header.page_count = page.page_count;
@@ -2700,6 +3138,19 @@ ORDER BY p.page_index
             verified_page, stop_requested);
         if (!verified)
             return verified;
+        if (logical_length != 0) {
+            const auto frame_content_length = packed_page_frame_content_length_v9(
+                page.payload.data(), page.payload.size());
+            if (!frame_content_length ||
+                *frame_content_length + packed_record_page_prefix_size !=
+                    logical_length) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed domain page logical length does not match its frame",
+                        "workspace_schema_v9.visit_domain"));
+            }
+        }
         auto prefix = packed_record_page_prefix_t::decode(
             page.payload.data(), page.payload.size());
         if (!prefix || index.domain != encoded_domain ||
@@ -2907,7 +3358,7 @@ workspace_result_t<void> publish_packed_generation_metadata(
     v9_statement_t statement;
     auto result = statement.prepare(database, R"SQL(
 SELECT p.page_index,p.page_count,p.page_type,p.checksum,p.payload_length,
-       i.domain,i.ordinal_begin,i.count
+       i.domain,i.ordinal_begin,i.count,p.logical_length
 FROM packed_pages p
 JOIN packed_page_index i ON i.generation=p.generation AND i.page_index=p.page_index
 WHERE p.generation=?1
@@ -2955,6 +3406,25 @@ ORDER BY p.page_index
             sqlite3_column_int64(statement.get(), 6));
         const auto record_count = static_cast<std::uint32_t>(
             sqlite3_column_int64(statement.get(), 7));
+        std::uint32_t logical_length = 0;
+        if (sqlite3_column_type(statement.get(), 8) != SQLITE_NULL) {
+            const auto declared_logical_length =
+                sqlite3_column_int64(statement.get(), 8);
+            if (declared_logical_length <
+                    static_cast<std::int64_t>(packed_record_page_prefix_size) ||
+                declared_logical_length >
+                    static_cast<std::int64_t>(packed_page_max_payload)) {
+                return fail(workspace_result_t<void>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "staged packed page logical length is invalid",
+                        "workspace_schema_v9.publish_packed_generation_metadata")));
+            }
+            logical_length = static_cast<std::uint32_t>(declared_logical_length);
+        }
+        const std::uint64_t logical_bytes = logical_length != 0
+            ? static_cast<std::uint64_t>(logical_length)
+            : static_cast<std::uint64_t>(payload_length);
         const auto domain_index = static_cast<std::size_t>(page_type);
         std::uint64_t next_domain_ordinal = 0;
         if (page_index != next_page_index || page_count == 0 ||
@@ -2966,10 +3436,11 @@ ORDER BY p.page_index
             domain != static_cast<std::uint16_t>(page_type) ||
             payload_length < packed_record_page_prefix_size ||
             payload_length > packed_page_max_payload ||
+            (logical_length != 0 && logical_length <= payload_length) ||
             ordinal_begin != next_domain_ordinals[domain_index] ||
             !checked_add_u64(next_domain_ordinals[domain_index],
                              record_count, next_domain_ordinal) ||
-            !checked_add_u64(observed_payload_bytes, payload_length,
+            !checked_add_u64(observed_payload_bytes, logical_bytes,
                              observed_payload_bytes) ||
             observed_payload_bytes > packed_generation_max_payload_bytes ||
             !checked_add_u64(observed_records, record_count,
@@ -3304,6 +3775,326 @@ workspace_result_t<void> delete_pipeline_cache_v1_functions(
         if (!result) return result;
     }
     return workspace_result_t<void>::success();
+}
+
+workspace_result_t<bool> write_pdb_symbol_module(
+    sqlite3* database, const pdb_symbol_module_record_t& record,
+    const packed_stop_predicate_t& stop_requested) {
+    if (!database || record.module_key.empty() ||
+        record.module_key.size() > pdb_symbol_module_max_name_bytes ||
+        record.module_name.empty() ||
+        record.module_name.size() > pdb_symbol_module_max_name_bytes ||
+        record.pdb_path.size() > pdb_symbol_module_max_path_bytes ||
+        record.size == 0 ||
+        record.symbol_count > pdb_symbol_module_max_symbols ||
+        record.struct_count > pdb_symbol_module_max_structs ||
+        record.enum_count > pdb_symbol_module_max_enums ||
+        record.payload.size() > pdb_symbol_module_max_uncompressed_bytes ||
+        (record.source_lines &&
+         record.source_lines->size() > pdb_symbol_module_max_uncompressed_bytes)) {
+        return workspace_result_t<bool>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "pdb symbol module record exceeds its bounded invariants",
+            "workspace_schema_v10.write_pdb_symbol_module"));
+    }
+    if (publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<bool>::failure(
+            cancelled_pdb_error_v10("workspace_schema_v10.write_pdb_symbol_module"));
+    std::uint32_t payload_codec = packed_page_codec_raw;
+    auto sealed_payload = seal_pdb_payload_v10(
+        record.payload.data(), record.payload.size(), payload_codec,
+        stop_requested);
+    if (!sealed_payload)
+        return workspace_result_t<bool>::failure(sealed_payload.error());
+    std::uint32_t source_lines_codec = packed_page_codec_raw;
+    std::vector<std::uint8_t> sealed_source_lines;
+    if (record.source_lines) {
+        auto sealed = seal_pdb_payload_v10(
+            record.source_lines->data(), record.source_lines->size(),
+            source_lines_codec, stop_requested);
+        if (!sealed)
+            return workspace_result_t<bool>::failure(sealed.error());
+        sealed_source_lines = std::move(sealed.value());
+    }
+    v9_statement_t caps_statement;
+    auto result = caps_statement.prepare(database,
+        "SELECT COUNT(*),COALESCE(SUM(length(payload)+COALESCE(length(source_lines),0)),0) FROM pdb_symbol_modules WHERE module_key<>?1",
+        "workspace_schema_v10.write_pdb_symbol_module.caps");
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    result = caps_statement.bind_text(1, record.module_key);
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    const int caps_status = sqlite3_step(caps_statement.get());
+    if (caps_status == SQLITE_INTERRUPT && publish_stop_requested_v9(stop_requested))
+        return workspace_result_t<bool>::failure(
+            cancelled_pdb_error_v10("workspace_schema_v10.write_pdb_symbol_module"));
+    if (caps_status != SQLITE_ROW) {
+        return workspace_result_t<bool>::failure(schema_v9_error(
+            database, caps_status, "unable to bound pdb symbol module rows",
+            "workspace_schema_v10.write_pdb_symbol_module"));
+    }
+    const auto other_rows = sqlite3_column_int64(caps_statement.get(), 0);
+    const auto other_bytes = sqlite3_column_int64(caps_statement.get(), 1);
+    const std::uint64_t new_stored_bytes =
+        static_cast<std::uint64_t>(sealed_payload.value().size()) +
+        static_cast<std::uint64_t>(sealed_source_lines.size());
+    if (other_rows < 0 || other_bytes < 0 ||
+        static_cast<std::uint64_t>(other_rows) + 1ULL >
+            pdb_symbol_modules_max_rows ||
+        static_cast<std::uint64_t>(other_bytes) + new_stored_bytes >
+            pdb_symbol_modules_max_stored_bytes) {
+        return workspace_result_t<bool>::success(false);
+    }
+    v9_statement_t statement;
+    result = statement.prepare(database, R"SQL(
+INSERT INTO pdb_symbol_modules(module_key,module_name,base,size,pdb_guid,pdb_age,pdb_path,pdb_file_size,pdb_volume_serial,pdb_file_id,pdb_last_write_100ns,symbol_count,struct_count,enum_count,payload_codec,payload_uncompressed_bytes,payload,source_lines_codec,source_lines_uncompressed_bytes,source_lines,created_utc_ms,updated_utc_ms)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
+ON CONFLICT(module_key) DO UPDATE SET module_name=excluded.module_name,base=excluded.base,size=excluded.size,pdb_guid=excluded.pdb_guid,pdb_age=excluded.pdb_age,pdb_path=excluded.pdb_path,pdb_file_size=excluded.pdb_file_size,pdb_volume_serial=excluded.pdb_volume_serial,pdb_file_id=excluded.pdb_file_id,pdb_last_write_100ns=excluded.pdb_last_write_100ns,symbol_count=excluded.symbol_count,struct_count=excluded.struct_count,enum_count=excluded.enum_count,payload_codec=excluded.payload_codec,payload_uncompressed_bytes=excluded.payload_uncompressed_bytes,payload=excluded.payload,source_lines_codec=excluded.source_lines_codec,source_lines_uncompressed_bytes=excluded.source_lines_uncompressed_bytes,source_lines=excluded.source_lines,updated_utc_ms=excluded.updated_utc_ms
+)SQL", "workspace_schema_v10.write_pdb_symbol_module");
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    const auto now = utc_ms_v9();
+    result = statement.bind_text(1, record.module_key); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_text(2, record.module_name); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_uint(3, record.base); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_uint(4, record.size); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_blob(5, record.pdb_guid.data(), record.pdb_guid.size()); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_int(6, static_cast<std::int64_t>(record.pdb_age)); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_text(7, record.pdb_path); if (!result) return workspace_result_t<bool>::failure(result.error());
+    if (record.pdb_file_size) {
+        result = statement.bind_uint(8, *record.pdb_file_size);
+    } else {
+        result = statement.bind_null(8);
+    }
+    if (!result) return workspace_result_t<bool>::failure(result.error());
+    if (record.pdb_volume_serial) {
+        result = statement.bind_uint(9, *record.pdb_volume_serial);
+    } else {
+        result = statement.bind_null(9);
+    }
+    if (!result) return workspace_result_t<bool>::failure(result.error());
+    if (record.pdb_file_id) {
+        result = statement.bind_blob(10, record.pdb_file_id->data(), record.pdb_file_id->size());
+    } else {
+        result = statement.bind_null(10);
+    }
+    if (!result) return workspace_result_t<bool>::failure(result.error());
+    if (record.pdb_last_write_100ns) {
+        result = statement.bind_uint(11, *record.pdb_last_write_100ns);
+    } else {
+        result = statement.bind_null(11);
+    }
+    if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_int(12, static_cast<std::int64_t>(record.symbol_count)); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_int(13, static_cast<std::int64_t>(record.struct_count)); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_int(14, static_cast<std::int64_t>(record.enum_count)); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_int(15, static_cast<std::int64_t>(payload_codec)); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_int(16, static_cast<std::int64_t>(record.payload.size())); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_blob(17, sealed_payload.value().data(), sealed_payload.value().size()); if (!result) return workspace_result_t<bool>::failure(result.error());
+    if (record.source_lines) {
+        result = statement.bind_int(18, static_cast<std::int64_t>(source_lines_codec)); if (!result) return workspace_result_t<bool>::failure(result.error());
+        result = statement.bind_int(19, static_cast<std::int64_t>(record.source_lines->size())); if (!result) return workspace_result_t<bool>::failure(result.error());
+        result = statement.bind_blob(20, sealed_source_lines.data(), sealed_source_lines.size()); if (!result) return workspace_result_t<bool>::failure(result.error());
+    } else {
+        result = statement.bind_null(18); if (!result) return workspace_result_t<bool>::failure(result.error());
+        result = statement.bind_null(19); if (!result) return workspace_result_t<bool>::failure(result.error());
+        result = statement.bind_null(20); if (!result) return workspace_result_t<bool>::failure(result.error());
+    }
+    result = statement.bind_uint(21, now); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.bind_uint(22, now); if (!result) return workspace_result_t<bool>::failure(result.error());
+    result = statement.step_done();
+    if (!result)
+        return workspace_result_t<bool>::failure(result.error());
+    return workspace_result_t<bool>::success(true);
+}
+
+workspace_result_t<void> visit_pdb_symbol_modules(
+    sqlite3* database, const pdb_symbol_module_visitor_t& visitor,
+    const packed_stop_predicate_t& stop_requested) {
+    if (!database || !visitor) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "pdb symbol module visitor identity is invalid",
+            "workspace_schema_v10.visit_pdb_symbol_modules"));
+    }
+    v9_statement_t statement;
+    auto result = statement.prepare(database, R"SQL(
+SELECT module_key,module_name,base,size,pdb_guid,pdb_age,pdb_path,pdb_file_size,pdb_volume_serial,pdb_file_id,pdb_last_write_100ns,symbol_count,struct_count,enum_count,payload_codec,payload_uncompressed_bytes,payload,source_lines_codec,source_lines_uncompressed_bytes,source_lines,created_utc_ms,updated_utc_ms
+FROM pdb_symbol_modules
+ORDER BY module_key
+)SQL", "workspace_schema_v10.visit_pdb_symbol_modules");
+    if (!result)
+        return result;
+    std::uint64_t visited = 0;
+    for (;;) {
+        if (publish_stop_requested_v9(stop_requested))
+            return workspace_result_t<void>::failure(
+                cancelled_pdb_error_v10("workspace_schema_v10.visit_pdb_symbol_modules"));
+        const int status = sqlite3_step(statement.get());
+        if (status == SQLITE_DONE)
+            break;
+        if (status != SQLITE_ROW) {
+            return workspace_result_t<void>::failure(schema_v9_error(
+                database, status, "unable to visit pdb symbol module row",
+                "workspace_schema_v10.visit_pdb_symbol_modules"));
+        }
+        if (visited >= pdb_symbol_modules_max_rows) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "pdb symbol module table exceeds its bounded row count",
+                                     "workspace_schema_v10.visit_pdb_symbol_modules"));
+        }
+        pdb_symbol_module_record_t record;
+        record.module_key = column_text_v9(statement.get(), 0);
+        record.module_name = column_text_v9(statement.get(), 1);
+        record.base = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 2));
+        record.size = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 3));
+        const void* guid = sqlite3_column_blob(statement.get(), 4);
+        const int guid_size = sqlite3_column_bytes(statement.get(), 4);
+        const auto pdb_age = sqlite3_column_int64(statement.get(), 5);
+        record.pdb_path = column_text_v9(statement.get(), 6);
+        const auto read_optional_u64 = [&](int index) -> std::optional<std::uint64_t> {
+            if (sqlite3_column_type(statement.get(), index) == SQLITE_NULL)
+                return std::nullopt;
+            return static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), index));
+        };
+        record.pdb_file_size = read_optional_u64(7);
+        record.pdb_volume_serial = read_optional_u64(8);
+        const void* file_id = sqlite3_column_blob(statement.get(), 9);
+        const int file_id_size = sqlite3_column_bytes(statement.get(), 9);
+        record.pdb_last_write_100ns = read_optional_u64(10);
+        const auto symbol_count = sqlite3_column_int64(statement.get(), 11);
+        const auto struct_count = sqlite3_column_int64(statement.get(), 12);
+        const auto enum_count = sqlite3_column_int64(statement.get(), 13);
+        const auto payload_codec = sqlite3_column_int64(statement.get(), 14);
+        const auto payload_uncompressed = sqlite3_column_int64(statement.get(), 15);
+        const void* payload_blob = sqlite3_column_blob(statement.get(), 16);
+        const int payload_blob_size = sqlite3_column_bytes(statement.get(), 16);
+        const bool source_lines_codec_null =
+            sqlite3_column_type(statement.get(), 17) == SQLITE_NULL;
+        const bool source_lines_bytes_null =
+            sqlite3_column_type(statement.get(), 18) == SQLITE_NULL;
+        const bool source_lines_blob_null =
+            sqlite3_column_type(statement.get(), 19) == SQLITE_NULL;
+        const auto source_lines_codec = sqlite3_column_int64(statement.get(), 17);
+        const auto source_lines_uncompressed = sqlite3_column_int64(statement.get(), 18);
+        const void* source_lines_blob = sqlite3_column_blob(statement.get(), 19);
+        const int source_lines_blob_size = sqlite3_column_bytes(statement.get(), 19);
+        record.created_utc_ms = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 20));
+        record.updated_utc_ms = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 21));
+        if (record.module_key.empty() ||
+            record.module_key.size() > pdb_symbol_module_max_name_bytes ||
+            record.module_name.empty() ||
+            record.module_name.size() > pdb_symbol_module_max_name_bytes ||
+            record.pdb_path.size() > pdb_symbol_module_max_path_bytes ||
+            record.size == 0 || !guid || guid_size != 16 ||
+            pdb_age < 0 ||
+            pdb_age > static_cast<std::int64_t>((std::numeric_limits<std::uint32_t>::max)()) ||
+            symbol_count < 0 || symbol_count > pdb_symbol_module_max_symbols ||
+            struct_count < 0 || struct_count > pdb_symbol_module_max_structs ||
+            enum_count < 0 || enum_count > pdb_symbol_module_max_enums ||
+            (payload_codec != packed_page_codec_raw &&
+             payload_codec != packed_page_codec_zstd) ||
+            payload_uncompressed < 0 ||
+            static_cast<std::uint64_t>(payload_uncompressed) >
+                pdb_symbol_module_max_uncompressed_bytes ||
+            !payload_blob || payload_blob_size < 20 ||
+            source_lines_codec_null != source_lines_bytes_null ||
+            source_lines_bytes_null != source_lines_blob_null ||
+            (!source_lines_codec_null &&
+             ((source_lines_codec != packed_page_codec_raw &&
+               source_lines_codec != packed_page_codec_zstd) ||
+              source_lines_uncompressed < 0 ||
+              static_cast<std::uint64_t>(source_lines_uncompressed) >
+                  pdb_symbol_module_max_uncompressed_bytes ||
+              !source_lines_blob || source_lines_blob_size < 20)) ||
+            (file_id_size != 0 && (!file_id || file_id_size != 16))) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "pdb symbol module row is malformed",
+                                     "workspace_schema_v10.visit_pdb_symbol_modules"));
+        }
+        std::memcpy(record.pdb_guid.data(), guid, record.pdb_guid.size());
+        record.pdb_age = static_cast<std::uint32_t>(pdb_age);
+        record.symbol_count = static_cast<std::uint32_t>(symbol_count);
+        record.struct_count = static_cast<std::uint32_t>(struct_count);
+        record.enum_count = static_cast<std::uint32_t>(enum_count);
+        if (file_id_size == 16) {
+            std::array<std::uint8_t, 16> file_id_value{};
+            std::memcpy(file_id_value.data(), file_id, file_id_value.size());
+            record.pdb_file_id = file_id_value;
+        }
+        auto payload = open_pdb_payload_v10(
+            static_cast<const std::uint8_t*>(payload_blob),
+            static_cast<std::size_t>(payload_blob_size),
+            static_cast<std::uint32_t>(payload_codec),
+            static_cast<std::uint64_t>(payload_uncompressed), stop_requested);
+        if (!payload)
+            return workspace_result_t<void>::failure(payload.error());
+        record.payload = std::move(payload.value());
+        if (!source_lines_codec_null) {
+            auto source_lines = open_pdb_payload_v10(
+                static_cast<const std::uint8_t*>(source_lines_blob),
+                static_cast<std::size_t>(source_lines_blob_size),
+                static_cast<std::uint32_t>(source_lines_codec),
+                static_cast<std::uint64_t>(source_lines_uncompressed),
+                stop_requested);
+            if (!source_lines)
+                return workspace_result_t<void>::failure(source_lines.error());
+            record.source_lines = std::move(source_lines.value());
+        }
+        ++visited;
+        auto visited_result = visitor(std::move(record));
+        if (!visited_result)
+            return visited_result;
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<std::vector<pdb_symbol_module_record_t>>
+    read_pdb_symbol_modules(sqlite3* database,
+                            const packed_stop_predicate_t& stop_requested) {
+    std::vector<pdb_symbol_module_record_t> rows;
+    rows.reserve(pdb_symbol_modules_max_rows);
+    std::uint64_t total_uncompressed_bytes = 0;
+    auto collected = visit_pdb_symbol_modules(
+        database,
+        [&](pdb_symbol_module_record_t record) -> workspace_result_t<void> {
+            const std::uint64_t uncompressed =
+                static_cast<std::uint64_t>(record.payload.size()) +
+                (record.source_lines
+                     ? static_cast<std::uint64_t>(record.source_lines->size())
+                     : 0ULL);
+            if (!checked_add_u64(total_uncompressed_bytes, uncompressed,
+                                 total_uncompressed_bytes) ||
+                total_uncompressed_bytes >
+                    pdb_symbol_modules_max_total_uncompressed_bytes) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                         "pdb symbol module payloads exceed their bounded total",
+                                         "workspace_schema_v10.read_pdb_symbol_modules"));
+            }
+            rows.push_back(std::move(record));
+            return workspace_result_t<void>::success();
+        },
+        stop_requested);
+    if (!collected)
+        return workspace_result_t<std::vector<pdb_symbol_module_record_t>>::failure(
+            collected.error());
+    return workspace_result_t<std::vector<pdb_symbol_module_record_t>>::success(
+        std::move(rows));
+}
+
+workspace_result_t<void> delete_pdb_symbol_modules(sqlite3* database) {
+    if (!database) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "pdb symbol module deletion requires an open database",
+            "workspace_schema_v10.delete_pdb_symbol_modules"));
+    }
+    return exec_sql_v9(database, "DELETE FROM pdb_symbol_modules",
+                       "workspace_schema_v10.delete_pdb_symbol_modules");
 }
 
 }

@@ -34,6 +34,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -221,6 +222,582 @@ struct phase_windows_t {
     std::uint64_t publish_wall_ns() const { return window_ns(publish_begin, publish_end); }
 };
 
+struct analysis_once_result_t {
+    std::shared_ptr<analysis_workspace_t> workspace;
+    std::shared_ptr<const analysis_snapshot_t> snapshot;
+    phase_windows_t windows;
+    std::uint64_t wall_ns = 0;
+    std::uint64_t decode_window_ns = 0;
+    std::uint64_t decoded_bytes = 0;
+    std::uint64_t file_bytes = 0;
+    std::uint64_t instruction_count = 0;
+    std::uint64_t code_bytes = 0;
+};
+
+analysis_once_result_t run_analysis_once(const open_static_workspace_request_t& open_request,
+                                         std::uint32_t worker_budget,
+                                         const cancellation_token_t& cancel)
+{
+    analysis_once_result_t outcome;
+    try {
+        auto opened = workspace_registry().open_static(open_request, cancel);
+        if (!opened)
+            throw std::runtime_error("benchmark workspace open failed: " +
+                opened.error().stable_code() + ":" + opened.error().message);
+        outcome.workspace = opened.take_value();
+        const auto image = outcome.workspace->normalized_image();
+        if (!image)
+            throw std::runtime_error("benchmark fixture image metadata is unavailable");
+        outcome.code_bytes = executable_bytes_of(image);
+        if (outcome.code_bytes == 0)
+            throw std::runtime_error("benchmark fixture has no normalized executable bytes");
+
+        baseline_analysis_settings_t settings;
+        settings.decode_worker_lanes = worker_budget;
+        auto started = baseline_analysis_service_t::start(outcome.workspace, settings);
+        if (!started)
+            throw std::runtime_error("baseline analysis submission failed: " +
+                started.error().stable_code() + ":" + started.error().message);
+
+        const auto analysis_begin = steady_clock_t::now();
+        bool analysis_cancelled = false;
+        for (;;) {
+            const auto waited = aida::infra::taskflow_runtime::wait_for(started.value(), 25);
+            outcome.windows.sample(outcome.workspace->progress(), !waited.timed_out);
+            if (waited.completed || waited.failed || waited.cancelled)
+                break;
+            if (cancel.stop_requested()) {
+                baseline_analysis_service_t::cancel(started.value());
+                (void)aida::infra::taskflow_runtime::wait_for(started.value(), 10000);
+                analysis_cancelled = true;
+                break;
+            }
+        }
+        outcome.wall_ns = nanoseconds_since(analysis_begin);
+        const auto progress = outcome.workspace->progress();
+        if (analysis_cancelled || cancel.stop_requested())
+            throw std::runtime_error("benchmark analysis cancelled");
+        if (progress.error)
+            throw std::runtime_error("baseline analysis failed: " +
+                progress.error->stable_code() + ":" + progress.error->message);
+        if (progress.readiness != workspace_readiness_t::baseline_ready ||
+            !outcome.workspace->snapshot())
+            throw std::runtime_error("baseline graph completed without a ready publication");
+
+        outcome.snapshot = outcome.workspace->snapshot();
+        for (const auto& span : outcome.snapshot->coverage) {
+            if (span.reason == coverage_reason_t::decoded)
+                outcome.decoded_bytes += span.size;
+        }
+        outcome.file_bytes = outcome.workspace->provider().size();
+        outcome.decode_window_ns = outcome.windows.decode_wall_ns() +
+            outcome.windows.merge_wall_ns();
+        outcome.instruction_count = outcome.snapshot->instructions.size();
+        return outcome;
+    } catch (...) {
+        if (outcome.workspace) {
+            try { close_benchmark_workspace(outcome.workspace, true); } catch (...) {}
+        }
+        throw;
+    }
+}
+
+struct determinism_walker_t {
+    test_fixture::detail::large_pe_sha256_stream_t stream;
+
+    void bytes(const void* data, std::size_t size)
+    {
+        stream.update(static_cast<const std::uint8_t*>(data), size);
+    }
+    void u8(std::uint8_t value) { bytes(&value, sizeof(value)); }
+    void boolean(bool value) { u8(value ? static_cast<std::uint8_t>(1) : static_cast<std::uint8_t>(0)); }
+    void u16(std::uint16_t value)
+    {
+        u8(static_cast<std::uint8_t>(value & 0xFFU));
+        u8(static_cast<std::uint8_t>((value >> 8) & 0xFFU));
+    }
+    void u32(std::uint32_t value)
+    {
+        u16(static_cast<std::uint16_t>(value & 0xFFFFU));
+        u16(static_cast<std::uint16_t>((value >> 16) & 0xFFFFU));
+    }
+    void u64(std::uint64_t value)
+    {
+        u32(static_cast<std::uint32_t>(value & 0xFFFFFFFFULL));
+        u32(static_cast<std::uint32_t>((value >> 32) & 0xFFFFFFFFULL));
+    }
+    void i64(std::int64_t value) { u64(static_cast<std::uint64_t>(value)); }
+    void address(const address_t& value)
+    {
+        u8(static_cast<std::uint8_t>(value.space));
+        u64(value.value);
+        u8(static_cast<std::uint8_t>(value.architecture));
+        u8(static_cast<std::uint8_t>(value.mode));
+    }
+    void address_opt(const std::optional<address_t>& value)
+    {
+        boolean(value.has_value());
+        if (value)
+            address(*value);
+    }
+    void entity_opt(const std::optional<entity_id_t>& value)
+    {
+        boolean(value.has_value());
+        if (value)
+            u64(*value);
+    }
+    void string_bytes(const std::string& value)
+    {
+        u64(value.size());
+        if (!value.empty())
+            bytes(value.data(), value.size());
+    }
+    void digest_bytes(const sha256_digest_t& value)
+    {
+        bytes(value.bytes.data(), value.bytes.size());
+    }
+};
+
+void walk_instruction(determinism_walker_t& walk, const instruction_record_t& record)
+{
+    walk.u64(record.id);
+    walk.address(record.address);
+    walk.u8(record.length);
+    walk.u16(record.mnemonic_id);
+    walk.u32(record.opcode_id);
+    walk.u32(record.flow_flags);
+    walk.u32(record.operand_fact_begin);
+    walk.u16(record.operand_fact_count);
+    walk.u32(record.target_fact_begin);
+    walk.u16(record.target_fact_count);
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+    walk.u8(static_cast<std::uint8_t>(record.coverage));
+    walk.u64(record.stable_source_id);
+}
+
+void walk_operand_fact(determinism_walker_t& walk, const operand_fact_t& record)
+{
+    walk.u64(record.id);
+    walk.u64(record.instruction_id);
+    walk.u64(record.address_expression_id);
+    walk.u8(record.operand_index);
+    walk.u8(record.decoder_operand_id);
+    walk.u8(static_cast<std::uint8_t>(record.kind));
+    walk.u8(record.access);
+    walk.u8(record.visibility);
+    walk.u8(record.encoding);
+    walk.u8(record.memory_type);
+    walk.u8(record.access_width);
+    walk.u16(record.bit_width);
+    walk.u16(record.access_width_bits);
+    walk.u16(record.access_count);
+    walk.u16(record.element_width_bits);
+    walk.u16(record.element_count);
+    walk.u16(record.address_width_bits);
+    walk.u16(record.reg);
+    walk.u16(record.segment_reg);
+    walk.u16(record.base_reg);
+    walk.u16(record.index_reg);
+    walk.u8(record.scale);
+    walk.boolean(record.relative);
+    walk.boolean(record.signed_value);
+    walk.boolean(record.has_displacement);
+    walk.boolean(record.has_resolved_expression_value);
+    walk.i64(record.displacement);
+    walk.u64(record.immediate);
+    walk.u64(record.resolved_expression_value);
+    walk.u16(record.address_components);
+    walk.u8(static_cast<std::uint8_t>(record.address_expression));
+    walk.u8(static_cast<std::uint8_t>(record.address_resolution));
+}
+
+void walk_target_fact(determinism_walker_t& walk, const target_fact_t& record)
+{
+    walk.u64(record.instruction_id);
+    walk.u64(record.operand_fact_id);
+    walk.u64(record.address_expression_id);
+    walk.address(record.target);
+    walk.u8(static_cast<std::uint8_t>(record.kind));
+    walk.u8(static_cast<std::uint8_t>(record.resolution));
+    walk.u8(record.operand_index);
+    walk.u16(record.access_width_bits);
+    walk.u16(record.access_count);
+    walk.boolean(record.direct);
+    walk.boolean(record.is_external);
+}
+
+void walk_block(determinism_walker_t& walk, const basic_block_record_t& record)
+{
+    walk.u64(record.id);
+    walk.u64(record.function_id);
+    walk.address(record.start);
+    walk.address(record.end);
+    walk.u32(record.first_instruction);
+    walk.u32(record.instruction_count);
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+}
+
+void walk_chunk(determinism_walker_t& walk, const function_chunk_record_t& record)
+{
+    walk.u64(record.id);
+    walk.u64(record.function_id);
+    walk.address(record.start);
+    walk.address(record.end);
+    walk.u32(record.first_block);
+    walk.u32(record.block_count);
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+    walk.boolean(record.cold);
+    walk.boolean(record.shared);
+}
+
+void walk_membership(determinism_walker_t& walk,
+                     const function_block_membership_record_t& record)
+{
+    walk.u64(record.function_id);
+    walk.u64(record.chunk_id);
+    walk.u64(record.block_id);
+    walk.u32(record.block_index);
+    walk.u32(record.ordinal);
+    walk.boolean(record.shared);
+}
+
+void walk_function(determinism_walker_t& walk, const function_record_t& record)
+{
+    walk.u64(record.id);
+    walk.address(record.start);
+    walk.address(record.end);
+    walk.u32(record.first_block);
+    walk.u32(record.block_count);
+    walk.u32(record.first_chunk);
+    walk.u32(record.chunk_count);
+    walk.u32(record.first_block_membership);
+    walk.u32(record.block_membership_count);
+    walk.entity_opt(record.symbol_id);
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+    walk.boolean(record.thunk);
+    walk.boolean(record.noreturn);
+    walk.u64(record.chunks.size());
+    for (const auto& chunk : record.chunks) {
+        walk.u64(chunk.rva_start);
+        walk.u64(chunk.rva_end);
+        walk.u8(chunk.chunk_kind);
+    }
+}
+
+void walk_edge(determinism_walker_t& walk, const edge_record_t& record)
+{
+    walk.u64(record.id);
+    walk.u64(record.source_entity);
+    walk.entity_opt(record.target_entity);
+    walk.address(record.source);
+    walk.address(record.target);
+    walk.u8(static_cast<std::uint8_t>(record.kind));
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+}
+
+void walk_call_quality(determinism_walker_t& walk, const call_graph_quality_t& quality)
+{
+    walk.u8(static_cast<std::uint8_t>(quality.provenance));
+    walk.u8(quality.confidence);
+    walk.u32(quality.contributor_count);
+    walk.boolean(quality.conflicted);
+}
+
+void walk_call_graph(determinism_walker_t& walk, const call_graph_publication_t& graph)
+{
+    walk.u64(graph.nodes.size());
+    for (const auto& record : graph.nodes) {
+        walk.u64(record.function_id);
+        walk.address(record.address);
+        walk.u64(record.incoming_edges);
+        walk.u64(record.outgoing_edges);
+        walk.u64(record.indirect_edges);
+        walk.u64(record.unresolved_sites);
+    }
+    walk.u64(graph.call_sites.size());
+    for (const auto& record : graph.call_sites) {
+        walk.u64(record.id);
+        walk.u64(record.source_function_id);
+        walk.u64(record.source_block_id);
+        walk.u64(record.instruction_id);
+        walk.address(record.address);
+        walk.u32(record.first_candidate);
+        walk.u32(record.candidate_count);
+        walk.boolean(record.indirect);
+        walk.boolean(record.tail_call);
+        walk.boolean(record.unresolved);
+    }
+    walk.u64(graph.candidates.size());
+    for (const auto& record : graph.candidates) {
+        walk.u64(record.id);
+        walk.u64(record.call_site_id);
+        walk.address(record.target);
+        walk.entity_opt(record.target_function_id);
+        walk.u8(static_cast<std::uint8_t>(record.kind));
+        walk_call_quality(walk, record.quality);
+        walk.u64(record.stable_source_id);
+        walk.u32(record.rank);
+        walk.boolean(record.external_target);
+    }
+    walk.u64(graph.edges.size());
+    for (const auto& record : graph.edges) {
+        walk.u64(record.id);
+        walk.u64(record.call_site_id);
+        walk.u64(record.source_function_id);
+        walk.u64(record.source_block_id);
+        walk.entity_opt(record.target_function_id);
+        walk.address(record.call_site);
+        walk.address(record.target);
+        walk.u8(static_cast<std::uint8_t>(record.resolution));
+        walk_call_quality(walk, record.quality);
+        walk.u32(record.candidate_rank);
+        walk.boolean(record.external_target);
+        walk.boolean(record.target_noreturn);
+    }
+    walk.u64(graph.conflicts.size());
+    for (const auto& record : graph.conflicts) {
+        walk.u64(record.id);
+        walk.u8(static_cast<std::uint8_t>(record.kind));
+        walk.u64(record.instruction_id);
+        walk.u64(record.source_function_id);
+        walk.u64(record.call_site_rva);
+        walk.u64(record.selected_target_rva);
+        walk.u64(record.competing_target_rva);
+        walk.u64(record.selected_target_function_id);
+        walk.u64(record.competing_target_function_id);
+    }
+    walk.u64(graph.indirect_site_count);
+    walk.u64(graph.unresolved_site_count);
+    walk.boolean(graph.bounded);
+}
+
+void walk_xref(determinism_walker_t& walk, const xref_record_t& record)
+{
+    walk.u64(record.id);
+    walk.address(record.source);
+    walk.address(record.target);
+    walk.u8(static_cast<std::uint8_t>(record.kind));
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+}
+
+void walk_string_record(determinism_walker_t& walk, const string_record_t& record)
+{
+    walk.u64(record.id);
+    walk.address(record.address);
+    walk.u64(record.byte_length);
+    walk.u8(static_cast<std::uint8_t>(record.encoding));
+    walk.string_bytes(record.value);
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+}
+
+void walk_symbol(determinism_walker_t& walk, const symbol_record_t& record)
+{
+    walk.u64(record.id);
+    walk.address(record.address);
+    walk.string_bytes(record.name);
+    walk.u8(static_cast<std::uint8_t>(record.kind));
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+}
+
+void walk_rich_facts(determinism_walker_t& walk,
+                     const analysis_rich_fact_publication_t& facts)
+{
+    walk.u64(facts.data_candidates.size());
+    for (const auto& record : facts.data_candidates) {
+        walk.u64(record.id);
+        walk.address(record.address);
+        walk.u64(record.size);
+        walk.u8(static_cast<std::uint8_t>(record.kind));
+        walk.address_opt(record.target);
+        walk.u8(static_cast<std::uint8_t>(record.provenance));
+        walk.u8(record.confidence);
+    }
+    walk.u64(facts.data_pointer_facts.size());
+    for (const auto& record : facts.data_pointer_facts) {
+        walk.u64(record.id);
+        walk.address(record.slot);
+        walk.address(record.target);
+        walk.u8(static_cast<std::uint8_t>(record.candidate_kind));
+        walk.u8(static_cast<std::uint8_t>(record.encoding));
+        walk.u8(record.width_bytes);
+        walk.u8(static_cast<std::uint8_t>(record.provenance));
+        walk.u8(record.confidence);
+    }
+    walk.u64(facts.data_conflicts.size());
+    for (const auto& record : facts.data_conflicts) {
+        walk.u64(record.id);
+        walk.address(record.address);
+        walk.u8(static_cast<std::uint8_t>(record.kind));
+        walk.address_opt(record.selected_target);
+        walk.address_opt(record.rejected_target);
+        walk.u8(static_cast<std::uint8_t>(record.selected_provenance));
+        walk.u8(static_cast<std::uint8_t>(record.rejected_provenance));
+        walk.u8(record.selected_confidence);
+        walk.u8(record.rejected_confidence);
+    }
+    walk.u64(facts.type_candidates.size());
+    for (const auto& record : facts.type_candidates) {
+        walk.u64(record.id);
+        walk.address_opt(record.address);
+        walk.address_opt(record.related_address);
+        walk.u8(static_cast<std::uint8_t>(record.kind));
+        walk.string_bytes(record.display_name);
+        walk.string_bytes(record.canonical_type);
+        walk.string_bytes(record.source_key);
+        walk.u8(static_cast<std::uint8_t>(record.provenance));
+        walk.u8(record.confidence);
+        walk.boolean(record.explicitly_unknown);
+    }
+    walk.u64(facts.type_references.size());
+    for (const auto& record : facts.type_references) {
+        walk.u64(record.id);
+        walk.address_opt(record.source);
+        walk.address_opt(record.target);
+        walk.u64(record.source_entity);
+        walk.u64(record.target_entity);
+        walk.u8(static_cast<std::uint8_t>(record.kind));
+        walk.u8(static_cast<std::uint8_t>(record.provenance));
+        walk.u8(record.confidence);
+        walk.string_bytes(record.source_key);
+    }
+    walk.u64(facts.metadata_conflicts.size());
+    for (const auto& record : facts.metadata_conflicts) {
+        walk.u64(record.id);
+        walk.address_opt(record.address);
+        walk.string_bytes(record.identity);
+        walk.u8(static_cast<std::uint8_t>(record.kind));
+        walk.string_bytes(record.selected_value);
+        walk.string_bytes(record.rejected_value);
+        walk.u8(static_cast<std::uint8_t>(record.selected_provenance));
+        walk.u8(static_cast<std::uint8_t>(record.rejected_provenance));
+        walk.u8(record.selected_confidence);
+        walk.u8(record.rejected_confidence);
+    }
+}
+
+void walk_coverage(determinism_walker_t& walk, const coverage_span_t& record)
+{
+    walk.address(record.start);
+    walk.u64(record.size);
+    walk.u8(static_cast<std::uint8_t>(record.reason));
+    walk.u8(static_cast<std::uint8_t>(record.provenance));
+    walk.u8(record.confidence);
+    walk.u32(record.detail_code);
+}
+
+std::string snapshot_determinism_sha256(const analysis_snapshot_t& snapshot)
+{
+    constexpr std::uint32_t field_walk_version = 1;
+    determinism_walker_t walk;
+    walk.stream.open();
+    walk.u32(field_walk_version);
+    walk.digest_bytes(snapshot.binary_id);
+    walk.digest_bytes(snapshot.load_profile_hash);
+    walk.u64(snapshot.generation);
+    walk.u64(snapshot.analysis_revision);
+    walk.u64(snapshot.overlay_revision);
+    walk.boolean(snapshot.baseline_complete);
+    walk.u64(snapshot.instructions.size());
+    for (const auto& record : snapshot.instructions)
+        walk_instruction(walk, record);
+    walk.u64(snapshot.delay_slot_counts.size());
+    if (!snapshot.delay_slot_counts.empty())
+        walk.bytes(snapshot.delay_slot_counts.data(), snapshot.delay_slot_counts.size());
+    walk.u64(snapshot.operand_facts.size());
+    for (const auto& record : snapshot.operand_facts)
+        walk_operand_fact(walk, record);
+    walk.u64(snapshot.target_facts.size());
+    for (const auto& record : snapshot.target_facts)
+        walk_target_fact(walk, record);
+    walk.u64(snapshot.blocks.size());
+    for (const auto& record : snapshot.blocks)
+        walk_block(walk, record);
+    walk.u64(snapshot.function_chunks.size());
+    for (const auto& record : snapshot.function_chunks)
+        walk_chunk(walk, record);
+    walk.u64(snapshot.function_block_memberships.size());
+    for (const auto& record : snapshot.function_block_memberships)
+        walk_membership(walk, record);
+    walk.u64(snapshot.functions.size());
+    for (const auto& record : snapshot.functions)
+        walk_function(walk, record);
+    walk.u64(snapshot.edges.size());
+    for (const auto& record : snapshot.edges)
+        walk_edge(walk, record);
+    walk_call_graph(walk, snapshot.call_graph);
+    walk.u64(snapshot.xrefs.size());
+    for (const auto& record : snapshot.xrefs)
+        walk_xref(walk, record);
+    walk.u64(snapshot.strings.size());
+    for (const auto& record : snapshot.strings)
+        walk_string_record(walk, record);
+    walk.u64(snapshot.symbols.size());
+    for (const auto& record : snapshot.symbols)
+        walk_symbol(walk, record);
+    walk_rich_facts(walk, snapshot.rich_facts);
+    walk.u64(snapshot.coverage.size());
+    for (const auto& record : snapshot.coverage)
+        walk_coverage(walk, record);
+    const auto digest = walk.stream.finish();
+    return test_fixture::detail::large_pe_hex(digest.data(), digest.size());
+}
+
+std::string stage_config_fingerprint()
+{
+    const baseline_analysis_settings_t settings;
+    const std::string canonical = settings.canonical_json();
+    test_fixture::detail::large_pe_sha256_stream_t stream;
+    stream.open();
+    stream.update(reinterpret_cast<const std::uint8_t*>(canonical.data()), canonical.size());
+    const auto digest = stream.finish();
+    return test_fixture::detail::large_pe_hex(digest.data(), digest.size());
+}
+
+std::uint32_t hardware_default_budget() noexcept
+{
+    const auto hardware = (std::max)(1U, std::thread::hardware_concurrency());
+    return (std::min)(16U, (std::max)(2U, hardware));
+}
+
+struct stage_run_measurement_t {
+    std::uint32_t budget = 0;
+    std::uint64_t wall_ns = 0;
+    std::uint64_t decode_window_ns = 0;
+    std::uint64_t decoded_bytes = 0;
+    std::uint64_t instruction_count = 0;
+    std::string snapshot_sha256;
+};
+
+stage_run_measurement_t run_stage_measurement(
+    const open_static_workspace_request_t& open_request, std::uint32_t budget,
+    const cancellation_token_t& cancel)
+{
+    stage_run_measurement_t measurement;
+    measurement.budget = budget;
+    auto once = run_analysis_once(open_request, budget, cancel);
+    measurement.wall_ns = once.wall_ns;
+    measurement.decode_window_ns = once.decode_window_ns;
+    measurement.decoded_bytes = once.decoded_bytes;
+    measurement.instruction_count = once.instruction_count;
+    try {
+        measurement.snapshot_sha256 = snapshot_determinism_sha256(*once.snapshot);
+    } catch (...) {
+        try { close_benchmark_workspace(once.workspace, true); } catch (...) {}
+        throw;
+    }
+    close_benchmark_workspace(once.workspace, true);
+    return measurement;
+}
+
+
 const json& program_sla_thresholds()
 {
     static const json thresholds = {
@@ -274,6 +851,9 @@ struct benchmark_async_state_t {
     std::atomic<std::uint64_t> started_ms{0};
     std::atomic<std::uint64_t> finished_ms{0};
     std::atomic<std::uint64_t> job_id{0};
+    std::atomic<bool> run_scaling_stage{false};
+    std::atomic<bool> run_determinism_stage{false};
+    std::atomic<std::uint32_t> determinism_runs{2};
     mutable std::mutex mutex;
     std::string mode;
     std::string verdict;
@@ -452,11 +1032,13 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
     const auto run_begin = steady_clock_t::now();
     const auto cpu_begin = process_cpu_ns_now();
     diag::log_tagged_fmt("benchmark",
-        "run_begin mode=%s path=%s code_mb=%llu seed=0x%llX lanes=%u",
+        "run_begin mode=%s path=%s code_mb=%llu seed=0x%llX lanes=%u scaling=%d determinism=%d",
         mode, request.real_path.c_str(),
         static_cast<unsigned long long>(request.synthetic_code_bytes / (1024ULL * 1024ULL)),
         static_cast<unsigned long long>(request.synthetic_seed),
-        static_cast<unsigned>(request.lanes));
+        static_cast<unsigned>(request.lanes),
+        request.run_scaling_stage ? 1 : 0,
+        request.run_determinism_stage ? 1 : 0);
 
     std::shared_ptr<analysis_workspace_t> workspace;
     std::shared_ptr<analysis_workspace_t> warm_workspace;
@@ -538,63 +1120,21 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         open_request.source_path = fixture_path.u8string();
         open_request.bin_name = fixture_path.filename().u8string();
         open_request.load_profile = {1, 0, 1, 0};
-        auto opened = workspace_registry().open_static(open_request, cancel);
-        if (!opened)
-            throw std::runtime_error("benchmark workspace open failed: " +
-                opened.error().stable_code() + ":" + opened.error().message);
-        workspace = opened.take_value();
-        const auto image = workspace->normalized_image();
-        if (!image)
-            throw std::runtime_error("benchmark fixture image metadata is unavailable");
-        const auto code_bytes = executable_bytes_of(image);
-        if (code_bytes == 0)
-            throw std::runtime_error("benchmark fixture has no normalized executable bytes");
-
+        auto primary = run_analysis_once(open_request, request.lanes, cancel);
+        workspace = std::move(primary.workspace);
         analysis_metrics_t run_metrics(workspace->generation());
-        baseline_analysis_settings_t settings;
-        settings.decode_worker_lanes = request.lanes;
-        auto started = baseline_analysis_service_t::start(workspace, settings);
-        if (!started)
-            throw std::runtime_error("baseline analysis submission failed: " +
-                started.error().stable_code() + ":" + started.error().message);
-
-        phase_windows_t windows;
-        const auto analysis_begin = steady_clock_t::now();
-        bool analysis_cancelled = false;
-        for (;;) {
-            const auto waited = aida::infra::taskflow_runtime::wait_for(started.value(), 25);
-            windows.sample(workspace->progress(), !waited.timed_out);
-            if (waited.completed || waited.failed || waited.cancelled)
-                break;
-            if (cancel.stop_requested()) {
-                baseline_analysis_service_t::cancel(started.value());
-                (void)aida::infra::taskflow_runtime::wait_for(started.value(), 10000);
-                analysis_cancelled = true;
-                break;
-            }
-        }
-        const auto analysis_wall_ns = nanoseconds_since(analysis_begin);
-        const auto progress = workspace->progress();
-        if (analysis_cancelled || cancel.stop_requested())
-            throw std::runtime_error("benchmark analysis cancelled");
-        if (progress.error)
-            throw std::runtime_error("baseline analysis failed: " +
-                progress.error->stable_code() + ":" + progress.error->message);
-        if (progress.readiness != workspace_readiness_t::baseline_ready || !workspace->snapshot())
-            throw std::runtime_error("baseline graph completed without a ready publication");
         run_metrics.sample_process_memory();
 
-        const auto snapshot = workspace->snapshot();
+        const auto image = workspace->normalized_image();
+        const std::uint64_t code_bytes = primary.code_bytes;
+        const auto snapshot = primary.snapshot;
         const auto search = workspace->search_index();
         const auto database = workspace->database()->snapshot();
-        std::uint64_t decoded_bytes = 0;
-        for (const auto& span : snapshot->coverage) {
-            if (span.reason == coverage_reason_t::decoded)
-                decoded_bytes += span.size;
-        }
-        const std::uint64_t file_bytes = workspace->provider().size();
-        const std::uint64_t decode_window_ns = windows.decode_wall_ns() +
-            windows.merge_wall_ns();
+        const std::uint64_t decoded_bytes = primary.decoded_bytes;
+        const std::uint64_t file_bytes = primary.file_bytes;
+        const auto& windows = primary.windows;
+        const std::uint64_t analysis_wall_ns = primary.wall_ns;
+        const std::uint64_t decode_window_ns = primary.decode_window_ns;
 
         std::uint64_t batch_completed = 0;
         std::uint64_t batch_failed = 0;
@@ -725,6 +1265,159 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         remove_database_artifacts(cold_database_path);
         database_path.clear();
 
+        json scaling_block = nullptr;
+        json determinism_block = nullptr;
+        bool scaling_gate_applicable = false;
+        double scaling_wall16_over_wall1 = 0.0;
+        double scaling_efficiency_16 = 0.0;
+        bool determinism_measured = false;
+        bool determinism_match = false;
+        if (request.run_scaling_stage || request.run_determinism_stage) {
+            std::vector<std::uint32_t> budgets = request.scaling_worker_budgets;
+            if (budgets.empty()) {
+                const auto default_budget = hardware_default_budget();
+                budgets = {1, default_budget, default_budget};
+            }
+            for (auto& budget : budgets) {
+                if (budget == 0)
+                    budget = hardware_default_budget();
+            }
+            if (request.run_determinism_stage) {
+                const std::uint32_t tail_budget = budgets.back();
+                std::uint32_t tail_count = 0;
+                for (auto cursor = budgets.rbegin();
+                     cursor != budgets.rend() && *cursor == tail_budget; ++cursor)
+                    ++tail_count;
+                const auto required = (std::max)(1U, request.determinism_runs);
+                for (std::uint32_t have = tail_count; have < required; ++have)
+                    budgets.push_back(tail_budget);
+            }
+            std::vector<stage_run_measurement_t> stage_runs;
+            stage_runs.reserve(budgets.size());
+            const auto stage_begin = steady_clock_t::now();
+            for (const auto budget : budgets) {
+                if (cancel.stop_requested())
+                    throw std::runtime_error("benchmark scaling/determinism stage cancelled");
+                stage_runs.push_back(run_stage_measurement(open_request, budget, cancel));
+                diag::log_tagged_fmt("benchmark",
+                    "stage_run budget=%u wall_ms=%llu decode_window_ms=%llu instructions=%llu snapshot_sha256=%s",
+                    static_cast<unsigned>(stage_runs.back().budget),
+                    static_cast<unsigned long long>(stage_runs.back().wall_ns / 1000000ULL),
+                    static_cast<unsigned long long>(
+                        stage_runs.back().decode_window_ns / 1000000ULL),
+                    static_cast<unsigned long long>(stage_runs.back().instruction_count),
+                    stage_runs.back().snapshot_sha256.c_str());
+            }
+
+            std::optional<std::uint64_t> wall_budget1;
+            for (const auto& run : stage_runs) {
+                if (run.budget == 1) {
+                    wall_budget1 = run.wall_ns;
+                    break;
+                }
+            }
+            SYSTEM_INFO host_system{};
+            GetNativeSystemInfo(&host_system);
+            const auto host_logical =
+                static_cast<std::uint32_t>(host_system.dwNumberOfProcessors);
+            json budget_values = json::array();
+            json wall_ms_values = json::array();
+            json ratio_values = json::array();
+            json efficiency_values = json::array();
+            json rows = json::array();
+            bool has_budget16 = false;
+            std::optional<std::uint64_t> wall_budget16;
+            std::optional<double> efficiency_budget16;
+            std::uint32_t n16 = 0;
+            for (const auto& run : stage_runs) {
+                json ratio = nullptr;
+                json efficiency = nullptr;
+                if (wall_budget1 && *wall_budget1 != 0 && run.wall_ns != 0) {
+                    ratio = static_cast<double>(run.wall_ns) /
+                        static_cast<double>(*wall_budget1);
+                    efficiency = static_cast<double>(*wall_budget1) /
+                        (static_cast<double>(run.wall_ns) *
+                            static_cast<double>(run.budget));
+                }
+                budget_values.push_back(run.budget);
+                wall_ms_values.push_back(static_cast<double>(run.wall_ns) / 1000000.0);
+                ratio_values.push_back(ratio);
+                efficiency_values.push_back(efficiency);
+                rows.push_back(json{{"budget", run.budget},
+                    {"wall_ns", run.wall_ns},
+                    {"wall_ms", static_cast<double>(run.wall_ns) / 1000000.0},
+                    {"decode_window_ns", run.decode_window_ns},
+                    {"decoded_bytes", run.decoded_bytes},
+                    {"instructions", run.instruction_count},
+                    {"ratio", ratio},
+                    {"efficiency", efficiency},
+                    {"snapshot_sha256", run.snapshot_sha256}});
+                if (run.budget <= 16)
+                    n16 = (std::max)(n16, run.budget);
+                if (run.budget == 16 && !has_budget16) {
+                    has_budget16 = true;
+                    wall_budget16 = run.wall_ns;
+                    if (efficiency.is_number())
+                        efficiency_budget16 = efficiency.get<double>();
+                }
+            }
+            scaling_gate_applicable =
+                wall_budget1.has_value() && has_budget16 && host_logical >= 16;
+            if (scaling_gate_applicable && *wall_budget1 != 0 && wall_budget16 &&
+                *wall_budget16 != 0) {
+                scaling_wall16_over_wall1 = static_cast<double>(*wall_budget16) /
+                    static_cast<double>(*wall_budget1);
+                scaling_efficiency_16 = efficiency_budget16.value_or(0.0);
+            }
+            scaling_block = json{{"budgets", std::move(budget_values)},
+                {"wall_ms", std::move(wall_ms_values)},
+                {"ratio", std::move(ratio_values)},
+                {"efficiency", std::move(efficiency_values)},
+                {"rows", std::move(rows)},
+                {"n16", n16},
+                {"has_budget_16", has_budget16},
+                {"wall16_over_wall1",
+                    scaling_gate_applicable ? json(scaling_wall16_over_wall1) : json(nullptr)},
+                {"efficiency_16",
+                    scaling_gate_applicable ? json(scaling_efficiency_16) : json(nullptr)},
+                {"gate_applicable", scaling_gate_applicable},
+                {"host_logical_processors", host_logical},
+                {"note", n16 < 16 ? json(std::string(
+                     "worker sweep caps below 16 on this host; the 16-worker scaling gate is not measurable"))
+                    : json(nullptr)}};
+            const std::string wall16_text = scaling_gate_applicable
+                ? std::to_string(scaling_wall16_over_wall1) : std::string("null");
+            const std::string eff16_text = scaling_gate_applicable
+                ? std::to_string(scaling_efficiency_16) : std::string("null");
+            diag::log_tagged_fmt("benchmark",
+                "scaling gate_applicable=%d n16=%u host_logical=%u wall16_over_wall1=%s efficiency_16=%s",
+                scaling_gate_applicable ? 1 : 0, static_cast<unsigned>(n16),
+                static_cast<unsigned>(host_logical), wall16_text.c_str(), eff16_text.c_str());
+
+            determinism_measured = stage_runs.size() >= 2;
+            determinism_match = determinism_measured;
+            for (std::size_t index = 1; index < stage_runs.size(); ++index) {
+                if (stage_runs[index].snapshot_sha256 != stage_runs.front().snapshot_sha256)
+                    determinism_match = false;
+            }
+            json hash_runs = json::array();
+            for (std::size_t index = 0; index < stage_runs.size(); ++index) {
+                hash_runs.push_back(json{{"label", "run_" + std::to_string(index)},
+                    {"budget", stage_runs[index].budget},
+                    {"snapshot_sha256", stage_runs[index].snapshot_sha256}});
+            }
+            determinism_block = json{{"runs", std::move(hash_runs)},
+                {"match", determinism_measured ? json(determinism_match) : json(nullptr)},
+                {"field_walk", json{{"contract", "aida.hyperperf.benchmark-determinism-walk"},
+                    {"version", 1}}},
+                {"config_fingerprint", stage_config_fingerprint()}};
+            diag::log_tagged_fmt("benchmark",
+                "determinism runs=%zu match=%d stage_wall_ms=%llu",
+                stage_runs.size(), determinism_match ? 1 : 0,
+                static_cast<unsigned long long>(nanoseconds_since(stage_begin) / 1000000ULL));
+        }
+
+
         const double wall_ms = static_cast<double>(analysis_wall_ns) / 1000000.0;
         const auto& thresholds = program_sla_thresholds();
         const double wall_scale = request.mode == benchmark_mode_t::synthetic
@@ -809,12 +1502,31 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             verdicts.push_back(verdict_entry("decompile_all_funcs_per_s_stretch",
                 thresholds["decompile_all_funcs_per_s_stretch"], nullptr, "NOT_MEASURED"));
         }
-        verdicts.push_back(verdict_entry("scaling_wall16_over_wall1_max",
-            thresholds["scaling_wall16_over_wall1_max"], nullptr, "NOT_MEASURED"));
-        verdicts.push_back(verdict_entry("scaling_efficiency_16_min",
-            thresholds["scaling_efficiency_16_min"], nullptr, "NOT_MEASURED"));
-        verdicts.push_back(verdict_entry("determinism_hash_match",
-            thresholds["determinism_hash_match"], nullptr, "NOT_MEASURED"));
+        if (scaling_gate_applicable) {
+            verdicts.push_back(verdict_entry("scaling_wall16_over_wall1_max",
+                thresholds["scaling_wall16_over_wall1_max"], scaling_wall16_over_wall1,
+                scaling_wall16_over_wall1 <=
+                    thresholds["scaling_wall16_over_wall1_max"].get<double>()
+                    ? "PASS" : "FAIL"));
+            verdicts.push_back(verdict_entry("scaling_efficiency_16_min",
+                thresholds["scaling_efficiency_16_min"], scaling_efficiency_16,
+                scaling_efficiency_16 >=
+                    thresholds["scaling_efficiency_16_min"].get<double>()
+                    ? "PASS" : "WARN"));
+        } else {
+            verdicts.push_back(verdict_entry("scaling_wall16_over_wall1_max",
+                thresholds["scaling_wall16_over_wall1_max"], nullptr, "NOT_MEASURED"));
+            verdicts.push_back(verdict_entry("scaling_efficiency_16_min",
+                thresholds["scaling_efficiency_16_min"], nullptr, "NOT_MEASURED"));
+        }
+        if (determinism_measured) {
+            verdicts.push_back(verdict_entry("determinism_hash_match",
+                thresholds["determinism_hash_match"], determinism_match,
+                determinism_match ? "PASS" : "FAIL"));
+        } else {
+            verdicts.push_back(verdict_entry("determinism_hash_match",
+                thresholds["determinism_hash_match"], nullptr, "NOT_MEASURED"));
+        }
 
         bool any_fail = false;
         bool all_pass_or_warn = true;
@@ -890,6 +1602,10 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                     static_cast<double>(fixture_size)},
                 {"generator", std::move(generator)}}},
             {"run", json{{"lanes", request.lanes}, {"load_profile_pinned", true},
+                {"run_scaling_stage", request.run_scaling_stage},
+                {"run_determinism_stage", request.run_determinism_stage},
+                {"determinism_runs", request.determinism_runs},
+                {"scaling_worker_budgets", request.scaling_worker_budgets},
                 {"wall_ns", analysis_wall_ns},
                 {"process_cpu_ns", process_cpu_ns_now() - cpu_begin},
                 {"analysis_revision", snapshot->analysis_revision},
@@ -947,8 +1663,8 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"strings", snapshot->strings.size()},
                 {"symbols", snapshot->symbols.size()},
                 {"decoded_bytes", decoded_bytes}}},
-            {"scaling", nullptr},
-            {"determinism", nullptr},
+            {"scaling", std::move(scaling_block)},
+            {"determinism", std::move(determinism_block)},
             {"sla", std::move(sla)},
             {"artifacts", json{{"report_json", nullptr},
                 {"compare_verdict_json", nullptr}, {"receipt_json", nullptr}}},
@@ -1042,6 +1758,11 @@ bool start_benchmark_async(const benchmark_run_request_t& request)
         g_async_state.error.clear();
         g_async_state.report_path.clear();
     }
+    g_async_state.run_scaling_stage.store(request.run_scaling_stage,
+        std::memory_order_release);
+    g_async_state.run_determinism_stage.store(request.run_determinism_stage,
+        std::memory_order_release);
+    g_async_state.determinism_runs.store(request.determinism_runs, std::memory_order_release);
     g_async_state.started_ms.store(GetTickCount64(), std::memory_order_release);
     g_async_state.finished_ms.store(0, std::memory_order_release);
     g_async_state.job_id.store(submitted.handle.id, std::memory_order_release);
@@ -1073,6 +1794,10 @@ nlohmann::json benchmark_run_status()
         {"started_ms", started}, {"finished_ms", finished},
         {"elapsed_ms", elapsed},
         {"job_id", g_async_state.job_id.load(std::memory_order_acquire)},
+        {"run_scaling_stage", g_async_state.run_scaling_stage.load(std::memory_order_acquire)},
+        {"run_determinism_stage",
+            g_async_state.run_determinism_stage.load(std::memory_order_acquire)},
+        {"determinism_runs", g_async_state.determinism_runs.load(std::memory_order_acquire)},
         {"verdict", verdict}, {"error", error},
         {"report_json", report_path}};
 }

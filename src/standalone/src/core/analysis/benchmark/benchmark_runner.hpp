@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -24,6 +25,10 @@ struct benchmark_run_request_t {
     bool sla_relaxed = false;
     std::uint32_t decompile_batch_max_functions = 512;
     std::uint32_t decompile_batch_max_ms = 120000;
+    bool run_scaling_stage = false;
+    bool run_determinism_stage = false;
+    std::vector<std::uint32_t> scaling_worker_budgets;
+    std::uint32_t determinism_runs = 2;
 };
 
 struct benchmark_run_result_t {

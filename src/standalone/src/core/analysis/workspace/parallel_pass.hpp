@@ -2,16 +2,20 @@
 
 #include "workspace_types.hpp"
 
+#include "../../infra/taskflow_runtime.hpp"
+
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
-#include <stdexcept>
-#include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -47,6 +51,144 @@ inline std::vector<parallel_shard_t> parallel_shards(std::size_t count,
     return shards;
 }
 
+namespace detail {
+
+struct parallel_no_local_t {};
+
+struct parallel_exec_state_base_t {
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> remaining{0};
+    std::size_t item_count = 0;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<std::exception_ptr> exceptions;
+
+    virtual ~parallel_exec_state_base_t() = default;
+    virtual void run_participant() = 0;
+
+    void finish_item() noexcept {
+        if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard<std::mutex> lock(mutex);
+            cv.notify_all();
+        }
+    }
+
+    void drain_abandoned() noexcept {
+        for (;;) {
+            const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+            if (index >= item_count)
+                return;
+            finish_item();
+        }
+    }
+
+    void wait_complete() {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] {
+            return remaining.load(std::memory_order_acquire) == 0;
+        });
+    }
+
+    void rethrow_first_exception() {
+        for (const auto& exception : exceptions) {
+            if (exception)
+                std::rethrow_exception(exception);
+        }
+    }
+};
+
+template <typename Local, typename Gate, typename F>
+struct parallel_exec_state_t final : parallel_exec_state_base_t {
+    Gate gate;
+    F fn;
+
+    parallel_exec_state_t(Gate gate_in, F fn_in)
+        : gate(std::move(gate_in)), fn(std::move(fn_in)) {}
+
+    void run_participant() override {
+        Local local{};
+        for (;;) {
+            const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+            if (index >= item_count)
+                return;
+            if (!gate()) {
+                finish_item();
+                continue;
+            }
+            try {
+                if constexpr (std::is_same<Local, parallel_no_local_t>::value) {
+                    fn(index);
+                } else {
+                    fn(index, local);
+                }
+            } catch (...) {
+                exceptions[index] = std::current_exception();
+                finish_item();
+                drain_abandoned();
+                return;
+            }
+            finish_item();
+        }
+    }
+};
+
+}
+
+struct parallel_executor_t {
+    template <typename F>
+    static void run(std::size_t item_count, std::uint32_t workers,
+                    const char* label, F&& item_fn) {
+        const auto always_open = [] { return true; };
+        execute<detail::parallel_no_local_t>(item_count, workers, label,
+            always_open, std::forward<F>(item_fn));
+    }
+
+    template <typename Local, typename F>
+    static void run_local(std::size_t item_count, std::uint32_t workers,
+                          const char* label, F&& item_fn) {
+        const auto always_open = [] { return true; };
+        execute<Local>(item_count, workers, label, always_open,
+            std::forward<F>(item_fn));
+    }
+
+    template <typename Gate, typename F>
+    static void run_gated(std::size_t item_count, std::uint32_t workers,
+                          const char* label, Gate&& schedule_gate, F&& item_fn) {
+        execute<detail::parallel_no_local_t>(item_count, workers, label,
+            std::forward<Gate>(schedule_gate), std::forward<F>(item_fn));
+    }
+
+private:
+    template <typename Local, typename Gate, typename F>
+    static void execute(std::size_t item_count, std::uint32_t workers,
+                        const char* label, Gate&& schedule_gate, F&& item_fn) {
+        if (item_count == 0)
+            return;
+        using state_t = detail::parallel_exec_state_t<Local,
+            std::decay_t<Gate>, std::decay_t<F>>;
+        auto state = std::make_shared<state_t>(
+            std::forward<Gate>(schedule_gate), std::forward<F>(item_fn));
+        state->item_count = item_count;
+        state->remaining.store(item_count, std::memory_order_relaxed);
+        state->exceptions.assign(item_count, nullptr);
+        const auto resolved = workers == 0 ? parallel_worker_count() : workers;
+        const std::size_t participants = (std::min<std::size_t>)(
+            static_cast<std::size_t>((std::max<std::uint32_t>)(1U, resolved)),
+            item_count);
+        for (std::size_t helper = 1; helper < participants; ++helper) {
+            aida::infra::taskflow_runtime::task_descriptor_t desc;
+            desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+            desc.owner_subsystem = "analysis_workspace";
+            desc.label = label;
+            desc.body = [state]() { state->run_participant(); };
+            static_cast<void>(aida::infra::taskflow_runtime::submit(std::move(desc)));
+        }
+        state->run_participant();
+        state->wait_complete();
+        state->rethrow_first_exception();
+    }
+};
+
 template <typename F>
 workspace_result_t<void> parallel_run_shards(
     const std::vector<parallel_shard_t>& shards, F&& shard_fn,
@@ -59,41 +201,16 @@ workspace_result_t<void> parallel_run_shards(
     if (count == 0)
         return workspace_result_t<void>::success();
     std::vector<slot_t> slots(count);
-    std::vector<std::thread> threads;
-    threads.reserve(count);
-    std::exception_ptr spawn_exception;
-    try {
-        for (std::size_t index = 0; index < count; ++index) {
-            threads.emplace_back([&, index] {
-                try {
-                    auto result = shard_fn(index, shards[index]);
-                    if (!result)
-                        slots[index].error = std::move(result.error());
-                } catch (...) {
-                    slots[index].exception = std::current_exception();
-                }
-            });
-        }
-    } catch (...) {
-        spawn_exception = std::current_exception();
-    }
-    for (auto& thread : threads)
-        thread.join();
-    if (spawn_exception) {
-        try {
-            std::rethrow_exception(spawn_exception);
-        } catch (const std::system_error&) {
-            slots[threads.size()].error = make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "parallel shard execution exceeded available thread resources",
-                "parallel_pass");
-        } catch (const std::resource_error&) {
-            slots[threads.size()].error = make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "parallel shard execution exceeded available thread resources",
-                "parallel_pass");
-        }
-    }
+    parallel_executor_t::run(count, static_cast<std::uint32_t>(count),
+        "analysis.parallel_run_shards", [&](std::size_t index) {
+            try {
+                auto result = shard_fn(index, shards[index]);
+                if (!result)
+                    slots[index].error = std::move(result.error());
+            } catch (...) {
+                slots[index].exception = std::current_exception();
+            }
+        });
     for (auto& slot : slots) {
         if (slot.exception)
             std::rethrow_exception(slot.exception);
@@ -116,30 +233,8 @@ void parallel_sort(RandomIt first, RandomIt last, Compare comp,
         return;
     }
     const auto run_phase = [](std::size_t lanes, auto&& phase_fn) {
-        std::vector<std::exception_ptr> exceptions(lanes);
-        std::vector<std::thread> threads;
-        threads.reserve(lanes);
-        try {
-            for (std::size_t lane = 0; lane < lanes; ++lane) {
-                threads.emplace_back([&, lane] {
-                    try {
-                        phase_fn(lane);
-                    } catch (...) {
-                        exceptions[lane] = std::current_exception();
-                    }
-                });
-            }
-        } catch (...) {
-            for (auto& thread : threads)
-                thread.join();
-            throw;
-        }
-        for (auto& thread : threads)
-            thread.join();
-        for (const auto& exception : exceptions) {
-            if (exception)
-                std::rethrow_exception(exception);
-        }
+        parallel_executor_t::run(lanes, static_cast<std::uint32_t>(lanes),
+            "analysis.parallel_sort", std::forward<decltype(phase_fn)>(phase_fn));
     };
     const std::size_t sample_target = 255U * worker_count;
     const std::size_t sample_stride = count / sample_target + 1U;
@@ -225,25 +320,14 @@ workspace_result_t<void> parallel_validate_shards(
     if (count == 0)
         return workspace_result_t<void>::success();
     std::vector<slot_t> slots(count);
-    std::vector<std::thread> threads;
-    threads.reserve(count);
-    try {
-        for (std::size_t index = 0; index < count; ++index) {
-            threads.emplace_back([&, index] {
-                try {
-                    slots[index].result = shard_validate_fn(index, shards[index]);
-                } catch (...) {
-                    slots[index].exception = std::current_exception();
-                }
-            });
-        }
-    } catch (...) {
-        for (auto& thread : threads)
-            thread.join();
-        throw;
-    }
-    for (auto& thread : threads)
-        thread.join();
+    parallel_executor_t::run(count, static_cast<std::uint32_t>(count),
+        "analysis.parallel_validate_shards", [&](std::size_t index) {
+            try {
+                slots[index].result = shard_validate_fn(index, shards[index]);
+            } catch (...) {
+                slots[index].exception = std::current_exception();
+            }
+        });
     std::size_t best_error = count;
     std::size_t best_exception = count;
     for (std::size_t index = 0; index < count; ++index) {

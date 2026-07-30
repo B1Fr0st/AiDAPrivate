@@ -10,6 +10,7 @@
 #include "spill_provider.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -27,6 +28,8 @@ static_assert(sizeof(sha256_digest_t) == 32);
 
 constexpr std::uint64_t kMaximumSpillBytes = 1024ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaximumWriteChunkBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kProgressReportByteStride = 16ULL * 1024ULL * 1024ULL;
+constexpr std::int64_t kProgressReportIntervalMs = 250;
 
 struct handle_closer_t {
     void operator()(void* value) const noexcept {
@@ -529,6 +532,24 @@ workspace_result_t<std::shared_ptr<spill_provider_t>> spill_provider_t::from_str
             make_workspace_error(workspace_error_code_t::provider_unavailable,
                                  "spill stream buffer allocation failed", "spill_stream"));
     }
+    std::uint64_t streamed_total = 0;
+    std::uint64_t last_report_bytes = 0;
+    auto last_report_time = std::chrono::steady_clock::now();
+    const auto report_progress = [&](bool final) {
+        if (!options.progress_sink)
+            return;
+        if (!final && streamed_total - last_report_bytes < kProgressReportByteStride &&
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - last_report_time).count() <
+                kProgressReportIntervalMs)
+            return;
+        last_report_bytes = streamed_total;
+        last_report_time = std::chrono::steady_clock::now();
+        try {
+            options.progress_sink(streamed_total, options.expected_total_bytes);
+        } catch (...) {
+        }
+    };
     for (;;) {
         if (cancel.stop_requested())
             return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(
@@ -555,7 +576,10 @@ workspace_result_t<std::shared_ptr<spill_provider_t>> spill_provider_t::from_str
         auto appended = sink.value()->append(buffer.data(), received, cancel);
         if (!appended)
             return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(appended.error());
+        streamed_total += received;
+        report_progress(false);
     }
+    report_progress(true);
     return sink.value()->finalize(cancel);
 }
 

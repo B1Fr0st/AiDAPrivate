@@ -2,9 +2,12 @@
 
 #include "decode_worker_pool.hpp"
 
+#include "../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -13,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1391,8 +1395,23 @@ struct decode_run_context_t final {
     std::mutex failure_mutex;
     std::optional<workspace_error_t> first_error;
     std::uint64_t supervisor_ordinal_counter = 0;
+    std::mutex progress_mutex;
+    std::condition_variable progress_cv;
     tile_decode_orchestrator_statistics_t stats;
 };
+
+void signal_progress(decode_run_context_t& ctx)
+{
+    {
+        std::lock_guard<std::mutex> lock(ctx.progress_mutex);
+    }
+    ctx.progress_cv.notify_all();
+}
+
+void pool_completion_signal(void* context)
+{
+    signal_progress(*static_cast<decode_run_context_t*>(context));
+}
 
 void record_run_failure(decode_run_context_t& ctx, workspace_error_t error)
 {
@@ -1404,6 +1423,7 @@ void record_run_failure(decode_run_context_t& ctx, workspace_error_t error)
     ctx.failed.store(true, std::memory_order_release);
     if (ctx.pool != nullptr)
         ctx.pool->request_stop();
+    signal_progress(ctx);
 }
 
 std::optional<decode_tile_id_t> locate_tile_global(
@@ -2138,6 +2158,9 @@ workspace_result_t<bool> shard_lease_step(decode_run_context_t& ctx,
             shard.incoming.emplace(seq, std::move(completion));
         }
     }
+    if (!shard.incoming.empty() &&
+        shard.incoming.begin()->first != shard.next_apply_seq)
+        ++shard.stats.apply_stall_count;
     while (!shard.incoming.empty() &&
            shard.incoming.begin()->first == shard.next_apply_seq) {
         auto node = shard.incoming.extract(shard.incoming.begin());
@@ -2539,8 +2562,10 @@ bool decode_lease_hook(void* context, std::uint32_t worker_index)
                 return false;
             }
         }
-        if (step.value())
+        if (step.value()) {
+            signal_progress(ctx);
             return true;
+        }
     }
     return false;
 }
@@ -2627,6 +2652,7 @@ bool build_phase_done(decode_run_context_t& ctx)
 workspace_result_t<void> supervise_phase(decode_run_context_t& ctx,
     bool (*predicate)(decode_run_context_t&), const char* cancel_message)
 {
+    constexpr auto kWakeBackstop = std::chrono::milliseconds(25);
     for (;;) {
         if (ctx.failed.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> lock(ctx.failure_mutex);
@@ -2643,7 +2669,13 @@ workspace_result_t<void> supervise_phase(decode_run_context_t& ctx,
                 cancellation_error(*ctx.cancellation, cancel_message));
         if (predicate(ctx))
             return workspace_result_t<void>::success();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::unique_lock<std::mutex> lock(ctx.progress_mutex);
+        ctx.progress_cv.wait_for(lock, kWakeBackstop, [&] {
+            return ctx.failed.load(std::memory_order_acquire) ||
+                (ctx.pool != nullptr && ctx.pool->has_fatal()) ||
+                ctx.cancellation->stop_requested() ||
+                predicate(ctx);
+        });
     }
 }
 
@@ -2848,15 +2880,19 @@ std::vector<T> kway_merge_unique(std::vector<std::vector<T>>& sources, Less less
 }
 
 workspace_result_t<tile_decode_orchestration_result_t>
-tile_decode_orchestrator_t::run(
+tile_decode_orchestrator_t::run_impl(
     const provider_snapshot_t& snapshot,
     const image_layout_index_t& layout,
+    const executable_decode_partition_t* precomputed_partition,
     std::vector<tile_decode_seed_t> seeds,
     tile_decode_executor_t& executor,
     const cancellation_token_t& cancellation,
     const decode_tile_range_t* tile_range,
     decode_lane_seed_exchange_t* lane_exchange,
-    std::uint32_t lane_id) const
+    std::uint32_t lane_id,
+    decode_worker_pool_t* shared_pool,
+    bool tile_only_shard_formula,
+    bool publish_unmerged_shards) const
 {
     const auto run_start = std::chrono::steady_clock::now();
     const auto& caps = executor.capabilities();
@@ -2887,15 +2923,20 @@ tile_decode_orchestrator_t::run(
         : (std::min)(limits_.maximum_frontier_wave,
             static_cast<std::uint64_t>(caps.maximum_batch_requests));
 
-    auto partition_result = partition_executable_decode_ranges(
-        layout, caps, limits_, cancellation);
-    if (!partition_result)
-        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-            partition_result.error());
-    auto partition = partition_result.take_value();
+    std::optional<executable_decode_partition_t> computed_partition;
+    const executable_decode_partition_t* partition = precomputed_partition;
+    if (partition == nullptr) {
+        auto partition_result = partition_executable_decode_ranges(
+            layout, caps, limits_, cancellation);
+        if (!partition_result)
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                partition_result.error());
+        computed_partition = partition_result.take_value();
+        partition = &*computed_partition;
+    }
 
     const auto tile_count =
-        static_cast<decode_tile_id_t>(partition.tiles.size());
+        static_cast<decode_tile_id_t>(partition->tiles.size());
     decode_tile_id_t range_begin = 0;
     decode_tile_id_t range_end = tile_count;
     if (tile_range != nullptr) {
@@ -2920,9 +2961,11 @@ tile_decode_orchestrator_t::run(
     ctx.batch_request_limit = batch_request_limit;
     ctx.range_begin = range_begin;
     ctx.range_end = range_end;
-    ctx.all_tiles = &partition.tiles;
+    ctx.all_tiles = &partition->tiles;
 
-    {
+    if (shared_pool != nullptr) {
+        ctx.pool = shared_pool;
+    } else {
         auto* production =
             dynamic_cast<production_tile_decode_executor_t*>(&executor);
         if (production != nullptr)
@@ -2941,13 +2984,13 @@ tile_decode_orchestrator_t::run(
     }
     ctx.image_size = image_size;
 
-    ctx.tiles_by_rva.resize(partition.tiles.size());
+    ctx.tiles_by_rva.resize(partition->tiles.size());
     for (decode_tile_id_t tile_id = 0; tile_id < tile_count; ++tile_id)
         ctx.tiles_by_rva[tile_id] = tile_id;
     std::sort(ctx.tiles_by_rva.begin(), ctx.tiles_by_rva.end(),
         [&](decode_tile_id_t lhs, decode_tile_id_t rhs) {
-            const auto& left = partition.tiles[lhs];
-            const auto& right = partition.tiles[rhs];
+            const auto& left = partition->tiles[lhs];
+            const auto& right = partition->tiles[rhs];
             if (left.start_rva != right.start_rva)
                 return left.start_rva < right.start_rva;
             return lhs < rhs;
@@ -2956,14 +2999,20 @@ tile_decode_orchestrator_t::run(
     const std::uint64_t range_tile_count = range_end - range_begin;
     std::uint32_t shard_count = 0;
     if (range_tile_count != 0) {
-        const auto desired = next_pow2(static_cast<std::uint64_t>((std::max)(
-            4ULL, (std::min)(64ULL,
-                static_cast<std::uint64_t>(caps.worker_count) * 2ULL))));
+        std::uint64_t desired = 0;
+        if (tile_only_shard_formula) {
+            desired = next_pow2(static_cast<std::uint64_t>((std::max)(
+                4ULL, (std::min)(64ULL, range_tile_count / 128ULL))));
+        } else {
+            desired = next_pow2(static_cast<std::uint64_t>((std::max)(
+                4ULL, (std::min)(64ULL,
+                    static_cast<std::uint64_t>(caps.worker_count) * 2ULL))));
+        }
         shard_count = static_cast<std::uint32_t>((std::min)(
             static_cast<std::uint64_t>(desired), range_tile_count));
     }
 
-    ctx.shard_of_tile.assign(partition.tiles.size(),
+    ctx.shard_of_tile.assign(partition->tiles.size(),
         (std::numeric_limits<std::uint32_t>::max)());
     ctx.shards.reserve(shard_count);
     for (std::uint32_t shard_index = 0; shard_index < shard_count;
@@ -2978,7 +3027,7 @@ tile_decode_orchestrator_t::run(
         frontier_tiles.reserve(shard->tile_end - shard->tile_begin);
         for (auto tile_id = shard->tile_begin; tile_id < shard->tile_end;
              ++tile_id) {
-            const auto& tile = partition.tiles[tile_id];
+            const auto& tile = partition->tiles[tile_id];
             decode_frontier_tile_t frontier_tile;
             frontier_tile.id = tile.tile_id;
             frontier_tile.start_rva = tile.start_rva;
@@ -2997,7 +3046,7 @@ tile_decode_orchestrator_t::run(
         for (auto tile_id = shard->tile_begin; tile_id < shard->tile_end;
              ++tile_id) {
             shard->accumulators[tile_id - shard->tile_begin].tile =
-                &partition.tiles[tile_id];
+                &partition->tiles[tile_id];
         }
         shard->built_shards.resize(shard->tile_end - shard->tile_begin);
         ctx.shards.push_back(std::move(shard));
@@ -3015,7 +3064,7 @@ tile_decode_orchestrator_t::run(
 
     const auto seed_frontier = [&](decode_frontier_seed_t& seed)
         -> workspace_result_t<void> {
-        const auto target_tile = locate_tile_global(ctx, partition.tiles,
+        const auto target_tile = locate_tile_global(ctx, partition->tiles,
             seed.rva);
         if (!target_tile) {
             if (ctx.shards.empty())
@@ -3062,7 +3111,7 @@ tile_decode_orchestrator_t::run(
     }
 
     if (limits_.seed_executable_range_starts) {
-        for (const auto& range : partition.ranges) {
+        for (const auto& range : partition->ranges) {
             decode_frontier_seed_t fs;
             fs.rva = range.start_rva;
             fs.kind = decode_frontier_seed_kind_t::range_entry;
@@ -3078,13 +3127,16 @@ tile_decode_orchestrator_t::run(
     struct lease_hook_guard_t final {
         decode_worker_pool_t* pool = nullptr;
         ~lease_hook_guard_t() {
-            if (pool != nullptr)
+            if (pool != nullptr) {
+                pool->clear_completion_signal();
                 pool->clear_lease_hook();
+            }
         }
     } hook_guard;
 
     if (ctx.pool != nullptr) {
         ctx.pool->bind_snapshot(snapshot);
+        ctx.pool->set_completion_signal(pool_completion_signal, &ctx);
         ctx.pool->set_lease_hook(decode_lease_hook, &ctx);
         hook_guard.pool = ctx.pool;
     }
@@ -3098,57 +3150,112 @@ tile_decode_orchestrator_t::run(
             batch_cancel_message);
     };
 
-    auto driven = drive(recursive_phase_done,
-        decode_run_context_t::phase_recursive,
+    const auto drive_timed = [&](bool (*predicate)(decode_run_context_t&),
+                                 std::uint32_t phase, const char* phase_name,
+                                 const char* cancel_message,
+                                 const char* batch_cancel_message,
+                                 std::uint64_t& phase_wall_ns)
+        -> workspace_result_t<void> {
+        const auto begin = std::chrono::steady_clock::now();
+        auto result = drive(predicate, phase, cancel_message,
+            batch_cancel_message);
+        phase_wall_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+        ::diag::log_tagged_fmt("tile_decode",
+            result ? "phase=%s done wall_us=%llu tiles=%llu shards=%u"
+                   : "phase=%s failed wall_us=%llu tiles=%llu shards=%u",
+            phase_name,
+            static_cast<unsigned long long>(phase_wall_ns / 1000ULL),
+            static_cast<unsigned long long>(range_tile_count),
+            shard_count);
+        return result;
+    };
+
+    std::uint64_t recursive_phase_ns = 0;
+    std::uint64_t gap_phase_ns = 0;
+    std::uint64_t reconcile_phase_ns = 0;
+    std::uint64_t edges_phase_ns = 0;
+    std::uint64_t build_phase_ns = 0;
+
+    auto driven = drive_timed(recursive_phase_done,
+        decode_run_context_t::phase_recursive, "recursive",
         "orchestrator recursive pass cancelled",
-        "orchestrator recursive batch cancelled");
+        "orchestrator recursive batch cancelled", recursive_phase_ns);
     if (!driven)
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             driven.error());
 
-    driven = drive(gap_phase_done, decode_run_context_t::phase_gap,
-        "orchestrator gap pass cancelled",
-        "orchestrator gap batch cancelled");
+    driven = drive_timed(gap_phase_done, decode_run_context_t::phase_gap,
+        "gap", "orchestrator gap pass cancelled",
+        "orchestrator gap batch cancelled", gap_phase_ns);
     if (!driven)
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             driven.error());
 
-    driven = drive(reconcile_phase_done,
-        decode_run_context_t::phase_reconcile,
+    driven = drive_timed(reconcile_phase_done,
+        decode_run_context_t::phase_reconcile, "reconcile",
         "cross-tile instruction reconciliation cancelled",
-        "cross-tile instruction reconciliation cancelled");
+        "cross-tile instruction reconciliation cancelled", reconcile_phase_ns);
     if (!driven)
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             driven.error());
 
-    auto fixed = reconcile_boundary_fixup(ctx);
-    if (!fixed)
-        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-            fixed.error());
+    {
+        const auto fixup_begin = std::chrono::steady_clock::now();
+        auto fixed = reconcile_boundary_fixup(ctx);
+        const auto fixup_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - fixup_begin).count());
+        reconcile_phase_ns += fixup_ns;
+        ::diag::log_tagged_fmt("tile_decode",
+            fixed ? "phase=reconcile_fixup done wall_us=%llu"
+                  : "phase=reconcile_fixup failed wall_us=%llu",
+            static_cast<unsigned long long>(fixup_ns / 1000ULL));
+        if (!fixed)
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                fixed.error());
+    }
 
-    driven = drive(edges_phase_done, decode_run_context_t::phase_edges,
-        "tile decode edge recording cancelled",
-        "tile decode edge recording cancelled");
+    driven = drive_timed(edges_phase_done, decode_run_context_t::phase_edges,
+        "edges", "tile decode edge recording cancelled",
+        "tile decode edge recording cancelled", edges_phase_ns);
     if (!driven)
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             driven.error());
 
-    driven = drive(build_phase_done, decode_run_context_t::phase_build,
-        "orchestrator shard build cancelled",
-        "orchestrator shard build cancelled");
+    driven = drive_timed(build_phase_done, decode_run_context_t::phase_build,
+        "build", "orchestrator shard build cancelled",
+        "orchestrator shard build cancelled", build_phase_ns);
     if (!driven)
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             driven.error());
 
     ctx.phase.store(decode_run_context_t::phase_done,
         std::memory_order_release);
-    if (ctx.pool != nullptr)
+    if (ctx.pool != nullptr) {
+        ctx.pool->clear_completion_signal();
         ctx.pool->clear_lease_hook();
+    }
     hook_guard.pool = nullptr;
 
     tile_decode_orchestrator_statistics_t stats;
-    stats.initialized_executable_bytes = partition.initialized_executable_bytes;
-    stats.zero_fill_executable_bytes = partition.zero_fill_executable_bytes;
+    stats.initialized_executable_bytes = partition->initialized_executable_bytes;
+    stats.zero_fill_executable_bytes = partition->zero_fill_executable_bytes;
+    stats.recursive_phase_wall_ns = recursive_phase_ns;
+    stats.gap_phase_wall_ns = gap_phase_ns;
+    stats.reconcile_phase_wall_ns = reconcile_phase_ns;
+    stats.edges_phase_wall_ns = edges_phase_ns;
+    stats.build_phase_wall_ns = build_phase_ns;
+    if (ctx.pool != nullptr) {
+        const auto pool_stats = ctx.pool->statistics();
+        stats.worker_completion_push_count = pool_stats.completion_push_count;
+        stats.worker_steal_count = pool_stats.steal_count;
+        stats.worker_backpressure_wait_count =
+            pool_stats.backpressure_wait_count;
+        stats.worker_inline_drain_count = pool_stats.inline_drain_count;
+        stats.worker_max_queue_depth = pool_stats.max_queue_depth_seen;
+    }
 
     std::vector<packed_analysis_shard_t> shards;
     std::vector<tile_decode_shard_summary_t> shard_summaries;
@@ -3190,6 +3297,7 @@ tile_decode_orchestrator_t::run(
         stats.attempted_bytes += shard.stats.attempted_bytes;
         stats.accepted_tiles += shard.stats.accepted_tiles;
         stats.duplicate_edges += shard.stats.duplicate_edges;
+        stats.apply_stall_count += shard.stats.apply_stall_count;
         const auto snapshot_of = shard.frontier.snapshot();
         stats.frontier.unique_seed_count += snapshot_of.unique_seed_count;
         stats.frontier.pending_seed_count += snapshot_of.pending_seed_count;
@@ -3204,11 +3312,31 @@ tile_decode_orchestrator_t::run(
     stats.overlap_instruction_candidates +=
         ctx.stats.overlap_instruction_candidates;
 
-    auto store_result = packed_analysis_store_t::merge(std::move(shards));
-    if (!store_result)
-        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
-            orchestrator_error(workspace_error_code_t::integrity_failure,
-                "packed store merge failed"));
+    std::unique_ptr<packed_analysis_store_t> merged_store;
+    if (publish_unmerged_shards) {
+        std::unordered_set<std::uint16_t> published_ids;
+        published_ids.reserve(shards.size());
+        for (const auto& packed : shards) {
+            if (!packed.valid()) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    orchestrator_error(workspace_error_code_t::integrity_failure,
+                        "packed shard publication is invalid"));
+            }
+            if (!published_ids.insert(packed.shard_id()).second) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    orchestrator_error(workspace_error_code_t::integrity_failure,
+                        "packed shard publication has a duplicate shard identifier"));
+            }
+        }
+    } else {
+        auto store_result = packed_analysis_store_t::merge(std::move(shards));
+        if (!store_result)
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "packed store merge failed"));
+        merged_store = std::make_unique<packed_analysis_store_t>(
+            std::move(store_result).take_value());
+    }
 
     auto merged_edges = kway_merge_unique(edge_sources, decoded_edge_less_t{});
     if (static_cast<std::uint64_t>(merged_edges.size()) >
@@ -3232,19 +3360,19 @@ tile_decode_orchestrator_t::run(
 
     const auto span_begin = range_tile_count == 0
         ? 0
-        : partition.tiles[range_begin].start_rva;
+        : partition->tiles[range_begin].start_rva;
     std::uint64_t span_end = 0;
     if (range_tile_count != 0 &&
-        !checked_add(partition.tiles[range_end - 1].start_rva,
-            partition.tiles[range_end - 1].byte_count, span_end)) {
+        !checked_add(partition->tiles[range_end - 1].start_rva,
+            partition->tiles[range_end - 1].byte_count, span_end)) {
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             orchestrator_error(workspace_error_code_t::range_overflow,
                 "decode tile span overflowed",
-                partition.tiles[range_end - 1].start_rva));
+                partition->tiles[range_end - 1].start_rva));
     }
 
     std::uint64_t zero_fill_visits = 0;
-    for (const auto& range : partition.zero_fill_ranges) {
+    for (const auto& range : partition->zero_fill_ranges) {
         if ((zero_fill_visits++ & 255ULL) == 0 &&
             cancellation.stop_requested()) {
             return workspace_result_t<tile_decode_orchestration_result_t>::failure(
@@ -3286,9 +3414,25 @@ tile_decode_orchestrator_t::run(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - run_start).count());
 
+    ::diag::log_tagged_fmt("tile_decode",
+        "run done wall_us=%llu tiles=%llu shards=%u workers=%u requests=%llu instructions=%llu steals=%llu apply_stalls=%llu backpressure_waits=%llu max_queue_depth=%llu",
+        static_cast<unsigned long long>(stats.lane_wall_ns / 1000ULL),
+        static_cast<unsigned long long>(range_tile_count),
+        shard_count,
+        caps.worker_count,
+        static_cast<unsigned long long>(
+            stats.recursive_requests + stats.gap_requests),
+        static_cast<unsigned long long>(stats.accepted_instructions),
+        static_cast<unsigned long long>(stats.worker_steal_count),
+        static_cast<unsigned long long>(stats.apply_stall_count),
+        static_cast<unsigned long long>(stats.worker_backpressure_wait_count),
+        static_cast<unsigned long long>(stats.worker_max_queue_depth));
+
     tile_decode_orchestration_result_t result;
-    result.packed_store = std::make_unique<packed_analysis_store_t>(
-        std::move(store_result).take_value());
+    if (publish_unmerged_shards)
+        result.packed_shards = std::move(shards);
+    else
+        result.packed_store = std::move(merged_store);
     result.delay_slot_counts = std::move(merged_delay_slot_counts);
     result.coverage = std::move(merged_coverage);
     result.cross_tile_edges = std::move(merged_cross_edges);
@@ -3297,6 +3441,51 @@ tile_decode_orchestrator_t::run(
 
     return workspace_result_t<tile_decode_orchestration_result_t>::success(
         std::move(result));
+}
+
+workspace_result_t<tile_decode_orchestration_result_t>
+tile_decode_orchestrator_t::run(
+    const provider_snapshot_t& snapshot,
+    const image_layout_index_t& layout,
+    std::vector<tile_decode_seed_t> seeds,
+    tile_decode_executor_t& executor,
+    const cancellation_token_t& cancellation,
+    const decode_tile_range_t* tile_range,
+    decode_lane_seed_exchange_t* lane_exchange,
+    std::uint32_t lane_id) const
+{
+    return run_impl(snapshot, layout, nullptr, std::move(seeds), executor,
+        cancellation, tile_range, lane_exchange, lane_id, nullptr, false,
+        false);
+}
+
+workspace_result_t<tile_decode_orchestration_result_t>
+tile_decode_orchestrator_t::run_shared(
+    const provider_snapshot_t& snapshot,
+    const image_layout_index_t& layout,
+    const executable_decode_partition_t& partition,
+    std::vector<tile_decode_seed_t> seeds,
+    tile_decode_executor_t& executor,
+    const cancellation_token_t& cancellation,
+    decode_worker_pool_t* shared_pool) const
+{
+    if (static_cast<std::uint64_t>(partition.tiles.size()) >
+        limits_.maximum_tiles) {
+        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+            limit_error("tiles", limits_.maximum_tiles,
+                static_cast<std::uint64_t>(partition.tiles.size())));
+    }
+    for (std::size_t index = 0; index < partition.tiles.size(); ++index) {
+        const auto& tile = partition.tiles[index];
+        if (tile.tile_id != static_cast<decode_tile_id_t>(index) ||
+            tile.byte_count == 0) {
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "precomputed decode partition is invalid", tile.start_rva));
+        }
+    }
+    return run_impl(snapshot, layout, &partition, std::move(seeds), executor,
+        cancellation, nullptr, nullptr, 0, shared_pool, true, true);
 }
 
 }

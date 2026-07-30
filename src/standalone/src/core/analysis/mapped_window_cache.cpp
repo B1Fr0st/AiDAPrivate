@@ -10,6 +10,7 @@
 
 #include "workspace/checked_range.hpp"
 #include "workspace/workspace_identity.hpp"
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -28,14 +29,43 @@ namespace {
 
 constexpr std::uint64_t kMinimumWindowBytes = 64ULL * 1024ULL;
 constexpr std::uint64_t kMaximumWindowBytes = 64ULL * 1024ULL * 1024ULL;
-constexpr std::uint64_t kMaximumCacheBytes = 1024ULL * 1024ULL * 1024ULL;
-constexpr std::uint64_t kMaximumGlobalMappedBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumCacheBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumGlobalMappedBytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kAutoCacheFloorBytes = 256ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kAutoWindowLargeSourceBytes = 256ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kAutoWindowMediumSourceBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kAutoWindowLargeBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kAutoWindowMediumBytes = 8ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kAutoWindowSmallBytes = 4ULL * 1024ULL * 1024ULL;
+
+std::atomic<std::uint64_t>& adaptive_per_file_ceiling_bytes() noexcept {
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+
+std::atomic<std::uint64_t>& adaptive_global_ceiling_bytes() noexcept {
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+
+std::atomic<bool>& adaptive_ceiling_claimed() noexcept {
+    static std::atomic<bool> value{false};
+    return value;
+}
+
+std::atomic<bool>& adaptive_ceiling_installed() noexcept {
+    static std::atomic<bool> value{false};
+    return value;
+}
+
+std::wstring create_file_api_path(const std::wstring& normalized) {
+    if (normalized.size() < static_cast<std::size_t>(MAX_PATH) ||
+        normalized.rfind(L"\\\\?\\", 0) == 0)
+        return normalized;
+    if (normalized.size() >= 2 && normalized[0] == L'\\' && normalized[1] == L'\\')
+        return L"\\\\?\\UNC\\" + normalized.substr(2);
+    return L"\\\\?\\" + normalized;
+}
 
 struct handle_closer_t {
     void operator()(void* value) const noexcept {
@@ -151,7 +181,8 @@ workspace_result_t<byte_provider_identity_t> query_current_path_identity(
     auto wide_result = utf8_to_wide(source);
     if (!wide_result)
         return workspace_result_t<std::wstring>::failure(wide_result.error());
-    HANDLE raw_file = CreateFileW(wide_result.value().c_str(), FILE_READ_ATTRIBUTES,
+    const std::wstring api_path = create_file_api_path(wide_result.value());
+    HANDLE raw_file = CreateFileW(api_path.c_str(), FILE_READ_ATTRIBUTES,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (raw_file == INVALID_HANDLE_VALUE) {
@@ -620,6 +651,47 @@ struct mapped_window_cache_t::state_t {
     }
 };
 
+void mapped_window_cache_t::set_adaptive_window_ceiling(std::uint64_t per_file_bytes,
+                                                        std::uint64_t global_bytes) {
+    if (per_file_bytes == 0 || global_bytes == 0) {
+        ::diag::log_tagged_fmt("mapped_window_cache",
+            "adaptive_window_ceiling rejected per_file=%llu global=%llu reason=zero",
+            static_cast<unsigned long long>(per_file_bytes),
+            static_cast<unsigned long long>(global_bytes));
+        return;
+    }
+    per_file_bytes = (std::max)(per_file_bytes, kMaximumWindowBytes);
+    per_file_bytes = (std::min)(per_file_bytes, kMaximumCacheBytes);
+    global_bytes = (std::min)(global_bytes, kMaximumGlobalMappedBytes);
+    if (global_bytes < per_file_bytes) {
+        ::diag::log_tagged_fmt("mapped_window_cache",
+            "adaptive_window_ceiling rejected per_file=%llu global=%llu reason=global_below_per_file",
+            static_cast<unsigned long long>(per_file_bytes),
+            static_cast<unsigned long long>(global_bytes));
+        return;
+    }
+    bool expected = false;
+    if (!adaptive_ceiling_claimed().compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        ::diag::log_tagged_fmt("mapped_window_cache",
+            "adaptive_window_ceiling already installed active_per_file=%llu active_global=%llu ignored_per_file=%llu ignored_global=%llu",
+            static_cast<unsigned long long>(
+                adaptive_per_file_ceiling_bytes().load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(
+                adaptive_global_ceiling_bytes().load(std::memory_order_acquire)),
+            static_cast<unsigned long long>(per_file_bytes),
+            static_cast<unsigned long long>(global_bytes));
+        return;
+    }
+    adaptive_per_file_ceiling_bytes().store(per_file_bytes, std::memory_order_release);
+    adaptive_global_ceiling_bytes().store(global_bytes, std::memory_order_release);
+    adaptive_ceiling_installed().store(true, std::memory_order_release);
+    ::diag::log_tagged_fmt("mapped_window_cache",
+        "adaptive_window_ceiling installed per_file=%llu global=%llu",
+        static_cast<unsigned long long>(per_file_bytes),
+        static_cast<unsigned long long>(global_bytes));
+}
+
 workspace_result_t<std::shared_ptr<mapped_window_cache_t>> mapped_window_cache_t::open(
     const std::string& utf8_path, mapped_window_cache_options_t options) {
     if (!is_power_of_two(options.shard_count) || options.shard_count > 64 ||
@@ -644,7 +716,8 @@ workspace_result_t<std::shared_ptr<mapped_window_cache_t>> mapped_window_cache_t
     const DWORD share_mode = options.immutable_source
         ? FILE_SHARE_READ
         : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    HANDLE raw_file = CreateFileW(wide.value().c_str(), GENERIC_READ,
+    const std::wstring api_path = create_file_api_path(wide.value());
+    HANDLE raw_file = CreateFileW(api_path.c_str(), GENERIC_READ,
                                   share_mode, nullptr, OPEN_EXISTING,
                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
     if (raw_file == INVALID_HANDLE_VALUE) {
@@ -679,6 +752,14 @@ workspace_result_t<std::shared_ptr<mapped_window_cache_t>> mapped_window_cache_t
         options.max_cached_window_bytes = (std::min)(
             (std::max)(bounded * options.window_bytes, kAutoCacheFloorBytes),
             kMaximumCacheBytes);
+    }
+    if (adaptive_ceiling_installed().load(std::memory_order_acquire)) {
+        options.max_cached_window_bytes = (std::min)(
+            options.max_cached_window_bytes,
+            adaptive_per_file_ceiling_bytes().load(std::memory_order_acquire));
+        options.max_global_mapped_window_bytes = (std::min)(
+            options.max_global_mapped_window_bytes,
+            adaptive_global_ceiling_bytes().load(std::memory_order_acquire));
     }
     if (options.window_bytes > static_cast<std::uint64_t>((std::numeric_limits<SIZE_T>::max)()) ||
         options.max_cached_window_bytes < options.window_bytes ||

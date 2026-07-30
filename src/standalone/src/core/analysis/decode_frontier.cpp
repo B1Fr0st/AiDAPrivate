@@ -1,6 +1,7 @@
 #include "decode_frontier.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <map>
 #include <new>
@@ -148,13 +149,24 @@ struct decode_frontier_t::impl_t final {
         decode_frontier_tile_t tile;
         std::map<std::uint64_t, decode_frontier_seed_t> pending;
         claimed_flat_set_t claimed;
+        bool in_queue = false;
     };
 
     std::vector<decode_frontier_tile_t> tiles;
     std::vector<tile_state_t> states;
+    std::deque<std::uint32_t> pending_queue;
     std::uint64_t maximum_unique_seeds = 0;
     decode_frontier_snapshot_t counters;
     std::atomic<std::uint64_t>* shared_unique_seed_count = nullptr;
+
+    void note_pending_insert(std::size_t index)
+    {
+        auto& state = states[index];
+        if (state.in_queue)
+            return;
+        pending_queue.push_back(static_cast<std::uint32_t>(index));
+        state.in_queue = true;
+    }
 
     std::optional<std::size_t> locate_index(std::uint64_t rva) const noexcept
     {
@@ -330,6 +342,7 @@ workspace_result_t<decode_frontier_add_result_t> decode_frontier_t::add_seed(
         }
         try {
             state.pending.emplace(seed.rva, seed);
+            impl_->note_pending_insert(*index);
         } catch (const std::bad_alloc&) {
             return workspace_result_t<decode_frontier_add_result_t>::failure(frontier_error(
                 workspace_error_code_t::limit_exceeded,
@@ -365,6 +378,7 @@ workspace_result_t<decode_frontier_add_result_t> decode_frontier_t::add_seed(
     }
     try {
         state.pending.emplace(seed.rva, seed);
+        impl_->note_pending_insert(*index);
     } catch (const std::bad_alloc&) {
         return workspace_result_t<decode_frontier_add_result_t>::failure(frontier_error(
             workspace_error_code_t::limit_exceeded,
@@ -391,26 +405,27 @@ workspace_result_t<std::vector<decode_frontier_seed_t>> decode_frontier_t::take_
         std::vector<decode_frontier_seed_t> wave;
         wave.reserve(static_cast<std::size_t>(
             (std::min)(maximum_items, impl_->counters.pending_seed_count)));
-        bool progress = true;
-        while (wave.size() < maximum_items && progress) {
-            progress = false;
-            for (auto& state : impl_->states) {
-                if (wave.size() >= maximum_items)
-                    break;
-                if (state.pending.empty())
-                    continue;
-                auto found = state.pending.begin();
-                auto seed = found->second;
-                state.pending.erase(found);
-                const auto claim_slot = state.claimed.insert(seed.rva);
-                const decode_frontier_claim_t claim{
-                    seed.provenance, seed.confidence, seed.stable_source_id};
-                if (!stronger_claim(state.claimed.claims[claim_slot], claim))
-                    state.claimed.claims[claim_slot] = claim;
-                wave.push_back(std::move(seed));
-                --impl_->counters.pending_seed_count;
-                ++impl_->counters.claimed_seed_count;
-                progress = true;
+        while (wave.size() < maximum_items && !impl_->pending_queue.empty()) {
+            const auto index = impl_->pending_queue.front();
+            impl_->pending_queue.pop_front();
+            auto& state = impl_->states[static_cast<std::size_t>(index)];
+            state.in_queue = false;
+            if (state.pending.empty())
+                continue;
+            auto found = state.pending.begin();
+            auto seed = found->second;
+            state.pending.erase(found);
+            const auto claim_slot = state.claimed.insert(seed.rva);
+            const decode_frontier_claim_t claim{
+                seed.provenance, seed.confidence, seed.stable_source_id};
+            if (!stronger_claim(state.claimed.claims[claim_slot], claim))
+                state.claimed.claims[claim_slot] = claim;
+            wave.push_back(std::move(seed));
+            --impl_->counters.pending_seed_count;
+            ++impl_->counters.claimed_seed_count;
+            if (!state.pending.empty()) {
+                impl_->pending_queue.push_back(index);
+                state.in_queue = true;
             }
         }
         return workspace_result_t<std::vector<decode_frontier_seed_t>>::success(

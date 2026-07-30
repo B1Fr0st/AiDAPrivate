@@ -85,11 +85,19 @@ public:
         packed_page_t& page,
         const packed_stop_predicate_t& stop_requested = {});
 
+    static workspace_result_t<void> seal_page_v3(
+        packed_page_t& page, int compression_level,
+        const packed_stop_predicate_t& stop_requested = {});
+
     static workspace_result_t<packed_record_page_prefix_t> record_prefix(
         const packed_page_t& page,
         const packed_stop_predicate_t& stop_requested = {});
 
     static workspace_result_t<std::vector<std::uint8_t>> record_payload(
+        const packed_page_t& page,
+        const packed_stop_predicate_t& stop_requested = {});
+
+    static workspace_result_t<std::vector<std::uint8_t>> decode_page_content(
         const packed_page_t& page,
         const packed_stop_predicate_t& stop_requested = {});
 

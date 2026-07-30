@@ -1,5 +1,7 @@
 #include "type_graph_builder.hpp"
 
+#include "../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -13,6 +15,24 @@
 namespace aida::analysis::type_graph {
 
 namespace {
+
+bool slot_conflicting_edge_kind(const decompiler_type_edge_kind_t kind) noexcept
+{
+    return kind == decompiler_type_edge_kind_t::member ||
+        kind == decompiler_type_edge_kind_t::pointee ||
+        kind == decompiler_type_edge_kind_t::element ||
+        kind == decompiler_type_edge_kind_t::return_type ||
+        kind == decompiler_type_edge_kind_t::parameter;
+}
+
+std::string offset_string(const std::optional<std::uint64_t>& offset)
+{
+    if (!offset)
+        return "<none>";
+    std::ostringstream ss;
+    ss << *offset;
+    return ss.str();
+}
 
 std::string edge_stable_name(const type_edge_candidate_t& edge)
 {
@@ -361,32 +381,60 @@ void type_graph_builder_t::merge_candidates(const std::vector<type_candidate_t>&
 
 void type_graph_builder_t::merge_edges(merged_node_t& merged, const type_candidate_t& candidate)
 {
+    const auto record_edge_conflict = [this](const std::string& canonical_name,
+                                             const std::string& field_name,
+                                             const type_edge_candidate_t& winner,
+                                             const type_edge_candidate_t& loser) {
+        provenance_conflict_t econflict;
+        econflict.canonical_name = canonical_name;
+        econflict.field_name = field_name;
+        econflict.winner = to_provenance_record(winner);
+        econflict.loser = to_provenance_record(loser);
+        econflict.winner_value = winner.target_canonical_name + "@" + offset_string(winner.byte_offset);
+        econflict.loser_value = loser.target_canonical_name + "@" + offset_string(loser.byte_offset);
+        edge_conflicts_.push_back(econflict);
+        stats_.conflicts++;
+        diag::log_tagged_fmt("type_graph",
+            "edge_conflict resolved type=%s field=%s winner=%s(%s,%u) loser=%s(%s,%u)",
+            canonical_name.c_str(), field_name.c_str(),
+            econflict.winner_value.c_str(),
+            provenance_label(econflict.winner.source).c_str(),
+            static_cast<unsigned>(econflict.winner.confidence),
+            econflict.loser_value.c_str(),
+            provenance_label(econflict.loser.source).c_str(),
+            static_cast<unsigned>(econflict.loser.confidence));
+    };
     for (const auto& edge : candidate.edges) {
         bool found_duplicate = false;
         for (auto& existing : merged.edges) {
-            if (existing.kind == edge.kind &&
+            const bool same_slot = slot_conflicting_edge_kind(edge.kind)
+                ? (existing.kind == edge.kind &&
+                   edge_stable_name(existing) == edge_stable_name(edge))
+                : (existing.kind == edge.kind &&
+                   existing.target_canonical_name == edge.target_canonical_name &&
+                   edge_stable_name(existing) == edge_stable_name(edge));
+            if (!same_slot)
+                continue;
+            found_duplicate = true;
+            const bool same_fact =
                 existing.target_canonical_name == edge.target_canonical_name &&
-                edge_stable_name(existing) == edge_stable_name(edge)) {
-                found_duplicate = true;
-                auto existing_score = effective_score(to_provenance_record(existing));
-                auto incoming_score = effective_score(to_provenance_record(edge));
-                if (incoming_score > existing_score) {
-                    if (config_.strict_conflict_reporting ||
-                        to_provenance_record(existing).source != decompiler_fact_provenance_t::unknown) {
-                        provenance_conflict_t econflict;
-                        econflict.canonical_name = merged.canonical_name;
-                        econflict.field_name = edge_stable_name(edge);
-                        econflict.winner = to_provenance_record(edge);
-                        econflict.loser = to_provenance_record(existing);
-                        econflict.winner_value = edge.target_canonical_name;
-                        econflict.loser_value = existing.target_canonical_name;
-                        edge_conflicts_.push_back(std::move(econflict));
-                        stats_.conflicts++;
-                    }
-                    existing = edge;
+                existing.byte_offset == edge.byte_offset;
+            const auto existing_score = effective_score(to_provenance_record(existing));
+            const auto incoming_score = effective_score(to_provenance_record(edge));
+            if (incoming_score > existing_score) {
+                if (!same_fact &&
+                    (config_.strict_conflict_reporting ||
+                        to_provenance_record(existing).source != decompiler_fact_provenance_t::unknown)) {
+                    record_edge_conflict(merged.canonical_name, edge_stable_name(edge), edge, existing);
                 }
-                break;
+                existing = edge;
+            } else if (!same_fact && slot_conflicting_edge_kind(edge.kind)) {
+                if (config_.strict_conflict_reporting ||
+                    to_provenance_record(edge).source != decompiler_fact_provenance_t::unknown) {
+                    record_edge_conflict(merged.canonical_name, edge_stable_name(edge), existing, edge);
+                }
             }
+            break;
         }
         if (!found_duplicate) {
             merged.edges.push_back(edge);

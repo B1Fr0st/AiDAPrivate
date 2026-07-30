@@ -38,6 +38,8 @@ class mapped_window_cache_t final : public byte_provider_t {
 public:
     static workspace_result_t<std::shared_ptr<mapped_window_cache_t>>
         open(const std::string& utf8_path, mapped_window_cache_options_t options = {});
+    static void set_adaptive_window_ceiling(std::uint64_t per_file_bytes,
+                                            std::uint64_t global_bytes);
 
     ~mapped_window_cache_t() override;
     mapped_window_cache_t(const mapped_window_cache_t&) = delete;

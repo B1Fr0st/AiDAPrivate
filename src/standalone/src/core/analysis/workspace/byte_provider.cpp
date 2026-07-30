@@ -11,11 +11,15 @@
 
 #include "../mapped_window_cache.hpp"
 #include "../provider_snapshot.hpp"
+#include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <utility>
 
@@ -149,6 +153,123 @@ workspace_error_t stop_error(const cancellation_token_t& cancel, const char* pha
                                       "operation cancelled", phase);
     error.cancellation = true;
     return error;
+}
+
+constexpr std::size_t kContentHashMemoCapacity = 64;
+
+struct content_hash_memo_entry_t {
+    bool occupied = false;
+    std::string normalized_source;
+    std::uint64_t size = 0;
+    std::uint64_t volume_serial = 0;
+    std::array<std::uint8_t, 16> file_id{};
+    std::uint64_t last_write_time_100ns = 0;
+    sha256_digest_t digest{};
+    std::uint64_t insert_ms = 0;
+};
+
+std::atomic<std::uint64_t>& memo_hit_count() noexcept {
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+
+std::atomic<std::uint64_t>& memo_miss_count() noexcept {
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+
+std::atomic<std::uint64_t>& memo_eviction_count() noexcept {
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+
+class content_hash_memo_t final {
+public:
+    std::optional<sha256_digest_t> lookup(const byte_provider_identity_t& identity) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& entry : entries_) {
+            if (entry.occupied && matches(entry, identity))
+                return entry.digest;
+        }
+        return std::nullopt;
+    }
+
+    void insert(const byte_provider_identity_t& identity, const sha256_digest_t& digest) {
+        const std::uint64_t now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::size_t free_slot = entries_.size();
+        std::size_t oldest_slot = entries_.size();
+        std::uint64_t oldest_ms = (std::numeric_limits<std::uint64_t>::max)();
+        std::size_t occupied = 0;
+        for (std::size_t index = 0; index < entries_.size(); ++index) {
+            const auto& entry = entries_[index];
+            if (!entry.occupied) {
+                if (free_slot == entries_.size())
+                    free_slot = index;
+                continue;
+            }
+            ++occupied;
+            if (matches(entry, identity)) {
+                auto& target = entries_[index];
+                target.digest = digest;
+                target.insert_ms = now_ms;
+                return;
+            }
+            if (entry.insert_ms < oldest_ms) {
+                oldest_ms = entry.insert_ms;
+                oldest_slot = index;
+            }
+        }
+        std::size_t target_index = free_slot;
+        if (target_index == entries_.size()) {
+            target_index = oldest_slot;
+            const auto evictions =
+                memo_eviction_count().fetch_add(1, std::memory_order_relaxed) + 1;
+            ::diag::log_tagged_fmt("byte_provider",
+                "content_hash_memo evict evicted_source='%s' new_source='%s' evictions=%llu entries=%zu",
+                entries_[target_index].normalized_source.c_str(),
+                identity.normalized_source.c_str(),
+                static_cast<unsigned long long>(evictions), occupied);
+        }
+        auto& target = entries_[target_index];
+        target.occupied = true;
+        target.normalized_source = identity.normalized_source;
+        target.size = identity.size;
+        target.volume_serial = identity.volume_serial;
+        target.file_id = identity.file_id;
+        target.last_write_time_100ns = identity.last_write_time_100ns;
+        target.digest = digest;
+        target.insert_ms = now_ms;
+    }
+
+    std::size_t size() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::size_t occupied = 0;
+        for (const auto& entry : entries_)
+            if (entry.occupied)
+                ++occupied;
+        return occupied;
+    }
+
+private:
+    static bool matches(const content_hash_memo_entry_t& entry,
+                        const byte_provider_identity_t& identity) noexcept {
+        return entry.normalized_source == identity.normalized_source &&
+               entry.size == identity.size &&
+               entry.volume_serial == identity.volume_serial &&
+               entry.file_id == identity.file_id &&
+               entry.last_write_time_100ns == identity.last_write_time_100ns;
+    }
+
+    std::mutex mutex_;
+    std::array<content_hash_memo_entry_t, kContentHashMemoCapacity> entries_{};
+};
+
+content_hash_memo_t& content_hash_memo() {
+    static content_hash_memo_t memo;
+    return memo;
 }
 
 }
@@ -324,15 +445,40 @@ mapped_file_provider_t::open(const std::string& utf8_path,
             snapshot.error());
     bool pin_active = false;
     if (options.pin_local_file_snapshot) {
-        auto digest = snapshot.value()->compute_content_sha256();
-        if (!digest)
-            return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
-                digest.error());
+        sha256_digest_t digest;
+        auto memoized = content_hash_memo().lookup(identity);
+        if (memoized) {
+            const auto hits = memo_hit_count().fetch_add(1, std::memory_order_relaxed) + 1;
+            ::diag::log_tagged_fmt("byte_provider",
+                "content_hash_memo hit source='%s' size=%llu hits=%llu misses=%llu entries=%zu",
+                identity.normalized_source.c_str(),
+                static_cast<unsigned long long>(identity.size),
+                static_cast<unsigned long long>(hits),
+                static_cast<unsigned long long>(memo_miss_count().load(std::memory_order_relaxed)),
+                content_hash_memo().size());
+            digest = *memoized;
+        } else {
+            const auto misses = memo_miss_count().fetch_add(1, std::memory_order_relaxed) + 1;
+            ::diag::log_tagged_fmt("byte_provider",
+                "content_hash_memo miss source='%s' size=%llu hits=%llu misses=%llu entries=%zu",
+                identity.normalized_source.c_str(),
+                static_cast<unsigned long long>(identity.size),
+                static_cast<unsigned long long>(memo_hit_count().load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(misses),
+                content_hash_memo().size());
+            auto computed = snapshot.value()->compute_content_sha256();
+            if (!computed)
+                return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
+                    computed.error());
+            digest = computed.take_value();
+        }
         auto revalidated = cache->revalidate();
         if (!revalidated)
             return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
                 revalidated.error());
-        identity.content_sha256 = digest.take_value();
+        if (!memoized)
+            content_hash_memo().insert(identity, digest);
+        identity.content_sha256 = digest;
         identity.immutable_snapshot = true;
         pin_active = true;
     } else {

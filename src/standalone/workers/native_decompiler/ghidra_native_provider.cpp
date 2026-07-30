@@ -16,7 +16,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +34,95 @@ struct provider_output_t {
     std::optional<std::string> printc_evidence;
     std::vector<decompiler_diagnostic_t> diagnostics;
 };
+
+struct arch_session_cache_t {
+    std::deque<std::unique_ptr<ghidra_decompiler::arch_session_entry_t>> entries;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t evictions = 0;
+    bool disabled = false;
+};
+
+constexpr std::size_t k_arch_session_cache_capacity = 2;
+
+std::unique_ptr<arch_session_cache_t> g_arch_session_cache;
+
+arch_session_cache_t& arch_session_cache()
+{
+    if (!g_arch_session_cache) {
+        g_arch_session_cache = std::make_unique<arch_session_cache_t>();
+        const std::string kill_switch =
+            ghidra_decompiler::detail::read_env_var("AIDA_DECOMPILER_NO_ARCH_REUSE");
+        if (!kill_switch.empty() && kill_switch != "0") {
+            g_arch_session_cache->disabled = true;
+            diag::log_tagged_fmt("dec",
+                "arch_pool_disabled reason=env_kill_switch value=%s", kill_switch.c_str());
+        }
+    }
+    return *g_arch_session_cache;
+}
+
+ghidra_decompiler::arch_session_entry_t* arch_session_acquire(
+    arch_session_cache_t& cache,
+    ghidra_decompiler::arch_pool_key_t key,
+    std::vector<native_provider_snapshot_range_t>& source_ranges,
+    std::uint64_t image_base,
+    std::uint64_t image_size,
+    std::string& error_text)
+{
+    for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
+        if ((*it)->key.matches(key)) {
+            auto hit = std::move(*it);
+            cache.entries.erase(it);
+            cache.entries.push_front(std::move(hit));
+            ++cache.hits;
+            auto* entry = cache.entries.front().get();
+            diag::log_tagged_fmt("dec",
+                "arch_pool_hit hits=%llu misses=%llu jobs_completed=%llu sleigh=%s",
+                static_cast<unsigned long long>(cache.hits),
+                static_cast<unsigned long long>(cache.misses),
+                static_cast<unsigned long long>(entry->jobs_completed),
+                entry->key.language_id.c_str());
+            return entry;
+        }
+    }
+    ++cache.misses;
+    const std::string sleigh = key.language_id;
+    std::vector<aida_ghidra::region_t> regions;
+    regions.reserve(source_ranges.size());
+    for (auto& source : source_ranges) {
+        aida_ghidra::region_t region;
+        region.start_va = image_base + source.relative_virtual_address;
+        region.data = std::move(source.bytes);
+        regions.push_back(std::move(region));
+    }
+    auto created = ghidra_decompiler::make_arch_session_entry(
+        std::move(regions), image_base, image_size, std::move(key));
+    if (!created.ok) {
+        error_text = std::move(created.error_text);
+        diag::log_tagged_fmt("dec",
+            "arch_pool_init_failed misses=%llu sleigh=%s",
+            static_cast<unsigned long long>(cache.misses), sleigh.c_str());
+        return nullptr;
+    }
+    diag::log_tagged_fmt("dec",
+        "arch_pool_miss arch_init_ms=%.2f hits=%llu misses=%llu sleigh=%s",
+        created.entry->arch_init_ms,
+        static_cast<unsigned long long>(cache.hits),
+        static_cast<unsigned long long>(cache.misses),
+        sleigh.c_str());
+    cache.entries.push_front(std::move(created.entry));
+    while (cache.entries.size() > k_arch_session_cache_capacity) {
+        const std::uint64_t evicted_jobs = cache.entries.back()->jobs_completed;
+        cache.entries.pop_back();
+        ++cache.evictions;
+        diag::log_tagged_fmt("dec",
+            "arch_pool_evict evictions=%llu evicted_jobs_completed=%llu",
+            static_cast<unsigned long long>(cache.evictions),
+            static_cast<unsigned long long>(evicted_jobs));
+    }
+    return cache.entries.front().get();
+}
 
 decompiler_diagnostic_t failure(const decompiler_diagnostic_code_t code, std::string key,
     std::string detail = {})
@@ -134,18 +225,42 @@ std::optional<provider_output_t> execute_native(
     limits.max_result_bytes = (std::min<std::uint64_t>)(
         limits.max_result_bytes, job.profile.max_memory_bytes);
     limits.capture_printc_evidence = job.request_printc_evidence;
-    std::vector<aida_ghidra::region_t> regions;
-    regions.reserve(snapshot->ranges.size());
-    for (auto& source : snapshot->ranges) {
-        aida_ghidra::region_t region;
-        region.start_va = snapshot->image_base + source.relative_virtual_address;
-        region.data = std::move(source.bytes);
-        regions.push_back(std::move(region));
+    ghidra_decompiler::ghidra_result_t output;
+    bool executed = false;
+    auto& cache = arch_session_cache();
+    if (!cache.disabled) {
+        ghidra_decompiler::arch_pool_key_t key;
+        key.language_id = job.cache_key.language.language_id;
+        key.compiler_spec_id = job.cache_key.language.compiler_spec_id;
+        key.architecture_mode = job.cache_key.language.mode;
+        key.endian = job.cache_key.language.endian;
+        key.snapshot_hash = job.snapshot_hash;
+        std::string pool_error;
+        if (auto* pooled = arch_session_acquire(cache, std::move(key), snapshot->ranges,
+                snapshot->image_base, snapshot->image_size, pool_error)) {
+            output = ghidra_decompiler::decompile_isolated_regions_reusing(
+                *pooled, entry, cancelled, deadline, limits, capture);
+        } else {
+            output.function_addr = entry;
+            output.is_error = true;
+            output.error_text = std::move(pool_error);
+        }
+        executed = true;
     }
-    const auto output = ghidra_decompiler::decompile_isolated_regions(
-        std::move(regions), snapshot->image_base, snapshot->image_size, entry,
-        job.cache_key.language.language_id, job.cache_key.language.mode,
-        cancelled, deadline, limits, capture);
+    if (!executed) {
+        std::vector<aida_ghidra::region_t> regions;
+        regions.reserve(snapshot->ranges.size());
+        for (auto& source : snapshot->ranges) {
+            aida_ghidra::region_t region;
+            region.start_va = snapshot->image_base + source.relative_virtual_address;
+            region.data = std::move(source.bytes);
+            regions.push_back(std::move(region));
+        }
+        output = ghidra_decompiler::decompile_isolated_regions(
+            std::move(regions), snapshot->image_base, snapshot->image_size, entry,
+            job.cache_key.language.language_id, job.cache_key.language.mode,
+            cancelled, deadline, limits, capture);
+    }
     if (output.is_error || !output.typed_artifacts) {
         diagnostics.insert(diagnostics.end(), output.typed_diagnostics.begin(), output.typed_diagnostics.end());
         if (!output.error_text.empty())

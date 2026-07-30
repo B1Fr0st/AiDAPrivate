@@ -24,6 +24,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -1208,6 +1209,20 @@ bool result_has_null_ast(const decompiler_pipeline_result_t& result) noexcept {
            document.rendered_text.empty();
 }
 
+bool document_has_partial_decompilation(const decompiler_document_t& document) noexcept {
+    return std::any_of(document.ast.nodes.begin(), document.ast.nodes.end(),
+        [](const typed_pseudocode_ast_node_t& node) {
+            return node.kind == typed_pseudocode_ast_node_kind_t::goto_statement ||
+                   node.kind == typed_pseudocode_ast_node_kind_t::label_statement;
+        });
+}
+
+bool result_has_partial_decompilation(const decompiler_pipeline_result_t& result) noexcept {
+    if (!result.rendered_stage)
+        return false;
+    return document_has_partial_decompilation(result.rendered_stage->document);
+}
+
 bool result_has_guessed_body(const decompiler_pipeline_result_t& result) noexcept {
     if (!result.rendered_stage)
         return true;
@@ -1446,10 +1461,21 @@ decompiler_ui_integration_t::create_production(
             return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
                 cache.error());
         }
+        native_worker::native_worker_session_pool_config_t pool_config;
+        const unsigned int logical_cores = (std::max)(2u, std::thread::hardware_concurrency());
+        pool_config.batch_slots = (std::min<std::size_t>)(
+            native_worker::native_worker_session_pool_config_t{}.batch_slots,
+            (std::max<std::size_t>)(2, logical_cores - 2));
+        ::diag::log_tagged_fmt("decompiler",
+            "pool_config batch_slots=%zu interactive_reserved=%zu logical_cores=%u source=hardware_formula",
+            pool_config.batch_slots,
+            pool_config.interactive_reserved_slots,
+            logical_cores);
         auto pooled_native_host =
-            native_worker::create_pooled_native_worker_provider_host(runtime.value());
+            native_worker::create_pooled_native_worker_provider_host(runtime.value(), pool_config);
         config.service_config.isolated_provider_host = pooled_native_host;
-        config.service_config.max_parallel_requests = 9;
+        config.service_config.max_parallel_requests =
+            pool_config.batch_slots + pool_config.interactive_reserved_slots + 1;
         config.service_config.database = workspace->database();
         config.service_config.metrics_sink = workspace->background_metrics();
         auto service = decompiler_pipeline_service_t::create(
@@ -2197,9 +2223,10 @@ decompiler_ui_integration_t::execute_pipeline(
         return workspace_result_t<decompiler_ui_result_t>::success(std::move(ui_result));
     }
     if (pipeline_result.succeeded()) {
-        ::diag::log_tagged_fmt("decompiler", "typed_pipeline path=primary status=completed elapsed_ms=%llu cache_hit=%d",
+        ::diag::log_tagged_fmt("decompiler", "typed_pipeline path=primary status=completed elapsed_ms=%llu cache_hit=%d partial=%d used_legacy_fallback=0",
             static_cast<unsigned long long>(pipeline_result.elapsed_wall_clock_ms),
-            pipeline_result.cache_hit_stage.has_value() ? 1 : 0);
+            pipeline_result.cache_hit_stage.has_value() ? 1 : 0,
+            result_has_partial_decompilation(pipeline_result) ? 1 : 0);
         if (impl_->state.config.reject_null_ast && result_has_null_ast(pipeline_result)) {
             impl_->increment_metric(&decompiler_ui_integration_metrics_t::rejected_null_ast);
             decompiler_ui_result_t ui_result;
@@ -2242,8 +2269,9 @@ decompiler_ui_integration_t::execute_pipeline(
         if (pipeline_result.cache_hit_stage)
             impl_->increment_metric(&decompiler_ui_integration_metrics_t::cache_hits);
     } else {
-        ::diag::log_tagged_fmt("decompiler", "typed_pipeline path=primary status=failed pipeline_status=%u",
-            static_cast<unsigned int>(pipeline_result.status));
+        ::diag::log_tagged_fmt("decompiler", "typed_pipeline path=primary status=failed pipeline_status=%u partial=%d",
+            static_cast<unsigned int>(pipeline_result.status),
+            result_has_partial_decompilation(pipeline_result) ? 1 : 0);
         switch (pipeline_result.status) {
         case decompiler_pipeline_status_t::provider_failed:
         case decompiler_pipeline_status_t::provider_crashed:
@@ -2290,8 +2318,9 @@ decompiler_ui_integration_t::execute_pipeline(
                         ws_result.value(), pipeline_request);
                     impl_->increment_metric(
                         &decompiler_ui_integration_metrics_t::completed);
-                    ::diag::log_tagged_fmt("decompiler", "legacy_fallback path=workspace_service status=completed elapsed_ms=%llu",
-                        static_cast<unsigned long long>(ws_result.value().elapsed_ms));
+                    ::diag::log_tagged_fmt("decompiler", "legacy_fallback path=workspace_service status=completed elapsed_ms=%llu used_legacy_fallback=1 partial=%d",
+                        static_cast<unsigned long long>(ws_result.value().elapsed_ms),
+                        document_has_partial_decompilation(ws_result.value().document) ? 1 : 0);
                     return workspace_result_t<decompiler_ui_result_t>::success(
                         std::move(fallback_result));
                 }

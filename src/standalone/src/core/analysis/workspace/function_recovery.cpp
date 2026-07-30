@@ -1,6 +1,7 @@
 #include "function_recovery.hpp"
 
 #include "checked_range.hpp"
+#include "parallel_pass.hpp"
 
 #include <algorithm>
 #include <array>
@@ -711,11 +712,6 @@ constexpr std::uint32_t kCancellationStride = 256;
 constexpr std::size_t kIndexShardFloor = 65536;
 constexpr std::size_t kSeedShardFloor = 4096;
 
-unsigned pass_worker_count() noexcept {
-    const unsigned hardware = std::thread::hardware_concurrency();
-    return (std::min)(16u, (std::max)(2u, hardware));
-}
-
 std::size_t pass_shard_count(std::size_t items, std::size_t floor) noexcept {
     if (items == 0 || floor == 0)
         return 0;
@@ -816,81 +812,14 @@ void guarded_shard_dual(shard_failure_t& failure, std::size_t shard,
 
 template <typename Fn>
 void run_sharded(std::size_t shard_total, Fn&& shard_fn) {
-    if (shard_total == 0)
-        return;
-    const std::size_t workers =
-        (std::min)(static_cast<std::size_t>(pass_worker_count()), shard_total);
-    if (workers <= 1) {
-        for (std::size_t shard = 0; shard < shard_total; ++shard)
-            shard_fn(shard);
-        return;
-    }
-    std::atomic<std::size_t> next{0};
-    const auto worker = [&]() {
-        for (;;) {
-            const std::size_t shard = next.fetch_add(1, std::memory_order_relaxed);
-            if (shard >= shard_total)
-                return;
-            shard_fn(shard);
-        }
-    };
-    std::vector<std::thread> threads;
-    threads.reserve(workers);
-    bool spawned = true;
-    try {
-        for (std::size_t index = 0; index < workers; ++index)
-            threads.emplace_back(worker);
-    } catch (...) {
-        spawned = false;
-    }
-    for (auto& thread : threads)
-        thread.join();
-    if (!spawned) {
-        for (std::size_t shard = next.load(std::memory_order_relaxed);
-             shard < shard_total; ++shard)
-            shard_fn(shard);
-    }
+    parallel_executor_t::run(shard_total, parallel_worker_count(),
+        "analysis.function_recovery", std::forward<Fn>(shard_fn));
 }
 
 template <typename Local, typename Fn>
 void run_sharded_local(std::size_t shard_total, Fn&& shard_fn) {
-    if (shard_total == 0)
-        return;
-    const std::size_t workers =
-        (std::min)(static_cast<std::size_t>(pass_worker_count()), shard_total);
-    if (workers <= 1) {
-        Local local{};
-        for (std::size_t shard = 0; shard < shard_total; ++shard)
-            shard_fn(shard, local);
-        return;
-    }
-    std::atomic<std::size_t> next{0};
-    const auto worker = [&]() {
-        Local local{};
-        for (;;) {
-            const std::size_t shard = next.fetch_add(1, std::memory_order_relaxed);
-            if (shard >= shard_total)
-                return;
-            shard_fn(shard, local);
-        }
-    };
-    std::vector<std::thread> threads;
-    threads.reserve(workers);
-    bool spawned = true;
-    try {
-        for (std::size_t index = 0; index < workers; ++index)
-            threads.emplace_back(worker);
-    } catch (...) {
-        spawned = false;
-    }
-    for (auto& thread : threads)
-        thread.join();
-    if (!spawned) {
-        Local local{};
-        for (std::size_t shard = next.load(std::memory_order_relaxed);
-             shard < shard_total; ++shard)
-            shard_fn(shard, local);
-    }
+    parallel_executor_t::run_local<Local>(shard_total, parallel_worker_count(),
+        "analysis.function_recovery", std::forward<Fn>(shard_fn));
 }
 
 struct pass_budget_t {

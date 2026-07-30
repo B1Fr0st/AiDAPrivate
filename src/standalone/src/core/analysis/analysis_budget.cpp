@@ -1,3 +1,11 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+
 #include "analysis_budget.hpp"
 
 #include <limits>
@@ -82,6 +90,31 @@ void subtract_usage(analysis_resource_usage_t& usage, const analysis_resource_de
     usage.spill_bytes -= demand.spill_bytes;
     usage.cache_bytes -= demand.cache_bytes;
 }
+
+constexpr std::uint64_t clamp_u64(std::uint64_t value, std::uint64_t floor_value,
+                                  std::uint64_t ceiling_value) noexcept
+{
+    return value < floor_value ? floor_value : value > ceiling_value ? ceiling_value : value;
+}
+
+constexpr std::uint64_t kReserveOsFloorBytes = 4ULL * analysis_gibibyte;
+constexpr std::uint64_t kReserveOsCeilingBytes = 16ULL * analysis_gibibyte;
+constexpr std::uint64_t kMaxAnalysisMemoryFloorBytes = 8ULL * analysis_gibibyte;
+constexpr std::uint64_t kMaxAnalysisMemoryCeilingBytes = 48ULL * analysis_gibibyte;
+constexpr std::uint64_t kStagingFloorBytes = 512ULL * analysis_mebibyte;
+constexpr std::uint64_t kStagingCeilingBytes = 4ULL * analysis_gibibyte;
+constexpr std::uint64_t kQuotaFloorBytes = 8ULL * analysis_gibibyte;
+constexpr std::uint64_t kQuotaCeilingBytes = 16ULL * analysis_gibibyte;
+constexpr std::uint64_t kWindowCachePerFileFloorBytes = 256ULL * analysis_mebibyte;
+constexpr std::uint64_t kWindowCachePerFileCeilingBytes = 2ULL * analysis_gibibyte;
+constexpr std::uint64_t kWindowCacheGlobalFloorBytes = analysis_gibibyte;
+constexpr std::uint64_t kWindowCacheGlobalCeilingBytes = 4ULL * analysis_gibibyte;
+constexpr std::uint64_t kPdbPersistFloorBytes = 256ULL * analysis_mebibyte;
+constexpr std::uint64_t kPdbPersistCeilingBytes = analysis_gibibyte;
+constexpr std::uint64_t kReopenRangeFloorBytes = analysis_gibibyte;
+constexpr std::uint64_t kReopenRangeCeilingBytes = 8ULL * analysis_gibibyte;
+constexpr std::uint64_t kLowMemoryThresholdBytes = 24ULL * analysis_gibibyte;
+constexpr std::uint64_t kFallbackTotalPhysBytes = 16ULL * analysis_gibibyte;
 
 }
 
@@ -333,6 +366,48 @@ analysis_budget_snapshot_t analysis_budget_ledger_t::snapshot() const noexcept
 const analysis_budget_t& analysis_budget_ledger_t::budget() const noexcept
 {
     return budget_;
+}
+
+host_memory_envelope_t host_memory_envelope() noexcept
+{
+    host_memory_envelope_t envelope;
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) {
+        envelope.total_phys = kFallbackTotalPhysBytes;
+        envelope.avail_phys = 0;
+    } else {
+        envelope.total_phys = static_cast<std::uint64_t>(status.ullTotalPhys);
+        envelope.avail_phys = static_cast<std::uint64_t>(status.ullAvailPhys);
+    }
+    envelope.reserve_os_bytes = clamp_u64(envelope.total_phys / 4ULL, kReserveOsFloorBytes,
+                                          kReserveOsCeilingBytes);
+    envelope.usable_bytes = envelope.total_phys > envelope.reserve_os_bytes
+        ? envelope.total_phys - envelope.reserve_os_bytes : 0;
+    return envelope;
+}
+
+adaptive_analysis_budget_fields_t adaptive_analysis_budget_fields(
+    const host_memory_envelope_t& envelope) noexcept
+{
+    adaptive_analysis_budget_fields_t fields;
+    const std::uint64_t usable = envelope.usable_bytes;
+    fields.max_analysis_memory_bytes = clamp_u64(usable / 2ULL, kMaxAnalysisMemoryFloorBytes,
+                                                 kMaxAnalysisMemoryCeilingBytes);
+    fields.packed_staging_memory_budget_bytes = clamp_u64(usable / 16ULL, kStagingFloorBytes,
+                                                          kStagingCeilingBytes);
+    fields.packed_generation_quota_bytes = clamp_u64(usable / 2ULL, kQuotaFloorBytes,
+                                                     kQuotaCeilingBytes);
+    fields.window_cache_per_file_bytes = clamp_u64(usable / 32ULL, kWindowCachePerFileFloorBytes,
+                                                   kWindowCachePerFileCeilingBytes);
+    fields.window_cache_global_bytes = clamp_u64(usable / 16ULL, kWindowCacheGlobalFloorBytes,
+                                                 kWindowCacheGlobalCeilingBytes);
+    fields.pdb_persistence_total_bytes = clamp_u64(usable / 32ULL, kPdbPersistFloorBytes,
+                                                   kPdbPersistCeilingBytes);
+    fields.reopen_range_budget_bytes = clamp_u64(usable / 8ULL, kReopenRangeFloorBytes,
+                                                 kReopenRangeCeilingBytes);
+    fields.low_memory = envelope.total_phys < kLowMemoryThresholdBytes;
+    return fields;
 }
 
 }

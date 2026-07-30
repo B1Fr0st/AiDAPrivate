@@ -32,7 +32,10 @@ constexpr std::uint64_t k_batch_deadline_cap_ms = 60'000;
 constexpr std::uint64_t k_interactive_deadline_cap_ms = 15'000;
 constexpr std::uint64_t k_deadline_scaled_log_threshold_ms = 15'000;
 constexpr std::uint64_t k_expected_worker_rss_bytes = 400ULL << 20;
-constexpr std::uint64_t k_analysis_memory_budget_bytes = 16ULL << 30;
+constexpr std::uint64_t k_arch_resident_bytes = 200ULL << 20;
+constexpr std::uint64_t k_memory_budget_floor_bytes = 4ULL << 30;
+constexpr std::uint64_t k_memory_budget_cap_bytes = 32ULL << 30;
+constexpr std::size_t k_absolute_slot_cap = 16;
 constexpr std::uint64_t k_batch_snapshot_absolute_cap = 256ULL << 20;
 constexpr std::uint64_t k_worker_snapshot_cap = 256ULL << 20;
 constexpr std::uint64_t k_snapshot_header_floor = 1ULL << 20;
@@ -114,11 +117,26 @@ bool result_retryable(const decompiler_pipeline_result_t& result) noexcept
         [](const decompiler_diagnostic_t& diagnostic) { return diagnostic.retryable; });
 }
 
+std::uint64_t resolve_memory_budget_bytes() noexcept
+{
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    std::uint64_t derived = 0;
+    if (GlobalMemoryStatusEx(&status) && status.ullTotalPhys != 0)
+        derived = status.ullTotalPhys / 4;
+    if (derived < k_memory_budget_floor_bytes)
+        return k_memory_budget_floor_bytes;
+    if (derived > k_memory_budget_cap_bytes)
+        return k_memory_budget_cap_bytes;
+    return derived;
+}
+
 }
 
 struct decompile_batch_orchestrator_t::state_t {
     std::weak_ptr<analysis_workspace_t> workspace;
     std::shared_ptr<analysis_metrics_t> metrics;
+    std::uint64_t memory_budget_bytes = 0;
 
     mutable std::mutex mutex;
     std::condition_variable wake;
@@ -401,23 +419,61 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
         ? context_bytes->snapshot()->size() : 0;
     const auto& quotas = mcp_standalone::downstream::governor_t::instance().quotas();
     const unsigned int logical_cores = (std::max)(2u, std::thread::hardware_concurrency());
-    const std::size_t slots = (std::min<std::size_t>)(8,
+    const std::size_t slots_desired = (std::min<std::size_t>)(k_absolute_slot_cap,
         (std::min<std::size_t>)(quotas.decompiler_worker_group_size,
-            (std::max<std::size_t>)(2, logical_cores / 2)));
-    const std::uint64_t snapshot_mapping_bytes =
-        static_cast<std::uint64_t>(slots + 1) * snapshot_bytes;
-    const std::uint64_t worker_rss_bytes =
-        static_cast<std::uint64_t>(slots) * k_expected_worker_rss_bytes;
-    const std::uint64_t memory_admission_bytes = snapshot_mapping_bytes + worker_rss_bytes;
-    const std::uint64_t memory_admission_budget = k_analysis_memory_budget_bytes / 4;
+            (std::max<std::size_t>)(2, logical_cores - 2)));
+    const std::uint64_t memory_admission_budget = state->memory_budget_bytes != 0
+        ? state->memory_budget_bytes : k_memory_budget_floor_bytes;
+    const std::uint64_t per_slot_bytes = k_expected_worker_rss_bytes + k_arch_resident_bytes;
+    const auto admission_bytes_for = [snapshot_bytes, per_slot_bytes](std::size_t slot_count,
+        std::uint64_t& snapshot_term, std::uint64_t& slot_term) noexcept -> std::uint64_t {
+        snapshot_term = 0;
+        slot_term = 0;
+        if (snapshot_bytes != 0 && static_cast<std::uint64_t>(slot_count + 1) >
+            (std::numeric_limits<std::uint64_t>::max)() / snapshot_bytes)
+            return (std::numeric_limits<std::uint64_t>::max)();
+        if (static_cast<std::uint64_t>(slot_count) >
+            (std::numeric_limits<std::uint64_t>::max)() / per_slot_bytes)
+            return (std::numeric_limits<std::uint64_t>::max)();
+        snapshot_term = static_cast<std::uint64_t>(slot_count + 1) * snapshot_bytes;
+        slot_term = static_cast<std::uint64_t>(slot_count) * per_slot_bytes;
+        if (snapshot_term > (std::numeric_limits<std::uint64_t>::max)() - slot_term)
+            return (std::numeric_limits<std::uint64_t>::max)();
+        return snapshot_term + slot_term;
+    };
+    if (slots_desired < 2) {
+        admission.release("slot_floor");
+        diag::log_tagged_fmt("dec_batch",
+            "run_deferred reason=slot_floor desired=%zu quota=%zu",
+            slots_desired, quotas.decompiler_worker_group_size);
+        abort_start("slot_floor");
+        return;
+    }
+    std::size_t slots = slots_desired;
+    std::uint64_t snapshot_mapping_bytes = 0;
+    std::uint64_t worker_resident_bytes = 0;
+    std::uint64_t memory_admission_bytes = admission_bytes_for(
+        slots, snapshot_mapping_bytes, worker_resident_bytes);
+    while (slots > 2 && memory_admission_bytes > memory_admission_budget) {
+        --slots;
+        memory_admission_bytes = admission_bytes_for(
+            slots, snapshot_mapping_bytes, worker_resident_bytes);
+    }
+    if (slots != slots_desired) {
+        diag::log_tagged_fmt("dec_batch",
+            "slots_trimmed from=%zu to=%zu reason=memory_admission",
+            slots_desired, slots);
+    }
     diag::log_tagged_fmt("dec_batch",
-        "budget_decision type=memory_admission formula=(slots+1)*snapshot_bytes+slots*expected_rss slots=%zu snapshot_bytes=%llu snapshot_term=%llu rss_term=%llu total=%llu budget=%llu decision=%s",
+        "budget_decision type=memory_admission formula=(slots+1)*snapshot_bytes+slots*(expected_rss+arch_resident) desired=%zu slots=%zu snapshot_bytes=%llu snapshot_term=%llu resident_term=%llu total=%llu budget=%llu per_slot=%llu decision=%s",
+        slots_desired,
         slots,
         static_cast<unsigned long long>(snapshot_bytes),
         static_cast<unsigned long long>(snapshot_mapping_bytes),
-        static_cast<unsigned long long>(worker_rss_bytes),
+        static_cast<unsigned long long>(worker_resident_bytes),
         static_cast<unsigned long long>(memory_admission_bytes),
         static_cast<unsigned long long>(memory_admission_budget),
+        static_cast<unsigned long long>(per_slot_bytes),
         memory_admission_bytes > memory_admission_budget ? "defer" : "admit");
     if (memory_admission_bytes > memory_admission_budget) {
         admission.release("memory_admission");
@@ -976,6 +1032,12 @@ decompile_batch_orchestrator_t::create(
     auto state = std::make_shared<state_t>();
     state->workspace = workspace;
     state->metrics = std::move(metrics);
+    state->memory_budget_bytes = resolve_memory_budget_bytes();
+    diag::log_tagged_fmt("dec_batch",
+        "memory_budget_resolved budget=%llu source=physical_ram_quarter floor=%llu cap=%llu",
+        static_cast<unsigned long long>(state->memory_budget_bytes),
+        static_cast<unsigned long long>(k_memory_budget_floor_bytes),
+        static_cast<unsigned long long>(k_memory_budget_cap_bytes));
     auto orchestrator = std::shared_ptr<decompile_batch_orchestrator_t>(
         new decompile_batch_orchestrator_t(std::move(state)));
     auto attach_failure = [&orchestrator](workspace_error_t error) {

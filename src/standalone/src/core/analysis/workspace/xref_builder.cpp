@@ -5,13 +5,11 @@
 
 #include <algorithm>
 #include <chrono>
-#include <exception>
 #include <iterator>
 #include <limits>
 #include <new>
 #include <optional>
 #include <stdexcept>
-#include <system_error>
 #include <thread>
 #include <tuple>
 #include <unordered_set>
@@ -55,61 +53,6 @@ std::size_t pass_shard_count(std::size_t items, std::size_t items_per_shard) {
         static_cast<std::uint64_t>(items_per_shard) - 1ULL) /
         static_cast<std::uint64_t>(items_per_shard);
     return static_cast<std::size_t>((std::min)((std::max)(wanted, 1ULL), cap));
-}
-
-template <typename F>
-workspace_result_t<void> run_pass_shards(const std::vector<parallel_shard_t>& shards,
-                                         F&& fn, const cancellation_token_t&) {
-    struct slot_t {
-        std::optional<workspace_error_t> error;
-        std::exception_ptr exception;
-    };
-    const std::size_t count = shards.size();
-    if (count == 0)
-        return workspace_result_t<void>::success();
-    if (count == 1)
-        return fn(0, shards[0]);
-    std::vector<slot_t> slots(count);
-    std::vector<std::thread> threads;
-    threads.reserve(count);
-    std::exception_ptr spawn_exception;
-    try {
-        for (std::size_t index = 0; index < count; ++index) {
-            threads.emplace_back([&, index] {
-                try {
-                    auto result = fn(index, shards[index]);
-                    if (!result)
-                        slots[index].error = std::move(result.error());
-                } catch (...) {
-                    slots[index].exception = std::current_exception();
-                }
-            });
-        }
-    } catch (...) {
-        spawn_exception = std::current_exception();
-    }
-    for (auto& thread : threads)
-        thread.join();
-    for (auto& slot : slots) {
-        if (slot.exception)
-            std::rethrow_exception(slot.exception);
-        if (slot.error)
-            return workspace_result_t<void>::failure(std::move(*slot.error));
-    }
-    if (spawn_exception) {
-        try {
-            std::rethrow_exception(spawn_exception);
-        } catch (const std::system_error&) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "xref analysis exceeded available thread resources", "xrefs"));
-        } catch (const std::resource_error&) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "xref analysis exceeded available thread resources", "xrefs"));
-        }
-    }
-    return workspace_result_t<void>::success();
 }
 
 std::optional<std::uint64_t> to_rva(const workspace_image_t& image,
@@ -213,65 +156,9 @@ workspace_result_t<std::uint64_t> validate_and_accumulate(
         if (result.ordinal != (std::numeric_limits<std::uint64_t>::max)())
             return workspace_result_t<std::uint64_t>::failure(std::move(result.error));
     } else {
-        struct slot_t {
-            ordered_error_t result;
-            std::exception_ptr exception;
-        };
-        const std::size_t count = shards.size();
-        std::vector<slot_t> slots(count);
-        std::vector<std::thread> threads;
-        threads.reserve(count);
-        std::exception_ptr spawn_exception;
-        try {
-            for (std::size_t index = 0; index < count; ++index) {
-                threads.emplace_back([&, index] {
-                    try {
-                        slots[index].result = shard_fn(index, shards[index]);
-                    } catch (...) {
-                        slots[index].exception = std::current_exception();
-                    }
-                });
-            }
-        } catch (...) {
-            spawn_exception = std::current_exception();
-        }
-        for (auto& thread : threads)
-            thread.join();
-        std::size_t best_error = count;
-        std::size_t best_exception = count;
-        for (std::size_t index = 0; index < count; ++index) {
-            if (slots[index].exception && best_exception == count)
-                best_exception = index;
-            if (slots[index].result.ordinal != (std::numeric_limits<std::uint64_t>::max)() &&
-                (best_error == count ||
-                 slots[index].result.ordinal < slots[best_error].result.ordinal))
-                best_error = index;
-        }
-        if (best_exception != count) {
-            const auto exception_ordinal =
-                static_cast<std::uint64_t>(shards[best_exception].begin);
-            if (best_error == count ||
-                exception_ordinal <= slots[best_error].result.ordinal)
-                std::rethrow_exception(slots[best_exception].exception);
-        }
-        if (best_error != count)
-            return workspace_result_t<std::uint64_t>::failure(
-                std::move(slots[best_error].result.error));
-        if (spawn_exception) {
-            try {
-                std::rethrow_exception(spawn_exception);
-            } catch (const std::system_error&) {
-                return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
-                    workspace_error_code_t::limit_exceeded,
-                    "analysis publication exceeded available thread resources",
-                    "analysis_discovery_publish"));
-            } catch (const std::resource_error&) {
-                return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
-                    workspace_error_code_t::limit_exceeded,
-                    "analysis publication exceeded available thread resources",
-                    "analysis_discovery_publish"));
-            }
-        }
+        auto validated = parallel_validate_shards(shards, 1, shard_fn, cancel);
+        if (!validated)
+            return workspace_result_t<std::uint64_t>::failure(validated.error());
     }
     std::uint64_t total = 0;
     for (const auto partial : partials) {
@@ -402,7 +289,7 @@ workspace_result_t<xref_build_result_t> build_core(
         }
         return workspace_result_t<void>::success();
     };
-    auto instructions_done = run_pass_shards(instruction_shards, instruction_fn, cancel);
+    auto instructions_done = parallel_run_shards(instruction_shards, instruction_fn, cancel);
     if (!instructions_done)
         return workspace_result_t<xref_build_result_t>::failure(instructions_done.error());
     const auto pointer_shards = parallel_shards(data.pointer_facts.size(),
@@ -431,7 +318,7 @@ workspace_result_t<xref_build_result_t> build_core(
         }
         return workspace_result_t<void>::success();
     };
-    auto pointers_done = run_pass_shards(pointer_shards, pointer_fn, cancel);
+    auto pointers_done = parallel_run_shards(pointer_shards, pointer_fn, cancel);
     if (!pointers_done)
         return workspace_result_t<xref_build_result_t>::failure(pointers_done.error());
     const auto merge_begin = std::chrono::steady_clock::now();

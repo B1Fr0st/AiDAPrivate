@@ -129,7 +129,7 @@ struct packaged_native_worker_runtime_t {
 struct native_worker_host_limits_t {
     std::size_t max_frame_bytes = k_decompiler_worker_result_frame_max_bytes;
     std::size_t max_snapshot_bytes = 256U * 1024U * 1024U;
-    std::size_t max_concurrent_workers = 4;
+    std::size_t max_concurrent_workers = 8;
     std::chrono::milliseconds startup_timeout{10000};
     std::chrono::milliseconds cancellation_grace{250};
     std::chrono::milliseconds poll_interval{10};
@@ -338,7 +338,7 @@ private:
 struct native_worker_session_pool_config_t {
     std::uint32_t max_jobs_per_session = 256;
     std::chrono::milliseconds max_session_lifetime{600000};
-    std::size_t batch_slots = 8;
+    std::size_t batch_slots = 16;
     std::size_t interactive_reserved_slots = 1;
 };
 
