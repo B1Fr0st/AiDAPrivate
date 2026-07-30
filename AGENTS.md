@@ -314,6 +314,7 @@ Key entry points:
 - `core/settings/standalone_settings.hpp`: config path and secret storage/obfuscation.
 - `core/auth/auth_store.cpp`: DPAPI storage for auth/API material.
 - `core/runtime/standalone_license.hpp` / `.cpp`: gate slots, licensing, ARC startup.
+- `core/runtime/kernel_symbols.hpp` / `.cpp`: in-memory kernel PDB symbol engine backed by the vendored `.deps/MemPDB` static library (C++20; only this TU compiles as C++20 via `CXX_STANDARD 20` + `SKIP_PRECOMPILE_HEADERS`). Resolves/downloads `ntoskrnl` symbols from the live kernel image's RSDS record, caches PDBs under `%LOCALAPPDATA%\AiDA\Standalone\symbols`, and backs `driver_read_kernel_memory` / `driver_write_kernel_memory` / `search_kernel_memory` symbol expressions plus the `driver_kernel_symbols` manage tool.
 - `core/anti-tamper/orchestrator.hpp`, `core/runtime/standalone_anti_tamper.hpp`: security-sensitive lifecycle code.
 - `core/testlab/test_lab.hpp`, `core/testlab/test_lab_view.cpp`: in-app test registration and work-queue execution.
 

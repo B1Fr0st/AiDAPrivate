@@ -1201,7 +1201,7 @@ make_adapter_decompile_request(
 }
 
 bool decompiler_service_v2_result_t::succeeded() const noexcept {
-    return ast_build.succeeded() && rendering.has_value() && rendering->succeeded();
+    return ast.has_value() && rendering.has_value() && rendering->succeeded();
 }
 
 namespace {
@@ -1229,14 +1229,14 @@ decompiler_service_v2_result_t decompiler_service_t::render_typed_pseudocode_v2(
     const type_graph_t& type_graph,
     const decompiler_service_v2_request_t& request) {
     decompiler_service_v2_result_t result;
-    result.ast_build = build_typed_ast_v2(hir, type_graph, request.ast);
-    append_v2_diagnostics(result, result.ast_build.diagnostics);
-    if (!result.ast_build.succeeded())
+    auto ast_build = build_typed_ast_v2(hir, type_graph, request.ast);
+    append_v2_diagnostics(result, ast_build.diagnostics);
+    if (!ast_build.succeeded() || !ast_build.ast)
         return result;
     if (hir.entity.kind == decompiler_entity_kind_t::native_function) {
         readability_transform_settings_t readability_settings;
         auto readability_result = apply_readability_transforms(
-            *result.ast_build.ast, type_graph, readability_settings);
+            *ast_build.ast, type_graph, readability_settings);
         append_v2_diagnostics(result, readability_result.diagnostics);
         if (readability_result.succeeded()) {
             ::diag::log_tagged_fmt("decompiler", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u",
@@ -1249,7 +1249,8 @@ decompiler_service_v2_result_t decompiler_service_t::render_typed_pseudocode_v2(
             ::diag::log_tagged_fmt("decompiler", "readability_transforms status=warning_no_transform continuing_with_unmodified_ast");
         }
     }
-    result.rendering = render_pseudocode_v2(*result.ast_build.ast, type_graph, request.renderer);
+    result.ast = std::move(*ast_build.ast);
+    result.rendering = render_pseudocode_v2(*result.ast, type_graph, request.renderer);
     append_v2_diagnostics(result, result.rendering->diagnostics);
     return result;
 }
@@ -1959,6 +1960,165 @@ workspace_result_t<decompiler_quality_result_t> run_decompiler_quality(
     if (!gate)
         return workspace_result_t<decompiler_quality_result_t>::failure(gate.error());
     return workspace_result_t<decompiler_quality_result_t>::success(std::move(quality));
+}
+
+workspace_result_t<std::vector<workspace_result_t<decompiler_quality_batch_item_t>>>
+decompiler_service_t::decompile_quality_batch(
+    const std::vector<address_t>& functions,
+    const decompiler_quality_batch_options_t& options,
+    const cancellation_token_t& cancel) {
+    using item_result_t = workspace_result_t<decompiler_quality_batch_item_t>;
+    using batch_result_t = std::vector<item_result_t>;
+    using result_t = workspace_result_t<batch_result_t>;
+    auto workspace = state_->workspace.lock();
+    if (!workspace) {
+        return result_t::failure(make_workspace_error(
+            workspace_error_code_t::target_not_found,
+            "workspace no longer exists",
+            "decompiler.quality_batch"));
+    }
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->accepting || state_->cancellation.token().stop_requested()) {
+            return result_t::failure(make_workspace_error(
+                workspace_error_code_t::workspace_closing,
+                "decompiler service is closing", "decompiler.quality_batch"));
+        }
+    }
+    constexpr std::size_t max_batch_functions = 2'000'000;
+    if (functions.size() > max_batch_functions) {
+        return result_t::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "decompiler quality batch exceeds its function bound",
+            "decompiler.quality_batch"));
+    }
+    if (cancel.stop_requested())
+        return result_t::failure(cancellation_error(cancel, "decompiler.quality_batch"));
+    const auto workspace_cancel = workspace->cancellation_token();
+    std::vector<std::optional<item_result_t>> slots(functions.size());
+    std::vector<resolved_function_t> resolved;
+    std::vector<std::size_t> resolved_indices;
+    resolved.reserve(functions.size());
+    resolved_indices.reserve(functions.size());
+    const auto overlay_revision = workspace->overlay_revision();
+    for (std::size_t ordinal = 0; ordinal < functions.size(); ++ordinal) {
+        if ((ordinal & 255U) == 0 && cancel.stop_requested())
+            return result_t::failure(cancellation_error(cancel, "decompiler.quality_batch"));
+        auto current = resolve_function(workspace, functions[ordinal], state_->limits);
+        if (!current) {
+            slots[ordinal] = item_result_t::failure(current.error());
+            continue;
+        }
+        current.value().overlay_revision = overlay_revision;
+        resolved_indices.push_back(ordinal);
+        resolved.push_back(std::move(current.take_value()));
+    }
+    std::vector<calling_convention_request_t> cc_requests;
+    cc_requests.reserve(resolved.size());
+    for (const auto& resolved_function : resolved) {
+        calling_convention_request_t request;
+        request.function = resolved_function.function.start;
+        request.expected_generation = resolved_function.generation;
+        request.expected_analysis_revision = resolved_function.analysis_revision;
+        request.expected_overlay_revision = resolved_function.overlay_revision;
+        cc_requests.push_back(request);
+    }
+    calling_convention_batch_options_t cc_options;
+    cc_options.worker_count = options.worker_count;
+    cc_options.metrics = options.metrics;
+    auto cc_results = infer_calling_conventions_batch(
+        *workspace, cc_requests, cc_options, cancel);
+    if (!cc_results)
+        return result_t::failure(cc_results.error());
+    if (cc_results.value().size() != resolved.size()) {
+        return result_t::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "calling-convention batch result count diverged from its request count",
+            "decompiler.quality_batch"));
+    }
+    if (cancel.stop_requested())
+        return result_t::failure(cancellation_error(cancel, "decompiler.quality_batch"));
+    std::vector<type_recovery_request_t> tr_requests;
+    tr_requests.reserve(resolved.size());
+    for (std::size_t index = 0; index < resolved.size(); ++index) {
+        const auto& cc = cc_results.value()[index];
+        type_recovery_request_t request;
+        request.function_rva = resolved[index].function_rva;
+        request.address_space = resolved[index].function.start.space;
+        if (cc)
+            request.calling_convention_result = &cc.value();
+        tr_requests.push_back(request);
+    }
+    type_recovery_batch_options_t tr_options;
+    tr_options.worker_count = options.worker_count;
+    tr_options.metrics = options.metrics;
+    auto tr_results = recover_types_batch(*workspace, tr_requests, tr_options, cancel);
+    if (!tr_results)
+        return result_t::failure(tr_results.error());
+    if (tr_results.value().size() != resolved.size()) {
+        return result_t::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "type-recovery batch result count diverged from its request count",
+            "decompiler.quality_batch"));
+    }
+    if (cancel.stop_requested())
+        return result_t::failure(cancellation_error(cancel, "decompiler.quality_batch"));
+    for (std::size_t index = 0; index < resolved.size(); ++index) {
+        if ((index & 255U) == 0 && cancel.stop_requested())
+            return result_t::failure(cancellation_error(cancel, "decompiler.quality_batch"));
+        const auto& function = resolved[index];
+        const std::uint64_t type_revision = function.analysis_revision;
+        decompiler_quality_result_t quality;
+        const auto& cc = cc_results.value()[index];
+        if (!cc) {
+            if (quality_error_requires_abort(cc.error()))
+                return result_t::failure(cc.error());
+            append_quality_error(quality, function, type_revision, "calling-convention",
+                decompiler_feedback_error_class_t::integration, cc.error().message);
+        } else {
+            quality.calling_convention = cc.value();
+            append_quality_abstention(quality, function, type_revision, "calling-convention",
+                decompiler_feedback_abstention_reason_t::unsupported_encoding,
+                "calling-convention inference was consumed by type recovery; no source-proven C declaration is available for prototype publication");
+        }
+        const auto& tr = tr_results.value()[index];
+        if (!tr) {
+            if (quality_error_requires_abort(tr.error()))
+                return result_t::failure(tr.error());
+            append_quality_error(quality, function, type_revision, "type-recovery",
+                decompiler_feedback_error_class_t::type_recovery, tr.error().message);
+        } else {
+            quality.types = tr.value();
+            const std::size_t facts_before = quality.feedback_facts.size();
+            append_validated_type_facts(quality, function, type_revision, *quality.types,
+                cancel, workspace_cancel, cancel);
+            if (quality.feedback_facts.size() == facts_before) {
+                append_quality_abstention(quality, function, type_revision, "type-recovery",
+                    decompiler_feedback_abstention_reason_t::unsupported_encoding,
+                    "type recovery produced no direct non-propagated confidence-100 debug or user declaration for feedback publication");
+            }
+        }
+        decompiler_quality_batch_item_t item;
+        item.calling_convention = std::move(quality.calling_convention);
+        item.types = std::move(quality.types);
+        item.feedback_facts = std::move(quality.feedback_facts);
+        slots[resolved_indices[index]] = item_result_t::success(std::move(item));
+    }
+    batch_result_t results;
+    results.reserve(slots.size());
+    for (auto& slot : slots) {
+        if (!slot) {
+            return result_t::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "decompiler quality batch left an item slot unresolved",
+                "decompiler.quality_batch"));
+        }
+        results.push_back(std::move(*slot));
+    }
+    ::diag::log_tagged_fmt("decompiler",
+        "quality_batch functions=%zu resolved=%zu",
+        functions.size(), resolved.size());
+    return result_t::success(std::move(results));
 }
 
 workspace_error_t feedback_error(

@@ -4,10 +4,17 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <unordered_set>
 #include <utility>
+
+#if defined(_M_X64) || defined(_M_AMD64)
+#define AIDA_PACKED_PAGE_CRC32C_HW 1
+#include <intrin.h>
+#include <nmmintrin.h>
+#endif
 
 namespace aida::analysis {
 
@@ -28,6 +35,52 @@ const std::array<std::uint32_t, 256>& crc32c_table() noexcept {
         return result;
     }();
     return table;
+}
+
+std::uint32_t crc32c_update_sw(std::uint32_t crc, const std::uint8_t* data,
+                               std::size_t size) noexcept {
+    const auto& table = crc32c_table();
+    for (std::size_t index = 0; index < size; ++index)
+        crc = table[(crc ^ data[index]) & 0xFFU] ^ (crc >> 8U);
+    return crc;
+}
+
+#if defined(AIDA_PACKED_PAGE_CRC32C_HW)
+
+bool crc32c_hw_supported() noexcept {
+    static const bool supported = [] {
+        int registers[4] = {0, 0, 0, 0};
+        __cpuid(registers, 1);
+        return (registers[2] & (1 << 20)) != 0;
+    }();
+    return supported;
+}
+
+std::uint32_t crc32c_update_hw(std::uint32_t crc, const std::uint8_t* data,
+                               std::size_t size) noexcept {
+    std::size_t offset = 0;
+    while (offset + sizeof(std::uint64_t) <= size) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, data + offset, sizeof(value));
+        crc = static_cast<std::uint32_t>(_mm_crc32_u64(crc, value));
+        offset += sizeof(std::uint64_t);
+    }
+    while (offset < size) {
+        crc = _mm_crc32_u8(crc, data[offset]);
+        ++offset;
+    }
+    return crc;
+}
+
+#endif
+
+std::uint32_t crc32c_update(std::uint32_t crc, const std::uint8_t* data,
+                            std::size_t size) noexcept {
+#if defined(AIDA_PACKED_PAGE_CRC32C_HW)
+    if (crc32c_hw_supported())
+        return crc32c_update_hw(crc, data, size);
+#endif
+    return crc32c_update_sw(crc, data, size);
 }
 
 void append_u32_le(std::vector<std::uint8_t>& output, std::uint32_t value) {
@@ -53,15 +106,10 @@ std::uint64_t read_u64_le(const std::uint8_t* data) noexcept {
 
 std::uint32_t compute_page_checksum(const packed_page_header_t& header,
                                      const std::vector<std::uint8_t>& payload) noexcept {
-    const auto& table = crc32c_table();
     std::uint32_t crc = 0xFFFFFFFFU;
     const auto encoded = header.encode();
-    for (std::size_t index = 0; index < 48; ++index) {
-        crc = table[(crc ^ encoded[index]) & 0xFFU] ^ (crc >> 8U);
-    }
-    for (std::size_t index = 0; index < payload.size(); ++index) {
-        crc = table[(crc ^ payload[index]) & 0xFFU] ^ (crc >> 8U);
-    }
+    crc = crc32c_update(crc, encoded.data(), 48);
+    crc = crc32c_update(crc, payload.data(), payload.size());
     return crc ^ 0xFFFFFFFFU;
 }
 
@@ -96,18 +144,16 @@ workspace_result_t<std::uint32_t> compute_page_checksum_cancellable(
     if (codec_stop_requested(stop_requested))
         return workspace_result_t<std::uint32_t>::failure(
             codec_cancelled_error("packed_page_codec.verify_page"));
-    const auto& table = crc32c_table();
     std::uint32_t crc = 0xFFFFFFFFU;
     const auto encoded = header.encode();
-    for (std::size_t index = 0; index < 48; ++index)
-        crc = table[(crc ^ encoded[index]) & 0xFFU] ^ (crc >> 8U);
+    crc = crc32c_update(crc, encoded.data(), 48);
     for (std::size_t offset = 0; offset < payload.size();) {
         if (codec_stop_requested(stop_requested))
             return workspace_result_t<std::uint32_t>::failure(
                 codec_cancelled_error("packed_page_codec.verify_page"));
         const auto end = (std::min)(payload.size(), offset + kCancellationStride);
-        for (; offset < end; ++offset)
-            crc = table[(crc ^ payload[offset]) & 0xFFU] ^ (crc >> 8U);
+        crc = crc32c_update(crc, payload.data() + offset, end - offset);
+        offset = end;
     }
     if (codec_stop_requested(stop_requested))
         return workspace_result_t<std::uint32_t>::failure(
@@ -138,11 +184,7 @@ workspace_result_t<std::uint32_t> checksum_headers_cancellable(
 std::uint32_t crc32c(const std::uint8_t* data, std::size_t size) noexcept {
     if (!data && size != 0)
         return 0;
-    const auto& table = crc32c_table();
-    std::uint32_t crc = 0xFFFFFFFFU;
-    for (std::size_t index = 0; index < size; ++index) {
-        crc = table[(crc ^ data[index]) & 0xFFU] ^ (crc >> 8U);
-    }
+    const std::uint32_t crc = crc32c_update(0xFFFFFFFFU, data, size);
     return crc ^ 0xFFFFFFFFU;
 }
 
@@ -158,15 +200,14 @@ workspace_result_t<std::uint32_t> crc32c_cancellable(
     if (codec_stop_requested(stop_requested))
         return workspace_result_t<std::uint32_t>::failure(
             codec_cancelled_error("packed_page_codec.crc32c"));
-    const auto& table = crc32c_table();
     std::uint32_t crc = 0xFFFFFFFFU;
     for (std::size_t offset = 0; offset < size;) {
         if (codec_stop_requested(stop_requested))
             return workspace_result_t<std::uint32_t>::failure(
                 codec_cancelled_error("packed_page_codec.crc32c"));
         const auto end = (std::min)(size, offset + kCancellationStride);
-        for (; offset < end; ++offset)
-            crc = table[(crc ^ data[offset]) & 0xFFU] ^ (crc >> 8U);
+        crc = crc32c_update(crc, data + offset, end - offset);
+        offset = end;
     }
     if (codec_stop_requested(stop_requested))
         return workspace_result_t<std::uint32_t>::failure(

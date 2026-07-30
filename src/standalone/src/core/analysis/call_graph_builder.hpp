@@ -42,6 +42,7 @@ struct call_graph_result_t {
     std::uint64_t indirect_site_count = 0;
     std::uint64_t unresolved_site_count = 0;
     std::uint64_t storage_bytes = 0;
+    std::uint64_t shard_merge_ns = 0;
     bool bounded = false;
 };
 

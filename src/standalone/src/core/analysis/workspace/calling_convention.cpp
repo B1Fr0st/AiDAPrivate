@@ -1,5 +1,7 @@
 #include "calling_convention.hpp"
 
+#include "parallel_pass.hpp"
+
 #include <Zydis/Zydis.h>
 
 #include <capstone/arm.h>
@@ -496,6 +498,31 @@ workspace_result_t<std::uint64_t> canonical_function_rva(
     return workspace_result_t<std::uint64_t>::failure(std::move(error));
 }
 
+workspace_result_t<void> validate_request_budgets(
+    const calling_convention_request_t& request) {
+    if (request.max_instruction_visits == 0 || request.max_evidence == 0 ||
+        request.max_stack_slots == 0) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "calling convention request contains a zero budget", "calling_convention.request"));
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> check_request_revisions(
+    const calling_convention_request_t& request, const analysis_snapshot_t& snapshot,
+    const char* phase) {
+    if ((request.expected_generation && *request.expected_generation != snapshot.generation) ||
+        (request.expected_analysis_revision &&
+         *request.expected_analysis_revision != snapshot.analysis_revision) ||
+        (request.expected_overlay_revision && *request.expected_overlay_revision != snapshot.overlay_revision)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::stale_generation,
+                                 "calling convention request revisions do not match the snapshot", phase));
+    }
+    return workspace_result_t<void>::success();
+}
+
 workspace_result_t<std::shared_ptr<const analysis_snapshot_t>> acquire_snapshot(
     const analysis_workspace_t& workspace, const calling_convention_request_t& request,
     const cancellation_token_t& cancel, const char* phase) {
@@ -522,13 +549,10 @@ workspace_result_t<std::shared_ptr<const analysis_snapshot_t>> acquire_snapshot(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "analysis snapshot identity does not match the workspace", phase));
     }
-    if ((request.expected_generation && *request.expected_generation != snapshot->generation) ||
-        (request.expected_analysis_revision &&
-         *request.expected_analysis_revision != snapshot->analysis_revision) ||
-        (request.expected_overlay_revision && *request.expected_overlay_revision != snapshot->overlay_revision)) {
+    const auto revisions = check_request_revisions(request, *snapshot, phase);
+    if (!revisions) {
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            make_workspace_error(workspace_error_code_t::stale_generation,
-                                 "calling convention request revisions do not match the snapshot", phase));
+            revisions.error());
     }
     return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::success(snapshot);
 }
@@ -829,23 +853,17 @@ make_calling_convention_cache_key(const analysis_workspace_t& workspace,
     return workspace_result_t<calling_convention_cache_key_t>::success(std::move(key));
 }
 
+namespace {
+
 workspace_result_t<cc_analysis_result_t>
-infer_calling_convention(const analysis_workspace_t& workspace,
-                         const calling_convention_request_t& request,
-                         const cancellation_token_t& cancel) {
-    if (request.max_instruction_visits == 0 || request.max_evidence == 0 ||
-        request.max_stack_slots == 0) {
-        return workspace_result_t<cc_analysis_result_t>::failure(make_workspace_error(
-            workspace_error_code_t::invalid_argument,
-            "calling convention request contains a zero budget", "calling_convention.request"));
-    }
-    const auto snapshot = acquire_snapshot(workspace, request, cancel, "calling_convention.infer");
-    if (!snapshot)
-        return workspace_result_t<cc_analysis_result_t>::failure(snapshot.error());
+infer_with_snapshot(const analysis_workspace_t& workspace,
+                    const std::shared_ptr<const analysis_snapshot_t>& snapshot,
+                    const calling_convention_request_t& request,
+                    const cancellation_token_t& cancel) {
     const auto function_rva = canonical_function_rva(workspace, request);
     if (!function_rva)
         return workspace_result_t<cc_analysis_result_t>::failure(function_rva.error());
-    const auto view = extract_function_view(*snapshot.value(), function_rva.value(), workspace.identity(), cancel);
+    const auto view = extract_function_view(*snapshot, function_rva.value(), workspace.identity(), cancel);
     if (!view)
         return workspace_result_t<cc_analysis_result_t>::failure(view.error());
     const auto workspace_cancel = workspace.cancellation_token();
@@ -857,9 +875,9 @@ infer_calling_convention(const analysis_workspace_t& workspace,
     result.cache_key.architecture = workspace.identity().architecture();
     result.cache_key.architecture_mode = workspace.identity().architecture_mode();
     result.cache_key.declared_abi = workspace.identity().abi();
-    result.cache_key.generation = snapshot.value()->generation;
-    result.cache_key.analysis_revision = snapshot.value()->analysis_revision;
-    result.cache_key.overlay_revision = snapshot.value()->overlay_revision;
+    result.cache_key.generation = snapshot->generation;
+    result.cache_key.analysis_revision = snapshot->analysis_revision;
+    result.cache_key.overlay_revision = snapshot->overlay_revision;
 
     const auto candidates = candidate_abis(workspace.identity());
     if (candidates.size() == 1 && is_managed_abi(candidates.front())) {
@@ -872,7 +890,7 @@ infer_calling_convention(const analysis_workspace_t& workspace,
                         cc_evidence_t{cc_evidence_kind_t::managed_identity,
                                       fact_provenance_t::linear_validation,
                                       request.function, 0, 0, 0, 100, true});
-        const auto current = validate_current_scope(workspace, *snapshot.value(), cancel);
+        const auto current = validate_current_scope(workspace, *snapshot, cancel);
         if (!current)
             return workspace_result_t<cc_analysis_result_t>::failure(current.error());
         return workspace_result_t<cc_analysis_result_t>::success(std::move(result));
@@ -881,7 +899,7 @@ infer_calling_convention(const analysis_workspace_t& workspace,
         result.state = cc_inference_state_t::abstained;
         result.arguments_state = cc_value_state_t::abstained;
         result.variadic_state = cc_value_state_t::abstained;
-        const auto current = validate_current_scope(workspace, *snapshot.value(), cancel);
+        const auto current = validate_current_scope(workspace, *snapshot, cancel);
         if (!current)
             return workspace_result_t<cc_analysis_result_t>::failure(current.error());
         return workspace_result_t<cc_analysis_result_t>::success(std::move(result));
@@ -925,8 +943,8 @@ infer_calling_convention(const analysis_workspace_t& workspace,
         const auto& instruction = *item.instruction;
         const std::size_t operand_begin = instruction.operand_fact_begin;
         const std::size_t operand_count = instruction.operand_fact_count;
-        if (operand_begin > snapshot.value()->operand_facts.size() ||
-            operand_count > snapshot.value()->operand_facts.size() - operand_begin) {
+        if (operand_begin > snapshot->operand_facts.size() ||
+            operand_count > snapshot->operand_facts.size() - operand_begin) {
             return workspace_result_t<cc_analysis_result_t>::failure(make_workspace_error(
                 workspace_error_code_t::integrity_failure,
                 "instruction operand range exceeds the snapshot", "calling_convention.scan"));
@@ -937,7 +955,7 @@ infer_calling_convention(const analysis_workspace_t& workspace,
         bool memory_read = false;
         bool memory_write = false;
         for (std::size_t operand_index = 0; operand_index < operand_count; ++operand_index) {
-            const auto& operand = snapshot.value()->operand_facts[operand_begin + operand_index];
+            const auto& operand = snapshot->operand_facts[operand_begin + operand_index];
             const auto bit_width = operand.access_width_bits != 0 ? operand.access_width_bits : operand.bit_width;
             if (operand.kind == operand_kind_t::reg) {
                 const auto reg = canonical_register(workspace.identity().architecture(), operand.reg);
@@ -1031,7 +1049,7 @@ infer_calling_convention(const analysis_workspace_t& workspace,
             result.frame.epilogue_start_rva = instruction.address.value;
         }
         for (std::size_t operand_index = 0; operand_index < operand_count; ++operand_index) {
-            const auto& operand = snapshot.value()->operand_facts[operand_begin + operand_index];
+            const auto& operand = snapshot->operand_facts[operand_begin + operand_index];
             if (operand.kind == operand_kind_t::immediate && operand.immediate != 0)
                 has_callee_cleanup = true;
         }
@@ -1324,10 +1342,115 @@ infer_calling_convention(const analysis_workspace_t& workspace,
     }
     result.argument_count = result.arguments.size();
     synchronize_legacy_return(result);
-    const auto current = validate_current_scope(workspace, *snapshot.value(), cancel);
+    const auto current = validate_current_scope(workspace, *snapshot, cancel);
     if (!current)
         return workspace_result_t<cc_analysis_result_t>::failure(current.error());
     return workspace_result_t<cc_analysis_result_t>::success(std::move(result));
+}
+
+workspace_result_t<cc_analysis_result_t>
+run_cc_batch_item(const analysis_workspace_t& workspace,
+    const std::shared_ptr<const analysis_snapshot_t>& snapshot,
+    const calling_convention_request_t& request,
+    const cancellation_token_t& cancel) {
+    const auto budgets = validate_request_budgets(request);
+    if (!budgets)
+        return workspace_result_t<cc_analysis_result_t>::failure(budgets.error());
+    if (cancelled(cancel))
+        return workspace_result_t<cc_analysis_result_t>::failure(
+            stopped_error(cancel, "calling_convention.infer"));
+    const auto workspace_cancel = workspace.cancellation_token();
+    if (cancelled(workspace_cancel)) {
+        return workspace_result_t<cc_analysis_result_t>::failure(
+            stopped_error(workspace_cancel, "calling_convention.infer"));
+    }
+    if (workspace.closing() || workspace.closed()) {
+        return workspace_result_t<cc_analysis_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::workspace_closing,
+                                 "calling convention inference rejected a closing workspace",
+                                 "calling_convention.infer"));
+    }
+    const auto revisions = check_request_revisions(request, *snapshot, "calling_convention.infer");
+    if (!revisions)
+        return workspace_result_t<cc_analysis_result_t>::failure(revisions.error());
+    return infer_with_snapshot(workspace, snapshot, request, cancel);
+}
+
+}
+
+workspace_result_t<cc_analysis_result_t>
+infer_calling_convention(const analysis_workspace_t& workspace,
+                         const calling_convention_request_t& request,
+                         const cancellation_token_t& cancel) {
+    const auto budgets = validate_request_budgets(request);
+    if (!budgets)
+        return workspace_result_t<cc_analysis_result_t>::failure(budgets.error());
+    const auto snapshot = acquire_snapshot(workspace, request, cancel, "calling_convention.infer");
+    if (!snapshot)
+        return workspace_result_t<cc_analysis_result_t>::failure(snapshot.error());
+    return infer_with_snapshot(workspace, snapshot.value(), request, cancel);
+}
+
+workspace_result_t<std::vector<workspace_result_t<cc_analysis_result_t>>>
+infer_calling_conventions_batch(const analysis_workspace_t& workspace,
+    const std::vector<calling_convention_request_t>& requests,
+    const calling_convention_batch_options_t& options,
+    const cancellation_token_t& cancel) {
+    using batch_output_t = std::vector<workspace_result_t<cc_analysis_result_t>>;
+    if (options.worker_count > 256) {
+        return workspace_result_t<batch_output_t>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "calling convention batch worker count is invalid", "calling_convention.batch"));
+    }
+    if (requests.empty())
+        return workspace_result_t<batch_output_t>::success(batch_output_t{});
+    if (cancelled(cancel)) {
+        return workspace_result_t<batch_output_t>::failure(
+            stopped_error(cancel, "calling_convention.infer"));
+    }
+    const auto workspace_cancel = workspace.cancellation_token();
+    if (cancelled(workspace_cancel)) {
+        return workspace_result_t<batch_output_t>::failure(
+            stopped_error(workspace_cancel, "calling_convention.infer"));
+    }
+    if (workspace.closing() || workspace.closed()) {
+        return workspace_result_t<batch_output_t>::failure(
+            make_workspace_error(workspace_error_code_t::workspace_closing,
+                                 "calling convention inference rejected a closing workspace",
+                                 "calling_convention.infer"));
+    }
+    const auto pinned = workspace.snapshot();
+    if (!pinned) {
+        return workspace_result_t<batch_output_t>::failure(
+            make_workspace_error(workspace_error_code_t::analysis_in_progress,
+                                 "calling convention inference requires a published analysis snapshot",
+                                 "calling_convention.infer"));
+    }
+    if (pinned->binary_id != workspace.identity().binary_id()) {
+        return workspace_result_t<batch_output_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "analysis snapshot identity does not match the workspace",
+                                 "calling_convention.infer"));
+    }
+    std::vector<std::optional<workspace_result_t<cc_analysis_result_t>>> slots(requests.size());
+    const auto shards = parallel_shards(requests.size(), options.worker_count);
+    const auto run = parallel_run_shards(shards,
+        [&](std::size_t, parallel_shard_t shard) -> workspace_result_t<void> {
+            for (std::size_t index = shard.begin; index != shard.end; ++index)
+                slots[index].emplace(run_cc_batch_item(workspace, pinned, requests[index], cancel));
+            return workspace_result_t<void>::success();
+        }, cancel);
+    if (!run)
+        return workspace_result_t<batch_output_t>::failure(run.error());
+    if (cancel.stop_requested()) {
+        return workspace_result_t<batch_output_t>::failure(
+            stopped_error(cancel, "calling_convention.infer"));
+    }
+    batch_output_t results;
+    results.reserve(requests.size());
+    for (auto& slot : slots)
+        results.push_back(std::move(*slot));
+    return workspace_result_t<batch_output_t>::success(std::move(results));
 }
 
 workspace_result_t<cc_analysis_result_t>

@@ -1,6 +1,7 @@
 #include "baseline_engine_integration.hpp"
 
 #include "analysis_metrics.hpp"
+#include "byte_provider.hpp"
 #include "checked_range.hpp"
 #include "persistence_queue.hpp"
 #include "workspace_database.hpp"
@@ -143,10 +144,16 @@ bool resource_budget_satisfied(
 }
 
 c03::analysis_resource_usage_t estimate_resource_usage(
-    const baseline_analysis_settings_t& settings) noexcept {
+    const baseline_analysis_settings_t& settings,
+    const byte_provider_t* provider) noexcept {
     c03::analysis_resource_usage_t usage;
     usage.incremental_private_bytes = settings.max_analysis_memory_bytes;
     usage.workspace_mapped_window_bytes = settings.decode_read_window_bytes;
+    if (provider != nullptr) {
+        const auto statistics = provider->window_cache_statistics();
+        if (statistics && statistics->capacity_bytes != 0)
+            usage.workspace_mapped_window_bytes = statistics->capacity_bytes;
+    }
     usage.workspace_spill_bytes = 0;
     usage.workspace_cache_bytes = settings.max_analysis_memory_bytes / 4;
     return usage;
@@ -222,7 +229,8 @@ struct baseline_engine_integration_t::impl_t {
     workspace_result_t<void> validate_resource_budget() {
         if (!state.config.enforce_resource_budget)
             return workspace_result_t<void>::success();
-        const auto usage = estimate_resource_usage(state.config.baseline_settings);
+        const auto usage = estimate_resource_usage(state.config.baseline_settings,
+            &state.workspace->provider());
         auto budget_result = c03::validate_analysis_resource_budget(state.config.resource_budget);
         if (!budget_result) {
             std::lock_guard<std::mutex> lock(state.snapshot_mutex);

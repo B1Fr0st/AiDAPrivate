@@ -178,8 +178,23 @@ void verify_production_snapshot_provider(const std::filesystem::path& path,
                                          const sha256_digest_t& expected_digest) {
     auto provider = require_value(mapped_file_provider_t::open(path.u8string()),
                                   "production provider open failed");
-    require(!provider->identity().immutable_snapshot,
-            "production static provider was misclassified as a live snapshot");
+    require(provider->identity().immutable_snapshot,
+            "production provider did not pin an immutable local-file snapshot");
+    require(provider->identity().content_sha256 &&
+            *provider->identity().content_sha256 == expected_digest,
+            "production provider pinned content identity diverged");
+    require(provider->content_pin_active(),
+            "production provider content pin is not active");
+    mapped_file_provider_options_t mutable_options;
+    mutable_options.pin_local_file_snapshot = false;
+    auto mutable_provider = require_value(
+        mapped_file_provider_t::open(path.u8string(), mutable_options),
+        "mutable escape-hatch provider open failed");
+    require(!mutable_provider->identity().immutable_snapshot,
+            "pin_local_file_snapshot=false did not restore the mutable identity");
+    require(mutable_provider->identity().content_sha256 &&
+            *mutable_provider->identity().content_sha256 == expected_digest,
+            "mutable escape-hatch content identity diverged");
     auto computed_digest = require_value(provider->compute_content_sha256(),
                                          "production provider hashing failed");
     require(computed_digest == expected_digest, "production provider hash diverged");

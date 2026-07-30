@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace aida::analysis {
@@ -57,10 +58,12 @@ public:
     std::uint64_t maximum_contiguous_lease(std::uint64_t offset) const noexcept override;
     workspace_result_t<byte_view_t> lease(std::uint64_t offset, std::uint64_t size,
                                           const cancellation_token_t& cancel = {}) const override;
+    bool content_pin_active() const noexcept override;
+    std::optional<mapped_window_cache_statistics_t>
+        window_cache_statistics() const noexcept override;
     workspace_result_t<void> revalidate() const;
     workspace_result_t<void> verify_content(
         const cancellation_token_t& cancel = {}) const;
-    mapped_window_cache_statistics_t statistics() const noexcept;
 
 private:
     friend class spill_sink_t;

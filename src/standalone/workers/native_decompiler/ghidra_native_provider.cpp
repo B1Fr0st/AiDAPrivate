@@ -106,6 +106,7 @@ bool checked_entry_address(
 std::optional<provider_output_t> execute_native(
     const std::string& payload,
     const decompiler_worker_job_request_t& job,
+    std::atomic<bool>* shared_cancel,
     std::vector<decompiler_diagnostic_t>& diagnostics)
 {
     auto snapshot = deserialize_native_provider_snapshot(payload, diagnostics);
@@ -125,7 +126,8 @@ std::optional<provider_output_t> execute_native(
     capture.entity = job.cache_key.entity;
     capture.workspace_generation = job.cache_key.workspace_generation;
     capture.type_graph_revision = job.cache_key.type_graph_revision;
-    std::atomic<bool> cancelled{false};
+    std::atomic<bool> local_cancel{false};
+    std::atomic<bool>* const cancelled = shared_cancel ? shared_cancel : &local_cancel;
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(job.profile.max_wall_clock_ms);
     ghidra_decompiler::ghidra_decompile_result_limits_t limits;
@@ -143,7 +145,7 @@ std::optional<provider_output_t> execute_native(
     const auto output = ghidra_decompiler::decompile_isolated_regions(
         std::move(regions), snapshot->image_base, snapshot->image_size, entry,
         job.cache_key.language.language_id, job.cache_key.language.mode,
-        &cancelled, deadline, limits, capture);
+        cancelled, deadline, limits, capture);
     if (output.is_error || !output.typed_artifacts) {
         diagnostics.insert(diagnostics.end(), output.typed_diagnostics.begin(), output.typed_diagnostics.end());
         if (!output.error_text.empty())
@@ -239,7 +241,8 @@ bool validate_output(const provider_output_t& output, const decompiler_worker_jo
 
 }
 
-result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_request_t& job)
+result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_request_t& job,
+    std::atomic<bool>* shared_cancel)
 {
     result_t result;
     if (job.request_printc_evidence &&
@@ -257,7 +260,7 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
     std::optional<provider_output_t> output;
     switch (job.cache_key.provider.provider) {
     case decompiler_provider_id_t::ghidra_native:
-        output = execute_native(*bytes, job, result.diagnostics);
+        output = execute_native(*bytes, job, shared_cancel, result.diagnostics);
         break;
     case decompiler_provider_id_t::jvm_ssa:
         output = execute_jvm(*bytes, result.diagnostics);

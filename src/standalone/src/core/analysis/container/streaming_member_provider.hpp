@@ -60,6 +60,10 @@ public:
     bool is_subrange_backed() const noexcept;
     bool is_spill_backed() const noexcept;
 
+    bool content_pin_active() const noexcept override;
+    std::optional<mapped_window_cache_statistics_t>
+        window_cache_statistics() const noexcept override;
+
 private:
     streaming_member_provider_t(std::shared_ptr<const byte_provider_t> source,
                                 std::shared_ptr<byte_provider_t> backing,

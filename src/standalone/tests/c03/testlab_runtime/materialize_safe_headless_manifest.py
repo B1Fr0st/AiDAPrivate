@@ -24,24 +24,24 @@ DEFAULT_WALL_MS = 120000
 QUALITY_WALL_MS = 1800000
 RESOURCE_POLICY_CASES_VERSION = 1
 EXPECTED_RESOURCE_POLICY_CASES = {
-    "ordinary-default": ("fixture.authority", "aida_c03_fixture_authority", 1, 120000, True),
+    "ordinary-default": ("fixture.materializer", "aida_c03_a06_fixture_materializer_harness", 1, 120000, True),
     "quality-approved": (QUALITY_ENTRY_ID, QUALITY_SOURCE_TARGET, 4, 1800000, True),
-    "zero-process": ("fixture.authority", "aida_c03_fixture_authority", 0, 120000, False),
+    "zero-process": ("fixture.materializer", "aida_c03_a06_fixture_materializer_harness", 0, 120000, False),
     "over-process": (QUALITY_ENTRY_ID, QUALITY_SOURCE_TARGET, 5, 1800000, False),
-    "unauthorized-multi-process": ("fixture.authority", "aida_c03_fixture_authority", 4, 120000, False),
-    "unauthorized-wall-override": ("fixture.authority", "aida_c03_fixture_authority", 1, 1800000, False),
+    "unauthorized-multi-process": ("fixture.materializer", "aida_c03_a06_fixture_materializer_harness", 4, 120000, False),
+    "unauthorized-wall-override": ("fixture.materializer", "aida_c03_a06_fixture_materializer_harness", 1, 1800000, False),
     "quality-noncanonical-process": (QUALITY_ENTRY_ID, QUALITY_SOURCE_TARGET, 3, 1800000, False),
     "quality-noncanonical-wall": (QUALITY_ENTRY_ID, QUALITY_SOURCE_TARGET, 4, 120000, False),
-    "under-wall-bound": ("fixture.authority", "aida_c03_fixture_authority", 1, 99, False),
+    "under-wall-bound": ("fixture.materializer", "aida_c03_a06_fixture_materializer_harness", 1, 99, False),
     "over-wall-bound": (QUALITY_ENTRY_ID, QUALITY_SOURCE_TARGET, 4, 1800001, False),
 }
 ALLOWED_CATEGORIES = {
-    "authority", "contract", "fixture", "provider", "layout", "store", "scheduler",
+    "contract", "fixture", "provider", "layout", "store", "scheduler",
     "reader", "container", "decode", "recovery", "query", "persistence", "decompiler",
-    "worker", "mcp", "workbench", "performance", "package", "surface", "message_pump", "security",
+    "worker", "mcp", "workbench", "performance", "surface", "security",
 }
 REQUIRED_REQUIREMENTS = (
-    {"ACT-01", "SURF-01", "SEC-01"}
+    {"SURF-01", "SEC-01", "DEP-02", "VER-02"}
     | {f"PERF-{index:02d}" for index in range(1, 11)}
     | {f"FMT-{index:02d}" for index in range(1, 4)}
     | {f"ARCH-{index:02d}" for index in range(1, 3)}
@@ -51,9 +51,7 @@ REQUIRED_REQUIREMENTS = (
     | {f"WB-{index:02d}" for index in range(1, 6)}
     | {f"OVL-{index:02d}" for index in range(1, 4)}
     | {f"LIVE-{index:02d}" for index in range(1, 4)}
-    | {f"DEP-{index:02d}" for index in range(1, 5)}
     | {f"HAR-{index:02d}" for index in range(1, 4)}
-    | {f"VER-{index:02d}" for index in range(1, 3)}
 )
 UNSAFE_FLAGS = {
     "requires_driver",

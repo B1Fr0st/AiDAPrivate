@@ -3,9 +3,14 @@
 #include <algorithm>
 #include <limits>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
+static_assert(!std::is_copy_constructible_v<aida::analysis::packed_analysis_shard_builder_t> &&
+              !std::is_copy_assignable_v<aida::analysis::packed_analysis_shard_builder_t>,
+              "packed_analysis_shard_builder_t must stay move-only so concurrent per-tile builds can never alias shared state");
 
 namespace aida::analysis {
 namespace {

@@ -41,6 +41,7 @@ std::string analysis_metrics_snapshot_t::to_json() const {
     std::ostringstream out;
     out.imbue(std::locale::classic());
     out << "{\"generation\":" << generation
+        << ",\"metrics_schema_version\":2"
         << ",\"started_steady_ns\":" << started_steady_ns
         << ",\"finished_steady_ns\":" << finished_steady_ns
         << ",\"wall_ns\":" << wall_ns
@@ -196,6 +197,8 @@ void analysis_metrics_t::record_runtime_pressure(std::uint64_t active_workers,
     std::uint64_t queue_depth) noexcept {
     set_max(analysis_metric_t::peak_workers, active_workers);
     set_max(analysis_metric_t::peak_queue_depth, queue_depth);
+    add(analysis_metric_t::queue_depth_sum, queue_depth);
+    add(analysis_metric_t::queue_depth_samples, 1);
     for (auto& phase : phases_) {
         if (phase.active_invocations.load(std::memory_order_acquire) == 0)
             continue;
@@ -215,6 +218,8 @@ void analysis_metrics_t::sample_process_memory() noexcept {
         static_cast<std::uint64_t>(counters.PrivateUsage));
     set_max(analysis_metric_t::peak_committed_bytes,
         static_cast<std::uint64_t>(counters.PagefileUsage));
+    set_max(analysis_metric_t::resident_bytes_peak,
+        static_cast<std::uint64_t>(counters.PeakWorkingSetSize));
 }
 
 void analysis_metrics_t::record_cancellation_request() noexcept {
@@ -317,7 +322,7 @@ const char* analysis_metrics_t::phase_name(baseline_phase_t phase) noexcept {
     static constexpr const char* names[] = {
         "parse", "seed", "decode", "blocks", "functions", "cfg_calls",
         "xrefs", "strings_data", "metadata_symbols_types", "search_index",
-        "persistence", "publish_ready"
+        "persistence", "publish_ready", "decode_merge"
     };
     static_assert(std::size(names) == baseline_phase_count);
     return names[phase_index(phase)];
@@ -344,7 +349,27 @@ const char* analysis_metrics_t::metric_name(analysis_metric_t metric) noexcept {
         "mcp_latency_ns", "mcp_latency_max_ns", "decompile_cold_calls",
         "decompile_cold_latency_ns", "decompile_cold_latency_max_ns",
         "decompile_warm_calls", "decompile_warm_latency_ns",
-        "decompile_warm_latency_max_ns"
+        "decompile_warm_latency_max_ns", "worker_slots_busy_ns",
+        "worker_slots_scheduled_ns", "queue_wait_ns_total",
+        "queue_wait_max_ns", "queue_depth_sum", "queue_depth_samples",
+        "decode_tiles", "decode_requests", "decode_frontier_seeds",
+        "decode_waves", "decode_cross_tile_edges", "decode_invalid_bytes",
+        "decode_invalid_runs", "decode_duplicate_instructions",
+        "decode_merge_ns", "decode_lane_wall_ns_max",
+        "decode_bytes_attempted", "blocks_split", "function_seeds_processed",
+        "cfg_indirect_sites", "xref_candidates", "strings_scanned_bytes",
+        "pass_merge_ns", "index_entries", "index_trigram_postings",
+        "index_text_bytes", "index_serialized_bytes",
+        "type_candidates_evaluated", "persist_queue_wait_ns",
+        "persist_queue_depth_peak", "persist_pages_written",
+        "persist_wal_bytes_peak", "resident_bytes_peak",
+        "mapped_window_bytes_peak", "mapped_window_bytes_global_peak",
+        "spill_bytes_peak", "spill_bytes_written", "spill_bytes_read",
+        "budget_rejections", "memory_pressure_events",
+        "decompile_batch_calls", "decompile_batch_completed",
+        "decompile_batch_failed", "decompile_batch_cancelled",
+        "decompile_batch_wall_ns", "decompile_batch_queue_depth_peak",
+        "decompile_memory_cache_hits", "decompile_persistent_cache_hits"
     };
     static_assert(std::size(names) == analysis_metric_count);
     return names[metric_index(metric)];

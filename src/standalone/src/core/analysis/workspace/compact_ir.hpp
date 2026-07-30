@@ -1,11 +1,13 @@
 #pragma once
 
+#include "checked_range.hpp"
 #include "workspace_types.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida::analysis {
@@ -639,7 +641,73 @@ struct analysis_snapshot_t {
     std::vector<symbol_record_t> symbols;
     analysis_rich_fact_publication_t rich_facts;
     std::vector<coverage_span_t> coverage;
+    std::uint64_t string_value_bytes = 0;
+    std::uint64_t symbol_name_bytes = 0;
+    std::uint64_t function_chunk_bytes = 0;
+    std::uint64_t type_candidate_text_bytes = 0;
+    std::uint64_t type_reference_key_bytes = 0;
+    std::uint64_t metadata_conflict_text_bytes = 0;
 };
+
+inline workspace_result_t<std::uint64_t> snapshot_memory_accounted_bytes(
+    const analysis_snapshot_t& snapshot) {
+    std::uint64_t total = sizeof(snapshot);
+    const auto add = [&total](std::uint64_t count, std::uint64_t size)
+        -> workspace_result_t<void> {
+        std::uint64_t bytes = 0;
+        std::uint64_t updated = 0;
+        if (!checked_mul_u64(count, size, bytes) || !checked_add_u64(total, bytes, updated)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::range_overflow,
+                "analysis memory accounting overflows", "memory_budget"));
+        }
+        total = updated;
+        return workspace_result_t<void>::success();
+    };
+    const std::pair<std::uint64_t, std::uint64_t> allocations[] = {
+        {snapshot.instructions.capacity(), sizeof(instruction_record_t)},
+        {snapshot.delay_slot_counts.capacity(), sizeof(std::uint8_t)},
+        {snapshot.operand_facts.capacity(), sizeof(operand_fact_t)},
+        {snapshot.target_facts.capacity(), sizeof(target_fact_t)},
+        {snapshot.blocks.capacity(), sizeof(basic_block_record_t)},
+        {snapshot.function_chunks.capacity(), sizeof(function_chunk_record_t)},
+        {snapshot.function_block_memberships.capacity(), sizeof(function_block_membership_record_t)},
+        {snapshot.functions.capacity(), sizeof(function_record_t)},
+        {snapshot.edges.capacity(), sizeof(edge_record_t)},
+        {snapshot.call_graph.nodes.capacity(), sizeof(call_graph_node_record_t)},
+        {snapshot.call_graph.call_sites.capacity(), sizeof(recovered_call_site_t)},
+        {snapshot.call_graph.candidates.capacity(), sizeof(recovered_call_candidate_t)},
+        {snapshot.call_graph.edges.capacity(), sizeof(call_graph_edge_record_t)},
+        {snapshot.call_graph.conflicts.capacity(), sizeof(call_graph_conflict_t)},
+        {snapshot.xrefs.capacity(), sizeof(xref_record_t)},
+        {snapshot.strings.capacity(), sizeof(string_record_t)},
+        {snapshot.symbols.capacity(), sizeof(symbol_record_t)},
+        {snapshot.rich_facts.data_candidates.capacity(), sizeof(data_candidate_record_t)},
+        {snapshot.rich_facts.data_pointer_facts.capacity(), sizeof(data_pointer_fact_t)},
+        {snapshot.rich_facts.data_conflicts.capacity(), sizeof(data_candidate_conflict_t)},
+        {snapshot.rich_facts.type_candidates.capacity(), sizeof(symbol_type_candidate_record_t)},
+        {snapshot.rich_facts.type_references.capacity(), sizeof(type_reference_fact_t)},
+        {snapshot.rich_facts.metadata_conflicts.capacity(), sizeof(metadata_conflict_record_t)},
+        {snapshot.coverage.capacity(), sizeof(coverage_span_t)}};
+    for (const auto& allocation : allocations) {
+        auto added = add(allocation.first, allocation.second);
+        if (!added)
+            return workspace_result_t<std::uint64_t>::failure(added.error());
+    }
+    const std::uint64_t ledger[] = {
+        snapshot.string_value_bytes,
+        snapshot.symbol_name_bytes,
+        snapshot.function_chunk_bytes,
+        snapshot.type_candidate_text_bytes,
+        snapshot.type_reference_key_bytes,
+        snapshot.metadata_conflict_text_bytes};
+    for (const std::uint64_t bytes : ledger) {
+        auto added = add(bytes, 1);
+        if (!added)
+            return workspace_result_t<std::uint64_t>::failure(added.error());
+    }
+    return workspace_result_t<std::uint64_t>::success(total);
+}
 
 workspace_result_t<void> validate_call_graph_publication(
     const analysis_snapshot_t& snapshot,

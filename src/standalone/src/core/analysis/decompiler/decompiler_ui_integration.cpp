@@ -1,5 +1,6 @@
 #include "decompiler_ui_integration.hpp"
 
+#include "decompile_batch_orchestrator.hpp"
 #include "legacy_document_adapter.hpp"
 #include "native_worker_host.hpp"
 #include "providers/cli_provider.hpp"
@@ -69,6 +70,7 @@ struct ui_state_t final {
 
     std::shared_ptr<analysis_workspace_t> workspace;
     std::shared_ptr<decompiler_pipeline_service_t> service;
+    std::shared_ptr<decompiler_isolated_provider_host_t> pooled_native_host;
     decompiler_ui_integration_config_t config;
     mutable std::mutex metrics_mutex;
     decompiler_ui_integration_metrics_t metrics;
@@ -948,6 +950,29 @@ bool publication_matches_request(
            publication->load_profile_hash == request.cache_identity.loader_layout_hash;
 }
 
+std::uint64_t native_function_byte_size(
+    const analysis_snapshot_t& snapshot,
+    const function_record_t& function) noexcept
+{
+    std::uint64_t total = 0;
+    for (const auto& chunk : function.chunks) {
+        if (chunk.rva_end > chunk.rva_start)
+            total += chunk.rva_end - chunk.rva_start;
+    }
+    if (total == 0 && function.chunk_count != 0 &&
+        function.first_chunk <= snapshot.function_chunks.size() &&
+        function.chunk_count <= snapshot.function_chunks.size() - function.first_chunk) {
+        for (std::uint32_t index = 0; index < function.chunk_count; ++index) {
+            const auto& chunk = snapshot.function_chunks[function.first_chunk + index];
+            if (chunk.end.value >= chunk.start.value)
+                total += chunk.end.value - chunk.start.value;
+        }
+    }
+    if (total == 0 && function.end.value >= function.start.value)
+        total = function.end.value - function.start.value;
+    return total;
+}
+
 workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>
 capture_native_provider_context(
     const std::shared_ptr<analysis_workspace_t>& workspace,
@@ -1421,7 +1446,12 @@ decompiler_ui_integration_t::create_production(
             return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
                 cache.error());
         }
-        config.service_config.isolated_provider_host = runtime.value().provider_host;
+        auto pooled_native_host =
+            native_worker::create_pooled_native_worker_provider_host(runtime.value());
+        config.service_config.isolated_provider_host = pooled_native_host;
+        config.service_config.max_parallel_requests = 9;
+        config.service_config.database = workspace->database();
+        config.service_config.metrics_sink = workspace->background_metrics();
         auto service = decompiler_pipeline_service_t::create(
             std::move(providers), cache.take_value(), {}, config.service_config);
         if (!service) {
@@ -1431,6 +1461,7 @@ decompiler_ui_integration_t::create_production(
         auto integration = create(workspace, service.take_value(), std::move(config));
         if (!integration)
             return integration;
+        integration.value()->impl_->state.pooled_native_host = std::move(pooled_native_host);
         integration.value()->impl_->state.native_provider = runtime.value().provider;
         integration.value()->impl_->state.cli_provider = runtime.value().cli_provider;
         integration.value()->impl_->state.jvm_provider = runtime.value().jvm_provider;
@@ -1511,6 +1542,30 @@ decompiler_ui_integration_t::production_for_workspace(
     }
     evicted.reset();
     return created;
+}
+
+workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>
+decompiler_ui_integration_t::find_production_for_workspace(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    if (!workspace) {
+        return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "production decompiler integration requires a workspace",
+                "decompiler_ui.production_cache"));
+    }
+    std::lock_guard lock(production_cache_mutex);
+    const auto found = production_cache.find(workspace.get());
+    if (found == production_cache.end() || found->second.workspace != workspace ||
+        !found->second.integration) {
+        return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
+            ui_request_error(workspace_error_code_t::provider_unavailable,
+                "production decompiler integration is not installed for the workspace",
+                "decompiler_ui.production_cache"));
+    }
+    found->second.touch = ++production_cache_clock;
+    return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::success(
+        found->second.integration);
 }
 
 decompiler_pipeline_invocation_t
@@ -1750,6 +1805,225 @@ decompiler_ui_integration_t::build_pipeline_request(
                 "decompiler_ui.identity"));
     }
 
+workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
+    analysis_workspace_t& workspace,
+    const std::shared_ptr<const analysis_publication_t>& publication,
+    const function_record_t& function,
+    const decompiler_pipeline_invocation_t invocation,
+    const decompiler_pipeline_cache_mode_t cache_mode,
+    const decompiler_profile_id_t profile,
+    const std::optional<decompiler_profile_budget_t>& budget,
+    const std::optional<std::chrono::steady_clock::time_point>& deadline,
+    const std::shared_ptr<const decompiler_provider_context_t>& provider_context,
+    const cancellation_token_t& cancel) try
+{
+    constexpr std::uint64_t max_function_bytes = 64ULL << 20;
+    constexpr std::size_t max_function_chunks = 65536;
+    if (!publication || !publication->coherent_with(workspace.identity()) ||
+        !publication->snapshot || !publication->snapshot->normalized_image ||
+        publication->analysis_revision == 0) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::stale_generation,
+                "decompiler pipeline workspace publication is stale or incoherent",
+                "decompiler_ui.identity.workspace"));
+    }
+    if (cancel.stop_requested()) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "decompiler pipeline identity construction was cancelled",
+                "decompiler_ui.identity"));
+    }
+    auto binding = workspace.verify_provider_binding();
+    if (!binding)
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(binding.error());
+    const auto snapshot = publication->snapshot;
+    const auto image = snapshot->normalized_image;
+    if (function.id == 0) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::target_not_found,
+                "decompiler pipeline function is not present in the current workspace snapshot",
+                "decompiler_ui.identity.function"));
+    }
+    const auto entry = relative_value(function.start, image->image_base);
+    const auto end = relative_value(function.end, image->image_base);
+    if (!entry || !end || *entry >= *end || *end > image->image_size) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "decompiler pipeline function identity range is invalid",
+                "decompiler_ui.identity.function"));
+    }
+    auto integration = decompiler_ui_integration_t::production_for_workspace(
+        workspace.shared_from_this());
+    if (!integration)
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            integration.error());
+    const auto& state = integration.value()->impl_->state;
+    if (!state.native_provider || state.native_worker_protocol_hash.empty() ||
+        state.native_manifest_hash.empty() ||
+        state.native_worker_protocol_version != k_decompiler_worker_protocol_version) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::provider_unavailable,
+                "production native decompiler runtime is unavailable",
+                "decompiler_ui.native"));
+    }
+    auto language = ghidra_adapter::resolve_ghidra_language(*image, cancel);
+    if (!language)
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(language.error());
+    const auto identity_language = native_language_identity(language.value(), *image);
+    auto dependencies = native_dependency_identities(state, identity_language);
+    if (!dependencies)
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            dependencies.error());
+    auto spans_result = function_spans(
+        *snapshot, function, image->image_base, max_function_chunks);
+    if (!spans_result)
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            spans_result.error());
+    auto spans = std::move(spans_result.value());
+    std::uint64_t total_bytes = 0;
+    for (const auto& span : spans) {
+        const auto span_size = span.second - span.first;
+        if (!checked_add(total_bytes, span_size, total_bytes) ||
+            total_bytes > max_function_bytes) {
+            return workspace_result_t<decompiler_pipeline_request_t>::failure(
+                ui_request_error(workspace_error_code_t::limit_exceeded,
+                    "decompiler pipeline function bytes exceed the configured limit",
+                    "decompiler_ui.identity.bytes"));
+        }
+    }
+    if (total_bytes == 0 || total_bytes > (std::numeric_limits<std::size_t>::max)()) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "decompiler pipeline function has no readable bytes",
+                "decompiler_ui.identity.bytes"));
+    }
+    std::vector<std::uint8_t> aggregate;
+    std::vector<decompiler_chunk_fingerprint_t> fingerprints;
+    try {
+        aggregate.reserve(static_cast<std::size_t>(total_bytes));
+        fingerprints.reserve(spans.size());
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "decompiler pipeline identity allocation failed",
+                "decompiler_ui.identity.bytes"));
+    }
+    const auto pe = snapshot->image;
+    for (const auto& span : spans) {
+        if (cancel.stop_requested()) {
+            return workspace_result_t<decompiler_pipeline_request_t>::failure(
+                ui_request_error(cancel.deadline_exceeded()
+                        ? workspace_error_code_t::deadline_exceeded
+                        : workspace_error_code_t::cancelled,
+                    "decompiler pipeline identity construction was cancelled",
+                    "decompiler_ui.identity.bytes"));
+        }
+        const auto size = span.second - span.first;
+        auto provider_offset = provider_offset_for_range(*image, span.first, size);
+        if (!provider_offset && pe) {
+            const auto mapped = pe->rva_to_file_offset(span.first, size);
+            if (mapped)
+                provider_offset = mapped.value();
+        }
+        if (!provider_offset) {
+            return workspace_result_t<decompiler_pipeline_request_t>::failure(
+                ui_request_error(workspace_error_code_t::out_of_range,
+                    "decompiler pipeline function chunk is not backed by provider bytes",
+                    "decompiler_ui.identity.mapping"));
+        }
+        auto bytes = workspace.provider().read_vector(
+            *provider_offset, size, max_function_bytes, cancel);
+        if (!bytes)
+            return workspace_result_t<decompiler_pipeline_request_t>::failure(bytes.error());
+        auto digest = sha256_bytes(bytes.value().data(), bytes.value().size(), cancel);
+        if (!digest)
+            return workspace_result_t<decompiler_pipeline_request_t>::failure(digest.error());
+        decompiler_chunk_fingerprint_t fingerprint;
+        fingerprint.begin = address_t{address_space_id_t::relative_virtual,
+            span.first, image->architecture, image->architecture_mode};
+        fingerprint.end = address_t{address_space_id_t::relative_virtual,
+            span.second, image->architecture, image->architecture_mode};
+        fingerprint.bytes_hash = digest.value();
+        fingerprints.push_back(std::move(fingerprint));
+        aggregate.insert(aggregate.end(), bytes.value().begin(), bytes.value().end());
+    }
+    auto function_hash = sha256_bytes(aggregate.data(), aggregate.size(), cancel);
+    if (!function_hash)
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            function_hash.error());
+    native_decompiler_entity_identity_t native_identity;
+    native_identity.function_id = function.id;
+    native_identity.entry = address_t{address_space_id_t::relative_virtual,
+        *entry, image->architecture, image->architecture_mode};
+    native_identity.end = address_t{address_space_id_t::relative_virtual,
+        *end, image->architecture, image->architecture_mode};
+    native_identity.function_bytes_hash = function_hash.value();
+    native_identity.canonical_symbol = resolve_function_symbol(*snapshot, function);
+    decompiler_entity_key_t entity;
+    entity.kind = decompiler_entity_kind_t::native_function;
+    entity.format = image->format;
+    entity.architecture = image->architecture;
+    entity.mode = image->architecture_mode;
+    entity.endian = image->endian;
+    entity.identity = std::move(native_identity);
+    if (!validate_decompiler_entity_key(entity).valid()) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "decompiler pipeline function identity failed contract validation",
+                "decompiler_ui.identity.function"));
+    }
+    decompiler_pipeline_request_t pipeline_request;
+    pipeline_request.invocation = invocation;
+    pipeline_request.cache_mode = cache_mode;
+    pipeline_request.workspace_id = workspace.identity().binary_id().to_hex();
+    pipeline_request.workspace_generation = snapshot->generation;
+    pipeline_request.analysis_revision = snapshot->analysis_revision;
+    pipeline_request.entity = std::move(entity);
+    pipeline_request.language = identity_language;
+    pipeline_request.profile = profile;
+    pipeline_request.budget = budget;
+    pipeline_request.provider_registration_id = "aida.decompiler.native.ghidra";
+    pipeline_request.provider_context = provider_context;
+    if (!pipeline_request.provider_context) {
+        std::shared_ptr<analysis_workspace_t> shared_workspace =
+            workspace.shared_from_this();
+        pipeline_request.provider_context_factory =
+            [shared_workspace](const decompiler_provider_request_t& provider_request,
+                               const cancellation_token_t& provider_cancel) {
+                return capture_native_provider_context(
+                    shared_workspace, provider_request, provider_cancel);
+            };
+    }
+    pipeline_request.cache_identity.worker_protocol_hash =
+        state.native_worker_protocol_hash;
+    pipeline_request.cache_identity.loader_layout_hash = publication->load_profile_hash;
+    pipeline_request.cache_identity.function_bytes_hash = function_hash.value();
+    pipeline_request.cache_identity.chunk_fingerprints = std::move(fingerprints);
+    pipeline_request.cache_identity.metadata_revision = publication->analysis_revision;
+    pipeline_request.cache_identity.type_graph_revision = publication->analysis_revision;
+    pipeline_request.cache_identity.overlay_revision = snapshot->overlay_revision;
+    pipeline_request.cache_identity.dependencies = dependencies.take_value();
+    auto type_evidence = workspace_type_evidence(
+        *snapshot, pipeline_request.entity, spans, image->image_base);
+    if (!type_evidence.candidates.empty())
+        pipeline_request.type_evidence.push_back(std::move(type_evidence));
+    pipeline_request.deadline = deadline;
+    return workspace_result_t<decompiler_pipeline_request_t>::success(
+        std::move(pipeline_request));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "decompiler pipeline identity allocation failed",
+                "decompiler_ui.identity"));
+    } catch (...) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "decompiler pipeline identity construction failed",
+                "decompiler_ui.identity"));
+    }
+
 decompiler_ui_result_t
 decompiler_ui_integration_t::map_pipeline_result(
     const decompiler_pipeline_result_t& result) {
@@ -1813,7 +2087,94 @@ decompiler_ui_integration_t::execute_pipeline(
     default:
         break;
     }
-    auto pipeline_result = impl_->state.service->decompile(pipeline_request, cancel);
+    const bool interactive_native =
+        pipeline_request.invocation == decompiler_pipeline_invocation_t::explicit_ui &&
+        pipeline_request.entity.kind == decompiler_entity_kind_t::native_function;
+    decompiler_pipeline_result_t pipeline_result;
+    bool probe_satisfied = false;
+    if (interactive_native) {
+        std::shared_ptr<decompile_batch_orchestrator_t> background;
+        try {
+            background = impl_->state.workspace->background_decompile();
+        } catch (...) {
+            background.reset();
+        }
+        if (background)
+            background->notify_interactive_request(pipeline_request.entity);
+        const auto probe_started = std::chrono::steady_clock::now();
+        const auto probe = impl_->state.service->probe_rendered_cache(pipeline_request);
+        const auto probe_ms = static_cast<std::uint64_t>((std::max<std::int64_t>)(0,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - probe_started).count()));
+        if (probe.hit_stage != decompiler_rendered_probe_stage_t::none && probe.rendered) {
+            pseudocode_readability_request_t readability_request;
+            readability_request.limits =
+                impl_->state.config.service_config.readability_limits;
+            readability_request.require_complete_source_map =
+                impl_->state.config.service_config.require_complete_source_map;
+            auto analyzed = analyze_pseudocode_readability(
+                probe.rendered->document.ast, probe.rendered->document,
+                readability_request);
+            if (analyzed.succeeded() && analyzed.report) {
+                pipeline_result.status = decompiler_pipeline_status_t::completed;
+                pipeline_result.rendered_stage = probe.rendered;
+                pipeline_result.cache_hit_stage =
+                    decompiler_cache_stage_t::rendered_document;
+                pipeline_result.diagnostics = probe.rendered->diagnostics;
+                pipeline_result.readability = std::move(*analyzed.report);
+                probe_satisfied = true;
+                ::diag::log_tagged_fmt("decompiler",
+                    "interactive_dispatch wait_ms=%llu slot=CACHED deadline_ms=0 est_insns=0 batch_active=%d probe_hit=%s",
+                    static_cast<unsigned long long>(probe_ms),
+                    background && background->run_snapshot().active ? 1 : 0,
+                    probe.hit_stage == decompiler_rendered_probe_stage_t::persistent_rendered
+                        ? "persistent" : "memory");
+            }
+        }
+        if (!probe_satisfied) {
+            const auto* native_identity =
+                std::get_if<native_decompiler_entity_identity_t>(
+                    &pipeline_request.entity.identity);
+            std::uint64_t estimated_instructions = 0;
+            std::uint64_t deadline_budget_ms = 0;
+            if (native_identity &&
+                native_identity->end.value > native_identity->entry.value) {
+                const std::uint64_t byte_size =
+                    native_identity->end.value - native_identity->entry.value;
+                estimated_instructions = byte_size / 4 + ((byte_size % 4) != 0 ? 1 : 0);
+            }
+            if (pipeline_request.deadline) {
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        *pipeline_request.deadline -
+                            std::chrono::steady_clock::now()).count();
+                deadline_budget_ms =
+                    static_cast<std::uint64_t>((std::max<std::int64_t>)(0, remaining));
+            }
+            const char* slot_class = "POOLED";
+            if (impl_->state.pooled_native_host) {
+                if (const auto* pooled =
+                        dynamic_cast<const native_worker::pooled_native_worker_provider_host_t*>(
+                            impl_->state.pooled_native_host.get())) {
+                    if (const auto classification = pooled->classify_interactive_dispatch()) {
+                        slot_class = *classification ==
+                                native_worker::pooled_native_worker_provider_host_t::slot_class_t::reserved
+                            ? "RESERVED"
+                            : "BORROWED";
+                    }
+                }
+            }
+            ::diag::log_tagged_fmt("decompiler",
+                "interactive_dispatch wait_ms=%llu slot=%s deadline_ms=%llu est_insns=%llu batch_active=%d",
+                static_cast<unsigned long long>(probe_ms),
+                slot_class,
+                static_cast<unsigned long long>(deadline_budget_ms),
+                static_cast<unsigned long long>(estimated_instructions),
+                background && background->run_snapshot().active ? 1 : 0);
+        }
+    }
+    if (!probe_satisfied)
+        pipeline_result = impl_->state.service->decompile(pipeline_request, cancel);
     if (!publication_matches_request(*impl_->state.workspace, pipeline_request)) {
         ::diag::log_tagged_fmt("decompiler", "typed_pipeline path=primary status=stale_generation workspace_generation=%llu current_generation=%llu",
             static_cast<unsigned long long>(pipeline_request.workspace_generation),
@@ -2007,29 +2368,20 @@ decompiler_ui_integration_t::decompile_native(
                 "decompiler_ui.native.function"));
     }
 
-    decompiler_ui_request_t request;
-    request.source = source;
-    request.function_address = function_address;
-    request.function_end_address = function->end.value;
-    request.function_symbol = resolve_function_symbol(*publication->snapshot, *function);
-    request.language = native_language_identity(
-        language.value(), *publication->snapshot->normalized_image);
-    request.worker_protocol_hash = impl_->state.native_worker_protocol_hash;
-    request.metadata_revision = publication->analysis_revision;
-    request.type_graph_revision = publication->analysis_revision;
-    request.profile = profile;
-    request.cache_mode = cache_mode;
-    request.provider_registration_id = "aida.decompiler.native.ghidra";
-    auto dependencies = native_dependency_identities(impl_->state, request.language);
-    if (!dependencies)
-        return workspace_result_t<decompiler_ui_result_t>::failure(dependencies.error());
-    request.dependencies = dependencies.take_value();
-    request.provider_context_factory = [workspace](
-        const decompiler_provider_request_t& provider_request,
-        const cancellation_token_t& provider_cancel) {
-        return capture_native_provider_context(workspace, provider_request, provider_cancel);
-    };
-    return decompile(request, cancel);
+    const auto& image = *publication->snapshot->normalized_image;
+    const std::uint64_t function_bytes =
+        native_function_byte_size(*publication->snapshot, *function);
+    const std::uint64_t deadline_ms =
+        decompile_batch_orchestrator_t::compute_size_aware_deadline(
+            function_bytes, image.architecture, decompile_deadline_lane_t::interactive);
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(deadline_ms);
+    auto built = make_native_pipeline_request(*workspace, publication, *function,
+        map_invocation_source(source), cache_mode, profile,
+        std::nullopt, deadline, {}, cancel);
+    if (!built)
+        return workspace_result_t<decompiler_ui_result_t>::failure(built.error());
+    return execute_pipeline(std::move(built.value()), source, true, cancel);
 }
 
 workspace_result_t<decompiler_ui_result_t>

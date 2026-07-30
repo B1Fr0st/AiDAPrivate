@@ -45,6 +45,7 @@ struct data_discovery_result_t {
     std::uint64_t invalid_pointer_values = 0;
     std::uint64_t duplicate_candidates = 0;
     std::uint64_t duplicate_pointer_facts = 0;
+    std::uint64_t shard_merge_ns = 0;
 };
 
 class data_discovery_t final {

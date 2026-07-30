@@ -1,1 +1,0 @@
-SQLite is in the public domain. This C03 distribution uses the pinned SQLite 3.53.3 amalgamation at `.deps/sqlite-amalgamation-3530300`.

@@ -917,6 +917,14 @@ set(CAPSTONE_FOUND TRUE CACHE BOOL "" FORCE)
 set(CAPSTONE_INCLUDE_DIRS "${capstone_SOURCE_DIR}/include" CACHE PATH "" FORCE)
 set(CAPSTONE_LIBRARIES "capstone::capstone" CACHE STRING "" FORCE)
 
+set(MEMPDB_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+set(MEMPDB_BUILD_PDB2JSON OFF CACHE BOOL "" FORCE)
+set(MEMPDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${DEPS_DIR}/MemPDB" "${CMAKE_BINARY_DIR}/.deps/MemPDB")
+if(NOT TARGET MemPDB)
+    message(FATAL_ERROR "AiDA: vendored MemPDB did not provide a linkable target")
+endif()
+
 if(TARGET nlohmann_json OR TARGET nlohmann_json::nlohmann_json)
     message(FATAL_ERROR "AiDA: an unexpected nlohmann/json target exists before pinned local integration")
 endif()
@@ -1493,7 +1501,6 @@ if(WIN32)
     if(BUILD_AIDA_STANDALONE)
         set(STANDALONE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src")
         include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_c03_dependencies.cmake")
-        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_c03_package_integration.cmake")
         include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_c03_safe_headless_manifest.cmake")
 
         set(IMGUI_WRAPPER_DIR "${CMAKE_BINARY_DIR}/_imgui_wrapper/imgui")
@@ -1573,6 +1580,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/mcp/mcp_standalone.cpp"
             "${STANDALONE_ROOT}/core/mcp/mcp_standalone_tools.cpp"
             "${STANDALONE_ROOT}/core/runtime/standalone_driver.cpp"
+            "${STANDALONE_ROOT}/core/runtime/kernel_symbols.cpp"
             "${STANDALONE_ROOT}/core/runtime/run_target.cpp"
             "${STANDALONE_ROOT}/core/runtime/vm_guest_bridge.cpp"
             "${STANDALONE_ROOT}/core/ai/standalone_ai_client.cpp"
@@ -2120,6 +2128,8 @@ if(WIN32)
             $<TARGET_OBJECTS:AiDAStandalone_asm>
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
         )
+        set_source_files_properties("${STANDALONE_ROOT}/core/runtime/kernel_symbols.cpp"
+            PROPERTIES CXX_STANDARD 20 SKIP_PRECOMPILE_HEADERS ON)
         set(_aida_c03_production_sources ${AIDA_C03_PRODUCTION_STANDALONE_SOURCES})
         list(REMOVE_ITEM _aida_c03_production_sources ${STANDALONE_SOURCES})
         list(REMOVE_DUPLICATES _aida_c03_production_sources)
@@ -2231,6 +2241,7 @@ if(WIN32)
             triton
             capstone
             capstone_static
+            MemPDB
             nlohmann_json_schema_validator
             libdecomp_aida
             zlibstatic
@@ -2296,6 +2307,7 @@ if(WIN32)
             triton
             "${Z3_LIBRARIES}"
             capstone::capstone
+            MemPDB
             nlohmann_json_schema_validator::validator
             libdecomp_aida
             freetype
@@ -2342,39 +2354,6 @@ if(WIN32)
 
         if(TARGET aida_hardening)
             target_link_libraries(AiDAStandalone PRIVATE aida_hardening)
-        endif()
-
-        set(AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE
-            "${CMAKE_BINARY_DIR}/c03_package_production/production_link_graph.json")
-        aida_c03_emit_production_link_graph_evidence(
-            "${AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE}"
-            AiDAStandalone
-            MANIFEST_ROOTS ${AIDA_C03_SAFE_HEADLESS_TARGETS}
-            DIRECT_ROOTS ${AIDA_C03_SAFE_HEADLESS_DIRECT_TARGETS}
-            OTHER_ROOTS
-                AiDAStandalone
-                aida_c03_b14_native_decompiler_worker
-                aida_c03_package_verifier)
-        add_custom_target(aida_c03_production_link_graph_package_evidence
-            COMMAND "${CMAKE_COMMAND}" -E make_directory
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence"
-            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "${AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE}"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence/production-link-graph.json"
-            DEPENDS AiDAStandalone
-                aida_c03_b14_native_decompiler_worker
-                aida_c03_package_verifier
-                "${AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE}"
-            VERBATIM)
-        set_target_properties(aida_c03_production_link_graph_package_evidence PROPERTIES
-            FOLDER "Packaging/C03"
-            AIDA_C03_PACKAGE_ROLE "production-target-link-graph-evidence-v3")
-        if(TARGET aida_c03_distribution_manifest)
-            add_dependencies(aida_c03_distribution_manifest
-                aida_c03_production_link_graph_package_evidence)
-            set_property(TARGET aida_c03_distribution_manifest APPEND PROPERTY
-                AIDA_C03_PACKAGE_OUTPUTS
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence/production-link-graph.json")
         endif()
 
         set_target_properties(AiDAStandalone PROPERTIES
@@ -3726,52 +3705,6 @@ if(BUILD_PROTECTOR)
                 COMMENT "Verifying AiDAStandalone.exe standalone no-imports profile..."
                 VERBATIM
             )
-            if(TARGET aida_c03_package_verifier)
-                _aida_c03_package_signing_step(
-                    _aida_c03_standalone_signing_commands
-                    _aida_c03_standalone_signing_dependencies
-                    "$<TARGET_FILE:AiDAStandalone>")
-                add_custom_target(aida_c03_standalone_security_receipts
-                    COMMAND ${CMAKE_COMMAND} -E make_directory
-                        "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence"
-                    ${_aida_c03_standalone_signing_commands}
-                    COMMAND "$<TARGET_FILE:aida_c03_package_verifier>" emit-receipts
-                        --artifact "$<TARGET_FILE:AiDAStandalone>"
-                        --artifact-relative "AiDAStandalone.exe"
-                        --protector-tool "$<TARGET_FILE:AiDAProtector>"
-                        --protector-verifier "$<TARGET_FILE:AiDAProtectorVerify>"
-                        --protector-profile "standalone-no-imports"
-                        --protector-receipt "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence/standalone.protector.json"
-                        --signature-receipt "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence/standalone.signature.json"
-                        --signer-policy "${AIDA_C03_SIGNER_POLICY_FILE}"
-                        --expected-signer-policy-sha256 "${AIDA_C03_SIGNER_POLICY_SHA256}"
-                        --signing-provider "${AIDA_C03_SIGNING_PROVIDER}"
-                        --expected-signing-provider-sha256 "${AIDA_C03_SIGNING_PROVIDER_SHA256}"
-                        --deadline-ms 900000
-                    DEPENDS AiDAStandaloneNoIATVerify AiDAProtector AiDAProtectorVerify
-                        aida_c03_package_verifier
-                        ${_aida_c03_standalone_signing_dependencies}
-                    VERBATIM)
-                set_target_properties(aida_c03_standalone_security_receipts PROPERTIES
-                    FOLDER "Packaging/C03"
-                    AIDA_C03_PACKAGE_ROLE "standalone-protector-signature-receipts-v4"
-                    AIDA_C03_FINAL_BYTE_ORDERING "link;scrub;protect;direct-protector-verify;offline-wintrust-receipts")
-                foreach(_aida_c03_worker_package_target IN ITEMS
-                        aida_c03_b14_native_worker_package_manifest
-                        aida_c03_b16_managed_worker_package_manifest)
-                    if(TARGET "${_aida_c03_worker_package_target}")
-                        add_dependencies("${_aida_c03_worker_package_target}"
-                            AiDAProtector AiDAProtectorVerify aida_c03_package_verifier)
-                    endif()
-                endforeach()
-                if(TARGET aida_c03_distribution_manifest)
-                    add_dependencies(aida_c03_distribution_manifest
-                        aida_c03_standalone_security_receipts
-                        AiDAProtector AiDAProtectorVerify aida_c03_package_verifier)
-                    set_property(TARGET aida_c03_distribution_manifest PROPERTY
-                        AIDA_C03_STANDALONE_RECEIPT_TARGET aida_c03_standalone_security_receipts)
-                endif()
-            endif()
         endif()
     endif()
 

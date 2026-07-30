@@ -285,6 +285,17 @@ public:
     native_worker_execution_result_t execute(const native_worker_execution_request_t& request);
     void stop() noexcept;
     std::uint64_t worker_generation() const noexcept;
+    const native_worker_host_limits_t& limits() const noexcept { return limits_; }
+    std::shared_ptr<native_worker_host_t> for_session_pool(std::size_t max_concurrent_workers) const;
+
+    struct session_state_t;
+    bool session_launch(const native_worker_execution_request_t& request,
+                        std::uint32_t max_jobs_per_session,
+                        session_state_t& session, native_worker_execution_result_t& result);
+    native_worker_execution_result_t execute_on_session(session_state_t& session,
+                                                        const native_worker_execution_request_t& request);
+    void session_terminate(session_state_t& session, DWORD exit_code,
+                           native_worker_execution_result_t* result, bool replacement) noexcept;
 
 private:
     native_worker_host_t(
@@ -323,5 +334,42 @@ private:
     std::shared_ptr<native_worker_host_t> managed_host_;
     std::atomic<std::uint64_t> next_job_id_{1};
 };
+
+struct native_worker_session_pool_config_t {
+    std::uint32_t max_jobs_per_session = 256;
+    std::chrono::milliseconds max_session_lifetime{600000};
+    std::size_t batch_slots = 8;
+    std::size_t interactive_reserved_slots = 1;
+};
+
+class pooled_native_worker_provider_host_t final : public decompiler_isolated_provider_host_t {
+public:
+    pooled_native_worker_provider_host_t(
+        std::shared_ptr<decompiler_isolated_provider_host_t> fallback_host,
+        std::shared_ptr<native_worker_host_t> session_host,
+        native_worker_session_pool_config_t config = {});
+    ~pooled_native_worker_provider_host_t() override;
+
+    pooled_native_worker_provider_host_t(const pooled_native_worker_provider_host_t&) = delete;
+    pooled_native_worker_provider_host_t& operator=(const pooled_native_worker_provider_host_t&) = delete;
+
+    bool supports(const decompiler_provider_descriptor_t& descriptor) const noexcept override;
+    decompiler_provider_result_t execute(
+        const decompiler_provider_route_t& route,
+        const decompiler_provider_request_t& request,
+        const cancellation_token_t& cancel) override;
+    void stop() noexcept;
+
+    enum class slot_class_t : std::uint8_t { reserved, borrowed };
+    std::optional<slot_class_t> classify_interactive_dispatch() const noexcept;
+
+private:
+    struct state_t;
+    std::shared_ptr<state_t> state_;
+};
+
+std::shared_ptr<decompiler_isolated_provider_host_t> create_pooled_native_worker_provider_host(
+    const packaged_native_worker_runtime_t& runtime,
+    native_worker_session_pool_config_t config = {});
 
 }

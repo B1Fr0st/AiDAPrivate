@@ -2,6 +2,7 @@
 
 #include "analysis_workspace.hpp"
 #include "decompiler_feedback.hpp"
+#include "type_recovery.hpp"
 #include "workspace_database.hpp"
 #include "../decompiler/pseudocode_renderer_v2.hpp"
 
@@ -116,11 +117,22 @@ struct decompiler_service_v2_request_t {
 };
 
 struct decompiler_service_v2_result_t {
-    typed_ast_v2_build_result_t ast_build;
+    std::optional<typed_pseudocode_ast_v2_t> ast;
     std::optional<pseudocode_renderer_v2_result_t> rendering;
     std::vector<decompiler_diagnostic_t> diagnostics;
 
     bool succeeded() const noexcept;
+};
+
+struct decompiler_quality_batch_item_t {
+    std::optional<cc_analysis_result_t> calling_convention;
+    std::optional<type_recovery_result_t> types;
+    std::vector<decompiler_feedback_fact_t> feedback_facts;
+};
+
+struct decompiler_quality_batch_options_t {
+    std::uint32_t worker_count = 0;
+    std::shared_ptr<analysis_metrics_t> metrics;
 };
 
 class decompiler_service_t final : public workspace_lifecycle_participant_t,
@@ -163,6 +175,11 @@ public:
     workspace_result_t<void> invalidate(
         std::optional<address_t> function = {},
         const cancellation_token_t& cancel = {});
+    workspace_result_t<std::vector<workspace_result_t<decompiler_quality_batch_item_t>>>
+        decompile_quality_batch(
+            const std::vector<address_t>& functions,
+            const decompiler_quality_batch_options_t& options = {},
+            const cancellation_token_t& cancel = {});
 
     decompiler_service_snapshot_t snapshot() const;
     std::vector<decompiler_history_entry_t> history() const;

@@ -1,12 +1,16 @@
 #include "analysis_workspace.hpp"
 
+#include "../decompiler/decompile_batch_orchestrator.hpp"
 #include "../decompiler/managed_entity_binding.hpp"
 
+#include "analysis_metrics.hpp"
 #include "checked_range.hpp"
 #include "live_snapshot_provider.hpp"
+#include "parallel_pass.hpp"
 #include "search_index.hpp"
 #include "../overlay_projection.hpp"
 #include "../incremental_reanalysis.hpp"
+#include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <array>
@@ -38,6 +42,211 @@ workspace_error_t workspace_stop_error(const cancellation_token_t& token,
                                       "workspace operation was cancelled", phase);
     error.cancellation = true;
     return error;
+}
+
+constexpr std::uint64_t validation_stage_ordinal(std::uint64_t stage,
+                                                 std::uint64_t index) noexcept {
+    return (stage << 56U) | index;
+}
+
+constexpr std::uint64_t validation_class_ordinal(std::uint64_t stage,
+                                                 std::uint64_t class_rank,
+                                                 std::uint64_t index) noexcept {
+    return (stage << 56U) | (class_rank << 40U) | index;
+}
+
+constexpr std::uint64_t validation_rank_ordinal(std::uint64_t stage,
+                                                std::uint64_t index,
+                                                std::uint64_t rank) noexcept {
+    return (stage << 56U) | (index << 3U) | rank;
+}
+
+ordered_error_t integrity_ordered(std::uint64_t ordinal, const char* message) {
+    ordered_error_t result;
+    result.ordinal = ordinal;
+    result.error = make_workspace_error(workspace_error_code_t::integrity_failure,
+                                        message, "snapshot_validate");
+    return result;
+}
+
+struct validation_poll_t {
+    const cancellation_token_t* token = nullptr;
+    const char* phase = nullptr;
+    std::uint64_t visits = 0;
+
+    bool stopped() noexcept {
+        return (visits++ & 255U) == 0 && token->stop_requested();
+    }
+
+    ordered_error_t stop_error(std::uint64_t ordinal) const {
+        ordered_error_t result;
+        result.ordinal = ordinal;
+        result.error = workspace_stop_error(*token, phase);
+        return result;
+    }
+};
+
+workspace_result_t<void> reduce_ordered_slots(
+    const std::vector<ordered_error_t>& first,
+    const std::vector<ordered_error_t>& second) {
+    const ordered_error_t* best = nullptr;
+    for (const auto* slots : {&first, &second}) {
+        for (const auto& slot : *slots) {
+            if (slot.ordinal != (std::numeric_limits<std::uint64_t>::max)() &&
+                (!best || slot.ordinal < best->ordinal))
+                best = &slot;
+        }
+    }
+    if (best)
+        return workspace_result_t<void>::failure(best->error);
+    return workspace_result_t<void>::success();
+}
+
+template <typename T, typename Less>
+workspace_result_t<void> validate_sorted_sharded(const std::vector<T>& values,
+                                                 Less less, std::uint64_t stage,
+                                                 std::uint32_t workers,
+                                                 const cancellation_token_t& cancel) {
+    if (values.size() < 2U)
+        return workspace_result_t<void>::success();
+    const auto shards = parallel_shards(values.size() - 1U, workers);
+    return parallel_validate_shards(shards, 1,
+        [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+            ordered_error_t result;
+            validation_poll_t poller{&cancel, "snapshot_validate", 0};
+            for (std::size_t index = shard.begin + 1U; index <= shard.end; ++index) {
+                if (poller.stopped())
+                    return poller.stop_error(validation_stage_ordinal(stage, index));
+                if (less(values[index], values[index - 1U]))
+                    return integrity_ordered(validation_stage_ordinal(stage, index),
+                        "snapshot fact tables are not in deterministic order");
+            }
+            return result;
+        }, cancel);
+}
+
+template <typename Record, typename Check>
+workspace_result_t<void> validate_records_sharded(const std::vector<Record>& records,
+                                                  std::uint64_t stage,
+                                                  std::uint32_t workers,
+                                                  const char* phase, Check&& check,
+                                                  const cancellation_token_t& cancel) {
+    if (records.empty())
+        return workspace_result_t<void>::success();
+    const auto shards = parallel_shards(records.size(), workers);
+    return parallel_validate_shards(shards, 1,
+        [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+            ordered_error_t result;
+            validation_poll_t poller{&cancel, phase, 0};
+            for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                if (poller.stopped())
+                    return poller.stop_error(validation_stage_ordinal(stage, index));
+                if (const char* message = check(index, records[index]))
+                    return integrity_ordered(validation_stage_ordinal(stage, index),
+                                             message);
+            }
+            return result;
+        }, cancel);
+}
+
+template <typename Record>
+workspace_result_t<void> collect_entity_ids_sharded(const std::vector<Record>& records,
+                                                    std::uint64_t stage,
+                                                    std::uint64_t class_rank,
+                                                    entity_id_t* entity_out,
+                                                    entity_id_t* graph_out,
+                                                    std::uint32_t workers,
+                                                    const cancellation_token_t& cancel) {
+    if (records.empty())
+        return workspace_result_t<void>::success();
+    const auto shards = parallel_shards(records.size(), workers);
+    return parallel_validate_shards(shards, 1,
+        [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+            ordered_error_t result;
+            validation_poll_t poller{&cancel, "snapshot_validate", 0};
+            for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                if (poller.stopped())
+                    return poller.stop_error(
+                        validation_class_ordinal(stage, class_rank, index));
+                const auto id = records[index].id;
+                if (id == 0)
+                    return integrity_ordered(
+                        validation_class_ordinal(stage, class_rank, index),
+                        "snapshot contains a zero or duplicate entity id");
+                entity_out[index] = id;
+                if (graph_out)
+                    graph_out[index] = id;
+            }
+            return result;
+        }, cancel);
+}
+
+template <typename Region>
+workspace_result_t<void> validate_coverage_regions_sharded(
+    const analysis_snapshot_t& snapshot, const std::vector<Region>& regions,
+    std::uint32_t workers, const cancellation_token_t& cancel) {
+    if (regions.empty())
+        return workspace_result_t<void>::success();
+    const auto& spans = snapshot.coverage;
+    const auto rva_begin = std::partition_point(spans.begin(), spans.end(),
+        [](const coverage_span_t& span) {
+            return span.start.space < address_space_id_t::relative_virtual;
+        });
+    const auto rva_end = std::partition_point(spans.begin(), spans.end(),
+        [](const coverage_span_t& span) {
+            return span.start.space <= address_space_id_t::relative_virtual;
+        });
+    const auto shards = parallel_shards(regions.size(), workers);
+    return parallel_validate_shards(shards, 1,
+        [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+            ordered_error_t result;
+            validation_poll_t poller{&cancel, "snapshot_validate", 0};
+            for (std::size_t region_index = shard.begin; region_index < shard.end;
+                 ++region_index) {
+                if (poller.stopped())
+                    return poller.stop_error(region_index);
+                const auto& region = regions[region_index];
+                if ((region.permissions & image_permission_execute) == 0)
+                    continue;
+                const std::uint64_t region_size =
+                    (std::max<std::uint64_t>)(region.virtual_size, region.file_size);
+                if (region_size == 0)
+                    continue;
+                const std::uint64_t region_start = region.virtual_address;
+                std::uint64_t region_end = 0;
+                if (!checked_add_u64(region_start, region_size, region_end))
+                    return integrity_ordered(region_index,
+                        "executable image range overflowed");
+                const auto first = std::partition_point(rva_begin, rva_end,
+                    [&](const coverage_span_t& span) {
+                        return span.start.value <= region_start &&
+                            span.size <= region_start - span.start.value;
+                    });
+                std::uint64_t cursor = region_start;
+                for (auto it = first; it != rva_end; ++it) {
+                    if (poller.stopped())
+                        return poller.stop_error(region_index);
+                    const auto& span = *it;
+                    std::uint64_t span_end = 0;
+                    if (!checked_add_u64(span.start.value, span.size, span_end))
+                        return integrity_ordered(region_index,
+                            "coverage span overflowed");
+                    if (span_end <= region_start || span.start.value >= region_end)
+                        continue;
+                    if (span.start.value != cursor || span_end > region_end)
+                        return integrity_ordered(region_index,
+                            "executable coverage contains a gap or overlap");
+                    if (span.reason == coverage_reason_t::pending || span.size == 0)
+                        return integrity_ordered(region_index,
+                            "executable coverage contains pending or empty data");
+                    cursor = span_end;
+                }
+                if (cursor != region_end)
+                    return integrity_ordered(region_index,
+                        "executable coverage does not account for the full image range");
+            }
+            return result;
+        }, cancel);
 }
 
 workspace_error_t publication_finalizer_conflict(const char* phase) {
@@ -121,57 +330,15 @@ bool same_live_module_source(const module_identity_t& lhs,
 }
 
 workspace_result_t<void> validate_complete_coverage(const analysis_snapshot_t& snapshot,
+                                                     std::uint32_t workers,
                                                      const cancellation_token_t& cancel) {
     if (!snapshot.normalized_image)
         return integrity_failure("complete coverage requires a normalized image");
-    std::uint64_t visited = 0;
-    const auto poll = [&]() -> workspace_result_t<void> {
-        if ((visited++ & 255U) == 0 && cancel.stop_requested())
-            return workspace_result_t<void>::failure(
-                workspace_stop_error(cancel, "snapshot_validate"));
-        return workspace_result_t<void>::success();
-    };
-    const auto validate_regions = [&](const auto& regions) -> workspace_result_t<void> {
-        for (const auto& region : regions) {
-            auto stopped = poll();
-            if (!stopped)
-                return stopped;
-            if ((region.permissions & image_permission_execute) == 0)
-                continue;
-            const std::uint64_t region_size =
-                std::max<std::uint64_t>(region.virtual_size, region.file_size);
-            if (region_size == 0)
-                continue;
-            const std::uint64_t region_start = region.virtual_address;
-            std::uint64_t region_end = 0;
-            if (!checked_add_u64(region_start, region_size, region_end))
-                return integrity_failure("executable image range overflowed");
-            std::uint64_t cursor = region_start;
-            for (const auto& span : snapshot.coverage) {
-                stopped = poll();
-                if (!stopped)
-                    return stopped;
-                if (span.start.space != address_space_id_t::relative_virtual)
-                    continue;
-                std::uint64_t span_end = 0;
-                if (!checked_add_u64(span.start.value, span.size, span_end))
-                    return integrity_failure("coverage span overflowed");
-                if (span_end <= region_start || span.start.value >= region_end)
-                    continue;
-                if (span.start.value != cursor || span_end > region_end)
-                    return integrity_failure("executable coverage contains a gap or overlap");
-                if (span.reason == coverage_reason_t::pending || span.size == 0)
-                    return integrity_failure("executable coverage contains pending or empty data");
-                cursor = span_end;
-            }
-            if (cursor != region_end)
-                return integrity_failure("executable coverage does not account for the full image range");
-        }
-        return workspace_result_t<void>::success();
-    };
     if (!snapshot.normalized_image->sections.empty())
-        return validate_regions(snapshot.normalized_image->sections);
-    return validate_regions(snapshot.normalized_image->segments);
+        return validate_coverage_regions_sharded(snapshot,
+            snapshot.normalized_image->sections, workers, cancel);
+    return validate_coverage_regions_sharded(snapshot,
+        snapshot.normalized_image->segments, workers, cancel);
 }
 
 workspace_result_t<std::shared_ptr<const workspace_image_t>> bind_publication_image(
@@ -358,6 +525,17 @@ public:
         return provider->lease(offset, size_value, cancel);
     }
 
+    bool content_pin_active() const noexcept override {
+        const auto provider = active_provider();
+        return provider && provider->content_pin_active();
+    }
+
+    std::optional<mapped_window_cache_statistics_t>
+    window_cache_statistics() const noexcept override {
+        const auto provider = active_provider();
+        return provider ? provider->window_cache_statistics() : std::nullopt;
+    }
+
 private:
     std::shared_ptr<const byte_provider_t> active_provider() const noexcept {
         const auto publication = std::atomic_load_explicit(
@@ -495,9 +673,17 @@ analysis_workspace_t::verify_provider_binding(
         if (!current)
             return workspace_result_t<workspace_provider_binding_t>::failure(current.error());
     }
-    auto content = sha256_provider(*provider, cancel);
-    if (!content)
-        return workspace_result_t<workspace_provider_binding_t>::failure(content.error());
+    const bool pinned_hash = identity_before.content_sha256.has_value() &&
+        provider->content_pin_active();
+    sha256_digest_t content;
+    if (pinned_hash) {
+        content = *identity_before.content_sha256;
+    } else {
+        auto computed = sha256_provider(*provider, cancel);
+        if (!computed)
+            return workspace_result_t<workspace_provider_binding_t>::failure(computed.error());
+        content = computed.take_value();
+    }
     if (mapped) {
         auto current = mapped->revalidate();
         if (!current)
@@ -512,19 +698,19 @@ analysis_workspace_t::verify_provider_binding(
                                  "workspace_create"));
     if (const auto live =
             std::dynamic_pointer_cast<const live_snapshot_provider_t>(provider)) {
-        if (live->metadata().capture_hash != content.value() ||
+        if (live->metadata().capture_hash != content ||
             live->metadata().capture_size != provider->size())
             return workspace_result_t<workspace_provider_binding_t>::failure(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "live provider content proof is invalid",
                                      "workspace_create"));
     }
-    workspace_provider_binding_t binding(content.value(),
+    workspace_provider_binding_t binding(content,
         identity_after.normalized_source, provider->size());
     binding.verified = true;
     binding.verified_provider = provider.get();
     binding.verified_identity = identity_after;
-    binding.verified_content_hash = content.value();
+    binding.verified_content_hash = content;
     if (const auto live =
             std::dynamic_pointer_cast<const live_snapshot_provider_t>(provider))
         binding.live_module_generation_hash = live->metadata().module.content_hash;
@@ -624,18 +810,13 @@ void workspace_analysis_run_t::release() noexcept {
         workspace->release_analysis_run(generation);
 }
 
-workspace_result_t<void> validate_rich_fact_publication(
+workspace_result_t<void> validate_rich_fact_publication_parallel(
     const analysis_snapshot_t& snapshot,
     const analysis_rich_fact_publication_t& publication,
+    std::uint32_t workers,
     const cancellation_token_t& cancel)
 {
-    std::uint64_t visits = 0;
-    const auto poll = [&]() -> workspace_result_t<void> {
-        if ((visits++ & 255U) == 0 && cancel.stop_requested())
-            return workspace_result_t<void>::failure(
-                workspace_stop_error(cancel, "rich_fact_validate"));
-        return workspace_result_t<void>::success();
-    };
+    const auto resolved_workers = workers == 0 ? parallel_worker_count() : workers;
     const auto address_in_snapshot = [&](const address_t& address,
                                          std::uint64_t size = 1) noexcept {
         if (!valid_address(address))
@@ -652,112 +833,148 @@ workspace_result_t<void> validate_rich_fact_publication(
         return entity_domain(id) == domain &&
             entity_ordinal(id) == static_cast<std::uint64_t>(index + 1);
     };
+    auto validated = validate_records_sharded(publication.data_candidates, 0,
+        resolved_workers, "rich_fact_validate",
+        [&](std::size_t index, const data_candidate_record_t& candidate) -> const char* {
+            if (!expected_id(candidate.id, 8, index) || candidate.size == 0 ||
+                candidate.kind > data_candidate_kind_t::in_image_pointer ||
+                !address_in_snapshot(candidate.address, candidate.size) ||
+                !valid_provenance(candidate.provenance) || candidate.confidence > 100 ||
+                (candidate.target && (!address_in_snapshot(*candidate.target) ||
+                    candidate.target->architecture != candidate.address.architecture ||
+                    candidate.target->mode != candidate.address.mode)))
+                return "published data candidate is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    validated = validate_records_sharded(publication.data_pointer_facts, 1,
+        resolved_workers, "rich_fact_validate",
+        [&](std::size_t index, const data_pointer_fact_t& pointer) -> const char* {
+            if (!expected_id(pointer.id, 12, index) ||
+                pointer.candidate_kind > data_candidate_kind_t::in_image_pointer ||
+                pointer.encoding > data_pointer_encoding_t::signed_relative_to_next ||
+                (pointer.width_bytes != 1 && pointer.width_bytes != 2 &&
+                 pointer.width_bytes != 4 && pointer.width_bytes != 8) ||
+                !address_in_snapshot(pointer.slot, pointer.width_bytes) ||
+                !address_in_snapshot(pointer.target) ||
+                pointer.slot.architecture != pointer.target.architecture ||
+                pointer.slot.mode != pointer.target.mode ||
+                !valid_provenance(pointer.provenance) || pointer.confidence > 100)
+                return "published data pointer fact is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    validated = validate_records_sharded(publication.data_conflicts, 2,
+        resolved_workers, "rich_fact_validate",
+        [&](std::size_t index, const data_candidate_conflict_t& conflict) -> const char* {
+            if (!expected_id(conflict.id, 13, index) ||
+                conflict.kind > data_candidate_kind_t::in_image_pointer ||
+                !address_in_snapshot(conflict.address) ||
+                !valid_provenance(conflict.selected_provenance) ||
+                !valid_provenance(conflict.rejected_provenance) ||
+                conflict.selected_confidence > 100 || conflict.rejected_confidence > 100 ||
+                conflict.selected_target == conflict.rejected_target ||
+                (conflict.selected_target && !address_in_snapshot(*conflict.selected_target)) ||
+                (conflict.rejected_target && !address_in_snapshot(*conflict.rejected_target)))
+                return "published data conflict is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
     std::unordered_set<entity_id_t> type_ids;
     type_ids.reserve(publication.type_candidates.size());
-    for (std::size_t index = 0; index < publication.data_candidates.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& candidate = publication.data_candidates[index];
-        if (!expected_id(candidate.id, 8, index) || candidate.size == 0 ||
-            candidate.kind > data_candidate_kind_t::in_image_pointer ||
-            !address_in_snapshot(candidate.address, candidate.size) ||
-            !valid_provenance(candidate.provenance) || candidate.confidence > 100 ||
-            (candidate.target && (!address_in_snapshot(*candidate.target) ||
-                candidate.target->architecture != candidate.address.architecture ||
-                candidate.target->mode != candidate.address.mode)))
-            return integrity_failure("published data candidate is invalid");
+    if (!publication.type_candidates.empty()) {
+        const auto shards = parallel_shards(publication.type_candidates.size(),
+            resolved_workers);
+        std::vector<std::vector<entity_id_t>> shard_type_ids(shards.size());
+        auto type_result = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "rich_fact_validate", 0};
+                auto& local_ids = shard_type_ids[slot];
+                local_ids.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(3, index));
+                    const auto& candidate = publication.type_candidates[index];
+                    if (!expected_id(candidate.id, 10, index) ||
+                        candidate.kind > symbol_type_candidate_kind_t::metadata_region ||
+                        candidate.provenance > metadata_provenance_t::managed_metadata ||
+                        candidate.confidence > 100 || candidate.display_name.empty() ||
+                        candidate.source_key.empty() ||
+                        (!candidate.explicitly_unknown && candidate.canonical_type.empty()) ||
+                        (candidate.address && !address_in_snapshot(*candidate.address)) ||
+                        (candidate.related_address &&
+                            !address_in_snapshot(*candidate.related_address)))
+                        return integrity_ordered(validation_stage_ordinal(3, index),
+                            "published symbol type candidate is invalid");
+                    local_ids.push_back(candidate.id);
+                }
+                return result;
+            }, cancel);
+        if (!type_result)
+            return type_result;
+        for (const auto& local_ids : shard_type_ids) {
+            for (const auto id : local_ids) {
+                if (!type_ids.insert(id).second)
+                    return integrity_failure(
+                        "published symbol type candidate is invalid");
+            }
+        }
     }
-    for (std::size_t index = 0; index < publication.data_pointer_facts.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& pointer = publication.data_pointer_facts[index];
-        if (!expected_id(pointer.id, 12, index) ||
-            pointer.candidate_kind > data_candidate_kind_t::in_image_pointer ||
-            pointer.encoding > data_pointer_encoding_t::signed_relative_to_next ||
-            (pointer.width_bytes != 1 && pointer.width_bytes != 2 &&
-             pointer.width_bytes != 4 && pointer.width_bytes != 8) ||
-            !address_in_snapshot(pointer.slot, pointer.width_bytes) ||
-            !address_in_snapshot(pointer.target) ||
-            pointer.slot.architecture != pointer.target.architecture ||
-            pointer.slot.mode != pointer.target.mode ||
-            !valid_provenance(pointer.provenance) || pointer.confidence > 100)
-            return integrity_failure("published data pointer fact is invalid");
-    }
-    for (std::size_t index = 0; index < publication.data_conflicts.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& conflict = publication.data_conflicts[index];
-        if (!expected_id(conflict.id, 13, index) ||
-            conflict.kind > data_candidate_kind_t::in_image_pointer ||
-            !address_in_snapshot(conflict.address) ||
-            !valid_provenance(conflict.selected_provenance) ||
-            !valid_provenance(conflict.rejected_provenance) ||
-            conflict.selected_confidence > 100 || conflict.rejected_confidence > 100 ||
-            conflict.selected_target == conflict.rejected_target ||
-            (conflict.selected_target && !address_in_snapshot(*conflict.selected_target)) ||
-            (conflict.rejected_target && !address_in_snapshot(*conflict.rejected_target)))
-            return integrity_failure("published data conflict is invalid");
-    }
-    for (std::size_t index = 0; index < publication.type_candidates.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& candidate = publication.type_candidates[index];
-        if (!expected_id(candidate.id, 10, index) ||
-            candidate.kind > symbol_type_candidate_kind_t::metadata_region ||
-            candidate.provenance > metadata_provenance_t::managed_metadata ||
-            candidate.confidence > 100 || candidate.display_name.empty() ||
-            candidate.source_key.empty() ||
-            (!candidate.explicitly_unknown && candidate.canonical_type.empty()) ||
-            (candidate.address && !address_in_snapshot(*candidate.address)) ||
-            (candidate.related_address &&
-                !address_in_snapshot(*candidate.related_address)) ||
-            !type_ids.insert(candidate.id).second)
-            return integrity_failure("published symbol type candidate is invalid");
-    }
-    for (std::size_t index = 0; index < publication.type_references.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& reference = publication.type_references[index];
-        if (!expected_id(reference.id, 9, index) ||
-            reference.kind > type_reference_kind_t::managed_reference ||
-            reference.provenance > metadata_provenance_t::managed_metadata ||
-            reference.confidence > 100 || reference.source_key.empty() ||
-            (!reference.source && !reference.target && reference.source_entity == 0 &&
-                reference.target_entity == 0) ||
-            (reference.source && !address_in_snapshot(*reference.source)) ||
-            (reference.target && !address_in_snapshot(*reference.target)) ||
-            (reference.source_entity != 0 &&
-                type_ids.find(reference.source_entity) == type_ids.end()) ||
-            (reference.target_entity != 0 &&
-                type_ids.find(reference.target_entity) == type_ids.end()))
-            return integrity_failure("published type reference fact is invalid");
-    }
-    for (std::size_t index = 0; index < publication.metadata_conflicts.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& conflict = publication.metadata_conflicts[index];
-        if (!expected_id(conflict.id, 14, index) ||
-            conflict.kind > metadata_conflict_kind_t::related_address ||
-            conflict.selected_provenance > metadata_provenance_t::managed_metadata ||
-            conflict.rejected_provenance > metadata_provenance_t::managed_metadata ||
-            conflict.selected_confidence > 100 || conflict.rejected_confidence > 100 ||
-            conflict.identity.empty() ||
-            conflict.selected_value == conflict.rejected_value ||
-            (conflict.address && !address_in_snapshot(*conflict.address)))
-            return integrity_failure("published metadata conflict is invalid");
-    }
+    validated = validate_records_sharded(publication.type_references, 4,
+        resolved_workers, "rich_fact_validate",
+        [&](std::size_t index, const type_reference_fact_t& reference) -> const char* {
+            if (!expected_id(reference.id, 9, index) ||
+                reference.kind > type_reference_kind_t::managed_reference ||
+                reference.provenance > metadata_provenance_t::managed_metadata ||
+                reference.confidence > 100 || reference.source_key.empty() ||
+                (!reference.source && !reference.target && reference.source_entity == 0 &&
+                    reference.target_entity == 0) ||
+                (reference.source && !address_in_snapshot(*reference.source)) ||
+                (reference.target && !address_in_snapshot(*reference.target)) ||
+                (reference.source_entity != 0 &&
+                    type_ids.find(reference.source_entity) == type_ids.end()) ||
+                (reference.target_entity != 0 &&
+                    type_ids.find(reference.target_entity) == type_ids.end()))
+                return "published type reference fact is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    validated = validate_records_sharded(publication.metadata_conflicts, 5,
+        resolved_workers, "rich_fact_validate",
+        [&](std::size_t index, const metadata_conflict_record_t& conflict) -> const char* {
+            if (!expected_id(conflict.id, 14, index) ||
+                conflict.kind > metadata_conflict_kind_t::related_address ||
+                conflict.selected_provenance > metadata_provenance_t::managed_metadata ||
+                conflict.rejected_provenance > metadata_provenance_t::managed_metadata ||
+                conflict.selected_confidence > 100 || conflict.rejected_confidence > 100 ||
+                conflict.identity.empty() ||
+                conflict.selected_value == conflict.rejected_value ||
+                (conflict.address && !address_in_snapshot(*conflict.address)))
+                return "published metadata conflict is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
     return workspace_result_t<void>::success();
 }
 
-workspace_result_t<void> validate_call_graph_publication(
+workspace_result_t<void> validate_rich_fact_publication(
+    const analysis_snapshot_t& snapshot,
+    const analysis_rich_fact_publication_t& publication,
+    const cancellation_token_t& cancel)
+{
+    return validate_rich_fact_publication_parallel(snapshot, publication, 0, cancel);
+}
+
+workspace_result_t<void> validate_call_graph_publication_parallel(
     const analysis_snapshot_t& snapshot,
     const call_graph_publication_t& publication,
+    std::uint32_t workers,
     const cancellation_token_t& cancel)
 {
     if (publication.nodes.empty() && publication.call_sites.empty() &&
@@ -768,13 +985,7 @@ workspace_result_t<void> validate_call_graph_publication(
             return integrity_failure("empty call graph publication has nonempty state");
         return workspace_result_t<void>::success();
     }
-    std::uint64_t visits = 0;
-    const auto poll = [&]() -> workspace_result_t<void> {
-        if ((visits++ & 255U) == 0 && cancel.stop_requested())
-            return workspace_result_t<void>::failure(
-                workspace_stop_error(cancel, "call_graph_validate"));
-        return workspace_result_t<void>::success();
-    };
+    const auto resolved_workers = workers == 0 ? parallel_worker_count() : workers;
     const auto valid_quality = [](const call_graph_quality_t& quality) noexcept {
         return valid_provenance(quality.provenance) && quality.confidence <= 100 &&
             quality.contributor_count != 0;
@@ -792,88 +1003,284 @@ workspace_result_t<void> validate_call_graph_publication(
     blocks.reserve(snapshot.blocks.size());
     instructions.reserve(snapshot.instructions.size());
     block_functions.reserve(snapshot.blocks.size());
-    for (const auto& function : snapshot.functions)
-        functions.emplace(function.id, &function);
-    for (const auto& block : snapshot.blocks) {
-        blocks.emplace(block.id, &block);
-        block_functions[block.id].insert(block.function_id);
+    if (!snapshot.functions.empty()) {
+        const auto shards = parallel_shards(snapshot.functions.size(), resolved_workers);
+        std::vector<std::unordered_map<entity_id_t, const function_record_t*>>
+            per_shard(shards.size());
+        auto built = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "call_graph_validate", 0};
+                auto& local = per_shard[slot];
+                local.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_class_ordinal(0, 0, index));
+                    const auto& function = snapshot.functions[index];
+                    local.emplace(function.id, &function);
+                }
+                return result;
+            }, cancel);
+        if (!built)
+            return built;
+        for (auto& local : per_shard)
+            for (const auto& entry : local)
+                functions.emplace(entry.first, entry.second);
     }
-    for (const auto& membership : snapshot.function_block_memberships)
-        block_functions[membership.block_id].insert(membership.function_id);
-    for (std::size_t index = 0; index < snapshot.instructions.size(); ++index)
-        instructions.emplace(snapshot.instructions[index].id, index);
+    if (!snapshot.blocks.empty()) {
+        const auto shards = parallel_shards(snapshot.blocks.size(), resolved_workers);
+        std::vector<std::unordered_map<entity_id_t, const basic_block_record_t*>>
+            per_shard_blocks(shards.size());
+        std::vector<std::unordered_map<entity_id_t, std::unordered_set<entity_id_t>>>
+            per_shard_members(shards.size());
+        auto built = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "call_graph_validate", 0};
+                auto& local_blocks = per_shard_blocks[slot];
+                auto& local_members = per_shard_members[slot];
+                local_blocks.reserve(shard.end - shard.begin);
+                local_members.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_class_ordinal(0, 1, index));
+                    const auto& block = snapshot.blocks[index];
+                    local_blocks.emplace(block.id, &block);
+                    local_members[block.id].insert(block.function_id);
+                }
+                return result;
+            }, cancel);
+        if (!built)
+            return built;
+        for (std::size_t slot = 0; slot < shards.size(); ++slot) {
+            for (const auto& entry : per_shard_blocks[slot])
+                blocks.emplace(entry.first, entry.second);
+            for (auto& entry : per_shard_members[slot]) {
+                auto& destination = block_functions[entry.first];
+                for (const auto id : entry.second)
+                    destination.insert(id);
+            }
+        }
+    }
+    if (!snapshot.function_block_memberships.empty()) {
+        const auto shards = parallel_shards(snapshot.function_block_memberships.size(),
+            resolved_workers);
+        std::vector<std::unordered_map<entity_id_t, std::unordered_set<entity_id_t>>>
+            per_shard(shards.size());
+        auto built = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "call_graph_validate", 0};
+                auto& local = per_shard[slot];
+                local.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_class_ordinal(0, 2, index));
+                    const auto& membership = snapshot.function_block_memberships[index];
+                    local[membership.block_id].insert(membership.function_id);
+                }
+                return result;
+            }, cancel);
+        if (!built)
+            return built;
+        for (auto& local : per_shard) {
+            for (auto& entry : local) {
+                auto& destination = block_functions[entry.first];
+                for (const auto id : entry.second)
+                    destination.insert(id);
+            }
+        }
+    }
+    if (!snapshot.instructions.empty()) {
+        const auto shards = parallel_shards(snapshot.instructions.size(), resolved_workers);
+        std::vector<std::unordered_map<entity_id_t, std::size_t>>
+            per_shard(shards.size());
+        auto built = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "call_graph_validate", 0};
+                auto& local = per_shard[slot];
+                local.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_class_ordinal(0, 3, index));
+                    local.emplace(snapshot.instructions[index].id, index);
+                }
+                return result;
+            }, cancel);
+        if (!built)
+            return built;
+        for (auto& local : per_shard)
+            for (const auto& entry : local)
+                instructions.emplace(entry.first, entry.second);
+    }
     if (publication.nodes.size() != snapshot.functions.size())
         return integrity_failure("published call graph node catalog is incomplete");
     std::unordered_map<entity_id_t, std::size_t> node_indices;
     node_indices.reserve(publication.nodes.size());
-    for (std::size_t index = 0; index < publication.nodes.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& node = publication.nodes[index];
-        const auto function = functions.find(node.function_id);
-        if (function == functions.end() || node.address != function->second->start ||
-            !node_indices.emplace(node.function_id, index).second ||
-            (index != 0 && !(publication.nodes[index - 1].address < node.address)))
-            return integrity_failure("published call graph node is invalid");
+    if (!publication.nodes.empty()) {
+        const auto shards = parallel_shards(publication.nodes.size(), resolved_workers);
+        std::vector<std::vector<std::pair<entity_id_t, std::size_t>>>
+            per_shard_ids(shards.size());
+        auto nodes_validated = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "call_graph_validate", 0};
+                std::unordered_set<entity_id_t> local_seen;
+                local_seen.reserve(shard.end - shard.begin);
+                auto& local_ids = per_shard_ids[slot];
+                local_ids.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_class_ordinal(1, 0, index));
+                    const auto& node = publication.nodes[index];
+                    const auto function = functions.find(node.function_id);
+                    if (function == functions.end() ||
+                        node.address != function->second->start ||
+                        !local_seen.emplace(node.function_id).second ||
+                        (index != 0 &&
+                            !(publication.nodes[index - 1].address < node.address)))
+                        return integrity_ordered(validation_class_ordinal(1, 0, index),
+                            "published call graph node is invalid");
+                    local_ids.emplace_back(node.function_id, index);
+                }
+                return result;
+            }, cancel);
+        if (!nodes_validated)
+            return nodes_validated;
+        for (const auto& local_ids : per_shard_ids) {
+            for (const auto& entry : local_ids) {
+                if (!node_indices.emplace(entry.first, entry.second).second)
+                    return integrity_failure("published call graph node is invalid");
+            }
+        }
     }
     std::unordered_map<entity_id_t, const recovered_call_site_t*> sites;
     sites.reserve(publication.call_sites.size());
     std::uint64_t expected_candidate = 0;
     std::uint64_t indirect_sites = 0;
     std::uint64_t unresolved_sites = 0;
-    for (std::size_t index = 0; index < publication.call_sites.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& site = publication.call_sites[index];
-        const auto instruction = instructions.find(site.instruction_id);
-        const auto block = blocks.find(site.source_block_id);
-        const auto membership = block_functions.find(site.source_block_id);
-        std::uint64_t candidate_end = 0;
-        if (!expected_id(site.id, 15, index) ||
-            functions.find(site.source_function_id) == functions.end() ||
-            block == blocks.end() || instruction == instructions.end() ||
-            membership == block_functions.end() ||
-            membership->second.find(site.source_function_id) == membership->second.end() ||
-            snapshot.instructions[instruction->second].address != site.address ||
-            instruction->second < block->second->first_instruction ||
-            instruction->second >= static_cast<std::uint64_t>(
-                block->second->first_instruction) + block->second->instruction_count ||
-            site.first_candidate != expected_candidate ||
-            !checked_add_u64(site.first_candidate, site.candidate_count, candidate_end) ||
-            candidate_end > publication.candidates.size() ||
-            site.unresolved != (site.candidate_count == 0) ||
-            !sites.emplace(site.id, &site).second)
-            return integrity_failure("published call site is invalid");
-        expected_candidate = candidate_end;
-        if (site.indirect)
-            ++indirect_sites;
-        if (site.unresolved)
-            ++unresolved_sites;
+    if (!publication.call_sites.empty()) {
+        const auto shards = parallel_shards(publication.call_sites.size(),
+            resolved_workers);
+        std::vector<std::uint64_t> shard_candidate_counts(shards.size(), 0);
+        std::vector<std::uint64_t> shard_indirect(shards.size(), 0);
+        std::vector<std::uint64_t> shard_unresolved(shards.size(), 0);
+        std::vector<std::unordered_map<entity_id_t, const recovered_call_site_t*>>
+            per_shard_sites(shards.size());
+        std::vector<ordered_error_t> pass1_slots(shards.size());
+        auto first_pass = parallel_run_shards(shards,
+            [&](std::size_t slot, const parallel_shard_t& shard)
+                -> workspace_result_t<void> {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "call_graph_validate", 0};
+                std::uint64_t local_expected = 0;
+                std::uint64_t candidate_total = 0;
+                std::uint64_t indirect_total = 0;
+                std::uint64_t unresolved_total = 0;
+                auto& local_sites = per_shard_sites[slot];
+                local_sites.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped()) {
+                        result = poller.stop_error(validation_class_ordinal(2, 0, index));
+                        break;
+                    }
+                    const auto& site = publication.call_sites[index];
+                    const auto instruction = instructions.find(site.instruction_id);
+                    const auto block = blocks.find(site.source_block_id);
+                    const auto membership = block_functions.find(site.source_block_id);
+                    std::uint64_t candidate_end = 0;
+                    const bool chain_ok = index == shard.begin ||
+                        site.first_candidate == local_expected;
+                    if (!expected_id(site.id, 15, index) ||
+                        functions.find(site.source_function_id) == functions.end() ||
+                        block == blocks.end() || instruction == instructions.end() ||
+                        membership == block_functions.end() ||
+                        membership->second.find(site.source_function_id) ==
+                            membership->second.end() ||
+                        snapshot.instructions[instruction->second].address != site.address ||
+                        instruction->second < block->second->first_instruction ||
+                        instruction->second >= static_cast<std::uint64_t>(
+                            block->second->first_instruction) +
+                            block->second->instruction_count ||
+                        !chain_ok ||
+                        !checked_add_u64(site.first_candidate, site.candidate_count,
+                            candidate_end) ||
+                        candidate_end > publication.candidates.size() ||
+                        site.unresolved != (site.candidate_count == 0) ||
+                        !local_sites.emplace(site.id, &site).second) {
+                        result = integrity_ordered(validation_class_ordinal(2, 0, index),
+                            "published call site is invalid");
+                        break;
+                    }
+                    local_expected = candidate_end;
+                    candidate_total += site.candidate_count;
+                    if (site.indirect)
+                        ++indirect_total;
+                    if (site.unresolved)
+                        ++unresolved_total;
+                }
+                shard_candidate_counts[slot] = candidate_total;
+                shard_indirect[slot] = indirect_total;
+                shard_unresolved[slot] = unresolved_total;
+                pass1_slots[slot] = std::move(result);
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!first_pass)
+            return first_pass;
+        const auto candidate_prefix = parallel_prefix_sums(shard_candidate_counts,
+            [](std::uint64_t lhs, std::uint64_t rhs) { return lhs + rhs; });
+        std::vector<ordered_error_t> pass2_slots(shards.size());
+        auto second_pass = parallel_run_shards(shards,
+            [&](std::size_t slot, const parallel_shard_t& shard)
+                -> workspace_result_t<void> {
+                ordered_error_t result;
+                if (shard.begin < shard.end &&
+                    publication.call_sites[shard.begin].first_candidate !=
+                        candidate_prefix[slot])
+                    result = integrity_ordered(validation_class_ordinal(2, 0, shard.begin),
+                        "published call site is invalid");
+                pass2_slots[slot] = std::move(result);
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!second_pass)
+            return second_pass;
+        auto sites_validated = reduce_ordered_slots(pass1_slots, pass2_slots);
+        if (!sites_validated)
+            return sites_validated;
+        for (auto& local : per_shard_sites)
+            for (const auto& entry : local)
+                sites.emplace(entry.first, entry.second);
+        for (const auto total : shard_candidate_counts)
+            expected_candidate += total;
+        for (const auto total : shard_indirect)
+            indirect_sites += total;
+        for (const auto total : shard_unresolved)
+            unresolved_sites += total;
     }
     if (expected_candidate != publication.candidates.size() ||
         indirect_sites != publication.indirect_site_count ||
         unresolved_sites != publication.unresolved_site_count)
         return integrity_failure("published call graph site counters are inconsistent");
-    for (std::size_t index = 0; index < publication.candidates.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& candidate = publication.candidates[index];
-        const auto site = sites.find(candidate.call_site_id);
-        if (!expected_id(candidate.id, 16, index) || site == sites.end() ||
-            candidate.kind > indirect_call_candidate_kind_t::decompiler ||
-            !valid_address(candidate.target) || !valid_quality(candidate.quality) ||
-            candidate.rank >= site->second->candidate_count ||
-            index != static_cast<std::size_t>(site->second->first_candidate) +
-                candidate.rank ||
-            candidate.external_target != !candidate.target_function_id.has_value() ||
-            (candidate.target_function_id &&
-                (functions.find(*candidate.target_function_id) == functions.end() ||
-                 functions[*candidate.target_function_id]->start != candidate.target)))
-            return integrity_failure("published call candidate is invalid");
-    }
+    auto validated = validate_records_sharded(publication.candidates, 3,
+        resolved_workers, "call_graph_validate",
+        [&](std::size_t index, const recovered_call_candidate_t& candidate) -> const char* {
+            const auto site = sites.find(candidate.call_site_id);
+            if (!expected_id(candidate.id, 16, index) || site == sites.end() ||
+                candidate.kind > indirect_call_candidate_kind_t::decompiler ||
+                !valid_address(candidate.target) || !valid_quality(candidate.quality) ||
+                candidate.rank >= site->second->candidate_count ||
+                index != static_cast<std::size_t>(site->second->first_candidate) +
+                    candidate.rank ||
+                candidate.external_target != !candidate.target_function_id.has_value() ||
+                (candidate.target_function_id &&
+                    (functions.find(*candidate.target_function_id) == functions.end() ||
+                     functions[*candidate.target_function_id]->start != candidate.target)))
+                return "published call candidate is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
     struct node_counts_t {
         std::uint64_t incoming = 0;
         std::uint64_t outgoing = 0;
@@ -884,132 +1291,213 @@ workspace_result_t<void> validate_call_graph_publication(
     counts.reserve(publication.nodes.size());
     std::unordered_map<entity_id_t, std::uint64_t> edge_counts;
     edge_counts.reserve(publication.call_sites.size());
-    for (const auto& site : publication.call_sites) {
-        counts[site.source_function_id].unresolved += site.unresolved ? 1 : 0;
-        edge_counts.emplace(site.id, 0);
-    }
-    for (std::size_t index = 0; index < publication.edges.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& edge = publication.edges[index];
-        const auto site = sites.find(edge.call_site_id);
-        if (!expected_id(edge.id, 17, index) || site == sites.end() ||
-            edge.source_function_id != site->second->source_function_id ||
-            edge.source_block_id != site->second->source_block_id ||
-            edge.call_site != site->second->address ||
-            edge.resolution > call_graph_resolution_t::unresolved ||
-            !valid_address(edge.call_site) || !valid_address(edge.target) ||
-            !valid_quality(edge.quality) ||
-            (site->second->unresolved !=
-                (edge.resolution == call_graph_resolution_t::unresolved)))
-            return integrity_failure("published call graph edge is invalid");
-        if (site->second->unresolved) {
-            if (edge.candidate_rank != 0 || edge.target.value != 0 ||
-                edge.target_function_id || edge.external_target || edge.target_noreturn)
-                return integrity_failure("published unresolved call edge is invalid");
-        } else {
-            std::uint64_t candidate_index = 0;
-            if (edge.candidate_rank >= site->second->candidate_count ||
-                !checked_add_u64(site->second->first_candidate,
-                    edge.candidate_rank, candidate_index) ||
-                candidate_index >= publication.candidates.size())
-                return integrity_failure("published call edge candidate is invalid");
-            const auto& candidate = publication.candidates[
-                static_cast<std::size_t>(candidate_index)];
-            const auto expected_resolution = site->second->tail_call
-                ? call_graph_resolution_t::tail_call
-                : (site->second->indirect
-                    ? call_graph_resolution_t::indirect_candidate
-                    : call_graph_resolution_t::direct);
-            const bool quality_matches =
-                edge.quality.provenance == candidate.quality.provenance &&
-                edge.quality.confidence == candidate.quality.confidence &&
-                edge.quality.contributor_count == candidate.quality.contributor_count &&
-                edge.quality.conflicted == candidate.quality.conflicted;
-            bool expected_noreturn = false;
-            if (candidate.target_function_id) {
-                const auto target = functions.find(*candidate.target_function_id);
-                if (target == functions.end())
-                    return integrity_failure("published call edge target is invalid");
-                expected_noreturn = target->second->noreturn;
-            }
-            if (candidate.call_site_id != edge.call_site_id ||
-                candidate.rank != edge.candidate_rank ||
-                candidate.target != edge.target ||
-                candidate.target_function_id != edge.target_function_id ||
-                candidate.external_target != edge.external_target ||
-                edge.external_target != !edge.target_function_id.has_value() ||
-                edge.resolution != expected_resolution || !quality_matches ||
-                edge.target_noreturn != expected_noreturn)
-                return integrity_failure("published call edge does not match its candidate");
+    if (!publication.call_sites.empty()) {
+        const auto shards = parallel_shards(publication.call_sites.size(),
+            resolved_workers);
+        std::vector<std::unordered_map<entity_id_t, node_counts_t>>
+            per_shard_counts(shards.size());
+        std::vector<std::unordered_map<entity_id_t, std::uint64_t>>
+            per_shard_edge_counts(shards.size());
+        auto initialized = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "call_graph_validate", 0};
+                auto& local_counts = per_shard_counts[slot];
+                auto& local_edge_counts = per_shard_edge_counts[slot];
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_class_ordinal(4, 0, index));
+                    const auto& site = publication.call_sites[index];
+                    local_counts[site.source_function_id].unresolved +=
+                        site.unresolved ? 1 : 0;
+                    local_edge_counts.emplace(site.id, 0);
+                }
+                return result;
+            }, cancel);
+        if (!initialized)
+            return initialized;
+        for (std::size_t slot = 0; slot < shards.size(); ++slot) {
+            for (const auto& entry : per_shard_counts[slot])
+                counts[entry.first].unresolved += entry.second.unresolved;
+            for (const auto& entry : per_shard_edge_counts[slot])
+                edge_counts.emplace(entry.first, entry.second);
         }
-        ++edge_counts[edge.call_site_id];
-        auto& source = counts[edge.source_function_id];
-        ++source.outgoing;
-        if (site->second->indirect)
-            ++source.indirect;
-        if (edge.target_function_id)
-            ++counts[*edge.target_function_id].incoming;
     }
-    for (const auto& site : publication.call_sites) {
-        const auto expected = site.unresolved ? 1ULL : site.candidate_count;
-        if (edge_counts[site.id] != expected)
-            return integrity_failure("published call graph edge ranges are inconsistent");
+    if (!publication.edges.empty()) {
+        const auto shards = parallel_shards(publication.edges.size(), resolved_workers);
+        std::vector<std::unordered_map<entity_id_t, node_counts_t>>
+            per_shard_counts(shards.size());
+        std::vector<std::unordered_map<entity_id_t, std::uint64_t>>
+            per_shard_edge_counts(shards.size());
+        auto edges_validated = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "call_graph_validate", 0};
+                auto& local_counts = per_shard_counts[slot];
+                auto& local_edge_counts = per_shard_edge_counts[slot];
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_class_ordinal(5, 0, index));
+                    const auto& edge = publication.edges[index];
+                    const auto site = sites.find(edge.call_site_id);
+                    if (!expected_id(edge.id, 17, index) || site == sites.end() ||
+                        edge.source_function_id != site->second->source_function_id ||
+                        edge.source_block_id != site->second->source_block_id ||
+                        edge.call_site != site->second->address ||
+                        edge.resolution > call_graph_resolution_t::unresolved ||
+                        !valid_address(edge.call_site) || !valid_address(edge.target) ||
+                        !valid_quality(edge.quality) ||
+                        (site->second->unresolved !=
+                            (edge.resolution == call_graph_resolution_t::unresolved)))
+                        return integrity_ordered(validation_class_ordinal(5, 0, index),
+                            "published call graph edge is invalid");
+                    if (site->second->unresolved) {
+                        if (edge.candidate_rank != 0 || edge.target.value != 0 ||
+                            edge.target_function_id || edge.external_target ||
+                            edge.target_noreturn)
+                            return integrity_ordered(
+                                validation_class_ordinal(5, 0, index),
+                                "published unresolved call edge is invalid");
+                    } else {
+                        std::uint64_t candidate_index = 0;
+                        if (edge.candidate_rank >= site->second->candidate_count ||
+                            !checked_add_u64(site->second->first_candidate,
+                                edge.candidate_rank, candidate_index) ||
+                            candidate_index >= publication.candidates.size())
+                            return integrity_ordered(
+                                validation_class_ordinal(5, 0, index),
+                                "published call edge candidate is invalid");
+                        const auto& candidate = publication.candidates[
+                            static_cast<std::size_t>(candidate_index)];
+                        const auto expected_resolution = site->second->tail_call
+                            ? call_graph_resolution_t::tail_call
+                            : (site->second->indirect
+                                ? call_graph_resolution_t::indirect_candidate
+                                : call_graph_resolution_t::direct);
+                        const bool quality_matches =
+                            edge.quality.provenance == candidate.quality.provenance &&
+                            edge.quality.confidence == candidate.quality.confidence &&
+                            edge.quality.contributor_count ==
+                                candidate.quality.contributor_count &&
+                            edge.quality.conflicted == candidate.quality.conflicted;
+                        bool expected_noreturn = false;
+                        if (candidate.target_function_id) {
+                            const auto target =
+                                functions.find(*candidate.target_function_id);
+                            if (target == functions.end())
+                                return integrity_ordered(
+                                    validation_class_ordinal(5, 0, index),
+                                    "published call edge target is invalid");
+                            expected_noreturn = target->second->noreturn;
+                        }
+                        if (candidate.call_site_id != edge.call_site_id ||
+                            candidate.rank != edge.candidate_rank ||
+                            candidate.target != edge.target ||
+                            candidate.target_function_id != edge.target_function_id ||
+                            candidate.external_target != edge.external_target ||
+                            edge.external_target != !edge.target_function_id.has_value() ||
+                            edge.resolution != expected_resolution || !quality_matches ||
+                            edge.target_noreturn != expected_noreturn)
+                            return integrity_ordered(
+                                validation_class_ordinal(5, 0, index),
+                                "published call edge does not match its candidate");
+                    }
+                    ++local_edge_counts[edge.call_site_id];
+                    auto& source = local_counts[edge.source_function_id];
+                    ++source.outgoing;
+                    if (site->second->indirect)
+                        ++source.indirect;
+                    if (edge.target_function_id)
+                        ++local_counts[*edge.target_function_id].incoming;
+                }
+                return result;
+            }, cancel);
+        if (!edges_validated)
+            return edges_validated;
+        for (std::size_t slot = 0; slot < shards.size(); ++slot) {
+            for (const auto& entry : per_shard_counts[slot]) {
+                auto& destination = counts[entry.first];
+                destination.incoming += entry.second.incoming;
+                destination.outgoing += entry.second.outgoing;
+                destination.indirect += entry.second.indirect;
+                destination.unresolved += entry.second.unresolved;
+            }
+            for (const auto& entry : per_shard_edge_counts[slot])
+                edge_counts[entry.first] += entry.second;
+        }
     }
-    for (const auto& node : publication.nodes) {
-        const auto& actual = counts[node.function_id];
-        if (node.incoming_edges != actual.incoming ||
-            node.outgoing_edges != actual.outgoing ||
-            node.indirect_edges != actual.indirect ||
-            node.unresolved_sites != actual.unresolved)
-            return integrity_failure("published call graph node counters are inconsistent");
-    }
-    for (std::size_t index = 0; index < publication.conflicts.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& conflict = publication.conflicts[index];
-        if (!expected_id(conflict.id, 18, index) ||
-            conflict.kind > call_graph_conflict_kind_t::orphan_candidate ||
-            (conflict.kind != call_graph_conflict_kind_t::orphan_candidate &&
-                conflict.instruction_id != 0 &&
-                instructions.find(conflict.instruction_id) == instructions.end()) ||
-            (conflict.source_function_id != 0 &&
-                functions.find(conflict.source_function_id) == functions.end()) ||
-            (conflict.selected_target_function_id != 0 &&
-                functions.find(conflict.selected_target_function_id) == functions.end()) ||
-            (conflict.kind != call_graph_conflict_kind_t::orphan_candidate &&
-                conflict.kind != call_graph_conflict_kind_t::candidate_identity_mismatch &&
-                conflict.competing_target_function_id != 0 &&
-                functions.find(conflict.competing_target_function_id) == functions.end()))
-            return integrity_failure("published call graph conflict is invalid");
-    }
+    validated = validate_records_sharded(publication.call_sites, 6,
+        resolved_workers, "call_graph_validate",
+        [&](std::size_t, const recovered_call_site_t& site) -> const char* {
+            const auto expected = site.unresolved ? 1ULL : site.candidate_count;
+            const auto found = edge_counts.find(site.id);
+            const auto actual = found != edge_counts.end() ? found->second : 0ULL;
+            if (actual != expected)
+                return "published call graph edge ranges are inconsistent";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    validated = validate_records_sharded(publication.nodes, 7,
+        resolved_workers, "call_graph_validate",
+        [&](std::size_t, const call_graph_node_record_t& node) -> const char* {
+            const auto found = counts.find(node.function_id);
+            const auto actual = found != counts.end() ? found->second : node_counts_t{};
+            if (node.incoming_edges != actual.incoming ||
+                node.outgoing_edges != actual.outgoing ||
+                node.indirect_edges != actual.indirect ||
+                node.unresolved_sites != actual.unresolved)
+                return "published call graph node counters are inconsistent";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    validated = validate_records_sharded(publication.conflicts, 8,
+        resolved_workers, "call_graph_validate",
+        [&](std::size_t index, const call_graph_conflict_t& conflict) -> const char* {
+            if (!expected_id(conflict.id, 18, index) ||
+                conflict.kind > call_graph_conflict_kind_t::orphan_candidate ||
+                (conflict.kind != call_graph_conflict_kind_t::orphan_candidate &&
+                    conflict.instruction_id != 0 &&
+                    instructions.find(conflict.instruction_id) == instructions.end()) ||
+                (conflict.source_function_id != 0 &&
+                    functions.find(conflict.source_function_id) == functions.end()) ||
+                (conflict.selected_target_function_id != 0 &&
+                    functions.find(conflict.selected_target_function_id) == functions.end()) ||
+                (conflict.kind != call_graph_conflict_kind_t::orphan_candidate &&
+                    conflict.kind != call_graph_conflict_kind_t::candidate_identity_mismatch &&
+                    conflict.competing_target_function_id != 0 &&
+                    functions.find(conflict.competing_target_function_id) == functions.end()))
+                return "published call graph conflict is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
     return workspace_result_t<void>::success();
 }
 
-workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& snapshot,
-                                                     bool require_complete_coverage,
-                                                     const cancellation_token_t& cancel) {
+workspace_result_t<void> validate_call_graph_publication(
+    const analysis_snapshot_t& snapshot,
+    const call_graph_publication_t& publication,
+    const cancellation_token_t& cancel)
+{
+    return validate_call_graph_publication_parallel(snapshot, publication, 0, cancel);
+}
+
+workspace_result_t<void> validate_analysis_snapshot_parallel(
+    const analysis_snapshot_t& snapshot,
+    bool require_complete_coverage,
+    std::uint32_t workers,
+    const cancellation_token_t& cancel) {
     if (cancel.stop_requested())
         return workspace_result_t<void>::failure(
             workspace_stop_error(cancel, "snapshot_validate"));
+    const auto resolved_workers = workers == 0 ? parallel_worker_count() : workers;
     std::uint64_t validation_visits = 0;
     const auto poll = [&]() -> workspace_result_t<void> {
         if ((validation_visits++ & 255U) == 0 && cancel.stop_requested())
             return workspace_result_t<void>::failure(
                 workspace_stop_error(cancel, "snapshot_validate"));
-        return workspace_result_t<void>::success();
-    };
-    const auto validate_sorted = [&](const auto& values, auto less)
-        -> workspace_result_t<void> {
-        for (std::size_t index = 1; index < values.size(); ++index) {
-            auto stopped = poll();
-            if (!stopped)
-                return stopped;
-            if (less(values[index], values[index - 1]))
-                return integrity_failure("snapshot fact tables are not in deterministic order");
-        }
         return workspace_result_t<void>::success();
     };
     if (snapshot.binary_id.empty() || snapshot.load_profile_hash.empty())
@@ -1020,7 +1508,7 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
         return integrity_failure("snapshot image is missing");
     if (snapshot.normalized_image) {
         auto image_validation = validate_workspace_image(*snapshot.normalized_image, {}, false,
-                                                         cancel);
+                                                          cancel);
         if (!image_validation)
             return image_validation;
         auto stopped = poll();
@@ -1050,46 +1538,104 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
             return workspace_image_contains(*snapshot.normalized_image, address, size);
         return true;
     };
-    for (std::size_t index = 1; index < snapshot.instructions.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (!(snapshot.instructions[index - 1].address < snapshot.instructions[index].address))
-            return integrity_failure("instructions are not in deterministic unique order");
+    if (snapshot.instructions.size() >= 2U) {
+        const auto shards = parallel_shards(snapshot.instructions.size() - 1U,
+            resolved_workers);
+        auto ordered = parallel_validate_shards(shards, 1,
+            [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                for (std::size_t index = shard.begin + 1U; index <= shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(0, index));
+                    if (!(snapshot.instructions[index - 1U].address <
+                          snapshot.instructions[index].address))
+                        return integrity_ordered(validation_stage_ordinal(0, index),
+                            "instructions are not in deterministic unique order");
+                }
+                return result;
+            }, cancel);
+        if (!ordered)
+            return ordered;
     }
     if (!snapshot.delay_slot_counts.empty()) {
         if (snapshot.delay_slot_counts.size() != snapshot.instructions.size())
             return integrity_failure("delay-slot column does not align with instructions");
-        std::vector<std::uint8_t> claimed_delay_slots(snapshot.instructions.size(), 0);
         constexpr std::uint32_t transfer_mask = flow_branch | flow_call | flow_return |
             flow_interrupt | flow_terminal;
-        for (std::size_t index = 0; index < snapshot.instructions.size(); ++index) {
-            auto stopped = poll();
-            if (!stopped)
-                return stopped;
-            const auto count = snapshot.delay_slot_counts[index];
-            if (count == 0)
-                continue;
-            if (count > 2 || claimed_delay_slots[index] != 0 ||
-                (snapshot.instructions[index].flow_flags & transfer_mask) == 0 ||
-                index + count >= snapshot.instructions.size())
-                return integrity_failure("delay-slot metadata is malformed");
-            auto expected = snapshot.instructions[index].address.value;
-            if (!checked_add_u64(expected, snapshot.instructions[index].length, expected))
-                return integrity_failure("delay-slot instruction range overflowed");
-            for (std::size_t offset = 1; offset <= count; ++offset) {
-                const auto slot_index = index + offset;
-                const auto& slot = snapshot.instructions[slot_index];
-                if (claimed_delay_slots[slot_index] != 0 ||
-                    slot.address.value != expected ||
-                    !same_address_domain(snapshot.instructions[index].address, slot.address) ||
-                    (slot.flow_flags & transfer_mask) != 0)
-                    return integrity_failure("delay-slot instruction sequence is malformed");
-                claimed_delay_slots[slot_index] = 1;
-                if (!checked_add_u64(expected, slot.length, expected))
-                    return integrity_failure("delay-slot instruction range overflowed");
-            }
-        }
+        const std::size_t instruction_count = snapshot.instructions.size();
+        const auto shards = parallel_shards(instruction_count, resolved_workers);
+        auto validated = parallel_validate_shards(shards, 1,
+            [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                const std::size_t bit_base =
+                    shard.begin >= 2U ? shard.begin - 2U : std::size_t{0};
+                const std::size_t bit_end =
+                    (std::min<std::size_t>)(instruction_count, shard.end + 2U);
+                std::vector<std::uint8_t> claimed(bit_end - bit_base, 0);
+                const auto process_group = [&](std::size_t index, bool report,
+                                               ordered_error_t& failure) -> bool {
+                    const auto count = snapshot.delay_slot_counts[index];
+                    if (count == 0)
+                        return true;
+                    if (count > 2 || claimed[index - bit_base] != 0 ||
+                        (snapshot.instructions[index].flow_flags & transfer_mask) == 0 ||
+                        index + count >= instruction_count) {
+                        if (report)
+                            failure = integrity_ordered(validation_stage_ordinal(1, index),
+                                "delay-slot metadata is malformed");
+                        return false;
+                    }
+                    auto expected = snapshot.instructions[index].address.value;
+                    if (!checked_add_u64(expected, snapshot.instructions[index].length,
+                                         expected)) {
+                        if (report)
+                            failure = integrity_ordered(validation_stage_ordinal(1, index),
+                                "delay-slot instruction range overflowed");
+                        return false;
+                    }
+                    for (std::size_t offset = 1; offset <= count; ++offset) {
+                        const auto slot_index = index + offset;
+                        const auto& slot = snapshot.instructions[slot_index];
+                        if (claimed[slot_index - bit_base] != 0 ||
+                            slot.address.value != expected ||
+                            !same_address_domain(snapshot.instructions[index].address,
+                                                 slot.address) ||
+                            (slot.flow_flags & transfer_mask) != 0) {
+                            if (report)
+                                failure = integrity_ordered(
+                                    validation_stage_ordinal(1, index),
+                                    "delay-slot instruction sequence is malformed");
+                            return false;
+                        }
+                        claimed[slot_index - bit_base] = 1;
+                        if (!checked_add_u64(expected, slot.length, expected)) {
+                            if (report)
+                                failure = integrity_ordered(
+                                    validation_stage_ordinal(1, index),
+                                    "delay-slot instruction range overflowed");
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                const std::size_t seed_begin =
+                    shard.begin >= 2U ? shard.begin - 2U : shard.begin;
+                for (std::size_t seed = seed_begin; seed < shard.begin; ++seed) {
+                    ordered_error_t ignored;
+                    process_group(seed, false, ignored);
+                }
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(1, index));
+                    if (!process_group(index, true, result))
+                        return result;
+                }
+                return result;
+            }, cancel);
+        if (!validated)
+            return validated;
     }
     std::uint64_t entity_count = snapshot.instructions.size();
     const std::array<std::uint64_t, 17> additional_counts{{
@@ -1108,369 +1654,753 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
             entity_count > std::numeric_limits<std::size_t>::max())
             return integrity_failure("snapshot entity count overflowed");
     }
-    std::vector<entity_id_t> entity_ids;
-    entity_ids.reserve(static_cast<std::size_t>(entity_count));
-    std::vector<entity_id_t> graph_entity_ids;
+    std::vector<entity_id_t> entity_ids(static_cast<std::size_t>(entity_count));
     const std::uint64_t graph_entity_count = snapshot.instructions.size() +
         snapshot.blocks.size() + snapshot.functions.size();
-    graph_entity_ids.reserve(static_cast<std::size_t>(graph_entity_count));
-    auto append_ids = [&](const auto& values, bool graph_entity) -> workspace_result_t<void> {
-        for (const auto& value : values) {
-            auto stopped = poll();
-            if (!stopped)
-                return stopped;
-            if (value.id == 0)
-                return integrity_failure("snapshot contains a zero or duplicate entity id");
-            entity_ids.push_back(value.id);
-            if (graph_entity)
-                graph_entity_ids.push_back(value.id);
-        }
-        return workspace_result_t<void>::success();
+    std::vector<entity_id_t> graph_entity_ids(static_cast<std::size_t>(graph_entity_count));
+    std::uint64_t entity_offset = 0;
+    std::uint64_t graph_offset = 0;
+    const auto run_class = [&](const auto& values, std::uint64_t class_rank,
+                               bool graph_entity) -> workspace_result_t<void> {
+        const auto offset = entity_offset;
+        entity_offset += values.size();
+        const auto graph_base = graph_offset;
+        if (graph_entity)
+            graph_offset += values.size();
+        if (values.empty())
+            return workspace_result_t<void>::success();
+        return collect_entity_ids_sharded(values, 2, class_rank,
+            entity_ids.data() + static_cast<std::size_t>(offset),
+            graph_entity
+                ? graph_entity_ids.data() + static_cast<std::size_t>(graph_base)
+                : nullptr,
+            resolved_workers, cancel);
     };
-    auto appended = append_ids(snapshot.instructions, true);
+    auto appended = run_class(snapshot.instructions, 0, true);
     if (!appended) return appended;
-    appended = append_ids(snapshot.blocks, true);
+    appended = run_class(snapshot.blocks, 1, true);
     if (!appended) return appended;
-    appended = append_ids(snapshot.function_chunks, false);
+    appended = run_class(snapshot.function_chunks, 2, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.functions, true);
+    appended = run_class(snapshot.functions, 3, true);
     if (!appended) return appended;
-    appended = append_ids(snapshot.edges, false);
+    appended = run_class(snapshot.edges, 4, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.xrefs, false);
+    appended = run_class(snapshot.xrefs, 5, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.strings, false);
+    appended = run_class(snapshot.strings, 6, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.symbols, false);
+    appended = run_class(snapshot.symbols, 7, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.call_graph.call_sites, false);
+    appended = run_class(snapshot.call_graph.call_sites, 8, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.call_graph.candidates, false);
+    appended = run_class(snapshot.call_graph.candidates, 9, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.call_graph.edges, false);
+    appended = run_class(snapshot.call_graph.edges, 10, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.call_graph.conflicts, false);
+    appended = run_class(snapshot.call_graph.conflicts, 11, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.rich_facts.data_candidates, false);
+    appended = run_class(snapshot.rich_facts.data_candidates, 12, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.rich_facts.data_pointer_facts, false);
+    appended = run_class(snapshot.rich_facts.data_pointer_facts, 13, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.rich_facts.data_conflicts, false);
+    appended = run_class(snapshot.rich_facts.data_conflicts, 14, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.rich_facts.type_candidates, false);
+    appended = run_class(snapshot.rich_facts.type_candidates, 15, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.rich_facts.type_references, false);
+    appended = run_class(snapshot.rich_facts.type_references, 16, false);
     if (!appended) return appended;
-    appended = append_ids(snapshot.rich_facts.metadata_conflicts, false);
+    appended = run_class(snapshot.rich_facts.metadata_conflicts, 17, false);
     if (!appended) return appended;
-    std::sort(entity_ids.begin(), entity_ids.end());
-    for (std::size_t index = 1; index < entity_ids.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (entity_ids[index - 1] == entity_ids[index])
-            return integrity_failure("snapshot contains a zero or duplicate entity id");
+    const auto entity_id_less = [](entity_id_t lhs, entity_id_t rhs) { return lhs < rhs; };
+    parallel_sort(entity_ids.begin(), entity_ids.end(), entity_id_less, resolved_workers);
+    if (entity_ids.size() >= 2U) {
+        const auto shards = parallel_shards(entity_ids.size() - 1U, resolved_workers);
+        auto duplicates = parallel_validate_shards(shards, 1,
+            [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                for (std::size_t index = shard.begin + 1U; index <= shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(3, index));
+                    if (entity_ids[index - 1U] == entity_ids[index])
+                        return integrity_ordered(validation_stage_ordinal(3, index),
+                            "snapshot contains a zero or duplicate entity id");
+                }
+                return result;
+            }, cancel);
+        if (!duplicates)
+            return duplicates;
     }
-    std::sort(graph_entity_ids.begin(), graph_entity_ids.end());
-    std::uint64_t expected_operand_begin = 0;
-    std::uint64_t expected_target_begin = 0;
-    for (const auto& instruction : snapshot.instructions) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (instruction.length == 0 ||
-            !valid_address(instruction.address) ||
-            !address_in_image(instruction.address, instruction.length) ||
-            instruction.coverage != coverage_reason_t::decoded ||
-            !valid_provenance(instruction.provenance) ||
-            (instruction.flow_flags & ~(flow_fallthrough | flow_direct |
-                  flow_indirect | flow_call | flow_branch | flow_conditional |
-                  flow_return | flow_interrupt | flow_terminal |
-                  flow_privileged)) != 0 ||
-            instruction.confidence > 100)
-            return integrity_failure("compact instruction record is invalid");
-        const std::uint64_t operand_end = static_cast<std::uint64_t>(instruction.operand_fact_begin) +
-                                          instruction.operand_fact_count;
-        const std::uint64_t target_end = static_cast<std::uint64_t>(instruction.target_fact_begin) +
-                                         instruction.target_fact_count;
-        if (instruction.operand_fact_begin != expected_operand_begin ||
-            instruction.target_fact_begin != expected_target_begin ||
-            operand_end > snapshot.operand_facts.size() ||
-            target_end > snapshot.target_facts.size())
-            return integrity_failure("instruction fact range exceeds its table");
-        for (std::uint64_t index = instruction.operand_fact_begin; index < operand_end; ++index) {
-            stopped = poll();
-            if (!stopped)
-                return stopped;
-            const auto& operand = snapshot.operand_facts[static_cast<std::size_t>(index)];
-            if (operand.instruction_id != instruction.id ||
-                operand.operand_index != index - instruction.operand_fact_begin ||
-                (operand.scale != 0 && operand.scale != 1 && operand.scale != 2 &&
-                 operand.scale != 4 && operand.scale != 8) ||
-                operand.kind > operand_kind_t::pointer)
-                return integrity_failure("operand fact belongs to a different instruction");
-            if (operand.kind != operand_kind_t::memory &&
-                (operand.segment_reg != 0 || operand.base_reg != 0 ||
-                 operand.index_reg != 0 || operand.scale != 0 ||
-                 operand.displacement != 0))
-                return integrity_failure("non-memory operand contains memory-only facts");
-        }
-        for (std::uint64_t index = instruction.target_fact_begin; index < target_end; ++index) {
-            stopped = poll();
-            if (!stopped)
-                return stopped;
-            const auto& target = snapshot.target_facts[static_cast<std::size_t>(index)];
-            if (target.instruction_id != instruction.id || !valid_address(target.target) ||
-                target.target.architecture != instruction.address.architecture ||
-                target.target.mode != instruction.address.mode ||
-                target.kind > target_kind_record_t::fallthrough)
-                return integrity_failure("target fact belongs to a different instruction");
-        }
-        expected_operand_begin = operand_end;
-        expected_target_begin = target_end;
+    parallel_sort(graph_entity_ids.begin(), graph_entity_ids.end(), entity_id_less,
+        resolved_workers);
+    std::uint64_t total_operand_facts = 0;
+    std::uint64_t total_target_facts = 0;
+    if (!snapshot.instructions.empty()) {
+        const auto shards = parallel_shards(snapshot.instructions.size(), resolved_workers);
+        std::vector<std::uint64_t> shard_operand_totals(shards.size(), 0);
+        std::vector<std::uint64_t> shard_target_totals(shards.size(), 0);
+        std::vector<ordered_error_t> pass1_slots(shards.size());
+        auto first_pass = parallel_run_shards(shards,
+            [&](std::size_t slot, const parallel_shard_t& shard)
+                -> workspace_result_t<void> {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                std::uint64_t expected_operand = 0;
+                std::uint64_t expected_target = 0;
+                std::uint64_t operand_total = 0;
+                std::uint64_t target_total = 0;
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped()) {
+                        result = poller.stop_error(validation_rank_ordinal(4, index, 0));
+                        break;
+                    }
+                    const auto& instruction = snapshot.instructions[index];
+                    if (instruction.length == 0 ||
+                        !valid_address(instruction.address) ||
+                        !address_in_image(instruction.address, instruction.length) ||
+                        instruction.coverage != coverage_reason_t::decoded ||
+                        !valid_provenance(instruction.provenance) ||
+                        (instruction.flow_flags & ~(flow_fallthrough | flow_direct |
+                              flow_indirect | flow_call | flow_branch | flow_conditional |
+                              flow_return | flow_interrupt | flow_terminal |
+                              flow_privileged)) != 0 ||
+                        instruction.confidence > 100) {
+                        result = integrity_ordered(validation_rank_ordinal(4, index, 0),
+                            "compact instruction record is invalid");
+                        break;
+                    }
+                    const std::uint64_t operand_end =
+                        static_cast<std::uint64_t>(instruction.operand_fact_begin) +
+                        instruction.operand_fact_count;
+                    const std::uint64_t target_end =
+                        static_cast<std::uint64_t>(instruction.target_fact_begin) +
+                        instruction.target_fact_count;
+                    const bool chain_ok = index == shard.begin ||
+                        (instruction.operand_fact_begin == expected_operand &&
+                         instruction.target_fact_begin == expected_target);
+                    if (!chain_ok ||
+                        operand_end > snapshot.operand_facts.size() ||
+                        target_end > snapshot.target_facts.size()) {
+                        result = integrity_ordered(validation_rank_ordinal(4, index, 1),
+                            "instruction fact range exceeds its table");
+                        break;
+                    }
+                    bool failed = false;
+                    for (std::uint64_t fact = instruction.operand_fact_begin;
+                         fact < operand_end; ++fact) {
+                        if (poller.stopped()) {
+                            result = poller.stop_error(
+                                validation_rank_ordinal(4, index, 2));
+                            failed = true;
+                            break;
+                        }
+                        const auto& operand =
+                            snapshot.operand_facts[static_cast<std::size_t>(fact)];
+                        if (operand.instruction_id != instruction.id ||
+                            operand.operand_index != fact - instruction.operand_fact_begin ||
+                            (operand.scale != 0 && operand.scale != 1 &&
+                             operand.scale != 2 && operand.scale != 4 &&
+                             operand.scale != 8) ||
+                            operand.kind > operand_kind_t::pointer) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(4, index, 2),
+                                "operand fact belongs to a different instruction");
+                            failed = true;
+                            break;
+                        }
+                        if (operand.kind != operand_kind_t::memory &&
+                            (operand.segment_reg != 0 || operand.base_reg != 0 ||
+                             operand.index_reg != 0 || operand.scale != 0 ||
+                             operand.displacement != 0)) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(4, index, 2),
+                                "non-memory operand contains memory-only facts");
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if (failed)
+                        break;
+                    for (std::uint64_t fact = instruction.target_fact_begin;
+                         fact < target_end; ++fact) {
+                        if (poller.stopped()) {
+                            result = poller.stop_error(
+                                validation_rank_ordinal(4, index, 2));
+                            failed = true;
+                            break;
+                        }
+                        const auto& target =
+                            snapshot.target_facts[static_cast<std::size_t>(fact)];
+                        if (target.instruction_id != instruction.id ||
+                            !valid_address(target.target) ||
+                            target.target.architecture !=
+                                instruction.address.architecture ||
+                            target.target.mode != instruction.address.mode ||
+                            target.kind > target_kind_record_t::fallthrough) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(4, index, 2),
+                                "target fact belongs to a different instruction");
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if (failed)
+                        break;
+                    expected_operand = operand_end;
+                    expected_target = target_end;
+                    operand_total += instruction.operand_fact_count;
+                    target_total += instruction.target_fact_count;
+                }
+                shard_operand_totals[slot] = operand_total;
+                shard_target_totals[slot] = target_total;
+                pass1_slots[slot] = std::move(result);
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!first_pass)
+            return first_pass;
+        const auto sum_u64 = [](std::uint64_t lhs, std::uint64_t rhs) { return lhs + rhs; };
+        const auto operand_prefix = parallel_prefix_sums(shard_operand_totals, sum_u64);
+        const auto target_prefix = parallel_prefix_sums(shard_target_totals, sum_u64);
+        std::vector<ordered_error_t> pass2_slots(shards.size());
+        auto second_pass = parallel_run_shards(shards,
+            [&](std::size_t slot, const parallel_shard_t& shard)
+                -> workspace_result_t<void> {
+                ordered_error_t result;
+                if (shard.begin < shard.end) {
+                    const auto& instruction = snapshot.instructions[shard.begin];
+                    if (instruction.operand_fact_begin != operand_prefix[slot] ||
+                        instruction.target_fact_begin != target_prefix[slot])
+                        result = integrity_ordered(
+                            validation_rank_ordinal(4, shard.begin, 1),
+                            "instruction fact range exceeds its table");
+                }
+                pass2_slots[slot] = std::move(result);
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!second_pass)
+            return second_pass;
+        auto ranges_validated = reduce_ordered_slots(pass1_slots, pass2_slots);
+        if (!ranges_validated)
+            return ranges_validated;
+        for (const auto total : shard_operand_totals)
+            total_operand_facts += total;
+        for (const auto total : shard_target_totals)
+            total_target_facts += total;
     }
-    if (expected_operand_begin != snapshot.operand_facts.size() ||
-        expected_target_begin != snapshot.target_facts.size())
+    if (total_operand_facts != snapshot.operand_facts.size() ||
+        total_target_facts != snapshot.target_facts.size())
         return integrity_failure("snapshot contains orphan instruction facts");
-    auto ordered = validate_sorted(snapshot.blocks, [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.start, lhs.end, lhs.id) < std::tie(rhs.start, rhs.end, rhs.id);
-    });
+    auto ordered = validate_sorted_sharded(snapshot.blocks,
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.start, lhs.end, lhs.id) < std::tie(rhs.start, rhs.end, rhs.id);
+        }, 5, resolved_workers, cancel);
     if (!ordered) return ordered;
-    ordered = validate_sorted(snapshot.functions, [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.start, lhs.end, lhs.id) < std::tie(rhs.start, rhs.end, rhs.id);
-    });
+    ordered = validate_sorted_sharded(snapshot.functions,
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.start, lhs.end, lhs.id) < std::tie(rhs.start, rhs.end, rhs.id);
+        }, 6, resolved_workers, cancel);
     if (!ordered) return ordered;
-    ordered = validate_sorted(snapshot.edges, [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.source, lhs.target, lhs.kind, lhs.id) <
-               std::tie(rhs.source, rhs.target, rhs.kind, rhs.id);
-    });
+    ordered = validate_sorted_sharded(snapshot.edges,
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.source, lhs.target, lhs.kind, lhs.id) <
+                   std::tie(rhs.source, rhs.target, rhs.kind, rhs.id);
+        }, 7, resolved_workers, cancel);
     if (!ordered) return ordered;
-    ordered = validate_sorted(snapshot.xrefs, [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.source, lhs.target, lhs.kind, lhs.id) <
-               std::tie(rhs.source, rhs.target, rhs.kind, rhs.id);
-    });
+    ordered = validate_sorted_sharded(snapshot.xrefs,
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.source, lhs.target, lhs.kind, lhs.id) <
+                   std::tie(rhs.source, rhs.target, rhs.kind, rhs.id);
+        }, 8, resolved_workers, cancel);
     if (!ordered) return ordered;
-    ordered = validate_sorted(snapshot.strings, [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.address, lhs.id) < std::tie(rhs.address, rhs.id);
-    });
+    ordered = validate_sorted_sharded(snapshot.strings,
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.address, lhs.id) < std::tie(rhs.address, rhs.id);
+        }, 9, resolved_workers, cancel);
     if (!ordered) return ordered;
-    ordered = validate_sorted(snapshot.symbols, [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.address, lhs.name, lhs.id) < std::tie(rhs.address, rhs.name, rhs.id);
-    });
+    ordered = validate_sorted_sharded(snapshot.symbols,
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.address, lhs.name, lhs.id) <
+                   std::tie(rhs.address, rhs.name, rhs.id);
+        }, 10, resolved_workers, cancel);
     if (!ordered) return ordered;
-    for (const auto& block : snapshot.blocks) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (!same_address_domain(block.start, block.end) ||
-            block.start.value >= block.end.value || !valid_address(block.start) ||
-            !address_in_image(block.start, block.end.value - block.start.value) ||
-            !valid_provenance(block.provenance) || block.confidence > 100 ||
-            static_cast<std::uint64_t>(block.first_instruction) + block.instruction_count >
-                snapshot.instructions.size())
-            return integrity_failure("basic block record is invalid");
-        if (block.instruction_count == 0)
-            return integrity_failure("basic block has no instructions");
-        const auto instruction_end = static_cast<std::uint64_t>(block.first_instruction) +
-                                     block.instruction_count;
-        std::uint64_t cursor = block.start.value;
-        for (std::uint64_t index = block.first_instruction; index < instruction_end; ++index) {
-            stopped = poll();
-            if (!stopped)
-                return stopped;
-            const auto& instruction = snapshot.instructions[static_cast<std::size_t>(index)];
-            if (!same_address_domain(block.start, instruction.address) ||
-                instruction.address.value != cursor ||
-                !checked_add_u64(cursor, instruction.length, cursor) ||
-                cursor > block.end.value)
-                return integrity_failure("basic block instruction range is inconsistent");
-            if (!snapshot.delay_slot_counts.empty() &&
-                index + snapshot.delay_slot_counts[static_cast<std::size_t>(index)] >=
-                    instruction_end)
-                return integrity_failure("basic block splits a delay-slot sequence");
-        }
-        if (cursor != block.end.value)
-            return integrity_failure("basic block end does not match its instruction range");
+    if (!snapshot.blocks.empty()) {
+        const auto shards = parallel_shards(snapshot.blocks.size(), resolved_workers);
+        auto blocks_validated = parallel_validate_shards(shards, 1,
+            [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                for (std::size_t block_position = shard.begin;
+                     block_position < shard.end; ++block_position) {
+                    if (poller.stopped())
+                        return poller.stop_error(
+                            validation_stage_ordinal(11, block_position));
+                    const auto& block = snapshot.blocks[block_position];
+                    if (!same_address_domain(block.start, block.end) ||
+                        block.start.value >= block.end.value ||
+                        !valid_address(block.start) ||
+                        !address_in_image(block.start,
+                                          block.end.value - block.start.value) ||
+                        !valid_provenance(block.provenance) || block.confidence > 100 ||
+                        static_cast<std::uint64_t>(block.first_instruction) +
+                                block.instruction_count >
+                            snapshot.instructions.size())
+                        return integrity_ordered(
+                            validation_stage_ordinal(11, block_position),
+                            "basic block record is invalid");
+                    if (block.instruction_count == 0)
+                        return integrity_ordered(
+                            validation_stage_ordinal(11, block_position),
+                            "basic block has no instructions");
+                    const auto instruction_end =
+                        static_cast<std::uint64_t>(block.first_instruction) +
+                        block.instruction_count;
+                    std::uint64_t cursor = block.start.value;
+                    for (std::uint64_t index = block.first_instruction;
+                         index < instruction_end; ++index) {
+                        if (poller.stopped())
+                            return poller.stop_error(
+                                validation_stage_ordinal(11, block_position));
+                        const auto& instruction =
+                            snapshot.instructions[static_cast<std::size_t>(index)];
+                        if (!same_address_domain(block.start, instruction.address) ||
+                            instruction.address.value != cursor ||
+                            !checked_add_u64(cursor, instruction.length, cursor) ||
+                            cursor > block.end.value)
+                            return integrity_ordered(
+                                validation_stage_ordinal(11, block_position),
+                                "basic block instruction range is inconsistent");
+                        if (!snapshot.delay_slot_counts.empty() &&
+                            index + snapshot.delay_slot_counts[
+                                static_cast<std::size_t>(index)] >= instruction_end)
+                            return integrity_ordered(
+                                validation_stage_ordinal(11, block_position),
+                                "basic block splits a delay-slot sequence");
+                    }
+                    if (cursor != block.end.value)
+                        return integrity_ordered(
+                            validation_stage_ordinal(11, block_position),
+                            "basic block end does not match its instruction range");
+                }
+                return result;
+            }, cancel);
+        if (!blocks_validated)
+            return blocks_validated;
     }
-    for (std::size_t index = 1; index < snapshot.blocks.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        const auto& previous = snapshot.blocks[index - 1];
-        const auto& current = snapshot.blocks[index];
-        if (same_address_domain(previous.end, current.start) &&
-            previous.end.value > current.start.value)
-            return integrity_failure("basic block records overlap");
+    if (snapshot.blocks.size() >= 2U) {
+        const auto shards = parallel_shards(snapshot.blocks.size() - 1U, resolved_workers);
+        auto overlaps = parallel_validate_shards(shards, 1,
+            [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                for (std::size_t index = shard.begin + 1U; index <= shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(12, index));
+                    const auto& previous = snapshot.blocks[index - 1U];
+                    const auto& current = snapshot.blocks[index];
+                    if (same_address_domain(previous.end, current.start) &&
+                        previous.end.value > current.start.value)
+                        return integrity_ordered(validation_stage_ordinal(12, index),
+                            "basic block records overlap");
+                }
+                return result;
+            }, cancel);
+        if (!overlaps)
+            return overlaps;
     }
     std::unordered_set<entity_id_t> function_ids;
     function_ids.reserve(snapshot.functions.size());
-    for (const auto& function : snapshot.functions) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        function_ids.insert(function.id);
+    if (!snapshot.functions.empty()) {
+        const auto shards = parallel_shards(snapshot.functions.size(), resolved_workers);
+        std::vector<std::unordered_set<entity_id_t>> per_shard(shards.size());
+        auto built = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                auto& local = per_shard[slot];
+                local.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(13, index));
+                    local.insert(snapshot.functions[index].id);
+                }
+                return result;
+            }, cancel);
+        if (!built)
+            return built;
+        for (auto& local : per_shard)
+            for (const auto id : local)
+                function_ids.insert(id);
     }
     std::unordered_set<entity_id_t> symbol_ids;
     symbol_ids.reserve(snapshot.symbols.size());
-    for (const auto& symbol : snapshot.symbols) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        symbol_ids.insert(symbol.id);
+    if (!snapshot.symbols.empty()) {
+        const auto shards = parallel_shards(snapshot.symbols.size(), resolved_workers);
+        std::vector<std::unordered_set<entity_id_t>> per_shard(shards.size());
+        auto built = parallel_validate_shards(shards, 1,
+            [&](std::size_t slot, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                auto& local = per_shard[slot];
+                local.reserve(shard.end - shard.begin);
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(14, index));
+                    local.insert(snapshot.symbols[index].id);
+                }
+                return result;
+            }, cancel);
+        if (!built)
+            return built;
+        for (auto& local : per_shard)
+            for (const auto id : local)
+                symbol_ids.insert(id);
     }
-    std::uint64_t expected_first_chunk = 0;
-    std::uint64_t expected_first_membership = 0;
-    for (const auto& function : snapshot.functions) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (!same_address_domain(function.start, function.end) ||
-            function.start.value >= function.end.value || !valid_address(function.start) ||
-            !address_in_image(function.start, function.end.value - function.start.value) ||
-            !valid_provenance(function.provenance) || function.confidence > 100 ||
-            static_cast<std::uint64_t>(function.first_block) + function.block_count >
-                snapshot.blocks.size())
-            return integrity_failure("function record is invalid");
-        if (function.symbol_id && symbol_ids.find(*function.symbol_id) == symbol_ids.end())
-            return integrity_failure("function references an unknown symbol");
-        const std::uint64_t block_end = static_cast<std::uint64_t>(function.first_block) +
-                                        function.block_count;
-        for (std::uint64_t index = function.first_block; index < block_end; ++index) {
-            stopped = poll();
-            if (!stopped)
-                return stopped;
-            const auto& block = snapshot.blocks[static_cast<std::size_t>(index)];
-            if (block.function_id != function.id ||
-                !same_address_domain(function.start, block.start) ||
-                block.start.value < function.start.value ||
-                block.end.value > function.end.value)
-                return integrity_failure("function block range contains a foreign block");
-        }
-        if (function.chunk_count == 0) {
-            if (function.first_chunk != 0 || function.block_membership_count != 0 ||
-                function.first_block_membership != 0)
-                return integrity_failure("function compact-IR ranges are inconsistent");
-            continue;
-        }
-        const std::uint64_t chunk_end = static_cast<std::uint64_t>(function.first_chunk) +
-                                        function.chunk_count;
-        const std::uint64_t membership_end =
-            static_cast<std::uint64_t>(function.first_block_membership) +
-            function.block_membership_count;
-        if (function.first_chunk != expected_first_chunk ||
-            function.first_block_membership != expected_first_membership ||
-            chunk_end > snapshot.function_chunks.size() ||
-            membership_end > snapshot.function_block_memberships.size() ||
-            function.chunks.size() != function.chunk_count)
-            return integrity_failure("function compact-IR ranges are inconsistent");
-        const auto& primary_chunk = snapshot.function_chunks[function.first_chunk];
-        if (primary_chunk.start != function.start ||
-            function.first_block != primary_chunk.first_block ||
-            function.block_count != primary_chunk.block_count)
-            return integrity_failure("function primary chunk is inconsistent");
-        std::uint64_t membership_index = function.first_block_membership;
-        const function_chunk_record_t* previous_chunk = nullptr;
-        for (std::uint64_t chunk_index = function.first_chunk; chunk_index < chunk_end;
-             ++chunk_index) {
-            stopped = poll();
-            if (!stopped)
-                return stopped;
-            const auto& chunk = snapshot.function_chunks[static_cast<std::size_t>(chunk_index)];
-            if (chunk.id == 0 || chunk.function_id != function.id ||
-                !same_address_domain(chunk.start, chunk.end) ||
-                !same_address_domain(function.start, chunk.start) ||
-                chunk.start.value >= chunk.end.value || !valid_address(chunk.start) ||
-                !address_in_image(chunk.start, chunk.end.value - chunk.start.value) ||
-                !valid_provenance(chunk.provenance) || chunk.confidence > 100 ||
-                chunk.block_count == 0 ||
-                static_cast<std::uint64_t>(chunk.first_block) + chunk.block_count >
-                    snapshot.blocks.size())
-                return integrity_failure("function chunk record is invalid");
-            const auto& range = function.chunks[static_cast<std::size_t>(
-                chunk_index - function.first_chunk)];
-            const auto expected_kind = static_cast<std::uint8_t>(
-                (chunk.shared ? function_chunk_shared : function_chunk_none) |
-                (chunk.cold ? function_chunk_cold : function_chunk_none));
-            if (range.rva_start != chunk.start.value ||
-                range.rva_end != chunk.end.value || range.chunk_kind != expected_kind)
-                return integrity_failure("function chunk compatibility range is inconsistent");
-            if (previous_chunk && previous_chunk->end.value > chunk.start.value)
-                return integrity_failure("function chunks are not in deterministic range order");
-            std::uint64_t cursor = chunk.start.value;
-            bool chunk_has_shared_block = false;
-            const std::uint64_t chunk_block_end =
-                static_cast<std::uint64_t>(chunk.first_block) + chunk.block_count;
-            for (std::uint64_t block_index = chunk.first_block;
-                 block_index < chunk_block_end; ++block_index) {
-                stopped = poll();
-                if (!stopped)
-                    return stopped;
-                if (membership_index >= membership_end)
-                    return integrity_failure("function block membership range is inconsistent");
-                const auto& block = snapshot.blocks[static_cast<std::size_t>(block_index)];
-                const auto& membership = snapshot.function_block_memberships[
-                    static_cast<std::size_t>(membership_index)];
-                if (membership.function_id == 0 || membership.chunk_id == 0 ||
-                    membership.block_id == 0 || membership.function_id != function.id ||
-                    membership.chunk_id != chunk.id || membership.block_id != block.id ||
-                    membership.block_index != block_index ||
-                    membership.ordinal != membership_index - function.first_block_membership ||
-                    membership.shared != (block.function_id != function.id))
-                    return integrity_failure("function block membership references are inconsistent");
-                if (!same_address_domain(chunk.start, block.start) ||
-                    block.start.value != cursor || block.end.value > chunk.end.value ||
-                    !checked_add_u64(cursor, block.end.value - block.start.value, cursor))
-                    return integrity_failure("function chunk block range is inconsistent");
-                chunk_has_shared_block = chunk_has_shared_block || membership.shared;
-                ++membership_index;
-            }
-            if (cursor != chunk.end.value || chunk.shared != chunk_has_shared_block)
-                return integrity_failure("function chunk membership state is inconsistent");
-            previous_chunk = &chunk;
-        }
-        if (membership_index != membership_end ||
-            snapshot.function_chunks[static_cast<std::size_t>(chunk_end - 1)].end != function.end)
-            return integrity_failure("function compact-IR ranges are inconsistent");
-        expected_first_chunk = chunk_end;
-        expected_first_membership = membership_end;
+    std::uint64_t total_chunks = 0;
+    std::uint64_t total_memberships = 0;
+    if (!snapshot.functions.empty()) {
+        constexpr std::size_t no_anchor = (std::numeric_limits<std::size_t>::max)();
+        const auto shards = parallel_shards(snapshot.functions.size(), resolved_workers);
+        std::vector<std::uint64_t> shard_chunk_totals(shards.size(), 0);
+        std::vector<std::uint64_t> shard_membership_totals(shards.size(), 0);
+        std::vector<std::size_t> shard_anchors(shards.size(), no_anchor);
+        std::vector<ordered_error_t> pass1_slots(shards.size());
+        auto first_pass = parallel_run_shards(shards,
+            [&](std::size_t slot, const parallel_shard_t& shard)
+                -> workspace_result_t<void> {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                std::uint64_t expected_chunk = 0;
+                std::uint64_t expected_membership = 0;
+                std::uint64_t chunk_total = 0;
+                std::uint64_t membership_total = 0;
+                std::size_t anchor = no_anchor;
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped()) {
+                        result = poller.stop_error(validation_rank_ordinal(15, index, 0));
+                        break;
+                    }
+                    const auto& function = snapshot.functions[index];
+                    if (!same_address_domain(function.start, function.end) ||
+                        function.start.value >= function.end.value ||
+                        !valid_address(function.start) ||
+                        !address_in_image(function.start,
+                                          function.end.value - function.start.value) ||
+                        !valid_provenance(function.provenance) ||
+                        function.confidence > 100 ||
+                        static_cast<std::uint64_t>(function.first_block) +
+                                function.block_count >
+                            snapshot.blocks.size()) {
+                        result = integrity_ordered(validation_rank_ordinal(15, index, 0),
+                            "function record is invalid");
+                        break;
+                    }
+                    if (function.symbol_id &&
+                        symbol_ids.find(*function.symbol_id) == symbol_ids.end()) {
+                        result = integrity_ordered(validation_rank_ordinal(15, index, 1),
+                            "function references an unknown symbol");
+                        break;
+                    }
+                    const std::uint64_t block_end =
+                        static_cast<std::uint64_t>(function.first_block) +
+                        function.block_count;
+                    bool failed = false;
+                    for (std::uint64_t block_index = function.first_block;
+                         block_index < block_end; ++block_index) {
+                        if (poller.stopped()) {
+                            result = poller.stop_error(
+                                validation_rank_ordinal(15, index, 2));
+                            failed = true;
+                            break;
+                        }
+                        const auto& block =
+                            snapshot.blocks[static_cast<std::size_t>(block_index)];
+                        if (block.function_id != function.id ||
+                            !same_address_domain(function.start, block.start) ||
+                            block.start.value < function.start.value ||
+                            block.end.value > function.end.value) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(15, index, 2),
+                                "function block range contains a foreign block");
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if (failed)
+                        break;
+                    if (function.chunk_count == 0) {
+                        if (function.first_chunk != 0 ||
+                            function.block_membership_count != 0 ||
+                            function.first_block_membership != 0) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(15, index, 3),
+                                "function compact-IR ranges are inconsistent");
+                            break;
+                        }
+                        continue;
+                    }
+                    const std::uint64_t chunk_end =
+                        static_cast<std::uint64_t>(function.first_chunk) +
+                        function.chunk_count;
+                    const std::uint64_t membership_end =
+                        static_cast<std::uint64_t>(function.first_block_membership) +
+                        function.block_membership_count;
+                    const bool chain_ok = anchor == no_anchor ||
+                        (function.first_chunk == expected_chunk &&
+                         function.first_block_membership == expected_membership);
+                    if (!chain_ok ||
+                        chunk_end > snapshot.function_chunks.size() ||
+                        membership_end > snapshot.function_block_memberships.size() ||
+                        function.chunks.size() != function.chunk_count) {
+                        result = integrity_ordered(
+                            validation_rank_ordinal(15, index, 4),
+                            "function compact-IR ranges are inconsistent");
+                        break;
+                    }
+                    if (anchor == no_anchor)
+                        anchor = index;
+                    const auto& primary_chunk =
+                        snapshot.function_chunks[function.first_chunk];
+                    if (primary_chunk.start != function.start ||
+                        function.first_block != primary_chunk.first_block ||
+                        function.block_count != primary_chunk.block_count) {
+                        result = integrity_ordered(
+                            validation_rank_ordinal(15, index, 5),
+                            "function primary chunk is inconsistent");
+                        break;
+                    }
+                    std::uint64_t membership_index = function.first_block_membership;
+                    const function_chunk_record_t* previous_chunk = nullptr;
+                    for (std::uint64_t chunk_index = function.first_chunk;
+                         chunk_index < chunk_end; ++chunk_index) {
+                        if (poller.stopped()) {
+                            result = poller.stop_error(
+                                validation_rank_ordinal(15, index, 6));
+                            failed = true;
+                            break;
+                        }
+                        const auto& chunk = snapshot.function_chunks[
+                            static_cast<std::size_t>(chunk_index)];
+                        if (chunk.id == 0 || chunk.function_id != function.id ||
+                            !same_address_domain(chunk.start, chunk.end) ||
+                            !same_address_domain(function.start, chunk.start) ||
+                            chunk.start.value >= chunk.end.value ||
+                            !valid_address(chunk.start) ||
+                            !address_in_image(chunk.start,
+                                              chunk.end.value - chunk.start.value) ||
+                            !valid_provenance(chunk.provenance) ||
+                            chunk.confidence > 100 ||
+                            chunk.block_count == 0 ||
+                            static_cast<std::uint64_t>(chunk.first_block) +
+                                    chunk.block_count >
+                                snapshot.blocks.size()) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(15, index, 6),
+                                "function chunk record is invalid");
+                            failed = true;
+                            break;
+                        }
+                        const auto& range = function.chunks[static_cast<std::size_t>(
+                            chunk_index - function.first_chunk)];
+                        const auto expected_kind = static_cast<std::uint8_t>(
+                            (chunk.shared ? function_chunk_shared : function_chunk_none) |
+                            (chunk.cold ? function_chunk_cold : function_chunk_none));
+                        if (range.rva_start != chunk.start.value ||
+                            range.rva_end != chunk.end.value ||
+                            range.chunk_kind != expected_kind) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(15, index, 6),
+                                "function chunk compatibility range is inconsistent");
+                            failed = true;
+                            break;
+                        }
+                        if (previous_chunk &&
+                            previous_chunk->end.value > chunk.start.value) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(15, index, 6),
+                                "function chunks are not in deterministic range order");
+                            failed = true;
+                            break;
+                        }
+                        std::uint64_t cursor = chunk.start.value;
+                        bool chunk_has_shared_block = false;
+                        const std::uint64_t chunk_block_end =
+                            static_cast<std::uint64_t>(chunk.first_block) +
+                            chunk.block_count;
+                        for (std::uint64_t block_index = chunk.first_block;
+                             block_index < chunk_block_end; ++block_index) {
+                            if (poller.stopped()) {
+                                result = poller.stop_error(
+                                    validation_rank_ordinal(15, index, 6));
+                                failed = true;
+                                break;
+                            }
+                            if (membership_index >= membership_end) {
+                                result = integrity_ordered(
+                                    validation_rank_ordinal(15, index, 6),
+                                    "function block membership range is inconsistent");
+                                failed = true;
+                                break;
+                            }
+                            const auto& block =
+                                snapshot.blocks[static_cast<std::size_t>(block_index)];
+                            const auto& membership = snapshot.function_block_memberships[
+                                static_cast<std::size_t>(membership_index)];
+                            if (membership.function_id == 0 || membership.chunk_id == 0 ||
+                                membership.block_id == 0 ||
+                                membership.function_id != function.id ||
+                                membership.chunk_id != chunk.id ||
+                                membership.block_id != block.id ||
+                                membership.block_index != block_index ||
+                                membership.ordinal !=
+                                    membership_index - function.first_block_membership ||
+                                membership.shared != (block.function_id != function.id)) {
+                                result = integrity_ordered(
+                                    validation_rank_ordinal(15, index, 6),
+                                    "function block membership references are inconsistent");
+                                failed = true;
+                                break;
+                            }
+                            if (!same_address_domain(chunk.start, block.start) ||
+                                block.start.value != cursor ||
+                                block.end.value > chunk.end.value ||
+                                !checked_add_u64(cursor,
+                                    block.end.value - block.start.value, cursor)) {
+                                result = integrity_ordered(
+                                    validation_rank_ordinal(15, index, 6),
+                                    "function chunk block range is inconsistent");
+                                failed = true;
+                                break;
+                            }
+                            chunk_has_shared_block =
+                                chunk_has_shared_block || membership.shared;
+                            ++membership_index;
+                        }
+                        if (failed)
+                            break;
+                        if (cursor != chunk.end.value ||
+                            chunk.shared != chunk_has_shared_block) {
+                            result = integrity_ordered(
+                                validation_rank_ordinal(15, index, 6),
+                                "function chunk membership state is inconsistent");
+                            failed = true;
+                            break;
+                        }
+                        previous_chunk = &chunk;
+                    }
+                    if (failed)
+                        break;
+                    if (membership_index != membership_end ||
+                        snapshot.function_chunks[static_cast<std::size_t>(
+                            chunk_end - 1)].end != function.end) {
+                        result = integrity_ordered(
+                            validation_rank_ordinal(15, index, 7),
+                            "function compact-IR ranges are inconsistent");
+                        break;
+                    }
+                    expected_chunk = chunk_end;
+                    expected_membership = membership_end;
+                    chunk_total += function.chunk_count;
+                    membership_total += function.block_membership_count;
+                }
+                shard_chunk_totals[slot] = chunk_total;
+                shard_membership_totals[slot] = membership_total;
+                shard_anchors[slot] = anchor;
+                pass1_slots[slot] = std::move(result);
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!first_pass)
+            return first_pass;
+        const auto sum_u64 = [](std::uint64_t lhs, std::uint64_t rhs) { return lhs + rhs; };
+        const auto chunk_prefix = parallel_prefix_sums(shard_chunk_totals, sum_u64);
+        const auto membership_prefix =
+            parallel_prefix_sums(shard_membership_totals, sum_u64);
+        std::vector<ordered_error_t> pass2_slots(shards.size());
+        auto second_pass = parallel_run_shards(shards,
+            [&](std::size_t slot, const parallel_shard_t&)
+                -> workspace_result_t<void> {
+                ordered_error_t result;
+                if (shard_anchors[slot] != no_anchor) {
+                    const auto& function = snapshot.functions[shard_anchors[slot]];
+                    if (function.first_chunk != chunk_prefix[slot] ||
+                        function.first_block_membership != membership_prefix[slot])
+                        result = integrity_ordered(
+                            validation_rank_ordinal(15, shard_anchors[slot], 4),
+                            "function compact-IR ranges are inconsistent");
+                }
+                pass2_slots[slot] = std::move(result);
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!second_pass)
+            return second_pass;
+        auto compact_validated = reduce_ordered_slots(pass1_slots, pass2_slots);
+        if (!compact_validated)
+            return compact_validated;
+        for (const auto total : shard_chunk_totals)
+            total_chunks += total;
+        for (const auto total : shard_membership_totals)
+            total_memberships += total;
     }
-    if (expected_first_chunk != snapshot.function_chunks.size() ||
-        expected_first_membership != snapshot.function_block_memberships.size())
+    if (total_chunks != snapshot.function_chunks.size() ||
+        total_memberships != snapshot.function_block_memberships.size())
         return integrity_failure("snapshot contains orphan function compact-IR records");
-    for (const auto& block : snapshot.blocks) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (function_ids.find(block.function_id) == function_ids.end())
-            return integrity_failure("basic block references an unknown function");
-    }
+    auto validated = validate_records_sharded(snapshot.blocks, 16, resolved_workers,
+        "snapshot_validate",
+        [&](std::size_t, const basic_block_record_t& block) -> const char* {
+            if (function_ids.find(block.function_id) == function_ids.end())
+                return "basic block references an unknown function";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
     struct function_extent_t {
         address_t start;
         address_t end;
         bool explicit_membership = false;
     };
-    std::vector<function_extent_t> function_extents;
-    function_extents.reserve(snapshot.function_chunks.size() + snapshot.functions.size());
-    for (const auto& function : snapshot.functions) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (function.chunk_count == 0) {
-            function_extents.push_back({function.start, function.end, false});
-            continue;
-        }
-        const auto end = static_cast<std::uint64_t>(function.first_chunk) +
-            function.chunk_count;
-        for (std::uint64_t index = function.first_chunk; index < end; ++index) {
-            const auto& chunk = snapshot.function_chunks[static_cast<std::size_t>(index)];
-            function_extents.push_back({chunk.start, chunk.end, true});
-        }
+    std::vector<std::uint64_t> extent_offsets(snapshot.functions.size() + 1U, 0);
+    for (std::size_t index = 0; index < snapshot.functions.size(); ++index) {
+        const auto& function = snapshot.functions[index];
+        extent_offsets[index + 1U] = extent_offsets[index] +
+            (function.chunk_count == 0 ? std::uint64_t{1} : function.chunk_count);
     }
-    std::sort(function_extents.begin(), function_extents.end(),
+    std::vector<function_extent_t> function_extents(
+        static_cast<std::size_t>(extent_offsets.back()));
+    if (!snapshot.functions.empty()) {
+        const auto shards = parallel_shards(snapshot.functions.size(), resolved_workers);
+        auto built = parallel_validate_shards(shards, 1,
+            [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(17, index));
+                    const auto& function = snapshot.functions[index];
+                    auto* out = function_extents.data() +
+                        static_cast<std::size_t>(extent_offsets[index]);
+                    if (function.chunk_count == 0) {
+                        out[0] = function_extent_t{function.start, function.end, false};
+                        continue;
+                    }
+                    const auto end = static_cast<std::uint64_t>(function.first_chunk) +
+                        function.chunk_count;
+                    for (std::uint64_t chunk_index = function.first_chunk;
+                         chunk_index < end; ++chunk_index) {
+                        const auto& chunk = snapshot.function_chunks[
+                            static_cast<std::size_t>(chunk_index)];
+                        *out++ = function_extent_t{chunk.start, chunk.end, true};
+                    }
+                }
+                return result;
+            }, cancel);
+        if (!built)
+            return built;
+    }
+    parallel_sort(function_extents.begin(), function_extents.end(),
         [](const function_extent_t& lhs, const function_extent_t& rhs) {
             return std::tie(lhs.start, lhs.end, lhs.explicit_membership) <
                 std::tie(rhs.start, rhs.end, rhs.explicit_membership);
-        });
+        }, resolved_workers);
     address_t maximum_end;
     address_t maximum_legacy_end;
     bool have_extent = false;
@@ -1501,92 +2431,125 @@ workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& s
             have_legacy_extent = true;
         }
     }
-    for (const auto& edge : snapshot.edges) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (!valid_address(edge.source) || !valid_address(edge.target) ||
-            !same_address_domain(edge.source, edge.target) ||
-            edge.kind > edge_kind_t::indirect ||
-            !valid_provenance(edge.provenance) || edge.confidence > 100)
-            return integrity_failure("edge record is invalid");
-        if (!std::binary_search(graph_entity_ids.begin(), graph_entity_ids.end(),
-                                edge.source_entity))
-            return integrity_failure("edge references an unknown source entity");
-        if (edge.target_entity &&
-            !std::binary_search(graph_entity_ids.begin(), graph_entity_ids.end(),
-                                *edge.target_entity))
-            return integrity_failure("edge references an unknown target entity");
-    }
-    for (const auto& xref : snapshot.xrefs) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (!valid_address(xref.source) || !valid_address(xref.target) ||
-            xref.kind > xref_kind_t::relocation ||
-            !valid_provenance(xref.provenance) || xref.confidence > 100)
-            return integrity_failure("xref record is invalid");
-    }
-    for (const auto& string : snapshot.strings) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (!valid_address(string.address) || string.byte_length == 0 ||
-            !address_in_image(string.address, string.byte_length) ||
-            string.encoding > string_encoding_t::utf16_le ||
-            !valid_provenance(string.provenance) || string.confidence > 100)
-            return integrity_failure("string record is invalid");
-    }
-    for (const auto& symbol : snapshot.symbols) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (!valid_address(symbol.address) || symbol.name.empty() ||
-            !address_in_image(symbol.address) ||
-            symbol.kind > symbol_kind_t::metadata ||
-            !valid_provenance(symbol.provenance) || symbol.confidence > 100)
-            return integrity_failure("symbol record is invalid");
-    }
-    auto rich_facts = validate_rich_fact_publication(snapshot, snapshot.rich_facts, cancel);
+    validated = validate_records_sharded(snapshot.edges, 19, resolved_workers,
+        "snapshot_validate",
+        [&](std::size_t, const edge_record_t& edge) -> const char* {
+            if (!valid_address(edge.source) || !valid_address(edge.target) ||
+                !same_address_domain(edge.source, edge.target) ||
+                edge.kind > edge_kind_t::indirect ||
+                !valid_provenance(edge.provenance) || edge.confidence > 100)
+                return "edge record is invalid";
+            if (!std::binary_search(graph_entity_ids.begin(), graph_entity_ids.end(),
+                                    edge.source_entity))
+                return "edge references an unknown source entity";
+            if (edge.target_entity &&
+                !std::binary_search(graph_entity_ids.begin(), graph_entity_ids.end(),
+                                    *edge.target_entity))
+                return "edge references an unknown target entity";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    validated = validate_records_sharded(snapshot.xrefs, 20, resolved_workers,
+        "snapshot_validate",
+        [&](std::size_t, const xref_record_t& xref) -> const char* {
+            if (!valid_address(xref.source) || !valid_address(xref.target) ||
+                xref.kind > xref_kind_t::relocation ||
+                !valid_provenance(xref.provenance) || xref.confidence > 100)
+                return "xref record is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    validated = validate_records_sharded(snapshot.strings, 21, resolved_workers,
+        "snapshot_validate",
+        [&](std::size_t, const string_record_t& string) -> const char* {
+            if (!valid_address(string.address) || string.byte_length == 0 ||
+                !address_in_image(string.address, string.byte_length) ||
+                string.encoding > string_encoding_t::utf16_le ||
+                !valid_provenance(string.provenance) || string.confidence > 100)
+                return "string record is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    validated = validate_records_sharded(snapshot.symbols, 22, resolved_workers,
+        "snapshot_validate",
+        [&](std::size_t, const symbol_record_t& symbol) -> const char* {
+            if (!valid_address(symbol.address) || symbol.name.empty() ||
+                !address_in_image(symbol.address) ||
+                symbol.kind > symbol_kind_t::metadata ||
+                !valid_provenance(symbol.provenance) || symbol.confidence > 100)
+                return "symbol record is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    auto rich_facts = validate_rich_fact_publication_parallel(snapshot,
+        snapshot.rich_facts, resolved_workers, cancel);
     if (!rich_facts)
         return rich_facts;
-    auto call_graph = validate_call_graph_publication(snapshot, snapshot.call_graph, cancel);
+    auto call_graph = validate_call_graph_publication_parallel(snapshot,
+        snapshot.call_graph, resolved_workers, cancel);
     if (!call_graph)
         return call_graph;
-    for (const auto& span : snapshot.coverage) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (span.size == 0 || span.reason > coverage_reason_t::pending ||
-            !valid_provenance(span.provenance) || span.confidence > 100 ||
-            !valid_address(span.start) || !address_in_image(span.start, span.size))
-            return integrity_failure("coverage span is invalid");
-    }
-    ordered = validate_sorted(snapshot.coverage, [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.start, lhs.size, lhs.reason) <
-               std::tie(rhs.start, rhs.size, rhs.reason);
-    });
+    validated = validate_records_sharded(snapshot.coverage, 25, resolved_workers,
+        "snapshot_validate",
+        [&](std::size_t, const coverage_span_t& span) -> const char* {
+            if (span.size == 0 || span.reason > coverage_reason_t::pending ||
+                !valid_provenance(span.provenance) || span.confidence > 100 ||
+                !valid_address(span.start) || !address_in_image(span.start, span.size))
+                return "coverage span is invalid";
+            return nullptr;
+        }, cancel);
+    if (!validated)
+        return validated;
+    ordered = validate_sorted_sharded(snapshot.coverage,
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.start, lhs.size, lhs.reason) <
+                   std::tie(rhs.start, rhs.size, rhs.reason);
+        }, 26, resolved_workers, cancel);
     if (!ordered)
         return ordered;
-    for (std::size_t index = 1; index < snapshot.coverage.size(); ++index) {
-        auto stopped = poll();
-        if (!stopped)
-            return stopped;
-        if (!same_address_domain(snapshot.coverage[index - 1].start,
-                                 snapshot.coverage[index].start))
-            continue;
-        std::uint64_t previous_end = 0;
-        if (!checked_add_u64(snapshot.coverage[index - 1].start.value,
-                             snapshot.coverage[index - 1].size, previous_end) ||
-            previous_end > snapshot.coverage[index].start.value)
-            return integrity_failure("coverage spans overlap or overflow");
+    if (snapshot.coverage.size() >= 2U) {
+        const auto shards = parallel_shards(snapshot.coverage.size() - 1U,
+            resolved_workers);
+        auto overlaps = parallel_validate_shards(shards, 1,
+            [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
+                ordered_error_t result;
+                validation_poll_t poller{&cancel, "snapshot_validate", 0};
+                for (std::size_t index = shard.begin + 1U; index <= shard.end; ++index) {
+                    if (poller.stopped())
+                        return poller.stop_error(validation_stage_ordinal(27, index));
+                    if (!same_address_domain(snapshot.coverage[index - 1U].start,
+                                             snapshot.coverage[index].start))
+                        continue;
+                    std::uint64_t previous_end = 0;
+                    if (!checked_add_u64(snapshot.coverage[index - 1U].start.value,
+                                         snapshot.coverage[index - 1U].size,
+                                         previous_end) ||
+                        previous_end > snapshot.coverage[index].start.value)
+                        return integrity_ordered(validation_stage_ordinal(27, index),
+                            "coverage spans overlap or overflow");
+                }
+                return result;
+            }, cancel);
+        if (!overlaps)
+            return overlaps;
     }
     if (require_complete_coverage) {
-        auto result = validate_complete_coverage(snapshot, cancel);
+        auto result = validate_complete_coverage(snapshot, resolved_workers, cancel);
         if (!result)
             return result;
     }
     return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> validate_analysis_snapshot(const analysis_snapshot_t& snapshot,
+                                                     bool require_complete_coverage,
+                                                     const cancellation_token_t& cancel) {
+    return validate_analysis_snapshot_parallel(snapshot, require_complete_coverage, 0,
+        cancel);
 }
 
 workspace_result_t<std::shared_ptr<analysis_workspace_t>> analysis_workspace_t::create(
@@ -1801,37 +2764,49 @@ analysis_workspace_t::publish_preview_overlay_generation(
         return workspace_result_t<void>::failure(
             publication_finalizer_conflict(
                 "workspace_preview_overlay_publish"));
+    const auto state_check = [&]() -> workspace_result_t<void> {
+        std::lock_guard state_lock(state_mutex_);
+        if (closing() || closed())
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::workspace_closing,
+                "workspace is closing", "workspace_preview_overlay_publish"));
+        const auto current = analysis_publication();
+        if (!current || current != source ||
+            current->generation != expected_generation ||
+            current->analysis_revision != expected_analysis_revision ||
+            current->overlay_revision != expected_overlay_revision ||
+            target_generation != current->generation + 1 ||
+            target_overlay_revision != current->overlay_revision + 1)
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::revision_conflict,
+                "workspace revisions changed before preview overlay publication",
+                "workspace_preview_overlay_publish"));
+        if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::analysis_in_progress,
+                "preview overlay generation cannot publish during analysis",
+                "workspace_preview_overlay_publish"));
+        if (workspace_cancel.stop_requested())
+            return workspace_result_t<void>::failure(
+                workspace_stop_error(workspace_cancel,
+                                     "workspace_preview_overlay_publish"));
+        return workspace_result_t<void>::success();
+    };
     std::unique_lock<std::shared_mutex> mutation_lock(
         mutation_mutex_, std::defer_lock);
     std::unique_lock<std::shared_mutex> publication_lock(
         publication_mutex_, std::defer_lock);
     std::lock(mutation_lock, publication_lock);
-    std::unique_lock state_lock(state_mutex_);
-    if (closing() || closed())
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::workspace_closing,
-            "workspace is closing", "workspace_preview_overlay_publish"));
-    const auto current = analysis_publication();
-    if (!current || current != source ||
-        current->generation != expected_generation ||
-        current->analysis_revision != expected_analysis_revision ||
-        current->overlay_revision != expected_overlay_revision ||
-        target_generation != current->generation + 1 ||
-        target_overlay_revision != current->overlay_revision + 1)
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::revision_conflict,
-            "workspace revisions changed before preview overlay publication",
-            "workspace_preview_overlay_publish"));
-    if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::analysis_in_progress,
-            "preview overlay generation cannot publish during analysis",
-            "workspace_preview_overlay_publish"));
-    if (workspace_cancel.stop_requested())
+    auto state = state_check();
+    if (!state)
+        return state;
+    if (publication_finalizer_active_.load(std::memory_order_acquire))
         return workspace_result_t<void>::failure(
-            workspace_stop_error(workspace_cancel,
-                                 "workspace_preview_overlay_publish"));
+            publication_finalizer_conflict(
+                "workspace_preview_overlay_publish"));
     publication_finalizer_active_.store(true, std::memory_order_release);
+    mutation_lock.unlock();
+    publication_lock.unlock();
     workspace_result_t<void> finalized = workspace_result_t<void>::success();
     try {
         finalized = finalizer();
@@ -1844,12 +2819,21 @@ analysis_workspace_t::publish_preview_overlay_generation(
     publication_finalizer_active_.store(false, std::memory_order_release);
     if (!finalized)
         return workspace_result_t<void>::failure(finalized.error());
-    cancellation_.request_cancel();
-    cancellation_ = std::move(*replacement_cancellation);
-    progress_.cancellation_requested = false;
-    std::atomic_store_explicit(&publication_state_->publication,
-                               std::move(replacement),
-                               std::memory_order_release);
+    std::lock(mutation_lock, publication_lock);
+    state = state_check();
+    if (!state)
+        return state;
+    {
+        std::lock_guard state_lock(state_mutex_);
+        cancellation_.request_cancel();
+        cancellation_ = std::move(*replacement_cancellation);
+        progress_.cancellation_requested = false;
+        std::atomic_store_explicit(&publication_state_->publication,
+                                   std::move(replacement),
+                                   std::memory_order_release);
+    }
+    mutation_lock.unlock();
+    publication_lock.unlock();
     return workspace_result_t<void>::success();
 }
 #endif
@@ -1869,7 +2853,7 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> analysis_workspace_t::
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
             workspace_stop_error(cancel, "workspace_create"));
     if (identity->target_kind() == target_kind_t::static_file &&
-        provider->identity().immutable_snapshot)
+        std::dynamic_pointer_cast<const live_snapshot_provider_t>(provider))
         return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "static workspace cannot use a live snapshot provider",
@@ -2533,11 +3517,29 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
             make_workspace_error(workspace_error_code_t::live_target_bulk_analysis_unsupported,
                                  "live targets do not accept baseline analysis publication",
                                  "workspace_publish"));
-    auto validation = validate_analysis_snapshot(*snapshot_value,
-                                                 require_complete_coverage,
-                                                 workspace_cancel);
-    if (!validation)
-        return validation;
+    std::uint64_t executable_bytes_value = 0;
+    bool validation_memo_hit = false;
+    {
+        std::lock_guard state_lock(state_mutex_);
+        if (validation_memo_ && validation_memo_->require_complete_coverage ==
+                require_complete_coverage) {
+            if (const auto memo_snapshot = validation_memo_->snapshot.lock();
+                memo_snapshot == snapshot_value &&
+                validation_memo_->generation == snapshot_value->generation &&
+                validation_memo_->analysis_revision == snapshot_value->analysis_revision &&
+                validation_memo_->overlay_revision == snapshot_value->overlay_revision) {
+                executable_bytes_value = validation_memo_->executable_bytes;
+                validation_memo_hit = true;
+            }
+        }
+    }
+    if (!validation_memo_hit) {
+        auto validation = validate_analysis_snapshot(*snapshot_value,
+                                                     require_complete_coverage,
+                                                     workspace_cancel);
+        if (!validation)
+            return validation;
+    }
     if (search_index_value &&
         (!search_index_value->matches(snapshot_value) ||
          !search_index_value->matches(identity_->binary_id(), identity_->load_profile_hash(),
@@ -2548,10 +3550,22 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "search index does not match the analysis snapshot",
                                  "workspace_publish"));
-    auto executable_bytes = executable_byte_count(
-        *snapshot_value, "workspace_publish");
-    if (!executable_bytes)
-        return workspace_result_t<void>::failure(executable_bytes.error());
+    if (!validation_memo_hit) {
+        auto executable_bytes = executable_byte_count(
+            *snapshot_value, "workspace_publish");
+        if (!executable_bytes)
+            return workspace_result_t<void>::failure(executable_bytes.error());
+        executable_bytes_value = executable_bytes.value();
+        std::lock_guard state_lock(state_mutex_);
+        validation_memo_t memo;
+        memo.snapshot = snapshot_value;
+        memo.generation = snapshot_value->generation;
+        memo.analysis_revision = snapshot_value->analysis_revision;
+        memo.overlay_revision = snapshot_value->overlay_revision;
+        memo.require_complete_coverage = require_complete_coverage;
+        memo.executable_bytes = executable_bytes_value;
+        validation_memo_ = memo;
+    }
     const auto source_publication = analysis_publication();
     if (!source_publication || !source_publication->snapshot)
         return workspace_result_t<void>::failure(
@@ -2572,14 +3586,11 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
         presentation_for_overlay(source_publication,
                                  snapshot_value->overlay_revision));
     auto replacement_progress = publication_progress(
-        readiness, executable_bytes.value());
+        readiness, executable_bytes_value);
     if (publication_finalizer_active_.load(std::memory_order_acquire))
         return workspace_result_t<void>::failure(
             publication_finalizer_conflict("workspace_publish"));
-    std::unique_lock<std::shared_mutex> mutation_lock(mutation_mutex_, std::defer_lock);
-    std::unique_lock<std::shared_mutex> publication_lock(publication_mutex_, std::defer_lock);
-    std::lock(mutation_lock, publication_lock);
-    {
+    const auto state_check = [&]() -> workspace_result_t<void> {
         std::lock_guard state_lock(state_mutex_);
         if (closing() || closed())
             return workspace_result_t<void>::failure(
@@ -2615,9 +3626,21 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
                                      "analysis bundle revision conflicts with workspace state",
                                      "workspace_publish"));
         }
-    }
+        return workspace_result_t<void>::success();
+    };
+    std::unique_lock<std::shared_mutex> mutation_lock(mutation_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> publication_lock(publication_mutex_, std::defer_lock);
+    std::lock(mutation_lock, publication_lock);
+    auto state = state_check();
+    if (!state)
+        return state;
     if (finalizer) {
+        if (publication_finalizer_active_.load(std::memory_order_acquire))
+            return workspace_result_t<void>::failure(
+                publication_finalizer_conflict("workspace_publish"));
         publication_finalizer_active_.store(true, std::memory_order_release);
+        mutation_lock.unlock();
+        publication_lock.unlock();
         workspace_result_t<void> finalized = workspace_result_t<void>::success();
         try {
             finalized = finalizer();
@@ -2630,6 +3653,10 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
         publication_finalizer_active_.store(false, std::memory_order_release);
         if (!finalized)
             return finalized;
+        std::lock(mutation_lock, publication_lock);
+        state = state_check();
+        if (!state)
+            return state;
     }
     {
         std::lock_guard state_lock(state_mutex_);
@@ -2639,6 +3666,9 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
         std::atomic_store_explicit(&publication_state_->publication, replacement,
                                    std::memory_order_release);
     }
+    mutation_lock.unlock();
+    publication_lock.unlock();
+    dispatch_baseline_published(replacement);
     return workspace_result_t<void>::success();
 }
 
@@ -3574,6 +4604,78 @@ make_projected_analysis_candidate(
     }
     if (invalidation.invalidated_stages != projection_stage_flag_t::none)
         next->baseline_complete = false;
+    const auto ledger_overflow = [] {
+        return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::failure(
+            make_workspace_error(workspace_error_code_t::range_overflow,
+                                 "analysis memory accounting overflows", "memory_budget"));
+    };
+    std::uint64_t string_value_bytes = 0;
+    for (const auto& string : next->strings) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(string_value_bytes,
+                static_cast<std::uint64_t>(string.value.capacity()), updated))
+            return ledger_overflow();
+        string_value_bytes = updated;
+    }
+    std::uint64_t symbol_name_bytes = 0;
+    for (const auto& symbol : next->symbols) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(symbol_name_bytes,
+                static_cast<std::uint64_t>(symbol.name.capacity()), updated))
+            return ledger_overflow();
+        symbol_name_bytes = updated;
+    }
+    std::uint64_t function_chunk_bytes = 0;
+    for (const auto& function : next->functions) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        std::uint64_t bytes = 0;
+        std::uint64_t updated = 0;
+        if (!checked_mul_u64(
+                static_cast<std::uint64_t>(function.chunks.capacity()),
+                static_cast<std::uint64_t>(sizeof(address_range_t)), bytes) ||
+            !checked_add_u64(function_chunk_bytes, bytes, updated))
+            return ledger_overflow();
+        function_chunk_bytes = updated;
+    }
+    std::uint64_t type_candidate_text_bytes = 0;
+    for (const auto& candidate : next->rich_facts.type_candidates) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(type_candidate_text_bytes,
+                static_cast<std::uint64_t>(candidate.display_name.capacity() +
+                    candidate.canonical_type.capacity() +
+                    candidate.source_key.capacity()), updated))
+            return ledger_overflow();
+        type_candidate_text_bytes = updated;
+    }
+    std::uint64_t type_reference_key_bytes = 0;
+    for (const auto& reference : next->rich_facts.type_references) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(type_reference_key_bytes,
+                static_cast<std::uint64_t>(reference.source_key.capacity()), updated))
+            return ledger_overflow();
+        type_reference_key_bytes = updated;
+    }
+    std::uint64_t metadata_conflict_text_bytes = 0;
+    for (const auto& conflict : next->rich_facts.metadata_conflicts) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(metadata_conflict_text_bytes,
+                static_cast<std::uint64_t>(conflict.identity.capacity() +
+                    conflict.selected_value.capacity() +
+                    conflict.rejected_value.capacity()), updated))
+            return ledger_overflow();
+        metadata_conflict_text_bytes = updated;
+    }
+    next->string_value_bytes = string_value_bytes;
+    next->symbol_name_bytes = symbol_name_bytes;
+    next->function_chunk_bytes = function_chunk_bytes;
+    next->type_candidate_text_bytes = type_candidate_text_bytes;
+    next->type_reference_key_bytes = type_reference_key_bytes;
+    next->metadata_conflict_text_bytes = metadata_conflict_text_bytes;
     return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::success(
         std::move(next));
 }
@@ -3814,41 +4916,50 @@ analysis_workspace_t::publish_projected_generation(
         return workspace_result_t<std::size_t>::failure(
             publication_finalizer_conflict("workspace_overlay_publish"));
 
+    const auto state_check = [&]() -> workspace_result_t<std::size_t> {
+        std::lock_guard state_lock(state_mutex_);
+        if (closing() || closed())
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(workspace_error_code_t::workspace_closing,
+                                     "workspace is closing",
+                                     "workspace_overlay_publish"));
+        const auto current = analysis_publication();
+        if (!current || current != source ||
+            current->generation != expected_generation)
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(workspace_error_code_t::stale_generation,
+                                     "workspace generation changed before projected publication",
+                                     "workspace_overlay_publish"));
+        if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(workspace_error_code_t::analysis_in_progress,
+                                     "projected generation cannot publish during analysis",
+                                     "workspace_overlay_publish"));
+        if (current->analysis_revision != expected_analysis_revision ||
+            current->overlay_revision ==
+                (std::numeric_limits<std::uint64_t>::max)() ||
+            target_overlay_revision != current->overlay_revision + 1 ||
+            projected_snapshot->image != current->snapshot->image)
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(workspace_error_code_t::revision_conflict,
+                                     "projected generation conflicts with workspace revisions",
+                                     "workspace_overlay_publish"));
+        return workspace_result_t<std::size_t>::success(0);
+    };
     std::unique_lock<std::shared_mutex> mutation_lock(
         mutation_mutex_, std::defer_lock);
     std::unique_lock<std::shared_mutex> publication_lock(
         publication_mutex_, std::defer_lock);
     std::lock(mutation_lock, publication_lock);
-    cancellation_source_t replacement_cancellation;
-    std::unique_lock state_lock(state_mutex_);
-    if (closing() || closed())
+    auto state = state_check();
+    if (!state)
+        return state;
+    if (publication_finalizer_active_.load(std::memory_order_acquire))
         return workspace_result_t<std::size_t>::failure(
-            make_workspace_error(workspace_error_code_t::workspace_closing,
-                                 "workspace is closing",
-                                 "workspace_overlay_publish"));
-    const auto current = analysis_publication();
-    if (!current || current != source ||
-        current->generation != expected_generation)
-        return workspace_result_t<std::size_t>::failure(
-            make_workspace_error(workspace_error_code_t::stale_generation,
-                                 "workspace generation changed before projected publication",
-                                 "workspace_overlay_publish"));
-    if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
-        return workspace_result_t<std::size_t>::failure(
-            make_workspace_error(workspace_error_code_t::analysis_in_progress,
-                                 "projected generation cannot publish during analysis",
-                                 "workspace_overlay_publish"));
-    if (current->analysis_revision != expected_analysis_revision ||
-        current->overlay_revision ==
-            (std::numeric_limits<std::uint64_t>::max)() ||
-        target_overlay_revision != current->overlay_revision + 1 ||
-        projected_snapshot->image != current->snapshot->image)
-        return workspace_result_t<std::size_t>::failure(
-            make_workspace_error(workspace_error_code_t::revision_conflict,
-                                 "projected generation conflicts with workspace revisions",
-                                 "workspace_overlay_publish"));
-
+            publication_finalizer_conflict("workspace_overlay_publish"));
     publication_finalizer_active_.store(true, std::memory_order_release);
+    mutation_lock.unlock();
+    publication_lock.unlock();
     workspace_result_t<void> finalized = workspace_result_t<void>::success();
     try {
         finalized = finalizer(projected_snapshot, projected_index);
@@ -3861,14 +4972,23 @@ analysis_workspace_t::publish_projected_generation(
     publication_finalizer_active_.store(false, std::memory_order_release);
     if (!finalized)
         return workspace_result_t<std::size_t>::failure(finalized.error());
-
-    cancellation_.request_cancel();
-    cancellation_ = std::move(replacement_cancellation);
-    replacement_progress.cancellation_requested = false;
-    progress_ = std::move(replacement_progress);
-    std::atomic_store_explicit(
-        &publication_state_->publication, replacement,
-        std::memory_order_release);
+    std::lock(mutation_lock, publication_lock);
+    state = state_check();
+    if (!state)
+        return state;
+    {
+        std::lock_guard state_lock(state_mutex_);
+        cancellation_source_t replacement_cancellation;
+        cancellation_.request_cancel();
+        cancellation_ = std::move(replacement_cancellation);
+        replacement_progress.cancellation_requested = false;
+        progress_ = std::move(replacement_progress);
+        std::atomic_store_explicit(
+            &publication_state_->publication, replacement,
+            std::memory_order_release);
+    }
+    mutation_lock.unlock();
+    publication_lock.unlock();
 
     return workspace_result_t<std::size_t>::success(retired_index_entries);
 }
@@ -3940,6 +5060,8 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::begin_new_generation() {
     progress_ = std::move(replacement_progress);
     std::atomic_store_explicit(
         &publication_state_->publication, replacement, std::memory_order_release);
+    if (background_metrics_)
+        background_metrics_->reset(next);
     return workspace_result_t<std::uint64_t>::success(next);
     } catch (const std::bad_alloc&) {
         return workspace_result_t<std::uint64_t>::failure(
@@ -4513,6 +5635,68 @@ workspace_result_t<void> analysis_workspace_t::register_lifecycle_participant(
     return workspace_result_t<void>::success();
 }
 
+workspace_result_t<void> analysis_workspace_t::register_baseline_publish_observer(
+    std::weak_ptr<baseline_publish_observer_t> observer) {
+    const auto locked = observer.lock();
+    if (!locked)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "baseline publish observer is null",
+                                 "workspace_lifecycle"));
+    std::lock_guard lock(state_mutex_);
+    if (closing() || closed())
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::workspace_closing,
+                                 "workspace is closing", "workspace_lifecycle"));
+    baseline_publish_observers_.erase(
+        std::remove_if(baseline_publish_observers_.begin(),
+                       baseline_publish_observers_.end(),
+                       [](const auto& weak) { return weak.expired(); }),
+        baseline_publish_observers_.end());
+    for (const auto& weak : baseline_publish_observers_) {
+        if (auto existing = weak.lock(); existing == locked)
+            return workspace_result_t<void>::success();
+    }
+    if (baseline_publish_observers_.size() >= 64)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "baseline publish observer limit is reached",
+                                 "workspace_lifecycle"));
+    baseline_publish_observers_.push_back(std::move(observer));
+    return workspace_result_t<void>::success();
+}
+
+void analysis_workspace_t::dispatch_baseline_published(
+    const std::shared_ptr<const analysis_publication_t>& publication) noexcept {
+    try {
+        std::vector<std::shared_ptr<baseline_publish_observer_t>> observers;
+        {
+            std::lock_guard state_lock(state_mutex_);
+            baseline_publish_observers_.erase(
+                std::remove_if(baseline_publish_observers_.begin(),
+                               baseline_publish_observers_.end(),
+                               [](const auto& weak) { return weak.expired(); }),
+                baseline_publish_observers_.end());
+            observers.reserve(baseline_publish_observers_.size());
+            for (const auto& weak : baseline_publish_observers_) {
+                if (auto observer = weak.lock())
+                    observers.push_back(std::move(observer));
+            }
+        }
+        for (const auto& observer : observers) {
+            try {
+                observer->on_baseline_published(publication);
+            } catch (...) {
+                ::diag::log_tagged_fmt("workspace_publish",
+                    "baseline publish observer threw");
+            }
+        }
+    } catch (...) {
+        ::diag::log_tagged_fmt("workspace_publish",
+            "baseline publish observer dispatch failed");
+    }
+}
+
 workspace_result_t<void> analysis_workspace_t::close(
     std::chrono::steady_clock::time_point deadline) {
     if (publication_finalizer_active_.load(std::memory_order_acquire))
@@ -4609,6 +5793,16 @@ workspace_result_t<void> analysis_workspace_t::install_decompiler(
                                      closing() || closed(), "decompiler");
 }
 
+workspace_result_t<void> analysis_workspace_t::install_background_decompile(
+    std::shared_ptr<decompile_batch_orchestrator_t> orchestrator) {
+    if (publication_finalizer_active_.load(std::memory_order_acquire))
+        return workspace_result_t<void>::failure(
+            publication_finalizer_conflict("workspace_service"));
+    std::lock_guard lock(state_mutex_);
+    return install_workspace_service(background_decompile_, std::move(orchestrator),
+                                     closing() || closed(), "background_decompile");
+}
+
 workspace_result_t<void> analysis_workspace_t::install_persistence_queue(
     std::shared_ptr<persistence_queue_t> queue_value) {
     if (publication_finalizer_active_.load(std::memory_order_acquire))
@@ -4675,6 +5869,19 @@ std::shared_ptr<overlay_journal_t> analysis_workspace_t::overlay() const {
 std::shared_ptr<decompiler_service_t> analysis_workspace_t::decompiler() const {
     std::lock_guard lock(state_mutex_);
     return decompiler_;
+}
+
+std::shared_ptr<decompile_batch_orchestrator_t>
+analysis_workspace_t::background_decompile() const {
+    std::lock_guard lock(state_mutex_);
+    return background_decompile_;
+}
+
+std::shared_ptr<analysis_metrics_t> analysis_workspace_t::background_metrics() const {
+    std::lock_guard lock(state_mutex_);
+    if (!background_metrics_)
+        background_metrics_ = std::make_shared<analysis_metrics_t>(generation());
+    return background_metrics_;
 }
 
 std::shared_ptr<persistence_queue_t> analysis_workspace_t::persistence_queue() const {

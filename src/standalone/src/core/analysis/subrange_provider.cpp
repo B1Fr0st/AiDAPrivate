@@ -107,6 +107,15 @@ std::uint64_t subrange_provider_t::maximum_contiguous_lease(std::uint64_t offset
     return (std::min)(length_ - offset, parent_capacity);
 }
 
+bool subrange_provider_t::content_pin_active() const noexcept {
+    return parent_->content_pin_active();
+}
+
+std::optional<mapped_window_cache_statistics_t>
+subrange_provider_t::window_cache_statistics() const noexcept {
+    return parent_->window_cache_statistics();
+}
+
 workspace_result_t<byte_view_t> subrange_provider_t::lease(
     std::uint64_t offset, std::uint64_t size_value,
     const cancellation_token_t& cancel) const {

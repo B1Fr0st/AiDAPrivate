@@ -16,6 +16,7 @@
 #include "../infra/executor.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../runtime/standalone_driver.hpp"
+#include "../runtime/kernel_symbols.hpp"
 #include "../analysis/stealth_engine.hpp"
 #include "../anti-tamper/state.hpp"
 #include "../../helpers/diag_log.hpp"
@@ -2138,6 +2139,63 @@ static bool parse_kernel_address_param(const json& params, const char* key, std:
     return false;
 }
 
+static json kernel_symbols_status_json()
+{
+    const kernel_symbols::status_t st = kernel_symbols::status();
+    json out;
+    out["state"] = kernel_symbols::state_name(st.state);
+    out["ready"] = st.state == kernel_symbols::state_t::ready;
+    out["detail"] = st.detail;
+    out["last_error"] = st.last_error;
+    out["pdb_name"] = st.pdb_name;
+    out["cache_path"] = st.cache_path;
+    out["from_cache"] = st.from_cache;
+    out["ntoskrnl_base"] = sa_format_address(st.ntoskrnl_base);
+    out["ntoskrnl_size"] = st.ntoskrnl_size;
+    out["function_count"] = st.function_count;
+    out["global_count"] = st.global_count;
+    out["struct_count"] = st.struct_count;
+    out["load_duration_ms"] = st.load_duration_ms;
+    return out;
+}
+
+static bool parse_kernel_address_or_symbol(const json& params, const char* key,
+                                           std::uint64_t& out, std::string& err)
+{
+    err.clear();
+    if (parse_kernel_address_param(params, key, out))
+        return true;
+    if (!params.contains(key))
+    {
+        err = std::string("Missing '") + key + "'.";
+        return false;
+    }
+    const auto& value = params[key];
+    if (!value.is_string())
+    {
+        err = std::string("'") + key + "' must be a kernel address or symbol expression.";
+        return false;
+    }
+    const std::string expression = value.get<std::string>();
+    kernel_symbols::ensure_started();
+    if (auto resolved = kernel_symbols::resolve(expression))
+    {
+        out = *resolved;
+        diag::log_tagged_fmt("drv_tools",
+            "parse_kernel_address_or_symbol key=%s expr=\"%s\" -> 0x%llX",
+            key, expression.c_str(), static_cast<unsigned long long>(out));
+        return true;
+    }
+    const kernel_symbols::status_t st = kernel_symbols::status();
+    err = std::string("Could not resolve '") + expression +
+        "' as a kernel address or symbol expression (symbols state=" +
+        kernel_symbols::state_name(st.state) +
+        (st.detail.empty() ? "" : ", detail=" + st.detail) +
+        (st.last_error.empty() ? "" : ", last_error=" + st.last_error) + ").";
+    return false;
+}
+
+
 tool_result_t driver_read_kernel_memory(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_read_kernel_memory entry");
@@ -2145,8 +2203,17 @@ tool_result_t driver_read_kernel_memory(const json& params)
         return *context_error;
 
     std::uint64_t address = 0;
-    if (!parse_kernel_address_param(params, "address", address))
-        return tool_result_t::error(OBFSTR("Missing or invalid kernel address."));
+    std::string address_error;
+    if (!parse_kernel_address_or_symbol(params, "address", address, address_error))
+        return tool_result_t::error(OBFSTR("Missing or invalid kernel address: ") + address_error);
+
+    const bool annotate = !params.contains("annotate") || !params["annotate"].is_boolean() ||
+        params["annotate"].get<bool>();
+    std::string struct_name;
+    if (params.contains("struct") && params["struct"].is_string())
+        struct_name = params["struct"].get<std::string>();
+    if (annotate || !struct_name.empty())
+        kernel_symbols::ensure_started();
 
     std::uint64_t size64 = 0;
     if (!parse_kernel_size(params, "size", size64))
@@ -2169,6 +2236,7 @@ tool_result_t driver_read_kernel_memory(const json& params)
     {
         json details;
         details["address"] = sa_format_address(address);
+        details["address_pretty"] = kernel_symbols::format(address);
         details["requested_size"] = size64;
         details["driver_status"] = driver_bridge::status();
         details["driver_error"] = driver_bridge::last_error();
@@ -2183,11 +2251,94 @@ tool_result_t driver_read_kernel_memory(const json& params)
     result["hex"] = kernel_bytes_hex(bytes);
     result["ascii"] = kernel_bytes_ascii(bytes);
     result["kernel_dtb"] = sa_format_address(device->get_kernel_dtb() != 0 ? device->get_kernel_dtb() : device->get_dtb());
+    result["address_pretty"] = kernel_symbols::format(address);
+    result["symbols"] = kernel_symbols_status_json();
+
+    if (annotate)
+    {
+        const bool symbols_ready = kernel_symbols::ready();
+        constexpr std::size_t max_annotations = 256;
+        std::size_t annotation_count = 0;
+        json lines = json::array();
+        for (std::size_t row = 0; row < bytes.size(); row += 16)
+        {
+            const std::size_t row_len = (std::min)(bytes.size() - row, static_cast<std::size_t>(16));
+            const std::uint64_t row_address = address + row;
+            const std::vector<std::uint8_t> row_bytes(bytes.begin() + row, bytes.begin() + row + row_len);
+            json line;
+            line["address"] = sa_format_address(row_address);
+            line["pretty"] = kernel_symbols::format(row_address);
+            line["hex"] = kernel_bytes_hex(row_bytes);
+            line["ascii"] = kernel_bytes_ascii(row_bytes);
+            if (symbols_ready && annotation_count < max_annotations && row_len >= 8)
+            {
+                json pointers = json::array();
+                for (std::size_t off = 0; off + 8 <= row_len; off += 8)
+                {
+                    std::uint64_t pointer = 0;
+                    std::memcpy(&pointer, bytes.data() + row + off, sizeof(pointer));
+                    if (!is_probably_kernel_address(pointer))
+                        continue;
+                    if (!kernel_symbols::lookup(pointer))
+                        continue;
+                    json annotation;
+                    annotation["offset"] = row + off;
+                    annotation["value"] = sa_format_address(pointer);
+                    annotation["pretty"] = kernel_symbols::format(pointer);
+                    pointers.push_back(std::move(annotation));
+                    if (++annotation_count >= max_annotations)
+                        break;
+                }
+                if (!pointers.empty())
+                    line["pointers"] = std::move(pointers);
+            }
+            lines.push_back(std::move(line));
+        }
+        result["annotated_lines"] = std::move(lines);
+    }
+
+    if (!struct_name.empty())
+    {
+        if (auto desc = kernel_symbols::describe_struct(struct_name))
+        {
+            json decoded;
+            decoded["name"] = desc->name;
+            decoded["size"] = desc->size;
+            decoded["truncated"] = bytes.size() < desc->size;
+            const auto fields = kernel_symbols::decode_struct_buffer(*desc, bytes, address);
+            json field_array = json::array();
+            for (const auto& field : fields)
+            {
+                json entry;
+                entry["name"] = field.name;
+                entry["type"] = field.type;
+                entry["offset"] = field.offset;
+                entry["size"] = field.size;
+                entry["value"] = field.value;
+                entry["truncated"] = field.truncated;
+                if (!field.annotation.empty())
+                    entry["annotation"] = field.annotation;
+                field_array.push_back(std::move(entry));
+            }
+            decoded["fields"] = std::move(field_array);
+            result["struct_decode"] = std::move(decoded);
+        }
+        else
+        {
+            json failure;
+            failure["error"] = std::string("Struct '") + struct_name +
+                "' was not found in the loaded kernel PDB (symbols state=" +
+                kernel_symbols::state_name(kernel_symbols::status().state) + ").";
+            failure["struct"] = struct_name;
+            result["struct_decode"] = std::move(failure);
+        }
+    }
+
     diag::log_tagged_fmt("drv_tools",
-        "driver_read_kernel_memory exit addr=0x%llX requested=%llu read=%zu complete=%d",
+        "driver_read_kernel_memory exit addr=0x%llX requested=%llu read=%zu complete=%d annotate=%d struct=\"%s\"",
         static_cast<unsigned long long>(address),
         static_cast<unsigned long long>(size64),
-        bytes.size(), bytes.size() == size64 ? 1 : 0);
+        bytes.size(), bytes.size() == size64 ? 1 : 0, annotate ? 1 : 0, struct_name.c_str());
     if (bytes.size() != size64)
         return tool_result_t::error(
             OBFSTR("Kernel memory read was partial; exact-length reads are required."),
@@ -2199,8 +2350,9 @@ tool_result_t driver_write_kernel_memory(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_write_kernel_memory entry");
     std::uint64_t address = 0;
-    if (!parse_kernel_address_param(params, "address", address))
-        return tool_result_t::error(OBFSTR("Missing or invalid kernel address."));
+    std::string address_error;
+    if (!parse_kernel_address_or_symbol(params, "address", address, address_error))
+        return tool_result_t::error(OBFSTR("Missing or invalid kernel address: ") + address_error);
 
     if (!params.contains("bytes"))
         return tool_result_t::error(OBFSTR("Missing bytes payload."));
@@ -2382,8 +2534,9 @@ tool_result_t search_kernel_memory(const json& params)
     else
     {
         const char* address_key = params.contains("address") ? "address" : "start_address";
-        if (!parse_kernel_address_param(params, address_key, start))
-            return tool_result_t::error(OBFSTR("Missing or invalid address/start_address."));
+        std::string address_error;
+        if (!parse_kernel_address_or_symbol(params, address_key, start, address_error))
+            return tool_result_t::error(OBFSTR("Missing or invalid address/start_address: ") + address_error);
         if (!parse_kernel_size(params, "size", span))
             return tool_result_t::error(OBFSTR("Missing or invalid scan size."));
     }
@@ -7009,6 +7162,156 @@ tool_result_t driver_set_page_guard(const json& params)
 }
 
 
+tool_result_t driver_kernel_symbols(const json& params)
+{
+    diag::log_tagged_fmt("drv_tools", "driver_kernel_symbols entry");
+    std::string action = "status";
+    if (params.contains("action") && params["action"].is_string())
+        action = params["action"].get<std::string>();
+    std::transform(action.begin(), action.end(), action.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (action == "reload")
+    {
+        kernel_symbols::request_reload();
+        json result;
+        result["reloading"] = true;
+        result["symbols"] = kernel_symbols_status_json();
+        return tool_result_t::ok(OBFSTR("Kernel symbol engine reload scheduled."), result);
+    }
+
+    kernel_symbols::ensure_started();
+
+    if (action == "status")
+    {
+        json result = kernel_symbols_status_json();
+        return tool_result_t::ok(OBFSTR("Kernel symbol engine status."), result);
+    }
+
+    if (action == "resolve")
+    {
+        std::string expression;
+        if (params.contains("expression") && params["expression"].is_string())
+            expression = params["expression"].get<std::string>();
+        if (expression.empty())
+            return tool_result_t::error(OBFSTR("Missing expression to resolve."));
+        if (const auto value = kernel_symbols::resolve(expression))
+        {
+            json result;
+            result["expression"] = expression;
+            result["address"] = sa_format_address(*value);
+            result["pretty"] = kernel_symbols::format(*value);
+            result["symbols"] = kernel_symbols_status_json();
+            return tool_result_t::ok(OBFSTR("Resolved kernel symbol expression."), result);
+        }
+        json details;
+        details["expression"] = expression;
+        details["symbols"] = kernel_symbols_status_json();
+        return tool_result_t::error(
+            OBFSTR("Could not resolve the kernel symbol expression."),
+            OBFSTR("symbol_resolve_failed"), details);
+    }
+
+    if (action == "lookup")
+    {
+        std::uint64_t address = 0;
+        std::string address_error;
+        if (!parse_kernel_address_or_symbol(params, "address", address, address_error))
+            return tool_result_t::error(OBFSTR("Missing or invalid address: ") + address_error);
+        json result;
+        result["address"] = sa_format_address(address);
+        result["pretty"] = kernel_symbols::format(address);
+        if (const auto hit = kernel_symbols::lookup(address))
+        {
+            json found;
+            found["resolved"] = hit->resolved;
+            found["module"] = hit->module;
+            found["symbol"] = hit->symbol;
+            found["symbol_base_va"] = sa_format_address(hit->symbol_base_va);
+            found["offset"] = hit->offset;
+            found["offset_hex"] = sa_format_address(hit->offset);
+            found["exact"] = hit->exact;
+            result["lookup"] = std::move(found);
+        }
+        else
+        {
+            result["lookup"] = nullptr;
+        }
+        result["symbols"] = kernel_symbols_status_json();
+        return tool_result_t::ok(OBFSTR("Looked up kernel address."), result);
+    }
+
+    if (action == "struct")
+    {
+        std::string name;
+        if (params.contains("name") && params["name"].is_string())
+            name = params["name"].get<std::string>();
+        if (name.empty())
+            return tool_result_t::error(OBFSTR("Missing struct name."));
+        if (const auto desc = kernel_symbols::describe_struct(name))
+        {
+            json result;
+            result["name"] = desc->name;
+            result["size"] = desc->size;
+            json fields = json::array();
+            for (const auto& field : desc->fields)
+            {
+                json entry;
+                entry["name"] = field.name;
+                entry["type"] = field.type;
+                entry["offset"] = field.offset;
+                entry["size"] = field.size;
+                fields.push_back(std::move(entry));
+            }
+            result["fields"] = std::move(fields);
+            result["symbols"] = kernel_symbols_status_json();
+            return tool_result_t::ok(OBFSTR("Described kernel struct layout."), result);
+        }
+        json details;
+        details["struct"] = name;
+        details["symbols"] = kernel_symbols_status_json();
+        return tool_result_t::error(
+            OBFSTR("Struct was not found in the loaded kernel PDB."),
+            OBFSTR("struct_not_found"), details);
+    }
+
+    if (action == "modules")
+    {
+        std::vector<std::uint8_t> module_buffer;
+        sys_module_info_t* info = nullptr;
+        std::string module_error;
+        kernel_module_query_diagnostics_t query_diagnostics{};
+        if (!query_kernel_modules(module_buffer, info, module_error, &query_diagnostics,
+                kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
+            return kernel_module_query_error_result(module_error, query_diagnostics);
+        json modules_arr = json::array();
+        for (ULONG i = 0; i < info->NumberOfModules; ++i)
+        {
+            const auto& m = info->Modules[i];
+            json entry;
+            entry["name"] = bounded_kernel_module_name(m);
+            entry["path"] = bounded_kernel_module_path(m);
+            entry["base"] = sa_format_address(
+                static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(m.ImageBase)));
+            entry["size"] = m.ImageSize;
+            entry["size_hex"] = sa_format_address(static_cast<uint64_t>(m.ImageSize));
+            modules_arr.push_back(std::move(entry));
+        }
+        json result;
+        result["modules"] = std::move(modules_arr);
+        result["total_loaded"] = info->NumberOfModules;
+        result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diagnostics);
+        result["symbols"] = kernel_symbols_status_json();
+        return tool_result_t::ok(
+            OBFSTR("Enumerated ") + std::to_string(info->NumberOfModules) + OBFSTR(" loaded kernel modules."),
+            result);
+    }
+
+    return tool_result_t::error(
+        OBFSTR("Invalid action. Use 'status', 'reload', 'resolve', 'lookup', 'struct', or 'modules'."));
+}
+
+
 void register_driver_tools(mcp_standalone::server_t& srv)
 {
     diag::log_tagged_fmt("drv_tools", "register_driver_tools entry");
@@ -7051,10 +7354,35 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         OBFSTR("Read an arbitrary canonical kernel virtual-address range using the live kernel DTB. "
                "This is independent of the attached process address space and is intended for ntoskrnl globals, "
                "driver globals, executive objects, pool allocations, and other live kernel structures. "
-               "Returns exact packed hex, ASCII rendering, byte counts, and whether the full request was readable."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Canonical kernel virtual address, for example 0xFFFFF80000000000"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to read, from 1 through 1048576"), true}},
+               "The address accepts plain hex/decimal values and kernel symbol expressions such as "
+               "'nt!NtCreateFile+0x10' or 'PsInitialSystemProcess' once the kernel symbol engine is ready. "
+               "Returns exact packed hex, ASCII rendering, byte counts, and whether the full request was readable. "
+               "With annotate=true (default) also returns annotated_lines: 16-byte rows whose embedded qword "
+               "pointers are resolved to 'nt!Symbol+0xN' or '<module>+0xN'. "
+               "Pass struct='<PDB struct name>' (for example '_EPROCESS' or 'EPROCESS') to decode the read buffer "
+               "field-by-field from the live kernel PDB."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Canonical kernel virtual address (0x...) or symbol expression such as 'nt!NtCreateFile+0x10'"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to read, from 1 through 1048576"), true},
+         {OBFSTR("annotate"), OBFSTR("boolean"), OBFSTR("Attach symbolicated 16-byte annotated_lines with pointer resolution (default true)"), false},
+         {OBFSTR("struct"), OBFSTR("string"), OBFSTR("Optional PDB struct name used to decode the read buffer field-by-field"), false}},
         driver_read_kernel_memory, true});
+
+    register_compat(srv, {
+        OBFSTR("driver_kernel_symbols"), OBFSTR("driver"),
+        OBFSTR("Manage the in-memory kernel symbol engine (MemPDB over the live ntoskrnl debug directory, cached "
+               "under the user profile, resolved through the Microsoft symbol server when missing). "
+               "Actions: status (default) reports engine state, PDB name, cache path, symbol counts and ntoskrnl base; "
+               "reload drops all state and re-downloads/re-parses after a driver reconnect; "
+               "resolve (expression='nt!NtCreateFile+0x10' or bare 'PsInitialSystemProcess') maps a symbol expression to an address; "
+               "lookup (address=0x... or symbol expression) maps an address to the nearest symbol or containing kernel module; "
+               "struct (name='_EPROCESS') returns the PDB field layout; "
+               "modules lists loaded kernel modules with base, size, and path."),
+        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("status | reload | resolve | lookup | struct | modules"), false},
+         {OBFSTR("expression"), OBFSTR("string"), OBFSTR("Symbol expression for action=resolve, for example 'nt!NtCreateFile+0x10'"), false},
+         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Kernel address or symbol expression for action=lookup"), false},
+         {OBFSTR("name"), OBFSTR("string"), OBFSTR("PDB struct name for action=struct (leading underscore optional)"), false}},
+        driver_kernel_symbols, true});
+
 
     register_compat(srv, {
         OBFSTR("driver_write_kernel_memory"), OBFSTR("driver"),

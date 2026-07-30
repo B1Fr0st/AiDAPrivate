@@ -42,6 +42,7 @@ workspace_registry_t& workspace_registry() {
 
 #include "workspace_identity.hpp"
 #include "decompiler_service.hpp"
+#include "../decompiler/decompile_batch_orchestrator.hpp"
 #include "workspace_database.hpp"
 #include "overlay_journal.hpp"
 #include "apk_container.hpp"
@@ -1555,6 +1556,10 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
         if (!decompiler_result && !workspace->decompiler())
             return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
                 decompiler_result.error());
+    }
+
+    if (!workspace->background_decompile()) {
+        (void)decompile_batch_orchestrator_t::create(workspace, workspace->background_metrics());
     }
 
     return insert_or_get(workspace);

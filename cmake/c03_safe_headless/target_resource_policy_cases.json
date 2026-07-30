@@ -4,8 +4,8 @@
   "cases": [
     {
       "id": "ordinary-default",
-      "entry_id": "fixture.authority",
-      "source_target": "aida_c03_fixture_authority",
+      "entry_id": "fixture.materializer",
+      "source_target": "aida_c03_a06_fixture_materializer_harness",
       "max_active_processes": 1,
       "max_wall_ms": 120000,
       "accepted": true
@@ -20,8 +20,8 @@
     },
     {
       "id": "zero-process",
-      "entry_id": "fixture.authority",
-      "source_target": "aida_c03_fixture_authority",
+      "entry_id": "fixture.materializer",
+      "source_target": "aida_c03_a06_fixture_materializer_harness",
       "max_active_processes": 0,
       "max_wall_ms": 120000,
       "accepted": false
@@ -36,16 +36,16 @@
     },
     {
       "id": "unauthorized-multi-process",
-      "entry_id": "fixture.authority",
-      "source_target": "aida_c03_fixture_authority",
+      "entry_id": "fixture.materializer",
+      "source_target": "aida_c03_a06_fixture_materializer_harness",
       "max_active_processes": 4,
       "max_wall_ms": 120000,
       "accepted": false
     },
     {
       "id": "unauthorized-wall-override",
-      "entry_id": "fixture.authority",
-      "source_target": "aida_c03_fixture_authority",
+      "entry_id": "fixture.materializer",
+      "source_target": "aida_c03_a06_fixture_materializer_harness",
       "max_active_processes": 1,
       "max_wall_ms": 1800000,
       "accepted": false
@@ -68,8 +68,8 @@
     },
     {
       "id": "under-wall-bound",
-      "entry_id": "fixture.authority",
-      "source_target": "aida_c03_fixture_authority",
+      "entry_id": "fixture.materializer",
+      "source_target": "aida_c03_a06_fixture_materializer_harness",
       "max_active_processes": 1,
       "max_wall_ms": 99,
       "accepted": false

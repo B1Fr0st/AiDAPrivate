@@ -97,6 +97,7 @@ struct decompiler_provider_request_t {
     decompiler_pipeline_cache_key_t cache_key;
     std::chrono::steady_clock::time_point deadline;
     std::shared_ptr<const decompiler_provider_context_t> context;
+    bool interactive = false;
 };
 
 struct decompiler_provider_artifacts_t {

@@ -1169,6 +1169,33 @@ CREATE TABLE IF NOT EXISTS overlay_v9_state(
     updated_utc_ms INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO overlay_v9_state(singleton,target_image_hash,target_provenance_hash,target_image_base,target_image_size,target_generation,target_kind,target_architecture,target_address_width,revision,next_transaction_id,history_cursor,history_epoch,updated_utc_ms) VALUES(1,zeroblob(32),zeroblob(32),0,0,0,0,0,0,0,1,0,1,0);
+CREATE TABLE IF NOT EXISTS packed_generation_staging(
+    generation INTEGER NOT NULL,
+    domain INTEGER NOT NULL CHECK(domain BETWEEN 1 AND 19),
+    domain_page_index INTEGER NOT NULL,
+    ordinal_begin INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    address_value_min INTEGER NOT NULL,
+    address_value_max INTEGER NOT NULL,
+    payload BLOB NOT NULL CHECK(length(payload) BETWEEN 32 AND 1048576),
+    PRIMARY KEY(generation,domain,domain_page_index)
+);
+CREATE TABLE IF NOT EXISTS decompiler_pipeline_cache_v1(
+    cache_key BLOB PRIMARY KEY,
+    stage INTEGER NOT NULL,
+    workspace_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    analysis_revision INTEGER NOT NULL,
+    overlay_revision INTEGER NOT NULL,
+    function_rva INTEGER NOT NULL,
+    value BLOB NOT NULL,
+    diagnostics BLOB NOT NULL,
+    created_utc_ms INTEGER NOT NULL,
+    last_access_utc_ms INTEGER NOT NULL,
+    value_bytes INTEGER NOT NULL CHECK(value_bytes=length(CAST(value AS BLOB)))
+);
+CREATE INDEX IF NOT EXISTS decompiler_pipeline_cache_v1_workspace ON decompiler_pipeline_cache_v1(workspace_id,generation,stage);
+CREATE INDEX IF NOT EXISTS decompiler_pipeline_cache_v1_function ON decompiler_pipeline_cache_v1(function_rva,overlay_revision,generation);
 )SQL", "workspace_schema_v9.migrate");
     if (!result)
         return result;
@@ -2829,6 +2856,454 @@ workspace_result_t<void> rollback_packed_generation(
                          "RELEASE aida_rollback_packed_generation_v9",
                          "workspace_schema_v9.rollback.commit");
     return result;
+}
+
+workspace_result_t<void> publish_packed_generation_metadata(
+    sqlite3* database, std::uint64_t generation,
+    const packed_stop_predicate_t& stop_requested) {
+    if (generation == 0) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "publish generation must be non-zero",
+                                 "workspace_schema_v9.publish_packed_generation_metadata"));
+    }
+    auto transaction = exec_sql_v9(
+        database, "SAVEPOINT aida_publish_packed_generation_metadata_v9",
+        "workspace_schema_v9.publish_packed_generation_metadata.begin");
+    if (!transaction)
+        return transaction;
+    const auto fail = [&](workspace_result_t<void> failure) {
+        exec_sql_v9(database,
+            "ROLLBACK TO aida_publish_packed_generation_metadata_v9",
+            "workspace_schema_v9.publish_packed_generation_metadata.rollback");
+        exec_sql_v9(database,
+            "RELEASE aida_publish_packed_generation_metadata_v9",
+            "workspace_schema_v9.publish_packed_generation_metadata.release");
+        return failure;
+    };
+    if (publish_stop_requested_v9(stop_requested))
+        return fail(cancelled_publish_error());
+    auto manifest = read_packed_generation(
+        database, generation, false, stop_requested);
+    if (!manifest)
+        return fail(workspace_result_t<void>::failure(manifest.error()));
+    if (!manifest.value() || manifest.value()->committed) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_not_found,
+                                 "packed generation not found or already committed",
+                                 "workspace_schema_v9.publish_packed_generation_metadata")));
+    }
+    if (manifest.value()->shard_count == 0 ||
+        manifest.value()->shard_count >
+            static_cast<std::uint16_t>(packed_page_last_data_type) ||
+        manifest.value()->total_payload_bytes >
+            packed_generation_max_payload_bytes ||
+        manifest.value()->total_records > packed_generation_max_records) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "staged packed generation metadata is invalid",
+                                 "workspace_schema_v9.publish_packed_generation_metadata")));
+    }
+    v9_statement_t statement;
+    auto result = statement.prepare(database, R"SQL(
+SELECT p.page_index,p.page_count,p.page_type,p.checksum,p.payload_length,
+       i.domain,i.ordinal_begin,i.count
+FROM packed_pages p
+JOIN packed_page_index i ON i.generation=p.generation AND i.page_index=p.page_index
+WHERE p.generation=?1
+ORDER BY p.page_index
+)SQL", "workspace_schema_v9.publish_packed_generation_metadata.validate");
+    if (!result)
+        return fail(std::move(result));
+    result = statement.bind_uint(1, generation);
+    if (!result)
+        return fail(std::move(result));
+    std::uint32_t expected_page_count = 0;
+    std::uint32_t next_page_index = 0;
+    std::uint64_t observed_payload_bytes = 0;
+    std::uint64_t observed_records = 0;
+    std::unordered_set<std::uint16_t> domains;
+    std::array<std::uint64_t,
+               static_cast<std::size_t>(packed_page_last_data_type) + 1U>
+        next_domain_ordinals{};
+    std::vector<std::uint8_t> checksum_bytes;
+    for (;;) {
+        if (publish_stop_requested_v9(stop_requested))
+            return fail(cancelled_publish_error());
+        const int status = sqlite3_step(statement.get());
+        if (status == SQLITE_DONE)
+            break;
+        if (status != SQLITE_ROW) {
+            return fail(workspace_result_t<void>::failure(
+                schema_v9_error(database, status,
+                                "unable to validate staged packed generation metadata",
+                                "workspace_schema_v9.publish_packed_generation_metadata")));
+        }
+        const auto page_index = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 0));
+        const auto page_count = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 1));
+        const auto page_type = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 2));
+        const auto page_checksum = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 3));
+        const auto payload_length = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 4));
+        const auto domain = static_cast<std::uint16_t>(
+            sqlite3_column_int(statement.get(), 5));
+        const auto ordinal_begin = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 6));
+        const auto record_count = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 7));
+        const auto domain_index = static_cast<std::size_t>(page_type);
+        std::uint64_t next_domain_ordinal = 0;
+        if (page_index != next_page_index || page_count == 0 ||
+            page_count > packed_generation_max_pages ||
+            (expected_page_count != 0 && page_count != expected_page_count) ||
+            page_type < static_cast<std::uint32_t>(
+                packed_page_type_t::instructions) ||
+            page_type > static_cast<std::uint32_t>(packed_page_last_data_type) ||
+            domain != static_cast<std::uint16_t>(page_type) ||
+            payload_length < packed_record_page_prefix_size ||
+            payload_length > packed_page_max_payload ||
+            ordinal_begin != next_domain_ordinals[domain_index] ||
+            !checked_add_u64(next_domain_ordinals[domain_index],
+                             record_count, next_domain_ordinal) ||
+            !checked_add_u64(observed_payload_bytes, payload_length,
+                             observed_payload_bytes) ||
+            observed_payload_bytes > packed_generation_max_payload_bytes ||
+            !checked_add_u64(observed_records, record_count,
+                             observed_records) ||
+            observed_records > packed_generation_max_records) {
+            return fail(workspace_result_t<void>::failure(
+                make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "staged packed page metadata is inconsistent",
+                    "workspace_schema_v9.publish_packed_generation_metadata")));
+        }
+        expected_page_count = page_count;
+        next_domain_ordinals[domain_index] = next_domain_ordinal;
+        append_u32_le_v9(checksum_bytes, page_checksum);
+        domains.insert(domain);
+        ++next_page_index;
+    }
+    if (next_page_index == 0 || next_page_index != expected_page_count ||
+        domains.size() != manifest.value()->shard_count ||
+        observed_payload_bytes != manifest.value()->total_payload_bytes ||
+        observed_records != manifest.value()->total_records) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "staged packed generation metadata totals are inconsistent",
+                "workspace_schema_v9.publish_packed_generation_metadata")));
+    }
+    auto checksum = crc32c_cancellable(
+        checksum_bytes.data(), checksum_bytes.size(), stop_requested);
+    if (!checksum)
+        return fail(workspace_result_t<void>::failure(checksum.error()));
+    if (checksum.value() != manifest.value()->batch_checksum) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "staged packed generation metadata checksum is inconsistent",
+                "workspace_schema_v9.publish_packed_generation_metadata")));
+    }
+    if (publish_stop_requested_v9(stop_requested))
+        return fail(cancelled_publish_error());
+    v9_statement_t promote;
+    result = promote.prepare(database,
+        "UPDATE packed_generations SET committed=1 WHERE generation=?1 AND committed=0",
+        "workspace_schema_v9.publish_packed_generation_metadata");
+    if (!result) return fail(std::move(result));
+    result = promote.bind_uint(1, generation);
+    if (!result) return fail(std::move(result));
+    result = promote.step_done();
+    if (!result) return fail(std::move(result));
+    if (sqlite3_changes(database) == 0) {
+        return fail(workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::target_not_found,
+                                 "packed generation not found or already committed",
+                                 "workspace_schema_v9.publish_packed_generation_metadata")));
+    }
+    result = exec_sql_v9(database,
+        "RELEASE aida_publish_packed_generation_metadata_v9",
+        "workspace_schema_v9.publish_packed_generation_metadata.commit");
+    return result;
+}
+
+workspace_result_t<void> write_packed_generation_staging_page(
+    sqlite3* database, const packed_generation_staging_row_t& row) {
+    if (!database || row.generation == 0 ||
+        row.domain < static_cast<std::uint16_t>(packed_page_type_t::instructions) ||
+        row.domain > static_cast<std::uint16_t>(packed_page_last_data_type) ||
+        row.payload.size() < packed_record_page_prefix_size ||
+        row.payload.size() > packed_page_max_payload) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "packed staging row exceeds its bounded invariants",
+                                 "workspace_schema_v9.write_staging_page"));
+    }
+    v9_statement_t statement;
+    auto result = statement.prepare(database, R"SQL(
+INSERT INTO packed_generation_staging(generation,domain,domain_page_index,ordinal_begin,record_count,address_value_min,address_value_max,payload)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+ON CONFLICT(generation,domain,domain_page_index) DO UPDATE SET ordinal_begin=excluded.ordinal_begin,record_count=excluded.record_count,address_value_min=excluded.address_value_min,address_value_max=excluded.address_value_max,payload=excluded.payload
+)SQL", "workspace_schema_v9.write_staging_page");
+    if (!result) return result;
+    result = statement.bind_uint(1, row.generation); if (!result) return result;
+    result = statement.bind_int(2, static_cast<std::int64_t>(row.domain)); if (!result) return result;
+    result = statement.bind_int(3, static_cast<std::int64_t>(row.domain_page_index)); if (!result) return result;
+    result = statement.bind_int(4, static_cast<std::int64_t>(row.ordinal_begin)); if (!result) return result;
+    result = statement.bind_int(5, static_cast<std::int64_t>(row.record_count)); if (!result) return result;
+    result = statement.bind_uint(6, row.address_value_min); if (!result) return result;
+    result = statement.bind_uint(7, row.address_value_max); if (!result) return result;
+    result = statement.bind_blob(8, row.payload.data(), row.payload.size()); if (!result) return result;
+    return statement.step_done();
+}
+
+workspace_result_t<void> visit_packed_generation_staging(
+    sqlite3* database, std::uint64_t generation, std::uint16_t domain,
+    const packed_generation_staging_visitor_t& visitor,
+    const packed_stop_predicate_t& stop_requested) {
+    if (!database || generation == 0 || !visitor ||
+        domain < static_cast<std::uint16_t>(packed_page_type_t::instructions) ||
+        domain > static_cast<std::uint16_t>(packed_page_last_data_type)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "packed staging visitor identity is invalid",
+                                 "workspace_schema_v9.visit_staging"));
+    }
+    v9_statement_t statement;
+    auto result = statement.prepare(database, R"SQL(
+SELECT domain_page_index,ordinal_begin,record_count,address_value_min,address_value_max,payload
+FROM packed_generation_staging
+WHERE generation=?1 AND domain=?2
+ORDER BY domain_page_index
+)SQL", "workspace_schema_v9.visit_staging");
+    if (!result)
+        return result;
+    result = statement.bind_uint(1, generation); if (!result) return result;
+    result = statement.bind_int(2, static_cast<std::int64_t>(domain)); if (!result) return result;
+    std::uint32_t expected_page_index = 0;
+    for (;;) {
+        if (publish_stop_requested_v9(stop_requested))
+            return workspace_result_t<void>::failure(
+                cancelled_read_error_v9("workspace_schema_v9.visit_staging"));
+        const int status = sqlite3_step(statement.get());
+        if (status == SQLITE_DONE)
+            break;
+        if (status != SQLITE_ROW) {
+            return workspace_result_t<void>::failure(schema_v9_error(
+                database, status, "unable to visit packed staging row",
+                "workspace_schema_v9.visit_staging"));
+        }
+        packed_generation_staging_row_t row;
+        row.generation = generation;
+        row.domain = domain;
+        row.domain_page_index = static_cast<std::uint32_t>(sqlite3_column_int64(statement.get(), 0));
+        row.ordinal_begin = static_cast<std::uint32_t>(sqlite3_column_int64(statement.get(), 1));
+        row.record_count = static_cast<std::uint32_t>(sqlite3_column_int64(statement.get(), 2));
+        row.address_value_min = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 3));
+        row.address_value_max = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 4));
+        const void* blob = sqlite3_column_blob(statement.get(), 5);
+        const int blob_size = sqlite3_column_bytes(statement.get(), 5);
+        if (row.domain_page_index != expected_page_index ||
+            blob_size < static_cast<int>(packed_record_page_prefix_size) ||
+            blob_size > static_cast<int>(packed_page_max_payload) || !blob) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "packed staging row identity or payload is malformed",
+                                     "workspace_schema_v9.visit_staging"));
+        }
+        auto copied = copy_blob_v9(
+            row.payload, static_cast<const std::uint8_t*>(blob),
+            static_cast<std::size_t>(blob_size), stop_requested,
+            "workspace_schema_v9.visit_staging");
+        if (!copied)
+            return copied;
+        auto visited = visitor(std::move(row));
+        if (!visited)
+            return visited;
+        ++expected_page_index;
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> delete_packed_generation_staging(
+    sqlite3* database, std::uint64_t generation) {
+    v9_statement_t statement;
+    auto result = statement.prepare(database,
+        "DELETE FROM packed_generation_staging WHERE generation=?1",
+        "workspace_schema_v9.delete_staging");
+    if (!result) return result;
+    result = statement.bind_uint(1, generation); if (!result) return result;
+    return statement.step_done();
+}
+
+workspace_result_t<void> gc_packed_generation_staging(sqlite3* database) {
+    return exec_sql_v9(database,
+        "DELETE FROM packed_generation_staging WHERE generation NOT IN (SELECT generation FROM packed_generations WHERE committed=0)",
+        "workspace_schema_v9.gc_staging");
+}
+
+workspace_result_t<void> write_pipeline_cache_v1(
+    sqlite3* database, const decompiler_pipeline_cache_v1_row_t& record) {
+    constexpr std::uint64_t kValueLimit = 64ULL << 20;
+    if (!database || record.cache_key.empty() ||
+        record.cache_key.size() > 16384 ||
+        record.workspace_id.empty() || record.workspace_id.size() > 4096 ||
+        record.stage < 0 || record.stage > 16 ||
+        record.value.empty() || record.value.size() > kValueLimit ||
+        record.diagnostics.size() > kValueLimit) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "decompiler pipeline cache record exceeds its bounded invariants",
+                                 "workspace_schema_v9.write_pipeline_cache"));
+    }
+    v9_statement_t statement;
+    auto result = statement.prepare(database, R"SQL(
+INSERT INTO decompiler_pipeline_cache_v1(cache_key,stage,workspace_id,generation,analysis_revision,overlay_revision,function_rva,value,diagnostics,created_utc_ms,last_access_utc_ms,value_bytes)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+ON CONFLICT(cache_key) DO UPDATE SET stage=excluded.stage,workspace_id=excluded.workspace_id,generation=excluded.generation,analysis_revision=excluded.analysis_revision,overlay_revision=excluded.overlay_revision,function_rva=excluded.function_rva,value=excluded.value,diagnostics=excluded.diagnostics,created_utc_ms=excluded.created_utc_ms,last_access_utc_ms=excluded.last_access_utc_ms,value_bytes=excluded.value_bytes
+)SQL", "workspace_schema_v9.write_pipeline_cache");
+    if (!result) return result;
+    result = statement.bind_blob(1, record.cache_key.data(), record.cache_key.size()); if (!result) return result;
+    result = statement.bind_int(2, record.stage); if (!result) return result;
+    result = statement.bind_text(3, record.workspace_id); if (!result) return result;
+    result = statement.bind_uint(4, record.generation); if (!result) return result;
+    result = statement.bind_uint(5, record.analysis_revision); if (!result) return result;
+    result = statement.bind_uint(6, record.overlay_revision); if (!result) return result;
+    result = statement.bind_uint(7, record.function_rva); if (!result) return result;
+    result = statement.bind_blob(8, record.value.data(), record.value.size()); if (!result) return result;
+    result = statement.bind_blob(9, record.diagnostics.data(), record.diagnostics.size()); if (!result) return result;
+    result = statement.bind_int(10, record.created_utc_ms); if (!result) return result;
+    result = statement.bind_int(11, record.last_access_utc_ms); if (!result) return result;
+    result = statement.bind_int(12, static_cast<std::int64_t>(record.value.size())); if (!result) return result;
+    return statement.step_done();
+}
+
+workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>
+    read_pipeline_cache_v1(sqlite3* database,
+                           const std::vector<std::uint8_t>& cache_key) {
+    constexpr std::uint64_t kValueLimit = 64ULL << 20;
+    if (!database || cache_key.empty() || cache_key.size() > 16384) {
+        return workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "decompiler pipeline cache lookup key is invalid",
+                                 "workspace_schema_v9.read_pipeline_cache"));
+    }
+    v9_statement_t statement;
+    auto result = statement.prepare(database, R"SQL(
+SELECT stage,workspace_id,generation,analysis_revision,overlay_revision,function_rva,value,diagnostics,created_utc_ms,last_access_utc_ms,value_bytes
+FROM decompiler_pipeline_cache_v1 WHERE cache_key=?1
+)SQL", "workspace_schema_v9.read_pipeline_cache");
+    if (!result)
+        return workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>::failure(
+            result.error());
+    result = statement.bind_blob(1, cache_key.data(), cache_key.size());
+    if (!result)
+        return workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>::failure(
+            result.error());
+    const int status = sqlite3_step(statement.get());
+    if (status == SQLITE_DONE) {
+        return workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>::success(
+            std::nullopt);
+    }
+    if (status != SQLITE_ROW) {
+        return workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>::failure(
+            schema_v9_error(database, status, "unable to read decompiler pipeline cache row",
+                            "workspace_schema_v9.read_pipeline_cache"));
+    }
+    decompiler_pipeline_cache_v1_row_t row;
+    row.cache_key = cache_key;
+    row.stage = sqlite3_column_int64(statement.get(), 0);
+    row.workspace_id = column_text_v9(statement.get(), 1);
+    row.generation = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 2));
+    row.analysis_revision = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 3));
+    row.overlay_revision = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 4));
+    row.function_rva = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 5));
+    const void* value_blob = sqlite3_column_blob(statement.get(), 6);
+    const int value_size = sqlite3_column_bytes(statement.get(), 6);
+    const void* diagnostics_blob = sqlite3_column_blob(statement.get(), 7);
+    const int diagnostics_size = sqlite3_column_bytes(statement.get(), 7);
+    row.created_utc_ms = sqlite3_column_int64(statement.get(), 8);
+    row.last_access_utc_ms = sqlite3_column_int64(statement.get(), 9);
+    const auto declared_value_bytes = sqlite3_column_int64(statement.get(), 10);
+    if (row.stage < 0 || row.stage > 16 || row.workspace_id.empty() ||
+        value_size <= 0 ||
+        static_cast<std::uint64_t>(value_size) > kValueLimit || !value_blob ||
+        diagnostics_size < 0 ||
+        static_cast<std::uint64_t>(diagnostics_size) > kValueLimit ||
+        (diagnostics_size > 0 && !diagnostics_blob) ||
+        declared_value_bytes != value_size) {
+        return workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "decompiler pipeline cache row is malformed",
+                                 "workspace_schema_v9.read_pipeline_cache"));
+    }
+    const auto* value_begin = static_cast<const std::uint8_t*>(value_blob);
+    row.value.assign(value_begin, value_begin + value_size);
+    if (diagnostics_size > 0) {
+        const auto* diagnostics_begin = static_cast<const std::uint8_t*>(diagnostics_blob);
+        row.diagnostics.assign(diagnostics_begin, diagnostics_begin + diagnostics_size);
+    }
+    return workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>::success(
+        std::optional<decompiler_pipeline_cache_v1_row_t>(std::move(row)));
+}
+
+workspace_result_t<void> delete_pipeline_cache_v1(
+    sqlite3* database, const std::string& workspace_id) {
+    if (!database || workspace_id.empty() || workspace_id.size() > 4096) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "decompiler pipeline cache invalidation identity is invalid",
+                                 "workspace_schema_v9.delete_pipeline_cache"));
+    }
+    v9_statement_t statement;
+    auto result = statement.prepare(database,
+        "DELETE FROM decompiler_pipeline_cache_v1 WHERE workspace_id=?1",
+        "workspace_schema_v9.delete_pipeline_cache");
+    if (!result) return result;
+    result = statement.bind_text(1, workspace_id); if (!result) return result;
+    return statement.step_done();
+}
+
+workspace_result_t<void> delete_pipeline_cache_v1_functions(
+    sqlite3* database, const std::string& workspace_id,
+    const std::vector<std::uint64_t>& function_rvas) {
+    if (!database || workspace_id.empty() || workspace_id.size() > 4096) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "decompiler pipeline cache invalidation identity is invalid",
+                                 "workspace_schema_v9.delete_pipeline_cache_functions"));
+    }
+    if (function_rvas.empty())
+        return workspace_result_t<void>::success();
+    constexpr std::size_t kChunk = 256;
+    for (std::size_t offset = 0; offset < function_rvas.size(); offset += kChunk) {
+        const std::size_t count = (std::min)(kChunk, function_rvas.size() - offset);
+        std::string sql =
+            "DELETE FROM decompiler_pipeline_cache_v1 WHERE workspace_id=?1 AND function_rva IN (";
+        for (std::size_t index = 0; index < count; ++index) {
+            if (index != 0)
+                sql += ',';
+            sql += '?' + std::to_string(index + 2);
+        }
+        sql += ')';
+        v9_statement_t statement;
+        auto result = statement.prepare(database, sql.c_str(),
+            "workspace_schema_v9.delete_pipeline_cache_functions");
+        if (!result) return result;
+        result = statement.bind_text(1, workspace_id); if (!result) return result;
+        for (std::size_t index = 0; index < count; ++index) {
+            result = statement.bind_uint(static_cast<int>(index + 2),
+                                         function_rvas[offset + index]);
+            if (!result) return result;
+        }
+        result = statement.step_done();
+        if (!result) return result;
+    }
+    return workspace_result_t<void>::success();
 }
 
 }

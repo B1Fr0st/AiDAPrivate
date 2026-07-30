@@ -4,11 +4,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -703,6 +707,501 @@ bool compact_thunk(const function_candidate_t& candidate,
         (transfer->flow_flags & (flow_conditional | flow_return)) == 0;
 }
 
+constexpr std::uint32_t kCancellationStride = 256;
+constexpr std::size_t kIndexShardFloor = 65536;
+constexpr std::size_t kSeedShardFloor = 4096;
+
+unsigned pass_worker_count() noexcept {
+    const unsigned hardware = std::thread::hardware_concurrency();
+    return (std::min)(16u, (std::max)(2u, hardware));
+}
+
+std::size_t pass_shard_count(std::size_t items, std::size_t floor) noexcept {
+    if (items == 0 || floor == 0)
+        return 0;
+    const unsigned hardware = std::thread::hardware_concurrency();
+    const std::size_t maximum = (std::max)(std::size_t{1},
+        static_cast<std::size_t>(hardware == 0 ? 1u : 4u * hardware));
+    const std::size_t wanted = (items + floor - 1) / floor;
+    return (std::max)(std::size_t{1}, (std::min)(wanted, maximum));
+}
+
+struct shard_range_t {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+};
+
+std::vector<shard_range_t> partition_shards(std::size_t items, std::size_t count) {
+    std::vector<shard_range_t> shards;
+    shards.reserve(count);
+    const std::size_t base = count == 0 ? 0 : items / count;
+    const std::size_t extra = count == 0 ? 0 : items % count;
+    std::size_t cursor = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const std::size_t size = base + (index < extra ? 1 : 0);
+        shards.push_back({cursor, cursor + size});
+        cursor += size;
+    }
+    return shards;
+}
+
+struct shard_failure_t {
+    std::atomic<bool> failed{false};
+    std::mutex mutex;
+    std::size_t lowest_shard = (std::numeric_limits<std::size_t>::max)();
+    workspace_error_t error{};
+
+    void report(std::size_t shard, workspace_error_t value) {
+        failed.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex);
+        if (shard < lowest_shard) {
+            lowest_shard = shard;
+            error = std::move(value);
+        }
+    }
+
+    workspace_error_t take_error() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return std::move(error);
+    }
+};
+
+struct shard_poll_t {
+    const cancellation_token_t* cancel = nullptr;
+    shard_failure_t* failure = nullptr;
+    std::size_t shard = 0;
+    const char* phase = nullptr;
+
+    bool stopped(std::size_t iteration) const {
+        if ((iteration & (kCancellationStride - 1)) != 0)
+            return false;
+        if (failure->failed.load(std::memory_order_relaxed))
+            return true;
+        if (cancel->stop_requested()) {
+            failure->report(shard, stop_error(*cancel, phase));
+            return true;
+        }
+        return false;
+    }
+};
+
+template <typename Fn>
+void guarded_shard(shard_failure_t& failure, std::size_t shard,
+                   const char* alloc_message, const char* phase, Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::bad_alloc&) {
+        failure.report(shard, make_workspace_error(
+            workspace_error_code_t::limit_exceeded, alloc_message, phase));
+    } catch (const std::length_error&) {
+        failure.report(shard, make_workspace_error(
+            workspace_error_code_t::limit_exceeded, alloc_message, phase));
+    }
+}
+
+template <typename Fn>
+void guarded_shard_dual(shard_failure_t& failure, std::size_t shard,
+                        const char* alloc_message, const char* length_message,
+                        const char* phase, Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::bad_alloc&) {
+        failure.report(shard, make_workspace_error(
+            workspace_error_code_t::limit_exceeded, alloc_message, phase));
+    } catch (const std::length_error&) {
+        failure.report(shard, make_workspace_error(
+            workspace_error_code_t::limit_exceeded, length_message, phase));
+    }
+}
+
+template <typename Fn>
+void run_sharded(std::size_t shard_total, Fn&& shard_fn) {
+    if (shard_total == 0)
+        return;
+    const std::size_t workers =
+        (std::min)(static_cast<std::size_t>(pass_worker_count()), shard_total);
+    if (workers <= 1) {
+        for (std::size_t shard = 0; shard < shard_total; ++shard)
+            shard_fn(shard);
+        return;
+    }
+    std::atomic<std::size_t> next{0};
+    const auto worker = [&]() {
+        for (;;) {
+            const std::size_t shard = next.fetch_add(1, std::memory_order_relaxed);
+            if (shard >= shard_total)
+                return;
+            shard_fn(shard);
+        }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    bool spawned = true;
+    try {
+        for (std::size_t index = 0; index < workers; ++index)
+            threads.emplace_back(worker);
+    } catch (...) {
+        spawned = false;
+    }
+    for (auto& thread : threads)
+        thread.join();
+    if (!spawned) {
+        for (std::size_t shard = next.load(std::memory_order_relaxed);
+             shard < shard_total; ++shard)
+            shard_fn(shard);
+    }
+}
+
+template <typename Local, typename Fn>
+void run_sharded_local(std::size_t shard_total, Fn&& shard_fn) {
+    if (shard_total == 0)
+        return;
+    const std::size_t workers =
+        (std::min)(static_cast<std::size_t>(pass_worker_count()), shard_total);
+    if (workers <= 1) {
+        Local local{};
+        for (std::size_t shard = 0; shard < shard_total; ++shard)
+            shard_fn(shard, local);
+        return;
+    }
+    std::atomic<std::size_t> next{0};
+    const auto worker = [&]() {
+        Local local{};
+        for (;;) {
+            const std::size_t shard = next.fetch_add(1, std::memory_order_relaxed);
+            if (shard >= shard_total)
+                return;
+            shard_fn(shard, local);
+        }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    bool spawned = true;
+    try {
+        for (std::size_t index = 0; index < workers; ++index)
+            threads.emplace_back(worker);
+    } catch (...) {
+        spawned = false;
+    }
+    for (auto& thread : threads)
+        thread.join();
+    if (!spawned) {
+        Local local{};
+        for (std::size_t shard = next.load(std::memory_order_relaxed);
+             shard < shard_total; ++shard)
+            shard_fn(shard, local);
+    }
+}
+
+struct pass_budget_t {
+    std::atomic<std::uint64_t> committed{0};
+    std::uint64_t ceiling = 0;
+
+    bool try_grant(std::uint64_t bytes) noexcept {
+        std::uint64_t observed = committed.load(std::memory_order_relaxed);
+        for (;;) {
+            if (observed > ceiling || bytes > ceiling - observed)
+                return false;
+            if (committed.compare_exchange_weak(observed, observed + bytes,
+                    std::memory_order_relaxed))
+                return true;
+        }
+    }
+};
+
+workspace_result_t<void> account_bytes(std::uint64_t& storage_bytes, std::uint64_t bytes,
+    std::uint64_t maximum_bytes, const char* phase, const char* message) {
+    std::uint64_t peak = 0;
+    if (!checked_add_u64(storage_bytes, bytes, peak)) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow, message, phase));
+    }
+    if (peak > maximum_bytes) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded, message, phase));
+    }
+    storage_bytes = peak;
+    return workspace_result_t<void>::success();
+}
+
+template <typename T>
+struct shard_vector_t {
+    std::vector<T> values;
+
+    workspace_result_t<void> reserve_grant(std::size_t count, pass_budget_t& budget,
+        const char* phase, const char* message) {
+        if (count <= values.capacity())
+            return workspace_result_t<void>::success();
+        std::uint64_t bytes = 0;
+        if (!checked_mul_u64(static_cast<std::uint64_t>(count), sizeof(T), bytes) ||
+            !budget.try_grant(bytes)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded, message, phase));
+        }
+        values.reserve(count);
+        return workspace_result_t<void>::success();
+    }
+
+    workspace_result_t<void> append(T value, std::uint64_t maximum_count,
+        pass_budget_t& budget, const char* phase, const char* message) {
+        if (values.size() >= maximum_count) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded, message, phase));
+        }
+        if (values.size() == values.capacity()) {
+            const auto current = static_cast<std::uint64_t>(values.capacity());
+            std::uint64_t desired = current == 0
+                ? (std::min<std::uint64_t>)(4096, maximum_count) : 0;
+            if (current != 0 && !checked_add_u64(current, current / 2ULL, desired)) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::range_overflow, message, phase));
+            }
+            std::uint64_t minimum = 0;
+            if (!checked_add_u64(current, 1, minimum)) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::range_overflow, message, phase));
+            }
+            desired = (std::min)((std::max)(desired, minimum), maximum_count);
+            if (desired <= current) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::limit_exceeded, message, phase));
+            }
+            std::uint64_t delta = 0;
+            if (!checked_mul_u64(desired - current, sizeof(T), delta) ||
+                !budget.try_grant(delta)) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::limit_exceeded, message, phase));
+            }
+            values.reserve(static_cast<std::size_t>(desired));
+        }
+        values.push_back(std::move(value));
+        return workspace_result_t<void>::success();
+    }
+};
+
+struct merge_clock_t {
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+
+    std::uint64_t elapsed_ns() const {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<
+            std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count());
+    }
+};
+
+std::optional<std::size_t> instruction_index_by_rva(
+    const std::vector<instruction_record_t>& instructions, std::uint64_t rva) noexcept {
+    const auto found = std::lower_bound(instructions.begin(), instructions.end(), rva,
+        [](const instruction_record_t& instruction, std::uint64_t value) {
+            return instruction.address.value < value;
+        });
+    if (found != instructions.end() && found->address.value == rva)
+        return static_cast<std::size_t>(found - instructions.begin());
+    return std::nullopt;
+}
+
+std::optional<std::size_t> block_index_by_start(
+    const std::vector<basic_block_record_t>& blocks, std::uint64_t rva) noexcept {
+    const auto found = std::lower_bound(blocks.begin(), blocks.end(), rva,
+        [](const basic_block_record_t& block, std::uint64_t value) {
+            return block.start.value < value;
+        });
+    if (found != blocks.end() && found->start.value == rva)
+        return static_cast<std::size_t>(found - blocks.begin());
+    return std::nullopt;
+}
+
+template <typename Record>
+struct start_rva_lookup_t {
+    const std::vector<Record>* records = nullptr;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> fallback;
+
+    std::optional<std::size_t> find(std::uint64_t rva) const noexcept {
+        if (records != nullptr) {
+            const auto found = std::lower_bound(records->begin(), records->end(), rva,
+                [](const Record& record, std::uint64_t value) {
+                    return record.start.value < value;
+                });
+            if (found != records->end() && found->start.value == rva)
+                return static_cast<std::size_t>(found - records->begin());
+            return std::nullopt;
+        }
+        const auto found = std::lower_bound(fallback.begin(), fallback.end(), rva,
+            [](const std::pair<std::uint64_t, std::uint32_t>& entry, std::uint64_t value) {
+                return entry.first < value;
+            });
+        if (found != fallback.end() && found->first == rva)
+            return static_cast<std::size_t>(found->second);
+        return std::nullopt;
+    }
+};
+
+template <typename Record>
+start_rva_lookup_t<Record> make_start_rva_lookup(const std::vector<Record>& records) {
+    start_rva_lookup_t<Record> lookup;
+    bool sorted = true;
+    for (std::size_t index = 1; index < records.size(); ++index) {
+        if (!(records[index - 1].start.value < records[index].start.value)) {
+            sorted = false;
+            break;
+        }
+    }
+    if (sorted) {
+        lookup.records = &records;
+        return lookup;
+    }
+    lookup.fallback.reserve(records.size());
+    for (std::size_t index = 0; index < records.size(); ++index)
+        lookup.fallback.emplace_back(records[index].start.value,
+            static_cast<std::uint32_t>(index));
+    std::stable_sort(lookup.fallback.begin(), lookup.fallback.end(),
+        [](const std::pair<std::uint64_t, std::uint32_t>& lhs,
+           const std::pair<std::uint64_t, std::uint32_t>& rhs) {
+            return lhs.first < rhs.first;
+        });
+    return lookup;
+}
+
+struct block_id_index_t {
+    std::size_t count = 0;
+    bool identity = false;
+    std::vector<std::uint32_t> ordinal_plus_one;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> sorted_entries;
+
+    std::optional<std::size_t> find(entity_id_t id) const noexcept {
+        if (identity) {
+            if ((id & 0xFF00000000000000ULL) != kBlockEntityTag)
+                return std::nullopt;
+            const auto ordinal = id & entity_ordinal_mask;
+            if (ordinal == 0 || ordinal > count)
+                return std::nullopt;
+            return static_cast<std::size_t>(ordinal - 1);
+        }
+        if (!ordinal_plus_one.empty()) {
+            if ((id & 0xFF00000000000000ULL) != kBlockEntityTag)
+                return std::nullopt;
+            const auto ordinal = id & entity_ordinal_mask;
+            if (ordinal == 0 || ordinal > ordinal_plus_one.size())
+                return std::nullopt;
+            const auto slot = ordinal_plus_one[static_cast<std::size_t>(ordinal - 1)];
+            if (slot == 0)
+                return std::nullopt;
+            return static_cast<std::size_t>(slot - 1);
+        }
+        const auto found = std::lower_bound(sorted_entries.begin(), sorted_entries.end(), id,
+            [](const std::pair<std::uint64_t, std::uint32_t>& entry, std::uint64_t value) {
+                return entry.first < value;
+            });
+        if (found != sorted_entries.end() && found->first == id)
+            return static_cast<std::size_t>(found->second);
+        return std::nullopt;
+    }
+};
+
+block_id_index_t build_block_id_index(const std::vector<basic_block_record_t>& blocks,
+                                      const cancellation_token_t& cancel) {
+    block_id_index_t index;
+    index.count = blocks.size();
+    if (blocks.empty()) {
+        index.identity = true;
+        return index;
+    }
+    const auto shards = partition_shards(blocks.size(),
+        pass_shard_count(blocks.size(), kIndexShardFloor));
+    std::vector<std::uint8_t> shard_identity(shards.size(), 1);
+    std::vector<std::uint8_t> shard_tag_dense(shards.size(), 1);
+    run_sharded(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        bool identity = true;
+        bool tag_dense = true;
+        for (std::size_t row = range.begin; row < range.end; ++row) {
+            if (((row - range.begin) & (kCancellationStride - 1)) == 0 &&
+                cancel.stop_requested()) {
+                identity = false;
+                tag_dense = false;
+                break;
+            }
+            const auto id = blocks[row].id;
+            const auto ordinal = id & entity_ordinal_mask;
+            identity = identity && id == (kBlockEntityTag | (row + 1));
+            tag_dense = tag_dense && (id & 0xFF00000000000000ULL) == kBlockEntityTag &&
+                ordinal >= 1 && ordinal <= blocks.size();
+        }
+        shard_identity[shard] = identity ? 1 : 0;
+        shard_tag_dense[shard] = tag_dense ? 1 : 0;
+    });
+    const auto all_identity = std::all_of(shard_identity.begin(), shard_identity.end(),
+        [](std::uint8_t value) { return value != 0; });
+    if (all_identity) {
+        index.identity = true;
+        return index;
+    }
+    const auto all_tag_dense = std::all_of(shard_tag_dense.begin(), shard_tag_dense.end(),
+        [](std::uint8_t value) { return value != 0; });
+    if (all_tag_dense) {
+        std::vector<std::atomic<std::uint32_t>> slots(blocks.size());
+        run_sharded(shards.size(), [&](std::size_t shard) {
+            const auto range = shards[shard];
+            for (std::size_t row = range.begin; row < range.end; ++row)
+                slots[row].store(0, std::memory_order_relaxed);
+        });
+        run_sharded(shards.size(), [&](std::size_t shard) {
+            const auto range = shards[shard];
+            for (std::size_t row = range.begin; row < range.end; ++row) {
+                const auto ordinal = blocks[row].id & entity_ordinal_mask;
+                auto& slot = slots[static_cast<std::size_t>(ordinal - 1)];
+                const auto desired = static_cast<std::uint32_t>(row + 1);
+                std::uint32_t observed = slot.load(std::memory_order_relaxed);
+                while (observed == 0 || desired < observed) {
+                    if (slot.compare_exchange_weak(observed, desired,
+                            std::memory_order_relaxed))
+                        break;
+                }
+            }
+        });
+        index.ordinal_plus_one.resize(blocks.size());
+        run_sharded(shards.size(), [&](std::size_t shard) {
+            const auto range = shards[shard];
+            for (std::size_t row = range.begin; row < range.end; ++row)
+                index.ordinal_plus_one[row] = slots[row].load(std::memory_order_relaxed);
+        });
+        return index;
+    }
+    index.sorted_entries.reserve(blocks.size());
+    for (std::size_t row = 0; row < blocks.size(); ++row)
+        index.sorted_entries.emplace_back(blocks[row].id, static_cast<std::uint32_t>(row));
+    std::stable_sort(index.sorted_entries.begin(), index.sorted_entries.end(),
+        [](const std::pair<std::uint64_t, std::uint32_t>& lhs,
+           const std::pair<std::uint64_t, std::uint32_t>& rhs) {
+            return lhs.first < rhs.first;
+        });
+    return index;
+}
+
+struct traverse_scratch_t {
+    std::vector<std::uint8_t> marks;
+    std::uint8_t generation = 0;
+    std::vector<std::size_t> pending;
+    std::vector<std::size_t> reached;
+};
+
+struct emit_run_t {
+    std::uint32_t first_member = 0;
+    std::uint32_t member_count = 0;
+    std::uint32_t first_block = 0;
+    std::uint32_t last_block = 0;
+    bool shared = false;
+    bool cold = false;
+};
+
+struct candidate_emit_t {
+    function_record_t function;
+    std::vector<emit_run_t> runs;
+    std::uint64_t range_bytes = 0;
+    std::uint64_t membership_total = 0;
+    bool loader_record = false;
+};
+
 }
 
 workspace_result_t<std::vector<function_seed_t>> function_recovery_t::combine_seed_sources(
@@ -785,289 +1284,349 @@ workspace_result_t<std::vector<function_seed_t>> function_recovery_t::converge_s
         return workspace_result_t<std::vector<function_seed_t>>::failure(
             stop_error(cancel, "seed_converge"));
     try {
-        function_seed_sources_t sources;
-        std::uint64_t source_count = 0;
-        std::uint64_t seed_storage_bytes = 0;
-        std::uint64_t visits = 0;
-        const auto inspect_source = [&]() -> workspace_result_t<void> {
-            if (++visits >= limits.cancellation_check_interval) {
-                visits = 0;
-                if (cancel.stop_requested())
-                    return workspace_result_t<void>::failure(
-                        stop_error(cancel, "seed_converge"));
-            }
-            if (source_count >= limits.max_seed_candidates) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::limit_exceeded,
-                    "function seed evidence exceeds analysis budget", "seed_converge"));
-            }
-            ++source_count;
-            return workspace_result_t<void>::success();
-        };
-        const auto select_group = [&](function_seed_kind_t kind)
-            -> std::vector<function_seed_t>& {
+        constexpr std::array<function_seed_kind_t, 10> group_kinds{{
+            function_seed_kind_t::image_entry,
+            function_seed_kind_t::tls_callback,
+            function_seed_kind_t::debug_symbol,
+            function_seed_kind_t::export_entry,
+            function_seed_kind_t::unwind_range,
+            function_seed_kind_t::load_config_entry,
+            function_seed_kind_t::relocation_target,
+            function_seed_kind_t::direct_call_target,
+            function_seed_kind_t::pointer_target,
+            function_seed_kind_t::validated_gap_target
+        }};
+        const auto group_index_of = [](function_seed_kind_t kind) noexcept {
             switch (kind) {
-                case function_seed_kind_t::image_entry: return sources.image_entries;
-                case function_seed_kind_t::tls_callback: return sources.tls_callbacks;
-                case function_seed_kind_t::export_entry: return sources.exports;
-                case function_seed_kind_t::unwind_range: return sources.unwind_ranges;
-                case function_seed_kind_t::debug_symbol: return sources.symbols;
-                case function_seed_kind_t::load_config_entry:
-                    return sources.load_config_entries;
-                case function_seed_kind_t::relocation_target:
-                    return sources.relocation_targets;
-                case function_seed_kind_t::direct_call_target:
-                    return sources.call_targets;
-                case function_seed_kind_t::validated_gap_target:
-                    return sources.validated_gap_targets;
-                case function_seed_kind_t::pointer_target:
-                    return sources.pointer_targets;
+                case function_seed_kind_t::image_entry: return std::size_t{0};
+                case function_seed_kind_t::tls_callback: return std::size_t{1};
+                case function_seed_kind_t::debug_symbol: return std::size_t{2};
+                case function_seed_kind_t::export_entry: return std::size_t{3};
+                case function_seed_kind_t::unwind_range: return std::size_t{4};
+                case function_seed_kind_t::load_config_entry: return std::size_t{5};
+                case function_seed_kind_t::relocation_target: return std::size_t{6};
+                case function_seed_kind_t::direct_call_target: return std::size_t{7};
+                case function_seed_kind_t::pointer_target: return std::size_t{8};
+                case function_seed_kind_t::validated_gap_target: return std::size_t{9};
             }
-            return sources.validated_gap_targets;
+            return std::size_t{9};
         };
-        const auto append_seed = [&](function_seed_t seed, function_seed_kind_t kind,
-                                     std::uint64_t source_discriminator)
-            -> workspace_result_t<void> {
-            const auto rva = to_rva(image, seed.address);
-            if (!rva || !executable_rva(image, *rva))
-                return workspace_result_t<void>::success();
-            seed.address = rva_address(image, *rva);
-            if (seed.known_end) {
-                const auto end = to_rva_endpoint(image, *seed.known_end);
-                if (end && *end > *rva)
-                    seed.known_end = rva_address(image, *end);
-                else
-                    seed.known_end.reset();
+        const auto group_at = [](function_seed_sources_t& sources, std::size_t group)
+            -> std::vector<function_seed_t>& {
+            switch (group) {
+                case 0: return sources.image_entries;
+                case 1: return sources.tls_callbacks;
+                case 2: return sources.symbols;
+                case 3: return sources.exports;
+                case 4: return sources.unwind_ranges;
+                case 5: return sources.load_config_entries;
+                case 6: return sources.relocation_targets;
+                case 7: return sources.call_targets;
+                case 8: return sources.pointer_targets;
+                default: return sources.validated_gap_targets;
             }
-            seed.kind = kind;
-            if (seed.provenance == fact_provenance_t::unknown)
-                seed.provenance = default_seed_provenance(kind);
-            if (seed.confidence == 0)
-                seed.confidence = seed_confidence(kind);
-            if (seed.provenance > fact_provenance_t::decompiler_feedback ||
-                seed.confidence > 100) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::integrity_failure,
-                    "function seed provenance or confidence is invalid", "seed_converge"));
-            }
-            if (seed.stable_source_id == 0) {
-                auto discriminator = seed.known_end ? seed.known_end->value : 0;
-                discriminator = stable_mix(discriminator,
-                    static_cast<std::uint64_t>(seed.provenance));
-                discriminator = stable_mix(discriminator, seed.confidence);
-                discriminator = stable_mix(discriminator, stable_text(seed.name));
-                discriminator = stable_mix(discriminator, seed.noreturn ? 1 : 0);
-                discriminator = stable_mix(discriminator, source_discriminator);
-                seed.stable_source_id = stable_seed_source(kind, *rva, discriminator);
-            }
-            std::uint64_t seed_bytes = 0;
-            if (!checked_add_u64(sizeof(function_seed_t), seed.name.size(), seed_bytes) ||
-                !checked_add_u64(seed_storage_bytes, seed_bytes, seed_storage_bytes) ||
-                seed_storage_bytes > limits.max_result_bytes) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::limit_exceeded,
-                    "converged function seed storage exceeds analysis budget",
-                    "seed_converge"));
-            }
-            select_group(kind).push_back(std::move(seed));
-            return workspace_result_t<void>::success();
         };
+        std::array<std::uint64_t, 18> unit_sizes{};
         if (evidence.additional_sources) {
-            const std::array<std::pair<const std::vector<function_seed_t>*,
-                                       function_seed_kind_t>, 10> groups{{
-                {&evidence.additional_sources->image_entries,
-                    function_seed_kind_t::image_entry},
-                {&evidence.additional_sources->tls_callbacks,
-                    function_seed_kind_t::tls_callback},
-                {&evidence.additional_sources->symbols,
-                    function_seed_kind_t::debug_symbol},
-                {&evidence.additional_sources->exports,
-                    function_seed_kind_t::export_entry},
-                {&evidence.additional_sources->unwind_ranges,
-                    function_seed_kind_t::unwind_range},
-                {&evidence.additional_sources->load_config_entries,
-                    function_seed_kind_t::load_config_entry},
-                {&evidence.additional_sources->relocation_targets,
-                    function_seed_kind_t::relocation_target},
-                {&evidence.additional_sources->call_targets,
-                    function_seed_kind_t::direct_call_target},
-                {&evidence.additional_sources->pointer_targets,
-                    function_seed_kind_t::pointer_target},
-                {&evidence.additional_sources->validated_gap_targets,
-                    function_seed_kind_t::validated_gap_target}
-            }};
-            for (const auto& group : groups) {
-                for (const auto& seed : *group.first) {
-                    auto inspected = inspect_source();
-                    if (!inspected) {
-                        return workspace_result_t<std::vector<function_seed_t>>::failure(
-                            inspected.error());
+            unit_sizes[0] = evidence.additional_sources->image_entries.size();
+            unit_sizes[1] = evidence.additional_sources->tls_callbacks.size();
+            unit_sizes[2] = evidence.additional_sources->symbols.size();
+            unit_sizes[3] = evidence.additional_sources->exports.size();
+            unit_sizes[4] = evidence.additional_sources->unwind_ranges.size();
+            unit_sizes[5] = evidence.additional_sources->load_config_entries.size();
+            unit_sizes[6] = evidence.additional_sources->relocation_targets.size();
+            unit_sizes[7] = evidence.additional_sources->call_targets.size();
+            unit_sizes[8] = evidence.additional_sources->pointer_targets.size();
+            unit_sizes[9] = evidence.additional_sources->validated_gap_targets.size();
+        }
+        unit_sizes[10] = image.entry_points.size();
+        unit_sizes[11] = image.exports.size();
+        unit_sizes[12] = image.symbols.size();
+        unit_sizes[13] = evidence.symbols ? evidence.symbols->size() : 0;
+        unit_sizes[14] = evidence.unwind_ranges ? evidence.unwind_ranges->size() : 0;
+        unit_sizes[15] = targets.size();
+        unit_sizes[16] = image.relocations.size();
+        unit_sizes[17] = evidence.pointer_facts ? evidence.pointer_facts->size() : 0;
+        std::uint64_t total_visits = 0;
+        std::array<std::uint64_t, 18> unit_bases{};
+        for (std::size_t unit = 0; unit < unit_sizes.size(); ++unit) {
+            unit_bases[unit] = total_visits;
+            total_visits += unit_sizes[unit];
+        }
+        const std::uint64_t effective_visits =
+            (std::min)(total_visits, limits.max_seed_candidates);
+        struct converge_range_t {
+            std::uint32_t tag = 0;
+            std::uint64_t begin = 0;
+            std::uint64_t end = 0;
+        };
+        std::vector<converge_range_t> converge_ranges;
+        for (std::size_t unit = 0; unit < unit_sizes.size(); ++unit) {
+            if (unit_bases[unit] >= effective_visits)
+                break;
+            const auto clipped = static_cast<std::size_t>(
+                (std::min)(unit_sizes[unit], effective_visits - unit_bases[unit]));
+            if (clipped == 0)
+                continue;
+            const auto shard_total = pass_shard_count(clipped, kSeedShardFloor);
+            const auto ranges = partition_shards(clipped, shard_total);
+            for (const auto& range : ranges) {
+                converge_ranges.push_back({static_cast<std::uint32_t>(unit),
+                    static_cast<std::uint64_t>(range.begin),
+                    static_cast<std::uint64_t>(range.end)});
+            }
+        }
+        struct converge_shard_state_t {
+            function_seed_sources_t sources;
+            std::uint64_t storage_bytes = 0;
+        };
+        std::vector<converge_shard_state_t> states(converge_ranges.size());
+        shard_failure_t failure;
+        run_sharded(converge_ranges.size(), [&](std::size_t shard) {
+            guarded_shard_dual(failure, shard,
+                "function seed convergence exhausted memory",
+                "function seed convergence exceeded container capacity",
+                "seed_converge", [&]() {
+                auto& state = states[shard];
+                const auto& range = converge_ranges[shard];
+                shard_poll_t poll{&cancel, &failure, shard, "seed_converge"};
+                const auto append_seed = [&](function_seed_t seed,
+                                             function_seed_kind_t kind,
+                                             std::uint64_t source_discriminator) {
+                    const auto rva = to_rva(image, seed.address);
+                    if (!rva || !executable_rva(image, *rva))
+                        return true;
+                    seed.address = rva_address(image, *rva);
+                    if (seed.known_end) {
+                        const auto end = to_rva_endpoint(image, *seed.known_end);
+                        if (end && *end > *rva)
+                            seed.known_end = rva_address(image, *end);
+                        else
+                            seed.known_end.reset();
                     }
-                    auto appended = append_seed(seed, group.second, 0);
-                    if (!appended)
-                        return workspace_result_t<std::vector<function_seed_t>>::failure(
-                            appended.error());
+                    seed.kind = kind;
+                    if (seed.provenance == fact_provenance_t::unknown)
+                        seed.provenance = default_seed_provenance(kind);
+                    if (seed.confidence == 0)
+                        seed.confidence = seed_confidence(kind);
+                    if (seed.provenance > fact_provenance_t::decompiler_feedback ||
+                        seed.confidence > 100) {
+                        failure.report(shard, make_workspace_error(
+                            workspace_error_code_t::integrity_failure,
+                            "function seed provenance or confidence is invalid",
+                            "seed_converge"));
+                        return false;
+                    }
+                    if (seed.stable_source_id == 0) {
+                        auto discriminator = seed.known_end ? seed.known_end->value : 0;
+                        discriminator = stable_mix(discriminator,
+                            static_cast<std::uint64_t>(seed.provenance));
+                        discriminator = stable_mix(discriminator, seed.confidence);
+                        discriminator = stable_mix(discriminator, stable_text(seed.name));
+                        discriminator = stable_mix(discriminator, seed.noreturn ? 1 : 0);
+                        discriminator = stable_mix(discriminator, source_discriminator);
+                        seed.stable_source_id = stable_seed_source(kind, *rva, discriminator);
+                    }
+                    std::uint64_t seed_bytes = 0;
+                    if (!checked_add_u64(sizeof(function_seed_t), seed.name.size(),
+                            seed_bytes) ||
+                        !checked_add_u64(state.storage_bytes, seed_bytes,
+                            state.storage_bytes) ||
+                        state.storage_bytes > limits.max_result_bytes) {
+                        failure.report(shard, make_workspace_error(
+                            workspace_error_code_t::limit_exceeded,
+                            "converged function seed storage exceeds analysis budget",
+                            "seed_converge"));
+                        return false;
+                    }
+                    group_at(state.sources, group_index_of(kind)).push_back(std::move(seed));
+                    return true;
+                };
+                const auto additional = evidence.additional_sources;
+                for (std::uint64_t item = range.begin; item < range.end; ++item) {
+                    if (poll.stopped(static_cast<std::size_t>(item - range.begin)))
+                        return;
+                    const auto row = static_cast<std::size_t>(item);
+                    bool live = true;
+                    switch (range.tag) {
+                        case 0: case 1: case 2: case 3: case 4:
+                        case 5: case 6: case 7: case 8: case 9: {
+                            const std::vector<function_seed_t>* values = nullptr;
+                            switch (range.tag) {
+                                case 0: values = &additional->image_entries; break;
+                                case 1: values = &additional->tls_callbacks; break;
+                                case 2: values = &additional->symbols; break;
+                                case 3: values = &additional->exports; break;
+                                case 4: values = &additional->unwind_ranges; break;
+                                case 5: values = &additional->load_config_entries; break;
+                                case 6: values = &additional->relocation_targets; break;
+                                case 7: values = &additional->call_targets; break;
+                                case 8: values = &additional->pointer_targets; break;
+                                default:
+                                    values = &additional->validated_gap_targets;
+                                    break;
+                            }
+                            live = append_seed((*values)[row], group_kinds[range.tag], 0);
+                            break;
+                        }
+                        case 10: {
+                            const auto& entry = image.entry_points[row];
+                            const auto kind = entry_seed_kind(entry.provenance);
+                            function_seed_t seed;
+                            seed.address = entry.address;
+                            seed.name = entry.provenance;
+                            const auto source_discriminator = stable_mix(
+                                stable_text(entry.provenance),
+                                static_cast<std::uint64_t>(kind));
+                            live = append_seed(std::move(seed), kind, source_discriminator);
+                            break;
+                        }
+                        case 11: {
+                            const auto& exported = image.exports[row];
+                            if (exported.forwarder)
+                                break;
+                            function_seed_t seed;
+                            seed.address = exported.address;
+                            seed.name = exported.name.value_or(std::string{});
+                            const auto source_discriminator = stable_mix(
+                                exported.ordinal, stable_text(seed.name));
+                            live = append_seed(std::move(seed),
+                                function_seed_kind_t::export_entry, source_discriminator);
+                            break;
+                        }
+                        case 12: {
+                            const auto& symbol = image.symbols[row];
+                            if (!symbol.defined ||
+                                (symbol.kind != image_symbol_kind_t::function &&
+                                 symbol.kind != image_symbol_kind_t::debug_symbol &&
+                                 symbol.kind != image_symbol_kind_t::export_symbol))
+                                break;
+                            function_seed_t seed;
+                            seed.address = symbol.address;
+                            seed.name = symbol.name;
+                            const auto kind = symbol.kind == image_symbol_kind_t::export_symbol
+                                ? function_seed_kind_t::export_entry
+                                : function_seed_kind_t::debug_symbol;
+                            seed.confidence = symbol.kind == image_symbol_kind_t::function
+                                ? 96 : 95;
+                            const auto source_discriminator = stable_mix(
+                                symbol.ordinal, stable_text(symbol.name));
+                            live = append_seed(std::move(seed), kind, source_discriminator);
+                            break;
+                        }
+                        case 13: {
+                            const auto& symbol = (*evidence.symbols)[row];
+                            if (symbol.kind != symbol_kind_t::function &&
+                                symbol.kind != symbol_kind_t::debug_symbol &&
+                                symbol.kind != symbol_kind_t::export_symbol)
+                                break;
+                            function_seed_t seed;
+                            seed.address = symbol.address;
+                            seed.name = symbol.name;
+                            seed.provenance = symbol.provenance;
+                            seed.confidence = symbol.confidence;
+                            seed.stable_source_id = symbol.id;
+                            const auto kind = symbol.kind == symbol_kind_t::export_symbol
+                                ? function_seed_kind_t::export_entry
+                                : function_seed_kind_t::debug_symbol;
+                            live = append_seed(std::move(seed), kind,
+                                stable_text(symbol.name));
+                            break;
+                        }
+                        case 14: {
+                            const auto& unwind = (*evidence.unwind_ranges)[row];
+                            function_seed_t seed;
+                            seed.address = rva_address(image, unwind.function_rva);
+                            if (unwind.end_rva > unwind.function_rva)
+                                seed.known_end = rva_address(image, unwind.end_rva);
+                            const auto source_discriminator = stable_mix(
+                                unwind.end_rva, unwind.unwind_info_rva);
+                            live = append_seed(std::move(seed),
+                                function_seed_kind_t::unwind_range, source_discriminator);
+                            break;
+                        }
+                        case 15: {
+                            const auto& target = targets[row];
+                            if (target.kind != target_kind_record_t::call || !target.direct ||
+                                target.is_external)
+                                break;
+                            function_seed_t seed;
+                            seed.address = target.target;
+                            const auto source_discriminator = stable_mix(
+                                target.instruction_id,
+                                stable_mix(target.operand_fact_id,
+                                    target.address_expression_id));
+                            live = append_seed(std::move(seed),
+                                function_seed_kind_t::direct_call_target,
+                                source_discriminator);
+                            break;
+                        }
+                        case 16: {
+                            const auto& relocation = image.relocations[row];
+                            if (!relocation.target)
+                                break;
+                            function_seed_t seed;
+                            seed.address = *relocation.target;
+                            const auto slot_rva = to_rva(image, relocation.address);
+                            const auto source_discriminator = stable_mix(
+                                slot_rva.value_or(relocation.address.value),
+                                relocation.type);
+                            live = append_seed(std::move(seed),
+                                function_seed_kind_t::relocation_target,
+                                source_discriminator);
+                            break;
+                        }
+                        default: {
+                            const auto& pointer = (*evidence.pointer_facts)[row];
+                            function_seed_t seed;
+                            seed.address = pointer.target;
+                            seed.provenance = pointer.provenance;
+                            seed.confidence = pointer.confidence;
+                            seed.stable_source_id = pointer.id;
+                            const auto slot_rva = to_rva(image, pointer.slot);
+                            live = append_seed(std::move(seed),
+                                function_seed_kind_t::pointer_target,
+                                slot_rva.value_or(pointer.slot.value));
+                            break;
+                        }
+                    }
+                    if (!live)
+                        return;
                 }
+            });
+        });
+        if (failure.failed.load(std::memory_order_relaxed)) {
+            return workspace_result_t<std::vector<function_seed_t>>::failure(
+                failure.take_error());
+        }
+        function_seed_sources_t sources;
+        for (std::size_t group = 0; group < group_kinds.size(); ++group) {
+            std::uint64_t total = 0;
+            for (auto& state : states)
+                total += group_at(state.sources, group).size();
+            auto& destination = group_at(sources, group);
+            destination.reserve(static_cast<std::size_t>(total));
+            for (auto& state : states) {
+                auto& values = group_at(state.sources, group);
+                for (auto& seed : values)
+                    destination.push_back(std::move(seed));
             }
         }
-        for (const auto& entry : image.entry_points) {
-            auto inspected = inspect_source();
-            if (!inspected)
+        std::uint64_t seed_storage_bytes = 0;
+        for (const auto& state : states) {
+            if (!checked_add_u64(seed_storage_bytes, state.storage_bytes,
+                    seed_storage_bytes) ||
+                seed_storage_bytes > limits.max_result_bytes) {
                 return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    inspected.error());
-            const auto kind = entry_seed_kind(entry.provenance);
-            function_seed_t seed;
-            seed.address = entry.address;
-            seed.name = entry.provenance;
-            const auto source_discriminator = stable_mix(
-                stable_text(entry.provenance), static_cast<std::uint64_t>(kind));
-            auto appended = append_seed(std::move(seed), kind, source_discriminator);
-            if (!appended)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    appended.error());
-        }
-        for (const auto& exported : image.exports) {
-            auto inspected = inspect_source();
-            if (!inspected)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    inspected.error());
-            if (exported.forwarder)
-                continue;
-            function_seed_t seed;
-            seed.address = exported.address;
-            seed.name = exported.name.value_or(std::string{});
-            const auto source_discriminator = stable_mix(
-                exported.ordinal, stable_text(seed.name));
-            auto appended = append_seed(std::move(seed),
-                function_seed_kind_t::export_entry, source_discriminator);
-            if (!appended)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    appended.error());
-        }
-        for (const auto& symbol : image.symbols) {
-            auto inspected = inspect_source();
-            if (!inspected)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    inspected.error());
-            if (!symbol.defined ||
-                (symbol.kind != image_symbol_kind_t::function &&
-                 symbol.kind != image_symbol_kind_t::debug_symbol &&
-                 symbol.kind != image_symbol_kind_t::export_symbol))
-                continue;
-            function_seed_t seed;
-            seed.address = symbol.address;
-            seed.name = symbol.name;
-            const auto kind = symbol.kind == image_symbol_kind_t::export_symbol
-                ? function_seed_kind_t::export_entry
-                : function_seed_kind_t::debug_symbol;
-            seed.confidence = symbol.kind == image_symbol_kind_t::function ? 96 : 95;
-            const auto source_discriminator = stable_mix(
-                symbol.ordinal, stable_text(symbol.name));
-            auto appended = append_seed(std::move(seed), kind, source_discriminator);
-            if (!appended)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    appended.error());
-        }
-        if (evidence.symbols) {
-            for (const auto& symbol : *evidence.symbols) {
-                auto inspected = inspect_source();
-                if (!inspected)
-                    return workspace_result_t<std::vector<function_seed_t>>::failure(
-                        inspected.error());
-                if (symbol.kind != symbol_kind_t::function &&
-                    symbol.kind != symbol_kind_t::debug_symbol &&
-                    symbol.kind != symbol_kind_t::export_symbol)
-                    continue;
-                function_seed_t seed;
-                seed.address = symbol.address;
-                seed.name = symbol.name;
-                seed.provenance = symbol.provenance;
-                seed.confidence = symbol.confidence;
-                seed.stable_source_id = symbol.id;
-                const auto kind = symbol.kind == symbol_kind_t::export_symbol
-                    ? function_seed_kind_t::export_entry
-                    : function_seed_kind_t::debug_symbol;
-                auto appended = append_seed(std::move(seed), kind,
-                    stable_text(symbol.name));
-                if (!appended)
-                    return workspace_result_t<std::vector<function_seed_t>>::failure(
-                        appended.error());
+                    make_workspace_error(workspace_error_code_t::limit_exceeded,
+                        "converged function seed storage exceeds analysis budget",
+                        "seed_converge"));
             }
         }
-        if (evidence.unwind_ranges) {
-            for (const auto& unwind : *evidence.unwind_ranges) {
-                auto inspected = inspect_source();
-                if (!inspected)
-                    return workspace_result_t<std::vector<function_seed_t>>::failure(
-                        inspected.error());
-                function_seed_t seed;
-                seed.address = rva_address(image, unwind.function_rva);
-                if (unwind.end_rva > unwind.function_rva)
-                    seed.known_end = rva_address(image, unwind.end_rva);
-                const auto source_discriminator = stable_mix(
-                    unwind.end_rva, unwind.unwind_info_rva);
-                auto appended = append_seed(std::move(seed),
-                    function_seed_kind_t::unwind_range, source_discriminator);
-                if (!appended)
-                    return workspace_result_t<std::vector<function_seed_t>>::failure(
-                        appended.error());
-            }
-        }
-        for (const auto& target : targets) {
-            auto inspected = inspect_source();
-            if (!inspected)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    inspected.error());
-            if (target.kind != target_kind_record_t::call || !target.direct ||
-                target.is_external)
-                continue;
-            function_seed_t seed;
-            seed.address = target.target;
-            const auto source_discriminator = stable_mix(target.instruction_id,
-                stable_mix(target.operand_fact_id, target.address_expression_id));
-            auto appended = append_seed(std::move(seed),
-                function_seed_kind_t::direct_call_target, source_discriminator);
-            if (!appended)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    appended.error());
-        }
-        for (const auto& relocation : image.relocations) {
-            auto inspected = inspect_source();
-            if (!inspected)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    inspected.error());
-            if (!relocation.target)
-                continue;
-            function_seed_t seed;
-            seed.address = *relocation.target;
-            const auto slot_rva = to_rva(image, relocation.address);
-            const auto source_discriminator = stable_mix(
-                slot_rva.value_or(relocation.address.value), relocation.type);
-            auto appended = append_seed(std::move(seed),
-                function_seed_kind_t::relocation_target, source_discriminator);
-            if (!appended)
-                return workspace_result_t<std::vector<function_seed_t>>::failure(
-                    appended.error());
-        }
-        if (evidence.pointer_facts) {
-            for (const auto& pointer : *evidence.pointer_facts) {
-                auto inspected = inspect_source();
-                if (!inspected)
-                    return workspace_result_t<std::vector<function_seed_t>>::failure(
-                        inspected.error());
-                function_seed_t seed;
-                seed.address = pointer.target;
-                seed.provenance = pointer.provenance;
-                seed.confidence = pointer.confidence;
-                seed.stable_source_id = pointer.id;
-                const auto slot_rva = to_rva(image, pointer.slot);
-                auto appended = append_seed(std::move(seed),
-                    function_seed_kind_t::pointer_target,
-                    slot_rva.value_or(pointer.slot.value));
-                if (!appended)
-                    return workspace_result_t<std::vector<function_seed_t>>::failure(
-                        appended.error());
-            }
+        if (total_visits > limits.max_seed_candidates) {
+            return workspace_result_t<std::vector<function_seed_t>>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "function seed evidence exceeds analysis budget", "seed_converge"));
         }
         return combine_seed_sources(sources, limits, cancel);
     } catch (const std::bad_alloc&) {
@@ -1152,190 +1711,355 @@ workspace_result_t<block_recovery_result_t> function_recovery_t::build_blocks(
     block_recovery_result_t result;
     if (instructions.empty())
         return workspace_result_t<block_recovery_result_t>::success(std::move(result));
-    std::vector<bool> leaders(instructions.size(), false);
-    leaders.front() = true;
-    std::map<std::uint64_t, std::size_t> instruction_index;
-    for (std::size_t index = 0; index < instructions.size(); ++index)
-        instruction_index.emplace(instructions[index].address.value, index);
-    std::uint64_t checks = 0;
-    for (const auto& seed : seeds) {
-        if (++checks >= limits.cancellation_check_interval) {
-            checks = 0;
-            if (cancel.stop_requested())
-                return workspace_result_t<block_recovery_result_t>::failure(
-                    stop_error(cancel, "blocks"));
-        }
-        const auto rva = to_rva(image, seed.address);
-        const auto found = rva ? instruction_index.find(*rva) : instruction_index.end();
-        if (found != instruction_index.end())
-            leaders[found->second] = true;
-        if (seed.known_end) {
-            const auto end_rva = to_rva_endpoint(image, *seed.known_end);
-            const auto end_found = end_rva ? instruction_index.find(*end_rva)
-                                           : instruction_index.end();
-            if (end_found != instruction_index.end())
-                leaders[end_found->second] = true;
-        }
+    std::vector<std::uint8_t> leaders(instructions.size(), 0);
+    leaders.front() = 1;
+    shard_failure_t failure;
+    {
+        const auto shards = partition_shards(seeds.size(),
+            pass_shard_count(seeds.size(), kSeedShardFloor));
+        run_sharded(shards.size(), [&](std::size_t shard) {
+            guarded_shard(failure, shard, "basic block storage exceeds analysis budget",
+                "blocks", [&]() {
+                const auto range = shards[shard];
+                shard_poll_t poll{&cancel, &failure, shard, "blocks"};
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (poll.stopped(index - range.begin))
+                        return;
+                    const auto& seed = seeds[index];
+                    const auto rva = to_rva(image, seed.address);
+                    const auto found = rva ? instruction_index_by_rva(instructions, *rva)
+                                           : std::nullopt;
+                    if (found)
+                        leaders[*found] = 1;
+                    if (seed.known_end) {
+                        const auto end_rva = to_rva_endpoint(image, *seed.known_end);
+                        const auto end_found = end_rva
+                            ? instruction_index_by_rva(instructions, *end_rva)
+                            : std::nullopt;
+                        if (end_found)
+                            leaders[*end_found] = 1;
+                    }
+                }
+            });
+        });
+        if (failure.failed.load(std::memory_order_relaxed))
+            return workspace_result_t<block_recovery_result_t>::failure(
+                failure.take_error());
     }
-    for (std::size_t index = 0; index < instructions.size(); ++index) {
-        if (++checks >= limits.cancellation_check_interval) {
-            checks = 0;
-            if (cancel.stop_requested())
-                return workspace_result_t<block_recovery_result_t>::failure(
-                    stop_error(cancel, "blocks"));
-        }
-        const auto& instruction = instructions[index];
-        const auto target_end = static_cast<std::uint64_t>(instruction.target_fact_begin) +
-            instruction.target_fact_count;
-        for (std::uint64_t target_index = instruction.target_fact_begin;
-             target_index < target_end; ++target_index) {
-            const auto& target = targets[static_cast<std::size_t>(target_index)];
-            if (target.kind != target_kind_record_t::branch &&
-                target.kind != target_kind_record_t::call)
-                continue;
-            const auto rva = to_rva(image, target.target);
-            const auto found = rva ? instruction_index.find(*rva) : instruction_index.end();
-            if (found != instruction_index.end())
-                leaders[found->second] = true;
-        }
-        const auto delay_count = delay_slot_counts.empty() ? 0U : delay_slot_counts[index];
-        const auto transfer_end = index + delay_count;
-        if ((instruction.flow_flags & kControlFlowMask) != 0 &&
-            transfer_end + 1 < instructions.size()) {
-            leaders[transfer_end + 1] = true;
-        }
-        if (index + 1 < instructions.size() &&
-            instruction_end(instruction) != instructions[index + 1].address.value)
-            leaders[index + 1] = true;
+    {
+        const auto shards = partition_shards(instructions.size(),
+            pass_shard_count(instructions.size(), kIndexShardFloor));
+        run_sharded(shards.size(), [&](std::size_t shard) {
+            guarded_shard(failure, shard, "basic block storage exceeds analysis budget",
+                "blocks", [&]() {
+                const auto range = shards[shard];
+                shard_poll_t poll{&cancel, &failure, shard, "blocks"};
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (poll.stopped(index - range.begin))
+                        return;
+                    const auto& instruction = instructions[index];
+                    const auto target_end =
+                        static_cast<std::uint64_t>(instruction.target_fact_begin) +
+                        instruction.target_fact_count;
+                    for (std::uint64_t target_index = instruction.target_fact_begin;
+                         target_index < target_end; ++target_index) {
+                        const auto& target = targets[static_cast<std::size_t>(target_index)];
+                        if (target.kind != target_kind_record_t::branch &&
+                            target.kind != target_kind_record_t::call)
+                            continue;
+                        const auto rva = to_rva(image, target.target);
+                        const auto found = rva
+                            ? instruction_index_by_rva(instructions, *rva)
+                            : std::nullopt;
+                        if (found)
+                            leaders[*found] = 1;
+                    }
+                    const auto delay_count =
+                        delay_slot_counts.empty() ? 0U : delay_slot_counts[index];
+                    const auto transfer_end = index + delay_count;
+                    if ((instruction.flow_flags & kControlFlowMask) != 0 &&
+                        transfer_end + 1 < instructions.size()) {
+                        leaders[transfer_end + 1] = 1;
+                    }
+                    if (index + 1 < instructions.size() &&
+                        instruction_end(instruction) != instructions[index + 1].address.value)
+                        leaders[index + 1] = 1;
+                }
+            });
+        });
+        if (failure.failed.load(std::memory_order_relaxed))
+            return workspace_result_t<block_recovery_result_t>::failure(
+                failure.take_error());
     }
     if (!delay_slot_counts.empty()) {
-        for (std::size_t index = 0; index < delay_slot_counts.size(); ++index) {
-            for (std::size_t offset = 1; offset <= delay_slot_counts[index]; ++offset) {
-                if (leaders[index + offset]) {
-                    auto error = make_workspace_error(workspace_error_code_t::integrity_failure,
-                        "delay-slot instruction is also a basic-block leader", "blocks");
-                    error.address = instructions[index + offset].address;
-                    return workspace_result_t<block_recovery_result_t>::failure(
-                        std::move(error));
+        const auto shards = partition_shards(delay_slot_counts.size(),
+            pass_shard_count(delay_slot_counts.size(), kIndexShardFloor));
+        run_sharded(shards.size(), [&](std::size_t shard) {
+            guarded_shard(failure, shard, "basic block storage exceeds analysis budget",
+                "blocks", [&]() {
+                const auto range = shards[shard];
+                shard_poll_t poll{&cancel, &failure, shard, "blocks"};
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (poll.stopped(index - range.begin))
+                        return;
+                    for (std::size_t offset = 1; offset <= delay_slot_counts[index];
+                         ++offset) {
+                        if (leaders[index + offset] == 0)
+                            continue;
+                        auto error = make_workspace_error(
+                            workspace_error_code_t::integrity_failure,
+                            "delay-slot instruction is also a basic-block leader", "blocks");
+                        error.address = instructions[index + offset].address;
+                        failure.report(shard, std::move(error));
+                        return;
+                    }
+                }
+            });
+        });
+        if (failure.failed.load(std::memory_order_relaxed))
+            return workspace_result_t<block_recovery_result_t>::failure(
+                failure.take_error());
+    }
+    const auto leader_shards = partition_shards(instructions.size(),
+        pass_shard_count(instructions.size(), kIndexShardFloor));
+    std::vector<std::uint64_t> shard_leader_bases(leader_shards.size(), 0);
+    run_sharded(leader_shards.size(), [&](std::size_t shard) {
+        const auto range = leader_shards[shard];
+        std::uint64_t count = 0;
+        for (std::size_t index = range.begin; index < range.end; ++index)
+            count += leaders[index];
+        shard_leader_bases[shard] = count;
+    });
+    std::uint64_t block_count = 0;
+    for (auto& base : shard_leader_bases) {
+        const auto offset = block_count;
+        if (!checked_add_u64(block_count, base, block_count)) {
+            return workspace_result_t<block_recovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                    "basic block storage exceeds analysis budget", "blocks"));
+        }
+        base = offset;
+    }
+    if (block_count > limits.max_blocks) {
+        return workspace_result_t<block_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "basic block storage exceeds analysis budget", "blocks"));
+    }
+    std::uint64_t block_bytes = 0;
+    if (!checked_mul_u64(block_count, sizeof(basic_block_record_t), block_bytes)) {
+        return workspace_result_t<block_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "basic block storage exceeds analysis budget", "blocks"));
+    }
+    auto accounted = account_bytes(result.storage_bytes, block_bytes,
+        limits.max_result_bytes, "blocks", "basic block storage exceeds analysis budget");
+    if (!accounted)
+        return workspace_result_t<block_recovery_result_t>::failure(accounted.error());
+    std::uint64_t terminator_bytes = 0;
+    if (!checked_mul_u64(block_count, sizeof(std::uint32_t), terminator_bytes)) {
+        return workspace_result_t<block_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "basic block terminator storage exceeds analysis budget", "blocks"));
+    }
+    accounted = account_bytes(result.storage_bytes, terminator_bytes,
+        limits.max_result_bytes, "blocks",
+        "basic block terminator storage exceeds analysis budget");
+    if (!accounted)
+        return workspace_result_t<block_recovery_result_t>::failure(accounted.error());
+    std::vector<std::uint32_t> leader_indices(static_cast<std::size_t>(block_count));
+    run_sharded(leader_shards.size(), [&](std::size_t shard) {
+        const auto range = leader_shards[shard];
+        std::uint64_t cursor = shard_leader_bases[shard];
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            if (leaders[index] != 0) {
+                leader_indices[static_cast<std::size_t>(cursor)] =
+                    static_cast<std::uint32_t>(index);
+                ++cursor;
+            }
+        }
+    });
+    result.blocks.resize(static_cast<std::size_t>(block_count));
+    result.terminator_instruction_indices.resize(static_cast<std::size_t>(block_count));
+    const auto block_shards = partition_shards(static_cast<std::size_t>(block_count),
+        pass_shard_count(static_cast<std::size_t>(block_count), kIndexShardFloor));
+    run_sharded(block_shards.size(), [&](std::size_t shard) {
+        guarded_shard(failure, shard, "basic block storage exceeds analysis budget",
+            "blocks", [&]() {
+            const auto range = block_shards[shard];
+            shard_poll_t poll{&cancel, &failure, shard, "blocks"};
+            for (std::size_t block_ordinal = range.begin; block_ordinal < range.end;
+                 ++block_ordinal) {
+                if (poll.stopped(block_ordinal - range.begin))
+                    return;
+                const auto first =
+                    static_cast<std::size_t>(leader_indices[block_ordinal]);
+                const auto end = block_ordinal + 1 < block_count
+                    ? static_cast<std::size_t>(leader_indices[block_ordinal + 1])
+                    : instructions.size();
+                std::size_t terminator = end - 1;
+                for (std::size_t index = first; index < end; ++index) {
+                    const auto delay_count =
+                        delay_slot_counts.empty() ? 0U : delay_slot_counts[index];
+                    if ((instructions[index].flow_flags & kControlFlowMask) != 0 &&
+                        index + delay_count == end - 1) {
+                        terminator = index;
+                        break;
+                    }
+                }
+                basic_block_record_t block;
+                block.id = kBlockEntityTag | static_cast<std::uint64_t>(block_ordinal + 1);
+                block.start = instructions[first].address;
+                block.end = rva_address(image, instruction_end(instructions[end - 1]));
+                block.first_instruction = static_cast<std::uint32_t>(first);
+                block.instruction_count = static_cast<std::uint32_t>(end - first);
+                block.provenance = instructions[first].provenance;
+                block.confidence = instructions[first].confidence;
+                for (std::size_t index = first + 1; index < end; ++index) {
+                    if (provenance_rank(instructions[index].provenance) >
+                            provenance_rank(block.provenance) ||
+                        (instructions[index].provenance == block.provenance &&
+                         instructions[index].confidence > block.confidence)) {
+                        block.provenance = instructions[index].provenance;
+                        block.confidence = instructions[index].confidence;
+                    }
+                }
+                result.blocks[block_ordinal] = block;
+                result.terminator_instruction_indices[block_ordinal] =
+                    static_cast<std::uint32_t>(terminator);
+            }
+        });
+    });
+    if (failure.failed.load(std::memory_order_relaxed))
+        return workspace_result_t<block_recovery_result_t>::failure(failure.take_error());
+    pass_budget_t edge_budget;
+    edge_budget.ceiling = limits.max_result_bytes - result.storage_bytes;
+    std::vector<shard_vector_t<edge_record_t>> shard_edges(block_shards.size());
+    run_sharded(block_shards.size(), [&](std::size_t shard) {
+        guarded_shard(failure, shard, "CFG edge storage exceeds analysis budget",
+            "blocks", [&]() {
+            const auto range = block_shards[shard];
+            auto& edges = shard_edges[shard];
+            std::uint64_t reserve_count = 0;
+            if (!checked_add_u64(
+                    2ULL * static_cast<std::uint64_t>(range.end - range.begin), 8ULL,
+                    reserve_count)) {
+                failure.report(shard, make_workspace_error(
+                    workspace_error_code_t::range_overflow,
+                    "CFG edge storage exceeds analysis budget", "blocks"));
+                return;
+            }
+            reserve_count = (std::min)(limits.max_edges / block_shards.size(),
+                reserve_count);
+            auto reserved = edges.reserve_grant(static_cast<std::size_t>(reserve_count),
+                edge_budget, "blocks", "CFG edge storage exceeds analysis budget");
+            if (!reserved) {
+                failure.report(shard, reserved.error());
+                return;
+            }
+            shard_poll_t poll{&cancel, &failure, shard, "blocks"};
+            for (std::size_t block_index = range.begin; block_index < range.end;
+                 ++block_index) {
+                if (poll.stopped(block_index - range.begin))
+                    return;
+                const auto& block = result.blocks[block_index];
+                const auto* transfer = transfer_instruction(block_index, result.blocks,
+                    result.terminator_instruction_indices, instructions);
+                if (!transfer)
+                    continue;
+                const auto append_edge = [&](const address_t& target, edge_kind_t kind)
+                    -> workspace_result_t<void> {
+                    edge_record_t edge;
+                    edge.source_entity = block.id;
+                    edge.source = transfer->address;
+                    edge.target = target;
+                    edge.kind = kind;
+                    edge.provenance = transfer->provenance;
+                    edge.confidence = transfer->confidence;
+                    return edges.append(std::move(edge), limits.max_edges, edge_budget,
+                        "blocks", "CFG edge storage exceeds analysis budget");
+                };
+                const auto target_end =
+                    static_cast<std::uint64_t>(transfer->target_fact_begin) +
+                    transfer->target_fact_count;
+                bool stopped = false;
+                for (std::uint64_t target_index = transfer->target_fact_begin;
+                     target_index < target_end && !stopped; ++target_index) {
+                    const auto& target = targets[static_cast<std::size_t>(target_index)];
+                    if (target.kind != target_kind_record_t::branch &&
+                        target.kind != target_kind_record_t::call)
+                        continue;
+                    const auto rva = to_rva(image, target.target);
+                    if (!rva || !executable_rva(image, *rva) ||
+                        !block_index_by_start(result.blocks, *rva))
+                        continue;
+                    edge_kind_t kind = edge_kind_t::call;
+                    if (target.kind == target_kind_record_t::branch) {
+                        if (!target.direct || (transfer->flow_flags & flow_indirect) != 0)
+                            kind = edge_kind_t::indirect;
+                        else if ((transfer->flow_flags & flow_conditional) != 0)
+                            kind = edge_kind_t::conditional_taken;
+                        else
+                            kind = edge_kind_t::unconditional;
+                    }
+                    auto appended = append_edge(target.target, kind);
+                    if (!appended) {
+                        failure.report(shard, appended.error());
+                        stopped = true;
+                    }
+                }
+                if (stopped)
+                    return;
+                if ((transfer->flow_flags & flow_fallthrough) != 0) {
+                    const auto found = block_index_by_start(result.blocks, block.end.value);
+                    if (found) {
+                        auto appended = append_edge(result.blocks[*found].start,
+                            edge_kind_t::fallthrough);
+                        if (!appended) {
+                            failure.report(shard, appended.error());
+                            return;
+                        }
+                    }
                 }
             }
-        }
-    }
-    for (std::size_t first = 0; first < instructions.size();) {
-        if (cancel.stop_requested())
+        });
+    });
+    if (failure.failed.load(std::memory_order_relaxed))
+        return workspace_result_t<block_recovery_result_t>::failure(failure.take_error());
+    merge_clock_t merge_clock;
+    std::uint64_t edge_total = 0;
+    for (const auto& edges : shard_edges) {
+        if (!checked_add_u64(edge_total, edges.values.size(), edge_total)) {
             return workspace_result_t<block_recovery_result_t>::failure(
-                stop_error(cancel, "blocks"));
-        std::size_t end = first + 1;
-        while (end < instructions.size() && !leaders[end])
-            ++end;
-        std::size_t terminator = end - 1;
-        for (std::size_t index = first; index < end; ++index) {
-            const auto delay_count = delay_slot_counts.empty() ? 0U : delay_slot_counts[index];
-            if ((instructions[index].flow_flags & kControlFlowMask) != 0 &&
-                index + delay_count == end - 1) {
-                terminator = index;
-                break;
-            }
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                    "CFG edge storage exceeds analysis budget", "blocks"));
         }
-        basic_block_record_t block;
-        block.id = kBlockEntityTag | static_cast<std::uint64_t>(result.blocks.size() + 1);
-        block.start = instructions[first].address;
-        block.end = rva_address(image, instruction_end(instructions[end - 1]));
-        block.first_instruction = static_cast<std::uint32_t>(first);
-        block.instruction_count = static_cast<std::uint32_t>(end - first);
-        block.provenance = instructions[first].provenance;
-        block.confidence = instructions[first].confidence;
-        for (std::size_t index = first + 1; index < end; ++index) {
-            if (provenance_rank(instructions[index].provenance) >
-                    provenance_rank(block.provenance) ||
-                (instructions[index].provenance == block.provenance &&
-                 instructions[index].confidence > block.confidence)) {
-                block.provenance = instructions[index].provenance;
-                block.confidence = instructions[index].confidence;
-            }
-        }
-        auto appended = append_bounded(result.blocks, std::move(block), limits.max_blocks,
-            limits.max_result_bytes, result.storage_bytes, "blocks",
-            "basic block storage exceeds analysis budget");
-        if (!appended)
-            return workspace_result_t<block_recovery_result_t>::failure(appended.error());
-        appended = append_bounded(result.terminator_instruction_indices,
-            static_cast<std::uint32_t>(terminator), limits.max_blocks,
-            limits.max_result_bytes, result.storage_bytes, "blocks",
-            "basic block terminator storage exceeds analysis budget");
-        if (!appended)
-            return workspace_result_t<block_recovery_result_t>::failure(appended.error());
-        first = end;
     }
-    std::map<std::uint64_t, std::size_t> blocks_by_start;
-    for (std::size_t index = 0; index < result.blocks.size(); ++index)
-        blocks_by_start.emplace(result.blocks[index].start.value, index);
-    for (std::size_t block_index = 0; block_index < result.blocks.size(); ++block_index) {
-        if (++checks >= limits.cancellation_check_interval) {
-            checks = 0;
-            if (cancel.stop_requested())
-                return workspace_result_t<block_recovery_result_t>::failure(
-                    stop_error(cancel, "blocks"));
-        }
-        const auto& block = result.blocks[block_index];
-        const auto* transfer = transfer_instruction(block_index, result.blocks,
-            result.terminator_instruction_indices, instructions);
-        if (!transfer)
-            continue;
-        const auto append_edge = [&](const address_t& target, edge_kind_t kind)
-            -> workspace_result_t<void> {
-            edge_record_t edge;
-            edge.source_entity = block.id;
-            edge.source = transfer->address;
-            edge.target = target;
-            edge.kind = kind;
-            edge.provenance = transfer->provenance;
-            edge.confidence = transfer->confidence;
-            return append_bounded(result.edges, std::move(edge), limits.max_edges,
-                limits.max_result_bytes, result.storage_bytes, "blocks",
-                "CFG edge storage exceeds analysis budget");
-        };
-        const auto target_end = static_cast<std::uint64_t>(transfer->target_fact_begin) +
-            transfer->target_fact_count;
-        for (std::uint64_t target_index = transfer->target_fact_begin;
-             target_index < target_end; ++target_index) {
-            const auto& target = targets[static_cast<std::size_t>(target_index)];
-            if (target.kind != target_kind_record_t::branch &&
-                target.kind != target_kind_record_t::call)
-                continue;
-            const auto rva = to_rva(image, target.target);
-            if (!rva || !executable_rva(image, *rva) ||
-                blocks_by_start.find(*rva) == blocks_by_start.end())
-                continue;
-            edge_kind_t kind = edge_kind_t::call;
-            if (target.kind == target_kind_record_t::branch) {
-                if (!target.direct || (transfer->flow_flags & flow_indirect) != 0)
-                    kind = edge_kind_t::indirect;
-                else if ((transfer->flow_flags & flow_conditional) != 0)
-                    kind = edge_kind_t::conditional_taken;
-                else
-                    kind = edge_kind_t::unconditional;
-            }
-            auto appended = append_edge(target.target, kind);
-            if (!appended)
-                return workspace_result_t<block_recovery_result_t>::failure(appended.error());
-        }
-        if ((transfer->flow_flags & flow_fallthrough) != 0) {
-            const auto found = blocks_by_start.find(block.end.value);
-            if (found != blocks_by_start.end()) {
-                auto appended = append_edge(result.blocks[found->second].start,
-                                            edge_kind_t::fallthrough);
-                if (!appended)
-                    return workspace_result_t<block_recovery_result_t>::failure(
-                        appended.error());
-            }
-        }
+    if (edge_total > limits.max_edges) {
+        return workspace_result_t<block_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "CFG edge storage exceeds analysis budget", "blocks"));
+    }
+    std::uint64_t edge_bytes = 0;
+    if (!checked_mul_u64(edge_total, sizeof(edge_record_t), edge_bytes)) {
+        return workspace_result_t<block_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "CFG edge storage exceeds analysis budget", "blocks"));
+    }
+    accounted = account_bytes(result.storage_bytes, edge_bytes, limits.max_result_bytes,
+        "blocks", "CFG edge storage exceeds analysis budget");
+    if (!accounted)
+        return workspace_result_t<block_recovery_result_t>::failure(accounted.error());
+    result.edges.reserve(static_cast<std::size_t>(edge_total));
+    for (auto& edges : shard_edges) {
+        for (auto& edge : edges.values)
+            result.edges.push_back(std::move(edge));
     }
     std::sort(result.edges.begin(), result.edges.end(), edge_less);
     result.edges.erase(std::unique(result.edges.begin(), result.edges.end(), edge_equal),
         result.edges.end());
     for (std::size_t index = 0; index < result.edges.size(); ++index)
         result.edges[index].id = kEdgeEntityTag | static_cast<std::uint64_t>(index + 1);
+    result.shard_merge_ns += merge_clock.elapsed_ns();
     return workspace_result_t<block_recovery_result_t>::success(std::move(result));
 }
 
@@ -1366,75 +2090,140 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
         std::move(block_result.terminator_instruction_indices);
     result.edges = std::move(block_result.edges);
     result.storage_bytes = block_result.storage_bytes;
-    std::map<std::uint64_t, std::size_t> block_by_start;
-    std::map<entity_id_t, std::size_t> block_by_id;
-    std::map<std::uint64_t, bool> block_boundaries;
-    for (std::size_t index = 0; index < result.blocks.size(); ++index) {
-        block_by_start.emplace(result.blocks[index].start.value, index);
-        block_by_id.emplace(result.blocks[index].id, index);
-        block_boundaries.emplace(result.blocks[index].start.value, true);
-        block_boundaries.emplace(result.blocks[index].end.value, true);
+    result.shard_merge_ns = block_result.shard_merge_ns;
+    shard_failure_t failure;
+    std::vector<std::uint64_t> block_boundaries(result.blocks.size() * 2);
+    {
+        const auto shards = partition_shards(result.blocks.size(),
+            pass_shard_count(result.blocks.size(), kIndexShardFloor));
+        run_sharded(shards.size(), [&](std::size_t shard) {
+            const auto range = shards[shard];
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                block_boundaries[index * 2] = result.blocks[index].start.value;
+                block_boundaries[index * 2 + 1] = result.blocks[index].end.value;
+            }
+        });
+        merge_clock_t boundary_clock;
+        std::sort(block_boundaries.begin(), block_boundaries.end());
+        block_boundaries.erase(std::unique(block_boundaries.begin(),
+            block_boundaries.end()), block_boundaries.end());
+        result.shard_merge_ns += boundary_clock.elapsed_ns();
     }
+    const auto boundary_contains = [&](std::uint64_t rva) {
+        return std::binary_search(block_boundaries.begin(), block_boundaries.end(), rva);
+    };
+    struct seed_shard_output_t {
+        std::vector<selected_seed_t> selected;
+        std::vector<function_recovery_conflict_t> conflicts;
+    };
+    const auto seed_shards = partition_shards(seeds.size(),
+        pass_shard_count(seeds.size(), kSeedShardFloor));
+    std::vector<seed_shard_output_t> seed_outputs(seed_shards.size());
+    run_sharded(seed_shards.size(), [&](std::size_t shard) {
+        guarded_shard(failure, shard,
+            "function recovery conflict storage exceeds analysis budget", "functions",
+            [&]() {
+            auto& output = seed_outputs[shard];
+            const auto range = seed_shards[shard];
+            output.selected.reserve(range.end - range.begin);
+            shard_poll_t poll{&cancel, &failure, shard, "functions"};
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                if (poll.stopped(index - range.begin))
+                    return;
+                const auto& seed = seeds[index];
+                const auto start = to_rva(image, seed.address);
+                if (!start) {
+                    function_recovery_conflict_t conflict;
+                    conflict.kind = function_recovery_conflict_kind_t::invalid_seed_address;
+                    conflict.rva = seed.address.value;
+                    conflict.competing_seed_kind = seed.kind;
+                    conflict.competing_source_id = seed.stable_source_id;
+                    output.conflicts.push_back(std::move(conflict));
+                    continue;
+                }
+                const auto block = block_index_by_start(result.blocks, *start);
+                const bool loader_only = !block &&
+                    authoritative_loader_seed(seed.kind) && executable_rva(image, *start) &&
+                    executable_region_end(image, *start).has_value();
+                if (!block) {
+                    function_recovery_conflict_t conflict;
+                    conflict.kind = function_recovery_conflict_kind_t::seed_without_block;
+                    conflict.rva = *start;
+                    conflict.competing_seed_kind = seed.kind;
+                    conflict.competing_source_id = seed.stable_source_id;
+                    output.conflicts.push_back(std::move(conflict));
+                    if (!loader_only)
+                        continue;
+                }
+                std::optional<std::uint64_t> end;
+                if (seed.known_end) {
+                    end = to_rva_endpoint(image, *seed.known_end);
+                    const auto executable_end = executable_region_end(image, *start);
+                    const bool valid_end = end && *end > *start &&
+                        (loader_only
+                            ? executable_end && *end <= *executable_end
+                            : boundary_contains(*end));
+                    if (!valid_end) {
+                        function_recovery_conflict_t conflict;
+                        conflict.kind =
+                            function_recovery_conflict_kind_t::invalid_seed_range;
+                        conflict.rva = *start;
+                        conflict.related_rva = seed.known_end->value;
+                        conflict.competing_seed_kind = seed.kind;
+                        conflict.competing_source_id = seed.stable_source_id;
+                        output.conflicts.push_back(std::move(conflict));
+                        end.reset();
+                    }
+                }
+                output.selected.push_back({seed, *start, end, loader_only});
+            }
+        });
+    });
+    if (failure.failed.load(std::memory_order_relaxed))
+        return workspace_result_t<function_recovery_result_t>::failure(failure.take_error());
     std::vector<selected_seed_t> selected;
-    selected.reserve(std::min<std::size_t>(seeds.size(),
-        static_cast<std::size_t>(limits.max_functions)));
-    for (const auto& seed : seeds) {
-        if (cancel.stop_requested())
-            return workspace_result_t<function_recovery_result_t>::failure(
-                stop_error(cancel, "functions"));
-        const auto start = to_rva(image, seed.address);
-        if (!start) {
-            function_recovery_conflict_t conflict;
-            conflict.kind = function_recovery_conflict_kind_t::invalid_seed_address;
-            conflict.rva = seed.address.value;
-            conflict.competing_seed_kind = seed.kind;
-            conflict.competing_source_id = seed.stable_source_id;
-            auto appended = append_conflict(result, std::move(conflict), limits);
-            if (!appended)
+    {
+        merge_clock_t seed_clock;
+        std::uint64_t selected_total = 0;
+        std::uint64_t conflict_total = 0;
+        for (const auto& output : seed_outputs) {
+            if (!checked_add_u64(selected_total, output.selected.size(), selected_total) ||
+                !checked_add_u64(conflict_total, output.conflicts.size(), conflict_total)) {
                 return workspace_result_t<function_recovery_result_t>::failure(
-                    appended.error());
-            continue;
-        }
-        const auto block = block_by_start.find(*start);
-        const bool loader_only = block == block_by_start.end() &&
-            authoritative_loader_seed(seed.kind) && executable_rva(image, *start) &&
-            executable_region_end(image, *start).has_value();
-        if (block == block_by_start.end()) {
-            function_recovery_conflict_t conflict;
-            conflict.kind = function_recovery_conflict_kind_t::seed_without_block;
-            conflict.rva = *start;
-            conflict.competing_seed_kind = seed.kind;
-            conflict.competing_source_id = seed.stable_source_id;
-            auto appended = append_conflict(result, std::move(conflict), limits);
-            if (!appended)
-                return workspace_result_t<function_recovery_result_t>::failure(
-                    appended.error());
-            if (!loader_only)
-                continue;
-        }
-        std::optional<std::uint64_t> end;
-        if (seed.known_end) {
-            end = to_rva_endpoint(image, *seed.known_end);
-            const auto executable_end = executable_region_end(image, *start);
-            const bool valid_end = end && *end > *start &&
-                (loader_only
-                    ? executable_end && *end <= *executable_end
-                    : block_boundaries.find(*end) != block_boundaries.end());
-            if (!valid_end) {
-                function_recovery_conflict_t conflict;
-                conflict.kind = function_recovery_conflict_kind_t::invalid_seed_range;
-                conflict.rva = *start;
-                conflict.related_rva = seed.known_end->value;
-                conflict.competing_seed_kind = seed.kind;
-                conflict.competing_source_id = seed.stable_source_id;
-                auto appended = append_conflict(result, std::move(conflict), limits);
-                if (!appended)
-                    return workspace_result_t<function_recovery_result_t>::failure(
-                        appended.error());
-                end.reset();
+                    make_workspace_error(workspace_error_code_t::range_overflow,
+                        "function recovery conflict storage exceeds analysis budget",
+                        "functions"));
             }
         }
-        selected.push_back({seed, *start, end, loader_only});
+        if (conflict_total > limits.max_conflicts) {
+            return workspace_result_t<function_recovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "function recovery conflict storage exceeds analysis budget",
+                    "functions"));
+        }
+        std::uint64_t conflict_bytes = 0;
+        if (!checked_mul_u64(conflict_total, sizeof(function_recovery_conflict_t),
+                conflict_bytes)) {
+            return workspace_result_t<function_recovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                    "function recovery conflict storage exceeds analysis budget",
+                    "functions"));
+        }
+        auto accounted = account_bytes(result.storage_bytes, conflict_bytes,
+            limits.max_result_bytes, "functions",
+            "function recovery conflict storage exceeds analysis budget");
+        if (!accounted)
+            return workspace_result_t<function_recovery_result_t>::failure(
+                accounted.error());
+        selected.reserve(static_cast<std::size_t>(selected_total));
+        result.conflicts.reserve(static_cast<std::size_t>(conflict_total));
+        for (auto& output : seed_outputs) {
+            for (auto& selection : output.selected)
+                selected.push_back(std::move(selection));
+            for (auto& conflict : output.conflicts)
+                result.conflicts.push_back(std::move(conflict));
+        }
+        result.shard_merge_ns += seed_clock.elapsed_ns();
     }
     std::sort(selected.begin(), selected.end(), selected_seed_less);
     std::vector<selected_seed_t> canonical;
@@ -1523,122 +2312,260 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
             active_end = *canonical[index].end;
         }
     }
+    const auto block_ids = build_block_id_index(result.blocks, cancel);
+    if (cancel.stop_requested())
+        return workspace_result_t<function_recovery_result_t>::failure(
+            stop_error(cancel, "functions"));
     std::vector<std::vector<std::size_t>> successors(result.blocks.size());
-    for (const auto& edge : result.edges) {
-        if (edge.kind == edge_kind_t::call || edge.kind == edge_kind_t::tail_call ||
-            edge.kind == edge_kind_t::return_edge)
-            continue;
-        const auto source = block_by_id.find(edge.source_entity);
-        const auto target = to_rva(image, edge.target);
-        const auto found = target ? block_by_start.find(*target) : block_by_start.end();
-        if (source == block_by_id.end() || found == block_by_start.end())
-            continue;
-        successors[source->second].push_back(found->second);
-    }
-    for (auto& values : successors) {
-        std::sort(values.begin(), values.end());
-        values.erase(std::unique(values.begin(), values.end()), values.end());
-    }
-    std::map<std::size_t, std::size_t> seeded_blocks;
-    for (std::size_t index = 0; index < canonical.size(); ++index) {
-        const auto block = block_by_start.find(canonical[index].start);
-        if (block != block_by_start.end())
-            seeded_blocks.emplace(block->second, index);
-    }
-    std::vector<std::uint32_t> visit_marks(result.blocks.size(), 0);
-    result.reachability_mark_slots = visit_marks.size();
-    std::uint32_t generation = 0;
-    std::uint64_t total_memberships = 0;
-    std::vector<std::uint32_t> claim_counts(result.blocks.size(), 0);
-    const auto next_generation = [&]() {
-        ++generation;
-        if (generation == 0) {
-            std::fill(visit_marks.begin(), visit_marks.end(), 0);
-            generation = 1;
+    {
+        struct successor_pair_t {
+            std::uint32_t source = 0;
+            std::uint32_t target = 0;
+        };
+        const auto edge_shards = partition_shards(result.edges.size(),
+            pass_shard_count(result.edges.size(), kIndexShardFloor));
+        std::vector<std::vector<successor_pair_t>> shard_pairs(edge_shards.size());
+        run_sharded(edge_shards.size(), [&](std::size_t shard) {
+            guarded_shard(failure, shard, "function storage exceeds analysis budget",
+                "functions", [&]() {
+                auto& pairs = shard_pairs[shard];
+                const auto range = edge_shards[shard];
+                shard_poll_t poll{&cancel, &failure, shard, "functions"};
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (poll.stopped(index - range.begin))
+                        return;
+                    const auto& edge = result.edges[index];
+                    if (edge.kind == edge_kind_t::call ||
+                        edge.kind == edge_kind_t::tail_call ||
+                        edge.kind == edge_kind_t::return_edge)
+                        continue;
+                    const auto source = block_ids.find(edge.source_entity);
+                    const auto target = to_rva(image, edge.target);
+                    const auto found = target
+                        ? block_index_by_start(result.blocks, *target) : std::nullopt;
+                    if (!source || !found)
+                        continue;
+                    pairs.push_back({static_cast<std::uint32_t>(*source),
+                        static_cast<std::uint32_t>(*found)});
+                }
+            });
+        });
+        if (failure.failed.load(std::memory_order_relaxed))
+            return workspace_result_t<function_recovery_result_t>::failure(
+                failure.take_error());
+        merge_clock_t successor_clock;
+        for (auto& pairs : shard_pairs) {
+            for (const auto& pair : pairs)
+                successors[pair.source].push_back(pair.target);
         }
-        ++result.reachability_passes;
-        return generation;
-    };
-    const auto traverse = [&](const selected_seed_t& selection, bool unclaimed_only)
-        -> workspace_result_t<std::vector<std::size_t>> {
-        const auto start = block_by_start.find(selection.start);
-        if (start == block_by_start.end())
-            return workspace_result_t<std::vector<std::size_t>>::success({});
-        const auto mark = next_generation();
-        std::vector<std::size_t> pending;
-        std::vector<std::size_t> reached;
-        pending.push_back(start->second);
-        while (!pending.empty()) {
-            if (cancel.stop_requested())
-                return workspace_result_t<std::vector<std::size_t>>::failure(
-                    stop_error(cancel, "functions"));
-            const auto block_index = pending.back();
-            pending.pop_back();
-            if (visit_marks[block_index] == mark)
+        result.shard_merge_ns += successor_clock.elapsed_ns();
+    }
+    {
+        const auto block_shards = partition_shards(result.blocks.size(),
+            pass_shard_count(result.blocks.size(), kIndexShardFloor));
+        run_sharded(block_shards.size(), [&](std::size_t shard) {
+            const auto range = block_shards[shard];
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                auto& values = successors[index];
+                std::sort(values.begin(), values.end());
+                values.erase(std::unique(values.begin(), values.end()), values.end());
+            }
+        });
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> seeded_blocks;
+    seeded_blocks.reserve(canonical.size());
+    for (std::size_t index = 0; index < canonical.size(); ++index) {
+        const auto block = block_index_by_start(result.blocks, canonical[index].start);
+        if (block) {
+            seeded_blocks.emplace_back(static_cast<std::uint32_t>(*block),
+                static_cast<std::uint32_t>(index));
+        }
+    }
+    std::vector<std::atomic<std::uint32_t>> claim_counts(result.blocks.size());
+    {
+        const auto block_shards = partition_shards(result.blocks.size(),
+            pass_shard_count(result.blocks.size(), kIndexShardFloor));
+        run_sharded(block_shards.size(), [&](std::size_t shard) {
+            const auto range = block_shards[shard];
+            for (std::size_t index = range.begin; index < range.end; ++index)
+                claim_counts[index].store(0, std::memory_order_relaxed);
+        });
+    }
+    result.reachability_mark_slots = result.blocks.size();
+    std::uint64_t total_memberships = 0;
+    const auto traverse_one = [&](traverse_scratch_t& scratch,
+                                  const selected_seed_t& selection, bool unclaimed_only,
+                                  std::uint64_t& memberships, std::uint64_t& passes)
+        -> workspace_result_t<void> {
+        scratch.reached.clear();
+        const auto start = block_index_by_start(result.blocks, selection.start);
+        if (!start)
+            return workspace_result_t<void>::success();
+        if (scratch.marks.size() != result.blocks.size())
+            scratch.marks.resize(result.blocks.size(), 0);
+        ++scratch.generation;
+        if (scratch.generation == 0) {
+            std::fill(scratch.marks.begin(), scratch.marks.end(), 0);
+            scratch.generation = 1;
+        }
+        ++passes;
+        const auto mark = scratch.generation;
+        scratch.pending.clear();
+        scratch.pending.push_back(*start);
+        std::size_t visits = 0;
+        while (!scratch.pending.empty()) {
+            if ((visits++ & (kCancellationStride - 1)) == 0 && cancel.stop_requested())
+                return workspace_result_t<void>::failure(stop_error(cancel, "functions"));
+            const auto block_index = scratch.pending.back();
+            scratch.pending.pop_back();
+            if (scratch.marks[block_index] == mark)
                 continue;
-            visit_marks[block_index] = mark;
+            scratch.marks[block_index] = mark;
             const auto& block = result.blocks[block_index];
             if (block.start.value < selection.start ||
                 (selection.end && block.end.value > *selection.end))
                 continue;
-            const auto barrier = seeded_blocks.find(block_index);
+            const auto barrier = std::lower_bound(seeded_blocks.begin(),
+                seeded_blocks.end(), static_cast<std::uint32_t>(block_index),
+                [](const std::pair<std::uint32_t, std::uint32_t>& entry,
+                   std::uint32_t value) {
+                    return entry.first < value;
+                });
             if (barrier != seeded_blocks.end() &&
+                barrier->first == static_cast<std::uint32_t>(block_index) &&
                 block.start.value != selection.start)
                 continue;
-            if (unclaimed_only && claim_counts[block_index] != 0)
+            if (unclaimed_only &&
+                claim_counts[block_index].load(std::memory_order_relaxed) != 0)
                 continue;
-            if (reached.size() >= limits.max_blocks_per_function ||
-                total_memberships >= limits.max_function_memberships) {
-                return workspace_result_t<std::vector<std::size_t>>::failure(
-                    make_workspace_error(workspace_error_code_t::limit_exceeded,
-                        "function reachability exceeds analysis budget", "functions"));
+            if (scratch.reached.size() >= limits.max_blocks_per_function ||
+                memberships >= limits.max_function_memberships) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "function reachability exceeds analysis budget", "functions"));
             }
-            reached.push_back(block_index);
-            ++total_memberships;
+            scratch.reached.push_back(block_index);
+            ++memberships;
             for (auto iterator = successors[block_index].rbegin();
                  iterator != successors[block_index].rend(); ++iterator) {
-                if (visit_marks[*iterator] != mark)
-                    pending.push_back(*iterator);
+                if (scratch.marks[*iterator] != mark)
+                    scratch.pending.push_back(*iterator);
             }
         }
-        std::sort(reached.begin(), reached.end());
-        return workspace_result_t<std::vector<std::size_t>>::success(std::move(reached));
+        std::sort(scratch.reached.begin(), scratch.reached.end());
+        return workspace_result_t<void>::success();
+    };
+    struct traverse_shard_output_t {
+        std::vector<function_candidate_t> candidates;
+        std::vector<function_recovery_conflict_t> conflicts;
+        std::uint64_t memberships = 0;
+        std::uint64_t passes = 0;
+        bool reachability_failed = false;
     };
     std::vector<function_candidate_t> candidates;
-    candidates.reserve(canonical.size());
-    for (const auto& selection : canonical) {
-        if (selection.loader_only) {
-            if (!selection.end || *selection.end <= selection.start)
-                continue;
-            function_candidate_t candidate;
-            candidate.selection = selection;
-            candidates.push_back(std::move(candidate));
-            continue;
-        }
-        auto reached = traverse(selection, false);
-        if (!reached)
-            return workspace_result_t<function_recovery_result_t>::failure(reached.error());
-        if (reached.value().empty()) {
-            function_recovery_conflict_t conflict;
-            conflict.kind = function_recovery_conflict_kind_t::seed_without_block;
-            conflict.rva = selection.start;
-            conflict.competing_seed_kind = selection.seed.kind;
-            conflict.competing_source_id = selection.seed.stable_source_id;
-            auto appended = append_conflict(result, std::move(conflict), limits);
-            if (!appended)
-                return workspace_result_t<function_recovery_result_t>::failure(
-                    appended.error());
-            continue;
-        }
-        function_candidate_t candidate;
-        candidate.selection = selection;
-        candidate.blocks = reached.take_value();
-        for (const auto block : candidate.blocks)
-            ++claim_counts[block];
-        candidates.push_back(std::move(candidate));
+    const auto canonical_shards = partition_shards(canonical.size(),
+        pass_shard_count(canonical.size(), kSeedShardFloor));
+    std::vector<traverse_shard_output_t> traverse_outputs(canonical_shards.size());
+    run_sharded_local<traverse_scratch_t>(canonical_shards.size(),
+        [&](std::size_t shard, traverse_scratch_t& scratch) {
+        guarded_shard(failure, shard, "function storage exceeds analysis budget",
+            "functions", [&]() {
+            auto& output = traverse_outputs[shard];
+            const auto range = canonical_shards[shard];
+            shard_poll_t poll{&cancel, &failure, shard, "functions"};
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                if (poll.stopped(index - range.begin) || output.reachability_failed)
+                    return;
+                const auto& selection = canonical[index];
+                if (selection.loader_only) {
+                    if (!selection.end || *selection.end <= selection.start)
+                        continue;
+                    function_candidate_t candidate;
+                    candidate.selection = selection;
+                    output.candidates.push_back(std::move(candidate));
+                    continue;
+                }
+                auto traversed = traverse_one(scratch, selection, false,
+                    output.memberships, output.passes);
+                if (!traversed) {
+                    const auto code = traversed.error().code;
+                    if (code == workspace_error_code_t::cancelled ||
+                        code == workspace_error_code_t::deadline_exceeded) {
+                        failure.report(shard, traversed.error());
+                        return;
+                    }
+                    output.reachability_failed = true;
+                    return;
+                }
+                if (scratch.reached.empty()) {
+                    function_recovery_conflict_t conflict;
+                    conflict.kind = function_recovery_conflict_kind_t::seed_without_block;
+                    conflict.rva = selection.start;
+                    conflict.competing_seed_kind = selection.seed.kind;
+                    conflict.competing_source_id = selection.seed.stable_source_id;
+                    output.conflicts.push_back(std::move(conflict));
+                    continue;
+                }
+                function_candidate_t candidate;
+                candidate.selection = selection;
+                candidate.blocks = std::move(scratch.reached);
+                scratch.reached.clear();
+                for (const auto block : candidate.blocks)
+                    claim_counts[block].fetch_add(1, std::memory_order_relaxed);
+                output.candidates.push_back(std::move(candidate));
+            }
+        });
+    });
+    if (failure.failed.load(std::memory_order_relaxed))
+        return workspace_result_t<function_recovery_result_t>::failure(failure.take_error());
+    bool reachability_failed = false;
+    std::uint64_t traverse_conflict_total = 0;
+    std::uint64_t candidate_total = 0;
+    for (const auto& output : traverse_outputs) {
+        reachability_failed = reachability_failed || output.reachability_failed;
+        total_memberships += output.memberships;
+        result.reachability_passes += output.passes;
+        traverse_conflict_total += output.conflicts.size();
+        candidate_total += output.candidates.size();
     }
+    if (reachability_failed || total_memberships >= limits.max_function_memberships) {
+        return workspace_result_t<function_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "function reachability exceeds analysis budget", "functions"));
+    }
+    if (traverse_conflict_total > limits.max_conflicts) {
+        return workspace_result_t<function_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "function recovery conflict storage exceeds analysis budget", "functions"));
+    }
+    {
+        merge_clock_t traverse_clock;
+        std::uint64_t conflict_bytes = 0;
+        if (!checked_mul_u64(traverse_conflict_total,
+                sizeof(function_recovery_conflict_t), conflict_bytes)) {
+            return workspace_result_t<function_recovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                    "function recovery conflict storage exceeds analysis budget",
+                    "functions"));
+        }
+        auto accounted = account_bytes(result.storage_bytes, conflict_bytes,
+            limits.max_result_bytes, "functions",
+            "function recovery conflict storage exceeds analysis budget");
+        if (!accounted)
+            return workspace_result_t<function_recovery_result_t>::failure(
+                accounted.error());
+        candidates.reserve(candidate_total);
+        for (auto& output : traverse_outputs) {
+            for (auto& candidate : output.candidates)
+                candidates.push_back(std::move(candidate));
+            for (auto& conflict : output.conflicts)
+                result.conflicts.push_back(std::move(conflict));
+        }
+        result.shard_merge_ns += traverse_clock.elapsed_ns();
+    }
+    traverse_scratch_t gap_scratch;
     for (std::size_t block_index = 0; block_index < result.blocks.size(); ++block_index) {
-        if (claim_counts[block_index] != 0)
+        if (claim_counts[block_index].load(std::memory_order_relaxed) != 0)
             continue;
         if (candidates.size() >= limits.max_functions) {
             return workspace_result_t<function_recovery_result_t>::failure(
@@ -1652,17 +2579,20 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
         gap.seed.provenance = fact_provenance_t::gap_recovery;
         gap.seed.confidence = result.blocks[block_index].confidence;
         gap.seed.stable_source_id = result.blocks[block_index].id ^ gap.start;
-        auto reached = traverse(gap, true);
-        if (!reached)
-            return workspace_result_t<function_recovery_result_t>::failure(reached.error());
-        if (reached.value().empty())
+        auto traversed = traverse_one(gap_scratch, gap, true, total_memberships,
+            result.reachability_passes);
+        if (!traversed)
+            return workspace_result_t<function_recovery_result_t>::failure(
+                traversed.error());
+        if (gap_scratch.reached.empty())
             continue;
         function_candidate_t candidate;
         candidate.selection = gap;
-        candidate.blocks = reached.take_value();
+        candidate.blocks = std::move(gap_scratch.reached);
+        gap_scratch.reached.clear();
         candidate.synthetic_gap = true;
         for (const auto block : candidate.blocks)
-            ++claim_counts[block];
+            claim_counts[block].fetch_add(1, std::memory_order_relaxed);
         function_recovery_conflict_t conflict;
         conflict.kind = function_recovery_conflict_kind_t::gap_component_seeded;
         conflict.rva = gap.start;
@@ -1728,178 +2658,272 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
                     appended.error());
         }
     }
-    struct chunk_run_t {
-        std::size_t first_member = 0;
-        std::size_t member_count = 0;
-        bool shared = false;
-    };
-    for (std::size_t candidate_index = 0;
-         candidate_index < candidates.size(); ++candidate_index) {
-        auto& candidate = candidates[candidate_index];
-        if (candidate.blocks.empty()) {
-            if (!candidate.selection.loader_only || !candidate.selection.end ||
-                *candidate.selection.end <= candidate.selection.start) {
-                return workspace_result_t<function_recovery_result_t>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                        "loader-backed function range is invalid", "functions"));
-            }
-            function_record_t function;
-            function.id = candidate.function_id;
-            function.start = rva_address(image, candidate.selection.start);
-            function.end = rva_address(image, *candidate.selection.end);
-            function.provenance = candidate.selection.seed.provenance;
-            function.confidence = candidate.selection.seed.confidence;
-            function.noreturn = candidate.selection.seed.noreturn ||
-                known_noreturn_name(candidate.selection.seed.name);
-            auto appended_function = append_bounded(result.functions,
-                std::move(function), limits.max_functions, limits.max_result_bytes,
-                result.storage_bytes, "functions",
-                "function storage exceeds analysis budget");
-            if (!appended_function)
-                return workspace_result_t<function_recovery_result_t>::failure(
-                    appended_function.error());
-            continue;
-        }
-        std::vector<chunk_run_t> runs;
-        std::size_t run_begin = 0;
-        while (run_begin < candidate.blocks.size()) {
-            const bool shared = owners[candidate.blocks[run_begin]] != candidate_index;
-            std::size_t run_end = run_begin + 1;
-            while (run_end < candidate.blocks.size()) {
-                const auto previous = candidate.blocks[run_end - 1];
-                const auto current = candidate.blocks[run_end];
-                if (current != previous + 1 ||
-                    result.blocks[previous].end != result.blocks[current].start ||
-                    (owners[current] != candidate_index) != shared)
-                    break;
-                ++run_end;
-            }
-            runs.push_back({run_begin, run_end - run_begin, shared});
-            run_begin = run_end;
-        }
-        const auto entry_block = block_by_start.find(candidate.selection.start);
-        if (entry_block == block_by_start.end()) {
-            return workspace_result_t<function_recovery_result_t>::failure(
-                make_workspace_error(workspace_error_code_t::integrity_failure,
-                    "function entry block disappeared during recovery", "functions"));
-        }
-        const auto primary = std::find_if(runs.begin(), runs.end(),
-            [&](const chunk_run_t& run) {
-                for (std::size_t offset = 0; offset < run.member_count; ++offset) {
-                    if (candidate.blocks[run.first_member + offset] ==
-                        entry_block->second)
-                        return true;
+    std::vector<candidate_emit_t> emissions(candidates.size());
+    const auto emit_shards = partition_shards(candidates.size(),
+        pass_shard_count(candidates.size(), kSeedShardFloor));
+    run_sharded(emit_shards.size(), [&](std::size_t shard) {
+        guarded_shard(failure, shard, "function storage exceeds analysis budget",
+            "functions", [&]() {
+            const auto range = emit_shards[shard];
+            shard_poll_t poll{&cancel, &failure, shard, "functions"};
+            for (std::size_t candidate_index = range.begin; candidate_index < range.end;
+                 ++candidate_index) {
+                if (poll.stopped(candidate_index - range.begin))
+                    return;
+                const auto& candidate = candidates[candidate_index];
+                auto& emission = emissions[candidate_index];
+                if (candidate.blocks.empty()) {
+                    if (!candidate.selection.loader_only || !candidate.selection.end ||
+                        *candidate.selection.end <= candidate.selection.start) {
+                        failure.report(shard, make_workspace_error(
+                            workspace_error_code_t::integrity_failure,
+                            "loader-backed function range is invalid", "functions"));
+                        return;
+                    }
+                    auto& function = emission.function;
+                    function.id = candidate.function_id;
+                    function.start = rva_address(image, candidate.selection.start);
+                    function.end = rva_address(image, *candidate.selection.end);
+                    function.provenance = candidate.selection.seed.provenance;
+                    function.confidence = candidate.selection.seed.confidence;
+                    function.noreturn = candidate.selection.seed.noreturn ||
+                        known_noreturn_name(candidate.selection.seed.name);
+                    emission.loader_record = true;
+                    continue;
                 }
-                return false;
-            });
-        if (primary == runs.end() || primary->shared) {
-            return workspace_result_t<function_recovery_result_t>::failure(
-                make_workspace_error(workspace_error_code_t::integrity_failure,
-                    "function entry has no deterministic primary ownership", "functions"));
-        }
-        if (primary != runs.begin())
-            std::rotate(runs.begin(), primary, primary + 1);
-        function_record_t function;
-        function.id = candidate.function_id;
-        function.start = rva_address(image, candidate.selection.start);
-        function.provenance = candidate.selection.seed.provenance;
-        function.confidence = candidate.selection.seed.confidence;
-        function.noreturn = candidate.selection.seed.noreturn ||
-            known_noreturn_name(candidate.selection.seed.name);
-        function.thunk = compact_thunk(candidate, result.blocks,
-            result.terminator_instruction_indices, instructions);
-        function.first_chunk =
-            static_cast<std::uint32_t>(result.function_chunks.size());
-        function.first_block_membership = static_cast<std::uint32_t>(
-            result.function_block_memberships.size());
-        std::uint64_t range_bytes = 0;
-        std::uint64_t range_peak = 0;
-        if (!checked_mul_u64(runs.size(), sizeof(address_range_t), range_bytes) ||
-            !checked_add_u64(result.storage_bytes, range_bytes, range_peak) ||
-            range_peak > limits.max_result_bytes) {
-            return workspace_result_t<function_recovery_result_t>::failure(
-                make_workspace_error(workspace_error_code_t::limit_exceeded,
-                    "function range storage exceeds analysis budget", "functions"));
-        }
-        result.storage_bytes = range_peak;
-        function.chunks.reserve(runs.size());
-        std::uint32_t membership_ordinal = 0;
-        std::uint64_t maximum_end = function.start.value;
-        for (std::size_t run_index = 0; run_index < runs.size(); ++run_index) {
-            const auto& run = runs[run_index];
-            const auto first_block = candidate.blocks[run.first_member];
-            const auto last_block =
-                candidate.blocks[run.first_member + run.member_count - 1];
-            function_chunk_record_t chunk;
-            chunk.id = kFunctionChunkEntityTag |
-                static_cast<std::uint64_t>(result.function_chunks.size() + 1);
-            chunk.function_id = function.id;
-            chunk.start = result.blocks[first_block].start;
-            chunk.end = result.blocks[last_block].end;
-            chunk.first_block = static_cast<std::uint32_t>(first_block);
-            chunk.block_count = static_cast<std::uint32_t>(run.member_count);
-            chunk.provenance = function.provenance;
-            chunk.confidence = function.confidence;
-            chunk.cold = run_index != 0 && !run.shared;
-            chunk.shared = run.shared;
-            const auto chunk_id = chunk.id;
-            auto appended_chunk = append_bounded(result.function_chunks,
-                std::move(chunk), limits.max_function_memberships,
-                limits.max_result_bytes, result.storage_bytes, "functions",
-                "function chunk storage exceeds analysis budget");
-            if (!appended_chunk)
-                return workspace_result_t<function_recovery_result_t>::failure(
-                    appended_chunk.error());
-            address_range_t range;
-            range.rva_start = result.blocks[first_block].start.value;
-            range.rva_end = result.blocks[last_block].end.value;
-            range.chunk_kind = static_cast<std::uint8_t>(
-                (run.shared ? function_chunk_shared : function_chunk_none) |
-                ((run_index != 0 && !run.shared) ? function_chunk_cold
-                                                  : function_chunk_none));
-            function.chunks.push_back(range);
-            if (run_index == 0) {
-                function.first_block = static_cast<std::uint32_t>(first_block);
-                function.block_count = static_cast<std::uint32_t>(run.member_count);
+                std::size_t run_begin = 0;
+                while (run_begin < candidate.blocks.size()) {
+                    const bool shared =
+                        owners[candidate.blocks[run_begin]] != candidate_index;
+                    std::size_t run_end = run_begin + 1;
+                    while (run_end < candidate.blocks.size()) {
+                        const auto previous = candidate.blocks[run_end - 1];
+                        const auto current = candidate.blocks[run_end];
+                        if (current != previous + 1 ||
+                            result.blocks[previous].end !=
+                                result.blocks[current].start ||
+                            (owners[current] != candidate_index) != shared)
+                            break;
+                        ++run_end;
+                    }
+                    emit_run_t run;
+                    run.first_member = static_cast<std::uint32_t>(run_begin);
+                    run.member_count = static_cast<std::uint32_t>(run_end - run_begin);
+                    run.shared = shared;
+                    emission.runs.push_back(run);
+                    run_begin = run_end;
+                }
+                const auto entry_block = block_index_by_start(result.blocks,
+                    candidate.selection.start);
+                if (!entry_block) {
+                    failure.report(shard, make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "function entry block disappeared during recovery", "functions"));
+                    return;
+                }
+                const auto primary = std::find_if(emission.runs.begin(),
+                    emission.runs.end(), [&](const emit_run_t& run) {
+                        for (std::size_t offset = 0; offset < run.member_count; ++offset) {
+                            if (candidate.blocks[run.first_member + offset] == *entry_block)
+                                return true;
+                        }
+                        return false;
+                    });
+                if (primary == emission.runs.end() || primary->shared) {
+                    failure.report(shard, make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "function entry has no deterministic primary ownership",
+                        "functions"));
+                    return;
+                }
+                if (primary != emission.runs.begin())
+                    std::rotate(emission.runs.begin(), primary, primary + 1);
+                auto& function = emission.function;
+                function.id = candidate.function_id;
+                function.start = rva_address(image, candidate.selection.start);
+                function.provenance = candidate.selection.seed.provenance;
+                function.confidence = candidate.selection.seed.confidence;
+                function.noreturn = candidate.selection.seed.noreturn ||
+                    known_noreturn_name(candidate.selection.seed.name);
+                function.thunk = compact_thunk(candidate, result.blocks,
+                    result.terminator_instruction_indices, instructions);
+                function.chunks.reserve(emission.runs.size());
+                std::uint64_t maximum_end = function.start.value;
+                for (std::size_t run_index = 0; run_index < emission.runs.size();
+                     ++run_index) {
+                    auto& run = emission.runs[run_index];
+                    const auto first_block = candidate.blocks[run.first_member];
+                    const auto last_block =
+                        candidate.blocks[run.first_member + run.member_count - 1];
+                    run.first_block = static_cast<std::uint32_t>(first_block);
+                    run.last_block = static_cast<std::uint32_t>(last_block);
+                    run.cold = run_index != 0 && !run.shared;
+                    address_range_t range_record;
+                    range_record.rva_start = result.blocks[first_block].start.value;
+                    range_record.rva_end = result.blocks[last_block].end.value;
+                    range_record.chunk_kind = static_cast<std::uint8_t>(
+                        (run.shared ? function_chunk_shared : function_chunk_none) |
+                        (run.cold ? function_chunk_cold : function_chunk_none));
+                    function.chunks.push_back(range_record);
+                    if (run_index == 0) {
+                        function.first_block = static_cast<std::uint32_t>(first_block);
+                        function.block_count = run.member_count;
+                    }
+                    maximum_end = (std::max)(maximum_end, range_record.rva_end);
+                    emission.membership_total += run.member_count;
+                }
+                function.end = rva_address(image, maximum_end);
+                if (!checked_mul_u64(static_cast<std::uint64_t>(emission.runs.size()),
+                        sizeof(address_range_t), emission.range_bytes)) {
+                    failure.report(shard, make_workspace_error(
+                        workspace_error_code_t::limit_exceeded,
+                        "function range storage exceeds analysis budget", "functions"));
+                    return;
+                }
             }
-            maximum_end = std::max(maximum_end, range.rva_end);
-            for (std::size_t offset = 0; offset < run.member_count; ++offset) {
-                const auto block_index = candidate.blocks[run.first_member + offset];
-                function_block_membership_record_t membership;
-                membership.function_id = function.id;
-                membership.chunk_id = chunk_id;
-                membership.block_id = result.blocks[block_index].id;
-                membership.block_index = static_cast<std::uint32_t>(block_index);
-                membership.ordinal = membership_ordinal++;
-                membership.shared = owners[block_index] != candidate_index;
-                auto appended_membership = append_bounded(
-                    result.function_block_memberships, std::move(membership),
-                    limits.max_function_memberships, limits.max_result_bytes,
-                    result.storage_bytes, "functions",
-                    "function membership storage exceeds analysis budget");
-                if (!appended_membership) {
+        });
+    });
+    if (failure.failed.load(std::memory_order_relaxed))
+        return workspace_result_t<function_recovery_result_t>::failure(failure.take_error());
+    std::uint64_t first_chunk = 0;
+    std::uint64_t first_membership = 0;
+    {
+        merge_clock_t ledger_clock;
+        for (std::size_t candidate_index = 0; candidate_index < candidates.size();
+             ++candidate_index) {
+            auto& emission = emissions[candidate_index];
+            const auto run_count = static_cast<std::uint64_t>(emission.runs.size());
+            if (!emission.loader_record) {
+                auto accounted = account_bytes(result.storage_bytes, emission.range_bytes,
+                    limits.max_result_bytes, "functions",
+                    "function range storage exceeds analysis budget");
+                if (!accounted)
                     return workspace_result_t<function_recovery_result_t>::failure(
-                        appended_membership.error());
+                        accounted.error());
+                if (first_chunk + run_count > limits.max_function_memberships) {
+                    return workspace_result_t<function_recovery_result_t>::failure(
+                        make_workspace_error(workspace_error_code_t::limit_exceeded,
+                            "function chunk storage exceeds analysis budget", "functions"));
                 }
+                std::uint64_t chunk_bytes = 0;
+                if (!checked_mul_u64(run_count, sizeof(function_chunk_record_t),
+                        chunk_bytes)) {
+                    return workspace_result_t<function_recovery_result_t>::failure(
+                        make_workspace_error(workspace_error_code_t::range_overflow,
+                            "function chunk storage exceeds analysis budget", "functions"));
+                }
+                accounted = account_bytes(result.storage_bytes, chunk_bytes,
+                    limits.max_result_bytes, "functions",
+                    "function chunk storage exceeds analysis budget");
+                if (!accounted)
+                    return workspace_result_t<function_recovery_result_t>::failure(
+                        accounted.error());
+                if (first_membership + emission.membership_total >
+                    limits.max_function_memberships) {
+                    return workspace_result_t<function_recovery_result_t>::failure(
+                        make_workspace_error(workspace_error_code_t::limit_exceeded,
+                            "function membership storage exceeds analysis budget",
+                            "functions"));
+                }
+                std::uint64_t membership_bytes = 0;
+                if (!checked_mul_u64(emission.membership_total,
+                        sizeof(function_block_membership_record_t), membership_bytes)) {
+                    return workspace_result_t<function_recovery_result_t>::failure(
+                        make_workspace_error(workspace_error_code_t::range_overflow,
+                            "function membership storage exceeds analysis budget",
+                            "functions"));
+                }
+                accounted = account_bytes(result.storage_bytes, membership_bytes,
+                    limits.max_result_bytes, "functions",
+                    "function membership storage exceeds analysis budget");
+                if (!accounted)
+                    return workspace_result_t<function_recovery_result_t>::failure(
+                        accounted.error());
+                emission.function.first_chunk = static_cast<std::uint32_t>(first_chunk);
+                emission.function.first_block_membership =
+                    static_cast<std::uint32_t>(first_membership);
+                emission.function.chunk_count = static_cast<std::uint32_t>(run_count);
+                emission.function.block_membership_count =
+                    static_cast<std::uint32_t>(emission.membership_total);
             }
+            if (candidate_index + 1 > limits.max_functions) {
+                return workspace_result_t<function_recovery_result_t>::failure(
+                    make_workspace_error(workspace_error_code_t::limit_exceeded,
+                        "function storage exceeds analysis budget", "functions"));
+            }
+            auto accounted = account_bytes(result.storage_bytes,
+                sizeof(function_record_t), limits.max_result_bytes, "functions",
+                "function storage exceeds analysis budget");
+            if (!accounted)
+                return workspace_result_t<function_recovery_result_t>::failure(
+                    accounted.error());
+            first_chunk += run_count;
+            first_membership += emission.membership_total;
         }
-        function.end = rva_address(image, maximum_end);
-        function.chunk_count = static_cast<std::uint32_t>(
-            result.function_chunks.size() - function.first_chunk);
-        function.block_membership_count = static_cast<std::uint32_t>(
-            result.function_block_memberships.size() -
-            function.first_block_membership);
-        auto appended_function = append_bounded(result.functions,
-            std::move(function), limits.max_functions, limits.max_result_bytes,
-            result.storage_bytes, "functions",
-            "function storage exceeds analysis budget");
-        if (!appended_function)
-            return workspace_result_t<function_recovery_result_t>::failure(
-                appended_function.error());
+        result.shard_merge_ns += ledger_clock.elapsed_ns();
     }
+    result.function_chunks.resize(static_cast<std::size_t>(first_chunk));
+    result.function_block_memberships.resize(static_cast<std::size_t>(first_membership));
+    result.functions.resize(candidates.size());
+    run_sharded(emit_shards.size(), [&](std::size_t shard) {
+        guarded_shard(failure, shard, "function storage exceeds analysis budget",
+            "functions", [&]() {
+            const auto range = emit_shards[shard];
+            shard_poll_t poll{&cancel, &failure, shard, "functions"};
+            for (std::size_t candidate_index = range.begin; candidate_index < range.end;
+                 ++candidate_index) {
+                if (poll.stopped(candidate_index - range.begin))
+                    return;
+                const auto& candidate = candidates[candidate_index];
+                auto& emission = emissions[candidate_index];
+                const auto function_id = emission.function.id;
+                std::uint32_t membership_ordinal = 0;
+                std::uint64_t membership_cursor = emission.function.first_block_membership;
+                for (std::size_t run_index = 0; run_index < emission.runs.size();
+                     ++run_index) {
+                    const auto& run = emission.runs[run_index];
+                    const auto chunk_ordinal =
+                        static_cast<std::uint64_t>(emission.function.first_chunk) +
+                        run_index;
+                    function_chunk_record_t chunk;
+                    chunk.id = kFunctionChunkEntityTag | (chunk_ordinal + 1);
+                    chunk.function_id = function_id;
+                    chunk.start = result.blocks[run.first_block].start;
+                    chunk.end = result.blocks[run.last_block].end;
+                    chunk.first_block = run.first_block;
+                    chunk.block_count = run.member_count;
+                    chunk.provenance = emission.function.provenance;
+                    chunk.confidence = emission.function.confidence;
+                    chunk.cold = run.cold;
+                    chunk.shared = run.shared;
+                    result.function_chunks[static_cast<std::size_t>(chunk_ordinal)] = chunk;
+                    const auto chunk_id = chunk.id;
+                    for (std::size_t offset = 0; offset < run.member_count; ++offset) {
+                        const auto block_index =
+                            candidate.blocks[run.first_member + offset];
+                        function_block_membership_record_t membership;
+                        membership.function_id = function_id;
+                        membership.chunk_id = chunk_id;
+                        membership.block_id = result.blocks[block_index].id;
+                        membership.block_index = static_cast<std::uint32_t>(block_index);
+                        membership.ordinal = membership_ordinal++;
+                        membership.shared = owners[block_index] != candidate_index;
+                        result.function_block_memberships[
+                            static_cast<std::size_t>(membership_cursor)] = membership;
+                        ++membership_cursor;
+                    }
+                }
+                result.functions[candidate_index] = std::move(emission.function);
+            }
+        });
+    });
+    if (failure.failed.load(std::memory_order_relaxed))
+        return workspace_result_t<function_recovery_result_t>::failure(failure.take_error());
+    merge_clock_t final_clock;
     std::sort(result.conflicts.begin(), result.conflicts.end(), conflict_less);
     result.conflicts.erase(std::unique(result.conflicts.begin(),
         result.conflicts.end(), conflict_equal), result.conflicts.end());
+    result.shard_merge_ns += final_clock.elapsed_ns();
     return workspace_result_t<function_recovery_result_t>::success(std::move(result));
 }
 
@@ -1918,115 +2942,199 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::finalize_cfg
             workspace_error_code_t::invalid_argument,
             "function recovery limits are invalid", "cfg_calls"));
     }
-    std::map<std::uint64_t, const function_record_t*> functions_by_start;
-    std::map<std::uint64_t, const basic_block_record_t*> blocks_by_start;
-    std::map<std::uint64_t, const image_import_t*> imports_by_slot;
-    std::map<entity_id_t, std::size_t> block_indices;
-    for (const auto& function : result.functions)
-        functions_by_start.emplace(function.start.value, &function);
-    for (std::size_t index = 0; index < result.blocks.size(); ++index) {
-        blocks_by_start.emplace(result.blocks[index].start.value, &result.blocks[index]);
-        block_indices.emplace(result.blocks[index].id, index);
-    }
-    for (const auto& imported : image.imports) {
-        const auto slot = to_rva(image, imported.address);
+    shard_failure_t failure;
+    const auto function_lookup = make_start_rva_lookup(result.functions);
+    const auto block_lookup = make_start_rva_lookup(result.blocks);
+    const auto block_ids = build_block_id_index(result.blocks, cancel);
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> imports_by_slot;
+    imports_by_slot.reserve(image.imports.size());
+    for (std::size_t index = 0; index < image.imports.size(); ++index) {
+        const auto slot = to_rva(image, image.imports[index].address);
         if (slot)
-            imports_by_slot.emplace(*slot, &imported);
+            imports_by_slot.emplace_back(*slot, static_cast<std::uint32_t>(index));
     }
+    std::stable_sort(imports_by_slot.begin(), imports_by_slot.end(),
+        [](const std::pair<std::uint64_t, std::uint32_t>& lhs,
+           const std::pair<std::uint64_t, std::uint32_t>& rhs) {
+            return lhs.first < rhs.first;
+        });
+    const auto import_at = [&](std::uint64_t slot) -> const image_import_t* {
+        const auto found = std::lower_bound(imports_by_slot.begin(),
+            imports_by_slot.end(), slot,
+            [](const std::pair<std::uint64_t, std::uint32_t>& entry, std::uint64_t value) {
+                return entry.first < value;
+            });
+        if (found != imports_by_slot.end() && found->first == slot)
+            return &image.imports[found->second];
+        return nullptr;
+    };
+    if (cancel.stop_requested())
+        return workspace_result_t<function_recovery_result_t>::failure(
+            stop_error(cancel, "cfg_calls"));
     std::vector<std::uint8_t> noreturn_sources(result.blocks.size(), 0);
-    for (auto& edge : result.edges) {
-        if (cancel.stop_requested())
+    {
+        const auto edge_shards = partition_shards(result.edges.size(),
+            pass_shard_count(result.edges.size(), kIndexShardFloor));
+        run_sharded(edge_shards.size(), [&](std::size_t shard) {
+            guarded_shard(failure, shard, "import call edge storage exceeds analysis budget",
+                "cfg_calls", [&]() {
+                const auto range = edge_shards[shard];
+                shard_poll_t poll{&cancel, &failure, shard, "cfg_calls"};
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (poll.stopped(index - range.begin))
+                        return;
+                    auto& edge = result.edges[index];
+                    const auto target = to_rva(image, edge.target);
+                    if (!target)
+                        continue;
+                    const auto function = function_lookup.find(*target);
+                    const auto source = block_ids.find(edge.source_entity);
+                    if (edge.kind == edge_kind_t::unconditional && function && source &&
+                        result.blocks[*source].function_id !=
+                            result.functions[*function].id) {
+                        edge.kind = edge_kind_t::tail_call;
+                        edge.target_entity = result.functions[*function].id;
+                    } else if ((edge.kind == edge_kind_t::call ||
+                                edge.kind == edge_kind_t::tail_call) && function) {
+                        edge.target_entity = result.functions[*function].id;
+                    } else {
+                        const auto block = block_lookup.find(*target);
+                        if (block)
+                            edge.target_entity = result.blocks[*block].id;
+                    }
+                    if (source && edge.target_entity &&
+                        ((*edge.target_entity & 0xFF00000000000000ULL) ==
+                         kFunctionEntityTag)) {
+                        const auto ordinal = *edge.target_entity & 0x00FFFFFFFFFFFFFFULL;
+                        if (ordinal != 0 && ordinal <= result.functions.size() &&
+                            result.functions[static_cast<std::size_t>(ordinal - 1)].noreturn)
+                            noreturn_sources[*source] = 1;
+                    }
+                }
+            });
+        });
+        if (failure.failed.load(std::memory_order_relaxed))
             return workspace_result_t<function_recovery_result_t>::failure(
-                stop_error(cancel, "cfg_calls"));
-        const auto target = to_rva(image, edge.target);
-        if (!target)
-            continue;
-        const auto function = functions_by_start.find(*target);
-        const auto source = block_indices.find(edge.source_entity);
-        if (edge.kind == edge_kind_t::unconditional &&
-            function != functions_by_start.end() &&
-            source != block_indices.end() &&
-            result.blocks[source->second].function_id != function->second->id) {
-            edge.kind = edge_kind_t::tail_call;
-            edge.target_entity = function->second->id;
-        } else if ((edge.kind == edge_kind_t::call ||
-                    edge.kind == edge_kind_t::tail_call) &&
-                   function != functions_by_start.end()) {
-            edge.target_entity = function->second->id;
-        } else {
-            const auto block = blocks_by_start.find(*target);
-            if (block != blocks_by_start.end())
-                edge.target_entity = block->second->id;
-        }
-        if (source != block_indices.end() && edge.target_entity &&
-            ((*edge.target_entity & 0xFF00000000000000ULL) ==
-             kFunctionEntityTag)) {
-            const auto ordinal =
-                *edge.target_entity & 0x00FFFFFFFFFFFFFFULL;
-            if (ordinal != 0 && ordinal <= result.functions.size() &&
-                result.functions[static_cast<std::size_t>(ordinal - 1)].noreturn)
-                noreturn_sources[source->second] = 1;
+                failure.take_error());
+    }
+    pass_budget_t import_budget;
+    import_budget.ceiling = limits.max_result_bytes - result.storage_bytes;
+    const auto block_shards = partition_shards(result.blocks.size(),
+        pass_shard_count(result.blocks.size(), kIndexShardFloor));
+    std::vector<shard_vector_t<edge_record_t>> shard_import_edges(block_shards.size());
+    run_sharded(block_shards.size(), [&](std::size_t shard) {
+        guarded_shard(failure, shard, "import call edge storage exceeds analysis budget",
+            "cfg_calls", [&]() {
+            const auto range = block_shards[shard];
+            auto& edges = shard_import_edges[shard];
+            shard_poll_t poll{&cancel, &failure, shard, "cfg_calls"};
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                if (poll.stopped(index - range.begin))
+                    return;
+                const auto* call = transfer_instruction(index, result.blocks,
+                    result.terminator_instruction_indices, instructions);
+                if (!call || (call->flow_flags & flow_call) == 0)
+                    continue;
+                std::uint64_t target_end = 0;
+                if (!checked_add_u64(call->target_fact_begin,
+                        call->target_fact_count, target_end) ||
+                    target_end > targets.size()) {
+                    failure.report(shard, make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "call target-fact range is invalid", "cfg_calls"));
+                    return;
+                }
+                for (std::uint64_t target_index = call->target_fact_begin;
+                     target_index < target_end; ++target_index) {
+                    const auto& target = targets[static_cast<std::size_t>(target_index)];
+                    if (target.kind != target_kind_record_t::data &&
+                        target.kind != target_kind_record_t::call)
+                        continue;
+                    const auto slot = to_rva(image, target.target);
+                    const auto imported = slot ? import_at(*slot) : nullptr;
+                    if (!imported)
+                        continue;
+                    edge_record_t edge;
+                    edge.source_entity = result.blocks[index].id;
+                    edge.source = call->address;
+                    edge.target = target.target;
+                    edge.kind = edge_kind_t::call;
+                    edge.provenance = fact_provenance_t::relocation;
+                    edge.confidence = (std::min<std::uint8_t>)(call->confidence, 95);
+                    auto appended = edges.append(std::move(edge), limits.max_edges,
+                        import_budget, "cfg_calls",
+                        "import call edge storage exceeds analysis budget");
+                    if (!appended) {
+                        failure.report(shard, appended.error());
+                        return;
+                    }
+                    if (imported->name && known_noreturn_name(*imported->name))
+                        noreturn_sources[index] = 1;
+                    break;
+                }
+            }
+        });
+    });
+    if (failure.failed.load(std::memory_order_relaxed))
+        return workspace_result_t<function_recovery_result_t>::failure(failure.take_error());
+    merge_clock_t merge_clock;
+    std::uint64_t import_total = 0;
+    for (const auto& edges : shard_import_edges) {
+        if (!checked_add_u64(import_total, edges.values.size(), import_total)) {
+            return workspace_result_t<function_recovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                    "import call edge storage exceeds analysis budget", "cfg_calls"));
         }
     }
-    for (std::size_t index = 0; index < result.blocks.size(); ++index) {
-        if (cancel.stop_requested())
+    if (import_total > limits.max_edges ||
+        result.edges.size() > limits.max_edges - import_total) {
+        return workspace_result_t<function_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "import call edge storage exceeds analysis budget", "cfg_calls"));
+    }
+    std::uint64_t import_bytes = 0;
+    if (!checked_mul_u64(import_total, sizeof(edge_record_t), import_bytes)) {
+        return workspace_result_t<function_recovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "import call edge storage exceeds analysis budget", "cfg_calls"));
+    }
+    auto accounted = account_bytes(result.storage_bytes, import_bytes,
+        limits.max_result_bytes, "cfg_calls",
+        "import call edge storage exceeds analysis budget");
+    if (!accounted)
+        return workspace_result_t<function_recovery_result_t>::failure(accounted.error());
+    result.edges.reserve(result.edges.size() + static_cast<std::size_t>(import_total));
+    for (auto& edges : shard_import_edges) {
+        for (auto& edge : edges.values)
+            result.edges.push_back(std::move(edge));
+    }
+    std::vector<std::uint8_t> keep_flags(result.edges.size(), 0);
+    {
+        const auto edge_shards = partition_shards(result.edges.size(),
+            pass_shard_count(result.edges.size(), kIndexShardFloor));
+        run_sharded(edge_shards.size(), [&](std::size_t shard) {
+            const auto range = edge_shards[shard];
+            shard_poll_t poll{&cancel, &failure, shard, "cfg_calls"};
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                if (poll.stopped(index - range.begin))
+                    return;
+                const auto source = block_ids.find(result.edges[index].source_entity);
+                const bool remove = result.edges[index].kind == edge_kind_t::fallthrough &&
+                    source && noreturn_sources[*source] != 0;
+                keep_flags[index] = remove ? 0 : 1;
+            }
+        });
+        if (failure.failed.load(std::memory_order_relaxed))
             return workspace_result_t<function_recovery_result_t>::failure(
-                stop_error(cancel, "cfg_calls"));
-        const auto* call = transfer_instruction(index, result.blocks,
-            result.terminator_instruction_indices, instructions);
-        if (!call || (call->flow_flags & flow_call) == 0)
-            continue;
-        std::uint64_t target_end = 0;
-        if (!checked_add_u64(call->target_fact_begin,
-                call->target_fact_count, target_end) || target_end > targets.size()) {
-            return workspace_result_t<function_recovery_result_t>::failure(
-                make_workspace_error(workspace_error_code_t::integrity_failure,
-                    "call target-fact range is invalid", "cfg_calls"));
-        }
-        for (std::uint64_t target_index = call->target_fact_begin;
-             target_index < target_end; ++target_index) {
-            const auto& target = targets[static_cast<std::size_t>(target_index)];
-            if (target.kind != target_kind_record_t::data &&
-                target.kind != target_kind_record_t::call)
-                continue;
-            const auto slot = to_rva(image, target.target);
-            const auto imported = slot ? imports_by_slot.find(*slot)
-                                       : imports_by_slot.end();
-            if (imported == imports_by_slot.end())
-                continue;
-            edge_record_t edge;
-            edge.source_entity = result.blocks[index].id;
-            edge.source = call->address;
-            edge.target = target.target;
-            edge.kind = edge_kind_t::call;
-            edge.provenance = fact_provenance_t::relocation;
-            edge.confidence = std::min<std::uint8_t>(call->confidence, 95);
-            auto appended = append_bounded(result.edges, std::move(edge),
-                limits.max_edges, limits.max_result_bytes, result.storage_bytes,
-                "cfg_calls", "import call edge storage exceeds analysis budget");
-            if (!appended)
-                return workspace_result_t<function_recovery_result_t>::failure(
-                    appended.error());
-            if (imported->second->name &&
-                known_noreturn_name(*imported->second->name))
-                noreturn_sources[index] = 1;
-            break;
-        }
+                failure.take_error());
     }
     std::size_t output = 0;
     for (std::size_t index = 0; index < result.edges.size(); ++index) {
-        if (cancel.stop_requested())
-            return workspace_result_t<function_recovery_result_t>::failure(
-                stop_error(cancel, "cfg_calls"));
-        const auto source = block_indices.find(result.edges[index].source_entity);
-        const bool remove = result.edges[index].kind == edge_kind_t::fallthrough &&
-            source != block_indices.end() &&
-            noreturn_sources[source->second] != 0;
-        if (!remove) {
-            if (output != index)
-                result.edges[output] = std::move(result.edges[index]);
-            ++output;
-        }
+        if (keep_flags[index] == 0)
+            continue;
+        if (output != index)
+            result.edges[output] = std::move(result.edges[index]);
+        ++output;
     }
     result.edges.resize(output);
     std::sort(result.edges.begin(), result.edges.end(), edge_less);
@@ -2035,6 +3143,7 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::finalize_cfg
     for (std::size_t index = 0; index < result.edges.size(); ++index)
         result.edges[index].id =
             kEdgeEntityTag | static_cast<std::uint64_t>(index + 1);
+    result.shard_merge_ns += merge_clock.elapsed_ns();
     return workspace_result_t<function_recovery_result_t>::success(std::move(result));
 }
 

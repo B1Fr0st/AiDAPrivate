@@ -56,19 +56,105 @@ bool stronger_seed(const decode_frontier_seed_t& left,
     return left.source_rva < right.source_rva;
 }
 
+bool stronger_claim(const decode_frontier_claim_t& left,
+                    const decode_frontier_claim_t& right) noexcept
+{
+    const auto left_provenance = provenance_rank(left.provenance);
+    const auto right_provenance = provenance_rank(right.provenance);
+    if (left_provenance != right_provenance)
+        return left_provenance > right_provenance;
+    if (left.confidence != right.confidence)
+        return left.confidence > right.confidence;
+    return left.stable_source_id < right.stable_source_id;
+}
+
+struct claimed_flat_set_t final {
+    static constexpr std::uint32_t npos = 0xFFFFFFFFu;
+
+    std::vector<std::uint64_t> keys;
+    std::vector<decode_frontier_claim_t> claims;
+    std::uint32_t size = 0;
+    std::uint32_t mask = 0;
+
+    std::uint32_t find(std::uint64_t rva) const noexcept
+    {
+        if (keys.empty())
+            return npos;
+        const std::uint64_t key = rva + 1;
+        std::uint32_t slot = static_cast<std::uint32_t>(
+            (key * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+        for (;;) {
+            const auto current = keys[slot];
+            if (current == 0)
+                return npos;
+            if (current == key)
+                return slot;
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    std::uint32_t insert(std::uint64_t rva)
+    {
+        if (keys.empty()) {
+            keys.assign(64, 0);
+            claims.assign(64, decode_frontier_claim_t{});
+            mask = 63;
+        } else if ((static_cast<std::uint64_t>(size) + 1ULL) * 10ULL >=
+                   static_cast<std::uint64_t>(keys.size()) * 7ULL) {
+            grow();
+        }
+        const std::uint64_t key = rva + 1;
+        std::uint32_t slot = static_cast<std::uint32_t>(
+            (key * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+        while (keys[slot] != 0 && keys[slot] != key)
+            slot = (slot + 1) & mask;
+        if (keys[slot] == 0) {
+            keys[slot] = key;
+            claims[slot] = decode_frontier_claim_t{};
+            ++size;
+            return slot;
+        }
+        return slot;
+    }
+
+    void grow()
+    {
+        std::vector<std::uint64_t> previous_keys = std::move(keys);
+        std::vector<decode_frontier_claim_t> previous_claims = std::move(claims);
+        const std::size_t capacity = previous_keys.size() * 2;
+        keys.assign(capacity, 0);
+        claims.assign(capacity, decode_frontier_claim_t{});
+        mask = static_cast<std::uint32_t>(capacity - 1);
+        size = 0;
+        for (std::size_t index = 0; index < previous_keys.size(); ++index) {
+            const auto key = previous_keys[index];
+            if (key == 0)
+                continue;
+            std::uint32_t slot = static_cast<std::uint32_t>(
+                (key * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+            while (keys[slot] != 0)
+                slot = (slot + 1) & mask;
+            keys[slot] = key;
+            claims[slot] = previous_claims[index];
+            ++size;
+        }
+    }
+};
+
 }
 
 struct decode_frontier_t::impl_t final {
     struct tile_state_t final {
         decode_frontier_tile_t tile;
         std::map<std::uint64_t, decode_frontier_seed_t> pending;
-        std::unordered_set<std::uint64_t> claimed;
+        claimed_flat_set_t claimed;
     };
 
     std::vector<decode_frontier_tile_t> tiles;
     std::vector<tile_state_t> states;
     std::uint64_t maximum_unique_seeds = 0;
     decode_frontier_snapshot_t counters;
+    std::atomic<std::uint64_t>* shared_unique_seed_count = nullptr;
 
     std::optional<std::size_t> locate_index(std::uint64_t rva) const noexcept
     {
@@ -84,6 +170,20 @@ struct decode_frontier_t::impl_t final {
         if (rva < tile.start_rva || rva - tile.start_rva >= tile.byte_count)
             return std::nullopt;
         return candidate;
+    }
+
+    bool try_consume_seed_budget() noexcept
+    {
+        if (shared_unique_seed_count == nullptr)
+            return counters.unique_seed_count < maximum_unique_seeds;
+        auto current = shared_unique_seed_count->load(std::memory_order_relaxed);
+        for (;;) {
+            if (current >= maximum_unique_seeds)
+                return false;
+            if (shared_unique_seed_count->compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel))
+                return true;
+        }
     }
 };
 
@@ -107,6 +207,14 @@ std::uint8_t decode_frontier_seed_priority(decode_frontier_seed_kind_t kind) noe
 workspace_result_t<decode_frontier_t> decode_frontier_t::build(
     std::vector<decode_frontier_tile_t> tiles,
     std::uint64_t maximum_unique_seeds)
+{
+    return build(std::move(tiles), maximum_unique_seeds, nullptr);
+}
+
+workspace_result_t<decode_frontier_t> decode_frontier_t::build(
+    std::vector<decode_frontier_tile_t> tiles,
+    std::uint64_t maximum_unique_seeds,
+    std::atomic<std::uint64_t>* shared_unique_seed_count)
 {
     if (maximum_unique_seeds == 0) {
         return workspace_result_t<decode_frontier_t>::failure(frontier_error(
@@ -146,6 +254,7 @@ workspace_result_t<decode_frontier_t> decode_frontier_t::build(
         auto impl = std::make_unique<impl_t>();
         impl->tiles = std::move(tiles);
         impl->maximum_unique_seeds = maximum_unique_seeds;
+        impl->shared_unique_seed_count = shared_unique_seed_count;
         impl->states.reserve(impl->tiles.size());
         for (const auto& tile : impl->tiles)
             impl->states.push_back(impl_t::tile_state_t{tile, {}, {}});
@@ -189,9 +298,48 @@ workspace_result_t<decode_frontier_add_result_t> decode_frontier_t::add_seed(
     decode_frontier_add_result_t result;
     result.tile_id = state.tile.id;
     result.cross_tile = source_tile.has_value() && *source_tile != state.tile.id;
-    if (state.claimed.find(seed.rva) != state.claimed.end()) {
-        ++impl_->counters.duplicate_seed_count;
-        result.disposition = decode_frontier_add_disposition_t::already_claimed;
+    const auto claimed_slot = state.claimed.find(seed.rva);
+    if (claimed_slot != claimed_flat_set_t::npos) {
+        const auto requeued = state.pending.find(seed.rva);
+        if (requeued != state.pending.end()) {
+            if (stronger_seed(seed, requeued->second)) {
+                requeued->second = seed;
+                ++impl_->counters.strengthened_seed_count;
+                if (result.cross_tile)
+                    ++impl_->counters.cross_tile_route_count;
+                result.disposition = decode_frontier_add_disposition_t::strengthened;
+            } else {
+                ++impl_->counters.duplicate_seed_count;
+                result.disposition = decode_frontier_add_disposition_t::already_claimed;
+            }
+            return workspace_result_t<decode_frontier_add_result_t>::success(result);
+        }
+        const decode_frontier_claim_t offer{
+            seed.provenance, seed.confidence, seed.stable_source_id};
+        if (!stronger_claim(offer, state.claimed.claims[claimed_slot])) {
+            ++impl_->counters.duplicate_seed_count;
+            result.disposition = decode_frontier_add_disposition_t::already_claimed;
+            return workspace_result_t<decode_frontier_add_result_t>::success(result);
+        }
+        if (!impl_->try_consume_seed_budget()) {
+            auto error = frontier_error(workspace_error_code_t::limit_exceeded,
+                                        "decode frontier seed budget is exhausted", seed.rva);
+            error.details.emplace_back("resource", "frontier_seeds");
+            error.details.emplace_back("limit", std::to_string(impl_->maximum_unique_seeds));
+            return workspace_result_t<decode_frontier_add_result_t>::failure(std::move(error));
+        }
+        try {
+            state.pending.emplace(seed.rva, seed);
+        } catch (const std::bad_alloc&) {
+            return workspace_result_t<decode_frontier_add_result_t>::failure(frontier_error(
+                workspace_error_code_t::limit_exceeded,
+                "decode frontier seed allocation failed", seed.rva));
+        }
+        ++impl_->counters.unique_seed_count;
+        ++impl_->counters.pending_seed_count;
+        if (result.cross_tile)
+            ++impl_->counters.cross_tile_route_count;
+        result.disposition = decode_frontier_add_disposition_t::queued;
         return workspace_result_t<decode_frontier_add_result_t>::success(result);
     }
     const auto existing = state.pending.find(seed.rva);
@@ -208,7 +356,7 @@ workspace_result_t<decode_frontier_add_result_t> decode_frontier_t::add_seed(
         }
         return workspace_result_t<decode_frontier_add_result_t>::success(result);
     }
-    if (impl_->counters.unique_seed_count >= impl_->maximum_unique_seeds) {
+    if (!impl_->try_consume_seed_budget()) {
         auto error = frontier_error(workspace_error_code_t::limit_exceeded,
                                     "decode frontier seed budget is exhausted", seed.rva);
         error.details.emplace_back("resource", "frontier_seeds");
@@ -254,7 +402,11 @@ workspace_result_t<std::vector<decode_frontier_seed_t>> decode_frontier_t::take_
                 auto found = state.pending.begin();
                 auto seed = found->second;
                 state.pending.erase(found);
-                state.claimed.insert(seed.rva);
+                const auto claim_slot = state.claimed.insert(seed.rva);
+                const decode_frontier_claim_t claim{
+                    seed.provenance, seed.confidence, seed.stable_source_id};
+                if (!stronger_claim(state.claimed.claims[claim_slot], claim))
+                    state.claimed.claims[claim_slot] = claim;
                 wave.push_back(std::move(seed));
                 --impl_->counters.pending_seed_count;
                 ++impl_->counters.claimed_seed_count;
@@ -283,12 +435,43 @@ workspace_result_t<void> decode_frontier_t::mark_claimed(decode_tile_id_t tile_i
             workspace_error_code_t::out_of_range,
             "decode frontier claim is outside its tile", rva));
     }
+    decode_frontier_claim_t claim;
+    const auto pending = impl_->states[*index].pending.find(rva);
+    if (pending != impl_->states[*index].pending.end()) {
+        claim.provenance = pending->second.provenance;
+        claim.confidence = pending->second.confidence;
+        claim.stable_source_id = pending->second.stable_source_id;
+    } else {
+        claim.provenance = fact_provenance_t::unknown;
+        claim.confidence = 0;
+        claim.stable_source_id = (std::numeric_limits<std::uint64_t>::max)();
+    }
+    return mark_claimed(tile_id, rva, claim);
+}
+
+workspace_result_t<void> decode_frontier_t::mark_claimed(decode_tile_id_t tile_id,
+                                                         std::uint64_t rva,
+                                                         const decode_frontier_claim_t& claim)
+{
+    if (!impl_)
+        return workspace_result_t<void>::failure(frontier_error(
+            workspace_error_code_t::integrity_failure,
+            "decode frontier state is unavailable", rva));
+    const auto index = impl_->locate_index(rva);
+    if (!index || impl_->states[*index].tile.id != tile_id) {
+        return workspace_result_t<void>::failure(frontier_error(
+            workspace_error_code_t::out_of_range,
+            "decode frontier claim is outside its tile", rva));
+    }
     auto& state = impl_->states[*index];
-    if (state.claimed.find(rva) != state.claimed.end())
+    const auto existing_slot = state.claimed.find(rva);
+    if (existing_slot != claimed_flat_set_t::npos) {
+        if (stronger_claim(claim, state.claimed.claims[existing_slot]))
+            state.claimed.claims[existing_slot] = claim;
         return workspace_result_t<void>::success();
+    }
     const auto pending = state.pending.find(rva);
-    if (pending == state.pending.end() &&
-        impl_->counters.unique_seed_count >= impl_->maximum_unique_seeds) {
+    if (pending == state.pending.end() && !impl_->try_consume_seed_budget()) {
         auto error = frontier_error(workspace_error_code_t::limit_exceeded,
                                     "decode frontier claim budget is exhausted", rva);
         error.details.emplace_back("resource", "frontier_claims");
@@ -296,7 +479,8 @@ workspace_result_t<void> decode_frontier_t::mark_claimed(decode_tile_id_t tile_i
         return workspace_result_t<void>::failure(std::move(error));
     }
     try {
-        state.claimed.insert(rva);
+        const auto slot = state.claimed.insert(rva);
+        state.claimed.claims[slot] = claim;
     } catch (const std::bad_alloc&) {
         return workspace_result_t<void>::failure(frontier_error(
             workspace_error_code_t::limit_exceeded,

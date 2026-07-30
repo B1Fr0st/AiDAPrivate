@@ -28,6 +28,27 @@ struct byte_provider_identity_t {
     std::optional<provider_member_metadata_t> member;
 };
 
+struct mapped_window_cache_statistics_t final {
+    std::uint64_t source_bytes = 0;
+    std::uint64_t cached_window_bytes = 0;
+    std::uint64_t reserved_window_bytes = 0;
+    std::uint64_t global_mapped_window_bytes = 0;
+    std::uint64_t global_reserved_window_bytes = 0;
+    std::uint64_t global_admitted_window_bytes = 0;
+    std::uint64_t mapped_windows = 0;
+    std::uint64_t cache_hits = 0;
+    std::uint64_t cache_misses = 0;
+    std::uint64_t evictions = 0;
+    std::uint64_t pinned_windows = 0;
+    std::uint64_t capacity_bytes = 0;
+    std::uint64_t lease_count = 0;
+    std::uint64_t lease_wait_ns = 0;
+    std::uint64_t shard_lock_contention = 0;
+    std::uint64_t admission_steals = 0;
+    std::uint64_t duplicate_map_races = 0;
+    std::uint64_t map_calls = 0;
+};
+
 class byte_view_t final {
 public:
     byte_view_t() = default;
@@ -75,6 +96,12 @@ public:
         return identity().member;
     }
 
+    virtual bool content_pin_active() const noexcept { return false; }
+    virtual std::optional<mapped_window_cache_statistics_t>
+        window_cache_statistics() const noexcept {
+        return std::nullopt;
+    }
+
     workspace_result_t<void> read_exact(std::uint64_t offset, void* destination, std::uint64_t size,
                                         const cancellation_token_t& cancel = {}) const;
     workspace_result_t<std::size_t> read_some(std::uint64_t offset, void* destination,
@@ -101,6 +128,7 @@ public:
     workspace_result_t<byte_view_t> lease(
         std::uint64_t offset, std::uint64_t size,
         const cancellation_token_t& cancel = {}) const override;
+    bool content_pin_active() const noexcept override { return true; }
 
 private:
     memory_provider_t(std::shared_ptr<const std::vector<std::uint8_t>> bytes,
@@ -114,6 +142,7 @@ private:
 struct mapped_file_provider_options_t {
     std::uint64_t max_lease_size = 64ULL * 1024ULL * 1024ULL;
     std::uint64_t read_chunk_size = 4ULL * 1024ULL * 1024ULL;
+    bool pin_local_file_snapshot = true;
 };
 
 class mapped_file_provider_t final : public byte_provider_t {
@@ -130,6 +159,9 @@ public:
     std::uint64_t maximum_contiguous_lease(std::uint64_t offset) const noexcept override;
     workspace_result_t<byte_view_t> lease(std::uint64_t offset, std::uint64_t size,
                                           const cancellation_token_t& cancel = {}) const override;
+    bool content_pin_active() const noexcept override;
+    std::optional<mapped_window_cache_statistics_t>
+        window_cache_statistics() const noexcept override;
     workspace_result_t<void> revalidate() const;
 
 private:

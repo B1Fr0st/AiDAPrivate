@@ -2,6 +2,7 @@
 
 #include "workspace/compact_ir.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -62,12 +63,23 @@ struct decode_frontier_snapshot_t final {
 
 std::uint8_t decode_frontier_seed_priority(decode_frontier_seed_kind_t kind) noexcept;
 
+struct decode_frontier_claim_t final {
+    fact_provenance_t provenance = fact_provenance_t::unknown;
+    std::uint8_t confidence = 0;
+    std::uint64_t stable_source_id = 0;
+};
+
 class decode_frontier_t final {
 public:
     static workspace_result_t<decode_frontier_t> build(
         std::vector<decode_frontier_tile_t> tiles,
         std::uint64_t maximum_unique_seeds);
+    static workspace_result_t<decode_frontier_t> build(
+        std::vector<decode_frontier_tile_t> tiles,
+        std::uint64_t maximum_unique_seeds,
+        std::atomic<std::uint64_t>* shared_unique_seed_count);
 
+    decode_frontier_t() = default;
     decode_frontier_t(decode_frontier_t&&) noexcept;
     decode_frontier_t& operator=(decode_frontier_t&&) noexcept;
     ~decode_frontier_t();
@@ -81,7 +93,10 @@ public:
     workspace_result_t<std::vector<decode_frontier_seed_t>> take_wave(
         std::uint64_t maximum_items);
     workspace_result_t<void> mark_claimed(decode_tile_id_t tile_id,
-                                          std::uint64_t rva);
+                                           std::uint64_t rva);
+    workspace_result_t<void> mark_claimed(decode_tile_id_t tile_id,
+                                           std::uint64_t rva,
+                                           const decode_frontier_claim_t& claim);
 
     std::optional<decode_tile_id_t> locate_tile(std::uint64_t rva) const noexcept;
     bool empty() const noexcept;

@@ -8,6 +8,7 @@
 #include "workspace_types.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace aida::analysis {
@@ -36,6 +37,7 @@ struct xref_build_result_t {
     std::uint64_t invalid_pointer_values = 0;
     std::uint64_t duplicate_xrefs = 0;
     std::uint64_t duplicate_type_xrefs = 0;
+    std::uint64_t shard_merge_ns = 0;
 };
 
 class xref_builder_t final {
@@ -66,6 +68,16 @@ public:
         const std::vector<operand_fact_t>& operands,
         const std::vector<target_fact_t>& targets,
         data_discovery_result_t data,
+        std::vector<type_reference_fact_t> type_references,
+        const xref_build_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<xref_build_result_t> build(
+        const workspace_image_t& image,
+        const std::vector<instruction_record_t>& instructions,
+        const std::vector<operand_fact_t>& operands,
+        const std::vector<target_fact_t>& targets,
+        std::shared_ptr<const data_discovery_result_t> data,
         std::vector<type_reference_fact_t> type_references,
         const xref_build_limits_t& limits,
         const cancellation_token_t& cancel);

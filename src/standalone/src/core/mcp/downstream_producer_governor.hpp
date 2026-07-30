@@ -104,7 +104,7 @@ struct producer_quota_set_t
 
     std::size_t global_active_decompiler = 2;
     std::size_t per_principal_active_decompiler = 1;
-    std::size_t decompiler_worker_group_size = 2;
+    std::size_t decompiler_worker_group_size = 8;
     std::size_t decompiler_queue_depth = 16;
 
     std::size_t global_active_pdb = 2;

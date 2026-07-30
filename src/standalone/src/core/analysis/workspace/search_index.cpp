@@ -8,6 +8,7 @@
 #include "search_index.hpp"
 
 #include "checked_range.hpp"
+#include "parallel_pass.hpp"
 #include "pe_image.hpp"
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -19,9 +20,11 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 
@@ -117,35 +120,40 @@ public:
         return workspace_result_t<packed_string_id_t>::success(id);
     }
 
-    workspace_result_t<interned_string_pool_t> freeze() && {
-        std::uint64_t total = 0;
-        for (const auto& value : values_) {
-            std::uint64_t updated = 0;
-            if (!checked_add_u64(total, value.size(), updated) ||
-                updated > std::numeric_limits<std::uint32_t>::max()) {
-                return workspace_result_t<interned_string_pool_t>::failure(
-                    make_workspace_error(workspace_error_code_t::limit_exceeded,
-                        "search-index string payload exceeds packed offset limits",
-                        "search_index"));
-            }
-            total = updated;
-        }
-        interned_string_pool_t pool;
-        pool.offsets.reserve(values_.size());
-        pool.lengths.reserve(values_.size());
-        pool.bytes.reserve(static_cast<std::size_t>(total));
-        for (const auto& value : values_) {
-            pool.offsets.push_back(static_cast<std::uint32_t>(pool.bytes.size()));
-            pool.lengths.push_back(static_cast<std::uint32_t>(value.size()));
-            pool.bytes.insert(pool.bytes.end(), value.begin(), value.end());
-        }
-        return workspace_result_t<interned_string_pool_t>::success(std::move(pool));
+    const std::vector<std::string>& values() const noexcept {
+        return values_;
     }
 
 private:
     std::vector<std::string> values_;
     std::unordered_map<std::string, packed_string_id_t> index_;
 };
+
+workspace_result_t<interned_string_pool_t> freeze_string_values(
+    const std::vector<std::string>& values) {
+    std::uint64_t total = 0;
+    for (const auto& value : values) {
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(total, value.size(), updated) ||
+            updated > std::numeric_limits<std::uint32_t>::max()) {
+            return workspace_result_t<interned_string_pool_t>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "search-index string payload exceeds packed offset limits",
+                    "search_index"));
+        }
+        total = updated;
+    }
+    interned_string_pool_t pool;
+    pool.offsets.reserve(values.size());
+    pool.lengths.reserve(values.size());
+    pool.bytes.reserve(static_cast<std::size_t>(total));
+    for (const auto& value : values) {
+        pool.offsets.push_back(static_cast<std::uint32_t>(pool.bytes.size()));
+        pool.lengths.push_back(static_cast<std::uint32_t>(value.size()));
+        pool.bytes.insert(pool.bytes.end(), value.begin(), value.end());
+    }
+    return workspace_result_t<interned_string_pool_t>::success(std::move(pool));
+}
 
 packed_address_t pack_address(const address_t& address) noexcept {
     const auto metadata = static_cast<std::uint32_t>(address.space) |
@@ -788,174 +796,345 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
         impl->limits = limits;
         impl->records.reserve(static_cast<std::size_t>(prospective_entries));
 
-        std::uint64_t cancellation_checks = 0;
-        const auto stopped = [&]() noexcept {
-            if (++cancellation_checks < limits.cancellation_check_interval)
-                return false;
-            cancellation_checks = 0;
-            return cancel.stop_requested();
+        const std::uint32_t worker_count = parallel_worker_count();
+
+        struct record_task_t {
+            std::uint32_t class_index = 0;
+            std::size_t begin = 0;
+            std::size_t end = 0;
+            std::size_t stream_begin = 0;
+            std::vector<packed_search_record_t> records;
+            interned_string_builder_t strings;
+            std::vector<std::uint32_t> local_to_global;
+            std::uint64_t indexed_text_bytes = 0;
+            std::uint64_t source_text_bytes = 0;
         };
-        interned_string_builder_t string_builder;
-        std::uint64_t indexed_text_bytes = 0;
-        auto add_record = [&](search_entity_kind_t kind, entity_id_t entity_id,
-                              const address_t& address, std::uint64_t numeric_value,
-                              std::uint32_t auxiliary_flags,
-                              std::string_view text) -> workspace_result_t<void> {
-            if (entity_id == 0) {
-                return workspace_result_t<void>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                        "search-index entity has no stable identifier", "search_index"));
-            }
-            packed_search_record_t record;
-            record.kind = kind;
-            record.entity_id = entity_id;
-            record.address = pack_address(address);
-            record.numeric_value = numeric_value;
-            record.auxiliary_flags = auxiliary_flags;
-            if (!text.empty()) {
-                const auto normalized = normalize_text(text);
-                std::uint64_t referenced = text.size();
-                if (!normalized.empty() &&
-                    !checked_add_u64(referenced, normalized.size(), referenced)) {
-                    return workspace_result_t<void>::failure(
-                        make_workspace_error(workspace_error_code_t::range_overflow,
-                            "search-index text accounting overflows", "search_index"));
-                }
-                std::uint64_t updated = 0;
-                if (!checked_add_u64(indexed_text_bytes, referenced, updated) ||
-                    updated > limits.max_indexed_text_bytes ||
-                    updated > limits.max_index_bytes) {
-                    return workspace_result_t<void>::failure(
-                        make_workspace_error(workspace_error_code_t::limit_exceeded,
-                            "search-index text budget exceeded", "search_index"));
-                }
-                indexed_text_bytes = updated;
-                if (!checked_add_u64(impl->accounting.source_text_bytes,
-                        text.size(), updated)) {
-                    return workspace_result_t<void>::failure(
-                        make_workspace_error(workspace_error_code_t::range_overflow,
-                            "search-index source text accounting overflows", "search_index"));
-                }
-                impl->accounting.source_text_bytes = updated;
-                impl->accounting.referenced_text_bytes = indexed_text_bytes;
-                auto display_id = string_builder.intern(text);
-                if (!display_id)
-                    return workspace_result_t<void>::failure(display_id.error());
-                record.text = display_id.take_value();
-                if (!normalized.empty()) {
-                    auto normalized_id = string_builder.intern(normalized);
-                    if (!normalized_id)
-                        return workspace_result_t<void>::failure(normalized_id.error());
-                    record.normalized_text = normalized_id.take_value();
+
+        const std::array<std::size_t, 6> class_sizes{
+            impl->snapshot->symbols.size(), impl->snapshot->strings.size(),
+            impl->types.size(), impl->snapshot->instructions.size(),
+            impl->data_candidates.size(), impl->switches.size()};
+        std::vector<record_task_t> tasks;
+        {
+            std::size_t stream_cursor = 0;
+            for (std::size_t class_index = 0; class_index < class_sizes.size(); ++class_index) {
+                const auto shards = parallel_shards(class_sizes[class_index], worker_count);
+                for (const auto& shard : shards) {
+                    record_task_t task;
+                    task.class_index = static_cast<std::uint32_t>(class_index);
+                    task.begin = shard.begin;
+                    task.end = shard.end;
+                    task.stream_begin = stream_cursor;
+                    stream_cursor += shard.end - shard.begin;
+                    tasks.push_back(std::move(task));
                 }
             }
-            impl->records.push_back(record);
+        }
+
+        const auto run_record_task = [&](record_task_t& task) -> workspace_result_t<void> {
+            task.records.reserve(task.end - task.begin);
+            std::uint64_t cancellation_checks = 0;
+            for (std::size_t index = task.begin; index < task.end; ++index) {
+                if (++cancellation_checks >= limits.cancellation_check_interval) {
+                    cancellation_checks = 0;
+                    if (cancel.stop_requested())
+                        return workspace_result_t<void>::failure(
+                            stop_error(cancel, "search_index"));
+                }
+                search_entity_kind_t kind = search_entity_kind_t::symbol;
+                entity_id_t entity_id = 0;
+                address_t address;
+                std::uint64_t numeric_value = 0;
+                std::uint32_t auxiliary_flags = 0;
+                std::string_view text;
+                switch (task.class_index) {
+                case 0: {
+                    const auto& symbol = impl->snapshot->symbols[index];
+                    kind = symbol.kind == symbol_kind_t::function
+                        ? search_entity_kind_t::function : search_entity_kind_t::symbol;
+                    entity_id = symbol.id;
+                    address = symbol.address;
+                    text = symbol.name;
+                    break;
+                }
+                case 1: {
+                    const auto& string = impl->snapshot->strings[index];
+                    kind = search_entity_kind_t::string;
+                    entity_id = string.id;
+                    address = string.address;
+                    numeric_value = string.byte_length;
+                    auxiliary_flags = static_cast<std::uint32_t>(string.encoding);
+                    text = string.value;
+                    break;
+                }
+                case 2: {
+                    const auto& type = impl->types[index];
+                    kind = search_entity_kind_t::type_candidate;
+                    entity_id = type.id;
+                    address = type.address;
+                    auxiliary_flags = static_cast<std::uint32_t>(type.kind);
+                    text = type.display_name.empty()
+                        ? std::string_view(type.canonical_type)
+                        : std::string_view(type.display_name);
+                    break;
+                }
+                case 3: {
+                    const auto& instruction = impl->snapshot->instructions[index];
+                    kind = search_entity_kind_t::instruction;
+                    entity_id = instruction.id;
+                    address = instruction.address;
+                    numeric_value = instruction.opcode_id;
+                    auxiliary_flags = instruction.flow_flags;
+                    break;
+                }
+                case 4: {
+                    const auto& data = impl->data_candidates[index];
+                    kind = search_entity_kind_t::data_candidate;
+                    entity_id = data.id;
+                    address = data.address;
+                    numeric_value = data.size;
+                    auxiliary_flags = static_cast<std::uint32_t>(data.kind);
+                    break;
+                }
+                default: {
+                    const auto& dispatch = impl->switches[index];
+                    kind = search_entity_kind_t::switch_dispatch;
+                    entity_id = dispatch.id;
+                    address = dispatch.dispatch;
+                    numeric_value = dispatch.case_targets.size();
+                    auxiliary_flags = dispatch.entry_size;
+                    break;
+                }
+                }
+                if (entity_id == 0) {
+                    return workspace_result_t<void>::failure(
+                        make_workspace_error(workspace_error_code_t::integrity_failure,
+                            "search-index entity has no stable identifier", "search_index"));
+                }
+                packed_search_record_t record;
+                record.kind = kind;
+                record.entity_id = entity_id;
+                record.address = pack_address(address);
+                record.numeric_value = numeric_value;
+                record.auxiliary_flags = auxiliary_flags;
+                if (!text.empty()) {
+                    const auto normalized = normalize_text(text);
+                    std::uint64_t referenced = text.size();
+                    if (!normalized.empty() &&
+                        !checked_add_u64(referenced, normalized.size(), referenced)) {
+                        return workspace_result_t<void>::failure(
+                            make_workspace_error(workspace_error_code_t::range_overflow,
+                                "search-index text accounting overflows", "search_index"));
+                    }
+                    std::uint64_t updated = 0;
+                    if (!checked_add_u64(task.indexed_text_bytes, referenced, updated) ||
+                        updated > limits.max_indexed_text_bytes ||
+                        updated > limits.max_index_bytes) {
+                        return workspace_result_t<void>::failure(
+                            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                "search-index text budget exceeded", "search_index"));
+                    }
+                    task.indexed_text_bytes = updated;
+                    if (!checked_add_u64(task.source_text_bytes, text.size(), updated)) {
+                        return workspace_result_t<void>::failure(
+                            make_workspace_error(workspace_error_code_t::range_overflow,
+                                "search-index source text accounting overflows", "search_index"));
+                    }
+                    task.source_text_bytes = updated;
+                    auto display_id = task.strings.intern(text);
+                    if (!display_id)
+                        return workspace_result_t<void>::failure(display_id.error());
+                    record.text = display_id.take_value();
+                    if (!normalized.empty()) {
+                        auto normalized_id = task.strings.intern(normalized);
+                        if (!normalized_id)
+                            return workspace_result_t<void>::failure(normalized_id.error());
+                        record.normalized_text = normalized_id.take_value();
+                    }
+                }
+                task.records.push_back(record);
+            }
             return workspace_result_t<void>::success();
         };
 
-        impl->text_references.reserve(impl->snapshot->symbols.size() +
-            impl->snapshot->strings.size() + impl->types.size());
-        for (const auto& symbol : impl->snapshot->symbols) {
-            if (stopped())
+        const auto task_shards = parallel_shards(tasks.size(), worker_count);
+        auto packed = parallel_run_shards(task_shards,
+            [&](std::size_t, const parallel_shard_t& shard) {
+                for (std::size_t task_index = shard.begin; task_index < shard.end; ++task_index) {
+                    auto result = run_record_task(tasks[task_index]);
+                    if (!result)
+                        return result;
+                }
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!packed)
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(packed.error());
+
+        std::uint64_t indexed_text_bytes = 0;
+        std::uint64_t source_text_bytes = 0;
+        for (const auto& task : tasks) {
+            std::uint64_t updated = 0;
+            if (!checked_add_u64(indexed_text_bytes, task.indexed_text_bytes, updated) ||
+                updated > limits.max_indexed_text_bytes ||
+                updated > limits.max_index_bytes) {
                 return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            const auto kind = symbol.kind == symbol_kind_t::function
-                ? search_entity_kind_t::function : search_entity_kind_t::symbol;
-            auto added = add_record(kind, symbol.id, symbol.address, 0, 0, symbol.name);
-            if (!added)
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(added.error());
-        }
-        for (const auto& string : impl->snapshot->strings) {
-            if (stopped())
+                    make_workspace_error(workspace_error_code_t::limit_exceeded,
+                        "search-index text budget exceeded", "search_index"));
+            }
+            indexed_text_bytes = updated;
+            if (!checked_add_u64(source_text_bytes, task.source_text_bytes, updated)) {
                 return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            auto added = add_record(search_entity_kind_t::string, string.id, string.address,
-                string.byte_length, static_cast<std::uint32_t>(string.encoding), string.value);
-            if (!added)
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(added.error());
+                    make_workspace_error(workspace_error_code_t::range_overflow,
+                        "search-index source text accounting overflows", "search_index"));
+            }
+            source_text_bytes = updated;
         }
-        for (const auto& type : impl->types) {
-            if (stopped())
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            const std::string_view text = type.display_name.empty()
-                ? std::string_view(type.canonical_type) : std::string_view(type.display_name);
-            auto added = add_record(search_entity_kind_t::type_candidate, type.id,
-                type.address, 0, static_cast<std::uint32_t>(type.kind), text);
-            if (!added)
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(added.error());
+        impl->accounting.source_text_bytes = source_text_bytes;
+        impl->accounting.referenced_text_bytes = indexed_text_bytes;
+
+        std::vector<std::string> global_values;
+        {
+            std::unordered_map<std::string, packed_string_id_t> global_index;
+            std::uint64_t merge_checks = 0;
+            for (auto& task : tasks) {
+                const auto& local_values = task.strings.values();
+                task.local_to_global.reserve(local_values.size());
+                for (const auto& value : local_values) {
+                    if (++merge_checks >= limits.cancellation_check_interval) {
+                        merge_checks = 0;
+                        if (cancel.stop_requested()) {
+                            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                                stop_error(cancel, "search_index"));
+                        }
+                    }
+                    const auto found = global_index.find(value);
+                    if (found != global_index.end()) {
+                        task.local_to_global.push_back(found->second.value);
+                        continue;
+                    }
+                    if (global_values.size() >= std::numeric_limits<std::uint32_t>::max()) {
+                        return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                "search-index string pool exceeds packed identifier limits",
+                                "search_index"));
+                    }
+                    const auto global_id = static_cast<std::uint32_t>(global_values.size() + 1U);
+                    global_values.push_back(value);
+                    global_index.emplace(global_values.back(), packed_string_id_t{global_id});
+                    task.local_to_global.push_back(global_id);
+                }
+            }
         }
-        for (const auto& instruction : impl->snapshot->instructions) {
-            if (stopped())
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            auto added = add_record(search_entity_kind_t::instruction, instruction.id,
-                instruction.address, instruction.opcode_id, instruction.flow_flags, {});
-            if (!added)
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(added.error());
-        }
-        for (const auto& data : impl->data_candidates) {
-            if (stopped())
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            auto added = add_record(search_entity_kind_t::data_candidate, data.id,
-                data.address, data.size, static_cast<std::uint32_t>(data.kind), {});
-            if (!added)
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(added.error());
-        }
-        for (const auto& dispatch : impl->switches) {
-            if (stopped())
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            auto added = add_record(search_entity_kind_t::switch_dispatch, dispatch.id,
-                dispatch.dispatch, dispatch.case_targets.size(), dispatch.entry_size, {});
-            if (!added)
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(added.error());
-        }
+
+        auto frozen = freeze_string_values(global_values);
+        if (!frozen)
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(frozen.error());
+        impl->strings = frozen.take_value();
+        global_values = std::vector<std::string>{};
+        if (cancel.stop_requested())
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                stop_error(cancel, "search_index"));
+
+        impl->records.resize(static_cast<std::size_t>(prospective_entries));
+        auto remapped = parallel_run_shards(task_shards,
+            [&](std::size_t, const parallel_shard_t& shard) {
+                for (std::size_t task_index = shard.begin; task_index < shard.end; ++task_index) {
+                    auto& task = tasks[task_index];
+                    for (auto& record : task.records) {
+                        if (record.text.valid())
+                            record.text.value = task.local_to_global[record.text.value - 1U];
+                        if (record.normalized_text.valid()) {
+                            record.normalized_text.value =
+                                task.local_to_global[record.normalized_text.value - 1U];
+                        }
+                    }
+                    std::move(task.records.begin(), task.records.end(),
+                        impl->records.begin() + static_cast<std::ptrdiff_t>(task.stream_begin));
+                    task.records = std::vector<packed_search_record_t>{};
+                }
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!remapped)
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(remapped.error());
+        tasks.clear();
+        tasks.shrink_to_fit();
         if (impl->records.size() != prospective_entries) {
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                     "search-index record count diverged during packing", "search_index"));
         }
 
-        auto frozen = std::move(string_builder).freeze();
-        if (!frozen)
-            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(frozen.error());
-        impl->strings = frozen.take_value();
-        if (cancel.stop_requested())
-            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                stop_error(cancel, "search_index"));
+        parallel_sort(impl->records.begin(), impl->records.end(), record_less, worker_count);
 
-        std::sort(impl->records.begin(), impl->records.end(), record_less);
-
+        impl->text_references.reserve(class_sizes[0] + class_sizes[1] + class_sizes[2]);
         impl->address_references.reserve(impl->records.size());
         impl->entity_kind_references.reserve(impl->records.size());
         impl->entity_id_references.reserve(impl->records.size());
         impl->instruction_references.reserve(impl->snapshot->instructions.size());
         impl->opcode_references.reserve(impl->snapshot->instructions.size());
-        for (std::size_t index = 0; index < impl->records.size(); ++index) {
-            if (stopped())
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            const auto reference = static_cast<std::uint32_t>(index);
-            const auto& record = impl->records[index];
-            impl->address_references.push_back(reference);
-            impl->entity_kind_references.push_back(reference);
-            impl->entity_id_references.push_back(reference);
-            if (record.normalized_text.valid())
-                impl->text_references.push_back(
-                    packed_text_reference_t{reference, record.normalized_text});
-            if (record.kind == search_entity_kind_t::instruction) {
-                impl->instruction_references.push_back(reference);
-                impl->opcode_references.push_back(packed_key32_reference_t{
-                    static_cast<std::uint32_t>(record.numeric_value), reference});
-            }
+        struct reference_slot_t {
+            std::vector<std::uint32_t> address;
+            std::vector<std::uint32_t> entity_kind;
+            std::vector<std::uint32_t> entity_id;
+            std::vector<std::uint32_t> instruction;
+            std::vector<packed_key32_reference_t> opcode;
+            std::vector<packed_text_reference_t> text;
+        };
+        const auto record_shards = parallel_shards(impl->records.size(), worker_count);
+        std::vector<reference_slot_t> reference_slots(record_shards.size());
+        auto emitted = parallel_run_shards(record_shards,
+            [&](std::size_t shard_index, const parallel_shard_t& shard) {
+                auto& slot = reference_slots[shard_index];
+                std::uint64_t checks = 0;
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (++checks >= limits.cancellation_check_interval) {
+                        checks = 0;
+                        if (cancel.stop_requested())
+                            return workspace_result_t<void>::failure(
+                                stop_error(cancel, "search_index"));
+                    }
+                    const auto reference = static_cast<std::uint32_t>(index);
+                    const auto& record = impl->records[index];
+                    slot.address.push_back(reference);
+                    slot.entity_kind.push_back(reference);
+                    slot.entity_id.push_back(reference);
+                    if (record.normalized_text.valid())
+                        slot.text.push_back(
+                            packed_text_reference_t{reference, record.normalized_text});
+                    if (record.kind == search_entity_kind_t::instruction) {
+                        slot.instruction.push_back(reference);
+                        slot.opcode.push_back(packed_key32_reference_t{
+                            static_cast<std::uint32_t>(record.numeric_value), reference});
+                    }
+                }
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!emitted)
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(emitted.error());
+        for (auto& slot : reference_slots) {
+            impl->address_references.insert(impl->address_references.end(),
+                slot.address.begin(), slot.address.end());
+            impl->entity_kind_references.insert(impl->entity_kind_references.end(),
+                slot.entity_kind.begin(), slot.entity_kind.end());
+            impl->entity_id_references.insert(impl->entity_id_references.end(),
+                slot.entity_id.begin(), slot.entity_id.end());
+            impl->instruction_references.insert(impl->instruction_references.end(),
+                slot.instruction.begin(), slot.instruction.end());
+            impl->opcode_references.insert(impl->opcode_references.end(),
+                std::make_move_iterator(slot.opcode.begin()),
+                std::make_move_iterator(slot.opcode.end()));
+            impl->text_references.insert(impl->text_references.end(),
+                std::make_move_iterator(slot.text.begin()),
+                std::make_move_iterator(slot.text.end()));
         }
+        reference_slots.clear();
+        reference_slots.shrink_to_fit();
         std::sort(impl->address_references.begin(), impl->address_references.end(),
             [&](std::uint32_t lhs, std::uint32_t rhs) {
                 return record_less(impl->records[lhs], impl->records[rhs]);
             });
-        std::sort(impl->entity_kind_references.begin(), impl->entity_kind_references.end(),
+        parallel_sort(impl->entity_kind_references.begin(),
+            impl->entity_kind_references.end(),
             [&](std::uint32_t lhs, std::uint32_t rhs) {
                 const auto& left = impl->records[lhs];
                 const auto& right = impl->records[rhs];
@@ -964,17 +1143,36 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                 if (left.entity_id != right.entity_id)
                     return left.entity_id < right.entity_id;
                 return lhs < rhs;
-            });
-        for (std::size_t index = 1; index < impl->entity_kind_references.size(); ++index) {
-            const auto& previous = impl->records[impl->entity_kind_references[index - 1U]];
-            const auto& current = impl->records[impl->entity_kind_references[index]];
-            if (previous.kind == current.kind && previous.entity_id == current.entity_id) {
+            }, worker_count);
+        if (impl->entity_kind_references.size() >= 2) {
+            const auto pair_shards = parallel_shards(
+                impl->entity_kind_references.size() - 1U, worker_count);
+            auto checked = parallel_validate_shards(pair_shards, 1,
+                [&](std::size_t, const parallel_shard_t& shard) {
+                    ordered_error_t result;
+                    for (std::size_t pair = shard.begin; pair < shard.end; ++pair) {
+                        const auto& previous =
+                            impl->records[impl->entity_kind_references[pair]];
+                        const auto& current =
+                            impl->records[impl->entity_kind_references[pair + 1U]];
+                        if (previous.kind == current.kind &&
+                            previous.entity_id == current.entity_id) {
+                            result.ordinal = pair;
+                            result.error = make_workspace_error(
+                                workspace_error_code_t::integrity_failure,
+                                "search-index contains a duplicate final entity",
+                                "search_index");
+                            return result;
+                        }
+                    }
+                    return result;
+                }, cancel);
+            if (!checked)
                 return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                        "search-index contains a duplicate final entity", "search_index"));
-            }
+                    checked.error());
         }
-        std::sort(impl->entity_id_references.begin(), impl->entity_id_references.end(),
+        parallel_sort(impl->entity_id_references.begin(),
+            impl->entity_id_references.end(),
             [&](std::uint32_t lhs, std::uint32_t rhs) {
                 const auto& left = impl->records[lhs];
                 const auto& right = impl->records[rhs];
@@ -983,94 +1181,278 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                 if (left.kind != right.kind)
                     return left.kind < right.kind;
                 return lhs < rhs;
-            });
-        std::sort(impl->opcode_references.begin(), impl->opcode_references.end(),
+            }, worker_count);
+        parallel_sort(impl->opcode_references.begin(), impl->opcode_references.end(),
             [](const packed_key32_reference_t& lhs, const packed_key32_reference_t& rhs) {
                 return lhs.key != rhs.key ? lhs.key < rhs.key : lhs.record < rhs.record;
-            });
+            }, worker_count);
 
         impl->immediate_references.reserve(impl->snapshot->operand_facts.size());
-        for (const auto& operand : impl->snapshot->operand_facts) {
-            if (stopped())
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            if (operand.kind != operand_kind_t::immediate)
-                continue;
-            const auto reference = impl->instruction_reference(operand.instruction_id);
-            if (!reference) {
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                        "search-index immediate references an unknown instruction",
-                        "search_index"));
-            }
-            impl->immediate_references.push_back(
-                packed_key64_reference_t{operand.immediate, *reference});
+        const auto operand_shards = parallel_shards(
+            impl->snapshot->operand_facts.size(), worker_count);
+        std::vector<std::vector<packed_key64_reference_t>> immediate_slots(
+            operand_shards.size());
+        auto immediates = parallel_run_shards(operand_shards,
+            [&](std::size_t shard_index, const parallel_shard_t& shard) {
+                std::uint64_t checks = 0;
+                for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                    if (++checks >= limits.cancellation_check_interval) {
+                        checks = 0;
+                        if (cancel.stop_requested())
+                            return workspace_result_t<void>::failure(
+                                stop_error(cancel, "search_index"));
+                    }
+                    const auto& operand = impl->snapshot->operand_facts[index];
+                    if (operand.kind != operand_kind_t::immediate)
+                        continue;
+                    const auto reference = impl->instruction_reference(operand.instruction_id);
+                    if (!reference) {
+                        return workspace_result_t<void>::failure(
+                            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                "search-index immediate references an unknown instruction",
+                                "search_index"));
+                    }
+                    immediate_slots[shard_index].push_back(
+                        packed_key64_reference_t{operand.immediate, *reference});
+                }
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!immediates)
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                immediates.error());
+        for (auto& slot : immediate_slots) {
+            impl->immediate_references.insert(impl->immediate_references.end(),
+                std::make_move_iterator(slot.begin()), std::make_move_iterator(slot.end()));
         }
-        std::sort(impl->immediate_references.begin(), impl->immediate_references.end(),
+        immediate_slots.clear();
+        immediate_slots.shrink_to_fit();
+        parallel_sort(impl->immediate_references.begin(), impl->immediate_references.end(),
             [](const packed_key64_reference_t& lhs, const packed_key64_reference_t& rhs) {
                 return lhs.key != rhs.key ? lhs.key < rhs.key : lhs.record < rhs.record;
-            });
-        impl->immediate_references.erase(std::unique(impl->immediate_references.begin(),
-            impl->immediate_references.end(),
-            [](const packed_key64_reference_t& lhs, const packed_key64_reference_t& rhs) {
+            }, worker_count);
+        if (!impl->immediate_references.empty()) {
+            const auto equal = [](const packed_key64_reference_t& lhs,
+                                  const packed_key64_reference_t& rhs) noexcept {
                 return lhs.key == rhs.key && lhs.record == rhs.record;
-            }), impl->immediate_references.end());
+            };
+            auto unique_shards = parallel_shards(
+                impl->immediate_references.size(), worker_count);
+            for (auto& shard : unique_shards) {
+                while (shard.begin < shard.end && shard.begin != 0 &&
+                       equal(impl->immediate_references[shard.begin - 1U],
+                             impl->immediate_references[shard.begin]))
+                    ++shard.begin;
+            }
+            std::vector<std::vector<packed_key64_reference_t>> unique_slots(
+                unique_shards.size());
+            auto uniqued = parallel_run_shards(unique_shards,
+                [&](std::size_t shard_index, const parallel_shard_t& shard) {
+                    auto& output = unique_slots[shard_index];
+                    output.reserve(shard.end - shard.begin);
+                    for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                        if (index == shard.begin ||
+                            !equal(impl->immediate_references[index - 1U],
+                                   impl->immediate_references[index]))
+                            output.push_back(impl->immediate_references[index]);
+                    }
+                    return workspace_result_t<void>::success();
+                }, cancel);
+            if (!uniqued)
+                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                    uniqued.error());
+            const auto compaction_shards = parallel_shards(unique_slots.size(), worker_count);
+            auto compacted = parallel_run_shards(compaction_shards,
+                [&](std::size_t, const parallel_shard_t& shard) {
+                    std::size_t position = 0;
+                    for (std::size_t slot_index = 0; slot_index < shard.begin; ++slot_index)
+                        position += unique_slots[slot_index].size();
+                    for (std::size_t slot_index = shard.begin; slot_index < shard.end;
+                         ++slot_index) {
+                        auto& slot = unique_slots[slot_index];
+                        std::move(slot.begin(), slot.end(),
+                            impl->immediate_references.begin() +
+                                static_cast<std::ptrdiff_t>(position));
+                        position += slot.size();
+                    }
+                    return workspace_result_t<void>::success();
+                }, cancel);
+            if (!compacted)
+                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                    compacted.error());
+            std::size_t unique_total = 0;
+            for (const auto& slot : unique_slots)
+                unique_total += slot.size();
+            impl->immediate_references.resize(unique_total);
+            unique_slots.clear();
+            unique_slots.shrink_to_fit();
+        }
 
-        std::sort(impl->text_references.begin(), impl->text_references.end(),
+        std::vector<std::uint32_t> normalized_ids;
+        normalized_ids.reserve(impl->text_references.size());
+        for (const auto& reference : impl->text_references)
+            normalized_ids.push_back(reference.normalized.value);
+        parallel_sort(normalized_ids.begin(), normalized_ids.end(),
+            [](std::uint32_t lhs, std::uint32_t rhs) { return lhs < rhs; }, worker_count);
+        normalized_ids.erase(std::unique(normalized_ids.begin(), normalized_ids.end()),
+            normalized_ids.end());
+        parallel_sort(normalized_ids.begin(), normalized_ids.end(),
+            [&](std::uint32_t lhs, std::uint32_t rhs) {
+                const auto left = impl->strings.lookup(packed_string_id_t{lhs})
+                    .value_or(std::string_view{});
+                const auto right = impl->strings.lookup(packed_string_id_t{rhs})
+                    .value_or(std::string_view{});
+                return left < right;
+            }, worker_count);
+        std::vector<std::uint32_t> normalized_ranks(impl->strings.offsets.size() + 1U, 0U);
+        const auto rank_shards = parallel_shards(normalized_ids.size(), worker_count);
+        auto ranked = parallel_run_shards(rank_shards,
+            [&](std::size_t, const parallel_shard_t& shard) {
+                for (std::size_t index = shard.begin; index < shard.end; ++index)
+                    normalized_ranks[normalized_ids[index]] =
+                        static_cast<std::uint32_t>(index);
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!ranked)
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(ranked.error());
+        normalized_ids.clear();
+        normalized_ids.shrink_to_fit();
+        parallel_sort(impl->text_references.begin(), impl->text_references.end(),
             [&](const packed_text_reference_t& lhs, const packed_text_reference_t& rhs) {
-                const auto left = impl->strings.lookup(lhs.normalized).value_or(std::string_view{});
-                const auto right = impl->strings.lookup(rhs.normalized).value_or(std::string_view{});
-                if (left != right)
-                    return left < right;
+                const auto left_rank = normalized_ranks[lhs.normalized.value];
+                const auto right_rank = normalized_ranks[rhs.normalized.value];
+                if (left_rank != right_rank)
+                    return left_rank < right_rank;
                 return record_less(impl->records[lhs.record], impl->records[rhs.record]);
-            });
+            }, worker_count);
+        normalized_ranks.clear();
+        normalized_ranks.shrink_to_fit();
 
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> trigram_pairs;
-        for (std::size_t text_index = 0; text_index < impl->text_references.size(); ++text_index) {
-            if (stopped())
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    stop_error(cancel, "search_index"));
-            const auto text = impl->strings.lookup(impl->text_references[text_index].normalized);
-            if (!text) {
-                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                        "search-index text reference is invalid", "search_index"));
-            }
-            std::vector<std::uint32_t> keys;
-            if (text->size() >= 3)
-                keys.reserve(text->size() - 2U);
-            for (std::size_t offset = 0; offset + 3U <= text->size(); ++offset) {
-                if ((offset & 0x3ffU) == 0 && cancel.stop_requested())
-                    return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                        stop_error(cancel, "search_index"));
-                keys.push_back(trigram_key(text->data() + offset));
-            }
-            std::sort(keys.begin(), keys.end());
-            keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-            if (keys.size() > limits.max_trigram_postings - trigram_pairs.size()) {
+        const auto text_shards = parallel_shards(impl->text_references.size(), worker_count);
+        std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> trigram_runs(
+            text_shards.size());
+        auto generated = parallel_run_shards(text_shards,
+            [&](std::size_t shard_index, const parallel_shard_t& shard) {
+                auto& pairs = trigram_runs[shard_index];
+                std::uint64_t checks = 0;
+                for (std::size_t text_index = shard.begin; text_index < shard.end;
+                     ++text_index) {
+                    if (++checks >= limits.cancellation_check_interval) {
+                        checks = 0;
+                        if (cancel.stop_requested())
+                            return workspace_result_t<void>::failure(
+                                stop_error(cancel, "search_index"));
+                    }
+                    const auto text = impl->strings.lookup(
+                        impl->text_references[text_index].normalized);
+                    if (!text) {
+                        return workspace_result_t<void>::failure(
+                            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                "search-index text reference is invalid", "search_index"));
+                    }
+                    std::vector<std::uint32_t> keys;
+                    if (text->size() >= 3)
+                        keys.reserve(text->size() - 2U);
+                    for (std::size_t offset = 0; offset + 3U <= text->size(); ++offset) {
+                        if ((offset & 0x3ffU) == 0 && cancel.stop_requested())
+                            return workspace_result_t<void>::failure(
+                                stop_error(cancel, "search_index"));
+                        keys.push_back(trigram_key(text->data() + offset));
+                    }
+                    std::sort(keys.begin(), keys.end());
+                    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+                    if (pairs.size() > limits.max_trigram_postings ||
+                        keys.size() > limits.max_trigram_postings - pairs.size()) {
+                        return workspace_result_t<void>::failure(
+                            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                "search-index posting budget exceeded", "search_index"));
+                    }
+                    for (const auto key : keys) {
+                        pairs.emplace_back(key,
+                            static_cast<std::uint32_t>(text_index));
+                    }
+                }
+                std::sort(pairs.begin(), pairs.end());
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!generated)
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                generated.error());
+
+        std::uint64_t total_pairs = 0;
+        for (const auto& run : trigram_runs) {
+            std::uint64_t updated = 0;
+            if (!checked_add_u64(total_pairs, run.size(), updated) ||
+                updated > limits.max_trigram_postings) {
                 return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                     make_workspace_error(workspace_error_code_t::limit_exceeded,
                         "search-index posting budget exceeded", "search_index"));
             }
-            for (const auto key : keys)
-                trigram_pairs.emplace_back(key, static_cast<std::uint32_t>(text_index));
+            total_pairs = updated;
         }
-        std::sort(trigram_pairs.begin(), trigram_pairs.end());
-        impl->trigram_postings.reserve(trigram_pairs.size());
-        impl->trigram_spans.reserve(trigram_pairs.size());
-        std::size_t pair_index = 0;
-        while (pair_index < trigram_pairs.size()) {
-            const auto key = trigram_pairs[pair_index].first;
-            const auto begin = static_cast<std::uint32_t>(impl->trigram_postings.size());
-            do {
-                impl->trigram_postings.push_back(trigram_pairs[pair_index].second);
-                ++pair_index;
-            } while (pair_index < trigram_pairs.size() &&
-                     trigram_pairs[pair_index].first == key);
-            const auto count = static_cast<std::uint32_t>(
-                impl->trigram_postings.size() - begin);
-            impl->trigram_spans.push_back(packed_trigram_span_t{key, begin, count});
+        impl->trigram_postings.reserve(static_cast<std::size_t>(total_pairs));
+        impl->trigram_spans.reserve(static_cast<std::size_t>(total_pairs));
+        if (total_pairs != 0) {
+            const std::size_t run_count = trigram_runs.size();
+            const auto exhausted = std::numeric_limits<std::size_t>::max();
+            std::vector<std::size_t> cursors(run_count, 0);
+            const auto run_greater = [&](std::size_t lhs, std::size_t rhs) {
+                const bool lhs_done = cursors[lhs] >= trigram_runs[lhs].size();
+                const bool rhs_done = cursors[rhs] >= trigram_runs[rhs].size();
+                if (lhs_done != rhs_done)
+                    return lhs_done;
+                if (lhs_done)
+                    return lhs > rhs;
+                return trigram_runs[rhs][cursors[rhs]] <
+                    trigram_runs[lhs][cursors[lhs]];
+            };
+            std::vector<std::size_t> loser(run_count, exhausted);
+            const auto adjust = [&](std::size_t seed) {
+                std::size_t node = (seed + run_count) / 2U;
+                while (node >= 1U) {
+                    if (loser[node] == exhausted || run_greater(loser[node], seed))
+                        std::swap(loser[node], seed);
+                    node /= 2U;
+                }
+                loser[0] = seed;
+            };
+            for (std::size_t seed = run_count; seed-- > 0;)
+                adjust(seed);
+            std::uint64_t merge_checks = 0;
+            std::uint64_t emitted_count = 0;
+            std::uint32_t span_key = 0;
+            std::uint32_t span_begin = 0;
+            bool span_open = false;
+            while (emitted_count < total_pairs) {
+                if (++merge_checks >= limits.cancellation_check_interval) {
+                    merge_checks = 0;
+                    if (cancel.stop_requested())
+                        return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                            stop_error(cancel, "search_index"));
+                }
+                const auto winner = loser[0];
+                const auto pair = trigram_runs[winner][cursors[winner]];
+                if (!span_open || pair.first != span_key) {
+                    if (span_open) {
+                        impl->trigram_spans.push_back(packed_trigram_span_t{span_key,
+                            span_begin, static_cast<std::uint32_t>(
+                                impl->trigram_postings.size() - span_begin)});
+                    }
+                    span_key = pair.first;
+                    span_begin = static_cast<std::uint32_t>(impl->trigram_postings.size());
+                    span_open = true;
+                }
+                impl->trigram_postings.push_back(pair.second);
+                ++cursors[winner];
+                adjust(winner);
+                ++emitted_count;
+            }
+            if (span_open) {
+                impl->trigram_spans.push_back(packed_trigram_span_t{span_key, span_begin,
+                    static_cast<std::uint32_t>(impl->trigram_postings.size() - span_begin)});
+            }
         }
+        trigram_runs.clear();
+        trigram_runs.shrink_to_fit();
         if (cancel.stop_requested())
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 stop_error(cancel, "search_index"));
@@ -1140,8 +1522,14 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                     "search-index memory budget exceeded", "search_index"));
         }
         accounting.memory_bytes = memory_bytes;
-        if (impl->metrics)
+        if (impl->metrics) {
             impl->metrics->set(analysis_metric_t::indexed_bytes, memory_bytes);
+            impl->metrics->add(analysis_metric_t::index_entries, accounting.record_count);
+            impl->metrics->add(analysis_metric_t::index_trigram_postings,
+                               accounting.trigram_posting_count);
+            impl->metrics->add(analysis_metric_t::index_text_bytes,
+                               accounting.source_text_bytes);
+        }
         impl->snapshot.reset();
         return workspace_result_t<std::shared_ptr<search_index_t>>::success(
             std::shared_ptr<search_index_t>(new search_index_t(std::move(impl))));
@@ -1153,6 +1541,10 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
         return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
             make_workspace_error(workspace_error_code_t::limit_exceeded,
                 "search-index allocation exceeds container limits", "search_index"));
+    } catch (const std::system_error&) {
+        return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "search-index allocation exceeded available memory", "search_index"));
     }
 }
 
@@ -1836,7 +2228,10 @@ workspace_result_t<void> search_index_t::serialize_to(
     writer.u64(impl_->accounting.trigram_count);
     writer.u64(impl_->accounting.trigram_posting_count);
     writer.u64(impl_->accounting.string_count);
-    return writer.finish();
+    auto finished = writer.finish();
+    if (finished && impl_->metrics)
+        impl_->metrics->add(analysis_metric_t::index_serialized_bytes, writer.size());
+    return finished;
 }
 
 search_generation_identity_t search_index_t::identity() const noexcept {

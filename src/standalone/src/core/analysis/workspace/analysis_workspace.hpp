@@ -23,14 +23,34 @@ namespace aida::analysis {
 class workspace_database_t;
 class overlay_journal_t;
 class decompiler_service_t;
+class decompile_batch_orchestrator_t;
 class persistence_queue_t;
 class search_index_t;
+class analysis_metrics_t;
 class analysis_workspace_t;
 class workspace_registry_t;
 struct workspace_publication_state_t;
 struct projection_invalidation_set_t;
 struct managed_artifact_publication_t;
 struct workspace_overlay_presentation_t;
+
+workspace_result_t<void> validate_analysis_snapshot_parallel(
+    const analysis_snapshot_t& snapshot,
+    bool require_complete_coverage,
+    std::uint32_t workers,
+    const cancellation_token_t& cancel = {});
+
+workspace_result_t<void> validate_rich_fact_publication_parallel(
+    const analysis_snapshot_t& snapshot,
+    const analysis_rich_fact_publication_t& publication,
+    std::uint32_t workers,
+    const cancellation_token_t& cancel = {});
+
+workspace_result_t<void> validate_call_graph_publication_parallel(
+    const analysis_snapshot_t& snapshot,
+    const call_graph_publication_t& publication,
+    std::uint32_t workers,
+    const cancellation_token_t& cancel = {});
 
 class workspace_analysis_run_t final {
 public:
@@ -168,6 +188,13 @@ public:
         drain(std::chrono::steady_clock::time_point deadline) = 0;
 };
 
+class baseline_publish_observer_t {
+public:
+    virtual ~baseline_publish_observer_t() = default;
+    virtual void on_baseline_published(
+        const std::shared_ptr<const analysis_publication_t>& publication) noexcept = 0;
+};
+
 class analysis_workspace_t final : public std::enable_shared_from_this<analysis_workspace_t> {
 public:
     static workspace_result_t<std::shared_ptr<analysis_workspace_t>>
@@ -294,16 +321,22 @@ public:
 
     workspace_result_t<void> register_lifecycle_participant(
         std::shared_ptr<workspace_lifecycle_participant_t> participant);
+    workspace_result_t<void> register_baseline_publish_observer(
+        std::weak_ptr<baseline_publish_observer_t> observer);
     workspace_result_t<void> close(std::chrono::steady_clock::time_point deadline);
 
     workspace_result_t<void> install_database(std::shared_ptr<workspace_database_t> database);
     workspace_result_t<void> install_overlay(std::shared_ptr<overlay_journal_t> overlay);
     workspace_result_t<void> install_decompiler(std::shared_ptr<decompiler_service_t> decompiler);
+    workspace_result_t<void> install_background_decompile(
+        std::shared_ptr<decompile_batch_orchestrator_t> orchestrator);
     workspace_result_t<void> install_persistence_queue(std::shared_ptr<persistence_queue_t> queue);
     workspace_result_t<void> install_search_index(std::shared_ptr<search_index_t> index);
     std::shared_ptr<workspace_database_t> database() const;
     std::shared_ptr<overlay_journal_t> overlay() const;
     std::shared_ptr<decompiler_service_t> decompiler() const;
+    std::shared_ptr<decompile_batch_orchestrator_t> background_decompile() const;
+    std::shared_ptr<analysis_metrics_t> background_metrics() const;
     std::shared_ptr<persistence_queue_t> persistence_queue() const;
     std::shared_ptr<search_index_t> search_index() const;
 
@@ -332,6 +365,15 @@ private:
         canonicalize_snapshot(std::shared_ptr<const analysis_snapshot_t> snapshot,
                               const std::shared_ptr<const byte_provider_t>& provider) const;
     void release_analysis_run(std::uint64_t generation) noexcept;
+    void dispatch_baseline_published(
+        const std::shared_ptr<const analysis_publication_t>& publication) noexcept;
+
+    struct validation_memo_t {
+        std::weak_ptr<const analysis_snapshot_t> snapshot;
+        std::uint64_t generation = 0, analysis_revision = 0, overlay_revision = 0;
+        bool require_complete_coverage = false;
+        std::uint64_t executable_bytes = 0;
+    };
 
     std::shared_ptr<const workspace_identity_t> identity_;
     std::shared_ptr<const byte_provider_t> source_provider_;
@@ -347,10 +389,14 @@ private:
     workspace_progress_t progress_;
     workspace_view_state_t view_state_;
     cancellation_source_t cancellation_;
+    std::optional<validation_memo_t> validation_memo_;
     std::vector<std::weak_ptr<workspace_lifecycle_participant_t>> lifecycle_participants_;
+    std::vector<std::weak_ptr<baseline_publish_observer_t>> baseline_publish_observers_;
     std::shared_ptr<workspace_database_t> database_;
     std::shared_ptr<overlay_journal_t> overlay_;
     std::shared_ptr<decompiler_service_t> decompiler_;
+    std::shared_ptr<decompile_batch_orchestrator_t> background_decompile_;
+    mutable std::shared_ptr<analysis_metrics_t> background_metrics_;
     std::shared_ptr<persistence_queue_t> persistence_queue_;
     std::shared_mutex mutation_mutex_;
     std::mutex close_mutex_;

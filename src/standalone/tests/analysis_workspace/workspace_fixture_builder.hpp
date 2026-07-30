@@ -1111,14 +1111,16 @@ inline std::shared_ptr<analysis_metrics_t> analyze_workspace_instrumented(
     for (std::uint32_t lane = 0; lane < analyzer.value()->decode_lane_count(); ++lane)
         run([&] { return analyzer.value()->decode_lane_phase(lane, runtime_cancelled); });
     run([&] { return analyzer.value()->decode_merge_phase(runtime_cancelled); });
-    run([&] { return analyzer.value()->blocks_phase(runtime_cancelled); });
+    run([&] { return analyzer.value()->data_discovery_phase(runtime_cancelled); });
+    run([&] { return analyzer.value()->function_recovery_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->functions_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->cfg_calls_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->xrefs_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->strings_data_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->metadata_symbols_types_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->search_index_phase(runtime_cancelled); });
-    run([&] { return analyzer.value()->persistence_phase(runtime_cancelled); });
+    run([&] { return analyzer.value()->persistence_submit_phase(runtime_cancelled); });
+    run([&] { return analyzer.value()->persistence_commit_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->publish_ready_phase(runtime_cancelled); });
     std::uint64_t decoded_bytes = 0;
     const auto snapshot = workspace->snapshot();

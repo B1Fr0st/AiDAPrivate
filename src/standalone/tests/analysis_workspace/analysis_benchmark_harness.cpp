@@ -1,22 +1,29 @@
 #include "workspace_fixture_builder.hpp"
+#include "large_pe_fixture_builder.hpp"
+#include "snapshot_hash.hpp"
 
 #include "../c03/benchmark_sla_schema.hpp"
 #include "../c03/assertion_telemetry/assertion_telemetry.hpp"
+#include "../c03/evidence_hash.hpp"
 
 #include <winioctl.h>
 #include <psapi.h>
 
 #include "../../src/core/mcp/compat/c03_compatibility_registration.hpp"
 #include "../../src/core/mcp/registry/tool_registry.hpp"
+#include "../../src/core/analysis/tile_decode_orchestrator.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <intrin.h>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -296,7 +303,8 @@ json database_measurement(const workspace_database_snapshot_t& snapshot)
 
 std::shared_ptr<analysis_workspace_t> open_benchmark_workspace(
     const std::filesystem::path& path, std::uint8_t profile,
-    json* acquisition_metrics = nullptr)
+    json* acquisition_metrics = nullptr,
+    bool pin_profile = false)
 {
     static const std::uint64_t run_nonce =
         (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32) ^
@@ -305,8 +313,10 @@ std::shared_ptr<analysis_workspace_t> open_benchmark_workspace(
     request.source_path = path.u8string();
     request.bin_name = path.filename().u8string();
     request.load_profile = {1, 0, profile, 0};
-    for (unsigned shift = 0; shift < 64; shift += 8)
-        request.load_profile.push_back(static_cast<std::uint8_t>(run_nonce >> shift));
+    if (!pin_profile) {
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            request.load_profile.push_back(static_cast<std::uint8_t>(run_nonce >> shift));
+    }
     const auto acquisition_begin = steady_clock_t::now();
     auto opened = workspace_registry().open_static(request);
     const auto acquisition_ns = nanoseconds_since(acquisition_begin);
@@ -404,12 +414,13 @@ std::shared_ptr<analysis_workspace_t> reopen_persisted_benchmark_workspace(
     std::uint64_t expected_analysis_revision,
     std::uint64_t expected_overlay_revision,
     const json& expected_counts,
-    json& measurement)
+    json& measurement,
+    bool pin_profile = false)
 {
     const auto wall_begin = steady_clock_t::now();
     const auto memory_before = process_memory_snapshot();
     const auto acquisition_begin = steady_clock_t::now();
-    auto workspace = open_benchmark_workspace(path, profile);
+    auto workspace = open_benchmark_workspace(path, profile, nullptr, pin_profile);
     const auto acquisition_ns = nanoseconds_since(acquisition_begin);
     try {
         if (workspace->identity().binary_id() != expected_identity.binary_id() ||
@@ -607,7 +618,72 @@ json instrumentation_summary(const analysis_metrics_snapshot_t& snapshot)
             {"cold_latency_max_ns", value(analysis_metric_t::decompile_cold_latency_max_ns)},
             {"warm_calls", value(analysis_metric_t::decompile_warm_calls)},
             {"warm_latency_ns", value(analysis_metric_t::decompile_warm_latency_ns)},
-            {"warm_latency_max_ns", value(analysis_metric_t::decompile_warm_latency_max_ns)}}}};
+            {"warm_latency_max_ns", value(analysis_metric_t::decompile_warm_latency_max_ns)}}},
+        {"worker_pool", json{
+            {"slots_busy_ns", value(analysis_metric_t::worker_slots_busy_ns)},
+            {"slots_scheduled_ns", value(analysis_metric_t::worker_slots_scheduled_ns)},
+            {"utilization", value(analysis_metric_t::worker_slots_scheduled_ns) == 0
+                ? json(nullptr) : json(static_cast<double>(
+                    value(analysis_metric_t::worker_slots_busy_ns)) /
+                    static_cast<double>(value(analysis_metric_t::worker_slots_scheduled_ns)))},
+            {"queue_wait_ns_total", value(analysis_metric_t::queue_wait_ns_total)},
+            {"queue_wait_max_ns", value(analysis_metric_t::queue_wait_max_ns)},
+            {"queue_depth_mean", value(analysis_metric_t::queue_depth_samples) == 0
+                ? json(nullptr) : json(static_cast<double>(
+                    value(analysis_metric_t::queue_depth_sum)) /
+                    static_cast<double>(value(analysis_metric_t::queue_depth_samples)))}}},
+        {"decode_detail", json{
+            {"tiles", value(analysis_metric_t::decode_tiles)},
+            {"requests", value(analysis_metric_t::decode_requests)},
+            {"frontier_seeds", value(analysis_metric_t::decode_frontier_seeds)},
+            {"waves", value(analysis_metric_t::decode_waves)},
+            {"cross_tile_edges", value(analysis_metric_t::decode_cross_tile_edges)},
+            {"invalid_bytes", value(analysis_metric_t::decode_invalid_bytes)},
+            {"invalid_runs", value(analysis_metric_t::decode_invalid_runs)},
+            {"duplicate_instructions", value(analysis_metric_t::decode_duplicate_instructions)},
+            {"merge_ns", value(analysis_metric_t::decode_merge_ns)},
+            {"lane_wall_ns_max", value(analysis_metric_t::decode_lane_wall_ns_max)},
+            {"bytes_attempted", value(analysis_metric_t::decode_bytes_attempted)}}},
+        {"post_decode", json{
+            {"blocks_split", value(analysis_metric_t::blocks_split)},
+            {"function_seeds_processed", value(analysis_metric_t::function_seeds_processed)},
+            {"cfg_indirect_sites", value(analysis_metric_t::cfg_indirect_sites)},
+            {"xref_candidates", value(analysis_metric_t::xref_candidates)},
+            {"strings_scanned_bytes", value(analysis_metric_t::strings_scanned_bytes)},
+            {"pass_merge_ns", value(analysis_metric_t::pass_merge_ns)}}},
+        {"index", json{
+            {"entries", value(analysis_metric_t::index_entries)},
+            {"trigram_postings", value(analysis_metric_t::index_trigram_postings)},
+            {"text_bytes", value(analysis_metric_t::index_text_bytes)},
+            {"serialized_bytes", value(analysis_metric_t::index_serialized_bytes)},
+            {"type_candidates_evaluated", value(analysis_metric_t::type_candidates_evaluated)}}},
+        {"persistence_queue", json{
+            {"wait_ns", value(analysis_metric_t::persist_queue_wait_ns)},
+            {"depth_peak", value(analysis_metric_t::persist_queue_depth_peak)},
+            {"pages_written", value(analysis_metric_t::persist_pages_written)},
+            {"wal_bytes_peak", value(analysis_metric_t::persist_wal_bytes_peak)}}},
+        {"memory_pressure", json{
+            {"resident_bytes_peak", value(analysis_metric_t::resident_bytes_peak)},
+            {"mapped_workspace_peak", value(analysis_metric_t::mapped_window_bytes_peak)},
+            {"mapped_global_peak", value(analysis_metric_t::mapped_window_bytes_global_peak)},
+            {"spill_bytes_peak", value(analysis_metric_t::spill_bytes_peak)},
+            {"spill_written", value(analysis_metric_t::spill_bytes_written)},
+            {"spill_read", value(analysis_metric_t::spill_bytes_read)},
+            {"budget_rejections", value(analysis_metric_t::budget_rejections)},
+            {"pressure_events", value(analysis_metric_t::memory_pressure_events)}}},
+        {"decompiler_batch", json{
+            {"calls", value(analysis_metric_t::decompile_batch_calls)},
+            {"completed", value(analysis_metric_t::decompile_batch_completed)},
+            {"failed", value(analysis_metric_t::decompile_batch_failed)},
+            {"cancelled", value(analysis_metric_t::decompile_batch_cancelled)},
+            {"wall_ns", value(analysis_metric_t::decompile_batch_wall_ns)},
+            {"queue_depth_peak", value(analysis_metric_t::decompile_batch_queue_depth_peak)},
+            {"memory_cache_hits", value(analysis_metric_t::decompile_memory_cache_hits)},
+            {"persistent_cache_hits", value(analysis_metric_t::decompile_persistent_cache_hits)},
+            {"funcs_per_s", value(analysis_metric_t::decompile_batch_wall_ns) == 0
+                ? json(nullptr) : json(static_cast<double>(
+                    value(analysis_metric_t::decompile_batch_completed)) * 1000000000.0 /
+                    static_cast<double>(value(analysis_metric_t::decompile_batch_wall_ns)))}}}};
 }
 
 json measured_percentile(std::vector<std::uint64_t> values, double rank)
@@ -825,11 +901,11 @@ json mcp_measurement(const std::shared_ptr<analysis_workspace_t>& workspace,
         {"failures", std::move(failures)}, {"last_returned", last_returned}};
 }
 
-json cancellation_measurement(const std::filesystem::path& path)
+json cancellation_measurement(const std::filesystem::path& path, bool pin_profile = false)
 {
     const auto runtime_before = aida::infra::taskflow_runtime::active_snapshot();
     const auto memory_before = process_memory_snapshot();
-    auto workspace = open_benchmark_workspace(path, 7);
+    auto workspace = open_benchmark_workspace(path, 7, nullptr, pin_profile);
     try {
         baseline_analysis_settings_t settings;
         settings.decode_worker_lanes = 1;
@@ -877,7 +953,7 @@ json cancellation_measurement(const std::filesystem::path& path)
     }
 }
 
-json concurrent_measurement(const std::filesystem::path& path)
+json concurrent_measurement(const std::filesystem::path& path, bool pin_profile = false)
 {
     using job_handle_t = aida::infra::taskflow_runtime::job_handle_t;
     std::vector<std::shared_ptr<analysis_workspace_t>> workspaces;
@@ -887,7 +963,7 @@ json concurrent_measurement(const std::filesystem::path& path)
     const auto begin = steady_clock_t::now();
     try {
         for (std::uint8_t profile = 11; profile < 15; ++profile) {
-            auto workspace = open_benchmark_workspace(path, profile);
+            auto workspace = open_benchmark_workspace(path, profile, nullptr, pin_profile);
             baseline_analysis_settings_t settings;
             settings.decode_worker_lanes = static_cast<std::uint32_t>((profile % 4) + 1);
             auto started = baseline_analysis_service_t::start(workspace, settings);
@@ -1007,22 +1083,20 @@ int validate_receipt_command(const std::filesystem::path& root, const std::files
     return 0;
 }
 
-}
+struct measurement_options_t {
+    std::string benchmark_mode = "deterministic_component";
+    std::string claim_status = "development_only";
+    bool release_qualification = false;
+    bool pin_profile = false;
+    bool skip_concurrent = false;
+    std::uint32_t worker_lanes = 0;
+    std::function<void(const std::shared_ptr<analysis_workspace_t>&)> publication_callback;
+};
 
-int main(int argc, char** argv)
+json run_measurement(const std::filesystem::path& path, const measurement_options_t& options)
 {
     std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
     try {
-        if (argc == 4 && std::string_view(argv[1]) == "--validate-receipt")
-            return validate_receipt_command(argv[2], std::filesystem::u8path(argv[3]));
-        if (argc != 3)
-            throw aida::analysis::test_fixture::fixture_error_t(
-                "usage: analysis_benchmark_harness <deterministic_component|release_sla> <code-bearing supported static fixture>");
-        const std::string benchmark_mode = argv[1];
-        if (benchmark_mode != "deterministic_component" && benchmark_mode != "release_sla")
-            throw aida::analysis::test_fixture::fixture_error_t("benchmark mode is unsupported");
-        const bool release_sla = benchmark_mode == "release_sla";
-        const std::filesystem::path path = std::filesystem::absolute(argv[2]);
         if (!std::filesystem::is_regular_file(path))
             throw aida::analysis::test_fixture::fixture_error_t("benchmark fixture does not exist");
         const auto fixture_size = std::filesystem::file_size(path);
@@ -1032,7 +1106,7 @@ int main(int argc, char** argv)
         const auto cold_memory_before = process_memory_snapshot();
         json acquisition_metrics;
         const auto cold_begin = steady_clock_t::now();
-        workspace = open_benchmark_workspace(path, 1, &acquisition_metrics);
+        workspace = open_benchmark_workspace(path, 1, &acquisition_metrics, options.pin_profile);
         const auto image = workspace->normalized_image();
         if (!image)
             throw aida::analysis::test_fixture::fixture_error_t("benchmark fixture image metadata is unavailable");
@@ -1040,7 +1114,7 @@ int main(int argc, char** argv)
         if (code_bytes == 0)
             throw aida::analysis::test_fixture::fixture_error_t(
                 "benchmark fixture has no normalized executable bytes");
-        if (release_sla) {
+        if (options.release_qualification) {
             const auto& thresholds = aida::analysis::c03::benchmark_sla_thresholds();
             const auto minimum = thresholds.at("release_min_artifact_bytes").get<std::uint64_t>();
             const auto maximum = thresholds.at("release_max_artifact_bytes").get<std::uint64_t>();
@@ -1052,9 +1126,11 @@ int main(int argc, char** argv)
                     "release SLA fixture fails size, executable-volume, density, or zero-padding qualification");
         }
         const auto analysis_begin = steady_clock_t::now();
-        analyze_workspace(workspace, 0);
+        analyze_workspace(workspace, options.worker_lanes);
         const auto analysis_ns = nanoseconds_since(analysis_begin);
         const auto cold_wall_ns = nanoseconds_since(cold_begin);
+        if (options.publication_callback)
+            options.publication_callback(workspace);
         const auto runtime_after = aida::infra::taskflow_runtime::active_snapshot();
         const workspace_identity_t cold_identity = workspace->identity();
         const auto cold_analysis_revision = workspace->analysis_revision();
@@ -1106,7 +1182,8 @@ int main(int argc, char** argv)
         workspace.reset();
         json warm_reopen;
         workspace = reopen_persisted_benchmark_workspace(path, 1, cold_identity,
-            cold_analysis_revision, cold_overlay_revision, cold_counts, warm_reopen);
+            cold_analysis_revision, cold_overlay_revision, cold_counts, warm_reopen,
+            options.pin_profile);
         report["warm_reopen"] = std::move(warm_reopen);
         analysis_metrics_t interaction_metrics(workspace->generation());
         interaction_metrics.sample_process_memory();
@@ -1120,10 +1197,10 @@ int main(int argc, char** argv)
             database_measurement(workspace->database()->snapshot());
         close_workspace(workspace, true);
         workspace.reset();
-        workspace = open_benchmark_workspace(path, 2);
+        workspace = open_benchmark_workspace(path, 2, nullptr, options.pin_profile);
         const auto instrumented_memory_before = process_memory_snapshot();
         const auto instrumented_begin = steady_clock_t::now();
-        auto instrumented = analyze_workspace_instrumented(workspace, 0);
+        auto instrumented = analyze_workspace_instrumented(workspace, options.worker_lanes);
         const auto instrumented_snapshot = instrumented->snapshot();
         const auto published_snapshot = workspace->snapshot();
         const auto published_search = workspace->search_index();
@@ -1161,22 +1238,1105 @@ int main(int argc, char** argv)
             {"counts", snapshot_counts(*published_snapshot, published_search)}};
         close_workspace(workspace, true);
         workspace.reset();
-        report["concurrent_fairness"] = concurrent_measurement(path);
-        report["cancellation"] = cancellation_measurement(path);
+        if (options.skip_concurrent) {
+            report["concurrent_fairness"] = json{{"skipped", true},
+                {"reason", "pinned_measurement_mode"}};
+        } else {
+            report["concurrent_fairness"] = concurrent_measurement(path, options.pin_profile);
+        }
+        report["cancellation"] = cancellation_measurement(path, options.pin_profile);
         report["fixture"]["file_version"] = file_version_identity(path);
-        report["benchmark_contract"] = json{{"mode", benchmark_mode},
-            {"claim_status", release_sla ? "measurement_candidate" : "development_only"},
+        report["benchmark_contract"] = json{{"mode", options.benchmark_mode},
+            {"claim_status", options.claim_status},
             {"thresholds", aida::analysis::c03::benchmark_sla_thresholds()},
             {"receipt_validation_required", true}, {"target_execution_forbidden", true}};
         report["runtime_claim"] = "measurement_only";
-        std::cout << report.dump(2) << '\n';
-        return 0;
-    } catch (const std::exception& error) {
-        aida::analysis::c03_test::assertion_telemetry::record_exception(
-            error.what());
+        return report;
+    } catch (...) {
         if (workspace) {
             try { close_workspace(workspace, true); } catch (...) {}
         }
+        throw;
+    }
+}
+
+const json& program_sla_thresholds()
+{
+    static const json thresholds = {
+        {"threshold_schema", "aida.hyperperf.program-sla-thresholds"},
+        {"threshold_schema_version", 2},
+        {"total_wall_ms_max_300mb", 300000.0},
+        {"total_wall_ms_stretch_300mb", 180000.0},
+        {"decode_throughput_bytes_per_s_min", 26214400.0},
+        {"file_throughput_bytes_per_s_min", 1048576.0},
+        {"instructions_per_s_min", 2000000.0},
+        {"publish_ready_ms_max", 50.0},
+        {"indexed_query_p95_ms_max", 50.0},
+        {"metadata_ready_ms_max", 3000.0},
+        {"warm_reopen_ms_max", 10000.0},
+        {"cancellation_p95_ms_max", 250.0},
+        {"incremental_private_bytes_max", 8589934592ULL},
+        {"workspace_mapped_bytes_max", 1073741824ULL},
+        {"global_mapped_bytes_max", 2147483648ULL},
+        {"decompile_all_funcs_per_s_min", 5.0},
+        {"decompile_all_funcs_per_s_stretch", 10.0},
+        {"scaling_wall16_over_wall1_max", 0.20},
+        {"scaling_efficiency_16_min", 0.5},
+        {"determinism_hash_match", true}
+    };
+    return thresholds;
+}
+
+std::uint64_t metrics_counter(const json& metrics, const char* name)
+{
+    if (!metrics.is_object())
+        return 0;
+    const auto it = metrics.find("counters");
+    if (it == metrics.end() || !it->is_object())
+        return 0;
+    const auto counter = it->find(name);
+    if (counter == it->end() || !counter->is_number())
+        return 0;
+    return counter->get<std::uint64_t>();
+}
+
+std::uint64_t metrics_phase_wall_ns(const json& metrics, const char* name)
+{
+    if (!metrics.is_object())
+        return 0;
+    const auto it = metrics.find("phases");
+    if (it == metrics.end() || !it->is_array())
+        return 0;
+    for (const auto& phase : *it) {
+        if (phase.value("name", std::string()) == name)
+            return phase.value("wall_ns", 0ULL);
+    }
+    return 0;
+}
+
+bool metrics_phase_present(const json& metrics, const char* name)
+{
+    if (!metrics.is_object())
+        return false;
+    const auto it = metrics.find("phases");
+    if (it == metrics.end() || !it->is_array())
+        return false;
+    for (const auto& phase : *it) {
+        if (phase.value("name", std::string()) == name)
+            return true;
+    }
+    return false;
+}
+
+json nullable_rate(std::uint64_t units, std::uint64_t wall_ns)
+{
+    if (wall_ns == 0)
+        return nullptr;
+    return static_cast<double>(units) * 1000000000.0 / static_cast<double>(wall_ns);
+}
+
+json throughput_block(const json& report, const json& metrics)
+{
+    const std::uint64_t cold_wall_ns = report["cold"].value("wall_ns", 0ULL);
+    const std::uint64_t file_bytes = report["cold"].value("file_bytes", 0ULL);
+    const std::uint64_t decode_wall_ns = metrics_phase_wall_ns(metrics, "decode") +
+        metrics_phase_wall_ns(metrics, "decode_merge");
+    const std::uint64_t decoded_bytes = metrics_counter(metrics, "decoded_bytes");
+    const std::uint64_t instructions = metrics_counter(metrics, "instructions");
+    const std::uint64_t functions = metrics_counter(metrics, "functions");
+    const std::uint64_t analysis_ns = report["cold"]["phases"].value("baseline_analysis_ns", 0ULL);
+    const std::uint64_t index_wall_ns = metrics_phase_wall_ns(metrics, "search_index");
+    const std::uint64_t persist_wall_ns = metrics_phase_wall_ns(metrics, "persistence");
+    return json{
+        {"file_bytes_per_s", nullable_rate(file_bytes, cold_wall_ns)},
+        {"decode_bytes_per_s", nullable_rate(decoded_bytes, decode_wall_ns)},
+        {"instructions_per_s", nullable_rate(instructions, decode_wall_ns)},
+        {"functions_per_s", nullable_rate(functions, analysis_ns)},
+        {"index_bytes_per_s", nullable_rate(
+            metrics_counter(metrics, "index_text_bytes"), index_wall_ns)},
+        {"persist_bytes_per_s", nullable_rate(
+            metrics_counter(metrics, "database_bytes_written"), persist_wall_ns)},
+        {"decompile_all_funcs_per_s", nullptr}};
+}
+
+json memory_block(const json& report, const json& metrics)
+{
+    return json{
+        {"peak_private_bytes", metrics_counter(metrics, "peak_private_bytes")},
+        {"peak_committed_bytes", metrics_counter(metrics, "peak_committed_bytes")},
+        {"resident_bytes_peak", metrics_counter(metrics, "resident_bytes_peak")},
+        {"mapped_workspace_peak", metrics_counter(metrics, "mapped_window_bytes_peak")},
+        {"mapped_global_peak", metrics_counter(metrics, "mapped_window_bytes_global_peak")},
+        {"spill_bytes_peak", metrics_counter(metrics, "spill_bytes_peak")},
+        {"spill_bytes_written", metrics_counter(metrics, "spill_bytes_written")},
+        {"spill_bytes_read", metrics_counter(metrics, "spill_bytes_read")},
+        {"budget_rejections", metrics_counter(metrics, "budget_rejections")},
+        {"memory_pressure_events", metrics_counter(metrics, "memory_pressure_events")},
+        {"process_before", report["cold"]["memory_before"]},
+        {"process_after", report["cold"]["memory_after"]}};
+}
+
+struct sla_measurement_context_t {
+    const json* report = nullptr;
+    const json* metrics = nullptr;
+    const json* throughput = nullptr;
+    double wall_scale = 1.0;
+    const bool* determinism_match = nullptr;
+    double scaling_wall16_over_wall1 = -1.0;
+    double scaling_efficiency_16 = -1.0;
+    bool scaling_gate_applicable = false;
+};
+
+json sla_verdict(const char* key, const json& target, const json& actual,
+                 const char* verdict)
+{
+    return json{{"key", key}, {"target", target}, {"actual", actual},
+        {"verdict", verdict}};
+}
+
+json evaluate_program_sla(const sla_measurement_context_t& context)
+{
+    const auto& thresholds = program_sla_thresholds();
+    const auto& report = *context.report;
+    const auto& metrics = *context.metrics;
+    const auto& throughput = *context.throughput;
+    json verdicts = json::array();
+    const auto push_max_ms = [&](const char* key, double target, const json& actual_ms) {
+        if (actual_ms.is_null()) {
+            verdicts.push_back(sla_verdict(key, target, nullptr, "NOT_MEASURED"));
+            return;
+        }
+        verdicts.push_back(sla_verdict(key, target, actual_ms,
+            actual_ms.get<double>() <= target ? "PASS" : "FAIL"));
+    };
+    const auto push_min = [&](const char* key, double target, const json& actual) {
+        if (actual.is_null()) {
+            verdicts.push_back(sla_verdict(key, target, nullptr, "NOT_MEASURED"));
+            return;
+        }
+        verdicts.push_back(sla_verdict(key, target, actual,
+            actual.get<double>() >= target ? "PASS" : "FAIL"));
+    };
+    const auto push_max_bytes = [&](const char* key, std::uint64_t target,
+                                    std::optional<std::uint64_t> actual) {
+        if (!actual) {
+            verdicts.push_back(sla_verdict(key, target, nullptr, "NOT_MEASURED"));
+            return;
+        }
+        verdicts.push_back(sla_verdict(key, target, *actual,
+            *actual <= target ? "PASS" : "FAIL"));
+    };
+
+    const double wall_ms = static_cast<double>(report["cold"].value("wall_ns", 0ULL)) / 1000000.0;
+    push_max_ms("total_wall_ms_max_300mb",
+        thresholds["total_wall_ms_max_300mb"].get<double>() * context.wall_scale, wall_ms);
+    {
+        const double stretch = thresholds["total_wall_ms_stretch_300mb"].get<double>() *
+            context.wall_scale;
+        verdicts.push_back(sla_verdict("total_wall_ms_stretch_300mb", stretch, wall_ms,
+            wall_ms <= stretch ? "PASS" : "WARN"));
+    }
+    push_min("decode_throughput_bytes_per_s_min",
+        thresholds["decode_throughput_bytes_per_s_min"].get<double>(),
+        throughput["decode_bytes_per_s"]);
+    push_min("file_throughput_bytes_per_s_min",
+        thresholds["file_throughput_bytes_per_s_min"].get<double>(),
+        throughput["file_bytes_per_s"]);
+    push_min("instructions_per_s_min",
+        thresholds["instructions_per_s_min"].get<double>(),
+        throughput["instructions_per_s"]);
+    push_max_ms("publish_ready_ms_max", thresholds["publish_ready_ms_max"].get<double>(),
+        metrics_phase_present(metrics, "publish_ready")
+            ? json(static_cast<double>(metrics_phase_wall_ns(metrics, "publish_ready")) / 1000000.0)
+            : json(nullptr));
+    push_max_ms("indexed_query_p95_ms_max", thresholds["indexed_query_p95_ms_max"].get<double>(),
+        report["mcp"]["p95_ns"].is_number()
+            ? json(static_cast<double>(report["mcp"]["p95_ns"].get<std::uint64_t>()) / 1000000.0)
+            : json(nullptr));
+    push_max_ms("metadata_ready_ms_max", thresholds["metadata_ready_ms_max"].get<double>(),
+        metrics_phase_present(metrics, "metadata_symbols_types")
+            ? json(static_cast<double>(
+                metrics_phase_wall_ns(metrics, "metadata_symbols_types")) / 1000000.0)
+            : json(nullptr));
+    push_max_ms("warm_reopen_ms_max", thresholds["warm_reopen_ms_max"].get<double>(),
+        report["warm_reopen"]["wall_ns"].is_number()
+            ? json(static_cast<double>(
+                report["warm_reopen"]["wall_ns"].get<std::uint64_t>()) / 1000000.0)
+            : json(nullptr));
+    push_max_ms("cancellation_p95_ms_max", thresholds["cancellation_p95_ms_max"].get<double>(),
+        report["cancellation"]["request_to_completion_ns"].is_number()
+            ? json(static_cast<double>(
+                report["cancellation"]["request_to_completion_ns"].get<std::uint64_t>()) / 1000000.0)
+            : json(nullptr));
+    push_max_bytes("incremental_private_bytes_max",
+        thresholds["incremental_private_bytes_max"].get<std::uint64_t>(),
+        metrics_counter(metrics, "peak_private_bytes"));
+    {
+        const std::uint64_t mapped = metrics_counter(metrics, "mapped_window_bytes_peak");
+        push_max_bytes("workspace_mapped_bytes_max",
+            thresholds["workspace_mapped_bytes_max"].get<std::uint64_t>(),
+            mapped == 0 ? std::optional<std::uint64_t>{} : std::optional<std::uint64_t>(mapped));
+    }
+    {
+        const std::uint64_t mapped = metrics_counter(metrics, "mapped_window_bytes_global_peak");
+        push_max_bytes("global_mapped_bytes_max",
+            thresholds["global_mapped_bytes_max"].get<std::uint64_t>(),
+            mapped == 0 ? std::optional<std::uint64_t>{} : std::optional<std::uint64_t>(mapped));
+    }
+    verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_min",
+        thresholds["decompile_all_funcs_per_s_min"], nullptr, "NOT_MEASURED"));
+    verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_stretch",
+        thresholds["decompile_all_funcs_per_s_stretch"], nullptr, "NOT_MEASURED"));
+    if (context.scaling_gate_applicable) {
+        verdicts.push_back(sla_verdict("scaling_wall16_over_wall1_max",
+            thresholds["scaling_wall16_over_wall1_max"], context.scaling_wall16_over_wall1,
+            context.scaling_wall16_over_wall1 <=
+                thresholds["scaling_wall16_over_wall1_max"].get<double>() ? "PASS" : "FAIL"));
+        verdicts.push_back(sla_verdict("scaling_efficiency_16_min",
+            thresholds["scaling_efficiency_16_min"], context.scaling_efficiency_16,
+            context.scaling_efficiency_16 >=
+                thresholds["scaling_efficiency_16_min"].get<double>() ? "PASS" : "WARN"));
+    } else {
+        verdicts.push_back(sla_verdict("scaling_wall16_over_wall1_max",
+            thresholds["scaling_wall16_over_wall1_max"], nullptr, "NOT_MEASURED"));
+        verdicts.push_back(sla_verdict("scaling_efficiency_16_min",
+            thresholds["scaling_efficiency_16_min"], nullptr, "NOT_MEASURED"));
+    }
+    if (context.determinism_match) {
+        verdicts.push_back(sla_verdict("determinism_hash_match",
+            thresholds["determinism_hash_match"], *context.determinism_match,
+            *context.determinism_match ? "PASS" : "FAIL"));
+    } else {
+        verdicts.push_back(sla_verdict("determinism_hash_match",
+            thresholds["determinism_hash_match"], nullptr, "NOT_MEASURED"));
+    }
+
+    bool any_fail = false;
+    bool all_pass_or_warn = true;
+    for (const auto& verdict : verdicts) {
+        const auto value = verdict.value("verdict", std::string());
+        if (value == "FAIL")
+            any_fail = true;
+        if (value != "PASS" && value != "WARN")
+            all_pass_or_warn = false;
+    }
+    return json{{"thresholds", thresholds},
+        {"verdicts", std::move(verdicts)},
+        {"overall", any_fail ? "FAIL" : (all_pass_or_warn ? "PASS" : "NOT_MEASURED")}};
+}
+
+std::string benchmark_run_id()
+{
+    SYSTEMTIME utc{};
+    GetSystemTime(&utc);
+    char stamp[32]{};
+    _snprintf_s(stamp, sizeof(stamp), _TRUNCATE, "%04u%02u%02uT%02u%02u%02uZ",
+        static_cast<unsigned>(utc.wYear), static_cast<unsigned>(utc.wMonth),
+        static_cast<unsigned>(utc.wDay), static_cast<unsigned>(utc.wHour),
+        static_cast<unsigned>(utc.wMinute), static_cast<unsigned>(utc.wSecond));
+    return std::string(stamp) + "-" + std::to_string(GetCurrentProcessId());
+}
+
+json large_pe_params_json(const large_pe_params_t& params)
+{
+    return json{{"code_bytes", params.code_bytes},
+        {"function_count", params.function_count},
+        {"seed", params.seed},
+        {"code_sections", params.code_sections},
+        {"string_count", params.string_count},
+        {"data_pointer_count", params.data_pointer_count},
+        {"seed_pdata", params.seed_pdata},
+        {"call_density_pct", params.call_density_pct},
+        {"jump_density_pct", params.jump_density_pct},
+        {"padding_pct", params.padding_pct}};
+}
+
+json large_pe_manifest_json(const large_pe_manifest_t& manifest)
+{
+    json sections = json::array();
+    for (const auto& section : manifest.sections) {
+        sections.push_back(json{{"name", section.name}, {"rva", section.rva},
+            {"raw_offset", section.raw_offset}, {"virtual_size", section.virtual_size},
+            {"raw_size", section.raw_size}});
+    }
+    return json{{"sections", std::move(sections)},
+        {"function_rva_begin", manifest.function_rva_begin},
+        {"function_rva_end", manifest.function_rva_end},
+        {"function_count", manifest.function_count},
+        {"instruction_count_estimate", manifest.instruction_count_estimate},
+        {"code_bytes", manifest.code_bytes},
+        {"pdata_bytes", manifest.pdata_bytes},
+        {"xdata_bytes", manifest.xdata_bytes},
+        {"rdata_bytes", manifest.rdata_bytes},
+        {"data_bytes", manifest.data_bytes},
+        {"reloc_bytes", manifest.reloc_bytes},
+        {"file_size", manifest.file_size}};
+}
+
+json scorecard_phases(const json& metrics)
+{
+    json phases = json::array();
+    if (metrics.is_object() && metrics.contains("phases") && metrics["phases"].is_array()) {
+        for (const auto& phase : metrics["phases"]) {
+            const std::uint64_t wall_ns = phase.value("wall_ns", 0ULL);
+            phases.push_back(json{{"name", phase.value("name", std::string())},
+                {"invocations", phase.value("invocations", 0ULL)},
+                {"wall_ns", wall_ns}, {"cpu_ns", phase.value("cpu_ns", 0ULL)},
+                {"bytes_in", phase.value("bytes_in", 0ULL)},
+                {"bytes_out", phase.value("bytes_out", 0ULL)},
+                {"work_items", phase.value("work_items", 0ULL)},
+                {"queue_depth_peak", phase.value("queue_depth_peak", 0ULL)},
+                {"active_workers_peak", phase.value("active_workers_peak", 0ULL)},
+                {"throughput_bytes_per_s", nullable_rate(
+                    phase.value("bytes_out", 0ULL), wall_ns)}});
+        }
+    }
+    return phases;
+}
+
+struct scorecard_input_t {
+    std::string mode;
+    const json* report = nullptr;
+    const json* metrics = nullptr;
+    const json* throughput = nullptr;
+    const json* memory = nullptr;
+    const json* program_sla = nullptr;
+    std::uint32_t lanes = 0;
+    bool load_profile_pinned = true;
+    const json* scaling = nullptr;
+    const json* determinism = nullptr;
+};
+
+json build_scorecard(const scorecard_input_t& input)
+{
+    const auto& report = *input.report;
+    const auto& metrics = *input.metrics;
+    const auto& sla = *input.program_sla;
+    const std::uint64_t tasks_completed = metrics_counter(metrics, "tasks_completed");
+    const std::uint64_t slots_scheduled = metrics_counter(metrics, "worker_slots_scheduled_ns");
+    const std::uint64_t depth_samples = metrics_counter(metrics, "queue_depth_samples");
+    const std::uint64_t logical_bytes = metrics_counter(metrics, "database_logical_bytes");
+    json scorecard{
+        {"scorecard_schema", "aida.hyperperf.program-scorecard"},
+        {"scorecard_schema_version", 1},
+        {"run_id", benchmark_run_id()},
+        {"mode", input.mode},
+        {"claim_status", "measurement_only"},
+        {"run", json{{"lanes", input.lanes},
+            {"load_profile_pinned", input.load_profile_pinned},
+            {"wall_ns", report["cold"].value("wall_ns", 0ULL)},
+            {"process_cpu_ns", metrics.value("process_cpu_ns", 0ULL)},
+            {"analysis_revision", report["warm_reopen"].value("analysis_revision", 0ULL)},
+            {"overlay_revision", report["warm_reopen"].value("overlay_revision", 0ULL)},
+            {"generation", metrics.value("generation", 0ULL)}}},
+        {"phases", scorecard_phases(metrics)},
+        {"throughput", *input.throughput},
+        {"worker_pool", json{
+            {"utilization", slots_scheduled == 0 ? json(nullptr) : json(static_cast<double>(
+                metrics_counter(metrics, "worker_slots_busy_ns")) /
+                static_cast<double>(slots_scheduled))},
+            {"queue_wait_mean_ns", tasks_completed == 0 ? json(nullptr) : json(
+                metrics_counter(metrics, "queue_wait_ns_total") / tasks_completed)},
+            {"queue_wait_max_ns", metrics_counter(metrics, "queue_wait_max_ns")},
+            {"queue_depth_mean", depth_samples == 0 ? json(nullptr) : json(static_cast<double>(
+                metrics_counter(metrics, "queue_depth_sum")) /
+                static_cast<double>(depth_samples))},
+            {"queue_depth_peak", metrics_counter(metrics, "peak_queue_depth")},
+            {"tasks_scheduled", metrics_counter(metrics, "tasks_scheduled")},
+            {"tasks_completed", tasks_completed},
+            {"tasks_rejected", metrics_counter(metrics, "tasks_rejected")}}},
+        {"decode_detail", json{
+            {"tiles", metrics_counter(metrics, "decode_tiles")},
+            {"requests", metrics_counter(metrics, "decode_requests")},
+            {"waves", metrics_counter(metrics, "decode_waves")},
+            {"frontier_seeds", metrics_counter(metrics, "decode_frontier_seeds")},
+            {"cross_tile_edges", metrics_counter(metrics, "decode_cross_tile_edges")},
+            {"invalid_bytes", metrics_counter(metrics, "decode_invalid_bytes")},
+            {"duplicate_instructions", metrics_counter(metrics, "decode_duplicate_instructions")},
+            {"merge_ns", metrics_counter(metrics, "decode_merge_ns")},
+            {"lane_wall_ns_max", metrics_counter(metrics, "decode_lane_wall_ns_max")}}},
+        {"memory", *input.memory},
+        {"persistence", json{
+            {"database_bytes", report["cold"]["database"].value("database_bytes", 0ULL)},
+            {"bytes_written", metrics_counter(metrics, "database_bytes_written")},
+            {"logical_bytes", logical_bytes},
+            {"rows", metrics_counter(metrics, "database_rows")},
+            {"commit_elapsed_ns", metrics_counter(metrics, "database_commit_elapsed_ns")},
+            {"write_amplification", logical_bytes == 0 ? json(nullptr) : json(static_cast<double>(
+                metrics_counter(metrics, "database_bytes_written")) /
+                static_cast<double>(logical_bytes))},
+            {"queue_wait_ns", metrics_counter(metrics, "persist_queue_wait_ns")},
+            {"queue_depth_peak", metrics_counter(metrics, "persist_queue_depth_peak")},
+            {"pages_written", metrics_counter(metrics, "persist_pages_written")},
+            {"wal_bytes_peak", metrics_counter(metrics, "persist_wal_bytes_peak")}}},
+        {"interaction", json{
+            {"warm_reopen_ms", report["warm_reopen"]["wall_ns"].is_number()
+                ? json(static_cast<double>(
+                    report["warm_reopen"]["wall_ns"].get<std::uint64_t>()) / 1000000.0)
+                : json(nullptr)},
+            {"metadata_ready_ms", metrics_phase_present(metrics, "metadata_symbols_types")
+                ? json(static_cast<double>(
+                    metrics_phase_wall_ns(metrics, "metadata_symbols_types")) / 1000000.0)
+                : json(nullptr)},
+            {"indexed_query_p95_ms", report["mcp"]["p95_ns"].is_number()
+                ? json(static_cast<double>(report["mcp"]["p95_ns"].get<std::uint64_t>()) / 1000000.0)
+                : json(nullptr)},
+            {"mcp_call_p95_ms", report["mcp"]["p95_ns"].is_number()
+                ? json(static_cast<double>(report["mcp"]["p95_ns"].get<std::uint64_t>()) / 1000000.0)
+                : json(nullptr)},
+            {"decompile_cold_p95_ms", report["decompiler"]["cold_p95_ns"].is_number()
+                ? json(static_cast<double>(
+                    report["decompiler"]["cold_p95_ns"].get<std::uint64_t>()) / 1000000.0)
+                : json(nullptr)},
+            {"decompile_warm_p95_ms", report["decompiler"]["warm_p95_ns"].is_number()
+                ? json(static_cast<double>(
+                    report["decompiler"]["warm_p95_ns"].get<std::uint64_t>()) / 1000000.0)
+                : json(nullptr)},
+            {"cancellation_request_to_completion_ms",
+                report["cancellation"]["request_to_completion_ns"].is_number()
+                    ? json(static_cast<double>(
+                        report["cancellation"]["request_to_completion_ns"].get<std::uint64_t>()) /
+                        1000000.0)
+                    : json(nullptr)}}},
+        {"sla", sla},
+        {"artifacts", json{{"report_json", nullptr},
+            {"compare_verdict_json", nullptr}, {"receipt_json", nullptr}}},
+        {"verdict", sla.value("overall", std::string("NOT_MEASURED")) == "FAIL" ? "FAIL" : "PASS"}};
+    if (input.scaling)
+        scorecard["scaling"] = *input.scaling;
+    else
+        scorecard["scaling"] = nullptr;
+    if (input.determinism)
+        scorecard["determinism"] = *input.determinism;
+    else
+        scorecard["determinism"] = nullptr;
+    return scorecard;
+}
+
+std::uint32_t parse_code_mb(const std::string& text)
+{
+    std::size_t consumed = 0;
+    const unsigned long value = std::stoul(text, &consumed, 10);
+    if (consumed != text.size() || value < 8 || value > 256)
+        throw fixture_error_t("synthetic code size must be within 8..256 MiB");
+    return static_cast<std::uint32_t>(value);
+}
+
+std::uint64_t parse_seed_hex(const std::string& text)
+{
+    std::string_view view(text);
+    if (view.size() > 2 && view[0] == '0' && (view[1] == 'x' || view[1] == 'X'))
+        view.remove_prefix(2);
+    if (view.empty())
+        throw fixture_error_t("seed_hex must be a hexadecimal integer");
+    std::size_t consumed = 0;
+    const std::string narrowed(view);
+    const unsigned long long value = std::stoull(narrowed, &consumed, 16);
+    if (consumed != narrowed.size())
+        throw fixture_error_t("seed_hex must be a hexadecimal integer");
+    return static_cast<std::uint64_t>(value);
+}
+
+std::vector<std::uint32_t> parse_lanes_csv(const std::string& text)
+{
+    std::vector<std::uint32_t> lanes;
+    std::size_t offset = 0;
+    while (offset <= text.size()) {
+        const auto comma = text.find(',', offset);
+        const std::string token = text.substr(offset,
+            comma == std::string::npos ? std::string::npos : comma - offset);
+        if (token.empty())
+            throw fixture_error_t("lanes_csv contains an empty element");
+        std::size_t consumed = 0;
+        const unsigned long value = std::stoul(token, &consumed, 10);
+        if (consumed != token.size())
+            throw fixture_error_t("lanes_csv elements must be decimal integers");
+        const std::uint32_t lane = static_cast<std::uint32_t>(value);
+        if (lane != 1 && lane != 2 && lane != 4 && lane != 8 && lane != 16 && lane != 32)
+            throw fixture_error_t("lanes_csv elements must be within {1,2,4,8,16,32}");
+        if (std::find(lanes.begin(), lanes.end(), lane) != lanes.end())
+            throw fixture_error_t("lanes_csv elements must be unique");
+        if (!lanes.empty() && lane < lanes.back())
+            throw fixture_error_t("lanes_csv elements must be ascending");
+        lanes.push_back(lane);
+        if (comma == std::string::npos)
+            break;
+        offset = comma + 1;
+    }
+    if (lanes.empty())
+        throw fixture_error_t("lanes_csv must contain at least one lane count");
+    return lanes;
+}
+
+void assert_synthetic_within_limits(const large_pe_manifest_t& manifest)
+{
+    const tile_decode_orchestrator_limits_t tile_limits;
+    const baseline_analysis_settings_t settings;
+    const std::uint64_t instruction_limit =
+        (std::min<std::uint64_t>)(tile_limits.maximum_instructions,
+                                  settings.max_decoded_instructions);
+    if (manifest.instruction_count_estimate >= instruction_limit)
+        throw fixture_error_t(
+            "synthetic fixture instruction estimate " +
+            std::to_string(manifest.instruction_count_estimate) +
+            " meets or exceeds the active decode limit " +
+            std::to_string(instruction_limit) +
+            "; the generator never truncates, so this configuration is rejected");
+}
+
+void assert_fixture_digest(const std::filesystem::path& path,
+                           const large_pe_params_t& params)
+{
+    const auto file_digest = c03::sha256_evidence_file(path);
+    if (!file_digest.ok)
+        throw fixture_error_t("synthetic fixture digest failed: " + file_digest.error);
+    if (file_digest.sha256 != large_pe_sha256(params))
+        throw fixture_error_t("synthetic fixture digest diverged from the deterministic generator");
+}
+
+snapshot_hash_result_t capture_publication_hash(
+    const std::shared_ptr<analysis_workspace_t>& workspace)
+{
+    const auto snapshot = workspace->snapshot();
+    const auto search = workspace->search_index();
+    if (!snapshot || !search)
+        throw fixture_error_t("determinism capture requires a published workspace");
+    auto validated = validate_analysis_snapshot(*snapshot, true, workspace->cancellation_token());
+    if (!validated)
+        throw fixture_error_t(validated.error().stable_code() + ":" + validated.error().message);
+    snapshot_hash_input_t input;
+    input.snapshot = snapshot.get();
+    input.data_candidates = &search->data_candidates();
+    input.switches = &search->switches();
+    input.types = &search->types();
+    input.content_hash = workspace->identity().content_hash();
+    return compute_snapshot_hash(input);
+}
+
+json scaling_row_from_report(std::uint32_t lanes, const json& report)
+{
+    const auto& metrics = report["instrumented_engine"]["metrics"];
+    const std::uint64_t tasks_completed = metrics_counter(metrics, "tasks_completed");
+    const std::uint64_t slots_scheduled = metrics_counter(metrics, "worker_slots_scheduled_ns");
+    return json{{"lanes", lanes},
+        {"wall_ns", report["cold"].value("wall_ns", 0ULL)},
+        {"decode_wall_ns", metrics_phase_wall_ns(metrics, "decode")},
+        {"decode_merge_wall_ns", metrics_phase_wall_ns(metrics, "decode_merge")},
+        {"instructions", metrics_counter(metrics, "instructions")},
+        {"decoded_bytes", metrics_counter(metrics, "decoded_bytes")},
+        {"file_bytes", report["cold"].value("file_bytes", 0ULL)},
+        {"peak_private_bytes", metrics_counter(metrics, "peak_private_bytes")},
+        {"resident_bytes_peak", metrics_counter(metrics, "resident_bytes_peak")},
+        {"worker_utilization", slots_scheduled == 0 ? json(nullptr) : json(static_cast<double>(
+            metrics_counter(metrics, "worker_slots_busy_ns")) /
+            static_cast<double>(slots_scheduled))},
+        {"queue_wait_mean_ns", tasks_completed == 0 ? json(nullptr) : json(
+            metrics_counter(metrics, "queue_wait_ns_total") / tasks_completed)},
+        {"tasks_scheduled", metrics_counter(metrics, "tasks_scheduled")},
+        {"tasks_completed", tasks_completed},
+        {"tasks_rejected", metrics_counter(metrics, "tasks_rejected")}};
+}
+
+void remove_report_database_artifacts(const json& report)
+{
+    const std::string cold_path = report["cold"]["database"].value("path", std::string());
+    remove_database_artifacts(cold_path);
+    const std::string instrumented_path =
+        report["instrumented_engine"]["database"].value("path", std::string());
+    remove_database_artifacts(instrumented_path);
+}
+
+}
+
+void emit_benchmark_report(const json& report, const std::optional<std::filesystem::path>& out)
+{
+    const std::string text = report.dump(2);
+    std::cout << text << '\n';
+    if (out) {
+        std::ofstream stream(*out, std::ios::binary | std::ios::trunc);
+        stream << text << '\n';
+        stream.flush();
+        if (!stream)
+            throw aida::analysis::test_fixture::fixture_error_t(
+                "unable to write the --out benchmark report");
+    }
+}
+
+int run_legacy_mode(const std::string& benchmark_mode, const std::filesystem::path& path,
+                    const std::optional<std::filesystem::path>& out)
+{
+    const bool release_sla = benchmark_mode == "release_sla";
+    measurement_options_t options;
+    options.benchmark_mode = benchmark_mode;
+    options.claim_status = release_sla ? "measurement_candidate" : "development_only";
+    options.release_qualification = release_sla;
+    options.pin_profile = false;
+    options.skip_concurrent = false;
+    options.worker_lanes = 0;
+    const auto report = run_measurement(std::filesystem::absolute(path), options);
+    emit_benchmark_report(report, out);
+    return 0;
+}
+
+int run_synthetic_mode(std::uint32_t code_mb, std::uint64_t seed, std::uint32_t lanes,
+                       const std::optional<std::filesystem::path>& out)
+{
+    large_pe_params_t params;
+    params.code_bytes = static_cast<std::uint64_t>(code_mb) * 1024ULL * 1024ULL;
+    params.seed = seed;
+    params = validated_large_pe_params(params);
+    const auto manifest = describe_large_pe(params);
+    assert_synthetic_within_limits(manifest);
+    fixture_root_t root("synthetic_benchmark");
+    const auto fixture_path = root.path() / "synthetic.exe";
+    write_large_pe64(fixture_path, params);
+    assert_fixture_digest(fixture_path, params);
+    measurement_options_t options;
+    options.benchmark_mode = "synthetic";
+    options.claim_status = "measurement_only";
+    options.pin_profile = true;
+    options.skip_concurrent = true;
+    options.worker_lanes = lanes;
+    auto report = run_measurement(fixture_path, options);
+    const auto metrics = report["instrumented_engine"]["metrics"];
+    const search_index_limits_t search_limits;
+    if (metrics_counter(metrics, "index_entries") >= search_limits.max_entries)
+        throw aida::analysis::test_fixture::fixture_error_t(
+            "synthetic run exceeded the search index entry bound");
+    report["fixture"]["generator"] = json{{"kind", "synthetic_large_pe64"},
+        {"params", large_pe_params_json(params)},
+        {"manifest", large_pe_manifest_json(manifest)}};
+    report["fixture"]["kind"] = "synthetic";
+    report["fixture"]["size_bytes"] = report["fixture"]["size"];
+    const auto throughput = throughput_block(report, metrics);
+    report["throughput"] = throughput;
+    const auto memory = memory_block(report, metrics);
+    report["memory"] = memory;
+    sla_measurement_context_t sla_context;
+    sla_context.report = &report;
+    sla_context.metrics = &metrics;
+    sla_context.throughput = &throughput;
+    sla_context.wall_scale = static_cast<double>(code_mb) / 300.0;
+    auto program_sla = evaluate_program_sla(sla_context);
+    report["program_sla"] = program_sla;
+    scorecard_input_t scorecard_input;
+    scorecard_input.mode = "synthetic";
+    scorecard_input.report = &report;
+    scorecard_input.metrics = &metrics;
+    scorecard_input.throughput = &throughput;
+    scorecard_input.memory = &memory;
+    scorecard_input.program_sla = &program_sla;
+    scorecard_input.lanes = lanes;
+    scorecard_input.load_profile_pinned = true;
+    report["scorecard"] = build_scorecard(scorecard_input);
+    report["scorecard"]["fixture"] = report["fixture"];
+    report["scorecard"]["host"] = report["host"];
+    emit_benchmark_report(report, out);
+    return program_sla.value("overall", std::string()) == "FAIL" ? 1 : 0;
+}
+
+int run_scaling_mode(std::uint32_t code_mb, std::uint64_t seed,
+                     const std::vector<std::uint32_t>& lanes,
+                     const std::optional<std::filesystem::path>& out)
+{
+    large_pe_params_t params;
+    params.code_bytes = static_cast<std::uint64_t>(code_mb) * 1024ULL * 1024ULL;
+    params.seed = seed;
+    params = validated_large_pe_params(params);
+    const auto manifest = describe_large_pe(params);
+    assert_synthetic_within_limits(manifest);
+    fixture_root_t root("scaling_benchmark");
+    const auto fixture_path = root.path() / "synthetic.exe";
+    write_large_pe64(fixture_path, params);
+    assert_fixture_digest(fixture_path, params);
+
+    json rows = json::array();
+    std::vector<std::pair<std::string,
+        std::pair<std::uint32_t, snapshot_hash_result_t>>> hash_runs;
+    json last_report;
+    for (const auto lane : lanes) {
+        snapshot_hash_result_t captured;
+        measurement_options_t options;
+        options.benchmark_mode = "scaling";
+        options.claim_status = "measurement_only";
+        options.pin_profile = true;
+        options.skip_concurrent = true;
+        options.worker_lanes = lane;
+        options.publication_callback = [&](const std::shared_ptr<analysis_workspace_t>& workspace) {
+            captured = capture_publication_hash(workspace);
+        };
+        last_report = run_measurement(fixture_path, options);
+        remove_report_database_artifacts(last_report);
+        rows.push_back(scaling_row_from_report(lane, last_report));
+        hash_runs.push_back({"lanes=" + std::to_string(lane), {lane, captured}});
+    }
+    bool hash_match = false;
+    const auto hash_manifest = build_hash_manifest(hash_runs, hash_match);
+
+    std::optional<std::uint64_t> wall_lane1;
+    for (const auto& row : rows) {
+        if (row.value("lanes", 0U) == 1U) {
+            wall_lane1 = row.value("wall_ns", 0ULL);
+            break;
+        }
+    }
+    json lane_values = json::array();
+    json wall_values = json::array();
+    json speedup_values = json::array();
+    json efficiency_values = json::array();
+    for (auto& row : rows) {
+        const auto lane = row.value("lanes", 0U);
+        const std::uint64_t wall_ns = row.value("wall_ns", 0ULL);
+        json speedup = nullptr;
+        json efficiency = nullptr;
+        if (wall_lane1 && *wall_lane1 != 0 && wall_ns != 0) {
+            speedup = static_cast<double>(*wall_lane1) / static_cast<double>(wall_ns);
+            efficiency = static_cast<double>(*wall_lane1) /
+                (static_cast<double>(wall_ns) * static_cast<double>(lane));
+        }
+        row["speedup"] = speedup;
+        row["efficiency"] = efficiency;
+        row["decode_throughput_bytes_per_s"] = nullable_rate(
+            row.value("decoded_bytes", 0ULL),
+            row.value("decode_wall_ns", 0ULL) + row.value("decode_merge_wall_ns", 0ULL));
+        lane_values.push_back(lane);
+        wall_values.push_back(wall_ns);
+        speedup_values.push_back(speedup);
+        efficiency_values.push_back(efficiency);
+    }
+
+    double wall16_over_wall1 = -1.0;
+    double efficiency_16 = -1.0;
+    bool has_lane16 = false;
+    std::optional<std::uint64_t> wall_lane16;
+    for (const auto& row : rows) {
+        if (row.value("lanes", 0U) == 16U) {
+            has_lane16 = true;
+            wall_lane16 = row.value("wall_ns", 0ULL);
+            if (row["efficiency"].is_number())
+                efficiency_16 = row["efficiency"].get<double>();
+        }
+    }
+    const auto host_logical = last_report["host"].value("logical_processors", 0U);
+    const bool scaling_gate_applicable = wall_lane1.has_value() && has_lane16 &&
+        host_logical >= 16;
+    if (scaling_gate_applicable && *wall_lane1 != 0 && wall_lane16 && *wall_lane16 != 0)
+        wall16_over_wall1 = static_cast<double>(*wall_lane16) / static_cast<double>(*wall_lane1);
+
+    const auto metrics = last_report["instrumented_engine"]["metrics"];
+    const auto throughput = throughput_block(last_report, metrics);
+    const auto memory = memory_block(last_report, metrics);
+    sla_measurement_context_t sla_context;
+    sla_context.report = &last_report;
+    sla_context.metrics = &metrics;
+    sla_context.throughput = &throughput;
+    sla_context.wall_scale = static_cast<double>(code_mb) / 300.0;
+    sla_context.determinism_match = lanes.size() >= 2 ? &hash_match : nullptr;
+    sla_context.scaling_wall16_over_wall1 = wall16_over_wall1;
+    sla_context.scaling_efficiency_16 = efficiency_16;
+    sla_context.scaling_gate_applicable = scaling_gate_applicable;
+    auto program_sla = evaluate_program_sla(sla_context);
+
+    json scaling_block = json{{"lanes", std::move(lane_values)},
+        {"wall_ns", std::move(wall_values)},
+        {"speedup", std::move(speedup_values)},
+        {"efficiency", std::move(efficiency_values)},
+        {"rows", std::move(rows)},
+        {"hash_match_across_lanes", lanes.size() >= 2 ? json(hash_match) : json(nullptr)},
+        {"wall16_over_wall1", wall16_over_wall1 < 0 ? json(nullptr) : json(wall16_over_wall1)},
+        {"efficiency_16", efficiency_16 < 0 ? json(nullptr) : json(efficiency_16)},
+        {"gate_applicable", scaling_gate_applicable},
+        {"host_logical_processors", host_logical}};
+
+    last_report["fixture"]["generator"] = json{{"kind", "synthetic_large_pe64"},
+        {"params", large_pe_params_json(params)},
+        {"manifest", large_pe_manifest_json(manifest)}};
+    last_report["fixture"]["kind"] = "synthetic";
+    last_report["fixture"]["size_bytes"] = last_report["fixture"]["size"];
+    last_report["throughput"] = throughput;
+    last_report["memory"] = memory;
+    last_report["scaling"] = scaling_block;
+    last_report["determinism"] = hash_manifest;
+    last_report["program_sla"] = program_sla;
+    scorecard_input_t scorecard_input;
+    scorecard_input.mode = "scaling";
+    scorecard_input.report = &last_report;
+    scorecard_input.metrics = &metrics;
+    scorecard_input.throughput = &throughput;
+    scorecard_input.memory = &memory;
+    scorecard_input.program_sla = &program_sla;
+    scorecard_input.lanes = lanes.back();
+    scorecard_input.load_profile_pinned = true;
+    scorecard_input.scaling = &scaling_block;
+    scorecard_input.determinism = &hash_manifest;
+    last_report["scorecard"] = build_scorecard(scorecard_input);
+    last_report["scorecard"]["fixture"] = last_report["fixture"];
+    last_report["scorecard"]["host"] = last_report["host"];
+    emit_benchmark_report(last_report, out);
+    return program_sla.value("overall", std::string()) == "FAIL" ? 1 : 0;
+}
+
+int run_determinism_mode(std::uint32_t code_mb, std::uint64_t seed,
+                         const std::optional<std::filesystem::path>& out)
+{
+    large_pe_params_t params;
+    params.code_bytes = static_cast<std::uint64_t>(code_mb) * 1024ULL * 1024ULL;
+    params.seed = seed;
+    params = validated_large_pe_params(params);
+    const auto manifest = describe_large_pe(params);
+    assert_synthetic_within_limits(manifest);
+    fixture_root_t root("determinism_benchmark");
+    const auto fixture_path = root.path() / "synthetic.exe";
+    write_large_pe64(fixture_path, params);
+    assert_fixture_digest(fixture_path, params);
+
+    const std::array<std::pair<const char*, std::uint32_t>, 3> run_plan{{
+        {"A_lanes_1", 1}, {"B_lanes_16", 16}, {"C_lanes_16", 16}}};
+    std::vector<std::pair<std::string,
+        std::pair<std::uint32_t, snapshot_hash_result_t>>> hash_runs;
+    json report;
+    for (const auto& [label, lanes] : run_plan) {
+        snapshot_hash_result_t captured;
+        measurement_options_t options;
+        options.benchmark_mode = "determinism";
+        options.claim_status = "measurement_only";
+        options.pin_profile = true;
+        options.skip_concurrent = true;
+        options.worker_lanes = lanes;
+        options.publication_callback = [&](const std::shared_ptr<analysis_workspace_t>& workspace) {
+            captured = capture_publication_hash(workspace);
+        };
+        report = run_measurement(fixture_path, options);
+        remove_report_database_artifacts(report);
+        hash_runs.push_back({label, {lanes, captured}});
+    }
+    bool hash_match = false;
+    const auto hash_manifest = build_hash_manifest(hash_runs, hash_match);
+
+    const auto metrics = report["instrumented_engine"]["metrics"];
+    const auto throughput = throughput_block(report, metrics);
+    const auto memory = memory_block(report, metrics);
+    sla_measurement_context_t sla_context;
+    sla_context.report = &report;
+    sla_context.metrics = &metrics;
+    sla_context.throughput = &throughput;
+    sla_context.wall_scale = static_cast<double>(code_mb) / 300.0;
+    sla_context.determinism_match = &hash_match;
+    auto program_sla = evaluate_program_sla(sla_context);
+
+    report["fixture"]["generator"] = json{{"kind", "synthetic_large_pe64"},
+        {"params", large_pe_params_json(params)},
+        {"manifest", large_pe_manifest_json(manifest)}};
+    report["fixture"]["kind"] = "synthetic";
+    report["fixture"]["size_bytes"] = report["fixture"]["size"];
+    report["throughput"] = throughput;
+    report["memory"] = memory;
+    report["determinism"] = hash_manifest;
+    report["program_sla"] = program_sla;
+    scorecard_input_t scorecard_input;
+    scorecard_input.mode = "determinism";
+    scorecard_input.report = &report;
+    scorecard_input.metrics = &metrics;
+    scorecard_input.throughput = &throughput;
+    scorecard_input.memory = &memory;
+    scorecard_input.program_sla = &program_sla;
+    scorecard_input.lanes = 16;
+    scorecard_input.load_profile_pinned = true;
+    scorecard_input.determinism = &hash_manifest;
+    report["scorecard"] = build_scorecard(scorecard_input);
+    report["scorecard"]["fixture"] = report["fixture"];
+    report["scorecard"]["host"] = report["host"];
+    emit_benchmark_report(report, out);
+    if (!hash_match)
+        return 1;
+    return program_sla.value("overall", std::string()) == "FAIL" ? 1 : 0;
+}
+
+int run_compare_mode(const std::filesystem::path& baseline_path,
+                     const std::filesystem::path& candidate_path,
+                     const std::optional<std::filesystem::path>& out)
+{
+    const auto load_report = [](const std::filesystem::path& path) {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream)
+            throw fixture_error_t("compare report is unavailable: " + path.u8string());
+        json value;
+        try {
+            stream >> value;
+        } catch (const json::exception& exception) {
+            throw fixture_error_t(std::string("compare report JSON is invalid: ") +
+                exception.what());
+        }
+        return value;
+    };
+    const json baseline = load_report(baseline_path);
+    const json candidate = load_report(candidate_path);
+
+    const auto verdict_actual = [](const json& report, const std::string& key) -> json {
+        const json* container = nullptr;
+        if (report.contains("program_sla") && report["program_sla"].is_object())
+            container = &report["program_sla"];
+        else if (report.contains("sla") && report["sla"].is_object())
+            container = &report["sla"];
+        if (!container || !container->contains("verdicts") ||
+            !(*container)["verdicts"].is_array())
+            return nullptr;
+        for (const auto& verdict : (*container)["verdicts"]) {
+            if (verdict.value("key", std::string()) == key)
+                return verdict["actual"];
+        }
+        return nullptr;
+    };
+
+    json verdicts = json::array();
+    json warnings = json::array();
+    bool any_fail = false;
+    const auto& thresholds = program_sla_thresholds();
+    for (const auto& item : thresholds.items()) {
+        const auto& key = item.key();
+        if (key == "threshold_schema" || key == "threshold_schema_version")
+            continue;
+        const json candidate_actual = verdict_actual(candidate, key);
+        const json baseline_actual = verdict_actual(baseline, key);
+        if (baseline_actual.is_null() || candidate_actual.is_null()) {
+            verdicts.push_back(json{{"key", key}, {"target", item.value()},
+                {"baseline", baseline_actual}, {"candidate", candidate_actual},
+                {"delta_pct", nullptr}, {"verdict", "NOT_COMPARABLE"}});
+            continue;
+        }
+        if (item.value().is_boolean()) {
+            const bool worse = baseline_actual.get<bool>() && !candidate_actual.get<bool>();
+            if (worse)
+                any_fail = true;
+            verdicts.push_back(json{{"key", key}, {"target", item.value()},
+                {"baseline", baseline_actual}, {"candidate", candidate_actual},
+                {"delta_pct", nullptr}, {"verdict", worse ? "FAIL" : "PASS"}});
+            continue;
+        }
+        if (!baseline_actual.is_number() || !candidate_actual.is_number()) {
+            verdicts.push_back(json{{"key", key}, {"target", item.value()},
+                {"baseline", baseline_actual}, {"candidate", candidate_actual},
+                {"delta_pct", nullptr}, {"verdict", "NOT_COMPARABLE"}});
+            continue;
+        }
+        const double baseline_value = baseline_actual.get<double>();
+        const double candidate_value = candidate_actual.get<double>();
+        if (baseline_value == 0.0) {
+            verdicts.push_back(json{{"key", key}, {"target", item.value()},
+                {"baseline", baseline_actual}, {"candidate", candidate_actual},
+                {"delta_pct", nullptr}, {"verdict", "NOT_COMPARABLE"}});
+            continue;
+        }
+        const double delta_pct =
+            (candidate_value - baseline_value) / baseline_value * 100.0;
+        const bool lower_is_better = key.find("_max") != std::string::npos;
+        const bool worse = lower_is_better ? delta_pct > 5.0 : delta_pct < -5.0;
+        if (worse)
+            any_fail = true;
+        verdicts.push_back(json{{"key", key}, {"target", item.value()},
+            {"baseline", baseline_actual}, {"candidate", candidate_actual},
+            {"delta_pct", delta_pct}, {"verdict", worse ? "FAIL" : "PASS"}});
+    }
+
+    static const char* const informational_keys[] = {
+        "file_bytes_per_s", "decode_bytes_per_s", "instructions_per_s",
+        "functions_per_s", "index_bytes_per_s", "persist_bytes_per_s",
+        "decompile_all_funcs_per_s"};
+    json informational = json::array();
+    for (const char* key : informational_keys) {
+        const json baseline_value = baseline.contains("throughput")
+            ? baseline["throughput"].value(key, json(nullptr)) : json(nullptr);
+        const json candidate_value = candidate.contains("throughput")
+            ? candidate["throughput"].value(key, json(nullptr)) : json(nullptr);
+        if (!baseline_value.is_number() || !candidate_value.is_number()) {
+            informational.push_back(json{{"key", key}, {"baseline", baseline_value},
+                {"candidate", candidate_value}, {"delta_pct", nullptr},
+                {"verdict", "NOT_COMPARABLE"}});
+            continue;
+        }
+        const double before = baseline_value.get<double>();
+        const double after = candidate_value.get<double>();
+        if (before == 0.0) {
+            informational.push_back(json{{"key", key}, {"baseline", baseline_value},
+                {"candidate", candidate_value}, {"delta_pct", nullptr},
+                {"verdict", "NOT_COMPARABLE"}});
+            continue;
+        }
+        const double delta_pct = (after - before) / before * 100.0;
+        const bool warn = delta_pct < -10.0;
+        if (warn)
+            warnings.push_back(std::string(key) + " regressed " +
+                std::to_string(delta_pct) + "%");
+        informational.push_back(json{{"key", key}, {"baseline", baseline_value},
+            {"candidate", candidate_value}, {"delta_pct", delta_pct},
+            {"verdict", warn ? "WARN" : "PASS"}});
+    }
+
+    json verdict_report = json{
+        {"schema", "aida.hyperperf.compare-verdict"},
+        {"schema_version", 1},
+        {"baseline", baseline_path.u8string()},
+        {"candidate", candidate_path.u8string()},
+        {"verdicts", std::move(verdicts)},
+        {"informational", std::move(informational)},
+        {"warnings", std::move(warnings)},
+        {"overall", any_fail ? "FAIL" : "PASS"}};
+    emit_benchmark_report(verdict_report, out);
+    return any_fail ? 1 : 0;
+}
+
+int main(int argc, char** argv)
+{
+    try {
+        if (argc == 4 && std::string_view(argv[1]) == "--validate-receipt")
+            return validate_receipt_command(argv[2], std::filesystem::u8path(argv[3]));
+        std::vector<std::string> args;
+        for (int index = 1; index < argc; ++index)
+            args.emplace_back(argv[index]);
+        std::optional<std::filesystem::path> out_path;
+        for (std::size_t index = 0; index + 1 < args.size(); ++index) {
+            if (args[index] == "--out") {
+                out_path = std::filesystem::u8path(args[index + 1]);
+                args.erase(args.begin() + static_cast<std::ptrdiff_t>(index),
+                           args.begin() + static_cast<std::ptrdiff_t>(index + 2));
+                break;
+            }
+        }
+        if (args.empty())
+            throw aida::analysis::test_fixture::fixture_error_t(
+                "usage: analysis_benchmark_harness <deterministic_component|release_sla|synthetic|scaling|determinism|compare> ...");
+        const std::string& mode = args[0];
+        if ((mode == "deterministic_component" || mode == "release_sla") && args.size() == 2)
+            return run_legacy_mode(mode, std::filesystem::u8path(args[1]), out_path);
+        if (mode == "synthetic" && (args.size() == 3 || args.size() == 5)) {
+            std::uint32_t lanes = 0;
+            if (args.size() == 5) {
+                if (args[3] != "--lanes")
+                    throw aida::analysis::test_fixture::fixture_error_t(
+                        "synthetic mode accepts only --lanes <N> after <seed_hex>");
+                const auto parsed = parse_lanes_csv(args[4]);
+                if (parsed.size() != 1)
+                    throw aida::analysis::test_fixture::fixture_error_t(
+                        "synthetic --lanes accepts exactly one lane count");
+                lanes = parsed.at(0);
+            }
+            return run_synthetic_mode(parse_code_mb(args[1]), parse_seed_hex(args[2]),
+                lanes, out_path);
+        }
+        if (mode == "scaling" && args.size() == 4) {
+            return run_scaling_mode(parse_code_mb(args[1]), parse_seed_hex(args[2]),
+                parse_lanes_csv(args[3]), out_path);
+        }
+        if (mode == "determinism" && args.size() == 3)
+            return run_determinism_mode(parse_code_mb(args[1]), parse_seed_hex(args[2]), out_path);
+        if (mode == "compare" && args.size() == 3)
+            return run_compare_mode(std::filesystem::u8path(args[1]),
+                std::filesystem::u8path(args[2]), out_path);
+        throw aida::analysis::test_fixture::fixture_error_t(
+            "usage: analysis_benchmark_harness <deterministic_component|release_sla> <fixture> [--out <report.json>] | synthetic <code_mb> <seed_hex> [--lanes N] [--out <report.json>] | scaling <code_mb> <seed_hex> <lanes_csv> [--out <report.json>] | determinism <code_mb> <seed_hex> [--out <report.json>] | compare <baseline.json> <candidate.json> [--out <verdict.json>]");
+    } catch (const std::exception& error) {
+        aida::analysis::c03_test::assertion_telemetry::record_exception(
+            error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

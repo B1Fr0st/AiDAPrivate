@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -29,6 +30,12 @@ constexpr std::uint64_t kMinimumWindowBytes = 64ULL * 1024ULL;
 constexpr std::uint64_t kMaximumWindowBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaximumCacheBytes = 1024ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaximumGlobalMappedBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kAutoCacheFloorBytes = 256ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kAutoWindowLargeSourceBytes = 256ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kAutoWindowMediumSourceBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kAutoWindowLargeBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kAutoWindowMediumBytes = 8ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kAutoWindowSmallBytes = 4ULL * 1024ULL * 1024ULL;
 
 struct handle_closer_t {
     void operator()(void* value) const noexcept {
@@ -58,6 +65,11 @@ std::atomic<std::uint64_t>& global_reserved_window_bytes() noexcept {
 std::atomic<std::uint64_t>& global_admitted_window_bytes() noexcept {
     static std::atomic<std::uint64_t> value{0};
     return value;
+}
+
+std::atomic<analysis_metrics_t*>& relay_sink() noexcept {
+    static std::atomic<analysis_metrics_t*> sink{nullptr};
+    return sink;
 }
 
 workspace_error_t stop_error(const cancellation_token_t& cancel, const char* phase) {
@@ -138,7 +150,7 @@ workspace_result_t<byte_provider_identity_t> query_current_path_identity(
     const std::string& source, const char* phase) {
     auto wide_result = utf8_to_wide(source);
     if (!wide_result)
-        return workspace_result_t<byte_provider_identity_t>::failure(wide_result.error());
+        return workspace_result_t<std::wstring>::failure(wide_result.error());
     HANDLE raw_file = CreateFileW(wide_result.value().c_str(), FILE_READ_ATTRIBUTES,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -217,18 +229,72 @@ struct window_shard_t {
 
 }
 
+namespace provider_metrics_relay {
+
+void attach_analysis_metrics(analysis_metrics_t* metrics) noexcept {
+    relay_sink().store(metrics, std::memory_order_release);
+}
+
+void detach_analysis_metrics(const analysis_metrics_t* metrics) noexcept {
+    analysis_metrics_t* expected = const_cast<analysis_metrics_t*>(metrics);
+    relay_sink().compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
+                                         std::memory_order_acquire);
+}
+
+void record_mapped_window_bytes(std::uint64_t bytes) noexcept {
+    if (auto* sink = relay_sink().load(std::memory_order_acquire))
+        sink->set_max(analysis_metric_t::mapped_window_bytes_peak, bytes);
+}
+
+void record_global_mapped_window_bytes(std::uint64_t bytes) noexcept {
+    if (auto* sink = relay_sink().load(std::memory_order_acquire))
+        sink->set_max(analysis_metric_t::mapped_window_bytes_global_peak, bytes);
+}
+
+void record_spill_high_water(std::uint64_t bytes) noexcept {
+    if (auto* sink = relay_sink().load(std::memory_order_acquire))
+        sink->set_max(analysis_metric_t::spill_bytes_peak, bytes);
+}
+
+void record_spill_write(std::uint64_t bytes) noexcept {
+    if (auto* sink = relay_sink().load(std::memory_order_acquire))
+        sink->add(analysis_metric_t::spill_bytes_written, bytes);
+}
+
+void record_spill_read(std::uint64_t bytes) noexcept {
+    if (auto* sink = relay_sink().load(std::memory_order_acquire))
+        sink->add(analysis_metric_t::spill_bytes_read, bytes);
+}
+
+void record_budget_rejection() noexcept {
+    if (auto* sink = relay_sink().load(std::memory_order_acquire))
+        sink->add(analysis_metric_t::budget_rejections, 1);
+}
+
+void record_memory_pressure_event() noexcept {
+    if (auto* sink = relay_sink().load(std::memory_order_acquire))
+        sink->add(analysis_metric_t::memory_pressure_events, 1);
+}
+
+}
+
 struct mapped_window_cache_t::state_t {
     std::shared_ptr<mapping_file_state_t> file;
     mapped_window_cache_options_t options;
     std::vector<std::unique_ptr<window_shard_t>> shards;
-    mutable std::mutex admission_mutex;
-    std::uint64_t reserved_window_bytes = 0;
+    std::atomic<std::uint64_t> reserved_window_bytes{0};
     std::atomic<std::uint64_t> cached_window_bytes{0};
     std::atomic<std::uint64_t> access_sequence{1};
     std::atomic<std::uint64_t> mapped_windows{0};
     std::atomic<std::uint64_t> cache_hits{0};
     std::atomic<std::uint64_t> cache_misses{0};
     std::atomic<std::uint64_t> evictions{0};
+    std::atomic<std::uint64_t> lease_count{0};
+    std::atomic<std::uint64_t> lease_wait_ns{0};
+    std::atomic<std::uint64_t> shard_lock_contention{0};
+    std::atomic<std::uint64_t> admission_steals{0};
+    std::atomic<std::uint64_t> duplicate_map_races{0};
+    std::atomic<std::uint64_t> map_calls{0};
 
     std::size_t shard_index(std::uint64_t window_start) const noexcept {
         const std::uint64_t ordinal = window_start / options.window_bytes;
@@ -261,47 +327,89 @@ struct mapped_window_cache_t::state_t {
         return iterator->second;
     }
 
-    bool evict_one() {
-        std::size_t selected_shard = shards.size();
-        std::uint64_t selected_start = 0;
-        std::uint64_t oldest_access = (std::numeric_limits<std::uint64_t>::max)();
-        for (std::size_t index = 0; index < shards.size(); ++index) {
-            auto& shard = *shards[index];
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            for (const auto& item : shard.windows) {
-                if (item.second.use_count() != 1 || item.second->last_access >= oldest_access)
-                    continue;
-                selected_shard = index;
-                selected_start = item.first;
-                oldest_access = item.second->last_access;
-            }
+    std::unique_lock<std::mutex> contention_lock(window_shard_t& shard) {
+        std::unique_lock<std::mutex> lock(shard.mutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            shard_lock_contention.fetch_add(1, std::memory_order_relaxed);
+            lock.lock();
         }
-        if (selected_shard == shards.size())
-            return false;
-        std::shared_ptr<mapped_window_t> retired;
-        {
-            auto& shard = *shards[selected_shard];
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            const auto iterator = shard.windows.find(selected_start);
-            if (iterator == shard.windows.end() || iterator->second.use_count() != 1)
-                return false;
-            retired = std::move(iterator->second);
-            shard.windows.erase(iterator);
-        }
-        cached_window_bytes.fetch_sub(retired->mapped_size, std::memory_order_acq_rel);
-        evictions.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        return lock;
     }
 
-    workspace_result_t<void> reserve_window_bytes(std::uint64_t bytes) {
-        std::unique_lock<std::mutex> admission(admission_mutex);
+    bool evict_one_approx(std::size_t hint_shard) {
         for (;;) {
-            const std::uint64_t cached = cached_window_bytes.load(std::memory_order_acquire);
+            std::size_t selected_shard = shards.size();
+            std::uint64_t oldest_access = (std::numeric_limits<std::uint64_t>::max)();
+            const auto scan_shard = [&](std::size_t index) {
+                auto& shard = *shards[index];
+                auto lock = contention_lock(shard);
+                for (const auto& item : shard.windows) {
+                    if (item.second.use_count() != 1 || item.second->last_access >= oldest_access)
+                        continue;
+                    selected_shard = index;
+                    oldest_access = item.second->last_access;
+                }
+            };
+            scan_shard(hint_shard);
+            if (selected_shard == shards.size()) {
+                for (std::size_t offset = 1; offset < shards.size(); ++offset)
+                    scan_shard((hint_shard + offset) % shards.size());
+            }
+            if (selected_shard == shards.size())
+                return false;
+            auto& shard = *shards[selected_shard];
+            std::shared_ptr<mapped_window_t> retired;
+            bool erased = false;
+            {
+                auto lock = contention_lock(shard);
+                std::uint64_t best_access = (std::numeric_limits<std::uint64_t>::max)();
+                auto best = shard.windows.end();
+                for (auto iterator = shard.windows.begin(); iterator != shard.windows.end();
+                     ++iterator) {
+                    if (iterator->second.use_count() != 1 ||
+                        iterator->second->last_access >= best_access)
+                        continue;
+                    best = iterator;
+                    best_access = iterator->second->last_access;
+                }
+                if (best != shard.windows.end()) {
+                    retired = std::move(best->second);
+                    shard.windows.erase(best);
+                    erased = true;
+                }
+            }
+            if (!erased)
+                continue;
+            if (selected_shard != hint_shard)
+                admission_steals.fetch_add(1, std::memory_order_relaxed);
+            cached_window_bytes.fetch_sub(retired->mapped_size, std::memory_order_acq_rel);
+            evictions.fetch_add(1, std::memory_order_relaxed);
+            provider_metrics_relay::record_memory_pressure_event();
+            return true;
+        }
+    }
+
+    workspace_result_t<void> reserve_window_bytes(std::uint64_t bytes, std::size_t hint_shard) {
+        for (;;) {
+            std::uint64_t cached = cached_window_bytes.load(std::memory_order_acquire);
+            std::uint64_t reserved = reserved_window_bytes.load(std::memory_order_acquire);
             if (cached <= options.max_cached_window_bytes &&
-                reserved_window_bytes <= options.max_cached_window_bytes - cached &&
-                bytes <= options.max_cached_window_bytes - cached - reserved_window_bytes)
-                break;
-            if (!evict_one()) {
+                reserved <= options.max_cached_window_bytes - cached &&
+                bytes <= options.max_cached_window_bytes - cached - reserved) {
+                if (reserved_window_bytes.compare_exchange_weak(
+                        reserved, reserved + bytes, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    const std::uint64_t cached_now =
+                        cached_window_bytes.load(std::memory_order_acquire);
+                    if (cached_now <= options.max_cached_window_bytes &&
+                        reserved + bytes <= options.max_cached_window_bytes - cached_now)
+                        break;
+                    reserved_window_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+                } else {
+                    continue;
+                }
+            }
+            if (!evict_one_approx(hint_shard)) {
                 auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
                                                   "all mapped windows are pinned",
                                                   "mapped_window_reserve");
@@ -309,10 +417,12 @@ struct mapped_window_cache_t::state_t {
                 error.details.emplace_back("cached_window_bytes", std::to_string(cached));
                 error.details.emplace_back("max_cached_window_bytes",
                                            std::to_string(options.max_cached_window_bytes));
+                provider_metrics_relay::record_budget_rejection();
                 return workspace_result_t<void>::failure(std::move(error));
             }
         }
         if (!reserve_global_bytes(bytes, options.max_global_mapped_window_bytes)) {
+            reserved_window_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
             auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
                                               "global mapped-window capacity is exhausted",
                                               "mapped_window_reserve");
@@ -325,29 +435,30 @@ struct mapped_window_cache_t::state_t {
                 std::to_string(global_admitted_window_bytes().load(std::memory_order_acquire)));
             error.details.emplace_back("max_global_mapped_window_bytes",
                                        std::to_string(options.max_global_mapped_window_bytes));
+            provider_metrics_relay::record_budget_rejection();
             return workspace_result_t<void>::failure(std::move(error));
         }
-        reserved_window_bytes += bytes;
+        provider_metrics_relay::record_global_mapped_window_bytes(
+            global_admitted_window_bytes().load(std::memory_order_acquire));
         return workspace_result_t<void>::success();
     }
 
     void release_window_reservation(std::uint64_t bytes) noexcept {
-        std::lock_guard<std::mutex> admission(admission_mutex);
-        reserved_window_bytes -= bytes;
+        reserved_window_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
         release_global_reservation(bytes);
     }
 
     workspace_result_t<std::shared_ptr<mapped_window_t>> commit_window(
         std::uint64_t window_start, std::uint64_t bytes,
         std::shared_ptr<mapped_window_t> candidate) {
-        std::lock_guard<std::mutex> admission(admission_mutex);
         auto& shard = *shards[shard_index(window_start)];
         std::lock_guard<std::mutex> shard_lock(shard.mutex);
         const auto existing = shard.windows.find(window_start);
         if (existing != shard.windows.end()) {
             existing->second->last_access = access_sequence.fetch_add(1, std::memory_order_relaxed);
             cache_hits.fetch_add(1, std::memory_order_relaxed);
-            reserved_window_bytes -= bytes;
+            duplicate_map_races.fetch_add(1, std::memory_order_relaxed);
+            reserved_window_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
             release_global_reservation(bytes);
             return workspace_result_t<std::shared_ptr<mapped_window_t>>::success(existing->second);
         }
@@ -355,12 +466,13 @@ struct mapped_window_cache_t::state_t {
             candidate->last_access = access_sequence.fetch_add(1, std::memory_order_relaxed);
             auto inserted = shard.windows.emplace(window_start, candidate);
             if (!inserted.second) {
-                reserved_window_bytes -= bytes;
+                duplicate_map_races.fetch_add(1, std::memory_order_relaxed);
+                reserved_window_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
                 release_global_reservation(bytes);
                 return workspace_result_t<std::shared_ptr<mapped_window_t>>::success(inserted.first->second);
             }
         } catch (const std::bad_alloc&) {
-            reserved_window_bytes -= bytes;
+            reserved_window_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
             release_global_reservation(bytes);
             return workspace_result_t<std::shared_ptr<mapped_window_t>>::failure(
                 make_workspace_error(workspace_error_code_t::provider_unavailable,
@@ -370,8 +482,12 @@ struct mapped_window_cache_t::state_t {
         global_mapped_window_bytes().fetch_add(bytes, std::memory_order_acq_rel);
         cached_window_bytes.fetch_add(bytes, std::memory_order_acq_rel);
         mapped_windows.fetch_add(1, std::memory_order_relaxed);
-        reserved_window_bytes -= bytes;
+        reserved_window_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
         commit_global_reservation(bytes);
+        provider_metrics_relay::record_mapped_window_bytes(
+            cached_window_bytes.load(std::memory_order_acquire));
+        provider_metrics_relay::record_global_mapped_window_bytes(
+            global_mapped_window_bytes().load(std::memory_order_acquire));
         return workspace_result_t<std::shared_ptr<mapped_window_t>>::success(std::move(candidate));
     }
 
@@ -389,7 +505,7 @@ struct mapped_window_cache_t::state_t {
         if (cancel.stop_requested())
             return workspace_result_t<std::shared_ptr<mapped_window_t>>::failure(
                 stop_error(cancel, "mapped_window_lease"));
-        auto reservation = reserve_window_bytes(mapped_size);
+        auto reservation = reserve_window_bytes(mapped_size, shard_index(window_start));
         if (!reservation)
             return workspace_result_t<std::shared_ptr<mapped_window_t>>::failure(reservation.error());
         bool reservation_held = true;
@@ -406,6 +522,7 @@ struct mapped_window_cache_t::state_t {
         }
         const DWORD high = static_cast<DWORD>(window_start >> 32U);
         const DWORD low = static_cast<DWORD>(window_start & 0xffffffffULL);
+        map_calls.fetch_add(1, std::memory_order_relaxed);
         void* mapped = MapViewOfFile(static_cast<HANDLE>(file->mapping.get()), FILE_MAP_READ,
                                      high, low, static_cast<SIZE_T>(mapped_size));
         if (!mapped) {
@@ -451,11 +568,8 @@ struct mapped_window_cache_t::state_t {
     mapped_window_cache_statistics_t statistics() const noexcept {
         mapped_window_cache_statistics_t result;
         result.source_bytes = file->identity.size;
-        {
-            std::lock_guard<std::mutex> admission(admission_mutex);
-            result.cached_window_bytes = cached_window_bytes.load(std::memory_order_acquire);
-            result.reserved_window_bytes = reserved_window_bytes;
-        }
+        result.cached_window_bytes = cached_window_bytes.load(std::memory_order_acquire);
+        result.reserved_window_bytes = reserved_window_bytes.load(std::memory_order_acquire);
         result.global_mapped_window_bytes =
             global_mapped_window_bytes().load(std::memory_order_acquire);
         result.global_reserved_window_bytes =
@@ -466,6 +580,13 @@ struct mapped_window_cache_t::state_t {
         result.cache_hits = cache_hits.load(std::memory_order_relaxed);
         result.cache_misses = cache_misses.load(std::memory_order_relaxed);
         result.evictions = evictions.load(std::memory_order_relaxed);
+        result.capacity_bytes = options.max_cached_window_bytes;
+        result.lease_count = lease_count.load(std::memory_order_relaxed);
+        result.lease_wait_ns = lease_wait_ns.load(std::memory_order_relaxed);
+        result.shard_lock_contention = shard_lock_contention.load(std::memory_order_relaxed);
+        result.admission_steals = admission_steals.load(std::memory_order_relaxed);
+        result.duplicate_map_races = duplicate_map_races.load(std::memory_order_relaxed);
+        result.map_calls = map_calls.load(std::memory_order_relaxed);
         for (const auto& shard_ptr : shards) {
             std::lock_guard<std::mutex> lock(shard_ptr->mutex);
             for (const auto& item : shard_ptr->windows)
@@ -476,8 +597,24 @@ struct mapped_window_cache_t::state_t {
     }
 
     workspace_result_t<void> trim() {
-        std::unique_lock<std::mutex> admission(admission_mutex);
-        while (evict_one()) {
+        for (std::size_t index = 0; index < shards.size(); ++index) {
+            for (;;) {
+                std::shared_ptr<mapped_window_t> retired;
+                {
+                    auto& shard = *shards[index];
+                    std::lock_guard<std::mutex> lock(shard.mutex);
+                    const auto iterator = std::find_if(
+                        shard.windows.begin(), shard.windows.end(),
+                        [](const std::pair<const std::uint64_t, std::shared_ptr<mapped_window_t>>&
+                               item) { return item.second.use_count() == 1; });
+                    if (iterator == shard.windows.end())
+                        break;
+                    retired = std::move(iterator->second);
+                    shard.windows.erase(iterator);
+                }
+                cached_window_bytes.fetch_sub(retired->mapped_size, std::memory_order_acq_rel);
+                evictions.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         return workspace_result_t<void>::success();
     }
@@ -486,13 +623,14 @@ struct mapped_window_cache_t::state_t {
 workspace_result_t<std::shared_ptr<mapped_window_cache_t>> mapped_window_cache_t::open(
     const std::string& utf8_path, mapped_window_cache_options_t options) {
     if (!is_power_of_two(options.shard_count) || options.shard_count > 64 ||
-        options.window_bytes < kMinimumWindowBytes || options.window_bytes > kMaximumWindowBytes ||
-        options.max_lease_bytes == 0 || options.max_lease_bytes > options.window_bytes ||
-        options.max_cached_window_bytes < options.window_bytes ||
-        options.max_cached_window_bytes > kMaximumCacheBytes ||
-        options.max_global_mapped_window_bytes < options.max_cached_window_bytes ||
+        options.max_lease_bytes == 0 ||
+        options.max_global_mapped_window_bytes == 0 ||
         options.max_global_mapped_window_bytes > kMaximumGlobalMappedBytes ||
-        options.window_bytes > static_cast<std::uint64_t>((std::numeric_limits<SIZE_T>::max)())) {
+        (options.window_bytes != 0 &&
+         (options.window_bytes < kMinimumWindowBytes ||
+          options.window_bytes > kMaximumWindowBytes)) ||
+        (options.max_cached_window_bytes != 0 &&
+         options.max_cached_window_bytes > kMaximumCacheBytes)) {
         return workspace_result_t<std::shared_ptr<mapped_window_cache_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "mapped-window cache options are invalid", "mapped_window_open"));
@@ -520,6 +658,35 @@ workspace_result_t<std::shared_ptr<mapped_window_cache_t>> mapped_window_cache_t
     if (!identity)
         return workspace_result_t<std::shared_ptr<mapped_window_cache_t>>::failure(identity.error());
     identity.value().immutable_snapshot = options.immutable_source;
+    if (options.window_bytes == 0) {
+        const std::uint64_t source_bytes = identity.value().size;
+        options.window_bytes = source_bytes >= kAutoWindowLargeSourceBytes
+            ? kAutoWindowLargeBytes
+            : source_bytes >= kAutoWindowMediumSourceBytes
+                ? kAutoWindowMediumBytes
+                : kAutoWindowSmallBytes;
+        options.window_bytes = (std::min)(
+            (std::max)(options.window_bytes, kMinimumWindowBytes), kMaximumWindowBytes);
+    }
+    if (options.max_lease_bytes > options.window_bytes)
+        options.max_lease_bytes = options.window_bytes;
+    if (options.max_cached_window_bytes == 0) {
+        const std::uint64_t source_bytes = identity.value().size;
+        const std::uint64_t windows = source_bytes / options.window_bytes +
+            (source_bytes % options.window_bytes != 0 ? 1ULL : 0ULL);
+        const std::uint64_t bounded = (std::min)(windows,
+            kMaximumCacheBytes / options.window_bytes);
+        options.max_cached_window_bytes = (std::min)(
+            (std::max)(bounded * options.window_bytes, kAutoCacheFloorBytes),
+            kMaximumCacheBytes);
+    }
+    if (options.window_bytes > static_cast<std::uint64_t>((std::numeric_limits<SIZE_T>::max)()) ||
+        options.max_cached_window_bytes < options.window_bytes ||
+        options.max_global_mapped_window_bytes < options.max_cached_window_bytes) {
+        return workspace_result_t<std::shared_ptr<mapped_window_cache_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "mapped-window cache options are invalid", "mapped_window_open"));
+    }
     SYSTEM_INFO system_info{};
     GetSystemInfo(&system_info);
     if (system_info.dwAllocationGranularity == 0 ||
@@ -588,9 +755,29 @@ workspace_result_t<void> mapped_window_cache_t::revalidate() const {
     return state_->revalidate();
 }
 
+bool mapped_window_cache_t::content_pin_active() const noexcept {
+    return state_->file->identity.immutable_snapshot;
+}
+
+std::optional<mapped_window_cache_statistics_t>
+mapped_window_cache_t::window_cache_statistics() const noexcept {
+    return state_->statistics();
+}
+
 workspace_result_t<byte_view_t> mapped_window_cache_t::lease(
     std::uint64_t offset, std::uint64_t size_value,
     const cancellation_token_t& cancel) const {
+    struct lease_timing_guard_t {
+        const state_t& state;
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        ~lease_timing_guard_t() {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            state.lease_count.fetch_add(1, std::memory_order_relaxed);
+            state.lease_wait_ns.fetch_add(static_cast<std::uint64_t>(elapsed),
+                                          std::memory_order_relaxed);
+        }
+    } timing{*state_};
     if (cancel.stop_requested())
         return workspace_result_t<byte_view_t>::failure(stop_error(cancel, "mapped_window_lease"));
     auto range = validate_span(offset, size_value, size(), "mapped_window_lease");

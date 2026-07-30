@@ -1,5 +1,8 @@
 #include "type_recovery.hpp"
 
+#include "analysis_metrics.hpp"
+#include "parallel_pass.hpp"
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -2437,10 +2440,25 @@ type_recovery_cache_key_t make_type_recovery_cache_key(
     return key;
 }
 
+namespace {
+
+workspace_error_t type_recovery_stop_error(const cancellation_token_t& cancel) {
+    const bool deadline = cancel.deadline_exceeded();
+    auto error = make_workspace_error(deadline ? workspace_error_code_t::deadline_exceeded
+                                               : workspace_error_code_t::cancelled,
+                                      deadline ? "type recovery deadline exceeded"
+                                               : "type recovery cancelled",
+                                      "type_recovery");
+    error.deadline = deadline;
+    error.cancellation = !deadline;
+    return error;
+}
+
 workspace_result_t<type_recovery_result_t>
-    recover_types(const analysis_workspace_t& workspace,
-                  const type_recovery_request_t& request,
-                  const cancellation_token_t& cancel) {
+recover_with_snapshot(const analysis_workspace_t& workspace,
+    const std::shared_ptr<const analysis_snapshot_t>& snapshot,
+    const type_recovery_request_t& request,
+    const cancellation_token_t& cancel) {
     type_recovery_result_t result;
     result.function_rva = request.function_rva;
     result.cache_key = make_type_recovery_cache_key(workspace, request);
@@ -2508,7 +2526,6 @@ workspace_result_t<type_recovery_result_t>
         return workspace_result_t<type_recovery_result_t>::success(std::move(result));
     }
 
-    const auto snapshot = workspace.snapshot();
     if (!snapshot) {
         canonicalize_evidence(result);
         if (!result.evidence.empty() && resolve_evidence(result, limits, poller)) {
@@ -2597,6 +2614,78 @@ workspace_result_t<type_recovery_result_t>
         : result.bounded ? type_recovery_status_t::result_limited
         : type_recovery_status_t::complete;
     return workspace_result_t<type_recovery_result_t>::success(std::move(result));
+}
+
+}
+
+workspace_result_t<type_recovery_result_t>
+    recover_types(const analysis_workspace_t& workspace,
+                  const type_recovery_request_t& request,
+                  const cancellation_token_t& cancel) {
+    return recover_with_snapshot(workspace, workspace.snapshot(), request, cancel);
+}
+
+workspace_result_t<std::vector<workspace_result_t<type_recovery_result_t>>>
+recover_types_batch(const analysis_workspace_t& workspace,
+    const std::vector<type_recovery_request_t>& requests,
+    const type_recovery_batch_options_t& options,
+    const cancellation_token_t& cancel) {
+    using batch_output_t = std::vector<workspace_result_t<type_recovery_result_t>>;
+    if (options.worker_count > 256) {
+        return workspace_result_t<batch_output_t>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "type recovery batch worker count is invalid", "type_recovery.batch"));
+    }
+    if (requests.empty())
+        return workspace_result_t<batch_output_t>::success(batch_output_t{});
+    if (cancel.stop_requested())
+        return workspace_result_t<batch_output_t>::failure(type_recovery_stop_error(cancel));
+    const auto workspace_cancel = workspace.cancellation_token();
+    if (workspace_cancel.stop_requested()) {
+        return workspace_result_t<batch_output_t>::failure(
+            type_recovery_stop_error(workspace_cancel));
+    }
+    if (workspace.closing() || workspace.closed()) {
+        return workspace_result_t<batch_output_t>::failure(
+            make_workspace_error(workspace_error_code_t::workspace_closing,
+                                 "type recovery rejected a closing workspace", "type_recovery"));
+    }
+    const auto pinned = workspace.snapshot();
+    if (!pinned) {
+        return workspace_result_t<batch_output_t>::failure(
+            make_workspace_error(workspace_error_code_t::analysis_in_progress,
+                                 "type recovery requires a published analysis snapshot",
+                                 "type_recovery"));
+    }
+    if (pinned->binary_id != workspace.identity().binary_id()) {
+        return workspace_result_t<batch_output_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "analysis snapshot identity does not match the workspace",
+                                 "type_recovery"));
+    }
+    std::vector<std::optional<workspace_result_t<type_recovery_result_t>>> slots(requests.size());
+    const auto shards = parallel_shards(requests.size(), options.worker_count);
+    const auto run = parallel_run_shards(shards,
+        [&](std::size_t, parallel_shard_t shard) -> workspace_result_t<void> {
+            for (std::size_t index = shard.begin; index != shard.end; ++index) {
+                slots[index].emplace(
+                    recover_with_snapshot(workspace, pinned, requests[index], cancel));
+                if (options.metrics && static_cast<bool>(*slots[index])) {
+                    options.metrics->add(analysis_metric_t::type_candidates_evaluated,
+                        (*slots[index]).value().evidence_collected);
+                }
+            }
+            return workspace_result_t<void>::success();
+        }, cancel);
+    if (!run)
+        return workspace_result_t<batch_output_t>::failure(run.error());
+    if (cancel.stop_requested())
+        return workspace_result_t<batch_output_t>::failure(type_recovery_stop_error(cancel));
+    batch_output_t results;
+    results.reserve(requests.size());
+    for (auto& slot : slots)
+        results.push_back(std::move(*slot));
+    return workspace_result_t<batch_output_t>::success(std::move(results));
 }
 
 workspace_result_t<type_recovery_result_t>

@@ -44,6 +44,8 @@ struct workspace_database_options_t {
     std::uint64_t packed_generation_quota_bytes =
         packed_generation_default_quota_bytes;
     std::uint32_t packed_stream_page_size = 256U << 10;
+    std::uint64_t packed_staging_memory_budget_bytes = 1ULL << 30;
+    bool packed_finalize_full_revalidation = false;
 };
 
 struct decompiler_cache_key_t {
@@ -97,6 +99,19 @@ struct workspace_database_snapshot_t {
     std::uint64_t candidate_overlay_revision = 0;
     bool candidate_pending = false;
     bool open = false;
+    std::uint64_t staging_bytes = 0;
+    std::uint64_t staging_domains = 0;
+    bool staging_active = false;
+    std::uint64_t cumulative_pages_written = 0;
+    std::uint64_t wal_bytes_peak = 0;
+};
+
+struct staged_domain_stats_t {
+    std::uint32_t pages = 0;
+    std::uint64_t payload_bytes = 0;
+    std::uint64_t records = 0;
+    std::uint64_t serialize_us = 0;
+    bool spilled = false;
 };
 
 struct persisted_search_products_t {
@@ -175,6 +190,22 @@ private:
     friend class workspace_database_t;
 };
 
+class workspace_snapshot_staging_t final {
+public:
+    workspace_snapshot_staging_t(const workspace_snapshot_staging_t&) = delete;
+    workspace_snapshot_staging_t& operator=(const workspace_snapshot_staging_t&) = delete;
+
+    std::uint32_t staged_domain_mask() const noexcept;
+
+private:
+    struct state_t;
+    explicit workspace_snapshot_staging_t(std::shared_ptr<state_t> state);
+
+    std::shared_ptr<state_t> state_;
+
+    friend class workspace_database_t;
+};
+
 class workspace_database_t final : public workspace_lifecycle_participant_t,
                                    public std::enable_shared_from_this<workspace_database_t> {
 public:
@@ -216,6 +247,21 @@ public:
         std::string analysis_metrics_json,
         cancellation_token_t cancel = {});
 
+    persistence_ticket_t begin_snapshot_staging(
+        std::shared_ptr<const analysis_snapshot_t> snapshot,
+        std::string analysis_settings_json,
+        std::string analysis_metrics_json,
+        cancellation_token_t cancel = {});
+    persistence_ticket_t stage_snapshot_domains(
+        const std::shared_ptr<workspace_snapshot_staging_t>& staging,
+        std::uint32_t domain_mask,
+        cancellation_token_t cancel = {});
+    persistence_ticket_t finalize_snapshot_staging(
+        const std::shared_ptr<workspace_snapshot_staging_t>& staging,
+        persisted_search_products_t search_products,
+        std::shared_ptr<const managed_artifact_publication_t> managed_publication,
+        cancellation_token_t cancel = {});
+
     workspace_result_t<std::shared_ptr<const analysis_snapshot_t>> load_snapshot(
         std::shared_ptr<const pe_image_t> image,
         const cancellation_token_t& cancel = {});
@@ -253,6 +299,16 @@ public:
         load_workbench_state(const cancellation_token_t& cancel = {}) const;
     persistence_ticket_t checkpoint(bool truncate, cancellation_token_t cancel = {});
 
+    persistence_ticket_t store_pipeline_cache(
+        decompiler_pipeline_cache_v1_row_t record,
+        cancellation_token_t cancel = {});
+    workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>
+        load_pipeline_cache(const std::vector<std::uint8_t>& canonical_key,
+                            const cancellation_token_t& cancel = {}) const;
+    persistence_ticket_t invalidate_pipeline_cache(
+        std::optional<std::vector<std::uint64_t>> function_rvas,
+        cancellation_token_t cancel = {});
+
     workspace_database_snapshot_t snapshot() const;
 
     void request_cancel() noexcept override;
@@ -270,7 +326,9 @@ private:
 
     persistence_ticket_t enqueue_write(std::string label, writer_operation_t operation,
                                        cancellation_token_t cancel,
-                                       std::uint64_t reservation_bytes = 0);
+                                       std::uint64_t reservation_bytes = 0,
+                                       persistence_priority_t priority =
+                                           persistence_priority_t::deferred);
     workspace_result_t<void> with_reader(
         const reader_operation_t& operation,
         const cancellation_token_t& cancel = {}) const;

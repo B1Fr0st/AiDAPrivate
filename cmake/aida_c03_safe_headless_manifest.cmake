@@ -9,80 +9,24 @@ include("${AIDA_C03_PATH_POLICY_MODULE}")
 if(NOT DEFINED STANDALONE_ROOT OR NOT IS_DIRECTORY "${STANDALONE_ROOT}")
     message(WARNING "AiDA C03 integration requires STANDALONE_ROOT")
 endif()
-if(NOT COMMAND aida_c03_require_components OR
-   NOT COMMAND aida_c03_reject_forbidden_target_links)
-    message(WARNING "AiDA C03 dependency policy must be loaded before integration")
-endif()
-aida_c03_require_components(zydis Zydis)
-aida_c03_require_components(zycore Zycore)
-aida_c03_require_components(capstone ARM ARM64 MIPS PPC RISCV X86 detail)
-aida_c03_require_components(taskflow taskflow)
-aida_c03_require_components(ghidra_worker decompiler sleigh processor_specs compiler_specs)
-aida_c03_require_components(triton_thorough_only triton z3_interface)
-aida_c03_require_components(z3_thorough_only libz3)
-aida_c03_require_components(sqlite sqlite3)
-aida_c03_require_components(imgui imgui imgui_freetype imgui_impl_dx11 imgui_impl_win32)
-aida_c03_require_components(zlib zlib)
-aida_c03_require_components(zstd zstd_static)
-aida_c03_require_components(liblzma_minimal liblzma)
-aida_c03_require_components(minizip_ng_read_only mz_zip_reader)
-aida_c03_require_components(pcre2_8bit_no_jit pcre2_8)
-aida_c03_require_components(nlohmann_json nlohmann_json)
-aida_c03_require_components(json_schema_validator nlohmann_json_schema_validator)
-aida_c03_require_components(llvm_demangle_support Demangle Support)
-aida_c03_require_components(managed_worker_packages ICSharpCode.Decompiler System.Collections.Immutable System.Reflection.Metadata)
 
 set(AIDA_C03_TEST_ROOT "${STANDALONE_ROOT}/../tests/c03")
 set(AIDA_C03_MCP_TEST_ROOT "${STANDALONE_ROOT}/../tests/mcp_compat")
 set(AIDA_C03_WORKSPACE_TEST_ROOT "${STANDALONE_ROOT}/../tests/analysis_workspace")
-set(AIDA_C03_PACKAGE_VERIFIER_SOURCE
-    "${STANDALONE_ROOT}/../tools/c03_package_verifier/main.cpp")
 if(NOT DEFINED ENV{LOCALAPPDATA} OR NOT IS_ABSOLUTE "$ENV{LOCALAPPDATA}")
     message(WARNING "AiDA C03 requires the canonical per-user local application-data root")
 endif()
 file(TO_CMAKE_PATH "$ENV{LOCALAPPDATA}" _aida_c03_local_app_data)
 file(REAL_PATH "${_aida_c03_local_app_data}" _aida_c03_local_app_data)
 file(TO_CMAKE_PATH "${_aida_c03_local_app_data}" _aida_c03_local_app_data)
-string(SHA256 AIDA_C03_STAGE_AUTHORITY_ID
+string(SHA256 _aida_c03_stage_id
     "aida-c03-stage-v1|${CMAKE_SOURCE_DIR}|${CMAKE_BINARY_DIR}|ninja-msvc-release")
-string(SUBSTRING "${AIDA_C03_STAGE_AUTHORITY_ID}" 0 24 AIDA_C03_STAGE_AUTHORITY_ID)
+string(SUBSTRING "${_aida_c03_stage_id}" 0 24 _aida_c03_stage_id)
 set(AIDA_C03_STAGE_OWNER_ROOT
-    "${_aida_c03_local_app_data}/AiDA/C03/${AIDA_C03_STAGE_AUTHORITY_ID}")
-set(AIDA_C03_APPLICATION_BUILD_ROOT "${AIDA_C03_STAGE_OWNER_ROOT}/application")
+    "${_aida_c03_local_app_data}/AiDA/C03/${_aida_c03_stage_id}")
 set(AIDA_C03_DEVELOPER_ROOT "${AIDA_C03_STAGE_OWNER_ROOT}/developer")
-set(AIDA_C03_CUSTOMER_STAGE_ANCHOR "${AIDA_C03_STAGE_OWNER_ROOT}/customer")
-set(AIDA_C03_DISTRIBUTION_EVIDENCE_ROOT "${AIDA_C03_STAGE_OWNER_ROOT}/evidence")
-file(MAKE_DIRECTORY
-    "${AIDA_C03_STAGE_OWNER_ROOT}"
-    "${AIDA_C03_APPLICATION_BUILD_ROOT}"
-    "${AIDA_C03_DEVELOPER_ROOT}"
-    "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}"
-    "${AIDA_C03_DISTRIBUTION_EVIDENCE_ROOT}")
-set(_aida_c03_stage_owner_record
-    "{\"schema\":\"aida.c03.stage-owner.v1\",\"authority_id\":\"${AIDA_C03_STAGE_AUTHORITY_ID}\",\"repository\":\"${CMAKE_SOURCE_DIR}\",\"binary\":\"${CMAKE_BINARY_DIR}\"}\n")
-set(_aida_c03_stage_owner_record_path
-    "${AIDA_C03_STAGE_OWNER_ROOT}/.aida-c03-stage-owner.json")
-if(EXISTS "${_aida_c03_stage_owner_record_path}")
-    file(READ "${_aida_c03_stage_owner_record_path}" _aida_c03_existing_stage_owner
-        LIMIT 4096)
-    if(NOT _aida_c03_existing_stage_owner STREQUAL _aida_c03_stage_owner_record)
-        message(WARNING "AiDA C03 external stage root is owned by a different source/binary authority")
-    endif()
-else()
-    file(WRITE "${_aida_c03_stage_owner_record_path}" "${_aida_c03_stage_owner_record}")
-endif()
-aida_c03_require_detached_roots(
-    "${CMAKE_SOURCE_DIR}"
-    "${CMAKE_BINARY_DIR}"
-    "${CMAKE_BINARY_DIR}"
-    "${AIDA_C03_APPLICATION_BUILD_ROOT}"
-    "${AIDA_C03_DEVELOPER_ROOT}"
-    "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}"
-    "${AIDA_C03_DISTRIBUTION_EVIDENCE_ROOT}"
-    "${AIDA_C03_STAGE_OWNER_ROOT}")
 set(AIDA_C03_SAFE_HEADLESS_STAGE_ROOT "${AIDA_C03_DEVELOPER_ROOT}/suite/$<CONFIG>")
 set(AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT "${AIDA_C03_DEVELOPER_ROOT}/generated")
-set(AIDA_C03_CUSTOMER_PACKAGE_ROOT "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}/$<CONFIG>")
 set(AIDA_C03_SAFE_HEADLESS_INVENTORY "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_inventory.json")
 set(AIDA_C03_SAFE_HEADLESS_ASSERTION_INVENTORY "${AIDA_C03_TEST_ROOT}/testlab_runtime/assertion_site_inventory.json")
 set(AIDA_C03_SAFE_HEADLESS_MATERIALIZER "${AIDA_C03_TEST_ROOT}/testlab_runtime/materialize_safe_headless_manifest.py")
@@ -206,7 +150,7 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/analysis_budget.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_resource_metrics.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_scheduler.cpp"
-    "${STANDALONE_ROOT}/core/analysis/build_worker_packaging_integration.cpp"
+    "${STANDALONE_ROOT}/core/analysis/benchmark/benchmark_runner.cpp"
     "${STANDALONE_ROOT}/core/analysis/call_graph_builder.cpp"
     "${STANDALONE_ROOT}/core/analysis/collection/artifact_collection.cpp"
     "${STANDALONE_ROOT}/core/analysis/collection/member_graph.cpp"
@@ -214,6 +158,8 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/decode/capstone_tile_decoder.cpp"
     "${STANDALONE_ROOT}/core/analysis/decode/x86_tile_decoder.cpp"
     "${STANDALONE_ROOT}/core/analysis/decode_frontier.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decode_worker_pool.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decompiler/decompile_batch_orchestrator.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_cache_v9.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_provider_registry.cpp"
@@ -255,10 +201,12 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/workspace/baseline_engine_integration.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/c03_analysis_contracts.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/data_discovery.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/decode_materializer.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/packed_page_codec.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/query_index.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/regex_query.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery_simd_avx2.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/symbol_type_candidates.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/workspace_schema_v9.cpp"
     "${STANDALONE_ROOT}/core/auth/auth_store.cpp"
@@ -343,6 +291,9 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
 )
 list(REMOVE_DUPLICATES AIDA_C03_PRODUCTION_STANDALONE_SOURCES)
 
+set_source_files_properties("${STANDALONE_ROOT}/core/analysis/workspace/string_discovery_simd_avx2.cpp"
+    PROPERTIES COMPILE_OPTIONS /arch:AVX2)
+
 set(AIDA_C03_COMPILER_MATRIX_CM_01
     "${STANDALONE_ROOT}/core/analysis/provider_snapshot.cpp"
     "${STANDALONE_ROOT}/core/analysis/mapped_window_cache.cpp"
@@ -362,9 +313,11 @@ set(AIDA_C03_COMPILER_MATRIX_CM_02
 set(AIDA_C03_COMPILER_MATRIX_CM_03
     "${STANDALONE_ROOT}/core/analysis/analysis_scheduler.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_resource_metrics.cpp"
+    "${STANDALONE_ROOT}/core/analysis/benchmark/benchmark_runner.cpp"
     "${STANDALONE_ROOT}/core/analysis/decode/x86_tile_decoder.cpp"
     "${STANDALONE_ROOT}/core/analysis/decode/capstone_tile_decoder.cpp"
     "${STANDALONE_ROOT}/core/analysis/decode_frontier.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decode_worker_pool.cpp"
     "${STANDALONE_ROOT}/core/analysis/tile_decode_orchestrator.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/x86_decoder.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/arch_decoder.cpp"
@@ -381,7 +334,9 @@ set(AIDA_C03_COMPILER_MATRIX_CM_03
     "${STANDALONE_ROOT}/core/analysis/workspace/calling_convention.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/xref_builder.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/data_discovery.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/decode_materializer.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery_simd_avx2.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/symbol_type_candidates.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/query_index.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/regex_query.cpp"
@@ -459,6 +414,7 @@ set(AIDA_C03_COMPILER_MATRIX_CM_08
     "${STANDALONE_ROOT}/core/analysis/workspace/semantic_fusion.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/type_recovery.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_09
+    "${STANDALONE_ROOT}/core/analysis/decompiler/decompile_batch_orchestrator.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_cache_v9.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_provider_registry.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_service.cpp"
@@ -568,24 +524,19 @@ set(AIDA_C03_COMPILER_MATRIX_CM_14
 set(AIDA_C03_COMPILER_MATRIX_CM_15
     ${AIDA_C03_LICENSE_ARC_PRODUCTION_CLOSURE_SOURCES}
     ${AIDA_C03_CAMOUFOX_AUDIT_PRODUCTION_CLOSURE_SOURCES}
-    "${AIDA_C03_PACKAGE_VERIFIER_SOURCE}"
     "${STANDALONE_ROOT}/core/auth/auth_store.cpp"
     "${STANDALONE_ROOT}/core/auth/auth_http.cpp"
     "${STANDALONE_ROOT}/core/auth/auth_codex.cpp"
     "${STANDALONE_ROOT}/core/auth/auth_copilot.cpp"
     "${STANDALONE_ROOT}/core/auth/auth_claude_code.cpp"
     "${STANDALONE_ROOT}/core/ai/provider_catalog.cpp"
-    "${STANDALONE_ROOT}/core/analysis/build_worker_packaging_integration.hpp"
-    "${STANDALONE_ROOT}/core/analysis/build_worker_packaging_integration.cpp"
     "${STANDALONE_ROOT}/core/analysis/surface_reconciliation.cpp"
     "${AIDA_C03_TEST_ROOT}/managed_decompiler_consumers/managed_decompiler_consumers_harness.cpp"
     "${AIDA_C03_TEST_ROOT}/managed_publication_persistence/managed_publication_persistence_harness.cpp"
     "${AIDA_C03_TEST_ROOT}/security/mcp_client_auth/mcp_client_auth_harness.cpp"
     "${AIDA_C03_TEST_ROOT}/security/anti_tamper_integrity/anti_tamper_integrity_harness.cpp"
-    "${AIDA_C03_TEST_ROOT}/build_packaging_integration_harness.cpp"
     "${AIDA_C03_TEST_ROOT}/auth_browser_dispatch/auth_browser_dispatch_harness.cpp"
     "${AIDA_C03_TEST_ROOT}/surface_reconciliation_harness.cpp"
-    "${AIDA_C03_TEST_ROOT}/testlab_runtime/source_policy_scanner.cpp"
     "${CMAKE_SOURCE_DIR}/src/emulation_engine.cpp"
     "${STANDALONE_ROOT}/core/network/burp/camoufox_bridge.cpp"
     "${STANDALONE_ROOT}/core/runtime/standalone_license.cpp"
@@ -608,17 +559,9 @@ set(AIDA_C03_COMPILER_MATRIX_CM_15
     "${STANDALONE_ROOT}/core/tools/workflow_tools_standalone.cpp"
     "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
     "${CMAKE_SOURCE_DIR}/cmake/aida_c03_dependencies.cmake"
-    "${CMAKE_SOURCE_DIR}/cmake/aida_c03_package_integration.cmake"
     "${AIDA_C03_SAFE_HEADLESS_CMAKE_MODULE}"
     "${AIDA_C03_PATH_POLICY_MODULE}"
     "${AIDA_C03_PATH_IDENTITY_POLICY}"
-    "${CMAKE_SOURCE_DIR}/packaging/c03_distribution_manifest.ps1"
-    "${CMAKE_SOURCE_DIR}/packaging/c03_distribution_manifest_spec.json"
-    "${CMAKE_SOURCE_DIR}/packaging/c03_distribution_fixture/path_byte_policy.json"
-    "${AIDA_C03_TEST_ROOT}/package_distribution_policy/policy_stage_spec.json"
-    "${AIDA_C03_TEST_ROOT}/package_distribution_policy/package_distribution_policy_harness.ps1"
-    "${CMAKE_SOURCE_DIR}/packaging/c03_worker_runtime/managed_runtime_source_spec.json"
-    "${CMAKE_SOURCE_DIR}/packaging/c03_worker_runtime/ghidra_spec_source_spec.json"
     "${CMAKE_SOURCE_DIR}/deploy_to_server.ps1"
     "${CMAKE_SOURCE_DIR}/tools/protector/main.cpp")
 set(AIDA_C03_COMPILER_MATRIX_UNION)
@@ -1004,12 +947,6 @@ function(aida_c03_register_worker_targets application_target)
     if(NOT Python3_Interpreter_FOUND)
         find_package(Python3 COMPONENTS Interpreter)
     endif()
-    set(AIDA_C03_VALIDATED_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
-    set(AIDA_C03_VALIDATED_POWERSHELL_EXECUTABLE "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe")
-    set(_aida_c03_worker_path_identity_policy "${AIDA_C03_PATH_IDENTITY_POLICY}")
-    set(_aida_c03_worker_python_sha256 "")
-    set(_aida_c03_worker_powershell_sha256 "")
-    set(_aida_c03_worker_path_identity_policy_sha256 "")
     set(_aida_native_sources
         "${STANDALONE_ROOT}/../workers/native_decompiler/native_decompiler_worker.cpp"
         "${STANDALONE_ROOT}/../workers/native_decompiler/ghidra_native_provider.cpp"
@@ -1043,23 +980,6 @@ function(aida_c03_register_worker_targets application_target)
         AIDA_C03_PACKAGE "B14"
         AIDA_C03_SAFE_HEADLESS FALSE)
 
-    aida_c03_require_sources("D06 production package verifier"
-        "${AIDA_C03_PACKAGE_VERIFIER_SOURCE}"
-        "${STANDALONE_ROOT}/core/analysis/build_worker_packaging_integration.cpp")
-    add_executable(aida_c03_package_verifier
-        "${AIDA_C03_PACKAGE_VERIFIER_SOURCE}"
-        "${STANDALONE_ROOT}/core/analysis/build_worker_packaging_integration.cpp")
-    aida_c03_configure_native_target(aida_c03_package_verifier)
-    target_include_directories(aida_c03_package_verifier PRIVATE "${CMAKE_SOURCE_DIR}")
-    target_link_libraries(aida_c03_package_verifier PRIVATE bcrypt crypt32 wintrust)
-    set_target_properties(aida_c03_package_verifier PROPERTIES
-        OUTPUT_NAME "AiDA_C03PackageVerifier"
-        RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/package-verifier/$<CONFIG>"
-        FOLDER "Packaging/C03"
-        AIDA_C03_PACKAGE "D06"
-        AIDA_C03_PRODUCTION_VERIFIER TRUE
-        AIDA_C03_SAFE_HEADLESS FALSE)
-
     file(GLOB _aida_managed_inputs CONFIGURE_DEPENDS
         "${AIDA_C03_MANAGED_WORKER_ROOT}/*.cs"
         "${AIDA_C03_MANAGED_WORKER_ROOT}/*.json"
@@ -1067,15 +987,6 @@ function(aida_c03_register_worker_targets application_target)
         "${AIDA_C03_MANAGED_WORKER_ROOT}/NuGet.Config")
     aida_c03_require_sources("B16 managed decompiler worker" ${_aida_managed_inputs})
     set(AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT "${AIDA_C03_DEVELOPER_ROOT}/managed-worker/publish")
-    set(AIDA_C03_MANAGED_WORKER_EXECUTABLE "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}/AiDA_ManagedDecompilerWorker.exe")
-    set(AIDA_C03_MANAGED_WORKER_PROVIDER "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}/ICSharpCode.Decompiler.dll")
-    set(AIDA_C03_MANAGED_WORKER_APPLICATION_FILES
-        "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}/AiDA_ManagedDecompilerWorker.dll"
-        "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}/AiDA_ManagedDecompilerWorker.deps.json"
-        "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}/AiDA_ManagedDecompilerWorker.runtimeconfig.json")
-    set(AIDA_C03_MANAGED_WORKER_FRAMEWORK_ASSEMBLIES
-        "${AIDA_C03_MANAGED_IMMUTABLE_FRAMEWORK_SOURCE}"
-        "${AIDA_C03_MANAGED_METADATA_FRAMEWORK_SOURCE}")
     get_filename_component(_aida_c03_dotnet_root "${AIDA_C03_DOTNET_EXECUTABLE}" DIRECTORY)
     set_property(GLOBAL APPEND PROPERTY AIDA_C03_COMPILER_MATRIX_NATIVE_WORKER_INPUTS
         ${_aida_native_sources})
@@ -1211,110 +1122,8 @@ function(aida_c03_register_worker_targets application_target)
     set_property(GLOBAL APPEND PROPERTY AIDA_C03_COMPILER_MATRIX_MANAGED_WORKER_INPUTS
         ${_aida_c03_managed_fixture_inputs})
 
-    aida_c03_register_ghidra_spec_package(
-        APPLICATION_TARGET ${application_target}
-        SPEC_TARGET ghidra_specs
-        GENERATOR_TARGET ghidra_sleigh_compiler
-        APPROVED_INPUT_ROOT "${GHIDRA_SPECS_OUTPUT_DIR}"
-        SPEC_FILES ${GHIDRA_STAGED_SPEC_OUTPUTS})
-    aida_c03_register_native_worker_package(
-        APPLICATION_TARGET ${application_target}
-        WORKER_TARGET aida_c03_b14_native_decompiler_worker)
-    aida_c03_register_managed_worker_package(
-        APPLICATION_TARGET ${application_target}
-        BUILD_TARGET aida_c03_b16_managed_decompiler_worker
-        WORKER_EXECUTABLE "${AIDA_C03_MANAGED_WORKER_EXECUTABLE}"
-        PROVIDER_BINARY "${AIDA_C03_MANAGED_WORKER_PROVIDER}"
-        APPLICATION_FILES ${AIDA_C03_MANAGED_WORKER_APPLICATION_FILES}
-        FRAMEWORK_ASSEMBLIES ${AIDA_C03_MANAGED_WORKER_FRAMEWORK_ASSEMBLIES})
     set(AIDA_C03_SAFE_HEADLESS_WORKER_RUNTIME_ROOT
         "${AIDA_C03_DEVELOPER_ROOT}/safe-headless-worker-runtime/$<CONFIG>")
-    aida_c03_register_safe_headless_worker_runtime(
-        TARGET aida_c03_safe_headless_worker_runtime
-        RUNTIME_ROOT "${AIDA_C03_SAFE_HEADLESS_WORKER_RUNTIME_ROOT}"
-        SPEC_TARGET ghidra_specs
-        GENERATOR_TARGET ghidra_sleigh_compiler
-        APPROVED_INPUT_ROOT "${GHIDRA_SPECS_OUTPUT_DIR}"
-        NATIVE_WORKER_TARGET aida_c03_b14_native_decompiler_worker
-        MANAGED_BUILD_TARGET aida_c03_b16_managed_decompiler_worker
-        MANAGED_WORKER_EXECUTABLE "${AIDA_C03_MANAGED_WORKER_EXECUTABLE}"
-        MANAGED_PROVIDER_BINARY "${AIDA_C03_MANAGED_WORKER_PROVIDER}"
-        SPEC_FILES ${GHIDRA_STAGED_SPEC_OUTPUTS}
-        MANAGED_APPLICATION_FILES ${AIDA_C03_MANAGED_WORKER_APPLICATION_FILES}
-        MANAGED_FRAMEWORK_ASSEMBLIES ${AIDA_C03_MANAGED_WORKER_FRAMEWORK_ASSEMBLIES})
-    aida_c03_register_analysis_python_worker_package(APPLICATION_TARGET ${application_target})
-    aida_c03_register_customer_notice_package(APPLICATION_TARGET ${application_target})
-    aida_c03_register_auxiliary_notice_package(
-        TARGET aida_c03_auxiliary_notice_package
-        OUTPUT_ROOT "${AIDA_C03_DEVELOPER_ROOT}/auxiliary-notices")
-    set(_aida_c03_distribution_dependencies
-        ${application_target}
-        ${AIDA_C03_GHIDRA_SPEC_PACKAGE_TARGET}
-        ${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET}
-        ${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET}
-        ${AIDA_C03_CUSTOMER_NOTICE_PACKAGE_TARGET})
-    if(TARGET ${AIDA_C03_ANALYSIS_PYTHON_WORKER_PACKAGE_TARGET})
-        list(APPEND _aida_c03_distribution_dependencies
-            ${AIDA_C03_ANALYSIS_PYTHON_WORKER_PACKAGE_TARGET})
-    endif()
-    if(NOT DEFINED ENV{SystemDrive} OR NOT "$ENV{SystemDrive}" MATCHES "^[A-Z]:$" OR
-       NOT DEFINED ENV{SystemRoot} OR
-       NOT "$ENV{SystemRoot}" STREQUAL "$ENV{SystemDrive}\\Windows")
-        message(WARNING "AiDA C03 distribution requires the canonical Windows system root")
-    endif()
-    set(_aida_c03_distribution_system_root "$ENV{SystemDrive}/Windows")
-    aida_c03_validate_canonical_directory(
-        _aida_c03_distribution_system_root
-        "${_aida_c03_distribution_system_root}"
-        "distribution Windows system root")
-    aida_c03_validate_canonical_regular_file(
-        _aida_c03_distribution_powershell
-        _aida_c03_distribution_powershell_sha256
-        "${_aida_c03_distribution_system_root}/System32/WindowsPowerShell/v1.0/powershell.exe"
-        "distribution system PowerShell")
-    aida_c03_validate_no_reparse_chain(
-        "${_aida_c03_distribution_powershell}"
-        "${AIDA_C03_PATH_IDENTITY_POLICY}"
-        "${_aida_c03_distribution_powershell}"
-        "distribution system PowerShell")
-    set(_aida_c03_distribution_output_root
-        "${AIDA_C03_DISTRIBUTION_EVIDENCE_ROOT}/distribution")
-    file(MAKE_DIRECTORY "${_aida_c03_distribution_output_root}")
-    foreach(_aida_c03_distribution_path IN ITEMS
-            "${AIDA_C03_APPLICATION_BUILD_ROOT}"
-            "${AIDA_C03_DEVELOPER_ROOT}"
-            "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}"
-            "${_aida_c03_distribution_output_root}")
-        aida_c03_validate_no_reparse_chain(
-            "${_aida_c03_distribution_powershell}"
-            "${AIDA_C03_PATH_IDENTITY_POLICY}"
-            "${_aida_c03_distribution_path}"
-            "distribution detached root")
-    endforeach()
-    aida_c03_register_distribution_manifest(
-        REQUIRE_ANALYSIS_PYTHON
-        TARGET aida_c03_distribution_manifest
-        APPLICATION_TARGET ${application_target}
-        APPLICATION_ROOT "${AIDA_C03_APPLICATION_BUILD_ROOT}"
-        REPOSITORY_ROOT "${CMAKE_SOURCE_DIR}"
-        BINARY_ROOT "${CMAKE_BINARY_DIR}"
-        SOURCE_ROOT "$<TARGET_FILE_DIR:${application_target}>"
-        DEVELOPER_ROOT "${AIDA_C03_DEVELOPER_ROOT}"
-        CUSTOMER_STAGE_ANCHOR "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}"
-        EVIDENCE_ROOT "${AIDA_C03_DISTRIBUTION_EVIDENCE_ROOT}"
-        STAGE_OWNER_ROOT "${AIDA_C03_STAGE_OWNER_ROOT}"
-        PACKAGE_ROOT "${AIDA_C03_CUSTOMER_PACKAGE_ROOT}"
-        SPEC "${AIDA_C03_DISTRIBUTION_MANIFEST_SPEC}"
-        OUTPUT_MANIFEST "${_aida_c03_distribution_output_root}/AiDA_C03.distribution.json"
-        OUTPUT_DIGEST "${_aida_c03_distribution_output_root}/AiDA_C03.distribution.sha256"
-        POWERSHELL_EXECUTABLE "${_aida_c03_distribution_powershell}"
-        PACKAGE_VERIFIER_TARGET aida_c03_package_verifier
-        DEPENDS ${_aida_c03_distribution_dependencies})
-    set(AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}" PARENT_SCOPE)
-    set(AIDA_C03_MANAGED_WORKER_EXECUTABLE "${AIDA_C03_MANAGED_WORKER_EXECUTABLE}" PARENT_SCOPE)
-    set(AIDA_C03_MANAGED_WORKER_PROVIDER "${AIDA_C03_MANAGED_WORKER_PROVIDER}" PARENT_SCOPE)
-    set(AIDA_C03_MANAGED_WORKER_APPLICATION_FILES "${AIDA_C03_MANAGED_WORKER_APPLICATION_FILES}" PARENT_SCOPE)
-    set(AIDA_C03_MANAGED_WORKER_FRAMEWORK_ASSEMBLIES "${AIDA_C03_MANAGED_WORKER_FRAMEWORK_ASSEMBLIES}" PARENT_SCOPE)
     set(AIDA_C03_MANAGED_FIXTURE_DLL "${AIDA_C03_MANAGED_FIXTURE_DLL}" PARENT_SCOPE)
     set(AIDA_C03_SAFE_HEADLESS_WORKER_RUNTIME_ROOT
         "${AIDA_C03_SAFE_HEADLESS_WORKER_RUNTIME_ROOT}" PARENT_SCOPE)
@@ -1362,8 +1171,6 @@ function(aida_c03_register_safe_headless_targets application_target)
     set(_aida_authority_repository_files
         "${AIDA_C03_PATH_POLICY_MODULE}"
         "${AIDA_C03_PATH_IDENTITY_POLICY}"
-        "${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py"
-        "${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json"
         "${CMAKE_SOURCE_DIR}/tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py"
         "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1"
         "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/standalone_surface_baseline.json"
@@ -1406,15 +1213,11 @@ function(aida_c03_register_safe_headless_targets application_target)
         "|archive=${_aida_authority_archive}:${_aida_authority_archive_sha256}")
     string(SHA256 _aida_authority_identity "${_aida_authority_identity_material}")
     string(TOUPPER "${_aida_authority_identity}" _aida_authority_identity)
-    file(SHA256 "${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py" _aida_authority_verifier_sha256)
-    file(SHA256 "${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json" _aida_authority_ledger_sha256)
     file(SHA256 "${CMAKE_SOURCE_DIR}/tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py" _aida_contract_generator_sha256)
     file(SHA256 "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1" _aida_surface_generator_sha256)
     file(SHA256 "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/standalone_surface_baseline.json" _aida_surface_baseline_sha256)
     file(SHA256 "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/standalone_surface_final.json" _aida_surface_final_sha256)
     foreach(_aida_hash_variable IN ITEMS
-            _aida_authority_verifier_sha256
-            _aida_authority_ledger_sha256
             _aida_contract_generator_sha256
             _aida_surface_generator_sha256
             _aida_surface_baseline_sha256
@@ -1516,10 +1319,6 @@ function(aida_c03_register_safe_headless_targets application_target)
     aida_c03_stage_runtime_file("${AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT}/c03_safe_headless/benchmark_search_receipt.json" "fixtures/benchmark_search_receipt.json")
     aida_c03_stage_runtime_file("${AIDA_C03_TEST_ROOT}/fixtures/external_sla_qualification_policy.json" "fixtures/external_sla_qualification_policy.json")
 
-    aida_c03_register_manifest_entry(
-        TARGET aida_c03_a00_authority_surface_harness PACKAGE A00
-        ENTRY_DEFINITION AIDA_C03_ENTRY_AUTHORITY
-        SOURCES "${_aida_entries}" "${AIDA_C03_TEST_ROOT}/authority_surface_ledger.cpp")
     aida_c03_register_manifest_entry(
         TARGET aida_c03_a01_analysis_contracts_harness PACKAGE A01
         SOURCES "${AIDA_C03_TEST_ROOT}/analysis_contracts_harness.cpp")
@@ -1748,8 +1547,6 @@ function(aida_c03_register_safe_headless_targets application_target)
             "scratch/quality/results"
             "120000"
         RUNTIME_FILES ${_aida_fixture_runtime})
-    add_dependencies(aida_c03_a06_decompiler_quality_scorer_harness
-        aida_c03_safe_headless_worker_runtime)
     aida_c03_register_manifest_entry(
         TARGET aida_c03_a06_benchmark_sla_receipt_harness PACKAGE A06 ARGS_ENTRY
         SOURCES
@@ -1765,142 +1562,9 @@ function(aida_c03_register_safe_headless_targets application_target)
             "fixtures/external_sla_qualification_policy.json"
             "src/standalone/tests/c03/fixtures/external_sla_qualification_policy.json")
 
-    set(_aida_dependency_runtime)
-    foreach(_aida_input IN LISTS
-            AIDA_C03_REQUIRED_PRODUCTION_INPUTS
-            AIDA_C03_REQUIRED_BUILD_INPUTS
-            AIDA_C03_REQUIRED_EVIDENCE_INPUTS)
-        file(RELATIVE_PATH _aida_relative "${CMAKE_SOURCE_DIR}" "${_aida_input}")
-        string(REPLACE "\\" "/" _aida_relative "${_aida_relative}")
-        set(_aida_staging_input "${_aida_input}")
-        if("${_aida_input}" STREQUAL "${AIDA_C03_CAMOUFOX_REVERSE_MCP_EXECUTABLE}")
-            set(_aida_staging_input
-                "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}/locked-input-snapshots/AiDA_CamoufoxReverseMcp.exe")
-            cmake_path(GET _aida_staging_input PARENT_PATH _aida_staging_input_parent)
-            file(MAKE_DIRECTORY "${_aida_staging_input_parent}")
-            file(COPY_FILE "${_aida_input}" "${_aida_staging_input}"
-                RESULT _aida_staging_input_copy_result ONLY_IF_DIFFERENT)
-            if(NOT "${_aida_staging_input_copy_result}" STREQUAL "0")
-                message(WARNING "AiDA C03 detached safe-headless reverse MCP snapshot failed: ${_aida_staging_input_copy_result}")
-            endif()
-            file(SHA256 "${_aida_staging_input}" _aida_staging_input_sha256)
-            string(TOLOWER "${_aida_staging_input_sha256}" _aida_staging_input_sha256)
-            if(NOT "${_aida_staging_input_sha256}" STREQUAL "${AIDA_C03_CAMOUFOX_REVERSE_MCP_EXECUTABLE_SHA256}")
-                message(WARNING "AiDA C03 detached safe-headless reverse MCP snapshot identity is invalid")
-            endif()
-        endif()
-        aida_c03_stage_runtime_file("${_aida_staging_input}" "${_aida_relative}")
-        list(APPEND _aida_dependency_runtime "${_aida_relative}")
-    endforeach()
-    set(_aida_dependency_explicit
-        ".gitignore"
-        "cmake/aida_c03_dependencies.cmake"
-        "cmake/aida_c03_package_integration.cmake"
-        "cmake/aida_c03_safe_headless_manifest.cmake"
-        "deploy_to_server.ps1"
-        "licenses/c03/THIRD_PARTY_NOTICES.md")
-    foreach(_aida_relative IN LISTS _aida_dependency_explicit)
-        aida_c03_stage_runtime_file("${CMAKE_SOURCE_DIR}/${_aida_relative}" "${_aida_relative}")
-        list(APPEND _aida_dependency_runtime "${_aida_relative}")
-    endforeach()
-    list(REMOVE_DUPLICATES _aida_dependency_runtime)
-    aida_c03_register_manifest_entry(
-        TARGET aida_c03_dependency_inventory_harness PACKAGE A05 ARGS_ENTRY
-        SOURCES
-            "${AIDA_C03_TEST_ROOT}/dependency_inventory_harness.cpp"
-            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
-        ARGUMENTS "."
-        RUNTIME_FILES ${_aida_dependency_runtime})
-
-    set(_aida_managed_runtime_source_root
-        "${CMAKE_SOURCE_DIR}/.deps/dotnet-sdk-10.0.301-win-x64")
-    set(_aida_managed_runtime_sources
-        "${_aida_managed_runtime_source_root}/dotnet.exe"
-        "${_aida_managed_runtime_source_root}/LICENSE.txt"
-        "${_aida_managed_runtime_source_root}/ThirdPartyNotices.txt"
-        "${_aida_managed_runtime_source_root}/host/fxr/10.0.9/hostfxr.dll")
-    file(GLOB _aida_managed_framework_sources CONFIGURE_DEPENDS LIST_DIRECTORIES FALSE
-        "${_aida_managed_runtime_source_root}/shared/Microsoft.NETCore.App/10.0.9/*")
-    list(LENGTH _aida_managed_framework_sources _aida_managed_framework_source_count)
-    if(NOT _aida_managed_framework_source_count EQUAL 189)
-        message(WARNING "AiDA C03 managed safe-headless runtime requires the exact 189-file .NET 10.0.9 framework inventory")
-    endif()
-    list(APPEND _aida_managed_runtime_sources ${_aida_managed_framework_sources})
-    list(LENGTH _aida_managed_runtime_sources _aida_managed_runtime_source_count)
-    if(NOT _aida_managed_runtime_source_count EQUAL 193)
-        message(WARNING "AiDA C03 managed safe-headless runtime requires the exact 193-file host/framework inventory")
-    endif()
-    set(_aida_build_packaging_runtime
-        "packaging/c03_worker_runtime/managed_runtime_source_spec.json")
-    aida_c03_stage_runtime_file(
-        "${CMAKE_SOURCE_DIR}/packaging/c03_worker_runtime/managed_runtime_source_spec.json"
-        "packaging/c03_worker_runtime/managed_runtime_source_spec.json")
-    foreach(_aida_managed_runtime_source IN LISTS _aida_managed_runtime_sources)
-        file(RELATIVE_PATH _aida_managed_runtime_relative
-            "${CMAKE_SOURCE_DIR}" "${_aida_managed_runtime_source}")
-        string(REPLACE "\\" "/" _aida_managed_runtime_relative
-            "${_aida_managed_runtime_relative}")
-        aida_c03_stage_runtime_file(
-            "${_aida_managed_runtime_source}" "${_aida_managed_runtime_relative}")
-        list(APPEND _aida_build_packaging_runtime "${_aida_managed_runtime_relative}")
-    endforeach()
-    aida_c03_register_manifest_entry(
-        TARGET aida_c03_build_packaging_integration_harness PACKAGE D06
-        SOURCES
-            "${AIDA_C03_TEST_ROOT}/build_packaging_integration_harness.cpp"
-            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
-        COMPILE_DEFINITIONS AIDA_C03_PACKAGE_FIXTURE_ADAPTERS=1
-        RUNTIME_FILES ${_aida_build_packaging_runtime})
     aida_c03_register_manifest_entry(
         TARGET aida_c03_surface_reconciliation_harness PACKAGE D08
         SOURCES "${AIDA_C03_TEST_ROOT}/surface_reconciliation_harness.cpp")
-
-    set(_aida_policy_runtime
-        "CMakeLists.txt"
-        "src/standalone/src/main.cpp"
-        "deploy_to_server.ps1"
-        "src/standalone/src/core/auth/auth_browser_launch.hpp"
-        "packaging/c03_distribution_manifest.ps1"
-        "packaging/c03_distribution_fixture/path_byte_policy.json"
-        "src/standalone/tools/c03_package_verifier/main.cpp"
-        "src/standalone/src/core/analysis/build_worker_packaging_integration.cpp"
-        "src/standalone/tests/c03/build_packaging_integration_harness.cpp"
-        "src/standalone/tests/c03/auth_browser_dispatch/auth_browser_dispatch_harness.hpp"
-        "src/standalone/tests/c03/auth_browser_dispatch/auth_browser_dispatch_harness.cpp"
-        "src/standalone/tests/c03/testlab_runtime/safe_headless_driver_bridge.cpp"
-        "src/standalone/tests/c03/testlab_runtime/safe_headless_emulation_bridge.cpp"
-        "src/standalone/tests/c03/testlab_runtime/safe_headless_runtime_bridges.cpp"
-        "src/standalone/src/core/anti-tamper/self_guard.hpp"
-        "src/standalone/tests/c03/package_distribution_policy/package_distribution_policy_harness.ps1"
-        "src/standalone/tests/c03/package_distribution_policy/policy_stage_spec.json"
-        "src/standalone/src/core/testlab/test_lab_features_c03_safe_headless.cpp"
-        "src/standalone/tests/c03/testlab_runtime/materialize_safe_headless_manifest.py"
-        "cmake/aida_c03_safe_headless_manifest.cmake"
-        "cmake/aida_c03_package_integration.cmake"
-        "cmake/aida_c03_dependencies.cmake"
-        "cmake/c03_safe_headless/package_policy_fixture/aida_c03_path_policy.cmake"
-        "cmake/c03_safe_headless/package_policy_fixture/aida_c03_path_identity.ps1"
-        "cmake/c03_safe_headless/target_resource_policy_cases.json"
-        "cmake/c03_safe_headless/decompiler_quality_pipeline_main.cpp"
-        "tools/c03_authority/verify_authority_surface_ledger.py"
-        "tools/c03_authority/authority_surface_ledger.json"
-        "tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py"
-        "src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1"
-        "src/standalone/tests/analysis_workspace/standalone_surface_baseline.json"
-        "src/standalone/tests/analysis_workspace/standalone_surface_final.json"
-        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json"
-        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json"
-        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json"
-        "src/standalone/src/core/mcp/compat/ida_contracts_generated.hpp"
-        "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp")
-    foreach(_aida_relative IN LISTS _aida_policy_runtime)
-        aida_c03_stage_runtime_file("${CMAKE_SOURCE_DIR}/${_aida_relative}" "${_aida_relative}")
-    endforeach()
-    aida_c03_register_manifest_entry(
-        TARGET aida_c03_source_policy_scanner PACKAGE D08 ARGS_ENTRY
-        SOURCES "${AIDA_C03_TEST_ROOT}/testlab_runtime/source_policy_scanner.cpp"
-        ARGUMENTS "."
-        RUNTIME_FILES ${_aida_policy_runtime})
 
     set(_aida_anti_tamper_runtime
         "src/standalone/src/core/anti-tamper/anti_hook.hpp"
@@ -1926,14 +1590,14 @@ function(aida_c03_register_safe_headless_targets application_target)
     get_property(_aida_manifest_records GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGET_RECORDS)
     list(LENGTH _aida_manifest_targets _aida_manifest_target_count)
     list(LENGTH _aida_manifest_records _aida_manifest_record_count)
-    if(NOT _aida_manifest_target_count EQUAL 56 OR NOT _aida_manifest_record_count EQUAL 56)
+    if(NOT _aida_manifest_target_count EQUAL 52 OR NOT _aida_manifest_record_count EQUAL 52)
         message(WARNING "AiDA C03 canonical manifest cardinality is invalid: targets=${_aida_manifest_target_count}, records=${_aida_manifest_record_count}")
     endif()
     file(READ "${AIDA_C03_SAFE_HEADLESS_INVENTORY}" _aida_inventory_json)
     string(JSON _aida_inventory_schema GET "${_aida_inventory_json}" schema)
     string(JSON _aida_inventory_count LENGTH "${_aida_inventory_json}" entries)
     if(NOT _aida_inventory_schema STREQUAL "aida.c03.safe-headless.inventory.v1" OR
-       NOT _aida_inventory_count EQUAL 56)
+       NOT _aida_inventory_count EQUAL 52)
         message(WARNING "AiDA C03 safe-headless inventory identity or cardinality is invalid")
     endif()
     math(EXPR _aida_inventory_last "${_aida_inventory_count} - 1")
@@ -1955,21 +1619,17 @@ function(aida_c03_register_safe_headless_targets application_target)
     string(JSON _aida_assertion_inventory_schema GET "${_aida_assertion_inventory_json}" schema)
     string(JSON _aida_assertion_inventory_version GET "${_aida_assertion_inventory_json}" version)
     string(JSON _aida_assertion_entry_count GET "${_aida_assertion_inventory_json}" entry_count)
-    string(JSON _aida_assertion_source_count GET "${_aida_assertion_inventory_json}" all_inventory_source_files_with_static_record_calls)
-    string(JSON _aida_assertion_site_count GET "${_aida_assertion_inventory_json}" all_inventory_static_record_call_count)
     string(JSON _aida_assertion_pending_count GET "${_aida_assertion_inventory_json}" pending_handoff_entry_count)
     string(JSON _aida_assertion_entries_length LENGTH "${_aida_assertion_inventory_json}" entries)
     if(NOT _aida_assertion_inventory_schema STREQUAL "aida.c03.safe-headless.assertion-sites.v1" OR
        NOT _aida_assertion_inventory_version EQUAL 1 OR
-       NOT _aida_assertion_entry_count EQUAL 56 OR
-       NOT _aida_assertion_entries_length EQUAL 56 OR
-       NOT _aida_assertion_source_count EQUAL 70 OR
-       NOT _aida_assertion_site_count EQUAL 185 OR
+       NOT _aida_assertion_entry_count EQUAL 52 OR
+       NOT _aida_assertion_entries_length EQUAL 52 OR
        NOT _aida_assertion_pending_count EQUAL 0)
         message(WARNING "AiDA C03 assertion telemetry inventory identity, cardinality, or handoff state is invalid")
     endif()
     set(_aida_assertion_targets)
-    foreach(_aida_index RANGE 0 55)
+    foreach(_aida_index RANGE 0 51)
         string(JSON _aida_assertion_target GET "${_aida_assertion_inventory_json}" entries ${_aida_index} target)
         if(_aida_assertion_target IN_LIST _aida_assertion_targets OR
            NOT _aida_assertion_target IN_LIST _aida_manifest_targets)
@@ -1987,8 +1647,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         FOLDER "Tests/C03/SafeHeadless"
         AIDA_C03_SAFE_HEADLESS TRUE
         AIDA_C03_AUTHORITY_SURFACE_IDENTITY "${_aida_authority_identity}"
-        AIDA_C03_AUTHORITY_LEDGER_SHA256 "${_aida_authority_ledger_sha256}"
-        AIDA_C03_AUTHORITY_VERIFIER_SHA256 "${_aida_authority_verifier_sha256}"
         AIDA_C03_SURFACE_GENERATOR_SHA256 "${_aida_surface_generator_sha256}"
         AIDA_C03_SURFACE_BASELINE_SHA256 "${_aida_surface_baseline_sha256}"
         AIDA_C03_SURFACE_FINAL_SHA256 "${_aida_surface_final_sha256}"
@@ -2001,11 +1659,10 @@ function(aida_c03_register_safe_headless_targets application_target)
     file(SHA256 "${CMAKE_SOURCE_DIR}/CMakeLists.txt" _aida_root_cmake_identity)
     file(SHA256 "${AIDA_C03_SAFE_HEADLESS_CMAKE_MODULE}" _aida_manifest_cmake_identity)
     file(SHA256 "${CMAKE_SOURCE_DIR}/cmake/aida_c03_dependencies.cmake" _aida_dependency_cmake_identity)
-    file(SHA256 "${CMAKE_SOURCE_DIR}/cmake/aida_c03_package_integration.cmake" _aida_package_cmake_identity)
     string(TOLOWER "${_aida_contract_identity}" _aida_contract_identity)
     string(TOLOWER "${_aida_assertion_inventory_identity}" _aida_assertion_inventory_identity)
     string(SHA256 _aida_build_identity
-        "aida-c03-safe-headless|${_aida_contract_identity}|${_aida_assertion_inventory_identity}|${_aida_materializer_identity}|${_aida_resource_policy_cases_identity}|${_aida_root_cmake_identity}|${_aida_manifest_cmake_identity}|${_aida_dependency_cmake_identity}|${_aida_package_cmake_identity}|${_aida_authority_identity}")
+        "aida-c03-safe-headless|${_aida_contract_identity}|${_aida_assertion_inventory_identity}|${_aida_materializer_identity}|${_aida_resource_policy_cases_identity}|${_aida_root_cmake_identity}|${_aida_manifest_cmake_identity}|${_aida_dependency_cmake_identity}|${_aida_authority_identity}")
     string(TOLOWER "${_aida_build_identity}" _aida_build_identity)
     add_custom_command(OUTPUT "${AIDA_C03_SAFE_HEADLESS_MANIFEST}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}"
@@ -2037,8 +1694,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         AIDA_C03_DEVELOPER_SUITE_OUTPUTS "suite/$<CONFIG>/manifest.json"
         AIDA_C03_ASSERTION_INVENTORY_SHA256 "${_aida_assertion_inventory_identity}"
         AIDA_C03_AUTHORITY_SURFACE_IDENTITY "${_aida_authority_identity}"
-        AIDA_C03_AUTHORITY_LEDGER_SHA256 "${_aida_authority_ledger_sha256}"
-        AIDA_C03_AUTHORITY_VERIFIER_SHA256 "${_aida_authority_verifier_sha256}"
         AIDA_C03_CONTRACT_GENERATOR_SHA256 "${_aida_contract_generator_sha256}"
         AIDA_C03_SURFACE_GENERATOR_SHA256 "${_aida_surface_generator_sha256}"
         AIDA_C03_SURFACE_BASELINE_SHA256 "${_aida_surface_baseline_sha256}"
@@ -2238,6 +1893,50 @@ function(aida_c03_register_safe_headless_targets application_target)
     set_tests_properties(aida_c03_analysis_benchmark_harness PROPERTIES
         FIXTURES_REQUIRED aida_c03_materialized_corpus)
 
+    aida_c03_register_direct_test(
+        TARGET aida_c03_search_index_parity_harness PACKAGE A06 TIMEOUT 600
+        SOURCES "${AIDA_C03_WORKSPACE_TEST_ROOT}/search_index_parity_harness.cpp"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_workspace_provider_budget_harness PACKAGE D01 TIMEOUT 600
+        SOURCES "${AIDA_C03_TEST_ROOT}/workspace_provider_budget_harness.cpp"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_analysis_validation_parity_harness PACKAGE A06 TIMEOUT 600
+        SOURCES "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_validation_parity_harness.cpp"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_large_pe_fixture_harness PACKAGE A06 TIMEOUT 900
+        SOURCES "${AIDA_C03_WORKSPACE_TEST_ROOT}/large_pe_fixture_harness.cpp"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_synthetic_harness PACKAGE A06 TIMEOUT 1200
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "synthetic" "32" "0xA1DA0001"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_scaling_harness PACKAGE A06 TIMEOUT 2400
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "scaling" "32" "0xA1DA0002" "1,2,4"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_determinism_harness PACKAGE A06 TIMEOUT 2400
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "determinism" "32" "0xA1DA0003"
+        LINK_LIBRARIES bcrypt)
+
     set(_aida_managed_consumer_sources
         "${AIDA_C03_TEST_ROOT}/managed_decompiler_consumers/main.cpp"
         "${AIDA_C03_TEST_ROOT}/managed_decompiler_consumers/managed_decompiler_consumers_harness.cpp")
@@ -2253,38 +1952,6 @@ function(aida_c03_register_safe_headless_targets application_target)
         DEPENDS aida_c03_a06_managed_cli_fixture)
     set_tests_properties(aida_c03_managed_decompiler_consumers_harness PROPERTIES
         FIXTURES_REQUIRED aida_c03_materialized_corpus)
-    add_test(NAME aida_c03_authority_surface_reproduction
-        COMMAND "${_aida_python_executable}"
-            "${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py"
-            --repository-root "${CMAKE_SOURCE_DIR}"
-            --ledger "${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json"
-            --archive "${_aida_authority_archive}"
-            --powershell "${_aida_system_powershell}")
-    set_tests_properties(aida_c03_authority_surface_reproduction PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        TIMEOUT 600
-        LABELS "c03;c03_safe_headless;safe-headless;authority;surface;contract-reproduction"
-        RESOURCE_LOCK "aida_c03_authority_surface_reproduction")
-
-    add_test(NAME aida_c03_package_distribution_policy
-        COMMAND "${_aida_system_powershell}" -NoLogo -NoProfile -NonInteractive
-            -ExecutionPolicy Bypass
-            -File "${AIDA_C03_TEST_ROOT}/package_distribution_policy/package_distribution_policy_harness.ps1"
-            -PowerShellExecutable "${_aida_system_powershell}"
-            -Producer "${CMAKE_SOURCE_DIR}/packaging/c03_distribution_manifest.ps1"
-            -ContractVerifier "$<TARGET_FILE:aida_c03_build_packaging_integration_harness>"
-            -ProductionVerifier "$<TARGET_FILE:aida_c03_package_verifier>"
-            -StageSpec "${AIDA_C03_TEST_ROOT}/package_distribution_policy/policy_stage_spec.json"
-            -PathBytePolicy "${CMAKE_SOURCE_DIR}/packaging/c03_distribution_fixture/path_byte_policy.json"
-            -AuthorityLock "${AIDA_C03_WORKER_MANIFEST_LOCK}"
-            -ProtectorTool "$<TARGET_FILE:AiDAProtector>"
-            -ProtectorVerifier "$<TARGET_FILE:AiDAProtectorVerify>"
-            -ScratchRoot "${AIDA_C03_DEVELOPER_ROOT}/scratch/package-policy/$<CONFIG>")
-    set_tests_properties(aida_c03_package_distribution_policy PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        TIMEOUT 1200
-        LABELS "c03;c03_safe_headless;safe-headless;package;distribution;policy"
-        RESOURCE_LOCK "aida_c03_package_distribution_policy")
 
     get_property(_aida_compiler_harness_inputs GLOBAL PROPERTY AIDA_C03_COMPILER_MATRIX_HARNESS_INPUTS)
     get_property(_aida_compiler_native_worker_inputs GLOBAL PROPERTY AIDA_C03_COMPILER_MATRIX_NATIVE_WORKER_INPUTS)

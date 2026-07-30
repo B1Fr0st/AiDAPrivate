@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace aida::analysis {
@@ -22,6 +23,9 @@ public:
     std::uint64_t maximum_contiguous_lease(std::uint64_t offset) const noexcept override;
     workspace_result_t<byte_view_t> lease(std::uint64_t offset, std::uint64_t size,
                                           const cancellation_token_t& cancel = {}) const override;
+    bool content_pin_active() const noexcept override;
+    std::optional<mapped_window_cache_statistics_t>
+        window_cache_statistics() const noexcept override;
 
     std::uint64_t parent_base() const noexcept { return base_; }
     const std::shared_ptr<const byte_provider_t>& parent() const noexcept { return parent_; }

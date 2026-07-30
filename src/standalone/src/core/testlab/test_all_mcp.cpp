@@ -1431,6 +1431,7 @@ namespace {
         static const std::set<std::string> no_target_required = {
             "debugger_get_attached",
             "driver_enumerate_kernel_modules",
+            "driver_kernel_symbols",
         };
         if (no_target_required.find(name) != no_target_required.end())
             return false;
@@ -5311,6 +5312,27 @@ namespace {
                 " browser_open=" + std::to_string(browser_open ? 1 : 0) +
                 " not_readiness_proof zero_reason=" + zero_reason;
             return true;
+        }
+        if ((tool_lc == "driver_kernel_symbols" || tool_lc == "driver_read_kernel_memory") &&
+            zero_reason.find("function_count=0") != std::string::npos) {
+            const mcp_standalone::json* status_obj = nullptr;
+            if (ir.data.is_object() && ir.data.contains("state"))
+                status_obj = &ir.data;
+            else if (ir.data.is_object() && ir.data.contains("symbols") && ir.data["symbols"].is_object())
+                status_obj = &ir.data["symbols"];
+            if (status_obj) {
+                bool symbols_ready = true;
+                payload_bool_field(*status_obj, "ready", symbols_ready);
+                std::string engine_state;
+                payload_string_field(*status_obj, "state", engine_state);
+                if (!symbols_ready && (engine_state == "not_started" || engine_state == "loading" ||
+                    engine_state == "failed")) {
+                    status = mcp_tool_call_status_t::state_contract_pass;
+                    proof = "driver_kernel_symbols engine state contract ready=false state=" + engine_state +
+                        " zero_reason=" + zero_reason;
+                    return true;
+                }
+            }
         }
         if (tool_lc == "dbg_get_modules_detail" &&
             (zero_reason.find("export_count=0") != std::string::npos ||
@@ -22234,6 +22256,21 @@ void test_tool_driver_read_pointer_chain(HANDLE hf, std::atomic<int>& passed, st
         test_tool_call(hf, "mcp.driver_enumerate_kernel_modules", get_server(), "driver_enumerate_kernel_modules", {}, passed, failed, skipped);
     }
 
+    void test_tool_driver_kernel_symbols(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        mcp_standalone::json args;
+        args["action"] = "status";
+        auto status = test_tool_call(hf, "mcp.driver_kernel_symbols", get_server(), "driver_kernel_symbols", args, passed, failed, skipped);
+        if (status != mcp_tool_call_status_t::passed)
+            return;
+        mcp_standalone::tool_result_t modules_result;
+        mcp_standalone::json modules_args;
+        modules_args["action"] = "modules";
+        test_tool_call(hf, "mcp.driver_kernel_symbols.modules", get_server(), "driver_kernel_symbols", modules_args, passed, failed, skipped, false, &modules_result);
+        mcp_standalone::json reload_args;
+        reload_args["action"] = "reload";
+        test_tool_call(hf, "mcp.driver_kernel_symbols.reload", get_server(), "driver_kernel_symbols", reload_args, passed, failed, skipped);
+    }
+
 
 
 void test_tool_driver_allocate_memory(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
@@ -24176,7 +24213,11 @@ void test_tool_scanner_undo(HANDLE hf, std::atomic<int>& passed, std::atomic<int
             {{"address", "string", false}, {"addresses", "array", false},
              {"size", "number", false}, {"sizes", "array", false}}, passed, failed);
         test_memory_tool_schema_contract(hf, "driver_read_kernel_memory", true,
-            {{"address", "string", true}, {"size", "number", true}}, passed, failed);
+            {{"address", "string", true}, {"size", "number", true},
+             {"annotate", "boolean", false}, {"struct", "string", false}}, passed, failed);
+        test_memory_tool_schema_contract(hf, "driver_kernel_symbols", true,
+            {{"action", "string", false}, {"expression", "string", false},
+             {"address", "string", false}, {"name", "string", false}}, passed, failed);
         test_memory_tool_schema_contract(hf, "driver_write_kernel_memory", false,
             {{"address", "string", true}, {"bytes", "string", true},
              {"expected_bytes", "string", false}, {"confirm_unsafe", "boolean", false},
@@ -24348,6 +24389,35 @@ void test_tool_scanner_undo(HANDLE hf, std::atomic<int>& passed, std::atomic<int
                 }
                 return true;
             }, passed, failed, &kernel_search);
+
+        test_coverage_domains_1_8_case(hf, tag, "driver_kernel_symbols", "status_snapshot",
+            mcp_standalone::json{{"action", "status"}}, 5000,
+            [](const invoke_result_t& ir, std::string& reason) {
+                if (!ir.success || !ir.data.contains("state") || !ir.data["state"].is_string() ||
+                    !ir.data.contains("ready") || !ir.data["ready"].is_boolean() ||
+                    !ir.data.contains("function_count") || !ir.data["function_count"].is_number() ||
+                    !ir.data.contains("ntoskrnl_base") || !ir.data["ntoskrnl_base"].is_string()) {
+                    reason = "kernel symbols status snapshot missing fields data=" + compact_json(ir.data, 900);
+                    return false;
+                }
+                return true;
+            }, passed, failed);
+
+        test_coverage_domains_1_8_case(hf, tag, "driver_kernel_symbols", "resolve_unknown_symbol_error_shape",
+            mcp_standalone::json{{"action", "resolve"}, {"expression", "nt!AiDaDefinitelyMissingSymbolName1234"}}, 5000,
+            [](const invoke_result_t& ir, std::string& reason) {
+                if (ir.success) {
+                    reason = "resolving a guaranteed-missing symbol unexpectedly succeeded data=" + compact_json(ir.data, 900);
+                    return false;
+                }
+                if (!ir.data.contains("symbols") || !ir.data["symbols"].is_object() ||
+                    !ir.data["symbols"].contains("state")) {
+                    reason = "resolve failure did not carry a symbols status object data=" + compact_json(ir.data, 900);
+                    return false;
+                }
+                return true;
+            }, passed, failed);
+
 
         if (!kernel_search_ok || !kernel_search.success || !kernel_search.data.contains("matches") ||
             !kernel_search.data["matches"].is_array() || kernel_search.data["matches"].empty()) {
@@ -35722,6 +35792,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_webfetch(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_read_pointer_chain(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_enumerate_kernel_modules(hf, passed, failed, skipped);
+    if (!cancelled()) test_tool_driver_kernel_symbols(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_allocate_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_free_memory(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_driver_call_function(hf, passed, failed, skipped);

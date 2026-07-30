@@ -292,6 +292,7 @@ workspace_result_t<std::shared_ptr<spill_sink_t>> spill_sink_t::create(
         storage->content_hasher.emplace(hasher.take_value());
         auto state = std::make_shared<state_t>();
         state->storage = std::move(storage);
+        provider_metrics_relay::record_memory_pressure_event();
         return workspace_result_t<std::shared_ptr<spill_sink_t>>::success(
             std::shared_ptr<spill_sink_t>(new spill_sink_t(std::move(state))));
     } catch (const std::bad_alloc&) {
@@ -336,6 +337,7 @@ workspace_result_t<void> spill_sink_t::append(
         error.size = size_value;
         error.details.emplace_back("appended_bytes", std::to_string(storage->appended));
         error.details.emplace_back("max_spill_bytes", std::to_string(storage->options.max_spill_bytes));
+        provider_metrics_relay::record_budget_rejection();
         return workspace_result_t<void>::failure(std::move(error));
     }
     std::uint64_t completed = 0;
@@ -374,6 +376,8 @@ workspace_result_t<void> spill_sink_t::append(
         completed += written;
         storage->appended += written;
     }
+    provider_metrics_relay::record_spill_write(size_value);
+    provider_metrics_relay::record_spill_high_water(storage->appended);
     return workspace_result_t<void>::success();
 }
 
@@ -442,7 +446,8 @@ workspace_result_t<std::shared_ptr<spill_provider_t>> spill_sink_t::finalize(
         return workspace_result_t<std::shared_ptr<spill_provider_t>>::failure(std::move(error));
     }
     auto actual_digest = cache.value()->compute_content_sha256(
-        cancel, storage->options.write_chunk_bytes);
+        cancel, (std::min)(16ULL * 1024ULL * 1024ULL,
+                           (std::max)(storage->appended, 1ULL)));
     if (!actual_digest) {
         auto error = actual_digest.error();
         fail_storage(*storage);
@@ -562,7 +567,22 @@ std::uint64_t spill_provider_t::maximum_contiguous_lease(std::uint64_t offset) c
 workspace_result_t<byte_view_t> spill_provider_t::lease(
     std::uint64_t offset, std::uint64_t size_value,
     const cancellation_token_t& cancel) const {
-    return state_->storage->cache->lease(offset, size_value, cancel);
+    auto view = state_->storage->cache->lease(offset, size_value, cancel);
+    if (view)
+        provider_metrics_relay::record_spill_read(size_value);
+    return view;
+}
+
+bool spill_provider_t::content_pin_active() const noexcept {
+    return true;
+}
+
+std::optional<mapped_window_cache_statistics_t>
+spill_provider_t::window_cache_statistics() const noexcept {
+    const auto storage = state_->storage;
+    if (!storage->cache)
+        return std::nullopt;
+    return storage->cache->statistics();
 }
 
 workspace_result_t<void> spill_provider_t::revalidate() const {
@@ -601,11 +621,6 @@ workspace_result_t<void> spill_provider_t::verify_content(
                                  "spill content identity verification failed",
                                  "spill_verify"));
     return workspace_result_t<void>::success();
-}
-
-mapped_window_cache_statistics_t spill_provider_t::statistics() const noexcept {
-    const auto storage = state_->storage;
-    return storage->cache ? storage->cache->statistics() : mapped_window_cache_statistics_t{};
 }
 
 }

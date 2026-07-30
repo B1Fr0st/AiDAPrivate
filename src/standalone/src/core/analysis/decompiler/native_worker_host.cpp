@@ -6,6 +6,7 @@
 #include "providers/ghidra_ir_adapter.hpp"
 #include "providers/jvm_ssa.hpp"
 #include "../workspace/workspace_identity.hpp"
+#include "../../../helpers/diag_log.hpp"
 
 #include "../../../../workers/native_decompiler/native_worker_protocol.hpp"
 
@@ -25,7 +26,10 @@
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
+#include <deque>
+#include <exception>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -1533,11 +1537,16 @@ private:
     SECURITY_ATTRIBUTES attributes_{};
 };
 
-bool configure_job(HANDLE job, const decompiler_profile_budget_t& profile, DWORD& error)
+bool configure_job(HANDLE job, const decompiler_profile_budget_t& profile, DWORD& error,
+                   std::uint64_t session_cpu_backstop_ms = 0)
 {
-    if (profile.max_memory_bytes == 0 || profile.max_cpu_ms == 0 ||
+    const std::uint64_t effective_cpu_ms = session_cpu_backstop_ms != 0
+        ? session_cpu_backstop_ms
+        : profile.max_cpu_ms;
+    if (profile.max_memory_bytes == 0 || effective_cpu_ms == 0 ||
+        (session_cpu_backstop_ms != 0 && session_cpu_backstop_ms < profile.max_cpu_ms) ||
         profile.max_memory_bytes > static_cast<std::uint64_t>((std::numeric_limits<SIZE_T>::max)()) ||
-        profile.max_cpu_ms > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)() / 10000)) {
+        effective_cpu_ms > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)() / 10000)) {
         error = ERROR_INVALID_PARAMETER;
         return false;
     }
@@ -1549,7 +1558,7 @@ bool configure_job(HANDLE job, const decompiler_profile_budget_t& profile, DWORD
         JOB_OBJECT_LIMIT_JOB_MEMORY |
         JOB_OBJECT_LIMIT_PROCESS_TIME;
     limits.BasicLimitInformation.ActiveProcessLimit = 1;
-    limits.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart = static_cast<LONGLONG>(profile.max_cpu_ms * 10000);
+    limits.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart = static_cast<LONGLONG>(effective_cpu_ms * 10000);
     limits.ProcessMemoryLimit = static_cast<SIZE_T>(profile.max_memory_bytes);
     limits.JobMemoryLimit = static_cast<SIZE_T>(profile.max_memory_bytes);
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
@@ -1672,7 +1681,7 @@ bool create_pipe_pair(handle_t& child_end, handle_t& parent_end, bool child_read
 bool launch_worker(const native_worker_verified_package_t& verified,
                    const native_worker_execution_request_t& request,
                    const native_worker_host_limits_t& host_limits, worker_instance_t& worker,
-                   native_worker_execution_result_t& result)
+                   native_worker_execution_result_t& result, std::uint64_t session_cpu_backstop_ms = 0)
 {
     handle_t child_read;
     handle_t parent_write;
@@ -1707,7 +1716,7 @@ bool launch_worker(const native_worker_verified_package_t& verified,
         return false;
     }
     worker.job.reset(CreateJobObjectW(nullptr, nullptr));
-    if (!worker.job || !configure_job(worker.job.get(), request.profile, error)) {
+    if (!worker.job || !configure_job(worker.job.get(), request.profile, error, session_cpu_backstop_ms)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected, "native_worker.job", "job limits could not be applied", error);
         return false;
     }
@@ -3409,177 +3418,15 @@ native_worker_provider_host_t::native_worker_provider_host_t(
 {
 }
 
-bool native_worker_provider_host_t::supports(
-    const decompiler_provider_descriptor_t& descriptor) const noexcept
-{
-    if (!descriptor.isolated)
-        return false;
-    switch (descriptor.identity.provider) {
-    case decompiler_provider_id_t::ghidra_native:
-        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::native_function;
-    case decompiler_provider_id_t::jvm_ssa:
-        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::jvm_method;
-    case decompiler_provider_id_t::dalvik_ssa:
-        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::dalvik_method;
-    case decompiler_provider_id_t::ilspy_cli:
-        return managed_host_ && descriptor.entity_kind == decompiler_entity_kind_t::cli_method;
-    }
-    return false;
-}
-
-decompiler_provider_result_t native_worker_provider_host_t::execute(
+decompiler_provider_result_t map_worker_result_to_provider_result(
     const decompiler_provider_route_t& route,
     const decompiler_provider_request_t& request,
-    const cancellation_token_t& cancel)
+    const cancellation_token_t& cancel,
+    const native_worker_execution_request_t& worker_request,
+    native_worker_execution_result_t& worker_result,
+    const std::chrono::steady_clock::time_point started)
 {
-    const auto started = std::chrono::steady_clock::now();
     decompiler_provider_result_t result;
-    if (!supports(route.descriptor) || !route.provider) {
-        decompiler_diagnostic_t diagnostic;
-        diagnostic.severity = decompiler_diagnostic_severity_t::error;
-        diagnostic.code = decompiler_diagnostic_code_t::worker_protocol_failure;
-        diagnostic.localization_key = "decompiler.native_host.route_rejected";
-        diagnostic.ordinal = 1;
-        result.diagnostics.push_back(std::move(diagnostic));
-        return result;
-    }
-    if (cancel.stop_requested() || started >= request.deadline) {
-        const bool timed_out = cancel.deadline_exceeded() || started >= request.deadline;
-        result.status = timed_out ? decompiler_provider_execution_status_t::timed_out
-                                  : decompiler_provider_execution_status_t::cancelled;
-        decompiler_diagnostic_t diagnostic;
-        diagnostic.severity = decompiler_diagnostic_severity_t::error;
-        diagnostic.code = timed_out ? decompiler_diagnostic_code_t::deadline_exceeded
-                                    : decompiler_diagnostic_code_t::cancelled;
-        diagnostic.localization_key = timed_out
-            ? "decompiler.native_host.deadline" : "decompiler.native_host.cancelled";
-        diagnostic.ordinal = 1;
-        result.diagnostics.push_back(std::move(diagnostic));
-        return result;
-    }
-
-    if (request.cache_key.stage != decompiler_cache_stage_t::provider_ir ||
-        !validate_decompiler_pipeline_cache_key(request.cache_key).valid() ||
-        !same_provider(request.cache_key.provider, route.descriptor.identity)) {
-        decompiler_diagnostic_t diagnostic;
-        diagnostic.severity = decompiler_diagnostic_severity_t::error;
-        diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
-        diagnostic.localization_key = "decompiler.isolated_host.request_rejected";
-        diagnostic.ordinal = 1;
-        result.diagnostics.push_back(std::move(diagnostic));
-        return result;
-    }
-
-    std::optional<native_worker_snapshot_t> snapshot;
-    std::shared_ptr<const managed_cli::request_t> bound_managed_request;
-    try {
-        std::vector<std::uint8_t> bytes;
-        switch (route.descriptor.identity.provider) {
-        case decompiler_provider_id_t::ghidra_native: {
-            const auto context = std::dynamic_pointer_cast<const ghidra_native_provider_context_t>(request.context);
-            if (!context || !context->snapshot() || context->snapshot()->empty() ||
-                context->snapshot_hash().empty())
-                break;
-            bytes.assign(context->snapshot()->begin(), context->snapshot()->end());
-            snapshot = make_native_worker_snapshot(std::move(bytes));
-            if (snapshot && snapshot->hash != context->snapshot_hash())
-                snapshot.reset();
-            break;
-        }
-        case decompiler_provider_id_t::jvm_ssa: {
-            const auto context = std::dynamic_pointer_cast<const jvm_ssa_provider_context_t>(request.context);
-            if (!context || !context->input() || context->input()->entity != request.cache_key.entity ||
-                !same_provider(context->input()->provider, route.descriptor.identity) ||
-                !same_language(context->input()->language, request.cache_key.language) ||
-                context->input()->workspace_generation != request.cache_key.workspace_generation ||
-                context->input()->type_graph_revision != request.cache_key.type_graph_revision)
-                break;
-            const auto serialized = jvm_ssa::serialize_jvm_method_input(*context->input());
-            bytes.assign(serialized.begin(), serialized.end());
-            snapshot = make_native_worker_snapshot(std::move(bytes));
-            break;
-        }
-        case decompiler_provider_id_t::dalvik_ssa: {
-            const auto context = std::dynamic_pointer_cast<const dalvik_ssa_provider_context_t>(request.context);
-            if (!context || !context->capture() ||
-                context->capture()->request.entity != request.cache_key.entity ||
-                !same_provider(context->capture()->request.provider, route.descriptor.identity) ||
-                !same_language(context->capture()->request.language, request.cache_key.language) ||
-                context->capture()->request.workspace_generation != request.cache_key.workspace_generation ||
-                context->capture()->request.type_graph_revision != request.cache_key.type_graph_revision)
-                break;
-            const auto serialized = dalvik_ssa::serialize_capture(*context->capture());
-            bytes.assign(serialized.begin(), serialized.end());
-            snapshot = make_native_worker_snapshot(std::move(bytes));
-            break;
-        }
-        case decompiler_provider_id_t::ilspy_cli:
-        {
-            const auto context = std::dynamic_pointer_cast<const managed_cli_provider_context_t>(request.context);
-            if (!context || !context->request() ||
-                context->request()->entity != request.cache_key.entity ||
-                context->request()->workspace_generation != request.cache_key.workspace_generation ||
-                context->request()->type_graph_revision != request.cache_key.type_graph_revision ||
-                !same_profile(context->request()->profile,
-                    request.cache_key.profile) ||
-                context->request()->worker.provider_version != route.descriptor.identity.provider_version ||
-                context->request()->worker.decompiler_assembly_hash !=
-                    route.descriptor.identity.provider_binary_hash ||
-                context->request()->worker.worker_build_id != route.descriptor.identity.worker_build_id ||
-                context->request()->worker.worker_build_hash != route.descriptor.identity.worker_build_hash)
-                break;
-            const auto maximum_module_bytes = static_cast<std::size_t>((std::min<std::uint64_t>)(
-                managed_cli::k_managed_cli_maximum_module_bytes,
-                request.cache_key.profile.max_memory_bytes / 2));
-            const auto captured = capture_managed_worker_snapshot(
-                context->request(), maximum_module_bytes, cancel);
-            if (!captured)
-                break;
-            if (captured.value().request->entity != request.cache_key.entity ||
-                captured.value().request->workspace_generation !=
-                    request.cache_key.workspace_generation ||
-                captured.value().request->type_graph_revision !=
-                    request.cache_key.type_graph_revision ||
-                !same_profile(captured.value().request->profile,
-                    request.cache_key.profile)) {
-                break;
-            }
-            snapshot = captured.value().snapshot;
-            bound_managed_request = captured.value().request;
-            break;
-        }
-        }
-    } catch (...) {
-        snapshot.reset();
-    }
-    if (!snapshot) {
-        decompiler_diagnostic_t diagnostic;
-        diagnostic.severity = decompiler_diagnostic_severity_t::error;
-        diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
-        diagnostic.localization_key = "decompiler.isolated_host.input_snapshot_rejected";
-        diagnostic.ordinal = 1;
-        result.diagnostics.push_back(std::move(diagnostic));
-        return result;
-    }
-
-    auto job_id = next_job_id_.fetch_add(1, std::memory_order_acq_rel);
-    if (job_id == 0)
-        job_id = next_job_id_.fetch_add(1, std::memory_order_acq_rel);
-    native_worker_execution_request_t worker_request;
-    worker_request.job_id = job_id;
-    worker_request.cache_key = request.cache_key;
-    worker_request.profile = request.cache_key.profile;
-    worker_request.snapshot = std::move(*snapshot);
-    worker_request.deadline = request.deadline;
-    worker_request.cancellation_requested = [cancel] {
-        return cancel.stop_requested();
-    };
-    if (route.descriptor.identity.provider == decompiler_provider_id_t::ilspy_cli) {
-        worker_request.managed_request = std::move(bound_managed_request);
-    }
-    auto worker_result = route.descriptor.identity.provider == decompiler_provider_id_t::ilspy_cli
-        ? managed_host_->execute(worker_request)
-        : host_->execute(worker_request);
     result.diagnostics.insert(result.diagnostics.end(),
         worker_result.worker_diagnostics.begin(), worker_result.worker_diagnostics.end());
     for (const auto& source : worker_result.diagnostics) {
@@ -3761,6 +3608,1220 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
         std::chrono::steady_clock::now() - started).count();
     result.elapsed_wall_clock_ms = static_cast<std::uint64_t>((std::max<std::int64_t>)(elapsed, 0));
     return result;
+}
+
+bool native_worker_provider_host_t::supports(
+    const decompiler_provider_descriptor_t& descriptor) const noexcept
+{
+    if (!descriptor.isolated)
+        return false;
+    switch (descriptor.identity.provider) {
+    case decompiler_provider_id_t::ghidra_native:
+        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::native_function;
+    case decompiler_provider_id_t::jvm_ssa:
+        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::jvm_method;
+    case decompiler_provider_id_t::dalvik_ssa:
+        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::dalvik_method;
+    case decompiler_provider_id_t::ilspy_cli:
+        return managed_host_ && descriptor.entity_kind == decompiler_entity_kind_t::cli_method;
+    }
+    return false;
+}
+
+decompiler_provider_result_t native_worker_provider_host_t::execute(
+    const decompiler_provider_route_t& route,
+    const decompiler_provider_request_t& request,
+    const cancellation_token_t& cancel)
+{
+    const auto started = std::chrono::steady_clock::now();
+    decompiler_provider_result_t result;
+    if (!supports(route.descriptor) || !route.provider) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::worker_protocol_failure;
+        diagnostic.localization_key = "decompiler.native_host.route_rejected";
+        diagnostic.ordinal = 1;
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+    if (cancel.stop_requested() || started >= request.deadline) {
+        const bool timed_out = cancel.deadline_exceeded() || started >= request.deadline;
+        result.status = timed_out ? decompiler_provider_execution_status_t::timed_out
+                                  : decompiler_provider_execution_status_t::cancelled;
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = timed_out ? decompiler_diagnostic_code_t::deadline_exceeded
+                                    : decompiler_diagnostic_code_t::cancelled;
+        diagnostic.localization_key = timed_out
+            ? "decompiler.native_host.deadline" : "decompiler.native_host.cancelled";
+        diagnostic.ordinal = 1;
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+
+    if (request.cache_key.stage != decompiler_cache_stage_t::provider_ir ||
+        !validate_decompiler_pipeline_cache_key(request.cache_key).valid() ||
+        !same_provider(request.cache_key.provider, route.descriptor.identity)) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
+        diagnostic.localization_key = "decompiler.isolated_host.request_rejected";
+        diagnostic.ordinal = 1;
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+
+    std::optional<native_worker_snapshot_t> snapshot;
+    std::shared_ptr<const managed_cli::request_t> bound_managed_request;
+    try {
+        std::vector<std::uint8_t> bytes;
+        switch (route.descriptor.identity.provider) {
+        case decompiler_provider_id_t::ghidra_native: {
+            const auto context = std::dynamic_pointer_cast<const ghidra_native_provider_context_t>(request.context);
+            if (!context || !context->snapshot() || context->snapshot()->empty() ||
+                context->snapshot_hash().empty())
+                break;
+            bytes.assign(context->snapshot()->begin(), context->snapshot()->end());
+            snapshot = make_native_worker_snapshot(std::move(bytes));
+            if (snapshot && snapshot->hash != context->snapshot_hash())
+                snapshot.reset();
+            break;
+        }
+        case decompiler_provider_id_t::jvm_ssa: {
+            const auto context = std::dynamic_pointer_cast<const jvm_ssa_provider_context_t>(request.context);
+            if (!context || !context->input() || context->input()->entity != request.cache_key.entity ||
+                !same_provider(context->input()->provider, route.descriptor.identity) ||
+                !same_language(context->input()->language, request.cache_key.language) ||
+                context->input()->workspace_generation != request.cache_key.workspace_generation ||
+                context->input()->type_graph_revision != request.cache_key.type_graph_revision)
+                break;
+            const auto serialized = jvm_ssa::serialize_jvm_method_input(*context->input());
+            bytes.assign(serialized.begin(), serialized.end());
+            snapshot = make_native_worker_snapshot(std::move(bytes));
+            break;
+        }
+        case decompiler_provider_id_t::dalvik_ssa: {
+            const auto context = std::dynamic_pointer_cast<const dalvik_ssa_provider_context_t>(request.context);
+            if (!context || !context->capture() ||
+                context->capture()->request.entity != request.cache_key.entity ||
+                !same_provider(context->capture()->request.provider, route.descriptor.identity) ||
+                !same_language(context->capture()->request.language, request.cache_key.language) ||
+                context->capture()->request.workspace_generation != request.cache_key.workspace_generation ||
+                context->capture()->request.type_graph_revision != request.cache_key.type_graph_revision)
+                break;
+            const auto serialized = dalvik_ssa::serialize_capture(*context->capture());
+            bytes.assign(serialized.begin(), serialized.end());
+            snapshot = make_native_worker_snapshot(std::move(bytes));
+            break;
+        }
+        case decompiler_provider_id_t::ilspy_cli:
+        {
+            const auto context = std::dynamic_pointer_cast<const managed_cli_provider_context_t>(request.context);
+            if (!context || !context->request() ||
+                context->request()->entity != request.cache_key.entity ||
+                context->request()->workspace_generation != request.cache_key.workspace_generation ||
+                context->request()->type_graph_revision != request.cache_key.type_graph_revision ||
+                !same_profile(context->request()->profile,
+                    request.cache_key.profile) ||
+                context->request()->worker.provider_version != route.descriptor.identity.provider_version ||
+                context->request()->worker.decompiler_assembly_hash !=
+                    route.descriptor.identity.provider_binary_hash ||
+                context->request()->worker.worker_build_id != route.descriptor.identity.worker_build_id ||
+                context->request()->worker.worker_build_hash != route.descriptor.identity.worker_build_hash)
+                break;
+            const auto maximum_module_bytes = static_cast<std::size_t>((std::min<std::uint64_t>)(
+                managed_cli::k_managed_cli_maximum_module_bytes,
+                request.cache_key.profile.max_memory_bytes / 2));
+            const auto captured = capture_managed_worker_snapshot(
+                context->request(), maximum_module_bytes, cancel);
+            if (!captured)
+                break;
+            if (captured.value().request->entity != request.cache_key.entity ||
+                captured.value().request->workspace_generation !=
+                    request.cache_key.workspace_generation ||
+                captured.value().request->type_graph_revision !=
+                    request.cache_key.type_graph_revision ||
+                !same_profile(captured.value().request->profile,
+                    request.cache_key.profile)) {
+                break;
+            }
+            snapshot = captured.value().snapshot;
+            bound_managed_request = captured.value().request;
+            break;
+        }
+        }
+    } catch (...) {
+        snapshot.reset();
+    }
+    if (!snapshot) {
+        decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+        diagnostic.code = decompiler_diagnostic_code_t::invalid_contract;
+        diagnostic.localization_key = "decompiler.isolated_host.input_snapshot_rejected";
+        diagnostic.ordinal = 1;
+        result.diagnostics.push_back(std::move(diagnostic));
+        return result;
+    }
+
+    auto job_id = next_job_id_.fetch_add(1, std::memory_order_acq_rel);
+    if (job_id == 0)
+        job_id = next_job_id_.fetch_add(1, std::memory_order_acq_rel);
+    native_worker_execution_request_t worker_request;
+    worker_request.job_id = job_id;
+    worker_request.cache_key = request.cache_key;
+    worker_request.profile = request.cache_key.profile;
+    worker_request.snapshot = std::move(*snapshot);
+    worker_request.deadline = request.deadline;
+    worker_request.cancellation_requested = [cancel] {
+        return cancel.stop_requested();
+    };
+    if (route.descriptor.identity.provider == decompiler_provider_id_t::ilspy_cli) {
+        worker_request.managed_request = std::move(bound_managed_request);
+    }
+    auto worker_result = route.descriptor.identity.provider == decompiler_provider_id_t::ilspy_cli
+        ? managed_host_->execute(worker_request)
+        : host_->execute(worker_request);
+    return map_worker_result_to_provider_result(route, request, cancel, worker_request, worker_result, started);
+}
+
+struct native_worker_host_t::session_state_t {
+    worker_instance_t worker;
+    sha256_digest_t snapshot_hash;
+    std::uint64_t worker_generation = 0;
+    std::uint32_t jobs_completed = 0;
+    std::uint32_t max_jobs_per_session = 0;
+    std::uint64_t cpu_backstop_ms = 0;
+    std::uint64_t cpu_base_ms = 0;
+    std::chrono::steady_clock::time_point launched_steady;
+    std::shared_ptr<std::atomic<bool>> preempt;
+    bool healthy = true;
+    bool slot_released = false;
+};
+
+namespace {
+
+std::uint64_t session_cpu_backstop_for(std::uint32_t max_jobs_per_session, std::uint64_t max_cpu_ms) noexcept
+{
+    const std::uint64_t jobs = max_jobs_per_session != 0 ? max_jobs_per_session : 1;
+    const std::uint64_t clamped_cpu = (std::min)(max_cpu_ms, k_decompiler_profile_max_cpu_ms);
+    if (clamped_cpu > (std::numeric_limits<std::uint64_t>::max)() / jobs)
+        return (std::numeric_limits<std::uint64_t>::max)();
+    return jobs * clamped_cpu;
+}
+
+}
+
+void native_worker_host_t::session_terminate(session_state_t& session, DWORD exit_code,
+    native_worker_execution_result_t* result, bool replacement) noexcept
+{
+    native_worker_execution_result_t discarded;
+    native_worker_execution_result_t& target = result ? *result : discarded;
+    try {
+        terminate_worker(session.worker, exit_code, target, replacement);
+    } catch (...) {
+    }
+    if (!session.slot_released) {
+        session.slot_released = true;
+        std::lock_guard lock(state_mutex_);
+        if (active_workers_ != 0)
+            --active_workers_;
+        state_wake_.notify_all();
+    }
+}
+
+bool native_worker_host_t::session_launch(const native_worker_execution_request_t& input,
+    std::uint32_t max_jobs_per_session, session_state_t& session, native_worker_execution_result_t& result)
+{
+    if (stopped_.load(std::memory_order_acquire)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::host_stopped, "native_worker.execute", "worker host is stopped");
+        return false;
+    }
+    if (limits_.max_frame_bytes == 0 ||
+        limits_.max_frame_bytes > k_decompiler_worker_result_frame_max_bytes ||
+        limits_.max_snapshot_bytes == 0 ||
+        limits_.max_concurrent_workers == 0 || limits_.startup_timeout.count() <= 0 ||
+        limits_.cancellation_grace.count() < 0 || limits_.poll_interval.count() <= 0 || input.job_id == 0 ||
+        max_jobs_per_session == 0 ||
+        !input.snapshot.valid() || input.snapshot.bytes->size() > limits_.max_snapshot_bytes ||
+        input.snapshot.bytes->size() > input.profile.max_memory_bytes) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request, "native_worker.request", "worker request or host limits are invalid");
+        return false;
+    }
+    const auto queue_deadline = effective_deadline(input);
+    {
+        std::unique_lock lock(state_mutex_);
+        while (!stopped_.load(std::memory_order_acquire) &&
+               active_workers_ >= limits_.max_concurrent_workers) {
+            if ((input.cancellation_requested && input.cancellation_requested()) ||
+                std::chrono::steady_clock::now() >= queue_deadline) {
+                result.status = std::chrono::steady_clock::now() >= queue_deadline
+                    ? native_worker_execution_status_t::deadline_exceeded
+                    : native_worker_execution_status_t::cancelled;
+                append_diagnostic(result,
+                    result.status == native_worker_execution_status_t::deadline_exceeded
+                        ? native_worker_diagnostic_code_t::deadline_exceeded
+                        : native_worker_diagnostic_code_t::cancelled,
+                    "native_worker.queue", "worker admission was cancelled before launch");
+                return false;
+            }
+            const auto poll_deadline = (std::min)(
+                queue_deadline,
+                std::chrono::steady_clock::now() + limits_.poll_interval);
+            state_wake_.wait_until(lock, poll_deadline);
+        }
+        if (stopped_.load(std::memory_order_acquire)) {
+            append_diagnostic(result, native_worker_diagnostic_code_t::host_stopped,
+                "native_worker.queue", "worker host stopped before admission");
+            return false;
+        }
+        ++active_workers_;
+    }
+    bool slot_held = true;
+    const auto release_slot = [this, &slot_held] {
+        if (!slot_held)
+            return;
+        slot_held = false;
+        std::lock_guard lock(state_mutex_);
+        if (active_workers_ != 0)
+            --active_workers_;
+        state_wake_.notify_all();
+    };
+    native_worker_execution_request_t request = input;
+    const auto external_cancel = input.cancellation_requested;
+    request.cancellation_requested = [this, external_cancel] {
+        return stopped_.load(std::memory_order_acquire) ||
+               (external_cancel && external_cancel());
+    };
+    sha256_digest_t verified_snapshot_hash;
+    if (!wire::sha256(request.snapshot.bytes->data(), request.snapshot.bytes->size(), verified_snapshot_hash) || verified_snapshot_hash != request.snapshot.hash) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::snapshot_invalid, "native_worker.snapshot", "snapshot hash is invalid", ERROR_CRC);
+        release_slot();
+        return false;
+    }
+    result.snapshot_hash = verified_snapshot_hash;
+    const auto cache_validation = validate_decompiler_pipeline_cache_key(request.cache_key);
+    const auto profile_validation = validate_decompiler_profile(request.profile);
+    if (!cache_validation.valid() || !profile_validation.valid() ||
+        request.cache_key.worker_protocol_hash != native_worker_protocol_hash() ||
+        request.cache_key.profile.profile != request.profile.profile ||
+        request.cache_key.profile.max_wall_clock_ms != request.profile.max_wall_clock_ms ||
+        request.cache_key.profile.max_cpu_ms != request.profile.max_cpu_ms ||
+        request.cache_key.profile.max_memory_bytes != request.profile.max_memory_bytes ||
+        request.cache_key.profile.max_provider_ir_nodes != request.profile.max_provider_ir_nodes ||
+        request.cache_key.profile.max_hir_nodes != request.profile.max_hir_nodes ||
+        request.cache_key.profile.max_ast_nodes != request.profile.max_ast_nodes ||
+        request.cache_key.profile.max_semantic_queries != request.profile.max_semantic_queries ||
+        request.cache_key.profile.semantic_proofs_enabled != request.profile.semantic_proofs_enabled) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request, "native_worker.contract", "cache key and profile do not form a valid bound request", ERROR_INVALID_DATA);
+        release_slot();
+        return false;
+    }
+    if (request.cache_key.provider.provider != decompiler_provider_id_t::ghidra_native ||
+        request.managed_request) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request,
+            "native_worker.session_route",
+            "session launch is restricted to the native Ghidra provider", ERROR_INVALID_DATA);
+        release_slot();
+        return false;
+    }
+    const auto verified = verified_package_;
+    if (!verified) {
+        result.diagnostics = verification_diagnostics_;
+        release_slot();
+        return false;
+    }
+    result.manifest_hash = verified->manifest_hash;
+    if (!compatible_worker_provider(request.cache_key.provider, verified->manifest.provider)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::worker_identity_mismatch,
+            "native_worker.request_identity",
+            "cache provider identity does not match the verified worker manifest",
+            ERROR_CRC, true);
+        release_slot();
+        return false;
+    }
+    session.worker_generation = worker_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    result.worker_generation = session.worker_generation;
+    const std::uint64_t backstop = session_cpu_backstop_for(max_jobs_per_session, request.profile.max_cpu_ms);
+    if (!launch_worker(*verified, request, limits_, session.worker, result, backstop)) {
+        result.worker_process_id = session.worker.process_id;
+        if (session.worker.process)
+            terminate_worker(session.worker, ERROR_ACCESS_DENIED, result, true);
+        release_slot();
+        return false;
+    }
+    result.worker_process_id = session.worker.process_id;
+    const auto startup_timeout_deadline = std::chrono::steady_clock::now() + limits_.startup_timeout;
+    const auto startup_deadline = (std::min)(startup_timeout_deadline, queue_deadline);
+    wire::frame_t frame;
+    DWORD error = ERROR_SUCCESS;
+    const auto hello_wait = wait_for_message(session.worker, request, limits_, startup_deadline, frame, error);
+    if (hello_wait != terminal_wait_t::message) {
+        DWORD termination_code = ERROR_CANCELLED;
+        if (hello_wait == terminal_wait_t::cancelled) {
+            result.status = native_worker_execution_status_t::cancelled;
+            append_diagnostic(result, native_worker_diagnostic_code_t::cancelled,
+                "native_worker.hello", "worker startup was cancelled before an authenticated hello",
+                ERROR_CANCELLED, true);
+        } else if (hello_wait == terminal_wait_t::deadline) {
+            result.status = native_worker_execution_status_t::deadline_exceeded;
+            termination_code = WAIT_TIMEOUT;
+            append_diagnostic(result, native_worker_diagnostic_code_t::deadline_exceeded, "native_worker.hello",
+                queue_deadline <= startup_timeout_deadline
+                    ? "request deadline expired before an authenticated worker hello"
+                    : "worker did not provide an authenticated hello before the startup deadline",
+                WAIT_TIMEOUT, true);
+        } else if (hello_wait == terminal_wait_t::exited) {
+            append_worker_exit(result, session.worker, "native_worker.hello",
+                "worker exited before providing an authenticated hello");
+        } else {
+            append_protocol_failure(result, session.worker.reader.failure(), "native_worker.hello", error,
+                &session.worker.wait_observation);
+        }
+        terminate_worker(session.worker, termination_code, result, true);
+        release_slot();
+        return false;
+    }
+    const auto decoded_hello = deserialize_decompiler_worker_message(
+        std::string(reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size()));
+    if (!decoded_hello.valid() || !decoded_hello.value || !validate_envelope(*decoded_hello.value, frame, session.worker.session) ||
+        !std::holds_alternative<decompiler_worker_hello_t>(*decoded_hello.value)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.hello", "worker hello violates the authenticated protocol", ERROR_INVALID_DATA, true);
+        terminate_worker(session.worker, ERROR_CRC, result, true);
+        release_slot();
+        return false;
+    }
+    const auto& hello = std::get<decompiler_worker_hello_t>(*decoded_hello.value);
+    if (hello.manifest_hash != verified->manifest_hash ||
+        !same_provider(hello.provider, request.cache_key.provider) ||
+        !compatible_worker_provider(hello.provider, verified->manifest.provider)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::worker_identity_mismatch, "native_worker.hello_identity", "worker identity does not match verified manifest", ERROR_CRC, true);
+        terminate_worker(session.worker, ERROR_CRC, result, true);
+        release_slot();
+        return false;
+    }
+    session.snapshot_hash = verified_snapshot_hash;
+    session.jobs_completed = 0;
+    session.max_jobs_per_session = max_jobs_per_session;
+    session.cpu_backstop_ms = backstop;
+    session.cpu_base_ms = request.profile.max_cpu_ms;
+    session.launched_steady = std::chrono::steady_clock::now();
+    session.preempt.reset();
+    session.healthy = true;
+    session.slot_released = false;
+    slot_held = false;
+    diag::log_tagged_fmt("dec_batch",
+        "pool_spawn worker_gen=%llu pid=%lu jobs_bound=%u cpu_backstop_ms=%llu",
+        static_cast<unsigned long long>(session.worker_generation),
+        static_cast<unsigned long>(session.worker.process_id),
+        static_cast<unsigned int>(max_jobs_per_session),
+        static_cast<unsigned long long>(backstop));
+    return true;
+}
+
+native_worker_execution_result_t native_worker_host_t::execute_on_session(
+    session_state_t& session, const native_worker_execution_request_t& input)
+{
+    native_worker_execution_result_t result;
+    result.worker_generation = session.worker_generation;
+    result.worker_process_id = session.worker.process_id;
+    result.snapshot_hash = session.snapshot_hash;
+    const auto verified = verified_package_;
+    if (verified)
+        result.manifest_hash = verified->manifest_hash;
+    if (stopped_.load(std::memory_order_acquire)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::host_stopped, "native_worker.execute", "worker host is stopped");
+        session.healthy = false;
+        return result;
+    }
+    if (!session.healthy || !session.worker.process || input.job_id == 0 ||
+        input.snapshot.hash.empty() || input.snapshot.hash != session.snapshot_hash) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request,
+            "native_worker.session_request", "session is not reusable for the requested job", ERROR_INVALID_DATA);
+        session.healthy = false;
+        session_terminate(session, ERROR_INVALID_DATA, &result, true);
+        return result;
+    }
+    const auto cache_validation = validate_decompiler_pipeline_cache_key(input.cache_key);
+    const auto profile_validation = validate_decompiler_profile(input.profile);
+    if (!cache_validation.valid() || !profile_validation.valid() ||
+        input.cache_key.worker_protocol_hash != native_worker_protocol_hash() ||
+        input.cache_key.profile.profile != input.profile.profile ||
+        input.cache_key.profile.max_wall_clock_ms != input.profile.max_wall_clock_ms ||
+        input.cache_key.profile.max_cpu_ms != input.profile.max_cpu_ms ||
+        input.cache_key.profile.max_memory_bytes != input.profile.max_memory_bytes ||
+        input.cache_key.profile.max_provider_ir_nodes != input.profile.max_provider_ir_nodes ||
+        input.cache_key.profile.max_hir_nodes != input.profile.max_hir_nodes ||
+        input.cache_key.profile.max_ast_nodes != input.profile.max_ast_nodes ||
+        input.cache_key.profile.max_semantic_queries != input.profile.max_semantic_queries ||
+        input.cache_key.profile.semantic_proofs_enabled != input.profile.semantic_proofs_enabled) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request, "native_worker.contract", "cache key and profile do not form a valid bound request", ERROR_INVALID_DATA);
+        session.healthy = false;
+        session_terminate(session, ERROR_INVALID_DATA, &result, true);
+        return result;
+    }
+    if (!verified ||
+        input.cache_key.provider.provider != decompiler_provider_id_t::ghidra_native ||
+        !compatible_worker_provider(input.cache_key.provider, verified->manifest.provider)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::worker_identity_mismatch,
+            "native_worker.request_identity",
+            "cache provider identity does not match the verified worker manifest",
+            ERROR_CRC, true);
+        session.healthy = false;
+        session_terminate(session, ERROR_CRC, &result, true);
+        return result;
+    }
+    if (input.profile.max_cpu_ms > session.cpu_base_ms) {
+        const std::uint64_t backstop = session_cpu_backstop_for(session.max_jobs_per_session, input.profile.max_cpu_ms);
+        if (backstop > session.cpu_backstop_ms) {
+            DWORD error = ERROR_SUCCESS;
+            if (!configure_job(session.worker.job.get(), input.profile, error, backstop)) {
+                append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected,
+                    "native_worker.session_job", "session CPU backstop could not be raised", error, true);
+                session.healthy = false;
+                session_terminate(session, ERROR_INVALID_DATA, &result, true);
+                return result;
+            }
+            session.cpu_backstop_ms = backstop;
+        }
+        session.cpu_base_ms = input.profile.max_cpu_ms;
+    }
+    native_worker_execution_request_t request = input;
+    const auto external_cancel = input.cancellation_requested;
+    const auto preempt = session.preempt;
+    request.cancellation_requested = [this, external_cancel, preempt] {
+        return stopped_.load(std::memory_order_acquire) ||
+               (preempt && preempt->load(std::memory_order_acquire)) ||
+               (external_cancel && external_cancel());
+    };
+    decompiler_worker_job_request_t job;
+    job.envelope.kind = decompiler_worker_message_kind_t::job_request;
+    job.envelope.session_nonce_hash = session.worker.session.nonce_hash;
+    job.envelope.sequence = session.worker.next_host_sequence;
+    job.job_id = request.job_id;
+    job.cache_key = request.cache_key;
+    job.profile = request.profile;
+    job.snapshot_hash = session.snapshot_hash;
+    job.request_printc_evidence = request.request_printc_evidence;
+    DWORD error = ERROR_SUCCESS;
+    if (!send_contract(session.worker, decompiler_worker_message_t{std::move(job)}, limits_, error)) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::bootstrap_failed, "native_worker.job", "job request could not be written", error, true);
+        session.healthy = false;
+        session_terminate(session, ERROR_CANCELLED, &result, true);
+        return result;
+    }
+    const auto deadline = effective_deadline(request);
+    wire::frame_t frame;
+    while (true) {
+        const auto terminal = wait_for_message(session.worker, request, limits_, deadline, frame, error);
+        if (terminal == terminal_wait_t::cancelled || terminal == terminal_wait_t::deadline) {
+            const bool is_deadline = terminal == terminal_wait_t::deadline;
+            send_cancel(session.worker, request, limits_, is_deadline ? "deadline_exceeded" : "cancelled");
+            auto saved_cancel = request.cancellation_requested;
+            request.cancellation_requested = [] { return false; };
+            const auto grace_deadline = std::chrono::steady_clock::now() + limits_.cancellation_grace;
+            while (std::chrono::steady_clock::now() < grace_deadline) {
+                const auto grace_terminal = wait_for_message(session.worker, request, limits_, grace_deadline, frame, error);
+                if (grace_terminal == terminal_wait_t::message) {
+                    const auto decoded = deserialize_decompiler_worker_message(
+                        std::string(reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size()));
+                    if (decoded.valid() && decoded.value && validate_envelope(*decoded.value, frame, session.worker.session)) {
+                        if (std::holds_alternative<decompiler_worker_failure_message_t>(*decoded.value)) {
+                            const auto& failure = std::get<decompiler_worker_failure_message_t>(*decoded.value);
+                            if (failure.job_id == request.job_id)
+                                append_worker_failure(result, failure);
+                        }
+                    }
+                    break;
+                }
+                if (grace_terminal == terminal_wait_t::exited ||
+                    grace_terminal == terminal_wait_t::deadline ||
+                    grace_terminal == terminal_wait_t::protocol_failure)
+                    break;
+            }
+            request.cancellation_requested = saved_cancel;
+            result.status = is_deadline ? native_worker_execution_status_t::deadline_exceeded : native_worker_execution_status_t::cancelled;
+            append_diagnostic(result, is_deadline ? native_worker_diagnostic_code_t::deadline_exceeded : native_worker_diagnostic_code_t::cancelled,
+                "native_worker.cancel", is_deadline ? "worker exceeded its deadline" : "worker cancellation was requested", ERROR_CANCELLED, true);
+            session.healthy = false;
+            session_terminate(session, ERROR_CANCELLED, &result, true);
+            return result;
+        }
+        if (terminal == terminal_wait_t::exited) {
+            append_worker_exit(result, session.worker, "native_worker.wait",
+                "worker exited before a terminal result");
+            const DWORD exit_code = session.worker.wait_observation.exit_code_available
+                ? session.worker.wait_observation.exit_code : ERROR_PROCESS_ABORTED;
+            session.healthy = false;
+            session_terminate(session, exit_code, &result, true);
+            return result;
+        }
+        if (terminal == terminal_wait_t::protocol_failure) {
+            append_protocol_failure(result, session.worker.reader.failure(), "native_worker.response", error,
+                &session.worker.wait_observation);
+            session.healthy = false;
+            session_terminate(session, ERROR_CRC, &result, true);
+            return result;
+        }
+        const auto decoded = deserialize_decompiler_worker_message(
+            std::string(reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size()));
+        if (!decoded.valid() || !decoded.value || !validate_envelope(*decoded.value, frame, session.worker.session)) {
+            append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.response", "worker response cannot be decoded or validated", ERROR_INVALID_DATA, true);
+            session.healthy = false;
+            session_terminate(session, ERROR_CRC, &result, true);
+            return result;
+        }
+        if (std::holds_alternative<decompiler_worker_heartbeat_t>(*decoded.value)) {
+            const auto& heartbeat = std::get<decompiler_worker_heartbeat_t>(*decoded.value);
+            if (heartbeat.active_job_id != request.job_id) {
+                append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.heartbeat", "heartbeat job identity does not match active job", ERROR_INVALID_DATA, true);
+                session.healthy = false;
+                session_terminate(session, ERROR_CRC, &result, true);
+                return result;
+            }
+            continue;
+        }
+        if (std::holds_alternative<decompiler_worker_failure_message_t>(*decoded.value)) {
+            const auto& failure = std::get<decompiler_worker_failure_message_t>(*decoded.value);
+            if (failure.job_id != request.job_id) {
+                append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.failure", "failure job identity does not match active job", ERROR_INVALID_DATA, true);
+                session.healthy = false;
+                session_terminate(session, ERROR_CRC, &result, true);
+                return result;
+            }
+            append_worker_failure(result, failure);
+            std::string detail = "worker returned typed failure diagnostics";
+            if (!failure.diagnostics.empty())
+                append_worker_diagnostic_detail(detail, failure.diagnostics.front());
+            append_diagnostic(result, native_worker_diagnostic_code_t::worker_failed,
+                "native_worker.failure", std::move(detail), ERROR_SUCCESS, false);
+            result.status = native_worker_execution_status_t::failed;
+            ++session.jobs_completed;
+            const bool replacement = std::any_of(failure.diagnostics.begin(), failure.diagnostics.end(),
+                [](const decompiler_diagnostic_t& current) { return current.retryable; });
+            if (replacement) {
+                session.healthy = false;
+                session_terminate(session, ERROR_RETRY, &result, true);
+            }
+            return result;
+        }
+        if (std::holds_alternative<decompiler_worker_document_message_t>(*decoded.value)) {
+            const auto& document = std::get<decompiler_worker_document_message_t>(*decoded.value);
+            const auto document_validation = validate_decompiler_document(document.document);
+            if (document.job_id != request.job_id || !document_validation.valid() || !(document.document.entity == request.cache_key.entity) ||
+                document.document.profile != request.profile.profile ||
+                document.provider_artifacts.empty() || document.provider_artifacts_hash.empty() ||
+                document.provider_artifacts.size() > k_decompiler_worker_provider_artifacts_max_bytes ||
+                stable_serialization_hash(document.provider_artifacts) != document.provider_artifacts_hash ||
+                document.printc_evidence.has_value() != request.request_printc_evidence ||
+                (document.printc_evidence &&
+                    (document.printc_evidence->empty() ||
+                     document.printc_evidence->size() > k_decompiler_worker_printc_evidence_max_bytes ||
+                     document.printc_evidence_hash.empty() ||
+                     stable_serialization_hash(*document.printc_evidence) != document.printc_evidence_hash))) {
+                append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.document", "worker document is not bound to the requested entity and profile", ERROR_INVALID_DATA, true);
+                session.healthy = false;
+                session_terminate(session, ERROR_CRC, &result, true);
+                return result;
+            }
+            result.document = document.document;
+            result.provider_artifacts = document.provider_artifacts;
+            result.provider_artifacts_hash = document.provider_artifacts_hash;
+            result.printc_evidence = document.printc_evidence;
+            result.printc_evidence_hash = document.printc_evidence_hash;
+            result.status = native_worker_execution_status_t::completed;
+            ++session.jobs_completed;
+            return result;
+        }
+        append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.response", "worker sent a message that is invalid in the active job state", ERROR_INVALID_DATA, true);
+        session.healthy = false;
+        session_terminate(session, ERROR_CRC, &result, true);
+        return result;
+    }
+}
+
+std::shared_ptr<native_worker_host_t> native_worker_host_t::for_session_pool(std::size_t max_concurrent_workers) const
+{
+    if (!verified_package_ || max_concurrent_workers == 0)
+        return {};
+    native_worker_host_limits_t limits = limits_;
+    limits.max_concurrent_workers = max_concurrent_workers;
+    return std::shared_ptr<native_worker_host_t>(
+        new native_worker_host_t(contract_, limits, verified_package_));
+}
+
+namespace {
+
+struct worker_pool_key_t {
+    std::string workspace_id;
+    std::uint64_t generation = 0;
+    sha256_digest_t snapshot_hash;
+    decompiler_profile_id_t profile = decompiler_profile_id_t::balanced;
+    std::uint64_t max_memory_bytes = 0;
+    std::uint64_t max_provider_ir_nodes = 0;
+    std::uint64_t max_hir_nodes = 0;
+    std::uint64_t max_ast_nodes = 0;
+    std::uint32_t max_semantic_queries = 0;
+    bool semantic_proofs_enabled = false;
+};
+
+int digest_order(const sha256_digest_t& left, const sha256_digest_t& right) noexcept
+{
+    return std::memcmp(left.bytes.data(), right.bytes.data(), left.bytes.size());
+}
+
+bool operator<(const worker_pool_key_t& left, const worker_pool_key_t& right) noexcept
+{
+    if (left.workspace_id != right.workspace_id)
+        return left.workspace_id < right.workspace_id;
+    if (left.generation != right.generation)
+        return left.generation < right.generation;
+    const int digest = digest_order(left.snapshot_hash, right.snapshot_hash);
+    if (digest != 0)
+        return digest < 0;
+    if (left.profile != right.profile)
+        return left.profile < right.profile;
+    if (left.max_memory_bytes != right.max_memory_bytes)
+        return left.max_memory_bytes < right.max_memory_bytes;
+    if (left.max_provider_ir_nodes != right.max_provider_ir_nodes)
+        return left.max_provider_ir_nodes < right.max_provider_ir_nodes;
+    if (left.max_hir_nodes != right.max_hir_nodes)
+        return left.max_hir_nodes < right.max_hir_nodes;
+    if (left.max_ast_nodes != right.max_ast_nodes)
+        return left.max_ast_nodes < right.max_ast_nodes;
+    if (left.max_semantic_queries != right.max_semantic_queries)
+        return left.max_semantic_queries < right.max_semantic_queries;
+    return left.semantic_proofs_enabled < right.semantic_proofs_enabled;
+}
+
+bool operator==(const worker_pool_key_t& left, const worker_pool_key_t& right) noexcept
+{
+    return left.workspace_id == right.workspace_id &&
+        left.generation == right.generation &&
+        digest_order(left.snapshot_hash, right.snapshot_hash) == 0 &&
+        left.profile == right.profile &&
+        left.max_memory_bytes == right.max_memory_bytes &&
+        left.max_provider_ir_nodes == right.max_provider_ir_nodes &&
+        left.max_hir_nodes == right.max_hir_nodes &&
+        left.max_ast_nodes == right.max_ast_nodes &&
+        left.max_semantic_queries == right.max_semantic_queries &&
+        left.semantic_proofs_enabled == right.semantic_proofs_enabled;
+}
+
+worker_pool_key_t make_worker_pool_key(const decompiler_provider_request_t& request,
+                                       const sha256_digest_t& snapshot_hash)
+{
+    worker_pool_key_t key;
+    key.workspace_id = request.cache_key.workspace_id;
+    key.generation = request.cache_key.workspace_generation;
+    key.snapshot_hash = snapshot_hash;
+    key.profile = request.cache_key.profile.profile;
+    key.max_memory_bytes = request.cache_key.profile.max_memory_bytes;
+    key.max_provider_ir_nodes = request.cache_key.profile.max_provider_ir_nodes;
+    key.max_hir_nodes = request.cache_key.profile.max_hir_nodes;
+    key.max_ast_nodes = request.cache_key.profile.max_ast_nodes;
+    key.max_semantic_queries = request.cache_key.profile.max_semantic_queries;
+    key.semantic_proofs_enabled = request.cache_key.profile.semantic_proofs_enabled;
+    return key;
+}
+
+struct worker_session_record_t {
+    std::unique_ptr<native_worker_host_t::session_state_t> session;
+    worker_pool_key_t key;
+    std::uint64_t ordinal = 0;
+    bool busy = false;
+    bool interactive = false;
+    bool borrowed = false;
+    bool preempted = false;
+    std::shared_ptr<std::atomic<bool>> preempt;
+};
+
+decompiler_diagnostic_t pool_failure_diagnostic(decompiler_diagnostic_code_t code, std::string key)
+{
+    decompiler_diagnostic_t diagnostic;
+    diagnostic.severity = decompiler_diagnostic_severity_t::error;
+    diagnostic.code = code;
+    diagnostic.localization_key = std::move(key);
+    diagnostic.ordinal = 1;
+    return diagnostic;
+}
+
+}
+
+struct pooled_native_worker_provider_host_t::state_t {
+    std::shared_ptr<decompiler_isolated_provider_host_t> fallback;
+    std::shared_ptr<native_worker_host_t> host;
+    native_worker_session_pool_config_t config;
+    mutable std::mutex mutex;
+    std::condition_variable wake;
+    std::map<worker_pool_key_t, std::deque<std::shared_ptr<worker_session_record_t>>> idle;
+    std::unordered_set<std::shared_ptr<worker_session_record_t>> busy;
+    std::size_t total_sessions = 0;
+    std::size_t batch_busy = 0;
+    std::size_t interactive_busy = 0;
+    std::uint64_t next_ordinal = 0;
+    std::atomic<bool> stopped{false};
+    std::atomic<std::uint64_t> next_job_id{1};
+
+    bool session_alive(const std::shared_ptr<worker_session_record_t>& record) const noexcept
+    {
+        if (!record || !record->session || !record->session->healthy || !record->session->worker.process)
+            return false;
+        return WaitForSingleObject(record->session->worker.process.get(), 0) == WAIT_TIMEOUT;
+    }
+
+    bool recycle_due(const std::shared_ptr<worker_session_record_t>& record) const noexcept
+    {
+        if (!record || !record->session)
+            return true;
+        if (config.max_jobs_per_session != 0 &&
+            record->session->jobs_completed >= config.max_jobs_per_session)
+            return true;
+        return config.max_session_lifetime.count() > 0 &&
+            std::chrono::steady_clock::now() - record->session->launched_steady >= config.max_session_lifetime;
+    }
+
+    void retire_locked(const std::shared_ptr<worker_session_record_t>& record, const char* reason)
+    {
+        if (!record)
+            return;
+        if (record->session) {
+            host->session_terminate(*record->session, ERROR_SUCCESS, nullptr, false);
+            diag::log_tagged_fmt("dec_batch",
+                "pool_recycle reason=%s worker_gen=%llu jobs_done=%u",
+                reason ? reason : "retire",
+                static_cast<unsigned long long>(record->session->worker_generation),
+                static_cast<unsigned int>(record->session->jobs_completed));
+        }
+        if (total_sessions != 0)
+            --total_sessions;
+    }
+
+    struct acquire_outcome_t {
+        std::shared_ptr<worker_session_record_t> record;
+        std::optional<decompiler_provider_result_t> failure;
+    };
+
+    acquire_outcome_t acquire(const worker_pool_key_t& key, bool interactive,
+                              const native_worker_execution_request_t& request,
+                              const cancellation_token_t& cancel,
+                              const decompiler_provider_route_t& route,
+                              const decompiler_provider_request_t& provider_request,
+                              std::chrono::steady_clock::time_point started)
+    {
+        acquire_outcome_t outcome;
+        const auto preempt_started = std::chrono::steady_clock::now();
+        bool preempted_any = false;
+        std::unique_lock lock(mutex);
+        while (true) {
+            if (stopped.load(std::memory_order_acquire)) {
+                outcome.failure.emplace();
+                outcome.failure->status = decompiler_provider_execution_status_t::failed;
+                outcome.failure->diagnostics.push_back(pool_failure_diagnostic(
+                    decompiler_diagnostic_code_t::worker_protocol_failure,
+                    "decompiler.native_host.pool_stopped"));
+                return outcome;
+            }
+            const auto idle_found = idle.find(key);
+            if (idle_found != idle.end()) {
+                auto& queue = idle_found->second;
+                while (!queue.empty()) {
+                    auto record = queue.front();
+                    if (!session_alive(record) || recycle_due(record)) {
+                        queue.pop_front();
+                        retire_locked(record, !record->session || !record->session->healthy
+                            ? "unhealthy" : "bounds");
+                        continue;
+                    }
+                    auto preempt = std::make_shared<std::atomic<bool>>(false);
+                    queue.pop_front();
+                    record->busy = true;
+                    record->interactive = interactive;
+                    record->preempted = false;
+                    try {
+                        record->preempt = std::move(preempt);
+                        record->session->preempt = record->preempt;
+                        busy.insert(record);
+                    } catch (...) {
+                        record->busy = false;
+                        record->preempt.reset();
+                        if (record->session)
+                            record->session->preempt.reset();
+                        retire_locked(record, "reuse_insert_failed");
+                        continue;
+                    }
+                    if (interactive)
+                        ++interactive_busy;
+                    else
+                        ++batch_busy;
+                    if (preempted_any) {
+                        const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - preempt_started).count();
+                        diag::log_tagged_fmt("dec_batch",
+                            "pool_preempt interactive_wait_ms=%lld slot=RECYCLED",
+                            static_cast<long long>(wait_ms));
+                    }
+                    outcome.record = std::move(record);
+                    return outcome;
+                }
+            }
+            const std::size_t capacity = config.batch_slots + config.interactive_reserved_slots;
+            const bool batch_borrow = !interactive && interactive_busy == 0 &&
+                batch_busy >= config.batch_slots;
+            const bool may_spawn = total_sessions < capacity &&
+                (interactive || batch_busy < config.batch_slots || batch_borrow);
+            if (may_spawn) {
+                auto session = std::make_unique<native_worker_host_t::session_state_t>();
+                ++total_sessions;
+                if (interactive)
+                    ++interactive_busy;
+                else
+                    ++batch_busy;
+                lock.unlock();
+                native_worker_execution_result_t launch_result;
+                bool launched = false;
+                std::exception_ptr launch_exception;
+                try {
+                    launched = host->session_launch(request, config.max_jobs_per_session,
+                        *session, launch_result);
+                } catch (...) {
+                    launch_exception = std::current_exception();
+                }
+                lock.lock();
+                if (launch_exception || !launched) {
+                    if (total_sessions != 0)
+                        --total_sessions;
+                    if (interactive)
+                        --interactive_busy;
+                    else
+                        --batch_busy;
+                    wake.notify_all();
+                    if (launch_exception) {
+                        diag::log_tagged_fmt("dec_batch",
+                            "pool_launch_exception interactive=%d", interactive ? 1 : 0);
+                        outcome.failure.emplace();
+                        outcome.failure->status = decompiler_provider_execution_status_t::failed;
+                        outcome.failure->diagnostics.push_back(pool_failure_diagnostic(
+                            decompiler_diagnostic_code_t::worker_protocol_failure,
+                            "decompiler.native_host.pool_launch"));
+                        return outcome;
+                    }
+                    outcome.failure = map_worker_result_to_provider_result(
+                        route, provider_request, cancel, request, launch_result, started);
+                    return outcome;
+                }
+                std::shared_ptr<worker_session_record_t> record;
+                try {
+                    record = std::make_shared<worker_session_record_t>();
+                    record->session = std::move(session);
+                    record->key = key;
+                    record->ordinal = ++next_ordinal;
+                    record->busy = true;
+                    record->interactive = interactive;
+                    record->borrowed = batch_borrow;
+                    record->preempt = std::make_shared<std::atomic<bool>>(false);
+                    record->session->preempt = record->preempt;
+                    busy.insert(record);
+                } catch (...) {
+                    if (record && record->session)
+                        host->session_terminate(*record->session, ERROR_SUCCESS, nullptr, false);
+                    else if (session)
+                        host->session_terminate(*session, ERROR_SUCCESS, nullptr, false);
+                    if (total_sessions != 0)
+                        --total_sessions;
+                    if (interactive)
+                        --interactive_busy;
+                    else
+                        --batch_busy;
+                    wake.notify_all();
+                    throw;
+                }
+                if (preempted_any) {
+                    const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - preempt_started).count();
+                    diag::log_tagged_fmt("dec_batch",
+                        "pool_preempt interactive_wait_ms=%lld slot=FRESH",
+                        static_cast<long long>(wait_ms));
+                }
+                outcome.record = std::move(record);
+                return outcome;
+            }
+            if (interactive && !preempted_any) {
+                std::shared_ptr<worker_session_record_t> victim;
+                std::shared_ptr<worker_session_record_t> mismatched_victim;
+                for (const auto& candidate : busy) {
+                    if (!candidate || candidate->interactive || candidate->preempted)
+                        continue;
+                    auto& selected = candidate->key == key ? victim : mismatched_victim;
+                    if (!selected || (candidate->borrowed && !selected->borrowed) ||
+                        (candidate->borrowed == selected->borrowed && candidate->ordinal < selected->ordinal))
+                        selected = candidate;
+                }
+                if (!victim)
+                    victim = mismatched_victim;
+                if (victim) {
+                    victim->preempted = true;
+                    if (victim->preempt)
+                        victim->preempt->store(true, std::memory_order_release);
+                    preempted_any = true;
+                    diag::log_tagged_fmt("dec_batch",
+                        "pool_preempt_victim ordinal=%llu key_match=%d",
+                        static_cast<unsigned long long>(victim->ordinal),
+                        victim->key == key ? 1 : 0);
+                }
+            }
+            if (cancel.stop_requested() || std::chrono::steady_clock::now() >= provider_request.deadline) {
+                const bool timed_out = cancel.deadline_exceeded() ||
+                    std::chrono::steady_clock::now() >= provider_request.deadline;
+                outcome.failure.emplace();
+                outcome.failure->status = timed_out
+                    ? decompiler_provider_execution_status_t::timed_out
+                    : decompiler_provider_execution_status_t::cancelled;
+                outcome.failure->diagnostics.push_back(pool_failure_diagnostic(
+                    timed_out ? decompiler_diagnostic_code_t::deadline_exceeded
+                              : decompiler_diagnostic_code_t::cancelled,
+                    timed_out ? "decompiler.native_host.pool_deadline"
+                              : "decompiler.native_host.pool_cancelled"));
+                return outcome;
+            }
+            wake.wait_until(lock, (std::min)(provider_request.deadline,
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(10)));
+        }
+    }
+
+    void release(const std::shared_ptr<worker_session_record_t>& record, bool reusable)
+    {
+        if (!record)
+            return;
+        std::lock_guard lock(mutex);
+        if (record->busy) {
+            record->busy = false;
+            busy.erase(record);
+            if (record->interactive)
+                --interactive_busy;
+            else
+                --batch_busy;
+        }
+        if (record->preempt)
+            record->preempt.reset();
+        if (record->session)
+            record->session->preempt.reset();
+        if (stopped.load(std::memory_order_acquire) || !reusable ||
+            !session_alive(record) || recycle_due(record)) {
+            retire_locked(record, stopped.load(std::memory_order_acquire)
+                ? "stopped" : (!reusable ? "unhealthy" : "bounds"));
+        } else {
+            try {
+                idle[record->key].push_back(record);
+            } catch (...) {
+                retire_locked(record, "idle_push_failed");
+            }
+        }
+        wake.notify_all();
+    }
+
+    struct session_lease_guard_t {
+        session_lease_guard_t(std::shared_ptr<state_t> owner,
+                              std::shared_ptr<worker_session_record_t> leased) noexcept
+            : host_state(std::move(owner)), record(std::move(leased)) {}
+        session_lease_guard_t(const session_lease_guard_t&) = delete;
+        session_lease_guard_t& operator=(const session_lease_guard_t&) = delete;
+        ~session_lease_guard_t()
+        {
+            if (!host_state || !record)
+                return;
+            try {
+                host_state->release(record, record->session && record->session->healthy);
+            } catch (...) {
+                diag::log_tagged_fmt("dec_batch", "pool_release_exception ordinal=%llu",
+                    static_cast<unsigned long long>(record->ordinal));
+            }
+        }
+        std::shared_ptr<state_t> host_state;
+        std::shared_ptr<worker_session_record_t> record;
+    };
+
+    void stop_all() noexcept
+    {
+        try {
+            stopped.store(true, std::memory_order_release);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+            std::unique_lock lock(mutex);
+            for (const auto& record : busy) {
+                if (!record)
+                    continue;
+                record->preempted = true;
+                if (record->preempt)
+                    record->preempt->store(true, std::memory_order_release);
+            }
+            for (auto& entry : idle) {
+                for (auto& record : entry.second)
+                    retire_locked(record, "stopped");
+                entry.second.clear();
+            }
+            idle.clear();
+            wake.notify_all();
+            wake.wait_until(lock, deadline, [this] { return busy.empty(); });
+        } catch (...) {
+        }
+    }
+};
+
+pooled_native_worker_provider_host_t::pooled_native_worker_provider_host_t(
+    std::shared_ptr<decompiler_isolated_provider_host_t> fallback_host,
+    std::shared_ptr<native_worker_host_t> session_host,
+    native_worker_session_pool_config_t config)
+    : state_(std::make_shared<state_t>())
+{
+    state_->fallback = std::move(fallback_host);
+    state_->host = std::move(session_host);
+    state_->config = config;
+    if (state_->config.batch_slots == 0)
+        state_->config.batch_slots = 1;
+    if (state_->config.max_jobs_per_session == 0)
+        state_->config.max_jobs_per_session = 256;
+}
+
+pooled_native_worker_provider_host_t::~pooled_native_worker_provider_host_t()
+{
+    stop();
+}
+
+bool pooled_native_worker_provider_host_t::supports(
+    const decompiler_provider_descriptor_t& descriptor) const noexcept
+{
+    if (!descriptor.isolated || !state_ || !state_->host)
+        return false;
+    if (descriptor.identity.provider == decompiler_provider_id_t::ghidra_native)
+        return descriptor.entity_kind == decompiler_entity_kind_t::native_function &&
+            !state_->stopped.load(std::memory_order_acquire);
+    return state_->fallback && state_->fallback->supports(descriptor);
+}
+
+decompiler_provider_result_t pooled_native_worker_provider_host_t::execute(
+    const decompiler_provider_route_t& route,
+    const decompiler_provider_request_t& request,
+    const cancellation_token_t& cancel)
+{
+    const auto started = std::chrono::steady_clock::now();
+    decompiler_provider_result_t result;
+    if (!state_ || !state_->host || !state_->fallback ||
+        route.descriptor.identity.provider != decompiler_provider_id_t::ghidra_native) {
+        if (state_ && state_->fallback)
+            return state_->fallback->execute(route, request, cancel);
+        result.diagnostics.push_back(pool_failure_diagnostic(
+            decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.native_host.route_rejected"));
+        return result;
+    }
+    if (!supports(route.descriptor) || !route.provider) {
+        result.diagnostics.push_back(pool_failure_diagnostic(
+            decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.native_host.route_rejected"));
+        return result;
+    }
+    if (cancel.stop_requested() || started >= request.deadline) {
+        const bool timed_out = cancel.deadline_exceeded() || started >= request.deadline;
+        result.status = timed_out ? decompiler_provider_execution_status_t::timed_out
+                                  : decompiler_provider_execution_status_t::cancelled;
+        result.diagnostics.push_back(pool_failure_diagnostic(
+            timed_out ? decompiler_diagnostic_code_t::deadline_exceeded
+                      : decompiler_diagnostic_code_t::cancelled,
+            timed_out ? "decompiler.native_host.deadline" : "decompiler.native_host.cancelled"));
+        return result;
+    }
+    if (request.cache_key.stage != decompiler_cache_stage_t::provider_ir ||
+        !validate_decompiler_pipeline_cache_key(request.cache_key).valid() ||
+        !same_provider(request.cache_key.provider, route.descriptor.identity)) {
+        result.diagnostics.push_back(pool_failure_diagnostic(
+            decompiler_diagnostic_code_t::invalid_contract,
+            "decompiler.isolated_host.request_rejected"));
+        return result;
+    }
+    const auto context = std::dynamic_pointer_cast<const ghidra_native_provider_context_t>(request.context);
+    if (!context || !context->snapshot() || context->snapshot()->empty() ||
+        context->snapshot_hash().empty() ||
+        context->snapshot()->size() > state_->host->limits().max_snapshot_bytes) {
+        result.diagnostics.push_back(pool_failure_diagnostic(
+            decompiler_diagnostic_code_t::invalid_contract,
+            "decompiler.isolated_host.input_snapshot_rejected"));
+        return result;
+    }
+    auto job_id = state_->next_job_id.fetch_add(1, std::memory_order_acq_rel);
+    if (job_id == 0)
+        job_id = state_->next_job_id.fetch_add(1, std::memory_order_acq_rel);
+    native_worker_execution_request_t worker_request;
+    worker_request.job_id = job_id;
+    worker_request.cache_key = request.cache_key;
+    worker_request.profile = request.cache_key.profile;
+    native_worker_snapshot_t snapshot;
+    snapshot.bytes = context->snapshot();
+    snapshot.hash = context->snapshot_hash();
+    worker_request.snapshot = std::move(snapshot);
+    worker_request.deadline = request.deadline;
+    worker_request.cancellation_requested = [cancel] {
+        return cancel.stop_requested();
+    };
+    const auto key = make_worker_pool_key(request, context->snapshot_hash());
+    auto acquired = state_->acquire(key, request.interactive, worker_request, cancel,
+        route, request, started);
+    if (!acquired.record) {
+        if (acquired.failure)
+            return std::move(*acquired.failure);
+        result.diagnostics.push_back(pool_failure_diagnostic(
+            decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.native_host.pool_acquire"));
+        return result;
+    }
+    state_t::session_lease_guard_t lease(state_, acquired.record);
+    native_worker_execution_result_t worker_result;
+    try {
+        worker_result = state_->host->execute_on_session(*acquired.record->session, worker_request);
+    } catch (...) {
+        if (acquired.record->session)
+            acquired.record->session->healthy = false;
+        throw;
+    }
+    return map_worker_result_to_provider_result(route, request, cancel, worker_request, worker_result, started);
+}
+
+void pooled_native_worker_provider_host_t::stop() noexcept
+{
+    if (state_)
+        state_->stop_all();
+}
+
+std::optional<pooled_native_worker_provider_host_t::slot_class_t>
+pooled_native_worker_provider_host_t::classify_interactive_dispatch() const noexcept
+{
+    const auto state = state_;
+    if (!state || state->stopped.load(std::memory_order_acquire))
+        return std::nullopt;
+    std::lock_guard lock(state->mutex);
+    return state->interactive_busy < state->config.interactive_reserved_slots
+        ? std::optional<slot_class_t>(slot_class_t::reserved)
+        : std::optional<slot_class_t>(slot_class_t::borrowed);
+}
+
+std::shared_ptr<decompiler_isolated_provider_host_t> create_pooled_native_worker_provider_host(
+    const packaged_native_worker_runtime_t& runtime,
+    native_worker_session_pool_config_t config)
+{
+    if (!runtime.provider_host || !runtime.native_host)
+        return runtime.provider_host;
+    if (config.batch_slots == 0)
+        config.batch_slots = 1;
+    const std::size_t capacity = config.batch_slots + config.interactive_reserved_slots + 1;
+    auto session_host = runtime.native_host->for_session_pool(capacity);
+    if (!session_host)
+        return runtime.provider_host;
+    diag::log_tagged_fmt("dec_batch",
+        "pool_create batch_slots=%zu interactive_reserved=%zu max_jobs=%u max_lifetime_ms=%lld",
+        config.batch_slots,
+        config.interactive_reserved_slots,
+        static_cast<unsigned int>(config.max_jobs_per_session),
+        static_cast<long long>(config.max_session_lifetime.count()));
+    return std::make_shared<pooled_native_worker_provider_host_t>(
+        runtime.provider_host, std::move(session_host), config);
 }
 
 }

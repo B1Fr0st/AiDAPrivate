@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -380,6 +382,140 @@ inline bool verify_snapshot(const startup_t& startup, const decompiler_worker_jo
     UnmapViewOfFile(view);
     return valid;
 }
+
+enum class job_receive_result_t : std::uint8_t {
+    received,
+    idle_timeout,
+    pipe_closed
+};
+
+struct job_receive_outcome_t {
+    job_receive_result_t result = job_receive_result_t::pipe_closed;
+    std::optional<decompiler_worker_job_request_t> job;
+};
+
+inline job_receive_outcome_t receive_job_or_shutdown(startup_t& startup, std::chrono::milliseconds timeout)
+{
+    job_receive_outcome_t outcome;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        wire::frame_t frame;
+        DWORD error = ERROR_SUCCESS;
+        const auto state = startup.reader.poll(startup.read_handle, startup.session, startup.next_host_sequence,
+            k_decompiler_worker_control_frame_max_bytes, frame, error);
+        if (state == wire::read_state_t::failure) {
+            outcome.result = job_receive_result_t::pipe_closed;
+            return outcome;
+        }
+        if (state == wire::read_state_t::complete) {
+            ++startup.next_host_sequence;
+            const auto decoded = deserialize_decompiler_worker_message(
+                std::string(reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size()));
+            if (!decoded.valid() || !decoded.value || !std::holds_alternative<decompiler_worker_job_request_t>(*decoded.value)) {
+                outcome.result = job_receive_result_t::pipe_closed;
+                return outcome;
+            }
+            const auto& job = std::get<decompiler_worker_job_request_t>(*decoded.value);
+            const auto validation = validate_decompiler_worker_message(*decoded.value);
+            if (!validation.valid() || job.envelope.sequence != frame.sequence || job.envelope.session_nonce_hash != startup.session.nonce_hash) {
+                outcome.result = job_receive_result_t::pipe_closed;
+                return outcome;
+            }
+            outcome.result = job_receive_result_t::received;
+            outcome.job = job;
+            return outcome;
+        }
+        Sleep(2);
+    }
+    outcome.result = job_receive_result_t::idle_timeout;
+    return outcome;
+}
+
+class cancel_pump_t final {
+public:
+    cancel_pump_t() = default;
+    cancel_pump_t(const cancel_pump_t&) = delete;
+    cancel_pump_t& operator=(const cancel_pump_t&) = delete;
+
+    ~cancel_pump_t()
+    {
+        stop();
+    }
+
+    bool start(startup_t& startup) noexcept
+    {
+        if (thread_.joinable())
+            return false;
+        exit_.store(false, std::memory_order_release);
+        cancelled_.store(false, std::memory_order_release);
+        consumed_.store(false, std::memory_order_release);
+        startup_ = &startup;
+        try {
+            thread_ = std::thread([this] { run(); });
+        } catch (...) {
+            startup_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    void stop() noexcept
+    {
+        exit_.store(true, std::memory_order_release);
+        if (thread_.joinable())
+            thread_.join();
+        startup_ = nullptr;
+    }
+
+    std::atomic<bool>* cancel_flag() noexcept
+    {
+        return &cancelled_;
+    }
+
+    bool consumed_cancel() const noexcept
+    {
+        return consumed_.load(std::memory_order_acquire);
+    }
+
+private:
+    void run() noexcept
+    {
+        startup_t* const startup = startup_;
+        if (!startup)
+            return;
+        while (!exit_.load(std::memory_order_acquire) && !cancelled_.load(std::memory_order_acquire)) {
+            wire::frame_t frame;
+            DWORD error = ERROR_SUCCESS;
+            const auto state = startup->reader.poll(startup->read_handle, startup->session,
+                startup->next_host_sequence, k_decompiler_worker_control_frame_max_bytes, frame, error);
+            if (state == wire::read_state_t::failure)
+                return;
+            if (state == wire::read_state_t::complete) {
+                ++startup->next_host_sequence;
+                const auto decoded = deserialize_decompiler_worker_message(
+                    std::string(reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size()));
+                if (!decoded.valid() || !decoded.value ||
+                    !std::holds_alternative<decompiler_worker_cancel_request_t>(*decoded.value))
+                    return;
+                const auto& cancel = std::get<decompiler_worker_cancel_request_t>(*decoded.value);
+                const auto validation = validate_decompiler_worker_message(*decoded.value);
+                if (!validation.valid() || cancel.envelope.sequence != frame.sequence ||
+                    cancel.envelope.session_nonce_hash != startup->session.nonce_hash)
+                    return;
+                consumed_.store(true, std::memory_order_release);
+                cancelled_.store(true, std::memory_order_release);
+                return;
+            }
+            Sleep(2);
+        }
+    }
+
+    startup_t* startup_ = nullptr;
+    std::thread thread_;
+    std::atomic<bool> exit_{false};
+    std::atomic<bool> cancelled_{false};
+    std::atomic<bool> consumed_{false};
+};
 
 inline std::optional<decompiler_worker_cancel_request_t> receive_cancel(startup_t& startup, std::chrono::milliseconds timeout)
 {

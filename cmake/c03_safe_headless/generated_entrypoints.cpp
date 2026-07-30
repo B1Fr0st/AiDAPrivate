@@ -1,4 +1,3 @@
-#include "authority_surface_ledger.hpp"
 #include "managed_reader_harness.hpp"
 #include "packed_store_harness.hpp"
 #include "pe_reader_harness.hpp"
@@ -48,10 +47,7 @@ bool report(bool passed, const std::string& failure)
 
 int main()
 {
-#if defined(AIDA_C03_ENTRY_AUTHORITY)
-    const auto result = aida::tests::c03::run_authority_surface_ledger_harness();
-    return report(result.passed, result.failure) ? 0 : 1;
-#elif defined(AIDA_C03_ENTRY_PROVIDER_SNAPSHOT)
+#if defined(AIDA_C03_ENTRY_PROVIDER_SNAPSHOT)
     const auto root = scratch_root("provider-snapshot");
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);

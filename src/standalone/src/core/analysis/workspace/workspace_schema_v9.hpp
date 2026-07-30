@@ -126,6 +126,31 @@ struct packed_generation_publication_t {
     std::vector<packed_page_index_row_t> index;
 };
 
+struct packed_generation_staging_row_t {
+    std::uint64_t generation = 0;
+    std::uint16_t domain = 0;
+    std::uint32_t domain_page_index = 0;
+    std::uint32_t ordinal_begin = 0;
+    std::uint32_t record_count = 0;
+    std::uint64_t address_value_min = 0;
+    std::uint64_t address_value_max = 0;
+    std::vector<std::uint8_t> payload;
+};
+
+struct decompiler_pipeline_cache_v1_row_t {
+    std::vector<std::uint8_t> cache_key;
+    std::int64_t stage = 0;
+    std::string workspace_id;
+    std::uint64_t generation = 0;
+    std::uint64_t analysis_revision = 0;
+    std::uint64_t overlay_revision = 0;
+    std::uint64_t function_rva = 0;
+    std::vector<std::uint8_t> value;
+    std::vector<std::uint8_t> diagnostics;
+    std::int64_t created_utc_ms = 0;
+    std::int64_t last_access_utc_ms = 0;
+};
+
 using packed_stop_predicate_t = std::function<bool()>;
 using packed_publish_stop_predicate_t = packed_stop_predicate_t;
 using packed_page_stream_sink_t = std::function<workspace_result_t<void>(
@@ -281,7 +306,41 @@ workspace_result_t<void> publish_packed_generation(
     sqlite3* database, std::uint64_t generation,
     const packed_stop_predicate_t& stop_requested = {});
 
+workspace_result_t<void> publish_packed_generation_metadata(
+    sqlite3* database, std::uint64_t generation,
+    const packed_stop_predicate_t& stop_requested = {});
+
 workspace_result_t<void> rollback_packed_generation(
     sqlite3* database, std::uint64_t generation);
+
+workspace_result_t<void> write_packed_generation_staging_page(
+    sqlite3* database, const packed_generation_staging_row_t& row);
+
+using packed_generation_staging_visitor_t = std::function<workspace_result_t<void>(
+    packed_generation_staging_row_t)>;
+
+workspace_result_t<void> visit_packed_generation_staging(
+    sqlite3* database, std::uint64_t generation, std::uint16_t domain,
+    const packed_generation_staging_visitor_t& visitor,
+    const packed_stop_predicate_t& stop_requested = {});
+
+workspace_result_t<void> delete_packed_generation_staging(
+    sqlite3* database, std::uint64_t generation);
+
+workspace_result_t<void> gc_packed_generation_staging(sqlite3* database);
+
+workspace_result_t<void> write_pipeline_cache_v1(
+    sqlite3* database, const decompiler_pipeline_cache_v1_row_t& record);
+
+workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>
+    read_pipeline_cache_v1(sqlite3* database,
+                           const std::vector<std::uint8_t>& cache_key);
+
+workspace_result_t<void> delete_pipeline_cache_v1(
+    sqlite3* database, const std::string& workspace_id);
+
+workspace_result_t<void> delete_pipeline_cache_v1_functions(
+    sqlite3* database, const std::string& workspace_id,
+    const std::vector<std::uint64_t>& function_rvas);
 
 }

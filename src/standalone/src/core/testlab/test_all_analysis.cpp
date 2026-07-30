@@ -7,6 +7,7 @@
 #include "../analysis/code_patcher.hpp"
 #include "../analysis/integrity_hunter.hpp"
 #include "../analysis/binary_map.hpp"
+#include "../analysis/benchmark/benchmark_runner.hpp"
 #include "../analysis/source_reconstructor.hpp"
 #include "../analysis/xref_engine.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
@@ -29,6 +30,8 @@
 #include "../editor/expression_eval.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../../helpers/diag_log.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <Windows.h>
 #include <algorithm>
@@ -4934,6 +4937,110 @@ static void test_stale_revisions_and_decompiler_errors(HANDLE hf, std::atomic<in
     passed.fetch_add(1);
 }
 
+static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    char path_buffer[MAX_PATH]{};
+    const DWORD path_length = GetEnvironmentVariableA("AIDA_BENCHMARK_REAL_PE", path_buffer, MAX_PATH);
+    if (path_length == 0 || path_length >= MAX_PATH) {
+        log_msg(hf, "analysis", "SKIP -- AIDA_BENCHMARK_REAL_PE not set; real 300MB benchmark not run");
+        passed.fetch_add(1);
+        return;
+    }
+    std::error_code path_error;
+    const auto fixture_path = std::filesystem::u8path(path_buffer);
+    if (!std::filesystem::is_regular_file(fixture_path, path_error)) {
+        log_msg(hf, "analysis", "FAIL -- AIDA_BENCHMARK_REAL_PE is not a regular file path=%s", path_buffer);
+        failed.fetch_add(1);
+        return;
+    }
+    std::error_code size_error;
+    const auto fixture_size = std::filesystem::file_size(fixture_path, size_error);
+    if (size_error || fixture_size < 300000000ULL || fixture_size > 500000000ULL) {
+        log_msg(hf, "analysis", "FAIL -- real benchmark fixture outside the 300000000..500000000 byte window path=%s size=%llu error=%d",
+            path_buffer, static_cast<unsigned long long>(fixture_size),
+            size_error ? size_error.value() : 0);
+        failed.fetch_add(1);
+        return;
+    }
+    char relax_buffer[8]{};
+    const DWORD relax_length = GetEnvironmentVariableA("AIDA_BENCHMARK_REAL_SLA_RELAX", relax_buffer, sizeof(relax_buffer));
+    const bool sla_relaxed = relax_length != 0 && relax_length < sizeof(relax_buffer) && relax_buffer[0] == '1';
+    log_msg(hf, "analysis", "benchmark run_begin mode=%s path=%s size=%llu relaxed=%d",
+        "real", path_buffer, static_cast<unsigned long long>(fixture_size), sla_relaxed ? 1 : 0);
+
+    aida::analysis::benchmark::benchmark_run_request_t request;
+    request.mode = aida::analysis::benchmark::benchmark_mode_t::real;
+    request.real_path = path_buffer;
+    request.sla_relaxed = sla_relaxed;
+    const auto run_begin = GetTickCount64();
+    auto result = aida::analysis::benchmark::run_benchmark(request, {});
+    const auto run_wall_ms = GetTickCount64() - run_begin;
+
+    std::string failing_keys;
+    bool parse_ok = false;
+    if (!result.scorecard_json.empty()) {
+        try {
+            const auto scorecard = nlohmann::json::parse(result.scorecard_json);
+            parse_ok = true;
+            const auto number_or_zero = [](const nlohmann::json& object, const char* key) {
+                return object.contains(key) && object[key].is_number()
+                    ? object[key].get<double>() : 0.0;
+            };
+            if (scorecard.contains("throughput")) {
+                const auto& throughput = scorecard["throughput"];
+                log_msg(hf, "analysis", "benchmark throughput file_Bps=%.1f decode_Bps=%.1f instr_s=%.1f funcs_s=%.2f",
+                    number_or_zero(throughput, "file_bytes_per_s"),
+                    number_or_zero(throughput, "decode_bytes_per_s"),
+                    number_or_zero(throughput, "instructions_per_s"),
+                    number_or_zero(throughput, "decompile_all_funcs_per_s"));
+            }
+            if (scorecard.contains("memory")) {
+                const auto& memory = scorecard["memory"];
+                const auto u64_or_zero = [](const nlohmann::json& object, const char* key) {
+                    return object.contains(key) && object[key].is_number()
+                        ? object[key].get<std::uint64_t>() : 0ULL;
+                };
+                log_msg(hf, "analysis", "benchmark memory peak_private=%llu resident_peak=%llu",
+                    static_cast<unsigned long long>(u64_or_zero(memory, "peak_private_bytes")),
+                    static_cast<unsigned long long>(u64_or_zero(memory, "resident_bytes_peak")));
+            }
+            if (scorecard.contains("sla") && scorecard["sla"].contains("verdicts")) {
+                for (const auto& verdict : scorecard["sla"]["verdicts"]) {
+                    const auto key = verdict.value("key", std::string());
+                    const auto state = verdict.value("verdict", std::string());
+                    log_msg(hf, "analysis", "benchmark sla key=%s target=%s actual=%s verdict=%s",
+                        key.c_str(),
+                        verdict["target"].is_null() ? "null" : verdict["target"].dump().c_str(),
+                        verdict["actual"].is_null() ? "null" : verdict["actual"].dump().c_str(),
+                        state.c_str());
+                    if (state == "FAIL") {
+                        if (!failing_keys.empty())
+                            failing_keys += ",";
+                        failing_keys += key;
+                    }
+                }
+            }
+        } catch (const nlohmann::json::exception& exception) {
+            log_msg(hf, "analysis", "benchmark scorecard parse failed: %s", exception.what());
+        }
+    }
+    log_msg(hf, "analysis", "benchmark run_end wall_ms=%llu verdict=%s report=%s",
+        static_cast<unsigned long long>(run_wall_ms),
+        result.verdict.c_str(),
+        result.report_json_path.empty() ? result.error.c_str() : result.report_json_path.c_str());
+
+    if (result.ok && result.verdict == "PASS") {
+        log_msg(hf, "analysis", "PASS -- analysis_benchmark_real_300mb sla_overall=%s parse_ok=%d relaxed=%d",
+            result.sla_overall.c_str(), parse_ok ? 1 : 0, sla_relaxed ? 1 : 0);
+        passed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "analysis", "FAIL -- analysis_benchmark_real_300mb verdict=%s sla_overall=%s failing_keys=%s error=%s",
+        result.verdict.c_str(), result.sla_overall.c_str(),
+        failing_keys.empty() ? "<none>" : failing_keys.c_str(),
+        result.error.empty() ? "<none>" : result.error.c_str());
+    failed.fetch_add(1);
+}
+
 using analysis_test_fn_t = void (*)(HANDLE, std::atomic<int>&, std::atomic<int>&);
 
 struct analysis_test_entry_t {
@@ -5149,6 +5256,7 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "symbolic_inner_expression",   test_symbolic_inner_expression   },
         { "protection_inner_scan",       test_protection_inner_scan       },
         { "protection_inner_controls",   test_protection_inner_controls   },
+        { "analysis_benchmark_real_300mb", test_analysis_benchmark_real_300mb, 600000 },
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));

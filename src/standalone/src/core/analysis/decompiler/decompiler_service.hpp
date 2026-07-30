@@ -17,12 +17,16 @@
 
 namespace aida::analysis {
 
+class analysis_metrics_t;
+class workspace_database_t;
+
 enum class decompiler_pipeline_invocation_t : std::uint8_t {
     unspecified = 0,
     explicit_ui = 1,
     explicit_mcp = 2,
     explicit_api = 3,
-    baseline_analysis = 4
+    baseline_analysis = 4,
+    background_batch = 5
 };
 
 enum class decompiler_pipeline_cache_mode_t : std::uint8_t {
@@ -56,6 +60,17 @@ struct decompiler_profile_policy_t {
 };
 
 decompiler_profile_policy_t default_decompiler_profile_policy();
+
+enum class decompiler_rendered_probe_stage_t : std::uint8_t {
+    none = 0,
+    memory_rendered = 1,
+    persistent_rendered = 2
+};
+
+struct decompiler_rendered_probe_result_t {
+    decompiler_rendered_probe_stage_t hit_stage = decompiler_rendered_probe_stage_t::none;
+    std::shared_ptr<const decompiler_rendered_cache_value_t> rendered;
+};
 
 struct decompiler_pipeline_cache_identity_t {
     sha256_digest_t worker_protocol_hash;
@@ -117,6 +132,8 @@ struct decompiler_pipeline_service_config_t {
     std::shared_ptr<decompiler_isolated_provider_host_t> isolated_provider_host;
     pseudocode_readability_limits_t readability_limits;
     bool require_complete_source_map = true;
+    std::shared_ptr<workspace_database_t> database;
+    std::shared_ptr<analysis_metrics_t> metrics_sink;
 };
 
 struct decompiler_pipeline_service_snapshot_t {
@@ -153,9 +170,15 @@ public:
     decompiler_pipeline_result_t decompile(
         const decompiler_pipeline_request_t& request,
         const cancellation_token_t& cancel = {});
+    decompiler_rendered_probe_result_t probe_rendered_cache(
+        const decompiler_pipeline_request_t& request);
     workspace_result_t<void> invalidate_workspace(
         const std::string& workspace_id,
         std::uint64_t generation);
+    workspace_result_t<void> invalidate_entities(
+        const std::string& workspace_id,
+        std::uint64_t generation,
+        const std::vector<decompiler_entity_key_t>& entities);
     decompiler_pipeline_service_snapshot_t snapshot() const;
     void request_stop() noexcept;
 

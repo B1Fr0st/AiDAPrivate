@@ -6,6 +6,7 @@
 #include <limits>
 #include <mutex>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -20,6 +21,7 @@ using cache_payload_t = std::variant<
 
 struct cache_entry_t {
     decompiler_cache_stage_t stage = decompiler_cache_stage_t::provider_ir;
+    decompiler_entity_key_t entity;
     cache_payload_t payload;
     sha256_digest_t content_hash;
     std::uint64_t resident_bytes = 0;
@@ -182,6 +184,121 @@ std::string serialize_cache_value(const decompiler_rendered_cache_value_t& value
     append_semantic_facts(output, value.semantic_facts);
     append_diagnostics(output, value.diagnostics);
     return output;
+}
+
+class bounded_reader_t final {
+public:
+    explicit bounded_reader_t(std::string_view bytes) noexcept : bytes_(bytes) {}
+
+    bool complete() const noexcept { return valid_ && offset_ == bytes_.size(); }
+
+    bool u64(std::uint64_t& value) noexcept
+    {
+        if (!valid_ || bytes_.size() - offset_ < 8) {
+            valid_ = false;
+            return false;
+        }
+        value = 0;
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            value |= static_cast<std::uint64_t>(
+                static_cast<std::uint8_t>(bytes_[offset_++])) << shift;
+        return true;
+    }
+
+    bool blob(std::string& value)
+    {
+        std::uint64_t size = 0;
+        if (!u64(size) || size > bytes_.size() - offset_) {
+            valid_ = false;
+            return false;
+        }
+        try {
+            value.assign(bytes_.data() + offset_, static_cast<std::size_t>(size));
+        } catch (...) {
+            valid_ = false;
+            return false;
+        }
+        offset_ += static_cast<std::size_t>(size);
+        return true;
+    }
+
+private:
+    std::string_view bytes_;
+    std::size_t offset_ = 0;
+    bool valid_ = true;
+};
+
+bool read_semantic_facts(
+    bounded_reader_t& reader,
+    std::vector<semantic_refinement_fact_t>& facts)
+{
+    std::uint64_t count = 0;
+    if (!reader.u64(count) || count > (1U << 20))
+        return false;
+    facts.clear();
+    facts.reserve(static_cast<std::size_t>(count));
+    for (std::uint64_t index = 0; index < count; ++index) {
+        semantic_refinement_fact_t fact;
+        std::uint64_t confidence = 0;
+        std::uint64_t provenance = 0;
+        std::string coordinate;
+        if (!reader.u64(fact.ordinal) || !reader.blob(fact.stable_id) ||
+            !reader.blob(fact.refinement_key) || !reader.blob(coordinate) ||
+            !reader.u64(confidence) || !reader.u64(provenance))
+            return false;
+        auto decoded = deserialize_source_coordinate(coordinate);
+        if (!decoded.valid())
+            return false;
+        fact.coordinate = std::move(*decoded.value);
+        if (confidence > 100 ||
+            provenance > static_cast<std::uint64_t>(
+                std::numeric_limits<std::underlying_type_t<decompiler_fact_provenance_t>>::max()))
+            return false;
+        fact.confidence = static_cast<std::uint8_t>(confidence);
+        fact.provenance = static_cast<decompiler_fact_provenance_t>(provenance);
+        facts.push_back(std::move(fact));
+    }
+    return true;
+}
+
+bool read_diagnostics(
+    bounded_reader_t& reader,
+    std::vector<decompiler_diagnostic_t>& diagnostics)
+{
+    std::uint64_t count = 0;
+    if (!reader.u64(count) || count > (1U << 20))
+        return false;
+    diagnostics.clear();
+    diagnostics.reserve(static_cast<std::size_t>(count));
+    for (std::uint64_t index = 0; index < count; ++index) {
+        std::string encoded;
+        if (!reader.blob(encoded))
+            return false;
+        auto decoded = deserialize_decompiler_diagnostic(encoded);
+        if (!decoded.valid())
+            return false;
+        diagnostics.push_back(std::move(*decoded.value));
+    }
+    return true;
+}
+
+bool entity_matches_invalidation_probe(
+    const decompiler_entity_key_t& stored,
+    const decompiler_entity_key_t& probe) noexcept
+{
+    if (stored.kind != probe.kind || stored.format != probe.format ||
+        stored.architecture != probe.architecture || stored.mode != probe.mode ||
+        stored.endian != probe.endian)
+        return false;
+    if (stored.kind == decompiler_entity_kind_t::native_function) {
+        const auto* left = std::get_if<native_decompiler_entity_identity_t>(&stored.identity);
+        const auto* right = std::get_if<native_decompiler_entity_identity_t>(&probe.identity);
+        if (!left || !right)
+            return false;
+        return left->function_id == right->function_id &&
+               left->entry == right->entry && left->end == right->end;
+    }
+    return stable_serialization_hash(stored) == stable_serialization_hash(probe);
 }
 
 bool equal_provider(
@@ -649,6 +766,7 @@ workspace_result_t<void> store_value(
 
     cache_entry_t entry;
     entry.stage = stage;
+    entry.entity = key.entity;
     entry.payload = std::move(payload);
     entry.content_hash = content_hash;
     entry.resident_bytes = resident_bytes;
@@ -662,6 +780,36 @@ workspace_result_t<void> store_value(
     return workspace_result_t<void>::success();
 }
 
+}
+
+std::string serialize_decompiler_rendered_cache_value(
+    const decompiler_rendered_cache_value_t& value)
+{
+    return serialize_cache_value(value);
+}
+
+std::optional<decompiler_rendered_cache_value_t>
+    deserialize_decompiler_rendered_cache_value(std::string_view bytes) noexcept
+{
+    if (bytes.empty() || bytes.size() > (64ULL << 20))
+        return std::nullopt;
+    try {
+        bounded_reader_t reader(bytes);
+        std::string document;
+        if (!reader.blob(document))
+            return std::nullopt;
+        auto decoded_document = deserialize_decompiler_document(document);
+        if (!decoded_document.valid())
+            return std::nullopt;
+        decompiler_rendered_cache_value_t value;
+        value.document = std::move(*decoded_document.value);
+        if (!read_semantic_facts(reader, value.semantic_facts) ||
+            !read_diagnostics(reader, value.diagnostics) || !reader.complete())
+            return std::nullopt;
+        return value;
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 struct decompiler_cache_v9_t::state_t : cache_state_data_t {
@@ -796,6 +944,41 @@ workspace_result_t<void> decompiler_cache_v9_t::invalidate_stage(
     }
     for (auto entry = workspace->second.entries.begin(); entry != workspace->second.entries.end();) {
         if (entry->second.stage != stage) {
+            ++entry;
+            continue;
+        }
+        auto erase = entry++;
+        erase_entry(*state_, workspace->second, erase, false);
+    }
+    ++state_->explicit_invalidations;
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> decompiler_cache_v9_t::invalidate_entities(
+    const std::string& workspace_id,
+    const std::uint64_t generation,
+    const std::vector<decompiler_entity_key_t>& entities)
+{
+    if (workspace_id.empty() || workspace_id.size() > state_->limits.max_workspace_id_bytes) {
+        return workspace_result_t<void>::failure(
+            cache_error(workspace_error_code_t::invalid_argument,
+                        "cache invalidation workspace identity is invalid", workspace_id));
+    }
+    std::lock_guard lock(state_->mutex);
+    auto workspace = state_->workspaces.find(workspace_id);
+    if (workspace == state_->workspaces.end() || workspace->second.generation != generation) {
+        return workspace_result_t<void>::failure(
+            cache_error(workspace_error_code_t::stale_generation,
+                        "cache entity invalidation generation is stale", workspace_id));
+    }
+    if (entities.empty())
+        return workspace_result_t<void>::success();
+    for (auto entry = workspace->second.entries.begin(); entry != workspace->second.entries.end();) {
+        const bool evict = std::any_of(entities.begin(), entities.end(),
+            [&entry](const decompiler_entity_key_t& probe) {
+                return entity_matches_invalidation_probe(entry->second.entity, probe);
+            });
+        if (!evict) {
             ++entry;
             continue;
         }

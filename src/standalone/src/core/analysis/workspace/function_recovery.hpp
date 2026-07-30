@@ -110,6 +110,7 @@ struct block_recovery_result_t {
     std::vector<std::uint32_t> terminator_instruction_indices;
     std::vector<edge_record_t> edges;
     std::uint64_t storage_bytes = 0;
+    std::uint64_t shard_merge_ns = 0;
 };
 
 struct function_recovery_result_t {
@@ -130,6 +131,7 @@ struct function_recovery_result_t {
     std::uint64_t synthetic_gap_functions = 0;
     std::uint64_t converged_seed_count = 0;
     std::uint64_t delay_slot_transfer_count = 0;
+    std::uint64_t shard_merge_ns = 0;
 };
 
 class function_recovery_t final {

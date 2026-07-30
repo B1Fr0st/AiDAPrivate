@@ -6,10 +6,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
 namespace aida::analysis {
+
+class analysis_metrics_t;
 
 inline constexpr std::uint64_t calling_convention_rules_revision = 2;
 inline constexpr std::uint64_t calling_convention_max_arguments = 256;
@@ -298,6 +301,17 @@ workspace_result_t<cc_analysis_result_t>
 infer_calling_convention(const analysis_workspace_t& workspace,
                          const calling_convention_request_t& request,
                          const cancellation_token_t& cancel);
+
+struct calling_convention_batch_options_t {
+    std::uint32_t worker_count = 0;
+    std::shared_ptr<analysis_metrics_t> metrics;
+};
+
+workspace_result_t<std::vector<workspace_result_t<cc_analysis_result_t>>>
+infer_calling_conventions_batch(const analysis_workspace_t& workspace,
+    const std::vector<calling_convention_request_t>& requests,
+    const calling_convention_batch_options_t& options,
+    const cancellation_token_t& cancel);
 
 workspace_result_t<cc_analysis_result_t>
 merge_calling_convention_results(const std::vector<cc_analysis_result_t>& candidates,

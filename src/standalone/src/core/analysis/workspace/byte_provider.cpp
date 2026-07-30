@@ -157,6 +157,7 @@ struct mapped_file_provider_t::state_t {
     std::shared_ptr<provider_snapshot_t> snapshot;
     byte_provider_identity_t identity;
     mapped_file_provider_options_t options;
+    bool pin_active = false;
 };
 
 workspace_result_t<void> byte_provider_t::read_exact(
@@ -307,25 +308,43 @@ mapped_file_provider_t::open(const std::string& utf8_path,
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "mapped-file provider limits are invalid", "byte_provider_open"));
     mapped_window_cache_options_t cache_options;
-    cache_options.max_lease_bytes =
-        (std::min)(cache_options.window_bytes, options.max_lease_size);
+    cache_options.window_bytes = 0;
+    cache_options.max_cached_window_bytes = 0;
+    cache_options.max_lease_bytes = options.max_lease_size;
     cache_options.immutable_source = true;
     auto cached = mapped_window_cache_t::open(utf8_path, cache_options);
     if (!cached)
         return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
             cached.error());
-    byte_provider_identity_t identity = cached.value()->identity();
-    auto snapshot = provider_snapshot_t::capture(cached.take_value());
+    std::shared_ptr<mapped_window_cache_t> cache = cached.take_value();
+    byte_provider_identity_t identity = cache->identity();
+    auto snapshot = provider_snapshot_t::capture(cache);
     if (!snapshot)
         return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
             snapshot.error());
-    identity.immutable_snapshot = false;
-    identity.content_sha256 = snapshot.value()->identity().content_sha256;
+    bool pin_active = false;
+    if (options.pin_local_file_snapshot) {
+        auto digest = snapshot.value()->compute_content_sha256();
+        if (!digest)
+            return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
+                digest.error());
+        auto revalidated = cache->revalidate();
+        if (!revalidated)
+            return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
+                revalidated.error());
+        identity.content_sha256 = digest.take_value();
+        identity.immutable_snapshot = true;
+        pin_active = true;
+    } else {
+        identity.immutable_snapshot = false;
+        identity.content_sha256 = snapshot.value()->identity().content_sha256;
+    }
     try {
         auto state = std::make_shared<state_t>();
         state->snapshot = snapshot.take_value();
         state->identity = std::move(identity);
         state->options = options;
+        state->pin_active = pin_active;
         return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::success(
             std::shared_ptr<mapped_file_provider_t>(new mapped_file_provider_t(std::move(state))));
     } catch (const std::bad_alloc&) {
@@ -355,11 +374,21 @@ std::uint64_t mapped_file_provider_t::maximum_contiguous_lease(
     return (std::min)(state_->identity.size - offset, state_->options.max_lease_size);
 }
 
+bool mapped_file_provider_t::content_pin_active() const noexcept {
+    return state_->pin_active;
+}
+
+std::optional<mapped_window_cache_statistics_t>
+mapped_file_provider_t::window_cache_statistics() const noexcept {
+    return state_->snapshot->source()->window_cache_statistics();
+}
+
 workspace_result_t<void> mapped_file_provider_t::revalidate() const {
     auto valid = state_->snapshot->validate_source();
     if (!valid)
         return valid;
-    if (state_->snapshot->identity().content_sha256 != state_->identity.content_sha256)
+    const auto& snapshot_hash = state_->snapshot->identity().content_sha256;
+    if (snapshot_hash && snapshot_hash != state_->identity.content_sha256)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "mapped snapshot content identity diverged",

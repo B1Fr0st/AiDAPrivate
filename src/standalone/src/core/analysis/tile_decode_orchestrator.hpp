@@ -85,6 +85,7 @@ public:
 struct production_tile_decode_executor_options_t final {
     arch_decoder_key_t decoder_key;
     std::uint32_t worker_count = 0;
+    std::uint64_t maximum_frontier_wave = 16'384;
     analysis_budget_t analysis_budget;
     decode::x86_tile_decode_limits_t x86_limits;
     decode::capstone_tile_decoder_options_t capstone_options;
@@ -111,14 +112,14 @@ struct tile_invalid_run_policy_t final {
 struct tile_decode_orchestrator_limits_t final {
     std::uint64_t target_tile_bytes = 16ULL * 1024ULL;
     std::uint32_t maximum_tiles = 65535;
-    std::uint64_t maximum_frontier_seeds = 4'000'000;
-    std::uint64_t maximum_frontier_wave = 4096;
-    std::uint64_t maximum_decode_requests = 8'000'000;
-    std::uint64_t maximum_instructions = 32'000'000;
-    std::uint64_t maximum_operand_facts = 256'000'000;
-    std::uint64_t maximum_target_facts = 256'000'000;
+    std::uint64_t maximum_frontier_seeds = 64'000'000;
+    std::uint64_t maximum_frontier_wave = 16'384;
+    std::uint64_t maximum_decode_requests = 64'000'000;
+    std::uint64_t maximum_instructions = 128'000'000;
+    std::uint64_t maximum_operand_facts = 128'000'000;
+    std::uint64_t maximum_target_facts = 128'000'000;
     std::uint64_t maximum_edges = 128'000'000;
-    std::uint64_t maximum_coverage_spans = 8'000'000;
+    std::uint64_t maximum_coverage_spans = 16'000'000;
     bool seed_executable_range_starts = true;
     tile_invalid_run_policy_t invalid_run_policy;
 };
@@ -191,6 +192,10 @@ struct tile_decode_orchestrator_statistics_t final {
     std::uint64_t cross_tile_edges = 0;
     std::uint64_t invalid_bytes = 0;
     std::uint64_t invalid_runs = 0;
+    std::uint64_t frontier_waves = 0;
+    std::uint64_t attempted_bytes = 0;
+    std::uint64_t accepted_tiles = 0;
+    std::uint64_t lane_wall_ns = 0;
     decode_frontier_snapshot_t frontier;
 };
 
@@ -203,6 +208,31 @@ struct tile_decode_orchestration_result_t final {
     tile_decode_orchestrator_statistics_t statistics;
 };
 
+struct decode_tile_range_t final {
+    decode_tile_id_t begin = 0;
+    decode_tile_id_t end = 0;
+};
+
+struct decode_lane_seed_envelope_t final {
+    std::uint64_t generation_ordinal = 0;
+    std::uint32_t source_lane = 0;
+    decode_frontier_seed_t seed;
+    std::optional<decode_tile_id_t> source_tile;
+};
+
+class decode_lane_seed_exchange_t {
+public:
+    virtual ~decode_lane_seed_exchange_t() = default;
+
+    virtual void forward_seed(std::uint32_t source_lane,
+                              decode_lane_seed_envelope_t envelope) = 0;
+    virtual std::size_t drain_seeds(std::uint32_t lane_id,
+        std::vector<decode_lane_seed_envelope_t>& out) = 0;
+    virtual void note_recursive_activity(std::uint32_t lane_id,
+                                         bool active) = 0;
+    virtual bool drained(std::uint32_t lane_id) = 0;
+};
+
 class tile_decode_orchestrator_t final {
 public:
     static workspace_result_t<tile_decode_orchestrator_t> create(
@@ -213,7 +243,10 @@ public:
         const image_layout_index_t& layout,
         std::vector<tile_decode_seed_t> seeds,
         tile_decode_executor_t& executor,
-        const cancellation_token_t& cancellation = {}) const;
+        const cancellation_token_t& cancellation = {},
+        const decode_tile_range_t* tile_range = nullptr,
+        decode_lane_seed_exchange_t* lane_exchange = nullptr,
+        std::uint32_t lane_id = 0) const;
 
     const tile_decode_orchestrator_limits_t& limits() const noexcept { return limits_; }
 

@@ -1,12 +1,18 @@
 #include "decompiler_service.hpp"
 
+#include "../workspace/analysis_metrics.hpp"
+#include "../workspace/workspace_database.hpp"
+#include "../../../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <variant>
 
 namespace aida::analysis {
 namespace {
@@ -75,7 +81,8 @@ bool valid_invocation(const decompiler_pipeline_invocation_t value) noexcept
 {
     return value == decompiler_pipeline_invocation_t::explicit_ui ||
            value == decompiler_pipeline_invocation_t::explicit_mcp ||
-           value == decompiler_pipeline_invocation_t::explicit_api;
+           value == decompiler_pipeline_invocation_t::explicit_api ||
+           value == decompiler_pipeline_invocation_t::background_batch;
 }
 
 bool valid_cache_mode(const decompiler_pipeline_cache_mode_t value) noexcept
@@ -826,6 +833,191 @@ decompiler_diagnostic_t provider_context_error_diagnostic(const workspace_error_
     return diagnostic;
 }
 
+std::uint64_t utc_now_ms()
+{
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+void metrics_add(const std::shared_ptr<analysis_metrics_t>& sink,
+                 const analysis_metric_t metric,
+                 const std::uint64_t value = 1) noexcept
+{
+    if (sink)
+        sink->add(metric, value);
+}
+
+bool native_entity_rva(const decompiler_entity_key_t& entity, std::uint64_t& rva) noexcept
+{
+    const auto* native = std::get_if<native_decompiler_entity_identity_t>(&entity.identity);
+    if (entity.kind != decompiler_entity_kind_t::native_function || !native)
+        return false;
+    rva = native->entry.value;
+    return true;
+}
+
+std::vector<std::uint8_t> serialize_diagnostics_blob(
+    const std::vector<decompiler_diagnostic_t>& diagnostics)
+{
+    std::string output;
+    const auto append_u64 = [&output](const std::uint64_t value) {
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            output.push_back(static_cast<char>((value >> shift) & 0xffU));
+    };
+    const auto append_blob = [&output, &append_u64](const std::string& value) {
+        append_u64(value.size());
+        output.append(value);
+    };
+    append_u64(diagnostics.size());
+    for (const auto& diagnostic : diagnostics)
+        append_blob(serialize_decompiler_diagnostic(diagnostic));
+    const auto* begin = reinterpret_cast<const std::uint8_t*>(output.data());
+    return std::vector<std::uint8_t>(begin, begin + output.size());
+}
+
+void discard_persistent_rendered(
+    service_state_data_t& state,
+    const std::uint64_t function_rva,
+    const char* reason) noexcept
+{
+    if (!state.config.database)
+        return;
+    try {
+        auto ticket = state.config.database->invalidate_pipeline_cache(
+            std::optional<std::vector<std::uint64_t>>({function_rva}), {});
+        ::diag::log_tagged_fmt("decompiler",
+            "pipeline_cache_discard reason=%s function_rva=0x%llx accepted=%d",
+            reason, static_cast<unsigned long long>(function_rva),
+            ticket.accepted ? 1 : 0);
+    } catch (...) {
+    }
+}
+
+struct persistent_rendered_load_t {
+    std::shared_ptr<const decompiler_rendered_cache_value_t> value;
+};
+
+persistent_rendered_load_t load_persistent_rendered(
+    service_state_data_t& state,
+    const decompiler_pipeline_request_t& request,
+    const decompiler_pipeline_cache_key_t& rendered_key)
+{
+    persistent_rendered_load_t result;
+    std::uint64_t function_rva = 0;
+    if (!state.config.database ||
+        request.entity.kind != decompiler_entity_kind_t::native_function ||
+        !native_entity_rva(request.entity, function_rva))
+        return result;
+    std::string canonical;
+    try {
+        canonical = serialize_decompiler_pipeline_cache_key(rendered_key);
+    } catch (...) {
+        return result;
+    }
+    if (canonical.empty())
+        return result;
+    const auto* key_begin = reinterpret_cast<const std::uint8_t*>(canonical.data());
+    const std::vector<std::uint8_t> key_bytes(key_begin, key_begin + canonical.size());
+    auto loaded = state.config.database->load_pipeline_cache(key_bytes, {});
+    if (!loaded) {
+        ::diag::log_tagged_fmt("decompiler",
+            "pipeline_cache_load function_rva=0x%llx status=read_error code=%s",
+            static_cast<unsigned long long>(function_rva),
+            loaded.error().stable_code().c_str());
+        return result;
+    }
+    if (!loaded.value())
+        return result;
+    const auto& row = *loaded.value();
+    bool corrupt = row.stage !=
+            static_cast<std::int64_t>(decompiler_cache_stage_t::rendered_document) ||
+        row.workspace_id != request.workspace_id ||
+        row.generation != request.workspace_generation ||
+        row.analysis_revision != request.analysis_revision ||
+        row.overlay_revision != request.cache_identity.overlay_revision ||
+        row.function_rva != function_rva;
+    std::optional<decompiler_rendered_cache_value_t> parsed;
+    if (!corrupt) {
+        try {
+            parsed = deserialize_decompiler_rendered_cache_value(
+                std::string_view(reinterpret_cast<const char*>(row.value.data()),
+                                 row.value.size()));
+        } catch (...) {
+            parsed.reset();
+        }
+        corrupt = !parsed.has_value();
+    }
+    if (!corrupt && !readability_report(parsed->document, state.config))
+        corrupt = true;
+    if (corrupt) {
+        discard_persistent_rendered(state, function_rva, "validation");
+        return result;
+    }
+    if (!(parsed->document.entity == request.entity) ||
+        parsed->document.profile != request.profile) {
+        discard_persistent_rendered(state, function_rva, "binding");
+        return result;
+    }
+    auto generation = state.cache->activate_workspace_generation(
+        request.workspace_id, request.workspace_generation);
+    if (!generation)
+        return result;
+    auto stored = state.cache->store_rendered(rendered_key, *parsed);
+    if (!stored) {
+        if (stored.error().code == workspace_error_code_t::integrity_failure)
+            discard_persistent_rendered(state, function_rva, "integrity");
+        return result;
+    }
+    auto hydrated = state.cache->lookup_rendered(rendered_key);
+    if (!hydrated || !hydrated.value().hit())
+        return result;
+    result.value = hydrated.value().value;
+    return result;
+}
+
+void persist_rendered_row(
+    service_state_data_t& state,
+    const decompiler_pipeline_request_t& request,
+    const decompiler_pipeline_cache_key_t& rendered_key,
+    const decompiler_rendered_cache_value_t& rendered) noexcept
+{
+    if (!state.config.database)
+        return;
+    std::uint64_t function_rva = 0;
+    if (!native_entity_rva(request.entity, function_rva))
+        return;
+    try {
+        const std::string canonical = serialize_decompiler_pipeline_cache_key(rendered_key);
+        if (canonical.empty())
+            return;
+        decompiler_pipeline_cache_v1_row_t row;
+        const auto* key_begin = reinterpret_cast<const std::uint8_t*>(canonical.data());
+        row.cache_key.assign(key_begin, key_begin + canonical.size());
+        row.stage = static_cast<std::int64_t>(decompiler_cache_stage_t::rendered_document);
+        row.workspace_id = request.workspace_id;
+        row.generation = request.workspace_generation;
+        row.analysis_revision = request.analysis_revision;
+        row.overlay_revision = request.cache_identity.overlay_revision;
+        row.function_rva = function_rva;
+        const auto serialized = serialize_decompiler_rendered_cache_value(rendered);
+        const auto* value_begin = reinterpret_cast<const std::uint8_t*>(serialized.data());
+        row.value.assign(value_begin, value_begin + serialized.size());
+        row.diagnostics = serialize_diagnostics_blob(rendered.diagnostics);
+        row.created_utc_ms = static_cast<std::int64_t>(utc_now_ms());
+        row.last_access_utc_ms = row.created_utc_ms;
+        auto ticket = state.config.database->store_pipeline_cache(std::move(row), {});
+        if (!ticket.accepted) {
+            ::diag::log_tagged_fmt("decompiler",
+                "pipeline_cache_store function_rva=0x%llx status=enqueue_rejected",
+                static_cast<unsigned long long>(function_rva));
+        }
+    } catch (...) {
+        ::diag::log_tagged_fmt("decompiler",
+            "pipeline_cache_store function_rva=0x%llx status=exception",
+            static_cast<unsigned long long>(function_rva));
+    }
+}
+
 }
 
 struct decompiler_pipeline_service_t::state_t : service_state_data_t {
@@ -851,8 +1043,8 @@ decompiler_profile_policy_t default_decompiler_profile_policy()
     policy.balanced.max_ast_nodes = 750'000;
 
     policy.thorough.profile = decompiler_profile_id_t::thorough;
-    policy.thorough.max_wall_clock_ms = 15'000;
-    policy.thorough.max_cpu_ms = 12'000;
+    policy.thorough.max_wall_clock_ms = 60'000;
+    policy.thorough.max_cpu_ms = 30'000;
     policy.thorough.max_memory_bytes = 1ULL << 30;
     policy.thorough.max_provider_ir_nodes = 1'000'000;
     policy.thorough.max_hir_nodes = 1'000'000;
@@ -1049,7 +1241,38 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
                 std::lock_guard lock(state_->metrics_mutex);
                 ++state_->metrics.rendered_cache_hits;
             }
+            if (request.invocation == decompiler_pipeline_invocation_t::background_batch)
+                metrics_add(state_->config.metrics_sink,
+                    analysis_metric_t::decompile_memory_cache_hits);
             return finish(decompiler_pipeline_status_t::completed);
+        }
+
+        if (state_->config.database &&
+            request.entity.kind == decompiler_entity_kind_t::native_function) {
+            auto persistent = load_persistent_rendered(*state_, request, rendered_key);
+            if (persistent.value) {
+                result.rendered_stage = std::move(persistent.value);
+                result.cache_hit_stage = decompiler_cache_stage_t::rendered_document;
+                result.diagnostics = result.rendered_stage->diagnostics;
+                auto readability = readability_report(
+                    result.rendered_stage->document, state_->config);
+                if (!readability) {
+                    result.diagnostics.push_back(pipeline_diagnostic(
+                        decompiler_diagnostic_severity_t::error,
+                        decompiler_diagnostic_code_t::malformed_document,
+                        "decompiler.pipeline.readability.rejected"));
+                    return finish(decompiler_pipeline_status_t::rendering_failed);
+                }
+                result.readability = readability.take_value();
+                {
+                    std::lock_guard lock(state_->metrics_mutex);
+                    ++state_->metrics.rendered_cache_hits;
+                }
+                if (request.invocation == decompiler_pipeline_invocation_t::background_batch)
+                    metrics_add(state_->config.metrics_sink,
+                        analysis_metric_t::decompile_persistent_cache_hits);
+                return finish(decompiler_pipeline_status_t::completed);
+            }
         }
 
         auto normalized_lookup = state_->cache->lookup_normalized(normalized_key);
@@ -1064,6 +1287,9 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
                 std::lock_guard lock(state_->metrics_mutex);
                 ++state_->metrics.normalized_cache_hits;
             }
+            if (request.invocation == decompiler_pipeline_invocation_t::background_batch)
+                metrics_add(state_->config.metrics_sink,
+                    analysis_metric_t::decompile_memory_cache_hits);
         }
     }
 
@@ -1080,6 +1306,9 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
                 std::lock_guard lock(state_->metrics_mutex);
                 ++state_->metrics.provider_ir_cache_hits;
             }
+            if (request.invocation == decompiler_pipeline_invocation_t::background_batch)
+                metrics_add(state_->config.metrics_sink,
+                    analysis_metric_t::decompile_memory_cache_hits);
         }
     }
 
@@ -1098,6 +1327,8 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
         provider_request.cache_key = provider_key;
         provider_request.deadline = operation_deadline;
         provider_request.context = request.provider_context;
+        provider_request.interactive =
+            request.invocation == decompiler_pipeline_invocation_t::explicit_ui;
         std::shared_ptr<decompiler_isolated_provider_host_t> isolated_host;
         if (route.value().descriptor.isolated) {
             isolated_host = state_->config.isolated_provider_host;
@@ -1523,6 +1754,7 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
                 stored.error().code == workspace_error_code_t::integrity_failure)
                 return finish(cache_error_status(stored.error()));
         }
+        persist_rendered_row(*state_, request, rendered_key, *result.rendered_stage);
     }
     if (!state_->cache->is_current_generation(request.workspace_id, request.workspace_generation)) {
         result.diagnostics.push_back(pipeline_diagnostic(
@@ -1534,11 +1766,91 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
     return finish(decompiler_pipeline_status_t::completed);
 }
 
+decompiler_rendered_probe_result_t decompiler_pipeline_service_t::probe_rendered_cache(
+    const decompiler_pipeline_request_t& request)
+{
+    decompiler_rendered_probe_result_t result;
+    if (!valid_invocation(request.invocation) ||
+        !cache_reads_enabled(request.cache_mode) || request.workspace_id.empty() ||
+        request.workspace_generation == 0 ||
+        !validate_decompiler_entity_key(request.entity).valid())
+        return result;
+    const auto budget = effective_budget(request, state_->config.profiles);
+    if (!budget)
+        return result;
+    auto route = state_->providers->resolve(
+        request.entity, request.language, *budget, request.provider_registration_id);
+    if (!route)
+        return result;
+    const auto rendered_key = make_cache_key(
+        request, route.value().descriptor, *budget, renderer_settings(request),
+        decompiler_cache_stage_t::rendered_document);
+    if (!validate_decompiler_pipeline_cache_key(rendered_key).valid())
+        return result;
+    auto lookup = state_->cache->lookup_rendered(rendered_key);
+    if (lookup && lookup.value().hit()) {
+        if (readability_report(lookup.value().value->document, state_->config)) {
+            result.hit_stage = decompiler_rendered_probe_stage_t::memory_rendered;
+            result.rendered = lookup.value().value;
+        }
+        return result;
+    }
+    auto persistent = load_persistent_rendered(*state_, request, rendered_key);
+    if (persistent.value) {
+        result.hit_stage = decompiler_rendered_probe_stage_t::persistent_rendered;
+        result.rendered = std::move(persistent.value);
+    }
+    return result;
+}
+
 workspace_result_t<void> decompiler_pipeline_service_t::invalidate_workspace(
     const std::string& workspace_id,
     const std::uint64_t generation)
 {
-    return state_->cache->invalidate_workspace(workspace_id, generation);
+    auto result = state_->cache->invalidate_workspace(workspace_id, generation);
+    if (state_->config.database) {
+        try {
+            auto ticket = state_->config.database->invalidate_pipeline_cache(std::nullopt, {});
+            if (!ticket.accepted) {
+                ::diag::log_tagged_fmt("decompiler",
+                    "pipeline_cache_invalidate scope=workspace status=enqueue_rejected");
+            }
+        } catch (...) {
+        }
+    }
+    return result;
+}
+
+workspace_result_t<void> decompiler_pipeline_service_t::invalidate_entities(
+    const std::string& workspace_id,
+    const std::uint64_t generation,
+    const std::vector<decompiler_entity_key_t>& entities)
+{
+    auto invalidated = state_->cache->invalidate_entities(workspace_id, generation, entities);
+    if (!invalidated)
+        return invalidated;
+    if (state_->config.database && !entities.empty()) {
+        std::vector<std::uint64_t> rvas;
+        rvas.reserve(entities.size());
+        for (const auto& entity : entities) {
+            std::uint64_t rva = 0;
+            if (native_entity_rva(entity, rva))
+                rvas.push_back(rva);
+        }
+        if (!rvas.empty()) {
+            try {
+                auto ticket = state_->config.database->invalidate_pipeline_cache(
+                    std::move(rvas), {});
+                if (!ticket.accepted) {
+                    ::diag::log_tagged_fmt("decompiler",
+                        "pipeline_cache_invalidate scope=entities count=%zu status=enqueue_rejected",
+                        entities.size());
+                }
+            } catch (...) {
+            }
+        }
+    }
+    return workspace_result_t<void>::success();
 }
 
 decompiler_pipeline_service_snapshot_t decompiler_pipeline_service_t::snapshot() const

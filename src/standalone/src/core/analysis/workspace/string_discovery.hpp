@@ -34,6 +34,7 @@ struct string_discovery_result_t {
     std::uint64_t rejected_oversized_strings = 0;
     std::uint64_t rejected_unterminated_strings = 0;
     std::uint64_t duplicate_strings = 0;
+    std::uint64_t shard_merge_ns = 0;
 };
 
 class string_discovery_t final {

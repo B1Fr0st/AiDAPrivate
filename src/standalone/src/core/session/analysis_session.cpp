@@ -534,6 +534,7 @@ session_summary_t summarize_session_at(std::size_t index) {
 #include "../analysis/workspace/search_index.hpp"
 #include "../analysis/workspace/workspace_database.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
+#include "../analysis/decompiler/decompile_batch_orchestrator.hpp"
 #include "../analysis/decompiler/managed_entity_binding.hpp"
 #include "../infra/executor.hpp"
 #include "../runtime/standalone_driver.hpp"
@@ -830,6 +831,9 @@ workspace_result_t<void> install_workspace_services(
             workspace_error_code_t::service_conflict,
             "Workspace decompiler installation did not publish a service",
             "analysis_session.services.decompiler"));
+    }
+    if (!workspace->background_decompile()) {
+        (void)decompile_batch_orchestrator_t::create(workspace, workspace->background_metrics());
     }
     database_out = std::move(database);
     return workspace_result_t<void>::success();

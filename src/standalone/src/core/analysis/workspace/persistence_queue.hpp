@@ -14,6 +14,12 @@
 namespace aida::analysis {
 
 class workspace_persistence_candidate_t;
+class workspace_snapshot_staging_t;
+
+enum class persistence_priority_t : std::uint8_t {
+    baseline_chain = 0,
+    deferred = 1
+};
 
 struct persistence_queue_limits_t {
     std::size_t max_pending_operations = 1024;
@@ -30,6 +36,13 @@ struct persistence_commit_metrics_t {
     std::uint64_t rows = 0;
     std::uint64_t page_write_bytes = 0;
     std::uint64_t elapsed_us = 0;
+    std::uint64_t stage_serialize_us = 0;
+    std::uint64_t stage_seal_us = 0;
+    std::uint64_t stage_db_write_us = 0;
+    std::uint64_t finalize_us = 0;
+    std::uint64_t pages = 0;
+    std::uint64_t staged_bytes = 0;
+    std::uint64_t finalize_retries = 0;
 };
 
 struct persistence_ticket_t {
@@ -38,6 +51,7 @@ struct persistence_ticket_t {
     std::shared_future<workspace_result_t<void>> completion;
     std::shared_ptr<const persistence_commit_metrics_t> commit_metrics;
     std::shared_ptr<const workspace_persistence_candidate_t> snapshot_candidate;
+    std::shared_ptr<workspace_snapshot_staging_t> staging;
 };
 
 struct persistence_queue_snapshot_t {
@@ -52,6 +66,16 @@ struct persistence_queue_snapshot_t {
     std::uint64_t active_bytes = 0;
     bool accepting = false;
     bool drain_active = false;
+    std::size_t pending_high = 0;
+    std::size_t pending_low = 0;
+    std::uint64_t bytes_committed_total = 0;
+    std::uint64_t last_op_elapsed_us = 0;
+    std::string last_op_label;
+    std::uint64_t high_ops_served = 0;
+    std::uint64_t low_ops_served = 0;
+    std::uint64_t starvation_saves = 0;
+    std::uint64_t total_wait_ns = 0;
+    std::uint64_t pending_depth_peak = 0;
 };
 
 class persistence_queue_t final : public workspace_lifecycle_participant_t,
@@ -68,7 +92,9 @@ public:
 
     persistence_ticket_t enqueue(std::string label, persistence_operation_t operation,
                                  cancellation_token_t cancel = {},
-                                 std::uint64_t reservation_bytes = 0);
+                                 std::uint64_t reservation_bytes = 0,
+                                 persistence_priority_t priority =
+                                     persistence_priority_t::deferred);
     persistence_queue_snapshot_t snapshot() const;
     bool idle() const;
 

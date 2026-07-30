@@ -20,27 +20,8 @@
 !build-host.ps1
 !build-host.cmd
 !CMakePresets.json
-!/licenses/
-/licenses/*
-!/licenses/c03/
-!/licenses/c03/**
 !/packaging/
 /packaging/*
-!/packaging/c03_worker_manifest.schema.json
-!/packaging/c03_worker_manifest.lock.json
-!/packaging/c03_native_worker_manifest.json
-!/packaging/c03_native_worker_manifest.schema.json
-!/packaging/c03_native_worker_manifest.py
-!/packaging/c03_distribution_manifest.schema.json
-!/packaging/c03_distribution_manifest.ps1
-!/packaging/c03_distribution_manifest_spec.json
-!/packaging/c03_distribution_fixture/
-!/packaging/c03_distribution_fixture/**
-**/.aida-c03-publication-journal.json
-**/.aida-c03-signing-provider-*.exe
-**/.aida-c03-signer-policy-*.json
-!/packaging/c03_worker_runtime/
-!/packaging/c03_worker_runtime/**
 !/packaging/c03_camoufox_reverse_mcp_build.lock.json
 
 # ==========================================

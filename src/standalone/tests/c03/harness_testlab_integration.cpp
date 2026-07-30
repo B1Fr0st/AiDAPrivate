@@ -228,8 +228,7 @@ struct category_fixture_t {
 	entry_outcome_e expected;
 };
 
-constexpr std::array<category_fixture_t, 22> k_categories{{
-	{"authority", "ACT-01", "pass", entry_outcome_e::passed},
+constexpr std::array<category_fixture_t, 19> k_categories{{
 	{"contract", "VER-01", "fail", entry_outcome_e::failed},
 	{"fixture", "HAR-01", "malformed", entry_outcome_e::malformed_result},
 	{"provider", "PERF-01", "crash", entry_outcome_e::crashed},
@@ -247,9 +246,7 @@ constexpr std::array<category_fixture_t, 22> k_categories{{
 	{"mcp", "MCP-01", "pass", entry_outcome_e::passed},
 	{"workbench", "WB-01", "pass", entry_outcome_e::passed},
 	{"performance", "PERF-10", "pass", entry_outcome_e::passed},
-	{"package", "DEP-04", "stdout", entry_outcome_e::failed},
-	{"surface", "SURF-01", "pass", entry_outcome_e::passed},
-	{"message_pump", "SEC-01", "pass", entry_outcome_e::passed},
+	{"surface", "SURF-01", "stdout", entry_outcome_e::failed},
 	{"security", "VER-02", "child", entry_outcome_e::passed}
 }};
 
@@ -331,8 +328,15 @@ void validate_outcome_matrix(const fixture_root_t& fixture, const manifest_load_
 		const auto outcome = execute_entry(fixture.path(), loaded.manifest.entries[index], {}, deadline).outcome;
 		require(outcome == k_categories[index].expected, "runner outcome matrix did not preserve an exact terminal state");
 	}
+	std::size_t hang_index = 0;
+	for (std::size_t index = 0; index < k_categories.size(); ++index) {
+		if (k_categories[index].mode == "hang") {
+			hang_index = index;
+			break;
+		}
+	}
 	std::uint32_t cancellation_polls = 0;
-	const auto cancelled = execute_entry(fixture.path(), loaded.manifest.entries[4],
+	const auto cancelled = execute_entry(fixture.path(), loaded.manifest.entries[hang_index],
 		[&cancellation_polls] { return ++cancellation_polls >= 4; });
 	require(cancelled.outcome == entry_outcome_e::cancelled, "in-flight cancellation was not preserved");
 	const auto not_run = execute_manifest(fixture.path(), loaded, [] { return true; });

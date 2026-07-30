@@ -127,6 +127,18 @@ struct decompiler_ui_integration_metrics_t {
     std::uint64_t managed_capture_cache_hits = 0;
 };
 
+workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
+    analysis_workspace_t& workspace,
+    const std::shared_ptr<const analysis_publication_t>& publication,
+    const function_record_t& function,
+    decompiler_pipeline_invocation_t invocation,
+    decompiler_pipeline_cache_mode_t cache_mode,
+    decompiler_profile_id_t profile,
+    const std::optional<decompiler_profile_budget_t>& budget = std::nullopt,
+    const std::optional<std::chrono::steady_clock::time_point>& deadline = std::nullopt,
+    const std::shared_ptr<const decompiler_provider_context_t>& provider_context = {},
+    const cancellation_token_t& cancel = {});
+
 class decompiler_ui_integration_t final {
 public:
     static workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>
@@ -139,6 +151,9 @@ public:
                           decompiler_ui_integration_config_t config = {});
     static workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>
         production_for_workspace(std::shared_ptr<analysis_workspace_t> workspace);
+    static workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>
+        find_production_for_workspace(
+            const std::shared_ptr<analysis_workspace_t>& workspace);
 
     ~decompiler_ui_integration_t();
     decompiler_ui_integration_t(const decompiler_ui_integration_t&) = delete;
@@ -220,6 +235,18 @@ private:
     struct impl_t;
     explicit decompiler_ui_integration_t(std::unique_ptr<impl_t> impl);
     std::unique_ptr<impl_t> impl_;
+
+    friend workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
+        analysis_workspace_t& workspace,
+        const std::shared_ptr<const analysis_publication_t>& publication,
+        const function_record_t& function,
+        decompiler_pipeline_invocation_t invocation,
+        decompiler_pipeline_cache_mode_t cache_mode,
+        decompiler_profile_id_t profile,
+        const std::optional<decompiler_profile_budget_t>& budget,
+        const std::optional<std::chrono::steady_clock::time_point>& deadline,
+        const std::shared_ptr<const decompiler_provider_context_t>& provider_context,
+        const cancellation_token_t& cancel);
 };
 
 }

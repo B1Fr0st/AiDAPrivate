@@ -6,6 +6,7 @@
 #include "../spill_provider.hpp"
 #include "checked_range.hpp"
 #include "decompiler_service.hpp"
+#include "../decompiler/decompiler_ui_integration.hpp"
 #include "../decompiler/managed_entity_binding.hpp"
 
 #include <sqlite3.h>
@@ -2037,6 +2038,15 @@ public:
         return storage_->lease(offset, size, cancel);
     }
 
+    bool content_pin_active() const noexcept override {
+        return storage_->content_pin_active();
+    }
+
+    std::optional<mapped_window_cache_statistics_t>
+        window_cache_statistics() const noexcept override {
+        return storage_->window_cache_statistics();
+    }
+
 private:
     std::shared_ptr<const byte_provider_t> storage_;
     byte_provider_identity_t identity_;
@@ -2385,7 +2395,13 @@ projection_invalidation_hook_result_t invalidate_decompiler_cache(
         result.detail = "workspace snapshot is unavailable for cache invalidation";
         return result;
     }
-    std::vector<std::pair<address_t, std::uint64_t>> affected_functions;
+    struct invalidation_function_t {
+        address_t start;
+        entity_id_t id = 0;
+        std::uint64_t rva = 0;
+        std::uint64_t end_rva = 0;
+    };
+    std::vector<invalidation_function_t> affected_functions;
     if (!request.invalidate_workspace && !request.affected_ranges.empty()) {
         for (const auto& function : publication->snapshot->functions) {
             bool affected = false;
@@ -2431,7 +2447,19 @@ projection_invalidation_hook_result_t invalidate_decompiler_cache(
                 result.detail = rva.error().message;
                 return result;
             }
-            affected_functions.emplace_back(function.start, rva.value());
+            auto end_rva = overlay_static_offset(
+                function.end, *workspace,
+                "overlay_journal.cache_invalidation");
+            if (!end_rva) {
+                result.detail = end_rva.error().message;
+                return result;
+            }
+            invalidation_function_t affected_function;
+            affected_function.start = function.start;
+            affected_function.id = function.id;
+            affected_function.rva = rva.value();
+            affected_function.end_rva = end_rva.value();
+            affected_functions.push_back(std::move(affected_function));
         }
     }
     const bool invalidate_all = request.invalidate_workspace;
@@ -2447,7 +2475,7 @@ projection_invalidation_hook_result_t invalidate_decompiler_cache(
             invalidated = service->invalidate({}, cancel);
         } else {
             for (const auto& function : affected_functions) {
-                invalidated = service->invalidate(function.first, cancel);
+                invalidated = service->invalidate(function.start, cancel);
                 if (!invalidated)
                     break;
             }
@@ -2458,28 +2486,70 @@ projection_invalidation_hook_result_t invalidate_decompiler_cache(
         }
         const auto after = service->snapshot().memory_cache_entries;
         result.invalidated_entry_count = before >= after ? before - after : 0;
-        result.succeeded = true;
-        return result;
-    }
-    if (invalidate_all) {
+    } else if (invalidate_all) {
         auto ticket = database->invalidate_decompiler_cache({}, {}, cancel);
         auto waited = wait_ticket(ticket, cancel);
         if (!waited) {
             result.detail = waited.error().message;
             return result;
         }
+        result.invalidated_entry_count = affected_functions.size();
     } else {
         for (const auto& function : affected_functions) {
             auto ticket = database->invalidate_decompiler_cache(
-                function.second, {}, cancel);
+                function.rva, {}, cancel);
             auto waited = wait_ticket(ticket, cancel);
             if (!waited) {
                 result.detail = waited.error().message;
                 return result;
             }
         }
+        result.invalidated_entry_count = affected_functions.size();
     }
-    result.invalidated_entry_count = affected_functions.size();
+    if (publication->snapshot->normalized_image) {
+        auto integration = decompiler_ui_integration_t::find_production_for_workspace(
+            workspace);
+        if (integration && integration.value() && integration.value()->service()) {
+            const auto pipeline = integration.value()->service();
+            const auto workspace_id = workspace->identity().binary_id().to_hex();
+            workspace_result_t<void> invalidated = workspace_result_t<void>::success();
+            if (invalidate_all) {
+                invalidated = pipeline->invalidate_workspace(
+                    workspace_id, publication->generation);
+            } else {
+                const auto& image = *publication->snapshot->normalized_image;
+                std::vector<decompiler_entity_key_t> entities;
+                entities.reserve(affected_functions.size());
+                for (const auto& function : affected_functions) {
+                    if (function.end_rva <= function.rva)
+                        continue;
+                    native_decompiler_entity_identity_t native_identity;
+                    native_identity.function_id = function.id;
+                    native_identity.entry = address_t{
+                        address_space_id_t::relative_virtual, function.rva,
+                        image.architecture, image.architecture_mode};
+                    native_identity.end = address_t{
+                        address_space_id_t::relative_virtual, function.end_rva,
+                        image.architecture, image.architecture_mode};
+                    decompiler_entity_key_t entity;
+                    entity.kind = decompiler_entity_kind_t::native_function;
+                    entity.format = image.format;
+                    entity.architecture = image.architecture;
+                    entity.mode = image.architecture_mode;
+                    entity.endian = image.endian;
+                    entity.identity = std::move(native_identity);
+                    entities.push_back(std::move(entity));
+                }
+                invalidated = pipeline->invalidate_entities(
+                    workspace_id, publication->generation, entities);
+            }
+            if (!invalidated &&
+                invalidated.error().code != workspace_error_code_t::stale_generation) {
+                result.detail = invalidated.error().message;
+                return result;
+            }
+        }
+    }
     result.succeeded = true;
     return result;
 }
@@ -2960,7 +3030,7 @@ workspace_result_t<void> overlay_journal_t::ensure_fixed_target_binding(
             if (!committed)
                 overlay_exec(writer, "ROLLBACK", "overlay_journal.target");
             return committed;
-        }, cancel);
+        }, cancel, 0, persistence_priority_t::baseline_chain);
     return wait_ticket(ticket, cancel);
 }
 
@@ -3171,7 +3241,7 @@ workspace_result_t<void> overlay_journal_t::recover_and_load(
                 return committed;
             }
             return workspace_result_t<void>::success();
-        }, cancel);
+        }, cancel, 0, persistence_priority_t::baseline_chain);
     auto waited = wait_ticket(ticket, cancel);
     if (!waited) return waited;
     return reload_items();
@@ -3822,7 +3892,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             auto committed = overlay_exec(writer, "COMMIT", "overlay_journal.commit");
             if (!committed) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return committed; }
             return workspace_result_t<void>::success();
-        }, cancel);
+        }, cancel, 0, persistence_priority_t::baseline_chain);
         auto waited = wait_ticket(ticket, cancel);
         if (!waited) {
             static_cast<void>(candidate->discard());
@@ -4356,7 +4426,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
             auto committed = overlay_exec(writer, "COMMIT", "overlay_journal.history");
             if (!committed) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return committed; }
             return workspace_result_t<void>::success();
-        }, cancel);
+        }, cancel, 0, persistence_priority_t::baseline_chain);
         auto waited = wait_ticket(ticket, cancel);
         if (!waited) {
             static_cast<void>(candidate->discard());

@@ -2,6 +2,7 @@
 
 #include "native_worker_runtime.hpp"
 
+#include <atomic>
 #include <optional>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@ struct result_t {
     std::vector<decompiler_diagnostic_t> diagnostics;
 };
 
-result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_request_t& job);
+result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_request_t& job,
+    std::atomic<bool>* shared_cancel = nullptr);
 
 }

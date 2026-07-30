@@ -8,11 +8,14 @@
 #include "workspace_types.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace aida::analysis {
+
+class analysis_metrics_t;
 
 inline constexpr std::uint64_t type_recovery_max_constraints = 65536;
 inline constexpr std::uint64_t type_recovery_max_iterations = 16;
@@ -457,5 +460,16 @@ workspace_result_t<type_recovery_result_t>
     recover_types(const analysis_workspace_t& workspace,
                   std::uint64_t function_rva,
                   const cancellation_token_t& cancel);
+
+struct type_recovery_batch_options_t {
+    std::uint32_t worker_count = 0;
+    std::shared_ptr<analysis_metrics_t> metrics;
+};
+
+workspace_result_t<std::vector<workspace_result_t<type_recovery_result_t>>>
+recover_types_batch(const analysis_workspace_t& workspace,
+    const std::vector<type_recovery_request_t>& requests,
+    const type_recovery_batch_options_t& options,
+    const cancellation_token_t& cancel);
 
 }

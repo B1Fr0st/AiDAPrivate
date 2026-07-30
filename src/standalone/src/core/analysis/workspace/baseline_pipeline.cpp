@@ -6,10 +6,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -142,6 +145,42 @@ private:
     bool terminal_ = false;
 };
 
+struct baseline_graph_schedule_t {
+    std::atomic<std::uint64_t> submitted_ns{0};
+    std::mutex finished_mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> node_finished_ns;
+};
+
+struct phase_node_schedule_t {
+    std::shared_ptr<baseline_graph_schedule_t> graph;
+    std::uint64_t node_id = 0;
+    std::vector<std::uint64_t> dependencies;
+    std::uint64_t decode_lane_count = 0;
+};
+
+class busy_slot_guard_t final {
+public:
+    busy_slot_guard_t(std::shared_ptr<pe_baseline_analyzer_t> analyzer,
+        std::chrono::steady_clock::time_point started) noexcept
+        : analyzer_(std::move(analyzer)), started_(started) {}
+
+    busy_slot_guard_t(const busy_slot_guard_t&) = delete;
+    busy_slot_guard_t& operator=(const busy_slot_guard_t&) = delete;
+
+    ~busy_slot_guard_t() noexcept {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started_).count();
+        if (elapsed > 0) {
+            analyzer_->metrics()->add(analysis_metric_t::worker_slots_busy_ns,
+                static_cast<std::uint64_t>(elapsed));
+        }
+    }
+
+private:
+    std::shared_ptr<pe_baseline_analyzer_t> analyzer_;
+    std::chrono::steady_clock::time_point started_;
+};
+
 std::uint64_t runtime_deadline_ms(
     const std::optional<std::chrono::steady_clock::time_point>& deadline) {
     if (!deadline)
@@ -161,13 +200,39 @@ std::uint64_t runtime_deadline_ms(
 template <typename Callable>
 std::function<void(const aida::infra::taskflow_runtime::cancellation_token_t&)>
 phase_body(std::shared_ptr<baseline_job_state_t> state, Callable callable,
-    bool terminal = false) {
-    return [state = std::move(state), callable = std::move(callable), terminal](
+    phase_node_schedule_t schedule, bool terminal = false) {
+    return [state = std::move(state), callable = std::move(callable),
+            schedule = std::move(schedule), terminal](
                const aida::infra::taskflow_runtime::cancellation_token_t& cancel) {
+        const auto task_started = std::chrono::steady_clock::now();
+        const auto task_started_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                task_started.time_since_epoch()).count());
         auto analyzer = state->begin_call();
         if (!analyzer)
             return;
         baseline_call_guard_t call_guard(state);
+        busy_slot_guard_t busy_guard(analyzer, task_started);
+        if (schedule.graph) {
+            std::uint64_t queued_ns =
+                schedule.graph->submitted_ns.load(std::memory_order_acquire);
+            {
+                std::lock_guard<std::mutex> lock(schedule.graph->finished_mutex);
+                for (const auto dependency : schedule.dependencies) {
+                    const auto finished =
+                        schedule.graph->node_finished_ns.find(dependency);
+                    if (finished != schedule.graph->node_finished_ns.end())
+                        queued_ns = (std::max)(queued_ns, finished->second);
+                }
+            }
+            if (queued_ns != 0 && task_started_ns >= queued_ns) {
+                const auto wait_ns = task_started_ns - queued_ns;
+                analyzer->metrics()->add(analysis_metric_t::queue_wait_ns_total,
+                    wait_ns);
+                analyzer->metrics()->set_max(analysis_metric_t::queue_wait_max_ns,
+                    wait_ns);
+            }
+        }
         bool reported = false;
         try {
         const auto before = aida::infra::taskflow_runtime::active_snapshot(64);
@@ -193,8 +258,28 @@ phase_body(std::shared_ptr<baseline_job_state_t> state, Callable callable,
                 after.critical_queue_pending);
         if (result) {
             analyzer->metrics()->add(analysis_metric_t::tasks_completed);
-            if (terminal)
+            if (schedule.graph) {
+                const auto finished_ns = analysis_metrics_t::steady_now_ns();
+                std::lock_guard<std::mutex> lock(schedule.graph->finished_mutex);
+                schedule.graph->node_finished_ns[schedule.node_id] = finished_ns;
+            }
+            if (terminal) {
+                if (schedule.graph && schedule.decode_lane_count != 0) {
+                    const auto submitted =
+                        schedule.graph->submitted_ns.load(std::memory_order_acquire);
+                    const auto completed_ns = analysis_metrics_t::steady_now_ns();
+                    if (submitted != 0 && completed_ns >= submitted) {
+                        std::uint64_t scheduled_ns = 0;
+                        if (checked_mul_u64(schedule.decode_lane_count,
+                                completed_ns - submitted, scheduled_ns)) {
+                            analyzer->metrics()->add(
+                                analysis_metric_t::worker_slots_scheduled_ns,
+                                scheduled_ns);
+                        }
+                    }
+                }
                 call_guard.mark_terminal();
+            }
             return;
         }
         const auto error = result.error();
@@ -257,6 +342,8 @@ baseline_analysis_service_t::start(
             analysis_run.error());
     }
     const auto task_priority = settings.task_priority;
+    const auto enable_parallel_fact_passes = settings.enable_parallel_fact_passes;
+    const auto overlap_strings_with_decode = settings.overlap_strings_with_decode;
     auto created = pe_baseline_analyzer_t::create(workspace, std::move(settings),
         generation, analysis_revision, deadline);
     if (!created)
@@ -289,8 +376,9 @@ baseline_analysis_service_t::start(
             locked->request_cancel();
         state->mark_terminal();
     };
+    auto graph_schedule = std::make_shared<baseline_graph_schedule_t>();
     std::vector<std::string> labels;
-    labels.reserve(analyzer->decode_lane_count() + 12);
+    labels.reserve(analyzer->decode_lane_count() + 14);
     auto add_node = [&](std::uint64_t id, std::string label,
                         std::vector<std::uint64_t> dependencies,
                         std::function<void(
@@ -304,9 +392,11 @@ baseline_analysis_service_t::start(
         graph.nodes.push_back(std::move(node));
     };
     add_node(1, "baseline.parse", {}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.parse_phase(cancel); }));
+        [](auto& value, const auto& cancel) { return value.parse_phase(cancel); },
+        {graph_schedule, 1, {}}));
     add_node(2, "baseline.seed", {1}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.seed_phase(cancel); }));
+        [](auto& value, const auto& cancel) { return value.seed_phase(cancel); },
+        {graph_schedule, 2, {1}}));
     std::vector<std::uint64_t> decode_nodes;
     decode_nodes.reserve(analyzer->decode_lane_count());
     for (std::uint32_t lane = 0; lane < analyzer->decode_lane_count(); ++lane) {
@@ -315,30 +405,83 @@ baseline_analysis_service_t::start(
         add_node(node_id, "baseline.decode." + std::to_string(lane), {2},
             phase_body(state, [lane](auto& value, const auto& cancel) {
                 return value.decode_lane_phase(lane, cancel);
-            }));
+            }, {graph_schedule, node_id, {2}}));
     }
     add_node(200, "baseline.decode_merge", decode_nodes, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.decode_merge_phase(cancel); }));
-    add_node(3, "baseline.blocks", {200}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.blocks_phase(cancel); }));
-    add_node(4, "baseline.functions", {3}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.functions_phase(cancel); }));
-    add_node(5, "baseline.cfg_calls", {4}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.cfg_calls_phase(cancel); }));
-    add_node(6, "baseline.xrefs", {5}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.xrefs_phase(cancel); }));
-    add_node(7, "baseline.strings_data", {6}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.strings_data_phase(cancel); }));
-    add_node(8, "baseline.metadata_symbols_types", {7}, phase_body(state,
+        [](auto& value, const auto& cancel) { return value.decode_merge_phase(cancel); },
+        {graph_schedule, 200, decode_nodes}));
+    if (enable_parallel_fact_passes) {
+        const auto strings_dependency = overlap_strings_with_decode ? 1ULL : 200ULL;
+        add_node(3, "baseline.strings_data", {strings_dependency},
+            phase_body(state,
+                [](auto& value, const auto& cancel) {
+                    return value.strings_data_phase(cancel);
+                }, {graph_schedule, 3, {strings_dependency}}));
+        add_node(210, "baseline.data_discovery", {200}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.data_discovery_phase(cancel);
+            }, {graph_schedule, 210, {200}}));
+        add_node(220, "baseline.function_recovery", {210}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.function_recovery_phase(cancel);
+            }, {graph_schedule, 220, {210}}));
+        add_node(230, "baseline.functions", {220}, phase_body(state,
+            [](auto& value, const auto& cancel) { return value.functions_phase(cancel); },
+            {graph_schedule, 230, {220}}));
+        add_node(240, "baseline.cfg_calls", {230}, phase_body(state,
+            [](auto& value, const auto& cancel) { return value.cfg_calls_phase(cancel); },
+            {graph_schedule, 240, {230}}));
+        add_node(250, "baseline.xrefs", {200, 210}, phase_body(state,
+            [](auto& value, const auto& cancel) { return value.xrefs_phase(cancel); },
+            {graph_schedule, 250, {200, 210}}));
+        add_node(260, "baseline.metadata_symbols_types", {240, 250, 3}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.metadata_symbols_types_phase(cancel);
+            }, {graph_schedule, 260, {240, 250, 3}}));
+    } else {
+        add_node(210, "baseline.data_discovery", {200}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.data_discovery_phase(cancel);
+            }, {graph_schedule, 210, {200}}));
+        add_node(220, "baseline.function_recovery", {210}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.function_recovery_phase(cancel);
+            }, {graph_schedule, 220, {210}}));
+        add_node(230, "baseline.functions", {220}, phase_body(state,
+            [](auto& value, const auto& cancel) { return value.functions_phase(cancel); },
+            {graph_schedule, 230, {220}}));
+        add_node(240, "baseline.cfg_calls", {230}, phase_body(state,
+            [](auto& value, const auto& cancel) { return value.cfg_calls_phase(cancel); },
+            {graph_schedule, 240, {230}}));
+        add_node(250, "baseline.xrefs", {240}, phase_body(state,
+            [](auto& value, const auto& cancel) { return value.xrefs_phase(cancel); },
+            {graph_schedule, 250, {240}}));
+        add_node(3, "baseline.strings_data", {250}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.strings_data_phase(cancel);
+            }, {graph_schedule, 3, {250}}));
+        add_node(260, "baseline.metadata_symbols_types", {3}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.metadata_symbols_types_phase(cancel);
+            }, {graph_schedule, 260, {3}}));
+    }
+    add_node(270, "baseline.search_index", {260}, phase_body(state,
+        [](auto& value, const auto& cancel) { return value.search_index_phase(cancel); },
+        {graph_schedule, 270, {260}}));
+    add_node(280, "baseline.persistence_submit", {270}, phase_body(state,
         [](auto& value, const auto& cancel) {
-            return value.metadata_symbols_types_phase(cancel);
-        }));
-    add_node(9, "baseline.search_index", {8}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.search_index_phase(cancel); }));
-    add_node(10, "baseline.persistence", {9}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.persistence_phase(cancel); }));
-    add_node(11, "baseline.publish_ready", {10}, phase_body(state,
-        [](auto& value, const auto& cancel) { return value.publish_ready_phase(cancel); }, true));
+            return value.persistence_submit_phase(cancel);
+        }, {graph_schedule, 280, {270}}));
+    add_node(290, "baseline.persistence_commit", {280}, phase_body(state,
+        [](auto& value, const auto& cancel) {
+            return value.persistence_commit_phase(cancel);
+        }, {graph_schedule, 290, {280}}));
+    add_node(300, "baseline.publish_ready", {290}, phase_body(state,
+        [](auto& value, const auto& cancel) { return value.publish_ready_phase(cancel); },
+        {graph_schedule, 300, {290},
+            static_cast<std::uint64_t>(decode_nodes.size())}, true));
+    graph_schedule->submitted_ns.store(analysis_metrics_t::steady_now_ns(),
+        std::memory_order_release);
     analyzer->metrics()->set(analysis_metric_t::tasks_scheduled, graph.nodes.size());
     auto submitted = aida::infra::taskflow_runtime::submit_graph(std::move(graph));
     if (!submitted.submitted) {

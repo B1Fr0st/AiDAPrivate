@@ -8,6 +8,7 @@
 #include "standalone_compat.hpp"
 #include "../disasm/ghidra_decompiler.hpp"
 #include "../disasm/zydis_disasm.hpp"
+#include "benchmark/benchmark_runner.hpp"
 #include "crypto_scanner.hpp"
 #include "aob_generator.hpp"
 #include "struct_recon_engine.hpp"
@@ -39,6 +40,7 @@
 #include <sstream>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <chrono>
 
@@ -1814,6 +1816,89 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		true,
 		{}},
 		workspace_analysis_query);
+
+	srv.register_tool({
+		"analysis_benchmark_manage",
+		"Manage hyper-performance benchmark runs against synthetic or real artifacts. Actions: run_synthetic, run_real, status, last_result.",
+		{{"action", "string", "run_synthetic|run_real|status|last_result", true},
+		 {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
+		 {"code_mb", "integer", "Synthetic code size in MiB (8..256) for run_synthetic", false},
+		 {"seed", "string", "Hex seed for the deterministic synthetic generator", false},
+		 {"lanes", "integer", "Decode worker lanes (0 = engine default)", false},
+		 {"path", "string", "Real fixture path for run_real (300..500 MB program gate)", false},
+		 {"sla_relaxed", "boolean", "Record the measurement without failing SLA verdicts", false}},
+		false,
+		[](const json& params) -> tool_result_t {
+			const std::string action = compat_action_name(params);
+			const json p = compat_action_payload(params);
+			if (action == "run_synthetic" || action == "run_real") {
+				aida::analysis::benchmark::benchmark_run_request_t request;
+				if (action == "run_synthetic") {
+					request.mode = aida::analysis::benchmark::benchmark_mode_t::synthetic;
+					if (p.contains("code_mb") && p["code_mb"].is_number()) {
+						const auto code_mb = p["code_mb"].get<std::uint64_t>();
+						if (code_mb < 8 || code_mb > 256)
+							return tool_result_t::error("code_mb must be within 8..256");
+						request.synthetic_code_bytes = code_mb * 1024ULL * 1024ULL;
+					}
+					if (p.contains("seed") && p["seed"].is_string()) {
+						const std::string seed_text = p["seed"].get<std::string>();
+						std::string_view seed_view(seed_text);
+						if (seed_view.size() > 2 && seed_view[0] == '0' &&
+							(seed_view[1] == 'x' || seed_view[1] == 'X'))
+							seed_view.remove_prefix(2);
+						if (seed_view.empty())
+							return tool_result_t::error("seed must be a hexadecimal integer");
+						std::size_t consumed = 0;
+						const std::string narrowed(seed_view);
+						unsigned long long seed_value = 0;
+						try {
+							seed_value = std::stoull(narrowed, &consumed, 16);
+						} catch (const std::exception&) {
+							return tool_result_t::error("seed must be a hexadecimal integer");
+						}
+						if (consumed != narrowed.size())
+							return tool_result_t::error("seed must be a hexadecimal integer");
+						request.synthetic_seed = static_cast<std::uint64_t>(seed_value);
+					}
+				} else {
+					request.mode = aida::analysis::benchmark::benchmark_mode_t::real;
+					request.real_path = p.value("path", std::string());
+					if (request.real_path.empty())
+						return tool_result_t::error("path is required for run_real");
+				}
+				if (p.contains("lanes") && p["lanes"].is_number()) {
+					const auto lanes = p["lanes"].get<std::uint64_t>();
+					if (lanes > 64)
+						return tool_result_t::error("lanes must be within 0..64");
+					request.lanes = static_cast<std::uint32_t>(lanes);
+				}
+				if (p.contains("sla_relaxed") && p["sla_relaxed"].is_boolean())
+					request.sla_relaxed = p["sla_relaxed"].get<bool>();
+				diag::log_tagged_fmt("analysis",
+					"analysis_benchmark_manage submit action=%s code_bytes=%llu seed=0x%llX lanes=%u path=%s relaxed=%d",
+					action.c_str(),
+					static_cast<unsigned long long>(request.synthetic_code_bytes),
+					static_cast<unsigned long long>(request.synthetic_seed),
+					static_cast<unsigned>(request.lanes),
+					request.real_path.c_str(),
+					request.sla_relaxed ? 1 : 0);
+				if (!aida::analysis::benchmark::start_benchmark_async(request)) {
+					diag::log_tagged("analysis", "analysis_benchmark_manage refused already_active");
+					return tool_result_t::error("a benchmark run is already active");
+				}
+				json result{{"accepted", true},
+					{"mode", action == "run_synthetic" ? "synthetic" : "real"}};
+				return tool_result_t::ok(result);
+			}
+			if (action == "status")
+				return tool_result_t::ok(aida::analysis::benchmark::benchmark_run_status());
+			if (action == "last_result")
+				return tool_result_t::ok(aida::analysis::benchmark::benchmark_last_result());
+			return compat_unknown_action("analysis_benchmark_manage", action);
+		}
+	});
+
 }
 
 }

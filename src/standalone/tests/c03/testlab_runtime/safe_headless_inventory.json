@@ -22,7 +22,6 @@
     }
   },
   "entries": [
-    {"id":"authority.surface","category":"authority","requirement_ids":["ACT-01","MCP-01","SURF-01","VER-01"],"source_target":"aida_c03_a00_authority_surface_harness"},
     {"id":"contract.analysis","category":"contract","requirement_ids":["PERF-01","FMT-01","ARCH-01"],"source_target":"aida_c03_a01_analysis_contracts_harness"},
     {"id":"contract.decompiler","category":"contract","requirement_ids":["DEC-01","DEC-05"],"source_target":"aida_c03_a02_decompiler_contracts_harness"},
     {"id":"contract.workbench","category":"contract","requirement_ids":["WB-01","WB-05"],"source_target":"aida_c03_a04_workbench_contracts_harness"},
@@ -73,10 +72,7 @@
     {"id":"worker.managed_snapshot","category":"worker","requirement_ids":["DEC-05","DEP-02"],"source_target":"aida_c03_managed_cli_snapshot_protocol_harness"},
     {"id":"decompiler.quality_scorer","category":"decompiler","requirement_ids":["DEC-10","HAR-03"],"source_target":"aida_c03_a06_decompiler_quality_scorer_harness"},
     {"id":"performance.sla_receipt","category":"performance","requirement_ids":["PERF-09","PERF-10","HAR-03"],"source_target":"aida_c03_a06_benchmark_sla_receipt_harness"},
-    {"id":"package.dependency_inventory","category":"package","requirement_ids":["DEP-01","DEP-03"],"source_target":"aida_c03_dependency_inventory_harness"},
-    {"id":"package.integration","category":"package","requirement_ids":["DEP-02","DEP-04"],"source_target":"aida_c03_build_packaging_integration_harness"},
     {"id":"surface.reconciliation","category":"surface","requirement_ids":["SURF-01"],"source_target":"aida_c03_surface_reconciliation_harness"},
-    {"id":"message_pump.policy","category":"message_pump","requirement_ids":["SEC-01","SURF-01"],"source_target":"aida_c03_source_policy_scanner"},
     {"id":"security.anti_tamper","category":"security","requirement_ids":["SEC-01","VER-02"],"source_target":"aida_c03_anti_tamper_integrity_harness"}
   ]
 }

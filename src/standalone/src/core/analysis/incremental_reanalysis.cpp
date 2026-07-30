@@ -774,6 +774,104 @@ std::vector<tile_decode_seed_t> collect_scoped_seeds(
     return seeds;
 }
 
+workspace_result_t<void> recompute_snapshot_ledger(
+    analysis_snapshot_t& snapshot, const cancellation_token_t& cancel) {
+    std::uint64_t visits = 0;
+    const auto poll = [&]() -> workspace_result_t<void> {
+        if ((visits++ & 255U) == 0 && cancel.stop_requested())
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::cancelled,
+                "incremental reanalysis cancelled during ledger recompute",
+                "incremental_reanalysis"));
+        return workspace_result_t<void>::success();
+    };
+    const auto overflow = [] {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "analysis memory accounting overflows", "memory_budget"));
+    };
+    std::uint64_t string_value_bytes = 0;
+    for (const auto& string : snapshot.strings) {
+        auto active = poll();
+        if (!active)
+            return active;
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(string_value_bytes,
+                static_cast<std::uint64_t>(string.value.capacity()), updated))
+            return overflow();
+        string_value_bytes = updated;
+    }
+    std::uint64_t symbol_name_bytes = 0;
+    for (const auto& symbol : snapshot.symbols) {
+        auto active = poll();
+        if (!active)
+            return active;
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(symbol_name_bytes,
+                static_cast<std::uint64_t>(symbol.name.capacity()), updated))
+            return overflow();
+        symbol_name_bytes = updated;
+    }
+    std::uint64_t function_chunk_bytes = 0;
+    for (const auto& function : snapshot.functions) {
+        auto active = poll();
+        if (!active)
+            return active;
+        std::uint64_t bytes = 0;
+        std::uint64_t updated = 0;
+        if (!checked_mul_u64(
+                static_cast<std::uint64_t>(function.chunks.capacity()),
+                static_cast<std::uint64_t>(sizeof(address_range_t)), bytes) ||
+            !checked_add_u64(function_chunk_bytes, bytes, updated))
+            return overflow();
+        function_chunk_bytes = updated;
+    }
+    std::uint64_t type_candidate_text_bytes = 0;
+    for (const auto& candidate : snapshot.rich_facts.type_candidates) {
+        auto active = poll();
+        if (!active)
+            return active;
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(type_candidate_text_bytes,
+                static_cast<std::uint64_t>(candidate.display_name.capacity() +
+                    candidate.canonical_type.capacity() +
+                    candidate.source_key.capacity()), updated))
+            return overflow();
+        type_candidate_text_bytes = updated;
+    }
+    std::uint64_t type_reference_key_bytes = 0;
+    for (const auto& reference : snapshot.rich_facts.type_references) {
+        auto active = poll();
+        if (!active)
+            return active;
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(type_reference_key_bytes,
+                static_cast<std::uint64_t>(reference.source_key.capacity()), updated))
+            return overflow();
+        type_reference_key_bytes = updated;
+    }
+    std::uint64_t metadata_conflict_text_bytes = 0;
+    for (const auto& conflict : snapshot.rich_facts.metadata_conflicts) {
+        auto active = poll();
+        if (!active)
+            return active;
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(metadata_conflict_text_bytes,
+                static_cast<std::uint64_t>(conflict.identity.capacity() +
+                    conflict.selected_value.capacity() +
+                    conflict.rejected_value.capacity()), updated))
+            return overflow();
+        metadata_conflict_text_bytes = updated;
+    }
+    snapshot.string_value_bytes = string_value_bytes;
+    snapshot.symbol_name_bytes = symbol_name_bytes;
+    snapshot.function_chunk_bytes = function_chunk_bytes;
+    snapshot.type_candidate_text_bytes = type_candidate_text_bytes;
+    snapshot.type_reference_key_bytes = type_reference_key_bytes;
+    snapshot.metadata_conflict_text_bytes = metadata_conflict_text_bytes;
+    return workspace_result_t<void>::success();
+}
+
 }
 
 incremental_reanalysis_executor_result_t
@@ -959,6 +1057,11 @@ incremental_reanalysis_executor_t::execute(
                 static_cast<unsigned long long>(scope.generation));
         }
 
+        auto ledger = recompute_snapshot_ledger(*merged, cancel);
+        if (!ledger) {
+            result.detail = ledger.error().message;
+            return result;
+        }
         result.ok = true;
         result.merged_snapshot = std::const_pointer_cast<
             const analysis_snapshot_t>(merged);
@@ -1436,6 +1539,12 @@ incremental_reanalysis_executor_t::execute(
     }
 
     merged->baseline_complete = false;
+
+    auto ledger = recompute_snapshot_ledger(*merged, cancel);
+    if (!ledger) {
+        result.detail = ledger.error().message;
+        return result;
+    }
 
     const auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();

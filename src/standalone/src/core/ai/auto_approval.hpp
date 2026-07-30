@@ -341,6 +341,7 @@ inline tool_category_t categorize_tool(const std::string& tool_name)
         name == "read_struct" || name == "read_u8" || name == "read_u16" ||
         name == "read_u32" || name == "read_u64" || name == "read_bytes" ||
         name == "driver_read_kernel_memory" || name == "search_kernel_memory" ||
+        name == "driver_kernel_symbols" ||
         name == "disassemble_zydis" || name == "disassemble_file" ||
         name == "get_imports" || name == "get_exports" ||
         name == "get_sections" || name == "get_pe_header" ||

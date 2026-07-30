@@ -32,8 +32,8 @@ struct baseline_analysis_settings_t {
     string_discovery_limits_t string_limits;
     symbol_type_candidate_limits_t symbol_type_limits;
     search_index_limits_t search_limits;
-    std::uint64_t max_seed_count = 1ULL << 24;
-    std::uint64_t max_decode_queue = 1ULL << 24;
+    std::uint64_t max_seed_count = 1ULL << 26;
+    std::uint64_t max_decode_queue = 1ULL << 26;
     std::uint64_t max_decoded_instructions = 1ULL << 28;
     std::uint64_t max_coverage_spans = 1ULL << 28;
     std::uint64_t max_analysis_memory_bytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -50,6 +50,8 @@ struct baseline_analysis_settings_t {
     bool scan_utf8 = true;
     bool scan_utf16 = true;
     int task_priority = 3;
+    bool enable_parallel_fact_passes = true;
+    bool overlap_strings_with_decode = true;
 
     workspace_result_t<void> validate() const;
     std::string canonical_json() const;
@@ -79,7 +81,9 @@ public:
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> decode_merge_phase(
         const std::atomic<bool>& runtime_cancel_requested);
-    workspace_result_t<void> blocks_phase(
+    workspace_result_t<void> data_discovery_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> function_recovery_phase(
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> functions_phase(
         const std::atomic<bool>& runtime_cancel_requested);
@@ -93,7 +97,9 @@ public:
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> search_index_phase(
         const std::atomic<bool>& runtime_cancel_requested);
-    workspace_result_t<void> persistence_phase(
+    workspace_result_t<void> persistence_submit_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> persistence_commit_phase(
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> publish_ready_phase(
         const std::atomic<bool>& runtime_cancel_requested);

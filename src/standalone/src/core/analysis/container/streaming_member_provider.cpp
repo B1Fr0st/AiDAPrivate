@@ -1208,4 +1208,13 @@ bool streaming_member_provider_t::is_spill_backed() const noexcept {
     return !subrange_backed_;
 }
 
+bool streaming_member_provider_t::content_pin_active() const noexcept {
+    return backing_->content_pin_active();
+}
+
+std::optional<mapped_window_cache_statistics_t>
+streaming_member_provider_t::window_cache_statistics() const noexcept {
+    return backing_->window_cache_statistics();
+}
+
 }

@@ -1,10 +1,18 @@
 #include "xref_builder.hpp"
 
 #include "checked_range.hpp"
+#include "parallel_pass.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <exception>
+#include <iterator>
+#include <limits>
 #include <new>
+#include <optional>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -14,6 +22,10 @@ namespace {
 
 constexpr std::uint64_t kXrefEntityTag = 5ULL << 56;
 constexpr std::uint64_t kTypeXrefEntityTag = 9ULL << 56;
+constexpr std::uint32_t kShardCancellationStride = 256;
+constexpr std::size_t kInstructionShardFloor = 65536;
+constexpr std::size_t kCandidateShardFloor = 4096;
+constexpr std::size_t kPublicationShardFloor = 65536;
 
 workspace_error_t stop_error(const cancellation_token_t& cancel) {
     if (cancel.deadline_exceeded()) {
@@ -27,6 +39,77 @@ workspace_error_t stop_error(const cancellation_token_t& cancel) {
         "xref analysis cancelled", "xrefs");
     error.cancellation = true;
     return error;
+}
+
+std::uint64_t elapsed_ns(std::chrono::steady_clock::time_point begin) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+}
+
+std::size_t pass_shard_count(std::size_t items, std::size_t items_per_shard) {
+    if (items == 0)
+        return 0;
+    const auto hardware = std::thread::hardware_concurrency();
+    const std::uint64_t cap = 4ULL * static_cast<std::uint64_t>(hardware == 0 ? 1U : hardware);
+    const std::uint64_t wanted = (static_cast<std::uint64_t>(items) +
+        static_cast<std::uint64_t>(items_per_shard) - 1ULL) /
+        static_cast<std::uint64_t>(items_per_shard);
+    return static_cast<std::size_t>((std::min)((std::max)(wanted, 1ULL), cap));
+}
+
+template <typename F>
+workspace_result_t<void> run_pass_shards(const std::vector<parallel_shard_t>& shards,
+                                         F&& fn, const cancellation_token_t&) {
+    struct slot_t {
+        std::optional<workspace_error_t> error;
+        std::exception_ptr exception;
+    };
+    const std::size_t count = shards.size();
+    if (count == 0)
+        return workspace_result_t<void>::success();
+    if (count == 1)
+        return fn(0, shards[0]);
+    std::vector<slot_t> slots(count);
+    std::vector<std::thread> threads;
+    threads.reserve(count);
+    std::exception_ptr spawn_exception;
+    try {
+        for (std::size_t index = 0; index < count; ++index) {
+            threads.emplace_back([&, index] {
+                try {
+                    auto result = fn(index, shards[index]);
+                    if (!result)
+                        slots[index].error = std::move(result.error());
+                } catch (...) {
+                    slots[index].exception = std::current_exception();
+                }
+            });
+        }
+    } catch (...) {
+        spawn_exception = std::current_exception();
+    }
+    for (auto& thread : threads)
+        thread.join();
+    for (auto& slot : slots) {
+        if (slot.exception)
+            std::rethrow_exception(slot.exception);
+        if (slot.error)
+            return workspace_result_t<void>::failure(std::move(*slot.error));
+    }
+    if (spawn_exception) {
+        try {
+            std::rethrow_exception(spawn_exception);
+        } catch (const std::system_error&) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "xref analysis exceeded available thread resources", "xrefs"));
+        } catch (const std::resource_error&) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "xref analysis exceeded available thread resources", "xrefs"));
+        }
+    }
+    return workspace_result_t<void>::success();
 }
 
 std::optional<std::uint64_t> to_rva(const workspace_image_t& image,
@@ -92,12 +175,121 @@ bool same_type_reference(const type_reference_fact_t& lhs,
            lhs.target_entity == rhs.target_entity && lhs.kind == rhs.kind;
 }
 
-workspace_result_t<xref_build_result_t> build_impl(
+template <typename RecordT, typename ValidateF, typename BytesF>
+workspace_result_t<std::uint64_t> validate_and_accumulate(
+    const std::vector<RecordT>& records, const char* integrity_message,
+    ValidateF&& validate, BytesF&& bytes, const cancellation_token_t& cancel) {
+    if (records.empty())
+        return workspace_result_t<std::uint64_t>::success(0);
+    const auto shards = parallel_shards(records.size(), static_cast<std::uint32_t>(
+        pass_shard_count(records.size(), kPublicationShardFloor)));
+    std::vector<std::uint64_t> partials(shards.size(), 0);
+    const auto shard_fn = [&](std::size_t index, parallel_shard_t shard) -> ordered_error_t {
+        std::uint64_t local = 0;
+        std::uint32_t checks = 0;
+        for (std::size_t i = shard.begin; i < shard.end; ++i) {
+            if (++checks >= kShardCancellationStride) {
+                checks = 0;
+                if (cancel.stop_requested())
+                    return ordered_error_t{static_cast<std::uint64_t>(i), stop_error(cancel)};
+            }
+            const auto& record = records[i];
+            if (integrity_message != nullptr && !validate(record, i)) {
+                return ordered_error_t{static_cast<std::uint64_t>(i), make_workspace_error(
+                    workspace_error_code_t::integrity_failure, integrity_message,
+                    "analysis_discovery_publish")};
+            }
+            if (!checked_add_u64(local, bytes(record), local)) {
+                return ordered_error_t{static_cast<std::uint64_t>(i), make_workspace_error(
+                    workspace_error_code_t::range_overflow,
+                    "analysis memory accounting overflows", "memory_budget")};
+            }
+        }
+        partials[index] = local;
+        return ordered_error_t{};
+    };
+    if (shards.size() == 1) {
+        auto result = shard_fn(0, shards[0]);
+        if (result.ordinal != (std::numeric_limits<std::uint64_t>::max)())
+            return workspace_result_t<std::uint64_t>::failure(std::move(result.error));
+    } else {
+        struct slot_t {
+            ordered_error_t result;
+            std::exception_ptr exception;
+        };
+        const std::size_t count = shards.size();
+        std::vector<slot_t> slots(count);
+        std::vector<std::thread> threads;
+        threads.reserve(count);
+        std::exception_ptr spawn_exception;
+        try {
+            for (std::size_t index = 0; index < count; ++index) {
+                threads.emplace_back([&, index] {
+                    try {
+                        slots[index].result = shard_fn(index, shards[index]);
+                    } catch (...) {
+                        slots[index].exception = std::current_exception();
+                    }
+                });
+            }
+        } catch (...) {
+            spawn_exception = std::current_exception();
+        }
+        for (auto& thread : threads)
+            thread.join();
+        std::size_t best_error = count;
+        std::size_t best_exception = count;
+        for (std::size_t index = 0; index < count; ++index) {
+            if (slots[index].exception && best_exception == count)
+                best_exception = index;
+            if (slots[index].result.ordinal != (std::numeric_limits<std::uint64_t>::max)() &&
+                (best_error == count ||
+                 slots[index].result.ordinal < slots[best_error].result.ordinal))
+                best_error = index;
+        }
+        if (best_exception != count) {
+            const auto exception_ordinal =
+                static_cast<std::uint64_t>(shards[best_exception].begin);
+            if (best_error == count ||
+                exception_ordinal <= slots[best_error].result.ordinal)
+                std::rethrow_exception(slots[best_exception].exception);
+        }
+        if (best_error != count)
+            return workspace_result_t<std::uint64_t>::failure(
+                std::move(slots[best_error].result.error));
+        if (spawn_exception) {
+            try {
+                std::rethrow_exception(spawn_exception);
+            } catch (const std::system_error&) {
+                return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "analysis publication exceeded available thread resources",
+                    "analysis_discovery_publish"));
+            } catch (const std::resource_error&) {
+                return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "analysis publication exceeded available thread resources",
+                    "analysis_discovery_publish"));
+            }
+        }
+    }
+    std::uint64_t total = 0;
+    for (const auto partial : partials) {
+        if (!checked_add_u64(total, partial, total)) {
+            return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                workspace_error_code_t::range_overflow,
+                "analysis memory accounting overflows", "memory_budget"));
+        }
+    }
+    return workspace_result_t<std::uint64_t>::success(total);
+}
+
+workspace_result_t<xref_build_result_t> build_core(
     const workspace_image_t& image,
     const std::vector<instruction_record_t>& instructions,
     const std::vector<operand_fact_t>& operands,
     const std::vector<target_fact_t>& targets,
-    data_discovery_result_t data,
+    const data_discovery_result_t& data,
     std::vector<type_reference_fact_t> type_references,
     const xref_build_limits_t& limits,
     const cancellation_token_t& cancel) {
@@ -133,17 +325,6 @@ workspace_result_t<xref_build_result_t> build_impl(
             workspace_error_code_t::limit_exceeded,
             "xref input storage exceeds its memory bound", "xrefs"));
     }
-    const auto append_xref = [&](xref_record_t value) -> workspace_result_t<void> {
-        if (result.xrefs.size() >= limits.max_xrefs ||
-            storage_bytes > limits.max_result_bytes - sizeof(xref_record_t)) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "xref storage exceeds its memory bound", "xrefs"));
-        }
-        storage_bytes += sizeof(xref_record_t);
-        result.xrefs.push_back(std::move(value));
-        return workspace_result_t<void>::success();
-    };
     std::unordered_set<std::uint64_t> import_rvas;
     import_rvas.reserve(image.imports.size());
     for (const auto& imported : image.imports) {
@@ -151,41 +332,41 @@ workspace_result_t<xref_build_result_t> build_impl(
         if (import_rva)
             import_rvas.insert(*import_rva);
     }
-    struct chunk_output_t {
+    struct emission_shard_t {
         std::vector<xref_record_t> xrefs;
-        std::optional<workspace_error_t> error;
     };
-    auto process_chunk = [&](std::size_t begin, std::size_t end) -> chunk_output_t {
-        chunk_output_t output;
-        std::uint64_t checks = 0;
-        for (std::size_t i = begin; i < end; ++i) {
-            const auto& instruction = instructions[i];
-            if (++checks >= limits.cancellation_check_interval) {
+    const auto instruction_shards = parallel_shards(instructions.size(),
+        static_cast<std::uint32_t>(pass_shard_count(instructions.size(),
+            kInstructionShardFloor)));
+    std::vector<emission_shard_t> instruction_outputs(instruction_shards.size());
+    const auto instruction_fn = [&](std::size_t index, parallel_shard_t shard)
+        -> workspace_result_t<void> {
+        auto& output = instruction_outputs[index];
+        std::uint32_t checks = 0;
+        for (std::size_t i = shard.begin; i < shard.end; ++i) {
+            if (++checks >= kShardCancellationStride) {
                 checks = 0;
-                if (cancel.stop_requested()) {
-                    output.error = stop_error(cancel);
-                    return output;
-                }
+                if (cancel.stop_requested())
+                    return workspace_result_t<void>::failure(stop_error(cancel));
             }
+            const auto& instruction = instructions[i];
             std::uint64_t operand_end = 0;
             std::uint64_t target_end = 0;
             if (!checked_add_u64(instruction.operand_fact_begin,
                     instruction.operand_fact_count, operand_end) || operand_end > operands.size() ||
                 !checked_add_u64(instruction.target_fact_begin,
                     instruction.target_fact_count, target_end) || target_end > targets.size()) {
-                output.error = make_workspace_error(
+                return workspace_result_t<void>::failure(make_workspace_error(
                     workspace_error_code_t::integrity_failure,
-                    "instruction fact range is invalid", "xrefs");
-                return output;
+                    "instruction fact range is invalid", "xrefs"));
             }
-            for (std::uint64_t index = instruction.target_fact_begin; index < target_end; ++index) {
-                const auto& target = targets[static_cast<std::size_t>(index)];
+            for (std::uint64_t fact = instruction.target_fact_begin; fact < target_end; ++fact) {
+                const auto& target = targets[static_cast<std::size_t>(fact)];
                 if (!valid_address(instruction.address) || !valid_address(target.target) ||
                     (target.instruction_id != 0 && target.instruction_id != instruction.id)) {
-                    output.error = make_workspace_error(
+                    return workspace_result_t<void>::failure(make_workspace_error(
                         workspace_error_code_t::integrity_failure,
-                        "xref target fact is invalid", "xrefs");
-                    return output;
+                        "xref target fact is invalid", "xrefs"));
                 }
                 const auto target_rva = to_rva(image, target.target);
                 const bool imported_call = target.kind == target_kind_record_t::call &&
@@ -219,42 +400,111 @@ workspace_result_t<xref_build_result_t> build_impl(
                 }
             }
         }
-        return output;
+        return workspace_result_t<void>::success();
     };
-    auto chunk_output = process_chunk(0, instructions.size());
-    if (chunk_output.error)
-        return workspace_result_t<xref_build_result_t>::failure(*chunk_output.error);
-    for (auto& xref : chunk_output.xrefs) {
-        auto appended = append_xref(std::move(xref));
-        if (!appended)
-            return workspace_result_t<xref_build_result_t>::failure(appended.error());
+    auto instructions_done = run_pass_shards(instruction_shards, instruction_fn, cancel);
+    if (!instructions_done)
+        return workspace_result_t<xref_build_result_t>::failure(instructions_done.error());
+    const auto pointer_shards = parallel_shards(data.pointer_facts.size(),
+        static_cast<std::uint32_t>(pass_shard_count(data.pointer_facts.size(),
+            kCandidateShardFloor)));
+    std::vector<emission_shard_t> pointer_outputs(pointer_shards.size());
+    const auto pointer_fn = [&](std::size_t index, parallel_shard_t shard)
+        -> workspace_result_t<void> {
+        auto& output = pointer_outputs[index];
+        std::uint32_t checks = 0;
+        for (std::size_t i = shard.begin; i < shard.end; ++i) {
+            if (++checks >= kShardCancellationStride) {
+                checks = 0;
+                if (cancel.stop_requested())
+                    return workspace_result_t<void>::failure(stop_error(cancel));
+            }
+            const auto& pointer = data.pointer_facts[i];
+            xref_record_t xref;
+            xref.source = pointer.slot;
+            xref.target = pointer.target;
+            xref.kind = pointer.candidate_kind == data_candidate_kind_t::relocation_slot
+                ? xref_kind_t::relocation : xref_kind_t::address;
+            xref.provenance = pointer.provenance;
+            xref.confidence = pointer.confidence;
+            output.xrefs.push_back(xref);
+        }
+        return workspace_result_t<void>::success();
+    };
+    auto pointers_done = run_pass_shards(pointer_shards, pointer_fn, cancel);
+    if (!pointers_done)
+        return workspace_result_t<xref_build_result_t>::failure(pointers_done.error());
+    const auto merge_begin = std::chrono::steady_clock::now();
+    std::uint64_t instruction_total = 0;
+    for (const auto& output : instruction_outputs) {
+        if (!checked_add_u64(instruction_total, output.xrefs.size(), instruction_total)) {
+            return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "xref storage exceeds its memory bound", "xrefs"));
+        }
     }
-    std::uint64_t checks = 0;
-    for (const auto& pointer : data.pointer_facts) {
-        if (++checks >= limits.cancellation_check_interval) {
-            checks = 0;
+    const auto charge_xrefs = [&](std::uint64_t count) {
+        return charge_existing(count, static_cast<std::uint64_t>(sizeof(xref_record_t)));
+    };
+    const std::uint64_t appends_possible = (std::min)(limits.max_xrefs,
+        (limits.max_result_bytes - storage_bytes) /
+            static_cast<std::uint64_t>(sizeof(xref_record_t)));
+    if (instruction_total > appends_possible) {
+        return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "xref storage exceeds its memory bound", "xrefs"));
+    }
+    result.xrefs.reserve(static_cast<std::size_t>(instruction_total));
+    for (auto& output : instruction_outputs) {
+        auto& xrefs = output.xrefs;
+        std::size_t position = 0;
+        while (position < xrefs.size()) {
             if (cancel.stop_requested())
                 return workspace_result_t<xref_build_result_t>::failure(stop_error(cancel));
+            const auto chunk = (std::min<std::size_t>)(kShardCancellationStride,
+                xrefs.size() - position);
+            result.xrefs.insert(result.xrefs.end(),
+                std::make_move_iterator(xrefs.begin() +
+                    static_cast<std::ptrdiff_t>(position)),
+                std::make_move_iterator(xrefs.begin() +
+                    static_cast<std::ptrdiff_t>(position + chunk)));
+            position += chunk;
         }
-        if (!valid_address(pointer.slot) || !valid_address(pointer.target) ||
-            pointer.confidence > 100) {
-            return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
-                workspace_error_code_t::integrity_failure,
-                "data pointer fact is invalid", "xrefs"));
-        }
-        xref_record_t xref;
-        xref.source = pointer.slot;
-        xref.target = pointer.target;
-        xref.kind = pointer.candidate_kind == data_candidate_kind_t::relocation_slot
-            ? xref_kind_t::relocation : xref_kind_t::address;
-        xref.provenance = pointer.provenance;
-        xref.confidence = pointer.confidence;
-        auto appended = append_xref(std::move(xref));
-        if (!appended)
-            return workspace_result_t<xref_build_result_t>::failure(appended.error());
     }
-    if (cancel.stop_requested())
-        return workspace_result_t<xref_build_result_t>::failure(stop_error(cancel));
+    if (!charge_xrefs(instruction_total)) {
+        return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "xref storage exceeds its memory bound", "xrefs"));
+    }
+    const auto append_xref = [&](xref_record_t value) -> workspace_result_t<void> {
+        if (result.xrefs.size() >= limits.max_xrefs || !charge_xrefs(1)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "xref storage exceeds its memory bound", "xrefs"));
+        }
+        result.xrefs.push_back(std::move(value));
+        return workspace_result_t<void>::success();
+    };
+    std::uint32_t pointer_checks = 0;
+    for (auto& output : pointer_outputs) {
+        for (auto& xref : output.xrefs) {
+            if (++pointer_checks >= kShardCancellationStride) {
+                pointer_checks = 0;
+                if (cancel.stop_requested())
+                    return workspace_result_t<xref_build_result_t>::failure(stop_error(cancel));
+            }
+            if (!valid_address(xref.source) || !valid_address(xref.target) ||
+                xref.confidence > 100) {
+                return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "data pointer fact is invalid", "xrefs"));
+            }
+            auto appended = append_xref(std::move(xref));
+            if (!appended)
+                return workspace_result_t<xref_build_result_t>::failure(appended.error());
+        }
+    }
+    result.shard_merge_ns += elapsed_ns(merge_begin);
     std::sort(result.xrefs.begin(), result.xrefs.end(), [](const auto& lhs, const auto& rhs) {
         if (lhs.source != rhs.source)
             return lhs.source < rhs.source;
@@ -318,9 +568,6 @@ workspace_result_t<xref_build_result_t> build_impl(
         type_references[index].id = kTypeXrefEntityTag |
             static_cast<std::uint64_t>(index + 1);
     result.type_xrefs = std::move(type_references);
-    result.data_candidates = std::move(data.candidates);
-    result.data_pointer_facts = std::move(data.pointer_facts);
-    result.data_conflicts = std::move(data.conflicts);
     return workspace_result_t<xref_build_result_t>::success(std::move(result));
 }
 
@@ -369,8 +616,49 @@ workspace_result_t<xref_build_result_t> xref_builder_t::build(
     std::vector<type_reference_fact_t> type_references,
     const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
     try {
-        return build_impl(image, instructions, operands, targets, std::move(data),
+        auto built = build_core(image, instructions, operands, targets, data,
             std::move(type_references), limits, cancel);
+        if (!built)
+            return workspace_result_t<xref_build_result_t>::failure(built.error());
+        auto result = built.take_value();
+        result.data_candidates = std::move(data.candidates);
+        result.data_pointer_facts = std::move(data.pointer_facts);
+        result.data_conflicts = std::move(data.conflicts);
+        return workspace_result_t<xref_build_result_t>::success(std::move(result));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "xref analysis allocation failed", "xrefs"));
+    } catch (const std::length_error&) {
+        return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "xref analysis allocation length is unsupported", "xrefs"));
+    }
+}
+
+workspace_result_t<xref_build_result_t> xref_builder_t::build(
+    const workspace_image_t& image,
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<operand_fact_t>& operands,
+    const std::vector<target_fact_t>& targets,
+    std::shared_ptr<const data_discovery_result_t> data,
+    std::vector<type_reference_fact_t> type_references,
+    const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
+    if (!data) {
+        return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "shared data discovery result is null", "xrefs"));
+    }
+    try {
+        auto built = build_core(image, instructions, operands, targets, *data,
+            std::move(type_references), limits, cancel);
+        if (!built)
+            return workspace_result_t<xref_build_result_t>::failure(built.error());
+        auto result = built.take_value();
+        result.data_candidates = data->candidates;
+        result.data_pointer_facts = data->pointer_facts;
+        result.data_conflicts = data->conflicts;
+        return workspace_result_t<xref_build_result_t>::success(std::move(result));
     } catch (const std::bad_alloc&) {
         return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
             workspace_error_code_t::limit_exceeded,
@@ -411,42 +699,42 @@ workspace_result_t<void> xref_builder_t::publish(
     } else if (xrefs.type_xrefs.empty()) {
         xrefs.type_xrefs = std::move(symbols.type_references);
     }
-    for (std::size_t index = 0; index < xrefs.xrefs.size(); ++index) {
-        const auto& xref = xrefs.xrefs[index];
-        if (entity_domain(xref.id) != 5 || entity_ordinal(xref.id) != index + 1 ||
-            !valid_address(xref.source) || !valid_address(xref.target) ||
-            xref.kind > xref_kind_t::relocation ||
-            xref.provenance > fact_provenance_t::decompiler_feedback ||
-            xref.confidence > 100) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::integrity_failure,
-                "xref publication contains an invalid fact", "analysis_discovery_publish"));
-        }
-    }
-    for (std::size_t index = 0; index < strings.strings.size(); ++index) {
-        const auto& string = strings.strings[index];
-        if (entity_domain(string.id) != 6 || entity_ordinal(string.id) != index + 1 ||
-            !valid_address(string.address) || string.byte_length == 0 ||
-            string.encoding > string_encoding_t::utf16_le || string.value.empty() ||
-            string.provenance > fact_provenance_t::decompiler_feedback ||
-            string.confidence > 100) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::integrity_failure,
-                "string publication contains an invalid fact", "analysis_discovery_publish"));
-        }
-    }
-    for (std::size_t index = 0; index < symbols.symbols.size(); ++index) {
-        const auto& symbol = symbols.symbols[index];
-        if (entity_domain(symbol.id) != 7 || entity_ordinal(symbol.id) != index + 1 ||
-            !valid_address(symbol.address) || symbol.name.empty() ||
-            symbol.kind > symbol_kind_t::metadata ||
-            symbol.provenance > fact_provenance_t::decompiler_feedback ||
-            symbol.confidence > 100) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::integrity_failure,
-                "symbol publication contains an invalid fact", "analysis_discovery_publish"));
-        }
-    }
+    const auto xref_valid = [](const xref_record_t& xref, std::size_t index) {
+        return entity_domain(xref.id) == 5 && entity_ordinal(xref.id) == index + 1 &&
+            valid_address(xref.source) && valid_address(xref.target) &&
+            xref.kind <= xref_kind_t::relocation &&
+            xref.provenance <= fact_provenance_t::decompiler_feedback &&
+            xref.confidence <= 100;
+    };
+    auto xref_text = validate_and_accumulate(xrefs.xrefs,
+        "xref publication contains an invalid fact", xref_valid,
+        [](const xref_record_t&) { return std::uint64_t{0}; }, cancel);
+    if (!xref_text)
+        return workspace_result_t<void>::failure(xref_text.error());
+    const auto string_valid = [](const string_record_t& string, std::size_t index) {
+        return entity_domain(string.id) == 6 && entity_ordinal(string.id) == index + 1 &&
+            valid_address(string.address) && string.byte_length != 0 &&
+            string.encoding <= string_encoding_t::utf16_le && !string.value.empty() &&
+            string.provenance <= fact_provenance_t::decompiler_feedback &&
+            string.confidence <= 100;
+    };
+    auto string_text = validate_and_accumulate(strings.strings,
+        "string publication contains an invalid fact", string_valid,
+        [](const string_record_t& string) { return string.value.capacity(); }, cancel);
+    if (!string_text)
+        return workspace_result_t<void>::failure(string_text.error());
+    const auto symbol_valid = [](const symbol_record_t& symbol, std::size_t index) {
+        return entity_domain(symbol.id) == 7 && entity_ordinal(symbol.id) == index + 1 &&
+            valid_address(symbol.address) && !symbol.name.empty() &&
+            symbol.kind <= symbol_kind_t::metadata &&
+            symbol.provenance <= fact_provenance_t::decompiler_feedback &&
+            symbol.confidence <= 100;
+    };
+    auto symbol_text = validate_and_accumulate(symbols.symbols,
+        "symbol publication contains an invalid fact", symbol_valid,
+        [](const symbol_record_t& symbol) { return symbol.name.capacity(); }, cancel);
+    if (!symbol_text)
+        return workspace_result_t<void>::failure(symbol_text.error());
     analysis_rich_fact_publication_t rich;
     rich.data_candidates = std::move(xrefs.data_candidates);
     rich.data_pointer_facts = std::move(xrefs.data_pointer_facts);
@@ -454,11 +742,37 @@ workspace_result_t<void> xref_builder_t::publish(
     rich.type_candidates = std::move(symbols.type_candidates);
     rich.type_references = std::move(xrefs.type_xrefs);
     rich.metadata_conflicts = std::move(symbols.conflicts);
+    const auto always_valid = [](const auto&, std::size_t) { return true; };
+    auto candidate_text = validate_and_accumulate(rich.type_candidates, nullptr, always_valid,
+        [](const symbol_type_candidate_record_t& candidate) {
+            return candidate.display_name.capacity() + candidate.canonical_type.capacity() +
+                candidate.source_key.capacity();
+        }, cancel);
+    if (!candidate_text)
+        return workspace_result_t<void>::failure(candidate_text.error());
+    auto reference_keys = validate_and_accumulate(rich.type_references, nullptr, always_valid,
+        [](const type_reference_fact_t& reference) {
+            return reference.source_key.capacity();
+        }, cancel);
+    if (!reference_keys)
+        return workspace_result_t<void>::failure(reference_keys.error());
+    auto conflict_text = validate_and_accumulate(rich.metadata_conflicts, nullptr, always_valid,
+        [](const metadata_conflict_record_t& conflict) {
+            return conflict.identity.capacity() + conflict.selected_value.capacity() +
+                conflict.rejected_value.capacity();
+        }, cancel);
+    if (!conflict_text)
+        return workspace_result_t<void>::failure(conflict_text.error());
     auto validated = validate_rich_fact_publication(snapshot, rich, cancel);
     if (!validated)
         return validated;
     if (cancel.stop_requested())
         return workspace_result_t<void>::failure(stop_error(cancel));
+    snapshot.string_value_bytes = string_text.value();
+    snapshot.symbol_name_bytes = symbol_text.value();
+    snapshot.type_candidate_text_bytes = candidate_text.value();
+    snapshot.type_reference_key_bytes = reference_keys.value();
+    snapshot.metadata_conflict_text_bytes = conflict_text.value();
     snapshot.xrefs = std::move(xrefs.xrefs);
     snapshot.strings = std::move(strings.strings);
     snapshot.symbols = std::move(symbols.symbols);

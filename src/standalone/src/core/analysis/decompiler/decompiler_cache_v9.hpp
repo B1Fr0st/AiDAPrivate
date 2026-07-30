@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace aida::analysis {
@@ -50,6 +51,11 @@ struct decompiler_cache_v9_lookup_t {
 
     bool hit() const noexcept { return static_cast<bool>(value); }
 };
+
+std::string serialize_decompiler_rendered_cache_value(
+    const decompiler_rendered_cache_value_t& value);
+std::optional<decompiler_rendered_cache_value_t>
+    deserialize_decompiler_rendered_cache_value(std::string_view bytes) noexcept;
 
 struct decompiler_cache_v9_limits_t {
     std::size_t max_workspaces = 256;
@@ -118,6 +124,10 @@ public:
         const std::string& workspace_id,
         std::uint64_t generation,
         decompiler_cache_stage_t stage);
+    workspace_result_t<void> invalidate_entities(
+        const std::string& workspace_id,
+        std::uint64_t generation,
+        const std::vector<decompiler_entity_key_t>& entities);
     workspace_result_t<void> invalidate_workspace(
         const std::string& workspace_id,
         std::uint64_t generation);
