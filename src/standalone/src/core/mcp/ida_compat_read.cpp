@@ -32,12 +32,12 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "../infra/cancellation_watchdog.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace mcp_standalone::ida_compat
@@ -340,45 +340,23 @@ namespace mcp_standalone::ida_compat
         public:
             request_cancellation_bridge_t(
                 const workspace_request_context_t& context,
-                cancellation_source_t& source)
-                : context_(context), source_(source) {
-                if (!context_.cancellation) {
+                cancellation_source_t& source) {
+                if (!context.cancellation) {
                     ready_ = true;
                     return;
                 }
-                auto& active = active_bridges();
-                auto observed = active.load(std::memory_order_acquire);
-                while (observed < k_max_active_bridges &&
-                       !active.compare_exchange_weak(
-                           observed, observed + 1U,
-                           std::memory_order_acq_rel,
-                           std::memory_order_acquire)) {
-                }
-                if (observed >= k_max_active_bridges)
-                    return;
-                owns_slot_ = true;
-                try {
-                    worker_ = std::thread([this] {
-                        while (!stopping_.load(std::memory_order_acquire)) {
-                            if (context_.cancellation_requested()) {
-                                source_.request_cancel();
-                                return;
-                            }
-                            ::Sleep(2);
-                        }
-                    });
-                    ready_ = true;
-                } catch (...) {
-                    owns_slot_ = false;
-                    active.fetch_sub(1U, std::memory_order_acq_rel);
-                }
+                aida::infra::cancellation_watchdog::watch_descriptor_t watch;
+                watch.external_flag = context.cancellation;
+                watch.on_fire = [source_snapshot = source]() mutable {
+                    source_snapshot.request_cancel();
+                };
+                watch_id_ = aida::infra::cancellation_watchdog::register_watch(std::move(watch));
+                ready_ = watch_id_.valid();
             }
 
             ~request_cancellation_bridge_t() {
-                stopping_.store(true, std::memory_order_release);
-                if (worker_.joinable()) worker_.join();
-                if (owns_slot_)
-                    active_bridges().fetch_sub(1U, std::memory_order_acq_rel);
+                if (watch_id_.valid())
+                    aida::infra::cancellation_watchdog::unregister_watch(watch_id_);
             }
 
             request_cancellation_bridge_t(
@@ -389,18 +367,7 @@ namespace mcp_standalone::ida_compat
             bool ready() const noexcept { return ready_; }
 
         private:
-            static constexpr std::uint32_t k_max_active_bridges = 16;
-
-            static std::atomic<std::uint32_t>& active_bridges() noexcept {
-                static std::atomic<std::uint32_t> active{0};
-                return active;
-            }
-
-            const workspace_request_context_t& context_;
-            cancellation_source_t& source_;
-            std::atomic<bool> stopping_{false};
-            std::thread worker_;
-            bool owns_slot_ = false;
+            aida::infra::cancellation_watchdog::watch_id_t watch_id_;
             bool ready_ = false;
         };
 

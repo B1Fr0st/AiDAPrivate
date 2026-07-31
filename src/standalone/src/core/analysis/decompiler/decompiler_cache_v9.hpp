@@ -19,6 +19,7 @@ struct decompiler_provider_ir_cache_value_t {
     std::uint64_t return_type_id = 0;
     std::vector<semantic_refinement_query_t> semantic_queries;
     std::vector<decompiler_diagnostic_t> diagnostics;
+    std::shared_ptr<const decompiler_render_evidence_t> evidence;
     std::uint64_t provider_wall_clock_ms = 0;
     std::uint64_t provider_cpu_ms = 0;
     std::uint64_t provider_peak_memory_bytes = 0;
@@ -31,6 +32,7 @@ struct decompiler_normalized_cache_value_t {
     typed_pseudocode_ast_v2_t ast;
     std::vector<semantic_refinement_fact_t> semantic_facts;
     std::vector<decompiler_diagnostic_t> diagnostics;
+    std::shared_ptr<const decompiler_render_evidence_t> evidence;
     std::uint64_t provider_wall_clock_ms = 0;
     std::uint64_t provider_cpu_ms = 0;
     std::uint64_t provider_peak_memory_bytes = 0;
@@ -60,8 +62,9 @@ std::optional<decompiler_rendered_cache_value_t>
 struct decompiler_cache_v9_limits_t {
     std::size_t max_workspaces = 256;
     std::size_t max_entries_per_workspace = 384;
+    std::size_t max_rendered_entries_per_workspace = 65536;
     std::uint64_t max_bytes_per_workspace = 128ULL << 20;
-    std::size_t max_total_entries = 4096;
+    std::size_t max_total_entries = 1ULL << 20;
     std::uint64_t max_total_bytes = 512ULL << 20;
     std::uint64_t max_entry_bytes = 64ULL << 20;
     std::size_t max_cache_key_bytes = 1U << 20;

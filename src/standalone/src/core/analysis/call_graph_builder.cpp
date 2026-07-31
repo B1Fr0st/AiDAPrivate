@@ -330,6 +330,44 @@ void run_sharded(std::size_t shard_total, Fn&& shard_fn) {
         "analysis.call_graph_builder", std::forward<Fn>(shard_fn));
 }
 
+template <typename T, typename Equal>
+void parallel_unique_erase(std::vector<T>& values, Equal&& equal) {
+    if (values.size() < 2)
+        return;
+    const std::size_t count = values.size();
+    const auto shards = partition_shards(count,
+        pass_shard_count(count, kIndexShardFloor));
+    std::vector<std::uint8_t> keep(count, 0);
+    std::vector<std::uint64_t> shard_keeps(shards.size(), 0);
+    run_sharded(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        std::uint64_t kept = 0;
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            const auto flagged = index == 0 || !equal(values[index - 1], values[index]);
+            keep[index] = flagged ? static_cast<std::uint8_t>(1)
+                                  : static_cast<std::uint8_t>(0);
+            kept += flagged ? 1ULL : 0ULL;
+        }
+        shard_keeps[shard] = kept;
+    });
+    std::uint64_t total = 0;
+    for (auto& base : shard_keeps) {
+        const auto offset = total;
+        total += base;
+        base = offset;
+    }
+    std::vector<T> compacted(static_cast<std::size_t>(total));
+    run_sharded(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        auto cursor = shard_keeps[shard];
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            if (keep[index] != 0)
+                compacted[static_cast<std::size_t>(cursor++)] = std::move(values[index]);
+        }
+    });
+    values = std::move(compacted);
+}
+
 struct merge_clock_t {
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 
@@ -678,12 +716,22 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
             "call graph node storage exceeds analysis budget");
         if (!accounted)
             return workspace_result_t<call_graph_result_t>::failure(accounted.error());
-        result.nodes.reserve(static_cast<std::size_t>(node_total));
-        for (auto& nodes : shard_nodes) {
-            for (auto& node : nodes)
-                result.nodes.push_back(std::move(node));
+        result.nodes.resize(static_cast<std::size_t>(node_total));
+        {
+            std::vector<std::uint64_t> node_bases(shard_nodes.size(), 0);
+            std::uint64_t node_cursor = 0;
+            for (std::size_t index = 0; index < shard_nodes.size(); ++index) {
+                node_bases[index] = node_cursor;
+                node_cursor += shard_nodes[index].size();
+            }
+            run_sharded(shard_nodes.size(), [&](std::size_t shard) {
+                auto& nodes = shard_nodes[shard];
+                auto cursor = node_bases[shard];
+                for (auto& node : nodes)
+                    result.nodes[static_cast<std::size_t>(cursor++)] = std::move(node);
+            });
         }
-        std::sort(result.nodes.begin(), result.nodes.end(),
+        parallel_sort(result.nodes.begin(), result.nodes.end(),
             [](const call_graph_node_record_t& lhs,
                const call_graph_node_record_t& rhs) {
                 if (lhs.address != rhs.address)
@@ -935,13 +983,30 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
             "call graph conflict storage exceeds analysis budget");
         if (!accounted)
             return workspace_result_t<call_graph_result_t>::failure(accounted.error());
-        evidence_pairs.reserve(static_cast<std::size_t>(pair_total));
-        result.conflicts.reserve(static_cast<std::size_t>(conflict_total));
-        for (auto& output : evidence_outputs) {
-            for (auto& pair : output.pairs)
-                evidence_pairs.push_back(std::move(pair));
-            for (auto& conflict : output.conflicts)
-                result.conflicts.push_back(std::move(conflict));
+        evidence_pairs.resize(static_cast<std::size_t>(pair_total));
+        result.conflicts.resize(static_cast<std::size_t>(conflict_total));
+        {
+            std::vector<std::uint64_t> pair_bases(evidence_outputs.size(), 0);
+            std::vector<std::uint64_t> conflict_bases(evidence_outputs.size(), 0);
+            std::uint64_t pair_cursor = 0;
+            std::uint64_t conflict_cursor = 0;
+            for (std::size_t index = 0; index < evidence_outputs.size(); ++index) {
+                pair_bases[index] = pair_cursor;
+                conflict_bases[index] = conflict_cursor;
+                pair_cursor += evidence_outputs[index].pairs.size();
+                conflict_cursor += evidence_outputs[index].conflicts.size();
+            }
+            run_sharded(evidence_outputs.size(), [&](std::size_t shard) {
+                auto& output = evidence_outputs[shard];
+                auto pair_slot = pair_bases[shard];
+                for (auto& pair : output.pairs)
+                    evidence_pairs[static_cast<std::size_t>(pair_slot++)] =
+                        std::move(pair);
+                auto conflict_slot = conflict_bases[shard];
+                for (auto& conflict : output.conflicts)
+                    result.conflicts[static_cast<std::size_t>(conflict_slot++)] =
+                        std::move(conflict);
+            });
         }
         result.shard_merge_ns += evidence_clock.elapsed_ns();
     }
@@ -1008,15 +1073,28 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
             call_total += output.calls.size();
             tail_total += output.tails.size();
         }
-        std::vector<block_edge_ref_t> call_refs;
-        std::vector<block_edge_ref_t> tail_refs;
-        call_refs.reserve(static_cast<std::size_t>(call_total));
-        tail_refs.reserve(static_cast<std::size_t>(tail_total));
-        for (auto& output : edge_outputs) {
-            for (auto& ref : output.calls)
-                call_refs.push_back(std::move(ref));
-            for (auto& ref : output.tails)
-                tail_refs.push_back(std::move(ref));
+        std::vector<block_edge_ref_t> call_refs(static_cast<std::size_t>(call_total));
+        std::vector<block_edge_ref_t> tail_refs(static_cast<std::size_t>(tail_total));
+        {
+            std::vector<std::uint64_t> call_bases(edge_outputs.size(), 0);
+            std::vector<std::uint64_t> tail_bases(edge_outputs.size(), 0);
+            std::uint64_t call_cursor = 0;
+            std::uint64_t tail_cursor = 0;
+            for (std::size_t index = 0; index < edge_outputs.size(); ++index) {
+                call_bases[index] = call_cursor;
+                tail_bases[index] = tail_cursor;
+                call_cursor += edge_outputs[index].calls.size();
+                tail_cursor += edge_outputs[index].tails.size();
+            }
+            run_sharded(edge_outputs.size(), [&](std::size_t shard) {
+                auto& output = edge_outputs[shard];
+                auto call_slot = call_bases[shard];
+                for (auto& ref : output.calls)
+                    call_refs[static_cast<std::size_t>(call_slot++)] = std::move(ref);
+                auto tail_slot = tail_bases[shard];
+                for (auto& ref : output.tails)
+                    tail_refs[static_cast<std::size_t>(tail_slot++)] = std::move(ref);
+            });
         }
         for (const auto& ref : call_refs)
             ++call_edge_offsets[ref.block + 1];
@@ -1255,12 +1333,22 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
                 workspace_error_code_t::limit_exceeded,
                 "raw call graph evidence exceeds analysis limits", "call_graph.sites"));
         }
-        raw_sites.reserve(static_cast<std::size_t>(site_total));
-        for (auto& output : site_outputs) {
-            for (auto& site : output.sites)
-                raw_sites.push_back(std::move(site));
+        raw_sites.resize(static_cast<std::size_t>(site_total));
+        {
+            std::vector<std::uint64_t> site_bases(site_outputs.size(), 0);
+            std::uint64_t site_cursor = 0;
+            for (std::size_t index = 0; index < site_outputs.size(); ++index) {
+                site_bases[index] = site_cursor;
+                site_cursor += site_outputs[index].sites.size();
+            }
+            run_sharded(site_outputs.size(), [&](std::size_t shard) {
+                auto& output = site_outputs[shard];
+                auto cursor = site_bases[shard];
+                for (auto& site : output.sites)
+                    raw_sites[static_cast<std::size_t>(cursor++)] = std::move(site);
+            });
         }
-        std::sort(raw_sites.begin(), raw_sites.end(), raw_site_less);
+        parallel_sort(raw_sites.begin(), raw_sites.end(), raw_site_less);
         result.shard_merge_ns += site_clock.elapsed_ns();
     }
     struct resolved_site_t {
@@ -1582,11 +1670,21 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
     result.call_sites.resize(static_cast<std::size_t>(total_sites));
     result.candidates.resize(static_cast<std::size_t>(total_candidates));
     result.edges.resize(static_cast<std::size_t>(total_edges));
-    result.conflicts.reserve(result.conflicts.size() +
-        static_cast<std::size_t>(total_conflicts));
-    for (auto& output : resolve_outputs) {
-        for (auto& conflict : output.conflicts)
-            result.conflicts.push_back(std::move(conflict));
+    {
+        std::vector<std::uint64_t> conflict_bases(resolve_outputs.size(), 0);
+        std::uint64_t conflict_cursor = result.conflicts.size();
+        for (std::size_t index = 0; index < resolve_outputs.size(); ++index) {
+            conflict_bases[index] = conflict_cursor;
+            conflict_cursor += resolve_outputs[index].conflicts.size();
+        }
+        result.conflicts.resize(static_cast<std::size_t>(conflict_cursor));
+        run_sharded(resolve_outputs.size(), [&](std::size_t shard) {
+            auto& output = resolve_outputs[shard];
+            auto cursor = conflict_bases[shard];
+            for (auto& conflict : output.conflicts)
+                result.conflicts[static_cast<std::size_t>(cursor++)] =
+                    std::move(conflict);
+        });
     }
     {
         std::uint64_t candidate_base = 0;
@@ -1642,9 +1740,8 @@ workspace_result_t<call_graph_result_t> call_graph_builder_t::build(
         result.nodes[index].incoming_edges =
             node_incoming[index].load(std::memory_order_relaxed);
     }
-    std::sort(result.conflicts.begin(), result.conflicts.end(), conflict_less);
-    result.conflicts.erase(std::unique(result.conflicts.begin(),
-        result.conflicts.end(), conflict_equal), result.conflicts.end());
+    parallel_sort(result.conflicts.begin(), result.conflicts.end(), conflict_less);
+    parallel_unique_erase(result.conflicts, conflict_equal);
     for (std::size_t index = 0; index < result.conflicts.size(); ++index)
         result.conflicts[index].id = call_conflict_entity_tag |
             static_cast<std::uint64_t>(index + 1);

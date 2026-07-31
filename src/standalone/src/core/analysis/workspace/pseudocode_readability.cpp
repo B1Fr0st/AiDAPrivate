@@ -8,9 +8,11 @@
 #include <limits>
 #include <sstream>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 namespace aida::analysis {
 
@@ -1070,7 +1072,12 @@ private:
         if (braces) {
             ++indent_;
         }
-        if (request_.policy.declaration_placement == pseudocode_declaration_placement_t::scope_entry) {
+        const bool hoist_declarations =
+            request_.policy.declaration_placement == pseudocode_declaration_placement_t::scope_entry;
+        const bool first_use_declarations =
+            request_.policy.declaration_placement == pseudocode_declaration_placement_t::first_use;
+        std::unordered_map<std::size_t, std::vector<pseudocode_variable_id_t>> first_use_declarations_by_statement;
+        if (hoist_declarations) {
             const auto declarations = declarations_by_scope_.find(node.id);
             if (declarations != declarations_by_scope_.end()) {
                 for (const auto variable_id : declarations->second) {
@@ -1083,14 +1090,47 @@ private:
                 }
             }
         }
-        for (const auto statement : block.statements) {
+        if (first_use_declarations) {
+            const auto declarations = declarations_by_scope_.find(node.id);
+            if (declarations != declarations_by_scope_.end()) {
+                std::vector<pseudocode_variable_id_t> unused;
+                for (const auto variable_id : declarations->second) {
+                    const auto use_index = first_use_statement_index(block, variable_id);
+                    if (use_index.has_value()) {
+                        first_use_declarations_by_statement[*use_index].push_back(variable_id);
+                    } else {
+                        unused.push_back(variable_id);
+                    }
+                }
+                for (const auto variable_id : unused) {
+                    if (!render_synthetic_declaration(variable_id)) {
+                        return false;
+                    }
+                }
+                if (!unused.empty() && !block.statements.empty() && !write_line_break()) {
+                    return false;
+                }
+            }
+        }
+        for (std::size_t statement_index = 0; statement_index < block.statements.size(); ++statement_index) {
+            if (first_use_declarations) {
+                const auto pending = first_use_declarations_by_statement.find(statement_index);
+                if (pending != first_use_declarations_by_statement.end()) {
+                    for (const auto variable_id : pending->second) {
+                        if (!render_synthetic_declaration(variable_id)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            const auto statement = block.statements[statement_index];
             const auto* child = find_node(statement);
             if (child == nullptr) {
                 fail(pseudocode_render_error_code_t::missing_node, statement, invalid_pseudocode_variable_id, node.source,
                      "block contains an unknown statement");
                 return false;
             }
-            if (request_.policy.declaration_placement == pseudocode_declaration_placement_t::scope_entry &&
+            if ((hoist_declarations || first_use_declarations) &&
                 child->kind == pseudocode_node_kind_t::declaration) {
                 const auto& declaration = std::get<pseudocode_declaration_t>(child->payload);
                 if (declaration.initializer.has_value() && !render_declaration_initializer(*child, declaration)) {
@@ -1107,6 +1147,124 @@ private:
             return write_indent() && append("}") && write_line_break();
         }
         return true;
+    }
+
+    std::optional<std::size_t> first_use_statement_index(const pseudocode_block_t& block,
+                                                         const pseudocode_variable_id_t variable) const {
+        for (std::size_t index = 0; index < block.statements.size(); ++index) {
+            const auto* child = find_node(block.statements[index]);
+            if (child == nullptr) {
+                continue;
+            }
+            if (child->kind == pseudocode_node_kind_t::declaration) {
+                const auto& declaration = std::get<pseudocode_declaration_t>(child->payload);
+                if (declaration.variable == variable) {
+                    if (declaration.initializer.has_value()) {
+                        return index;
+                    }
+                    continue;
+                }
+            }
+            if (statement_uses_variable(*child, variable)) {
+                return index;
+            }
+        }
+        return std::nullopt;
+    }
+
+    bool statement_uses_variable(const typed_pseudocode_node_t& root,
+                                 const pseudocode_variable_id_t variable) const {
+        std::vector<pseudocode_node_id_t> pending{root.id};
+        std::unordered_set<pseudocode_node_id_t> visited;
+        while (!pending.empty()) {
+            const auto id = pending.back();
+            pending.pop_back();
+            if (!visited.insert(id).second) {
+                continue;
+            }
+            const auto* current = find_node(id);
+            if (current == nullptr) {
+                continue;
+            }
+            if (current->kind == pseudocode_node_kind_t::identifier_expression &&
+                std::get<pseudocode_identifier_expression_t>(current->payload).variable == variable) {
+                return true;
+            }
+            if (current->kind == pseudocode_node_kind_t::declaration) {
+                const auto& declaration = std::get<pseudocode_declaration_t>(current->payload);
+                if (declaration.initializer.has_value()) {
+                    pending.push_back(*declaration.initializer);
+                }
+                continue;
+            }
+            collect_payload_children(*current, pending);
+        }
+        return false;
+    }
+
+    static void collect_payload_children(const typed_pseudocode_node_t& node,
+                                         std::vector<pseudocode_node_id_t>& pending) {
+        const auto push = [&pending](const pseudocode_node_id_t id) {
+            if (id != invalid_pseudocode_node_id) {
+                pending.push_back(id);
+            }
+        };
+        std::visit([&](const auto& payload) {
+            using payload_t = std::decay_t<decltype(payload)>;
+            if constexpr (std::is_same_v<payload_t, pseudocode_module_t>) {
+                for (const auto id : payload.declarations) push(id);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_function_t>) {
+                push(payload.body);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_block_t>) {
+                for (const auto id : payload.statements) push(id);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_declaration_t>) {
+                if (payload.initializer.has_value()) push(*payload.initializer);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_expression_statement_t>) {
+                push(payload.expression);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_return_statement_t>) {
+                if (payload.value.has_value()) push(*payload.value);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_condition_statement_t>) {
+                push(payload.condition);
+                push(payload.when_true);
+                if (payload.when_false.has_value()) push(*payload.when_false);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_loop_statement_t>) {
+                if (payload.initializer.has_value()) push(*payload.initializer);
+                if (payload.condition.has_value()) push(*payload.condition);
+                if (payload.iteration.has_value()) push(*payload.iteration);
+                push(payload.body);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_switch_statement_t>) {
+                push(payload.selector);
+                for (const auto& switch_case : payload.cases) {
+                    if (switch_case.value.has_value()) push(*switch_case.value);
+                    for (const auto id : switch_case.statements) push(id);
+                }
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_label_statement_t>) {
+                if (payload.statement.has_value()) push(*payload.statement);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_unary_expression_t>) {
+                push(payload.operand);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_binary_expression_t>) {
+                push(payload.left);
+                push(payload.right);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_ternary_expression_t>) {
+                push(payload.condition);
+                push(payload.when_true);
+                push(payload.when_false);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_call_expression_t>) {
+                push(payload.callee);
+                for (const auto id : payload.arguments) push(id);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_cast_expression_t>) {
+                push(payload.operand);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_member_expression_t>) {
+                push(payload.object);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_index_expression_t>) {
+                push(payload.object);
+                push(payload.index);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_sizeof_expression_t>) {
+                if (!payload.uses_type) push(payload.operand);
+            } else if constexpr (std::is_same_v<payload_t, pseudocode_group_expression_t>) {
+                push(payload.expression);
+            }
+        }, node.payload);
     }
 
     bool render_synthetic_declaration(const pseudocode_variable_id_t variable_id) {

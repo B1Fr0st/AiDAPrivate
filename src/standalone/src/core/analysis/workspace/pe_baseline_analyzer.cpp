@@ -2,10 +2,12 @@
 
 #include "checked_range.hpp"
 #include "decode_materializer.hpp"
+#include "fact_residency.hpp"
 #include "parallel_pass.hpp"
 #include "persistence_queue.hpp"
 #include "workspace_database.hpp"
 #include "../mapped_window_cache.hpp"
+#include "../working_set_governor.hpp"
 #include "../decompiler/managed_entity_binding.hpp"
 #include "../../../helpers/diag_log.hpp"
 #include <algorithm>
@@ -888,12 +890,15 @@ enum class baseline_progress_slot_t : std::size_t {
     strings,
     decode,
     decode_merge,
+    data_image_scan,
     data,
     function_recovery,
     call_graph,
     cfg_calls,
     xrefs,
+    publish_xrefs,
     metadata,
+    search_instructions,
     search,
     persistence_submit,
     persistence_commit,
@@ -905,23 +910,24 @@ constexpr std::size_t kProgressSlotCount =
     static_cast<std::size_t>(baseline_progress_slot_t::count);
 
 constexpr std::uint64_t kProgressSlotWeights[kProgressSlotCount] = {
-    2, 2, 5, 45, 3, 6, 10, 7, 2, 7, 5, 3, 1, 1, 1};
+    2, 2, 4, 45, 3, 2, 5, 10, 6, 2, 6, 1, 4, 3, 2, 1, 1, 1};
 
 constexpr const char* kProgressSlotNames[kProgressSlotCount] = {
-    "parse", "seed", "strings_data", "decode", "decode_merge", "data_discovery",
-    "function_recovery", "functions", "cfg_calls", "xrefs",
-    "metadata_symbols_types", "search_index", "persistence", "persistence",
-    "publish_ready"};
+    "parse", "seed", "strings_data", "decode", "decode_merge", "data_image_scan",
+    "data_discovery", "function_recovery", "functions", "cfg_calls", "xrefs",
+    "publish_xrefs", "metadata_symbols_types", "search_index_instructions",
+    "search_index", "persistence", "persistence", "publish_ready"};
 
 constexpr const char* kNodeWindowNames[kProgressSlotCount] = {
-    "parse", "seed", "strings_data", "decode", "decode_merge", "data_discovery",
-    "function_recovery", "functions", "cfg_calls", "xrefs",
-    "metadata_symbols_types", "search_index", "persistence_submit",
-    "persistence_commit", "publish_ready"};
+    "parse", "seed", "strings_data", "decode", "decode_merge", "data_image_scan",
+    "data_discovery", "function_recovery", "functions", "cfg_calls", "xrefs",
+    "publish_xrefs", "metadata_symbols_types", "search_index_instructions",
+    "search_index_entities", "persistence_submit", "persistence_commit",
+    "publish_ready"};
 
 constexpr std::uint64_t kNodeSoftBudgetMs[kProgressSlotCount] = {
-    5000, 5000, 30000, 135000, 10000, 20000, 30000, 20000, 5000, 25000, 15000,
-    15000, 5000, 25000, 2000};
+    5000, 5000, 30000, 135000, 10000, 8000, 20000, 30000, 20000, 5000, 25000,
+    5000, 15000, 15000, 15000, 5000, 25000, 2000};
 
 struct progress_slot_state_t {
     std::atomic<std::uint64_t> complete{0};
@@ -1192,15 +1198,22 @@ struct pe_baseline_analyzer_t::impl_t {
     std::optional<executable_decode_partition_t> decode_partition;
     std::optional<workspace_error_t> decode_partition_error;
     std::uint32_t decode_workers = 1;
+    std::optional<data_discovery_result_t> data_image_result;
     std::shared_ptr<const data_discovery_result_t> data_result;
     function_recovery_result_t function_result;
     call_graph_result_t call_graph_result;
     xref_build_result_t xref_result;
+    bool xrefs_published = false;
     string_discovery_result_t string_result;
     symbol_type_candidate_result_t symbol_type_result;
     std::vector<type_candidate_record_t> type_candidates;
+    std::shared_ptr<search_index_t> instruction_search;
     std::shared_ptr<search_index_t> search;
     persistence_ticket_t persistence_ticket;
+    std::uint64_t persistence_submit_ns = 0;
+    std::uint64_t merge_snapshot_bytes = 0;
+    std::uint64_t decode_transient_charged = 0;
+    std::uint64_t resident_facts_charged = 0;
     std::uint64_t strings_budget_bytes = 0;
     std::uint64_t data_budget_bytes = 0;
     std::uint64_t function_budget_bytes = 0;
@@ -1220,9 +1233,13 @@ struct pe_baseline_analyzer_t::impl_t {
           expected_generation(generation), expected_analysis_revision(analysis_revision),
           cancellation(deadline), metrics(std::make_shared<analysis_metrics_t>(generation)) {
         const auto hardware = (std::max)(1U, std::thread::hardware_concurrency());
+        const auto fabric_stats = aida::infra::taskflow_runtime::domain_stats(
+            aida::infra::taskflow_runtime::executor_domain_t::feature_worker);
+        const auto fabric_lease = fabric_stats.pool_size > 0
+            ? static_cast<std::uint32_t>(fabric_stats.pool_size) : hardware;
         decode_workers = settings.decode_worker_lanes != 0
             ? (std::min)(64U, (std::max)(2U, settings.decode_worker_lanes))
-            : (std::min)(64U, (std::max)(2U, hardware));
+            : (std::min)(64U, (std::max)(2U, (std::max)(hardware, fabric_lease)));
     }
 
     workspace_result_t<void> ensure_decode_partition_state(
@@ -1377,6 +1394,68 @@ struct pe_baseline_analyzer_t::impl_t {
         }
         return total;
     }
+
+    void governor_charge_resident(std::uint64_t accounted_bytes) noexcept {
+        auto& governor = working_set_governor_t::instance();
+        std::lock_guard<std::mutex> lock(governor_mutex);
+        if (accounted_bytes >= resident_facts_charged) {
+            const auto delta = accounted_bytes - resident_facts_charged;
+            if (delta != 0) {
+                governor.charge(working_set_metrics::subsystem_t::resident_facts,
+                    static_cast<std::int64_t>(delta));
+            }
+        } else {
+            const auto delta = resident_facts_charged - accounted_bytes;
+            governor.charge(working_set_metrics::subsystem_t::resident_facts,
+                -static_cast<std::int64_t>(delta));
+        }
+        resident_facts_charged = accounted_bytes;
+        governor.refresh();
+    }
+
+    void governor_transfer_resident_to_workspace() noexcept {
+        std::lock_guard<std::mutex> lock(governor_mutex);
+        workspace->governor_adopt_resident_facts(resident_facts_charged);
+        resident_facts_charged = 0;
+    }
+
+    void governor_charge_decode_transient(std::uint64_t bytes) noexcept {
+        if (bytes == 0)
+            return;
+        std::lock_guard<std::mutex> lock(governor_mutex);
+        working_set_governor_t::instance().charge(
+            working_set_metrics::subsystem_t::decode_transient,
+            static_cast<std::int64_t>(bytes));
+        decode_transient_charged = bytes >
+                std::numeric_limits<std::uint64_t>::max() - decode_transient_charged
+            ? std::numeric_limits<std::uint64_t>::max()
+            : decode_transient_charged + bytes;
+        working_set_governor_t::instance().refresh();
+    }
+
+    void governor_release_decode_transient() noexcept {
+        std::lock_guard<std::mutex> lock(governor_mutex);
+        if (decode_transient_charged == 0)
+            return;
+        working_set_governor_t::instance().charge(
+            working_set_metrics::subsystem_t::decode_transient,
+            -static_cast<std::int64_t>(decode_transient_charged));
+        decode_transient_charged = 0;
+        working_set_governor_t::instance().refresh();
+    }
+
+    void governor_release_all() noexcept {
+        governor_release_decode_transient();
+        std::lock_guard<std::mutex> lock(governor_mutex);
+        if (resident_facts_charged != 0) {
+            working_set_governor_t::instance().charge(
+                working_set_metrics::subsystem_t::resident_facts,
+                -static_cast<std::int64_t>(resident_facts_charged));
+            resident_facts_charged = 0;
+        }
+    }
+
+    std::mutex governor_mutex;
 };
 
 pe_baseline_analyzer_t::pe_baseline_analyzer_t(std::unique_ptr<impl_t> impl) : impl_(std::move(impl)) {
@@ -1956,6 +2035,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_phase(const std::atomic<
     const auto initialized_bytes = result.statistics.initialized_executable_bytes;
     const auto lane_wall_ns = result.statistics.lane_wall_ns;
     impl_->tile_result = std::move(result);
+    impl_->governor_charge_decode_transient(retained.value());
     impl_->metrics->set_max(analysis_metric_t::decode_lane_wall_ns_max, lane_wall_ns);
     impl_->metrics->end_phase(measurement, initialized_bytes, retained.value(),
         decoded_count, 1, false);
@@ -2049,6 +2129,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
     }
     impl_->tile_result.reset();
     impl_->decode_partition.reset();
+    impl_->governor_release_decode_transient();
 
     impl_->metrics->set(analysis_metric_t::instructions, impl_->draft->instructions.size());
     for (const auto& span : impl_->draft->coverage) {
@@ -2076,6 +2157,36 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
     impl_->call_graph_budget_bytes = remaining / 4ULL;
     impl_->xref_budget_bytes = remaining / 4ULL;
     impl_->symbol_type_budget_bytes = remaining / 4ULL;
+    impl_->merge_snapshot_bytes = retained.value();
+    impl_->governor_charge_resident(retained.value());
+    {
+        std::array<fact_domain_projection_t, fact_domain_count> projections{};
+        projections[static_cast<std::size_t>(fact_domain_t::instructions)] = {
+            impl_->draft->instructions.size(), sizeof(instruction_record_t)};
+        projections[static_cast<std::size_t>(fact_domain_t::operand_facts)] = {
+            impl_->draft->operand_facts.size(), sizeof(operand_fact_t)};
+        projections[static_cast<std::size_t>(fact_domain_t::target_facts)] = {
+            impl_->draft->target_facts.size(), sizeof(target_fact_t)};
+        projections[static_cast<std::size_t>(fact_domain_t::coverage)] = {
+            impl_->draft->coverage.size(), sizeof(coverage_span_t)};
+        const auto residency_plan = fact_residency_select(projections,
+            fact_resident_budget_bytes(host_memory_envelope()));
+        std::uint64_t projected_total = 0;
+        for (const auto& domain : residency_plan.domains) {
+            projected_total = domain.projected_bytes >
+                    std::numeric_limits<std::uint64_t>::max() - projected_total
+                ? std::numeric_limits<std::uint64_t>::max()
+                : projected_total + domain.projected_bytes;
+        }
+        ::diag::log_tagged_fmt("baseline_pipeline",
+            "fact_residency_decision projected=%llu resident=%llu paged=%llu budget=%llu any_paged=%u accounted=%llu",
+            static_cast<unsigned long long>(projected_total),
+            static_cast<unsigned long long>(residency_plan.resident_bytes),
+            static_cast<unsigned long long>(residency_plan.paged_bytes),
+            static_cast<unsigned long long>(residency_plan.budget_bytes),
+            residency_plan.any_paged() ? 1U : 0U,
+            static_cast<unsigned long long>(retained.value()));
+    }
     impl_->metrics->end_phase(measurement, 0, retained.value(),
         impl_->draft->instructions.size(), 1, false);
     const auto completed_bytes = impl_->native_decode_applicable
@@ -2086,6 +2197,54 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
         impl_->draft->instructions.size(),
         completed_bytes, impl_->executable_bytes());
 }
+workspace_result_t<void> pe_baseline_analyzer_t::data_image_scan_phase(
+    const std::atomic<bool>& runtime_cancel) {
+    auto measurement = impl_->metrics->begin_phase(baseline_phase_t::blocks);
+    phase_completion_guard_t guard(*impl_->metrics, measurement);
+    auto node_window = impl_->node_guard(baseline_progress_slot_t::data_image_scan);
+    auto active = impl_->ensure_active(runtime_cancel, "data_image_scan");
+    if (!active)
+        return active;
+    if (!impl_->image || !impl_->provider_snapshot || !impl_->draft) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "image-driven data scan prerequisites are unavailable", "data_image_scan"));
+    }
+    if (impl_->data_image_result) {
+        impl_->metrics->end_phase(measurement, 0, 0, 0, 1, false);
+        return workspace_result_t<void>::success();
+    }
+    auto data_limits = impl_->settings.data_limits;
+    data_limits.max_pointer_scan_bytes = (std::min)(
+        data_limits.max_pointer_scan_bytes,
+        impl_->settings.xref_limits.max_pointer_scan_bytes);
+    data_limits.max_pointer_scan_bytes = (std::min)(
+        data_limits.max_pointer_scan_bytes,
+        saturated_double_u64(impl_->provider_snapshot->size()));
+    data_limits.read_window_bytes = (std::min)(
+        data_limits.read_window_bytes, impl_->settings.xref_limits.read_window_bytes);
+    data_limits.cancellation_check_interval = (std::min)(
+        data_limits.cancellation_check_interval,
+        impl_->settings.cancellation_check_interval);
+    auto data = data_discovery_t::discover_image_driven(*impl_->image,
+        *impl_->provider_snapshot, data_limits, impl_->cancellation.token());
+    if (!data)
+        return workspace_result_t<void>::failure(data.error());
+    auto discovered = data.take_value();
+    impl_->metrics->add(analysis_metric_t::provider_leases, discovered.provider_leases);
+    impl_->metrics->add(analysis_metric_t::mapped_bytes, discovered.mapped_bytes);
+    impl_->metrics->add(analysis_metric_t::read_bytes, discovered.bytes_scanned);
+    impl_->metrics->add(analysis_metric_t::pass_merge_ns, discovered.shard_merge_ns);
+    const auto work_items = discovered.pointer_facts.size();
+    impl_->data_image_result = std::move(discovered);
+    impl_->metrics->end_phase(measurement,
+        impl_->data_image_result->bytes_scanned, 0, work_items, 1, false);
+    return impl_->update_progress_slot(baseline_progress_slot_t::data_image_scan,
+        "data_image_scan", work_items, work_items,
+        impl_->data_image_result->bytes_scanned,
+        impl_->data_image_result->bytes_scanned);
+}
+
 workspace_result_t<void> pe_baseline_analyzer_t::data_discovery_phase(
     const std::atomic<bool>& runtime_cancel) {
     auto measurement = impl_->metrics->begin_phase(baseline_phase_t::blocks);
@@ -2119,9 +2278,25 @@ workspace_result_t<void> pe_baseline_analyzer_t::data_discovery_phase(
     data_limits.cancellation_check_interval = (std::min)(
         data_limits.cancellation_check_interval,
         impl_->settings.cancellation_check_interval);
-    auto data = data_discovery_t::discover(*impl_->image, *impl_->provider_snapshot,
-        impl_->draft->instructions, impl_->draft->target_facts, data_limits,
-        impl_->cancellation.token());
+    workspace_result_t<data_discovery_result_t> data =
+        workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "data discovery did not run", "data_discovery"));
+    if (impl_->data_image_result) {
+        auto instruction_driven = data_discovery_t::discover_instruction_driven(
+            *impl_->image, *impl_->provider_snapshot, impl_->draft->instructions,
+            impl_->draft->target_facts, data_limits, impl_->cancellation.token());
+        if (!instruction_driven)
+            return workspace_result_t<void>::failure(instruction_driven.error());
+        data = data_discovery_t::combine_results(data_limits,
+            instruction_driven.take_value(), std::move(*impl_->data_image_result),
+            impl_->cancellation.token());
+        impl_->data_image_result.reset();
+    } else {
+        data = data_discovery_t::discover(*impl_->image, *impl_->provider_snapshot,
+            impl_->draft->instructions, impl_->draft->target_facts, data_limits,
+            impl_->cancellation.token());
+    }
     if (!data)
         return workspace_result_t<void>::failure(data.error());
     impl_->data_result = std::shared_ptr<const data_discovery_result_t>(
@@ -2349,6 +2524,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::cfg_calls_phase(
                 "recovery publication exceeds analysis memory budget", "cfg_calls")
             : retained.error());
     }
+    impl_->governor_charge_resident(retained.value());
     const auto work_items = impl_->draft->edges.size() +
         impl_->draft->call_graph.call_sites.size() +
         impl_->draft->call_graph.candidates.size();
@@ -2412,6 +2588,45 @@ workspace_result_t<void> pe_baseline_analyzer_t::xrefs_phase(
     return impl_->update_progress_slot(baseline_progress_slot_t::xrefs, "xrefs",
         impl_->xref_result.xrefs.size(), impl_->xref_result.xrefs.size(),
         impl_->xref_result.bytes_scanned, impl_->xref_result.bytes_scanned);
+}
+workspace_result_t<void> pe_baseline_analyzer_t::publish_xrefs_phase(
+    const std::atomic<bool>& runtime_cancel) {
+    auto measurement = impl_->metrics->begin_phase(baseline_phase_t::xrefs);
+    phase_completion_guard_t guard(*impl_->metrics, measurement);
+    auto node_window = impl_->node_guard(baseline_progress_slot_t::publish_xrefs);
+    auto active = impl_->ensure_active(runtime_cancel, "publish_xrefs");
+    if (!active)
+        return active;
+    if (!impl_->draft) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "xref publication requires the analysis draft", "publish_xrefs"));
+    }
+    if (impl_->xrefs_published) {
+        impl_->metrics->end_phase(measurement, 0, 0, 0, 1, false);
+        return workspace_result_t<void>::success();
+    }
+    auto published = xref_builder_t::publish_xrefs(*impl_->draft,
+        std::move(impl_->xref_result), impl_->cancellation.token());
+    if (!published)
+        return published;
+    impl_->xref_result = xref_build_result_t{};
+    impl_->xrefs_published = true;
+    impl_->metrics->set(analysis_metric_t::xrefs, impl_->draft->xrefs.size());
+    auto retained = snapshot_memory_accounted_bytes(*impl_->draft);
+    if (!retained || retained.value() > impl_->settings.max_analysis_memory_bytes) {
+        return workspace_result_t<void>::failure(retained
+            ? make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "xref publication exceeds analysis memory budget", "publish_xrefs")
+            : retained.error());
+    }
+    impl_->governor_charge_resident(retained.value());
+    impl_->metrics->end_phase(measurement,
+        impl_->draft->xrefs.size() * sizeof(xref_record_t), retained.value(),
+        impl_->draft->xrefs.size(), 1, false);
+    return impl_->update_progress_slot(baseline_progress_slot_t::publish_xrefs,
+        "publish_xrefs", impl_->draft->xrefs.size(), impl_->draft->xrefs.size(),
+        0, impl_->executable_bytes());
 }
 workspace_result_t<void> pe_baseline_analyzer_t::strings_data_phase(
     const std::atomic<bool>& runtime_cancel) {
@@ -2546,11 +2761,25 @@ workspace_result_t<void> pe_baseline_analyzer_t::metadata_symbols_types_phase(
             kTypeEntityTag | static_cast<std::uint64_t>(index + 1);
     }
 
-    auto published = xref_builder_t::publish(*impl_->draft,
-        std::move(impl_->xref_result), std::move(impl_->string_result),
-        std::move(impl_->symbol_type_result), impl_->cancellation.token());
+    workspace_result_t<void> published = workspace_result_t<void>::success();
+    if (impl_->xrefs_published) {
+        xref_build_result_t republish;
+        republish.xrefs = std::move(impl_->draft->xrefs);
+        republish.data_candidates = std::move(impl_->draft->rich_facts.data_candidates);
+        republish.data_pointer_facts = std::move(impl_->draft->rich_facts.data_pointer_facts);
+        republish.data_conflicts = std::move(impl_->draft->rich_facts.data_conflicts);
+        republish.type_xrefs = std::move(impl_->draft->rich_facts.type_references);
+        published = xref_builder_t::publish(*impl_->draft, std::move(republish),
+            std::move(impl_->string_result), std::move(impl_->symbol_type_result),
+            impl_->cancellation.token());
+    } else {
+        published = xref_builder_t::publish(*impl_->draft,
+            std::move(impl_->xref_result), std::move(impl_->string_result),
+            std::move(impl_->symbol_type_result), impl_->cancellation.token());
+    }
     if (!published)
         return published;
+    impl_->xrefs_published = true;
     std::unordered_map<std::uint64_t, std::size_t> function_symbol_by_value;
     for (std::size_t index = 0; index < impl_->draft->symbols.size(); ++index) {
         const auto& symbol = impl_->draft->symbols[index];
@@ -2579,6 +2808,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::metadata_symbols_types_phase(
                 "metadata_symbols_types")
             : retained.error());
     }
+    impl_->governor_charge_resident(retained.value());
     const auto work_items = impl_->draft->xrefs.size() +
         impl_->draft->strings.size() + impl_->draft->symbols.size() +
         impl_->draft->rich_facts.data_candidates.size() +
@@ -2592,7 +2822,44 @@ workspace_result_t<void> pe_baseline_analyzer_t::metadata_symbols_types_phase(
         impl_->executable_bytes());
 }
 
-workspace_result_t<void> pe_baseline_analyzer_t::search_index_phase(
+workspace_result_t<void> pe_baseline_analyzer_t::search_index_instructions_phase(
+    const std::atomic<bool>& runtime_cancel) {
+    auto measurement = impl_->metrics->begin_phase(baseline_phase_t::search_index);
+    phase_completion_guard_t guard(*impl_->metrics, measurement);
+    auto node_window = impl_->node_guard(baseline_progress_slot_t::search_instructions);
+    auto active = impl_->ensure_active(runtime_cancel, "search_index_instructions");
+    if (!active)
+        return active;
+    if (!impl_->draft) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "instruction-class index build requires the analysis draft",
+            "search_index_instructions"));
+    }
+    if (impl_->instruction_search || impl_->search) {
+        impl_->metrics->end_phase(measurement, 0, 0, 0, 1, false);
+        return workspace_result_t<void>::success();
+    }
+    auto limits = impl_->settings.search_limits;
+    const auto accounted_bytes = (std::min)(impl_->merge_snapshot_bytes,
+        impl_->settings.max_analysis_memory_bytes);
+    limits.max_index_bytes = std::min(limits.max_index_bytes,
+        impl_->settings.max_analysis_memory_bytes - accounted_bytes);
+    auto index = search_index_t::build_instruction_class(impl_->draft,
+        impl_->metrics, limits, impl_->cancellation.token());
+    if (!index)
+        return workspace_result_t<void>::failure(index.error());
+    impl_->instruction_search = index.take_value();
+    const auto count = impl_->draft->instructions.size();
+    impl_->metrics->end_phase(measurement, count,
+        impl_->instruction_search->memory_bytes(), count, 1, false);
+    return impl_->update_progress_slot(
+        baseline_progress_slot_t::search_instructions, "search_index_instructions",
+        count, count, impl_->instruction_search->memory_bytes(),
+        impl_->instruction_search->memory_bytes());
+}
+
+workspace_result_t<void> pe_baseline_analyzer_t::search_index_entities_phase(
     const std::atomic<bool>& runtime_cancel) {
     auto measurement = impl_->metrics->begin_phase(baseline_phase_t::search_index);
     phase_completion_guard_t guard(*impl_->metrics, measurement);
@@ -2627,13 +2894,27 @@ workspace_result_t<void> pe_baseline_analyzer_t::search_index_phase(
     auto limits = impl_->settings.search_limits;
     limits.max_index_bytes = std::min(limits.max_index_bytes,
         impl_->settings.max_analysis_memory_bytes - bytes.value());
-    auto index = search_index_t::build(impl_->final_snapshot,
-        impl_->final_snapshot->rich_facts.data_candidates,
-        std::move(impl_->function_result.switches),
-        std::move(impl_->type_candidates), impl_->metrics, limits, impl_->cancellation.token());
+    workspace_result_t<std::shared_ptr<search_index_t>> index =
+        workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                "search index build did not run", "search_index"));
+    if (impl_->instruction_search) {
+        index = search_index_t::append_entity_classes(impl_->instruction_search,
+            impl_->final_snapshot, impl_->final_snapshot->rich_facts.data_candidates,
+            std::move(impl_->function_result.switches),
+            std::move(impl_->type_candidates), impl_->metrics, limits,
+            impl_->cancellation.token());
+    } else {
+        index = search_index_t::build(impl_->final_snapshot,
+            impl_->final_snapshot->rich_facts.data_candidates,
+            std::move(impl_->function_result.switches),
+            std::move(impl_->type_candidates), impl_->metrics, limits,
+            impl_->cancellation.token());
+    }
     if (!index)
         return workspace_result_t<void>::failure(index.error());
     impl_->search = index.take_value();
+    impl_->instruction_search.reset();
     std::uint64_t retained = 0;
     if (!checked_add_u64(bytes.value(), impl_->search->memory_bytes(), retained) ||
         retained > impl_->settings.max_analysis_memory_bytes) {
@@ -2641,6 +2922,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::search_index_phase(
             workspace_error_code_t::limit_exceeded,
             "retained baseline state exceeds analysis memory budget", "search_index"));
     }
+    impl_->governor_charge_resident(bytes.value());
     const auto count = impl_->final_snapshot->instructions.size() + impl_->final_snapshot->symbols.size() +
         impl_->final_snapshot->strings.size() + impl_->search->data_candidates().size() +
         impl_->search->switches().size() + impl_->search->types().size();
@@ -2649,6 +2931,11 @@ workspace_result_t<void> pe_baseline_analyzer_t::search_index_phase(
         "search_index", count, count,
         impl_->metrics->snapshot().value(analysis_metric_t::indexed_bytes),
         impl_->metrics->snapshot().value(analysis_metric_t::indexed_bytes));
+}
+
+workspace_result_t<void> pe_baseline_analyzer_t::search_index_phase(
+    const std::atomic<bool>& runtime_cancel) {
+    return search_index_entities_phase(runtime_cancel);
 }
 
 workspace_result_t<void> pe_baseline_analyzer_t::persistence_submit_phase(
@@ -2703,6 +2990,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_submit_phase(
             workspace_error_code_t::persistence_failure,
             "workspace persistence queue rejected the baseline snapshot", "persistence"));
     }
+    impl_->persistence_submit_ns = analysis_metrics_t::steady_now_ns();
     impl_->metrics->end_phase(measurement, 0, 0, 1, 1, false);
     return impl_->update_progress_slot(baseline_progress_slot_t::persistence_submit,
         "persistence", 1, 1, 0, 0);
@@ -2780,6 +3068,18 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_commit_phase(
         database_state.cumulative_pages_written);
     impl_->metrics->set_max(analysis_metric_t::persist_wal_bytes_peak,
         database_state.wal_bytes_peak);
+    auto finalized = candidate->finalize(impl_->cancellation.token());
+    if (!finalized) {
+        impl_->discard_persistence_candidate();
+        return workspace_result_t<void>::failure(finalized.error());
+    }
+    if (impl_->persistence_submit_ns != 0) {
+        const auto completed_ns = analysis_metrics_t::steady_now_ns();
+        if (completed_ns >= impl_->persistence_submit_ns) {
+            working_set_metrics::record_commit_lag(
+                completed_ns - impl_->persistence_submit_ns);
+        }
+    }
     impl_->metrics->end_phase(measurement, logical_bytes, page_write_bytes,
         rows, 1, false);
     return impl_->update_progress_slot(baseline_progress_slot_t::persistence_commit,
@@ -2801,14 +3101,13 @@ workspace_result_t<void> pe_baseline_analyzer_t::publish_ready_phase(
             workspace_error_code_t::integrity_failure,
             "immutable baseline products are incomplete", "publish_ready"));
     }
-    const auto candidate = impl_->persistence_ticket.snapshot_candidate;
     auto published = impl_->workspace->publish_analysis_bundle(impl_->expected_generation,
-        impl_->expected_analysis_revision, impl_->final_snapshot, impl_->search, true,
-        [candidate] { return candidate->finalize(); });
+        impl_->expected_analysis_revision, impl_->final_snapshot, impl_->search, true);
     if (!published) {
         impl_->discard_persistence_candidate();
         return published;
     }
+    impl_->governor_transfer_resident_to_workspace();
     node_window.finish();
     std::string windows;
     for (std::size_t index = 0; index < kProgressSlotCount; ++index) {
@@ -2827,6 +3126,26 @@ workspace_result_t<void> pe_baseline_analyzer_t::publish_ready_phase(
         windows.c_str());
     impl_->metrics->end_phase(measurement, 0, 0, 1, 1, false);
     impl_->metrics->mark_finished();
+    impl_->workspace->publish_baseline_metrics(
+        std::make_shared<const analysis_metrics_snapshot_t>(impl_->metrics->snapshot()));
+    {
+        const auto final_metrics = impl_->metrics->snapshot();
+        std::uint64_t phase_wall_sum_ns = 0;
+        for (const auto& phase : final_metrics.phases) {
+            phase_wall_sum_ns = phase.wall_ns >
+                    std::numeric_limits<std::uint64_t>::max() - phase_wall_sum_ns
+                ? std::numeric_limits<std::uint64_t>::max()
+                : phase_wall_sum_ns + phase.wall_ns;
+        }
+        if (final_metrics.wall_ns != 0 &&
+            phase_wall_sum_ns > final_metrics.wall_ns +
+                final_metrics.wall_ns / 20ULL) {
+            ::diag::log_tagged_fmt("baseline_pipeline",
+                "baseline_phase_wall_overlap sum_wall_ns=%llu wall_ns=%llu",
+                static_cast<unsigned long long>(phase_wall_sum_ns),
+                static_cast<unsigned long long>(final_metrics.wall_ns));
+        }
+    }
     return workspace_result_t<void>::success();
 }
 
@@ -2848,6 +3167,9 @@ void pe_baseline_analyzer_t::report_failure(const workspace_error_t& error) noex
         impl_->metrics->record_cancellation_completion();
     impl_->discard_persistence_candidate();
     impl_->metrics->mark_finished();
+    impl_->workspace->publish_baseline_metrics(
+        std::make_shared<const analysis_metrics_snapshot_t>(impl_->metrics->snapshot()));
+    impl_->governor_release_all();
     if (publish) {
         (void)impl_->workspace->record_analysis_attempt_failure(
             impl_->expected_generation, impl_->expected_analysis_revision, error);

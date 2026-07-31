@@ -36,6 +36,8 @@
 #include <atomic>
 #include <cctype>
 #include <cinttypes>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <sstream>
 #include <shared_mutex>
@@ -1819,18 +1821,59 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 
 	srv.register_tool({
 		"analysis_benchmark_manage",
-		"Manage hyper-performance benchmark runs against synthetic or real artifacts. Actions: run_synthetic, run_real, status, last_result.",
-		{{"action", "string", "run_synthetic|run_real|status|last_result", true},
+		"Manage hyper-performance benchmark runs against synthetic or real artifacts. Actions: run_synthetic, run_real, status, last_result, compare.",
+		{{"action", "string", "run_synthetic|run_real|status|last_result|compare", true},
 		 {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
 		 {"code_mb", "integer", "Synthetic code size in MiB (8..256) for run_synthetic", false},
 		 {"seed", "string", "Hex seed for the deterministic synthetic generator", false},
 		 {"lanes", "integer", "Decode worker lanes (0 = engine default)", false},
 		 {"path", "string", "Real fixture path for run_real (300..500 MB program gate)", false},
-		 {"sla_relaxed", "boolean", "Record the measurement without failing SLA verdicts", false}},
+		 {"sla_relaxed", "boolean", "Record the measurement without failing SLA verdicts", false},
+		 {"batch_lanes", "integer", "Requested parallel decompile batch lane budget (0 = engine default)", false},
+		 {"sample_ms", "integer", "Runtime memory/worker sampler interval in ms (50..10000)", false},
+		 {"baseline", "string", "Baseline report JSON path: run_synthetic/run_real compare against it; compare action baseline", false},
+		 {"record_baseline", "string", "Record the scorecard as a named baseline under benchmark_results/baselines", false},
+		 {"candidate", "string", "Candidate report JSON path for the compare action", false},
+		 {"run_scaling_stage", "boolean", "Run the worker-budget scaling stage", false},
+		 {"run_determinism_stage", "boolean", "Run the snapshot determinism stage", false},
+		 {"scaling_worker_budgets", "string", "Comma-separated worker budgets for the scaling stage", false},
+		 {"determinism_runs", "integer", "Determinism repetitions at the tail budget (1..8)", false}},
 		false,
 		[](const json& params) -> tool_result_t {
 			const std::string action = compat_action_name(params);
 			const json p = compat_action_payload(params);
+			if (action == "compare") {
+				const std::string baseline_path = p.value("baseline", std::string());
+				const std::string candidate_path = p.value("candidate", std::string());
+				if (baseline_path.empty() || candidate_path.empty())
+					return tool_result_t::error("compare requires baseline and candidate report paths");
+				const auto load_report = [](const std::string& path, json& out) -> bool {
+					std::ifstream stream(std::filesystem::u8path(path), std::ios::binary);
+					if (!stream)
+						return false;
+					try {
+						stream >> out;
+					} catch (const json::exception&) {
+						return false;
+					}
+					return stream.good() || stream.eof();
+				};
+				json baseline_report;
+				json candidate_report;
+				if (!load_report(baseline_path, baseline_report))
+					return tool_result_t::error("compare baseline report is unavailable or invalid: " + baseline_path);
+				if (!load_report(candidate_path, candidate_report))
+					return tool_result_t::error("compare candidate report is unavailable or invalid: " + candidate_path);
+				auto verdict = aida::analysis::benchmark::compare_scorecards(
+					baseline_report, candidate_report);
+				verdict["baseline"] = baseline_path;
+				verdict["candidate"] = candidate_path;
+				diag::log_tagged_fmt("analysis",
+					"analysis_benchmark_manage compare overall=%s baseline=%s candidate=%s",
+					verdict.value("overall", std::string()).c_str(),
+					baseline_path.c_str(), candidate_path.c_str());
+				return tool_result_t::ok(verdict);
+			}
 			if (action == "run_synthetic" || action == "run_real") {
 				aida::analysis::benchmark::benchmark_run_request_t request;
 				if (action == "run_synthetic") {
@@ -1875,14 +1918,81 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 				}
 				if (p.contains("sla_relaxed") && p["sla_relaxed"].is_boolean())
 					request.sla_relaxed = p["sla_relaxed"].get<bool>();
+				if (p.contains("batch_lanes") && p["batch_lanes"].is_number()) {
+					const auto batch_lanes = p["batch_lanes"].get<std::uint64_t>();
+					if (batch_lanes > 64)
+						return tool_result_t::error("batch_lanes must be within 0..64");
+					request.decompile_batch_lanes = static_cast<std::uint32_t>(batch_lanes);
+				}
+				if (p.contains("sample_ms") && p["sample_ms"].is_number()) {
+					const auto sample_ms = p["sample_ms"].get<std::uint64_t>();
+					if (sample_ms < 50 || sample_ms > 10000)
+						return tool_result_t::error("sample_ms must be within 50..10000");
+					request.memory_sample_interval_ms = static_cast<std::uint32_t>(sample_ms);
+				}
+				if (p.contains("baseline") && p["baseline"].is_string())
+					request.baseline_report_path = p["baseline"].get<std::string>();
+				if (p.contains("record_baseline") && p["record_baseline"].is_string())
+					request.record_baseline_name = p["record_baseline"].get<std::string>();
+				if (p.contains("run_scaling_stage") && p["run_scaling_stage"].is_boolean())
+					request.run_scaling_stage = p["run_scaling_stage"].get<bool>();
+				if (p.contains("run_determinism_stage") && p["run_determinism_stage"].is_boolean())
+					request.run_determinism_stage = p["run_determinism_stage"].get<bool>();
+				if (p.contains("scaling_worker_budgets") && p["scaling_worker_budgets"].is_string()) {
+					const std::string csv = p["scaling_worker_budgets"].get<std::string>();
+					std::vector<std::uint32_t> budgets;
+					std::size_t offset = 0;
+					bool parse_failed = csv.empty();
+					while (!parse_failed && offset <= csv.size()) {
+						const auto comma = csv.find(',', offset);
+						const std::string token = csv.substr(offset,
+							comma == std::string::npos ? std::string::npos : comma - offset);
+						if (token.empty()) {
+							parse_failed = true;
+							break;
+						}
+						std::size_t consumed = 0;
+						unsigned long value = 0;
+						try {
+							value = std::stoul(token, &consumed, 10);
+						} catch (const std::exception&) {
+							parse_failed = true;
+							break;
+						}
+						if (consumed != token.size() || value > 64) {
+							parse_failed = true;
+							break;
+						}
+						budgets.push_back(static_cast<std::uint32_t>(value));
+						if (comma == std::string::npos)
+							break;
+						offset = comma + 1;
+					}
+					if (parse_failed || budgets.empty())
+						return tool_result_t::error(
+							"scaling_worker_budgets must be a comma-separated list of integers within 0..64");
+					request.scaling_worker_budgets = std::move(budgets);
+				}
+				if (p.contains("determinism_runs") && p["determinism_runs"].is_number()) {
+					const auto runs = p["determinism_runs"].get<std::uint64_t>();
+					if (runs < 1 || runs > 8)
+						return tool_result_t::error("determinism_runs must be within 1..8");
+					request.determinism_runs = static_cast<std::uint32_t>(runs);
+				}
 				diag::log_tagged_fmt("analysis",
-					"analysis_benchmark_manage submit action=%s code_bytes=%llu seed=0x%llX lanes=%u path=%s relaxed=%d",
+					"analysis_benchmark_manage submit action=%s code_bytes=%llu seed=0x%llX lanes=%u path=%s relaxed=%d batch_lanes=%u sample_ms=%u baseline=%s record_baseline=%s scaling=%d determinism=%d",
 					action.c_str(),
 					static_cast<unsigned long long>(request.synthetic_code_bytes),
 					static_cast<unsigned long long>(request.synthetic_seed),
 					static_cast<unsigned>(request.lanes),
 					request.real_path.c_str(),
-					request.sla_relaxed ? 1 : 0);
+					request.sla_relaxed ? 1 : 0,
+					static_cast<unsigned>(request.decompile_batch_lanes),
+					static_cast<unsigned>(request.memory_sample_interval_ms),
+					request.baseline_report_path.c_str(),
+					request.record_baseline_name.c_str(),
+					request.run_scaling_stage ? 1 : 0,
+					request.run_determinism_stage ? 1 : 0);
 				if (!aida::analysis::benchmark::start_benchmark_async(request)) {
 					diag::log_tagged("analysis", "analysis_benchmark_manage refused already_active");
 					return tool_result_t::error("a benchmark run is already active");

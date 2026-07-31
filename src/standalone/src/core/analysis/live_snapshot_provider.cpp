@@ -1,5 +1,7 @@
 #include "live_snapshot_provider.hpp"
 
+#include "../infra/taskflow_runtime.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -208,15 +210,29 @@ live_snapshot_result_t<value_t> invoke_adapter_call_bounded(
         const auto caller_cancellation = context.cancellation;
         using operation_value_t = std::decay_t<operation_t>;
 
-        std::thread worker(
+        infra::taskflow_runtime::task_descriptor_t call_desc;
+        call_desc.domain = infra::taskflow_runtime::executor_domain_t::feature_worker;
+        call_desc.owner_subsystem = "live_snapshot_provider";
+        call_desc.label = "live_snapshot.adapter_call";
+        call_desc.priority = 3;
+        call_desc.shutdown_policy = "cancel_pending";
+        {
+            const auto deadline_gap = std::chrono::duration_cast<std::chrono::milliseconds>(
+                call_context.wall_deadline - live_request_budget_t::clock_t::now()).count();
+            call_desc.deadline_ms = static_cast<std::uint64_t>(GetTickCount64()) +
+                static_cast<std::uint64_t>(deadline_gap > 0 ? deadline_gap : 0);
+        }
+        call_desc.cancellable_body =
             [state, call_active, call_context, caller_cancellation,
-             operation = operation_value_t(std::forward<operation_t>(operation))]() mutable {
+             operation = operation_value_t(std::forward<operation_t>(operation))](
+                const infra::taskflow_runtime::cancellation_token_t& job_token) mutable {
                 auto result = live_snapshot_result_t<value_t>::failure(
                     make_live_snapshot_error(live_snapshot_error_code_t::adapter_failure,
                                              "adapter_call"));
                 try {
                     if (caller_cancellation.stop_requested() ||
-                        call_context.cancellation.stop_requested()) {
+                        call_context.cancellation.stop_requested() ||
+                        job_token.requested.load(std::memory_order_acquire)) {
                         result = live_snapshot_result_t<value_t>::failure(
                             make_live_snapshot_error(live_snapshot_error_code_t::cancelled,
                                                      "adapter_call"));
@@ -247,9 +263,17 @@ live_snapshot_result_t<value_t> invoke_adapter_call_bounded(
                     state->wake.notify_one();
                 } catch (...) {
                 }
-            });
+            };
+        call_desc.cancel_hook = [call_cancellation]() mutable {
+            call_cancellation.request_stop();
+        };
+        auto call_submission = infra::taskflow_runtime::submit(std::move(call_desc));
+        if (!call_submission.submitted) {
+            call_active->store(false, std::memory_order_release);
+            return live_snapshot_result_t<value_t>::failure(
+                make_live_snapshot_error(live_snapshot_error_code_t::adapter_failure, phase));
+        }
         release_call = false;
-        worker.detach();
 
         for (;;) {
             std::optional<live_snapshot_result_t<value_t>> completed;
@@ -268,12 +292,14 @@ live_snapshot_result_t<value_t> invoke_adapter_call_bounded(
             const auto checkpoint = checkpoint_request(budget, context, *clock, phase);
             if (!checkpoint) {
                 call_cancellation.request_stop();
+                infra::taskflow_runtime::cancel(call_submission.handle);
                 return live_snapshot_result_t<value_t>::failure(checkpoint.error());
             }
 
             const auto wall_now = live_request_budget_t::clock_t::now();
             if (wall_now >= context.wall_deadline) {
                 call_cancellation.request_stop();
+                infra::taskflow_runtime::cancel(call_submission.handle);
                 return live_snapshot_result_t<value_t>::failure(
                     make_live_snapshot_error(live_snapshot_error_code_t::deadline_exceeded,
                                              phase));

@@ -10,6 +10,7 @@
 #include "active_scanner.hpp"
 #include "audit_http.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
+#include "../../infra/taskflow_runtime.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <atomic>
@@ -32,7 +33,7 @@ struct pipeline_entry_t
 {
     pipeline_status_t                  status;
     std::shared_ptr<std::atomic<bool>> cancel_flag;
-    aida::infra::win_thread::joinable_thread_t worker;
+    std::uint64_t                      job_id = 0;
     bool                               imported_snapshot = false;
 };
 
@@ -413,8 +414,9 @@ void stop_entries(std::vector<std::unique_ptr<pipeline_entry_t>>& entries)
 
     for (auto& e : entries)
     {
-        if (e) {
-            e->worker.join();
+        if (e && e->job_id != 0) {
+            aida::infra::taskflow_runtime::wait_for(
+                aida::infra::taskflow_runtime::job_handle_t{e->job_id}, 0xFFFFFFFFu);
         }
     }
 }
@@ -515,23 +517,34 @@ uint64_t start(const pipeline_config_t& config)
         static_cast<unsigned long long>(pipeline_id),
         static_cast<unsigned long long>(ca_token));
     auto admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(ca_admission));
-    std::string thread_err;
     const std::string thread_label = "crawl_audit.pipeline." + std::to_string(pipeline_id);
-    const bool started = entry->worker.start(
-        [pipeline_id, crawl_id, cf, cfg_copy, admission_ptr, ca_token]() {
+    aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+    worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::service;
+    worker_desc.owner_subsystem = "burp.crawl_audit";
+    worker_desc.label = thread_label.c_str();
+    worker_desc.priority = 5;
+    worker_desc.shutdown_policy = "cancel_pending";
+    worker_desc.cancellable_body =
+        [pipeline_id, crawl_id, cf, cfg_copy, admission_ptr, ca_token](
+            const aida::infra::taskflow_runtime::cancellation_token_t&) {
             pipeline_worker(pipeline_id, crawl_id, cf, cfg_copy);
             diag::log_tagged_fmt("crawl_audit", "BURP-NETWORK-WORKER-RELEASE pipeline_id=%llu token=%llu reason=completed",
                 static_cast<unsigned long long>(pipeline_id),
                 static_cast<unsigned long long>(ca_token));
             admission_ptr->release("completed");
-        },
-        &thread_err, aida::infra::win_thread::default_stack_reserve, thread_label.c_str());
-    if (!started) {
+        };
+    worker_desc.cancel_hook = [cf]() {
+        cf->store(true, std::memory_order_release);
+    };
+    auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+    if (!worker_submission.submitted) {
         diag::log_tagged_fmt("crawl_audit", "pipeline_worker_start_failed pipeline_id=%llu err=%s",
-            static_cast<unsigned long long>(pipeline_id), thread_err.c_str());
+            static_cast<unsigned long long>(pipeline_id),
+            worker_submission.reject_reason.empty() ? "<none>" : worker_submission.reject_reason.c_str());
         admission_ptr->release("thread_start_failed");
         return 0;
     }
+    entry->job_id = worker_submission.handle.id;
 
     g_pipelines.push_back(std::move(entry));
 

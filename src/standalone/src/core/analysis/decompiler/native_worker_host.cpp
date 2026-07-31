@@ -1,5 +1,6 @@
 #include "native_worker_host.hpp"
 
+#include "generation_snapshot_store.hpp"
 #include "isolated_worker_codec.hpp"
 #include "providers/dalvik_ssa.hpp"
 #include "providers/cli_provider.hpp"
@@ -1578,6 +1579,23 @@ bool configure_job(HANDLE job, const decompiler_profile_budget_t& profile, DWORD
 
 bool create_snapshot_mapping(const native_worker_snapshot_t& snapshot, handle_t& child_mapping, DWORD& error)
 {
+    if (snapshot.shared_mapping_handle != nullptr &&
+        snapshot.shared_mapping_size != 0 && snapshot.bytes &&
+        snapshot.shared_mapping_size == snapshot.bytes->size()) {
+        HANDLE raw_shared_mapping = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(),
+                static_cast<HANDLE>(snapshot.shared_mapping_handle), GetCurrentProcess(),
+                &raw_shared_mapping, FILE_MAP_READ, TRUE, 0)) {
+            error = GetLastError();
+            diag::log_tagged_fmt("dec_batch",
+                "snapshot_shared_duplicate_failed gle=%lu fallback=private_mapping",
+                static_cast<unsigned long>(error));
+        } else {
+            child_mapping.reset(raw_shared_mapping);
+            error = ERROR_SUCCESS;
+            return true;
+        }
+    }
     if (!snapshot.valid() || snapshot.bytes->empty() || snapshot.bytes->size() > (std::numeric_limits<DWORD>::max)()) {
         error = ERROR_INVALID_PARAMETER;
         return false;
@@ -4010,11 +4028,13 @@ bool native_worker_host_t::session_launch(const native_worker_execution_request_
     session.slot_released = false;
     slot_held = false;
     diag::log_tagged_fmt("dec_batch",
-        "pool_spawn worker_gen=%llu pid=%lu jobs_bound=%u cpu_backstop_ms=%llu",
+        "pool_spawn worker_gen=%llu pid=%lu jobs_bound=%u cpu_backstop_ms=%llu snapshot_shared=%d snapshot_bytes=%llu",
         static_cast<unsigned long long>(session.worker_generation),
         static_cast<unsigned long>(session.worker.process_id),
         static_cast<unsigned int>(max_jobs_per_session),
-        static_cast<unsigned long long>(backstop));
+        static_cast<unsigned long long>(backstop),
+        request.snapshot.shared_mapping_handle != nullptr ? 1 : 0,
+        static_cast<unsigned long long>(request.snapshot.bytes->size()));
     return true;
 }
 
@@ -4678,7 +4698,7 @@ pooled_native_worker_provider_host_t::pooled_native_worker_provider_host_t(
     if (state_->config.batch_slots == 0)
         state_->config.batch_slots = 1;
     if (state_->config.max_jobs_per_session == 0)
-        state_->config.max_jobs_per_session = 256;
+        state_->config.max_jobs_per_session = 8192;
 }
 
 pooled_native_worker_provider_host_t::~pooled_native_worker_provider_host_t()
@@ -4756,6 +4776,15 @@ decompiler_provider_result_t pooled_native_worker_provider_host_t::execute(
     native_worker_snapshot_t snapshot;
     snapshot.bytes = context->snapshot();
     snapshot.hash = context->snapshot_hash();
+    if (const auto shared = generation_snapshot_store_t::instance().find(
+            request.cache_key.workspace_generation, context->snapshot_hash())) {
+        if (shared->mapping_handle != nullptr &&
+            shared->mapping_size == context->snapshot()->size()) {
+            snapshot.shared_mapping_owner = shared;
+            snapshot.shared_mapping_handle = shared->mapping_handle;
+            snapshot.shared_mapping_size = shared->mapping_size;
+        }
+    }
     worker_request.snapshot = std::move(snapshot);
     worker_request.deadline = request.deadline;
     worker_request.cancellation_requested = [cancel] {

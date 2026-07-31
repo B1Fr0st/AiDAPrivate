@@ -8,7 +8,6 @@
 #include <chrono>
 #include <cstddef>
 #include <exception>
-#include <iterator>
 #include <limits>
 #include <new>
 #include <optional>
@@ -1059,6 +1058,61 @@ private:
     utf16_state_t utf16_;
 };
 
+std::size_t merge_shard_count(std::size_t items, std::size_t items_per_shard) {
+    if (items == 0)
+        return 0;
+    const auto hardware = std::thread::hardware_concurrency();
+    const std::uint64_t cap = 4ULL * static_cast<std::uint64_t>(hardware == 0 ? 1U : hardware);
+    const std::uint64_t wanted = (static_cast<std::uint64_t>(items) +
+        static_cast<std::uint64_t>(items_per_shard) - 1ULL) /
+        static_cast<std::uint64_t>(items_per_shard);
+    return static_cast<std::size_t>((std::min)((std::max)(wanted, 1ULL), cap));
+}
+
+template <typename Fn>
+void run_merge_shards(std::size_t shard_total, Fn&& shard_fn) {
+    parallel_executor_t::run(shard_total, parallel_worker_count(),
+        "analysis.string_discovery", std::forward<Fn>(shard_fn));
+}
+
+template <typename T, typename Equal>
+void parallel_unique_erase(std::vector<T>& values, Equal&& equal) {
+    if (values.size() < 2)
+        return;
+    const std::size_t count = values.size();
+    const auto shards = parallel_shards(count, static_cast<std::uint32_t>(
+        merge_shard_count(count, 65536)));
+    std::vector<std::uint8_t> keep(count, 0);
+    std::vector<std::uint64_t> shard_keeps(shards.size(), 0);
+    run_merge_shards(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        std::uint64_t kept = 0;
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            const auto flagged = index == 0 || !equal(values[index - 1], values[index]);
+            keep[index] = flagged ? static_cast<std::uint8_t>(1)
+                                  : static_cast<std::uint8_t>(0);
+            kept += flagged ? 1ULL : 0ULL;
+        }
+        shard_keeps[shard] = kept;
+    });
+    std::uint64_t total = 0;
+    for (auto& base : shard_keeps) {
+        const auto offset = total;
+        total += base;
+        base = offset;
+    }
+    std::vector<T> compacted(static_cast<std::size_t>(total));
+    run_merge_shards(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        auto cursor = shard_keeps[shard];
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            if (keep[index] != 0)
+                compacted[static_cast<std::size_t>(cursor++)] = std::move(values[index]);
+        }
+    });
+    values = std::move(compacted);
+}
+
 struct shard_slot_t {
     std::optional<workspace_error_t> error;
     std::exception_ptr exception;
@@ -1144,35 +1198,44 @@ workspace_result_t<string_discovery_result_t> discover_impl(
         result.rejected_oversized_strings += output.rejected_oversized_strings;
         result.rejected_unterminated_strings += output.rejected_unterminated_strings;
     }
-    result.strings.reserve(total_strings);
-    for (auto& output : outputs) {
-        result.strings.insert(result.strings.end(),
-            std::make_move_iterator(output.strings.begin()),
-            std::make_move_iterator(output.strings.end()));
+    std::vector<std::uint64_t> output_bases(outputs.size(), 0);
+    {
+        std::uint64_t cursor = 0;
+        for (std::size_t index = 0; index < outputs.size(); ++index) {
+            output_bases[index] = cursor;
+            cursor += outputs[index].strings.size();
+        }
     }
-    outputs.clear();
-    std::sort(result.strings.begin(), result.strings.end(), [](const auto& lhs,
-                                                               const auto& rhs) {
-        if (lhs.address != rhs.address)
-            return lhs.address < rhs.address;
-        if (lhs.encoding != rhs.encoding)
-            return lhs.encoding < rhs.encoding;
-        if (lhs.byte_length != rhs.byte_length)
-            return lhs.byte_length < rhs.byte_length;
-        if (lhs.value != rhs.value)
-            return lhs.value < rhs.value;
-        if (provenance_rank(lhs.provenance) != provenance_rank(rhs.provenance))
-            return provenance_rank(lhs.provenance) > provenance_rank(rhs.provenance);
-        return lhs.confidence > rhs.confidence;
+    result.strings.resize(total_strings);
+    run_merge_shards(outputs.size(), [&](std::size_t shard) {
+        auto& strings = outputs[shard].strings;
+        auto cursor = output_bases[shard];
+        for (std::size_t index = 0; index < strings.size(); ++index)
+            result.strings[static_cast<std::size_t>(cursor++)] =
+                std::move(strings[index]);
     });
-    const auto end = std::unique(result.strings.begin(), result.strings.end(),
+    outputs.clear();
+    parallel_sort(result.strings.begin(), result.strings.end(),
         [](const auto& lhs, const auto& rhs) {
-            return lhs.address == rhs.address && lhs.encoding == rhs.encoding &&
-                   lhs.byte_length == rhs.byte_length && lhs.value == rhs.value;
+            if (lhs.address != rhs.address)
+                return lhs.address < rhs.address;
+            if (lhs.encoding != rhs.encoding)
+                return lhs.encoding < rhs.encoding;
+            if (lhs.byte_length != rhs.byte_length)
+                return lhs.byte_length < rhs.byte_length;
+            if (lhs.value != rhs.value)
+                return lhs.value < rhs.value;
+            if (provenance_rank(lhs.provenance) != provenance_rank(rhs.provenance))
+                return provenance_rank(lhs.provenance) > provenance_rank(rhs.provenance);
+            return lhs.confidence > rhs.confidence;
         });
+    const auto strings_before_dedup = result.strings.size();
+    parallel_unique_erase(result.strings, [](const auto& lhs, const auto& rhs) {
+        return lhs.address == rhs.address && lhs.encoding == rhs.encoding &&
+               lhs.byte_length == rhs.byte_length && lhs.value == rhs.value;
+    });
     result.duplicate_strings = static_cast<std::uint64_t>(
-        std::distance(end, result.strings.end()));
-    result.strings.erase(end, result.strings.end());
+        strings_before_dedup - result.strings.size());
     for (std::size_t index = 0; index < result.strings.size(); ++index)
         result.strings[index].id = kStringEntityTag | static_cast<std::uint64_t>(index + 1);
     const auto merge_end = std::chrono::steady_clock::now();

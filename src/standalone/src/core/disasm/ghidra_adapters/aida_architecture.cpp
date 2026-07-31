@@ -1704,7 +1704,7 @@ void architecture_t::apply_pdb_function_prototypes()
 		parsed_signature_t       signature;
 	};
 	std::vector<proto_target_t> targets;
-	targets.reserve(symbol_db_.symbols.size());
+	targets.reserve(symbol_db_.symbols.size() + symbol_db_.prototypes.size());
 	for (auto& s : symbol_db_.symbols) {
 		if (s.kind != symbol_kind_t::function && s.kind != symbol_kind_t::export_)
 			continue;
@@ -1718,6 +1718,18 @@ void architecture_t::apply_pdb_function_prototypes()
 		target.signature = parse_symbol_signature(target.name);
 		targets.push_back(std::move(target));
 	}
+	std::size_t sidecar_candidates = 0;
+	for (const auto& record : symbol_db_.prototypes) {
+		if (record.address == 0 || record.prototype.empty()) continue;
+		proto_target_t target;
+		target.address = record.address;
+		target.name = !record.name.empty() ? record.name : record.prototype;
+		target.is_noreturn = record.is_noreturn;
+		target.signature = parse_symbol_signature(record.prototype);
+		if (!target.signature.valid) continue;
+		++sidecar_candidates;
+		targets.push_back(std::move(target));
+	}
 
 	size_t proto_attempted = 0;
 	for (const auto& t : targets) {
@@ -1726,8 +1738,8 @@ void architecture_t::apply_pdb_function_prototypes()
 	}
 
 	diag::log_tagged_critical_fmt("dec_pdb",
-		"apply_pdb_function_prototypes_enter candidates=%zu proto_candidates=%zu",
-		targets.size(), proto_attempted);
+		"apply_pdb_function_prototypes_enter candidates=%zu proto_candidates=%zu sidecar_candidates=%zu",
+		targets.size(), proto_attempted, sidecar_candidates);
 
 	size_t applied = 0;
 	size_t not_found = 0;
@@ -1812,9 +1824,10 @@ void architecture_t::apply_pdb_function_prototypes()
 	auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
 
 	diag::log_tagged_critical_fmt("dec_pdb",
-		"apply_pdb_function_prototypes_exit candidates=%zu applied=%zu not_found=%zu failed_set=%zu proto_attempted=%zu proto_applied=%zu proto_failed=%zu proto_unresolved=%zu cc_applied=%zu duration_ms=%lld",
+		"apply_pdb_function_prototypes_exit candidates=%zu applied=%zu not_found=%zu failed_set=%zu proto_attempted=%zu proto_applied=%zu proto_failed=%zu proto_unresolved=%zu cc_applied=%zu sidecar_candidates=%zu duration_ms=%lld",
 		targets.size(), applied, not_found, failed_set,
 		proto_attempted, proto_applied, proto_failed, proto_unresolved, cc_applied,
+		sidecar_candidates,
 		static_cast<long long>(dur_ms));
 }
 

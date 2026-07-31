@@ -2,6 +2,7 @@
 
 #include "checked_range.hpp"
 #include "packed_page_codec.hpp"
+#include "sqlite_statement_cache.hpp"
 
 #include <sqlite3.h>
 
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <unordered_set>
 #include <utility>
@@ -56,17 +58,51 @@ class v9_statement_t final {
 public:
     v9_statement_t() = default;
     ~v9_statement_t() {
-        if (statement_)
-            sqlite3_finalize(statement_);
+        release_current();
     }
     v9_statement_t(const v9_statement_t&) = delete;
     v9_statement_t& operator=(const v9_statement_t&) = delete;
 
     workspace_result_t<void> prepare(sqlite3* database, const char* sql,
                                      const char* phase) {
-        if (statement_) {
-            sqlite3_finalize(statement_);
-            statement_ = nullptr;
+        release_current();
+        std::shared_ptr<sqlite_statement_cache_t> cache;
+        try {
+            cache = sqlite_statement_cache_lookup(database);
+        } catch (...) {
+            cache.reset();
+        }
+        if (cache) {
+            int status = SQLITE_OK;
+            sqlite3_stmt* cached = nullptr;
+            try {
+                cached = cache->acquire(database, sql, status);
+            } catch (...) {
+                cached = nullptr;
+                status = SQLITE_OK;
+            }
+            if (cached) {
+                std::string sql_key;
+                try {
+                    sql_key = sql;
+                } catch (...) {
+                    sqlite3_finalize(cached);
+                    cached = nullptr;
+                }
+                if (cached) {
+                    statement_ = cached;
+                    cache_ = std::move(cache);
+                    cache_sql_ = std::move(sql_key);
+                    database_ = database;
+                    phase_ = phase;
+                    return workspace_result_t<void>::success();
+                }
+            }
+            if (status != SQLITE_OK) {
+                return workspace_result_t<void>::failure(
+                    schema_v9_error(database, status,
+                                    "failed to prepare v9 SQLite statement", phase));
+            }
         }
         const int status = sqlite3_prepare_v3(database, sql, -1,
                                               SQLITE_PREPARE_PERSISTENT,
@@ -162,9 +198,30 @@ public:
     }
 
 private:
+    void release_current() noexcept {
+        if (!statement_)
+            return;
+        if (cache_) {
+            try {
+                cache_->release(cache_sql_, statement_);
+                statement_ = nullptr;
+            } catch (...) {
+                sqlite3_finalize(statement_);
+                statement_ = nullptr;
+            }
+            cache_.reset();
+            cache_sql_.clear();
+        } else {
+            sqlite3_finalize(statement_);
+            statement_ = nullptr;
+        }
+    }
+
     sqlite3* database_ = nullptr;
     sqlite3_stmt* statement_ = nullptr;
     const char* phase_ = "workspace_schema_v9";
+    std::shared_ptr<sqlite_statement_cache_t> cache_;
+    std::string cache_sql_;
 };
 
 std::string column_text_v9(sqlite3_stmt* statement, int index) {
@@ -2503,6 +2560,137 @@ workspace_result_t<std::optional<decompiler_cache_v9_record_t>>
     }
     return workspace_result_t<std::optional<decompiler_cache_v9_record_t>>::success(
         std::optional<decompiler_cache_v9_record_t>(std::move(record)));
+}
+
+workspace_result_t<std::uint64_t> delete_decompiler_cache_v9_ranges(
+    sqlite3* database, const std::vector<decompiler_cache_v9_range_t>& ranges,
+    std::optional<std::uint64_t> minimum_overlay_revision) {
+    if (!database) {
+        return workspace_result_t<std::uint64_t>::failure(schema_v9_error(
+            database, SQLITE_MISUSE,
+            "decompiler cache v9 range delete requires an open database",
+            "workspace_schema_v9.delete_decompiler_cache_v9_ranges"));
+    }
+    if (ranges.empty())
+        return workspace_result_t<std::uint64_t>::success(0);
+    if (ranges.size() > decompiler_cache_v9_range_delete_max) {
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "decompiler cache v9 range delete exceeds its bounded range count",
+                "workspace_schema_v9.delete_decompiler_cache_v9_ranges"));
+    }
+    std::vector<decompiler_cache_v9_range_t> normalized;
+    normalized.reserve(ranges.size());
+    for (const auto& range : ranges) {
+        if (range.rva_begin >= range.rva_end)
+            continue;
+        normalized.push_back(range);
+    }
+    if (normalized.empty())
+        return workspace_result_t<std::uint64_t>::success(0);
+    constexpr std::size_t ranges_per_statement = 64;
+    std::uint64_t deleted_total = 0;
+    for (std::size_t chunk = 0; chunk < normalized.size();
+         chunk += ranges_per_statement) {
+        const std::size_t chunk_count =
+            (std::min)(ranges_per_statement, normalized.size() - chunk);
+        std::string sql = "DELETE FROM decompiler_cache_v9 WHERE (";
+        for (std::size_t index = 0; index < chunk_count; ++index) {
+            if (index != 0)
+                sql += " OR ";
+            sql += "(function_rva>=?" + std::to_string(index * 2 + 1) +
+                   " AND function_rva<?" + std::to_string(index * 2 + 2) + ")";
+        }
+        sql += ")";
+        if (minimum_overlay_revision) {
+            sql += " AND overlay_revision>=?" +
+                   std::to_string(chunk_count * 2 + 1);
+        }
+        v9_statement_t statement;
+        auto result = statement.prepare(
+            database, sql.c_str(),
+            "workspace_schema_v9.delete_decompiler_cache_v9_ranges");
+        if (!result)
+            return workspace_result_t<std::uint64_t>::failure(result.error());
+        for (std::size_t index = 0; index < chunk_count; ++index) {
+            result = statement.bind_uint(
+                static_cast<int>(index * 2 + 1), normalized[chunk + index].rva_begin);
+            if (!result)
+                return workspace_result_t<std::uint64_t>::failure(result.error());
+            result = statement.bind_uint(
+                static_cast<int>(index * 2 + 2), normalized[chunk + index].rva_end);
+            if (!result)
+                return workspace_result_t<std::uint64_t>::failure(result.error());
+        }
+        if (minimum_overlay_revision) {
+            result = statement.bind_uint(
+                static_cast<int>(chunk_count * 2 + 1), *minimum_overlay_revision);
+            if (!result)
+                return workspace_result_t<std::uint64_t>::failure(result.error());
+        }
+        result = statement.step_done();
+        if (!result)
+            return workspace_result_t<std::uint64_t>::failure(result.error());
+        const int deleted = sqlite3_changes(database);
+        if (deleted > 0)
+            deleted_total += static_cast<std::uint64_t>(deleted);
+    }
+    return workspace_result_t<std::uint64_t>::success(deleted_total);
+}
+
+workspace_result_t<std::optional<paged_domain_revision_tag_t>>
+    read_paged_domain_revision_tag(sqlite3* database, std::uint64_t generation) {
+    if (!database) {
+        return workspace_result_t<std::optional<paged_domain_revision_tag_t>>::failure(
+            schema_v9_error(database, SQLITE_MISUSE,
+                            "paged-domain revision tag read requires an open database",
+                            "workspace_schema_v9.read_paged_domain_revision_tag"));
+    }
+    if (generation == 0) {
+        return workspace_result_t<std::optional<paged_domain_revision_tag_t>>::failure(
+            make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "paged-domain revision tag requires a non-zero generation",
+                "workspace_schema_v9.read_paged_domain_revision_tag"));
+    }
+    v9_statement_t statement;
+    auto result = statement.prepare(
+        database,
+        "SELECT generation,analysis_revision,overlay_revision FROM packed_generations WHERE generation=?1 AND committed=1",
+        "workspace_schema_v9.read_paged_domain_revision_tag");
+    if (!result)
+        return workspace_result_t<std::optional<paged_domain_revision_tag_t>>::failure(
+            result.error());
+    result = statement.bind_uint(1, generation);
+    if (!result)
+        return workspace_result_t<std::optional<paged_domain_revision_tag_t>>::failure(
+            result.error());
+    const int status = sqlite3_step(statement.get());
+    if (status == SQLITE_DONE)
+        return workspace_result_t<std::optional<paged_domain_revision_tag_t>>::success(
+            std::nullopt);
+    if (status != SQLITE_ROW) {
+        return workspace_result_t<std::optional<paged_domain_revision_tag_t>>::failure(
+            schema_v9_error(database, status,
+                            "unable to read paged-domain revision tag",
+                            "workspace_schema_v9.read_paged_domain_revision_tag"));
+    }
+    paged_domain_revision_tag_t tag;
+    tag.generation = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 0));
+    tag.analysis_revision =
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 1));
+    tag.overlay_revision =
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 2));
+    if (tag.generation != generation) {
+        return workspace_result_t<std::optional<paged_domain_revision_tag_t>>::failure(
+            make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "paged-domain revision tag generation is inconsistent",
+                "workspace_schema_v9.read_paged_domain_revision_tag"));
+    }
+    return workspace_result_t<std::optional<paged_domain_revision_tag_t>>::success(
+        std::optional<paged_domain_revision_tag_t>(tag));
 }
 
 workspace_result_t<void> write_overlay_v9_state(

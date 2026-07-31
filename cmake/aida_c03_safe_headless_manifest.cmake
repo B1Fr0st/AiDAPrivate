@@ -148,6 +148,7 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/ai/provider_transforms.cpp"
     "${STANDALONE_ROOT}/core/ai/skill_manager_service.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_budget.cpp"
+    "${STANDALONE_ROOT}/core/analysis/analysis_fabric_metrics.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_resource_metrics.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_scheduler.cpp"
     "${STANDALONE_ROOT}/core/analysis/benchmark/benchmark_runner.cpp"
@@ -198,6 +199,7 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/spill_provider.cpp"
     "${STANDALONE_ROOT}/core/analysis/subrange_provider.cpp"
     "${STANDALONE_ROOT}/core/analysis/tile_decode_orchestrator.cpp"
+    "${STANDALONE_ROOT}/core/analysis/working_set_governor.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/baseline_engine_integration.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/c03_analysis_contracts.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/data_discovery.cpp"
@@ -205,6 +207,7 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/workspace/packed_page_codec.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/query_index.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/regex_query.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/string_arena.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery_simd_avx2.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/symbol_type_candidates.cpp"
@@ -313,6 +316,7 @@ set(AIDA_C03_COMPILER_MATRIX_CM_02
 set(AIDA_C03_COMPILER_MATRIX_CM_03
     "${STANDALONE_ROOT}/core/analysis/analysis_scheduler.cpp"
     "${STANDALONE_ROOT}/core/analysis/analysis_resource_metrics.cpp"
+    "${STANDALONE_ROOT}/core/analysis/analysis_fabric_metrics.cpp"
     "${STANDALONE_ROOT}/core/analysis/benchmark/benchmark_runner.cpp"
     "${STANDALONE_ROOT}/core/analysis/decode/x86_tile_decoder.cpp"
     "${STANDALONE_ROOT}/core/analysis/decode/capstone_tile_decoder.cpp"
@@ -346,7 +350,8 @@ set(AIDA_C03_COMPILER_MATRIX_CM_03
     "${STANDALONE_ROOT}/core/analysis/overlay_projection.cpp"
     "${STANDALONE_ROOT}/core/analysis/incremental_reanalysis.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/patched_export.cpp"
-    "${STANDALONE_ROOT}/core/analysis/workspace/pe_baseline_analyzer.cpp")
+    "${STANDALONE_ROOT}/core/analysis/workspace/pe_baseline_analyzer.cpp"
+    "${STANDALONE_ROOT}/core/analysis/working_set_governor.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_04
     "${STANDALONE_ROOT}/core/analysis/readers/pe_coff_reader.cpp"
     "${STANDALONE_ROOT}/core/analysis/readers/elf_reader.cpp"
@@ -373,8 +378,11 @@ set(AIDA_C03_COMPILER_MATRIX_CM_05
     "${STANDALONE_ROOT}/core/analysis/workspace/workspace_schema_v9.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/packed_page_codec.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/persistence_queue.cpp"
+    "${STANDALONE_ROOT}/core/analysis/working_set_metrics.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/workspace_database.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/sqlite_reader_pool.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/overlay_journal.cpp"
+    "${STANDALONE_ROOT}/core/analysis/fact_page_cache.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_persistence.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_06
     "${STANDALONE_ROOT}/core/analysis/decompiler/native_worker_host.cpp"
@@ -436,6 +444,7 @@ set(AIDA_C03_COMPILER_MATRIX_CM_10
     "${STANDALONE_ROOT}/core/mcp/registry/application_debugger_capability.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_11
     ${AIDA_C03_MCP_PRODUCTION_CLOSURE_SOURCES}
+    "${STANDALONE_ROOT}/core/analysis/workspace/string_arena.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/c03_compatibility_registration.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/mcp_server_integration.cpp"
     "${STANDALONE_ROOT}/core/mcp/compat/handlers/analysis.cpp"
@@ -571,7 +580,10 @@ endforeach()
 list(REMOVE_DUPLICATES AIDA_C03_COMPILER_MATRIX_UNION)
 
 set(AIDA_C03_HARNESS_SUPPORT_SOURCES
+    "${STANDALONE_ROOT}/core/analysis/fact_page_cache.cpp"
     "${STANDALONE_ROOT}/core/analysis/surface_reconciliation.cpp"
+    "${STANDALONE_ROOT}/core/analysis/working_set_metrics.cpp"
+    "${STANDALONE_ROOT}/core/analysis/working_set_governor.cpp"
     "${STANDALONE_ROOT}/core/analysis/readers/elf_reader.cpp"
     "${STANDALONE_ROOT}/core/analysis/readers/pe_coff_reader.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/advanced_cfg.cpp"
@@ -582,6 +594,7 @@ set(AIDA_C03_HARNESS_SUPPORT_SOURCES
     "${STANDALONE_ROOT}/core/analysis/workspace/overlay_journal.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/persistence_queue.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/search_index.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/sqlite_reader_pool.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/workspace_database.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/workspace_identity.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/xref_builder.cpp"
@@ -1954,6 +1967,15 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
             "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         ARGUMENTS "synthetic" "256" "0xA1DA0004"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_synthetic_compare_harness PACKAGE A06 TIMEOUT 1200
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "synthetic_compare" "32" "0xA1DA0006" "${AIDA_C03_WORKSPACE_TEST_ROOT}/baselines/synthetic_32mb_baseline.json"
         LINK_LIBRARIES bcrypt)
 
     set(_aida_managed_consumer_sources

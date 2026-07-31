@@ -168,6 +168,22 @@ public:
         const search_index_limits_t& limits,
         const cancellation_token_t& cancel);
 
+    static workspace_result_t<std::shared_ptr<search_index_t>> build_instruction_class(
+        std::shared_ptr<const analysis_snapshot_t> snapshot,
+        std::shared_ptr<analysis_metrics_t> metrics,
+        const search_index_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<std::shared_ptr<search_index_t>> append_entity_classes(
+        std::shared_ptr<const search_index_t> instruction_index,
+        std::shared_ptr<const analysis_snapshot_t> snapshot,
+        std::vector<data_candidate_record_t> data_candidates,
+        std::vector<switch_record_t> switches,
+        std::vector<type_candidate_record_t> types,
+        std::shared_ptr<analysis_metrics_t> metrics,
+        const search_index_limits_t& limits,
+        const cancellation_token_t& cancel);
+
     static workspace_result_t<std::shared_ptr<search_index_t>> restore(
         std::shared_ptr<const analysis_snapshot_t> snapshot,
         std::vector<data_candidate_record_t> data_candidates,
@@ -238,6 +254,16 @@ public:
 private:
     struct impl_t;
     explicit search_index_t(std::unique_ptr<impl_t> impl);
+    static workspace_result_t<std::shared_ptr<search_index_t>> build_impl(
+        std::shared_ptr<const search_index_t> instruction_index,
+        std::shared_ptr<const analysis_snapshot_t> snapshot,
+        std::vector<data_candidate_record_t> data_candidates,
+        std::vector<switch_record_t> switches,
+        std::vector<type_candidate_record_t> types,
+        std::shared_ptr<analysis_metrics_t> metrics,
+        const search_index_limits_t& limits,
+        const cancellation_token_t& cancel,
+        bool instruction_class_only);
     const std::array<std::uint64_t, 2>& cursor_integrity_key() const noexcept;
     std::unique_ptr<impl_t> impl_;
 

@@ -3605,7 +3605,7 @@ packed_analysis_compatibility_view_t::instruction(std::size_t index) const
     result.length = view->length;
     result.mnemonic_id = view->mnemonic_id;
     result.opcode_id = view->opcode_id;
-    result.flow_flags = view->flow_flags;
+    result.flow_flags = static_cast<std::uint16_t>(view->flow_flags);
     result.operand_fact_begin = view->first_operand;
     result.operand_fact_count = view->operand_count;
     result.provenance = view->provenance;
@@ -3790,7 +3790,7 @@ packed_analysis_compatibility_view_t::target_fact(std::size_t index) const
     result.resolution = view->resolution;
     result.operand_index = view->operand_index;
     result.access_width_bits = view->access_width_bits;
-    result.access_count = view->access_count;
+    result.access_count = static_cast<std::uint8_t>(view->access_count);
     result.direct = view->direct;
     result.is_external = view->is_external;
     return result;
@@ -3853,7 +3853,7 @@ packed_analysis_shard_compatibility_view_t::instruction(std::size_t index) const
     result.length = view->length;
     result.mnemonic_id = view->mnemonic_id;
     result.opcode_id = view->opcode_id;
-    result.flow_flags = view->flow_flags;
+    result.flow_flags = static_cast<std::uint16_t>(view->flow_flags);
     result.operand_fact_begin = view->first_operand;
     result.operand_fact_count = view->operand_count;
     result.provenance = view->provenance;
@@ -4041,7 +4041,7 @@ packed_analysis_shard_compatibility_view_t::target_fact(std::size_t index) const
     result.resolution = view->resolution;
     result.operand_index = view->operand_index;
     result.access_width_bits = view->access_width_bits;
-    result.access_count = view->access_count;
+    result.access_count = static_cast<std::uint8_t>(view->access_count);
     result.direct = view->direct;
     result.is_external = view->is_external;
     return result;

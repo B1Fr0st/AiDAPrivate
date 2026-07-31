@@ -1,7 +1,9 @@
 #include "decompile_batch_orchestrator.hpp"
 
+#include "api_prototype_table.hpp"
 #include "decompiler_service.hpp"
 #include "decompiler_ui_integration.hpp"
+#include "generation_snapshot_store.hpp"
 #include "native_worker_host.hpp"
 
 #include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
@@ -9,10 +11,12 @@
 #include "../../infra/executor.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
+#include "../../../../workers/native_decompiler/snapshot_sidecar.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
@@ -31,15 +35,16 @@ constexpr std::uint64_t k_batch_deadline_floor_ms = 2'000;
 constexpr std::uint64_t k_batch_deadline_cap_ms = 60'000;
 constexpr std::uint64_t k_interactive_deadline_cap_ms = 15'000;
 constexpr std::uint64_t k_deadline_scaled_log_threshold_ms = 15'000;
-constexpr std::uint64_t k_expected_worker_rss_bytes = 400ULL << 20;
+constexpr std::uint64_t k_expected_worker_rss_bytes = 300ULL << 20;
 constexpr std::uint64_t k_arch_resident_bytes = 200ULL << 20;
 constexpr std::uint64_t k_memory_budget_floor_bytes = 4ULL << 30;
 constexpr std::uint64_t k_memory_budget_cap_bytes = 32ULL << 30;
-constexpr std::size_t k_absolute_slot_cap = 16;
-constexpr std::uint64_t k_batch_snapshot_absolute_cap = 256ULL << 20;
-constexpr std::uint64_t k_worker_snapshot_cap = 256ULL << 20;
+constexpr std::size_t k_absolute_slot_cap = 64;
+constexpr std::uint64_t k_batch_snapshot_absolute_cap = 1024ULL << 20;
+constexpr std::uint64_t k_worker_snapshot_cap = 1024ULL << 20;
 constexpr std::uint64_t k_snapshot_header_floor = 1ULL << 20;
 constexpr std::uint64_t k_snapshot_read_quantum = 4ULL << 20;
+constexpr std::uint64_t k_snapshot_sidecar_absolute_cap = 64ULL << 20;
 
 struct batch_work_item_t {
     std::uint64_t function_id = 0;
@@ -144,7 +149,7 @@ struct decompile_batch_orchestrator_t::state_t {
     bool publish_pending = false;
     bool control_exit = false;
     bool control_started = false;
-    std::thread control_thread;
+    std::uint64_t control_task_id = 0;
 
     std::shared_ptr<const analysis_publication_t> run_publication;
     std::shared_ptr<decompiler_pipeline_service_t> service;
@@ -168,7 +173,7 @@ struct decompile_batch_orchestrator_t::state_t {
     std::uint64_t mem_hits = 0;
     std::uint64_t disk_hits = 0;
     std::uint64_t wall_ns = 0;
-    std::uint64_t in_flight = 0;
+    std::atomic<std::uint64_t> in_flight{0};
     std::uint64_t progress_log_mark = 0;
     std::uint64_t ema_last_completed = 0;
     std::chrono::steady_clock::time_point ema_last_time;
@@ -178,8 +183,12 @@ struct decompile_batch_orchestrator_t::state_t {
     std::size_t slots_total = 0;
     std::size_t slots_done = 0;
     std::atomic<std::size_t> slots_effective{0};
-    std::deque<batch_work_item_t> queue;
+    std::vector<batch_work_item_t> worklist;
+    std::atomic<std::uint64_t> worklist_cursor{0};
+    std::deque<batch_work_item_t> retry_queue;
     std::deque<batch_work_item_t> interactive_queue;
+    std::vector<std::thread> slot_threads;
+    mutable std::mutex ids_mutex;
     std::unordered_set<std::uint64_t> queued_ids;
     std::unordered_set<std::uint64_t> in_flight_ids;
     std::uint64_t last_started_generation = 0;
@@ -201,8 +210,12 @@ decompile_batch_orchestrator_t::~decompile_batch_orchestrator_t()
             state_->control_exit = true;
             state_->wake.notify_all();
         }
-        if (state_->control_started && state_->control_thread.joinable())
-            state_->control_thread.join();
+        if (state_->control_started && state_->control_task_id != 0) {
+            const auto waited = aida::infra::executor::wait_for(
+                state_->control_task_id, 2000);
+            if (!waited.completed)
+                (void)aida::infra::executor::cancel(state_->control_task_id);
+        }
     }
 }
 
@@ -244,26 +257,31 @@ std::uint64_t function_byte_size(const analysis_snapshot_t& snapshot,
     return total;
 }
 
+std::size_t pending_queue_depth(const decompile_batch_orchestrator_t::state_t& state) noexcept
+{
+    const std::uint64_t cursor = state.worklist_cursor.load(std::memory_order_acquire);
+    const std::uint64_t pending_worklist = cursor < state.worklist.size()
+        ? state.worklist.size() - cursor : 0;
+    return static_cast<std::size_t>(pending_worklist) +
+        state.retry_queue.size() + state.interactive_queue.size();
+}
+
 void cancel_run_locked(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& state)
 {
     state->cancel_epoch.fetch_add(1, std::memory_order_acq_rel);
     state->run_cancel.request_cancel();
     state->run_cancelling.store(true, std::memory_order_release);
-    const std::uint64_t queued = static_cast<std::uint64_t>(
-        state->queue.size() + state->interactive_queue.size());
+    const std::uint64_t queued = pending_queue_depth(*state);
     if (queued != 0) {
         state->cancelled += queued;
         metrics_add(state->metrics, analysis_metric_t::decompile_batch_cancelled, queued);
-        state->queue.clear();
+        state->worklist_cursor.store(state->worklist.size(), std::memory_order_release);
+        state->retry_queue.clear();
         state->interactive_queue.clear();
+        std::lock_guard ids_lock(state->ids_mutex);
         state->queued_ids.clear();
     }
     state->wake.notify_all();
-}
-
-std::size_t pending_queue_depth(const decompile_batch_orchestrator_t::state_t& state) noexcept
-{
-    return state.queue.size() + state.interactive_queue.size();
 }
 
 void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& state,
@@ -289,9 +307,11 @@ struct in_flight_lease_t {
         if (!state)
             return;
         try {
-            std::lock_guard lock(state->mutex);
-            --state->in_flight;
-            state->in_flight_ids.erase(function_id);
+            {
+                std::lock_guard ids_lock(state->ids_mutex);
+                state->in_flight_ids.erase(function_id);
+            }
+            state->in_flight.fetch_sub(1, std::memory_order_acq_rel);
             state->wake.notify_all();
         } catch (...) {
         }
@@ -420,8 +440,7 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
     const auto& quotas = mcp_standalone::downstream::governor_t::instance().quotas();
     const unsigned int logical_cores = (std::max)(2u, std::thread::hardware_concurrency());
     const std::size_t slots_desired = (std::min<std::size_t>)(k_absolute_slot_cap,
-        (std::min<std::size_t>)(quotas.decompiler_worker_group_size,
-            (std::max<std::size_t>)(2, logical_cores - 2)));
+        (std::max<std::size_t>)(2, static_cast<std::size_t>(logical_cores) - 2));
     const std::uint64_t memory_admission_budget = state->memory_budget_bytes != 0
         ? state->memory_budget_bytes : k_memory_budget_floor_bytes;
     const std::uint64_t per_slot_bytes = k_expected_worker_rss_bytes + k_arch_resident_bytes;
@@ -429,13 +448,13 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
         std::uint64_t& snapshot_term, std::uint64_t& slot_term) noexcept -> std::uint64_t {
         snapshot_term = 0;
         slot_term = 0;
-        if (snapshot_bytes != 0 && static_cast<std::uint64_t>(slot_count + 1) >
+        if (snapshot_bytes != 0 && 2ULL >
             (std::numeric_limits<std::uint64_t>::max)() / snapshot_bytes)
             return (std::numeric_limits<std::uint64_t>::max)();
         if (static_cast<std::uint64_t>(slot_count) >
             (std::numeric_limits<std::uint64_t>::max)() / per_slot_bytes)
             return (std::numeric_limits<std::uint64_t>::max)();
-        snapshot_term = static_cast<std::uint64_t>(slot_count + 1) * snapshot_bytes;
+        snapshot_term = 2ULL * snapshot_bytes;
         slot_term = static_cast<std::uint64_t>(slot_count) * per_slot_bytes;
         if (snapshot_term > (std::numeric_limits<std::uint64_t>::max)() - slot_term)
             return (std::numeric_limits<std::uint64_t>::max)();
@@ -465,7 +484,7 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
             slots_desired, slots);
     }
     diag::log_tagged_fmt("dec_batch",
-        "budget_decision type=memory_admission formula=(slots+1)*snapshot_bytes+slots*(expected_rss+arch_resident) desired=%zu slots=%zu snapshot_bytes=%llu snapshot_term=%llu resident_term=%llu total=%llu budget=%llu per_slot=%llu decision=%s",
+        "budget_decision type=memory_admission formula=2*snapshot_bytes+slots*(expected_rss+arch_resident) shared_mapping=1 desired=%zu slots=%zu snapshot_bytes=%llu snapshot_term=%llu resident_term=%llu total=%llu budget=%llu per_slot=%llu decision=%s",
         slots_desired,
         slots,
         static_cast<unsigned long long>(snapshot_bytes),
@@ -603,19 +622,25 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
             state->mem_hits = 0;
             state->disk_hits = 0;
             state->wall_ns = 0;
-            state->in_flight = 0;
+            state->in_flight.store(0, std::memory_order_release);
             state->progress_log_mark = 0;
             state->ema_last_completed = 0;
             state->ema_last_time = state->run_started;
             state->rate_ema = 0.0;
             state->governor_rejected_baseline = 0;
-            state->queue.assign(worklist.begin(), worklist.end());
+            state->worklist = std::move(worklist);
+            state->worklist_cursor.store(0, std::memory_order_release);
+            state->retry_queue.clear();
             state->interactive_queue.clear();
-            state->queued_ids.clear();
-            state->in_flight_ids.clear();
-            state->queued_ids.reserve(worklist.size());
-            for (const auto& item : worklist)
-                state->queued_ids.insert(item.function_id);
+            state->slot_threads.clear();
+            {
+                std::lock_guard ids_lock(state->ids_mutex);
+                state->in_flight_ids.clear();
+                state->queued_ids.clear();
+                state->queued_ids.reserve(state->worklist.size());
+                for (const auto& item : state->worklist)
+                    state->queued_ids.insert(item.function_id);
+            }
             state->admission = std::move(admission);
             state->slots_total = slots;
             state->slots_done = 0;
@@ -634,27 +659,27 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
     }
     metrics_add(state->metrics, analysis_metric_t::decompile_batch_calls, 1);
     metrics_set_max(state->metrics, analysis_metric_t::decompile_batch_queue_depth_peak,
-        static_cast<std::uint64_t>(worklist.size()));
+        static_cast<std::uint64_t>(state->worklist.size()));
     diag::log_tagged_fmt("dec_batch",
         "run_start generation=%llu analysis_revision=%llu functions=%zu lanes=interactive,exports,depth,linear slots=%zu quota=%zu snapshot_bytes=%llu profile=thorough deadlines=size_aware",
         static_cast<unsigned long long>(publication->generation),
         static_cast<unsigned long long>(publication->analysis_revision),
-        worklist.size(), slots, quotas.decompiler_worker_group_size,
+        state->worklist.size(), slots, quotas.decompiler_worker_group_size,
         static_cast<unsigned long long>(snapshot_bytes));
     std::size_t submitted = 0;
+    std::vector<std::thread> spawned_threads;
+    spawned_threads.reserve(slots);
     for (std::size_t index = 0; index < slots; ++index) {
-        aida::infra::executor::submission_t submission;
-        submission.owner_subsystem = "decompiler";
-        submission.label = "decompile.batch_slot";
-        submission.thread_class = "external_tool";
-        submission.domain = aida::infra::executor::domain_t::external_tool;
-        submission.priority = 2;
-        submission.shutdown_policy = "drain";
-        submission.body = [state, index] { slot_main(state, index); };
-        if (aida::infra::executor::submit(std::move(submission)).submitted)
+        try {
+            spawned_threads.emplace_back(slot_main, state, index);
             ++submitted;
-        else
+        } catch (...) {
             diag::log_tagged_fmt("dec_batch", "slot_post_failed index=%zu", index);
+        }
+    }
+    {
+        std::lock_guard lock(state->mutex);
+        state->slot_threads = std::move(spawned_threads);
     }
     if (submitted == 0) {
         diag::log_tagged_fmt("dec_batch", "run_aborted reason=slot_submit_failed");
@@ -684,7 +709,7 @@ void monitor_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>&
         if (state->control_exit && !state->run_cancelling.load(std::memory_order_acquire))
             cancel_run_locked(state);
         if (state->publish_pending && !state->run_cancelling.load(std::memory_order_acquire)) {
-            const std::uint64_t in_flight = state->in_flight;
+            const std::uint64_t in_flight = state->in_flight.load(std::memory_order_acquire);
             diag::log_tagged_fmt("dec_batch", "run_cancel reason=superseded in_flight=%llu queued=%zu",
                 static_cast<unsigned long long>(in_flight), pending_queue_depth(*state));
             cancel_run_locked(state);
@@ -730,8 +755,9 @@ void monitor_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>&
                 "scale_down slots=%zu to=%zu reason=governor_rejections",
                 effective, reduced);
         }
-        if (state->queue.empty() && state->interactive_queue.empty() &&
-            state->in_flight == 0 && !state->run_finishing) {
+        if (state->worklist_cursor.load(std::memory_order_acquire) >= state->worklist.size() &&
+            state->retry_queue.empty() && state->interactive_queue.empty() &&
+            state->in_flight.load(std::memory_order_acquire) == 0 && !state->run_finishing) {
             state->run_finishing = true;
             state->wake.notify_all();
         }
@@ -783,12 +809,22 @@ void finish_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& 
     state->service.reset();
     state->provider_context.reset();
     state->functions_by_id.clear();
-    state->queue.clear();
+    state->worklist.clear();
+    state->worklist_cursor.store(0, std::memory_order_release);
+    state->retry_queue.clear();
     state->interactive_queue.clear();
-    state->queued_ids.clear();
-    state->in_flight_ids.clear();
+    {
+        std::lock_guard ids_lock(state->ids_mutex);
+        state->queued_ids.clear();
+        state->in_flight_ids.clear();
+    }
     state->wake.notify_all();
     lock.unlock();
+    for (auto& thread : state->slot_threads) {
+        if (thread.joinable())
+            thread.join();
+    }
+    state->slot_threads.clear();
 }
 
 void slot_main(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& state,
@@ -799,34 +835,54 @@ void slot_main(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
             slot_index, static_cast<unsigned long>(GetCurrentThreadId()));
         while (true) {
             batch_work_item_t item;
+            bool have_item = false;
             {
                 std::unique_lock lock(state->mutex);
-                state->wake.wait_for(lock, std::chrono::milliseconds(100), [&state] {
-                    return !state->queue.empty() || !state->interactive_queue.empty() ||
-                        state->run_finishing || state->control_exit ||
-                        state->run_cancelling.load(std::memory_order_acquire);
-                });
-                if (slot_index >= state->slots_effective.load(std::memory_order_acquire))
-                    break;
-                if (state->queue.empty() && state->interactive_queue.empty()) {
-                    if (state->run_finishing || state->control_exit ||
-                        state->run_cancelling.load(std::memory_order_acquire))
-                        break;
-                    continue;
-                }
                 if (!state->interactive_queue.empty()) {
                     item = state->interactive_queue.front();
                     state->interactive_queue.pop_front();
-                } else {
-                    item = state->queue.front();
-                    state->queue.pop_front();
+                    have_item = true;
+                } else if (!state->retry_queue.empty()) {
+                    item = state->retry_queue.front();
+                    state->retry_queue.pop_front();
+                    have_item = true;
                 }
-                state->queued_ids.erase(item.function_id);
-                state->in_flight_ids.insert(item.function_id);
-                ++state->in_flight;
             }
-            in_flight_lease_t in_flight_lease(state, item.function_id);
-            process_item(state, item);
+            if (!have_item && slot_index < state->slots_effective.load(std::memory_order_acquire)) {
+                const std::uint64_t cursor = state->worklist_cursor.fetch_add(1,
+                    std::memory_order_acq_rel);
+                if (cursor < state->worklist.size()) {
+                    item = state->worklist[static_cast<std::size_t>(cursor)];
+                    have_item = true;
+                }
+            }
+            if (have_item) {
+                {
+                    std::lock_guard ids_lock(state->ids_mutex);
+                    state->queued_ids.erase(item.function_id);
+                    state->in_flight_ids.insert(item.function_id);
+                }
+                state->in_flight.fetch_add(1, std::memory_order_acq_rel);
+                in_flight_lease_t in_flight_lease(state, item.function_id);
+                process_item(state, item);
+                continue;
+            }
+            {
+                std::unique_lock lock(state->mutex);
+                if (slot_index >= state->slots_effective.load(std::memory_order_acquire))
+                    break;
+                const bool exhausted =
+                    state->worklist_cursor.load(std::memory_order_acquire) >= state->worklist.size() &&
+                    state->retry_queue.empty() && state->interactive_queue.empty();
+                if (exhausted && (state->run_finishing || state->control_exit ||
+                    state->run_cancelling.load(std::memory_order_acquire)))
+                    break;
+                state->wake.wait_for(lock, std::chrono::milliseconds(100), [&state] {
+                    return !state->retry_queue.empty() || !state->interactive_queue.empty() ||
+                        state->run_finishing || state->control_exit ||
+                        state->run_cancelling.load(std::memory_order_acquire);
+                });
+            }
         }
     } catch (...) {
         diag::log_tagged_fmt("dec_batch", "slot_exception index=%zu", slot_index);
@@ -943,30 +999,40 @@ void process_item_core(const std::shared_ptr<decompile_batch_orchestrator_t::sta
             metrics_add(state->metrics, analysis_metric_t::decompile_batch_cancelled, 1);
             return;
         }
-        std::lock_guard lock(state->mutex);
-        state->in_flight_ids.erase(item.function_id);
-        state->queued_ids.insert(item.function_id);
-        if (item.lane == 0)
-            state->interactive_queue.push_front(item);
-        else
-            state->queue.push_front(item);
-        metrics_set_max(state->metrics, analysis_metric_t::decompile_batch_queue_depth_peak,
-            static_cast<std::uint64_t>(pending_queue_depth(*state)));
-        state->wake.notify_one();
+        {
+            std::lock_guard ids_lock(state->ids_mutex);
+            state->in_flight_ids.erase(item.function_id);
+            state->queued_ids.insert(item.function_id);
+        }
+        {
+            std::lock_guard lock(state->mutex);
+            if (item.lane == 0)
+                state->interactive_queue.push_front(item);
+            else
+                state->retry_queue.push_front(item);
+            metrics_set_max(state->metrics, analysis_metric_t::decompile_batch_queue_depth_peak,
+                static_cast<std::uint64_t>(pending_queue_depth(*state)));
+            state->wake.notify_one();
+        }
         return;
     }
     if (result_retryable(result) && item.attempt < 1) {
         item.attempt = static_cast<std::uint8_t>(item.attempt + 1);
-        std::lock_guard lock(state->mutex);
-        state->in_flight_ids.erase(item.function_id);
-        state->queued_ids.insert(item.function_id);
-        if (item.lane == 0)
-            state->interactive_queue.push_back(item);
-        else
-            state->queue.push_back(item);
-        metrics_set_max(state->metrics, analysis_metric_t::decompile_batch_queue_depth_peak,
-            static_cast<std::uint64_t>(pending_queue_depth(*state)));
-        state->wake.notify_one();
+        {
+            std::lock_guard ids_lock(state->ids_mutex);
+            state->in_flight_ids.erase(item.function_id);
+            state->queued_ids.insert(item.function_id);
+        }
+        {
+            std::lock_guard lock(state->mutex);
+            if (item.lane == 0)
+                state->interactive_queue.push_back(item);
+            else
+                state->retry_queue.push_back(item);
+            metrics_set_max(state->metrics, analysis_metric_t::decompile_batch_queue_depth_peak,
+                static_cast<std::uint64_t>(pending_queue_depth(*state)));
+            state->wake.notify_one();
+        }
         diag::log_tagged_fmt("dec_batch",
             "worker_retry function_rva=0x%llx attempt=2 reason=%s",
             static_cast<unsigned long long>(item.entry_rva),
@@ -1046,20 +1112,35 @@ decompile_batch_orchestrator_t::create(
         return workspace_result_t<std::shared_ptr<decompile_batch_orchestrator_t>>::failure(
             std::move(error));
     };
-    try {
-        orchestrator->state_->control_thread = std::thread(control_main, orchestrator->state_);
-        orchestrator->state_->control_started = true;
-    } catch (const std::bad_alloc&) {
-        return workspace_result_t<std::shared_ptr<decompile_batch_orchestrator_t>>::failure(
-            make_workspace_error(workspace_error_code_t::limit_exceeded,
-                "decompile batch orchestrator control thread allocation failed",
-                "decompile_batch.create"));
-    } catch (...) {
+    auto control_state = orchestrator->state_;
+    aida::infra::executor::submission_t control_submission;
+    control_submission.owner_subsystem = "decompiler";
+    control_submission.label = "decompile.batch_control";
+    control_submission.thread_class = "long_running";
+    control_submission.domain = aida::infra::executor::domain_t::long_running;
+    control_submission.priority = 4;
+    control_submission.shutdown_policy = "cancel_pending";
+    control_submission.cancel_hook = [control_state] {
+        try {
+            std::lock_guard lock(control_state->mutex);
+            control_state->control_exit = true;
+            control_state->wake.notify_all();
+        } catch (...) {
+        }
+    };
+    control_submission.body = [control_state] { control_main(control_state); };
+    const auto control_result = aida::infra::executor::submit(std::move(control_submission));
+    if (!control_result.submitted || control_result.task_id == 0) {
+        diag::log_tagged_fmt("dec_batch",
+            "control_post_failed reason=%s",
+            control_result.reject_reason.empty() ? "unknown" : control_result.reject_reason.c_str());
         return workspace_result_t<std::shared_ptr<decompile_batch_orchestrator_t>>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
-                "decompile batch orchestrator control thread could not be started",
+                "decompile batch orchestrator control job could not be started",
                 "decompile_batch.create"));
     }
+    orchestrator->state_->control_task_id = control_result.task_id;
+    orchestrator->state_->control_started = true;
     auto observed = workspace->register_baseline_publish_observer(orchestrator);
     if (!observed)
         return attach_failure(observed.error());
@@ -1098,7 +1179,7 @@ void decompile_batch_orchestrator_t::request_cancel() noexcept
         {
             std::lock_guard lock(state_->mutex);
             queued = static_cast<std::uint64_t>(pending_queue_depth(*state_));
-            in_flight = state_->in_flight;
+            in_flight = state_->in_flight.load(std::memory_order_acquire);
             cancel_run_locked(state_);
         }
         diag::log_tagged_fmt("dec_batch", "run_cancel in_flight=%llu queued=%llu",
@@ -1134,36 +1215,72 @@ workspace_result_t<void> decompile_batch_orchestrator_t::drain(
     return workspace_result_t<void>::success();
 }
 
-void decompile_batch_orchestrator_t::notify_interactive_request(const decompiler_entity_key_t& entity)
+namespace {
+
+bool enqueue_interactive_item(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& state,
+                              const decompiler_entity_key_t& entity, bool priority)
 {
-    if (!state_ || entity.kind != decompiler_entity_kind_t::native_function)
-        return;
+    if (!state || entity.kind != decompiler_entity_kind_t::native_function)
+        return false;
     const auto* native = std::get_if<native_decompiler_entity_identity_t>(&entity.identity);
     if (!native)
-        return;
-    std::lock_guard lock(state_->mutex);
-    if (!state_->run_active || state_->run_finishing ||
-        state_->run_cancelling.load(std::memory_order_acquire) || !state_->run_publication ||
-        !state_->run_publication->snapshot)
-        return;
-    const auto found = state_->functions_by_id.find(native->function_id);
-    if (found == state_->functions_by_id.end() || !found->second)
-        return;
-    if (state_->in_flight_ids.count(native->function_id) != 0)
-        return;
-    if (!state_->queued_ids.insert(native->function_id).second)
-        return;
+        return false;
     batch_work_item_t item;
+    std::unique_lock lock(state->mutex);
+    if (!state->run_active || state->run_finishing ||
+        state->run_cancelling.load(std::memory_order_acquire) || !state->run_publication ||
+        !state->run_publication->snapshot)
+        return false;
+    const auto found = state->functions_by_id.find(native->function_id);
+    if (found == state->functions_by_id.end() || !found->second)
+        return false;
     item.function_id = native->function_id;
-    item.entry_rva = rva_of(found->second->start, state_->run_image_base);
-    item.byte_size = function_byte_size(*state_->run_publication->snapshot, *found->second);
+    item.entry_rva = rva_of(found->second->start, state->run_image_base);
+    item.byte_size = function_byte_size(*state->run_publication->snapshot, *found->second);
     item.lane = 0;
     item.depth = 0;
-    state_->interactive_queue.push_back(item);
-    ++state_->total;
-    metrics_set_max(state_->metrics, analysis_metric_t::decompile_batch_queue_depth_peak,
-        static_cast<std::uint64_t>(pending_queue_depth(*state_)));
-    state_->wake.notify_one();
+    lock.unlock();
+    {
+        std::lock_guard ids_lock(state->ids_mutex);
+        if (state->in_flight_ids.count(native->function_id) != 0)
+            return false;
+        if (!state->queued_ids.insert(native->function_id).second)
+            return false;
+    }
+    lock.lock();
+    if (!state->run_active || state->run_finishing ||
+        state->run_cancelling.load(std::memory_order_acquire)) {
+        std::lock_guard ids_lock(state->ids_mutex);
+        state->queued_ids.erase(native->function_id);
+        return false;
+    }
+    if (priority)
+        state->interactive_queue.push_front(item);
+    else
+        state->interactive_queue.push_back(item);
+    ++state->total;
+    metrics_set_max(state->metrics, analysis_metric_t::decompile_batch_queue_depth_peak,
+        static_cast<std::uint64_t>(pending_queue_depth(*state)));
+    state->wake.notify_one();
+    lock.unlock();
+    if (priority) {
+        diag::log_tagged_fmt("dec_batch",
+            "interactive_priority_admitted function_rva=0x%llx",
+            static_cast<unsigned long long>(item.entry_rva));
+    }
+    return true;
+}
+
+}
+
+void decompile_batch_orchestrator_t::notify_interactive_request(const decompiler_entity_key_t& entity)
+{
+    (void)enqueue_interactive_item(state_, entity, false);
+}
+
+bool decompile_batch_orchestrator_t::admit_interactive_priority(const decompiler_entity_key_t& entity)
+{
+    return enqueue_interactive_item(state_, entity, true);
 }
 
 decompile_batch_orchestrator_t::run_snapshot_t decompile_batch_orchestrator_t::run_snapshot() const
@@ -1180,6 +1297,10 @@ decompile_batch_orchestrator_t::run_snapshot_t decompile_batch_orchestrator_t::r
     snapshot.failed = state_->failed;
     snapshot.cancelled = state_->cancelled;
     snapshot.queue_depth = pending_queue_depth(*state_);
+    {
+        std::lock_guard ids_lock(state_->ids_mutex);
+        snapshot.interactive_pending = static_cast<std::uint64_t>(state_->interactive_queue.size());
+    }
     snapshot.slots = state_->slots_total;
     snapshot.slots_effective = state_->slots_effective.load(std::memory_order_acquire);
     snapshot.rate_funcs_s = state_->rate_ema;
@@ -1236,27 +1357,6 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
         workspace->provider_handle(), image, language.value(), revision.value(), {}, cancel);
     if (!load_image)
         return result_t::failure(load_image.error());
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    ranges.emplace_back(0, (std::min<std::uint64_t>)(image->image_size,
-        (std::max<std::uint64_t>)(image->header_size, k_snapshot_header_floor)));
-    for (const auto& section : image->sections) {
-        if ((section.permissions & image_permission_execute) == 0 ||
-            section.virtual_address >= image->image_size || section.virtual_size == 0)
-            continue;
-        ranges.emplace_back(section.virtual_address,
-            (std::min<std::uint64_t>)(image->image_size,
-                section.virtual_address + section.virtual_size));
-    }
-    std::sort(ranges.begin(), ranges.end());
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
-    for (const auto& range : ranges) {
-        if (range.first >= range.second || range.second > image->image_size)
-            continue;
-        if (!merged.empty() && range.first <= merged.back().second)
-            merged.back().second = (std::max)(merged.back().second, range.second);
-        else
-            merged.push_back(range);
-    }
     const auto thorough = default_decompiler_profile_policy().thorough;
     const std::uint64_t snapshot_limit = (std::min<std::uint64_t>)(k_batch_snapshot_absolute_cap,
         (std::min<std::uint64_t>)(k_worker_snapshot_cap,
@@ -1268,7 +1368,142 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
         static_cast<unsigned long long>(
             thorough.max_memory_bytes != 0 ? thorough.max_memory_bytes / 2 : 0),
         static_cast<unsigned long long>(snapshot_limit));
-    std::uint64_t requested_bytes = 0;
+    const auto analysis_snapshot = publication->snapshot;
+    std::vector<std::uint64_t> import_rvas;
+    import_rvas.reserve(image->imports.size());
+    for (const auto& item : image->imports) {
+        const std::uint64_t iat_rva = rva_of(item.address, image->image_base);
+        if (iat_rva != 0 && iat_rva < image->image_size)
+            import_rvas.push_back(iat_rva);
+    }
+    std::sort(import_rvas.begin(), import_rvas.end());
+    import_rvas.erase(std::unique(import_rvas.begin(), import_rvas.end()), import_rvas.end());
+    const auto section_contains_import = [&import_rvas](const image_section_t& section) {
+        if (section.virtual_size == 0)
+            return false;
+        const std::uint64_t end = section.virtual_address +
+            (section.virtual_size > (std::numeric_limits<std::uint64_t>::max)() - section.virtual_address
+                ? (std::numeric_limits<std::uint64_t>::max)() - section.virtual_address
+                : section.virtual_size);
+        const auto found = std::lower_bound(import_rvas.begin(), import_rvas.end(),
+            section.virtual_address);
+        return found != import_rvas.end() && *found < end;
+    };
+    const auto section_name_is = [](const std::string& name, const char* prefix) {
+        const std::size_t length = std::strlen(prefix);
+        if (name.size() < length)
+            return false;
+        for (std::size_t index = 0; index < length; ++index) {
+            char left = name[index];
+            if (left >= 'A' && left <= 'Z')
+                left = static_cast<char>(left - 'A' + 'a');
+            if (left != prefix[index])
+                return false;
+        }
+        return true;
+    };
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.emplace_back(0, (std::min<std::uint64_t>)(image->image_size,
+        (std::max<std::uint64_t>)(image->header_size, k_snapshot_header_floor)));
+    std::uint64_t exec_bytes = 0;
+    for (const auto& section : image->sections) {
+        if ((section.permissions & image_permission_execute) == 0 ||
+            section.virtual_address >= image->image_size || section.virtual_size == 0)
+            continue;
+        const std::uint64_t end = (std::min<std::uint64_t>)(image->image_size,
+            section.virtual_address + section.virtual_size);
+        ranges.emplace_back(section.virtual_address, end);
+        exec_bytes += end - section.virtual_address;
+    }
+    std::uint64_t requested_bytes = exec_bytes;
+    if (exec_bytes > snapshot_limit) {
+        return result_t::failure(make_workspace_error(workspace_error_code_t::limit_exceeded,
+            "batch decompile generation snapshot exceeds its memory bound",
+            "decompile_batch.capture"));
+    }
+    std::vector<const image_section_t*> import_sections;
+    std::vector<const image_section_t*> rdata_sections;
+    std::vector<const image_section_t*> data_sections;
+    std::vector<const image_section_t*> other_data_sections;
+    for (const auto& section : image->sections) {
+        if ((section.permissions & image_permission_execute) != 0 ||
+            (section.permissions & image_permission_read) == 0 ||
+            (section.permissions & image_permission_discardable) != 0 ||
+            section.virtual_address >= image->image_size || section.virtual_size == 0)
+            continue;
+        if (section_contains_import(section)) {
+            if (import_sections.size() < 8)
+                import_sections.push_back(&section);
+            continue;
+        }
+        if (section_name_is(section.name, ".rdata") || section_name_is(section.name, ".idata")) {
+            rdata_sections.push_back(&section);
+            continue;
+        }
+        if (section_name_is(section.name, ".data")) {
+            data_sections.push_back(&section);
+            continue;
+        }
+        other_data_sections.push_back(&section);
+    }
+    std::uint64_t data_bytes = 0;
+    std::uint64_t skipped_data_bytes = 0;
+    std::uint64_t included_data_sections = 0;
+    const auto include_data_sections = [&](const std::vector<const image_section_t*>& sections,
+                                           bool mandatory) {
+        for (const auto* section : sections) {
+            const std::uint64_t end = (std::min<std::uint64_t>)(image->image_size,
+                section->virtual_address + section->virtual_size);
+            const std::uint64_t size = end - section->virtual_address;
+            if (size == 0)
+                continue;
+            if (size > snapshot_limit - requested_bytes) {
+                skipped_data_bytes += size;
+                if (mandatory) {
+                    diag::log_tagged_fmt("dec_batch",
+                        "snapshot_data_section_skipped name=%s rva=0x%llx size=%llu reason=cap mandatory=%d",
+                        section->name.c_str(),
+                        static_cast<unsigned long long>(section->virtual_address),
+                        static_cast<unsigned long long>(size), mandatory ? 1 : 0);
+                }
+                continue;
+            }
+            ranges.emplace_back(section->virtual_address, end);
+            requested_bytes += size;
+            data_bytes += size;
+            ++included_data_sections;
+        }
+    };
+    include_data_sections(import_sections, true);
+    include_data_sections(rdata_sections, false);
+    include_data_sections(data_sections, false);
+    include_data_sections(other_data_sections, false);
+    const bool import_data_degraded = import_rvas.empty() ? false : (import_sections.empty() ||
+        std::any_of(import_sections.begin(), import_sections.end(), [&ranges](const image_section_t* section) {
+            for (const auto& range : ranges) {
+                if (section->virtual_address >= range.first && section->virtual_address < range.second)
+                    return false;
+            }
+            return true;
+        }));
+    diag::log_tagged_fmt("dec_batch",
+        "snapshot_layout exec_bytes=%llu data_bytes=%llu data_sections=%llu skipped_data_bytes=%llu import_data_degraded=%d ranges=%zu",
+        static_cast<unsigned long long>(exec_bytes),
+        static_cast<unsigned long long>(data_bytes),
+        static_cast<unsigned long long>(included_data_sections),
+        static_cast<unsigned long long>(skipped_data_bytes),
+        import_data_degraded ? 1 : 0, ranges.size());
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : ranges) {
+        if (range.first >= range.second || range.second > image->image_size)
+            continue;
+        if (!merged.empty() && range.first <= merged.back().second)
+            merged.back().second = (std::max)(merged.back().second, range.second);
+        else
+            merged.push_back(range);
+    }
+    requested_bytes = 0;
     for (const auto& range : merged) {
         const std::uint64_t size = range.second - range.first;
         if (size > snapshot_limit - requested_bytes) {
@@ -1316,18 +1551,154 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
         }
         snapshot.ranges.push_back(std::move(captured));
     }
-    const auto serialized = native_worker::serialize_native_provider_snapshot(snapshot);
+    namespace sidecar_ns = native_worker::snapshot_sidecar;
+    sidecar_ns::sidecar_t sidecar;
+    sidecar.is_64bit = image->address_width_bits >= 64;
+    std::uint64_t sidecar_estimate_bytes = 4096;
+    const auto sidecar_budget_remaining = [&sidecar_estimate_bytes]() {
+        return sidecar_estimate_bytes < k_snapshot_sidecar_absolute_cap
+            ? k_snapshot_sidecar_absolute_cap - sidecar_estimate_bytes : 0;
+    };
+    const auto sidecar_charge = [&sidecar_estimate_bytes](std::uint64_t bytes) {
+        sidecar_estimate_bytes += bytes;
+    };
+    std::unordered_set<std::uint64_t> prototype_rvas;
+    prototype_rvas.reserve(image->imports.size());
+    for (const auto& item : image->imports) {
+        const std::uint64_t iat_rva = rva_of(item.address, image->image_base);
+        if (iat_rva == 0 || iat_rva >= image->image_size)
+            continue;
+        sidecar_ns::import_record_t record;
+        record.iat_rva = iat_rva;
+        record.ordinal = item.ordinal ? static_cast<std::uint32_t>(*item.ordinal & 0xFFFFFFFFULL) : 0;
+        record.delayed = item.delayed;
+        record.module = item.library;
+        record.name = item.name.value_or(std::string());
+        if (!record.name.empty()) {
+            if (const auto prototype = api_prototypes::find(record.module, record.name)) {
+                sidecar_ns::prototype_record_t prototype_record;
+                prototype_record.rva = iat_rva;
+                prototype_record.confidence = 255;
+                prototype_record.is_noreturn = prototype->is_noreturn;
+                prototype_record.name = record.name;
+                prototype_record.prototype = prototype->signature;
+                prototype_rvas.insert(iat_rva);
+                sidecar_charge(24 + prototype_record.name.size() + prototype_record.prototype.size());
+                sidecar.prototypes.push_back(std::move(prototype_record));
+            }
+        }
+        sidecar_charge(32 + record.module.size() + record.name.size());
+        sidecar.imports.push_back(std::move(record));
+    }
+    if (analysis_snapshot) {
+        for (const auto& candidate : analysis_snapshot->rich_facts.type_candidates) {
+            if (candidate.kind != symbol_type_candidate_kind_t::function_prototype &&
+                candidate.kind != symbol_type_candidate_kind_t::import_prototype)
+                continue;
+            if (!candidate.address || sidecar.prototypes.size() >= 65536)
+                continue;
+            const std::uint64_t rva = rva_of(*candidate.address, image->image_base);
+            if (rva == 0 || rva >= image->image_size || prototype_rvas.count(rva) != 0)
+                continue;
+            const std::string* text = nullptr;
+            if (candidate.display_name.find('(') != std::string::npos)
+                text = &candidate.display_name;
+            else if (candidate.canonical_type.find('(') != std::string::npos)
+                text = &candidate.canonical_type;
+            if (!text || text->empty() || text->size() > 4096)
+                continue;
+            sidecar_ns::prototype_record_t prototype_record;
+            prototype_record.rva = rva;
+            prototype_record.confidence = candidate.confidence;
+            prototype_record.prototype = *text;
+            prototype_rvas.insert(rva);
+            sidecar_charge(24 + prototype_record.prototype.size());
+            sidecar.prototypes.push_back(std::move(prototype_record));
+        }
+        for (const auto& item : analysis_snapshot->symbols) {
+            if (item.name.empty() || item.name.size() > sidecar_ns::k_max_name_bytes ||
+                sidecar.names.size() >= sidecar_ns::k_max_records)
+                continue;
+            const std::uint64_t rva = rva_of(item.address, image->image_base);
+            if (rva == 0 || rva >= image->image_size)
+                continue;
+            const std::uint64_t charge = 16 + item.name.size();
+            if (charge > sidecar_budget_remaining())
+                break;
+            sidecar_ns::name_record_t record;
+            record.rva = rva;
+            switch (item.kind) {
+            case symbol_kind_t::function:
+            case symbol_kind_t::debug_symbol:
+            case symbol_kind_t::metadata:
+                record.kind = sidecar_ns::name_kind_t::function;
+                break;
+            case symbol_kind_t::import_symbol:
+                record.kind = sidecar_ns::name_kind_t::import;
+                break;
+            case symbol_kind_t::export_symbol:
+                record.kind = sidecar_ns::name_kind_t::export_;
+                break;
+            default:
+                record.kind = sidecar_ns::name_kind_t::data;
+                break;
+            }
+            record.name = item.name;
+            sidecar_charge(charge);
+            sidecar.names.push_back(std::move(record));
+        }
+        for (const auto& function : analysis_snapshot->functions) {
+            if (!function.noreturn || sidecar.noreturn.size() >= sidecar_ns::k_max_records)
+                continue;
+            const std::uint64_t rva = rva_of(function.start, image->image_base);
+            if (rva == 0 || rva >= image->image_size)
+                continue;
+            if (sidecar_budget_remaining() < 8)
+                break;
+            sidecar_charge(8);
+            sidecar.noreturn.push_back(rva);
+        }
+    }
+    const auto sidecar_bytes = sidecar_ns::encode(sidecar);
+    if (sidecar_bytes.empty()) {
+        diag::log_tagged_fmt("dec_batch",
+            "snapshot_sidecar_encode_failed names=%zu imports=%zu prototypes=%zu noreturn=%zu estimate_bytes=%llu",
+            sidecar.names.size(), sidecar.imports.size(), sidecar.prototypes.size(),
+            sidecar.noreturn.size(),
+            static_cast<unsigned long long>(sidecar_estimate_bytes));
+    }
+    if (requested_bytes + sidecar_bytes.size() > k_batch_snapshot_absolute_cap) {
+        return result_t::failure(make_workspace_error(workspace_error_code_t::limit_exceeded,
+            "batch decompile generation snapshot exceeds its absolute memory bound",
+            "decompile_batch.capture"));
+    }
+    const auto serialized = native_worker::serialize_native_provider_snapshot_v3(
+        snapshot, sidecar_bytes);
     if (serialized.empty()) {
         return result_t::failure(make_workspace_error(workspace_error_code_t::limit_exceeded,
             "batch decompile generation snapshot serialization failed",
             "decompile_batch.capture"));
     }
+    diag::log_tagged_fmt("dec_batch",
+        "snapshot_serialized version=3 snapshot_bytes=%llu ranges=%zu sidecar_bytes=%llu sidecar_names=%zu sidecar_imports=%zu sidecar_prototypes=%zu sidecar_noreturn=%zu",
+        static_cast<unsigned long long>(serialized.size()), snapshot.ranges.size(),
+        static_cast<unsigned long long>(sidecar_bytes.size()),
+        sidecar.names.size(), sidecar.imports.size(), sidecar.prototypes.size(),
+        sidecar.noreturn.size());
     std::vector<std::uint8_t> serialized_bytes(serialized.begin(), serialized.end());
     auto shared_snapshot = std::make_shared<const std::vector<std::uint8_t>>(
         std::move(serialized_bytes));
+    const auto snapshot_hash = stable_serialization_hash(serialized);
+    const auto published = generation_snapshot_store_t::instance().publish(
+        publication->generation, snapshot_hash, shared_snapshot);
+    diag::log_tagged_fmt("dec_batch",
+        "generation_snapshot_store_publish generation=%llu snapshot_bytes=%llu published=%d",
+        static_cast<unsigned long long>(publication->generation),
+        static_cast<unsigned long long>(shared_snapshot->size()),
+        published ? 1 : 0);
     std::shared_ptr<const decompiler_provider_context_t> context =
         std::make_shared<ghidra_native_provider_context_t>(
-            std::move(shared_snapshot), stable_serialization_hash(serialized));
+            std::move(shared_snapshot), snapshot_hash);
     return result_t::success(std::move(context));
 } catch (const std::bad_alloc&) {
     return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(

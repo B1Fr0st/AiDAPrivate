@@ -14,6 +14,7 @@
 #include "../analysis/stealth_engine.hpp"
 #include "../debugger/debugger_engine.hpp"
 #include "../infra/taskflow_runtime.hpp"
+#include "../infra/cancellation_watchdog.hpp"
 #include "../session/analysis_session.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../network/burp/camoufox_bridge.hpp"
@@ -26,7 +27,6 @@
 #include <cwctype>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1664,33 +1664,23 @@ tool_result_t ensure_attached()
         explicit workspace_call_cancel_bridge_t(
             std::optional<std::chrono::steady_clock::time_point> deadline,
             std::atomic<bool>* external = nullptr)
-            : source_(deadline), external_(external ? external : mcp_standalone::current_cancel_token())
+            : source_(deadline)
         {
-            if (external_) {
-                worker_ = std::thread([this]() {
-                    std::unique_lock<std::mutex> lock(mutex_);
-                    while (!stopping_) {
-                        if (external_->load(std::memory_order_acquire)) {
-                            source_.request_cancel();
-                            break;
-                        }
-                        cv_.wait_for(lock, std::chrono::milliseconds(10), [this]() {
-                            return stopping_;
-                        });
-                    }
-                });
+            std::atomic<bool>* const observed = external ? external : mcp_standalone::current_cancel_token();
+            if (observed) {
+                aida::infra::cancellation_watchdog::watch_descriptor_t watch;
+                watch.external_flag = observed;
+                watch.on_fire = [source_snapshot = source_]() mutable {
+                    source_snapshot.request_cancel();
+                };
+                watch_id_ = aida::infra::cancellation_watchdog::register_watch(std::move(watch));
             }
         }
 
         ~workspace_call_cancel_bridge_t()
         {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stopping_ = true;
-            }
-            cv_.notify_all();
-            if (worker_.joinable())
-                worker_.join();
+            if (watch_id_.valid())
+                aida::infra::cancellation_watchdog::unregister_watch(watch_id_);
         }
 
         workspace_call_cancel_bridge_t(const workspace_call_cancel_bridge_t&) = delete;
@@ -1703,11 +1693,7 @@ tool_result_t ensure_attached()
 
     private:
         aida::analysis::cancellation_source_t source_;
-        std::atomic<bool>* external_ = nullptr;
-        std::mutex mutex_;
-        std::condition_variable cv_;
-        bool stopping_ = false;
-        std::thread worker_;
+        aida::infra::cancellation_watchdog::watch_id_t watch_id_;
     };
 
     std::optional<std::chrono::steady_clock::time_point> current_workspace_deadline()

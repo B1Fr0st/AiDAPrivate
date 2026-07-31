@@ -185,6 +185,17 @@ private:
     ZSTD_CCtx* context_ = nullptr;
 };
 
+ZSTD_DCtx* thread_local_dctx() noexcept {
+    thread_local struct dctx_holder_t {
+        ZSTD_DCtx* context = ZSTD_createDCtx();
+        ~dctx_holder_t() {
+            if (context)
+                ZSTD_freeDCtx(context);
+        }
+    } holder;
+    return holder.context;
+}
+
 workspace_error_t codec_cancelled_error(const char* phase) {
     auto error = make_workspace_error(workspace_error_code_t::cancelled,
                                       "packed page operation was cancelled",
@@ -580,7 +591,8 @@ workspace_result_t<void> packed_page_codec_t::verify_page(
                                  "packed_page_codec.verify_page"));
     }
     if (page.header.version != packed_page_blob_version &&
-        page.header.version != packed_page_blob_version_v3) {
+        page.header.version != packed_page_blob_version_v3 &&
+        page.header.version != packed_page_blob_version_v4) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "page version is unsupported",
@@ -606,7 +618,8 @@ workspace_result_t<void> packed_page_codec_t::verify_page(
                                  "page payload length does not match header",
                                  "packed_page_codec.verify_page"));
     }
-    if (page.header.version == packed_page_blob_version_v3) {
+    if (page.header.version == packed_page_blob_version_v3 ||
+        page.header.version == packed_page_blob_version_v4) {
         if (page.header.page_type == packed_page_checkpoint_type ||
             page.payload.size() < packed_record_page_prefix_size +
                 packed_page_frame_header_size + packed_page_zstd_min_frame) {
@@ -622,13 +635,52 @@ workspace_result_t<void> packed_page_codec_t::verify_page(
         const std::uint64_t frame_content_length =
             read_u64_le(page.payload.data() + packed_record_page_prefix_size + 8);
         if (frame_magic != packed_page_frame_magic ||
-            frame_codec != packed_page_codec_zstd ||
             frame_content_length == 0 ||
             frame_content_length > packed_page_max_payload) {
             return workspace_result_t<void>::failure(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "page compressed frame header is invalid",
                                      "packed_page_codec.verify_page"));
+        }
+        if (page.header.version == packed_page_blob_version_v3) {
+            if (frame_codec != packed_page_codec_zstd) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                                         "page compressed frame header is invalid",
+                                         "packed_page_codec.verify_page"));
+            }
+        } else {
+            if (frame_codec != packed_page_codec_zstd &&
+                frame_codec != packed_page_codec_zstd_seeded) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                                         "page compressed frame codec is invalid",
+                                         "packed_page_codec.verify_page"));
+            }
+            if (frame_codec == packed_page_codec_zstd_seeded) {
+                const std::size_t dictionary_length_offset =
+                    packed_record_page_prefix_size + packed_page_frame_header_size;
+                if (page.payload.size() <
+                    dictionary_length_offset + packed_page_v4_dictionary_length_size +
+                        packed_page_zstd_min_frame) {
+                    return workspace_result_t<void>::failure(
+                        make_workspace_error(workspace_error_code_t::integrity_failure,
+                                             "page dictionary-seeded frame is truncated",
+                                             "packed_page_codec.verify_page"));
+                }
+                const std::uint32_t dictionary_length =
+                    read_u32_le(page.payload.data() + dictionary_length_offset);
+                if (dictionary_length == 0 ||
+                    dictionary_length > packed_page_v4_max_dictionary_bytes ||
+                    page.payload.size() <
+                        dictionary_length_offset + packed_page_v4_dictionary_length_size +
+                            dictionary_length + packed_page_zstd_min_frame) {
+                    return workspace_result_t<void>::failure(
+                        make_workspace_error(workspace_error_code_t::integrity_failure,
+                                             "page dictionary seed length is invalid",
+                                             "packed_page_codec.verify_page"));
+                }
+            }
         }
     }
     auto expected_checksum = compute_page_checksum_cancellable(
@@ -785,6 +837,177 @@ workspace_result_t<void> packed_page_codec_t::seal_page_v3(
     return workspace_result_t<void>::success();
 }
 
+std::vector<std::uint8_t> packed_page_codec_t::build_v4_dictionary_seed(
+    const std::vector<std::uint8_t>& decoded_previous_domain_page) {
+    const std::size_t seed_size =
+        (std::min)(decoded_previous_domain_page.size(),
+                   static_cast<std::size_t>(packed_page_v4_max_dictionary_bytes));
+    return std::vector<std::uint8_t>(decoded_previous_domain_page.begin(),
+                                     decoded_previous_domain_page.begin() +
+                                         static_cast<std::ptrdiff_t>(seed_size));
+}
+
+workspace_result_t<void> packed_page_codec_t::seal_page_v4(
+    packed_page_t& page, int compression_level,
+    const std::vector<std::uint8_t>& dictionary_seed,
+    const packed_stop_predicate_t& stop_requested) {
+    page.header.magic = packed_page_magic;
+    page.header.version = packed_page_blob_version;
+    page.header.payload_length = static_cast<std::uint32_t>(page.payload.size());
+    page.header.checksum = 0;
+    if (!valid_page_type(page.header.page_type) ||
+        page.header.page_type == packed_page_checkpoint_type ||
+        page.header.generation == 0 || page.header.page_count == 0 ||
+        page.header.page_count > packed_generation_max_pages ||
+        page.header.page_index >= page.header.page_count ||
+        page.payload.size() < packed_record_page_prefix_size ||
+        page.payload.size() > packed_page_max_payload ||
+        !packed_record_page_prefix_t::decode(
+            page.payload.data(), page.payload.size())) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "page cannot be sealed because its bounded invariants are invalid",
+                                 "packed_page_codec.seal_page_v4"));
+    }
+    if (compression_level != 0 &&
+        (compression_level < 0 || compression_level > ZSTD_maxCLevel())) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "compression level is outside the supported zstd range",
+                                 "packed_page_codec.seal_page_v4"));
+    }
+    if (dictionary_seed.size() > packed_page_v4_max_dictionary_bytes) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "dictionary seed exceeds the v4 bounded seed size",
+                                 "packed_page_codec.seal_page_v4"));
+    }
+    const std::size_t content_size =
+        page.payload.size() - packed_record_page_prefix_size;
+    if (compression_level == 0 ||
+        content_size < packed_page_compress_min_content_bytes) {
+        return seal_page(page, stop_requested);
+    }
+    if (codec_stop_requested(stop_requested))
+        return workspace_result_t<void>::failure(
+            codec_cancelled_error("packed_page_codec.seal_page_v4"));
+    std::array<std::uint8_t, packed_record_page_prefix_size> prefix{};
+    std::memcpy(prefix.data(), page.payload.data(), prefix.size());
+    std::vector<std::uint8_t> content(
+        page.payload.begin() + packed_record_page_prefix_size,
+        page.payload.end());
+    zstd_cctx_t context;
+    auto initialized = context.initialize(compression_level);
+    if (!initialized)
+        return workspace_result_t<void>::failure(initialized.error());
+    size_t status = ZSTD_CCtx_setParameter(context.get(), ZSTD_c_windowLog,
+                                           packed_page_v4_window_log);
+    if (ZSTD_isError(status)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "unable to bound the v4 zstd frame window",
+                                 "packed_page_codec.seal_page_v4"));
+    }
+    const std::size_t bound = ZSTD_compressBound(content.size());
+    if (ZSTD_isError(bound)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "page compression bound could not be computed",
+                                 "packed_page_codec.seal_page_v4"));
+    }
+    std::vector<std::uint8_t> compressed(bound);
+    const std::size_t plain_produced = ZSTD_compress2(
+        context.get(), compressed.data(), compressed.size(),
+        content.data(), content.size());
+    if (ZSTD_isError(plain_produced)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "page compression failed",
+                                 "packed_page_codec.seal_page_v4"));
+    }
+    std::vector<std::uint8_t> seeded;
+    std::size_t seeded_produced = 0;
+    if (!dictionary_seed.empty()) {
+        status = ZSTD_CCtx_loadDictionary(context.get(), dictionary_seed.data(),
+                                          dictionary_seed.size());
+        if (ZSTD_isError(status)) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "unable to seed the v4 compression dictionary",
+                                     "packed_page_codec.seal_page_v4"));
+        }
+        seeded.resize(bound);
+        seeded_produced = ZSTD_compress2(
+            context.get(), seeded.data(), seeded.size(),
+            content.data(), content.size());
+        static_cast<void>(ZSTD_CCtx_loadDictionary(context.get(), nullptr, 0));
+        if (ZSTD_isError(seeded_produced)) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "dictionary-seeded page compression failed",
+                                     "packed_page_codec.seal_page_v4"));
+        }
+    }
+    const std::size_t plain_total = plain_produced + packed_page_frame_header_size;
+    const std::size_t seeded_total = dictionary_seed.empty()
+        ? (std::numeric_limits<std::size_t>::max)()
+        : seeded_produced + packed_page_frame_header_size +
+              packed_page_v4_dictionary_length_size + dictionary_seed.size();
+    if (seeded_total < plain_total && seeded_total < content_size) {
+        std::vector<std::uint8_t> sealed_payload;
+        sealed_payload.reserve(packed_record_page_prefix_size + seeded_total);
+        sealed_payload.insert(sealed_payload.end(), prefix.begin(), prefix.end());
+        append_u32_le(sealed_payload, packed_page_frame_magic);
+        append_u32_le(sealed_payload, packed_page_codec_zstd_seeded);
+        append_u64_le(sealed_payload, static_cast<std::uint64_t>(content.size()));
+        append_u32_le(sealed_payload,
+                      static_cast<std::uint32_t>(dictionary_seed.size()));
+        sealed_payload.insert(sealed_payload.end(), dictionary_seed.begin(),
+                              dictionary_seed.end());
+        sealed_payload.insert(sealed_payload.end(), seeded.begin(),
+                              seeded.begin() + seeded_produced);
+        page.payload = std::move(sealed_payload);
+        page.header.version = packed_page_blob_version_v4;
+    } else if (plain_total < content_size) {
+        std::vector<std::uint8_t> sealed_payload;
+        sealed_payload.reserve(packed_record_page_prefix_size +
+                               packed_page_frame_header_size + plain_produced);
+        sealed_payload.insert(sealed_payload.end(), prefix.begin(), prefix.end());
+        append_u32_le(sealed_payload, packed_page_frame_magic);
+        append_u32_le(sealed_payload, packed_page_codec_zstd);
+        append_u64_le(sealed_payload, static_cast<std::uint64_t>(content.size()));
+        sealed_payload.insert(sealed_payload.end(), compressed.begin(),
+                              compressed.begin() + plain_produced);
+        page.payload = std::move(sealed_payload);
+        page.header.version = packed_page_blob_version_v4;
+    } else {
+        return seal_page(page, stop_requested);
+    }
+    page.header.payload_length = static_cast<std::uint32_t>(page.payload.size());
+    page.header.checksum = 0;
+    auto checksum = compute_page_checksum_cancellable(
+        page.header, page.payload, stop_requested);
+    if (!checksum)
+        return workspace_result_t<void>::failure(checksum.error());
+    page.header.checksum = checksum.value();
+    auto decoded = decode_page_content(page, stop_requested);
+    if (!decoded || decoded.value() != content) {
+        page.payload.clear();
+        page.payload.insert(page.payload.end(), prefix.begin(), prefix.end());
+        page.payload.insert(page.payload.end(), content.begin(), content.end());
+        page.header.version = packed_page_blob_version;
+        page.header.payload_length = static_cast<std::uint32_t>(page.payload.size());
+        page.header.checksum = 0;
+        if (!decoded)
+            return workspace_result_t<void>::failure(decoded.error());
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "page compression round-trip verification failed",
+                                 "packed_page_codec.seal_page_v4"));
+    }
+    return workspace_result_t<void>::success();
+}
+
 workspace_result_t<packed_record_page_prefix_t>
 packed_page_codec_t::record_prefix(
     const packed_page_t& page,
@@ -846,6 +1069,8 @@ packed_page_codec_t::decode_page_content(
                                  "page compressed frame is truncated",
                                  "packed_page_codec.decode_page_content"));
     }
+    const std::uint32_t frame_codec =
+        read_u32_le(page.payload.data() + packed_record_page_prefix_size + 4);
     const std::uint64_t content_length =
         read_u64_le(page.payload.data() + packed_record_page_prefix_size + 8);
     if (content_length == 0 || content_length > packed_page_max_payload) {
@@ -854,18 +1079,55 @@ packed_page_codec_t::decode_page_content(
                                  "page compressed content length is invalid",
                                  "packed_page_codec.decode_page_content"));
     }
-    const std::uint8_t* compressed =
-        page.payload.data() + packed_record_page_prefix_size +
+    std::size_t cursor = packed_record_page_prefix_size +
         packed_page_frame_header_size;
-    const std::size_t compressed_size =
-        page.payload.size() - packed_record_page_prefix_size -
-        packed_page_frame_header_size;
+    const std::uint8_t* dictionary = nullptr;
+    std::size_t dictionary_size = 0;
+    if (page.header.version == packed_page_blob_version_v4 &&
+        frame_codec == packed_page_codec_zstd_seeded) {
+        if (page.payload.size() < cursor + packed_page_v4_dictionary_length_size) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "page dictionary-seeded frame is truncated",
+                                     "packed_page_codec.decode_page_content"));
+        }
+        const std::uint32_t dictionary_length = read_u32_le(page.payload.data() + cursor);
+        cursor += packed_page_v4_dictionary_length_size;
+        if (dictionary_length == 0 ||
+            dictionary_length > packed_page_v4_max_dictionary_bytes ||
+            page.payload.size() < cursor + dictionary_length) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "page dictionary seed length is invalid",
+                                     "packed_page_codec.decode_page_content"));
+        }
+        dictionary = page.payload.data() + cursor;
+        dictionary_size = dictionary_length;
+        cursor += dictionary_length;
+    } else if (frame_codec != packed_page_codec_zstd) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "page compressed codec identifier is invalid",
+                                 "packed_page_codec.decode_page_content"));
+    }
+    const std::uint8_t* compressed = page.payload.data() + cursor;
+    const std::size_t compressed_size = page.payload.size() - cursor;
     if (codec_stop_requested(stop_requested))
         return workspace_result_t<std::vector<std::uint8_t>>::failure(
             codec_cancelled_error("packed_page_codec.decode_page_content"));
+    ZSTD_DCtx* dctx = thread_local_dctx();
+    if (!dctx) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "unable to allocate a zstd decompression context",
+                                 "packed_page_codec.decode_page_content"));
+    }
     std::vector<std::uint8_t> output(static_cast<std::size_t>(content_length));
-    const std::size_t produced = ZSTD_decompress(
-        output.data(), output.size(), compressed, compressed_size);
+    const std::size_t produced = dictionary
+        ? ZSTD_decompress_usingDict(dctx, output.data(), output.size(), compressed,
+                                    compressed_size, dictionary, dictionary_size)
+        : ZSTD_decompressDCtx(dctx, output.data(), output.size(), compressed,
+                              compressed_size);
     if (ZSTD_isError(produced) || produced != content_length) {
         return workspace_result_t<std::vector<std::uint8_t>>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,

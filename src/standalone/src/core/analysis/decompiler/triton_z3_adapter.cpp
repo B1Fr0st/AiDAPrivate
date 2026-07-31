@@ -1,14 +1,14 @@
 #include "triton_z3_adapter.hpp"
 
+#include "../../infra/taskflow_runtime.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <limits>
-#include <mutex>
 #include <new>
 #include <sstream>
-#include <thread>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
@@ -486,37 +486,48 @@ public:
                 solver.add(assertions[index]);
 
             std::atomic<bool> solver_finished{false};
-            std::mutex interrupt_mutex;
-            std::condition_variable interrupt_condition;
-            std::thread interrupter([&] {
-                std::unique_lock<std::mutex> lock(interrupt_mutex);
+
+            infra::taskflow_runtime::task_descriptor_t interrupt_desc;
+            interrupt_desc.domain = infra::taskflow_runtime::executor_domain_t::external_tool;
+            interrupt_desc.owner_subsystem = "semantic_refiner";
+            interrupt_desc.label = "triton_z3.interrupt";
+            interrupt_desc.priority = 1;
+            interrupt_desc.shutdown_policy = "cancel_pending";
+            interrupt_desc.cancellable_body = [&solver_finished, &cancel, &z3_context](
+                const infra::taskflow_runtime::cancellation_token_t& job_token) {
                 while (!solver_finished.load(std::memory_order_acquire)) {
-                    if (cancel.stop_requested()) {
+                    if (cancel.stop_requested() ||
+                        job_token.requested.load(std::memory_order_acquire)) {
                         z3_context.interrupt();
                         return;
                     }
-                    auto wake = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
-                    const auto deadline = cancel.deadline();
-                    if (deadline && *deadline < wake)
-                        wake = *deadline;
-                    interrupt_condition.wait_until(lock, wake, [&] {
-                        return solver_finished.load(std::memory_order_acquire);
-                    });
+                    Sleep(1);
                 }
-            });
+            };
+            interrupt_desc.cancel_hook = [&solver_finished, &z3_context]() {
+                if (!solver_finished.load(std::memory_order_acquire))
+                    z3_context.interrupt();
+            };
+            auto interrupt_submission = infra::taskflow_runtime::submit(std::move(interrupt_desc));
+            if (!interrupt_submission.submitted)
+                throw std::runtime_error(interrupt_submission.reject_reason.empty()
+                    ? "interrupt worker submission rejected"
+                    : interrupt_submission.reject_reason);
+
+            const auto stop_interrupter = [&]() {
+                solver_finished.store(true, std::memory_order_release);
+                infra::taskflow_runtime::cancel(interrupt_submission.handle);
+                infra::taskflow_runtime::wait_for(interrupt_submission.handle, 5000);
+            };
 
             z3::check_result checked = z3::unknown;
             try {
                 checked = solver.check();
             } catch (...) {
-                solver_finished.store(true, std::memory_order_release);
-                interrupt_condition.notify_all();
-                interrupter.join();
+                stop_interrupter();
                 throw;
             }
-            solver_finished.store(true, std::memory_order_release);
-            interrupt_condition.notify_all();
-            interrupter.join();
+            stop_interrupter();
 
             const auto peak_memory = peak_solver_memory_bytes(solver);
             if (cancel.stop_requested())

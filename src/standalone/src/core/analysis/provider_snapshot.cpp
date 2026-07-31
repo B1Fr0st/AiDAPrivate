@@ -4,6 +4,7 @@
 #include "spill_provider.hpp"
 #include "workspace/checked_range.hpp"
 #include "workspace/live_snapshot_provider.hpp"
+#include "../infra/taskflow_runtime.hpp"
 
 #include <algorithm>
 #include <array>
@@ -13,7 +14,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -216,10 +216,15 @@ workspace_result_t<std::shared_ptr<provider_snapshot_t>> provider_snapshot_t::ma
     pipeline_state_t pipeline;
     std::uint64_t hash_bytes = 0;
     std::uint64_t hash_ns = 0;
-    std::thread reader;
+    infra::taskflow_runtime::job_handle_t reader_job;
     if (chunk_count != 0) {
-        try {
-            reader = std::thread([&]() {
+        infra::taskflow_runtime::task_descriptor_t reader_desc;
+        reader_desc.domain = infra::taskflow_runtime::executor_domain_t::feature_worker;
+        reader_desc.owner_subsystem = "provider_snapshot";
+        reader_desc.label = "provider_snapshot.materialize_reader";
+        reader_desc.priority = 3;
+        reader_desc.shutdown_policy = "cancel_pending";
+        reader_desc.cancellable_body = [&](const infra::taskflow_runtime::cancellation_token_t&) {
                 try {
                     for (std::uint64_t chunk = 0; chunk < chunk_count; ++chunk) {
                         {
@@ -288,13 +293,24 @@ workspace_result_t<std::shared_ptr<provider_snapshot_t>> provider_snapshot_t::ma
                             "provider_snapshot_materialize");
                 }
                 pipeline.buffer_ready.notify_all();
-            });
-        } catch (const std::exception&) {
+            };
+        reader_desc.cancel_hook = [&]() {
+            {
+                std::lock_guard<std::mutex> lock(pipeline.mutex);
+                if (!pipeline.first_error)
+                    pipeline.first_error = stop_error(cancel, "provider_snapshot_materialize");
+            }
+            pipeline.buffer_free.notify_all();
+            pipeline.buffer_ready.notify_all();
+        };
+        auto reader_submission = infra::taskflow_runtime::submit(std::move(reader_desc));
+        if (!reader_submission.submitted) {
             return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(
                 make_workspace_error(workspace_error_code_t::provider_unavailable,
                                      "snapshot materialization worker creation failed",
                                      "provider_snapshot_materialize"));
         }
+        reader_job = reader_submission.handle;
     }
     for (std::uint64_t chunk = 0; chunk < chunk_count; ++chunk) {
         {
@@ -334,8 +350,8 @@ workspace_result_t<std::shared_ptr<provider_snapshot_t>> provider_snapshot_t::ma
     }
     pipeline.buffer_free.notify_all();
     pipeline.buffer_ready.notify_all();
-    if (reader.joinable())
-        reader.join();
+    if (reader_job.valid())
+        infra::taskflow_runtime::wait_for(reader_job, 0xFFFFFFFFu);
     if (pipeline.first_error)
         return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(
             std::move(*pipeline.first_error));

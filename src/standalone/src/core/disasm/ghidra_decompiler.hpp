@@ -24,6 +24,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -63,6 +64,8 @@
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
+
+#include "../../../workers/native_decompiler/worker_symbol_binder.hpp"
 
 namespace ghidra_decompiler {
 
@@ -627,6 +630,135 @@ inline pe_parser::pe_info_t* try_parse_pe_info(const DisasmFile* file,
 
 static constexpr int WATCHDOG_TIMEOUT_MS = 10000;
 
+class session_job_guard_t final {
+public:
+	session_job_guard_t() = default;
+	session_job_guard_t(const session_job_guard_t&) = delete;
+	session_job_guard_t& operator=(const session_job_guard_t&) = delete;
+
+	~session_job_guard_t()
+	{
+		stop();
+	}
+
+	bool start(std::atomic<bool>* loader_cancel_sink) noexcept
+	{
+		if (!loader_cancel_sink || thread_.joinable())
+			return false;
+		loader_cancel_sink_ = loader_cancel_sink;
+		exit_.store(false, std::memory_order_release);
+		try {
+			thread_ = std::thread([this] { run(); });
+		} catch (...) {
+			loader_cancel_sink_ = nullptr;
+			return false;
+		}
+		return true;
+	}
+
+	void stop() noexcept
+	{
+		exit_.store(true, std::memory_order_release);
+		if (thread_.joinable())
+			thread_.join();
+		loader_cancel_sink_ = nullptr;
+	}
+
+	void arm(std::atomic<bool>* job_cancel,
+	         std::chrono::steady_clock::time_point deadline,
+	         uint64_t addr) noexcept
+	{
+		watchdog_fired_elapsed_ms_.store(0, std::memory_order_release);
+		watchdog_addr_.store(addr, std::memory_order_release);
+		watchdog_deadline_.store(
+			std::chrono::duration_cast<std::chrono::milliseconds>(
+				deadline.time_since_epoch()).count(),
+			std::memory_order_release);
+		job_cancel_.store(job_cancel, std::memory_order_release);
+		watchdog_armed_.store(true, std::memory_order_release);
+		watchdog_state_.store(static_cast<uint32_t>(wd_state_t::running),
+			std::memory_order_release);
+	}
+
+	void disarm() noexcept
+	{
+		uint32_t expected = static_cast<uint32_t>(wd_state_t::running);
+		watchdog_state_.compare_exchange_strong(expected,
+			static_cast<uint32_t>(wd_state_t::completed),
+			std::memory_order_acq_rel, std::memory_order_acquire);
+		watchdog_armed_.store(false, std::memory_order_release);
+		job_cancel_.store(nullptr, std::memory_order_release);
+	}
+
+	bool watchdog_fired() const noexcept
+	{
+		return watchdog_state_.load(std::memory_order_acquire) ==
+			static_cast<uint32_t>(wd_state_t::cancelled);
+	}
+
+	long long watchdog_fired_elapsed_ms() const noexcept
+	{
+		return watchdog_fired_elapsed_ms_.load(std::memory_order_acquire);
+	}
+
+private:
+	void run() noexcept
+	{
+		auto armed_since = std::chrono::steady_clock::now();
+		bool was_armed = false;
+		while (!exit_.load(std::memory_order_acquire)) {
+			std::atomic<bool>* cancel = job_cancel_.load(std::memory_order_acquire);
+			if (cancel && loader_cancel_sink_ &&
+				cancel->load(std::memory_order_acquire)) {
+				loader_cancel_sink_->store(true, std::memory_order_release);
+			}
+			const bool armed = watchdog_armed_.load(std::memory_order_acquire);
+			if (armed && !was_armed) {
+				armed_since = std::chrono::steady_clock::now();
+				was_armed = true;
+			} else if (!armed) {
+				was_armed = false;
+			}
+			if (armed &&
+				watchdog_state_.load(std::memory_order_acquire) ==
+					static_cast<uint32_t>(wd_state_t::running)) {
+				const long long deadline_ms = watchdog_deadline_.load(std::memory_order_acquire);
+				const auto now = std::chrono::steady_clock::now();
+				const long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					now.time_since_epoch()).count();
+				if (now_ms >= deadline_ms) {
+					uint32_t expected = static_cast<uint32_t>(wd_state_t::running);
+					if (watchdog_state_.compare_exchange_strong(expected,
+						static_cast<uint32_t>(wd_state_t::cancelled),
+						std::memory_order_acq_rel, std::memory_order_acquire)) {
+						const long long fired_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+							now - armed_since).count();
+						watchdog_fired_elapsed_ms_.store(fired_ms, std::memory_order_release);
+						if (cancel)
+							cancel->store(true, std::memory_order_release);
+						diag::log_tagged_critical_fmt("dec",
+							"do_decompile_watchdog_fired addr=0x%llx elapsed_ms=%lld",
+							static_cast<unsigned long long>(
+								watchdog_addr_.load(std::memory_order_acquire)),
+							fired_ms);
+					}
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+	}
+
+	std::thread thread_;
+	std::atomic<bool> exit_{false};
+	std::atomic<bool>* loader_cancel_sink_ = nullptr;
+	std::atomic<std::atomic<bool>*> job_cancel_{nullptr};
+	std::atomic<bool> watchdog_armed_{false};
+	std::atomic<uint32_t> watchdog_state_{static_cast<uint32_t>(wd_state_t::completed)};
+	std::atomic<long long> watchdog_deadline_{0};
+	std::atomic<long long> watchdog_fired_elapsed_ms_{0};
+	std::atomic<unsigned long long> watchdog_addr_{0};
+};
+
 inline std::vector<std::pair<std::string, uint64_t>>
 collect_callees(ghidra::Funcdata* fd, std::size_t max_callees = 65536,
                 std::atomic<bool>* cancel = nullptr)
@@ -715,7 +847,10 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
                                     std::atomic<bool>* cancel = nullptr,
                                     std::optional<std::chrono::steady_clock::time_point> request_deadline = {},
                                     const ghidra_decompile_result_limits_t& result_limits = {},
-                                    const aida::analysis::ghidra_ir_adapter::capture_request_t* typed_request = nullptr)
+                                    const aida::analysis::ghidra_ir_adapter::capture_request_t* typed_request = nullptr,
+                                    session_job_guard_t* job_guard = nullptr,
+                                    ghidra::FunctionSymbol** job_symbol_out = nullptr,
+                                    uint64_t job_ordinal = 0)
 {
 	ghidra_result_t result;
 	result.function_addr = entry_addr;
@@ -724,6 +859,9 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 		result.error_text = "decompilation result limits are invalid";
 		return result;
 	}
+
+	const bool verbose_logs = (job_ordinal == 0) || (job_ordinal <= 256) ||
+		((job_ordinal & 0xFFULL) == 0);
 
 	auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -769,6 +907,9 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 		return result;
 	}
 
+	if (job_symbol_out)
+		*job_symbol_out = fd->getSymbol();
+
 	if (fd->hasNoCode()) {
 		result.is_error = true;
 		result.error_text = "no code at the specified address";
@@ -777,10 +918,12 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 
 	arch->allacts.getCurrent()->reset(*fd);
 
-	diag::log_tagged_critical_fmt("dec",
-		"do_decompile_enter addr=0x%llx tid=%lu",
-		static_cast<unsigned long long>(entry_addr),
-		static_cast<unsigned long>(GetCurrentThreadId()));
+	if (verbose_logs) {
+		diag::log_tagged_critical_fmt("dec",
+			"do_decompile_enter addr=0x%llx tid=%lu",
+			static_cast<unsigned long long>(entry_addr),
+			static_cast<unsigned long>(GetCurrentThreadId()));
+	}
 
 	auto wd_state = std::make_shared<std::atomic<uint32_t>>(
 		static_cast<uint32_t>(wd_state_t::running));
@@ -791,46 +934,56 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 		? *request_deadline
 		: wd_start + std::chrono::milliseconds(WATCHDOG_TIMEOUT_MS);
 
+	if (job_guard) {
+		job_guard->arm(cancel, wd_deadline, entry_addr);
+	}
+	struct watchdog_release_t {
+		session_job_guard_t* guard = nullptr;
+		~watchdog_release_t() { if (guard) guard->disarm(); }
+	} watchdog_release{job_guard};
+
 	std::atomic<bool>* cancel_for_wd = cancel;
 	uint64_t wd_addr = entry_addr;
-	aida::infra::executor::submission_t watchdog_sub;
-	watchdog_sub.owner_subsystem = "disasm";
-	watchdog_sub.label = "disasm.ghidra.watchdog";
-	watchdog_sub.thread_class = "bounded_task";
-	watchdog_sub.domain = aida::infra::executor::domain_t::diagnostics;
-	watchdog_sub.priority = 3;
-	watchdog_sub.body = [wd_state, watchdog_fired_elapsed_ms,
-	                     cancel_for_wd, wd_deadline, wd_start, wd_addr]() {
-		while (true) {
-			uint32_t cur = wd_state->load(std::memory_order_acquire);
-			if (cur != static_cast<uint32_t>(wd_state_t::running))
-				return;
-			auto now = std::chrono::steady_clock::now();
-			if (now >= wd_deadline) {
-				uint32_t expected = static_cast<uint32_t>(wd_state_t::running);
-				if (!wd_state->compare_exchange_strong(expected,
-				    static_cast<uint32_t>(wd_state_t::cancelled),
-				    std::memory_order_acq_rel, std::memory_order_acquire)) {
+	if (!job_guard) {
+		aida::infra::executor::submission_t watchdog_sub;
+		watchdog_sub.owner_subsystem = "disasm";
+		watchdog_sub.label = "disasm.ghidra.watchdog";
+		watchdog_sub.thread_class = "bounded_task";
+		watchdog_sub.domain = aida::infra::executor::domain_t::diagnostics;
+		watchdog_sub.priority = 3;
+		watchdog_sub.body = [wd_state, watchdog_fired_elapsed_ms,
+		                     cancel_for_wd, wd_deadline, wd_start, wd_addr]() {
+			while (true) {
+				uint32_t cur = wd_state->load(std::memory_order_acquire);
+				if (cur != static_cast<uint32_t>(wd_state_t::running))
+					return;
+				auto now = std::chrono::steady_clock::now();
+				if (now >= wd_deadline) {
+					uint32_t expected = static_cast<uint32_t>(wd_state_t::running);
+					if (!wd_state->compare_exchange_strong(expected,
+					    static_cast<uint32_t>(wd_state_t::cancelled),
+					    std::memory_order_acq_rel, std::memory_order_acquire)) {
+						return;
+					}
+					long long fired_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+						now - wd_start).count();
+					watchdog_fired_elapsed_ms->store(fired_ms, std::memory_order_release);
+					if (cancel_for_wd)
+						cancel_for_wd->store(true, std::memory_order_release);
+					diag::log_tagged_critical_fmt("dec",
+						"do_decompile_watchdog_fired addr=0x%llx elapsed_ms=%lld",
+						static_cast<unsigned long long>(wd_addr),
+						fired_ms);
 					return;
 				}
-				long long fired_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-					now - wd_start).count();
-				watchdog_fired_elapsed_ms->store(fired_ms, std::memory_order_release);
-				if (cancel_for_wd)
-					cancel_for_wd->store(true, std::memory_order_release);
-				diag::log_tagged_critical_fmt("dec",
-					"do_decompile_watchdog_fired addr=0x%llx elapsed_ms=%lld",
-					static_cast<unsigned long long>(wd_addr),
-					fired_ms);
-				return;
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		};
+		if (!aida::infra::executor::submit(std::move(watchdog_sub)).submitted) {
+			diag::log_tagged_critical_fmt("dec",
+				"do_decompile_watchdog_post_failed addr=0x%llx",
+				static_cast<unsigned long long>(wd_addr));
 		}
-	};
-	if (!aida::infra::executor::submit(std::move(watchdog_sub)).submitted) {
-		diag::log_tagged_critical_fmt("dec",
-			"do_decompile_watchdog_post_failed addr=0x%llx",
-			static_cast<unsigned long long>(wd_addr));
 	}
 
 	auto perform_start = std::chrono::steady_clock::now();
@@ -874,12 +1027,21 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 	long long perform_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		perform_end - perform_start).count();
 
-	uint32_t expected_running = static_cast<uint32_t>(wd_state_t::running);
-	bool we_completed_first = wd_state->compare_exchange_strong(expected_running,
-		static_cast<uint32_t>(wd_state_t::completed),
-		std::memory_order_acq_rel, std::memory_order_acquire);
-	bool fired = !we_completed_first &&
-		(static_cast<wd_state_t>(wd_state->load(std::memory_order_acquire)) == wd_state_t::cancelled);
+	bool fired = false;
+	if (job_guard) {
+		fired = job_guard->watchdog_fired();
+		if (fired) {
+			watchdog_fired_elapsed_ms->store(job_guard->watchdog_fired_elapsed_ms(),
+				std::memory_order_release);
+		}
+	} else {
+		uint32_t expected_running = static_cast<uint32_t>(wd_state_t::running);
+		bool we_completed_first = wd_state->compare_exchange_strong(expected_running,
+			static_cast<uint32_t>(wd_state_t::completed),
+			std::memory_order_acq_rel, std::memory_order_acquire);
+		fired = !we_completed_first &&
+			(static_cast<wd_state_t>(wd_state->load(std::memory_order_acquire)) == wd_state_t::cancelled);
+	}
 	bool external_cancel = (cancel && cancel->load(std::memory_order_acquire));
 
 	if (fired) {
@@ -998,13 +1160,15 @@ inline ghidra_result_t do_decompile(aida_ghidra::architecture_t* arch,
 	auto end_time = std::chrono::high_resolution_clock::now();
 	result.elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
-	diag::log_tagged_critical_fmt("dec",
-		"do_decompile_exit addr=0x%llx outcome=ok total_ms=%.2f typed=%d printc_evidence_bytes=%zu annot=%zu",
-		static_cast<unsigned long long>(entry_addr),
-		result.elapsed_ms,
-		result.typed_artifacts ? 1 : 0,
-		result.printc_evidence ? result.printc_evidence->size() : 0,
-		result.annotations.size());
+	if (verbose_logs) {
+		diag::log_tagged_critical_fmt("dec",
+			"do_decompile_exit addr=0x%llx outcome=ok total_ms=%.2f typed=%d printc_evidence_bytes=%zu annot=%zu",
+			static_cast<unsigned long long>(entry_addr),
+			result.elapsed_ms,
+			result.typed_artifacts ? 1 : 0,
+			result.printc_evidence ? result.printc_evidence->size() : 0,
+			result.annotations.size());
+	}
 
 	return result;
 }
@@ -1068,7 +1232,10 @@ struct prepared_arch_t {
 		if (total_image_size != 0)
 			loader->set_image_size(total_image_size);
 		for (auto& reg : extra_regions) {
-			loader->add_region(reg.start_va, std::move(reg.data));
+			if (reg.view)
+				loader->add_region_view(reg.start_va, reg.view, reg.view_size, reg.owner);
+			else
+				loader->add_region(reg.start_va, std::move(reg.data));
 		}
 		arch = std::make_unique<aida_ghidra::architecture_t>(sleigh_id, &err);
 		arch->set_keep_fixateglobals(keep_fixateglobals);
@@ -1635,14 +1802,15 @@ inline bool validate_isolated_region_layout(std::vector<aida_ghidra::region_t>& 
 	uint64_t prior_end = image_base;
 	for (std::size_t index = 0; index < regions.size(); ++index) {
 		const auto& region = regions[index];
-		if (region.data.empty() || region.start_va < image_base ||
+		const size_t region_size = region.effective_size();
+		if (region_size == 0 || region.start_va < image_base ||
 			region.start_va < prior_end || region.start_va - image_base >= image_size ||
-			region.data.size() > image_size - (region.start_va - image_base)) {
+			region_size > image_size - (region.start_va - image_base)) {
 			result.is_error = true;
 			result.error_text = "isolated decompiler regions are malformed or overlap";
 			return false;
 		}
-		prior_end = region.start_va + region.data.size();
+		prior_end = region.start_va + region_size;
 	}
 	return true;
 }
@@ -1652,7 +1820,7 @@ inline std::size_t find_isolated_entry_region(const std::vector<aida_ghidra::reg
 {
 	for (std::size_t index = 0; index < regions.size(); ++index) {
 		const auto& region = regions[index];
-		if (entry_addr >= region.start_va && entry_addr - region.start_va < region.data.size())
+		if (entry_addr >= region.start_va && entry_addr - region.start_va < region.effective_size())
 			return index;
 	}
 	return regions.size();
@@ -1830,6 +1998,18 @@ struct arch_session_entry_t {
 	uint64_t image_size = 0;
 	uint64_t jobs_completed = 0;
 	double arch_init_ms = 0.0;
+	std::unordered_set<ghidra::FunctionSymbol*> pinned_symbols;
+	ghidra::FunctionSymbol* job_function_symbol = nullptr;
+	uint32_t jobs_since_purge = 0;
+	session_job_guard_t guard;
+
+	arch_session_entry_t() = default;
+	arch_session_entry_t(const arch_session_entry_t&) = delete;
+	arch_session_entry_t& operator=(const arch_session_entry_t&) = delete;
+	~arch_session_entry_t()
+	{
+		guard.stop();
+	}
 
 	bool captures(uint64_t address) const noexcept
 	{
@@ -1843,6 +2023,8 @@ struct arch_session_entry_t {
 
 namespace detail {
 
+inline constexpr uint32_t k_arch_session_purge_interval_jobs = 512;
+
 inline void reset_arch_session_entry(arch_session_entry_t& entry)
 {
 	if (!entry.prepared || !entry.prepared->arch)
@@ -1851,83 +2033,54 @@ inline void reset_arch_session_entry(arch_session_entry_t& entry)
 	ghidra::Scope* global_scope = arch.symboltab->getGlobalScope();
 	if (!global_scope)
 		return;
-	std::vector<ghidra::FunctionSymbol*> functions;
-	for (ghidra::MapIterator it = global_scope->begin(); it != global_scope->end(); ++it) {
-		const ghidra::SymbolEntry* sym_entry = *it;
-		if (!sym_entry)
-			continue;
-		if (auto* function_symbol = dynamic_cast<ghidra::FunctionSymbol*>(sym_entry->getSymbol()))
-			functions.push_back(function_symbol);
-	}
-	for (auto* function_symbol : functions) {
+	std::size_t functions_removed = 0;
+	if (entry.job_function_symbol) {
+		ghidra::FunctionSymbol* job_symbol = entry.job_function_symbol;
+		entry.job_function_symbol = nullptr;
 		try {
-			if (ghidra::Funcdata* fd = function_symbol->getFunction())
+			if (ghidra::Funcdata* fd = job_symbol->getFunction())
 				arch.clearAnalysis(fd);
 		} catch (...) {
 		}
-		try {
-			global_scope->removeSymbol(function_symbol);
-		} catch (...) {
-		}
-	}
-	if (!functions.empty()) {
-		diag::log_tagged_fmt("dec",
-			"arch_session_reset functions_removed=%zu jobs_completed=%llu",
-			functions.size(),
-			static_cast<unsigned long long>(entry.jobs_completed));
-	}
-}
-
-struct loader_cancel_bridge_t {
-	std::shared_ptr<std::atomic<bool>> stop;
-	std::shared_ptr<std::atomic<bool>> done;
-	bool submitted = false;
-};
-
-inline loader_cancel_bridge_t start_loader_cancel_bridge(std::atomic<bool>* source,
-                                                         std::atomic<bool>* sink)
-{
-	loader_cancel_bridge_t bridge;
-	if (!source || !sink)
-		return bridge;
-	bridge.stop = std::make_shared<std::atomic<bool>>(false);
-	bridge.done = std::make_shared<std::atomic<bool>>(false);
-	aida::infra::executor::submission_t bridge_sub;
-	bridge_sub.owner_subsystem = "disasm";
-	bridge_sub.label = "disasm.ghidra.loader_cancel_bridge";
-	bridge_sub.thread_class = "bounded_task";
-	bridge_sub.domain = aida::infra::executor::domain_t::diagnostics;
-	bridge_sub.priority = 3;
-	auto stop = bridge.stop;
-	auto done = bridge.done;
-	bridge_sub.body = [source, sink, stop, done]() {
-		while (!stop->load(std::memory_order_acquire)) {
-			if (source->load(std::memory_order_acquire)) {
-				sink->store(true, std::memory_order_release);
-				break;
+		if (entry.pinned_symbols.find(job_symbol) == entry.pinned_symbols.end()) {
+			try {
+				global_scope->removeSymbol(job_symbol);
+				++functions_removed;
+			} catch (...) {
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		}
-		done->store(true, std::memory_order_release);
-	};
-	bridge.submitted = aida::infra::executor::submit(std::move(bridge_sub)).submitted;
-	if (!bridge.submitted) {
-		bridge.stop.reset();
-		bridge.done.reset();
-		diag::log_tagged_fmt("dec", "loader_cancel_bridge_post_failed");
 	}
-	return bridge;
-}
-
-inline void stop_loader_cancel_bridge(loader_cancel_bridge_t& bridge)
-{
-	if (!bridge.submitted || !bridge.stop || !bridge.done)
-		return;
-	bridge.stop->store(true, std::memory_order_release);
-	const auto wait_started = std::chrono::steady_clock::now();
-	while (!bridge.done->load(std::memory_order_acquire) &&
-	       std::chrono::steady_clock::now() - wait_started < std::chrono::milliseconds(100)) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	if (++entry.jobs_since_purge >= k_arch_session_purge_interval_jobs) {
+		entry.jobs_since_purge = 0;
+		std::vector<ghidra::FunctionSymbol*> stale;
+		for (ghidra::MapIterator it = global_scope->begin(); it != global_scope->end(); ++it) {
+			const ghidra::SymbolEntry* sym_entry = *it;
+			if (!sym_entry)
+				continue;
+			if (auto* function_symbol = dynamic_cast<ghidra::FunctionSymbol*>(sym_entry->getSymbol())) {
+				if (entry.pinned_symbols.find(function_symbol) == entry.pinned_symbols.end())
+					stale.push_back(function_symbol);
+			}
+		}
+		for (auto* function_symbol : stale) {
+			try {
+				if (ghidra::Funcdata* fd = function_symbol->getFunction())
+					arch.clearAnalysis(fd);
+			} catch (...) {
+			}
+			try {
+				global_scope->removeSymbol(function_symbol);
+				++functions_removed;
+			} catch (...) {
+			}
+		}
+	}
+	if (functions_removed != 0) {
+		diag::log_tagged_fmt("dec",
+			"arch_session_reset functions_removed=%zu jobs_completed=%llu pinned=%zu",
+			functions_removed,
+			static_cast<unsigned long long>(entry.jobs_completed),
+			entry.pinned_symbols.size());
 	}
 }
 
@@ -1944,7 +2097,8 @@ inline arch_session_entry_create_t make_arch_session_entry(
 	uint64_t image_base,
 	uint64_t image_size,
 	arch_pool_key_t key,
-	bool keep_fixateglobals)
+	bool keep_fixateglobals,
+	const aida::analysis::native_worker::snapshot_sidecar::sidecar_t* sidecar = nullptr)
 {
 	arch_session_entry_create_t output;
 	if (regions.empty() || image_size == 0 || key.language_id.empty()) {
@@ -1966,9 +2120,10 @@ inline arch_session_entry_create_t make_arch_session_entry(
 	entry->image_size = image_size;
 	entry->captured_ranges.reserve(regions.size());
 	for (const auto& region : regions) {
-		if (region.data.size() > UINT64_MAX - region.start_va)
+		const size_t region_size = region.effective_size();
+		if (region_size > UINT64_MAX - region.start_va)
 			continue;
-		entry->captured_ranges.emplace_back(region.start_va, region.start_va + region.data.size());
+		entry->captured_ranges.emplace_back(region.start_va, region.start_va + region_size);
 	}
 	try {
 		entry->prepared = std::make_unique<detail::prepared_arch_t>(
@@ -1987,6 +2142,23 @@ inline arch_session_entry_create_t make_arch_session_entry(
 		return output;
 	} catch (...) {
 		output.error_text = "isolated region decompilation failed";
+		return output;
+	}
+	if (sidecar) {
+		try {
+			auto bind_result = aida::analysis::native_worker::worker_symbol_binder::bind(
+				*entry->prepared->arch, *sidecar, image_base, image_size);
+			entry->pinned_symbols = std::move(bind_result.pinned);
+		} catch (const std::bad_alloc&) {
+			output.error_text = "isolated symbol sidecar binding allocation failed";
+			return output;
+		} catch (...) {
+			output.error_text = "isolated symbol sidecar binding failed";
+			return output;
+		}
+	}
+	if (!entry->guard.start(&entry->loader_cancel)) {
+		output.error_text = "isolated session guard could not be started";
 		return output;
 	}
 	output.entry = std::move(entry);
@@ -2037,10 +2209,11 @@ inline ghidra_result_t decompile_isolated_regions_reusing(
 	}
 	detail::reset_arch_session_entry(entry);
 	entry.loader_cancel.store(false, std::memory_order_release);
-	auto bridge = detail::start_loader_cancel_bridge(cancel, &entry.loader_cancel);
+	const uint64_t job_ordinal = entry.jobs_completed + 1;
 	try {
 		result = detail::do_decompile(entry.prepared->arch.get(), entry_addr, cancel, deadline,
-			result_limits, &typed_request);
+			result_limits, &typed_request, &entry.guard, &entry.job_function_symbol,
+			job_ordinal);
 	} catch (ghidra::LowlevelError& error) {
 		result.is_error = true;
 		result.error_text = error.explain;
@@ -2051,7 +2224,6 @@ inline ghidra_result_t decompile_isolated_regions_reusing(
 		result.is_error = true;
 		result.error_text = "isolated region decompilation failed";
 	}
-	detail::stop_loader_cancel_bridge(bridge);
 	detail::reset_arch_session_entry(entry);
 	++entry.jobs_completed;
 	detail::finalize_isolated_result(result, result_limits);

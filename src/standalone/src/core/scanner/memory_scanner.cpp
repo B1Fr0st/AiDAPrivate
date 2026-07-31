@@ -9,6 +9,7 @@
 #include "../anti-tamper/state.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../settings/standalone_settings.hpp"
 #include "../settings/settings_persistence_service.hpp"
 #include "scanner_task_center.hpp"
@@ -932,20 +933,25 @@ static void first_scan_thread(scan_config_t config,
 		"FEATURE-WORKER-GROUP-ADMIT first_scan token=%llu worker_group_size=%zu",
 		static_cast<unsigned long long>(scan_admission.token()), scanner_wg_size);
 	std::atomic<size_t> next_region{0};
-	std::vector<aida::infra::win_thread::joinable_thread_t> workers;
+	std::vector<aida::infra::taskflow_runtime::job_handle_t> workers;
 	const int actual_workers = static_cast<int>((std::min<size_t>)(static_cast<size_t>(worker_count), scan_regions.size()));
 	try {
 		workers.reserve(static_cast<size_t>(actual_workers));
 		for (int w = 0; w < actual_workers; ++w) {
-			aida::infra::win_thread::joinable_thread_t t;
-			std::string err;
 			char tname[32];
 			_snprintf_s(tname, sizeof(tname), _TRUNCATE, "mem_scan.fs.%d", w);
-			if (t.start([&]() {
+			aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+			worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+			worker_desc.owner_subsystem = "mem_scanner";
+			worker_desc.label = tname;
+			worker_desc.priority = 3;
+			worker_desc.shutdown_policy = "cancel_pending";
+			worker_desc.cancellable_body = [&](const aida::infra::taskflow_runtime::cancellation_token_t& job_token) {
 				for (;;) {
 					size_t idx = next_region.fetch_add(1);
 					if (idx >= scan_regions.size()) break;
-					if (!owns_scan(operation) || !st.scanning.load()) break;
+					if (!owns_scan(operation) || !st.scanning.load() ||
+						job_token.requested.load(std::memory_order_acquire)) break;
 					try {
 						scan_region(scan_regions[idx]);
 					} catch (...) {
@@ -953,10 +959,13 @@ static void first_scan_thread(scan_config_t config,
 						read_failures.fetch_add(1, std::memory_order_acq_rel);
 					}
 				}
-			}, &err, aida::infra::win_thread::default_stack_reserve, tname))
-				workers.push_back(std::move(t));
+			};
+			auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+			if (worker_submission.submitted)
+				workers.push_back(worker_submission.handle);
 			else
-				diag::log_tagged_fmt("mem_scanner", "first_scan_thread worker_start_failed w=%d err='%s'", w, err.c_str());
+				diag::log_tagged_fmt("mem_scanner", "first_scan_thread worker_start_failed w=%d err='%s'", w,
+					worker_submission.reject_reason.empty() ? "<none>" : worker_submission.reject_reason.c_str());
 		}
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("mem_scanner", "first_scan_thread local_worker_create_failed err='%s'", ex.what());
@@ -970,8 +979,7 @@ static void first_scan_thread(scan_config_t config,
 		}
 	} else {
 		for (auto& worker : workers) {
-			if (worker.joinable())
-				worker.join();
+			aida::infra::taskflow_runtime::wait_for(worker, 0xFFFFFFFFu);
 		}
 	}
 	diag::log_tagged_fmt("mem_scanner",
@@ -1643,18 +1651,27 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-ADMIT pointer_scan_map token=%llu worker_group_size=%zu",
 		static_cast<unsigned long long>(ptr_admission.token()), ptr_wg_size);
-	std::vector<aida::infra::win_thread::joinable_thread_t> ptr_workers;
+	std::vector<aida::infra::taskflow_runtime::job_handle_t> ptr_workers;
 	try {
 		ptr_workers.reserve(static_cast<size_t>(ptr_worker_count));
 		for (int w = 0; w < ptr_worker_count; ++w) {
-			aida::infra::win_thread::joinable_thread_t t;
-			std::string err;
 			char tname[32];
 			_snprintf_s(tname, sizeof(tname), _TRUNCATE, "ptr_scan.map.%d", w);
-			if (t.start([&scan_pointer_worker, w]() { scan_pointer_worker(w); }, &err, aida::infra::win_thread::default_stack_reserve, tname))
-				ptr_workers.push_back(std::move(t));
+			aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+			worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+			worker_desc.owner_subsystem = "pointer_scan";
+			worker_desc.label = tname;
+			worker_desc.priority = 3;
+			worker_desc.shutdown_policy = "cancel_pending";
+			worker_desc.cancellable_body = [&scan_pointer_worker, w](const aida::infra::taskflow_runtime::cancellation_token_t&) {
+				scan_pointer_worker(w);
+			};
+			auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+			if (worker_submission.submitted)
+				ptr_workers.push_back(worker_submission.handle);
 			else
-				diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread map_worker_start_failed w=%d err='%s'", w, err.c_str());
+				diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread map_worker_start_failed w=%d err='%s'", w,
+					worker_submission.reject_reason.empty() ? "<none>" : worker_submission.reject_reason.c_str());
 		}
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread map_worker_create_failed err='%s'", ex.what());
@@ -1666,8 +1683,7 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 			scan_pointer_worker(w);
 	} else {
 		for (auto& worker : ptr_workers) {
-			if (worker.joinable())
-				worker.join();
+			aida::infra::taskflow_runtime::wait_for(worker, 0xFFFFFFFFu);
 		}
 	}
 	diag::log_tagged_fmt("pointer_scan",
@@ -1802,18 +1818,27 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-ADMIT pointer_scan_dfs token=%llu worker_group_size=%zu",
 		static_cast<unsigned long long>(dfs_admission.token()), ptr_wg_size);
-	std::vector<aida::infra::win_thread::joinable_thread_t> dfs_workers;
+	std::vector<aida::infra::taskflow_runtime::job_handle_t> dfs_workers;
 	try {
 		dfs_workers.reserve(static_cast<size_t>(ptr_worker_count));
 		for (int w = 0; w < ptr_worker_count; ++w) {
-			aida::infra::win_thread::joinable_thread_t t;
-			std::string err;
 			char tname[32];
 			_snprintf_s(tname, sizeof(tname), _TRUNCATE, "ptr_scan.dfs.%d", w);
-			if (t.start(dfs_worker, &err, aida::infra::win_thread::default_stack_reserve, tname))
-				dfs_workers.push_back(std::move(t));
+			aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+			worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+			worker_desc.owner_subsystem = "pointer_scan";
+			worker_desc.label = tname;
+			worker_desc.priority = 3;
+			worker_desc.shutdown_policy = "cancel_pending";
+			worker_desc.cancellable_body = [&dfs_worker](const aida::infra::taskflow_runtime::cancellation_token_t&) {
+				dfs_worker();
+			};
+			auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+			if (worker_submission.submitted)
+				dfs_workers.push_back(worker_submission.handle);
 			else
-				diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread dfs_worker_start_failed w=%d err='%s'", w, err.c_str());
+				diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread dfs_worker_start_failed w=%d err='%s'", w,
+					worker_submission.reject_reason.empty() ? "<none>" : worker_submission.reject_reason.c_str());
 		}
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("pointer_scan", "pointer_scan_thread dfs_worker_create_failed err='%s'", ex.what());
@@ -1824,8 +1849,7 @@ static void pointer_scan_thread(uint64_t target_address, int max_depth, int max_
 		dfs_worker();
 	} else {
 		for (auto& worker : dfs_workers) {
-			if (worker.joinable())
-				worker.join();
+			aida::infra::taskflow_runtime::wait_for(worker, 0xFFFFFFFFu);
 		}
 	}
 	diag::log_tagged_fmt("pointer_scan",

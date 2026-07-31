@@ -11,6 +11,10 @@
 #include <string_view>
 #include <vector>
 
+namespace aida::infra::taskflow_runtime {
+struct cancellation_token_t;
+}
+
 namespace aida::analysis {
 
 inline constexpr std::size_t analysis_execution_domain_count = 5;
@@ -229,6 +233,8 @@ public:
     analysis_submit_result_t submit(analysis_task_request_t request);
     analysis_dispatch_result_t acquire_next();
     analysis_scheduler_error_t requeue(const analysis_task_dispatch_t& dispatch);
+    analysis_scheduler_error_t run_dispatcher();
+    bool dispatcher_running() const noexcept;
     analysis_cancellation_result_t cancel_task(analysis_task_id_t task_id);
     analysis_cancellation_result_t cancel_domain(analysis_execution_domain_t domain);
     analysis_cancellation_result_t shutdown();
@@ -240,6 +246,13 @@ public:
     analysis_scheduler_error_t verify_invariants() const;
 
 private:
+    static analysis_dispatch_result_t acquire_next_from_state(
+        const std::shared_ptr<analysis_scheduler_state_t>& state);
+    static void dispatcher_loop(const std::shared_ptr<analysis_scheduler_state_t>& state,
+        const aida::infra::taskflow_runtime::cancellation_token_t& token) noexcept;
+    static bool dispatch_to_fabric(const std::shared_ptr<analysis_scheduler_state_t>& state,
+        const analysis_task_dispatch_t& dispatch) noexcept;
+
     std::shared_ptr<analysis_scheduler_state_t> state_;
 };
 

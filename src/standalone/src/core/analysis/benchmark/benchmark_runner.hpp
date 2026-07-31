@@ -29,6 +29,10 @@ struct benchmark_run_request_t {
     bool run_determinism_stage = false;
     std::vector<std::uint32_t> scaling_worker_budgets;
     std::uint32_t determinism_runs = 2;
+    std::uint32_t decompile_batch_lanes = 0;
+    std::uint32_t memory_sample_interval_ms = 250;
+    std::string baseline_report_path;
+    std::string record_baseline_name;
 };
 
 struct benchmark_run_result_t {

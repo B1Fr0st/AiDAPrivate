@@ -23,6 +23,7 @@ constexpr std::uint32_t k_magic_document = 0x31444b44U;
 constexpr std::uint32_t k_magic_diagnostic = 0x31474b44U;
 constexpr std::uint32_t k_magic_cache = 0x31564b44U;
 constexpr std::uint32_t k_magic_worker = 0x31574b44U;
+constexpr std::uint32_t k_magic_render_evidence = 0x31524b44U;
 constexpr std::uint32_t k_max_collection_entries = 1U << 20;
 constexpr std::uint32_t k_max_string_bytes = 64U << 20;
 
@@ -709,7 +710,15 @@ bool read_document_source_map(canonical_reader_t& reader, decompiler_document_so
     return read_token_range(reader, value.document_range) && read_vector(reader, value.coordinates, read_coordinate);
 }
 
-void write_readability_settings(canonical_writer_t& writer, const readability_transform_settings_t& value)
+void write_u32_clamped(canonical_writer_t& writer, const std::size_t value)
+{
+    writer.u32(value > (std::numeric_limits<std::uint32_t>::max)()
+        ? (std::numeric_limits<std::uint32_t>::max)()
+        : static_cast<std::uint32_t>(value));
+}
+
+void write_readability_settings(canonical_writer_t& writer, const readability_transform_settings_t& value,
+                                const std::uint32_t schema_version)
 {
     writer.boolean(value.enable_variable_renaming);
     writer.boolean(value.enable_expression_simplification);
@@ -727,15 +736,24 @@ void write_readability_settings(canonical_writer_t& writer, const readability_tr
     writer.boolean(value.enable_single_use_inlining);
     writer.boolean(value.enable_copy_propagation);
     writer.boolean(value.enable_dead_store_elimination);
-    writer.u32(value.max_transform_iterations > (std::numeric_limits<std::uint32_t>::max)()
-        ? (std::numeric_limits<std::uint32_t>::max)()
-        : static_cast<std::uint32_t>(value.max_transform_iterations));
-    writer.u32(value.max_expression_depth > (std::numeric_limits<std::uint32_t>::max)()
-        ? (std::numeric_limits<std::uint32_t>::max)()
-        : static_cast<std::uint32_t>(value.max_expression_depth));
+    if (schema_version >= 3) {
+        writer.boolean(value.enable_member_name_propagation);
+        writer.boolean(value.enable_min_max_idioms);
+        writer.boolean(value.enable_idiom_recognition);
+        writer.boolean(value.enable_declaration_at_first_use);
+        writer.boolean(value.enable_string_comment_injection);
+        writer.boolean(value.enable_user_comment_injection);
+    }
+    write_u32_clamped(writer, value.max_transform_iterations);
+    write_u32_clamped(writer, value.max_expression_depth);
+    if (schema_version >= 3) {
+        write_u32_clamped(writer, value.max_comment_bytes);
+        write_u32_clamped(writer, value.max_comments_per_function);
+    }
 }
 
-bool read_readability_settings(canonical_reader_t& reader, readability_transform_settings_t& value)
+bool read_readability_settings(canonical_reader_t& reader, readability_transform_settings_t& value,
+                               const std::uint32_t schema_version)
 {
     std::uint32_t iterations = 0;
     std::uint32_t depth = 0;
@@ -754,11 +772,28 @@ bool read_readability_settings(canonical_reader_t& reader, readability_transform
         reader.boolean(value.enable_double_negation_simplification) &&
         reader.boolean(value.enable_single_use_inlining) &&
         reader.boolean(value.enable_copy_propagation) &&
-        reader.boolean(value.enable_dead_store_elimination) &&
-        reader.u32(iterations) && reader.u32(depth)))
+        reader.boolean(value.enable_dead_store_elimination)))
+        return false;
+    if (schema_version >= 3 &&
+        !(reader.boolean(value.enable_member_name_propagation) &&
+          reader.boolean(value.enable_min_max_idioms) &&
+          reader.boolean(value.enable_idiom_recognition) &&
+          reader.boolean(value.enable_declaration_at_first_use) &&
+          reader.boolean(value.enable_string_comment_injection) &&
+          reader.boolean(value.enable_user_comment_injection)))
+        return false;
+    if (!reader.u32(iterations) || !reader.u32(depth))
         return false;
     value.max_transform_iterations = iterations;
     value.max_expression_depth = depth;
+    if (schema_version >= 3) {
+        std::uint32_t comment_bytes = 0;
+        std::uint32_t comments_per_function = 0;
+        if (!reader.u32(comment_bytes) || !reader.u32(comments_per_function))
+            return false;
+        value.max_comment_bytes = comment_bytes;
+        value.max_comments_per_function = comments_per_function;
+    }
     return true;
 }
 
@@ -770,7 +805,12 @@ void write_renderer(canonical_writer_t& writer, const decompiler_renderer_settin
     writer.boolean(value.emit_type_annotations);
     writer.boolean(value.emit_provenance_annotations);
     writer.boolean(value.emit_unknown_tokens);
-    write_readability_settings(writer, value.readability);
+    if (value.schema_version >= 3) {
+        writer.boolean(value.emit_comments);
+        writer.boolean(value.emit_resolved_symbols);
+        writer.boolean(value.emit_enum_case_names);
+    }
+    write_readability_settings(writer, value.readability, value.schema_version);
 }
 
 bool read_renderer(canonical_reader_t& reader, decompiler_renderer_settings_t& value)
@@ -779,9 +819,13 @@ bool read_renderer(canonical_reader_t& reader, decompiler_renderer_settings_t& v
         reader.u32(value.indentation_spaces) && reader.boolean(value.emit_type_annotations) &&
         reader.boolean(value.emit_provenance_annotations) && reader.boolean(value.emit_unknown_tokens)))
         return false;
-    if (value.schema_version != 2)
+    if (value.schema_version != 2 && value.schema_version != 3)
         return false;
-    return read_readability_settings(reader, value.readability);
+    if (value.schema_version >= 3 &&
+        !(reader.boolean(value.emit_comments) && reader.boolean(value.emit_resolved_symbols) &&
+          reader.boolean(value.emit_enum_case_names)))
+        return false;
+    return read_readability_settings(reader, value.readability, value.schema_version);
 }
 
 void write_profile(canonical_writer_t& writer, const decompiler_profile_budget_t& value)
@@ -874,6 +918,129 @@ bool read_cache_key(canonical_reader_t& reader, decompiler_pipeline_cache_key_t&
         reader.u32(value.type_graph_schema_version) && reader.u32(value.ast_schema_version) &&
         reader.u32(value.document_schema_version) && read_renderer(reader, value.renderer) &&
         read_vector(reader, value.dependencies, read_dependency);
+}
+
+void write_symbol_evidence(canonical_writer_t& writer, const decompiler_symbol_evidence_t& value)
+{
+    writer.string(value.unresolved_text);
+    writer.string(value.resolved_name);
+    writer.string(value.module_name);
+    writer.u32(value.argument_count);
+    writer.boolean(value.is_import);
+    writer.boolean(value.is_noreturn);
+    writer.u8(value.confidence);
+}
+
+bool read_symbol_evidence(canonical_reader_t& reader, decompiler_symbol_evidence_t& value)
+{
+    return reader.string(value.unresolved_text) && reader.string(value.resolved_name) &&
+        reader.string(value.module_name) && reader.u32(value.argument_count) &&
+        reader.boolean(value.is_import) && reader.boolean(value.is_noreturn) && reader.u8(value.confidence);
+}
+
+void write_prototype_evidence(canonical_writer_t& writer, const decompiler_prototype_evidence_t& value)
+{
+    writer.string(value.api_name);
+    writer.string(value.return_type_display);
+    write_vector(writer, value.argument_names, [](canonical_writer_t& nested, const std::string& entry) {
+        nested.string(entry);
+    });
+    write_vector(writer, value.argument_type_displays, [](canonical_writer_t& nested, const std::string& entry) {
+        nested.string(entry);
+    });
+    writer.boolean(value.is_variadic);
+    writer.boolean(value.is_noreturn);
+    writer.u8(value.confidence);
+}
+
+bool read_prototype_evidence(canonical_reader_t& reader, decompiler_prototype_evidence_t& value)
+{
+    return reader.string(value.api_name) && reader.string(value.return_type_display) &&
+        read_vector(reader, value.argument_names, [](canonical_reader_t& nested, std::string& entry) {
+            return nested.string(entry);
+        }) &&
+        read_vector(reader, value.argument_type_displays, [](canonical_reader_t& nested, std::string& entry) {
+            return nested.string(entry);
+        }) &&
+        reader.boolean(value.is_variadic) && reader.boolean(value.is_noreturn) && reader.u8(value.confidence);
+}
+
+void write_string_evidence(canonical_writer_t& writer, const decompiler_string_evidence_t& value)
+{
+    writer.string(value.reference_text);
+    writer.string(value.utf8_content);
+    writer.boolean(value.is_wide);
+    writer.u8(value.confidence);
+}
+
+bool read_string_evidence(canonical_reader_t& reader, decompiler_string_evidence_t& value)
+{
+    return reader.string(value.reference_text) && reader.string(value.utf8_content) &&
+        reader.boolean(value.is_wide) && reader.u8(value.confidence);
+}
+
+void write_member_evidence(canonical_writer_t& writer, const decompiler_member_evidence_t& value)
+{
+    writer.string(value.object_type_canonical);
+    writer.u64(value.byte_offset);
+    writer.string(value.field_name);
+    writer.string(value.selector_hint);
+    writer.u8(value.confidence);
+}
+
+bool read_member_evidence(canonical_reader_t& reader, decompiler_member_evidence_t& value)
+{
+    return reader.string(value.object_type_canonical) && reader.u64(value.byte_offset) &&
+        reader.string(value.field_name) && reader.string(value.selector_hint) && reader.u8(value.confidence);
+}
+
+void write_vtable_slot_evidence(canonical_writer_t& writer, const decompiler_vtable_slot_evidence_t& value)
+{
+    writer.string(value.vtable_selector);
+    writer.u64(value.slot_index);
+    writer.string(value.method_name);
+    writer.u8(value.confidence);
+}
+
+bool read_vtable_slot_evidence(canonical_reader_t& reader, decompiler_vtable_slot_evidence_t& value)
+{
+    return reader.string(value.vtable_selector) && reader.u64(value.slot_index) &&
+        reader.string(value.method_name) && reader.u8(value.confidence);
+}
+
+void write_user_comment_evidence(canonical_writer_t& writer, const decompiler_user_comment_evidence_t& value)
+{
+    writer.string(value.anchor_text);
+    writer.string(value.comment_text);
+    writer.boolean(value.before_statement);
+    writer.u8(value.confidence);
+}
+
+bool read_user_comment_evidence(canonical_reader_t& reader, decompiler_user_comment_evidence_t& value)
+{
+    return reader.string(value.anchor_text) && reader.string(value.comment_text) &&
+        reader.boolean(value.before_statement) && reader.u8(value.confidence);
+}
+
+void write_render_evidence(canonical_writer_t& writer, const decompiler_render_evidence_t& value)
+{
+    writer.u32(value.schema_version);
+    write_vector(writer, value.symbols, write_symbol_evidence);
+    write_vector(writer, value.prototypes, write_prototype_evidence);
+    write_vector(writer, value.strings, write_string_evidence);
+    write_vector(writer, value.members, write_member_evidence);
+    write_vector(writer, value.vtable_slots, write_vtable_slot_evidence);
+    write_vector(writer, value.user_comments, write_user_comment_evidence);
+}
+
+bool read_render_evidence(canonical_reader_t& reader, decompiler_render_evidence_t& value)
+{
+    return reader.u32(value.schema_version) && read_vector(reader, value.symbols, read_symbol_evidence) &&
+        read_vector(reader, value.prototypes, read_prototype_evidence) &&
+        read_vector(reader, value.strings, read_string_evidence) &&
+        read_vector(reader, value.members, read_member_evidence) &&
+        read_vector(reader, value.vtable_slots, read_vtable_slot_evidence) &&
+        read_vector(reader, value.user_comments, read_user_comment_evidence);
 }
 
 void write_envelope(canonical_writer_t& writer, const decompiler_worker_envelope_t& value)
@@ -978,10 +1145,14 @@ bool language_matches_entity(const decompiler_language_identity_t& language, con
 
 bool valid_renderer(const decompiler_renderer_settings_t& value) noexcept
 {
-    return value.schema_version == 2 && !value.style_id.empty() && value.indentation_spaces >= 1 &&
-        value.indentation_spaces <= 16 &&
+    return (value.schema_version == 2 || value.schema_version == 3) && !value.style_id.empty() &&
+        value.indentation_spaces >= 1 && value.indentation_spaces <= 16 &&
         value.readability.max_transform_iterations >= 1 && value.readability.max_transform_iterations <= 16 &&
-        value.readability.max_expression_depth >= 16 && value.readability.max_expression_depth <= 4096;
+        value.readability.max_expression_depth >= 16 && value.readability.max_expression_depth <= 4096 &&
+        (value.schema_version == 2 ||
+         (value.readability.max_comment_bytes >= 16 && value.readability.max_comment_bytes <= 512 &&
+          value.readability.max_comments_per_function >= 1 &&
+          value.readability.max_comments_per_function <= 4096));
 }
 
 bool valid_diagnostic_severity(decompiler_diagnostic_severity_t value) noexcept
@@ -1283,6 +1454,12 @@ bool decompiler_entity_key_t::operator<(const decompiler_entity_key_t& other) co
 bool decompiler_contract_validation_t::valid() const noexcept
 {
     return diagnostics.empty();
+}
+
+bool decompiler_render_evidence_t::empty() const noexcept
+{
+    return symbols.empty() && prototypes.empty() && strings.empty() && members.empty() &&
+        vtable_slots.empty() && user_comments.empty();
 }
 
 decompiler_contract_validation_t validate_decompiler_entity_key(const decompiler_entity_key_t& value)
@@ -1776,6 +1953,148 @@ decompiler_contract_validation_t validate_decompiler_worker_message(const decomp
     return result;
 }
 
+decompiler_contract_validation_t validate_decompiler_render_evidence(const decompiler_render_evidence_t& value)
+{
+    decompiler_contract_validation_t result;
+    const auto error = [&result](const char* key) {
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::invalid_contract, key));
+    };
+    if (value.schema_version != k_decompiler_render_evidence_schema_version)
+        error("decompiler.render_evidence.schema");
+    if (value.symbols.size() > k_decompiler_render_evidence_max_entries ||
+        value.prototypes.size() > k_decompiler_render_evidence_max_entries ||
+        value.strings.size() > k_decompiler_render_evidence_max_entries ||
+        value.members.size() > k_decompiler_render_evidence_max_entries ||
+        value.vtable_slots.size() > k_decompiler_render_evidence_max_entries ||
+        value.user_comments.size() > k_decompiler_render_evidence_max_entries)
+        error("decompiler.render_evidence.entries");
+    const auto text_ok = [](const std::string& text, const bool required) {
+        return text.size() <= k_decompiler_render_evidence_max_text_bytes && (!required || !text.empty());
+    };
+    for (const auto& entry : value.symbols) {
+        if (!text_ok(entry.unresolved_text, true) || !text_ok(entry.resolved_name, true) ||
+            !text_ok(entry.module_name, false) || entry.confidence > 100)
+            error("decompiler.render_evidence.symbol");
+    }
+    for (const auto& entry : value.prototypes) {
+        if (!text_ok(entry.api_name, true) || !text_ok(entry.return_type_display, false) ||
+            entry.argument_names.size() > 64 || entry.argument_type_displays.size() > 64 ||
+            entry.confidence > 100)
+            error("decompiler.render_evidence.prototype");
+        for (const auto& name : entry.argument_names) {
+            if (!text_ok(name, true))
+                error("decompiler.render_evidence.prototype_argument");
+        }
+        for (const auto& display : entry.argument_type_displays) {
+            if (!text_ok(display, true))
+                error("decompiler.render_evidence.prototype_argument_type");
+        }
+    }
+    for (const auto& entry : value.strings) {
+        if (!text_ok(entry.reference_text, true) || !text_ok(entry.utf8_content, true) || entry.confidence > 100)
+            error("decompiler.render_evidence.string");
+    }
+    for (const auto& entry : value.members) {
+        if (!text_ok(entry.object_type_canonical, false) || !text_ok(entry.field_name, true) ||
+            !text_ok(entry.selector_hint, false) || entry.confidence > 100)
+            error("decompiler.render_evidence.member");
+    }
+    for (const auto& entry : value.vtable_slots) {
+        if (!text_ok(entry.vtable_selector, true) || !text_ok(entry.method_name, true) || entry.confidence > 100)
+            error("decompiler.render_evidence.vtable_slot");
+    }
+    for (const auto& entry : value.user_comments) {
+        if (!text_ok(entry.anchor_text, true) || !text_ok(entry.comment_text, true) || entry.confidence > 100)
+            error("decompiler.render_evidence.user_comment");
+    }
+    return result;
+}
+
+namespace {
+
+decompiler_render_pass_registration_t make_pass_registration(
+    const decompiler_render_pass_id_t id,
+    const char* label,
+    const std::uint32_t revision,
+    const bool enabled)
+{
+    decompiler_render_pass_registration_t result;
+    result.id = id;
+    result.stable_label = label;
+    result.pass_revision = revision;
+    result.enabled = enabled;
+    return result;
+}
+
+}
+
+std::vector<decompiler_render_pass_registration_t> decompiler_render_pass_chain(
+    const readability_transform_settings_t& readability,
+    const decompiler_renderer_settings_t& renderer,
+    const decompiler_render_evidence_t* evidence)
+{
+    const bool has_symbols = evidence != nullptr && !evidence->symbols.empty();
+    const bool has_strings = evidence != nullptr && !evidence->strings.empty();
+    const bool has_user_comments = evidence != nullptr && !evidence->user_comments.empty();
+    const bool has_vtable = evidence != nullptr && !evidence->vtable_slots.empty();
+    const bool any_classic_transform =
+        readability.enable_variable_renaming || readability.enable_expression_simplification ||
+        readability.enable_temporary_coalescing || readability.enable_loop_counter_naming ||
+        readability.enable_api_call_naming || readability.enable_type_based_naming ||
+        readability.enable_string_reference_naming || readability.enable_constant_folding ||
+        readability.enable_identity_simplification || readability.enable_cast_simplification ||
+        readability.enable_comparison_normalization || readability.enable_compound_assignment_marking ||
+        readability.enable_double_negation_simplification || readability.enable_single_use_inlining ||
+        readability.enable_copy_propagation || readability.enable_dead_store_elimination;
+    std::vector<decompiler_render_pass_registration_t> chain;
+    chain.reserve(10);
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::readability_transforms,
+        "readability_transforms", k_decompiler_render_pass_revision_readability_transforms,
+        any_classic_transform));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::member_name_propagation,
+        "member_name_propagation", k_decompiler_render_pass_revision_member_name_propagation,
+        readability.enable_member_name_propagation));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::min_max_idiom_rewrite,
+        "min_max_idiom_rewrite", k_decompiler_render_pass_revision_min_max_idiom_rewrite,
+        readability.enable_min_max_idioms));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::declaration_at_first_use,
+        "declaration_at_first_use", k_decompiler_render_pass_revision_declaration_at_first_use,
+        readability.enable_declaration_at_first_use));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::string_comment_injection,
+        "string_comment_injection", k_decompiler_render_pass_revision_string_comment_injection,
+        readability.enable_string_comment_injection && renderer.emit_comments && has_strings));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::user_comment_injection,
+        "user_comment_injection", k_decompiler_render_pass_revision_user_comment_injection,
+        readability.enable_user_comment_injection && renderer.emit_comments && has_user_comments));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::idiom_comment_recognition,
+        "idiom_comment_recognition", k_decompiler_render_pass_revision_idiom_comment_recognition,
+        readability.enable_idiom_recognition && renderer.emit_comments));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::symbol_resolution_rendering,
+        "symbol_resolution_rendering", k_decompiler_render_pass_revision_symbol_resolution_rendering,
+        renderer.emit_resolved_symbols && has_symbols));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::enum_case_name_rendering,
+        "enum_case_name_rendering", k_decompiler_render_pass_revision_enum_case_name_rendering,
+        renderer.emit_enum_case_names));
+    chain.push_back(make_pass_registration(decompiler_render_pass_id_t::vtable_call_rendering,
+        "vtable_call_rendering", k_decompiler_render_pass_revision_vtable_call_rendering,
+        renderer.emit_resolved_symbols && has_vtable));
+    return chain;
+}
+
+sha256_digest_t decompiler_render_pass_chain_hash(
+    const std::vector<decompiler_render_pass_registration_t>& passes)
+{
+    canonical_writer_t writer;
+    writer.u32(static_cast<std::uint32_t>(passes.size()));
+    for (const auto& entry : passes) {
+        write_enum(writer, entry.id);
+        writer.string(entry.stable_label);
+        writer.u32(entry.pass_revision);
+        writer.boolean(entry.enabled);
+    }
+    return stable_serialization_hash(writer.take());
+}
+
 std::string serialize_decompiler_entity_key(const decompiler_entity_key_t& value)
 {
     require_valid(validate_decompiler_entity_key(value));
@@ -1939,6 +2258,15 @@ std::string serialize_decompiler_worker_message(const decompiler_worker_message_
             writer.u64(message.active_job_id);
         }
     }, value);
+    return writer.take();
+}
+
+std::string serialize_decompiler_render_evidence(const decompiler_render_evidence_t& value)
+{
+    require_valid(validate_decompiler_render_evidence(value));
+    canonical_writer_t writer;
+    writer.u32(k_magic_render_evidence);
+    write_render_evidence(writer, value);
     return writer.take();
 }
 
@@ -2107,6 +2435,12 @@ decompiler_contract_decode_result_t<decompiler_worker_message_t> deserialize_dec
     }, validate_decompiler_worker_message);
 }
 
+decompiler_contract_decode_result_t<decompiler_render_evidence_t> deserialize_decompiler_render_evidence(const std::string& value)
+{
+    return decode_root<decompiler_render_evidence_t>(value, k_magic_render_evidence, read_render_evidence,
+        validate_decompiler_render_evidence);
+}
+
 sha256_digest_t stable_serialization_hash(const std::string& bytes)
 {
     sha256_t hash;
@@ -2124,5 +2458,6 @@ sha256_digest_t stable_serialization_hash(const decompiler_document_t& value) { 
 sha256_digest_t stable_serialization_hash(const decompiler_diagnostic_t& value) { return stable_serialization_hash(serialize_decompiler_diagnostic(value)); }
 sha256_digest_t stable_serialization_hash(const decompiler_pipeline_cache_key_t& value) { return stable_serialization_hash(serialize_decompiler_pipeline_cache_key(value)); }
 sha256_digest_t stable_serialization_hash(const decompiler_worker_message_t& value) { return stable_serialization_hash(serialize_decompiler_worker_message(value)); }
+sha256_digest_t stable_serialization_hash(const decompiler_render_evidence_t& value) { return stable_serialization_hash(serialize_decompiler_render_evidence(value)); }
 
 }

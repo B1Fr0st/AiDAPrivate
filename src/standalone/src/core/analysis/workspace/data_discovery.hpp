@@ -66,6 +66,26 @@ public:
         const std::vector<target_fact_t>& targets,
         const data_discovery_limits_t& limits,
         const cancellation_token_t& cancel = {});
+
+    static workspace_result_t<data_discovery_result_t> discover_image_driven(
+        const workspace_image_t& image,
+        const byte_provider_t& provider,
+        const data_discovery_limits_t& limits,
+        const cancellation_token_t& cancel = {});
+
+    static workspace_result_t<data_discovery_result_t> discover_instruction_driven(
+        const workspace_image_t& image,
+        const byte_provider_t& provider,
+        const std::vector<instruction_record_t>& instructions,
+        const std::vector<target_fact_t>& targets,
+        const data_discovery_limits_t& limits,
+        const cancellation_token_t& cancel = {});
+
+    static workspace_result_t<data_discovery_result_t> combine_results(
+        const data_discovery_limits_t& limits,
+        data_discovery_result_t instruction_driven,
+        data_discovery_result_t image_driven,
+        const cancellation_token_t& cancel = {});
 };
 
 }

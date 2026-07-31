@@ -1,7 +1,12 @@
 #include "analysis_scheduler.hpp"
 
+#include "../infra/taskflow_runtime.hpp"
+#include "../helpers/diag_log.hpp"
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <limits>
 #include <map>
@@ -9,6 +14,9 @@
 #include <utility>
 
 namespace aida::analysis {
+
+namespace rt = aida::infra::taskflow_runtime;
+
 namespace {
 
 struct analysis_task_record_t final {
@@ -104,6 +112,12 @@ struct analysis_scheduler_state_t final {
     std::array<std::deque<analysis_task_id_t>, analysis_execution_domain_count> queues;
     std::map<analysis_task_id_t, analysis_task_record_t> tasks;
     std::deque<analysis_task_id_t> terminal_history;
+    std::condition_variable dispatcher_cv;
+    std::uint64_t dispatcher_epoch = 0;
+    std::atomic<bool> dispatcher_started{false};
+    std::atomic<bool> dispatcher_active{false};
+    std::atomic<bool> dispatcher_stop{false};
+    rt::job_handle_t dispatcher_job;
 };
 
 struct analysis_task_context_state_t final {
@@ -128,6 +142,46 @@ namespace {
 std::uint64_t scheduler_now(const analysis_scheduler_state_t& state) noexcept
 {
     return state.clock ? state.clock->now_milliseconds() : 0;
+}
+
+void note_dispatcher_event_locked(analysis_scheduler_state_t& state) noexcept
+{
+    ++state.dispatcher_epoch;
+    state.dispatcher_cv.notify_all();
+}
+
+rt::executor_domain_t fabric_domain_for(analysis_execution_domain_t domain) noexcept
+{
+    switch (domain) {
+    case analysis_execution_domain_t::control:
+        return rt::executor_domain_t::critical;
+    case analysis_execution_domain_t::interactive:
+        return rt::executor_domain_t::external_tool;
+    case analysis_execution_domain_t::foreground:
+        return rt::executor_domain_t::general;
+    case analysis_execution_domain_t::background:
+        return rt::executor_domain_t::feature_worker;
+    case analysis_execution_domain_t::maintenance:
+        return rt::executor_domain_t::diagnostics;
+    }
+    return rt::executor_domain_t::general;
+}
+
+int fabric_priority_for(analysis_execution_domain_t domain) noexcept
+{
+    switch (domain) {
+    case analysis_execution_domain_t::control:
+        return 0;
+    case analysis_execution_domain_t::interactive:
+        return 1;
+    case analysis_execution_domain_t::foreground:
+        return 3;
+    case analysis_execution_domain_t::background:
+        return 5;
+    case analysis_execution_domain_t::maintenance:
+        return 7;
+    }
+    return 3;
 }
 
 bool request_active_cancellation_locked(analysis_scheduler_state_t& state,
@@ -214,6 +268,7 @@ analysis_scheduler_error_t finish_active_locked(analysis_scheduler_state_t& stat
     record_terminal_metrics(state, task, completion);
     state.terminal_history.push_back(task.task_id);
     prune_terminal_history_locked(state);
+    note_dispatcher_event_locked(state);
     return {};
 }
 
@@ -599,6 +654,7 @@ analysis_submit_result_t analysis_scheduler_t::submit(analysis_task_request_t re
         throw;
     }
     ++state_->next_ordinal;
+    note_dispatcher_event_locked(*state_);
     if (state_->metrics)
         state_->metrics->record_task_counts(analysis_task_counts_t{1, 0, 0, 0, 0});
     return {task_id, {}};
@@ -606,49 +662,210 @@ analysis_submit_result_t analysis_scheduler_t::submit(analysis_task_request_t re
 
 analysis_dispatch_result_t analysis_scheduler_t::acquire_next()
 {
-    if (!state_) {
+    return acquire_next_from_state(state_);
+}
+
+analysis_dispatch_result_t analysis_scheduler_t::acquire_next_from_state(
+    const std::shared_ptr<analysis_scheduler_state_t>& state)
+{
+    if (!state) {
         return {{}, make_scheduler_error(analysis_scheduler_error_code_t::invalid_scheduler_configuration)};
     }
-    if (!state_->configuration_error.ok())
-        return {{}, state_->configuration_error};
+    if (!state->configuration_error.ok())
+        return {{}, state->configuration_error};
 
-    std::lock_guard<std::mutex> lock(state_->mutex);
+    std::lock_guard<std::mutex> lock(state->mutex);
     for (std::size_t index = 0; index < analysis_execution_domain_count; ++index) {
-        auto& queue = state_->queues[index];
+        auto& queue = state->queues[index];
         if (queue.empty())
             continue;
 
         const auto task_id = queue.front();
-        const auto task = state_->tasks.find(task_id);
-        if (task == state_->tasks.end() || task->second.state != analysis_task_state_t::queued) {
+        const auto task = state->tasks.find(task_id);
+        if (task == state->tasks.end() || task->second.state != analysis_task_state_t::queued) {
             return {{}, make_scheduler_error(analysis_scheduler_error_code_t::internal_invariant_violation, task_id)};
         }
 
         auto context_state = std::make_shared<analysis_task_context_state_t>();
-        context_state->scheduler = state_;
+        context_state->scheduler = state;
         context_state->task_id = task_id;
         context_state->cancellation_requested = task->second.cancellation_requested;
 
         auto dispatch_state = std::make_shared<analysis_task_dispatch_state_t>();
-        dispatch_state->scheduler = state_;
+        dispatch_state->scheduler = state;
         dispatch_state->task_id = task_id;
         dispatch_state->domain = task->second.domain;
         dispatch_state->priority = task->second.priority;
         dispatch_state->body = task->second.body;
         dispatch_state->context = analysis_task_context_t(std::move(context_state));
 
-        const auto resource_error = state_->ledger.activate(
+        const auto resource_error = state->ledger.activate(
             task_id, task->second.domain == analysis_execution_domain_t::control);
         if (!resource_error.ok())
             return {{}, resource_scheduler_error(task_id, resource_error)};
 
         queue.pop_front();
         task->second.state = analysis_task_state_t::dispatched;
-        task->second.dispatched_milliseconds = scheduler_now(*state_);
+        task->second.dispatched_milliseconds = scheduler_now(*state);
         task->second.last_checkpoint_milliseconds = task->second.dispatched_milliseconds;
         return {analysis_task_dispatch_t(std::move(dispatch_state)), {}};
     }
     return {};
+}
+
+bool analysis_scheduler_t::dispatch_to_fabric(const std::shared_ptr<analysis_scheduler_state_t>& state,
+                                              const analysis_task_dispatch_t& dispatch) noexcept
+{
+    if (!state || !dispatch.valid())
+        return false;
+    std::string label;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const auto task = state->tasks.find(dispatch.task_id());
+        if (task != state->tasks.end())
+            label = task->second.label;
+    }
+    try {
+        rt::task_descriptor_t desc;
+        desc.domain = fabric_domain_for(dispatch.domain());
+        desc.priority = fabric_priority_for(dispatch.domain());
+        desc.owner_subsystem = "analysis_scheduler";
+        desc.label = label.empty() ? "analysis.scheduler.task" : label.c_str();
+        desc.shutdown_policy = "cancel_pending";
+        desc.body = dispatch.taskflow_callable();
+        const auto result = rt::submit(std::move(desc));
+        if (!result.submitted) {
+            const auto domain_text = analysis_execution_domain_name(dispatch.domain());
+            diag::log_tagged_fmt("analysis_scheduler",
+                "analysis_scheduler_dispatch_submit_failed task_id=%llu reason=%s domain=%.*s tid=%lu",
+                static_cast<unsigned long long>(dispatch.task_id()),
+                result.reject_reason.c_str(),
+                static_cast<int>(domain_text.size()),
+                domain_text.data(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+        return result.submitted;
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt("analysis_scheduler",
+            "analysis_scheduler_dispatch_submit_exception task_id=%llu err=%s tid=%lu",
+            static_cast<unsigned long long>(dispatch.task_id()),
+            ex.what(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    } catch (...) {
+        diag::log_tagged_fmt("analysis_scheduler",
+            "analysis_scheduler_dispatch_submit_exception task_id=%llu err=unknown tid=%lu",
+            static_cast<unsigned long long>(dispatch.task_id()),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+    return false;
+}
+
+void analysis_scheduler_t::dispatcher_loop(const std::shared_ptr<analysis_scheduler_state_t>& state,
+                                           const rt::cancellation_token_t& token) noexcept
+{
+    if (!state)
+        return;
+    struct active_guard_t {
+        std::atomic<bool>& flag;
+        explicit active_guard_t(std::atomic<bool>& value) : flag(value) {
+            flag.store(true, std::memory_order_release);
+        }
+        ~active_guard_t() { flag.store(false, std::memory_order_release); }
+    } active_guard{state->dispatcher_active};
+    for (;;) {
+        if (token.requested.load(std::memory_order_acquire) ||
+            state->dispatcher_stop.load(std::memory_order_acquire))
+            return;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->accepting)
+                return;
+        }
+        analysis_dispatch_result_t acquired;
+        try {
+            acquired = acquire_next_from_state(state);
+        } catch (...) {
+            acquired = {{}, make_scheduler_error(analysis_scheduler_error_code_t::internal_invariant_violation)};
+        }
+        if (acquired.available()) {
+            if (!dispatch_to_fabric(state, acquired.dispatch)) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                acquired.dispatch.state_->revoked.store(true, std::memory_order_release);
+                const auto task = state->tasks.find(acquired.dispatch.task_id());
+                if (task != state->tasks.end() && task->second.state == analysis_task_state_t::dispatched) {
+                    finish_active_locked(*state, task->second, analysis_task_completion_t::cancelled);
+                }
+            }
+            continue;
+        }
+        if (!acquired.error.ok() &&
+            acquired.error.code != analysis_scheduler_error_code_t::resource_rejected) {
+            diag::log_tagged_fmt("analysis_scheduler",
+                "analysis_scheduler_dispatcher_halted code=%u stable=%.*s tid=%lu",
+                static_cast<unsigned>(acquired.error.code),
+                static_cast<int>(acquired.error.stable_code.size()),
+                acquired.error.stable_code.data(),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+            return;
+        }
+        std::unique_lock<std::mutex> lock(state->mutex);
+        const auto seen_epoch = state->dispatcher_epoch;
+        state->dispatcher_cv.wait_for(lock, std::chrono::milliseconds(25), [&] {
+            return !state->accepting ||
+                   state->dispatcher_stop.load(std::memory_order_acquire) ||
+                   state->dispatcher_epoch != seen_epoch;
+        });
+    }
+}
+
+analysis_scheduler_error_t analysis_scheduler_t::run_dispatcher()
+{
+    if (!state_)
+        return make_scheduler_error(analysis_scheduler_error_code_t::invalid_scheduler_configuration);
+    if (!state_->configuration_error.ok())
+        return state_->configuration_error;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!state_->accepting)
+            return make_scheduler_error(analysis_scheduler_error_code_t::scheduler_stopped);
+    }
+    bool expected = false;
+    if (!state_->dispatcher_started.compare_exchange_strong(expected, true,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+        return {};
+    state_->dispatcher_stop.store(false, std::memory_order_release);
+    rt::task_descriptor_t desc;
+    desc.domain = rt::executor_domain_t::critical;
+    desc.priority = 0;
+    desc.owner_subsystem = "analysis_scheduler";
+    desc.label = "analysis.scheduler.dispatcher";
+    desc.shutdown_policy = "cancel_pending";
+    desc.cancellable_body = [state = state_](const rt::cancellation_token_t& token) {
+        dispatcher_loop(state, token);
+    };
+    const auto result = rt::submit(std::move(desc));
+    if (!result.submitted) {
+        state_->dispatcher_started.store(false, std::memory_order_release);
+        diag::log_tagged_fmt("analysis_scheduler",
+            "analysis_scheduler_dispatcher_rejected reason=%s tid=%lu",
+            result.reject_reason.c_str(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return make_scheduler_error(analysis_scheduler_error_code_t::internal_invariant_violation);
+    }
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->dispatcher_job = result.handle;
+    }
+    diag::log_tagged_fmt("analysis_scheduler",
+        "analysis_scheduler_dispatcher_started job_id=%llu tid=%lu",
+        static_cast<unsigned long long>(result.handle.id),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    return {};
+}
+
+bool analysis_scheduler_t::dispatcher_running() const noexcept
+{
+    return state_ && state_->dispatcher_active.load(std::memory_order_acquire);
 }
 
 analysis_scheduler_error_t analysis_scheduler_t::requeue(const analysis_task_dispatch_t& dispatch)
@@ -689,6 +906,7 @@ analysis_scheduler_error_t analysis_scheduler_t::requeue(const analysis_task_dis
     task->second.state = analysis_task_state_t::queued;
     task->second.dispatched_milliseconds = 0;
     task->second.last_checkpoint_milliseconds = 0;
+    note_dispatcher_event_locked(*state_);
     return {};
 }
 
@@ -751,22 +969,37 @@ analysis_cancellation_result_t analysis_scheduler_t::shutdown()
     if (!state_)
         return result;
 
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    state_->accepting = false;
-    for (auto& queue : state_->queues) {
-        while (!queue.empty()) {
-            const auto task_id = queue.front();
-            const auto error = cancel_task_locked(*state_, task_id, result);
-            if (!error.ok()) {
-                result.error = error;
-                return result;
+    state_->dispatcher_stop.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->accepting = false;
+        for (auto& queue : state_->queues) {
+            while (!queue.empty()) {
+                const auto task_id = queue.front();
+                const auto error = cancel_task_locked(*state_, task_id, result);
+                if (!error.ok()) {
+                    result.error = error;
+                    return result;
+                }
             }
         }
+        for (auto& entry : state_->tasks) {
+            auto& task = entry.second;
+            if (active_state(task.state) && request_active_cancellation_locked(*state_, task)) {
+                ++result.active_signalled;
+            }
+        }
+        note_dispatcher_event_locked(*state_);
     }
-    for (auto& entry : state_->tasks) {
-        auto& task = entry.second;
-        if (active_state(task.state) && request_active_cancellation_locked(*state_, task)) {
-            ++result.active_signalled;
+    if (state_->dispatcher_started.load(std::memory_order_acquire) &&
+        state_->dispatcher_job.valid()) {
+        rt::cancel(state_->dispatcher_job);
+        const auto waited = rt::wait_for(state_->dispatcher_job, 1000);
+        if (waited.timed_out) {
+            diag::log_tagged_fmt("analysis_scheduler",
+                "analysis_scheduler_dispatcher_stop_timeout job_id=%llu tid=%lu",
+                static_cast<unsigned long long>(state_->dispatcher_job.id),
+                static_cast<unsigned long>(GetCurrentThreadId()));
         }
     }
     return result;
@@ -778,6 +1011,7 @@ void analysis_scheduler_t::stop_accepting() noexcept
         return;
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->accepting = false;
+    note_dispatcher_event_locked(*state_);
 }
 
 analysis_task_snapshot_result_t analysis_scheduler_t::task_snapshot(analysis_task_id_t task_id) const

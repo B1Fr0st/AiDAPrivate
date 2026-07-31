@@ -30,6 +30,8 @@
 #include <OleAuto.h>
 #include "../../helpers/diag_log.hpp"
 #include "../infra/win_thread.hpp"
+#include "../infra/taskflow_runtime.hpp"
+#include "../infra/cancellation_watchdog.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 #endif
 
@@ -2917,21 +2919,26 @@ inline void quarantine_dbghelp_and_recycle()
 		s_dbghelp_recycle_in_flight.store(false, std::memory_order_release);
 	};
 
-	auto recycle_thread = std::make_shared<aida::infra::win_thread::joinable_thread_t>();
-	std::string start_err;
-	const bool started = recycle_thread->start(recycle_body, &start_err,
-		aida::infra::win_thread::default_stack_reserve, "dbghelp_recycle");
-	if (!started) {
+	aida::infra::taskflow_runtime::task_descriptor_t recycle_desc;
+	recycle_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::service;
+	recycle_desc.owner_subsystem = "pdb";
+	recycle_desc.label = "dbghelp_recycle";
+	recycle_desc.priority = 3;
+	recycle_desc.shutdown_policy = "cancel_pending";
+	recycle_desc.body = recycle_body;
+	auto recycle_submission = aida::infra::taskflow_runtime::submit(std::move(recycle_desc));
+	if (!recycle_submission.submitted) {
 		diag::log_tagged_critical_fmt("pdb",
 			"dbghelp_recycle_thread_start_failed attempt=%llu err='%s'",
 			static_cast<unsigned long long>(attempt),
-			start_err.c_str());
+			recycle_submission.reject_reason.empty() ? "<none>" : recycle_submission.reject_reason.c_str());
 		s_dbghelp_recycle_in_flight.store(false, std::memory_order_release);
 		return;
 	}
 
 	const DWORD hard_cap_ms = 5000;
-	const bool joined = recycle_thread->join_for(hard_cap_ms);
+	const auto recycle_wait = aida::infra::taskflow_runtime::wait_for(recycle_submission.handle, hard_cap_ms);
+	const bool joined = !recycle_wait.timed_out;
 	if (!joined) {
 		diag::log_tagged_critical_fmt("pdb",
 			"dbghelp_recycle_thread_stuck attempt=%llu hard_cap_ms=%lu still_quarantined=1",
@@ -2940,9 +2947,102 @@ inline void quarantine_dbghelp_and_recycle()
 		diag::log_tagged_critical_fmt("pdb",
 			"FEATURE-WORKER-GROUP-RELEASE dbghelp_recycle attempt=%llu reason=stuck_detach",
 			static_cast<unsigned long long>(attempt));
-		recycle_thread->detach();
+		aida::infra::taskflow_runtime::cancel(recycle_submission.handle);
 	}
 }
+
+struct bounded_state_t {
+	pdb_info_t info;
+	std::atomic<float> progress{0.f};
+	std::atomic<bool> cancel{false};
+	std::atomic<bool> finished{false};
+	std::atomic<bool> result{false};
+	std::atomic<DWORD> worker_tid{0};
+	std::atomic<bool> inner_stalled{false};
+	std::atomic<uint32_t> stalled_phase{0};
+	std::atomic<uint64_t> stalled_elapsed_ms{0};
+	std::atomic<uint32_t> stalled_deadline_ms{0};
+	std::atomic<uint64_t> stalled_generation{0};
+	std::atomic<DWORD> stalled_owner_tid{0};
+};
+
+struct inner_phase_watcher_chain_t : std::enable_shared_from_this<inner_phase_watcher_chain_t> {
+	std::mutex mtx;
+	aida::infra::cancellation_watchdog::watch_id_t watch_id;
+	bool done = false;
+	std::shared_ptr<bounded_state_t> state;
+	std::shared_ptr<std::atomic<bool>> watcher_done;
+	std::string pdb_path;
+	DWORD caller_pid = 0;
+	DWORD self_bounded_tid = 0;
+	uint64_t last_advance_log_ms = 0;
+	dbghelp_inner_phase_t last_logged_phase = dbghelp_inner_phase_t::idle;
+
+	void stop() {
+		aida::infra::cancellation_watchdog::watch_id_t id;
+		{
+			std::lock_guard<std::mutex> lk(mtx);
+			done = true;
+			id = watch_id;
+			watch_id = {};
+		}
+		if (id.valid())
+			aida::infra::cancellation_watchdog::unregister_watch(id);
+	}
+
+	void fire() {
+		if (!state->finished.load(std::memory_order_acquire) &&
+			!state->inner_stalled.load(std::memory_order_acquire)) {
+			const inner_phase_snapshot_t snap = read_inner_phase_snapshot();
+			if (snap.phase != dbghelp_inner_phase_t::idle && snap.started_ms != 0) {
+				const DWORD watcher_target_tid = state->worker_tid.load(std::memory_order_acquire);
+				if (watcher_target_tid != 0 && snap.owner_tid != 0 && snap.owner_tid == watcher_target_tid) {
+					const uint64_t now_ms = GetTickCount64();
+					const uint64_t elapsed_ms = now_ms > snap.started_ms ? now_ms - snap.started_ms : 0;
+					if (snap.deadline_ms > 0 && elapsed_ms >= snap.deadline_ms) {
+						state->stalled_phase.store(static_cast<uint32_t>(snap.phase), std::memory_order_release);
+						state->stalled_elapsed_ms.store(elapsed_ms, std::memory_order_release);
+						state->stalled_deadline_ms.store(snap.deadline_ms, std::memory_order_release);
+						state->stalled_generation.store(snap.generation, std::memory_order_release);
+						state->stalled_owner_tid.store(snap.owner_tid, std::memory_order_release);
+						state->cancel.store(true, std::memory_order_release);
+						state->inner_stalled.store(true, std::memory_order_release);
+						diag::log_tagged_critical_fmt("pdb",
+							"parse_pdb_inner_phase_stalled phase=%s elapsed_ms=%llu deadline_ms=%u generation=%llu pid=%lu tid=%lu worker_tid=%lu path='%s'",
+							dbghelp_inner_phase_name(snap.phase),
+							static_cast<unsigned long long>(elapsed_ms),
+							snap.deadline_ms,
+							static_cast<unsigned long long>(snap.generation),
+							caller_pid,
+							self_bounded_tid,
+							static_cast<unsigned long>(watcher_target_tid),
+							pdb_path.c_str());
+					} else if (now_ms - last_advance_log_ms >= 1000 || snap.phase != last_logged_phase) {
+						last_advance_log_ms = now_ms;
+						last_logged_phase = snap.phase;
+						diag::log_tagged_fmt("pdb",
+							"parse_pdb_inner_phase_advance phase=%s elapsed_ms=%llu generation=%llu worker_tid=%lu path='%s'",
+							dbghelp_inner_phase_name(snap.phase),
+							static_cast<unsigned long long>(elapsed_ms),
+							static_cast<unsigned long long>(snap.generation),
+							static_cast<unsigned long>(watcher_target_tid),
+							pdb_path.c_str());
+					}
+				}
+			}
+		}
+		std::lock_guard<std::mutex> lk(mtx);
+		if (done || watcher_done->load(std::memory_order_acquire) ||
+			state->finished.load(std::memory_order_acquire) ||
+			state->inner_stalled.load(std::memory_order_acquire))
+			return;
+		aida::infra::cancellation_watchdog::watch_descriptor_t next_watch;
+		next_watch.deadline_ms = GetTickCount64() + 250;
+		auto self = shared_from_this();
+		next_watch.on_fire = [self]() { self->fire(); };
+		watch_id = aida::infra::cancellation_watchdog::register_watch(std::move(next_watch));
+	}
+};
 
 inline bool parse_pdb_bounded(const std::string& pdb_path,
                               const std::string& symbol_search_path,
@@ -2994,24 +3094,16 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 		pdb_path.c_str(),
 		static_cast<unsigned long long>(pdb_admission.token()));
 
-	struct bounded_state_t {
-		pdb_info_t info;
-		std::atomic<float> progress{0.f};
-		std::atomic<bool> cancel{false};
-		std::atomic<bool> finished{false};
-		std::atomic<bool> result{false};
-		std::atomic<DWORD> worker_tid{0};
-		std::atomic<bool> inner_stalled{false};
-		std::atomic<uint32_t> stalled_phase{0};
-		std::atomic<uint64_t> stalled_elapsed_ms{0};
-		std::atomic<uint32_t> stalled_deadline_ms{0};
-		std::atomic<uint64_t> stalled_generation{0};
-		std::atomic<DWORD> stalled_owner_tid{0};
-	};
 	auto state = std::make_shared<bounded_state_t>();
-	auto worker_thread = std::make_shared<aida::infra::win_thread::joinable_thread_t>();
 
-	auto worker_fn = [state, pdb_path, symbol_search_path, caller_pid, caller_tid]() {
+	aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+	worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+	worker_desc.owner_subsystem = "pdb";
+	worker_desc.label = "pdb_parse_bounded";
+	worker_desc.priority = 3;
+	worker_desc.shutdown_policy = "cancel_pending";
+	worker_desc.cancellable_body = [state, pdb_path, symbol_search_path, caller_pid, caller_tid](
+		const aida::infra::taskflow_runtime::cancellation_token_t&) {
 		state->worker_tid.store(GetCurrentThreadId(), std::memory_order_release);
 		diag::log_tagged_critical_fmt("pdb",
 			"parse_pdb_bounded_thread_started caller_pid=%lu caller_tid=%lu worker_tid=%lu path='%s'",
@@ -3039,11 +3131,13 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 		state->result.store(ok, std::memory_order_release);
 		state->finished.store(true, std::memory_order_release);
 	};
-
-	std::string start_err;
-	const bool started = worker_thread->start(worker_fn, &start_err,
-		aida::infra::win_thread::default_stack_reserve, "pdb_parse_bounded");
-	if (!started) {
+	worker_desc.cancel_hook = [state]() {
+		state->cancel.store(true, std::memory_order_release);
+	};
+	auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+	if (!worker_submission.submitted) {
+		const std::string start_err = worker_submission.reject_reason.empty()
+			? std::string("rejected") : worker_submission.reject_reason;
 		diag::log_tagged_critical_fmt("pdb",
 			"parse_pdb_bounded_thread_start_failed pid=%lu tid=%lu path='%s' err='%s'",
 			caller_pid,
@@ -3057,68 +3151,30 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 		pdb_admission.release("thread_start_failed");
 		return false;
 	}
+	const aida::infra::taskflow_runtime::job_handle_t worker_job = worker_submission.handle;
 
 	const DWORD self_bounded_tid = caller_tid;
-	auto watcher_thread = std::make_shared<aida::infra::win_thread::joinable_thread_t>();
 	auto watcher_done = std::make_shared<std::atomic<bool>>(false);
-	auto watcher_fn = [state, watcher_done, pdb_path, caller_pid, caller_tid, self_bounded_tid]() {
-		uint64_t last_advance_log_ms = 0;
-		dbghelp_inner_phase_t last_logged_phase = dbghelp_inner_phase_t::idle;
-		while (!watcher_done->load(std::memory_order_acquire)) {
-			Sleep(250);
-			if (state->finished.load(std::memory_order_acquire)) break;
-			if (state->inner_stalled.load(std::memory_order_acquire)) break;
-			const inner_phase_snapshot_t snap = read_inner_phase_snapshot();
-			if (snap.phase == dbghelp_inner_phase_t::idle || snap.started_ms == 0) continue;
-			const DWORD watcher_target_tid = state->worker_tid.load(std::memory_order_acquire);
-			if (watcher_target_tid == 0) continue;
-			if (snap.owner_tid == 0) continue;
-			if (snap.owner_tid != watcher_target_tid) continue;
-			const uint64_t now_ms = GetTickCount64();
-			const uint64_t elapsed_ms = now_ms > snap.started_ms ? now_ms - snap.started_ms : 0;
-			if (snap.deadline_ms > 0 && elapsed_ms >= snap.deadline_ms) {
-				state->stalled_phase.store(static_cast<uint32_t>(snap.phase), std::memory_order_release);
-				state->stalled_elapsed_ms.store(elapsed_ms, std::memory_order_release);
-				state->stalled_deadline_ms.store(snap.deadline_ms, std::memory_order_release);
-				state->stalled_generation.store(snap.generation, std::memory_order_release);
-				state->stalled_owner_tid.store(snap.owner_tid, std::memory_order_release);
-				state->cancel.store(true, std::memory_order_release);
-				state->inner_stalled.store(true, std::memory_order_release);
-				diag::log_tagged_critical_fmt("pdb",
-					"parse_pdb_inner_phase_stalled phase=%s elapsed_ms=%llu deadline_ms=%u generation=%llu pid=%lu tid=%lu worker_tid=%lu path='%s'",
-					dbghelp_inner_phase_name(snap.phase),
-					static_cast<unsigned long long>(elapsed_ms),
-					snap.deadline_ms,
-					static_cast<unsigned long long>(snap.generation),
-					caller_pid,
-					self_bounded_tid,
-					static_cast<unsigned long>(watcher_target_tid),
-					pdb_path.c_str());
-				break;
-			}
-			if (now_ms - last_advance_log_ms >= 1000 || snap.phase != last_logged_phase) {
-				last_advance_log_ms = now_ms;
-				last_logged_phase = snap.phase;
-				diag::log_tagged_fmt("pdb",
-					"parse_pdb_inner_phase_advance phase=%s elapsed_ms=%llu generation=%llu worker_tid=%lu path='%s'",
-					dbghelp_inner_phase_name(snap.phase),
-					static_cast<unsigned long long>(elapsed_ms),
-					static_cast<unsigned long long>(snap.generation),
-					static_cast<unsigned long>(watcher_target_tid),
-					pdb_path.c_str());
-			}
+	auto watcher_chain = std::make_shared<inner_phase_watcher_chain_t>();
+	watcher_chain->state = state;
+	watcher_chain->watcher_done = watcher_done;
+	watcher_chain->pdb_path = pdb_path;
+	watcher_chain->caller_pid = caller_pid;
+	watcher_chain->self_bounded_tid = self_bounded_tid;
+	{
+		aida::infra::cancellation_watchdog::watch_descriptor_t first_watch;
+		first_watch.deadline_ms = GetTickCount64() + 250;
+		first_watch.on_fire = [watcher_chain]() { watcher_chain->fire(); };
+		std::lock_guard<std::mutex> lk(watcher_chain->mtx);
+		watcher_chain->watch_id = aida::infra::cancellation_watchdog::register_watch(std::move(first_watch));
+		if (!watcher_chain->watch_id.valid()) {
+			diag::log_tagged_critical_fmt("pdb",
+				"parse_pdb_bounded_watcher_start_failed pid=%lu tid=%lu path='%s' err='%s'",
+				caller_pid,
+				caller_tid,
+				pdb_path.c_str(),
+				"watchdog_register_rejected");
 		}
-	};
-	std::string watcher_start_err;
-	const bool watcher_started = watcher_thread->start(watcher_fn, &watcher_start_err,
-		aida::infra::win_thread::default_stack_reserve, "pdb_inner_phase_watcher");
-	if (!watcher_started) {
-		diag::log_tagged_critical_fmt("pdb",
-			"parse_pdb_bounded_watcher_start_failed pid=%lu tid=%lu path='%s' err='%s'",
-			caller_pid,
-			caller_tid,
-			pdb_path.c_str(),
-			watcher_start_err.c_str());
 	}
 
 	const uint64_t cap_deadline = bounded_start_ms + cap;
@@ -3130,20 +3186,19 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 		if (state->inner_stalled.load(std::memory_order_acquire)) { inner_stalled_break = true; break; }
 		const DWORD slice = static_cast<DWORD>(cap_deadline - now_ms);
 		const DWORD step = slice < 250u ? slice : 250u;
-		joined = worker_thread->join_for(step);
+		joined = !aida::infra::taskflow_runtime::wait_for(worker_job, step).timed_out;
 		if (progress) progress->store(state->progress.load(std::memory_order_acquire), std::memory_order_release);
 		if (cancel && cancel->load(std::memory_order_acquire))
 			state->cancel.store(true, std::memory_order_release);
 		if (joined) break;
 		if (state->finished.load(std::memory_order_acquire)) {
-			joined = worker_thread->join_for(0);
+			joined = !aida::infra::taskflow_runtime::wait_for(worker_job, 0).timed_out;
 			if (joined) break;
 		}
 		if (state->inner_stalled.load(std::memory_order_acquire)) { inner_stalled_break = true; break; }
 	}
 	watcher_done->store(true, std::memory_order_release);
-	if (watcher_thread && watcher_thread->joinable())
-		watcher_thread->join_for(2000);
+	watcher_chain->stop();
 	const uint64_t elapsed_ms = GetTickCount64() - bounded_start_ms;
 	const DWORD worker_tid = state->worker_tid.load(std::memory_order_acquire);
 	if (progress) progress->store(state->progress.load(std::memory_order_acquire), std::memory_order_release);
@@ -3199,7 +3254,7 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 			"FEATURE-WORKER-GROUP-RELEASE parse_pdb_bounded token=%llu reason=inner_phase_stall_detach",
 			static_cast<unsigned long long>(pdb_admission.token()));
 		pdb_admission.release("inner_phase_stall_detach");
-		worker_thread->detach();
+		aida::infra::taskflow_runtime::cancel(worker_job);
 		quarantine_dbghelp_and_recycle();
 		dbghelp_call_gate_reset(g_parse_generation.fetch_add(1, std::memory_order_acq_rel),
 			"inner_phase_stall_post_recycle");
@@ -3228,7 +3283,7 @@ inline bool parse_pdb_bounded(const std::string& pdb_path,
 		"FEATURE-WORKER-GROUP-RELEASE parse_pdb_bounded token=%llu reason=hard_cap_detach",
 		static_cast<unsigned long long>(pdb_admission.token()));
 	pdb_admission.release("hard_cap_detach");
-	worker_thread->detach();
+	aida::infra::taskflow_runtime::cancel(worker_job);
 	quarantine_dbghelp_and_recycle();
 	dbghelp_call_gate_reset(g_parse_generation.fetch_add(1, std::memory_order_acq_rel),
 		"hard_cap_post_recycle");

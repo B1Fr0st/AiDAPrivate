@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -30,6 +31,7 @@ struct pseudocode_renderer_v2_request_t {
     decompiler_profile_id_t profile = decompiler_profile_id_t::balanced;
     decompiler_renderer_settings_t settings;
     pseudocode_renderer_v2_limits_t limits;
+    std::shared_ptr<const decompiler_render_evidence_t> evidence;
     bool require_complete_source_map = true;
 };
 

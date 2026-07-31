@@ -1038,4 +1038,67 @@ workspace_result_t<type_graph_t> merge_type_evidence(
         std::move(provider_graph), std::move(evidence), config, &live_hir);
 }
 
+const decompiler_type_node_t* find_type_node(const type_graph_t& graph, const std::uint64_t type_id) noexcept
+{
+    for (const auto& node : graph.nodes) {
+        if (node.id == type_id)
+            return &node;
+    }
+    return nullptr;
+}
+
+const decompiler_type_edge_t* find_member_edge_by_offset(
+    const type_graph_t& graph, const std::uint64_t struct_type_id, const std::uint64_t byte_offset) noexcept
+{
+    const decompiler_type_edge_t* result = nullptr;
+    for (const auto& edge : graph.edges) {
+        if (edge.source_type_id != struct_type_id || edge.kind != decompiler_type_edge_kind_t::member ||
+            !edge.byte_offset.has_value() || *edge.byte_offset != byte_offset)
+            continue;
+        if (result == nullptr || edge.confidence > result->confidence)
+            result = &edge;
+    }
+    return result;
+}
+
+const decompiler_type_edge_t* find_member_edge_by_name(
+    const type_graph_t& graph, const std::uint64_t struct_type_id, const std::string& member_name) noexcept
+{
+    const decompiler_type_edge_t* result = nullptr;
+    for (const auto& edge : graph.edges) {
+        if (edge.source_type_id != struct_type_id || edge.kind != decompiler_type_edge_kind_t::member ||
+            edge.stable_name != member_name)
+            continue;
+        if (result == nullptr || edge.confidence > result->confidence)
+            result = &edge;
+    }
+    return result;
+}
+
+const decompiler_type_edge_t* find_pointee_edge(const type_graph_t& graph, const std::uint64_t pointer_type_id) noexcept
+{
+    const decompiler_type_edge_t* result = nullptr;
+    for (const auto& edge : graph.edges) {
+        if (edge.source_type_id != pointer_type_id || edge.kind != decompiler_type_edge_kind_t::pointee)
+            continue;
+        if (result == nullptr || edge.confidence > result->confidence)
+            result = &edge;
+    }
+    return result;
+}
+
+const decompiler_type_edge_t* find_enumerator_edge(
+    const type_graph_t& graph, const std::uint64_t enum_type_id, const std::uint64_t enumerator_value) noexcept
+{
+    const decompiler_type_edge_t* result = nullptr;
+    for (const auto& edge : graph.edges) {
+        if (edge.source_type_id != enum_type_id || edge.kind != decompiler_type_edge_kind_t::member ||
+            !edge.byte_offset.has_value() || *edge.byte_offset != enumerator_value)
+            continue;
+        if (result == nullptr || edge.confidence > result->confidence)
+            result = &edge;
+    }
+    return result;
+}
+
 }

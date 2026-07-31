@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "workspace/string_arena.hpp"
 #include "xref_engine.hpp"
 
 namespace xref_db {
@@ -22,17 +23,60 @@ struct xref_entry_t {
 	std::string              disasm_text;
 };
 
+struct xref_entry_v2_t {
+	uint64_t                 from_addr        = 0;
+	uint64_t                 to_addr          = 0;
+	std::uint32_t            disasm_string_id = aida::analysis::string_arena_t::null_id;
+	xref_engine::xref_type_t type             = xref_engine::xref_type_t::call;
+};
+
+static_assert(sizeof(xref_entry_v2_t) == 24,
+			  "xref_entry_v2_t must remain 24 bytes for bounded xref residency");
+
 struct module_index_t {
 	std::string name;
 	uint64_t    base = 0;
 	uint32_t    size = 0;
 	uint64_t    timestamp = 0;
 
-	std::unordered_map<uint64_t, std::vector<xref_entry_t>> to_index;
-	std::unordered_map<uint64_t, std::vector<xref_entry_t>> from_index;
+	std::vector<xref_entry_v2_t>      to_sorted;
+	std::vector<xref_entry_v2_t>      from_sorted;
+	aida::analysis::string_arena_t    disasm_strings;
 
 	size_t total_xrefs = 0;
 	bool   built = false;
+
+	std::vector<xref_entry_t> entries_to(uint64_t address, size_t limit = 1000) const
+	{
+		std::vector<xref_entry_t> result;
+		auto it = std::lower_bound(to_sorted.begin(), to_sorted.end(), address,
+			[](const xref_entry_v2_t& entry, uint64_t value) { return entry.to_addr < value; });
+		for (; it != to_sorted.end() && it->to_addr == address && result.size() < limit; ++it) {
+			xref_entry_t entry;
+			entry.from_addr = it->from_addr;
+			entry.to_addr = it->to_addr;
+			entry.type = it->type;
+			entry.disasm_text = disasm_strings.str(it->disasm_string_id);
+			result.push_back(std::move(entry));
+		}
+		return result;
+	}
+
+	std::vector<xref_entry_t> entries_from(uint64_t address, size_t limit = 1000) const
+	{
+		std::vector<xref_entry_t> result;
+		auto it = std::lower_bound(from_sorted.begin(), from_sorted.end(), address,
+			[](const xref_entry_v2_t& entry, uint64_t value) { return entry.from_addr < value; });
+		for (; it != from_sorted.end() && it->from_addr == address && result.size() < limit; ++it) {
+			xref_entry_t entry;
+			entry.from_addr = it->from_addr;
+			entry.to_addr = it->to_addr;
+			entry.type = it->type;
+			entry.disasm_text = disasm_strings.str(it->disasm_string_id);
+			result.push_back(std::move(entry));
+		}
+		return result;
+	}
 };
 
 struct call_graph_node_t {
@@ -124,22 +168,27 @@ inline aida::analysis::workspace_result_t<module_index_t> build_module_index(
 		if ((++visited & 0xFFFu) == 0 && stopped(workspace, cancel))
 			return workspace_result_t<module_index_t>::failure(
 				cancellation_error(workspace, cancel, "xref_db.workspace_index"));
-		xref_entry_t entry;
+		xref_entry_v2_t entry;
 		entry.from_addr = xref_engine::workspace_display_address(workspace, record.source);
 		entry.to_addr = xref_engine::workspace_display_address(workspace, record.target);
 		if (entry.from_addr == 0 || entry.to_addr == 0) continue;
 		entry.type = xref_engine::workspace_xref_type(record.kind);
-		result.to_index[entry.to_addr].push_back(entry);
-		result.from_index[entry.from_addr].push_back(std::move(entry));
+		result.to_sorted.push_back(entry);
+		result.from_sorted.push_back(entry);
 		++result.total_xrefs;
 	}
-	auto order = [](const xref_entry_t& left, const xref_entry_t& right) {
+	auto to_order = [](const xref_entry_v2_t& left, const xref_entry_v2_t& right) {
+		if (left.to_addr != right.to_addr) return left.to_addr < right.to_addr;
+		if (left.from_addr != right.from_addr) return left.from_addr < right.from_addr;
+		return static_cast<int>(left.type) < static_cast<int>(right.type);
+	};
+	auto from_order = [](const xref_entry_v2_t& left, const xref_entry_v2_t& right) {
 		if (left.from_addr != right.from_addr) return left.from_addr < right.from_addr;
 		if (left.to_addr != right.to_addr) return left.to_addr < right.to_addr;
 		return static_cast<int>(left.type) < static_cast<int>(right.type);
 	};
-	for (auto& item : result.to_index) std::sort(item.second.begin(), item.second.end(), order);
-	for (auto& item : result.from_index) std::sort(item.second.begin(), item.second.end(), order);
+	std::sort(result.to_sorted.begin(), result.to_sorted.end(), to_order);
+	std::sort(result.from_sorted.begin(), result.from_sorted.end(), from_order);
 	return workspace_result_t<module_index_t>::success(std::move(result));
 }
 

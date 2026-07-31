@@ -1,0 +1,45 @@
+{
+  "schema": "aida.hyperperf.synthetic-structural-baseline",
+  "schema_version": 1,
+  "code_mb": 32,
+  "seed_hex": "0xA1DA0006",
+  "capture": {
+    "status": "pending",
+    "snapshot_sha256": null,
+    "counts": null,
+    "write_amplification": null
+  },
+  "contract": {
+    "scorecard_schema_version_min": 2,
+    "phases": [
+      "parse",
+      "seed",
+      "decode",
+      "blocks",
+      "functions",
+      "cfg_calls",
+      "xrefs",
+      "strings_data",
+      "metadata_symbols_types",
+      "search_index",
+      "persistence",
+      "publish_ready",
+      "decode_merge"
+    ],
+    "required_scorecard_blocks": [
+      "phases",
+      "throughput",
+      "worker_pool",
+      "decode_detail",
+      "memory",
+      "persistence",
+      "decompile",
+      "interaction",
+      "counts",
+      "sla",
+      "artifacts",
+      "verdict"
+    ],
+    "write_amplification_band": [0.05, 64.0]
+  }
+}

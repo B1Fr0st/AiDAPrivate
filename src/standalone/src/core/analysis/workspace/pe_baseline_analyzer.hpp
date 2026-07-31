@@ -82,6 +82,8 @@ public:
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> decode_merge_phase(
         const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> data_image_scan_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> data_discovery_phase(
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> function_recovery_phase(
@@ -92,9 +94,15 @@ public:
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> xrefs_phase(
         const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> publish_xrefs_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> strings_data_phase(
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> metadata_symbols_types_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> search_index_instructions_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> search_index_entities_phase(
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> search_index_phase(
         const std::atomic<bool>& runtime_cancel_requested);

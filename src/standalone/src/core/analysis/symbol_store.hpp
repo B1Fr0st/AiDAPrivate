@@ -32,7 +32,7 @@
 #include "../anti-tamper/state.hpp"
 #include "../infra/executor.hpp"
 #include "../infra/taskflow_runtime.hpp"
-#include "../infra/win_thread.hpp"
+#include "../infra/cancellation_watchdog.hpp"
 #include "../../helpers/diag_log.hpp"
 
 extern settings_sa_t g_settings;
@@ -2302,6 +2302,75 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 	}
 }
 
+struct explicit_pdb_parse_monitor_chain_t : std::enable_shared_from_this<explicit_pdb_parse_monitor_chain_t> {
+	std::mutex mtx;
+	aida::infra::cancellation_watchdog::watch_id_t watch_id;
+	bool done = false;
+	std::string module_name;
+	std::string path;
+	uint64_t generation = 0;
+	std::shared_ptr<std::atomic<float>> parse_progress;
+	uint64_t last_log_ms = 0;
+
+	void stop() {
+		aida::infra::cancellation_watchdog::watch_id_t id;
+		{
+			std::lock_guard<std::mutex> lk(mtx);
+			done = true;
+			id = watch_id;
+			watch_id = {};
+		}
+		if (id.valid())
+			aida::infra::cancellation_watchdog::unregister_watch(id);
+	}
+
+	void fire() {
+		const uint64_t now_ms = GetTickCount64();
+		const float progress_value = parse_progress->load(std::memory_order_acquire);
+		const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
+		uint64_t elapsed = 0;
+		bool updated = false;
+		{
+			std::lock_guard<std::mutex> lk(g_state.mutex);
+			auto it = g_state.modules.find(module_name);
+			if (it != g_state.modules.end() && it->second.load_generation == generation && it->second.loading && it->second.load_phase == "parse") {
+				auto& ms = it->second;
+				elapsed = ms.load_started_ms ? now_ms - ms.load_started_ms : 0;
+				ms.parse_progress = progress_value;
+				ms.parse_progress_ms = elapsed;
+				ms.parse_diagnostic = parser_diag;
+				char status[512];
+				snprintf(status, sizeof(status), "Parsing user-supplied PDB: progress=%.1f%% elapsed=%llu / %u ms; %s",
+					static_cast<double>(progress_value) * 100.0,
+					static_cast<unsigned long long>(elapsed),
+					ms.load_timeout_ms,
+					parser_diag.c_str());
+				ms.status_text = status;
+				updated = true;
+			}
+		}
+		if (updated && now_ms - last_log_ms >= 5000) {
+			last_log_ms = now_ms;
+			diag::log_tagged_fmt("symbol_store",
+				"explicit_pdb_parse_progress module=%s generation=%llu path='%s' progress=%.3f elapsed_ms=%llu parser_diag=\"%s\"",
+				module_name.c_str(),
+				static_cast<unsigned long long>(generation),
+				path.c_str(),
+				static_cast<double>(progress_value),
+				static_cast<unsigned long long>(elapsed),
+				parser_diag.c_str());
+		}
+		std::lock_guard<std::mutex> lk(mtx);
+		if (done)
+			return;
+		aida::infra::cancellation_watchdog::watch_descriptor_t next_watch;
+		next_watch.deadline_ms = GetTickCount64() + 1000;
+		auto self = shared_from_this();
+		next_watch.on_fire = [self]() { self->fire(); };
+		watch_id = aida::infra::cancellation_watchdog::register_watch(std::move(next_watch));
+	}
+};
+
 inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t base, uint64_t size,
                                         const std::string& pdb_path)
 {
@@ -2466,71 +2535,41 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				rt_after_timeout.critical_queue_active,
 				static_cast<unsigned long long>(rt_after_timeout.total_rejected));
 			pdb_parser::pdb_info_t info;
-			std::atomic<float> parse_progress{0.f};
+			auto parse_progress = std::make_shared<std::atomic<float>>(0.f);
 			std::string search_path = std::filesystem::path(path_copy).parent_path().string();
-			std::atomic<bool> parse_monitor_done{false};
-			std::unique_ptr<aida::infra::win_thread::joinable_thread_t> parse_monitor;
-			auto parse_monitor_body = [&]() {
-				uint64_t last_log_ms = 0;
-				while (!parse_monitor_done.load(std::memory_order_acquire)) {
-					Sleep(1000);
-					const uint64_t now_ms = GetTickCount64();
-					const float progress_value = parse_progress.load(std::memory_order_acquire);
-					const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
-					uint64_t elapsed = 0;
-					bool updated = false;
-					{
-						std::lock_guard<std::mutex> lk(g_state.mutex);
-						auto it = g_state.modules.find(mod_copy);
-						if (it != g_state.modules.end() && it->second.load_generation == generation && it->second.loading && it->second.load_phase == "parse") {
-							auto& ms = it->second;
-							elapsed = ms.load_started_ms ? now_ms - ms.load_started_ms : 0;
-							ms.parse_progress = progress_value;
-							ms.parse_progress_ms = elapsed;
-							ms.parse_diagnostic = parser_diag;
-							char status[512];
-							snprintf(status, sizeof(status), "Parsing user-supplied PDB: progress=%.1f%% elapsed=%llu / %u ms; %s",
-								static_cast<double>(progress_value) * 100.0,
-								static_cast<unsigned long long>(elapsed),
-								ms.load_timeout_ms,
-								parser_diag.c_str());
-							ms.status_text = status;
-							updated = true;
-						}
-					}
-					if (updated && now_ms - last_log_ms >= 5000) {
-						last_log_ms = now_ms;
-						diag::log_tagged_fmt("symbol_store",
-							"explicit_pdb_parse_progress module=%s generation=%llu path='%s' progress=%.3f elapsed_ms=%llu parser_diag=\"%s\"",
-							mod_copy.c_str(),
-							static_cast<unsigned long long>(generation),
-							path_copy.c_str(),
-							static_cast<double>(progress_value),
-							static_cast<unsigned long long>(elapsed),
-							parser_diag.c_str());
-					}
-				}
-			};
+			auto parse_monitor_chain = std::make_shared<explicit_pdb_parse_monitor_chain_t>();
+			parse_monitor_chain->module_name = mod_copy;
+			parse_monitor_chain->path = path_copy;
+			parse_monitor_chain->generation = generation;
+			parse_monitor_chain->parse_progress = parse_progress;
+			bool monitor_registered = false;
 			constexpr int k_parse_monitor_max_attempts = 3;
 			for (int attempt = 1; attempt <= k_parse_monitor_max_attempts; ++attempt) {
-				parse_monitor = std::make_unique<aida::infra::win_thread::joinable_thread_t>();
-				std::string mon_err;
-				if (parse_monitor->start(parse_monitor_body, &mon_err,
-					aida::infra::win_thread::fixture_stack_reserve, "pdb_parse_monitor")) {
+				aida::infra::cancellation_watchdog::watch_descriptor_t first_watch;
+				first_watch.deadline_ms = GetTickCount64() + 1000;
+				first_watch.on_fire = [parse_monitor_chain]() { parse_monitor_chain->fire(); };
+				aida::infra::cancellation_watchdog::watch_id_t registered;
+				{
+					std::lock_guard<std::mutex> lk(parse_monitor_chain->mtx);
+					registered = aida::infra::cancellation_watchdog::register_watch(std::move(first_watch));
+					if (registered.valid())
+						parse_monitor_chain->watch_id = registered;
+				}
+				if (registered.valid()) {
+					monitor_registered = true;
 					parse_monitor_unavailable = false;
 					parse_monitor_error.clear();
 					break;
 				}
-				parse_monitor.reset();
 				parse_monitor_unavailable = true;
-				parse_monitor_error = mon_err;
+				parse_monitor_error = "watchdog_register_rejected";
 				diag::log_tagged_fmt("symbol_store",
 					"explicit_pdb_parse_monitor_retry module=%s generation=%llu attempt=%d max_attempts=%d err='%s'",
 					mod_copy.c_str(),
 					static_cast<unsigned long long>(generation),
 					attempt,
 					k_parse_monitor_max_attempts,
-					mon_err.c_str());
+					parse_monitor_error.c_str());
 				if (attempt < k_parse_monitor_max_attempts) {
 					Sleep(static_cast<DWORD>(100 * attempt * attempt));
 					continue;
@@ -2553,7 +2592,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					path_copy.c_str(),
 					static_cast<unsigned long long>(file_size_copy),
 					k_parse_monitor_max_attempts,
-					mon_err.c_str(),
+					parse_monitor_error.c_str(),
 					parser_diag.c_str(),
 					static_cast<unsigned long long>(rt.work_queue_pending),
 					rt.work_queue_active,
@@ -2564,9 +2603,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					static_cast<unsigned long long>(rt.total_rejected));
 			}
 			auto stop_parse_monitor = [&]() {
-				parse_monitor_done.store(true, std::memory_order_release);
-				if (parse_monitor && parse_monitor->joinable())
-					parse_monitor->join();
+				parse_monitor_chain->stop();
 			};
 			if (parse_monitor_unavailable) {
 				const std::string parser_diag = pdb_parser::dbghelp_load_diagnostic();
@@ -2588,11 +2625,11 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					path_copy.c_str(),
 					static_cast<unsigned long long>(file_size_copy),
 					search_path.c_str(),
-					parse_monitor ? 1 : 0,
+					monitor_registered ? 1 : 0,
 					parse_monitor_error.c_str(),
 					pdb_parser::dbghelp_load_diagnostic().c_str());
-				parser_called = true;
-				parse_ok = pdb_parser::parse_pdb_bounded(path_copy, search_path, info, &parse_progress, nullptr, k_explicit_pdb_load_timeout_ms);
+			parser_called = true;
+			parse_ok = pdb_parser::parse_pdb_bounded(path_copy, search_path, info, parse_progress.get(), nullptr, k_explicit_pdb_load_timeout_ms);
 				stop_parse_monitor();
 			} catch (...) {
 				stop_parse_monitor();
@@ -2612,7 +2649,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				info.structs.size(),
 				info.enums.size(),
 				info.structs.size() + info.enums.size(),
-				static_cast<double>(parse_progress.load()),
+				static_cast<double>(parse_progress->load()),
 				static_cast<unsigned long long>(GetTickCount64() - job_start),
 				parser_status.c_str(),
 				parser_diag.c_str());
@@ -2629,7 +2666,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 						parse_completed ? 1 : 0,
 						path_copy.c_str(),
 						static_cast<unsigned long long>(file_size_copy),
-						static_cast<double>(parse_progress.load()),
+						static_cast<double>(parse_progress->load()),
 						static_cast<unsigned long long>(GetTickCount64() - job_start),
 						ms.status_text.c_str(),
 						parser_status.c_str(),
@@ -2647,7 +2684,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					ms.pdb_path = path_copy;
 					ms.pdb_file_size = file_size_copy;
 					ms.load_failure_detail.clear();
-					ms.parse_progress = parse_progress.load();
+					ms.parse_progress = parse_progress->load();
 					ms.parse_progress_ms = GetTickCount64() - job_start;
 					ms.parse_diagnostic = parser_diag;
 					char buf[192];
@@ -2668,7 +2705,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 					ms.parse_completed = false;
 					ms.load_phase.clear();
 					ms.load_failure_detail = parser_status.empty() ? parser_diag : parser_status + " | " + parser_diag;
-					ms.parse_progress = parse_progress.load();
+					ms.parse_progress = parse_progress->load();
 					ms.parse_progress_ms = GetTickCount64() - job_start;
 					ms.parse_diagnostic = parser_diag;
 					ms.status_text = pdb_parse_failure_status("Failed to parse user-supplied PDB");

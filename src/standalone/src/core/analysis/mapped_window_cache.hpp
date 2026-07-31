@@ -17,7 +17,9 @@ struct mapped_window_cache_options_t final {
     std::uint64_t max_cached_window_bytes = 256ULL * 1024ULL * 1024ULL;
     std::uint64_t max_global_mapped_window_bytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     std::uint32_t shard_count = 64;
+    std::uint32_t max_span_windows = 1;
     bool immutable_source = false;
+    bool prefetch_next_window = false;
 };
 
 namespace provider_metrics_relay {
@@ -56,6 +58,10 @@ public:
     workspace_result_t<void> revalidate() const;
     workspace_result_t<void> trim();
     mapped_window_cache_statistics_t statistics() const noexcept;
+    workspace_result_t<std::uint64_t> pin_range(
+        std::uint64_t file_offset, std::uint64_t size, std::uint32_t max_windows,
+        const cancellation_token_t& cancel = {}) const;
+    void unpin_range(std::uint64_t token) const noexcept;
 
 private:
     struct state_t;

@@ -114,6 +114,7 @@
 #endif
 
 #include "../infra/executor.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../session/session_store.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
 #include "../settings/settings_persistence_service.hpp"
@@ -1477,10 +1478,11 @@ std::vector<tool_execution_result_t> execute_approved_tool_group(
         post_update(ai_update_t::THINKING, "Calling " + std::to_string(group.size()) + " tools...");
 
     std::atomic<size_t> next_index{0};
-    std::vector<aida::infra::win_thread::joinable_thread_t> workers;
+    std::vector<aida::infra::taskflow_runtime::job_handle_t> workers;
     workers.reserve(worker_count);
 
-    auto worker_body = [&](size_t worker_index) {
+    auto worker_body = [&](size_t worker_index,
+                           const aida::infra::taskflow_runtime::cancellation_token_t* job_token) {
             const auto worker_start = std::chrono::steady_clock::now();
             size_t claimed = 0;
             diag::log_tagged_fmt("chat",
@@ -1490,7 +1492,8 @@ std::vector<tool_execution_result_t> execute_approved_tool_group(
                 GetCurrentThreadId());
 
             for (;;) {
-                if (s_cancel.load(std::memory_order_acquire)) {
+                if (s_cancel.load(std::memory_order_acquire) ||
+                    (job_token && job_token->requested.load(std::memory_order_acquire))) {
                     diag::log_tagged_fmt("chat",
                         "agent_tool_fanout_worker_cancel seq=%llu worker=%zu claimed=%zu",
                         static_cast<unsigned long long>(group_seq),
@@ -1567,28 +1570,32 @@ std::vector<tool_execution_result_t> execute_approved_tool_group(
     };
 
     for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
-        aida::infra::win_thread::joinable_thread_t worker;
-        std::string err;
-        const bool started = worker.start([&, worker_index]() {
-            worker_body(worker_index);
-        }, &err, aida::infra::win_thread::default_stack_reserve, "agent_tool_fanout");
-        if (started) {
-            workers.emplace_back(std::move(worker));
+        aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+        worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::general;
+        worker_desc.owner_subsystem = "chat";
+        worker_desc.label = "agent_tool_fanout";
+        worker_desc.priority = 2;
+        worker_desc.shutdown_policy = "cancel_pending";
+        worker_desc.cancellable_body = [&, worker_index](const aida::infra::taskflow_runtime::cancellation_token_t& job_token) {
+            worker_body(worker_index, &job_token);
+        };
+        auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+        if (worker_submission.submitted) {
+            workers.emplace_back(worker_submission.handle);
             continue;
         }
         diag::log_tagged_fmt("chat",
             "agent_tool_fanout_worker_start_failed seq=%llu worker=%zu err=%.200s",
             static_cast<unsigned long long>(group_seq),
             worker_index,
-            err.empty() ? "<none>" : err.c_str());
+            worker_submission.reject_reason.empty() ? "<none>" : worker_submission.reject_reason.c_str());
     }
 
     if (workers.empty())
-        worker_body(0);
+        worker_body(0, nullptr);
 
     for (auto& worker : workers)
-        if (worker.joinable())
-            worker.join();
+        aida::infra::taskflow_runtime::wait_for(worker, 0xFFFFFFFFu);
 
     const auto group_end = std::chrono::steady_clock::now();
     diag::log_tagged_fmt("chat",

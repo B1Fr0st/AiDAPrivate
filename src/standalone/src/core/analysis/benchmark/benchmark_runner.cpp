@@ -1,12 +1,13 @@
 #include "benchmark_runner.hpp"
 
+#include "benchmark_scorecard.hpp"
+
 #include "../../../../tests/analysis_workspace/large_pe_fixture_builder.hpp"
 
 #include "../workspace/baseline_pipeline.hpp"
-#include "../workspace/checked_range.hpp"
-#include "../workspace/decompiler_service.hpp"
 #include "../workspace/search_index.hpp"
 #include "../workspace/workspace_registry.hpp"
+#include "../decompiler/decompile_batch_orchestrator.hpp"
 #include "../tile_decode_orchestrator.hpp"
 #include "../../infra/taskflow_runtime.hpp"
 #include "../../../helpers/diag_log.hpp"
@@ -19,12 +20,15 @@
 #endif
 #include <Windows.h>
 #include <winioctl.h>
+#include <Psapi.h>
 
 #pragma comment(lib, "bcrypt.lib")
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -222,6 +226,177 @@ struct phase_windows_t {
     std::uint64_t publish_wall_ns() const { return window_ns(publish_begin, publish_end); }
 };
 
+struct runtime_memory_sample_t {
+    std::uint64_t rss_bytes = 0;
+    std::uint64_t private_bytes = 0;
+    std::uint64_t active_workers = 0;
+};
+
+class benchmark_runtime_sampler_t final {
+public:
+    static constexpr std::size_t ring_capacity = 8192;
+
+    benchmark_runtime_sampler_t() = default;
+    ~benchmark_runtime_sampler_t() { stop(); }
+    benchmark_runtime_sampler_t(const benchmark_runtime_sampler_t&) = delete;
+    benchmark_runtime_sampler_t& operator=(const benchmark_runtime_sampler_t&) = delete;
+
+    void start(std::uint32_t interval_ms)
+    {
+        if (interval_ms == 0)
+            interval_ms = 250;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (running_)
+                return;
+            stop_requested_ = false;
+            interval_ms_ = interval_ms;
+            write_index_.store(0, std::memory_order_release);
+            running_ = true;
+        }
+        try {
+            thread_ = std::thread([this]() { run(); });
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
+            throw;
+        }
+        diag::log_tagged_fmt("benchmark", "runtime_sampler_start interval_ms=%u ring=%zu",
+            static_cast<unsigned>(interval_ms), ring_capacity);
+    }
+
+    void stop() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!running_)
+                return;
+            stop_requested_ = true;
+            wake_.notify_all();
+        }
+        if (thread_.joinable())
+            thread_.join();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
+        }
+        diag::log_tagged_fmt("benchmark", "runtime_sampler_stop samples=%llu",
+            static_cast<unsigned long long>(write_index_.load(std::memory_order_acquire)));
+    }
+
+    json summary_json() const
+    {
+        const auto total = write_index_.load(std::memory_order_acquire);
+        const auto count = static_cast<std::size_t>((std::min<std::uint64_t>)(total, ring_capacity));
+        std::uint64_t peak_rss = 0;
+        std::uint64_t peak_private = 0;
+        std::uint64_t peak_workers = 0;
+        long double rss_sum = 0.0;
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& sample = ring_[index];
+            peak_rss = (std::max)(peak_rss, sample.rss_bytes);
+            peak_private = (std::max)(peak_private, sample.private_bytes);
+            peak_workers = (std::max)(peak_workers, sample.active_workers);
+            rss_sum += static_cast<long double>(sample.rss_bytes);
+        }
+        return json{{"sample_count", count},
+            {"sample_interval_ms", interval_ms_},
+            {"peak_rss_bytes", count == 0 ? json(nullptr) : json(peak_rss)},
+            {"mean_rss_bytes", count == 0 ? json(nullptr)
+                : json(static_cast<double>(rss_sum / count))},
+            {"peak_private_bytes", count == 0 ? json(nullptr) : json(peak_private)},
+            {"peak_active_workers", count == 0 ? json(nullptr) : json(peak_workers)}};
+    }
+
+private:
+    void run() noexcept
+    {
+        for (;;) {
+            try {
+                PROCESS_MEMORY_COUNTERS_EX counters{};
+                counters.cb = static_cast<DWORD>(sizeof(counters));
+                runtime_memory_sample_t sample;
+                if (GetProcessMemoryInfo(GetCurrentProcess(),
+                    reinterpret_cast<PPROCESS_MEMORY_COUNTERS>(&counters),
+                    static_cast<DWORD>(sizeof(counters)))) {
+                    sample.rss_bytes = static_cast<std::uint64_t>(counters.WorkingSetSize);
+                    sample.private_bytes = static_cast<std::uint64_t>(counters.PrivateUsage);
+                }
+                sample.active_workers = static_cast<std::uint64_t>(
+                    aida::infra::taskflow_runtime::active_snapshot().total_active);
+                const auto index = write_index_.fetch_add(1, std::memory_order_acq_rel);
+                ring_[static_cast<std::size_t>(index % ring_capacity)] = sample;
+            } catch (...) {
+            }
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (stop_requested_)
+                break;
+            wake_.wait_for(lock, std::chrono::milliseconds(interval_ms_),
+                [this]() { return stop_requested_; });
+            if (stop_requested_)
+                break;
+        }
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable wake_;
+    std::thread thread_;
+    bool running_ = false;
+    bool stop_requested_ = false;
+    std::uint32_t interval_ms_ = 250;
+    std::array<runtime_memory_sample_t, ring_capacity> ring_{};
+    std::atomic<std::uint64_t> write_index_{0};
+};
+
+class latency_reservoir_t final {
+public:
+    static constexpr std::size_t capacity = 4096;
+
+    explicit latency_reservoir_t(std::uint64_t seed)
+        : state_(seed != 0 ? seed : 0x9E3779B97F4A7C15ULL)
+    {
+        values_.reserve(capacity);
+    }
+
+    void push(std::uint64_t value)
+    {
+        ++seen_;
+        if (values_.size() < capacity) {
+            values_.push_back(value);
+            return;
+        }
+        const auto slot = next() % seen_;
+        if (slot < capacity)
+            values_[static_cast<std::size_t>(slot)] = value;
+    }
+
+    std::size_t size() const noexcept { return values_.size(); }
+    std::uint64_t seen() const noexcept { return seen_; }
+
+    json percentile(double rank) const
+    {
+        if (values_.empty())
+            return nullptr;
+        auto ordered = values_;
+        std::sort(ordered.begin(), ordered.end());
+        return ordered[static_cast<std::size_t>((ordered.size() - 1) * rank)];
+    }
+
+private:
+    std::uint64_t next() noexcept
+    {
+        state_ += 0x9E3779B97F4A7C15ULL;
+        auto value = state_;
+        value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+        return value ^ (value >> 31);
+    }
+
+    std::uint64_t state_;
+    std::uint64_t seen_ = 0;
+    std::vector<std::uint64_t> values_;
+};
+
 struct analysis_once_result_t {
     std::shared_ptr<analysis_workspace_t> workspace;
     std::shared_ptr<const analysis_snapshot_t> snapshot;
@@ -232,11 +407,17 @@ struct analysis_once_result_t {
     std::uint64_t file_bytes = 0;
     std::uint64_t instruction_count = 0;
     std::uint64_t code_bytes = 0;
+    std::shared_ptr<const analysis_metrics_snapshot_t> harvested_metrics;
+    std::shared_ptr<decompile_batch_orchestrator_t> decompile_orchestrator;
+    std::shared_ptr<analysis_metrics_t> decompile_metrics;
+    bool decompile_orchestrator_owned = false;
 };
 
 analysis_once_result_t run_analysis_once(const open_static_workspace_request_t& open_request,
                                          std::uint32_t worker_budget,
-                                         const cancellation_token_t& cancel)
+                                         const cancellation_token_t& cancel,
+                                         benchmark_runtime_sampler_t* sampler = nullptr,
+                                         std::uint32_t sample_interval_ms = 250)
 {
     analysis_once_result_t outcome;
     try {
@@ -245,6 +426,37 @@ analysis_once_result_t run_analysis_once(const open_static_workspace_request_t& 
             throw std::runtime_error("benchmark workspace open failed: " +
                 opened.error().stable_code() + ":" + opened.error().message);
         outcome.workspace = opened.take_value();
+
+        struct sampler_guard_t {
+            benchmark_runtime_sampler_t* sampler = nullptr;
+            ~sampler_guard_t() { if (sampler) sampler->stop(); }
+        } sampler_guard;
+        if (sampler) {
+            sampler->start(sample_interval_ms);
+            sampler_guard.sampler = sampler;
+        }
+
+        outcome.decompile_orchestrator = outcome.workspace->background_decompile();
+        if (outcome.decompile_orchestrator) {
+            outcome.decompile_metrics = outcome.workspace->background_metrics();
+        } else {
+            auto sink = std::make_shared<analysis_metrics_t>(outcome.workspace->generation());
+            auto created = decompile_batch_orchestrator_t::create(outcome.workspace, sink);
+            if (created) {
+                outcome.decompile_orchestrator = created.take_value();
+                outcome.decompile_metrics = std::move(sink);
+                outcome.decompile_orchestrator_owned = true;
+                diag::log_tagged_fmt("benchmark",
+                    "decompile_orchestrator wiring=%s reason=%s",
+                    "benchmark_owned_orchestrator", "workspace_has_no_registry_orchestrator");
+            } else {
+                diag::log_tagged_fmt("benchmark",
+                    "decompile_orchestrator wiring=%s reason=%s error=%s",
+                    "unavailable", "benchmark_owned_create_failed",
+                    created.error().message.c_str());
+            }
+        }
+
         const auto image = outcome.workspace->normalized_image();
         if (!image)
             throw std::runtime_error("benchmark fixture image metadata is unavailable");
@@ -285,6 +497,9 @@ analysis_once_result_t run_analysis_once(const open_static_workspace_request_t& 
             !outcome.workspace->snapshot())
             throw std::runtime_error("baseline graph completed without a ready publication");
 
+        outcome.harvested_metrics = harvest_workspace_baseline_metrics(outcome.workspace);
+        diag::log_tagged_fmt("benchmark", "baseline_metrics_harvest available=%d",
+            outcome.harvested_metrics ? 1 : 0);
         outcome.snapshot = outcome.workspace->snapshot();
         for (const auto& span : outcome.snapshot->coverage) {
             if (span.reason == coverage_reason_t::decoded)
@@ -294,6 +509,7 @@ analysis_once_result_t run_analysis_once(const open_static_workspace_request_t& 
         outcome.decode_window_ns = outcome.windows.decode_wall_ns() +
             outcome.windows.merge_wall_ns();
         outcome.instruction_count = outcome.snapshot->instructions.size();
+        sampler_guard.sampler = nullptr;
         return outcome;
     } catch (...) {
         if (outcome.workspace) {
@@ -775,6 +991,7 @@ struct stage_run_measurement_t {
     std::uint64_t decoded_bytes = 0;
     std::uint64_t instruction_count = 0;
     std::string snapshot_sha256;
+    std::shared_ptr<const analysis_metrics_snapshot_t> harvested_metrics;
 };
 
 stage_run_measurement_t run_stage_measurement(
@@ -788,6 +1005,7 @@ stage_run_measurement_t run_stage_measurement(
     measurement.decode_window_ns = once.decode_window_ns;
     measurement.decoded_bytes = once.decoded_bytes;
     measurement.instruction_count = once.instruction_count;
+    measurement.harvested_metrics = std::move(once.harvested_metrics);
     try {
         measurement.snapshot_sha256 = snapshot_determinism_sha256(*once.snapshot);
     } catch (...) {
@@ -796,6 +1014,168 @@ stage_run_measurement_t run_stage_measurement(
     }
     close_benchmark_workspace(once.workspace, true);
     return measurement;
+}
+
+struct parallel_decompile_stage_t {
+    bool ran = false;
+    std::string wiring;
+    std::string unavailable_reason;
+    std::uint64_t total = 0;
+    std::uint64_t calls = 0;
+    std::uint64_t completed = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t cancelled = 0;
+    std::uint64_t wall_ns = 0;
+    std::uint64_t queue_depth_peak = 0;
+    std::uint64_t memory_cache_hits = 0;
+    std::uint64_t persistent_cache_hits = 0;
+    std::uint64_t slots = 0;
+    std::uint64_t slots_effective_peak = 0;
+    std::uint64_t latency_samples = 0;
+    bool truncated = false;
+    double funcs_per_s = 0.0;
+    json latency_p50_ns = nullptr;
+    json latency_p95_ns = nullptr;
+};
+
+parallel_decompile_stage_t run_parallel_decompile_stage(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    const std::shared_ptr<decompile_batch_orchestrator_t>& orchestrator,
+    const std::shared_ptr<analysis_metrics_t>& sink,
+    const analysis_snapshot_t& snapshot,
+    std::uint32_t max_functions,
+    std::uint32_t max_ms,
+    std::uint64_t seed,
+    bool orchestrator_owned,
+    const cancellation_token_t& cancel)
+{
+    parallel_decompile_stage_t stage;
+    if (snapshot.functions.empty()) {
+        stage.unavailable_reason = "no_recovered_functions";
+        return stage;
+    }
+    if (!workspace->decompiler()) {
+        stage.unavailable_reason = "decompiler_service_unavailable";
+        return stage;
+    }
+    if (!orchestrator || !sink) {
+        stage.unavailable_reason = "decompile_batch_orchestrator_unavailable";
+        return stage;
+    }
+    stage.ran = true;
+    stage.wiring = orchestrator_owned ? "benchmark_owned_orchestrator" : "registry_orchestrator";
+    const auto metrics_before = sink->snapshot();
+    const auto stage_begin = steady_clock_t::now();
+    latency_reservoir_t reservoir(seed ^ 0xDEC0DE17ULL);
+    std::uint64_t previous_completed = 0;
+    auto previous_at = steady_clock_t::now();
+    bool started_once = false;
+    bool cancel_requested = false;
+    decompile_batch_orchestrator_t::run_snapshot_t last;
+    diag::log_tagged_fmt("benchmark",
+        "decompile_stage_begin max_functions=%u max_ms=%u functions=%llu",
+        static_cast<unsigned>(max_functions), static_cast<unsigned>(max_ms),
+        static_cast<unsigned long long>(snapshot.functions.size()));
+    for (;;) {
+        last = orchestrator->run_snapshot();
+        stage.slots = (std::max)(stage.slots, last.slots);
+        stage.slots_effective_peak = (std::max)(stage.slots_effective_peak,
+            last.slots_effective);
+        if (last.active || last.total != 0)
+            started_once = true;
+        const auto now = steady_clock_t::now();
+        const auto interval_ns = nanoseconds_since(previous_at);
+        const auto completed_delta = last.completed >= previous_completed
+            ? last.completed - previous_completed : 0;
+        if (completed_delta != 0 && interval_ns != 0) {
+            const auto slots = (std::max<std::uint64_t>)(1, last.slots_effective);
+            reservoir.push(slots * interval_ns / completed_delta);
+            previous_completed = last.completed;
+            previous_at = now;
+        }
+        const auto elapsed_ms = nanoseconds_since(stage_begin) / 1000000ULL;
+        const auto processed = last.completed + last.failed + last.cancelled;
+        if (started_once && !last.active && last.total != 0 && processed >= last.total)
+            break;
+        if (last.completed >= max_functions) {
+            stage.truncated = true;
+            break;
+        }
+        if (elapsed_ms >= max_ms) {
+            stage.truncated = true;
+            break;
+        }
+        if (cancel.stop_requested())
+            break;
+        if (!started_once && elapsed_ms >= (std::min<std::uint64_t>)(max_ms, 30000ULL))
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (started_once) {
+        last = orchestrator->run_snapshot();
+        stage.slots = (std::max)(stage.slots, last.slots);
+        stage.slots_effective_peak = (std::max)(stage.slots_effective_peak,
+            last.slots_effective);
+        if (last.active) {
+            cancel_requested = true;
+            orchestrator->request_cancel();
+        }
+        const auto drained = orchestrator->drain(
+            steady_clock_t::now() + std::chrono::seconds(30));
+        if (!drained)
+            diag::log_tagged_fmt("benchmark",
+                "decompile_stage_drain_timeout code=%s message=%s",
+                drained.error().stable_code().c_str(), drained.error().message.c_str());
+        last = orchestrator->run_snapshot();
+    }
+    const auto stage_wall_ns = nanoseconds_since(stage_begin);
+    const auto metrics_after = sink->snapshot();
+    const auto counter_delta = [&](analysis_metric_t metric) {
+        const auto after = metrics_after.value(metric);
+        const auto before = metrics_before.value(metric);
+        return after >= before ? after - before : 0ULL;
+    };
+    stage.calls = counter_delta(analysis_metric_t::decompile_batch_calls);
+    stage.completed = counter_delta(analysis_metric_t::decompile_batch_completed);
+    stage.failed = counter_delta(analysis_metric_t::decompile_batch_failed);
+    stage.cancelled = counter_delta(analysis_metric_t::decompile_batch_cancelled);
+    stage.wall_ns = counter_delta(analysis_metric_t::decompile_batch_wall_ns);
+    stage.total = last.total != 0 ? last.total : snapshot.functions.size();
+    stage.queue_depth_peak = metrics_after.value(
+        analysis_metric_t::decompile_batch_queue_depth_peak) >=
+            metrics_before.value(analysis_metric_t::decompile_batch_queue_depth_peak)
+        ? metrics_after.value(analysis_metric_t::decompile_batch_queue_depth_peak)
+        : metrics_before.value(analysis_metric_t::decompile_batch_queue_depth_peak);
+    stage.memory_cache_hits = counter_delta(analysis_metric_t::decompile_memory_cache_hits);
+    stage.persistent_cache_hits = counter_delta(
+        analysis_metric_t::decompile_persistent_cache_hits);
+    if (stage.wall_ns == 0)
+        stage.wall_ns = stage_wall_ns;
+    if (stage.wall_ns != 0) {
+        stage.funcs_per_s = static_cast<double>(stage.completed) * 1000000000.0 /
+            static_cast<double>(stage.wall_ns);
+    }
+    if (reservoir.size() == 0 && stage.completed >= 2 && stage.wall_ns != 0) {
+        reservoir.push((std::max<std::uint64_t>)(1, stage.slots_effective_peak) *
+            stage.wall_ns / stage.completed);
+    }
+    stage.latency_samples = reservoir.seen();
+    stage.latency_p50_ns = reservoir.percentile(0.50);
+    stage.latency_p95_ns = reservoir.percentile(0.95);
+    diag::log_tagged_fmt("benchmark",
+        "decompile_stage_end completed=%llu failed=%llu cancelled=%llu total=%llu wall_ms=%llu funcs_s=%.2f slots=%llu slots_effective_peak=%llu truncated=%d cancel=%d drain_cancelled=%d",
+        static_cast<unsigned long long>(stage.completed),
+        static_cast<unsigned long long>(stage.failed),
+        static_cast<unsigned long long>(stage.cancelled),
+        static_cast<unsigned long long>(stage.total),
+        static_cast<unsigned long long>(stage.wall_ns / 1000000ULL),
+        stage.funcs_per_s,
+        static_cast<unsigned long long>(stage.slots),
+        static_cast<unsigned long long>(stage.slots_effective_peak),
+        stage.truncated ? 1 : 0,
+        cancel.stop_requested() ? 1 : 0,
+        cancel_requested ? 1 : 0);
+    return stage;
 }
 
 
@@ -1121,7 +1501,9 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         open_request.source_path = fixture_path.u8string();
         open_request.bin_name = fixture_path.filename().u8string();
         open_request.load_profile = {1, 0, 1, 0};
-        auto primary = run_analysis_once(open_request, request.lanes, cancel);
+        benchmark_runtime_sampler_t sampler;
+        auto primary = run_analysis_once(open_request, request.lanes, cancel,
+            &sampler, request.memory_sample_interval_ms);
         workspace = std::move(primary.workspace);
         analysis_metrics_t run_metrics(workspace->generation());
         run_metrics.sample_process_memory();
@@ -1136,69 +1518,15 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         const auto& windows = primary.windows;
         const std::uint64_t analysis_wall_ns = primary.wall_ns;
         const std::uint64_t decode_window_ns = primary.decode_window_ns;
+        const auto harvested = primary.harvested_metrics;
+        const bool harvested_available = harvested != nullptr;
 
-        std::uint64_t batch_completed = 0;
-        std::uint64_t batch_failed = 0;
-        std::uint64_t batch_wall_ns = 0;
-        double batch_funcs_per_s = 0.0;
-        bool batch_ran = false;
-        std::vector<std::uint64_t> decompile_samples;
-        if (!snapshot->functions.empty() && workspace->decompiler()) {
-            batch_ran = true;
-            const auto service = workspace->decompiler();
-            const auto service_before = service->snapshot();
-            const std::size_t batch_target = (std::min<std::size_t>)(snapshot->functions.size(),
-                request.decompile_batch_max_functions);
-            const auto batch_begin = steady_clock_t::now();
-            std::uint64_t consecutive_failures = 0;
-            for (std::size_t index = 0; index < batch_target; ++index) {
-                if (cancel.stop_requested()) {
-                    run_metrics.add(analysis_metric_t::decompile_batch_cancelled,
-                        batch_target - index);
-                    break;
-                }
-                if (nanoseconds_since(batch_begin) / 1000000ULL >= request.decompile_batch_max_ms)
-                    break;
-                const auto& function = snapshot->functions[index];
-                auto address = function.start;
-                if (address.space == address_space_id_t::relative_virtual) {
-                    address.space = address_space_id_t::virtual_address;
-                    if (!checked_add_u64(address.value, image->image_base, address.value))
-                        throw std::runtime_error("benchmark decompile address overflowed image base");
-                }
-                run_metrics.add(analysis_metric_t::decompile_batch_calls);
-                const auto call_begin = steady_clock_t::now();
-                auto value = service->decompile(address, {}, cancel);
-                const auto call_ns = nanoseconds_since(call_begin);
-                run_metrics.set_max(analysis_metric_t::decompile_batch_queue_depth_peak,
-                    service->snapshot().active_contexts);
-                const bool valid = value && value.value().function_id != 0 &&
-                    value.value().pseudocode.find_first_not_of(" \t\r\n") != std::string::npos &&
-                    !value.value().line_to_address.empty();
-                if (!valid) {
-                    run_metrics.add(analysis_metric_t::decompile_batch_failed);
-                    ++batch_failed;
-                    if (++consecutive_failures >= 64)
-                        break;
-                    continue;
-                }
-                consecutive_failures = 0;
-                run_metrics.add(analysis_metric_t::decompile_batch_completed);
-                ++batch_completed;
-                decompile_samples.push_back(call_ns);
-            }
-            batch_wall_ns = nanoseconds_since(batch_begin);
-            run_metrics.add(analysis_metric_t::decompile_batch_wall_ns, batch_wall_ns);
-            const auto service_after = service->snapshot();
-            run_metrics.set(analysis_metric_t::decompile_memory_cache_hits,
-                service_after.memory_cache_hits - service_before.memory_cache_hits);
-            run_metrics.set(analysis_metric_t::decompile_persistent_cache_hits,
-                service_after.persistent_cache_hits - service_before.persistent_cache_hits);
-            if (batch_wall_ns != 0) {
-                batch_funcs_per_s = static_cast<double>(batch_completed) * 1000000000.0 /
-                    static_cast<double>(batch_wall_ns);
-            }
-        }
+        const auto decompile_stage = run_parallel_decompile_stage(workspace,
+            primary.decompile_orchestrator, primary.decompile_metrics, *snapshot,
+            request.decompile_batch_max_functions, request.decompile_batch_max_ms,
+            request.synthetic_seed, primary.decompile_orchestrator_owned, cancel);
+        const bool batch_ran = decompile_stage.ran;
+        const double batch_funcs_per_s = decompile_stage.funcs_per_s;
 
         std::vector<std::uint64_t> query_samples;
         if (search) {
@@ -1213,6 +1541,8 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             }
         }
         run_metrics.sample_process_memory();
+        sampler.stop();
+        const auto sampler_summary = sampler.summary_json();
         run_metrics.mark_finished();
         const auto metrics_snapshot = run_metrics.snapshot();
 
@@ -1352,6 +1682,11 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                     {"instructions", run.instruction_count},
                     {"ratio", ratio},
                     {"efficiency", efficiency},
+                    {"phases", run.harvested_metrics
+                        ? scorecard_phase_entries(*run.harvested_metrics) : json(nullptr)},
+                    {"phases_status", run.harvested_metrics
+                        ? json("measured") : json(
+                            "not_applicable:workspace_baseline_metrics_publication_unavailable")},
                     {"snapshot_sha256", run.snapshot_sha256}});
                 if (run.budget <= 16)
                     n16 = (std::max)(n16, run.budget);
@@ -1424,21 +1759,47 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         const double wall_scale = request.mode == benchmark_mode_t::synthetic
             ? static_cast<double>(request.synthetic_code_bytes) / (300.0 * 1024.0 * 1024.0)
             : 1.0;
-        const double decode_wall_s = decode_window_ns == 0
-            ? 0.0 : static_cast<double>(decode_window_ns) / 1000000000.0;
-        const json decode_bps = decode_window_ns == 0 ? json(nullptr)
+        const std::uint64_t harvested_decode_wall_ns = harvested_available
+            ? harvested->phases[static_cast<std::size_t>(baseline_phase_t::decode)].wall_ns +
+                harvested->phases[static_cast<std::size_t>(baseline_phase_t::decode_merge)].wall_ns
+            : 0;
+        const std::uint64_t decode_effective_ns =
+            harvested_available ? harvested_decode_wall_ns : decode_window_ns;
+        if (harvested_available) {
+            diag::log_tagged_fmt("benchmark",
+                "phase_window_crosscheck harvested_decode_merge_ms=%llu inferred_decode_window_ms=%llu granularity_ms=%u",
+                static_cast<unsigned long long>(harvested_decode_wall_ns / 1000000ULL),
+                static_cast<unsigned long long>(decode_window_ns / 1000000ULL), 25U);
+        }
+        const double decode_wall_s = decode_effective_ns == 0
+            ? 0.0 : static_cast<double>(decode_effective_ns) / 1000000000.0;
+        const json decode_bps = decode_effective_ns == 0 ? json(nullptr)
             : json(static_cast<double>(decoded_bytes) / decode_wall_s);
         const json file_bps = analysis_wall_ns == 0 ? json(nullptr)
             : json(static_cast<double>(file_bytes) * 1000000000.0 /
                 static_cast<double>(analysis_wall_ns));
-        const json instructions_s = decode_window_ns == 0 ? json(nullptr)
+        const json instructions_s = decode_effective_ns == 0 ? json(nullptr)
             : json(static_cast<double>(snapshot->instructions.size()) / decode_wall_s);
-        const json publish_ms = windows.publish_wall_ns() == 0 ? json(nullptr)
-            : json(static_cast<double>(windows.publish_wall_ns()) / 1000000.0);
+        const json publish_ms = harvested_available
+            ? json(static_cast<double>(
+                harvested->phases[static_cast<std::size_t>(
+                    baseline_phase_t::publish_ready)].wall_ns) / 1000000.0)
+            : (windows.publish_wall_ns() == 0 ? json(nullptr)
+                : json(static_cast<double>(windows.publish_wall_ns()) / 1000000.0));
         const json query_p95_ms = query_samples.empty() ? json(nullptr)
             : json(static_cast<double>(percentile_value(query_samples, 0.95)) / 1000000.0);
-        const json decompile_p95_ms = decompile_samples.empty() ? json(nullptr)
-            : json(static_cast<double>(percentile_value(decompile_samples, 0.95)) / 1000000.0);
+        const json decompile_p95_ms = decompile_stage.latency_p95_ns.is_number()
+            ? json(decompile_stage.latency_p95_ns.get<std::uint64_t>() / 1000000.0)
+            : json(nullptr);
+        const json metadata_ready_ms = harvested_available
+            ? json(static_cast<double>(
+                harvested->phases[static_cast<std::size_t>(
+                    baseline_phase_t::metadata_symbols_types)].wall_ns) / 1000000.0)
+            : json(nullptr);
+        const std::uint64_t mapped_workspace_peak = harvested_available
+            ? harvested->value(analysis_metric_t::mapped_window_bytes_peak) : 0;
+        const std::uint64_t mapped_global_peak = harvested_available
+            ? harvested->value(analysis_metric_t::mapped_window_bytes_global_peak) : 0;
 
         json verdicts = json::array();
         const auto push_max = [&](const char* key, double target, const json& actual) {
@@ -1456,6 +1817,15 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             }
             verdicts.push_back(verdict_entry(key, target, actual,
                 actual.get<double>() >= target ? "PASS" : "FAIL"));
+        };
+        const auto push_max_u64 = [&](const char* key, std::uint64_t target,
+                                      std::uint64_t actual, bool measured) {
+            if (!measured) {
+                verdicts.push_back(verdict_entry(key, target, nullptr, "NOT_MEASURED"));
+                return;
+            }
+            verdicts.push_back(verdict_entry(key, target, actual,
+                actual <= target ? "PASS" : "FAIL"));
         };
         push_max("total_wall_ms_max_300mb",
             thresholds["total_wall_ms_max_300mb"].get<double>() * wall_scale, wall_ms);
@@ -1475,22 +1845,21 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             publish_ms);
         push_max("indexed_query_p95_ms_max",
             thresholds["indexed_query_p95_ms_max"].get<double>(), query_p95_ms);
-        verdicts.push_back(verdict_entry("metadata_ready_ms_max",
-            thresholds["metadata_ready_ms_max"], nullptr, "NOT_MEASURED"));
+        push_max("metadata_ready_ms_max",
+            thresholds["metadata_ready_ms_max"].get<double>(), metadata_ready_ms);
         push_max("warm_reopen_ms_max", thresholds["warm_reopen_ms_max"].get<double>(),
             warm_reopen_measured ? json(warm_reopen_ms) : json(nullptr));
         verdicts.push_back(verdict_entry("cancellation_p95_ms_max",
             thresholds["cancellation_p95_ms_max"], nullptr, "NOT_MEASURED"));
-        verdicts.push_back(verdict_entry("incremental_private_bytes_max",
-            thresholds["incremental_private_bytes_max"],
-            metrics_snapshot.value(analysis_metric_t::peak_private_bytes),
-            metrics_snapshot.value(analysis_metric_t::peak_private_bytes) <=
-                thresholds["incremental_private_bytes_max"].get<std::uint64_t>()
-                ? "PASS" : "FAIL"));
-        verdicts.push_back(verdict_entry("workspace_mapped_bytes_max",
-            thresholds["workspace_mapped_bytes_max"], nullptr, "NOT_MEASURED"));
-        verdicts.push_back(verdict_entry("global_mapped_bytes_max",
-            thresholds["global_mapped_bytes_max"], nullptr, "NOT_MEASURED"));
+        push_max_u64("incremental_private_bytes_max",
+            thresholds["incremental_private_bytes_max"].get<std::uint64_t>(),
+            metrics_snapshot.value(analysis_metric_t::peak_private_bytes), true);
+        push_max_u64("workspace_mapped_bytes_max",
+            thresholds["workspace_mapped_bytes_max"].get<std::uint64_t>(),
+            mapped_workspace_peak, harvested_available && mapped_workspace_peak != 0);
+        push_max_u64("global_mapped_bytes_max",
+            thresholds["global_mapped_bytes_max"].get<std::uint64_t>(),
+            mapped_global_peak, harvested_available && mapped_global_peak != 0);
         push_min("decompile_all_funcs_per_s_min",
             thresholds["decompile_all_funcs_per_s_min"].get<double>(),
             batch_ran ? json(batch_funcs_per_s) : json(nullptr));
@@ -1558,8 +1927,9 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         if (batch_ran) {
             diag::log_tagged_fmt("benchmark",
                 "phase name=%s wall_ms=%llu cpu_ms=%llu bytes_in=%llu work_items=%llu",
-                "decompile_batch", static_cast<unsigned long long>(batch_wall_ns / 1000000ULL),
-                0ULL, 0ULL, static_cast<unsigned long long>(batch_completed));
+                "decompile_batch",
+                static_cast<unsigned long long>(decompile_stage.wall_ns / 1000000ULL),
+                0ULL, 0ULL, static_cast<unsigned long long>(decompile_stage.completed));
         }
         diag::log_tagged_fmt("benchmark",
             "memory peak_private=%llu resident_peak=%llu mapped_ws_peak=%llu mapped_global_peak=%llu spill_peak=%llu",
@@ -1567,7 +1937,10 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 metrics_snapshot.value(analysis_metric_t::peak_private_bytes)),
             static_cast<unsigned long long>(
                 metrics_snapshot.value(analysis_metric_t::resident_bytes_peak)),
-            0ULL, 0ULL, 0ULL);
+            static_cast<unsigned long long>(mapped_workspace_peak),
+            static_cast<unsigned long long>(mapped_global_peak),
+            static_cast<unsigned long long>(harvested_available
+                ? harvested->value(analysis_metric_t::spill_bytes_peak) : 0));
         diag::log_tagged_fmt("benchmark",
             "throughput file_Bps=%.1f decode_Bps=%.1f instr_s=%.1f funcs_s=%.2f",
             file_bps.is_number() ? file_bps.get<double>() : 0.0,
@@ -1582,14 +1955,240 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 verdict.value("verdict", std::string()).c_str());
         }
 
-        const std::string verdict = sla_overall == "FAIL"
+        std::string verdict = sla_overall == "FAIL"
             ? (request.sla_relaxed ? "PASS" : "FAIL") : "PASS";
+
+        const json phases_block = harvested_available
+            ? scorecard_phase_entries(*harvested)
+            : json::array({
+                json{{"name", "baseline_analysis"}, {"invocations", 1},
+                    {"wall_ns", analysis_wall_ns},
+                    {"throughput_bytes_per_s", file_bps}},
+                json{{"name", "decode_window"}, {"invocations", 1},
+                    {"wall_ns", decode_window_ns},
+                    {"throughput_bytes_per_s", decode_bps}}});
+        const char* phases_status = harvested_available
+            ? "measured" : "not_applicable:workspace_baseline_metrics_publication_unavailable";
+
+        SYSTEM_INFO host_system{};
+        GetNativeSystemInfo(&host_system);
+        const auto host_logical =
+            static_cast<std::uint64_t>((std::max)(1U, host_system.dwNumberOfProcessors));
+        const std::uint64_t slots_busy_ns = harvested_available
+            ? harvested->value(analysis_metric_t::worker_slots_busy_ns) : 0;
+        const std::uint64_t slots_scheduled_ns = harvested_available
+            ? harvested->value(analysis_metric_t::worker_slots_scheduled_ns) : 0;
+        json parallelism_efficiency = nullptr;
+        if (harvested_available && analysis_wall_ns != 0 && slots_busy_ns != 0) {
+            const double denominator = static_cast<double>(analysis_wall_ns) *
+                static_cast<double>(host_logical);
+            parallelism_efficiency = (std::min)(1.0,
+                static_cast<double>(slots_busy_ns) / denominator);
+        }
+        const json worker_pool_block = harvested_available
+            ? json{{"status", "measured"},
+                {"slots_busy_ns", slots_busy_ns},
+                {"slots_scheduled_ns", slots_scheduled_ns},
+                {"utilization", slots_scheduled_ns == 0 ? json(nullptr)
+                    : json(static_cast<double>(slots_busy_ns) /
+                        static_cast<double>(slots_scheduled_ns))},
+                {"parallelism_efficiency", parallelism_efficiency},
+                {"logical_cores", host_logical},
+                {"queue_wait_ns_total",
+                    harvested->value(analysis_metric_t::queue_wait_ns_total)},
+                {"queue_wait_max_ns",
+                    harvested->value(analysis_metric_t::queue_wait_max_ns)},
+                {"queue_depth_mean",
+                    harvested->value(analysis_metric_t::queue_depth_samples) == 0
+                        ? json(nullptr)
+                        : json(static_cast<double>(
+                            harvested->value(analysis_metric_t::queue_depth_sum)) /
+                            static_cast<double>(
+                                harvested->value(analysis_metric_t::queue_depth_samples)))},
+                {"queue_depth_peak",
+                    harvested->value(analysis_metric_t::peak_queue_depth)},
+                {"tasks_scheduled",
+                    harvested->value(analysis_metric_t::tasks_scheduled)},
+                {"tasks_completed",
+                    harvested->value(analysis_metric_t::tasks_completed)},
+                {"tasks_rejected",
+                    harvested->value(analysis_metric_t::tasks_rejected)}}
+            : json{{"status", "not_applicable"},
+                {"reason", metrics_unavailable_reason},
+                {"slots_busy_ns", nullptr},
+                {"slots_scheduled_ns", nullptr},
+                {"utilization", nullptr},
+                {"parallelism_efficiency", nullptr}};
+
+        const std::uint64_t harvested_search_index_wall_ns = harvested_available
+            ? harvested->phases[static_cast<std::size_t>(
+                baseline_phase_t::search_index)].wall_ns
+            : 0;
+        const std::uint64_t harvested_persistence_wall_ns = harvested_available
+            ? harvested->phases[static_cast<std::size_t>(
+                baseline_phase_t::persistence)].wall_ns
+            : 0;
+        const json index_bps = harvested_available
+            ? nullable_rate(harvested->value(analysis_metric_t::index_text_bytes),
+                harvested_search_index_wall_ns)
+            : json(nullptr);
+        const json persist_bps = harvested_available
+            ? nullable_rate(harvested->value(analysis_metric_t::database_bytes_written),
+                harvested_persistence_wall_ns)
+            : (database.last_commit_elapsed_us == 0 ? json(nullptr)
+                : json(static_cast<double>(database.last_commit_page_write_bytes) /
+                    (static_cast<double>(database.last_commit_elapsed_us) / 1000000.0)));
+
+        const json decode_detail_block = harvested_available
+            ? json{{"status", "measured"},
+                {"decoded_bytes", decoded_bytes},
+                {"tiles", harvested->value(analysis_metric_t::decode_tiles)},
+                {"requests", harvested->value(analysis_metric_t::decode_requests)},
+                {"waves", harvested->value(analysis_metric_t::decode_waves)},
+                {"frontier_seeds",
+                    harvested->value(analysis_metric_t::decode_frontier_seeds)},
+                {"cross_tile_edges",
+                    harvested->value(analysis_metric_t::decode_cross_tile_edges)},
+                {"invalid_bytes",
+                    harvested->value(analysis_metric_t::decode_invalid_bytes)},
+                {"invalid_runs",
+                    harvested->value(analysis_metric_t::decode_invalid_runs)},
+                {"duplicate_instructions",
+                    harvested->value(analysis_metric_t::decode_duplicate_instructions)},
+                {"merge_ns", harvested->value(analysis_metric_t::decode_merge_ns)},
+                {"lane_wall_ns_max",
+                    harvested->value(analysis_metric_t::decode_lane_wall_ns_max)},
+                {"bytes_attempted",
+                    harvested->value(analysis_metric_t::decode_bytes_attempted)}}
+            : json{{"status", "not_applicable"},
+                {"reason", metrics_unavailable_reason},
+                {"decoded_bytes", decoded_bytes},
+                {"decode_window_ns", decode_window_ns},
+                {"merge_window_ns", windows.merge_wall_ns()}};
+
+        const json memory_block = json{
+            {"status", harvested_available ? "measured" : "partial"},
+            {"peak_private_bytes",
+                metrics_snapshot.value(analysis_metric_t::peak_private_bytes)},
+            {"peak_committed_bytes",
+                metrics_snapshot.value(analysis_metric_t::peak_committed_bytes)},
+            {"resident_bytes_peak",
+                metrics_snapshot.value(analysis_metric_t::resident_bytes_peak)},
+            {"peak_rss_bytes", sampler_summary["peak_rss_bytes"]},
+            {"mean_rss_bytes", sampler_summary["mean_rss_bytes"]},
+            {"sample_count", sampler_summary["sample_count"]},
+            {"sample_interval_ms", sampler_summary["sample_interval_ms"]},
+            {"peak_active_workers", sampler_summary["peak_active_workers"]},
+            {"mapped_workspace_peak",
+                harvested_available ? json(mapped_workspace_peak) : json(nullptr)},
+            {"mapped_global_peak",
+                harvested_available ? json(mapped_global_peak) : json(nullptr)},
+            {"spill_bytes_peak", harvested_available
+                ? json(harvested->value(analysis_metric_t::spill_bytes_peak))
+                : json(nullptr)},
+            {"spill_bytes_written", harvested_available
+                ? json(harvested->value(analysis_metric_t::spill_bytes_written))
+                : json(nullptr)},
+            {"spill_bytes_read", harvested_available
+                ? json(harvested->value(analysis_metric_t::spill_bytes_read))
+                : json(nullptr)},
+            {"budget_rejections", harvested_available
+                ? json(harvested->value(analysis_metric_t::budget_rejections))
+                : json(nullptr)},
+            {"pressure_events", harvested_available
+                ? json(harvested->value(analysis_metric_t::memory_pressure_events))
+                : json(nullptr)}};
+
+        const std::uint64_t persist_logical_bytes = harvested_available
+            ? harvested->value(analysis_metric_t::database_logical_bytes)
+            : database.cumulative_logical_bytes;
+        const std::uint64_t persist_bytes_written = harvested_available
+            ? harvested->value(analysis_metric_t::database_bytes_written)
+            : database.cumulative_page_write_bytes;
+        json write_amplification = nullptr;
+        if (persist_logical_bytes != 0) {
+            write_amplification = static_cast<double>(persist_bytes_written) /
+                static_cast<double>(persist_logical_bytes);
+        }
+        const json persistence_block = json{
+            {"status", harvested_available ? "measured" : "partial"},
+            {"database_bytes", database.database_bytes},
+            {"wal_bytes", database.wal_bytes},
+            {"logical_bytes", persist_logical_bytes},
+            {"rows", database.cumulative_rows},
+            {"bytes_written", persist_bytes_written},
+            {"page_write_bytes", database.cumulative_page_write_bytes},
+            {"last_commit_elapsed_us", database.last_commit_elapsed_us},
+            {"commit_elapsed_ns", harvested_available
+                ? json(harvested->value(analysis_metric_t::database_commit_elapsed_ns))
+                : json(nullptr)},
+            {"write_amplification", write_amplification},
+            {"queue_wait_ns", harvested_available
+                ? json(harvested->value(analysis_metric_t::persist_queue_wait_ns))
+                : json(nullptr)},
+            {"queue_depth_peak", harvested_available
+                ? json(harvested->value(analysis_metric_t::persist_queue_depth_peak))
+                : json(nullptr)},
+            {"pages_written", harvested_available
+                ? json(harvested->value(analysis_metric_t::persist_pages_written))
+                : json(nullptr)},
+            {"wal_bytes_peak", harvested_available
+                ? json(harvested->value(analysis_metric_t::persist_wal_bytes_peak))
+                : json(nullptr)}};
+
+        json decompile_block;
+        if (batch_ran) {
+            const std::uint64_t cache_hits = decompile_stage.memory_cache_hits +
+                decompile_stage.persistent_cache_hits;
+            decompile_block = json{
+                {"engine", "parallel_batch"},
+                {"wiring", decompile_stage.wiring},
+                {"calls", decompile_stage.calls},
+                {"completed", decompile_stage.completed},
+                {"failed", decompile_stage.failed},
+                {"cancelled", decompile_stage.cancelled},
+                {"total", decompile_stage.total},
+                {"wall_ns", decompile_stage.wall_ns},
+                {"funcs_per_s", decompile_stage.funcs_per_s},
+                {"p50_ns", decompile_stage.latency_p50_ns},
+                {"p95_ns", decompile_stage.latency_p95_ns},
+                {"latency_model", "interval_throughput_derived_service_time"},
+                {"latency_samples", decompile_stage.latency_samples},
+                {"memory_cache_hits", decompile_stage.memory_cache_hits},
+                {"persistent_cache_hits", decompile_stage.persistent_cache_hits},
+                {"cache_hit_rate", decompile_stage.calls == 0 ? json(nullptr)
+                    : json(static_cast<double>(cache_hits) /
+                        static_cast<double>(decompile_stage.calls))},
+                {"queue_depth_peak", decompile_stage.queue_depth_peak},
+                {"slots", decompile_stage.slots},
+                {"slots_effective_peak", decompile_stage.slots_effective_peak},
+                {"truncated", decompile_stage.truncated}};
+        } else {
+            decompile_block = json{
+                {"engine", "parallel_batch"},
+                {"status", "not_applicable"},
+                {"reason", decompile_stage.unavailable_reason.empty()
+                    ? "decompile_stage_not_run" : decompile_stage.unavailable_reason},
+                {"funcs_per_s", nullptr}};
+        }
+
+        const json phase_budgets_block = evaluate_phase_budgets(
+            phases_block, wall_ms, wall_scale);
+
         json scorecard = json{
-            {"scorecard_schema", "aida.hyperperf.program-scorecard"},
-            {"scorecard_schema_version", 1},
+            {"scorecard_schema", scorecard_schema_v2},
+            {"scorecard_schema_version", scorecard_schema_v2_version},
             {"run_id", utc_run_id()},
             {"mode", mode},
             {"claim_status", "measurement_only"},
+            {"claim", json{
+                {"tracks", json::array({
+                    json{{"id", "auto_analysis_wall"},
+                        {"definition", "total_wall_ms open-to-baseline_ready at or below total_wall_ms_max_300mb on a 300..500MB real binary"}},
+                    json{{"id", "batch_decompile_throughput"},
+                        {"definition", "decompile_all_funcs_per_s on the parallel production batch engine; a throughput claim, never a minutes claim"}}})},
+                {"real_mode_invocation",
+                    "Test Lab analysis_benchmark_real_300mb with AIDA_BENCHMARK_REAL_PE=<path> (optional AIDA_BENCHMARK_REAL_SLA_RELAX=1), or MCP analysis_benchmark_manage run_real, or headless analysis_benchmark_harness real <path>"}}},
             {"host", host_identity_block(fixture_path)},
             {"fixture", json{{"kind", request.mode == benchmark_mode_t::synthetic
                 ? "synthetic" : "real"},
@@ -1607,52 +2206,45 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"run_determinism_stage", request.run_determinism_stage},
                 {"determinism_runs", request.determinism_runs},
                 {"scaling_worker_budgets", request.scaling_worker_budgets},
+                {"decompile_batch_lanes", request.decompile_batch_lanes},
+                {"decompile_batch_max_functions", request.decompile_batch_max_functions},
+                {"decompile_batch_max_ms", request.decompile_batch_max_ms},
+                {"memory_sample_interval_ms", request.memory_sample_interval_ms},
+                {"baseline_report_path", request.baseline_report_path.empty()
+                    ? json(nullptr) : json(request.baseline_report_path)},
+                {"record_baseline_name", request.record_baseline_name.empty()
+                    ? json(nullptr) : json(request.record_baseline_name)},
                 {"wall_ns", analysis_wall_ns},
                 {"process_cpu_ns", process_cpu_ns_now() - cpu_begin},
                 {"analysis_revision", snapshot->analysis_revision},
                 {"overlay_revision", snapshot->overlay_revision},
                 {"generation", snapshot->generation},
                 {"decode_window_ns", decode_window_ns},
-                {"decode_window_granularity_ms", 25}}},
-            {"phases", json::array({
-                json{{"name", "baseline_analysis"}, {"invocations", 1},
-                    {"wall_ns", analysis_wall_ns},
-                    {"throughput_bytes_per_s", file_bps}},
-                json{{"name", "decode_window"}, {"invocations", 1},
-                    {"wall_ns", decode_window_ns},
-                    {"throughput_bytes_per_s", decode_bps}}})},
+                {"phase_window_crosscheck", json{
+                    {"decode_window_ns", windows.decode_wall_ns()},
+                    {"merge_window_ns", windows.merge_wall_ns()},
+                    {"publish_window_ns", windows.publish_wall_ns()},
+                    {"sample_granularity_ms", 25}}}}},
+            {"phases", std::move(phases_block)},
+            {"phases_status", phases_status},
             {"throughput", json{{"file_bytes_per_s", file_bps},
                 {"decode_bytes_per_s", decode_bps},
                 {"instructions_per_s", instructions_s},
                 {"functions_per_s", analysis_wall_ns == 0 ? json(nullptr)
                     : json(static_cast<double>(snapshot->functions.size()) * 1000000000.0 /
                         static_cast<double>(analysis_wall_ns))},
-                {"index_bytes_per_s", nullptr},
-                {"persist_bytes_per_s", database.last_commit_elapsed_us == 0 ? json(nullptr)
-                    : json(static_cast<double>(database.last_commit_page_write_bytes) /
-                        (static_cast<double>(database.last_commit_elapsed_us) / 1000000.0))},
+                {"index_bytes_per_s", index_bps},
+                {"persist_bytes_per_s", persist_bps},
                 {"decompile_all_funcs_per_s",
                     batch_ran ? json(batch_funcs_per_s) : json(nullptr)}}},
-            {"worker_pool", nullptr},
-            {"decode_detail", json{{"decoded_bytes", decoded_bytes},
-                {"decode_window_ns", decode_window_ns},
-                {"merge_window_ns", windows.merge_wall_ns()}}},
-            {"memory", json{
-                {"peak_private_bytes", metrics_snapshot.value(analysis_metric_t::peak_private_bytes)},
-                {"peak_committed_bytes", metrics_snapshot.value(analysis_metric_t::peak_committed_bytes)},
-                {"resident_bytes_peak", metrics_snapshot.value(analysis_metric_t::resident_bytes_peak)},
-                {"mapped_workspace_peak", 0},
-                {"mapped_global_peak", 0},
-                {"spill_bytes_peak", 0}}},
-            {"persistence", json{{"database_bytes", database.database_bytes},
-                {"wal_bytes", database.wal_bytes},
-                {"logical_bytes", database.cumulative_logical_bytes},
-                {"rows", database.cumulative_rows},
-                {"page_write_bytes", database.cumulative_page_write_bytes},
-                {"last_commit_elapsed_us", database.last_commit_elapsed_us}}},
+            {"worker_pool", std::move(worker_pool_block)},
+            {"decode_detail", std::move(decode_detail_block)},
+            {"memory", std::move(memory_block)},
+            {"persistence", std::move(persistence_block)},
+            {"decompile", std::move(decompile_block)},
             {"interaction", json{{"warm_reopen_ms",
                 warm_reopen_measured ? json(warm_reopen_ms) : json(nullptr)},
-                {"metadata_ready_ms", nullptr},
+                {"metadata_ready_ms", metadata_ready_ms},
                 {"indexed_query_p95_ms", query_p95_ms},
                 {"decompile_p95_ms", decompile_p95_ms},
                 {"cancellation_request_to_completion_ms", nullptr}}},
@@ -1663,11 +2255,14 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"xrefs", snapshot->xrefs.size()},
                 {"strings", snapshot->strings.size()},
                 {"symbols", snapshot->symbols.size()},
+                {"types", search ? json(search->types().size()) : json(nullptr)},
                 {"decoded_bytes", decoded_bytes}}},
+            {"phase_budgets", std::move(phase_budgets_block)},
             {"scaling", std::move(scaling_block)},
             {"determinism", std::move(determinism_block)},
             {"sla", std::move(sla)},
             {"artifacts", json{{"report_json", nullptr},
+                {"baseline_json", nullptr},
                 {"compare_verdict_json", nullptr}, {"receipt_json", nullptr}}},
             {"verdict", verdict}};
 
@@ -1684,8 +2279,85 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"note", "no determinism stage ran for this request; determinism_hash_match remains NOT_MEASURED"}};
         }
 
+        const std::string artifact_directory =
+            request.out_dir.empty() ? benchmark_results_dir() : request.out_dir;
+        json compare_verdict = nullptr;
+        std::string compare_artifact_path;
+        if (!request.baseline_report_path.empty()) {
+            std::ifstream baseline_stream(
+                std::filesystem::u8path(request.baseline_report_path), std::ios::binary);
+            if (!baseline_stream)
+                throw std::runtime_error("baseline report is unavailable: " +
+                    request.baseline_report_path);
+            json baseline_report;
+            try {
+                baseline_stream >> baseline_report;
+            } catch (const json::exception& exception) {
+                throw std::runtime_error(std::string(
+                    "baseline report JSON is invalid: ") + exception.what());
+            }
+            compare_verdict = compare_scorecards(baseline_report, scorecard);
+            compare_verdict["baseline"] = request.baseline_report_path;
+            compare_verdict["candidate"] = "current_run";
+            const auto compare_overall = compare_verdict.value("overall", std::string());
+            if (compare_overall == "FAIL" && !request.sla_relaxed) {
+                verdict = "FAIL";
+                scorecard["verdict"] = verdict;
+            }
+            compare_artifact_path = (std::filesystem::u8path(artifact_directory) /
+                ("compare_" + std::string(mode) + "_" + utc_stamp_filename() + ".json"))
+                    .u8string();
+            scorecard["artifacts"]["compare_verdict_json"] = compare_artifact_path;
+            diag::log_tagged_fmt("benchmark", "compare overall=%s baseline=%s",
+                compare_overall.c_str(), request.baseline_report_path.c_str());
+            for (const auto& entry : compare_verdict["verdicts"]) {
+                diag::log_tagged_fmt("benchmark",
+                    "compare key=%s baseline=%s candidate=%s delta_pct=%s verdict=%s",
+                    entry.value("key", std::string()).c_str(),
+                    json_value_text(entry["baseline"]).c_str(),
+                    json_value_text(entry["candidate"]).c_str(),
+                    json_value_text(entry["delta_pct"]).c_str(),
+                    entry.value("verdict", std::string()).c_str());
+            }
+        }
+
+        std::string baseline_record_path;
+        if (!request.record_baseline_name.empty()) {
+            const auto& name = request.record_baseline_name;
+            const bool valid_name = !name.empty() && name.size() <= 64 &&
+                name.find("..") == std::string::npos &&
+                std::all_of(name.begin(), name.end(), [](char ch) {
+                    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.';
+                });
+            if (!valid_name)
+                throw std::runtime_error(
+                    "record_baseline_name must be 1..64 chars of [A-Za-z0-9._-] without '..'");
+            const auto baseline_dir = std::filesystem::u8path(artifact_directory) / "baselines";
+            std::error_code baseline_dir_error;
+            std::filesystem::create_directories(baseline_dir, baseline_dir_error);
+            if (baseline_dir_error)
+                throw std::runtime_error("baseline directory creation failed: " +
+                    baseline_dir_error.message());
+            baseline_record_path = (baseline_dir / (name + ".json")).u8string();
+            scorecard["artifacts"]["baseline_json"] = baseline_record_path;
+        }
+
         const std::string report_path = write_benchmark_artifacts(
             request.out_dir, mode, scorecard);
+        if (!compare_verdict.is_null()) {
+            write_json_file(std::filesystem::u8path(compare_artifact_path),
+                compare_verdict.dump(2));
+        }
+        if (!baseline_record_path.empty()) {
+            const std::string temporary = baseline_record_path + ".tmp";
+            write_json_file(std::filesystem::u8path(temporary), scorecard.dump(2));
+            if (!MoveFileExW(std::filesystem::u8path(temporary).wstring().c_str(),
+                std::filesystem::u8path(baseline_record_path).wstring().c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                throw std::runtime_error("baseline artifact replace failed: " +
+                    std::to_string(GetLastError()));
+        }
         diag::log_tagged_fmt("benchmark", "run_end wall_ms=%llu verdict=%s report=%s",
             static_cast<unsigned long long>(wall_ms), verdict.c_str(), report_path.c_str());
         result.ok = true;

@@ -11,7 +11,6 @@
 #include <atomic>
 #include <charconv>
 #include <cctype>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <new>
@@ -565,17 +564,29 @@ workspace_result_t<void> accumulate_budgets(collect_totals_t& totals,
     return workspace_result_t<void>::success();
 }
 
+template <typename Fn>
+void run_merge_shards(std::size_t shard_total, Fn&& shard_fn) {
+    parallel_executor_t::run(shard_total, parallel_worker_count(),
+        "analysis.symbol_type_candidates", std::forward<Fn>(shard_fn));
+}
+
 template <typename T>
 void append_sink_vectors(std::vector<T>& out, std::vector<collect_sink_t>& sinks,
     std::vector<T> collect_sink_t::* member) {
-    std::size_t total = 0;
-    for (const auto& sink : sinks)
-        total += (sink.*member).size();
-    out.reserve(out.size() + total);
-    for (auto& sink : sinks) {
-        auto& source = sink.*member;
-        std::move(source.begin(), source.end(), std::back_inserter(out));
+    std::vector<std::uint64_t> bases(sinks.size(), 0);
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index < sinks.size(); ++index) {
+        bases[index] = total;
+        total += (sinks[index].*member).size();
     }
+    const auto offset = out.size();
+    out.resize(offset + static_cast<std::size_t>(total));
+    run_merge_shards(sinks.size(), [&](std::size_t slot) {
+        auto& source = sinks[slot].*member;
+        auto cursor = offset + bases[slot];
+        for (auto& value : source)
+            out[static_cast<std::size_t>(cursor++)] = std::move(value);
+    });
 }
 
 template <typename T, typename SameRun>
@@ -618,10 +629,21 @@ std::uint64_t unique_aligned(std::vector<T>& items, Equal&& equal,
         total_removed += removed[index];
         total_kept += kept[index].size();
     }
-    std::vector<T> compacted;
-    compacted.reserve(total_kept);
-    for (auto& shard_kept : kept)
-        std::move(shard_kept.begin(), shard_kept.end(), std::back_inserter(compacted));
+    std::vector<T> compacted(total_kept);
+    {
+        std::vector<std::uint64_t> bases(shards.size(), 0);
+        std::uint64_t cursor = 0;
+        for (std::size_t index = 0; index < shards.size(); ++index) {
+            bases[index] = cursor;
+            cursor += kept[index].size();
+        }
+        run_merge_shards(shards.size(), [&](std::size_t slot) {
+            auto& shard_kept = kept[slot];
+            auto slot_cursor = bases[slot];
+            for (auto& value : shard_kept)
+                compacted[static_cast<std::size_t>(slot_cursor++)] = std::move(value);
+        });
+    }
     items = std::move(compacted);
     return total_removed;
 }
@@ -1318,9 +1340,22 @@ workspace_result_t<symbol_type_candidate_result_t> build_impl(
         std::size_t total = 0;
         for (const auto& local : per_shard)
             total += local.size();
-        named_functions.reserve(total);
-        for (auto& local : per_shard)
-            std::move(local.begin(), local.end(), std::back_inserter(named_functions));
+        named_functions.resize(total);
+        {
+            std::vector<std::uint64_t> bases(per_shard.size(), 0);
+            std::uint64_t cursor = 0;
+            for (std::size_t index = 0; index < per_shard.size(); ++index) {
+                bases[index] = cursor;
+                cursor += per_shard[index].size();
+            }
+            run_merge_shards(per_shard.size(), [&](std::size_t slot) {
+                auto& local = per_shard[slot];
+                auto slot_cursor = bases[slot];
+                for (auto& value : local)
+                    named_functions[static_cast<std::size_t>(slot_cursor++)] =
+                        std::move(value);
+            });
+        }
         parallel_sort(named_functions.begin(), named_functions.end(),
             [](std::uint64_t lhs, std::uint64_t rhs) { return lhs < rhs; });
         unique_aligned(named_functions,
@@ -1450,9 +1485,22 @@ workspace_result_t<symbol_type_candidate_result_t> build_impl(
             std::size_t total = 0;
             for (const auto& local : per_shard)
                 total += local.size();
-            pointers.reserve(total);
-            for (auto& local : per_shard)
-                std::move(local.begin(), local.end(), std::back_inserter(pointers));
+            pointers.resize(total);
+            {
+                std::vector<std::uint64_t> bases(per_shard.size(), 0);
+                std::uint64_t cursor = 0;
+                for (std::size_t index = 0; index < per_shard.size(); ++index) {
+                    bases[index] = cursor;
+                    cursor += per_shard[index].size();
+                }
+                run_merge_shards(per_shard.size(), [&](std::size_t slot) {
+                    auto& local = per_shard[slot];
+                    auto slot_cursor = bases[slot];
+                    for (auto& value : local)
+                        pointers[static_cast<std::size_t>(slot_cursor++)] =
+                            std::move(value);
+                });
+            }
         }
         parallel_sort(pointers.begin(), pointers.end(), [&](const auto* lhs, const auto* rhs) {
             const auto left = to_rva(image, lhs->address).value_or(image.image_size);

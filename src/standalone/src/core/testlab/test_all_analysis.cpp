@@ -4977,6 +4977,7 @@ static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& pass
 
     std::string failing_keys;
     bool parse_ok = false;
+    bool v2_complete = true;
     if (!result.scorecard_json.empty()) {
         try {
             const auto scorecard = nlohmann::json::parse(result.scorecard_json);
@@ -5019,6 +5020,58 @@ static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& pass
                     }
                 }
             }
+            std::string v2_failures;
+            const auto v2_fail = [&v2_failures](const char* what) {
+                if (!v2_failures.empty())
+                    v2_failures += ",";
+                v2_failures += what;
+            };
+            if (!scorecard.contains("scorecard_schema_version") ||
+                !scorecard["scorecard_schema_version"].is_number() ||
+                scorecard["scorecard_schema_version"].get<int>() != 2)
+                v2_fail("scorecard_schema_version");
+            if (!scorecard.contains("phases") || !scorecard["phases"].is_array() ||
+                scorecard["phases"].size() != 13) {
+                v2_fail("phases");
+            } else {
+                for (const auto& phase : scorecard["phases"]) {
+                    const auto wall_ns = phase.value("wall_ns", 0ULL);
+                    log_msg(hf, "analysis", "benchmark phase name=%s wall_ms=%.3f bytes_out=%llu",
+                        phase.value("name", std::string()).c_str(),
+                        static_cast<double>(wall_ns) / 1000000.0,
+                        static_cast<unsigned long long>(phase.value("bytes_out", 0ULL)));
+                }
+            }
+            if (!scorecard.contains("worker_pool") || !scorecard["worker_pool"].is_object() ||
+                !scorecard["worker_pool"].contains("parallelism_efficiency") ||
+                !scorecard["worker_pool"]["parallelism_efficiency"].is_number() ||
+                scorecard["worker_pool"]["parallelism_efficiency"].get<double>() <= 0.0 ||
+                scorecard["worker_pool"]["parallelism_efficiency"].get<double>() > 1.0) {
+                v2_fail("worker_pool.parallelism_efficiency");
+            } else {
+                log_msg(hf, "analysis", "benchmark worker_pool parallelism_efficiency=%.4f utilization=%.4f",
+                    scorecard["worker_pool"]["parallelism_efficiency"].get<double>(),
+                    number_or_zero(scorecard["worker_pool"], "utilization"));
+            }
+            if (!scorecard.contains("memory") || !scorecard["memory"].is_object() ||
+                !scorecard["memory"].contains("peak_rss_bytes") ||
+                !scorecard["memory"]["peak_rss_bytes"].is_number() ||
+                scorecard["memory"]["peak_rss_bytes"].get<std::uint64_t>() == 0)
+                v2_fail("memory.peak_rss_bytes");
+            const bool functions_present = scorecard.contains("counts") &&
+                scorecard["counts"].is_object() &&
+                scorecard["counts"].value("functions", 0ULL) > 0;
+            if (functions_present &&
+                (!scorecard.contains("decompile") || !scorecard["decompile"].is_object() ||
+                    !scorecard["decompile"].contains("funcs_per_s") ||
+                    !scorecard["decompile"]["funcs_per_s"].is_number() ||
+                    scorecard["decompile"]["funcs_per_s"].get<double>() <= 0.0))
+                v2_fail("decompile.funcs_per_s");
+            if (!v2_failures.empty()) {
+                v2_complete = false;
+                log_msg(hf, "analysis", "benchmark scorecard_v2_incomplete failures=%s",
+                    v2_failures.c_str());
+            }
         } catch (const nlohmann::json::exception& exception) {
             log_msg(hf, "analysis", "benchmark scorecard parse failed: %s", exception.what());
         }
@@ -5028,15 +5081,16 @@ static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& pass
         result.verdict.c_str(),
         result.report_json_path.empty() ? result.error.c_str() : result.report_json_path.c_str());
 
-    if (result.ok && result.verdict == "PASS") {
-        log_msg(hf, "analysis", "PASS -- analysis_benchmark_real_300mb sla_overall=%s parse_ok=%d relaxed=%d",
-            result.sla_overall.c_str(), parse_ok ? 1 : 0, sla_relaxed ? 1 : 0);
+    if (result.ok && result.verdict == "PASS" && v2_complete) {
+        log_msg(hf, "analysis", "PASS -- analysis_benchmark_real_300mb sla_overall=%s parse_ok=%d v2_complete=%d relaxed=%d",
+            result.sla_overall.c_str(), parse_ok ? 1 : 0, v2_complete ? 1 : 0, sla_relaxed ? 1 : 0);
         passed.fetch_add(1);
         return;
     }
-    log_msg(hf, "analysis", "FAIL -- analysis_benchmark_real_300mb verdict=%s sla_overall=%s failing_keys=%s error=%s",
+    log_msg(hf, "analysis", "FAIL -- analysis_benchmark_real_300mb verdict=%s sla_overall=%s failing_keys=%s v2_complete=%d error=%s",
         result.verdict.c_str(), result.sla_overall.c_str(),
         failing_keys.empty() ? "<none>" : failing_keys.c_str(),
+        v2_complete ? 1 : 0,
         result.error.empty() ? "<none>" : result.error.c_str());
     failed.fetch_add(1);
 }

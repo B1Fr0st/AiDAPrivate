@@ -10,6 +10,7 @@
 #include "search_index.hpp"
 #include "../overlay_projection.hpp"
 #include "../incremental_reanalysis.hpp"
+#include "../working_set_governor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -3210,6 +3211,10 @@ analysis_workspace_t::try_begin_analysis(std::uint64_t expected_generation) {
         error.details.emplace_back("active_generation", std::to_string(inactive));
         return workspace_result_t<workspace_analysis_run_t>::failure(std::move(error));
     }
+    {
+        std::lock_guard state_lock(state_mutex_);
+        last_baseline_metrics_.reset();
+    }
     return workspace_result_t<workspace_analysis_run_t>::success(
         workspace_analysis_run_t(shared_from_this(), expected_generation));
 }
@@ -5759,6 +5764,19 @@ workspace_result_t<void> analysis_workspace_t::close(
         decompiler_.reset();
         persistence_queue_.reset();
     }
+    {
+        std::uint64_t tracked = 0;
+        {
+            std::lock_guard lock(state_mutex_);
+            tracked = governor_resident_facts_bytes_;
+            governor_resident_facts_bytes_ = 0;
+        }
+        if (tracked != 0) {
+            working_set_governor_t::instance().charge(
+                working_set_metrics::subsystem_t::resident_facts,
+                -static_cast<std::int64_t>(tracked));
+        }
+    }
     closed_.store(true, std::memory_order_release);
     return workspace_result_t<void>::success();
 }
@@ -5882,6 +5900,36 @@ std::shared_ptr<analysis_metrics_t> analysis_workspace_t::background_metrics() c
     if (!background_metrics_)
         background_metrics_ = std::make_shared<analysis_metrics_t>(generation());
     return background_metrics_;
+}
+
+std::shared_ptr<const analysis_metrics_snapshot_t>
+analysis_workspace_t::last_baseline_metrics() const noexcept {
+    std::lock_guard lock(state_mutex_);
+    return last_baseline_metrics_;
+}
+
+void analysis_workspace_t::publish_baseline_metrics(
+    std::shared_ptr<const analysis_metrics_snapshot_t> snapshot) noexcept {
+    if (!snapshot)
+        return;
+    std::lock_guard lock(state_mutex_);
+    last_baseline_metrics_ = std::move(snapshot);
+}
+
+void analysis_workspace_t::governor_adopt_resident_facts(
+    std::uint64_t bytes) noexcept {
+    std::uint64_t replaced = 0;
+    {
+        std::lock_guard lock(state_mutex_);
+        replaced = governor_resident_facts_bytes_;
+        governor_resident_facts_bytes_ = bytes;
+    }
+    if (replaced != 0) {
+        working_set_governor_t::instance().charge(
+            working_set_metrics::subsystem_t::resident_facts,
+            -static_cast<std::int64_t>(replaced));
+    }
+    working_set_governor_t::instance().refresh();
 }
 
 std::shared_ptr<persistence_queue_t> analysis_workspace_t::persistence_queue() const {

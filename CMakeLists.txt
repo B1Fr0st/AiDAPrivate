@@ -559,6 +559,12 @@ set(AIDA_GHIDRA_LICENSE_FILE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/Ghidra-LICENSE.txt")
 set(AIDA_GHIDRA_NOTICE_FILE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/Ghidra-NOTICE.txt")
+set(AIDA_ZSTD_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/zstd-LICENSE.txt")
+set(AIDA_LIBLZMA_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/liblzma-COPYING.txt")
+set(AIDA_PCRE2_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/PCRE2-LICENCE.txt")
 foreach(_aida_required_analysis_dependency IN ITEMS
         "${zydis_SOURCE_DIR}/CMakeLists.txt"
         "${zydis_SOURCE_DIR}/include/Zydis/Zydis.h"
@@ -577,6 +583,9 @@ foreach(_aida_required_analysis_dependency IN ITEMS
         "${json_schema_validator_SOURCE_DIR}/CMakeLists.txt"
         "${json_schema_validator_SOURCE_DIR}/src/nlohmann/json-schema.hpp"
         "${json_schema_validator_SOURCE_DIR}/LICENSE"
+        "${DEPS_DIR}/zstd-1.5.7/LICENSE"
+        "${DEPS_DIR}/xz-5.8.3/COPYING"
+        "${DEPS_DIR}/pcre2-10.47/LICENCE.md"
         "${AIDA_ANALYSIS_NOTICE_LEDGER_FILE}")
     if(NOT EXISTS "${_aida_required_analysis_dependency}")
         message(FATAL_ERROR "AiDA: required pinned analysis dependency or notice is missing: ${_aida_required_analysis_dependency}")
@@ -649,6 +658,24 @@ aida_require_analysis_text_sha256(
 aida_require_analysis_text_sha256(
     "${AIDA_GHIDRA_NOTICE_FILE}"
     "ad4b2bb6e75e908251226180081b5afa01c7161d7710e08b603d0c340a08a23f")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/zstd-1.5.7/LICENSE"
+    "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8")
+aida_require_analysis_text_sha256(
+    "${AIDA_ZSTD_LICENSE_FILE}"
+    "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/xz-5.8.3/COPYING"
+    "616a3ad264ce29b8f1cb97e53037b139d406899ca8d1f799651e17bfa09830b8")
+aida_require_analysis_text_sha256(
+    "${AIDA_LIBLZMA_LICENSE_FILE}"
+    "616a3ad264ce29b8f1cb97e53037b139d406899ca8d1f799651e17bfa09830b8")
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/pcre2-10.47/LICENCE.md"
+    "197d8a73ffee0d6b09adba2f9c677b5f5aede24edf89258a68e48248d010d811")
+aida_require_analysis_text_sha256(
+    "${AIDA_PCRE2_LICENSE_FILE}"
+    "197d8a73ffee0d6b09adba2f9c677b5f5aede24edf89258a68e48248d010d811")
 add_subdirectory("${zydis_SOURCE_DIR}" "${zydis_BINARY_DIR}")
 
 if(MSVC AND TARGET Zycore)
@@ -1627,6 +1654,10 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/analysis/analysis_budget.cpp"
             "${STANDALONE_ROOT}/core/analysis/analysis_resource_metrics.cpp"
             "${STANDALONE_ROOT}/core/analysis/analysis_scheduler.cpp"
+            "${STANDALONE_ROOT}/core/analysis/analysis_fabric_metrics.cpp"
+            "${STANDALONE_ROOT}/core/analysis/fact_page_cache.cpp"
+            "${STANDALONE_ROOT}/core/analysis/working_set_metrics.cpp"
+            "${STANDALONE_ROOT}/core/analysis/working_set_governor.cpp"
             "${STANDALONE_ROOT}/core/disasm/disasm_view.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_pretty_xml_encode.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_function_db.cpp"
@@ -1875,6 +1906,8 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/analysis/workspace/baseline_pipeline.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/persistence_queue.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/workspace_database.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/sqlite_reader_pool.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/string_arena.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/overlay_journal.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/patched_export.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/decompiler_service.cpp"
@@ -2535,6 +2568,15 @@ if(WIN32)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${AIDA_GHIDRA_NOTICE_FILE}"
                 "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/Ghidra-NOTICE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_ZSTD_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/zstd-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_LIBLZMA_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/liblzma-COPYING.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_PCRE2_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/PCRE2-LICENCE.txt"
             COMMENT "Staging pinned analysis dependency notices beside AiDAStandalone..."
             VERBATIM
         )

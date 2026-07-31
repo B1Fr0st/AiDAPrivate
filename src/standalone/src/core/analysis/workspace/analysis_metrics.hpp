@@ -238,4 +238,60 @@ private:
     std::atomic<std::uint64_t> cancellation_requested_ns_{0};
 };
 
+enum class workspace_io_metric_t : std::uint8_t {
+    governor_zone = 0,
+    governor_rejections,
+    fact_page_cache_hits,
+    fact_page_cache_misses,
+    fact_page_cache_evictions,
+    fact_page_cache_bytes,
+    fact_page_cache_range_drops,
+    working_set_bytes,
+    working_set_peak_bytes,
+    private_bytes,
+    private_bytes_peak,
+    pagefile_bytes,
+    persist_commit_lag_ns_last,
+    persist_commit_lag_ns_max,
+    persist_commit_lag_ns_total,
+    persist_commit_lag_samples,
+    persist_coalesced_transactions,
+    persist_coalesced_operations,
+    persist_coalesced_rollbacks,
+    reader_pool_acquisitions,
+    reader_pool_wait_ns_total,
+    reader_pool_wait_ns_max,
+    reader_pool_timeouts,
+    statement_cache_hits,
+    statement_cache_misses,
+    count
+};
+
+inline constexpr std::size_t workspace_io_metric_count =
+    static_cast<std::size_t>(workspace_io_metric_t::count);
+
+struct workspace_io_metrics_snapshot_t {
+    std::array<std::uint64_t, workspace_io_metric_count> counters{};
+
+    std::uint64_t value(workspace_io_metric_t metric) const noexcept;
+    std::string to_json() const;
+};
+
+class workspace_io_metrics_t final {
+public:
+    void add(workspace_io_metric_t metric, std::uint64_t value = 1) noexcept;
+    void set(workspace_io_metric_t metric, std::uint64_t value) noexcept;
+    void set_max(workspace_io_metric_t metric, std::uint64_t value) noexcept;
+    std::uint64_t value(workspace_io_metric_t metric) const noexcept;
+    workspace_io_metrics_snapshot_t snapshot() const noexcept;
+    void reset() noexcept;
+
+    static const char* metric_name(workspace_io_metric_t metric) noexcept;
+
+private:
+    std::array<std::atomic<std::uint64_t>, workspace_io_metric_count> counters_{};
+};
+
+workspace_io_metrics_t& workspace_io_metrics() noexcept;
+
 }

@@ -28,7 +28,7 @@ struct parallel_shard_t {
 
 inline std::uint32_t parallel_worker_count() noexcept {
     const auto hardware = std::thread::hardware_concurrency();
-    return (std::min<std::uint32_t>)(16U, (std::max<std::uint32_t>)(1U, hardware));
+    return (std::min<std::uint32_t>)(64U, (std::max<std::uint32_t>)(1U, hardware));
 }
 
 inline std::vector<parallel_shard_t> parallel_shards(std::size_t count,
@@ -137,31 +137,39 @@ struct parallel_exec_state_t final : parallel_exec_state_base_t {
 struct parallel_executor_t {
     template <typename F>
     static void run(std::size_t item_count, std::uint32_t workers,
-                    const char* label, F&& item_fn) {
+                    const char* label, F&& item_fn,
+                    aida::infra::taskflow_runtime::executor_domain_t domain =
+                        aida::infra::taskflow_runtime::executor_domain_t::feature_worker) {
         const auto always_open = [] { return true; };
         execute<detail::parallel_no_local_t>(item_count, workers, label,
-            always_open, std::forward<F>(item_fn));
+            always_open, std::forward<F>(item_fn), domain);
     }
 
     template <typename Local, typename F>
     static void run_local(std::size_t item_count, std::uint32_t workers,
-                          const char* label, F&& item_fn) {
+                          const char* label, F&& item_fn,
+                          aida::infra::taskflow_runtime::executor_domain_t domain =
+                              aida::infra::taskflow_runtime::executor_domain_t::feature_worker) {
         const auto always_open = [] { return true; };
         execute<Local>(item_count, workers, label, always_open,
-            std::forward<F>(item_fn));
+            std::forward<F>(item_fn), domain);
     }
 
     template <typename Gate, typename F>
     static void run_gated(std::size_t item_count, std::uint32_t workers,
-                          const char* label, Gate&& schedule_gate, F&& item_fn) {
+                          const char* label, Gate&& schedule_gate, F&& item_fn,
+                          aida::infra::taskflow_runtime::executor_domain_t domain =
+                              aida::infra::taskflow_runtime::executor_domain_t::feature_worker) {
         execute<detail::parallel_no_local_t>(item_count, workers, label,
-            std::forward<Gate>(schedule_gate), std::forward<F>(item_fn));
+            std::forward<Gate>(schedule_gate), std::forward<F>(item_fn), domain);
     }
 
 private:
     template <typename Local, typename Gate, typename F>
     static void execute(std::size_t item_count, std::uint32_t workers,
-                        const char* label, Gate&& schedule_gate, F&& item_fn) {
+                        const char* label, Gate&& schedule_gate, F&& item_fn,
+                        aida::infra::taskflow_runtime::executor_domain_t domain =
+                            aida::infra::taskflow_runtime::executor_domain_t::feature_worker) {
         if (item_count == 0)
             return;
         using state_t = detail::parallel_exec_state_t<Local,
@@ -177,7 +185,7 @@ private:
             item_count);
         for (std::size_t helper = 1; helper < participants; ++helper) {
             aida::infra::taskflow_runtime::task_descriptor_t desc;
-            desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+            desc.domain = domain;
             desc.owner_subsystem = "analysis_workspace";
             desc.label = label;
             desc.body = [state]() { state->run_participant(); };

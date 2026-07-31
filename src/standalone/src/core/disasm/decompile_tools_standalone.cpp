@@ -9,19 +9,17 @@
 #include "standalone_compat.hpp"
 #include "../analysis/decompiler/decompiler_ui_integration.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
+#include "../infra/cancellation_watchdog.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <limits>
-#include <mutex>
 #include <string>
 #include <system_error>
-#include <thread>
 
 using json = nlohmann::json;
 using tool_result_t = mcp_standalone::tool_result_t;
@@ -32,10 +30,17 @@ class cancellation_bridge_t final {
 public:
     cancellation_bridge_t(aida::analysis::cancellation_source_t& source,
                           std::atomic<bool>* external)
-        : source_(source), external_(external)
     {
-        if (external_)
-            worker_ = std::thread([this] { monitor(); });
+        if (external) {
+            aida::infra::cancellation_watchdog::watch_descriptor_t watch;
+            watch.external_flag = external;
+            watch.on_fire = [source_snapshot = source]() mutable {
+                source_snapshot.request_cancel();
+            };
+            watch_id_ = aida::infra::cancellation_watchdog::register_watch(std::move(watch));
+            if (!watch_id_.valid())
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+        }
     }
 
     cancellation_bridge_t(const cancellation_bridge_t&) = delete;
@@ -43,36 +48,12 @@ public:
 
     ~cancellation_bridge_t()
     {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-        }
-        wake_.notify_all();
-        if (worker_.joinable())
-            worker_.join();
+        if (watch_id_.valid())
+            aida::infra::cancellation_watchdog::unregister_watch(watch_id_);
     }
 
 private:
-    void monitor()
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        while (!stopping_) {
-            lock.unlock();
-            if (external_->load(std::memory_order_acquire)) {
-                source_.request_cancel();
-                return;
-            }
-            lock.lock();
-            wake_.wait_for(lock, std::chrono::milliseconds(10), [this] { return stopping_; });
-        }
-    }
-
-    aida::analysis::cancellation_source_t& source_;
-    std::atomic<bool>* external_ = nullptr;
-    std::mutex mutex_;
-    std::condition_variable wake_;
-    bool stopping_ = false;
-    std::thread worker_;
+    aida::infra::cancellation_watchdog::watch_id_t watch_id_;
 };
 
 static std::string hex_u64(uint64_t value)

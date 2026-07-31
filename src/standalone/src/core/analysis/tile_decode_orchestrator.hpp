@@ -22,6 +22,11 @@ enum class tile_decode_pass_t : std::uint8_t {
     gap = 1
 };
 
+enum class tile_decode_pipeline_mode_t : std::uint8_t {
+    gated = 0,
+    pipelined = 1
+};
+
 enum class tile_coverage_detail_t : std::uint32_t {
     none = 0,
     undecodable_gap = 1,
@@ -123,6 +128,7 @@ struct tile_decode_orchestrator_limits_t final {
     std::uint64_t maximum_edges = 128'000'000;
     std::uint64_t maximum_coverage_spans = 16'000'000;
     bool seed_executable_range_starts = true;
+    tile_decode_pipeline_mode_t pipeline_mode = tile_decode_pipeline_mode_t::gated;
     tile_invalid_run_policy_t invalid_run_policy;
 };
 

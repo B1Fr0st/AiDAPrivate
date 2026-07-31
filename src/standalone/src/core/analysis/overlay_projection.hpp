@@ -136,6 +136,19 @@ struct decompiler_cache_invalidation_request_t final {
     }
 };
 
+struct fact_page_invalidation_request_t final {
+    std::uint64_t source_generation = 0;
+    std::uint64_t target_generation = 0;
+    std::vector<projected_range_t> affected_ranges;
+    bool rebuild_all = false;
+
+    bool required() const noexcept
+    {
+        return rebuild_all || source_generation != target_generation ||
+               !affected_ranges.empty();
+    }
+};
+
 struct projection_invalidation_set_t final {
     std::vector<projected_range_t> affected_ranges;
     std::vector<projected_entity_t> affected_entities;
@@ -144,6 +157,7 @@ struct projection_invalidation_set_t final {
     std::uint64_t max_contiguous_range = 0;
     packed_index_invalidation_request_t packed_index;
     decompiler_cache_invalidation_request_t decompiler_cache;
+    fact_page_invalidation_request_t fact_pages;
 
     bool empty() const noexcept
     {
@@ -176,10 +190,13 @@ using packed_index_invalidation_hook_t = std::function<projection_invalidation_h
     const packed_index_invalidation_request_t&)>;
 using decompiler_cache_invalidation_hook_t = std::function<projection_invalidation_hook_result_t(
     const decompiler_cache_invalidation_request_t&)>;
+using fact_page_invalidation_hook_t = std::function<projection_invalidation_hook_result_t(
+    const fact_page_invalidation_request_t&)>;
 
 struct projection_invalidation_hooks_t final {
     packed_index_invalidation_hook_t packed_index;
     decompiler_cache_invalidation_hook_t decompiler_cache;
+    fact_page_invalidation_hook_t fact_pages;
 };
 
 enum class projection_invalidation_dispatch_code_t : std::uint8_t {
@@ -196,8 +213,10 @@ struct projection_invalidation_dispatch_result_t final {
         projection_invalidation_dispatch_code_t::ok;
     projection_invalidation_hook_result_t packed_index;
     projection_invalidation_hook_result_t decompiler_cache;
+    projection_invalidation_hook_result_t fact_pages;
     bool packed_index_completed = false;
     bool decompiler_cache_completed = false;
+    bool fact_pages_completed = false;
     std::string detail;
 
     bool ok() const noexcept

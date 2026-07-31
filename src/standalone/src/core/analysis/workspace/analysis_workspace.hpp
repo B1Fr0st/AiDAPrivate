@@ -27,6 +27,7 @@ class decompile_batch_orchestrator_t;
 class persistence_queue_t;
 class search_index_t;
 class analysis_metrics_t;
+struct analysis_metrics_snapshot_t;
 class analysis_workspace_t;
 class workspace_registry_t;
 struct workspace_publication_state_t;
@@ -337,6 +338,10 @@ public:
     std::shared_ptr<decompiler_service_t> decompiler() const;
     std::shared_ptr<decompile_batch_orchestrator_t> background_decompile() const;
     std::shared_ptr<analysis_metrics_t> background_metrics() const;
+    std::shared_ptr<const analysis_metrics_snapshot_t> last_baseline_metrics() const noexcept;
+    void publish_baseline_metrics(
+        std::shared_ptr<const analysis_metrics_snapshot_t> snapshot) noexcept;
+    void governor_adopt_resident_facts(std::uint64_t bytes) noexcept;
     std::shared_ptr<persistence_queue_t> persistence_queue() const;
     std::shared_ptr<search_index_t> search_index() const;
 
@@ -397,6 +402,8 @@ private:
     std::shared_ptr<decompiler_service_t> decompiler_;
     std::shared_ptr<decompile_batch_orchestrator_t> background_decompile_;
     mutable std::shared_ptr<analysis_metrics_t> background_metrics_;
+    std::shared_ptr<const analysis_metrics_snapshot_t> last_baseline_metrics_;
+    std::uint64_t governor_resident_facts_bytes_ = 0;
     std::shared_ptr<persistence_queue_t> persistence_queue_;
     std::shared_mutex mutation_mutex_;
     std::mutex close_mutex_;

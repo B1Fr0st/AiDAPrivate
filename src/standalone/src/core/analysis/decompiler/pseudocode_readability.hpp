@@ -27,6 +27,13 @@ struct readability_transform_metrics_t {
     std::uint64_t temporaries_inlined = 0;
     std::uint64_t copies_propagated = 0;
     std::uint64_t dead_stores_eliminated = 0;
+    std::uint64_t member_names_propagated = 0;
+    std::uint64_t member_accesses_rewritten = 0;
+    std::uint64_t min_max_idioms_rewritten = 0;
+    std::uint64_t idioms_recognized = 0;
+    std::uint64_t declarations_relocated = 0;
+    std::uint64_t string_comments_injected = 0;
+    std::uint64_t user_comments_injected = 0;
     std::uint64_t nodes_removed = 0;
 };
 
@@ -42,6 +49,12 @@ readability_transform_result_t apply_readability_transforms(
     typed_pseudocode_ast_v2_t& ast,
     const type_graph_t& type_graph,
     const readability_transform_settings_t& settings = {});
+
+readability_transform_result_t apply_readability_transforms(
+    typed_pseudocode_ast_v2_t& ast,
+    const type_graph_t& type_graph,
+    const readability_transform_settings_t& settings,
+    const decompiler_render_evidence_t& evidence);
 
 bool readability_transforms_enabled(const readability_transform_settings_t& settings) noexcept;
 

@@ -134,6 +134,7 @@ struct decompiler_pipeline_service_config_t {
     std::shared_ptr<decompiler_isolated_provider_host_t> isolated_provider_host;
     pseudocode_readability_limits_t readability_limits;
     bool require_complete_source_map = true;
+    bool batch_rendered_only_memory_cache = true;
     std::shared_ptr<workspace_database_t> database;
     std::shared_ptr<analysis_metrics_t> metrics_sink;
 };
@@ -157,10 +158,17 @@ struct decompiler_pipeline_service_snapshot_t {
     std::uint64_t semantic_proof_adapter_denials = 0;
     std::size_t active_requests = 0;
     bool accepting = false;
+    std::uint64_t attest_stage_submitted = 0;
+    std::uint64_t attest_stage_inline = 0;
+    std::uint64_t attest_stage_completed = 0;
+    std::size_t attest_in_flight = 0;
+    std::size_t attest_in_flight_peak = 0;
 };
 
 class decompiler_pipeline_service_t final {
 public:
+    using decompiler_completion_t = std::function<void(decompiler_pipeline_result_t&&)>;
+
     static workspace_result_t<std::shared_ptr<decompiler_pipeline_service_t>> create(
         std::shared_ptr<decompiler_provider_registry_t> providers,
         std::shared_ptr<decompiler_cache_v9_t> cache,
@@ -174,6 +182,10 @@ public:
     decompiler_pipeline_result_t decompile(
         const decompiler_pipeline_request_t& request,
         const cancellation_token_t& cancel = {});
+    void decompile_async(
+        const decompiler_pipeline_request_t& request,
+        const cancellation_token_t& cancel,
+        decompiler_completion_t completion);
     decompiler_rendered_probe_result_t probe_rendered_cache(
         const decompiler_pipeline_request_t& request);
     workspace_result_t<void> invalidate_workspace(

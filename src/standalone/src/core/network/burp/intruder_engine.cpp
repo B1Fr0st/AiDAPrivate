@@ -9,6 +9,7 @@
 #include "../protocol_parser.hpp"
 #include "../../../helpers/diag_log.hpp"
 #include "../../infra/executor.hpp"
+#include "../../infra/taskflow_runtime.hpp"
 
 #ifdef _WIN32
 #  include <BaseTsd.h>
@@ -1927,20 +1928,30 @@ static void job_main(std::shared_ptr<job_t> job)
             if (capped_pool <= 1) {
                 worker_pooled_h1(job);
             } else {
-                std::vector<aida::infra::win_thread::joinable_thread_t> ws;
+                std::vector<aida::infra::taskflow_runtime::job_handle_t> ws;
                 try {
                     ws.reserve(capped_pool);
                     for (size_t i = 0; i < capped_pool; ++i) {
-                        aida::infra::win_thread::joinable_thread_t wt;
-                        std::string err;
                         const std::string label = "intruder.pooled_h1." + std::to_string(job->id) + "." + std::to_string(i);
-                        const bool started = wt.start([job]() { worker_pooled_h1(job); }, &err,
-                            aida::infra::win_thread::default_stack_reserve, label.c_str());
-                        if (started)
-                            ws.push_back(std::move(wt));
+                        aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+                        worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::service;
+                        worker_desc.owner_subsystem = "burp.intruder";
+                        worker_desc.label = label.c_str();
+                        worker_desc.priority = 3;
+                        worker_desc.shutdown_policy = "cancel_pending";
+                        worker_desc.cancellable_body = [job](const aida::infra::taskflow_runtime::cancellation_token_t&) {
+                            worker_pooled_h1(job);
+                        };
+                        worker_desc.cancel_hook = [job]() {
+                            job->cancel.store(true, std::memory_order_release);
+                        };
+                        auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+                        if (worker_submission.submitted)
+                            ws.push_back(worker_submission.handle);
                         else
                             diag::log_tagged_fmt("intruder", "pooled_worker_start_failed_single job_id=%llu idx=%zu err=%s",
-                                static_cast<unsigned long long>(job->id), i, err.c_str());
+                                static_cast<unsigned long long>(job->id), i,
+                                worker_submission.reject_reason.empty() ? "<none>" : worker_submission.reject_reason.c_str());
                     }
                 } catch (const std::exception& ex) {
                     set_err(std::string("intruder: pooled worker start failed: ") + ex.what());
@@ -1954,7 +1965,7 @@ static void job_main(std::shared_ptr<job_t> job)
                     job->running.store(false);
                 }
                 for (auto& t : ws) {
-                    t.join();
+                    aida::infra::taskflow_runtime::wait_for(t, 0xFFFFFFFFu);
                 }
             }
             break;

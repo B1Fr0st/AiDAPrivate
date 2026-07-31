@@ -169,8 +169,8 @@ private:
         if (request_.limits.max_ast_nodes == 0 || request_.limits.max_output_bytes == 0 || request_.limits.max_tokens == 0 ||
             request_.limits.max_source_maps == 0 || request_.limits.max_nesting == 0 ||
             request_.limits.max_output_bytes > std::numeric_limits<std::uint32_t>::max() ||
-            settings_.schema_version != 2 || settings_.style_id.empty() || settings_.indentation_spaces == 0 ||
-            settings_.indentation_spaces > 16) {
+            (settings_.schema_version != 2 && settings_.schema_version != 3) || settings_.style_id.empty() ||
+            settings_.indentation_spaces == 0 || settings_.indentation_spaces > 16) {
             fail(decompiler_diagnostic_code_t::invalid_contract, "decompiler.renderer.v2.request", nullptr);
             return false;
         }
@@ -191,7 +191,34 @@ private:
             nodes_.emplace(node.id, &node);
         for (const auto& type : type_graph_.nodes)
             types_.emplace(type.id, &type);
+        build_evidence_maps();
         return true;
+    }
+
+    void build_evidence_maps()
+    {
+        if (request_.evidence == nullptr)
+            return;
+        constexpr std::size_t k_max_evidence_map_entries = 262144;
+        for (const auto& entry : request_.evidence->symbols) {
+            if (resolved_symbols_.size() >= k_max_evidence_map_entries)
+                break;
+            if (!entry.unresolved_text.empty() && !entry.resolved_name.empty() &&
+                identifier_text(entry.resolved_name))
+                resolved_symbols_.emplace(entry.unresolved_text, entry.resolved_name);
+        }
+        for (const auto& entry : request_.evidence->vtable_slots) {
+            if (vtable_slots_.size() >= k_max_evidence_map_entries)
+                break;
+            if (!entry.vtable_selector.empty() && !entry.method_name.empty() &&
+                identifier_text(entry.method_name))
+                vtable_slots_.emplace(vtable_slot_key(entry.vtable_selector, entry.slot_index), entry.method_name);
+        }
+    }
+
+    static std::string vtable_slot_key(const std::string& selector, const std::uint64_t slot_index)
+    {
+        return selector + "#" + std::to_string(slot_index);
     }
 
     bool emit(
@@ -231,6 +258,62 @@ private:
     bool emit_newline(const typed_pseudocode_ast_node_t& node)
     {
         return emit("\n", decompiler_document_token_kind_t::whitespace, node);
+    }
+
+    bool retract_trailing_newline()
+    {
+        if (document_.tokens.empty() || document_.source_maps.empty() ||
+            document_.tokens.size() != document_.source_maps.size() || document_.rendered_text.empty() ||
+            document_.rendered_text.back() != '\n')
+            return false;
+        const auto& last = document_.tokens.back();
+        if (last.kind != decompiler_document_token_kind_t::whitespace ||
+            last.range.end != document_.rendered_text.size() || last.range.begin + 1 != last.range.end)
+            return false;
+        document_.rendered_text.pop_back();
+        document_.tokens.pop_back();
+        document_.source_maps.pop_back();
+        return true;
+    }
+
+    bool emit_comment_content(const typed_pseudocode_ast_node_t& node)
+    {
+        return emit("// ", decompiler_document_token_kind_t::comment, node) &&
+               emit(node.stable_text, decompiler_document_token_kind_t::comment, node);
+    }
+
+    bool render_standalone_comment(const typed_pseudocode_ast_node_t& node)
+    {
+        return emit_indent(node) && emit_comment_content(node) && emit_newline(node);
+    }
+
+    bool attach_trailing_comments(const std::vector<std::uint64_t>& siblings, std::size_t& index)
+    {
+        const auto* anchor = node(siblings[index]);
+        if (anchor != nullptr && anchor->kind == typed_pseudocode_ast_node_kind_t::comment_statement)
+            return true;
+        bool attached = false;
+        while (index + 1 < siblings.size()) {
+            const auto* comment = node(siblings[index + 1]);
+            if (comment == nullptr || comment->kind != typed_pseudocode_ast_node_kind_t::comment_statement)
+                break;
+            if (!settings_.emit_comments) {
+                ++index;
+                attached = true;
+                continue;
+            }
+            if (!attached) {
+                if (!retract_trailing_newline() || !emit_space(*comment))
+                    return false;
+            } else if (!emit_indent(*comment)) {
+                return false;
+            }
+            if (!emit_comment_content(*comment) || !emit_newline(*comment))
+                return false;
+            ++index;
+            attached = true;
+        }
+        return true;
     }
 
     bool emit_annotation(const typed_pseudocode_ast_node_t& node)
@@ -322,8 +405,8 @@ private:
         if (!emit("{", decompiler_document_token_kind_t::punctuation, *value) || !emit_newline(*value))
             return false;
         ++indent_;
-        for (const auto statement_id : value->child_ids) {
-            if (!render_statement(statement_id)) {
+        for (std::size_t index = 0; index < value->child_ids.size(); ++index) {
+            if (!render_statement(value->child_ids[index]) || !attach_trailing_comments(value->child_ids, index)) {
                 --indent_;
                 return false;
             }
@@ -390,6 +473,9 @@ private:
             break;
         case typed_pseudocode_ast_node_kind_t::try_statement:
             rendered = render_try(*value);
+            break;
+        case typed_pseudocode_ast_node_kind_t::comment_statement:
+            rendered = !settings_.emit_comments || render_standalone_comment(*value);
             break;
         default:
             fail(decompiler_diagnostic_code_t::malformed_ast, "decompiler.renderer.v2.statement_kind", value);
@@ -527,20 +613,32 @@ private:
 
     bool render_switch(const typed_pseudocode_ast_node_t& value)
     {
+        const auto saved_selector_type = switch_selector_type_id_;
+        switch_selector_type_id_ = 0;
+        if (!value.child_ids.empty()) {
+            const auto selector_iterator = nodes_.find(value.child_ids[0]);
+            if (selector_iterator != nodes_.end())
+                switch_selector_type_id_ = selector_iterator->second->type_id;
+        }
+        const auto restore = [this, saved_selector_type]() { switch_selector_type_id_ = saved_selector_type; };
         if (!emit_annotation(value) || !emit_indent(value) || !emit("switch", decompiler_document_token_kind_t::keyword, value) ||
             !emit_space(value) || !emit("(", decompiler_document_token_kind_t::punctuation, value) ||
             !render_expression(value.child_ids[0], 1) || !emit(")", decompiler_document_token_kind_t::punctuation, value) ||
-            !emit_space(value) || !emit("{", decompiler_document_token_kind_t::punctuation, value) || !emit_newline(value))
+            !emit_space(value) || !emit("{", decompiler_document_token_kind_t::punctuation, value) || !emit_newline(value)) {
+            restore();
             return false;
+        }
         ++indent_;
         for (std::size_t index = 1; index < value.child_ids.size(); ++index) {
             const auto* case_value = node(value.child_ids[index]);
             if (case_value == nullptr || !render_switch_case(*case_value)) {
                 --indent_;
+                restore();
                 return false;
             }
         }
         --indent_;
+        restore();
         return emit_indent(value) && emit("}", decompiler_document_token_kind_t::punctuation, value) && emit_newline(value);
     }
 
@@ -554,15 +652,26 @@ private:
                 !emit(":", decompiler_document_token_kind_t::punctuation, value) || !emit_newline(value))
                 return false;
         } else {
-            if (!emit("case", decompiler_document_token_kind_t::keyword, value) || !emit_space(value) ||
+            const auto* case_literal = node(value.child_ids[0]);
+            const auto enum_name = case_literal != nullptr &&
+                    case_literal->kind == typed_pseudocode_ast_node_kind_t::literal
+                ? enum_case_name(*case_literal)
+                : std::optional<std::string>{};
+            if (enum_name) {
+                if (!emit("case", decompiler_document_token_kind_t::keyword, value) || !emit_space(value) ||
+                    !emit(*enum_name, decompiler_document_token_kind_t::identifier, *case_literal) ||
+                    !emit(":", decompiler_document_token_kind_t::punctuation, value) || !emit_newline(value))
+                    return false;
+            } else if (!emit("case", decompiler_document_token_kind_t::keyword, value) || !emit_space(value) ||
                 !render_expression(value.child_ids[0], 1) || !emit(":", decompiler_document_token_kind_t::punctuation, value) ||
-                !emit_newline(value))
+                !emit_newline(value)) {
                 return false;
+            }
             statement_begin = 1;
         }
         ++indent_;
         for (std::size_t index = statement_begin; index < value.child_ids.size(); ++index) {
-            if (!render_statement(value.child_ids[index])) {
+            if (!render_statement(value.child_ids[index]) || !attach_trailing_comments(value.child_ids, index)) {
                 --indent_;
                 return false;
             }
@@ -704,7 +813,7 @@ private:
                        render_expression(value->child_ids[0], current_precedence);
             break;
         case typed_pseudocode_ast_node_kind_t::call_expression:
-            rendered = render_expression(value->child_ids[0], current_precedence) &&
+            rendered = render_call_callee(*value, current_precedence) &&
                        emit("(", decompiler_document_token_kind_t::punctuation, *value);
             for (std::size_t index = 1; rendered && index < value->child_ids.size(); ++index) {
                 if (index != 1)
@@ -721,7 +830,7 @@ private:
                 rendered = false;
             } else {
                 rendered = render_expression(value->child_ids[0], current_precedence) &&
-                           emit(".", decompiler_document_token_kind_t::operator_token, *value) &&
+                           emit(member_access_operator(*value), decompiler_document_token_kind_t::operator_token, *value) &&
                            emit(value->stable_text, decompiler_document_token_kind_t::identifier, *value);
             }
             break;
@@ -739,6 +848,120 @@ private:
             rendered = emit(")", decompiler_document_token_kind_t::punctuation, *value);
         --nesting_;
         return rendered && !failed_;
+    }
+
+    const char* member_access_operator(const typed_pseudocode_ast_node_t& member) const
+    {
+        if (member.child_ids.empty())
+            return ".";
+        const auto object_iterator = nodes_.find(member.child_ids[0]);
+        if (object_iterator == nodes_.end())
+            return ".";
+        const auto type_iterator = types_.find(object_iterator->second->type_id);
+        if (type_iterator == types_.end())
+            return ".";
+        return type_iterator->second->kind == decompiler_type_kind_t::pointer ? "->" : ".";
+    }
+
+    bool render_call_callee(const typed_pseudocode_ast_node_t& call, const int parent_precedence)
+    {
+        const auto* callee = node(call.child_ids[0]);
+        if (callee == nullptr)
+            return false;
+        if (settings_.emit_resolved_symbols && !resolved_symbols_.empty() &&
+            callee->kind == typed_pseudocode_ast_node_kind_t::identifier) {
+            const auto resolved = resolved_symbols_.find(callee->stable_text);
+            if (resolved != resolved_symbols_.end())
+                return emit(resolved->second, decompiler_document_token_kind_t::identifier, *callee);
+        }
+        if (settings_.emit_resolved_symbols && !vtable_slots_.empty() &&
+            callee->kind == typed_pseudocode_ast_node_kind_t::index_expression && callee->child_ids.size() == 2)
+            return render_vtable_call_callee(call, *callee, parent_precedence);
+        return render_expression(call.child_ids[0], parent_precedence);
+    }
+
+    bool render_vtable_call_callee(const typed_pseudocode_ast_node_t& call,
+                                   const typed_pseudocode_ast_node_t& callee,
+                                   const int parent_precedence)
+    {
+        const auto* member = node(callee.child_ids[0]);
+        const auto* slot = node(callee.child_ids[1]);
+        if (member == nullptr || slot == nullptr ||
+            member->kind != typed_pseudocode_ast_node_kind_t::member_expression || member->child_ids.size() != 1 ||
+            slot->kind != typed_pseudocode_ast_node_kind_t::literal || !identifier_text(member->stable_text))
+            return render_expression(call.child_ids[0], parent_precedence);
+        const auto slot_index = parse_unsigned_literal(slot->stable_text);
+        if (!slot_index)
+            return render_expression(call.child_ids[0], parent_precedence);
+        const auto method = vtable_slots_.find(vtable_slot_key(member->stable_text, *slot_index));
+        if (method == vtable_slots_.end())
+            return render_expression(call.child_ids[0], parent_precedence);
+        const auto* object = node(member->child_ids[0]);
+        if (object == nullptr)
+            return false;
+        const auto object_type = types_.find(object->type_id);
+        const char* access = object_type != types_.end() &&
+                object_type->second->kind == decompiler_type_kind_t::pointer
+            ? "->" : ".";
+        return render_expression(member->child_ids[0], 13) &&
+               emit(access, decompiler_document_token_kind_t::operator_token, *member) &&
+               emit(member->stable_text, decompiler_document_token_kind_t::identifier, *member) &&
+               emit("->", decompiler_document_token_kind_t::operator_token, callee) &&
+               emit(method->second, decompiler_document_token_kind_t::identifier, *slot);
+    }
+
+    static std::optional<std::uint64_t> parse_unsigned_literal(const std::string& text)
+    {
+        if (text.empty() || text.size() > 20)
+            return std::nullopt;
+        std::uint64_t value = 0;
+        int base = 10;
+        std::size_t offset = 0;
+        if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+            base = 16;
+            offset = 2;
+        }
+        if (offset == text.size())
+            return std::nullopt;
+        for (std::size_t index = offset; index < text.size(); ++index) {
+            const char character = text[index];
+            const auto digit = base == 16
+                ? (character >= '0' && character <= '9' ? character - '0'
+                    : character >= 'a' && character <= 'f' ? character - 'a' + 10
+                    : character >= 'A' && character <= 'F' ? character - 'A' + 10 : -1)
+                : (character >= '0' && character <= '9' ? character - '0' : -1);
+            if (digit < 0)
+                return std::nullopt;
+            if (value > (std::numeric_limits<std::uint64_t>::max() - 15ULL) / 16ULL)
+                return std::nullopt;
+            value = value * static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(digit);
+        }
+        return value;
+    }
+
+    std::optional<std::string> enum_case_name(const typed_pseudocode_ast_node_t& literal_node) const
+    {
+        if (!settings_.emit_enum_case_names || switch_selector_type_id_ == 0)
+            return std::nullopt;
+        const auto type_iterator = types_.find(switch_selector_type_id_);
+        if (type_iterator == types_.end() || type_iterator->second->kind != decompiler_type_kind_t::enumeration)
+            return std::nullopt;
+        const auto value = parse_unsigned_literal(literal_node.stable_text);
+        if (!value)
+            return std::nullopt;
+        const decompiler_type_edge_t* best = nullptr;
+        for (const auto& edge : type_graph_.edges) {
+            if (edge.source_type_id != switch_selector_type_id_ ||
+                edge.kind != decompiler_type_edge_kind_t::member || !edge.byte_offset.has_value() ||
+                *edge.byte_offset != *value || edge.stable_name.empty() ||
+                !identifier_text(edge.stable_name))
+                continue;
+            if (best == nullptr || edge.confidence > best->confidence)
+                best = &edge;
+        }
+        if (best == nullptr)
+            return std::nullopt;
+        return best->stable_name;
     }
 
     void append_document_metadata()
@@ -781,6 +1004,9 @@ private:
     decompiler_document_t document_;
     std::map<std::uint64_t, const typed_pseudocode_ast_node_t*> nodes_;
     std::map<std::uint64_t, const decompiler_type_node_t*> types_;
+    std::map<std::string, std::string> resolved_symbols_;
+    std::map<std::string, std::string> vtable_slots_;
+    std::uint64_t switch_selector_type_id_ = 0;
     std::size_t indent_ = 0;
     std::size_t nesting_ = 0;
     std::uint32_t next_diagnostic_ordinal_ = 1;
@@ -805,6 +1031,7 @@ decompiler_renderer_settings_t pseudocode_renderer_v2_style_settings(
         result.emit_type_annotations = true;
         result.emit_provenance_annotations = false;
         result.emit_unknown_tokens = true;
+        result.emit_comments = false;
         result.readability.enable_expression_simplification = false;
         result.readability.enable_temporary_coalescing = false;
         result.readability.enable_identity_simplification = false;

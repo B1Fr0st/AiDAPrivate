@@ -1,6 +1,7 @@
-﻿#include "tile_decode_orchestrator.hpp"
+#include "tile_decode_orchestrator.hpp"
 
 #include "decode_worker_pool.hpp"
+#include "workspace/parallel_pass.hpp"
 
 #include "../../helpers/diag_log.hpp"
 
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -401,15 +403,9 @@ struct cross_tile_edge_less_t final {
     }
 };
 
-void merge_coverage_into(std::vector<coverage_span_t>& dest,
-                         const std::vector<coverage_span_t>& src)
-{
-    for (const auto& span : src) {
-        if (span.size == 0)
-            continue;
-        dest.push_back(span);
-    }
-    std::sort(dest.begin(), dest.end(), [](const auto& a, const auto& b) {
+struct coverage_span_less_t final {
+    bool operator()(const coverage_span_t& a, const coverage_span_t& b) const noexcept
+    {
         if (a.start != b.start)
             return a.start < b.start;
         if (a.reason != b.reason)
@@ -421,7 +417,11 @@ void merge_coverage_into(std::vector<coverage_span_t>& dest,
         if (a.detail_code != b.detail_code)
             return a.detail_code < b.detail_code;
         return a.size < b.size;
-    });
+    }
+};
+
+void stitch_sorted_coverage(std::vector<coverage_span_t>& dest)
+{
     std::vector<coverage_span_t> merged;
     merged.reserve(dest.size());
     for (auto& span : dest) {
@@ -447,6 +447,18 @@ void merge_coverage_into(std::vector<coverage_span_t>& dest,
         merged.push_back(span);
     }
     dest = std::move(merged);
+}
+
+void merge_coverage_into(std::vector<coverage_span_t>& dest,
+                         const std::vector<coverage_span_t>& src)
+{
+    for (const auto& span : src) {
+        if (span.size == 0)
+            continue;
+        dest.push_back(span);
+    }
+    std::sort(dest.begin(), dest.end(), coverage_span_less_t{});
+    stitch_sorted_coverage(dest);
 }
 
 workspace_result_t<correlated_tile_decode_batch_t> execute_correlated_batch(
@@ -1392,6 +1404,9 @@ struct decode_run_context_t final {
     std::vector<decode_tile_id_t> tiles_by_rva;
     std::atomic<std::uint32_t> phase{phase_recursive};
     std::atomic<bool> failed{false};
+    tile_decode_pipeline_mode_t mode = tile_decode_pipeline_mode_t::gated;
+    std::atomic<bool> stage1_quiesced_announced{false};
+    std::atomic<bool> fixup_done{false};
     std::mutex failure_mutex;
     std::optional<workspace_error_t> first_error;
     std::uint64_t supervisor_ordinal_counter = 0;
@@ -2145,6 +2160,310 @@ workspace_result_t<void> shard_build_tile(decode_run_context_t& ctx,
     return workspace_result_t<void>::success();
 }
 
+workspace_result_t<bool> shard_lease_recursive_wave(
+    decode_run_context_t& ctx, decode_shard_context_t& shard,
+    lease_outgoing_t& outgoing)
+{
+    if (shard.frontier.empty())
+        return workspace_result_t<bool>::success(false);
+    auto wave_result = shard.frontier.take_wave(ctx.batch_request_limit);
+    if (!wave_result)
+        return workspace_result_t<bool>::failure(wave_result.error());
+    auto wave = wave_result.take_value();
+    if (wave.empty())
+        return workspace_result_t<bool>::success(false);
+    std::uint32_t minted = 0;
+    for (const auto& seed : wave) {
+        if (seed.tile_id >= ctx.all_tiles->size())
+            continue;
+        const auto& tile = (*ctx.all_tiles)[seed.tile_id];
+        const auto consumed = ctx.ledger.decode_requests.fetch_add(1,
+            std::memory_order_acq_rel);
+        if (consumed >= ctx.limits->maximum_decode_requests) {
+            return workspace_result_t<bool>::failure(
+                limit_error("decode_requests",
+                    ctx.limits->maximum_decode_requests,
+                    consumed ==
+                            (std::numeric_limits<std::uint64_t>::max)()
+                        ? consumed
+                        : consumed + 1,
+                    seed.rva));
+        }
+        if (shard.next_request_seq >= (1ULL << 48)) {
+            return workspace_result_t<bool>::failure(
+                limit_error("request_identifiers",
+                    shard.next_request_seq, shard.next_request_seq,
+                    seed.rva));
+        }
+
+        const std::uint64_t offset_in_tile = seed.rva - tile.start_rva;
+        const std::uint64_t remaining = tile.byte_count - offset_in_tile;
+        std::uint64_t available_bytes = 0;
+        if (!checked_add(remaining, tile.lookahead_bytes, available_bytes)) {
+            return workspace_result_t<bool>::failure(
+                orchestrator_error(workspace_error_code_t::range_overflow,
+                    "recursive decode request range overflow", seed.rva));
+        }
+        const std::uint64_t effective_bytes = (std::min)(
+            available_bytes, ctx.caps->maximum_request_bytes);
+        std::uint64_t provider_offset = 0;
+        std::uint64_t runtime_address = 0;
+        std::uint64_t owned_end = 0;
+        if (!checked_add(tile.provider_offset, offset_in_tile,
+                provider_offset) ||
+            !checked_add(tile.start_virtual_address, offset_in_tile,
+                runtime_address) ||
+            !checked_add(tile.start_rva, tile.byte_count, owned_end)) {
+            return workspace_result_t<bool>::failure(
+                orchestrator_error(workspace_error_code_t::range_overflow,
+                    "recursive decode request range overflow", seed.rva));
+        }
+
+        tile_decode_request_t req;
+        req.request_id =
+            (static_cast<std::uint64_t>(shard.shard_index) << 48) |
+            shard.next_request_seq;
+        req.tile_id = seed.tile_id;
+        req.pass = tile_decode_pass_t::recursive;
+        req.seed_kind = seed.kind;
+        req.start.space = address_space_id_t::relative_virtual;
+        req.start.value = seed.rva;
+        req.start.architecture = ctx.caps->decoder_key.architecture;
+        req.start.mode = ctx.caps->decoder_key.mode;
+        req.provider_offset = provider_offset;
+        req.runtime_address = runtime_address;
+        req.image_base = ctx.image_base;
+        req.image_size = ctx.image_size;
+        req.byte_count = effective_bytes;
+        req.owned_end_rva = owned_end;
+        req.stable_source_id = seed.stable_source_id;
+        req.provenance = seed.provenance;
+        req.confidence = seed.confidence;
+
+        shard.requests_in_flight.emplace(shard.next_request_seq, req);
+        ++shard.next_request_seq;
+        outgoing.requests.push_back(req);
+        ++minted;
+        ++shard.stats.recursive_requests;
+        shard.stats.attempted_bytes += effective_bytes;
+    }
+    if (minted != 0) {
+        shard.in_flight.fetch_add(minted, std::memory_order_acq_rel);
+        ++shard.wave_index;
+        ++shard.stats.frontier_waves;
+    }
+    return workspace_result_t<bool>::success(minted != 0);
+}
+
+workspace_result_t<bool> shard_lease_gap_step(
+    decode_run_context_t& ctx, decode_shard_context_t& shard,
+    lease_outgoing_t& outgoing)
+{
+    if (shard.next_gap_tile >= shard.accumulators.size())
+        return workspace_result_t<bool>::success(false);
+    auto& accumulator = shard.accumulators[shard.next_gap_tile];
+    const auto* tile = accumulator.tile;
+    if (tile == nullptr) {
+        ++shard.next_gap_tile;
+        return workspace_result_t<bool>::success(true);
+    }
+    ensure_tile_sorted(accumulator);
+    std::uint64_t tile_end_rva = 0;
+    if (!checked_add(tile->start_rva, tile->byte_count, tile_end_rva)) {
+        return workspace_result_t<bool>::failure(
+            orchestrator_error(workspace_error_code_t::range_overflow,
+                "gap decode tile range overflow", tile->start_rva));
+    }
+
+    const auto request_capacity = (std::min)(
+        ctx.caps->maximum_request_bytes,
+        ctx.limits->invalid_run_policy.maximum_gap_resynchronization_bytes);
+    if (request_capacity < ctx.caps->minimum_instruction_bytes) {
+        return workspace_result_t<bool>::failure(
+            orchestrator_error(workspace_error_code_t::invalid_argument,
+                "gap resynchronization window is below the decoder minimum",
+                tile->start_rva));
+    }
+
+    std::uint64_t cursor = tile->start_rva;
+    std::uint64_t visits = 0;
+    const auto emit_gap = [&](std::uint64_t gap_start,
+                              std::uint64_t gap_length)
+        -> workspace_result_t<void> {
+        if (gap_length == 0)
+            return workspace_result_t<void>::success();
+        const auto maximum_lookahead =
+            static_cast<std::uint64_t>(ctx.caps->maximum_instruction_bytes -
+                ctx.caps->instruction_alignment);
+        const auto minimum_owned_bytes = (std::min)(
+            request_capacity,
+            static_cast<std::uint64_t>(ctx.caps->instruction_alignment));
+        const auto lookahead_reserve = (std::min)(maximum_lookahead,
+            request_capacity - minimum_owned_bytes);
+        auto owned_capacity = request_capacity - lookahead_reserve;
+        if (owned_capacity >= ctx.caps->instruction_alignment) {
+            owned_capacity -= owned_capacity % ctx.caps->instruction_alignment;
+        }
+        if (owned_capacity == 0) {
+            return workspace_result_t<void>::failure(
+                orchestrator_error(workspace_error_code_t::invalid_argument,
+                    "gap resynchronization window has no aligned ownership",
+                    gap_start));
+        }
+
+        std::uint64_t gap_offset = 0;
+        while (gap_offset < gap_length) {
+            if (ctx.cancellation->stop_requested()) {
+                return workspace_result_t<void>::failure(
+                    cancellation_error(*ctx.cancellation,
+                        "orchestrator gap pass cancelled"));
+            }
+            const auto consumed = ctx.ledger.decode_requests.fetch_add(1,
+                std::memory_order_acq_rel);
+            if (consumed >= ctx.limits->maximum_decode_requests) {
+                return workspace_result_t<void>::failure(
+                    limit_error("decode_requests",
+                        ctx.limits->maximum_decode_requests,
+                        consumed ==
+                                (std::numeric_limits<std::uint64_t>::max)()
+                            ? consumed
+                            : consumed + 1,
+                        gap_start));
+            }
+            if (shard.next_request_seq >= (1ULL << 48)) {
+                return workspace_result_t<void>::failure(
+                    limit_error("request_identifiers",
+                        shard.next_request_seq, shard.next_request_seq,
+                        gap_start));
+            }
+
+            std::uint64_t request_start = 0;
+            std::uint64_t offset_in_tile = 0;
+            if (!checked_add(gap_start, gap_offset, request_start) ||
+                request_start < tile->start_rva) {
+                return workspace_result_t<void>::failure(
+                    orchestrator_error(workspace_error_code_t::range_overflow,
+                        "gap decode request start overflowed", gap_start));
+            }
+            offset_in_tile = request_start - tile->start_rva;
+            const auto remaining_gap_bytes = gap_length - gap_offset;
+            const auto owned_bytes = (std::min)(
+                remaining_gap_bytes, owned_capacity);
+            const auto lookahead_bytes = (std::min)({
+                remaining_gap_bytes - owned_bytes,
+                request_capacity - owned_bytes,
+                lookahead_reserve});
+            std::uint64_t request_bytes = 0;
+            std::uint64_t owned_end = 0;
+            std::uint64_t provider_offset = 0;
+            std::uint64_t runtime_address = 0;
+            if (!checked_add(owned_bytes, lookahead_bytes, request_bytes) ||
+                !checked_add(request_start, owned_bytes, owned_end) ||
+                !checked_add(tile->provider_offset, offset_in_tile,
+                    provider_offset) ||
+                !checked_add(tile->start_virtual_address, offset_in_tile,
+                    runtime_address)) {
+                return workspace_result_t<void>::failure(
+                    orchestrator_error(workspace_error_code_t::range_overflow,
+                        "gap decode request range overflowed", request_start));
+            }
+
+            tile_decode_request_t request;
+            request.request_id =
+                (static_cast<std::uint64_t>(shard.shard_index) << 48) |
+                shard.next_request_seq;
+            request.tile_id = tile->tile_id;
+            request.pass = tile_decode_pass_t::gap;
+            request.seed_kind = decode_frontier_seed_kind_t::fallthrough;
+            request.start.space = address_space_id_t::relative_virtual;
+            request.start.value = request_start;
+            request.start.architecture = ctx.caps->decoder_key.architecture;
+            request.start.mode = ctx.caps->decoder_key.mode;
+            request.provider_offset = provider_offset;
+            request.runtime_address = runtime_address;
+            request.image_base = ctx.image_base;
+            request.image_size = ctx.image_size;
+            request.byte_count = request_bytes;
+            request.owned_end_rva = owned_end;
+            request.provenance = fact_provenance_t::gap_recovery;
+            request.confidence = 50;
+
+            shard.requests_in_flight.emplace(shard.next_request_seq, request);
+            ++shard.next_request_seq;
+            outgoing.requests.push_back(request);
+            shard.in_flight.fetch_add(1, std::memory_order_acq_rel);
+            ++shard.stats.gap_requests;
+            shard.stats.attempted_bytes += request_bytes;
+            gap_offset += owned_bytes;
+        }
+        return workspace_result_t<void>::success();
+    };
+
+    for (const auto& entry : accumulator.entries) {
+        if (entry.evicted)
+            continue;
+        if ((visits++ & 255ULL) == 0 &&
+            ctx.cancellation->stop_requested()) {
+            return workspace_result_t<bool>::failure(
+                cancellation_error(*ctx.cancellation,
+                    "orchestrator gap pass cancelled"));
+        }
+        const auto rva = entry.record.address.value;
+        if (rva > cursor) {
+            auto emitted = emit_gap(cursor, rva - cursor);
+            if (!emitted)
+                return workspace_result_t<bool>::failure(emitted.error());
+        }
+        std::uint64_t entry_end = 0;
+        if (!checked_add(rva, entry.record.length, entry_end)) {
+            return workspace_result_t<bool>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "gap decode instruction range overflow", rva));
+        }
+        cursor = (std::max)(cursor, entry_end);
+    }
+    if (cursor < tile_end_rva) {
+        auto emitted = emit_gap(cursor, tile_end_rva - cursor);
+        if (!emitted)
+            return workspace_result_t<bool>::failure(emitted.error());
+    }
+    ++shard.next_gap_tile;
+    return workspace_result_t<bool>::success(true);
+}
+
+workspace_result_t<bool> shard_lease_reconcile_step(
+    decode_run_context_t& ctx, decode_shard_context_t& shard)
+{
+    if (shard.reconcile_done)
+        return workspace_result_t<bool>::success(false);
+    auto swept = shard_reconcile_local(ctx, shard);
+    if (!swept)
+        return workspace_result_t<bool>::failure(swept.error());
+    return workspace_result_t<bool>::success(true);
+}
+
+workspace_result_t<bool> shard_lease_edges_step(
+    decode_run_context_t& ctx, decode_shard_context_t& shard)
+{
+    if (shard.edges_done)
+        return workspace_result_t<bool>::success(false);
+    auto recorded = shard_record_edges(ctx, shard);
+    if (!recorded)
+        return workspace_result_t<bool>::failure(recorded.error());
+    return workspace_result_t<bool>::success(true);
+}
+
+workspace_result_t<bool> shard_lease_build_step(
+    decode_run_context_t& ctx, decode_shard_context_t& shard)
+{
+    if (shard.next_build_tile >= shard.accumulators.size())
+        return workspace_result_t<bool>::success(false);
+    auto built = shard_build_tile(ctx, shard);
+    if (!built)
+        return workspace_result_t<bool>::failure(built.error());
+    return workspace_result_t<bool>::success(true);
+}
+
 workspace_result_t<bool> shard_lease_step(decode_run_context_t& ctx,
     decode_shard_context_t& shard, lease_outgoing_t& outgoing)
 {
@@ -2224,298 +2543,90 @@ workspace_result_t<bool> shard_lease_step(decode_run_context_t& ctx,
         did_work = true;
     }
 
+    if (ctx.mode == tile_decode_pipeline_mode_t::pipelined) {
+        if (!ctx.stage1_quiesced_announced.load(std::memory_order_acquire)) {
+            if (!shard.frontier.empty()) {
+                auto waved = shard_lease_recursive_wave(ctx, shard, outgoing);
+                if (!waved)
+                    return workspace_result_t<bool>::failure(waved.error());
+                if (waved.value())
+                    did_work = true;
+            } else if (shard.next_gap_tile < shard.accumulators.size()) {
+                auto gapped = shard_lease_gap_step(ctx, shard, outgoing);
+                if (!gapped)
+                    return workspace_result_t<bool>::failure(gapped.error());
+                if (gapped.value())
+                    did_work = true;
+            }
+            return workspace_result_t<bool>::success(did_work);
+        }
+        if (!shard.reconcile_done) {
+            auto reconciled = shard_lease_reconcile_step(ctx, shard);
+            if (!reconciled)
+                return workspace_result_t<bool>::failure(reconciled.error());
+            if (reconciled.value())
+                did_work = true;
+            return workspace_result_t<bool>::success(did_work);
+        }
+        if (ctx.fixup_done.load(std::memory_order_acquire)) {
+            if (!shard.edges_done) {
+                auto recorded = shard_lease_edges_step(ctx, shard);
+                if (!recorded)
+                    return workspace_result_t<bool>::failure(recorded.error());
+                if (recorded.value())
+                    did_work = true;
+                return workspace_result_t<bool>::success(did_work);
+            }
+            if (shard.next_build_tile < shard.accumulators.size()) {
+                auto built = shard_lease_build_step(ctx, shard);
+                if (!built)
+                    return workspace_result_t<bool>::failure(built.error());
+                if (built.value())
+                    did_work = true;
+                return workspace_result_t<bool>::success(did_work);
+            }
+        }
+        return workspace_result_t<bool>::success(did_work);
+    }
     switch (phase) {
     case decode_run_context_t::phase_recursive: {
-        if (shard.frontier.empty())
-            break;
-        auto wave_result = shard.frontier.take_wave(ctx.batch_request_limit);
-        if (!wave_result)
-            return workspace_result_t<bool>::failure(wave_result.error());
-        auto wave = wave_result.take_value();
-        if (wave.empty())
-            break;
-        std::uint32_t minted = 0;
-        for (const auto& seed : wave) {
-            if (seed.tile_id >= ctx.all_tiles->size())
-                continue;
-            const auto& tile = (*ctx.all_tiles)[seed.tile_id];
-            const auto consumed = ctx.ledger.decode_requests.fetch_add(1,
-                std::memory_order_acq_rel);
-            if (consumed >= ctx.limits->maximum_decode_requests) {
-                return workspace_result_t<bool>::failure(
-                    limit_error("decode_requests",
-                        ctx.limits->maximum_decode_requests,
-                        consumed ==
-                                (std::numeric_limits<std::uint64_t>::max)()
-                            ? consumed
-                            : consumed + 1,
-                        seed.rva));
-            }
-            if (shard.next_request_seq >= (1ULL << 48)) {
-                return workspace_result_t<bool>::failure(
-                    limit_error("request_identifiers",
-                        shard.next_request_seq, shard.next_request_seq,
-                        seed.rva));
-            }
-
-            const std::uint64_t offset_in_tile = seed.rva - tile.start_rva;
-            const std::uint64_t remaining = tile.byte_count - offset_in_tile;
-            std::uint64_t available_bytes = 0;
-            if (!checked_add(remaining, tile.lookahead_bytes, available_bytes)) {
-                return workspace_result_t<bool>::failure(
-                    orchestrator_error(workspace_error_code_t::range_overflow,
-                        "recursive decode request range overflow", seed.rva));
-            }
-            const std::uint64_t effective_bytes = (std::min)(
-                available_bytes, ctx.caps->maximum_request_bytes);
-            std::uint64_t provider_offset = 0;
-            std::uint64_t runtime_address = 0;
-            std::uint64_t owned_end = 0;
-            if (!checked_add(tile.provider_offset, offset_in_tile,
-                    provider_offset) ||
-                !checked_add(tile.start_virtual_address, offset_in_tile,
-                    runtime_address) ||
-                !checked_add(tile.start_rva, tile.byte_count, owned_end)) {
-                return workspace_result_t<bool>::failure(
-                    orchestrator_error(workspace_error_code_t::range_overflow,
-                        "recursive decode request range overflow", seed.rva));
-            }
-
-            tile_decode_request_t req;
-            req.request_id =
-                (static_cast<std::uint64_t>(shard.shard_index) << 48) |
-                shard.next_request_seq;
-            req.tile_id = seed.tile_id;
-            req.pass = tile_decode_pass_t::recursive;
-            req.seed_kind = seed.kind;
-            req.start.space = address_space_id_t::relative_virtual;
-            req.start.value = seed.rva;
-            req.start.architecture = ctx.caps->decoder_key.architecture;
-            req.start.mode = ctx.caps->decoder_key.mode;
-            req.provider_offset = provider_offset;
-            req.runtime_address = runtime_address;
-            req.image_base = ctx.image_base;
-            req.image_size = ctx.image_size;
-            req.byte_count = effective_bytes;
-            req.owned_end_rva = owned_end;
-            req.stable_source_id = seed.stable_source_id;
-            req.provenance = seed.provenance;
-            req.confidence = seed.confidence;
-
-            shard.requests_in_flight.emplace(shard.next_request_seq, req);
-            ++shard.next_request_seq;
-            outgoing.requests.push_back(req);
-            ++minted;
-            ++shard.stats.recursive_requests;
-            shard.stats.attempted_bytes += effective_bytes;
-        }
-        if (minted != 0) {
-            shard.in_flight.fetch_add(minted, std::memory_order_acq_rel);
-            ++shard.wave_index;
-            ++shard.stats.frontier_waves;
+        auto waved = shard_lease_recursive_wave(ctx, shard, outgoing);
+        if (!waved)
+            return workspace_result_t<bool>::failure(waved.error());
+        if (waved.value())
             did_work = true;
-        }
         break;
     }
     case decode_run_context_t::phase_gap: {
-        if (shard.next_gap_tile >= shard.accumulators.size())
-            break;
-        auto& accumulator = shard.accumulators[shard.next_gap_tile];
-        const auto* tile = accumulator.tile;
-        if (tile == nullptr) {
-            ++shard.next_gap_tile;
+        auto gapped = shard_lease_gap_step(ctx, shard, outgoing);
+        if (!gapped)
+            return workspace_result_t<bool>::failure(gapped.error());
+        if (gapped.value())
             did_work = true;
-            break;
-        }
-        ensure_tile_sorted(accumulator);
-        std::uint64_t tile_end_rva = 0;
-        if (!checked_add(tile->start_rva, tile->byte_count, tile_end_rva)) {
-            return workspace_result_t<bool>::failure(
-                orchestrator_error(workspace_error_code_t::range_overflow,
-                    "gap decode tile range overflow", tile->start_rva));
-        }
-
-        const auto request_capacity = (std::min)(
-            ctx.caps->maximum_request_bytes,
-            ctx.limits->invalid_run_policy.maximum_gap_resynchronization_bytes);
-        if (request_capacity < ctx.caps->minimum_instruction_bytes) {
-            return workspace_result_t<bool>::failure(
-                orchestrator_error(workspace_error_code_t::invalid_argument,
-                    "gap resynchronization window is below the decoder minimum",
-                    tile->start_rva));
-        }
-
-        std::uint64_t cursor = tile->start_rva;
-        std::uint64_t visits = 0;
-        const auto emit_gap = [&](std::uint64_t gap_start,
-                                  std::uint64_t gap_length)
-            -> workspace_result_t<void> {
-            if (gap_length == 0)
-                return workspace_result_t<void>::success();
-            const auto maximum_lookahead =
-                static_cast<std::uint64_t>(ctx.caps->maximum_instruction_bytes -
-                    ctx.caps->instruction_alignment);
-            const auto minimum_owned_bytes = (std::min)(
-                request_capacity,
-                static_cast<std::uint64_t>(ctx.caps->instruction_alignment));
-            const auto lookahead_reserve = (std::min)(maximum_lookahead,
-                request_capacity - minimum_owned_bytes);
-            auto owned_capacity = request_capacity - lookahead_reserve;
-            if (owned_capacity >= ctx.caps->instruction_alignment) {
-                owned_capacity -= owned_capacity % ctx.caps->instruction_alignment;
-            }
-            if (owned_capacity == 0) {
-                return workspace_result_t<void>::failure(
-                    orchestrator_error(workspace_error_code_t::invalid_argument,
-                        "gap resynchronization window has no aligned ownership",
-                        gap_start));
-            }
-
-            std::uint64_t gap_offset = 0;
-            while (gap_offset < gap_length) {
-                if (ctx.cancellation->stop_requested()) {
-                    return workspace_result_t<void>::failure(
-                        cancellation_error(*ctx.cancellation,
-                            "orchestrator gap pass cancelled"));
-                }
-                const auto consumed = ctx.ledger.decode_requests.fetch_add(1,
-                    std::memory_order_acq_rel);
-                if (consumed >= ctx.limits->maximum_decode_requests) {
-                    return workspace_result_t<void>::failure(
-                        limit_error("decode_requests",
-                            ctx.limits->maximum_decode_requests,
-                            consumed ==
-                                    (std::numeric_limits<std::uint64_t>::max)()
-                                ? consumed
-                                : consumed + 1,
-                            gap_start));
-                }
-                if (shard.next_request_seq >= (1ULL << 48)) {
-                    return workspace_result_t<void>::failure(
-                        limit_error("request_identifiers",
-                            shard.next_request_seq, shard.next_request_seq,
-                            gap_start));
-                }
-
-                std::uint64_t request_start = 0;
-                std::uint64_t offset_in_tile = 0;
-                if (!checked_add(gap_start, gap_offset, request_start) ||
-                    request_start < tile->start_rva) {
-                    return workspace_result_t<void>::failure(
-                        orchestrator_error(workspace_error_code_t::range_overflow,
-                            "gap decode request start overflowed", gap_start));
-                }
-                offset_in_tile = request_start - tile->start_rva;
-                const auto remaining_gap_bytes = gap_length - gap_offset;
-                const auto owned_bytes = (std::min)(
-                    remaining_gap_bytes, owned_capacity);
-                const auto lookahead_bytes = (std::min)({
-                    remaining_gap_bytes - owned_bytes,
-                    request_capacity - owned_bytes,
-                    lookahead_reserve});
-                std::uint64_t request_bytes = 0;
-                std::uint64_t owned_end = 0;
-                std::uint64_t provider_offset = 0;
-                std::uint64_t runtime_address = 0;
-                if (!checked_add(owned_bytes, lookahead_bytes, request_bytes) ||
-                    !checked_add(request_start, owned_bytes, owned_end) ||
-                    !checked_add(tile->provider_offset, offset_in_tile,
-                        provider_offset) ||
-                    !checked_add(tile->start_virtual_address, offset_in_tile,
-                        runtime_address)) {
-                    return workspace_result_t<void>::failure(
-                        orchestrator_error(workspace_error_code_t::range_overflow,
-                            "gap decode request range overflowed", request_start));
-                }
-
-                tile_decode_request_t request;
-                request.request_id =
-                    (static_cast<std::uint64_t>(shard.shard_index) << 48) |
-                    shard.next_request_seq;
-                request.tile_id = tile->tile_id;
-                request.pass = tile_decode_pass_t::gap;
-                request.seed_kind = decode_frontier_seed_kind_t::fallthrough;
-                request.start.space = address_space_id_t::relative_virtual;
-                request.start.value = request_start;
-                request.start.architecture = ctx.caps->decoder_key.architecture;
-                request.start.mode = ctx.caps->decoder_key.mode;
-                request.provider_offset = provider_offset;
-                request.runtime_address = runtime_address;
-                request.image_base = ctx.image_base;
-                request.image_size = ctx.image_size;
-                request.byte_count = request_bytes;
-                request.owned_end_rva = owned_end;
-                request.provenance = fact_provenance_t::gap_recovery;
-                request.confidence = 50;
-
-                shard.requests_in_flight.emplace(shard.next_request_seq, request);
-                ++shard.next_request_seq;
-                outgoing.requests.push_back(request);
-                shard.in_flight.fetch_add(1, std::memory_order_acq_rel);
-                ++shard.stats.gap_requests;
-                shard.stats.attempted_bytes += request_bytes;
-                gap_offset += owned_bytes;
-            }
-            return workspace_result_t<void>::success();
-        };
-
-        for (const auto& entry : accumulator.entries) {
-            if (entry.evicted)
-                continue;
-            if ((visits++ & 255ULL) == 0 &&
-                ctx.cancellation->stop_requested()) {
-                return workspace_result_t<bool>::failure(
-                    cancellation_error(*ctx.cancellation,
-                        "orchestrator gap pass cancelled"));
-            }
-            const auto rva = entry.record.address.value;
-            if (rva > cursor) {
-                auto emitted = emit_gap(cursor, rva - cursor);
-                if (!emitted)
-                    return workspace_result_t<bool>::failure(emitted.error());
-            }
-            std::uint64_t entry_end = 0;
-            if (!checked_add(rva, entry.record.length, entry_end)) {
-                return workspace_result_t<bool>::failure(
-                    orchestrator_error(workspace_error_code_t::integrity_failure,
-                        "gap decode instruction range overflow", rva));
-            }
-            cursor = (std::max)(cursor, entry_end);
-        }
-        if (cursor < tile_end_rva) {
-            auto emitted = emit_gap(cursor, tile_end_rva - cursor);
-            if (!emitted)
-                return workspace_result_t<bool>::failure(emitted.error());
-        }
-        ++shard.next_gap_tile;
-        did_work = true;
         break;
     }
     case decode_run_context_t::phase_reconcile: {
-        if (shard.reconcile_done)
-            break;
-        auto swept = shard_reconcile_local(ctx, shard);
-        if (!swept)
-            return workspace_result_t<bool>::failure(swept.error());
-        did_work = true;
+        auto reconciled = shard_lease_reconcile_step(ctx, shard);
+        if (!reconciled)
+            return workspace_result_t<bool>::failure(reconciled.error());
+        if (reconciled.value())
+            did_work = true;
         break;
     }
     case decode_run_context_t::phase_edges: {
-        if (shard.edges_done)
-            break;
-        auto recorded = shard_record_edges(ctx, shard);
+        auto recorded = shard_lease_edges_step(ctx, shard);
         if (!recorded)
             return workspace_result_t<bool>::failure(recorded.error());
-        did_work = true;
+        if (recorded.value())
+            did_work = true;
         break;
     }
     case decode_run_context_t::phase_build: {
-        if (shard.next_build_tile >= shard.accumulators.size())
-            break;
-        auto built = shard_build_tile(ctx, shard);
+        auto built = shard_lease_build_step(ctx, shard);
         if (!built)
             return workspace_result_t<bool>::failure(built.error());
-        did_work = true;
+        if (built.value())
+            did_work = true;
         break;
     }
     default:
@@ -2611,6 +2722,11 @@ bool gap_phase_done(decode_run_context_t& ctx)
     if (ctx.pool != nullptr && !ctx.pool->drained())
         return false;
     return true;
+}
+
+bool pipelined_stage1_done(decode_run_context_t& ctx)
+{
+    return recursive_phase_done(ctx) && gap_phase_done(ctx);
 }
 
 bool reconcile_phase_done(decode_run_context_t& ctx)
@@ -2877,6 +2993,153 @@ std::vector<T> kway_merge_unique(std::vector<std::vector<T>>& sources, Less less
     return merged;
 }
 
+template <typename T, typename Less>
+std::vector<T> merge_two_unique(const std::vector<T>& left,
+                                const std::vector<T>& right, Less less)
+{
+    std::vector<T> merged;
+    merged.reserve(left.size() + right.size());
+    auto left_cursor = left.begin();
+    auto right_cursor = right.begin();
+    bool have_last = false;
+    T last{};
+    const auto push = [&](const T& value) {
+        if (!have_last || less(last, value) || less(value, last)) {
+            merged.push_back(value);
+            last = value;
+            have_last = true;
+        }
+    };
+    while (left_cursor != left.end() && right_cursor != right.end()) {
+        if (less(*right_cursor, *left_cursor)) {
+            push(*right_cursor);
+            ++right_cursor;
+        } else {
+            push(*left_cursor);
+            ++left_cursor;
+        }
+    }
+    while (left_cursor != left.end()) {
+        push(*left_cursor);
+        ++left_cursor;
+    }
+    while (right_cursor != right.end()) {
+        push(*right_cursor);
+        ++right_cursor;
+    }
+    return merged;
+}
+
+template <typename T, typename Less>
+std::vector<T> parallel_kway_merge_unique(std::vector<std::vector<T>>& sources,
+                                          Less less)
+{
+    std::size_t total = 0;
+    std::size_t live_sources = 0;
+    for (const auto& source : sources) {
+        total += source.size();
+        live_sources += source.empty() ? 0U : 1U;
+    }
+    if (live_sources < 4 || total < 65'536)
+        return kway_merge_unique(sources, less);
+    std::vector<std::vector<T>> runs;
+    runs.reserve(live_sources);
+    for (auto& source : sources) {
+        if (!source.empty())
+            runs.push_back(std::move(source));
+    }
+    while (runs.size() > 1) {
+        const std::size_t pairs = runs.size() / 2;
+        std::vector<std::vector<T>> next(pairs + (runs.size() % 2));
+        parallel_executor_t::run(pairs, 0, "analysis.decode_edge_merge",
+            [&](std::size_t index) {
+                next[index] = merge_two_unique(
+                    runs[index * 2], runs[index * 2 + 1], less);
+            });
+        if (runs.size() % 2 != 0)
+            next[pairs] = std::move(runs.back());
+        runs = std::move(next);
+    }
+    return std::move(runs.front());
+}
+
+workspace_result_t<void> parallel_coverage_union(
+    std::vector<coverage_span_t>& decoded_coverage,
+    std::vector<coverage_span_t>& zero_fill_coverage,
+    const cancellation_token_t& cancellation)
+{
+    std::sort(zero_fill_coverage.begin(), zero_fill_coverage.end(),
+        coverage_span_less_t{});
+    if (!std::is_sorted(decoded_coverage.begin(), decoded_coverage.end(),
+            coverage_span_less_t{})) {
+        merge_coverage_into(decoded_coverage, zero_fill_coverage);
+        return workspace_result_t<void>::success();
+    }
+    const std::size_t total =
+        decoded_coverage.size() + zero_fill_coverage.size();
+    const auto workers = parallel_worker_count();
+    if (total < 65'536 || workers <= 1 || decoded_coverage.empty()) {
+        std::vector<coverage_span_t> merged;
+        merged.reserve(total);
+        std::merge(decoded_coverage.begin(), decoded_coverage.end(),
+            zero_fill_coverage.begin(), zero_fill_coverage.end(),
+            std::back_inserter(merged), coverage_span_less_t{});
+        stitch_sorted_coverage(merged);
+        decoded_coverage = std::move(merged);
+        return workspace_result_t<void>::success();
+    }
+    const auto shards = parallel_shards(decoded_coverage.size(), workers);
+    std::vector<std::vector<coverage_span_t>> outputs(shards.size());
+    std::atomic<bool> stopped{false};
+    parallel_executor_t::run(shards.size(), 0, "analysis.decode_coverage_merge",
+        [&](std::size_t index) {
+            if (stopped.load(std::memory_order_acquire))
+                return;
+            if (cancellation.stop_requested()) {
+                stopped.store(true, std::memory_order_release);
+                return;
+            }
+            const auto& shard = shards[index];
+            coverage_span_t boundary_key;
+            boundary_key.start = decoded_coverage[shard.begin].start;
+            const auto zero_begin = std::lower_bound(
+                zero_fill_coverage.begin(), zero_fill_coverage.end(),
+                boundary_key, coverage_span_less_t{});
+            auto zero_end = zero_fill_coverage.end();
+            if (shard.end < decoded_coverage.size()) {
+                coverage_span_t end_key;
+                end_key.start = decoded_coverage[shard.end].start;
+                zero_end = std::lower_bound(zero_begin, zero_fill_coverage.end(),
+                    end_key, coverage_span_less_t{});
+            }
+            std::vector<coverage_span_t> local;
+            local.reserve(static_cast<std::size_t>(shard.end - shard.begin) +
+                static_cast<std::size_t>(std::distance(zero_begin, zero_end)));
+            std::merge(decoded_coverage.begin() +
+                    static_cast<std::ptrdiff_t>(shard.begin),
+                decoded_coverage.begin() +
+                    static_cast<std::ptrdiff_t>(shard.end),
+                zero_begin, zero_end, std::back_inserter(local),
+                coverage_span_less_t{});
+            stitch_sorted_coverage(local);
+            outputs[index] = std::move(local);
+        });
+    if (stopped.load(std::memory_order_acquire)) {
+        return workspace_result_t<void>::failure(cancellation_error(
+            cancellation, "orchestrator coverage merge cancelled"));
+    }
+    std::vector<coverage_span_t> merged;
+    merged.reserve(total);
+    for (auto& output : outputs) {
+        merged.insert(merged.end(),
+            std::make_move_iterator(output.begin()),
+            std::make_move_iterator(output.end()));
+    }
+    stitch_sorted_coverage(merged);
+    decoded_coverage = std::move(merged);
+    return workspace_result_t<void>::success();
+}
+
 }
 
 workspace_result_t<tile_decode_orchestration_result_t>
@@ -2962,6 +3225,7 @@ tile_decode_orchestrator_t::run_impl(
     ctx.range_begin = range_begin;
     ctx.range_end = range_end;
     ctx.all_tiles = &partition->tiles;
+    ctx.mode = limits_.pipeline_mode;
 
     if (shared_pool != nullptr) {
         ctx.pool = shared_pool;
@@ -3178,6 +3442,9 @@ tile_decode_orchestrator_t::run_impl(
     std::uint64_t edges_phase_ns = 0;
     std::uint64_t build_phase_ns = 0;
 
+    const bool pipelined =
+        ctx.mode == tile_decode_pipeline_mode_t::pipelined;
+
     auto driven = drive_timed(recursive_phase_done,
         decode_run_context_t::phase_recursive, "recursive",
         "orchestrator recursive pass cancelled",
@@ -3186,12 +3453,16 @@ tile_decode_orchestrator_t::run_impl(
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             driven.error());
 
-    driven = drive_timed(gap_phase_done, decode_run_context_t::phase_gap,
-        "gap", "orchestrator gap pass cancelled",
+    driven = drive_timed(
+        pipelined ? pipelined_stage1_done : gap_phase_done,
+        decode_run_context_t::phase_gap, "gap",
+        "orchestrator gap pass cancelled",
         "orchestrator gap batch cancelled", gap_phase_ns);
     if (!driven)
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             driven.error());
+
+    ctx.stage1_quiesced_announced.store(true, std::memory_order_release);
 
     driven = drive_timed(reconcile_phase_done,
         decode_run_context_t::phase_reconcile, "reconcile",
@@ -3216,6 +3487,8 @@ tile_decode_orchestrator_t::run_impl(
             return workspace_result_t<tile_decode_orchestration_result_t>::failure(
                 fixed.error());
     }
+
+    ctx.fixup_done.store(true, std::memory_order_release);
 
     driven = drive_timed(edges_phase_done, decode_run_context_t::phase_edges,
         "edges", "tile decode edge recording cancelled",
@@ -3260,6 +3533,7 @@ tile_decode_orchestrator_t::run_impl(
     std::vector<packed_analysis_shard_t> shards;
     std::vector<tile_decode_shard_summary_t> shard_summaries;
     std::vector<coverage_span_t> merged_coverage;
+    std::vector<coverage_span_t> zero_fill_coverage;
     std::vector<std::uint8_t> merged_delay_slot_counts;
     merged_delay_slot_counts.reserve(static_cast<std::size_t>(
         ctx.ledger.instructions.load(std::memory_order_acquire)));
@@ -3338,14 +3612,15 @@ tile_decode_orchestrator_t::run_impl(
             std::move(store_result).take_value());
     }
 
-    auto merged_edges = kway_merge_unique(edge_sources, decoded_edge_less_t{});
+    auto merged_edges = parallel_kway_merge_unique(edge_sources,
+        decoded_edge_less_t{});
     if (static_cast<std::uint64_t>(merged_edges.size()) >
         limits_.maximum_edges) {
         return workspace_result_t<tile_decode_orchestration_result_t>::failure(
             limit_error("edges", limits_.maximum_edges,
                 static_cast<std::uint64_t>(merged_edges.size())));
     }
-    auto merged_cross_edges = kway_merge_unique(cross_edge_sources,
+    auto merged_cross_edges = parallel_kway_merge_unique(cross_edge_sources,
         cross_tile_edge_less_t{});
 
     stats.accepted_instructions =
@@ -3402,10 +3677,15 @@ tile_decode_orchestrator_t::run_impl(
         span.provenance = fact_provenance_t::linear_validation;
         span.confidence = 100;
         span.detail_code = static_cast<std::uint32_t>(tile_coverage_detail_t::zero_fill);
-        merged_coverage.push_back(std::move(span));
+        zero_fill_coverage.push_back(std::move(span));
     }
 
-    merge_coverage_into(merged_coverage, {});
+    auto coverage_merged = parallel_coverage_union(merged_coverage,
+        zero_fill_coverage, cancellation);
+    if (!coverage_merged) {
+        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+            coverage_merged.error());
+    }
 
     std::sort(shard_summaries.begin(), shard_summaries.end(),
               [](const auto& a, const auto& b) { return a.tile_id < b.tile_id; });
@@ -3415,7 +3695,7 @@ tile_decode_orchestrator_t::run_impl(
             std::chrono::steady_clock::now() - run_start).count());
 
     ::diag::log_tagged_fmt("tile_decode",
-        "run done wall_us=%llu tiles=%llu shards=%u workers=%u requests=%llu instructions=%llu steals=%llu apply_stalls=%llu backpressure_waits=%llu max_queue_depth=%llu",
+        "run done wall_us=%llu tiles=%llu shards=%u workers=%u requests=%llu instructions=%llu steals=%llu apply_stalls=%llu backpressure_waits=%llu max_queue_depth=%llu mode=%s",
         static_cast<unsigned long long>(stats.lane_wall_ns / 1000ULL),
         static_cast<unsigned long long>(range_tile_count),
         shard_count,
@@ -3426,7 +3706,8 @@ tile_decode_orchestrator_t::run_impl(
         static_cast<unsigned long long>(stats.worker_steal_count),
         static_cast<unsigned long long>(stats.apply_stall_count),
         static_cast<unsigned long long>(stats.worker_backpressure_wait_count),
-        static_cast<unsigned long long>(stats.worker_max_queue_depth));
+        static_cast<unsigned long long>(stats.worker_max_queue_depth),
+        pipelined ? "pipelined" : "gated");
 
     tile_decode_orchestration_result_t result;
     if (publish_unmerged_shards)

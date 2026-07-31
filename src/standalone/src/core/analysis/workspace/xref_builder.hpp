@@ -82,6 +82,11 @@ public:
         const xref_build_limits_t& limits,
         const cancellation_token_t& cancel);
 
+    static workspace_result_t<void> publish_xrefs(
+        analysis_snapshot_t& snapshot,
+        xref_build_result_t xrefs,
+        const cancellation_token_t& cancel = {});
+
     static workspace_result_t<void> publish(
         analysis_snapshot_t& snapshot,
         xref_build_result_t xrefs,

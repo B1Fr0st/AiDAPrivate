@@ -63,6 +63,50 @@ std::size_t pass_shard_count(std::size_t items, std::size_t items_per_shard) {
     return static_cast<std::size_t>((std::min)((std::max)(wanted, 1ULL), cap));
 }
 
+template <typename Fn>
+void run_merge_shards(std::size_t shard_total, Fn&& shard_fn) {
+    parallel_executor_t::run(shard_total, parallel_worker_count(),
+        "analysis.data_discovery", std::forward<Fn>(shard_fn));
+}
+
+template <typename T, typename Equal>
+void parallel_unique_erase(std::vector<T>& values, Equal&& equal) {
+    if (values.size() < 2)
+        return;
+    const std::size_t count = values.size();
+    const auto shards = parallel_shards(count, static_cast<std::uint32_t>(
+        pass_shard_count(count, kInstructionShardFloor)));
+    std::vector<std::uint8_t> keep(count, 0);
+    std::vector<std::uint64_t> shard_keeps(shards.size(), 0);
+    run_merge_shards(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        std::uint64_t kept = 0;
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            const auto flagged = index == 0 || !equal(values[index - 1], values[index]);
+            keep[index] = flagged ? static_cast<std::uint8_t>(1)
+                                  : static_cast<std::uint8_t>(0);
+            kept += flagged ? 1ULL : 0ULL;
+        }
+        shard_keeps[shard] = kept;
+    });
+    std::uint64_t total = 0;
+    for (auto& base : shard_keeps) {
+        const auto offset = total;
+        total += base;
+        base = offset;
+    }
+    std::vector<T> compacted(static_cast<std::size_t>(total));
+    run_merge_shards(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        auto cursor = shard_keeps[shard];
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            if (keep[index] != 0)
+                compacted[static_cast<std::size_t>(cursor++)] = std::move(values[index]);
+        }
+    });
+    values = std::move(compacted);
+}
+
 address_t rva_address(const workspace_image_t& image, std::uint64_t rva) noexcept {
     return {address_space_id_t::relative_virtual, rva, image.architecture,
         image.architecture_mode};
@@ -518,15 +562,19 @@ void merge_slot_vectors(
         import_slots.insert(import_slots.end(), output.import_slots.begin(),
             output.import_slots.end());
     }
-    std::sort(relocation_slots.begin(), relocation_slots.end());
-    relocation_slots.erase(std::unique(relocation_slots.begin(), relocation_slots.end()),
-        relocation_slots.end());
-    std::sort(authoritative_relocations.begin(), authoritative_relocations.end());
-    authoritative_relocations.erase(std::unique(authoritative_relocations.begin(),
-        authoritative_relocations.end()), authoritative_relocations.end());
-    std::sort(import_slots.begin(), import_slots.end());
-    import_slots.erase(std::unique(import_slots.begin(), import_slots.end()),
-        import_slots.end());
+    const auto uint64_less = [](std::uint64_t lhs, std::uint64_t rhs) {
+        return lhs < rhs;
+    };
+    const auto uint64_equal = [](std::uint64_t lhs, std::uint64_t rhs) {
+        return lhs == rhs;
+    };
+    parallel_sort(relocation_slots.begin(), relocation_slots.end(), uint64_less);
+    parallel_unique_erase(relocation_slots, uint64_equal);
+    parallel_sort(authoritative_relocations.begin(), authoritative_relocations.end(),
+        uint64_less);
+    parallel_unique_erase(authoritative_relocations, uint64_equal);
+    parallel_sort(import_slots.begin(), import_slots.end(), uint64_less);
+    parallel_unique_erase(import_slots, uint64_equal);
 }
 
 workspace_result_t<void> harvest_pointer_seeds(
@@ -814,72 +862,123 @@ workspace_result_t<void> scan_regions(
     return parallel_run_shards(shards, fn, cancel);
 }
 
-struct merge_context_t {
-    const data_discovery_limits_t* limits = nullptr;
-    std::uint64_t result_bytes = 0;
-
-    bool charge(std::uint64_t bytes) {
-        return checked_add_u64(result_bytes, bytes, result_bytes) &&
-               result_bytes <= limits->max_result_bytes;
-    }
-
-    workspace_result_t<void> append_candidate(const data_candidate_record_t& value,
-                                              data_discovery_result_t& result) {
-        if (result.candidates.size() >= limits->max_candidates ||
-            !charge(sizeof(data_candidate_record_t))) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "data candidate storage exceeds its bound", "data_discovery"));
-        }
-        result.candidates.push_back(value);
-        return workspace_result_t<void>::success();
-    }
-
-    workspace_result_t<void> append_pointer(const data_pointer_fact_t& value,
-                                            data_discovery_result_t& result) {
-        if (result.pointer_facts.size() >= limits->max_pointer_facts ||
-            !charge(sizeof(data_pointer_fact_t))) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "pointer fact storage exceeds its bound", "data_discovery"));
-        }
-        result.pointer_facts.push_back(value);
-        return workspace_result_t<void>::success();
-    }
-};
-
-workspace_result_t<data_discovery_result_t> discover_impl(
-    const workspace_image_t& image, const byte_provider_t& provider,
-    const std::vector<instruction_record_t>& instructions,
-    const std::vector<target_fact_t>& targets,
-    const std::vector<data_pointer_seed_t>& pointer_seeds,
-    const data_discovery_limits_t& limits, const cancellation_token_t& cancel) {
+workspace_result_t<void> validate_discovery_limits(const workspace_image_t& image,
+    const data_discovery_limits_t& limits, std::uint64_t pointer_seed_count) {
     if (limits.max_candidates == 0 || limits.max_pointer_facts == 0 ||
         limits.max_conflicts == 0 || limits.max_pointer_seeds == 0 ||
         limits.max_result_bytes == 0 || limits.cancellation_check_interval == 0 ||
         (limits.max_pointer_scan_bytes != 0 && limits.read_window_bytes == 0) ||
-        pointer_seeds.size() > limits.max_pointer_seeds) {
-        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+        pointer_seed_count > limits.max_pointer_seeds) {
+        return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::invalid_argument,
             "data discovery limits or pointer seeds are invalid", "data_discovery"));
     }
     if (image.address_width_bits != 32 && image.address_width_bits != 64) {
-        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+        return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::unsupported_format,
             "data discovery requires a 32-bit or 64-bit address model", "data_discovery"));
     }
-    auto regions_result = mapped_regions(image, provider);
-    if (!regions_result)
-        return workspace_result_t<data_discovery_result_t>::failure(regions_result.error());
-    const auto& regions = regions_result.value();
-    data_discovery_result_t result;
+    return workspace_result_t<void>::success();
+}
+
+void absorb_emission_counters(data_discovery_result_t& result,
+    const std::vector<emission_shard_t>& groups) {
+    for (const auto& group : groups) {
+        result.bytes_scanned += group.counters.bytes_scanned;
+        result.mapped_bytes += group.counters.mapped_bytes;
+        result.provider_leases += group.counters.provider_leases;
+        result.invalid_pointer_values += group.counters.invalid_pointer_values;
+    }
+}
+
+void scatter_emission_groups(
+    const std::vector<emission_shard_t>& groups,
+    std::vector<data_candidate_record_t>& candidates,
+    std::vector<data_pointer_fact_t>& facts, std::uint64_t& candidate_base,
+    std::uint64_t& fact_base, std::atomic<bool>& merge_cancelled,
+    const cancellation_token_t& cancel) {
+    std::vector<std::uint64_t> candidate_bases(groups.size(), 0);
+    std::vector<std::uint64_t> fact_bases(groups.size(), 0);
+    auto candidate_cursor = candidate_base;
+    auto fact_cursor = fact_base;
+    for (std::size_t index = 0; index < groups.size(); ++index) {
+        candidate_bases[index] = candidate_cursor;
+        fact_bases[index] = fact_cursor;
+        candidate_cursor += groups[index].candidates.size();
+        fact_cursor += groups[index].facts.size();
+    }
+    candidate_base = candidate_cursor;
+    fact_base = fact_cursor;
+    run_merge_shards(groups.size(), [&](std::size_t shard) {
+        const auto& group = groups[shard];
+        auto candidate_slot = candidate_bases[shard];
+        auto fact_slot = fact_bases[shard];
+        std::uint32_t checks = 0;
+        const auto poll = [&]() {
+            if (++checks >= kShardCancellationStride) {
+                checks = 0;
+                if (cancel.stop_requested()) {
+                    merge_cancelled.store(true, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (std::size_t index = 0; index < group.candidates.size(); ++index) {
+            if (poll())
+                return;
+            candidates[static_cast<std::size_t>(candidate_slot++)] =
+                group.candidates[index];
+        }
+        for (std::size_t index = 0; index < group.facts.size(); ++index) {
+            if (poll())
+                return;
+            facts[static_cast<std::size_t>(fact_slot++)] = group.facts[index];
+        }
+    });
+}
+
+workspace_result_t<data_discovery_result_t> produce_instruction_driven(
+    const workspace_image_t& image,
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<target_fact_t>& targets,
+    const cancellation_token_t& cancel) {
+    data_discovery_result_t raw;
     std::vector<emission_shard_t> instruction_outputs;
     auto harvested = harvest_instruction_refs(image, instructions, targets,
         instruction_outputs, cancel);
     if (!harvested)
         return workspace_result_t<data_discovery_result_t>::failure(harvested.error());
+    const auto merge_begin = std::chrono::steady_clock::now();
+    std::uint64_t total_candidates = 0;
+    for (const auto& group : instruction_outputs) {
+        if (!checked_add_u64(total_candidates, group.candidates.size(),
+                total_candidates)) {
+            return workspace_result_t<data_discovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "data candidate storage exceeds its bound", "data_discovery"));
+        }
+    }
+    raw.candidates.resize(static_cast<std::size_t>(total_candidates));
+    std::uint64_t candidate_base = 0;
+    std::uint64_t fact_base = 0;
+    std::atomic<bool> merge_cancelled{false};
+    scatter_emission_groups(instruction_outputs, raw.candidates, raw.pointer_facts,
+        candidate_base, fact_base, merge_cancelled, cancel);
+    if (merge_cancelled.load(std::memory_order_relaxed))
+        return workspace_result_t<data_discovery_result_t>::failure(stop_error(cancel));
+    raw.shard_merge_ns += elapsed_ns(merge_begin);
+    return workspace_result_t<data_discovery_result_t>::success(std::move(raw));
+}
+
+workspace_result_t<data_discovery_result_t> produce_image_driven(
+    const workspace_image_t& image, const byte_provider_t& provider,
+    const std::vector<mapped_region_t>& regions,
+    const std::vector<data_pointer_seed_t>& pointer_seeds,
+    const data_discovery_limits_t& limits, const cancellation_token_t& cancel) {
+    data_discovery_result_t raw;
     std::vector<emission_shard_t> relocation_outputs;
-    harvested = harvest_relocations(image, relocation_outputs, cancel);
+    auto harvested = harvest_relocations(image, relocation_outputs, cancel);
     if (!harvested)
         return workspace_result_t<data_discovery_result_t>::failure(harvested.error());
     std::vector<emission_shard_t> import_outputs;
@@ -892,7 +991,7 @@ workspace_result_t<data_discovery_result_t> discover_impl(
     std::vector<std::uint64_t> import_slots;
     merge_slot_vectors(relocation_outputs, import_outputs,
         relocation_slots, authoritative_relocations, import_slots);
-    result.shard_merge_ns += elapsed_ns(slot_merge_begin);
+    raw.shard_merge_ns += elapsed_ns(slot_merge_begin);
     std::vector<emission_shard_t> seed_outputs;
     harvested = harvest_pointer_seeds(image, provider, regions, pointer_seeds,
         seed_outputs, cancel);
@@ -908,209 +1007,342 @@ workspace_result_t<data_discovery_result_t> discover_impl(
             return workspace_result_t<data_discovery_result_t>::failure(harvested.error());
     }
     const auto merge_begin = std::chrono::steady_clock::now();
-    merge_context_t merge{&limits, 0};
     std::uint64_t total_candidates = 0;
     std::uint64_t total_facts = 0;
     const auto count_groups = [&](const std::vector<emission_shard_t>& groups) -> bool {
         for (const auto& group : groups) {
-            if (!checked_add_u64(total_candidates, group.candidates.size(), total_candidates) ||
+            if (!checked_add_u64(total_candidates, group.candidates.size(),
+                    total_candidates) ||
                 !checked_add_u64(total_facts, group.facts.size(), total_facts))
                 return false;
         }
         return true;
     };
-    if (!count_groups(instruction_outputs) || !count_groups(relocation_outputs) ||
-        !count_groups(import_outputs) || !count_groups(seed_outputs) ||
-        !count_groups(scan_outputs)) {
+    if (!count_groups(relocation_outputs) || !count_groups(import_outputs) ||
+        !count_groups(seed_outputs) || !count_groups(scan_outputs)) {
         return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
             workspace_error_code_t::limit_exceeded,
             "data candidate storage exceeds its bound", "data_discovery"));
     }
-    result.candidates.reserve(static_cast<std::size_t>(total_candidates));
-    result.pointer_facts.reserve(static_cast<std::size_t>(total_facts));
-    std::uint32_t replay_checks = 0;
-    const auto replay_poll = [&]() -> workspace_result_t<void> {
-        if (++replay_checks >= kShardCancellationStride) {
-            replay_checks = 0;
-            if (cancel.stop_requested())
-                return workspace_result_t<void>::failure(stop_error(cancel));
-        }
-        return workspace_result_t<void>::success();
-    };
-    const auto replay_candidates_only = [&](const std::vector<emission_shard_t>& groups)
-        -> workspace_result_t<void> {
-        for (const auto& group : groups) {
-            for (const auto& candidate : group.candidates) {
-                auto polled = replay_poll();
-                if (!polled)
-                    return polled;
-                auto appended = merge.append_candidate(candidate, result);
-                if (!appended)
-                    return appended;
-            }
-        }
-        return workspace_result_t<void>::success();
-    };
-    const auto replay_mixed = [&](const std::vector<emission_shard_t>& groups)
-        -> workspace_result_t<void> {
-        for (const auto& group : groups) {
-            std::size_t fact_index = 0;
-            for (std::size_t i = 0; i < group.candidates.size(); ++i) {
-                auto polled = replay_poll();
-                if (!polled)
-                    return polled;
-                auto appended = merge.append_candidate(group.candidates[i], result);
-                if (!appended)
-                    return appended;
-                if (i < group.candidate_has_fact.size() && group.candidate_has_fact[i] != 0 &&
-                    fact_index < group.facts.size()) {
-                    auto pointer_appended = merge.append_pointer(
-                        group.facts[fact_index], result);
-                    if (!pointer_appended)
-                        return pointer_appended;
-                    ++fact_index;
+    raw.candidates.resize(static_cast<std::size_t>(total_candidates));
+    raw.pointer_facts.resize(static_cast<std::size_t>(total_facts));
+    std::uint64_t candidate_base = 0;
+    std::uint64_t fact_base = 0;
+    std::atomic<bool> merge_cancelled{false};
+    scatter_emission_groups(relocation_outputs, raw.candidates, raw.pointer_facts,
+        candidate_base, fact_base, merge_cancelled, cancel);
+    scatter_emission_groups(import_outputs, raw.candidates, raw.pointer_facts,
+        candidate_base, fact_base, merge_cancelled, cancel);
+    scatter_emission_groups(seed_outputs, raw.candidates, raw.pointer_facts,
+        candidate_base, fact_base, merge_cancelled, cancel);
+    scatter_emission_groups(scan_outputs, raw.candidates, raw.pointer_facts,
+        candidate_base, fact_base, merge_cancelled, cancel);
+    if (merge_cancelled.load(std::memory_order_relaxed))
+        return workspace_result_t<data_discovery_result_t>::failure(stop_error(cancel));
+    absorb_emission_counters(raw, relocation_outputs);
+    absorb_emission_counters(raw, seed_outputs);
+    absorb_emission_counters(raw, scan_outputs);
+    raw.shard_merge_ns += elapsed_ns(merge_begin);
+    return workspace_result_t<data_discovery_result_t>::success(std::move(raw));
+}
+
+workspace_result_t<data_discovery_result_t> finalize_discovery(
+    const data_discovery_limits_t& limits,
+    data_discovery_result_t instruction_driven,
+    data_discovery_result_t image_driven,
+    const cancellation_token_t& cancel) {
+    data_discovery_result_t result;
+    result.bytes_scanned = instruction_driven.bytes_scanned + image_driven.bytes_scanned;
+    result.mapped_bytes = instruction_driven.mapped_bytes + image_driven.mapped_bytes;
+    result.provider_leases =
+        instruction_driven.provider_leases + image_driven.provider_leases;
+    result.invalid_pointer_values =
+        instruction_driven.invalid_pointer_values + image_driven.invalid_pointer_values;
+    result.shard_merge_ns =
+        instruction_driven.shard_merge_ns + image_driven.shard_merge_ns;
+    const auto merge_begin = std::chrono::steady_clock::now();
+    std::uint64_t total_candidates = 0;
+    std::uint64_t total_facts = 0;
+    if (!checked_add_u64(total_candidates, instruction_driven.candidates.size(),
+            total_candidates) ||
+        !checked_add_u64(total_candidates, image_driven.candidates.size(),
+            total_candidates) ||
+        !checked_add_u64(total_facts, instruction_driven.pointer_facts.size(),
+            total_facts) ||
+        !checked_add_u64(total_facts, image_driven.pointer_facts.size(), total_facts) ||
+        total_candidates > limits.max_candidates) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "data candidate storage exceeds its bound", "data_discovery"));
+    }
+    if (total_facts > limits.max_pointer_facts) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "pointer fact storage exceeds its bound", "data_discovery"));
+    }
+    std::uint64_t result_bytes = 0;
+    std::uint64_t candidate_bytes = 0;
+    if (!checked_mul_u64(total_candidates, sizeof(data_candidate_record_t),
+            candidate_bytes) ||
+        !checked_add_u64(result_bytes, candidate_bytes, result_bytes) ||
+        result_bytes > limits.max_result_bytes) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "data candidate storage exceeds its bound", "data_discovery"));
+    }
+    std::uint64_t fact_bytes = 0;
+    if (!checked_mul_u64(total_facts, sizeof(data_pointer_fact_t), fact_bytes) ||
+        !checked_add_u64(result_bytes, fact_bytes, result_bytes) ||
+        result_bytes > limits.max_result_bytes) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "pointer fact storage exceeds its bound", "data_discovery"));
+    }
+    result.candidates.resize(static_cast<std::size_t>(total_candidates));
+    result.pointer_facts.resize(static_cast<std::size_t>(total_facts));
+    {
+        std::atomic<bool> merge_cancelled{false};
+        const auto scatter_half = [&](data_discovery_result_t& source,
+                                      std::uint64_t candidate_base,
+                                      std::uint64_t fact_base) {
+            const auto candidate_shards = parallel_shards(source.candidates.size(),
+                static_cast<std::uint32_t>(pass_shard_count(source.candidates.size(),
+                    kInstructionShardFloor)));
+            run_merge_shards(candidate_shards.size(), [&](std::size_t shard) {
+                const auto range = candidate_shards[shard];
+                std::uint32_t checks = 0;
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (++checks >= kShardCancellationStride) {
+                        checks = 0;
+                        if (cancel.stop_requested()) {
+                            merge_cancelled.store(true, std::memory_order_relaxed);
+                            return;
+                        }
+                    }
+                    result.candidates[static_cast<std::size_t>(candidate_base + index)] =
+                        std::move(source.candidates[index]);
                 }
-            }
-        }
-        return workspace_result_t<void>::success();
-    };
-    const auto replay_paired = [&](const std::vector<emission_shard_t>& groups)
-        -> workspace_result_t<void> {
-        for (const auto& group : groups) {
-            const auto paired = (std::min)(group.candidates.size(), group.facts.size());
-            for (std::size_t i = 0; i < paired; ++i) {
-                auto polled = replay_poll();
-                if (!polled)
-                    return polled;
-                auto appended = merge.append_candidate(group.candidates[i], result);
-                if (!appended)
-                    return appended;
-                auto pointer_appended = merge.append_pointer(group.facts[i], result);
-                if (!pointer_appended)
-                    return pointer_appended;
-            }
-        }
-        return workspace_result_t<void>::success();
-    };
-    auto replayed = replay_candidates_only(instruction_outputs);
-    if (!replayed)
-        return workspace_result_t<data_discovery_result_t>::failure(replayed.error());
-    replayed = replay_mixed(relocation_outputs);
-    if (!replayed)
-        return workspace_result_t<data_discovery_result_t>::failure(replayed.error());
-    replayed = replay_candidates_only(import_outputs);
-    if (!replayed)
-        return workspace_result_t<data_discovery_result_t>::failure(replayed.error());
-    replayed = replay_mixed(seed_outputs);
-    if (!replayed)
-        return workspace_result_t<data_discovery_result_t>::failure(replayed.error());
-    replayed = replay_paired(scan_outputs);
-    if (!replayed)
-        return workspace_result_t<data_discovery_result_t>::failure(replayed.error());
-    const auto absorb_counters = [&](const std::vector<emission_shard_t>& groups) {
-        for (const auto& group : groups) {
-            result.bytes_scanned += group.counters.bytes_scanned;
-            result.mapped_bytes += group.counters.mapped_bytes;
-            result.provider_leases += group.counters.provider_leases;
-            result.invalid_pointer_values += group.counters.invalid_pointer_values;
-        }
-    };
-    absorb_counters(relocation_outputs);
-    absorb_counters(seed_outputs);
-    absorb_counters(scan_outputs);
+            });
+            const auto fact_shards = parallel_shards(source.pointer_facts.size(),
+                static_cast<std::uint32_t>(pass_shard_count(source.pointer_facts.size(),
+                    kInstructionShardFloor)));
+            run_merge_shards(fact_shards.size(), [&](std::size_t shard) {
+                const auto range = fact_shards[shard];
+                std::uint32_t checks = 0;
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (++checks >= kShardCancellationStride) {
+                        checks = 0;
+                        if (cancel.stop_requested()) {
+                            merge_cancelled.store(true, std::memory_order_relaxed);
+                            return;
+                        }
+                    }
+                    result.pointer_facts[static_cast<std::size_t>(fact_base + index)] =
+                        std::move(source.pointer_facts[index]);
+                }
+            });
+        };
+        scatter_half(instruction_driven, 0, 0);
+        scatter_half(image_driven, instruction_driven.candidates.size(),
+            instruction_driven.pointer_facts.size());
+        if (merge_cancelled.load(std::memory_order_relaxed))
+            return workspace_result_t<data_discovery_result_t>::failure(stop_error(cancel));
+    }
     result.shard_merge_ns += elapsed_ns(merge_begin);
-    std::sort(result.candidates.begin(), result.candidates.end(), [](const auto& lhs,
-                                                                     const auto& rhs) {
-        if (lhs.address != rhs.address)
-            return lhs.address < rhs.address;
-        if (lhs.kind != rhs.kind)
-            return lhs.kind < rhs.kind;
-        if (stronger(lhs, rhs))
-            return true;
-        if (stronger(rhs, lhs))
-            return false;
-        return std::tie(lhs.size, lhs.target) < std::tie(rhs.size, rhs.target);
-    });
-    std::vector<data_candidate_record_t> candidates;
-    candidates.reserve(result.candidates.size());
-    for (const auto& candidate : result.candidates) {
-        if (candidates.empty() || candidates.back().address != candidate.address ||
-            candidates.back().kind != candidate.kind) {
-            candidates.push_back(candidate);
-            continue;
+    parallel_sort(result.candidates.begin(), result.candidates.end(),
+        [](const auto& lhs, const auto& rhs) {
+            if (lhs.address != rhs.address)
+                return lhs.address < rhs.address;
+            if (lhs.kind != rhs.kind)
+                return lhs.kind < rhs.kind;
+            if (stronger(lhs, rhs))
+                return true;
+            if (stronger(rhs, lhs))
+                return false;
+            return std::tie(lhs.size, lhs.target) < std::tie(rhs.size, rhs.target);
+        });
+    {
+        const auto same_run = [](const data_candidate_record_t& lhs,
+                                 const data_candidate_record_t& rhs) {
+            return lhs.address == rhs.address && lhs.kind == rhs.kind;
+        };
+        auto shards = parallel_shards(result.candidates.size(),
+            static_cast<std::uint32_t>(pass_shard_count(result.candidates.size(),
+                kCandidateShardFloor)));
+        for (std::size_t index = 1; index < shards.size(); ++index) {
+            auto begin = shards[index].begin;
+            while (begin < result.candidates.size() &&
+                   same_run(result.candidates[begin - 1], result.candidates[begin]))
+                ++begin;
+            shards[index].begin = begin;
+            shards[index - 1].end = begin;
         }
-        ++result.duplicate_candidates;
-        const auto& selected = candidates.back();
-        if (selected.target == candidate.target)
-            continue;
-        if (result.conflicts.size() >= limits.max_conflicts ||
-            !merge.charge(sizeof(data_candidate_conflict_t))) {
+        struct dedup_slot_t {
+            std::vector<data_candidate_record_t> kept;
+            std::vector<data_candidate_conflict_t> conflicts;
+            std::uint64_t duplicates = 0;
+            bool cancelled = false;
+        };
+        std::vector<dedup_slot_t> slots(shards.size());
+        run_merge_shards(shards.size(), [&](std::size_t slot) {
+            const auto shard = shards[slot];
+            auto& out = slots[slot];
+            std::uint32_t checks = 0;
+            for (std::size_t index = shard.begin; index < shard.end; ++index) {
+                if (++checks >= kShardCancellationStride) {
+                    checks = 0;
+                    if (cancel.stop_requested()) {
+                        out.cancelled = true;
+                        return;
+                    }
+                }
+                const auto& candidate = result.candidates[index];
+                if (index == shard.begin || !same_run(result.candidates[index - 1],
+                        candidate)) {
+                    out.kept.push_back(candidate);
+                    continue;
+                }
+                ++out.duplicates;
+                const auto& selected = out.kept.back();
+                if (selected.target == candidate.target)
+                    continue;
+                data_candidate_conflict_t conflict;
+                conflict.address = selected.address;
+                conflict.kind = selected.kind;
+                conflict.selected_target = selected.target;
+                conflict.rejected_target = candidate.target;
+                conflict.selected_provenance = selected.provenance;
+                conflict.rejected_provenance = candidate.provenance;
+                conflict.selected_confidence = selected.confidence;
+                conflict.rejected_confidence = candidate.confidence;
+                out.conflicts.push_back(std::move(conflict));
+            }
+        });
+        for (const auto& slot : slots) {
+            if (slot.cancelled)
+                return workspace_result_t<data_discovery_result_t>::failure(
+                    stop_error(cancel));
+        }
+        std::uint64_t kept_total = 0;
+        std::uint64_t conflict_total = 0;
+        for (const auto& slot : slots) {
+            if (!checked_add_u64(kept_total, slot.kept.size(), kept_total) ||
+                !checked_add_u64(conflict_total, slot.conflicts.size(), conflict_total)) {
+                return workspace_result_t<data_discovery_result_t>::failure(
+                    make_workspace_error(workspace_error_code_t::limit_exceeded,
+                        "data conflict storage exceeds its bound", "data_discovery"));
+            }
+            result.duplicate_candidates += slot.duplicates;
+        }
+        std::uint64_t conflict_bytes = 0;
+        if (conflict_total > limits.max_conflicts ||
+            !checked_mul_u64(conflict_total, sizeof(data_candidate_conflict_t),
+                conflict_bytes) ||
+            !checked_add_u64(result_bytes, conflict_bytes, result_bytes) ||
+            result_bytes > limits.max_result_bytes) {
             return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
                 workspace_error_code_t::limit_exceeded,
                 "data conflict storage exceeds its bound", "data_discovery"));
         }
-        data_candidate_conflict_t conflict;
-        conflict.address = selected.address;
-        conflict.kind = selected.kind;
-        conflict.selected_target = selected.target;
-        conflict.rejected_target = candidate.target;
-        conflict.selected_provenance = selected.provenance;
-        conflict.rejected_provenance = candidate.provenance;
-        conflict.selected_confidence = selected.confidence;
-        conflict.rejected_confidence = candidate.confidence;
-        result.conflicts.push_back(std::move(conflict));
+        std::vector<data_candidate_record_t> candidates(
+            static_cast<std::size_t>(kept_total));
+        result.conflicts.resize(static_cast<std::size_t>(conflict_total));
+        std::vector<std::uint64_t> kept_bases(slots.size(), 0);
+        std::vector<std::uint64_t> conflict_bases(slots.size(), 0);
+        std::uint64_t kept_cursor = 0;
+        std::uint64_t conflict_cursor = 0;
+        for (std::size_t index = 0; index < slots.size(); ++index) {
+            kept_bases[index] = kept_cursor;
+            conflict_bases[index] = conflict_cursor;
+            kept_cursor += slots[index].kept.size();
+            conflict_cursor += slots[index].conflicts.size();
+        }
+        run_merge_shards(slots.size(), [&](std::size_t slot) {
+            auto& out = slots[slot];
+            auto kept_slot = kept_bases[slot];
+            for (auto& candidate : out.kept)
+                candidates[static_cast<std::size_t>(kept_slot++)] =
+                    std::move(candidate);
+            auto conflict_slot = conflict_bases[slot];
+            for (auto& conflict : out.conflicts)
+                result.conflicts[static_cast<std::size_t>(conflict_slot++)] =
+                    std::move(conflict);
+        });
+        result.candidates = std::move(candidates);
     }
-    result.candidates = std::move(candidates);
     for (std::size_t index = 0; index < result.candidates.size(); ++index)
         result.candidates[index].id = kDataEntityTag | static_cast<std::uint64_t>(index + 1);
-    std::sort(result.pointer_facts.begin(), result.pointer_facts.end(), [](const auto& lhs,
-                                                                          const auto& rhs) {
-        if (lhs.slot != rhs.slot)
-            return lhs.slot < rhs.slot;
-        if (lhs.target != rhs.target)
-            return lhs.target < rhs.target;
-        if (lhs.candidate_kind != rhs.candidate_kind)
-            return lhs.candidate_kind < rhs.candidate_kind;
-        if (stronger(lhs, rhs))
-            return true;
-        if (stronger(rhs, lhs))
-            return false;
-        return lhs.encoding < rhs.encoding;
-    });
-    const auto pointer_end = std::unique(result.pointer_facts.begin(),
-        result.pointer_facts.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs.slot == rhs.slot && lhs.target == rhs.target &&
-                   lhs.candidate_kind == rhs.candidate_kind;
+    parallel_sort(result.pointer_facts.begin(), result.pointer_facts.end(),
+        [](const auto& lhs, const auto& rhs) {
+            if (lhs.slot != rhs.slot)
+                return lhs.slot < rhs.slot;
+            if (lhs.target != rhs.target)
+                return lhs.target < rhs.target;
+            if (lhs.candidate_kind != rhs.candidate_kind)
+                return lhs.candidate_kind < rhs.candidate_kind;
+            if (stronger(lhs, rhs))
+                return true;
+            if (stronger(rhs, lhs))
+                return false;
+            return lhs.encoding < rhs.encoding;
         });
+    const auto facts_before_dedup = result.pointer_facts.size();
+    parallel_unique_erase(result.pointer_facts, [](const auto& lhs, const auto& rhs) {
+        return lhs.slot == rhs.slot && lhs.target == rhs.target &&
+               lhs.candidate_kind == rhs.candidate_kind;
+    });
     result.duplicate_pointer_facts = static_cast<std::uint64_t>(
-        std::distance(pointer_end, result.pointer_facts.end()));
-    result.pointer_facts.erase(pointer_end, result.pointer_facts.end());
+        facts_before_dedup - result.pointer_facts.size());
     for (std::size_t index = 0; index < result.pointer_facts.size(); ++index)
         result.pointer_facts[index].id = kPointerFactEntityTag |
             static_cast<std::uint64_t>(index + 1);
-    std::sort(result.conflicts.begin(), result.conflicts.end(), [](const auto& lhs,
-                                                                   const auto& rhs) {
-        return std::tie(lhs.address, lhs.kind, lhs.selected_target, lhs.rejected_target,
-                   lhs.selected_provenance, lhs.rejected_provenance,
-                   lhs.selected_confidence, lhs.rejected_confidence) <
-               std::tie(rhs.address, rhs.kind, rhs.selected_target, rhs.rejected_target,
-                   rhs.selected_provenance, rhs.rejected_provenance,
-                   rhs.selected_confidence, rhs.rejected_confidence);
-    });
-    result.conflicts.erase(std::unique(result.conflicts.begin(), result.conflicts.end(),
+    parallel_sort(result.conflicts.begin(), result.conflicts.end(),
         [](const auto& lhs, const auto& rhs) {
-            return lhs.address == rhs.address && lhs.kind == rhs.kind &&
-                   lhs.selected_target == rhs.selected_target &&
-                   lhs.rejected_target == rhs.rejected_target &&
-                   lhs.selected_provenance == rhs.selected_provenance &&
-                   lhs.rejected_provenance == rhs.rejected_provenance &&
-                   lhs.selected_confidence == rhs.selected_confidence &&
-                   lhs.rejected_confidence == rhs.rejected_confidence;
-        }), result.conflicts.end());
+            return std::tie(lhs.address, lhs.kind, lhs.selected_target, lhs.rejected_target,
+                       lhs.selected_provenance, lhs.rejected_provenance,
+                       lhs.selected_confidence, lhs.rejected_confidence) <
+                   std::tie(rhs.address, rhs.kind, rhs.selected_target, rhs.rejected_target,
+                       rhs.selected_provenance, rhs.rejected_provenance,
+                       rhs.selected_confidence, rhs.rejected_confidence);
+        });
+    parallel_unique_erase(result.conflicts, [](const auto& lhs, const auto& rhs) {
+        return lhs.address == rhs.address && lhs.kind == rhs.kind &&
+               lhs.selected_target == rhs.selected_target &&
+               lhs.rejected_target == rhs.rejected_target &&
+               lhs.selected_provenance == rhs.selected_provenance &&
+               lhs.rejected_provenance == rhs.rejected_provenance &&
+               lhs.selected_confidence == rhs.selected_confidence &&
+               lhs.rejected_confidence == rhs.rejected_confidence;
+    });
     for (std::size_t index = 0; index < result.conflicts.size(); ++index)
         result.conflicts[index].id = kDataConflictEntityTag |
             static_cast<std::uint64_t>(index + 1);
     return workspace_result_t<data_discovery_result_t>::success(std::move(result));
+}
+
+workspace_result_t<data_discovery_result_t> discover_impl(
+    const workspace_image_t& image, const byte_provider_t& provider,
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<target_fact_t>& targets,
+    const std::vector<data_pointer_seed_t>& pointer_seeds,
+    const data_discovery_limits_t& limits, const cancellation_token_t& cancel) {
+    auto valid = validate_discovery_limits(image, limits, pointer_seeds.size());
+    if (!valid)
+        return workspace_result_t<data_discovery_result_t>::failure(valid.error());
+    auto regions_result = mapped_regions(image, provider);
+    if (!regions_result)
+        return workspace_result_t<data_discovery_result_t>::failure(regions_result.error());
+    auto instruction_driven = produce_instruction_driven(image, instructions, targets,
+        cancel);
+    if (!instruction_driven)
+        return workspace_result_t<data_discovery_result_t>::failure(
+            instruction_driven.error());
+    auto image_driven = produce_image_driven(image, provider, regions_result.value(),
+        pointer_seeds, limits, cancel);
+    if (!image_driven)
+        return workspace_result_t<data_discovery_result_t>::failure(image_driven.error());
+    return finalize_discovery(limits, instruction_driven.take_value(),
+        image_driven.take_value(), cancel);
 }
 
 }
@@ -1140,6 +1372,80 @@ workspace_result_t<data_discovery_result_t> data_discovery_t::discover(
     const std::vector<target_fact_t>& targets,
     const data_discovery_limits_t& limits, const cancellation_token_t& cancel) {
     return discover(image, provider, instructions, targets, {}, limits, cancel);
+}
+
+workspace_result_t<data_discovery_result_t> data_discovery_t::discover_image_driven(
+    const workspace_image_t& image, const byte_provider_t& provider,
+    const data_discovery_limits_t& limits, const cancellation_token_t& cancel) {
+    try {
+        auto valid = validate_discovery_limits(image, limits, 0);
+        if (!valid)
+            return workspace_result_t<data_discovery_result_t>::failure(valid.error());
+        auto regions_result = mapped_regions(image, provider);
+        if (!regions_result) {
+            return workspace_result_t<data_discovery_result_t>::failure(
+                regions_result.error());
+        }
+        static const std::vector<data_pointer_seed_t> no_seeds;
+        return produce_image_driven(image, provider, regions_result.value(), no_seeds,
+            limits, cancel);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "data discovery allocation failed", "data_discovery"));
+    } catch (const std::length_error&) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "data discovery allocation length is unsupported", "data_discovery"));
+    }
+}
+
+workspace_result_t<data_discovery_result_t> data_discovery_t::discover_instruction_driven(
+    const workspace_image_t& image, const byte_provider_t&,
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<target_fact_t>& targets,
+    const data_discovery_limits_t& limits, const cancellation_token_t& cancel) {
+    try {
+        auto valid = validate_discovery_limits(image, limits, 0);
+        if (!valid)
+            return workspace_result_t<data_discovery_result_t>::failure(valid.error());
+        return produce_instruction_driven(image, instructions, targets, cancel);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "data discovery allocation failed", "data_discovery"));
+    } catch (const std::length_error&) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "data discovery allocation length is unsupported", "data_discovery"));
+    }
+}
+
+workspace_result_t<data_discovery_result_t> data_discovery_t::combine_results(
+    const data_discovery_limits_t& limits,
+    data_discovery_result_t instruction_driven,
+    data_discovery_result_t image_driven,
+    const cancellation_token_t& cancel) {
+    try {
+        if (limits.max_candidates == 0 || limits.max_pointer_facts == 0 ||
+            limits.max_conflicts == 0 || limits.max_result_bytes == 0 ||
+            limits.cancellation_check_interval == 0) {
+            return workspace_result_t<data_discovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::invalid_argument,
+                    "data discovery limits or pointer seeds are invalid",
+                    "data_discovery"));
+        }
+        return finalize_discovery(limits, std::move(instruction_driven),
+            std::move(image_driven), cancel);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "data discovery allocation failed", "data_discovery"));
+    } catch (const std::length_error&) {
+        return workspace_result_t<data_discovery_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "data discovery allocation length is unsupported", "data_discovery"));
+    }
 }
 
 }

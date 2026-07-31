@@ -1,5 +1,6 @@
 #include "overlay_journal.hpp"
 
+#include "../fact_page_cache.hpp"
 #include "../incremental_reanalysis.hpp"
 #include "../overlay_projection.hpp"
 #include "../provider_snapshot.hpp"
@@ -2697,6 +2698,42 @@ projection_finalize_result_t publish_projected_overlay(
                     return result;
                 }
                 result.invalidated_entry_count = published.value();
+                result.succeeded = true;
+                return result;
+            };
+        hooks.fact_pages =
+            [workspace, source_overlay_revision = prepared.source_revision,
+             target_overlay_revision = prepared.revision](
+                const fact_page_invalidation_request_t& request) {
+                projection_invalidation_hook_result_t result;
+                fact_page_coherence_notification_t notification;
+                notification.binary_id = workspace->identity().binary_id();
+                notification.source_generation = request.source_generation;
+                notification.target_generation = request.target_generation;
+                if (const auto publication = workspace->analysis_publication();
+                    publication && publication->snapshot)
+                    notification.analysis_revision =
+                        publication->snapshot->analysis_revision;
+                notification.source_overlay_revision = source_overlay_revision;
+                notification.target_overlay_revision = target_overlay_revision;
+                notification.rebuild_all = request.rebuild_all;
+                notification.affected_ranges.reserve(request.affected_ranges.size());
+                for (const auto& range : request.affected_ranges)
+                    notification.affected_ranges.push_back({range.offset, range.size});
+                const std::uint64_t dropped =
+                    fact_page_cache_t::instance().drop_ranges(
+                        notification.binary_id, request.source_generation,
+                        notification.affected_ranges);
+                fact_page_coherence_hub_t::instance().publish(notification);
+                ::diag::log_tagged_fmt("overlay_journal",
+                    "fact_page coherence source_generation=%llu target_generation=%llu source_overlay=%llu target_overlay=%llu ranges=%zu rebuild_all=%d dropped_pages=%llu",
+                    static_cast<unsigned long long>(request.source_generation),
+                    static_cast<unsigned long long>(request.target_generation),
+                    static_cast<unsigned long long>(source_overlay_revision),
+                    static_cast<unsigned long long>(target_overlay_revision),
+                    request.affected_ranges.size(), request.rebuild_all ? 1 : 0,
+                    static_cast<unsigned long long>(dropped));
+                result.invalidated_entry_count = static_cast<std::size_t>(dropped);
                 result.succeeded = true;
                 return result;
             };

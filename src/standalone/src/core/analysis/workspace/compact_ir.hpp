@@ -1,12 +1,14 @@
 #pragma once
 
 #include "checked_range.hpp"
+#include "snapshot_tables.hpp"
 #include "workspace_types.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -122,6 +124,20 @@ struct operand_fact_t {
     entity_id_t id = 0;
     entity_id_t instruction_id = 0;
     entity_id_t address_expression_id = 0;
+    std::int64_t displacement = 0;
+    std::uint64_t immediate = 0;
+    std::uint64_t resolved_expression_value = 0;
+    std::uint16_t bit_width = 0;
+    std::uint16_t access_width_bits = 0;
+    std::uint16_t element_width_bits = 0;
+    std::uint16_t reg = 0;
+    std::uint16_t segment_reg = 0;
+    std::uint16_t base_reg = 0;
+    std::uint16_t index_reg = 0;
+    std::uint16_t address_components = address_component_none;
+    std::uint16_t access_count = 0;
+    std::uint16_t element_count = 0;
+    std::uint16_t address_width_bits = 0;
     std::uint8_t operand_index = 0;
     std::uint8_t decoder_operand_id = 0;
     operand_kind_t kind = operand_kind_t::none;
@@ -130,25 +146,11 @@ struct operand_fact_t {
     std::uint8_t encoding = 0;
     std::uint8_t memory_type = 0;
     std::uint8_t access_width = 0;
-    std::uint16_t bit_width = 0;
-    std::uint16_t access_width_bits = 0;
-    std::uint16_t access_count = 0;
-    std::uint16_t element_width_bits = 0;
-    std::uint16_t element_count = 0;
-    std::uint16_t address_width_bits = 0;
-    std::uint16_t reg = 0;
-    std::uint16_t segment_reg = 0;
-    std::uint16_t base_reg = 0;
-    std::uint16_t index_reg = 0;
     std::uint8_t scale = 0;
     bool relative = false;
     bool signed_value = false;
     bool has_displacement = false;
     bool has_resolved_expression_value = false;
-    std::int64_t displacement = 0;
-    std::uint64_t immediate = 0;
-    std::uint64_t resolved_expression_value = 0;
-    std::uint16_t address_components = address_component_none;
     address_expression_kind_t address_expression = address_expression_kind_t::none;
     target_resolution_t address_resolution = target_resolution_t::unresolved_indirect;
 };
@@ -158,30 +160,30 @@ struct target_fact_t {
     entity_id_t operand_fact_id = 0;
     entity_id_t address_expression_id = 0;
     address_t target;
+    std::uint16_t access_width_bits = 0;
     target_kind_record_t kind = target_kind_record_t::branch;
     target_resolution_t resolution = target_resolution_t::image_relative;
     std::uint8_t operand_index = 0xFFU;
-    std::uint16_t access_width_bits = 0;
-    std::uint16_t access_count = 0;
+    std::uint8_t access_count = 0;
     bool direct = false;
     bool is_external = false;
 };
 
 struct instruction_record_t {
     entity_id_t id = 0;
+    std::uint64_t stable_source_id = 0;
     address_t address;
-    std::uint8_t length = 0;
-    std::uint16_t mnemonic_id = 0;
     std::uint32_t opcode_id = 0;
-    std::uint32_t flow_flags = flow_none;
     std::uint32_t operand_fact_begin = 0;
-    std::uint16_t operand_fact_count = 0;
     std::uint32_t target_fact_begin = 0;
+    std::uint16_t mnemonic_id = 0;
+    std::uint16_t flow_flags = flow_none;
+    std::uint16_t operand_fact_count = 0;
     std::uint16_t target_fact_count = 0;
+    std::uint8_t length = 0;
     fact_provenance_t provenance = fact_provenance_t::unknown;
     std::uint8_t confidence = 0;
     coverage_reason_t coverage = coverage_reason_t::decoded;
-    std::uint64_t stable_source_id = 0;
 };
 
 struct basic_block_record_t {
@@ -233,18 +235,18 @@ struct function_record_t {
     entity_id_t id = 0;
     address_t start;
     address_t end;
+    std::optional<entity_id_t> symbol_id;
+    std::vector<address_range_t> chunks;
     std::uint32_t first_block = 0;
     std::uint32_t block_count = 0;
     std::uint32_t first_chunk = 0;
     std::uint32_t chunk_count = 0;
     std::uint32_t first_block_membership = 0;
     std::uint32_t block_membership_count = 0;
-    std::optional<entity_id_t> symbol_id;
     fact_provenance_t provenance = fact_provenance_t::unknown;
     std::uint8_t confidence = 0;
     bool thunk = false;
     bool noreturn = false;
-    std::vector<address_range_t> chunks;
 };
 
 enum class edge_kind_t : std::uint8_t {
@@ -414,8 +416,8 @@ struct data_candidate_record_t {
     entity_id_t id = 0;
     address_t address;
     std::uint64_t size = 0;
-    data_candidate_kind_t kind = data_candidate_kind_t::referenced_storage;
     std::optional<address_t> target;
+    data_candidate_kind_t kind = data_candidate_kind_t::referenced_storage;
     fact_provenance_t provenance = fact_provenance_t::unknown;
     std::uint8_t confidence = 0;
 };
@@ -434,9 +436,9 @@ struct data_pointer_fact_t {
 struct data_candidate_conflict_t {
     entity_id_t id = 0;
     address_t address;
-    data_candidate_kind_t kind = data_candidate_kind_t::referenced_storage;
     std::optional<address_t> selected_target;
     std::optional<address_t> rejected_target;
+    data_candidate_kind_t kind = data_candidate_kind_t::referenced_storage;
     fact_provenance_t selected_provenance = fact_provenance_t::unknown;
     fact_provenance_t rejected_provenance = fact_provenance_t::unknown;
     std::uint8_t selected_confidence = 0;
@@ -495,10 +497,10 @@ struct symbol_type_candidate_record_t {
     entity_id_t id = 0;
     std::optional<address_t> address;
     std::optional<address_t> related_address;
-    symbol_type_candidate_kind_t kind = symbol_type_candidate_kind_t::global_object;
     std::string display_name;
     std::string canonical_type;
     std::string source_key;
+    symbol_type_candidate_kind_t kind = symbol_type_candidate_kind_t::global_object;
     metadata_provenance_t provenance = metadata_provenance_t::unknown;
     std::uint8_t confidence = 0;
     bool explicitly_unknown = true;
@@ -527,9 +529,9 @@ struct metadata_conflict_record_t {
     entity_id_t id = 0;
     std::optional<address_t> address;
     std::string identity;
-    metadata_conflict_kind_t kind = metadata_conflict_kind_t::type_kind;
     std::string selected_value;
     std::string rejected_value;
+    metadata_conflict_kind_t kind = metadata_conflict_kind_t::type_kind;
     metadata_provenance_t selected_provenance = metadata_provenance_t::unknown;
     metadata_provenance_t rejected_provenance = metadata_provenance_t::unknown;
     std::uint8_t selected_confidence = 0;
@@ -583,8 +585,8 @@ struct string_record_t {
     entity_id_t id = 0;
     address_t address;
     std::uint64_t byte_length = 0;
-    string_encoding_t encoding = string_encoding_t::ascii;
     std::string value;
+    string_encoding_t encoding = string_encoding_t::ascii;
     fact_provenance_t provenance = fact_provenance_t::unknown;
     std::uint8_t confidence = 0;
 };
@@ -611,10 +613,10 @@ struct symbol_record_t {
 struct coverage_span_t {
     address_t start;
     std::uint64_t size = 0;
+    std::uint32_t detail_code = 0;
     coverage_reason_t reason = coverage_reason_t::pending;
     fact_provenance_t provenance = fact_provenance_t::unknown;
     std::uint8_t confidence = 0;
-    std::uint32_t detail_code = 0;
 };
 
 struct analysis_snapshot_t {
@@ -626,21 +628,21 @@ struct analysis_snapshot_t {
     bool baseline_complete = false;
     mutable std::shared_ptr<const workspace_image_t> normalized_image;
     std::shared_ptr<const pe_image_t> image;
-    std::vector<instruction_record_t> instructions;
+    snapshot_table_t<instruction_record_t> instructions;
     std::vector<std::uint8_t> delay_slot_counts;
-    std::vector<operand_fact_t> operand_facts;
-    std::vector<target_fact_t> target_facts;
-    std::vector<basic_block_record_t> blocks;
-    std::vector<function_chunk_record_t> function_chunks;
-    std::vector<function_block_membership_record_t> function_block_memberships;
+    snapshot_table_t<operand_fact_t> operand_facts;
+    snapshot_table_t<target_fact_t> target_facts;
+    snapshot_table_t<basic_block_record_t> blocks;
+    snapshot_table_t<function_chunk_record_t> function_chunks;
+    snapshot_table_t<function_block_membership_record_t> function_block_memberships;
     std::vector<function_record_t> functions;
-    std::vector<edge_record_t> edges;
+    snapshot_table_t<edge_record_t> edges;
     call_graph_publication_t call_graph;
-    std::vector<xref_record_t> xrefs;
+    snapshot_table_t<xref_record_t> xrefs;
     std::vector<string_record_t> strings;
     std::vector<symbol_record_t> symbols;
     analysis_rich_fact_publication_t rich_facts;
-    std::vector<coverage_span_t> coverage;
+    snapshot_table_t<coverage_span_t> coverage;
     std::uint64_t string_value_bytes = 0;
     std::uint64_t symbol_name_bytes = 0;
     std::uint64_t function_chunk_bytes = 0;
@@ -648,6 +650,108 @@ struct analysis_snapshot_t {
     std::uint64_t type_reference_key_bytes = 0;
     std::uint64_t metadata_conflict_text_bytes = 0;
 };
+
+static_assert(sizeof(instruction_record_t) == 56,
+              "instruction_record_t must remain 56 bytes for compact snapshot residency");
+static_assert(offsetof(instruction_record_t, stable_source_id) == 8,
+              "instruction_record_t stable_source_id must stay at offset 8");
+static_assert(offsetof(instruction_record_t, address) == 16,
+              "instruction_record_t address must stay at offset 16");
+static_assert(sizeof(operand_fact_t) == 88,
+              "operand_fact_t must remain 88 bytes for compact snapshot residency");
+static_assert(offsetof(operand_fact_t, displacement) == 24,
+              "operand_fact_t displacement must stay at offset 24");
+static_assert(sizeof(target_fact_t) == 48,
+              "target_fact_t must remain 48 bytes for compact snapshot residency");
+static_assert(offsetof(target_fact_t, target) == 24,
+              "target_fact_t target must stay at offset 24");
+static_assert(sizeof(basic_block_record_t) == 64,
+              "basic_block_record_t must remain 64 bytes");
+static_assert(sizeof(function_chunk_record_t) == 64,
+              "function_chunk_record_t must remain 64 bytes");
+static_assert(sizeof(function_block_membership_record_t) == 40,
+              "function_block_membership_record_t must remain 40 bytes");
+static_assert(sizeof(function_record_t) == 112,
+              "function_record_t must remain 112 bytes");
+static_assert(sizeof(edge_record_t) == 72,
+              "edge_record_t must remain 72 bytes");
+static_assert(sizeof(xref_record_t) == 48,
+              "xref_record_t must remain 48 bytes");
+static_assert(sizeof(string_record_t) == 72,
+              "string_record_t must remain 72 bytes");
+static_assert(sizeof(symbol_record_t) == 64,
+              "symbol_record_t must remain 64 bytes");
+static_assert(sizeof(coverage_span_t) == 32,
+              "coverage_span_t must remain 32 bytes");
+static_assert(sizeof(data_candidate_record_t) == 64,
+              "data_candidate_record_t must remain 64 bytes");
+static_assert(sizeof(data_pointer_fact_t) == 48,
+              "data_pointer_fact_t must remain 48 bytes");
+static_assert(sizeof(data_candidate_conflict_t) == 80,
+              "data_candidate_conflict_t must remain 80 bytes");
+static_assert(sizeof(symbol_type_candidate_record_t) == 160,
+              "symbol_type_candidate_record_t must remain 160 bytes");
+static_assert(sizeof(type_reference_fact_t) == 112,
+              "type_reference_fact_t must remain 112 bytes");
+static_assert(sizeof(metadata_conflict_record_t) == 136,
+              "metadata_conflict_record_t must remain 136 bytes");
+static_assert(sizeof(recovered_call_candidate_t) == 80,
+              "recovered_call_candidate_t must remain 80 bytes");
+static_assert(sizeof(recovered_call_site_t) == 64,
+              "recovered_call_site_t must remain 64 bytes");
+static_assert(sizeof(call_graph_edge_record_t) == 104,
+              "call_graph_edge_record_t must remain 104 bytes");
+static_assert(sizeof(call_graph_node_record_t) == 56,
+              "call_graph_node_record_t must remain 56 bytes");
+static_assert(sizeof(call_graph_quality_t) == 12,
+              "call_graph_quality_t must remain 12 bytes");
+static_assert(sizeof(call_graph_conflict_t) == 72,
+              "call_graph_conflict_t must remain 72 bytes");
+
+static_assert(std::is_trivially_copyable<instruction_record_t>::value,
+              "instruction_record_t must remain trivially copyable");
+static_assert(std::is_trivially_copyable<operand_fact_t>::value,
+              "operand_fact_t must remain trivially copyable");
+static_assert(std::is_trivially_copyable<target_fact_t>::value,
+              "target_fact_t must remain trivially copyable");
+static_assert(std::is_trivially_copyable<basic_block_record_t>::value,
+              "basic_block_record_t must remain trivially copyable");
+static_assert(std::is_trivially_copyable<function_chunk_record_t>::value,
+              "function_chunk_record_t must remain trivially copyable");
+static_assert(std::is_trivially_copyable<function_block_membership_record_t>::value,
+              "function_block_membership_record_t must remain trivially copyable");
+static_assert(std::is_trivially_copyable<xref_record_t>::value,
+              "xref_record_t must remain trivially copyable");
+static_assert(std::is_trivially_copyable<coverage_span_t>::value,
+              "coverage_span_t must remain trivially copyable");
+
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<instruction_record_t>,
+              "instructions must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<operand_fact_t>,
+              "operand_facts must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<target_fact_t>,
+              "target_facts must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<basic_block_record_t>,
+              "blocks must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<function_chunk_record_t>,
+              "function_chunks must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<function_block_membership_record_t>,
+              "function_block_memberships must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<edge_record_t>,
+              "edges must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<xref_record_t>,
+              "xrefs must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<coverage_span_t>,
+              "coverage must stay noinit-safe when the stage-2 allocator is active");
 
 inline workspace_result_t<std::uint64_t> snapshot_memory_accounted_bytes(
     const analysis_snapshot_t& snapshot) {

@@ -19,6 +19,8 @@
 #include "image_layout_index.hpp"
 #include "tile_decode_orchestrator.hpp"
 
+#include "../infra/taskflow_runtime.hpp"
+
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -1121,11 +1123,22 @@ incremental_reanalysis_executor_t::execute(
         return result;
     }
 
+    namespace taskflow = aida::infra::taskflow_runtime;
+    std::uint32_t fabric_lane_lease = 2;
+    const auto fabric_stats = taskflow::domain_stats(
+        taskflow::executor_domain_t::feature_worker);
+    if (fabric_stats.pool_size > 0) {
+        fabric_lane_lease =
+            static_cast<std::uint32_t>(fabric_stats.pool_size);
+    }
+    const auto decode_lanes =
+        (std::min)(8U, (std::max)(2U, fabric_lane_lease / 4U));
+
     production_tile_decode_executor_options_t executor_options;
     executor_options.decoder_key = decoder_key;
-    executor_options.worker_count = 2;
+    executor_options.worker_count = decode_lanes;
     executor_options.analysis_budget.max_queued_tasks = 4096;
-    executor_options.analysis_budget.max_worker_slots = 4;
+    executor_options.analysis_budget.max_worker_slots = decode_lanes + 1;
     executor_options.analysis_budget.reserved_control_worker_slots = 1;
     executor_options.analysis_budget.max_private_bytes =
         settings.baseline_settings.max_analysis_memory_bytes;

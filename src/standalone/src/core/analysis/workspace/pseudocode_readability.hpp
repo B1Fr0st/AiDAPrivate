@@ -337,7 +337,8 @@ struct pseudocode_cache_key_material_t {
 
 enum class pseudocode_declaration_placement_t : std::uint8_t {
     scope_entry,
-    source_order
+    source_order,
+    first_use
 };
 
 enum class pseudocode_cast_cleanup_policy_t : std::uint8_t {

@@ -38,6 +38,12 @@ namespace aida_ghidra {
 struct region_t {
 	uint64_t start_va = 0;
 	std::vector<uint8_t> data;
+	const uint8_t* view = nullptr;
+	size_t view_size = 0;
+	std::shared_ptr<const void> owner;
+
+	size_t effective_size() const noexcept { return view ? view_size : data.size(); }
+	const uint8_t* effective_data() const noexcept { return view ? view : (data.empty() ? nullptr : data.data()); }
 };
 
 struct provider_patch_t {
@@ -74,6 +80,8 @@ public:
 	void set_address_space_manager(ghidra::AddrSpaceManager* mgr) { addr_space_manager_ = mgr; }
 
 	void add_region(uint64_t start_va, std::vector<uint8_t>&& bytes);
+	void add_region_view(uint64_t start_va, const uint8_t* view, size_t size,
+	                     std::shared_ptr<const void> owner);
 
 private:
 	const uint8_t* buffer_;

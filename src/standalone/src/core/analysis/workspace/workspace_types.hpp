@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -116,10 +117,18 @@ enum class address_space_id_t : std::uint8_t {
 };
 
 struct address_t {
-    address_space_id_t space = address_space_id_t::relative_virtual;
     std::uint64_t value = 0;
+    address_space_id_t space = address_space_id_t::relative_virtual;
     architecture_id_t architecture = architecture_id_t::unknown;
     architecture_mode_t mode = architecture_mode_t::unknown;
+
+    constexpr address_t() noexcept = default;
+
+    constexpr address_t(address_space_id_t address_space, std::uint64_t address_value,
+                        architecture_id_t address_architecture = architecture_id_t::unknown,
+                        architecture_mode_t address_mode = architecture_mode_t::unknown) noexcept
+        : value(address_value), space(address_space),
+          architecture(address_architecture), mode(address_mode) {}
 
     friend bool operator==(const address_t& lhs, const address_t& rhs) noexcept {
         return lhs.space == rhs.space && lhs.value == rhs.value &&
@@ -140,6 +149,19 @@ struct address_t {
         return lhs.mode < rhs.mode;
     }
 };
+
+static_assert(sizeof(address_t) == 16,
+              "address_t must remain 16 bytes for compact snapshot residency");
+static_assert(alignof(address_t) == 8,
+              "address_t must remain 8-byte aligned");
+static_assert(offsetof(address_t, value) == 0,
+              "address_t value must stay at offset 0");
+static_assert(offsetof(address_t, space) == 8,
+              "address_t space must stay at offset 8");
+static_assert(std::is_trivially_copyable<address_t>::value,
+              "address_t must remain trivially copyable");
+static_assert(std::is_standard_layout<address_t>::value,
+              "address_t must remain standard layout");
 
 struct address_hash_t {
     std::size_t operator()(const address_t& address) const noexcept {

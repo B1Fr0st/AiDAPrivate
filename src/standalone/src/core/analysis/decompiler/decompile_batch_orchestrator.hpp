@@ -34,6 +34,7 @@ public:
     void request_cancel() noexcept override;
     workspace_result_t<void> drain(std::chrono::steady_clock::time_point deadline) override;
     void notify_interactive_request(const decompiler_entity_key_t& entity);
+    bool admit_interactive_priority(const decompiler_entity_key_t& entity);
 
     static std::uint64_t compute_size_aware_deadline(
         std::uint64_t function_byte_size,
@@ -55,6 +56,7 @@ public:
         std::uint64_t failed = 0;
         std::uint64_t cancelled = 0;
         std::uint64_t queue_depth = 0;
+        std::uint64_t interactive_pending = 0;
         std::uint64_t slots = 0;
         std::uint64_t slots_effective = 0;
         double rate_funcs_s = 0.0;

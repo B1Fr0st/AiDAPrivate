@@ -10,6 +10,7 @@
 #include "checked_range.hpp"
 #include "parallel_pass.hpp"
 #include "pe_image.hpp"
+#include "../working_set_governor.hpp"
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <windows.h>
@@ -677,8 +678,20 @@ search_generation_handle_t::shared_index() const noexcept {
     return index_;
 }
 
-search_index_t::search_index_t(std::unique_ptr<impl_t> impl) : impl_(std::move(impl)) {}
-search_index_t::~search_index_t() = default;
+search_index_t::search_index_t(std::unique_ptr<impl_t> impl) : impl_(std::move(impl)) {
+    if (impl_ && impl_->accounting.memory_bytes != 0) {
+        working_set_governor_t::instance().charge(
+            working_set_metrics::subsystem_t::search_index,
+            static_cast<std::int64_t>(impl_->accounting.memory_bytes));
+    }
+}
+search_index_t::~search_index_t() {
+    if (impl_ && impl_->accounting.memory_bytes != 0) {
+        working_set_governor_t::instance().charge(
+            working_set_metrics::subsystem_t::search_index,
+            -static_cast<std::int64_t>(impl_->accounting.memory_bytes));
+    }
+}
 
 workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
     std::shared_ptr<const analysis_snapshot_t> snapshot,
@@ -688,7 +701,61 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
     std::shared_ptr<analysis_metrics_t> metrics,
     const search_index_limits_t& limits,
     const cancellation_token_t& cancel) {
+    auto instruction_index = build_instruction_class(snapshot, nullptr, limits, cancel);
+    if (!instruction_index)
+        return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+            instruction_index.error());
+    return append_entity_classes(instruction_index.value(), snapshot,
+                                 std::move(data_candidates), std::move(switches),
+                                 std::move(types), std::move(metrics), limits, cancel);
+}
+
+workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_instruction_class(
+    std::shared_ptr<const analysis_snapshot_t> snapshot,
+    std::shared_ptr<analysis_metrics_t> metrics,
+    const search_index_limits_t& limits,
+    const cancellation_token_t& cancel) {
+    return build_impl(nullptr, std::move(snapshot), {}, {}, {}, std::move(metrics), limits,
+                      cancel, true);
+}
+
+workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::append_entity_classes(
+    std::shared_ptr<const search_index_t> instruction_index,
+    std::shared_ptr<const analysis_snapshot_t> snapshot,
+    std::vector<data_candidate_record_t> data_candidates,
+    std::vector<switch_record_t> switches,
+    std::vector<type_candidate_record_t> types,
+    std::shared_ptr<analysis_metrics_t> metrics,
+    const search_index_limits_t& limits,
+    const cancellation_token_t& cancel) {
+    if (!instruction_index) {
+        return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                "entity-class append requires an instruction-class partial index",
+                "search_index"));
+    }
+    return build_impl(std::move(instruction_index), std::move(snapshot),
+                      std::move(data_candidates), std::move(switches), std::move(types),
+                      std::move(metrics), limits, cancel, false);
+}
+
+workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
+    std::shared_ptr<const search_index_t> instruction_index,
+    std::shared_ptr<const analysis_snapshot_t> snapshot,
+    std::vector<data_candidate_record_t> data_candidates,
+    std::vector<switch_record_t> switches,
+    std::vector<type_candidate_record_t> types,
+    std::shared_ptr<analysis_metrics_t> metrics,
+    const search_index_limits_t& limits,
+    const cancellation_token_t& cancel,
+    bool instruction_class_only) {
     try {
+        search_index_limits_t effective_limits = limits;
+        const auto governor_search_budget =
+            working_set_governor_t::instance().search_index_budget_bytes();
+        if (governor_search_budget != 0 &&
+            effective_limits.max_index_bytes > governor_search_budget)
+            effective_limits.max_index_bytes = governor_search_budget;
         if (!snapshot) {
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 make_workspace_error(workspace_error_code_t::invalid_argument,
@@ -702,13 +769,27 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                     "search index snapshot identity or revision is incomplete",
                     "search_index"));
         }
-        if (limits.max_entries == 0 || limits.max_trigram_postings == 0 ||
-            limits.max_indexed_text_bytes == 0 || limits.max_index_bytes == 0 ||
-            limits.max_query_bytes == 0 || limits.max_query_bytes > 16U * 1024U * 1024U ||
-            limits.max_results_per_query == 0 ||
-            limits.max_results_per_query > (1U << 20) ||
-            limits.cancellation_check_interval == 0 ||
-            limits.max_entries > std::numeric_limits<std::uint32_t>::max() ||
+        if (instruction_class_only && instruction_index) {
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                make_workspace_error(workspace_error_code_t::invalid_argument,
+                    "instruction-class build does not accept a partial index",
+                    "search_index"));
+        }
+        if (!instruction_class_only && instruction_index &&
+            (!instruction_index->impl_ ||
+             instruction_index->impl_->identity != snapshot_identity(*snapshot))) {
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                make_workspace_error(workspace_error_code_t::stale_generation,
+                    "search-index staged identity does not match the snapshot",
+                    "search_index"));
+        }
+        if (effective_limits.max_entries == 0 || effective_limits.max_trigram_postings == 0 ||
+            effective_limits.max_indexed_text_bytes == 0 || effective_limits.max_index_bytes == 0 ||
+            effective_limits.max_query_bytes == 0 || effective_limits.max_query_bytes > 16U * 1024U * 1024U ||
+            effective_limits.max_results_per_query == 0 ||
+            effective_limits.max_results_per_query > (1U << 20) ||
+            effective_limits.cancellation_check_interval == 0 ||
+            effective_limits.max_entries > std::numeric_limits<std::uint32_t>::max() ||
             snapshot->instructions.size() > std::numeric_limits<std::uint32_t>::max()) {
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 make_workspace_error(workspace_error_code_t::invalid_argument,
@@ -720,9 +801,12 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                 stop_error(cancel, "search_index"));
 
         std::uint64_t prospective_entries = 0;
-        const std::array<std::uint64_t, 6> entry_counts{
-            snapshot->symbols.size(), snapshot->strings.size(), snapshot->instructions.size(),
-            data_candidates.size(), switches.size(), types.size()};
+        const std::array<std::uint64_t, 6> entry_counts = instruction_class_only
+            ? std::array<std::uint64_t, 6>{0, 0, snapshot->instructions.size(), 0, 0, 0}
+            : std::array<std::uint64_t, 6>{
+                snapshot->symbols.size(), snapshot->strings.size(),
+                snapshot->instructions.size(), data_candidates.size(), switches.size(),
+                types.size()};
         for (const auto count : entry_counts) {
             std::uint64_t updated = 0;
             if (!checked_add_u64(prospective_entries, count, updated)) {
@@ -732,7 +816,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             }
             prospective_entries = updated;
         }
-        if (prospective_entries > limits.max_entries ||
+        if (prospective_entries > effective_limits.max_entries ||
             prospective_entries > std::numeric_limits<std::uint32_t>::max()) {
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 make_workspace_error(workspace_error_code_t::limit_exceeded,
@@ -741,7 +825,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
         std::uint64_t minimum_bytes = 0;
         if (!checked_mul_u64(prospective_entries,
                 sizeof(packed_search_record_t) + sizeof(std::uint32_t) * 3ULL,
-                minimum_bytes) || minimum_bytes > limits.max_index_bytes) {
+                minimum_bytes) || minimum_bytes > effective_limits.max_index_bytes) {
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 make_workspace_error(workspace_error_code_t::limit_exceeded,
                     "search-index base storage exceeds memory budget", "search_index"));
@@ -750,50 +834,59 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
         auto impl = std::make_unique<impl_t>();
         impl->snapshot = std::move(snapshot);
         impl->snapshot_owner = impl->snapshot;
-        impl->identity = snapshot_identity(*impl->snapshot);
-        if (impl->snapshot->normalized_image) {
-            impl->architecture = impl->snapshot->normalized_image->architecture;
-            impl->architecture_mode = impl->snapshot->normalized_image->architecture_mode;
-        } else if (impl->snapshot->image) {
-            impl->architecture = impl->snapshot->image->architecture();
-            impl->architecture_mode = impl->snapshot->image->architecture_mode();
-        }
+        if (!instruction_class_only && instruction_index) {
+            impl->identity = instruction_index->impl_->identity;
+            impl->architecture = instruction_index->impl_->architecture;
+            impl->architecture_mode = instruction_index->impl_->architecture_mode;
+            impl->cursor_integrity_key = instruction_index->impl_->cursor_integrity_key;
+        } else {
+            impl->identity = snapshot_identity(*impl->snapshot);
+            if (impl->snapshot->normalized_image) {
+                impl->architecture = impl->snapshot->normalized_image->architecture;
+                impl->architecture_mode = impl->snapshot->normalized_image->architecture_mode;
+            } else if (impl->snapshot->image) {
+                impl->architecture = impl->snapshot->image->architecture();
+                impl->architecture_mode = impl->snapshot->image->architecture_mode();
+            }
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-        impl->cursor_integrity_key = {0xCBF29CE484222325ULL, 0x9E3779B97F4A7C15ULL};
-        const auto mix_cursor_byte = [&impl](std::uint8_t value) {
-            impl->cursor_integrity_key[0] ^= value;
-            impl->cursor_integrity_key[0] *= 0x100000001B3ULL;
-            impl->cursor_integrity_key[1] ^= impl->cursor_integrity_key[0] + value;
-            impl->cursor_integrity_key[1] *= 0x9E3779B185EBCA87ULL;
-        };
-        for (const auto value : impl->identity.binary_id.bytes)
-            mix_cursor_byte(value);
-        for (const auto value : impl->identity.load_profile_hash.bytes)
-            mix_cursor_byte(value);
-        for (std::size_t shift = 0; shift < 64; shift += 8) {
-            mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.generation >> shift));
-            mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.analysis_revision >> shift));
-            mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.overlay_revision >> shift));
-        }
-        if (impl->cursor_integrity_key[0] == 0 && impl->cursor_integrity_key[1] == 0)
-            impl->cursor_integrity_key[1] = 1;
+            impl->cursor_integrity_key = {0xCBF29CE484222325ULL, 0x9E3779B97F4A7C15ULL};
+            const auto mix_cursor_byte = [&impl](std::uint8_t value) {
+                impl->cursor_integrity_key[0] ^= value;
+                impl->cursor_integrity_key[0] *= 0x100000001B3ULL;
+                impl->cursor_integrity_key[1] ^= impl->cursor_integrity_key[0] + value;
+                impl->cursor_integrity_key[1] *= 0x9E3779B185EBCA87ULL;
+            };
+            for (const auto value : impl->identity.binary_id.bytes)
+                mix_cursor_byte(value);
+            for (const auto value : impl->identity.load_profile_hash.bytes)
+                mix_cursor_byte(value);
+            for (std::size_t shift = 0; shift < 64; shift += 8) {
+                mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.generation >> shift));
+                mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.analysis_revision >> shift));
+                mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.overlay_revision >> shift));
+            }
+            if (impl->cursor_integrity_key[0] == 0 && impl->cursor_integrity_key[1] == 0)
+                impl->cursor_integrity_key[1] = 1;
 #else
-        const auto random_status = BCryptGenRandom(nullptr,
-            reinterpret_cast<PUCHAR>(impl->cursor_integrity_key.data()),
-            static_cast<ULONG>(sizeof(impl->cursor_integrity_key)),
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-        if (!BCRYPT_SUCCESS(random_status) ||
-            (impl->cursor_integrity_key[0] == 0 && impl->cursor_integrity_key[1] == 0)) {
-            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                make_workspace_error(workspace_error_code_t::integrity_failure,
-                    "search cursor integrity entropy is unavailable", "search_index"));
-        }
+            const auto random_status = BCryptGenRandom(nullptr,
+                reinterpret_cast<PUCHAR>(impl->cursor_integrity_key.data()),
+                static_cast<ULONG>(sizeof(impl->cursor_integrity_key)),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            if (!BCRYPT_SUCCESS(random_status) ||
+                (impl->cursor_integrity_key[0] == 0 && impl->cursor_integrity_key[1] == 0)) {
+                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                        "search cursor integrity entropy is unavailable", "search_index"));
+            }
 #endif
-        impl->data_candidates = std::move(data_candidates);
-        impl->switches = std::move(switches);
-        impl->types = std::move(types);
+        }
+        if (!instruction_class_only) {
+            impl->data_candidates = std::move(data_candidates);
+            impl->switches = std::move(switches);
+            impl->types = std::move(types);
+        }
         impl->metrics = std::move(metrics);
-        impl->limits = limits;
+        impl->limits = effective_limits;
         impl->records.reserve(static_cast<std::size_t>(prospective_entries));
 
         const std::uint32_t worker_count = parallel_worker_count();
@@ -810,10 +903,14 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             std::uint64_t source_text_bytes = 0;
         };
 
-        const std::array<std::size_t, 6> class_sizes{
+        std::array<std::size_t, 6> class_sizes{
             impl->snapshot->symbols.size(), impl->snapshot->strings.size(),
             impl->types.size(), impl->snapshot->instructions.size(),
             impl->data_candidates.size(), impl->switches.size()};
+        if (instruction_class_only)
+            class_sizes = {0, 0, 0, impl->snapshot->instructions.size(), 0, 0};
+        else if (instruction_index)
+            class_sizes[3] = 0;
         std::vector<record_task_t> tasks;
         {
             std::size_t stream_cursor = 0;
@@ -835,7 +932,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             task.records.reserve(task.end - task.begin);
             std::uint64_t cancellation_checks = 0;
             for (std::size_t index = task.begin; index < task.end; ++index) {
-                if (++cancellation_checks >= limits.cancellation_check_interval) {
+                if (++cancellation_checks >= effective_limits.cancellation_check_interval) {
                     cancellation_checks = 0;
                     if (cancel.stop_requested())
                         return workspace_result_t<void>::failure(
@@ -928,8 +1025,8 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                     }
                     std::uint64_t updated = 0;
                     if (!checked_add_u64(task.indexed_text_bytes, referenced, updated) ||
-                        updated > limits.max_indexed_text_bytes ||
-                        updated > limits.max_index_bytes) {
+                        updated > effective_limits.max_indexed_text_bytes ||
+                        updated > effective_limits.max_index_bytes) {
                         return workspace_result_t<void>::failure(
                             make_workspace_error(workspace_error_code_t::limit_exceeded,
                                 "search-index text budget exceeded", "search_index"));
@@ -975,8 +1072,8 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
         for (const auto& task : tasks) {
             std::uint64_t updated = 0;
             if (!checked_add_u64(indexed_text_bytes, task.indexed_text_bytes, updated) ||
-                updated > limits.max_indexed_text_bytes ||
-                updated > limits.max_index_bytes) {
+                updated > effective_limits.max_indexed_text_bytes ||
+                updated > effective_limits.max_index_bytes) {
                 return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                     make_workspace_error(workspace_error_code_t::limit_exceeded,
                         "search-index text budget exceeded", "search_index"));
@@ -1000,7 +1097,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                 const auto& local_values = task.strings.values();
                 task.local_to_global.reserve(local_values.size());
                 for (const auto& value : local_values) {
-                    if (++merge_checks >= limits.cancellation_check_interval) {
+                    if (++merge_checks >= effective_limits.cancellation_check_interval) {
                         merge_checks = 0;
                         if (cancel.stop_requested()) {
                             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
@@ -1035,7 +1132,11 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 stop_error(cancel, "search_index"));
 
-        impl->records.resize(static_cast<std::size_t>(prospective_entries));
+        std::uint64_t staged_entries = 0;
+        for (const auto size : class_sizes)
+            staged_entries += size;
+        std::vector<packed_search_record_t> staged_records(
+            static_cast<std::size_t>(staged_entries));
         auto remapped = parallel_run_shards(task_shards,
             [&](std::size_t, const parallel_shard_t& shard) {
                 for (std::size_t task_index = shard.begin; task_index < shard.end; ++task_index) {
@@ -1049,7 +1150,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                         }
                     }
                     std::move(task.records.begin(), task.records.end(),
-                        impl->records.begin() + static_cast<std::ptrdiff_t>(task.stream_begin));
+                        staged_records.begin() + static_cast<std::ptrdiff_t>(task.stream_begin));
                     task.records = std::vector<packed_search_record_t>{};
                 }
                 return workspace_result_t<void>::success();
@@ -1058,13 +1159,38 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(remapped.error());
         tasks.clear();
         tasks.shrink_to_fit();
-        if (impl->records.size() != prospective_entries) {
-            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
-                make_workspace_error(workspace_error_code_t::integrity_failure,
-                    "search-index record count diverged during packing", "search_index"));
-        }
 
-        parallel_sort(impl->records.begin(), impl->records.end(), record_less, worker_count);
+        if (!instruction_class_only && instruction_index) {
+            const auto& instruction_records = instruction_index->impl_->records;
+            if (instruction_records.size() + staged_records.size() != prospective_entries) {
+                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                        "search-index staged record count diverged during merge",
+                        "search_index"));
+            }
+            parallel_sort(staged_records.begin(), staged_records.end(), record_less,
+                          worker_count);
+            impl->records.resize(static_cast<std::size_t>(prospective_entries));
+            std::copy(instruction_records.begin(), instruction_records.end(),
+                      impl->records.begin());
+            std::move(staged_records.begin(), staged_records.end(),
+                      impl->records.begin() +
+                          static_cast<std::ptrdiff_t>(instruction_records.size()));
+            staged_records.clear();
+            staged_records.shrink_to_fit();
+            std::inplace_merge(impl->records.begin(),
+                               impl->records.begin() + static_cast<std::ptrdiff_t>(
+                                   instruction_records.size()),
+                               impl->records.end(), record_less);
+        } else {
+            impl->records = std::move(staged_records);
+            if (impl->records.size() != prospective_entries) {
+                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                        "search-index record count diverged during packing", "search_index"));
+            }
+            parallel_sort(impl->records.begin(), impl->records.end(), record_less, worker_count);
+        }
 
         impl->text_references.reserve(class_sizes[0] + class_sizes[1] + class_sizes[2]);
         impl->address_references.reserve(impl->records.size());
@@ -1087,7 +1213,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                 auto& slot = reference_slots[shard_index];
                 std::uint64_t checks = 0;
                 for (std::size_t index = shard.begin; index < shard.end; ++index) {
-                    if (++checks >= limits.cancellation_check_interval) {
+                    if (++checks >= effective_limits.cancellation_check_interval) {
                         checks = 0;
                         if (cancel.stop_requested())
                             return workspace_result_t<void>::failure(
@@ -1196,7 +1322,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             [&](std::size_t shard_index, const parallel_shard_t& shard) {
                 std::uint64_t checks = 0;
                 for (std::size_t index = shard.begin; index < shard.end; ++index) {
-                    if (++checks >= limits.cancellation_check_interval) {
+                    if (++checks >= effective_limits.cancellation_check_interval) {
                         checks = 0;
                         if (cancel.stop_requested())
                             return workspace_result_t<void>::failure(
@@ -1336,7 +1462,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                 std::uint64_t checks = 0;
                 for (std::size_t text_index = shard.begin; text_index < shard.end;
                      ++text_index) {
-                    if (++checks >= limits.cancellation_check_interval) {
+                    if (++checks >= effective_limits.cancellation_check_interval) {
                         checks = 0;
                         if (cancel.stop_requested())
                             return workspace_result_t<void>::failure(
@@ -1360,8 +1486,8 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                     }
                     std::sort(keys.begin(), keys.end());
                     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-                    if (pairs.size() > limits.max_trigram_postings ||
-                        keys.size() > limits.max_trigram_postings - pairs.size()) {
+                    if (pairs.size() > effective_limits.max_trigram_postings ||
+                        keys.size() > effective_limits.max_trigram_postings - pairs.size()) {
                         return workspace_result_t<void>::failure(
                             make_workspace_error(workspace_error_code_t::limit_exceeded,
                                 "search-index posting budget exceeded", "search_index"));
@@ -1382,7 +1508,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
         for (const auto& run : trigram_runs) {
             std::uint64_t updated = 0;
             if (!checked_add_u64(total_pairs, run.size(), updated) ||
-                updated > limits.max_trigram_postings) {
+                updated > effective_limits.max_trigram_postings) {
                 return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                     make_workspace_error(workspace_error_code_t::limit_exceeded,
                         "search-index posting budget exceeded", "search_index"));
@@ -1423,7 +1549,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             std::uint32_t span_begin = 0;
             bool span_open = false;
             while (emitted_count < total_pairs) {
-                if (++merge_checks >= limits.cancellation_check_interval) {
+                if (++merge_checks >= effective_limits.cancellation_check_interval) {
                     merge_checks = 0;
                     if (cancel.stop_requested())
                         return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
@@ -1516,7 +1642,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             }
             memory_bytes = updated;
         }
-        if (memory_bytes > limits.max_index_bytes) {
+        if (memory_bytes > effective_limits.max_index_bytes) {
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 make_workspace_error(workspace_error_code_t::limit_exceeded,
                     "search-index memory budget exceeded", "search_index"));

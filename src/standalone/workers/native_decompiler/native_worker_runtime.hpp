@@ -372,7 +372,7 @@ inline std::optional<decompiler_worker_job_request_t> receive_job(startup_t& sta
 
 inline bool verify_snapshot(const startup_t& startup, const decompiler_worker_job_request_t& job)
 {
-    if (startup.snapshot_size == 0 || startup.snapshot_size > 256U * 1024U * 1024U || job.snapshot_hash.empty())
+    if (startup.snapshot_size == 0 || startup.snapshot_size > 1024ULL * 1024ULL * 1024ULL || job.snapshot_hash.empty())
         return false;
     void* view = MapViewOfFile(startup.snapshot_handle, FILE_MAP_READ, 0, 0, startup.snapshot_size);
     if (!view)

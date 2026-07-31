@@ -1,5 +1,7 @@
 #include "workspace_registry.hpp"
 
+#include "../../helpers/diag_log.hpp"
+
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 namespace aida::analysis {
@@ -1185,6 +1187,28 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> workspace_registry_t::
         if (!revalidated)
             return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
                 revalidated.error());
+    }
+
+    if (admitted_provider == request.provider && request.provider_options.pin_sections) {
+        const auto mapped =
+            std::dynamic_pointer_cast<const mapped_file_provider_t>(admitted_provider);
+        if (mapped) {
+            const auto pin_ranges =
+                compute_admission_pin_ranges(*parsed.value().normalized);
+            if (!pin_ranges.empty()) {
+                auto pinned = mapped->pin_ranges(pin_ranges);
+                if (!pinned) {
+                    ::diag::log_tagged_fmt("workspace_registry",
+                        "admission section pins rejected source='%s' ranges=%zu error='%s'",
+                        request.bin_name.c_str(), pin_ranges.size(),
+                        pinned.error().message.c_str());
+                } else {
+                    ::diag::log_tagged_fmt("workspace_registry",
+                        "admission section pins applied source='%s' ranges=%zu",
+                        request.bin_name.c_str(), pin_ranges.size());
+                }
+            }
+        }
     }
 
     workspace_result_t<sha256_digest_t> profile_hash_result = parsed.value().pe_adapter && !member

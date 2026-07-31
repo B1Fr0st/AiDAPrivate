@@ -115,6 +115,26 @@ constexpr std::uint64_t kReopenRangeFloorBytes = analysis_gibibyte;
 constexpr std::uint64_t kReopenRangeCeilingBytes = 8ULL * analysis_gibibyte;
 constexpr std::uint64_t kLowMemoryThresholdBytes = 24ULL * analysis_gibibyte;
 constexpr std::uint64_t kFallbackTotalPhysBytes = 16ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorMappedFloorBytes = analysis_gibibyte;
+constexpr std::uint64_t kGovernorMappedCeilingBytes = 4ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorPageCacheFloorBytes = analysis_gibibyte;
+constexpr std::uint64_t kGovernorPageCacheCeilingBytes = 4ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorResidentFloorBytes = 8ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorResidentCeilingBytes = 48ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorStagingFloorBytes = 512ULL * analysis_mebibyte;
+constexpr std::uint64_t kGovernorStagingCeilingBytes = 4ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorDecodeFloorBytes = 4ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorDecodeCeilingBytes = 16ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorSearchFloorBytes = 2ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorSearchCeilingBytes = 8ULL * analysis_gibibyte;
+constexpr std::uint64_t kGovernorDecompilerFloorBytes = 128ULL * analysis_mebibyte;
+constexpr std::uint64_t kGovernorDecompilerCeilingBytes = 512ULL * analysis_mebibyte;
+constexpr std::uint64_t kGovernorWorkerFloorBytes = 256ULL * analysis_mebibyte;
+constexpr std::uint64_t kGovernorWorkerCeilingBytes = analysis_gibibyte;
+constexpr std::uint64_t kGovernorXrefFloorBytes = 256ULL * analysis_mebibyte;
+constexpr std::uint64_t kGovernorXrefCeilingBytes = analysis_gibibyte;
+constexpr std::uint64_t kGovernorSqliteCachesBytes = 512ULL * analysis_mebibyte;
+constexpr std::uint64_t kGovernorUiMiscBytes = analysis_gibibyte;
 
 }
 
@@ -405,8 +425,37 @@ adaptive_analysis_budget_fields_t adaptive_analysis_budget_fields(
     fields.pdb_persistence_total_bytes = clamp_u64(usable / 32ULL, kPdbPersistFloorBytes,
                                                    kPdbPersistCeilingBytes);
     fields.reopen_range_budget_bytes = clamp_u64(usable / 8ULL, kReopenRangeFloorBytes,
-                                                 kReopenRangeCeilingBytes);
+                                                  kReopenRangeCeilingBytes);
     fields.low_memory = envelope.total_phys < kLowMemoryThresholdBytes;
+    return fields;
+}
+
+governor_subsystem_budget_fields_t governor_subsystem_budget_fields(
+    const host_memory_envelope_t& envelope) noexcept
+{
+    governor_subsystem_budget_fields_t fields;
+    const std::uint64_t usable = envelope.usable_bytes;
+    fields.mapped_windows_bytes = clamp_u64(usable / 16ULL, kGovernorMappedFloorBytes,
+                                            kGovernorMappedCeilingBytes);
+    fields.fact_page_cache_bytes = clamp_u64(usable / 12ULL, kGovernorPageCacheFloorBytes,
+                                             kGovernorPageCacheCeilingBytes);
+    fields.resident_facts_bytes = clamp_u64(usable / 2ULL, kGovernorResidentFloorBytes,
+                                            kGovernorResidentCeilingBytes);
+    fields.persistence_staging_bytes = clamp_u64(usable / 16ULL, kGovernorStagingFloorBytes,
+                                                 kGovernorStagingCeilingBytes);
+    fields.decode_transient_bytes = clamp_u64(usable / 3ULL, kGovernorDecodeFloorBytes,
+                                              kGovernorDecodeCeilingBytes);
+    fields.search_index_bytes = clamp_u64(usable / 8ULL, kGovernorSearchFloorBytes,
+                                          kGovernorSearchCeilingBytes);
+    fields.decompiler_memory_bytes = clamp_u64(usable / 64ULL, kGovernorDecompilerFloorBytes,
+                                               kGovernorDecompilerCeilingBytes);
+    fields.worker_snapshots_bytes = clamp_u64(usable / 32ULL, kGovernorWorkerFloorBytes,
+                                              kGovernorWorkerCeilingBytes);
+    fields.xref_arenas_bytes = clamp_u64(usable / 48ULL, kGovernorXrefFloorBytes,
+                                         kGovernorXrefCeilingBytes);
+    fields.sqlite_caches_bytes = kGovernorSqliteCachesBytes;
+    fields.ui_misc_bytes = kGovernorUiMiscBytes;
+    fields.process_budget_bytes = usable;
     return fields;
 }
 

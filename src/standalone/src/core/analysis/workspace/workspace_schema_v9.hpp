@@ -337,6 +337,39 @@ workspace_result_t<void> write_decompiler_cache_v9(
 workspace_result_t<std::optional<decompiler_cache_v9_record_t>>
     read_decompiler_cache_v9(sqlite3* database, const std::string& cache_key);
 
+struct decompiler_cache_v9_range_t {
+    std::uint64_t rva_begin = 0;
+    std::uint64_t rva_end = 0;
+};
+
+inline constexpr std::size_t decompiler_cache_v9_range_delete_max = 4096;
+
+workspace_result_t<std::uint64_t> delete_decompiler_cache_v9_ranges(
+    sqlite3* database,
+    const std::vector<decompiler_cache_v9_range_t>& ranges,
+    std::optional<std::uint64_t> minimum_overlay_revision = std::nullopt);
+
+struct paged_domain_revision_tag_t {
+    std::uint64_t generation = 0;
+    std::uint64_t analysis_revision = 0;
+    std::uint64_t overlay_revision = 0;
+
+    friend bool operator==(const paged_domain_revision_tag_t& lhs,
+                           const paged_domain_revision_tag_t& rhs) noexcept {
+        return lhs.generation == rhs.generation &&
+               lhs.analysis_revision == rhs.analysis_revision &&
+               lhs.overlay_revision == rhs.overlay_revision;
+    }
+
+    friend bool operator!=(const paged_domain_revision_tag_t& lhs,
+                           const paged_domain_revision_tag_t& rhs) noexcept {
+        return !(lhs == rhs);
+    }
+};
+
+workspace_result_t<std::optional<paged_domain_revision_tag_t>>
+    read_paged_domain_revision_tag(sqlite3* database, std::uint64_t generation);
+
 workspace_result_t<void> write_overlay_v9_state(
     sqlite3* database, const overlay_v9_state_record_t& record);
 

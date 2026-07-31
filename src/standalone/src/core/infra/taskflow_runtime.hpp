@@ -7,6 +7,7 @@
 #else
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -195,6 +197,10 @@ struct stats_t {
     std::uint64_t failed = 0;
     std::uint64_t timed_out = 0;
     std::uint64_t oldest_active_ms = 0;
+    std::uint64_t lane_in_flight = 0;
+    std::uint64_t fairness_wait_ns_total = 0;
+    std::uint64_t lane_depth[8] = {};
+    std::uint64_t lane_admitted[8] = {};
     std::uint32_t active_label_count = 0;
     std::uint32_t healthy_long_lived = 0;
     std::uint32_t hot_workers = 0;
@@ -314,6 +320,11 @@ struct pool_t {
     std::size_t pending_capacity = 0;
     std::size_t per_target_pending_capacity = 0;
     std::size_t admission_capacity = 0;
+    std::array<std::deque<std::shared_ptr<job_record_t>>, 8> priority_lanes;
+    std::array<std::uint64_t, 8> lane_depth{};
+    std::array<std::uint64_t, 8> lane_dispatched{};
+    std::uint64_t lane_in_flight = 0;
+    std::atomic<std::uint64_t> fairness_wait_ns_total{0};
 
     pool_t(const char* pool_name_in, const char* log_tag_in, const char* default_label_in, pool_family_t family_in, int configured_pool_size_in) noexcept
         : pool_name(pool_name_in),
@@ -386,7 +397,14 @@ struct job_record_t {
     std::vector<graph_node_record_t> nodes;
     mutable std::mutex mtx;
     std::condition_variable cv;
+    std::atomic<bool> fabric_lane_queued{false};
+    std::atomic<bool> fabric_lane_dispatched{false};
 };
+
+inline void pump_lanes(pool_t& p);
+inline bool remove_record_from_lane(pool_t& p, const std::shared_ptr<job_record_t>& record);
+inline void ensure_deadline_sweeper_started() noexcept;
+inline void check_deadlines();
 
 inline std::atomic<std::uint64_t> g_next_job_id{0};
 inline std::atomic<std::uint64_t> g_total_submitted{0};
@@ -482,16 +500,41 @@ inline unsigned host_worker_count(unsigned fallback) {
     return n == 0 ? fallback : static_cast<unsigned>(n);
 }
 
+inline unsigned fabric_host_worker_count() {
+    const unsigned count = host_worker_count(4u);
+    return count < 4u ? 4u : count;
+}
+
+inline int feature_worker_pool_size() {
+    return clamp_pool_size((fabric_host_worker_count() * 6u + 9u) / 10u, 4u, 48u);
+}
+
 inline int general_pool_size() {
-    return clamp_pool_size(host_worker_count(32u), 32u, 64u);
+    return clamp_pool_size((fabric_host_worker_count() + 3u) / 4u, 4u, 16u);
 }
 
 inline int service_pool_size() {
-    return clamp_pool_size(host_worker_count(16u), 16u, 32u);
+    return clamp_pool_size(fabric_host_worker_count() / 2u, 4u, 16u);
 }
 
-inline int narrow_pool_size(unsigned fallback, unsigned high) {
-    return clamp_pool_size(host_worker_count(fallback), 4u, high);
+inline int critical_pool_size() {
+    return clamp_pool_size(fabric_host_worker_count() / 4u, 4u, 12u);
+}
+
+inline int ui_dispatch_pool_size() {
+    return clamp_pool_size(fabric_host_worker_count() / 4u, 2u, 8u);
+}
+
+inline int external_tool_pool_size() {
+    return clamp_pool_size((fabric_host_worker_count() + 3u) / 4u, 4u, 16u);
+}
+
+inline int long_running_pool_size() {
+    return clamp_pool_size(fabric_host_worker_count() / 4u, 4u, 16u);
+}
+
+inline int diagnostics_pool_size() {
+    return clamp_pool_size(fabric_host_worker_count() / 4u, 2u, 8u);
 }
 
 inline void register_pool(pool_t& p) {
@@ -503,13 +546,13 @@ inline void register_pool(pool_t& p) {
 inline pool_t& domain_pool(executor_domain_t d) {
     static pool_t& general = *new pool_t{"runtime.general", "taskflow_runtime", "runtime.general", pool_family_t::general, general_pool_size()};
     static pool_t& service = *new pool_t{"runtime.service", "taskflow_runtime", "runtime.service", pool_family_t::service, service_pool_size()};
-    static pool_t& critical = *new pool_t{"runtime.critical", "taskflow_runtime", "runtime.critical", pool_family_t::critical, 24};
-    static pool_t& ui_dispatch = *new pool_t{"runtime.ui_dispatch", "taskflow_runtime", "runtime.ui_dispatch", pool_family_t::general, narrow_pool_size(4u, 8u)};
-    static pool_t& external_tool = *new pool_t{"runtime.external_tool", "taskflow_runtime", "runtime.external_tool", pool_family_t::general, narrow_pool_size(8u, 16u)};
-    static pool_t& long_running = *new pool_t{"runtime.long_running", "taskflow_runtime", "runtime.long_running", pool_family_t::service, narrow_pool_size(8u, 16u)};
+    static pool_t& critical = *new pool_t{"runtime.critical", "taskflow_runtime", "runtime.critical", pool_family_t::critical, critical_pool_size()};
+    static pool_t& ui_dispatch = *new pool_t{"runtime.ui_dispatch", "taskflow_runtime", "runtime.ui_dispatch", pool_family_t::general, ui_dispatch_pool_size()};
+    static pool_t& external_tool = *new pool_t{"runtime.external_tool", "taskflow_runtime", "runtime.external_tool", pool_family_t::general, external_tool_pool_size()};
+    static pool_t& long_running = *new pool_t{"runtime.long_running", "taskflow_runtime", "runtime.long_running", pool_family_t::service, long_running_pool_size()};
     static pool_t& security_liveness = *new pool_t{"runtime.security_liveness", "taskflow_runtime", "runtime.security_liveness", pool_family_t::critical, 8};
-    static pool_t& feature_worker = *new pool_t{"runtime.feature_worker", "taskflow_runtime", "runtime.feature_worker", pool_family_t::general, narrow_pool_size(8u, 16u)};
-    static pool_t& diagnostics = *new pool_t{"runtime.diagnostics", "taskflow_runtime", "runtime.diagnostics", pool_family_t::general, narrow_pool_size(4u, 8u)};
+    static pool_t& feature_worker = *new pool_t{"runtime.feature_worker", "taskflow_runtime", "runtime.feature_worker", pool_family_t::general, feature_worker_pool_size()};
+    static pool_t& diagnostics = *new pool_t{"runtime.diagnostics", "taskflow_runtime", "runtime.diagnostics", pool_family_t::general, diagnostics_pool_size()};
     switch (d) {
     case executor_domain_t::service: return service;
     case executor_domain_t::critical: return critical;
@@ -746,6 +789,11 @@ inline void initialize_pool(pool_t& p, int pool_size) {
         p.target_pending_nodes.clear();
         p.deferred_nodes = 0;
         p.admitted_jobs = 0;
+        for (auto& lane : p.priority_lanes)
+            lane.clear();
+        p.lane_depth.fill(0);
+        p.lane_dispatched.fill(0);
+        p.lane_in_flight = 0;
         p.active_snapshots.assign(static_cast<std::size_t>(pool_size), {});
         p.executor.reset(new tf::Executor(static_cast<std::size_t>(pool_size), std::unique_ptr<tf::WorkerInterface>(new worker_interface_t(&p))));
         p.worker_count.store(p.executor ? p.executor->num_workers() : 0, std::memory_order_release);
@@ -756,6 +804,15 @@ inline void initialize_pool(pool_t& p, int pool_size) {
             p.worker_count.load(std::memory_order_acquire),
             pool_size,
             TF_VERSION,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "fabric_pool_sized pool=%s host=%u workers=%zu pending_capacity=%zu per_target_pending_capacity=%zu admission_capacity=%zu tid=%lu",
+            safe_pool_name(p),
+            static_cast<unsigned>(fabric_host_worker_count()),
+            p.worker_count.load(std::memory_order_acquire),
+            static_cast<unsigned long long>(p.pending_capacity),
+            static_cast<unsigned long long>(p.per_target_pending_capacity),
+            static_cast<unsigned long long>(p.admission_capacity),
             static_cast<unsigned long>(GetCurrentThreadId()));
         if (below_normal_priority_pool(p)) {
             diag::log_tagged_fmt(safe_log_tag(p),
@@ -793,6 +850,7 @@ inline void initialize() {
         pool_t& p = domain_pool(static_cast<executor_domain_t>(i));
         initialize_pool(p, p.configured_pool_size);
     }
+    ensure_deadline_sweeper_started();
 }
 
 inline void mark_record_inactive(const std::shared_ptr<job_record_t>& record, job_state_t final_state, const std::string& exception_text) {
@@ -838,6 +896,14 @@ inline void complete_not_started_record(const std::shared_ptr<job_record_t>& rec
         if (final_state == job_state_t::timed_out)
             p->timed_out_tasks.fetch_add(1u, std::memory_order_acq_rel);
     }
+    if (p && record->fabric_lane_dispatched.load(std::memory_order_acquire)) {
+        {
+            std::lock_guard<std::mutex> lk(p->mtx);
+            if (p->lane_in_flight != 0)
+                --p->lane_in_flight;
+        }
+        pump_lanes(*p);
+    }
 }
 
 inline void start_record(const std::shared_ptr<job_record_t>& record, std::uint64_t active_id, const std::string& active_label) {
@@ -849,6 +915,8 @@ inline void start_record(const std::shared_ptr<job_record_t>& record, std::uint6
     decrement_atomic_if_nonzero(p->pending_tasks);
     const std::uint64_t start = now_ms();
     const std::uint64_t start_ns = now_ns();
+    std::uint64_t fairness_wait_ns = 0;
+    bool fairness_recorded = false;
     {
         std::lock_guard<std::mutex> lk(record->mtx);
         if (record->started_ms == 0) {
@@ -856,10 +924,14 @@ inline void start_record(const std::shared_ptr<job_record_t>& record, std::uint6
             record->started_ns = start_ns;
             record->fairness_wait_ns = start_ns >= record->queued_ns
                 ? start_ns - record->queued_ns : 0;
+            fairness_wait_ns = record->fairness_wait_ns;
+            fairness_recorded = true;
         }
         if (record->state == job_state_t::queued || record->state == job_state_t::not_started)
             record->state = job_state_t::running;
     }
+    if (fairness_recorded)
+        p->fairness_wait_ns_total.fetch_add(fairness_wait_ns, std::memory_order_acq_rel);
     const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
     const DWORD tid = GetCurrentThreadId();
     if (!task_tls_ready) {
@@ -911,6 +983,14 @@ inline void finish_started_record(const std::shared_ptr<job_record_t>& record, s
         ++record->service_units;
     }
     mark_record_inactive(record, final_state, exception_text);
+    if (record->fabric_lane_dispatched.load(std::memory_order_acquire)) {
+        {
+            std::lock_guard<std::mutex> lk(p->mtx);
+            if (p->lane_in_flight != 0)
+                --p->lane_in_flight;
+        }
+        pump_lanes(*p);
+    }
 }
 
 inline void invoke_body(const std::function<void()>& body, const std::function<void(const cancellation_token_t&)>& cancellable_body, const std::shared_ptr<cancellation_token_t>& token) {
@@ -1198,7 +1278,159 @@ inline std::shared_ptr<job_record_t> make_record_from_descriptor(task_descriptor
     return record;
 }
 
+inline bool remove_record_from_lane(pool_t& p, const std::shared_ptr<job_record_t>& record) {
+    if (!record)
+        return false;
+    std::lock_guard<std::mutex> lk(p.mtx);
+    if (!record->fabric_lane_queued.load(std::memory_order_acquire) ||
+        record->fabric_lane_dispatched.load(std::memory_order_acquire))
+        return false;
+    const std::size_t lane_index = (std::min<std::size_t>)(
+        static_cast<std::size_t>(record->priority), p.priority_lanes.size() - 1u);
+    auto& lane = p.priority_lanes[lane_index];
+    bool erased = false;
+    for (auto it = lane.begin(); it != lane.end(); ++it) {
+        if (*it && (*it)->id == record->id) {
+            lane.erase(it);
+            erased = true;
+            break;
+        }
+    }
+    p.lane_depth[lane_index] = static_cast<std::uint64_t>(lane.size());
+    record->fabric_lane_queued.store(false, std::memory_order_release);
+    if (!erased) {
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "fabric_lane_remove_missing job_id=%llu pool=%s lane=%zu tid=%lu",
+            static_cast<unsigned long long>(record->id),
+            safe_pool_name(p),
+            lane_index,
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+    return true;
+}
+
+inline void pump_lanes(pool_t& p) {
+    std::vector<std::shared_ptr<job_record_t>> skipped;
+    std::vector<std::shared_ptr<job_record_t>> failed;
+    {
+        std::lock_guard<std::mutex> lk(p.mtx);
+        const bool executor_ready = p.executor && p.alive.load(std::memory_order_acquire);
+        if (!executor_ready) {
+            for (std::size_t lane_index = 0; lane_index < p.priority_lanes.size(); ++lane_index) {
+                auto& lane = p.priority_lanes[lane_index];
+                while (!lane.empty()) {
+                    auto record = std::move(lane.front());
+                    lane.pop_front();
+                    if (record) {
+                        record->fabric_lane_queued.store(false, std::memory_order_release);
+                        if (record->cancel_token)
+                            record->cancel_token->requested.store(true, std::memory_order_release);
+                        skipped.push_back(std::move(record));
+                    }
+                }
+                p.lane_depth[lane_index] = 0;
+            }
+        } else {
+            const std::uint64_t workers =
+                static_cast<std::uint64_t>(p.worker_count.load(std::memory_order_acquire));
+            while (p.lane_in_flight < workers) {
+                std::size_t lane_index = p.priority_lanes.size();
+                for (std::size_t i = 0; i < p.priority_lanes.size(); ++i) {
+                    if (!p.priority_lanes[i].empty()) {
+                        lane_index = i;
+                        break;
+                    }
+                }
+                if (lane_index == p.priority_lanes.size())
+                    break;
+                auto& lane = p.priority_lanes[lane_index];
+                auto record = std::move(lane.front());
+                lane.pop_front();
+                p.lane_depth[lane_index] = static_cast<std::uint64_t>(lane.size());
+                if (!record)
+                    continue;
+                record->fabric_lane_queued.store(false, std::memory_order_release);
+                bool cancelled = false;
+                {
+                    std::lock_guard<std::mutex> record_lk(record->mtx);
+                    cancelled = !record->active ||
+                        (record->cancel_token &&
+                         record->cancel_token->requested.load(std::memory_order_acquire));
+                    if (!cancelled)
+                        record->fabric_lane_dispatched.store(true, std::memory_order_release);
+                }
+                if (cancelled) {
+                    skipped.push_back(std::move(record));
+                    continue;
+                }
+                try {
+                    tf::Taskflow flow;
+                    auto task = flow.emplace([record]() { execute_single_record(record); });
+                    task.name(record->label);
+                    auto future = p.executor->run(std::move(flow),
+                        [record]() { complete_not_started_record(record); });
+                    {
+                        std::lock_guard<std::mutex> record_lk(record->mtx);
+                        record->future = std::move(future);
+                        record->has_future = true;
+                        if (record->state == job_state_t::queued)
+                            record->state = job_state_t::not_started;
+                    }
+                    ++p.lane_in_flight;
+                    ++p.lane_dispatched[lane_index];
+                    p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
+                    diag::log_tagged_fmt(safe_log_tag(p),
+                        "fabric_lane_dispatch job_id=%llu pool=%s lane=%zu in_flight=%llu owner=%s label=%s tid=%lu",
+                        static_cast<unsigned long long>(record->id),
+                        safe_pool_name(p),
+                        lane_index,
+                        static_cast<unsigned long long>(p.lane_in_flight),
+                        record->owner_subsystem.c_str(),
+                        record->label.c_str(),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                } catch (const std::exception& ex) {
+                    record->fabric_lane_dispatched.store(false, std::memory_order_release);
+                    {
+                        std::lock_guard<std::mutex> record_lk(record->mtx);
+                        record->exception_text = ex.what();
+                    }
+                    failed.push_back(std::move(record));
+                } catch (...) {
+                    record->fabric_lane_dispatched.store(false, std::memory_order_release);
+                    {
+                        std::lock_guard<std::mutex> record_lk(record->mtx);
+                        record->exception_text = "fabric_lane_dispatch_exception";
+                    }
+                    failed.push_back(std::move(record));
+                }
+            }
+        }
+    }
+    for (auto& record : skipped)
+        complete_not_started_record(record);
+    for (auto& record : failed) {
+        std::string reason;
+        {
+            std::lock_guard<std::mutex> record_lk(record->mtx);
+            reason = record->exception_text;
+        }
+        decrement_atomic_if_nonzero(p.pending_tasks);
+        p.failed_tasks.fetch_add(1u, std::memory_order_acq_rel);
+        g_total_failed.fetch_add(1u, std::memory_order_acq_rel);
+        mark_record_inactive(record, job_state_t::failed, reason);
+        diag::log_tagged_fmt(safe_log_tag(p),
+            "fabric_lane_dispatch_failed job_id=%llu pool=%s reason=%.300s owner=%s label=%s tid=%lu",
+            static_cast<unsigned long long>(record->id),
+            safe_pool_name(p),
+            reason.empty() ? "<none>" : reason.c_str(),
+            record->owner_subsystem.c_str(),
+            record->label.c_str(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+}
+
 inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_t&& desc) {
+    ensure_deadline_sweeper_started();
     submit_result_t result;
     register_pool(p);
     p.post_attempts.fetch_add(1u, std::memory_order_acq_rel);
@@ -1227,15 +1459,14 @@ inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_
     if (!p.alive.load(std::memory_order_acquire))
         initialize_pool(p, pool_size);
     std::shared_ptr<job_record_t> record = make_record_from_descriptor(std::move(desc), p);
-    tf::Taskflow flow;
-    auto task = flow.emplace([record]() { execute_single_record(record); });
-    task.name(record->label);
     {
         std::lock_guard<std::mutex> jobs_lk(g_jobs_mtx);
         prune_completed_jobs_locked();
         g_jobs[record->id] = record;
     }
     bool pending_incremented = false;
+    bool no_capacity = false;
+    std::uint64_t queued_total = 0;
     try {
         std::lock_guard<std::mutex> lk(p.mtx);
         if (g_stop_accepting.load(std::memory_order_acquire)
@@ -1243,20 +1474,36 @@ inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_
             || p.stop_accepting.load(std::memory_order_acquire) || !p.executor) {
             result.reject_reason = "pool_not_accepting";
         } else {
-            p.pending_tasks.fetch_add(1u, std::memory_order_acq_rel);
-            pending_incremented = true;
-            auto future = p.executor->run(std::move(flow), [record]() { complete_not_started_record(record); });
-            {
-                std::lock_guard<std::mutex> record_lk(record->mtx);
-                record->future = std::move(future);
-                record->has_future = true;
-                if (record->state == job_state_t::queued)
-                    record->state = job_state_t::not_started;
+            queued_total = p.lane_in_flight;
+            for (const auto depth : p.lane_depth)
+                queued_total += depth;
+            if (queued_total >= static_cast<std::uint64_t>(p.pending_capacity)) {
+                no_capacity = true;
+                result.reject_reason = record->no_capacity_reason.empty()
+                    ? "no_capacity" : record->no_capacity_reason;
+            } else {
+                p.pending_tasks.fetch_add(1u, std::memory_order_acq_rel);
+                pending_incremented = true;
+                record->fabric_lane_queued.store(true, std::memory_order_release);
+                const std::size_t lane_index = (std::min<std::size_t>)(
+                    static_cast<std::size_t>(record->priority), p.priority_lanes.size() - 1u);
+                auto& lane = p.priority_lanes[lane_index];
+                lane.push_back(record);
+                p.lane_depth[lane_index] = static_cast<std::uint64_t>(lane.size());
+                g_total_submitted.fetch_add(1u, std::memory_order_acq_rel);
+                result.submitted = true;
+                result.handle.id = record->id;
+                diag::log_tagged_fmt(safe_log_tag(p),
+                    "fabric_lane_enqueue job_id=%llu pool=%s lane=%zu lane_depth=%llu queued_total=%llu owner=%s label=%s tid=%lu",
+                    static_cast<unsigned long long>(record->id),
+                    safe_pool_name(p),
+                    lane_index,
+                    static_cast<unsigned long long>(p.lane_depth[lane_index]),
+                    static_cast<unsigned long long>(queued_total + 1u),
+                    record->owner_subsystem.c_str(),
+                    record->label.c_str(),
+                    static_cast<unsigned long>(GetCurrentThreadId()));
             }
-            p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
-            g_total_submitted.fetch_add(1u, std::memory_order_acq_rel);
-            result.submitted = true;
-            result.handle.id = record->id;
         }
     } catch (const std::exception& ex) {
         result.reject_reason = ex.what();
@@ -1269,14 +1516,27 @@ inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_
         p.rejected_tasks.fetch_add(1u, std::memory_order_acq_rel);
         g_total_rejected.fetch_add(1u, std::memory_order_acq_rel);
         mark_record_inactive(record, job_state_t::failed, result.reject_reason);
-        diag::log_tagged_fmt(safe_log_tag(p),
-            "taskflow_submit_failed pool=%s reason=%.300s owner=%s label=%s domain=%s tid=%lu",
-            safe_pool_name(p),
-            result.reject_reason.empty() ? "<none>" : result.reject_reason.c_str(),
-            record->owner_subsystem.c_str(),
-            record->label.c_str(),
-            domain_name(record->domain),
-            static_cast<unsigned long>(GetCurrentThreadId()));
+        if (no_capacity) {
+            diag::log_tagged_fmt(safe_log_tag(p),
+                "fabric_no_capacity pool=%s reason=%s queued_total=%llu pending_capacity=%llu owner=%s label=%s domain=%s tid=%lu",
+                safe_pool_name(p),
+                result.reject_reason.c_str(),
+                static_cast<unsigned long long>(queued_total),
+                static_cast<unsigned long long>(p.pending_capacity),
+                record->owner_subsystem.c_str(),
+                record->label.c_str(),
+                domain_name(record->domain),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        } else {
+            diag::log_tagged_fmt(safe_log_tag(p),
+                "taskflow_submit_failed pool=%s reason=%.300s owner=%s label=%s domain=%s tid=%lu",
+                safe_pool_name(p),
+                result.reject_reason.empty() ? "<none>" : result.reject_reason.c_str(),
+                record->owner_subsystem.c_str(),
+                record->label.c_str(),
+                domain_name(record->domain),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
     } else {
         diag::log_tagged_fmt(safe_log_tag(p),
             "taskflow_submit job_id=%llu pool=%s owner=%s label=%s domain=%s deadline_ms=%llu priority=%d tid=%lu",
@@ -1288,6 +1548,7 @@ inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_
             static_cast<unsigned long long>(record->deadline_ms),
             record->priority,
             static_cast<unsigned long>(GetCurrentThreadId()));
+        pump_lanes(p);
     }
     return result;
 }
@@ -1295,6 +1556,44 @@ inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_
 inline submit_result_t submit(task_descriptor_t&& desc) {
     pool_t& p = domain_pool(desc.domain);
     return submit_to_pool(p, p.configured_pool_size, std::move(desc));
+}
+
+inline std::atomic<bool> g_deadline_sweeper_started{false};
+
+inline void deadline_sweeper_tick() {
+    check_deadlines();
+    if (g_shutdown_requested.load(std::memory_order_acquire) ||
+        g_stop_accepting.load(std::memory_order_acquire))
+        return;
+    task_descriptor_t desc;
+    desc.domain = executor_domain_t::diagnostics;
+    desc.owner_subsystem = "taskflow_runtime";
+    desc.label = "runtime.deadline_sweeper";
+    desc.priority = 7;
+    desc.shutdown_policy = "cancel_pending";
+    desc.cancellable_body = [](const cancellation_token_t& token) {
+        for (int slice = 0; slice < 5; ++slice) {
+            if (token.requested.load(std::memory_order_acquire))
+                return;
+            Sleep(5);
+        }
+        deadline_sweeper_tick();
+    };
+    static_cast<void>(submit(std::move(desc)));
+}
+
+inline void ensure_deadline_sweeper_started() noexcept {
+    bool expected = false;
+    if (!g_deadline_sweeper_started.compare_exchange_strong(expected, true,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+        return;
+    if (g_shutdown_requested.load(std::memory_order_acquire) ||
+        g_stop_accepting.load(std::memory_order_acquire))
+        return;
+    try {
+        deadline_sweeper_tick();
+    } catch (...) {
+    }
 }
 
 inline void try_admit_deferred(pool_t& p) {
@@ -1567,6 +1866,10 @@ inline bool cancel(job_handle_t handle) {
             account_cancellation = true;
         }
     }
+    if (record->pool && record->fabric_lane_queued.load(std::memory_order_acquire) &&
+        remove_record_from_lane(*record->pool, record)) {
+        complete_not_started_record(record);
+    }
     invoke_cancel_hook_noexcept(record, std::move(cancel_hook));
     if (account_cancellation)
         g_total_cancelled.fetch_add(1u, std::memory_order_acq_rel);
@@ -1656,6 +1959,10 @@ inline void check_deadlines() {
                 cancel_hook = record->cancel_hook;
             }
         }
+        if (record->pool && record->fabric_lane_queued.load(std::memory_order_acquire) &&
+            remove_record_from_lane(*record->pool, record)) {
+            complete_not_started_record(record);
+        }
         invoke_cancel_hook_noexcept(record, std::move(cancel_hook));
         g_total_timed_out.fetch_add(1u, std::memory_order_acq_rel);
         diag::log_tagged_fmt(record->pool ? safe_log_tag(*record->pool) : "taskflow_runtime",
@@ -1689,12 +1996,18 @@ inline stats_t stats_for(pool_t& p, int pool_size, const char* pool_name) {
     s.cancelled = p.cancelled_tasks.load(std::memory_order_acquire);
     s.failed = p.failed_tasks.load(std::memory_order_acquire);
     s.timed_out = p.timed_out_tasks.load(std::memory_order_acquire);
+    s.fairness_wait_ns_total = p.fairness_wait_ns_total.load(std::memory_order_acquire);
     {
         std::unique_lock<std::mutex> lk(p.mtx, std::try_to_lock);
         if (!lk.owns_lock()) {
             s.active_labels = "<stats_lock_busy>";
             s.top_cpu_labels = "<stats_lock_busy>";
             return s;
+        }
+        s.lane_in_flight = p.lane_in_flight;
+        for (std::size_t lane_index = 0; lane_index < 8; ++lane_index) {
+            s.lane_depth[lane_index] = p.lane_depth[lane_index];
+            s.lane_admitted[lane_index] = p.lane_dispatched[lane_index];
         }
         const std::uint64_t current = now_ms();
         struct top_cpu_item_t {
@@ -1968,6 +2281,7 @@ inline bool shutdown_pool(pool_t& p, const char* name, std::uint32_t timeout_ms)
             static_cast<unsigned long>(GetCurrentThreadId()));
         return false;
     }
+    pump_lanes(p);
     const ULONGLONG start = GetTickCount64();
     const bool infinite_wait = timeout_ms == INFINITE;
     const ULONGLONG deadline = infinite_wait ? 0 : start + timeout_ms;

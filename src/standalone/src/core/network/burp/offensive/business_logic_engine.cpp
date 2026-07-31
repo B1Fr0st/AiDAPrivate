@@ -15,6 +15,7 @@
 #include "../issue.hpp"
 #include "../../../mcp/mcp_standalone.hpp"
 #include "../../../mcp/downstream_producer_governor.hpp"
+#include "../../../infra/taskflow_runtime.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -609,20 +610,25 @@ std::vector<send_result_t> concurrent_send(const target_t& target,
     const size_t capped_count = std::min(count,
         mcp_standalone::downstream::default_quotas().burp_network_worker_group_size);
     std::vector<send_result_t> results(count);
-    std::vector<aida::infra::win_thread::joinable_thread_t> threads;
+    std::vector<aida::infra::taskflow_runtime::job_handle_t> threads;
     threads.reserve(capped_count);
     for (size_t i = 0; i < capped_count; ++i) {
-        aida::infra::win_thread::joinable_thread_t wt;
-        std::string err;
         const std::string label = "biz_logic.concurrent_send." + std::to_string(i);
-        const bool started = wt.start([&, i]() {
+        aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+        worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::service;
+        worker_desc.owner_subsystem = "burp.business_logic";
+        worker_desc.label = label.c_str();
+        worker_desc.priority = 3;
+        worker_desc.shutdown_policy = "cancel_pending";
+        worker_desc.body = [&, i]() {
             results[i] = send_raw_request(target, raw, timeout_ms);
-        }, &err, aida::infra::win_thread::default_stack_reserve, label.c_str());
-        if (started)
-            threads.push_back(std::move(wt));
+        };
+        auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+        if (worker_submission.submitted)
+            threads.push_back(worker_submission.handle);
     }
     for (auto& t : threads) {
-        t.join();
+        aida::infra::taskflow_runtime::wait_for(t, 0xFFFFFFFFu);
     }
     return results;
 }

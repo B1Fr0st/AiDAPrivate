@@ -1,6 +1,7 @@
 #include "decompiler_ui_integration.hpp"
 
 #include "decompile_batch_orchestrator.hpp"
+#include "generation_snapshot_store.hpp"
 #include "legacy_document_adapter.hpp"
 #include "native_worker_host.hpp"
 #include "providers/cli_provider.hpp"
@@ -11,16 +12,18 @@
 #include "pseudocode_renderer_v2.hpp"
 #include "typed_ast_v2.hpp"
 
+#include "../workspace/decompiler_feedback.hpp"
 #include "../workspace/decompiler_service.hpp"
 #include "../../../helpers/diag_log.hpp"
+#include "../../../../workers/native_decompiler/snapshot_sidecar.hpp"
 
 #include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
-#include "../../disasm/ghidra_adapters/aida_load_image.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -974,6 +977,308 @@ std::uint64_t native_function_byte_size(
     return total;
 }
 
+struct native_generation_context_entry_t {
+    std::shared_ptr<const decompiler_provider_context_t> context;
+    sha256_digest_t snapshot_hash;
+    std::uint64_t touch = 0;
+};
+
+std::mutex native_generation_context_mutex;
+std::unordered_map<std::string, native_generation_context_entry_t> native_generation_context_cache;
+std::uint64_t native_generation_context_clock = 0;
+constexpr std::size_t k_native_generation_context_cache_limit = 8;
+
+const char* native_feedback_address_space_text(const address_space_id_t space) noexcept
+{
+    switch (space) {
+    case address_space_id_t::virtual_address:
+        return "virtual-address";
+    case address_space_id_t::relative_virtual:
+        return "relative-virtual";
+    case address_space_id_t::file_offset:
+        return "file-offset";
+    case address_space_id_t::live_virtual:
+        return "live-virtual";
+    }
+    return "unknown";
+}
+
+void feedback_digest_u64(std::string& output, const std::uint64_t value)
+{
+    for (unsigned shift = 0; shift < 64; shift += 8)
+        output.push_back(static_cast<char>((value >> shift) & 0xffU));
+}
+
+void feedback_digest_text(std::string& output, const std::string& value)
+{
+    feedback_digest_u64(output, value.size());
+    output.append(value);
+}
+
+sha256_digest_t compute_native_feedback_digest(
+    analysis_workspace_t& workspace,
+    const analysis_publication_t& publication)
+{
+    sha256_digest_t digest;
+    auto ws_decompiler = workspace.decompiler();
+    if (!ws_decompiler)
+        return digest;
+    const auto feedback = ws_decompiler->feedback_model();
+    if (!feedback)
+        return digest;
+    decompiler_feedback_scope_key_t scope;
+    scope.workspace_id = workspace.identity().binary_id().to_hex();
+    scope.binary_id = scope.workspace_id;
+    scope.address_space_id = native_feedback_address_space_text(
+        address_space_id_t::relative_virtual);
+    scope.architecture_id = "architecture-" + std::to_string(
+        static_cast<unsigned int>(workspace.identity().architecture()));
+    scope.generation = publication.generation;
+    scope.overlay_revision = publication.overlay_revision;
+    scope.type_revision = publication.analysis_revision;
+    const auto snapshot = feedback->snapshot(scope);
+    if (!snapshot.exists || snapshot.facts.empty())
+        return digest;
+    std::string canonical;
+    canonical.reserve(4096);
+    for (const auto& fact : snapshot.facts) {
+        const auto kind = static_cast<std::uint64_t>(fact.kind);
+        const auto* name = std::get_if<decompiler_feedback_name_t>(&fact.payload);
+        const auto* comment = std::get_if<decompiler_feedback_comment_t>(&fact.payload);
+        const auto* type_assignment = std::get_if<decompiler_feedback_type_assignment_t>(&fact.payload);
+        const auto* prototype = std::get_if<decompiler_feedback_prototype_t>(&fact.payload);
+        const auto* storage = std::get_if<decompiler_feedback_storage_t>(&fact.payload);
+        if (!name && !comment && !type_assignment && !prototype && !storage)
+            continue;
+        feedback_digest_u64(canonical, kind);
+        feedback_digest_text(canonical, fact.logical_key);
+        feedback_digest_text(canonical, fact.fact_id);
+        if (name) {
+            feedback_digest_u64(canonical, name->address);
+            feedback_digest_text(canonical, name->identifier);
+        } else if (comment) {
+            feedback_digest_u64(canonical, comment->address);
+            feedback_digest_text(canonical, comment->text);
+        } else if (type_assignment) {
+            feedback_digest_u64(canonical, type_assignment->address);
+            feedback_digest_text(canonical, type_assignment->type_name);
+        } else if (prototype) {
+            feedback_digest_u64(canonical, prototype->function);
+            feedback_digest_text(canonical, prototype->declaration);
+            feedback_digest_text(canonical, prototype->calling_convention);
+        } else {
+            feedback_digest_u64(canonical, storage->address);
+            feedback_digest_u64(canonical, static_cast<std::uint64_t>(storage->stack_offset));
+            feedback_digest_u64(canonical, storage->byte_size);
+            feedback_digest_text(canonical, storage->identifier);
+            feedback_digest_text(canonical, storage->type_name);
+        }
+    }
+    if (canonical.empty())
+        return digest;
+    return stable_serialization_hash(canonical);
+}
+
+workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>
+repack_context_with_feedback_digest(
+    const std::shared_ptr<const decompiler_provider_context_t>& base_context,
+    const sha256_digest_t& feedback_digest,
+    const std::uint64_t generation,
+    const bool is_64bit)
+{
+    using result_t = workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>;
+    const auto* native = dynamic_cast<const ghidra_native_provider_context_t*>(
+        base_context.get());
+    if (!native || !native->snapshot() || native->snapshot()->empty()) {
+        return result_t::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "native generation snapshot context is not digest-repackable",
+                "decompiler_ui.native_capture.repack"));
+    }
+    native_worker::native_provider_snapshot_views_t views;
+    std::vector<decompiler_diagnostic_t> parse_diagnostics;
+    if (!native_worker::parse_native_provider_snapshot_views(
+            std::string_view(reinterpret_cast<const char*>(native->snapshot()->data()),
+                             native->snapshot()->size()),
+            views, parse_diagnostics) ||
+        views.format_version != native_worker::k_native_provider_snapshot_v3_version) {
+        return result_t::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "native generation snapshot failed view parsing for digest repack",
+                "decompiler_ui.native_capture.repack"));
+    }
+    namespace sidecar_ns = native_worker::snapshot_sidecar;
+    sidecar_ns::sidecar_t sidecar;
+    sidecar.is_64bit = is_64bit;
+    if (!views.sidecar.empty()) {
+        const auto decoded = sidecar_ns::decode(views.sidecar.data(), views.sidecar.size());
+        if (!decoded) {
+            return result_t::failure(
+                ui_request_error(workspace_error_code_t::integrity_failure,
+                    "native generation snapshot sidecar failed decoding for digest repack",
+                    "decompiler_ui.native_capture.repack"));
+        }
+        sidecar = std::move(*decoded);
+    }
+    std::memcpy(sidecar.feedback_digest, feedback_digest.bytes.data(),
+        sizeof(sidecar.feedback_digest));
+    const auto sidecar_bytes = sidecar_ns::encode(sidecar);
+    if (sidecar_bytes.empty()) {
+        return result_t::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "native generation snapshot sidecar failed re-encoding for digest repack",
+                "decompiler_ui.native_capture.repack"));
+    }
+    native_worker::native_provider_snapshot_t snapshot;
+    snapshot.image_base = views.image_base;
+    snapshot.image_size = views.image_size;
+    snapshot.ranges.reserve(views.ranges.size());
+    try {
+        for (const auto& view : views.ranges) {
+            native_worker::native_provider_snapshot_range_t range;
+            range.relative_virtual_address = view.relative_virtual_address;
+            range.bytes.assign(view.data, view.data + view.size);
+            snapshot.ranges.push_back(std::move(range));
+        }
+    } catch (const std::bad_alloc&) {
+        return result_t::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "native generation snapshot digest repack allocation failed",
+                "decompiler_ui.native_capture.repack"));
+    }
+    const auto serialized = native_worker::serialize_native_provider_snapshot_v3(
+        snapshot, sidecar_bytes);
+    if (serialized.empty()) {
+        return result_t::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "native generation snapshot digest repack serialization failed",
+                "decompiler_ui.native_capture.repack"));
+    }
+    std::vector<std::uint8_t> serialized_bytes(serialized.begin(), serialized.end());
+    auto shared_snapshot = std::make_shared<const std::vector<std::uint8_t>>(
+        std::move(serialized_bytes));
+    const auto snapshot_hash = stable_serialization_hash(serialized);
+    const auto published = generation_snapshot_store_t::instance().publish(
+        generation, snapshot_hash, shared_snapshot);
+    ::diag::log_tagged_fmt("decompiler",
+        "generation_snapshot_feedback_repack generation=%llu snapshot_bytes=%llu published=%d",
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long long>(shared_snapshot->size()),
+        published ? 1 : 0);
+    std::shared_ptr<const decompiler_provider_context_t> context =
+        std::make_shared<ghidra_native_provider_context_t>(
+            std::move(shared_snapshot), snapshot_hash);
+    return result_t::success(std::move(context));
+}
+
+workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>
+resolve_native_generation_context(
+    analysis_workspace_t& workspace,
+    const std::shared_ptr<const analysis_publication_t>& publication,
+    const cancellation_token_t& cancel)
+{
+    using result_t = workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>;
+    if (!publication || !publication->coherent_with(workspace.identity()) ||
+        !publication->snapshot || !publication->snapshot->normalized_image) {
+        return result_t::failure(
+            ui_request_error(workspace_error_code_t::stale_generation,
+                "native generation context publication is stale or incoherent",
+                "decompiler_ui.native_capture.generation"));
+    }
+    if (cancel.stop_requested()) {
+        return result_t::failure(
+            ui_request_error(cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "native generation context resolution was cancelled",
+                "decompiler_ui.native_capture.generation"));
+    }
+    std::string base_key;
+    base_key.reserve(160);
+    base_key.append(workspace.identity().binary_id().to_hex());
+    base_key.push_back('|');
+    base_key.append(std::to_string(publication->generation));
+    base_key.push_back('|');
+    base_key.append(std::to_string(publication->analysis_revision));
+    base_key.push_back('|');
+    base_key.append(std::to_string(publication->overlay_revision));
+    base_key.push_back('|');
+    base_key.append(publication->load_profile_hash.to_hex());
+    {
+        std::lock_guard lock(native_generation_context_mutex);
+        const auto found = native_generation_context_cache.find(base_key);
+        if (found != native_generation_context_cache.end() && found->second.context) {
+            found->second.touch = ++native_generation_context_clock;
+            return result_t::success(found->second.context);
+        }
+    }
+    const auto feedback_digest = compute_native_feedback_digest(workspace, *publication);
+    const auto cache_key = base_key + "|" + feedback_digest.to_hex();
+    {
+        std::lock_guard lock(native_generation_context_mutex);
+        const auto found = native_generation_context_cache.find(cache_key);
+        if (found != native_generation_context_cache.end() && found->second.context) {
+            found->second.touch = ++native_generation_context_clock;
+            native_generation_context_cache[base_key] = found->second;
+            return result_t::success(found->second.context);
+        }
+    }
+    const auto shared_workspace = workspace.shared_from_this();
+    auto captured = decompile_batch_orchestrator_t::capture_generation_provider_context(
+        shared_workspace, publication, cancel);
+    if (!captured)
+        return result_t::failure(captured.error());
+    std::shared_ptr<const decompiler_provider_context_t> context =
+        std::move(captured.value());
+    if (!feedback_digest.empty()) {
+        auto repacked = repack_context_with_feedback_digest(
+            context, feedback_digest, publication->generation,
+            publication->snapshot->normalized_image->address_width_bits >= 64);
+        if (!repacked)
+            return result_t::failure(repacked.error());
+        context = std::move(repacked.value());
+    }
+    const auto* native = dynamic_cast<const ghidra_native_provider_context_t*>(context.get());
+    if (!native) {
+        return result_t::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "native generation context is not a ghidra provider context",
+                "decompiler_ui.native_capture.generation"));
+    }
+    const auto snapshot_hash = native->snapshot_hash();
+    {
+        std::lock_guard lock(native_generation_context_mutex);
+        const auto found = native_generation_context_cache.find(cache_key);
+        if (found != native_generation_context_cache.end() && found->second.context &&
+            found->second.snapshot_hash == snapshot_hash) {
+            found->second.touch = ++native_generation_context_clock;
+            native_generation_context_cache[base_key] = found->second;
+            return result_t::success(found->second.context);
+        }
+        while (native_generation_context_cache.size() >= k_native_generation_context_cache_limit) {
+            const auto oldest = std::min_element(
+                native_generation_context_cache.begin(), native_generation_context_cache.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.touch < right.second.touch;
+                });
+            if (oldest == native_generation_context_cache.end())
+                break;
+            native_generation_context_cache.erase(oldest);
+        }
+        native_generation_context_entry_t entry;
+        entry.context = context;
+        entry.snapshot_hash = snapshot_hash;
+        entry.touch = ++native_generation_context_clock;
+        native_generation_context_cache.insert_or_assign(cache_key, entry);
+        native_generation_context_cache.insert_or_assign(base_key, std::move(entry));
+    }
+    ::diag::log_tagged_fmt("decompiler",
+        "generation_context_resolved generation=%llu feedback_digest=%s shared=1",
+        static_cast<unsigned long long>(publication->generation),
+        feedback_digest.empty() ? "none" : "present");
+    return result_t::success(std::move(context));
+}
+
 workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>
 capture_native_provider_context(
     const std::shared_ptr<analysis_workspace_t>& workspace,
@@ -1020,16 +1325,6 @@ capture_native_provider_context(
                 "native decompiler language identity changed before provider capture",
                 "decompiler_ui.native_capture.language"));
     }
-    auto revision = ghidra_adapter::make_ghidra_adapter_revision(
-        workspace->identity(), *publication->snapshot, cancel);
-    if (!revision)
-        return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-            revision.error());
-    auto load_image = ghidra_adapter::ghidra_load_image_t::create(
-        workspace->provider_handle(), image, language.value(), revision.value(), {}, cancel);
-    if (!load_image)
-        return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-            load_image.error());
     const auto* native_identity = std::get_if<native_decompiler_entity_identity_t>(&key.entity.identity);
     const auto function = native_identity
         ? std::find_if(publication->snapshot->functions.begin(), publication->snapshot->functions.end(),
@@ -1050,103 +1345,13 @@ capture_native_provider_context(
                 "native decompiler image has no addressable extent",
                 "decompiler_ui.native_capture.image_limit"));
     }
-    auto function_ranges = function_spans(
-        *publication->snapshot, *function, image->image_base, 65536);
-    if (!function_ranges)
+    if (std::chrono::steady_clock::now() >= request.deadline) {
         return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-            function_ranges.error());
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> requested_ranges;
-    requested_ranges.reserve(function_ranges.value().size() + 1);
-    requested_ranges.emplace_back(0, (std::min<std::uint64_t>)(image->image_size, 1ULL << 20));
-    requested_ranges.insert(requested_ranges.end(),
-        function_ranges.value().begin(), function_ranges.value().end());
-    std::sort(requested_ranges.begin(), requested_ranges.end());
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged_ranges;
-    merged_ranges.reserve(requested_ranges.size());
-    for (const auto& range : requested_ranges) {
-        if (range.first >= range.second || range.second > image->image_size)
-            continue;
-        if (!merged_ranges.empty() && range.first <= merged_ranges.back().second) {
-            merged_ranges.back().second = (std::max)(merged_ranges.back().second, range.second);
-        } else {
-            merged_ranges.push_back(range);
-        }
+            ui_request_error(workspace_error_code_t::deadline_exceeded,
+                "native decompiler snapshot capture exceeded its deadline",
+                "decompiler_ui.native_capture.read"));
     }
-    constexpr std::uint64_t absolute_snapshot_limit = 192ULL << 20;
-    const auto profile_snapshot_limit = request.cache_key.profile.max_memory_bytes / 2;
-    const auto snapshot_limit = (std::min)(absolute_snapshot_limit, profile_snapshot_limit);
-    std::uint64_t requested_bytes = 0;
-    for (const auto& range : merged_ranges) {
-        const auto size = range.second - range.first;
-        if (!checked_add(requested_bytes, size, requested_bytes) || requested_bytes > snapshot_limit) {
-            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-                ui_request_error(workspace_error_code_t::limit_exceeded,
-                    "native decompiler function snapshot exceeds its profile memory bound",
-                    "decompiler_ui.native_capture.image_limit"));
-        }
-    }
-    native_worker::native_provider_snapshot_t snapshot;
-    snapshot.image_base = image->image_base;
-    snapshot.image_size = image->image_size;
-    snapshot.ranges.reserve(merged_ranges.size());
-    constexpr std::uint64_t read_quantum = 4ULL << 20;
-    for (const auto& range : merged_ranges) {
-        if (cancel.stop_requested() || std::chrono::steady_clock::now() >= request.deadline) {
-            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-                ui_request_error(cancel.deadline_exceeded() ||
-                        std::chrono::steady_clock::now() >= request.deadline
-                        ? workspace_error_code_t::deadline_exceeded
-                        : workspace_error_code_t::cancelled,
-                    "native decompiler snapshot capture was cancelled",
-                    "decompiler_ui.native_capture.read"));
-        }
-        native_worker::native_provider_snapshot_range_t captured;
-        captured.relative_virtual_address = range.first;
-        captured.bytes.reserve(static_cast<std::size_t>(range.second - range.first));
-        for (auto cursor = range.first; cursor < range.second;) {
-            if (cancel.stop_requested() || std::chrono::steady_clock::now() >= request.deadline) {
-                return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-                    ui_request_error(cancel.deadline_exceeded() ||
-                            std::chrono::steady_clock::now() >= request.deadline
-                            ? workspace_error_code_t::deadline_exceeded
-                            : workspace_error_code_t::cancelled,
-                        "native decompiler snapshot capture was cancelled",
-                        "decompiler_ui.native_capture.read"));
-            }
-            const auto amount = (std::min)(read_quantum, range.second - cursor);
-            address_t start{address_space_id_t::relative_virtual, cursor,
-                image->architecture, image->architecture_mode};
-            auto read = load_image.value()->read(start, amount, cancel);
-            if (!read)
-                return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-                    read.error());
-            if (read.value().bytes.size() != amount) {
-                return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-                    ui_request_error(workspace_error_code_t::integrity_failure,
-                        "native decompiler range snapshot is truncated",
-                        "decompiler_ui.native_capture.read"));
-            }
-            captured.bytes.insert(captured.bytes.end(),
-                read.value().bytes.begin(), read.value().bytes.end());
-            cursor += amount;
-        }
-        snapshot.ranges.push_back(std::move(captured));
-    }
-    const auto serialized = native_worker::serialize_native_provider_snapshot(snapshot);
-    if (serialized.empty()) {
-        return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-            ui_request_error(workspace_error_code_t::limit_exceeded,
-                "native decompiler snapshot serialization failed",
-                "decompiler_ui.native_capture.serialize"));
-    }
-    std::vector<std::uint8_t> serialized_bytes(serialized.begin(), serialized.end());
-    auto shared_snapshot = std::make_shared<const std::vector<std::uint8_t>>(
-        std::move(serialized_bytes));
-    std::shared_ptr<const decompiler_provider_context_t> context =
-        std::make_shared<ghidra_native_provider_context_t>(
-            std::move(shared_snapshot), stable_serialization_hash(serialized));
-    return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::success(
-        std::move(context));
+    return resolve_native_generation_context(*workspace, publication, cancel);
 } catch (const std::bad_alloc&) {
     return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
         ui_request_error(workspace_error_code_t::limit_exceeded,
@@ -1466,6 +1671,9 @@ decompiler_ui_integration_t::create_production(
         pool_config.batch_slots = (std::min<std::size_t>)(
             native_worker::native_worker_session_pool_config_t{}.batch_slots,
             (std::max<std::size_t>)(2, logical_cores - 2));
+        pool_config.interactive_reserved_slots = (std::min<std::size_t>)(
+            native_worker::native_worker_session_pool_config_t{}.interactive_reserved_slots,
+            static_cast<std::size_t>(logical_cores - 2));
         ::diag::log_tagged_fmt("decompiler",
             "pool_config batch_slots=%zu interactive_reserved=%zu logical_cores=%u source=hardware_formula",
             pool_config.batch_slots,
@@ -2116,6 +2324,21 @@ decompiler_ui_integration_t::execute_pipeline(
     const bool interactive_native =
         pipeline_request.invocation == decompiler_pipeline_invocation_t::explicit_ui &&
         pipeline_request.entity.kind == decompiler_entity_kind_t::native_function;
+    if (pipeline_request.entity.kind == decompiler_entity_kind_t::native_function &&
+        !pipeline_request.provider_context) {
+        const auto publication = impl_->state.workspace->analysis_publication();
+        if (publication && publication_matches_request(*impl_->state.workspace, pipeline_request)) {
+            auto generation_context = resolve_native_generation_context(
+                *impl_->state.workspace, publication, cancel);
+            if (generation_context) {
+                pipeline_request.provider_context = std::move(generation_context.value());
+            } else {
+                ::diag::log_tagged_fmt("decompiler",
+                    "interactive_generation_context_unavailable code=%s",
+                    generation_context.error().stable_code().c_str());
+            }
+        }
+    }
     decompiler_pipeline_result_t pipeline_result;
     bool probe_satisfied = false;
     if (interactive_native) {
@@ -2125,8 +2348,9 @@ decompiler_ui_integration_t::execute_pipeline(
         } catch (...) {
             background.reset();
         }
+        bool interactive_admitted = false;
         if (background)
-            background->notify_interactive_request(pipeline_request.entity);
+            interactive_admitted = background->admit_interactive_priority(pipeline_request.entity);
         const auto probe_started = std::chrono::steady_clock::now();
         const auto probe = impl_->state.service->probe_rendered_cache(pipeline_request);
         const auto probe_ms = static_cast<std::uint64_t>((std::max<std::int64_t>)(0,
@@ -2150,9 +2374,10 @@ decompiler_ui_integration_t::execute_pipeline(
                 pipeline_result.readability = std::move(*analyzed.report);
                 probe_satisfied = true;
                 ::diag::log_tagged_fmt("decompiler",
-                    "interactive_dispatch wait_ms=%llu slot=CACHED deadline_ms=0 est_insns=0 batch_active=%d probe_hit=%s",
+                    "interactive_dispatch wait_ms=%llu slot=CACHED deadline_ms=0 est_insns=0 batch_active=%d admitted=%d probe_hit=%s",
                     static_cast<unsigned long long>(probe_ms),
                     background && background->run_snapshot().active ? 1 : 0,
+                    interactive_admitted ? 1 : 0,
                     probe.hit_stage == decompiler_rendered_probe_stage_t::persistent_rendered
                         ? "persistent" : "memory");
             }
@@ -2191,12 +2416,13 @@ decompiler_ui_integration_t::execute_pipeline(
                 }
             }
             ::diag::log_tagged_fmt("decompiler",
-                "interactive_dispatch wait_ms=%llu slot=%s deadline_ms=%llu est_insns=%llu batch_active=%d",
+                "interactive_dispatch wait_ms=%llu slot=%s deadline_ms=%llu est_insns=%llu batch_active=%d admitted=%d",
                 static_cast<unsigned long long>(probe_ms),
                 slot_class,
                 static_cast<unsigned long long>(deadline_budget_ms),
                 static_cast<unsigned long long>(estimated_instructions),
-                background && background->run_snapshot().active ? 1 : 0);
+                background && background->run_snapshot().active ? 1 : 0,
+                interactive_admitted ? 1 : 0);
         }
     }
     if (!probe_satisfied)

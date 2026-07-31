@@ -9,6 +9,7 @@
 #include "../../../helpers/diag_log.hpp"
 #include "../../mcp/downstream_producer_governor.hpp"
 #include "../../infra/executor.hpp"
+#include "../../infra/taskflow_runtime.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -448,20 +449,30 @@ static void miner_main(std::shared_ptr<job_t> job)
     } else {
         const size_t capped_concurrency = std::min(concurrency,
             mcp_standalone::downstream::default_quotas().burp_network_worker_group_size);
-        std::vector<aida::infra::win_thread::joinable_thread_t> threads;
+        std::vector<aida::infra::taskflow_runtime::job_handle_t> threads;
         try {
             threads.reserve(capped_concurrency);
             for (size_t i = 0; i < capped_concurrency; ++i) {
-                aida::infra::win_thread::joinable_thread_t wt;
-                std::string err;
                 const std::string label = "param_miner." + std::to_string(job->id) + "." + std::to_string(i);
-                const bool started = wt.start(worker, &err,
-                    aida::infra::win_thread::default_stack_reserve, label.c_str());
-                if (started)
-                    threads.push_back(std::move(wt));
+                aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+                worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::service;
+                worker_desc.owner_subsystem = "burp.param_miner";
+                worker_desc.label = label.c_str();
+                worker_desc.priority = 3;
+                worker_desc.shutdown_policy = "cancel_pending";
+                worker_desc.cancellable_body = [&worker](const aida::infra::taskflow_runtime::cancellation_token_t&) {
+                    worker();
+                };
+                worker_desc.cancel_hook = [job]() {
+                    job->cancel.store(true, std::memory_order_release);
+                };
+                auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+                if (worker_submission.submitted)
+                    threads.push_back(worker_submission.handle);
                 else
                     diag::log_tagged_fmt("param_miner", "worker_thread_start_failed_single job_id=%llu idx=%zu err=%s",
-                        static_cast<unsigned long long>(job->id), i, err.c_str());
+                        static_cast<unsigned long long>(job->id), i,
+                        worker_submission.reject_reason.empty() ? "<none>" : worker_submission.reject_reason.c_str());
             }
         } catch (const std::exception& ex) {
             set_err(std::string("param_miner: worker thread start failed: ") + ex.what());
@@ -475,7 +486,7 @@ static void miner_main(std::shared_ptr<job_t> job)
             job->cancel.store(true);
         }
         for (auto& t : threads) {
-            t.join();
+            aida::infra::taskflow_runtime::wait_for(t, 0xFFFFFFFFu);
         }
     }
 

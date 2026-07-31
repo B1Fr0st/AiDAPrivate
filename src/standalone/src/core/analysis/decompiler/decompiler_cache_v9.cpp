@@ -3,6 +3,8 @@
 #include "typed_ast_v2.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <limits>
 #include <mutex>
 #include <tuple>
@@ -19,6 +21,21 @@ using cache_payload_t = std::variant<
     std::shared_ptr<const decompiler_normalized_cache_value_t>,
     std::shared_ptr<const decompiler_rendered_cache_value_t>>;
 
+constexpr std::size_t k_stripe_count = 32;
+
+std::size_t stage_index(const decompiler_cache_stage_t stage) noexcept
+{
+    switch (stage) {
+    case decompiler_cache_stage_t::provider_ir:
+        return 0;
+    case decompiler_cache_stage_t::normalized_hir_ast:
+        return 1;
+    case decompiler_cache_stage_t::rendered_document:
+        return 2;
+    }
+    return 0;
+}
+
 struct cache_entry_t {
     decompiler_cache_stage_t stage = decompiler_cache_stage_t::provider_ir;
     decompiler_entity_key_t entity;
@@ -28,24 +45,38 @@ struct cache_entry_t {
     std::uint64_t touch = 0;
 };
 
-struct cache_workspace_t {
-    std::uint64_t generation = 0;
-    std::uint64_t resident_bytes = 0;
+struct cache_directory_entry_t {
+    std::atomic<std::uint64_t> generation{0};
+    std::atomic<std::uint64_t> resident_bytes{0};
+    std::array<std::atomic<std::size_t>, 3> stage_counts{};
+};
+
+struct cache_partition_t {
+    std::shared_ptr<cache_directory_entry_t> directory;
     std::unordered_map<std::string, cache_entry_t> entries;
 };
 
-struct cache_state_data_t {
+struct cache_stripe_t {
     mutable std::mutex mutex;
+    std::unordered_map<std::string, cache_partition_t> partitions;
+};
+
+struct cache_state_data_t {
     decompiler_cache_v9_limits_t limits;
-    std::unordered_map<std::string, cache_workspace_t> workspaces;
-    decompiler_cache_v9_stage_snapshot_t provider_ir;
-    decompiler_cache_v9_stage_snapshot_t normalized;
-    decompiler_cache_v9_stage_snapshot_t rendered;
-    std::size_t total_entries = 0;
-    std::uint64_t total_bytes = 0;
-    std::uint64_t touch_clock = 0;
-    std::uint64_t generation_invalidations = 0;
-    std::uint64_t explicit_invalidations = 0;
+    std::array<cache_stripe_t, k_stripe_count> stripes;
+    mutable std::mutex directory_mutex;
+    std::unordered_map<std::string, std::shared_ptr<cache_directory_entry_t>> directory;
+    std::array<std::atomic<std::uint64_t>, 3> hits{};
+    std::array<std::atomic<std::uint64_t>, 3> misses{};
+    std::array<std::atomic<std::uint64_t>, 3> stores{};
+    std::array<std::atomic<std::uint64_t>, 3> rejections{};
+    std::array<std::atomic<std::uint64_t>, 3> evictions{};
+    std::atomic<std::size_t> total_entries{0};
+    std::atomic<std::uint64_t> total_bytes{0};
+    std::atomic<std::uint64_t> touch_clock{0};
+    std::atomic<std::uint64_t> generation_invalidations{0};
+    std::atomic<std::uint64_t> explicit_invalidations{0};
+    std::atomic<bool> eviction_running{false};
 };
 
 workspace_error_t cache_error(
@@ -62,27 +93,47 @@ workspace_error_t cache_error(
 bool valid_limits(const decompiler_cache_v9_limits_t& value) noexcept
 {
     return value.max_workspaces != 0 && value.max_entries_per_workspace != 0 &&
+           value.max_rendered_entries_per_workspace != 0 &&
            value.max_bytes_per_workspace != 0 && value.max_total_entries != 0 &&
            value.max_total_bytes != 0 && value.max_entry_bytes != 0 &&
            value.max_cache_key_bytes != 0 && value.max_workspace_id_bytes != 0 &&
            value.max_entries_per_workspace <= value.max_total_entries &&
+           value.max_rendered_entries_per_workspace <= value.max_total_entries &&
            value.max_bytes_per_workspace <= value.max_total_bytes &&
            value.max_entry_bytes <= value.max_bytes_per_workspace;
 }
 
-decompiler_cache_v9_stage_snapshot_t& stage_snapshot(
-    cache_state_data_t& state,
+std::size_t entries_cap_for(
+    const decompiler_cache_v9_limits_t& limits,
+    const decompiler_cache_stage_t stage) noexcept
+{
+    return stage == decompiler_cache_stage_t::rendered_document
+        ? limits.max_rendered_entries_per_workspace
+        : limits.max_entries_per_workspace;
+}
+
+std::size_t stripe_index_for(
+    const std::string& workspace_id,
+    const decompiler_cache_stage_t stage) noexcept
+{
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const char byte : workspace_id) {
+        hash ^= static_cast<std::uint8_t>(byte);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= static_cast<std::uint64_t>(stage_index(stage));
+    hash *= 1099511628211ULL;
+    return static_cast<std::size_t>(hash & (k_stripe_count - 1));
+}
+
+std::string partition_key_for(
+    const std::string& workspace_id,
     const decompiler_cache_stage_t stage)
 {
-    switch (stage) {
-    case decompiler_cache_stage_t::provider_ir:
-        return state.provider_ir;
-    case decompiler_cache_stage_t::normalized_hir_ast:
-        return state.normalized;
-    case decompiler_cache_stage_t::rendered_document:
-        return state.rendered;
-    }
-    return state.provider_ir;
+    std::string key = workspace_id;
+    key.push_back('\x1f');
+    key.push_back(static_cast<char>('0' + stage_index(stage)));
+    return key;
 }
 
 void append_u64(std::string& output, const std::uint64_t value)
@@ -333,6 +384,9 @@ bool equal_renderer(
            left.emit_type_annotations == right.emit_type_annotations &&
            left.emit_provenance_annotations == right.emit_provenance_annotations &&
            left.emit_unknown_tokens == right.emit_unknown_tokens &&
+           left.emit_comments == right.emit_comments &&
+           left.emit_resolved_symbols == right.emit_resolved_symbols &&
+           left.emit_enum_case_names == right.emit_enum_case_names &&
            left.readability == right.readability;
 }
 
@@ -568,49 +622,33 @@ workspace_result_t<std::string> canonical_key(
     }
 }
 
-void normalize_touch_clock(cache_state_data_t& state)
+std::uint64_t next_touch(cache_state_data_t& state) noexcept
 {
-    if (state.touch_clock != std::numeric_limits<std::uint64_t>::max())
-        return;
-    std::vector<std::tuple<std::uint64_t, std::string, std::string, cache_entry_t*>> ordered;
-    ordered.reserve(state.total_entries);
-    for (auto& workspace : state.workspaces) {
-        for (auto& entry : workspace.second.entries)
-            ordered.emplace_back(entry.second.touch, workspace.first, entry.first, &entry.second);
-    }
-    std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) {
-        return std::tie(std::get<0>(left), std::get<1>(left), std::get<2>(left)) <
-               std::tie(std::get<0>(right), std::get<1>(right), std::get<2>(right));
-    });
-    state.touch_clock = 0;
-    for (auto& item : ordered)
-        std::get<3>(item)->touch = ++state.touch_clock;
-}
-
-std::uint64_t next_touch(cache_state_data_t& state)
-{
-    normalize_touch_clock(state);
-    return ++state.touch_clock;
+    return state.touch_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
 void erase_entry(
     cache_state_data_t& state,
-    cache_workspace_t& workspace,
+    cache_partition_t& partition,
     const std::unordered_map<std::string, cache_entry_t>::iterator entry,
-    const bool eviction)
+    const bool eviction) noexcept
 {
     const auto bytes = entry->second.resident_bytes;
+    const auto stage_idx = stage_index(entry->second.stage);
     if (eviction)
-        ++stage_snapshot(state, entry->second.stage).evictions;
-    workspace.resident_bytes -= bytes;
-    state.total_bytes -= bytes;
-    --state.total_entries;
-    workspace.entries.erase(entry);
+        state.evictions[stage_idx].fetch_add(1, std::memory_order_acq_rel);
+    if (partition.directory) {
+        partition.directory->resident_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+        partition.directory->stage_counts[stage_idx].fetch_sub(1, std::memory_order_acq_rel);
+    }
+    state.total_bytes.fetch_sub(bytes, std::memory_order_acq_rel);
+    state.total_entries.fetch_sub(1, std::memory_order_acq_rel);
+    partition.entries.erase(entry);
 }
 
-auto oldest_entry(cache_workspace_t& workspace)
+auto oldest_entry(cache_partition_t& partition)
 {
-    return std::min_element(workspace.entries.begin(), workspace.entries.end(),
+    return std::min_element(partition.entries.begin(), partition.entries.end(),
         [](const auto& left, const auto& right) {
             if (left.second.touch != right.second.touch)
                 return left.second.touch < right.second.touch;
@@ -618,44 +656,131 @@ auto oldest_entry(cache_workspace_t& workspace)
         });
 }
 
-void enforce_limits(cache_state_data_t& state, cache_workspace_t& workspace)
+void erase_partition(
+    cache_state_data_t& state,
+    cache_partition_t& partition) noexcept
 {
-    while (workspace.entries.size() > state.limits.max_entries_per_workspace ||
-           workspace.resident_bytes > state.limits.max_bytes_per_workspace) {
-        const auto candidate = oldest_entry(workspace);
-        if (candidate == workspace.entries.end())
+    for (auto entry = partition.entries.begin(); entry != partition.entries.end();)
+        erase_entry(state, partition, entry++, false);
+}
+
+void enforce_partition_limit(
+    cache_state_data_t& state,
+    cache_partition_t& partition,
+    const decompiler_cache_stage_t stage)
+{
+    const auto cap = entries_cap_for(state.limits, stage);
+    while (partition.entries.size() > cap) {
+        const auto candidate = oldest_entry(partition);
+        if (candidate == partition.entries.end())
             break;
-        erase_entry(state, workspace, candidate, true);
-    }
-    while (state.total_entries > state.limits.max_total_entries ||
-           state.total_bytes > state.limits.max_total_bytes) {
-        auto selected_workspace = state.workspaces.end();
-        std::unordered_map<std::string, cache_entry_t>::iterator selected_entry;
-        for (auto workspace_it = state.workspaces.begin(); workspace_it != state.workspaces.end(); ++workspace_it) {
-            auto candidate = oldest_entry(workspace_it->second);
-            if (candidate == workspace_it->second.entries.end())
-                continue;
-            if (selected_workspace == state.workspaces.end() ||
-                candidate->second.touch < selected_entry->second.touch ||
-                (candidate->second.touch == selected_entry->second.touch &&
-                 std::tie(workspace_it->first, candidate->first) <
-                     std::tie(selected_workspace->first, selected_entry->first))) {
-                selected_workspace = workspace_it;
-                selected_entry = candidate;
-            }
-        }
-        if (selected_workspace == state.workspaces.end())
-            break;
-        erase_entry(state, selected_workspace->second, selected_entry, true);
+        erase_entry(state, partition, candidate, true);
     }
 }
 
-void clear_workspace(cache_state_data_t& state, cache_workspace_t& workspace)
+bool partition_key_matches(
+    const std::string& partition_key,
+    const std::string& workspace_prefix) noexcept
 {
-    state.total_entries -= workspace.entries.size();
-    state.total_bytes -= workspace.resident_bytes;
-    workspace.entries.clear();
-    workspace.resident_bytes = 0;
+    return partition_key.size() > workspace_prefix.size() &&
+           partition_key.compare(0, workspace_prefix.size(), workspace_prefix) == 0;
+}
+
+void rebalance_workspace_bytes(
+    cache_state_data_t& state,
+    const std::string& workspace_id)
+{
+    std::shared_ptr<cache_directory_entry_t> directory;
+    {
+        std::lock_guard lock(state.directory_mutex);
+        const auto found = state.directory.find(workspace_id);
+        if (found == state.directory.end())
+            return;
+        directory = found->second;
+    }
+    const auto prefix = workspace_id + '\x1f';
+    for (std::size_t stripe_index = 0; stripe_index < k_stripe_count; ++stripe_index) {
+        if (directory->resident_bytes.load(std::memory_order_acquire) <=
+            state.limits.max_bytes_per_workspace)
+            return;
+        auto& stripe = state.stripes[stripe_index];
+        std::lock_guard lock(stripe.mutex);
+        for (auto& partition : stripe.partitions) {
+            if (directory->resident_bytes.load(std::memory_order_acquire) <=
+                state.limits.max_bytes_per_workspace)
+                return;
+            if (!partition_key_matches(partition.first, prefix) ||
+                partition.second.entries.empty())
+                continue;
+            const auto candidate = oldest_entry(partition.second);
+            if (candidate == partition.second.entries.end())
+                continue;
+            erase_entry(state, partition.second, candidate, true);
+        }
+    }
+}
+
+void rebalance_global_totals(cache_state_data_t& state)
+{
+    for (;;) {
+        if (state.total_entries.load(std::memory_order_acquire) <= state.limits.max_total_entries &&
+            state.total_bytes.load(std::memory_order_acquire) <= state.limits.max_total_bytes)
+            return;
+        bool evicted = false;
+        for (std::size_t stripe_index = 0; stripe_index < k_stripe_count; ++stripe_index) {
+            if (state.total_entries.load(std::memory_order_acquire) <= state.limits.max_total_entries &&
+                state.total_bytes.load(std::memory_order_acquire) <= state.limits.max_total_bytes)
+                return;
+            auto& stripe = state.stripes[stripe_index];
+            std::lock_guard lock(stripe.mutex);
+            cache_partition_t* oldest_partition = nullptr;
+            std::unordered_map<std::string, cache_entry_t>::iterator oldest_candidate;
+            std::string oldest_key;
+            bool have_oldest = false;
+            for (auto partition = stripe.partitions.begin();
+                 partition != stripe.partitions.end(); ++partition) {
+                if (partition->second.entries.empty())
+                    continue;
+                auto candidate = oldest_entry(partition->second);
+                if (candidate == partition->second.entries.end())
+                    continue;
+                if (!have_oldest ||
+                    candidate->second.touch < oldest_candidate->second.touch ||
+                    (candidate->second.touch == oldest_candidate->second.touch &&
+                     partition->first < oldest_key)) {
+                    oldest_candidate = candidate;
+                    oldest_key = partition->first;
+                    oldest_partition = &partition->second;
+                    have_oldest = true;
+                }
+            }
+            if (!oldest_partition || !have_oldest)
+                continue;
+            erase_entry(state, *oldest_partition, oldest_candidate, true);
+            evicted = true;
+        }
+        if (!evicted)
+            return;
+    }
+}
+
+void maybe_rebalance(
+    cache_state_data_t& state,
+    const std::string& workspace_id)
+{
+    bool expected = false;
+    if (!state.eviction_running.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return;
+    struct eviction_guard_t {
+        cache_state_data_t& state;
+        ~eviction_guard_t()
+        {
+            state.eviction_running.store(false, std::memory_order_release);
+        }
+    } guard{state};
+    rebalance_workspace_bytes(state, workspace_id);
+    rebalance_global_totals(state);
 }
 
 template <typename T>
@@ -664,38 +789,55 @@ workspace_result_t<decompiler_cache_v9_lookup_t<T>> lookup_value(
     const decompiler_pipeline_cache_key_t& key,
     const decompiler_cache_stage_t stage)
 {
+    const auto stage_idx = stage_index(stage);
     auto canonical = canonical_key(key, stage, state.limits);
     if (!canonical) {
-        std::lock_guard lock(state.mutex);
-        ++stage_snapshot(state, stage).rejections;
+        state.rejections[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<decompiler_cache_v9_lookup_t<T>>::failure(canonical.error());
     }
 
-    std::lock_guard lock(state.mutex);
-    auto workspace = state.workspaces.find(key.workspace_id);
-    if (workspace == state.workspaces.end()) {
-        ++stage_snapshot(state, stage).misses;
+    auto& stripe = state.stripes[stripe_index_for(key.workspace_id, stage)];
+    std::unique_lock lock(stripe.mutex);
+    const auto partition = stripe.partitions.find(partition_key_for(key.workspace_id, stage));
+    if (partition == stripe.partitions.end()) {
+        lock.unlock();
+        std::shared_ptr<cache_directory_entry_t> directory;
+        {
+            std::lock_guard directory_lock(state.directory_mutex);
+            const auto workspace = state.directory.find(key.workspace_id);
+            if (workspace != state.directory.end())
+                directory = workspace->second;
+        }
+        if (directory &&
+            directory->generation.load(std::memory_order_acquire) != key.workspace_generation) {
+            return workspace_result_t<decompiler_cache_v9_lookup_t<T>>::failure(
+                cache_error(workspace_error_code_t::stale_generation,
+                            "cache lookup generation is stale", key.workspace_id));
+        }
+        state.misses[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<decompiler_cache_v9_lookup_t<T>>::success({});
     }
-    if (workspace->second.generation != key.workspace_generation) {
+    if (!partition->second.directory ||
+        partition->second.directory->generation.load(std::memory_order_acquire) !=
+            key.workspace_generation) {
         return workspace_result_t<decompiler_cache_v9_lookup_t<T>>::failure(
             cache_error(workspace_error_code_t::stale_generation,
                         "cache lookup generation is stale", key.workspace_id));
     }
-    auto entry = workspace->second.entries.find(canonical.value());
-    if (entry == workspace->second.entries.end()) {
-        ++stage_snapshot(state, stage).misses;
+    auto entry = partition->second.entries.find(canonical.value());
+    if (entry == partition->second.entries.end()) {
+        state.misses[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<decompiler_cache_v9_lookup_t<T>>::success({});
     }
     const auto* typed = std::get_if<std::shared_ptr<const T>>(&entry->second.payload);
     if (!typed || !*typed || entry->second.stage != stage) {
-        ++stage_snapshot(state, stage).rejections;
+        state.rejections[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<decompiler_cache_v9_lookup_t<T>>::failure(
             cache_error(workspace_error_code_t::integrity_failure,
                         "cache payload type does not match its stage", key.workspace_id));
     }
     entry->second.touch = next_touch(state);
-    ++stage_snapshot(state, stage).hits;
+    state.hits[stage_idx].fetch_add(1, std::memory_order_acq_rel);
     return workspace_result_t<decompiler_cache_v9_lookup_t<T>>::success({*typed});
 }
 
@@ -706,15 +848,14 @@ workspace_result_t<void> store_value(
     T value,
     const decompiler_cache_stage_t stage)
 {
+    const auto stage_idx = stage_index(stage);
     auto canonical = canonical_key(key, stage, state.limits);
     if (!canonical) {
-        std::lock_guard lock(state.mutex);
-        ++stage_snapshot(state, stage).rejections;
+        state.rejections[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<void>::failure(canonical.error());
     }
     if (!validate_value(key, value)) {
-        std::lock_guard lock(state.mutex);
-        ++stage_snapshot(state, stage).rejections;
+        state.rejections[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::integrity_failure,
                         "cache payload failed stage validation", key.workspace_id));
@@ -726,8 +867,7 @@ workspace_result_t<void> store_value(
         serialized = serialize_cache_value(value);
         payload = std::make_shared<const T>(std::move(value));
     } catch (...) {
-        std::lock_guard lock(state.mutex);
-        ++stage_snapshot(state, stage).rejections;
+        state.rejections[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::limit_exceeded,
                         "cache payload allocation or serialization failed", key.workspace_id));
@@ -736,8 +876,7 @@ workspace_result_t<void> store_value(
     const auto payload_bytes = static_cast<std::uint64_t>(serialized.size());
     if (payload_bytes > std::numeric_limits<std::uint64_t>::max() - key_bytes ||
         payload_bytes + key_bytes > state.limits.max_entry_bytes) {
-        std::lock_guard lock(state.mutex);
-        ++stage_snapshot(state, stage).rejections;
+        state.rejections[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::limit_exceeded,
                         "cache payload exceeds the configured entry limit", key.workspace_id));
@@ -745,39 +884,62 @@ workspace_result_t<void> store_value(
     const auto resident_bytes = payload_bytes + key_bytes;
     const auto content_hash = stable_serialization_hash(serialized);
 
-    std::lock_guard lock(state.mutex);
-    auto workspace = state.workspaces.find(key.workspace_id);
-    if (workspace == state.workspaces.end() || workspace->second.generation != key.workspace_generation) {
+    std::shared_ptr<cache_directory_entry_t> directory;
+    {
+        std::lock_guard lock(state.directory_mutex);
+        const auto found = state.directory.find(key.workspace_id);
+        if (found == state.directory.end()) {
+            return workspace_result_t<void>::failure(
+                cache_error(workspace_error_code_t::stale_generation,
+                            "cache store generation is stale", key.workspace_id));
+        }
+        directory = found->second;
+    }
+    if (directory->generation.load(std::memory_order_acquire) != key.workspace_generation) {
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::stale_generation,
                         "cache store generation is stale", key.workspace_id));
     }
-    auto existing = workspace->second.entries.find(canonical.value());
-    if (existing != workspace->second.entries.end()) {
-        if (existing->second.stage != stage || existing->second.content_hash != content_hash) {
-            ++stage_snapshot(state, stage).rejections;
-            return workspace_result_t<void>::failure(
-                cache_error(workspace_error_code_t::integrity_failure,
-                            "cache key produced nondeterministic artifacts", key.workspace_id));
-        }
-        existing->second.touch = next_touch(state);
-        ++stage_snapshot(state, stage).stores;
-        return workspace_result_t<void>::success();
-    }
 
-    cache_entry_t entry;
-    entry.stage = stage;
-    entry.entity = key.entity;
-    entry.payload = std::move(payload);
-    entry.content_hash = content_hash;
-    entry.resident_bytes = resident_bytes;
-    entry.touch = next_touch(state);
-    workspace->second.resident_bytes += resident_bytes;
-    state.total_bytes += resident_bytes;
-    ++state.total_entries;
-    workspace->second.entries.emplace(std::move(canonical.value()), std::move(entry));
-    ++stage_snapshot(state, stage).stores;
-    enforce_limits(state, workspace->second);
+    {
+        auto& stripe = state.stripes[stripe_index_for(key.workspace_id, stage)];
+        std::lock_guard lock(stripe.mutex);
+        auto& partition = stripe.partitions[partition_key_for(key.workspace_id, stage)];
+        if (!partition.directory)
+            partition.directory = directory;
+        auto existing = partition.entries.find(canonical.value());
+        if (existing != partition.entries.end()) {
+            if (existing->second.stage != stage || existing->second.content_hash != content_hash) {
+                state.rejections[stage_idx].fetch_add(1, std::memory_order_acq_rel);
+                return workspace_result_t<void>::failure(
+                    cache_error(workspace_error_code_t::integrity_failure,
+                                "cache key produced nondeterministic artifacts", key.workspace_id));
+            }
+            existing->second.touch = next_touch(state);
+            state.stores[stage_idx].fetch_add(1, std::memory_order_acq_rel);
+            return workspace_result_t<void>::success();
+        }
+
+        cache_entry_t entry;
+        entry.stage = stage;
+        entry.entity = key.entity;
+        entry.payload = std::move(payload);
+        entry.content_hash = content_hash;
+        entry.resident_bytes = resident_bytes;
+        entry.touch = next_touch(state);
+        directory->resident_bytes.fetch_add(resident_bytes, std::memory_order_acq_rel);
+        directory->stage_counts[stage_idx].fetch_add(1, std::memory_order_acq_rel);
+        state.total_bytes.fetch_add(resident_bytes, std::memory_order_acq_rel);
+        state.total_entries.fetch_add(1, std::memory_order_acq_rel);
+        partition.entries.emplace(std::move(canonical.value()), std::move(entry));
+        state.stores[stage_idx].fetch_add(1, std::memory_order_acq_rel);
+        enforce_partition_limit(state, partition, stage);
+    }
+    if (directory->resident_bytes.load(std::memory_order_acquire) >
+            state.limits.max_bytes_per_workspace ||
+        state.total_entries.load(std::memory_order_acquire) > state.limits.max_total_entries ||
+        state.total_bytes.load(std::memory_order_acquire) > state.limits.max_total_bytes)
+        maybe_rebalance(state, key.workspace_id);
     return workspace_result_t<void>::success();
 }
 
@@ -851,29 +1013,48 @@ workspace_result_t<void> decompiler_cache_v9_t::activate_workspace_generation(
                         "workspace generation identity is invalid", workspace_id));
     }
 
-    std::lock_guard lock(state_->mutex);
-    auto workspace = state_->workspaces.find(workspace_id);
-    if (workspace == state_->workspaces.end()) {
-        if (state_->workspaces.size() >= state_->limits.max_workspaces) {
-            return workspace_result_t<void>::failure(
-                cache_error(workspace_error_code_t::limit_exceeded,
-                            "cache workspace limit is exhausted", workspace_id));
+    std::shared_ptr<cache_directory_entry_t> directory;
+    {
+        std::lock_guard lock(state_->directory_mutex);
+        auto workspace = state_->directory.find(workspace_id);
+        if (workspace == state_->directory.end()) {
+            if (state_->directory.size() >= state_->limits.max_workspaces) {
+                return workspace_result_t<void>::failure(
+                    cache_error(workspace_error_code_t::limit_exceeded,
+                                "cache workspace limit is exhausted", workspace_id));
+            }
+            directory = std::make_shared<cache_directory_entry_t>();
+            directory->generation.store(generation, std::memory_order_release);
+            state_->directory.emplace(workspace_id, std::move(directory));
+            return workspace_result_t<void>::success();
         }
-        cache_workspace_t value;
-        value.generation = generation;
-        state_->workspaces.emplace(workspace_id, std::move(value));
-        return workspace_result_t<void>::success();
+        directory = workspace->second;
     }
-    if (generation < workspace->second.generation) {
+    const auto current = directory->generation.load(std::memory_order_acquire);
+    if (generation < current) {
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::stale_generation,
                         "workspace generation moved backwards", workspace_id));
     }
-    if (generation > workspace->second.generation) {
-        clear_workspace(*state_, workspace->second);
-        workspace->second.generation = generation;
-        ++state_->generation_invalidations;
+    if (generation == current)
+        return workspace_result_t<void>::success();
+    directory->generation.store(generation, std::memory_order_release);
+    const auto prefix = workspace_id + '\x1f';
+    for (std::size_t stripe_index = 0; stripe_index < k_stripe_count; ++stripe_index) {
+        auto& stripe = state_->stripes[stripe_index];
+        std::lock_guard lock(stripe.mutex);
+        for (auto partition = stripe.partitions.begin();
+             partition != stripe.partitions.end();) {
+            if (!partition_key_matches(partition->first, prefix)) {
+                ++partition;
+                continue;
+            }
+            auto erase = partition++;
+            erase_partition(*state_, erase->second);
+            stripe.partitions.erase(erase);
+        }
     }
+    state_->generation_invalidations.fetch_add(1, std::memory_order_acq_rel);
     return workspace_result_t<void>::success();
 }
 
@@ -881,9 +1062,15 @@ bool decompiler_cache_v9_t::is_current_generation(
     const std::string& workspace_id,
     const std::uint64_t generation) const
 {
-    std::lock_guard lock(state_->mutex);
-    const auto workspace = state_->workspaces.find(workspace_id);
-    return workspace != state_->workspaces.end() && workspace->second.generation == generation;
+    std::shared_ptr<cache_directory_entry_t> directory;
+    {
+        std::lock_guard lock(state_->directory_mutex);
+        const auto workspace = state_->directory.find(workspace_id);
+        if (workspace == state_->directory.end())
+            return false;
+        directory = workspace->second;
+    }
+    return directory->generation.load(std::memory_order_acquire) == generation;
 }
 
 workspace_result_t<decompiler_cache_v9_lookup_t<decompiler_provider_ir_cache_value_t>>
@@ -936,22 +1123,28 @@ workspace_result_t<void> decompiler_cache_v9_t::invalidate_stage(
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::invalid_argument, "cache stage is invalid", workspace_id));
     }
-    std::lock_guard lock(state_->mutex);
-    auto workspace = state_->workspaces.find(workspace_id);
-    if (workspace == state_->workspaces.end() || workspace->second.generation != generation) {
+    std::shared_ptr<cache_directory_entry_t> directory;
+    {
+        std::lock_guard lock(state_->directory_mutex);
+        const auto workspace = state_->directory.find(workspace_id);
+        if (workspace == state_->directory.end()) {
+            return workspace_result_t<void>::failure(
+                cache_error(workspace_error_code_t::stale_generation,
+                            "cache invalidation generation is stale", workspace_id));
+        }
+        directory = workspace->second;
+    }
+    if (directory->generation.load(std::memory_order_acquire) != generation) {
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::stale_generation,
                         "cache invalidation generation is stale", workspace_id));
     }
-    for (auto entry = workspace->second.entries.begin(); entry != workspace->second.entries.end();) {
-        if (entry->second.stage != stage) {
-            ++entry;
-            continue;
-        }
-        auto erase = entry++;
-        erase_entry(*state_, workspace->second, erase, false);
-    }
-    ++state_->explicit_invalidations;
+    auto& stripe = state_->stripes[stripe_index_for(workspace_id, stage)];
+    std::lock_guard lock(stripe.mutex);
+    const auto partition = stripe.partitions.find(partition_key_for(workspace_id, stage));
+    if (partition != stripe.partitions.end())
+        erase_partition(*state_, partition->second);
+    state_->explicit_invalidations.fetch_add(1, std::memory_order_acq_rel);
     return workspace_result_t<void>::success();
 }
 
@@ -965,28 +1158,49 @@ workspace_result_t<void> decompiler_cache_v9_t::invalidate_entities(
             cache_error(workspace_error_code_t::invalid_argument,
                         "cache invalidation workspace identity is invalid", workspace_id));
     }
-    std::lock_guard lock(state_->mutex);
-    auto workspace = state_->workspaces.find(workspace_id);
-    if (workspace == state_->workspaces.end() || workspace->second.generation != generation) {
+    std::shared_ptr<cache_directory_entry_t> directory;
+    {
+        std::lock_guard lock(state_->directory_mutex);
+        const auto workspace = state_->directory.find(workspace_id);
+        if (workspace == state_->directory.end()) {
+            return workspace_result_t<void>::failure(
+                cache_error(workspace_error_code_t::stale_generation,
+                            "cache entity invalidation generation is stale", workspace_id));
+        }
+        directory = workspace->second;
+    }
+    if (directory->generation.load(std::memory_order_acquire) != generation) {
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::stale_generation,
                         "cache entity invalidation generation is stale", workspace_id));
     }
     if (entities.empty())
         return workspace_result_t<void>::success();
-    for (auto entry = workspace->second.entries.begin(); entry != workspace->second.entries.end();) {
-        const bool evict = std::any_of(entities.begin(), entities.end(),
-            [&entry](const decompiler_entity_key_t& probe) {
-                return entity_matches_invalidation_probe(entry->second.entity, probe);
-            });
-        if (!evict) {
-            ++entry;
+    const std::array<decompiler_cache_stage_t, 3> stages{
+        decompiler_cache_stage_t::provider_ir,
+        decompiler_cache_stage_t::normalized_hir_ast,
+        decompiler_cache_stage_t::rendered_document};
+    for (const auto stage : stages) {
+        auto& stripe = state_->stripes[stripe_index_for(workspace_id, stage)];
+        std::lock_guard lock(stripe.mutex);
+        const auto partition = stripe.partitions.find(partition_key_for(workspace_id, stage));
+        if (partition == stripe.partitions.end())
             continue;
+        for (auto entry = partition->second.entries.begin();
+             entry != partition->second.entries.end();) {
+            const bool evict = std::any_of(entities.begin(), entities.end(),
+                [&entry](const decompiler_entity_key_t& probe) {
+                    return entity_matches_invalidation_probe(entry->second.entity, probe);
+                });
+            if (!evict) {
+                ++entry;
+                continue;
+            }
+            auto erase = entry++;
+            erase_entry(*state_, partition->second, erase, false);
         }
-        auto erase = entry++;
-        erase_entry(*state_, workspace->second, erase, false);
     }
-    ++state_->explicit_invalidations;
+    state_->explicit_invalidations.fetch_add(1, std::memory_order_acq_rel);
     return workspace_result_t<void>::success();
 }
 
@@ -994,15 +1208,38 @@ workspace_result_t<void> decompiler_cache_v9_t::invalidate_workspace(
     const std::string& workspace_id,
     const std::uint64_t generation)
 {
-    std::lock_guard lock(state_->mutex);
-    auto workspace = state_->workspaces.find(workspace_id);
-    if (workspace == state_->workspaces.end() || workspace->second.generation != generation) {
+    std::shared_ptr<cache_directory_entry_t> directory;
+    {
+        std::lock_guard lock(state_->directory_mutex);
+        const auto workspace = state_->directory.find(workspace_id);
+        if (workspace == state_->directory.end()) {
+            return workspace_result_t<void>::failure(
+                cache_error(workspace_error_code_t::stale_generation,
+                            "cache invalidation generation is stale", workspace_id));
+        }
+        directory = workspace->second;
+    }
+    if (directory->generation.load(std::memory_order_acquire) != generation) {
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::stale_generation,
                         "cache invalidation generation is stale", workspace_id));
     }
-    clear_workspace(*state_, workspace->second);
-    ++state_->explicit_invalidations;
+    const auto prefix = workspace_id + '\x1f';
+    for (std::size_t stripe_index = 0; stripe_index < k_stripe_count; ++stripe_index) {
+        auto& stripe = state_->stripes[stripe_index];
+        std::lock_guard lock(stripe.mutex);
+        for (auto partition = stripe.partitions.begin();
+             partition != stripe.partitions.end();) {
+            if (!partition_key_matches(partition->first, prefix)) {
+                ++partition;
+                continue;
+            }
+            auto erase = partition++;
+            erase_partition(*state_, erase->second);
+            stripe.partitions.erase(erase);
+        }
+    }
+    state_->explicit_invalidations.fetch_add(1, std::memory_order_acq_rel);
     return workspace_result_t<void>::success();
 }
 
@@ -1010,41 +1247,59 @@ workspace_result_t<void> decompiler_cache_v9_t::retire_workspace(
     const std::string& workspace_id,
     const std::uint64_t generation)
 {
-    std::lock_guard lock(state_->mutex);
-    auto workspace = state_->workspaces.find(workspace_id);
-    if (workspace == state_->workspaces.end() || workspace->second.generation != generation) {
+    auto invalidated = invalidate_workspace(workspace_id, generation);
+    if (!invalidated)
+        return invalidated;
+    std::lock_guard lock(state_->directory_mutex);
+    const auto workspace = state_->directory.find(workspace_id);
+    if (workspace == state_->directory.end() ||
+        workspace->second->generation.load(std::memory_order_acquire) != generation) {
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::stale_generation,
                         "cache retirement generation is stale", workspace_id));
     }
-    clear_workspace(*state_, workspace->second);
-    state_->workspaces.erase(workspace);
-    ++state_->explicit_invalidations;
+    state_->directory.erase(workspace);
     return workspace_result_t<void>::success();
 }
 
 void decompiler_cache_v9_t::clear() noexcept
 {
-    std::lock_guard lock(state_->mutex);
-    state_->workspaces.clear();
-    state_->total_entries = 0;
-    state_->total_bytes = 0;
-    state_->touch_clock = 0;
-    ++state_->explicit_invalidations;
+    for (std::size_t stripe_index = 0; stripe_index < k_stripe_count; ++stripe_index) {
+        auto& stripe = state_->stripes[stripe_index];
+        std::lock_guard lock(stripe.mutex);
+        stripe.partitions.clear();
+    }
+    {
+        std::lock_guard lock(state_->directory_mutex);
+        state_->directory.clear();
+    }
+    state_->total_entries.store(0, std::memory_order_release);
+    state_->total_bytes.store(0, std::memory_order_release);
+    state_->touch_clock.store(0, std::memory_order_release);
+    state_->explicit_invalidations.fetch_add(1, std::memory_order_acq_rel);
 }
 
 decompiler_cache_v9_snapshot_t decompiler_cache_v9_t::snapshot() const
 {
     decompiler_cache_v9_snapshot_t result;
-    std::lock_guard lock(state_->mutex);
-    result.provider_ir = state_->provider_ir;
-    result.normalized_hir_ast = state_->normalized;
-    result.rendered_document = state_->rendered;
-    result.workspaces = state_->workspaces.size();
-    result.entries = state_->total_entries;
-    result.resident_bytes = state_->total_bytes;
-    result.generation_invalidations = state_->generation_invalidations;
-    result.explicit_invalidations = state_->explicit_invalidations;
+    const auto load_stage = [this](const std::size_t index, decompiler_cache_v9_stage_snapshot_t& stage) {
+        stage.hits = state_->hits[index].load(std::memory_order_acquire);
+        stage.misses = state_->misses[index].load(std::memory_order_acquire);
+        stage.stores = state_->stores[index].load(std::memory_order_acquire);
+        stage.rejections = state_->rejections[index].load(std::memory_order_acquire);
+        stage.evictions = state_->evictions[index].load(std::memory_order_acquire);
+    };
+    load_stage(0, result.provider_ir);
+    load_stage(1, result.normalized_hir_ast);
+    load_stage(2, result.rendered_document);
+    {
+        std::lock_guard lock(state_->directory_mutex);
+        result.workspaces = state_->directory.size();
+    }
+    result.entries = state_->total_entries.load(std::memory_order_acquire);
+    result.resident_bytes = state_->total_bytes.load(std::memory_order_acquire);
+    result.generation_invalidations = state_->generation_invalidations.load(std::memory_order_acquire);
+    result.explicit_invalidations = state_->explicit_invalidations.load(std::memory_order_acquire);
     return result;
 }
 

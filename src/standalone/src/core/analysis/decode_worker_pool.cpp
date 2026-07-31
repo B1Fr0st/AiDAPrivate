@@ -1,5 +1,9 @@
 #include "decode_worker_pool.hpp"
 
+#include "../infra/taskflow_runtime.hpp"
+
+#include "../../helpers/diag_log.hpp"
+
 #include <Windows.h>
 
 #include <algorithm>
@@ -22,6 +26,8 @@ constexpr const char* kPhase = "decode_worker_pool";
 constexpr std::uint32_t kCppExceptionFatalCode = 0xFFFFFFFFu;
 
 constexpr auto kWakeBackstop = std::chrono::milliseconds(25);
+
+constexpr std::uint32_t kLaneJoinTimeoutMs = 15000;
 
 workspace_error_t pool_error(workspace_error_code_t code, std::string message)
 {
@@ -47,7 +53,7 @@ thread_local void* tls_worker_state = nullptr;
 }
 
 struct decode_worker_pool_t::worker_state_t final {
-    std::thread thread;
+    aida::infra::taskflow_runtime::job_handle_t lane_handle{};
     std::mutex mutex;
     std::condition_variable cv;
     std::condition_variable space_cv;
@@ -88,6 +94,16 @@ struct decode_worker_pool_t::impl_t final {
 };
 
 namespace {
+
+using fabric_token_t = aida::infra::taskflow_runtime::cancellation_token_t;
+
+bool lane_stop_requested(const decode_worker_pool_t::impl_t& impl,
+                         const fabric_token_t& lane_token)
+{
+    return impl.stop.load(std::memory_order_acquire) ||
+        impl.cancellation.stop_requested() ||
+        lane_token.requested.load(std::memory_order_acquire);
+}
 
 decode_worker_pool_t::lease_hook_t pool_hook(const decode_worker_pool_t::impl_t& impl,
                                              void*& context)
@@ -311,7 +327,8 @@ void record_worker_fatal(decode_worker_pool_t::impl_t& impl, std::uint32_t code)
 }
 
 void worker_main_body(decode_worker_pool_t::worker_state_t& worker,
-                      decode_worker_pool_t::impl_t& impl)
+                      decode_worker_pool_t::impl_t& impl,
+                      const fabric_token_t& lane_token)
 {
     try {
         create_worker_decoder(worker, impl);
@@ -326,7 +343,7 @@ void worker_main_body(decode_worker_pool_t::worker_state_t& worker,
                 impl.hook_active.fetch_sub(1, std::memory_order_seq_cst);
                 if (lease_progress)
                     continue;
-                if (impl.stop.load(std::memory_order_acquire))
+                if (lane_stop_requested(impl, lane_token))
                     break;
             } else {
                 impl.hook_active.fetch_sub(1, std::memory_order_seq_cst);
@@ -347,16 +364,13 @@ void worker_main_body(decode_worker_pool_t::worker_state_t& worker,
             }
             if (stole)
                 continue;
-            if (impl.stop.load(std::memory_order_acquire) ||
-                impl.cancellation.stop_requested()) {
+            if (lane_stop_requested(impl, lane_token))
                 break;
-            }
             {
                 std::unique_lock<std::mutex> lock(worker.mutex);
                 worker.cv.wait_for(lock, kWakeBackstop, [&] {
                     return !worker.queue.empty() ||
-                        impl.stop.load(std::memory_order_acquire) ||
-                        impl.cancellation.stop_requested() ||
+                        lane_stop_requested(impl, lane_token) ||
                         impl.hook.load(std::memory_order_acquire) != nullptr;
                 });
             }
@@ -366,19 +380,43 @@ void worker_main_body(decode_worker_pool_t::worker_state_t& worker,
     }
 }
 
-void worker_main(decode_worker_pool_t::worker_state_t& worker,
-                 decode_worker_pool_t::impl_t& impl)
+void worker_lane_body(decode_worker_pool_t::worker_state_t& worker,
+                      decode_worker_pool_t::impl_t& impl,
+                      const fabric_token_t& lane_token)
 {
     tls_worker_state = &worker;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     __try {
-        worker_main_body(worker, impl);
+        worker_main_body(worker, impl, lane_token);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         record_worker_fatal(impl,
             static_cast<std::uint32_t>(GetExceptionCode()));
     }
     tls_worker_state = nullptr;
     drain_worker_queue(worker, impl);
+}
+
+void join_lanes(decode_worker_pool_t::impl_t& impl, std::uint32_t timeout_ms)
+{
+    namespace rt = aida::infra::taskflow_runtime;
+    const auto begin = std::chrono::steady_clock::now();
+    for (auto& worker : impl.workers) {
+        if (!worker->lane_handle.valid())
+            continue;
+        const auto elapsed = static_cast<std::uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - begin).count());
+        const std::uint32_t remaining =
+            elapsed >= timeout_ms ? 0 : timeout_ms - elapsed;
+        const auto waited = rt::wait_for(worker->lane_handle, remaining);
+        const auto handle_id = worker->lane_handle.id;
+        worker->lane_handle = {};
+        if (waited.timed_out) {
+            ::diag::log_tagged_fmt(kPhase,
+                "lane_join_timeout worker=%u job_id=%llu timeout_ms=%u",
+                worker->index,
+                static_cast<unsigned long long>(handle_id), timeout_ms);
+        }
+    }
 }
 
 }
@@ -389,6 +427,7 @@ decode_worker_pool_t::create(std::uint32_t worker_count,
     std::uint64_t maximum_frontier_wave,
     const cancellation_token_t& cancellation)
 {
+    namespace rt = aida::infra::taskflow_runtime;
     if (worker_count == 0 || worker_count > 64) {
         return workspace_result_t<std::unique_ptr<decode_worker_pool_t>>::failure(
             pool_error(workspace_error_code_t::invalid_argument,
@@ -423,22 +462,49 @@ decode_worker_pool_t::create(std::uint32_t worker_count,
             worker->pool_impl = impl.get();
             impl->workers.push_back(std::move(worker));
         }
-        for (auto& worker : impl->workers) {
-            auto* raw = worker.get();
-            raw->thread = std::thread(worker_main, std::ref(*raw), std::ref(*impl));
-        }
     } catch (...) {
-        impl->stop.store(true, std::memory_order_release);
-        for (auto& worker : impl->workers)
-            worker->cv.notify_all();
-        for (auto& worker : impl->workers) {
-            if (worker->thread.joinable())
-                worker->thread.join();
-        }
         return workspace_result_t<std::unique_ptr<decode_worker_pool_t>>::failure(
             pool_error(workspace_error_code_t::limit_exceeded,
                 "decode worker pool thread creation failed"));
     }
+    for (auto& worker : impl->workers) {
+        auto* raw = worker.get();
+        auto* impl_raw = impl.get();
+        rt::task_descriptor_t desc;
+        desc.domain = rt::executor_domain_t::feature_worker;
+        desc.owner_subsystem = "analysis_workspace";
+        desc.label = "decode_worker_pool.lane";
+        desc.priority = 3;
+        desc.shutdown_policy = "cancel_pending";
+        desc.cancellable_body = [raw, impl_raw](const fabric_token_t& token) {
+            worker_lane_body(*raw, *impl_raw, token);
+        };
+        auto submitted = rt::submit(std::move(desc));
+        if (!submitted.submitted) {
+            impl->stop.store(true, std::memory_order_release);
+            for (auto& entry : impl->workers) {
+                entry->cv.notify_all();
+                entry->space_cv.notify_all();
+            }
+            for (auto& slot : impl->slots)
+                slot->cv.notify_all();
+            for (auto& entry : impl->workers) {
+                if (entry->lane_handle.valid())
+                    rt::cancel(entry->lane_handle);
+            }
+            join_lanes(*impl, kLaneJoinTimeoutMs);
+            ::diag::log_tagged_fmt(kPhase,
+                "lane_start_failed worker=%u reason=%s",
+                worker->index, submitted.reject_reason.c_str());
+            return workspace_result_t<std::unique_ptr<decode_worker_pool_t>>::failure(
+                pool_error(workspace_error_code_t::limit_exceeded,
+                    "decode worker pool thread creation failed"));
+        }
+        worker->lane_handle = submitted.handle;
+    }
+    ::diag::log_tagged_fmt(kPhase,
+        "pool_created workers=%u max_queue_depth=%u domain=feature_worker",
+        worker_count, impl->max_queue_depth);
     return workspace_result_t<std::unique_ptr<decode_worker_pool_t>>::success(
         std::unique_ptr<decode_worker_pool_t>(
             new decode_worker_pool_t(std::move(impl))));
@@ -451,11 +517,13 @@ decode_worker_pool_t::decode_worker_pool_t(std::unique_ptr<impl_t> impl) noexcep
 
 decode_worker_pool_t::~decode_worker_pool_t()
 {
+    namespace rt = aida::infra::taskflow_runtime;
     request_stop();
     for (auto& worker : impl_->workers) {
-        if (worker->thread.joinable())
-            worker->thread.join();
+        if (worker->lane_handle.valid())
+            rt::cancel(worker->lane_handle);
     }
+    join_lanes(*impl_, kLaneJoinTimeoutMs);
 }
 
 void decode_worker_pool_t::bind_snapshot(const provider_snapshot_t& snapshot) noexcept

@@ -16,6 +16,10 @@
 
 struct DisasmFile;
 
+namespace aida::analysis::native_worker::snapshot_sidecar {
+struct sidecar_t;
+}
+
 namespace aida_ghidra {
 
 enum class symbol_kind_t : uint8_t
@@ -42,9 +46,19 @@ struct symbol_record_t
 	bool is_noreturn = false;
 };
 
+struct sidecar_prototype_record_t
+{
+	uint64_t address = 0;
+	std::string name;
+	std::string prototype;
+	uint8_t confidence = 0;
+	bool is_noreturn = false;
+};
+
 struct function_db_t
 {
 	std::vector<symbol_record_t> symbols;
+	std::vector<sidecar_prototype_record_t> prototypes;
 	std::unordered_map<uint64_t, size_t> by_address;
 	std::unordered_map<std::string, size_t> by_name;
 	uint64_t image_base = 0;
@@ -75,6 +89,12 @@ void populate_from_workspace(
 	const aida::analysis::analysis_snapshot_t* snapshot);
 
 void populate_default_noreturn(function_db_t& db);
+
+void populate_from_sidecar(
+	function_db_t& db,
+	const aida::analysis::native_worker::snapshot_sidecar::sidecar_t& sidecar,
+	uint64_t image_base,
+	uint64_t image_size);
 
 }
 

@@ -1,4 +1,5 @@
 #include "aida_function_db.hpp"
+#include "../../../../workers/native_decompiler/snapshot_sidecar.hpp"
 #if !defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 #include "../zydis_disasm.hpp"
 #include "../../analysis/symbol_store.hpp"
@@ -19,6 +20,7 @@ namespace aida_ghidra {
 void function_db_t::clear()
 {
 	symbols.clear();
+	prototypes.clear();
 	by_address.clear();
 	by_name.clear();
 	image_base = 0;
@@ -531,6 +533,106 @@ void populate_default_noreturn(function_db_t& db)
 		if (!s.is_noreturn && name_is_noreturn_default(s.display_name.empty() ? s.name : s.display_name))
 			s.is_noreturn = true;
 	}
+}
+
+void populate_from_sidecar(
+	function_db_t& db,
+	const aida::analysis::native_worker::snapshot_sidecar::sidecar_t& sidecar,
+	uint64_t image_base,
+	uint64_t image_size)
+{
+	namespace sidecar = aida::analysis::native_worker::snapshot_sidecar;
+	db.clear();
+	db.image_base = image_base;
+	db.image_size = image_size;
+	db.is_pe = true;
+	db.is_64bit = sidecar.is_64bit;
+	if (image_base == 0 || image_size == 0)
+		return;
+	db.symbols.reserve(sidecar.names.size() + sidecar.imports.size() +
+		sidecar.noreturn.size() + sidecar.prototypes.size() + 16);
+	db.prototypes.reserve(sidecar.prototypes.size());
+	const auto rva_valid = [image_size](uint64_t rva) {
+		return rva != 0 && rva < image_size;
+	};
+	for (const auto& record : sidecar.names) {
+		if (!rva_valid(record.rva))
+			continue;
+		symbol_record_t symbol;
+		symbol.address = image_base + record.rva;
+		symbol.name = sanitize_symbol_name(record.name);
+		symbol.display_name = record.name;
+		switch (record.kind) {
+		case sidecar::name_kind_t::function: symbol.kind = symbol_kind_t::function; break;
+		case sidecar::name_kind_t::import: symbol.kind = symbol_kind_t::import; break;
+		case sidecar::name_kind_t::export_: symbol.kind = symbol_kind_t::export_; break;
+		case sidecar::name_kind_t::data: symbol.kind = symbol_kind_t::data; break;
+		case sidecar::name_kind_t::label: symbol.kind = symbol_kind_t::label; break;
+		default: symbol.kind = symbol_kind_t::unknown; break;
+		}
+		symbol.is_external = record.kind == sidecar::name_kind_t::import;
+		symbol.is_noreturn = record.is_noreturn || name_is_noreturn_default(record.name);
+		db.add_symbol(std::move(symbol));
+	}
+	for (const auto& record : sidecar.imports) {
+		if (rva_valid(record.iat_rva)) {
+			symbol_record_t symbol;
+			symbol.address = image_base + record.iat_rva;
+			const std::string base = !record.name.empty()
+				? record.name
+				: std::string("ord_") + std::to_string(record.ordinal);
+			symbol.name = std::string("imp_") + sanitize_symbol_name(base);
+			symbol.display_name = base;
+			symbol.module_name = record.module;
+			symbol.kind = symbol_kind_t::import;
+			symbol.is_external = true;
+			symbol.is_noreturn = record.is_noreturn || name_is_noreturn_default(base);
+			db.add_symbol(std::move(symbol));
+		}
+		if (rva_valid(record.thunk_rva) && !record.name.empty()) {
+			symbol_record_t thunk;
+			thunk.address = image_base + record.thunk_rva;
+			thunk.name = sanitize_symbol_name(record.name);
+			thunk.display_name = record.name;
+			thunk.module_name = record.module;
+			thunk.kind = symbol_kind_t::import;
+			thunk.is_external = true;
+			thunk.is_thunk = true;
+			thunk.is_noreturn = record.is_noreturn || name_is_noreturn_default(record.name);
+			db.add_symbol(std::move(thunk));
+		}
+	}
+	for (const auto& record : sidecar.prototypes) {
+		if (!rva_valid(record.rva))
+			continue;
+		sidecar_prototype_record_t prototype;
+		prototype.address = image_base + record.rva;
+		prototype.name = record.name;
+		prototype.prototype = record.prototype;
+		prototype.confidence = record.confidence;
+		prototype.is_noreturn = record.is_noreturn;
+		db.prototypes.push_back(std::move(prototype));
+		if (!record.name.empty() && !db.find_by_address(image_base + record.rva)) {
+			symbol_record_t symbol;
+			symbol.address = image_base + record.rva;
+			symbol.name = std::string("imp_") + sanitize_symbol_name(record.name);
+			symbol.display_name = record.name;
+			symbol.kind = symbol_kind_t::import;
+			symbol.is_external = true;
+			symbol.is_noreturn = record.is_noreturn || name_is_noreturn_default(record.name);
+			db.add_symbol(std::move(symbol));
+		}
+	}
+	for (const auto& rva : sidecar.noreturn) {
+		if (!rva_valid(rva))
+			continue;
+		symbol_record_t symbol;
+		symbol.address = image_base + rva;
+		symbol.kind = symbol_kind_t::function;
+		symbol.is_noreturn = true;
+		db.add_symbol(std::move(symbol));
+	}
+	populate_default_noreturn(db);
 }
 
 }

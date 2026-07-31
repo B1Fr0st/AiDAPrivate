@@ -2,6 +2,8 @@
 
 #include "checked_range.hpp"
 #include "packed_page_codec.hpp"
+#include "sqlite_reader_pool.hpp"
+#include "sqlite_statement_cache.hpp"
 #include "../decompiler/managed_entity_binding.hpp"
 #include "../../infra/taskflow_runtime.hpp"
 
@@ -1345,17 +1347,51 @@ class statement_t final {
 public:
     statement_t() = default;
     ~statement_t() {
-        if (statement_)
-            sqlite3_finalize(statement_);
+        release_current();
     }
     statement_t(const statement_t&) = delete;
     statement_t& operator=(const statement_t&) = delete;
 
     workspace_result_t<void> prepare(sqlite3* database, const char* sql,
                                      const char* phase) {
-        if (statement_) {
-            sqlite3_finalize(statement_);
-            statement_ = nullptr;
+        release_current();
+        std::shared_ptr<sqlite_statement_cache_t> cache;
+        try {
+            cache = sqlite_statement_cache_lookup(database);
+        } catch (...) {
+            cache.reset();
+        }
+        if (cache) {
+            int status = SQLITE_OK;
+            sqlite3_stmt* cached = nullptr;
+            try {
+                cached = cache->acquire(database, sql, status);
+            } catch (...) {
+                cached = nullptr;
+                status = SQLITE_OK;
+            }
+            if (cached) {
+                std::string sql_key;
+                try {
+                    sql_key = sql;
+                } catch (...) {
+                    sqlite3_finalize(cached);
+                    cached = nullptr;
+                }
+                if (cached) {
+                    statement_ = cached;
+                    cache_ = std::move(cache);
+                    cache_sql_ = std::move(sql_key);
+                    database_ = database;
+                    phase_ = phase;
+                    return workspace_result_t<void>::success();
+                }
+            }
+            if (status != SQLITE_OK) {
+                return workspace_result_t<void>::failure(
+                    database_error(database, status,
+                                   "failed to prepare SQLite statement", phase));
+            }
         }
         const int status = sqlite3_prepare_v3(database, sql, -1,
                                               SQLITE_PREPARE_PERSISTENT,
@@ -1435,9 +1471,30 @@ private:
             database_error(database_, status, "SQLite statement binding failed", phase_));
     }
 
+    void release_current() noexcept {
+        if (!statement_)
+            return;
+        if (cache_) {
+            try {
+                cache_->release(cache_sql_, statement_);
+                statement_ = nullptr;
+            } catch (...) {
+                sqlite3_finalize(statement_);
+                statement_ = nullptr;
+            }
+            cache_.reset();
+            cache_sql_.clear();
+        } else {
+            sqlite3_finalize(statement_);
+            statement_ = nullptr;
+        }
+    }
+
     sqlite3* database_ = nullptr;
     sqlite3_stmt* statement_ = nullptr;
     const char* phase_ = "workspace_database";
+    std::shared_ptr<sqlite_statement_cache_t> cache_;
+    std::string cache_sql_;
 };
 
 int sqlite_cancel_progress(void* context) noexcept {
@@ -3813,11 +3870,23 @@ struct workspace_database_t::connection_state_t {
     std::atomic<std::uint64_t> pdb_modules_stored{0};
     std::atomic<std::uint64_t> pdb_modules_skipped{0};
     std::atomic<std::uint64_t> pdb_modules_loaded{0};
+    std::shared_ptr<sqlite_statement_cache_t> writer_statements;
+    std::shared_ptr<sqlite_reader_pool_t> reader_pool;
+    std::atomic<bool> coalesce_group_active{false};
+    std::atomic<std::uint64_t> coalesce_owner_tid{0};
+    std::unique_ptr<sqlite_progress_guard_t> coalesce_progress;
 
     ~connection_state_t() {
         std::lock_guard<std::mutex> lock(close_mutex);
         std::lock_guard<std::timed_mutex> writer_lock(writer_mutex);
+        coalesce_progress.reset();
+        if (reader_pool)
+            reader_pool->close();
         if (writer) {
+            if (writer_statements) {
+                sqlite_statement_cache_unregister(writer);
+                writer_statements.reset();
+            }
             final_passive_checkpoint(writer);
             sqlite3_close_v2(writer);
             writer = nullptr;
@@ -3825,6 +3894,104 @@ struct workspace_database_t::connection_state_t {
         open.store(false, std::memory_order_release);
     }
 };
+
+namespace {
+
+persistence_operation_t make_cache_write_operation(
+    const std::shared_ptr<workspace_database_t::connection_state_t>& state,
+    std::function<workspace_result_t<void>(sqlite3*, const cancellation_token_t&)>
+        operation) {
+    return [state, operation = std::move(operation)](
+               const cancellation_token_t& token) mutable -> workspace_result_t<void> {
+        const std::uint64_t self_tid = static_cast<std::uint64_t>(GetCurrentThreadId());
+        if (state->coalesce_group_active.load(std::memory_order_acquire) &&
+            state->coalesce_owner_tid.load(std::memory_order_acquire) == self_tid &&
+            state->writer) {
+            return operation(state->writer, token);
+        }
+        std::lock_guard<std::timed_mutex> writer_lock(state->writer_mutex);
+        if (!state->open.load(std::memory_order_acquire) || !state->writer) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::workspace_closing,
+                                     "workspace database is closed",
+                                     "workspace_database.write"));
+        }
+        sqlite_progress_guard_t progress(state->writer, token);
+        auto result = operation(state->writer, token);
+        if (!result && token.stop_requested()) {
+            auto error = make_workspace_error(
+                token.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "workspace database write was cancelled",
+                "workspace_database.write");
+            error.deadline = token.deadline_exceeded();
+            error.cancellation = !error.deadline;
+            error.details.emplace_back("sqlite_write_error",
+                                       result.error().stable_code());
+            return workspace_result_t<void>::failure(std::move(error));
+        }
+        return result;
+    };
+}
+
+void install_writer_coalescing(
+    const std::shared_ptr<persistence_queue_t>& queue,
+    const std::shared_ptr<workspace_database_t::connection_state_t>& state) {
+    persistence_coalesce_hooks_t hooks;
+    hooks.begin_group = [state](const cancellation_token_t& token)
+        -> workspace_result_t<void> {
+        state->writer_mutex.lock();
+        if (!state->open.load(std::memory_order_acquire) || !state->writer) {
+            state->writer_mutex.unlock();
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::workspace_closing,
+                                     "workspace database is closed",
+                                     "workspace_database.coalesce"));
+        }
+        auto lowered = set_writer_synchronous(state->writer, 1,
+                                              "workspace_database.coalesce");
+        if (!lowered) {
+            state->writer_mutex.unlock();
+            return lowered;
+        }
+        auto begun = begin_immediate(state->writer, "workspace_database.coalesce");
+        if (!begun) {
+            set_writer_synchronous(state->writer, 2, "workspace_database.coalesce");
+            state->writer_mutex.unlock();
+            return begun;
+        }
+        state->coalesce_progress =
+            std::make_unique<sqlite_progress_guard_t>(state->writer, token);
+        state->coalesce_owner_tid.store(
+            static_cast<std::uint64_t>(GetCurrentThreadId()),
+            std::memory_order_release);
+        state->coalesce_group_active.store(true, std::memory_order_release);
+        return workspace_result_t<void>::success();
+    };
+    hooks.end_group = [state](bool commit_flag) -> workspace_result_t<void> {
+        state->coalesce_progress.reset();
+        workspace_result_t<void> result = workspace_result_t<void>::success();
+        if (commit_flag) {
+            result = commit(state->writer, "workspace_database.coalesce");
+            if (!result)
+                rollback(state->writer, "workspace_database.coalesce");
+        } else {
+            result = rollback(state->writer, "workspace_database.coalesce");
+        }
+        auto restored = set_writer_synchronous(state->writer, 2,
+                                               "workspace_database.coalesce");
+        state->coalesce_group_active.store(false, std::memory_order_release);
+        state->coalesce_owner_tid.store(0, std::memory_order_release);
+        state->writer_mutex.unlock();
+        if (!result)
+            return result;
+        return restored;
+    };
+    queue->set_coalesce_hooks(std::move(hooks));
+}
+
+}
 
 namespace {
 
@@ -6693,6 +6860,7 @@ workspace_result_t<packed_baseline_manifest_t> decode_packed_baseline_manifest(
 
 struct decoded_packed_baseline_t {
     std::shared_ptr<analysis_snapshot_t> snapshot;
+    paged_domain_revision_tag_t revision_tag;
 };
 
 workspace_result_t<std::vector<std::uint8_t>> read_packed_domain_payload(
@@ -7227,6 +7395,7 @@ struct packed_domain_range_output_t {
     std::uint64_t first_ordinal = 0;
     std::uint64_t next_ordinal = 0;
     std::uint32_t pages_seen = 0;
+    paged_domain_revision_tag_t revision_tag;
     std::optional<workspace_error_t> error;
 };
 
@@ -7236,6 +7405,9 @@ workspace_result_t<void> read_packed_domain_page_range(
     packed_domain_range_output_t& output, std::uint64_t maximum_bytes,
     const cancellation_token_t& cancel) {
     const auto encoded_domain = static_cast<std::uint32_t>(domain);
+    output.revision_tag.generation = generation.generation;
+    output.revision_tag.analysis_revision = generation.analysis_revision;
+    output.revision_tag.overlay_revision = generation.overlay_revision;
     statement_t statement;
     auto prepared = statement.prepare(database, R"SQL(
 SELECT p.generation,p.page_index,p.page_count,p.page_type,p.payload_length,p.checksum,p.payload,
@@ -8166,6 +8338,9 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
             validated.error());
     decoded_packed_baseline_t decoded;
     decoded.snapshot = std::move(snapshot);
+    decoded.revision_tag.generation = generation.generation;
+    decoded.revision_tag.analysis_revision = generation.analysis_revision;
+    decoded.revision_tag.overlay_revision = generation.overlay_revision;
     return workspace_result_t<decoded_packed_baseline_t>::success(
         std::move(decoded));
 }
@@ -8390,11 +8565,33 @@ workspace_database_t::open(workspace_database_options_t options) {
         std::memory_order_release);
     state->open.store(true, std::memory_order_release);
 
+    state->writer_statements = std::make_shared<sqlite_statement_cache_t>(64);
+    sqlite_statement_cache_register(state->writer, state->writer_statements);
+
+    sqlite_reader_pool_options_t reader_pool_options;
+    reader_pool_options.acquire_timeout = std::chrono::milliseconds(
+        (std::min<std::uint32_t>)(options.busy_timeout_ms, 60000));
+    const std::string reader_path = state->path;
+    const workspace_database_options_t reader_options = options;
+    auto reader_pool = sqlite_reader_pool_t::create(
+        [reader_path, reader_options]() {
+            return open_reader_connection(reader_path, reader_options);
+        },
+        reader_pool_options);
+    if (!reader_pool) {
+        sqlite_statement_cache_unregister(state->writer);
+        state->writer_statements.reset();
+        return workspace_result_t<std::shared_ptr<workspace_database_t>>::failure(
+            reader_pool.error());
+    }
+    state->reader_pool = reader_pool.take_value();
+
     auto queue_result = persistence_queue_t::create(options.identity->binary_id(),
                                                      options.queue_limits);
     if (!queue_result)
         return workspace_result_t<std::shared_ptr<workspace_database_t>>::failure(queue_result.error());
     auto queue = queue_result.take_value();
+    install_writer_coalescing(queue, state);
     auto result = std::shared_ptr<workspace_database_t>(
         new workspace_database_t(std::move(options), std::move(state), std::move(queue)));
     return workspace_result_t<std::shared_ptr<workspace_database_t>>::success(std::move(result));
@@ -9018,21 +9215,24 @@ workspace_result_t<void> workspace_database_t::with_reader(
     };
     if (cancel.stop_requested())
         return cancelled();
-    if (!state_->open.load(std::memory_order_acquire)) {
+    if (!state_->open.load(std::memory_order_acquire) || !state_->reader_pool) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::workspace_closing,
                                  "workspace database is closed",
                                  "workspace_database.read"));
     }
-    auto connection = open_reader_connection(state_->path, options_);
-    if (!connection)
-        return workspace_result_t<void>::failure(connection.error());
-    sqlite3* database = connection.take_value();
+    auto lease_result = state_->reader_pool->acquire(cancel);
+    if (!lease_result) {
+        if (cancel.stop_requested())
+            return cancelled();
+        return workspace_result_t<void>::failure(lease_result.error());
+    }
+    auto lease = lease_result.take_value();
+    sqlite3* database = lease.get();
     sqlite_progress_guard_t progress(database, cancel);
     auto begun = exec_sql(database, "BEGIN", "workspace_database.read");
     if (!begun) {
         progress.reset();
-        sqlite3_close_v2(database);
         if (cancel.stop_requested())
             return cancelled();
         return begun;
@@ -9050,12 +9250,6 @@ workspace_result_t<void> workspace_database_t::with_reader(
         exec_sql(database, "ROLLBACK", "workspace_database.read");
     }
     progress.reset();
-    const int close_status = sqlite3_close_v2(database);
-    if (result && close_status != SQLITE_OK) {
-        return workspace_result_t<void>::failure(
-            database_error(database, close_status, "unable to close workspace read connection",
-                           "workspace_database.read"));
-    }
     return result;
 }
 
@@ -10924,9 +11118,10 @@ persistence_ticket_t workspace_database_t::store_decompiler_cache(
     }
     const std::uint64_t record_json_bytes =
         static_cast<std::uint64_t>(record.result_json.size());
-    return enqueue_write("analysis.persistence.decompiler_cache.store",
-        [record = std::move(record), canonical](sqlite3* database,
-                                               const cancellation_token_t& token) {
+    return queue_->enqueue("analysis.persistence.decompiler_cache.store",
+        make_cache_write_operation(state_,
+            [record = std::move(record), canonical](sqlite3* database,
+                                                    const cancellation_token_t& token) {
             if (token.stop_requested()) {
                 auto error = make_workspace_error(token.deadline_exceeded()
                                                       ? workspace_error_code_t::deadline_exceeded
@@ -10967,8 +11162,10 @@ persistence_ticket_t workspace_database_t::store_decompiler_cache(
             persisted.result_bytes = record.result_bytes;
             persisted.cache_key_version = decompiler_cache_v9_key_version;
             return write_decompiler_cache_v9(database, persisted);
-        }, std::move(cancel),
-        static_cast<std::uint64_t>(record_json_bytes));
+        }),
+        std::move(cancel),
+        static_cast<std::uint64_t>(record_json_bytes),
+        persistence_priority_t::deferred, true);
 }
 
 workspace_result_t<std::optional<decompiler_cache_record_t>>
@@ -11052,9 +11249,10 @@ persistence_ticket_t workspace_database_t::invalidate_decompiler_cache(
     std::optional<std::uint64_t> minimum_overlay_revision,
     cancellation_token_t cancel) {
     auto state = state_;
-    return enqueue_write("analysis.persistence.decompiler_cache.invalidate",
-        [state, function_rva, minimum_overlay_revision](sqlite3* database,
-                                                       const cancellation_token_t&) {
+    return queue_->enqueue("analysis.persistence.decompiler_cache.invalidate",
+        make_cache_write_operation(state,
+            [state, function_rva, minimum_overlay_revision](sqlite3* database,
+                                                            const cancellation_token_t&) {
             std::string sql = "DELETE FROM decompiler_cache_v9 WHERE 1=1";
             if (function_rva) sql += " AND function_rva=?1";
             if (minimum_overlay_revision) sql += function_rva
@@ -11070,7 +11268,8 @@ persistence_ticket_t workspace_database_t::invalidate_decompiler_cache(
             if (result)
                 state->cache_invalidations.fetch_add(1, std::memory_order_acq_rel);
             return result;
-        }, std::move(cancel));
+        }),
+        std::move(cancel), 0, persistence_priority_t::deferred, true);
 }
 
 
@@ -11172,9 +11371,10 @@ persistence_ticket_t workspace_database_t::store_pipeline_cache(
         static_cast<std::uint64_t>(record.cache_key.size()) +
         static_cast<std::uint64_t>(record.value.size()) +
         static_cast<std::uint64_t>(record.diagnostics.size());
-    return enqueue_write("analysis.persistence.pipeline_cache.store",
-        [record = std::move(record)](sqlite3* database,
-                                     const cancellation_token_t& token) {
+    return queue_->enqueue("analysis.persistence.pipeline_cache.store",
+        make_cache_write_operation(state_,
+            [record = std::move(record)](sqlite3* database,
+                                         const cancellation_token_t& token) {
             if (token.stop_requested()) {
                 auto error = make_workspace_error(
                     token.deadline_exceeded()
@@ -11187,8 +11387,9 @@ persistence_ticket_t workspace_database_t::store_pipeline_cache(
                 return workspace_result_t<void>::failure(std::move(error));
             }
             return write_pipeline_cache_v1(database, record);
-        }, std::move(cancel), reservation,
-        persistence_priority_t::deferred);
+        }),
+        std::move(cancel), reservation,
+        persistence_priority_t::deferred, true);
 }
 
 workspace_result_t<std::optional<decompiler_pipeline_cache_v1_row_t>>
@@ -11232,9 +11433,10 @@ persistence_ticket_t workspace_database_t::invalidate_pipeline_cache(
     cancellation_token_t cancel) {
     auto state = state_;
     const std::string workspace_id = options_.identity->binary_id().to_hex();
-    return enqueue_write("analysis.persistence.pipeline_cache.invalidate",
-        [state, workspace_id, function_rvas = std::move(function_rvas)](
-            sqlite3* database, const cancellation_token_t&) {
+    return queue_->enqueue("analysis.persistence.pipeline_cache.invalidate",
+        make_cache_write_operation(state,
+            [state, workspace_id, function_rvas = std::move(function_rvas)](
+                sqlite3* database, const cancellation_token_t&) {
             workspace_result_t<void> result = workspace_result_t<void>::success();
             if (function_rvas) {
                 result = delete_pipeline_cache_v1_functions(
@@ -11245,7 +11447,8 @@ persistence_ticket_t workspace_database_t::invalidate_pipeline_cache(
             if (result)
                 state->cache_invalidations.fetch_add(1, std::memory_order_acq_rel);
             return result;
-        }, std::move(cancel), 0, persistence_priority_t::deferred);
+        }),
+        std::move(cancel), 0, persistence_priority_t::deferred, true);
 }
 
 persistence_ticket_t workspace_database_t::store_pdb_symbol_modules(
@@ -11256,9 +11459,10 @@ persistence_ticket_t workspace_database_t::store_pdb_symbol_modules(
         (record.source_lines
              ? static_cast<std::uint64_t>(record.source_lines->size()) : 0ULL);
     const std::uint64_t stored_cap = options_.pdb_persistence_max_stored_bytes;
-    return enqueue_write("analysis.persistence.pdb_modules.store",
-        [state, record = std::move(record), stored_cap](
-            sqlite3* database, const cancellation_token_t& token) {
+    return queue_->enqueue("analysis.persistence.pdb_modules.store",
+        make_cache_write_operation(state,
+            [state, record = std::move(record), stored_cap](
+                sqlite3* database, const cancellation_token_t& token) {
             const auto stop = [&token] { return token.stop_requested(); };
             if (stop()) {
                 auto error = make_workspace_error(
@@ -11329,8 +11533,9 @@ persistence_ticket_t workspace_database_t::store_pdb_symbol_modules(
                     1, std::memory_order_acq_rel);
             }
             return workspace_result_t<void>::success();
-        }, std::move(cancel), reservation_bytes,
-        persistence_priority_t::deferred);
+        }),
+        std::move(cancel), reservation_bytes,
+        persistence_priority_t::deferred, true);
 }
 
 workspace_result_t<std::vector<pdb_symbol_module_record_t>>
@@ -11434,6 +11639,12 @@ workspace_database_snapshot_t workspace_database_t::snapshot() const {
                std::memory_order_relaxed)) {
     }
     result.wal_bytes_peak = state_->wal_bytes_peak.load(std::memory_order_acquire);
+    workspace_io_metrics().set(
+        workspace_io_metric_t::statement_cache_hits,
+        global_statement_cache_hits().load(std::memory_order_relaxed));
+    workspace_io_metrics().set(
+        workspace_io_metric_t::statement_cache_misses,
+        global_statement_cache_misses().load(std::memory_order_relaxed));
     return result;
 }
 
@@ -11460,7 +11671,14 @@ workspace_database_t::drain(std::chrono::steady_clock::time_point deadline) {
     }
     std::lock_guard<std::mutex> lock(state_->close_mutex);
     std::lock_guard<std::timed_mutex> writer_lock(state_->writer_mutex);
+    state_->coalesce_progress.reset();
+    if (state_->reader_pool)
+        state_->reader_pool->close();
     if (state_->writer) {
+        if (state_->writer_statements) {
+            sqlite_statement_cache_unregister(state_->writer);
+            state_->writer_statements.reset();
+        }
         const int checkpoint_status = final_passive_checkpoint(state_->writer);
         if (checkpoint_status != SQLITE_OK && checkpoint_status != SQLITE_BUSY) {
             return workspace_result_t<void>::failure(database_error(state_->writer,

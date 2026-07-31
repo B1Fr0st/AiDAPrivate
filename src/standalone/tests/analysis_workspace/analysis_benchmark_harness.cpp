@@ -13,6 +13,7 @@
 #include "../../src/core/mcp/registry/tool_registry.hpp"
 #include "../../src/core/analysis/tile_decode_orchestrator.hpp"
 #include "../../src/core/analysis/benchmark/benchmark_runner.hpp"
+#include "../../src/core/analysis/benchmark/benchmark_scorecard.hpp"
 
 #include <algorithm>
 #include <array>
@@ -687,6 +688,41 @@ json instrumentation_summary(const analysis_metrics_snapshot_t& snapshot)
                     static_cast<double>(value(analysis_metric_t::decompile_batch_wall_ns)))}}}};
 }
 
+json background_batch_block(const analysis_metrics_snapshot_t& before,
+                            const analysis_metrics_snapshot_t& after,
+                            bool metrics_available)
+{
+    if (!metrics_available)
+        return json{{"engine", "parallel_batch"}, {"status", "not_applicable"},
+            {"reason", "workspace_background_metrics_unavailable"},
+            {"funcs_per_s", nullptr}};
+    const auto delta = [&](analysis_metric_t metric) {
+        const auto after_value = after.value(metric);
+        const auto before_value = before.value(metric);
+        return after_value >= before_value ? after_value - before_value : 0ULL;
+    };
+    const auto calls = delta(analysis_metric_t::decompile_batch_calls);
+    const auto completed = delta(analysis_metric_t::decompile_batch_completed);
+    const auto wall_ns = delta(analysis_metric_t::decompile_batch_wall_ns);
+    const auto memory_hits = delta(analysis_metric_t::decompile_memory_cache_hits);
+    const auto persistent_hits = delta(analysis_metric_t::decompile_persistent_cache_hits);
+    return json{{"engine", "parallel_batch"}, {"wiring", "registry_orchestrator"},
+        {"calls", calls}, {"completed", completed},
+        {"failed", delta(analysis_metric_t::decompile_batch_failed)},
+        {"cancelled", delta(analysis_metric_t::decompile_batch_cancelled)},
+        {"wall_ns", wall_ns},
+        {"queue_depth_peak", after.value(analysis_metric_t::decompile_batch_queue_depth_peak) >=
+                before.value(analysis_metric_t::decompile_batch_queue_depth_peak)
+            ? after.value(analysis_metric_t::decompile_batch_queue_depth_peak)
+            : before.value(analysis_metric_t::decompile_batch_queue_depth_peak)},
+        {"memory_cache_hits", memory_hits},
+        {"persistent_cache_hits", persistent_hits},
+        {"cache_hit_rate", calls == 0 ? json(nullptr) : json(
+            static_cast<double>(memory_hits + persistent_hits) / static_cast<double>(calls))},
+        {"funcs_per_s", wall_ns == 0 ? json(nullptr) : json(
+            static_cast<double>(completed) * 1000000000.0 / static_cast<double>(wall_ns))}};
+}
+
 json measured_percentile(std::vector<std::uint64_t> values, double rank)
 {
     if (values.size() < 2) return nullptr;
@@ -1132,6 +1168,7 @@ json run_measurement(const std::filesystem::path& path, const measurement_option
         const auto cold_wall_ns = nanoseconds_since(cold_begin);
         if (options.publication_callback)
             options.publication_callback(workspace);
+        const auto published_metrics = benchmark::harvest_workspace_baseline_metrics(workspace);
         const auto runtime_after = aida::infra::taskflow_runtime::active_snapshot();
         const workspace_identity_t cold_identity = workspace->identity();
         const auto cold_analysis_revision = workspace->analysis_revision();
@@ -1188,8 +1225,17 @@ json run_measurement(const std::filesystem::path& path, const measurement_option
         report["warm_reopen"] = std::move(warm_reopen);
         analysis_metrics_t interaction_metrics(workspace->generation());
         interaction_metrics.sample_process_memory();
+        const auto background_metrics = workspace->background_metrics();
+        analysis_metrics_snapshot_t background_before;
+        if (background_metrics)
+            background_before = background_metrics->snapshot();
         report["mcp"] = mcp_measurement(workspace, interaction_metrics);
         report["decompiler"] = decompiler_measurements(workspace, interaction_metrics);
+        analysis_metrics_snapshot_t background_after;
+        if (background_metrics)
+            background_after = background_metrics->snapshot();
+        report["background_decompile_batch"] = background_batch_block(
+            background_before, background_after, background_metrics != nullptr);
         interaction_metrics.sample_process_memory();
         interaction_metrics.mark_finished();
         report["interaction_instrumentation"] =
@@ -1198,47 +1244,82 @@ json run_measurement(const std::filesystem::path& path, const measurement_option
             database_measurement(workspace->database()->snapshot());
         close_workspace(workspace, true);
         workspace.reset();
-        workspace = open_benchmark_workspace(path, 2, nullptr, options.pin_profile);
-        const auto instrumented_memory_before = process_memory_snapshot();
-        const auto instrumented_begin = steady_clock_t::now();
-        auto instrumented = analyze_workspace_instrumented(workspace, options.worker_lanes);
-        const auto instrumented_snapshot = instrumented->snapshot();
-        const auto published_snapshot = workspace->snapshot();
-        const auto published_search = workspace->search_index();
-        if (!published_snapshot || !published_search ||
-            instrumented_snapshot.value(analysis_metric_t::file_bytes) !=
-                workspace->provider().size() ||
-            instrumented_snapshot.value(analysis_metric_t::executable_bytes) != code_bytes ||
-            instrumented_snapshot.value(analysis_metric_t::mapped_bytes) == 0 ||
-            instrumented_snapshot.value(analysis_metric_t::read_bytes) == 0 ||
-            instrumented_snapshot.value(analysis_metric_t::decoded_bytes) == 0 ||
-            instrumented_snapshot.value(analysis_metric_t::indexed_bytes) == 0 ||
-            instrumented_snapshot.value(analysis_metric_t::instructions) !=
-                published_snapshot->instructions.size() ||
-            instrumented_snapshot.value(analysis_metric_t::blocks) !=
-                published_snapshot->blocks.size() ||
-            instrumented_snapshot.value(analysis_metric_t::functions) !=
-                published_snapshot->functions.size() ||
-            instrumented_snapshot.value(analysis_metric_t::xrefs) !=
-                published_snapshot->xrefs.size() ||
-            instrumented_snapshot.value(analysis_metric_t::strings) !=
-                published_snapshot->strings.size() ||
-            instrumented_snapshot.value(analysis_metric_t::types) !=
-                published_search->types().size() ||
-            instrumented_snapshot.value(analysis_metric_t::database_bytes) == 0 ||
-            instrumented_snapshot.value(analysis_metric_t::peak_private_bytes) == 0)
-            throw aida::analysis::test_fixture::fixture_error_t(
-                "instrumented engine counters did not bind the published normalized baseline");
-        report["instrumented_engine"] = json{{"wall_ns", nanoseconds_since(instrumented_begin)},
-            {"cache_state", "cold_instrumented_phases"},
-            {"metrics", json::parse(instrumented_snapshot.to_json())},
-            {"summary", instrumentation_summary(instrumented_snapshot)},
-            {"memory_before", instrumented_memory_before},
-            {"memory_after", process_memory_snapshot()},
-            {"database", database_measurement(workspace->database()->snapshot())},
-            {"counts", snapshot_counts(*published_snapshot, published_search)}};
-        close_workspace(workspace, true);
-        workspace.reset();
+        if (published_metrics) {
+            const auto& metrics_snapshot = *published_metrics;
+            const auto counter = [&](analysis_metric_t metric) {
+                return metrics_snapshot.value(metric);
+            };
+            if (counter(analysis_metric_t::file_bytes) != report["cold"].value("file_bytes", 0ULL) ||
+                counter(analysis_metric_t::executable_bytes) != code_bytes ||
+                counter(analysis_metric_t::mapped_bytes) == 0 ||
+                counter(analysis_metric_t::read_bytes) == 0 ||
+                counter(analysis_metric_t::decoded_bytes) == 0 ||
+                counter(analysis_metric_t::indexed_bytes) == 0 ||
+                counter(analysis_metric_t::instructions) !=
+                    cold_counts.value("instructions", 0ULL) ||
+                counter(analysis_metric_t::blocks) != cold_counts.value("blocks", 0ULL) ||
+                counter(analysis_metric_t::functions) != cold_counts.value("functions", 0ULL) ||
+                counter(analysis_metric_t::xrefs) != cold_counts.value("xrefs", 0ULL) ||
+                counter(analysis_metric_t::strings) != cold_counts.value("strings", 0ULL) ||
+                counter(analysis_metric_t::types) != cold_counts.value("types", 0ULL) ||
+                counter(analysis_metric_t::database_bytes) == 0 ||
+                counter(analysis_metric_t::peak_private_bytes) == 0)
+                throw aida::analysis::test_fixture::fixture_error_t(
+                    "published baseline metrics did not bind the cold published normalized baseline");
+            report["instrumented_engine"] = json{
+                {"wall_ns", metrics_snapshot.wall_ns},
+                {"cache_state", "cold_graph_published_metrics"},
+                {"source", "workspace_last_baseline_metrics"},
+                {"metrics", json::parse(metrics_snapshot.to_json())},
+                {"summary", instrumentation_summary(metrics_snapshot)},
+                {"memory_before", cold_memory_before},
+                {"memory_after", report["cold"]["memory_after"]},
+                {"database", report["cold"]["database"]},
+                {"counts", cold_counts}};
+        } else {
+            workspace = open_benchmark_workspace(path, 2, nullptr, options.pin_profile);
+            const auto instrumented_memory_before = process_memory_snapshot();
+            const auto instrumented_begin = steady_clock_t::now();
+            auto instrumented = analyze_workspace_instrumented(workspace, options.worker_lanes);
+            const auto instrumented_snapshot = instrumented->snapshot();
+            const auto published_snapshot = workspace->snapshot();
+            const auto published_search = workspace->search_index();
+            if (!published_snapshot || !published_search ||
+                instrumented_snapshot.value(analysis_metric_t::file_bytes) !=
+                    workspace->provider().size() ||
+                instrumented_snapshot.value(analysis_metric_t::executable_bytes) != code_bytes ||
+                instrumented_snapshot.value(analysis_metric_t::mapped_bytes) == 0 ||
+                instrumented_snapshot.value(analysis_metric_t::read_bytes) == 0 ||
+                instrumented_snapshot.value(analysis_metric_t::decoded_bytes) == 0 ||
+                instrumented_snapshot.value(analysis_metric_t::indexed_bytes) == 0 ||
+                instrumented_snapshot.value(analysis_metric_t::instructions) !=
+                    published_snapshot->instructions.size() ||
+                instrumented_snapshot.value(analysis_metric_t::blocks) !=
+                    published_snapshot->blocks.size() ||
+                instrumented_snapshot.value(analysis_metric_t::functions) !=
+                    published_snapshot->functions.size() ||
+                instrumented_snapshot.value(analysis_metric_t::xrefs) !=
+                    published_snapshot->xrefs.size() ||
+                instrumented_snapshot.value(analysis_metric_t::strings) !=
+                    published_snapshot->strings.size() ||
+                instrumented_snapshot.value(analysis_metric_t::types) !=
+                    published_search->types().size() ||
+                instrumented_snapshot.value(analysis_metric_t::database_bytes) == 0 ||
+                instrumented_snapshot.value(analysis_metric_t::peak_private_bytes) == 0)
+                throw aida::analysis::test_fixture::fixture_error_t(
+                    "instrumented engine counters did not bind the published normalized baseline");
+            report["instrumented_engine"] = json{{"wall_ns", nanoseconds_since(instrumented_begin)},
+                {"cache_state", "cold_instrumented_phases"},
+                {"source", "direct_instrumented_analyzer"},
+                {"metrics", json::parse(instrumented_snapshot.to_json())},
+                {"summary", instrumentation_summary(instrumented_snapshot)},
+                {"memory_before", instrumented_memory_before},
+                {"memory_after", process_memory_snapshot()},
+                {"database", database_measurement(workspace->database()->snapshot())},
+                {"counts", snapshot_counts(*published_snapshot, published_search)}};
+            close_workspace(workspace, true);
+            workspace.reset();
+        }
         if (options.skip_concurrent) {
             report["concurrent_fairness"] = json{{"skipped", true},
                 {"reason", "pinned_measurement_mode"}};
@@ -1386,6 +1467,7 @@ struct sla_measurement_context_t {
     double scaling_wall16_over_wall1 = -1.0;
     double scaling_efficiency_16 = -1.0;
     bool scaling_gate_applicable = false;
+    const json* decompile_funcs_per_s = nullptr;
 };
 
 json sla_verdict(const char* key, const json& target, const json& actual,
@@ -1484,10 +1566,22 @@ json evaluate_program_sla(const sla_measurement_context_t& context)
             thresholds["global_mapped_bytes_max"].get<std::uint64_t>(),
             mapped == 0 ? std::optional<std::uint64_t>{} : std::optional<std::uint64_t>(mapped));
     }
-    verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_min",
-        thresholds["decompile_all_funcs_per_s_min"], nullptr, "NOT_MEASURED"));
-    verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_stretch",
-        thresholds["decompile_all_funcs_per_s_stretch"], nullptr, "NOT_MEASURED"));
+    if (context.decompile_funcs_per_s && context.decompile_funcs_per_s->is_number()) {
+        const double funcs_per_s = context.decompile_funcs_per_s->get<double>();
+        verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_min",
+            thresholds["decompile_all_funcs_per_s_min"], funcs_per_s,
+            funcs_per_s >= thresholds["decompile_all_funcs_per_s_min"].get<double>()
+                ? "PASS" : "FAIL"));
+        verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_stretch",
+            thresholds["decompile_all_funcs_per_s_stretch"], funcs_per_s,
+            funcs_per_s >= thresholds["decompile_all_funcs_per_s_stretch"].get<double>()
+                ? "PASS" : "WARN"));
+    } else {
+        verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_min",
+            thresholds["decompile_all_funcs_per_s_min"], nullptr, "NOT_MEASURED"));
+        verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_stretch",
+            thresholds["decompile_all_funcs_per_s_stretch"], nullptr, "NOT_MEASURED"));
+    }
     if (context.scaling_gate_applicable) {
         verdicts.push_back(sla_verdict("scaling_wall16_over_wall1_max",
             thresholds["scaling_wall16_over_wall1_max"], context.scaling_wall16_over_wall1,
@@ -1606,6 +1700,7 @@ struct scorecard_input_t {
     bool load_profile_pinned = true;
     const json* scaling = nullptr;
     const json* determinism = nullptr;
+    const json* decompile_batch = nullptr;
 };
 
 json build_scorecard(const scorecard_input_t& input)
@@ -1614,18 +1709,35 @@ json build_scorecard(const scorecard_input_t& input)
     const auto& metrics = *input.metrics;
     const auto& sla = *input.program_sla;
     const std::uint64_t tasks_completed = metrics_counter(metrics, "tasks_completed");
+    const std::uint64_t slots_busy = metrics_counter(metrics, "worker_slots_busy_ns");
     const std::uint64_t slots_scheduled = metrics_counter(metrics, "worker_slots_scheduled_ns");
     const std::uint64_t depth_samples = metrics_counter(metrics, "queue_depth_samples");
     const std::uint64_t logical_bytes = metrics_counter(metrics, "database_logical_bytes");
+    const std::uint64_t cold_wall_ns = report["cold"].value("wall_ns", 0ULL);
+    const std::uint64_t host_logical =
+        (std::max<std::uint64_t>)(1, report["host"].value("logical_processors", 0U));
+    json parallelism_efficiency = nullptr;
+    if (cold_wall_ns != 0 && slots_busy != 0) {
+        parallelism_efficiency = (std::min)(1.0, static_cast<double>(slots_busy) /
+            (static_cast<double>(cold_wall_ns) * static_cast<double>(host_logical)));
+    }
     json scorecard{
-        {"scorecard_schema", "aida.hyperperf.program-scorecard"},
-        {"scorecard_schema_version", 1},
+        {"scorecard_schema", benchmark::scorecard_schema_v2},
+        {"scorecard_schema_version", benchmark::scorecard_schema_v2_version},
         {"run_id", benchmark_run_id()},
         {"mode", input.mode},
         {"claim_status", "measurement_only"},
+        {"claim", json{
+            {"tracks", json::array({
+                json{{"id", "auto_analysis_wall"},
+                    {"definition", "cold wall_ns open-to-baseline_ready at or below total_wall_ms_max_300mb on a 300..500MB real binary"}},
+                json{{"id", "batch_decompile_throughput"},
+                    {"definition", "decompile_all_funcs_per_s on the parallel production batch engine; a throughput claim, never a minutes claim"}}})},
+            {"real_mode_invocation",
+                "analysis_benchmark_harness real <path>, or Test Lab analysis_benchmark_real_300mb with AIDA_BENCHMARK_REAL_PE=<path>"}}},
         {"run", json{{"lanes", input.lanes},
             {"load_profile_pinned", input.load_profile_pinned},
-            {"wall_ns", report["cold"].value("wall_ns", 0ULL)},
+            {"wall_ns", cold_wall_ns},
             {"process_cpu_ns", metrics.value("process_cpu_ns", 0ULL)},
             {"analysis_revision", report["warm_reopen"].value("analysis_revision", 0ULL)},
             {"overlay_revision", report["warm_reopen"].value("overlay_revision", 0ULL)},
@@ -1633,11 +1745,16 @@ json build_scorecard(const scorecard_input_t& input)
         {"phases", scorecard_phases(metrics)},
         {"throughput", *input.throughput},
         {"worker_pool", json{
+            {"status", "measured"},
+            {"slots_busy_ns", slots_busy},
+            {"slots_scheduled_ns", slots_scheduled},
             {"utilization", slots_scheduled == 0 ? json(nullptr) : json(static_cast<double>(
-                metrics_counter(metrics, "worker_slots_busy_ns")) /
-                static_cast<double>(slots_scheduled))},
+                slots_busy) / static_cast<double>(slots_scheduled))},
+            {"parallelism_efficiency", parallelism_efficiency},
+            {"logical_cores", host_logical},
             {"queue_wait_mean_ns", tasks_completed == 0 ? json(nullptr) : json(
                 metrics_counter(metrics, "queue_wait_ns_total") / tasks_completed)},
+            {"queue_wait_ns_total", metrics_counter(metrics, "queue_wait_ns_total")},
             {"queue_wait_max_ns", metrics_counter(metrics, "queue_wait_max_ns")},
             {"queue_depth_mean", depth_samples == 0 ? json(nullptr) : json(static_cast<double>(
                 metrics_counter(metrics, "queue_depth_sum")) /
@@ -1655,7 +1772,8 @@ json build_scorecard(const scorecard_input_t& input)
             {"invalid_bytes", metrics_counter(metrics, "decode_invalid_bytes")},
             {"duplicate_instructions", metrics_counter(metrics, "decode_duplicate_instructions")},
             {"merge_ns", metrics_counter(metrics, "decode_merge_ns")},
-            {"lane_wall_ns_max", metrics_counter(metrics, "decode_lane_wall_ns_max")}}},
+            {"lane_wall_ns_max", metrics_counter(metrics, "decode_lane_wall_ns_max")},
+            {"bytes_attempted", metrics_counter(metrics, "decode_bytes_attempted")}}},
         {"memory", *input.memory},
         {"persistence", json{
             {"database_bytes", report["cold"]["database"].value("database_bytes", 0ULL)},
@@ -1670,6 +1788,10 @@ json build_scorecard(const scorecard_input_t& input)
             {"queue_depth_peak", metrics_counter(metrics, "persist_queue_depth_peak")},
             {"pages_written", metrics_counter(metrics, "persist_pages_written")},
             {"wal_bytes_peak", metrics_counter(metrics, "persist_wal_bytes_peak")}}},
+        {"decompile", input.decompile_batch ? *input.decompile_batch
+            : json{{"engine", "parallel_batch"}, {"status", "not_applicable"},
+                {"reason", "background_batch_window_not_measured"},
+                {"funcs_per_s", nullptr}}},
         {"interaction", json{
             {"warm_reopen_ms", report["warm_reopen"]["wall_ns"].is_number()
                 ? json(static_cast<double>(
@@ -1699,8 +1821,18 @@ json build_scorecard(const scorecard_input_t& input)
                         report["cancellation"]["request_to_completion_ns"].get<std::uint64_t>()) /
                         1000000.0)
                     : json(nullptr)}}},
+        {"counts", json{
+            {"instructions", metrics_counter(metrics, "instructions")},
+            {"blocks", metrics_counter(metrics, "blocks")},
+            {"functions", metrics_counter(metrics, "functions")},
+            {"xrefs", metrics_counter(metrics, "xrefs")},
+            {"strings", metrics_counter(metrics, "strings")},
+            {"symbols", metrics_counter(metrics, "symbols")},
+            {"types", metrics_counter(metrics, "types")},
+            {"decoded_bytes", metrics_counter(metrics, "decoded_bytes")}}},
         {"sla", sla},
         {"artifacts", json{{"report_json", nullptr},
+            {"baseline_json", nullptr},
             {"compare_verdict_json", nullptr}, {"receipt_json", nullptr}}},
         {"verdict", sla.value("overall", std::string("NOT_MEASURED")) == "FAIL" ? "FAIL" : "PASS"}};
     if (input.scaling)
@@ -1913,11 +2045,13 @@ int run_synthetic_mode(std::uint32_t code_mb, std::uint64_t seed, std::uint32_t 
     report["throughput"] = throughput;
     const auto memory = memory_block(report, metrics);
     report["memory"] = memory;
+    const auto background_batch = report["background_decompile_batch"];
     sla_measurement_context_t sla_context;
     sla_context.report = &report;
     sla_context.metrics = &metrics;
     sla_context.throughput = &throughput;
     sla_context.wall_scale = static_cast<double>(code_mb) / 300.0;
+    sla_context.decompile_funcs_per_s = &background_batch["funcs_per_s"];
     auto program_sla = evaluate_program_sla(sla_context);
     report["program_sla"] = program_sla;
     scorecard_input_t scorecard_input;
@@ -1929,6 +2063,7 @@ int run_synthetic_mode(std::uint32_t code_mb, std::uint64_t seed, std::uint32_t 
     scorecard_input.program_sla = &program_sla;
     scorecard_input.lanes = lanes;
     scorecard_input.load_profile_pinned = true;
+    scorecard_input.decompile_batch = &background_batch;
     report["scorecard"] = build_scorecard(scorecard_input);
     report["scorecard"]["fixture"] = report["fixture"];
     report["scorecard"]["host"] = report["host"];
@@ -2027,6 +2162,7 @@ int run_scaling_mode(std::uint32_t code_mb, std::uint64_t seed,
     const auto metrics = last_report["instrumented_engine"]["metrics"];
     const auto throughput = throughput_block(last_report, metrics);
     const auto memory = memory_block(last_report, metrics);
+    const auto background_batch = last_report["background_decompile_batch"];
     sla_measurement_context_t sla_context;
     sla_context.report = &last_report;
     sla_context.metrics = &metrics;
@@ -2036,6 +2172,7 @@ int run_scaling_mode(std::uint32_t code_mb, std::uint64_t seed,
     sla_context.scaling_wall16_over_wall1 = wall16_over_wall1;
     sla_context.scaling_efficiency_16 = efficiency_16;
     sla_context.scaling_gate_applicable = scaling_gate_applicable;
+    sla_context.decompile_funcs_per_s = &background_batch["funcs_per_s"];
     auto program_sla = evaluate_program_sla(sla_context);
 
     json scaling_block = json{{"lanes", std::move(lane_values)},
@@ -2070,6 +2207,7 @@ int run_scaling_mode(std::uint32_t code_mb, std::uint64_t seed,
     scorecard_input.load_profile_pinned = true;
     scorecard_input.scaling = &scaling_block;
     scorecard_input.determinism = &hash_manifest;
+    scorecard_input.decompile_batch = &background_batch;
     last_report["scorecard"] = build_scorecard(scorecard_input);
     last_report["scorecard"]["fixture"] = last_report["fixture"];
     last_report["scorecard"]["host"] = last_report["host"];
@@ -2117,12 +2255,14 @@ int run_determinism_mode(std::uint32_t code_mb, std::uint64_t seed,
     const auto metrics = report["instrumented_engine"]["metrics"];
     const auto throughput = throughput_block(report, metrics);
     const auto memory = memory_block(report, metrics);
+    const auto background_batch = report["background_decompile_batch"];
     sla_measurement_context_t sla_context;
     sla_context.report = &report;
     sla_context.metrics = &metrics;
     sla_context.throughput = &throughput;
     sla_context.wall_scale = static_cast<double>(code_mb) / 300.0;
     sla_context.determinism_match = &hash_match;
+    sla_context.decompile_funcs_per_s = &background_batch["funcs_per_s"];
     auto program_sla = evaluate_program_sla(sla_context);
 
     report["fixture"]["generator"] = json{{"kind", "synthetic_large_pe64"},
@@ -2144,6 +2284,7 @@ int run_determinism_mode(std::uint32_t code_mb, std::uint64_t seed,
     scorecard_input.lanes = 16;
     scorecard_input.load_profile_pinned = true;
     scorecard_input.determinism = &hash_manifest;
+    scorecard_input.decompile_batch = &background_batch;
     report["scorecard"] = build_scorecard(scorecard_input);
     report["scorecard"]["fixture"] = report["fixture"];
     report["scorecard"]["host"] = report["host"];
@@ -2208,6 +2349,205 @@ int run_determinism_hw_mode(std::uint32_t code_mb, std::uint64_t seed,
         throw fixture_error_t("production determinism-hw SLA key determinism_hash_match did not PASS");
     emit_benchmark_report(scorecard, out);
     return 0;
+}
+
+int run_real_mode(const std::filesystem::path& path,
+                  const std::optional<std::filesystem::path>& out)
+{
+    measurement_options_t options;
+    options.benchmark_mode = "real";
+    options.claim_status = "measurement_candidate";
+    options.release_qualification = true;
+    options.pin_profile = false;
+    options.skip_concurrent = true;
+    options.worker_lanes = 0;
+    auto report = run_measurement(std::filesystem::absolute(path), options);
+    const auto metrics = report["instrumented_engine"]["metrics"];
+    const auto throughput = throughput_block(report, metrics);
+    const auto memory = memory_block(report, metrics);
+    const auto background_batch = report["background_decompile_batch"];
+    report["throughput"] = throughput;
+    report["memory"] = memory;
+    report["fixture"]["kind"] = "real";
+    report["fixture"]["size_bytes"] = report["fixture"]["size"];
+    sla_measurement_context_t sla_context;
+    sla_context.report = &report;
+    sla_context.metrics = &metrics;
+    sla_context.throughput = &throughput;
+    sla_context.wall_scale = 1.0;
+    sla_context.decompile_funcs_per_s = &background_batch["funcs_per_s"];
+    auto program_sla = evaluate_program_sla(sla_context);
+    report["program_sla"] = program_sla;
+    scorecard_input_t scorecard_input;
+    scorecard_input.mode = "real";
+    scorecard_input.report = &report;
+    scorecard_input.metrics = &metrics;
+    scorecard_input.throughput = &throughput;
+    scorecard_input.memory = &memory;
+    scorecard_input.program_sla = &program_sla;
+    scorecard_input.lanes = 0;
+    scorecard_input.load_profile_pinned = false;
+    scorecard_input.decompile_batch = &background_batch;
+    report["scorecard"] = build_scorecard(scorecard_input);
+    report["scorecard"]["fixture"] = report["fixture"];
+    report["scorecard"]["host"] = report["host"];
+    emit_benchmark_report(report, out);
+    return program_sla.value("overall", std::string()) == "FAIL" ? 1 : 0;
+}
+
+std::string seed_hex_text(std::uint64_t seed)
+{
+    char buffer[24]{};
+    _snprintf_s(buffer, sizeof(buffer), _TRUNCATE, "0x%llX",
+        static_cast<unsigned long long>(seed));
+    return buffer;
+}
+
+int run_synthetic_compare_mode(std::uint32_t code_mb, std::uint64_t seed,
+                               const std::filesystem::path& baseline_path,
+                               bool update_baseline,
+                               const std::optional<std::filesystem::path>& out)
+{
+    json baseline;
+    {
+        std::ifstream stream(baseline_path, std::ios::binary);
+        if (!stream)
+            throw fixture_error_t("structural baseline is unavailable: " +
+                baseline_path.u8string());
+        try {
+            stream >> baseline;
+        } catch (const json::exception& exception) {
+            throw fixture_error_t(std::string("structural baseline JSON is invalid: ") +
+                exception.what());
+        }
+    }
+    if (baseline.value("schema", std::string()) != benchmark::structural_baseline_schema_v1 ||
+        baseline.value("schema_version", 0U) != benchmark::structural_baseline_schema_v1_version)
+        throw fixture_error_t("structural baseline schema marker is missing or unsupported");
+    if (baseline.value("code_mb", 0U) != code_mb)
+        throw fixture_error_t("structural baseline code_mb does not match the requested fixture");
+    if (baseline.value("seed_hex", std::string()) != seed_hex_text(seed))
+        throw fixture_error_t("structural baseline seed_hex does not match the requested fixture");
+
+    large_pe_params_t params;
+    params.code_bytes = static_cast<std::uint64_t>(code_mb) * 1024ULL * 1024ULL;
+    params.seed = seed;
+    params = validated_large_pe_params(params);
+    const auto manifest = describe_large_pe(params);
+    assert_synthetic_within_limits(manifest);
+    fixture_root_t root("synthetic_compare_benchmark");
+    const auto fixture_path = root.path() / "synthetic.exe";
+    write_large_pe64(fixture_path, params);
+    assert_fixture_digest(fixture_path, params);
+
+    snapshot_hash_result_t captured;
+    measurement_options_t options;
+    options.benchmark_mode = "synthetic_compare";
+    options.claim_status = "measurement_only";
+    options.pin_profile = true;
+    options.skip_concurrent = true;
+    options.worker_lanes = 0;
+    options.publication_callback = [&](const std::shared_ptr<analysis_workspace_t>& workspace) {
+        captured = capture_publication_hash(workspace);
+    };
+    auto report = run_measurement(fixture_path, options);
+    const auto metrics = report["instrumented_engine"]["metrics"];
+    const auto throughput = throughput_block(report, metrics);
+    const auto memory = memory_block(report, metrics);
+    const auto background_batch = report["background_decompile_batch"];
+    report["throughput"] = throughput;
+    report["memory"] = memory;
+    report["fixture"]["generator"] = json{{"kind", "synthetic_large_pe64"},
+        {"params", large_pe_params_json(params)},
+        {"manifest", large_pe_manifest_json(manifest)}};
+    report["fixture"]["kind"] = "synthetic";
+    report["fixture"]["size_bytes"] = report["fixture"]["size"];
+    sla_measurement_context_t sla_context;
+    sla_context.report = &report;
+    sla_context.metrics = &metrics;
+    sla_context.throughput = &throughput;
+    sla_context.wall_scale = static_cast<double>(code_mb) / 300.0;
+    sla_context.determinism_match = nullptr;
+    sla_context.decompile_funcs_per_s = &background_batch["funcs_per_s"];
+    auto program_sla = evaluate_program_sla(sla_context);
+    report["program_sla"] = program_sla;
+    scorecard_input_t scorecard_input;
+    scorecard_input.mode = "synthetic_compare";
+    scorecard_input.report = &report;
+    scorecard_input.metrics = &metrics;
+    scorecard_input.throughput = &throughput;
+    scorecard_input.memory = &memory;
+    scorecard_input.program_sla = &program_sla;
+    scorecard_input.lanes = 0;
+    scorecard_input.load_profile_pinned = true;
+    scorecard_input.decompile_batch = &background_batch;
+    report["scorecard"] = build_scorecard(scorecard_input);
+    report["scorecard"]["fixture"] = report["fixture"];
+    report["scorecard"]["host"] = report["host"];
+
+    const std::uint64_t logical_bytes = metrics_counter(metrics, "database_logical_bytes");
+    const std::uint64_t written_bytes = metrics_counter(metrics, "database_bytes_written");
+    const json write_amplification = logical_bytes == 0 ? json(nullptr)
+        : json(static_cast<double>(written_bytes) / static_cast<double>(logical_bytes));
+    json scorecard_blocks = json::object();
+    if (baseline.contains("contract") && baseline["contract"].is_object() &&
+        baseline["contract"].contains("required_scorecard_blocks") &&
+        baseline["contract"]["required_scorecard_blocks"].is_array()) {
+        for (const auto& block : baseline["contract"]["required_scorecard_blocks"]) {
+            const auto name = block.get<std::string>();
+            scorecard_blocks[name] = report["scorecard"].contains(name) &&
+                !report["scorecard"][name].is_null();
+        }
+    }
+    json candidate = json{
+        {"schema", benchmark::structural_baseline_schema_v1},
+        {"schema_version", benchmark::structural_baseline_schema_v1_version},
+        {"code_mb", code_mb},
+        {"seed_hex", seed_hex_text(seed)},
+        {"capture", json{
+            {"status", "captured"},
+            {"snapshot_sha256", captured.manifest_sha256},
+            {"counts", json{
+                {"instructions", metrics_counter(metrics, "instructions")},
+                {"blocks", metrics_counter(metrics, "blocks")},
+                {"functions", metrics_counter(metrics, "functions")},
+                {"xrefs", metrics_counter(metrics, "xrefs")},
+                {"strings", metrics_counter(metrics, "strings")},
+                {"types", metrics_counter(metrics, "types")},
+                {"decoded_bytes", metrics_counter(metrics, "decoded_bytes")}}},
+            {"write_amplification", write_amplification},
+            {"phases_present", benchmark::metrics_phase_names_from_json(metrics)},
+            {"scorecard_schema_version",
+                report["scorecard"].value("scorecard_schema_version", 0U)},
+            {"scorecard_blocks", std::move(scorecard_blocks)}}}};
+
+    auto verdict = benchmark::compare_structural_baseline(baseline, candidate);
+    verdict["baseline"] = baseline_path.u8string();
+    if (update_baseline) {
+        if (!benchmark::structural_compare_update_allowed(verdict)) {
+            verdict["baseline_updated"] = false;
+            verdict["baseline_update_refused"] =
+                "contract checks failed; the baseline is only rewritten after a structural PASS";
+        } else {
+            candidate["contract"] = baseline.contains("contract") &&
+                    baseline["contract"].is_object()
+                ? baseline["contract"] : json::object();
+            std::ofstream stream(baseline_path, std::ios::binary | std::ios::trunc);
+            if (!stream)
+                throw fixture_error_t("unable to rewrite the structural baseline: " +
+                    baseline_path.u8string());
+            stream << candidate.dump(2) << '\n';
+            stream.flush();
+            if (!stream)
+                throw fixture_error_t("structural baseline rewrite failed: " +
+                    baseline_path.u8string());
+            verdict["baseline_updated"] = true;
+        }
+    } else {
+        verdict["baseline_updated"] = false;
+    }
+    emit_benchmark_report(verdict, out);
+    return verdict.value("overall", std::string()) == "FAIL" ? 1 : 0;
 }
 
 int run_compare_mode(const std::filesystem::path& baseline_path,
@@ -2362,7 +2702,7 @@ int main(int argc, char** argv)
         }
         if (args.empty())
             throw aida::analysis::test_fixture::fixture_error_t(
-                "usage: analysis_benchmark_harness <deterministic_component|release_sla|synthetic|scaling|determinism|determinism_hw|compare> ...");
+                "usage: analysis_benchmark_harness <deterministic_component|release_sla|synthetic|scaling|determinism|determinism_hw|real|synthetic_compare|compare> ...");
         const std::string& mode = args[0];
         if ((mode == "deterministic_component" || mode == "release_sla") && args.size() == 2)
             return run_legacy_mode(mode, std::filesystem::u8path(args[1]), out_path);
@@ -2389,11 +2729,24 @@ int main(int argc, char** argv)
             return run_determinism_mode(parse_code_mb(args[1]), parse_seed_hex(args[2]), out_path);
         if (mode == "determinism_hw" && args.size() == 3)
             return run_determinism_hw_mode(parse_code_mb(args[1]), parse_seed_hex(args[2]), out_path);
+        if (mode == "real" && args.size() == 2)
+            return run_real_mode(std::filesystem::u8path(args[1]), out_path);
+        if (mode == "synthetic_compare" && (args.size() == 4 || args.size() == 5)) {
+            bool update_baseline = false;
+            if (args.size() == 5) {
+                if (args[4] != "--update-baseline")
+                    throw aida::analysis::test_fixture::fixture_error_t(
+                        "synthetic_compare accepts only --update-baseline after <baseline.json>");
+                update_baseline = true;
+            }
+            return run_synthetic_compare_mode(parse_code_mb(args[1]), parse_seed_hex(args[2]),
+                std::filesystem::u8path(args[3]), update_baseline, out_path);
+        }
         if (mode == "compare" && args.size() == 3)
             return run_compare_mode(std::filesystem::u8path(args[1]),
                 std::filesystem::u8path(args[2]), out_path);
         throw aida::analysis::test_fixture::fixture_error_t(
-            "usage: analysis_benchmark_harness <deterministic_component|release_sla> <fixture> [--out <report.json>] | synthetic <code_mb> <seed_hex> [--lanes N] [--out <report.json>] | scaling <code_mb> <seed_hex> <lanes_csv> [--out <report.json>] | determinism <code_mb> <seed_hex> [--out <report.json>] | determinism_hw <code_mb> <seed_hex> [--out <report.json>] | compare <baseline.json> <candidate.json> [--out <verdict.json>]");
+            "usage: analysis_benchmark_harness <deterministic_component|release_sla> <fixture> [--out <report.json>] | synthetic <code_mb> <seed_hex> [--lanes N] [--out <report.json>] | scaling <code_mb> <seed_hex> <lanes_csv> [--out <report.json>] | determinism <code_mb> <seed_hex> [--out <report.json>] | determinism_hw <code_mb> <seed_hex> [--out <report.json>] | real <fixture> [--out <report.json>] | synthetic_compare <code_mb> <seed_hex> <baseline.json> [--update-baseline] [--out <verdict.json>] | compare <baseline.json> <candidate.json> [--out <verdict.json>]");
     } catch (const std::exception& error) {
         aida::analysis::c03_test::assertion_telemetry::record_exception(
             error.what());

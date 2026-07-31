@@ -12,6 +12,7 @@
 
 #include "kernel_symbols.hpp"
 #include "standalone_driver.hpp"
+#include "../infra/taskflow_runtime.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -25,7 +26,6 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -95,6 +95,7 @@ namespace kernel_symbols
         bool                                        g_from_cache       = false;
         bool                                        g_loader_active    = false;
         std::uint64_t                               g_generation       = 0;
+        std::uint64_t                               g_loader_job       = 0;
         std::shared_ptr<const snapshot_t>           g_snapshot;
 
         std::mutex                                  g_modules_mtx;
@@ -520,7 +521,8 @@ namespace kernel_symbols
             return true;
         }
 
-        void load_main(std::uint64_t gen) noexcept;
+        void load_main(std::uint64_t gen,
+                       const aida::infra::taskflow_runtime::cancellation_token_t* cancel) noexcept;
         void start_loader_locked()
         {
             g_loader_active = true;
@@ -532,19 +534,30 @@ namespace kernel_symbols
             diag::log_tagged_fmt("ksym", "loader armed gen=%llu tid=%lu",
                 static_cast<unsigned long long>(gen),
                 static_cast<unsigned long>(GetCurrentThreadId()));
-            try
-            {
-                std::thread([gen]() { load_main(gen); }).detach();
-            }
-            catch (const std::exception& ex)
+            aida::infra::taskflow_runtime::task_descriptor_t loader_desc;
+            loader_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::diagnostics;
+            loader_desc.owner_subsystem = "kernel_symbols";
+            loader_desc.label = "kernel_symbols.loader";
+            loader_desc.priority = 7;
+            loader_desc.shutdown_policy = "cancel_pending";
+            loader_desc.cancellable_body = [gen](
+                const aida::infra::taskflow_runtime::cancellation_token_t& token) {
+                load_main(gen, &token);
+            };
+            auto loader_submission = aida::infra::taskflow_runtime::submit(std::move(loader_desc));
+            if (!loader_submission.submitted)
             {
                 g_loader_active = false;
                 g_state = state_t::failed;
                 g_detail = "loader_spawn";
-                g_last_error = std::string("loader thread creation failed: ") + ex.what();
+                g_last_error = "loader spawn failed: " +
+                    (loader_submission.reject_reason.empty()
+                        ? std::string("rejected") : loader_submission.reject_reason);
                 diag::log_tagged_fmt("ksym", "loader spawn failed gen=%llu error=\"%s\"",
-                    static_cast<unsigned long long>(gen), ex.what());
+                    static_cast<unsigned long long>(gen), g_last_error.c_str());
+                return;
             }
+            g_loader_job = loader_submission.handle.id;
         }
 
         void finish_load(std::uint64_t gen, state_t result, const std::string& stage,
@@ -588,12 +601,16 @@ namespace kernel_symbols
             finish_load(gen, state_t::failed, stage, error, nullptr, load_ms, false, 0, 0, 0);
         }
 
-        void load_main(std::uint64_t gen) noexcept
+        void load_main(std::uint64_t gen,
+                       const aida::infra::taskflow_runtime::cancellation_token_t* cancel) noexcept
         {
             const auto t_start = std::chrono::steady_clock::now();
             const auto elapsed_ms = [&t_start]() {
                 return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - t_start).count());
+            };
+            const auto cancel_requested = [cancel]() {
+                return cancel && cancel->requested.load(std::memory_order_acquire);
             };
             try
             {
@@ -776,6 +793,13 @@ namespace kernel_symbols
                         elapsed_ms(), nullptr, 0, false, 0, 0, 0);
                     return;
                 }
+                if (cancel_requested())
+                {
+                    finish_load(gen, state_t::failed, "cancelled",
+                        "load cancelled by runtime shutdown", elapsed_ms(), nullptr, 0,
+                        false, 0, 0, 0);
+                    return;
+                }
 
                 const auto t_parse = std::chrono::steady_clock::now();
                 MemPDB::ParseOptions options;
@@ -816,6 +840,13 @@ namespace kernel_symbols
                 {
                     finish_load(gen, state_t::failed, "stale", "load superseded after parse",
                         elapsed_ms(), nullptr, 0, false, 0, 0, 0);
+                    return;
+                }
+                if (cancel_requested())
+                {
+                    finish_load(gen, state_t::failed, "cancelled",
+                        "load cancelled by runtime shutdown", elapsed_ms(), nullptr, 0,
+                        false, 0, 0, 0);
                     return;
                 }
 

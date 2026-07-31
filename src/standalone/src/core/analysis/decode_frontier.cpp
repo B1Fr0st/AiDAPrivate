@@ -1,9 +1,10 @@
 #include "decode_frontier.hpp"
 
+#include "frontier_pending_store.hpp"
+
 #include <algorithm>
 #include <deque>
 #include <limits>
-#include <map>
 #include <new>
 #include <string>
 #include <unordered_set>
@@ -145,9 +146,12 @@ struct claimed_flat_set_t final {
 }
 
 struct decode_frontier_t::impl_t final {
+    using pending_store_t =
+        frontier_pending_store_t<std::uint64_t, decode_frontier_seed_t>;
+
     struct tile_state_t final {
         decode_frontier_tile_t tile;
-        std::map<std::uint64_t, decode_frontier_seed_t> pending;
+        pending_store_t pending;
         claimed_flat_set_t claimed;
         bool in_queue = false;
     };
@@ -158,6 +162,7 @@ struct decode_frontier_t::impl_t final {
     std::uint64_t maximum_unique_seeds = 0;
     decode_frontier_snapshot_t counters;
     std::atomic<std::uint64_t>* shared_unique_seed_count = nullptr;
+    std::shared_ptr<frontier_pending_arena_t> pending_arena;
 
     void note_pending_insert(std::size_t index)
     {
@@ -267,9 +272,12 @@ workspace_result_t<decode_frontier_t> decode_frontier_t::build(
         impl->tiles = std::move(tiles);
         impl->maximum_unique_seeds = maximum_unique_seeds;
         impl->shared_unique_seed_count = shared_unique_seed_count;
+        impl->pending_arena = std::make_shared<frontier_pending_arena_t>();
         impl->states.reserve(impl->tiles.size());
-        for (const auto& tile : impl->tiles)
-            impl->states.push_back(impl_t::tile_state_t{tile, {}, {}});
+        for (const auto& tile : impl->tiles) {
+            impl->states.push_back(impl_t::tile_state_t{
+                tile, impl_t::pending_store_t(impl->pending_arena), {}});
+        }
         return workspace_result_t<decode_frontier_t>::success(
             decode_frontier_t(std::move(impl)));
     } catch (const std::bad_alloc&) {

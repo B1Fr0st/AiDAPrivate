@@ -40,6 +40,19 @@ void load_image_t::add_region(uint64_t start_va, std::vector<uint8_t>&& bytes)
 	regions_.push_back(std::move(r));
 }
 
+void load_image_t::add_region_view(uint64_t start_va, const uint8_t* view, size_t size,
+                                   std::shared_ptr<const void> owner)
+{
+	if (!view || size == 0)
+		throw ghidra::LowlevelError("isolated decompiler view region is invalid");
+	region_t r;
+	r.start_va = start_va;
+	r.view = view;
+	r.view_size = size;
+	r.owner = std::move(owner);
+	regions_.push_back(std::move(r));
+}
+
 load_image_t::load_image_t(const uint8_t* buffer,
                            size_t buffer_size,
                            uint64_t buffer_base,
@@ -284,16 +297,18 @@ void load_image_t::loadFill(ghidra::uint1* ptr, ghidra::int4 size, const ghidra:
 	}
 
 	for (auto& reg : regions_) {
-		if (reg.data.empty())
+		const uint8_t* reg_data = reg.effective_data();
+		const size_t reg_size = reg.effective_size();
+		if (!reg_data || reg_size == 0)
 			continue;
-		if (reg.data.size() > UINT64_MAX - reg.start_va)
+		if (reg_size > UINT64_MAX - reg.start_va)
 			throw ghidra::LowlevelError("isolated decompiler region address overflow");
-		uint64_t reg_end = reg.start_va + reg.data.size();
+		uint64_t reg_end = reg.start_va + reg_size;
 		if (offset >= reg.start_va && offset < reg_end) {
 			size_t buf_off = static_cast<size_t>(offset - reg.start_va);
-			size_t avail = reg.data.size() - buf_off;
+			size_t avail = reg_size - buf_off;
 			size_t to_copy = static_cast<size_t>(size) < avail ? static_cast<size_t>(size) : avail;
-			std::memcpy(ptr, reg.data.data() + buf_off, to_copy);
+			std::memcpy(ptr, reg_data + buf_off, to_copy);
 			ghidra_decompiler::g_state.last_loadfill_tick_ms.store(
 				static_cast<uint64_t>(::GetTickCount64()),
 				std::memory_order_release);

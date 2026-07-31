@@ -2,6 +2,7 @@
 
 #include "../../../helpers/diag_log.hpp"
 #include "../builtin_typelib.hpp"
+#include "type_graph_builder.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -56,7 +57,8 @@ bool is_statement_kind(const typed_pseudocode_ast_node_kind_t kind) noexcept
            kind == typed_pseudocode_ast_node_kind_t::throw_statement ||
            kind == typed_pseudocode_ast_node_kind_t::try_statement ||
            kind == typed_pseudocode_ast_node_kind_t::goto_statement ||
-           kind == typed_pseudocode_ast_node_kind_t::label_statement;
+           kind == typed_pseudocode_ast_node_kind_t::label_statement ||
+           kind == typed_pseudocode_ast_node_kind_t::comment_statement;
 }
 
 bool is_visible_text(const std::string& value) noexcept
@@ -2355,10 +2357,74 @@ private:
             typed_pseudocode_ast_node_kind_t::member_expression,
             value.type_id,
             {object},
-            value.stable_value,
+            resolve_member_selector(value),
             translate_coordinate(value.coordinate, decompiler_coordinate_layer_t::typed_ast),
             value.confidence,
             value.provenance);
+    }
+
+    std::string resolve_member_selector(const hir_value_t& value) const
+    {
+        const auto offset = generated_field_selector_offset(value.stable_value);
+        if (!offset.has_value())
+            return value.stable_value;
+        const auto object_entry = values_.find(value.operand_ids.front());
+        if (object_entry == values_.end())
+            return value.stable_value;
+        std::uint64_t struct_type_id = object_entry->second->type_id;
+        const auto* object_type = type_graph::find_type_node(type_graph_, struct_type_id);
+        if (object_type != nullptr && object_type->kind == decompiler_type_kind_t::pointer) {
+            const auto* pointee = type_graph::find_pointee_edge(type_graph_, struct_type_id);
+            if (pointee == nullptr)
+                return value.stable_value;
+            struct_type_id = pointee->target_type_id;
+            object_type = type_graph::find_type_node(type_graph_, struct_type_id);
+        }
+        if (object_type == nullptr ||
+            (object_type->kind != decompiler_type_kind_t::structure && object_type->kind != decompiler_type_kind_t::union_type &&
+             object_type->kind != decompiler_type_kind_t::class_type))
+            return value.stable_value;
+        const auto* member = type_graph::find_member_edge_by_offset(type_graph_, struct_type_id, *offset);
+        if (member == nullptr || member->stable_name.empty() ||
+            generated_field_selector_offset(member->stable_name).has_value())
+            return value.stable_value;
+        return member->stable_name;
+    }
+
+    static std::optional<std::uint64_t> generated_field_selector_offset(const std::string& selector)
+    {
+        std::size_t prefix_bytes = 0;
+        int base = 10;
+        if (selector.size() > 8 && selector.compare(0, 8, "field_0x") == 0) {
+            prefix_bytes = 8;
+            base = 16;
+        } else if (selector.size() > 8 && selector.compare(0, 8, "field_0X") == 0) {
+            prefix_bytes = 8;
+            base = 16;
+        } else if (selector.size() > 6 && selector.compare(0, 6, "field_") == 0) {
+            prefix_bytes = 6;
+        } else if (selector.size() > 5 && selector.compare(0, 5, "field") == 0) {
+            prefix_bytes = 5;
+        } else {
+            return std::nullopt;
+        }
+        const std::string digits = selector.substr(prefix_bytes);
+        if (digits.empty() || digits.size() > 16)
+            return std::nullopt;
+        std::uint64_t parsed = 0;
+        for (const char character : digits) {
+            const auto digit = base == 16
+                ? (character >= '0' && character <= '9' ? character - '0'
+                    : character >= 'a' && character <= 'f' ? character - 'a' + 10
+                    : character >= 'A' && character <= 'F' ? character - 'A' + 10 : -1)
+                : (character >= '0' && character <= '9' ? character - '0' : -1);
+            if (digit < 0)
+                return std::nullopt;
+            if (parsed > (std::numeric_limits<std::uint64_t>::max() - 15ULL) / 16ULL)
+                return std::nullopt;
+            parsed = parsed * static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(digit);
+        }
+        return parsed;
     }
 
     std::uint64_t append_index(const hir_value_t& value, const std::size_t depth)
@@ -2611,6 +2677,7 @@ std::string typed_ast_v2_node_layout(const typed_pseudocode_ast_node_kind_t kind
     case typed_pseudocode_ast_node_kind_t::identifier: return "empty";
     case typed_pseudocode_ast_node_kind_t::literal: return "empty";
     case typed_pseudocode_ast_node_kind_t::unknown_expression: return "empty";
+    case typed_pseudocode_ast_node_kind_t::comment_statement: return "empty";
     }
     return "invalid";
 }
@@ -2750,6 +2817,10 @@ decompiler_contract_validation_t validate_typed_ast_v2_semantics(
         case typed_pseudocode_ast_node_kind_t::goto_statement:
             if (!node.child_ids.empty() || !is_visible_text(node.stable_text))
                 append_semantic_error(result, &node, "decompiler.ast.v2.goto_layout", ordinal);
+            break;
+        case typed_pseudocode_ast_node_kind_t::comment_statement:
+            if (!node.child_ids.empty() || !is_visible_text(node.stable_text))
+                append_semantic_error(result, &node, "decompiler.ast.v2.comment_layout", ordinal);
             break;
         case typed_pseudocode_ast_node_kind_t::label_statement:
             if (!node.child_ids.empty() || !is_visible_text(node.stable_text))

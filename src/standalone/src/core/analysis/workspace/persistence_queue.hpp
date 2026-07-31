@@ -31,6 +31,11 @@ struct persistence_queue_limits_t {
 using persistence_operation_t =
     std::function<workspace_result_t<void>(const cancellation_token_t&)>;
 
+struct persistence_coalesce_hooks_t {
+    std::function<workspace_result_t<void>(const cancellation_token_t&)> begin_group;
+    std::function<workspace_result_t<void>(bool commit)> end_group;
+};
+
 struct persistence_commit_metrics_t {
     std::uint64_t logical_bytes = 0;
     std::uint64_t rows = 0;
@@ -76,6 +81,13 @@ struct persistence_queue_snapshot_t {
     std::uint64_t starvation_saves = 0;
     std::uint64_t total_wait_ns = 0;
     std::uint64_t pending_depth_peak = 0;
+    std::uint64_t coalesced_groups = 0;
+    std::uint64_t coalesced_operations = 0;
+    std::uint64_t coalesced_rollbacks = 0;
+    std::uint64_t coalesced_commit_failures = 0;
+    std::uint64_t coalesce_group_size_max = 0;
+    std::uint64_t commit_lag_ns_total = 0;
+    std::uint64_t commit_lag_ns_max = 0;
 };
 
 class persistence_queue_t final : public workspace_lifecycle_participant_t,
@@ -91,12 +103,14 @@ public:
     persistence_queue_t& operator=(const persistence_queue_t&) = delete;
 
     persistence_ticket_t enqueue(std::string label, persistence_operation_t operation,
-                                 cancellation_token_t cancel = {},
-                                 std::uint64_t reservation_bytes = 0,
-                                 persistence_priority_t priority =
-                                     persistence_priority_t::deferred);
+                                  cancellation_token_t cancel = {},
+                                  std::uint64_t reservation_bytes = 0,
+                                  persistence_priority_t priority =
+                                      persistence_priority_t::deferred,
+                                  bool coalescable = false);
     persistence_queue_snapshot_t snapshot() const;
     bool idle() const;
+    void set_coalesce_hooks(persistence_coalesce_hooks_t hooks);
 
     void request_cancel() noexcept override;
     workspace_result_t<void>

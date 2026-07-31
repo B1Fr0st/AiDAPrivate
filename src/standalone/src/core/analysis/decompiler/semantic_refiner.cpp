@@ -1,6 +1,8 @@
 #include "semantic_refiner.hpp"
 #include "pseudocode_readability.hpp"
 
+#include "../../infra/taskflow_runtime.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -268,6 +270,8 @@ struct proof_worker_state_t {
     bool failed = false;
     bool cpu_valid = false;
     std::uint64_t cpu_ms = 0;
+    std::atomic<std::uintptr_t> worker_thread_handle{0};
+    std::atomic<bool> caller_abandoned{false};
 };
 
 proof_worker_result_t bounded_prove(
@@ -293,39 +297,79 @@ proof_worker_result_t bounded_prove(
     const auto worker_token = worker_cancel.token();
     const auto state = std::make_shared<proof_worker_state_t>();
 
-    std::thread worker;
-    try {
-        worker = std::thread([adapter, execution_state, request, state, worker_token] {
-            triton_z3_proof_response_t response;
-            bool failed = false;
-            try {
-                response = adapter->prove(request, worker_token);
-            } catch (...) {
-                failed = true;
-            }
-            std::uint64_t cpu_ms = 0;
+    infra::taskflow_runtime::task_descriptor_t worker_desc;
+    worker_desc.domain = infra::taskflow_runtime::executor_domain_t::external_tool;
+    worker_desc.owner_subsystem = "semantic_refiner";
+    worker_desc.label = "semantic_refiner.bounded_prove";
+    worker_desc.priority = 1;
+    worker_desc.shutdown_policy = "cancel_pending";
 #if defined(_WIN32)
-            const bool cpu_valid = thread_cpu_milliseconds(GetCurrentThread(), cpu_ms);
-#else
-            const bool cpu_valid = false;
+    {
+        const auto deadline_gap = std::chrono::duration_cast<std::chrono::milliseconds>(
+            query_deadline - std::chrono::steady_clock::now()).count();
+        worker_desc.deadline_ms = static_cast<std::uint64_t>(GetTickCount64()) +
+            static_cast<std::uint64_t>(deadline_gap > 0 ? deadline_gap : 0);
+    }
 #endif
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->response = std::move(response);
-                state->failed = failed;
-                state->cpu_valid = cpu_valid;
-                state->cpu_ms = cpu_ms;
-                state->complete = true;
-            }
-            execution_state->adapter_busy.store(false, std::memory_order_release);
-            state->condition.notify_all();
-        });
-        result.invoked = true;
-    } catch (...) {
+    worker_desc.cancellable_body = [adapter, execution_state, request, state, worker_token](
+        const infra::taskflow_runtime::cancellation_token_t&) {
+#if defined(_WIN32)
+        const HANDLE self_handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
+        if (self_handle)
+            state->worker_thread_handle.store(
+                reinterpret_cast<std::uintptr_t>(self_handle), std::memory_order_release);
+#endif
+        triton_z3_proof_response_t response;
+        bool failed = false;
+        try {
+            response = adapter->prove(request, worker_token);
+        } catch (...) {
+            failed = true;
+        }
+        std::uint64_t cpu_ms = 0;
+#if defined(_WIN32)
+        const bool cpu_valid = thread_cpu_milliseconds(GetCurrentThread(), cpu_ms);
+#else
+        const bool cpu_valid = false;
+#endif
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->response = std::move(response);
+            state->failed = failed;
+            state->cpu_valid = cpu_valid;
+            state->cpu_ms = cpu_ms;
+            state->complete = true;
+        }
+        execution_state->adapter_busy.store(false, std::memory_order_release);
+        state->condition.notify_all();
+#if defined(_WIN32)
+        if (state->caller_abandoned.load(std::memory_order_acquire)) {
+            const std::uintptr_t handle_value =
+                state->worker_thread_handle.exchange(0, std::memory_order_acq_rel);
+            if (handle_value != 0)
+                CloseHandle(reinterpret_cast<HANDLE>(handle_value));
+        }
+#endif
+    };
+    worker_desc.cancel_hook = [worker_cancel]() mutable {
+        worker_cancel.request_cancel();
+    };
+    auto worker_submission = infra::taskflow_runtime::submit(std::move(worker_desc));
+    if (!worker_submission.submitted) {
         execution_state->adapter_busy.store(false, std::memory_order_release);
         result.terminal = proof_worker_terminal_t::launch_failure;
         return result;
     }
+    result.invoked = true;
+
+    const auto close_worker_handle = [&]() {
+#if defined(_WIN32)
+        const std::uintptr_t handle_value =
+            state->worker_thread_handle.exchange(0, std::memory_order_acq_rel);
+        if (handle_value != 0)
+            CloseHandle(reinterpret_cast<HANDLE>(handle_value));
+#endif
+    };
 
     const auto finish_early = [&](proof_worker_terminal_t terminal) {
         worker_cancel.request_cancel();
@@ -335,10 +379,13 @@ proof_worker_result_t bounded_prove(
             state->condition.wait_for(lock, k_worker_cancel_grace, [&] { return state->complete; });
             complete = state->complete;
         }
-        if (complete)
-            worker.join();
-        else
-            worker.detach();
+        if (complete) {
+            infra::taskflow_runtime::wait_for(worker_submission.handle, 5000);
+        } else {
+            state->caller_abandoned.store(true, std::memory_order_release);
+            infra::taskflow_runtime::cancel(worker_submission.handle);
+        }
+        close_worker_handle();
         result.terminal = terminal;
         result.measured_wall_clock_ms = elapsed_milliseconds(begin, std::chrono::steady_clock::now());
         return result;
@@ -360,9 +407,15 @@ proof_worker_result_t bounded_prove(
                 : proof_worker_terminal_t::wall_limit;
             return finish_early(terminal);
         }
+#if defined(_WIN32)
         std::uint64_t cpu_ms = 0;
-        if (thread_cpu_milliseconds(worker.native_handle(), cpu_ms) && cpu_ms > request.limits.max_cpu_ms)
+        const std::uintptr_t handle_value =
+            state->worker_thread_handle.load(std::memory_order_acquire);
+        if (handle_value != 0 &&
+            thread_cpu_milliseconds(reinterpret_cast<HANDLE>(handle_value), cpu_ms) &&
+            cpu_ms > request.limits.max_cpu_ms)
             return finish_early(proof_worker_terminal_t::cpu_limit);
+#endif
         std::unique_lock<std::mutex> lock(state->mutex);
         auto wake = std::chrono::steady_clock::now() + k_worker_poll_interval;
         if (query_deadline < wake)
@@ -370,7 +423,8 @@ proof_worker_result_t bounded_prove(
         state->condition.wait_until(lock, wake, [&] { return state->complete; });
     }
 
-    worker.join();
+    infra::taskflow_runtime::wait_for(worker_submission.handle, 5000);
+    close_worker_handle();
     result.measured_wall_clock_ms = elapsed_milliseconds(begin, std::chrono::steady_clock::now());
     {
         std::lock_guard<std::mutex> lock(state->mutex);

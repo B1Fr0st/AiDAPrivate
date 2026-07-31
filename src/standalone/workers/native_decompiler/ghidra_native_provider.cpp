@@ -13,6 +13,8 @@
 
 #include "../../src/core/disasm/ghidra_adapters/aida_ghidra_preamble.hpp"
 
+#include "snapshot_sidecar.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -63,69 +65,6 @@ arch_session_cache_t& arch_session_cache()
     return *g_arch_session_cache;
 }
 
-ghidra_decompiler::arch_session_entry_t* arch_session_acquire(
-    arch_session_cache_t& cache,
-    ghidra_decompiler::arch_pool_key_t key,
-    std::vector<native_provider_snapshot_range_t>& source_ranges,
-    std::uint64_t image_base,
-    std::uint64_t image_size,
-    bool keep_fixateglobals,
-    std::string& error_text)
-{
-    for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
-        if ((*it)->key.matches(key)) {
-            auto hit = std::move(*it);
-            cache.entries.erase(it);
-            cache.entries.push_front(std::move(hit));
-            ++cache.hits;
-            auto* entry = cache.entries.front().get();
-            diag::log_tagged_fmt("dec",
-                "arch_pool_hit hits=%llu misses=%llu jobs_completed=%llu sleigh=%s",
-                static_cast<unsigned long long>(cache.hits),
-                static_cast<unsigned long long>(cache.misses),
-                static_cast<unsigned long long>(entry->jobs_completed),
-                entry->key.language_id.c_str());
-            return entry;
-        }
-    }
-    ++cache.misses;
-    const std::string sleigh = key.language_id;
-    std::vector<aida_ghidra::region_t> regions;
-    regions.reserve(source_ranges.size());
-    for (auto& source : source_ranges) {
-        aida_ghidra::region_t region;
-        region.start_va = image_base + source.relative_virtual_address;
-        region.data = std::move(source.bytes);
-        regions.push_back(std::move(region));
-    }
-    auto created = ghidra_decompiler::make_arch_session_entry(
-        std::move(regions), image_base, image_size, std::move(key), keep_fixateglobals);
-    if (!created.ok) {
-        error_text = std::move(created.error_text);
-        diag::log_tagged_fmt("dec",
-            "arch_pool_init_failed misses=%llu sleigh=%s",
-            static_cast<unsigned long long>(cache.misses), sleigh.c_str());
-        return nullptr;
-    }
-    diag::log_tagged_fmt("dec",
-        "arch_pool_miss arch_init_ms=%.2f hits=%llu misses=%llu sleigh=%s",
-        created.entry->arch_init_ms,
-        static_cast<unsigned long long>(cache.hits),
-        static_cast<unsigned long long>(cache.misses),
-        sleigh.c_str());
-    cache.entries.push_front(std::move(created.entry));
-    while (cache.entries.size() > k_arch_session_cache_capacity) {
-        const std::uint64_t evicted_jobs = cache.entries.back()->jobs_completed;
-        cache.entries.pop_back();
-        ++cache.evictions;
-        diag::log_tagged_fmt("dec",
-            "arch_pool_evict evictions=%llu evicted_jobs_completed=%llu",
-            static_cast<unsigned long long>(cache.evictions),
-            static_cast<unsigned long long>(evicted_jobs));
-    }
-    return cache.entries.front().get();
-}
-
 decompiler_diagnostic_t failure(const decompiler_diagnostic_code_t code, std::string key,
     std::string detail = {})
 {
@@ -144,6 +83,171 @@ decompiler_diagnostic_t failure(const decompiler_diagnostic_code_t code, std::st
     return result;
 }
 
+struct session_snapshot_state_t {
+    sha256_digest_t hash;
+    const std::uint8_t* view = nullptr;
+    std::size_t view_size = 0;
+    native_provider_snapshot_views_t parsed;
+    snapshot_sidecar::sidecar_t sidecar;
+    bool sidecar_valid = false;
+    std::string payload_copy;
+
+    session_snapshot_state_t() = default;
+    session_snapshot_state_t(const session_snapshot_state_t&) = delete;
+    session_snapshot_state_t& operator=(const session_snapshot_state_t&) = delete;
+    ~session_snapshot_state_t()
+    {
+        if (view)
+            UnmapViewOfFile(view);
+    }
+};
+
+struct session_snapshot_cache_t {
+    std::deque<std::shared_ptr<session_snapshot_state_t>> states;
+};
+
+std::shared_ptr<session_snapshot_state_t> session_snapshot_acquire(
+    session_snapshot_cache_t& cache,
+    const runtime::startup_t& startup,
+    const sha256_digest_t& snapshot_hash,
+    std::vector<decompiler_diagnostic_t>& diagnostics,
+    decompiler_provider_id_t provider)
+{
+    for (const auto& state : cache.states) {
+        if (state->hash.constant_time_equal(snapshot_hash))
+            return state;
+    }
+    while (cache.states.size() >= 2)
+        cache.states.pop_front();
+    auto state = std::make_shared<session_snapshot_state_t>();
+    state->hash = snapshot_hash;
+    if (startup.snapshot_size == 0 || startup.snapshot_size > 1024ULL * 1024ULL * 1024ULL) {
+        diagnostics.push_back(failure(decompiler_diagnostic_code_t::resource_limit,
+            "decompiler.isolated_worker.snapshot_unavailable"));
+        return nullptr;
+    }
+    void* view = MapViewOfFile(startup.snapshot_handle, FILE_MAP_READ, 0, 0, startup.snapshot_size);
+    if (!view) {
+        diagnostics.push_back(failure(decompiler_diagnostic_code_t::resource_limit,
+            "decompiler.isolated_worker.snapshot_unavailable"));
+        return nullptr;
+    }
+    state->view = static_cast<const std::uint8_t*>(view);
+    state->view_size = startup.snapshot_size;
+    if (provider == decompiler_provider_id_t::ghidra_native) {
+        std::vector<decompiler_diagnostic_t> parse_diagnostics;
+        if (!parse_native_provider_snapshot_views(
+                std::string_view(reinterpret_cast<const char*>(state->view), state->view_size),
+                state->parsed, parse_diagnostics)) {
+            diagnostics.insert(diagnostics.end(), parse_diagnostics.begin(), parse_diagnostics.end());
+            return nullptr;
+        }
+        if (state->parsed.format_version >= 3 && !state->parsed.sidecar.empty()) {
+            auto decoded = snapshot_sidecar::decode(
+                state->parsed.sidecar.data(), state->parsed.sidecar.size());
+            if (decoded) {
+                state->sidecar = std::move(*decoded);
+                state->sidecar_valid = true;
+            } else {
+                diagnostics.push_back(failure(decompiler_diagnostic_code_t::malformed_serialization,
+                    "decompiler.native_worker.sidecar_decode"));
+                diag::log_tagged_fmt("dec",
+                    "sidecar_decode_failed bytes=%zu", state->parsed.sidecar.size());
+            }
+        }
+        diag::log_tagged_fmt("dec",
+            "session_snapshot_built bytes=%zu version=%u ranges=%zu sidecar=%d sidecar_names=%zu sidecar_imports=%zu sidecar_prototypes=%zu",
+            state->view_size, state->parsed.format_version, state->parsed.ranges.size(),
+            state->sidecar_valid ? 1 : 0,
+            state->sidecar.names.size(), state->sidecar.imports.size(),
+            state->sidecar.prototypes.size());
+    } else {
+        try {
+            state->payload_copy.assign(reinterpret_cast<const char*>(state->view), state->view_size);
+        } catch (...) {
+            diagnostics.push_back(failure(decompiler_diagnostic_code_t::resource_limit,
+                "decompiler.isolated_worker.snapshot_unavailable"));
+            return nullptr;
+        }
+    }
+    cache.states.push_back(state);
+    return state;
+}
+
+session_snapshot_cache_t& session_snapshot_cache()
+{
+    static session_snapshot_cache_t cache;
+    return cache;
+}
+
+ghidra_decompiler::arch_session_entry_t* arch_session_acquire(
+    arch_session_cache_t& cache,
+    ghidra_decompiler::arch_pool_key_t key,
+    const std::shared_ptr<session_snapshot_state_t>& snapshot_state,
+    bool keep_fixateglobals,
+    std::string& error_text)
+{
+    for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
+        if ((*it)->key.matches(key)) {
+            auto hit = std::move(*it);
+            cache.entries.erase(it);
+            cache.entries.push_front(std::move(hit));
+            ++cache.hits;
+            auto* entry = cache.entries.front().get();
+            if ((cache.hits & 0xFFULL) == 0) {
+                diag::log_tagged_fmt("dec",
+                    "arch_pool_hit hits=%llu misses=%llu jobs_completed=%llu sleigh=%s",
+                    static_cast<unsigned long long>(cache.hits),
+                    static_cast<unsigned long long>(cache.misses),
+                    static_cast<unsigned long long>(entry->jobs_completed),
+                    entry->key.language_id.c_str());
+            }
+            return entry;
+        }
+    }
+    ++cache.misses;
+    const std::string sleigh = key.language_id;
+    std::vector<aida_ghidra::region_t> regions;
+    regions.reserve(snapshot_state->parsed.ranges.size());
+    for (const auto& source : snapshot_state->parsed.ranges) {
+        aida_ghidra::region_t region;
+        region.start_va = snapshot_state->parsed.image_base + source.relative_virtual_address;
+        region.view = source.data;
+        region.view_size = static_cast<std::size_t>(source.size);
+        region.owner = snapshot_state;
+        regions.push_back(std::move(region));
+    }
+    const auto* sidecar = snapshot_state->sidecar_valid ? &snapshot_state->sidecar : nullptr;
+    auto created = ghidra_decompiler::make_arch_session_entry(
+        std::move(regions), snapshot_state->parsed.image_base,
+        snapshot_state->parsed.image_size, std::move(key), keep_fixateglobals, sidecar);
+    if (!created.ok) {
+        error_text = std::move(created.error_text);
+        diag::log_tagged_fmt("dec",
+            "arch_pool_init_failed misses=%llu sleigh=%s",
+            static_cast<unsigned long long>(cache.misses), sleigh.c_str());
+        return nullptr;
+    }
+    diag::log_tagged_fmt("dec",
+        "arch_pool_miss arch_init_ms=%.2f hits=%llu misses=%llu sidecar=%d sleigh=%s",
+        created.entry->arch_init_ms,
+        static_cast<unsigned long long>(cache.hits),
+        static_cast<unsigned long long>(cache.misses),
+        sidecar ? 1 : 0,
+        sleigh.c_str());
+    cache.entries.push_front(std::move(created.entry));
+    while (cache.entries.size() > k_arch_session_cache_capacity) {
+        const std::uint64_t evicted_jobs = cache.entries.back()->jobs_completed;
+        cache.entries.pop_back();
+        ++cache.evictions;
+        diag::log_tagged_fmt("dec",
+            "arch_pool_evict evictions=%llu evicted_jobs_completed=%llu",
+            static_cast<unsigned long long>(cache.evictions),
+            static_cast<unsigned long long>(evicted_jobs));
+    }
+    return cache.entries.front().get();
+}
+
 bool same_provider(const decompiler_provider_identity_t& left, const decompiler_provider_identity_t& right)
 {
     return left.provider == right.provider && left.provider_name == right.provider_name &&
@@ -156,22 +260,6 @@ bool same_language(const decompiler_language_identity_t& left, const decompiler_
     return left.language_id == right.language_id && left.language_version == right.language_version &&
         left.compiler_spec_id == right.compiler_spec_id && left.language_spec_hash == right.language_spec_hash &&
         left.architecture == right.architecture && left.mode == right.mode && left.endian == right.endian;
-}
-
-std::optional<std::string> snapshot_bytes(const runtime::startup_t& startup)
-{
-    if (startup.snapshot_size == 0 || startup.snapshot_size > 256U * 1024U * 1024U)
-        return std::nullopt;
-    void* view = MapViewOfFile(startup.snapshot_handle, FILE_MAP_READ, 0, 0, startup.snapshot_size);
-    if (!view)
-        return std::nullopt;
-    std::optional<std::string> result;
-    try {
-        result.emplace(static_cast<const char*>(view), startup.snapshot_size);
-    } catch (...) {
-    }
-    UnmapViewOfFile(view);
-    return result;
 }
 
 bool checked_entry_address(
@@ -197,18 +285,18 @@ bool checked_entry_address(
 }
 
 std::optional<provider_output_t> execute_native(
-    const std::string& payload,
+    const std::shared_ptr<session_snapshot_state_t>& snapshot_state,
     const decompiler_worker_job_request_t& job,
     std::atomic<bool>* shared_cancel,
     std::vector<decompiler_diagnostic_t>& diagnostics)
 {
-    auto snapshot = deserialize_native_provider_snapshot(payload, diagnostics);
+    const auto& parsed = snapshot_state->parsed;
     const auto* identity = std::get_if<native_decompiler_entity_identity_t>(&job.cache_key.entity.identity);
-    if (!snapshot || !identity || job.cache_key.entity.kind != decompiler_entity_kind_t::native_function)
+    if (!identity || job.cache_key.entity.kind != decompiler_entity_kind_t::native_function)
         return std::nullopt;
     std::uint64_t entry = 0;
-    if (!checked_entry_address(*identity, snapshot->image_base,
-            static_cast<std::size_t>(snapshot->image_size), entry)) {
+    if (!checked_entry_address(*identity, parsed.image_base,
+            static_cast<std::size_t>(parsed.image_size), entry)) {
         diagnostics.push_back(failure(decompiler_diagnostic_code_t::invalid_contract,
             "decompiler.native_worker.entry_binding"));
         return std::nullopt;
@@ -240,8 +328,8 @@ std::optional<provider_output_t> execute_native(
         key.snapshot_hash = job.snapshot_hash;
         key.keep_fixateglobals = limits.keep_fixateglobals;
         std::string pool_error;
-        if (auto* pooled = arch_session_acquire(cache, std::move(key), snapshot->ranges,
-                snapshot->image_base, snapshot->image_size, limits.keep_fixateglobals, pool_error)) {
+        if (auto* pooled = arch_session_acquire(cache, std::move(key), snapshot_state,
+                limits.keep_fixateglobals, pool_error)) {
             output = ghidra_decompiler::decompile_isolated_regions_reusing(
                 *pooled, entry, cancelled, deadline, limits, capture);
         } else {
@@ -253,15 +341,21 @@ std::optional<provider_output_t> execute_native(
     }
     if (!executed) {
         std::vector<aida_ghidra::region_t> regions;
-        regions.reserve(snapshot->ranges.size());
-        for (auto& source : snapshot->ranges) {
+        regions.reserve(parsed.ranges.size());
+        for (const auto& source : parsed.ranges) {
             aida_ghidra::region_t region;
-            region.start_va = snapshot->image_base + source.relative_virtual_address;
-            region.data = std::move(source.bytes);
+            region.start_va = parsed.image_base + source.relative_virtual_address;
+            try {
+                region.data.assign(source.data, source.data + source.size);
+            } catch (...) {
+                diagnostics.push_back(failure(decompiler_diagnostic_code_t::resource_limit,
+                    "decompiler.isolated_worker.snapshot_unavailable"));
+                return std::nullopt;
+            }
             regions.push_back(std::move(region));
         }
         output = ghidra_decompiler::decompile_isolated_regions(
-            std::move(regions), snapshot->image_base, snapshot->image_size, entry,
+            std::move(regions), parsed.image_base, parsed.image_size, entry,
             job.cache_key.language.language_id, job.cache_key.language.mode,
             cancelled, deadline, limits, capture);
     }
@@ -370,22 +464,24 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
             "decompiler.isolated_worker.printc_provider"));
         return result;
     }
-    const auto bytes = snapshot_bytes(startup);
-    if (!bytes) {
-        result.diagnostics.push_back(failure(decompiler_diagnostic_code_t::resource_limit,
-            "decompiler.isolated_worker.snapshot_unavailable"));
+    auto snapshot_state = session_snapshot_acquire(session_snapshot_cache(), startup,
+        job.snapshot_hash, result.diagnostics, job.cache_key.provider.provider);
+    if (!snapshot_state) {
+        if (result.diagnostics.empty())
+            result.diagnostics.push_back(failure(decompiler_diagnostic_code_t::resource_limit,
+                "decompiler.isolated_worker.snapshot_unavailable"));
         return result;
     }
     std::optional<provider_output_t> output;
     switch (job.cache_key.provider.provider) {
     case decompiler_provider_id_t::ghidra_native:
-        output = execute_native(*bytes, job, shared_cancel, result.diagnostics);
+        output = execute_native(snapshot_state, job, shared_cancel, result.diagnostics);
         break;
     case decompiler_provider_id_t::jvm_ssa:
-        output = execute_jvm(*bytes, result.diagnostics);
+        output = execute_jvm(snapshot_state->payload_copy, result.diagnostics);
         break;
     case decompiler_provider_id_t::dalvik_ssa:
-        output = execute_dalvik(*bytes, result.diagnostics);
+        output = execute_dalvik(snapshot_state->payload_copy, result.diagnostics);
         break;
     case decompiler_provider_id_t::ilspy_cli:
         break;
@@ -415,13 +511,19 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
         auto readability_result = apply_readability_transforms(
             *ast.ast, output->type_graph, to_rt_settings(job.cache_key.renderer.readability));
         readability_diagnostics = std::move(readability_result.diagnostics);
+        static std::atomic<std::uint64_t> produce_job_ordinal{0};
+        const std::uint64_t job_ordinal = produce_job_ordinal.fetch_add(1,
+            std::memory_order_relaxed) + 1;
+        const bool verbose_readability_log = (job_ordinal <= 256) || ((job_ordinal & 0xFFULL) == 0);
         if (readability_result.succeeded()) {
-            diag::log_tagged_fmt("dec", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u",
-                static_cast<unsigned int>(readability_result.metrics.variables_renamed),
-                static_cast<unsigned int>(readability_result.metrics.constants_folded),
-                static_cast<unsigned int>(readability_result.metrics.identities_simplified),
-                static_cast<unsigned int>(readability_result.metrics.temporaries_inlined),
-                static_cast<unsigned int>(readability_result.metrics.dead_stores_eliminated));
+            if (verbose_readability_log) {
+                diag::log_tagged_fmt("dec", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u",
+                    static_cast<unsigned int>(readability_result.metrics.variables_renamed),
+                    static_cast<unsigned int>(readability_result.metrics.constants_folded),
+                    static_cast<unsigned int>(readability_result.metrics.identities_simplified),
+                    static_cast<unsigned int>(readability_result.metrics.temporaries_inlined),
+                    static_cast<unsigned int>(readability_result.metrics.dead_stores_eliminated));
+            }
         } else {
             diag::log_tagged_fmt("dec", "readability_transforms status=warning_no_transform continuing_with_unmodified_ast");
         }

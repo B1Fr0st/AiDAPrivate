@@ -10,6 +10,7 @@
 
 #include "workspace/checked_range.hpp"
 #include "workspace/workspace_identity.hpp"
+#include "working_set_governor.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -326,6 +327,28 @@ struct mapped_window_cache_t::state_t {
     std::atomic<std::uint64_t> admission_steals{0};
     std::atomic<std::uint64_t> duplicate_map_races{0};
     std::atomic<std::uint64_t> map_calls{0};
+    std::atomic<std::uint64_t> prefetch_warm_issued{0};
+    mutable std::mutex pin_mutex;
+    mutable std::unordered_map<std::uint64_t,
+                               std::vector<std::shared_ptr<mapped_window_t>>>
+        pins;
+    mutable std::atomic<std::uint64_t> next_pin_token{1};
+
+    void warm_next_window(std::uint64_t next_start) noexcept {
+        if (!options.prefetch_next_window || next_start >= file->identity.size ||
+            file->identity.size == 0)
+            return;
+        const std::uint64_t next_size =
+            (std::min)(options.window_bytes, file->identity.size - next_start);
+        if (next_size == 0)
+            return;
+        try {
+            auto warmed = acquire_window(next_start, next_size, {});
+            if (warmed)
+                prefetch_warm_issued.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+        }
+    }
 
     std::size_t shard_index(std::uint64_t window_start) const noexcept {
         const std::uint64_t ordinal = window_start / options.window_bytes;
@@ -593,6 +616,13 @@ struct mapped_window_cache_t::state_t {
         }
         auto committed = commit_window(window_start, mapped_size, std::move(candidate));
         reservation_held = false;
+        if (committed) {
+            auto& governor = working_set_governor_t::instance();
+            governor.note(working_set_metrics::subsystem_t::mapped_windows,
+                global_mapped_window_bytes().load(std::memory_order_acquire));
+            if (governor.refresh() == governor_zone_t::red)
+                (void)trim();
+        }
         return committed;
     }
 
@@ -618,6 +648,7 @@ struct mapped_window_cache_t::state_t {
         result.admission_steals = admission_steals.load(std::memory_order_relaxed);
         result.duplicate_map_races = duplicate_map_races.load(std::memory_order_relaxed);
         result.map_calls = map_calls.load(std::memory_order_relaxed);
+        result.prefetch_warm_issued = prefetch_warm_issued.load(std::memory_order_relaxed);
         for (const auto& shard_ptr : shards) {
             std::lock_guard<std::mutex> lock(shard_ptr->mutex);
             for (const auto& item : shard_ptr->windows)
@@ -696,6 +727,8 @@ workspace_result_t<std::shared_ptr<mapped_window_cache_t>> mapped_window_cache_t
     const std::string& utf8_path, mapped_window_cache_options_t options) {
     if (!is_power_of_two(options.shard_count) || options.shard_count > 64 ||
         options.max_lease_bytes == 0 ||
+        options.max_span_windows == 0 ||
+        options.max_span_windows > byte_span_storage_t::kMaxSegments ||
         options.max_global_mapped_window_bytes == 0 ||
         options.max_global_mapped_window_bytes > kMaximumGlobalMappedBytes ||
         (options.window_bytes != 0 &&
@@ -864,15 +897,6 @@ workspace_result_t<byte_view_t> mapped_window_cache_t::lease(
     auto range = validate_span(offset, size_value, size(), "mapped_window_lease");
     if (!range)
         return workspace_result_t<byte_view_t>::failure(range.error());
-    if (size_value > state_->options.max_lease_bytes) {
-        auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
-                                          "mapped-window lease exceeds its configured limit",
-                                          "mapped_window_lease");
-        error.offset = offset;
-        error.size = size_value;
-        error.details.emplace_back("max_lease_bytes", std::to_string(state_->options.max_lease_bytes));
-        return workspace_result_t<byte_view_t>::failure(std::move(error));
-    }
     if (!state_->file->identity.immutable_snapshot) {
         auto valid_before = revalidate();
         if (!valid_before)
@@ -883,14 +907,101 @@ workspace_result_t<byte_view_t> mapped_window_cache_t::lease(
             byte_view_t(std::static_pointer_cast<const void>(state_->file), nullptr, 0));
     const std::uint64_t window_start = offset - (offset % state_->options.window_bytes);
     const std::uint64_t delta = offset - window_start;
-    if (delta > state_->options.window_bytes ||
-        size_value > state_->options.window_bytes - delta) {
+    if (delta > state_->options.window_bytes) {
         auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
                                           "mapped-window lease crosses a cache-window boundary",
                                           "mapped_window_lease");
         error.offset = offset;
         error.size = size_value;
         error.details.emplace_back("window_bytes", std::to_string(state_->options.window_bytes));
+        return workspace_result_t<byte_view_t>::failure(std::move(error));
+    }
+    if (size_value > state_->options.window_bytes - delta) {
+        const std::uint64_t window_count =
+            (delta + size_value + state_->options.window_bytes - 1ULL) /
+            state_->options.window_bytes;
+        if (window_count > state_->options.max_span_windows ||
+            window_count > byte_span_storage_t::kMaxSegments) {
+            auto error = make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "mapped-window lease crosses a cache-window boundary",
+                "mapped_window_lease");
+            error.offset = offset;
+            error.size = size_value;
+            error.details.emplace_back("window_bytes",
+                                       std::to_string(state_->options.window_bytes));
+            error.details.emplace_back("span_windows", std::to_string(window_count));
+            error.details.emplace_back("max_span_windows",
+                                       std::to_string(state_->options.max_span_windows));
+            return workspace_result_t<byte_view_t>::failure(std::move(error));
+        }
+        std::shared_ptr<byte_span_storage_t> storage;
+        try {
+            storage = std::make_shared<byte_span_storage_t>();
+        } catch (const std::bad_alloc&) {
+            return workspace_result_t<byte_view_t>::failure(
+                make_workspace_error(workspace_error_code_t::provider_unavailable,
+                                     "mapped-window span allocation failed",
+                                     "mapped_window_lease"));
+        }
+        std::size_t produced = 0;
+        std::uint64_t cursor = offset;
+        for (std::uint32_t span_index = 0; span_index < window_count; ++span_index) {
+            if (cancel.stop_requested())
+                return workspace_result_t<byte_view_t>::failure(
+                    stop_error(cancel, "mapped_window_lease"));
+            const std::uint64_t span_window_start =
+                window_start + span_index * state_->options.window_bytes;
+            const std::uint64_t span_window_size = (std::min)(
+                state_->options.window_bytes, size() - span_window_start);
+            auto window = state_->acquire_window(span_window_start, span_window_size, cancel);
+            if (!window)
+                return workspace_result_t<byte_view_t>::failure(window.error());
+            const std::uint64_t inner =
+                cursor > span_window_start ? cursor - span_window_start : 0;
+            if (inner >= span_window_size)
+                break;
+            const std::uint64_t available = span_window_size - inner;
+            const std::size_t amount = static_cast<std::size_t>((std::min)(
+                available, size_value - static_cast<std::uint64_t>(produced)));
+            storage->owners[span_index] =
+                std::static_pointer_cast<const void>(window.value());
+            storage->bases[span_index] =
+                static_cast<const std::uint8_t*>(window.value()->base) +
+                static_cast<std::size_t>(inner);
+            storage->sizes[span_index] = amount;
+            produced += amount;
+            cursor += amount;
+        }
+        if (produced != size_value) {
+            auto error = make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "mapped-window span lease could not cover its requested range",
+                "mapped_window_lease");
+            error.offset = offset;
+            error.size = size_value;
+            return workspace_result_t<byte_view_t>::failure(std::move(error));
+        }
+        storage->segment_count = static_cast<std::uint32_t>(window_count);
+        storage->total_bytes = static_cast<std::size_t>(size_value);
+        if (!state_->file->identity.immutable_snapshot) {
+            auto valid_after = revalidate();
+            if (!valid_after)
+                return workspace_result_t<byte_view_t>::failure(valid_after.error());
+        }
+        state_->warm_next_window(
+            window_start + window_count * state_->options.window_bytes);
+        return workspace_result_t<byte_view_t>::success(
+            byte_view_t(std::static_pointer_cast<const byte_span_storage_t>(
+                std::move(storage))));
+    }
+    if (size_value > state_->options.max_lease_bytes) {
+        auto error = make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                          "mapped-window lease exceeds its configured limit",
+                                          "mapped_window_lease");
+        error.offset = offset;
+        error.size = size_value;
+        error.details.emplace_back("max_lease_bytes", std::to_string(state_->options.max_lease_bytes));
         return workspace_result_t<byte_view_t>::failure(std::move(error));
     }
     const std::uint64_t window_size = (std::min)(state_->options.window_bytes, size() - window_start);
@@ -903,11 +1014,99 @@ workspace_result_t<byte_view_t> mapped_window_cache_t::lease(
             return workspace_result_t<byte_view_t>::failure(valid_after.error());
     }
     auto owner = window.take_value();
+    state_->warm_next_window(window_start + state_->options.window_bytes);
     const auto* bytes = static_cast<const std::uint8_t*>(owner->base) +
                         static_cast<std::size_t>(delta);
     return workspace_result_t<byte_view_t>::success(
         byte_view_t(std::static_pointer_cast<const void>(std::move(owner)), bytes,
                     static_cast<std::size_t>(size_value)));
+}
+
+workspace_result_t<std::uint64_t> mapped_window_cache_t::pin_range(
+    std::uint64_t file_offset, std::uint64_t size_value, std::uint32_t max_windows,
+    const cancellation_token_t& cancel) const {
+    if (max_windows == 0 || size_value == 0) {
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "mapped-window pin range is empty", "mapped_window_pin"));
+    }
+    auto range = validate_span(file_offset, size_value, size(), "mapped_window_pin");
+    if (!range)
+        return workspace_result_t<std::uint64_t>::failure(range.error());
+    const std::uint64_t first_window =
+        file_offset - (file_offset % state_->options.window_bytes);
+    const std::uint64_t delta = file_offset - first_window;
+    const std::uint64_t window_count =
+        (delta + size_value + state_->options.window_bytes - 1ULL) /
+        state_->options.window_bytes;
+    const std::uint32_t pinned_count = static_cast<std::uint32_t>(
+        (std::min)(window_count, static_cast<std::uint64_t>(max_windows)));
+    std::vector<std::shared_ptr<mapped_window_t>> held;
+    held.reserve(pinned_count);
+    for (std::uint32_t index = 0; index < pinned_count; ++index) {
+        if (cancel.stop_requested())
+            return workspace_result_t<std::uint64_t>::failure(
+                stop_error(cancel, "mapped_window_pin"));
+        const std::uint64_t window_start =
+            first_window + index * state_->options.window_bytes;
+        if (window_start >= size())
+            break;
+        const std::uint64_t window_size =
+            (std::min)(state_->options.window_bytes, size() - window_start);
+        auto window = state_->acquire_window(window_start, window_size, cancel);
+        if (!window)
+            return workspace_result_t<std::uint64_t>::failure(window.error());
+        held.push_back(window.take_value());
+    }
+    if (held.empty()) {
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::out_of_range,
+                                 "mapped-window pin range covers no windows",
+                                 "mapped_window_pin"));
+    }
+    std::uint64_t token = 0;
+    for (;;) {
+        token = state_->next_pin_token.fetch_add(1, std::memory_order_acq_rel);
+        if (token != 0)
+            break;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(state_->pin_mutex);
+        state_->pins.emplace(token, std::move(held));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::provider_unavailable,
+                                 "mapped-window pin allocation failed", "mapped_window_pin"));
+    }
+    ::diag::log_tagged_fmt("mapped_window_cache",
+        "pin_range token=%llu source='%s' offset=%llu size=%llu windows=%zu pinned_total=%zu",
+        static_cast<unsigned long long>(token),
+        state_->file->identity.normalized_source.c_str(),
+        static_cast<unsigned long long>(file_offset),
+        static_cast<unsigned long long>(size_value),
+        pinned_count <= static_cast<std::uint32_t>(window_count)
+            ? static_cast<std::size_t>(pinned_count)
+            : static_cast<std::size_t>(window_count),
+        [&] {
+            std::lock_guard<std::mutex> lock(state_->pin_mutex);
+            return state_->pins.size();
+        }());
+    return workspace_result_t<std::uint64_t>::success(token);
+}
+
+void mapped_window_cache_t::unpin_range(std::uint64_t token) const noexcept {
+    if (token == 0)
+        return;
+    std::size_t remaining = 0;
+    {
+        std::lock_guard<std::mutex> lock(state_->pin_mutex);
+        state_->pins.erase(token);
+        remaining = state_->pins.size();
+    }
+    ::diag::log_tagged_fmt("mapped_window_cache",
+        "unpin_range token=%llu source='%s' pinned_total=%zu",
+        static_cast<unsigned long long>(token),
+        state_->file->identity.normalized_source.c_str(), remaining);
 }
 
 workspace_result_t<void> mapped_window_cache_t::trim() {

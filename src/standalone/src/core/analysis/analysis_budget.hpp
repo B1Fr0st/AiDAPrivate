@@ -110,6 +110,24 @@ struct adaptive_analysis_budget_fields_t final {
 adaptive_analysis_budget_fields_t adaptive_analysis_budget_fields(
     const host_memory_envelope_t& envelope) noexcept;
 
+struct governor_subsystem_budget_fields_t final {
+    std::uint64_t mapped_windows_bytes = analysis_gibibyte;
+    std::uint64_t fact_page_cache_bytes = analysis_gibibyte;
+    std::uint64_t resident_facts_bytes = 8ULL * analysis_gibibyte;
+    std::uint64_t persistence_staging_bytes = 768ULL * analysis_mebibyte;
+    std::uint64_t decode_transient_bytes = 4ULL * analysis_gibibyte;
+    std::uint64_t search_index_bytes = 2ULL * analysis_gibibyte;
+    std::uint64_t decompiler_memory_bytes = 128ULL * analysis_mebibyte;
+    std::uint64_t worker_snapshots_bytes = 256ULL * analysis_mebibyte;
+    std::uint64_t xref_arenas_bytes = 256ULL * analysis_mebibyte;
+    std::uint64_t sqlite_caches_bytes = 512ULL * analysis_mebibyte;
+    std::uint64_t ui_misc_bytes = analysis_gibibyte;
+    std::uint64_t process_budget_bytes = 0;
+};
+
+governor_subsystem_budget_fields_t governor_subsystem_budget_fields(
+    const host_memory_envelope_t& envelope) noexcept;
+
 enum class analysis_reservation_state_t : std::uint8_t {
     queued = 1,
     active = 2

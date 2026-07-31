@@ -822,6 +822,44 @@ void run_sharded_local(std::size_t shard_total, Fn&& shard_fn) {
         "analysis.function_recovery", std::forward<Fn>(shard_fn));
 }
 
+template <typename T, typename Equal>
+void parallel_unique_erase(std::vector<T>& values, Equal&& equal) {
+    if (values.size() < 2)
+        return;
+    const std::size_t count = values.size();
+    const auto shards = partition_shards(count,
+        pass_shard_count(count, kIndexShardFloor));
+    std::vector<std::uint8_t> keep(count, 0);
+    std::vector<std::uint64_t> shard_keeps(shards.size(), 0);
+    run_sharded(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        std::uint64_t kept = 0;
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            const auto flagged = index == 0 || !equal(values[index - 1], values[index]);
+            keep[index] = flagged ? static_cast<std::uint8_t>(1)
+                                  : static_cast<std::uint8_t>(0);
+            kept += flagged ? 1ULL : 0ULL;
+        }
+        shard_keeps[shard] = kept;
+    });
+    std::uint64_t total = 0;
+    for (auto& base : shard_keeps) {
+        const auto offset = total;
+        total += base;
+        base = offset;
+    }
+    std::vector<T> compacted(static_cast<std::size_t>(total));
+    run_sharded(shards.size(), [&](std::size_t shard) {
+        const auto range = shards[shard];
+        auto cursor = shard_keeps[shard];
+        for (std::size_t index = range.begin; index < range.end; ++index) {
+            if (keep[index] != 0)
+                compacted[static_cast<std::size_t>(cursor++)] = std::move(values[index]);
+        }
+    });
+    values = std::move(compacted);
+}
+
 struct pass_budget_t {
     std::atomic<std::uint64_t> committed{0};
     std::uint64_t ceiling = 0;
@@ -1191,9 +1229,8 @@ workspace_result_t<std::vector<function_seed_t>> function_recovery_t::combine_se
                 appended.error());
         }
     }
-    std::sort(combined.begin(), combined.end(), seed_canonical_less);
-    combined.erase(std::unique(combined.begin(), combined.end(), seed_exact_equal),
-                   combined.end());
+    parallel_sort(combined.begin(), combined.end(), seed_canonical_less);
+    parallel_unique_erase(combined, seed_exact_equal);
     return workspace_result_t<std::vector<function_seed_t>>::success(std::move(combined));
 }
 
@@ -1983,9 +2020,8 @@ workspace_result_t<block_recovery_result_t> function_recovery_t::build_blocks(
         for (auto& edge : edges.values)
             result.edges.push_back(std::move(edge));
     }
-    std::sort(result.edges.begin(), result.edges.end(), edge_less);
-    result.edges.erase(std::unique(result.edges.begin(), result.edges.end(), edge_equal),
-        result.edges.end());
+    parallel_sort(result.edges.begin(), result.edges.end(), edge_less);
+    parallel_unique_erase(result.edges, edge_equal);
     for (std::size_t index = 0; index < result.edges.size(); ++index)
         result.edges[index].id = kEdgeEntityTag | static_cast<std::uint64_t>(index + 1);
     result.shard_merge_ns += merge_clock.elapsed_ns();
@@ -2033,9 +2069,10 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
             }
         });
         merge_clock_t boundary_clock;
-        std::sort(block_boundaries.begin(), block_boundaries.end());
-        block_boundaries.erase(std::unique(block_boundaries.begin(),
-            block_boundaries.end()), block_boundaries.end());
+        parallel_sort(block_boundaries.begin(), block_boundaries.end(),
+            [](std::uint64_t lhs, std::uint64_t rhs) { return lhs < rhs; });
+        parallel_unique_erase(block_boundaries,
+            [](std::uint64_t lhs, std::uint64_t rhs) { return lhs == rhs; });
         result.shard_merge_ns += boundary_clock.elapsed_ns();
     }
     const auto boundary_contains = [&](std::uint64_t rva) {
@@ -2154,7 +2191,7 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
         }
         result.shard_merge_ns += seed_clock.elapsed_ns();
     }
-    std::sort(selected.begin(), selected.end(), selected_seed_less);
+    parallel_sort(selected.begin(), selected.end(), selected_seed_less);
     std::vector<selected_seed_t> canonical;
     canonical.reserve(selected.size());
     for (std::size_t first = 0; first < selected.size();) {
@@ -2492,49 +2529,319 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
         }
         result.shard_merge_ns += traverse_clock.elapsed_ns();
     }
-    traverse_scratch_t gap_scratch;
-    for (std::size_t block_index = 0; block_index < result.blocks.size(); ++block_index) {
-        if (claim_counts[block_index].load(std::memory_order_relaxed) != 0)
-            continue;
-        if (candidates.size() >= limits.max_functions) {
+    const std::size_t gap_block_total = result.blocks.size();
+    std::vector<std::uint32_t> unclaimed_blocks;
+    {
+        const auto unclaimed_shards = partition_shards(gap_block_total,
+            pass_shard_count(gap_block_total, kIndexShardFloor));
+        std::vector<std::uint64_t> shard_unclaimed(unclaimed_shards.size(), 0);
+        run_sharded(unclaimed_shards.size(), [&](std::size_t shard) {
+            const auto range = unclaimed_shards[shard];
+            std::uint64_t count = 0;
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                count += claim_counts[index].load(std::memory_order_relaxed) == 0
+                    ? 1ULL : 0ULL;
+            }
+            shard_unclaimed[shard] = count;
+        });
+        std::uint64_t unclaimed_total = 0;
+        for (auto& base : shard_unclaimed) {
+            const auto offset = unclaimed_total;
+            unclaimed_total += base;
+            base = offset;
+        }
+        unclaimed_blocks.resize(static_cast<std::size_t>(unclaimed_total));
+        run_sharded(unclaimed_shards.size(), [&](std::size_t shard) {
+            const auto range = unclaimed_shards[shard];
+            auto cursor = shard_unclaimed[shard];
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                if (claim_counts[index].load(std::memory_order_relaxed) == 0) {
+                    unclaimed_blocks[static_cast<std::size_t>(cursor++)] =
+                        static_cast<std::uint32_t>(index);
+                }
+            }
+        });
+    }
+    struct gap_member_t {
+        std::uint32_t leader = 0;
+        std::uint32_t block = 0;
+    };
+    struct gap_shard_output_t {
+        std::vector<function_candidate_t> candidates;
+        std::vector<function_recovery_conflict_t> conflicts;
+        std::uint64_t memberships = 0;
+        std::uint64_t passes = 0;
+        std::uint64_t synthetic = 0;
+        bool reachability_failed = false;
+    };
+    std::vector<gap_member_t> gap_members;
+    std::vector<std::uint64_t> gap_group_starts;
+    if (!unclaimed_blocks.empty()) {
+        std::vector<std::atomic<std::uint32_t>> component_parent(gap_block_total);
+        {
+            const auto init_shards = partition_shards(gap_block_total,
+                pass_shard_count(gap_block_total, kIndexShardFloor));
+            run_sharded(init_shards.size(), [&](std::size_t shard) {
+                const auto range = init_shards[shard];
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    component_parent[index].store(static_cast<std::uint32_t>(index),
+                        std::memory_order_relaxed);
+                }
+            });
+        }
+        const auto component_find = [&](std::uint32_t value) {
+            for (;;) {
+                const auto parent =
+                    component_parent[value].load(std::memory_order_relaxed);
+                if (parent == value)
+                    return value;
+                const auto grand =
+                    component_parent[parent].load(std::memory_order_relaxed);
+                if (grand != parent) {
+                    auto expected = parent;
+                    component_parent[value].compare_exchange_weak(expected, grand,
+                        std::memory_order_relaxed);
+                }
+                value = grand;
+            }
+        };
+        const auto component_union = [&](std::uint32_t first, std::uint32_t second) {
+            for (;;) {
+                first = component_find(first);
+                second = component_find(second);
+                if (first == second)
+                    return;
+                if (first > second)
+                    std::swap(first, second);
+                auto expected = second;
+                if (component_parent[second].compare_exchange_strong(expected, first,
+                        std::memory_order_relaxed))
+                    return;
+            }
+        };
+        {
+            const auto member_shards = partition_shards(unclaimed_blocks.size(),
+                pass_shard_count(unclaimed_blocks.size(), kIndexShardFloor));
+            run_sharded(member_shards.size(), [&](std::size_t shard) {
+                const auto range = member_shards[shard];
+                shard_poll_t poll{&cancel, &failure, shard, "functions"};
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (poll.stopped(index - range.begin))
+                        return;
+                    const auto block = unclaimed_blocks[index];
+                    for (const auto successor : successors[block]) {
+                        if (claim_counts[successor].load(
+                                std::memory_order_relaxed) == 0) {
+                            component_union(block,
+                                static_cast<std::uint32_t>(successor));
+                        }
+                    }
+                }
+            });
+            if (failure.failed.load(std::memory_order_relaxed))
+                return workspace_result_t<function_recovery_result_t>::failure(
+                    failure.take_error());
+        }
+        gap_members.resize(unclaimed_blocks.size());
+        {
+            const auto member_shards = partition_shards(unclaimed_blocks.size(),
+                pass_shard_count(unclaimed_blocks.size(), kIndexShardFloor));
+            run_sharded(member_shards.size(), [&](std::size_t shard) {
+                const auto range = member_shards[shard];
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    const auto block = unclaimed_blocks[index];
+                    gap_members[index] =
+                        gap_member_t{component_find(block), block};
+                }
+            });
+        }
+        parallel_sort(gap_members.begin(), gap_members.end(),
+            [](const gap_member_t& lhs, const gap_member_t& rhs) {
+                if (lhs.leader != rhs.leader)
+                    return lhs.leader < rhs.leader;
+                return lhs.block < rhs.block;
+            });
+        {
+            const auto group_shards = partition_shards(gap_members.size(),
+                pass_shard_count(gap_members.size(), kIndexShardFloor));
+            std::vector<std::uint64_t> shard_groups(group_shards.size(), 0);
+            run_sharded(group_shards.size(), [&](std::size_t shard) {
+                const auto range = group_shards[shard];
+                std::uint64_t count = 0;
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    count += (index == 0 ||
+                        gap_members[index].leader != gap_members[index - 1].leader)
+                        ? 1ULL : 0ULL;
+                }
+                shard_groups[shard] = count;
+            });
+            std::uint64_t group_total = 0;
+            for (auto& base : shard_groups) {
+                const auto offset = group_total;
+                group_total += base;
+                base = offset;
+            }
+            gap_group_starts.resize(static_cast<std::size_t>(group_total));
+            run_sharded(group_shards.size(), [&](std::size_t shard) {
+                const auto range = group_shards[shard];
+                auto cursor = shard_groups[shard];
+                for (std::size_t index = range.begin; index < range.end; ++index) {
+                    if (index == 0 ||
+                        gap_members[index].leader != gap_members[index - 1].leader) {
+                        gap_group_starts[static_cast<std::size_t>(cursor++)] =
+                            static_cast<std::uint64_t>(index);
+                    }
+                }
+            });
+        }
+    }
+    std::uint64_t gap_candidate_total = 0;
+    std::uint64_t gap_conflict_total = 0;
+    {
+        const auto group_total = gap_group_starts.size();
+        const auto group_shards = partition_shards(group_total,
+            pass_shard_count(group_total, kSeedShardFloor));
+        std::vector<gap_shard_output_t> gap_outputs(group_shards.size());
+        run_sharded_local<traverse_scratch_t>(group_shards.size(),
+            [&](std::size_t shard, traverse_scratch_t& scratch) {
+            guarded_shard(failure, shard, "function storage exceeds analysis budget",
+                "functions", [&]() {
+                auto& output = gap_outputs[shard];
+                const auto range = group_shards[shard];
+                shard_poll_t poll{&cancel, &failure, shard, "functions"};
+                for (std::size_t group = range.begin; group < range.end; ++group) {
+                    if (poll.stopped(group - range.begin) || output.reachability_failed)
+                        return;
+                    const auto member_begin =
+                        static_cast<std::size_t>(gap_group_starts[group]);
+                    const auto member_end = group + 1 < group_total
+                        ? static_cast<std::size_t>(gap_group_starts[group + 1])
+                        : gap_members.size();
+                    for (std::size_t member = member_begin; member < member_end;
+                         ++member) {
+                        const auto block_index =
+                            static_cast<std::size_t>(gap_members[member].block);
+                        if (claim_counts[block_index].load(
+                                std::memory_order_relaxed) != 0)
+                            continue;
+                        selected_seed_t gap;
+                        gap.start = result.blocks[block_index].start.value;
+                        gap.seed.address = result.blocks[block_index].start;
+                        gap.seed.kind = function_seed_kind_t::validated_gap_target;
+                        gap.seed.provenance = fact_provenance_t::gap_recovery;
+                        gap.seed.confidence = result.blocks[block_index].confidence;
+                        gap.seed.stable_source_id =
+                            result.blocks[block_index].id ^ gap.start;
+                        auto traversed = traverse_one(scratch, gap, true,
+                            output.memberships, output.passes);
+                        if (!traversed) {
+                            const auto code = traversed.error().code;
+                            if (code == workspace_error_code_t::cancelled ||
+                                code == workspace_error_code_t::deadline_exceeded) {
+                                failure.report(shard, traversed.error());
+                                return;
+                            }
+                            output.reachability_failed = true;
+                            return;
+                        }
+                        if (scratch.reached.empty())
+                            continue;
+                        function_candidate_t candidate;
+                        candidate.selection = gap;
+                        candidate.blocks = std::move(scratch.reached);
+                        scratch.reached.clear();
+                        candidate.synthetic_gap = true;
+                        for (const auto block : candidate.blocks)
+                            claim_counts[block].fetch_add(1, std::memory_order_relaxed);
+                        function_recovery_conflict_t conflict;
+                        conflict.kind =
+                            function_recovery_conflict_kind_t::gap_component_seeded;
+                        conflict.rva = gap.start;
+                        conflict.selected_seed_kind = gap.seed.kind;
+                        conflict.selected_source_id = gap.seed.stable_source_id;
+                        output.conflicts.push_back(std::move(conflict));
+                        ++output.synthetic;
+                        output.candidates.push_back(std::move(candidate));
+                    }
+                }
+            });
+        });
+        if (failure.failed.load(std::memory_order_relaxed))
+            return workspace_result_t<function_recovery_result_t>::failure(
+                failure.take_error());
+        bool gap_reachability_failed = false;
+        for (const auto& output : gap_outputs) {
+            gap_reachability_failed =
+                gap_reachability_failed || output.reachability_failed;
+            total_memberships += output.memberships;
+            result.reachability_passes += output.passes;
+            gap_conflict_total += output.conflicts.size();
+            gap_candidate_total += output.candidates.size();
+            result.synthetic_gap_functions += output.synthetic;
+        }
+        if (gap_reachability_failed ||
+            total_memberships >= limits.max_function_memberships) {
+            return workspace_result_t<function_recovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "function reachability exceeds analysis budget", "functions"));
+        }
+        if (result.conflicts.size() > limits.max_conflicts ||
+            gap_conflict_total > limits.max_conflicts - result.conflicts.size()) {
+            return workspace_result_t<function_recovery_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "function recovery conflict storage exceeds analysis budget",
+                    "functions"));
+        }
+        if (gap_candidate_total > limits.max_functions - candidates.size()) {
             return workspace_result_t<function_recovery_result_t>::failure(
                 make_workspace_error(workspace_error_code_t::limit_exceeded,
                     "gap function recovery exceeds analysis budget", "functions"));
         }
-        selected_seed_t gap;
-        gap.start = result.blocks[block_index].start.value;
-        gap.seed.address = result.blocks[block_index].start;
-        gap.seed.kind = function_seed_kind_t::validated_gap_target;
-        gap.seed.provenance = fact_provenance_t::gap_recovery;
-        gap.seed.confidence = result.blocks[block_index].confidence;
-        gap.seed.stable_source_id = result.blocks[block_index].id ^ gap.start;
-        auto traversed = traverse_one(gap_scratch, gap, true, total_memberships,
-            result.reachability_passes);
-        if (!traversed)
-            return workspace_result_t<function_recovery_result_t>::failure(
-                traversed.error());
-        if (gap_scratch.reached.empty())
-            continue;
-        function_candidate_t candidate;
-        candidate.selection = gap;
-        candidate.blocks = std::move(gap_scratch.reached);
-        gap_scratch.reached.clear();
-        candidate.synthetic_gap = true;
-        for (const auto block : candidate.blocks)
-            claim_counts[block].fetch_add(1, std::memory_order_relaxed);
-        function_recovery_conflict_t conflict;
-        conflict.kind = function_recovery_conflict_kind_t::gap_component_seeded;
-        conflict.rva = gap.start;
-        conflict.selected_seed_kind = gap.seed.kind;
-        conflict.selected_source_id = gap.seed.stable_source_id;
-        auto appended = append_conflict(result, std::move(conflict), limits);
-        if (!appended)
-            return workspace_result_t<function_recovery_result_t>::failure(
-                appended.error());
-        ++result.synthetic_gap_functions;
-        candidates.push_back(std::move(candidate));
+        {
+            merge_clock_t gap_clock;
+            std::uint64_t conflict_bytes = 0;
+            if (!checked_mul_u64(gap_conflict_total,
+                    sizeof(function_recovery_conflict_t), conflict_bytes)) {
+                return workspace_result_t<function_recovery_result_t>::failure(
+                    make_workspace_error(workspace_error_code_t::range_overflow,
+                        "function recovery conflict storage exceeds analysis budget",
+                        "functions"));
+            }
+            auto accounted = account_bytes(result.storage_bytes, conflict_bytes,
+                limits.max_result_bytes, "functions",
+                "function recovery conflict storage exceeds analysis budget");
+            if (!accounted)
+                return workspace_result_t<function_recovery_result_t>::failure(
+                    accounted.error());
+            std::vector<std::uint64_t> candidate_bases(gap_outputs.size(), 0);
+            std::vector<std::uint64_t> conflict_bases(gap_outputs.size(), 0);
+            std::uint64_t candidate_cursor = candidates.size();
+            std::uint64_t conflict_cursor = result.conflicts.size();
+            for (std::size_t index = 0; index < gap_outputs.size(); ++index) {
+                candidate_bases[index] = candidate_cursor;
+                conflict_bases[index] = conflict_cursor;
+                candidate_cursor += gap_outputs[index].candidates.size();
+                conflict_cursor += gap_outputs[index].conflicts.size();
+            }
+            candidates.resize(static_cast<std::size_t>(candidate_cursor));
+            result.conflicts.resize(static_cast<std::size_t>(conflict_cursor));
+            run_sharded(gap_outputs.size(), [&](std::size_t shard) {
+                auto& output = gap_outputs[shard];
+                auto candidate_slot = candidate_bases[shard];
+                for (auto& candidate : output.candidates) {
+                    candidates[static_cast<std::size_t>(candidate_slot++)] =
+                        std::move(candidate);
+                }
+                auto conflict_slot = conflict_bases[shard];
+                for (auto& conflict : output.conflicts) {
+                    result.conflicts[static_cast<std::size_t>(conflict_slot++)] =
+                        std::move(conflict);
+                }
+            });
+            result.shard_merge_ns += gap_clock.elapsed_ns();
+        }
     }
-    std::sort(candidates.begin(), candidates.end(), candidate_less);
+    parallel_sort(candidates.begin(), candidates.end(), candidate_less);
     for (std::size_t index = 0; index < candidates.size(); ++index)
         candidates[index].function_id =
             kFunctionEntityTag | static_cast<std::uint64_t>(index + 1);
@@ -2849,9 +3156,8 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
     if (failure.failed.load(std::memory_order_relaxed))
         return workspace_result_t<function_recovery_result_t>::failure(failure.take_error());
     merge_clock_t final_clock;
-    std::sort(result.conflicts.begin(), result.conflicts.end(), conflict_less);
-    result.conflicts.erase(std::unique(result.conflicts.begin(),
-        result.conflicts.end(), conflict_equal), result.conflicts.end());
+    parallel_sort(result.conflicts.begin(), result.conflicts.end(), conflict_less);
+    parallel_unique_erase(result.conflicts, conflict_equal);
     result.shard_merge_ns += final_clock.elapsed_ns();
     return workspace_result_t<function_recovery_result_t>::success(std::move(result));
 }
@@ -3057,18 +3363,38 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::finalize_cfg
             return workspace_result_t<function_recovery_result_t>::failure(
                 failure.take_error());
     }
-    std::size_t output = 0;
-    for (std::size_t index = 0; index < result.edges.size(); ++index) {
-        if (keep_flags[index] == 0)
-            continue;
-        if (output != index)
-            result.edges[output] = std::move(result.edges[index]);
-        ++output;
+    {
+        const auto keep_shards = partition_shards(result.edges.size(),
+            pass_shard_count(result.edges.size(), kIndexShardFloor));
+        std::vector<std::uint64_t> shard_kept(keep_shards.size(), 0);
+        run_sharded(keep_shards.size(), [&](std::size_t shard) {
+            const auto range = keep_shards[shard];
+            std::uint64_t kept = 0;
+            for (std::size_t index = range.begin; index < range.end; ++index)
+                kept += keep_flags[index] != 0 ? 1ULL : 0ULL;
+            shard_kept[shard] = kept;
+        });
+        std::uint64_t kept_total = 0;
+        for (auto& base : shard_kept) {
+            const auto offset = kept_total;
+            kept_total += base;
+            base = offset;
+        }
+        std::vector<edge_record_t> kept_edges(static_cast<std::size_t>(kept_total));
+        run_sharded(keep_shards.size(), [&](std::size_t shard) {
+            const auto range = keep_shards[shard];
+            auto cursor = shard_kept[shard];
+            for (std::size_t index = range.begin; index < range.end; ++index) {
+                if (keep_flags[index] != 0) {
+                    kept_edges[static_cast<std::size_t>(cursor++)] =
+                        std::move(result.edges[index]);
+                }
+            }
+        });
+        result.edges = std::move(kept_edges);
     }
-    result.edges.resize(output);
-    std::sort(result.edges.begin(), result.edges.end(), edge_less);
-    result.edges.erase(std::unique(result.edges.begin(), result.edges.end(),
-                                   edge_equal), result.edges.end());
+    parallel_sort(result.edges.begin(), result.edges.end(), edge_less);
+    parallel_unique_erase(result.edges, edge_equal);
     for (std::size_t index = 0; index < result.edges.size(); ++index)
         result.edges[index].id =
             kEdgeEntityTag | static_cast<std::uint64_t>(index + 1);

@@ -12,6 +12,12 @@
 
 namespace aida::analysis {
 
+inline constexpr std::uint32_t packed_page_blob_version_v4 = 4;
+inline constexpr std::uint32_t packed_page_codec_zstd_seeded = 2;
+inline constexpr std::uint32_t packed_page_v4_max_dictionary_bytes = 64U * 1024U;
+inline constexpr std::uint32_t packed_page_v4_window_log = 18;
+inline constexpr std::uint32_t packed_page_v4_dictionary_length_size = 4;
+
 struct packed_page_header_t {
     std::uint64_t generation = 0;
     std::uint64_t analysis_revision = 0;
@@ -88,6 +94,14 @@ public:
     static workspace_result_t<void> seal_page_v3(
         packed_page_t& page, int compression_level,
         const packed_stop_predicate_t& stop_requested = {});
+
+    static workspace_result_t<void> seal_page_v4(
+        packed_page_t& page, int compression_level,
+        const std::vector<std::uint8_t>& dictionary_seed,
+        const packed_stop_predicate_t& stop_requested = {});
+
+    static std::vector<std::uint8_t> build_v4_dictionary_seed(
+        const std::vector<std::uint8_t>& decoded_previous_domain_page);
 
     static workspace_result_t<packed_record_page_prefix_t> record_prefix(
         const packed_page_t& page,

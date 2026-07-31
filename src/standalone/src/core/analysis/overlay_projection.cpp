@@ -377,6 +377,8 @@ void bind_invalidation_generations(projection_invalidation_set_t& invalidation,
     invalidation.packed_index.target_generation = target_generation;
     invalidation.decompiler_cache.source_generation = source_generation;
     invalidation.decompiler_cache.target_generation = target_generation;
+    invalidation.fact_pages.source_generation = source_generation;
+    invalidation.fact_pages.target_generation = target_generation;
 }
 
 bool packed_request_equal(const packed_index_invalidation_request_t& lhs,
@@ -832,6 +834,9 @@ projection_invalidation_set_t overlay_projection_t::compute_invalidation(
     invalidation.decompiler_cache.affected_ranges = invalidation.affected_ranges;
     invalidation.decompiler_cache.affected_entities = invalidation.affected_entities;
 
+    invalidation.fact_pages.affected_ranges = invalidation.affected_ranges;
+    invalidation.fact_pages.rebuild_all = invalidation.packed_index.rebuild_all;
+
     if (stage_test(invalidation.invalidated_stages,
                    projection_stage_flag_t::decompiler)) {
         invalidation.decompiler_cache.invalidated_stages =
@@ -885,6 +890,17 @@ projection_invalidation_dispatch_result_t overlay_projection_t::dispatch_invalid
                 return result;
             }
             result.packed_index_completed = true;
+        }
+        if (invalidation.fact_pages.required() && hooks.fact_pages) {
+            try {
+                result.fact_pages = hooks.fact_pages(invalidation.fact_pages);
+                result.fact_pages_completed = static_cast<bool>(result.fact_pages);
+            } catch (...) {
+                result.fact_pages_completed = false;
+                result.fact_pages.succeeded = false;
+                result.fact_pages.detail =
+                    "fact-page invalidation hook raised an exception";
+            }
         }
     } catch (...) {
         result.code = projection_invalidation_dispatch_code_t::hook_exception;

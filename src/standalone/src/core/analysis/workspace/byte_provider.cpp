@@ -276,10 +276,38 @@ content_hash_memo_t& content_hash_memo() {
 
 struct mapped_file_provider_t::state_t {
     std::shared_ptr<provider_snapshot_t> snapshot;
+    std::shared_ptr<mapped_window_cache_t> window_cache;
     byte_provider_identity_t identity;
     mapped_file_provider_options_t options;
     bool pin_active = false;
+    std::mutex pin_mutex;
+    std::vector<std::uint64_t> pin_tokens;
 };
+
+std::vector<provider_pin_range_t> compute_admission_pin_ranges(
+    const workspace_image_t& image) {
+    std::vector<provider_pin_range_t> ranges;
+    if (image.header_size != 0 && image.header_size <= image.provider_size) {
+        provider_pin_range_t header;
+        header.file_offset = 0;
+        header.size = image.header_size;
+        header.max_windows = 2;
+        ranges.push_back(header);
+    }
+    for (const auto& section : image.sections) {
+        if ((section.permissions & image_permission_execute) == 0 ||
+            section.file_size == 0 || section.file_offset >= image.provider_size)
+            continue;
+        provider_pin_range_t text;
+        text.file_offset = section.file_offset;
+        text.size = (std::min)(section.file_size,
+                               image.provider_size - section.file_offset);
+        text.max_windows = 2;
+        ranges.push_back(text);
+        break;
+    }
+    return ranges;
+}
 
 workspace_result_t<void> byte_provider_t::read_exact(
     std::uint64_t offset, void* destination, std::uint64_t size_value,
@@ -319,8 +347,14 @@ workspace_result_t<void> byte_provider_t::read_exact(
         auto lease_result = lease(offset + completed, amount, cancel);
         if (!lease_result)
             return workspace_result_t<void>::failure(lease_result.error());
-        std::memcpy(output + static_cast<std::size_t>(completed), lease_result.value().data(),
-                    lease_result.value().size());
+        lease_result.value().for_each_segment(
+            [&](const std::uint8_t* bytes, std::size_t segment_size,
+                std::size_t stream_offset) {
+                if (segment_size != 0) {
+                    std::memcpy(output + static_cast<std::size_t>(completed) + stream_offset,
+                                bytes, segment_size);
+                }
+            });
         completed += amount;
     }
     return workspace_result_t<void>::success();
@@ -403,13 +437,27 @@ workspace_result_t<sha256_digest_t> byte_provider_t::compute_content_sha256(
         auto view = lease(offset, amount, cancel);
         if (!view)
             return workspace_result_t<sha256_digest_t>::failure(view.error());
-        if (static_cast<std::uint64_t>(view.value().size()) != amount ||
-            !view.value().data())
+        if (static_cast<std::uint64_t>(view.value().size()) != amount)
             return workspace_result_t<sha256_digest_t>::failure(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "provider returned an invalid hash lease",
                                      "provider_hash"));
-        auto updated = builder.update(view.value().data(), view.value().size());
+        workspace_result_t<void> updated = workspace_result_t<void>::success();
+        view.value().for_each_segment(
+            [&](const std::uint8_t* bytes, std::size_t segment_size,
+                std::size_t stream_offset) {
+                static_cast<void>(stream_offset);
+                if (!updated || segment_size == 0)
+                    return;
+                if (!bytes) {
+                    updated = workspace_result_t<void>::failure(
+                        make_workspace_error(workspace_error_code_t::integrity_failure,
+                                             "provider returned an invalid hash lease segment",
+                                             "provider_hash"));
+                    return;
+                }
+                updated = builder.update(bytes, segment_size);
+            });
         if (!updated)
             return workspace_result_t<sha256_digest_t>::failure(updated.error());
         offset += amount;
@@ -432,6 +480,8 @@ mapped_file_provider_t::open(const std::string& utf8_path,
     cache_options.window_bytes = 0;
     cache_options.max_cached_window_bytes = 0;
     cache_options.max_lease_bytes = options.max_lease_size;
+    cache_options.max_span_windows =
+        static_cast<std::uint32_t>(byte_span_storage_t::kMaxSegments);
     cache_options.immutable_source = true;
     auto cached = mapped_window_cache_t::open(utf8_path, cache_options);
     if (!cached)
@@ -488,6 +538,7 @@ mapped_file_provider_t::open(const std::string& utf8_path,
     try {
         auto state = std::make_shared<state_t>();
         state->snapshot = snapshot.take_value();
+        state->window_cache = std::move(cache);
         state->identity = std::move(identity);
         state->options = options;
         state->pin_active = pin_active;
@@ -503,7 +554,17 @@ mapped_file_provider_t::open(const std::string& utf8_path,
 mapped_file_provider_t::mapped_file_provider_t(std::shared_ptr<state_t> state)
     : state_(std::move(state)) {}
 
-mapped_file_provider_t::~mapped_file_provider_t() = default;
+mapped_file_provider_t::~mapped_file_provider_t() {
+    if (!state_ || !state_->window_cache)
+        return;
+    std::vector<std::uint64_t> tokens;
+    {
+        std::lock_guard<std::mutex> lock(state_->pin_mutex);
+        tokens.swap(state_->pin_tokens);
+    }
+    for (const auto token : tokens)
+        state_->window_cache->unpin_range(token);
+}
 
 const byte_provider_identity_t& mapped_file_provider_t::identity() const noexcept {
     return state_->identity;
@@ -563,24 +624,42 @@ workspace_result_t<byte_view_t> mapped_file_provider_t::lease(
     if (size_value == 0)
         return workspace_result_t<byte_view_t>::success(
             byte_view_t(std::static_pointer_cast<const void>(state_), nullptr, 0));
-    if (size_value <= state_->snapshot->maximum_contiguous_lease(offset))
-        return state_->snapshot->lease(offset, size_value, cancel);
-    std::shared_ptr<std::vector<std::uint8_t>> owner;
-    try {
-        owner = std::make_shared<std::vector<std::uint8_t>>(
-            static_cast<std::size_t>(size_value));
-    } catch (const std::bad_alloc&) {
-        return workspace_result_t<byte_view_t>::failure(
+    return state_->snapshot->lease(offset, size_value, cancel);
+}
+
+workspace_result_t<void> mapped_file_provider_t::pin_ranges(
+    const std::vector<provider_pin_range_t>& ranges) const {
+    if (!state_->window_cache)
+        return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::provider_unavailable,
-                                 "mapped lease copy allocation failed", "byte_provider_lease"));
+                                 "mapped-file provider has no window cache to pin",
+                                 "byte_provider_pin"));
+    std::vector<std::uint64_t> tokens;
+    for (const auto& range : ranges) {
+        if (range.size == 0 || range.max_windows == 0 ||
+            range.file_offset >= state_->identity.size ||
+            range.size > state_->identity.size - range.file_offset)
+            continue;
+        auto token = state_->window_cache->pin_range(
+            range.file_offset, range.size, range.max_windows, {});
+        if (!token) {
+            for (const auto held : tokens)
+                state_->window_cache->unpin_range(held);
+            return workspace_result_t<void>::failure(token.error());
+        }
+        tokens.push_back(token.value());
     }
-    auto read = state_->snapshot->read_exact(offset, owner->data(), size_value, cancel);
-    if (!read)
-        return workspace_result_t<byte_view_t>::failure(read.error());
-    const auto* bytes = owner->data();
-    return workspace_result_t<byte_view_t>::success(
-        byte_view_t(std::static_pointer_cast<const void>(std::move(owner)), bytes,
-                    static_cast<std::size_t>(size_value)));
+    {
+        std::lock_guard<std::mutex> lock(state_->pin_mutex);
+        state_->pin_tokens.insert(state_->pin_tokens.end(), tokens.begin(), tokens.end());
+    }
+    const auto stats = state_->window_cache->statistics();
+    ::diag::log_tagged_fmt("byte_provider",
+        "section pins applied source='%s' ranges=%zu tokens=%zu pinned_windows=%llu cached_window_bytes=%llu",
+        state_->identity.normalized_source.c_str(), ranges.size(), tokens.size(),
+        static_cast<unsigned long long>(stats.pinned_windows),
+        static_cast<unsigned long long>(stats.cached_window_bytes));
+    return workspace_result_t<void>::success();
 }
 
 }

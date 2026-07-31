@@ -2,9 +2,11 @@
 
 #include "checked_range.hpp"
 #include "parallel_pass.hpp"
+#include "snapshot_tables.hpp"
 
 #include "../packed_analysis_store.hpp"
 #include "../tile_decode_orchestrator.hpp"
+#include "../working_set_governor.hpp"
 
 #include "compact_ir.hpp"
 
@@ -278,12 +280,28 @@ workspace_result_t<void> materialize(
             workspace_error_code_t::limit_exceeded,
             "decoded snapshot exceeds analysis memory budget", "decode_merge"));
     }
+    if (!working_set_governor_t::instance().check(
+            working_set_metrics::subsystem_t::resident_facts, required_bytes)) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "decoded snapshot exceeds the working-set governor resident-facts budget",
+            "decode_merge"));
+    }
     snapshot.instructions.clear();
     snapshot.operand_facts.clear();
     snapshot.target_facts.clear();
-    snapshot.instructions.resize(static_cast<std::size_t>(ordinals.instruction_total));
-    snapshot.operand_facts.resize(static_cast<std::size_t>(ordinals.operand_total));
-    snapshot.target_facts.resize(static_cast<std::size_t>(ordinals.target_total));
+    reserve_exact(snapshot.instructions,
+        static_cast<std::size_t>(ordinals.instruction_total));
+    reserve_exact(snapshot.operand_facts,
+        static_cast<std::size_t>(ordinals.operand_total));
+    reserve_exact(snapshot.target_facts,
+        static_cast<std::size_t>(ordinals.target_total));
+    resize_uninitialized(snapshot.instructions,
+        static_cast<std::size_t>(ordinals.instruction_total));
+    resize_uninitialized(snapshot.operand_facts,
+        static_cast<std::size_t>(ordinals.operand_total));
+    resize_uninitialized(snapshot.target_facts,
+        static_cast<std::size_t>(ordinals.target_total));
     const auto shard_ranges =
         parallel_shards(decoded.packed_shards.size(), workers);
     auto materialized = parallel_run_shards(shard_ranges,

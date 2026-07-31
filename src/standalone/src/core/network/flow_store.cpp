@@ -1,5 +1,6 @@
 #include "flow_store.hpp"
 
+#include "../infra/taskflow_runtime.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
@@ -139,16 +140,21 @@ client_replay_result client_replay(const client_replay_options& options)
         static_cast<unsigned long long>(fs_token), capped_worker_count);
     auto fs_admission_ptr = std::make_shared<mcp_standalone::downstream::scoped_admission_t>(std::move(fs_admission));
 
-    std::vector<aida::infra::win_thread::joinable_thread_t> workers;
+    std::vector<aida::infra::taskflow_runtime::job_handle_t> workers;
     workers.reserve(capped_worker_count);
 
     for (uint32_t i = 0; i < capped_worker_count; ++i) {
-        aida::infra::win_thread::joinable_thread_t wt;
-        std::string err;
         const std::string label = "flow_store.replay." + std::to_string(i);
-        const bool started = wt.start([&, i, fs_admission_ptr, fs_token]() {
+        aida::infra::taskflow_runtime::task_descriptor_t worker_desc;
+        worker_desc.domain = aida::infra::taskflow_runtime::executor_domain_t::service;
+        worker_desc.owner_subsystem = "flow_store";
+        worker_desc.label = label.c_str();
+        worker_desc.priority = 3;
+        worker_desc.shutdown_policy = "cancel_pending";
+        worker_desc.cancellable_body = [&, i, fs_admission_ptr, fs_token](const aida::infra::taskflow_runtime::cancellation_token_t& job_token) {
             for (;;) {
-                if (stop.load(std::memory_order_acquire) || cancelled(options.cancel))
+                if (stop.load(std::memory_order_acquire) || cancelled(options.cancel) ||
+                    job_token.requested.load(std::memory_order_acquire))
                     break;
                 const size_t index = next.fetch_add(1);
                 if (index >= flows.size())
@@ -187,13 +193,14 @@ client_replay_result client_replay(const client_replay_options& options)
                         stop.store(true, std::memory_order_release);
                 }
             }
-        }, &err, aida::infra::win_thread::default_stack_reserve, label.c_str());
-        if (started)
-            workers.push_back(std::move(wt));
+        };
+        auto worker_submission = aida::infra::taskflow_runtime::submit(std::move(worker_desc));
+        if (worker_submission.submitted)
+            workers.push_back(worker_submission.handle);
     }
 
     for (auto& worker : workers) {
-        worker.join();
+        aida::infra::taskflow_runtime::wait_for(worker, 0xFFFFFFFFu);
     }
 
     diag::log_tagged_fmt("flow_store", "BURP-NETWORK-WORKER-RELEASE token=%llu reason=completed",
