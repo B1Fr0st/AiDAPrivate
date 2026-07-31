@@ -327,6 +327,204 @@ void verify_bounded_deterministic_view(const decompiler_document_t& document)
         "legacy adapter produced a nondeterministic bounded view");
 }
 
+typed_pseudocode_ast_node_t golden_node(
+    const std::uint64_t id,
+    const typed_pseudocode_ast_node_kind_t kind,
+    const std::uint64_t type_id,
+    std::vector<std::uint64_t> children,
+    std::string text,
+    const decompiler_entity_key_t& entity_value)
+{
+    auto result = node(id, kind, std::move(children), std::move(text), entity_value);
+    result.type_id = type_id;
+    return result;
+}
+
+type_graph_t golden_type_graph(const decompiler_entity_key_t& entity_value)
+{
+    const auto make_type = [](const std::uint64_t id, const decompiler_type_kind_t kind,
+                              const std::string& name, const std::uint32_t size,
+                              const std::uint32_t alignment, const bool is_signed) {
+        decompiler_type_node_t result;
+        result.id = id;
+        result.kind = kind;
+        result.canonical_name = name;
+        result.display_name = name;
+        result.byte_size = size;
+        result.alignment = alignment;
+        result.is_signed = is_signed;
+        result.confidence = 100;
+        result.provenance = decompiler_fact_provenance_t::provider_semantics;
+        return result;
+    };
+    type_graph_t result;
+    result.entity = entity_value;
+    result.revision = 31;
+    result.nodes.push_back(make_type(1, decompiler_type_kind_t::unsigned_integer, "DWORD", 4, 4, false));
+    result.nodes.push_back(make_type(2, decompiler_type_kind_t::unsigned_integer, "SIZE_T", 8, 8, false));
+    result.nodes.push_back(make_type(3, decompiler_type_kind_t::pointer, "HANDLE", 8, 8, false));
+    result.nodes.push_back(make_type(4, decompiler_type_kind_t::signed_integer, "BOOL", 4, 4, true));
+    return result;
+}
+
+typed_pseudocode_ast_v2_t golden_ast(
+    const decompiler_entity_key_t& entity_value,
+    const type_graph_t& types)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-readability-golden-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes.push_back(golden_node(1, typed_pseudocode_ast_node_kind_t::function_definition,
+        0, {2}, "readability_golden_fixture", entity_value));
+    result.nodes.push_back(golden_node(2, typed_pseudocode_ast_node_kind_t::compound_statement,
+        0, {3, 5, 7, 13, 17}, {}, entity_value));
+    result.nodes.push_back(golden_node(3, typed_pseudocode_ast_node_kind_t::declaration,
+        1, {4}, "local_4", entity_value));
+    result.nodes.push_back(golden_node(4, typed_pseudocode_ast_node_kind_t::identifier,
+        1, {}, "global_count", entity_value));
+    result.nodes.push_back(golden_node(5, typed_pseudocode_ast_node_kind_t::declaration,
+        2, {6}, "local_8", entity_value));
+    result.nodes.push_back(golden_node(6, typed_pseudocode_ast_node_kind_t::identifier,
+        2, {}, "local_4", entity_value));
+    result.nodes.push_back(golden_node(7, typed_pseudocode_ast_node_kind_t::declaration,
+        3, {8}, "local_12", entity_value));
+    result.nodes.push_back(golden_node(8, typed_pseudocode_ast_node_kind_t::binary_expression,
+        1, {9, 10}, "&", entity_value));
+    result.nodes.push_back(golden_node(9, typed_pseudocode_ast_node_kind_t::identifier,
+        1, {}, "local_4", entity_value));
+    result.nodes.push_back(golden_node(10, typed_pseudocode_ast_node_kind_t::binary_expression,
+        1, {11, 12}, "+", entity_value));
+    result.nodes.push_back(golden_node(11, typed_pseudocode_ast_node_kind_t::literal,
+        1, {}, "2", entity_value));
+    result.nodes.push_back(golden_node(12, typed_pseudocode_ast_node_kind_t::literal,
+        1, {}, "3", entity_value));
+    result.nodes.push_back(golden_node(13, typed_pseudocode_ast_node_kind_t::declaration,
+        4, {14}, "local_16", entity_value));
+    result.nodes.push_back(golden_node(14, typed_pseudocode_ast_node_kind_t::binary_expression,
+        4, {15, 16}, "+", entity_value));
+    result.nodes.push_back(golden_node(15, typed_pseudocode_ast_node_kind_t::identifier,
+        4, {}, "local_8", entity_value));
+    result.nodes.push_back(golden_node(16, typed_pseudocode_ast_node_kind_t::literal,
+        4, {}, "0", entity_value));
+    result.nodes.push_back(golden_node(17, typed_pseudocode_ast_node_kind_t::return_statement,
+        0, {18}, {}, entity_value));
+    result.nodes.push_back(golden_node(18, typed_pseudocode_ast_node_kind_t::identifier,
+        3, {}, "local_12", entity_value));
+    return result;
+}
+
+bool same_transform_metrics(const readability_transform_metrics_t& left,
+                            const readability_transform_metrics_t& right)
+{
+    return left.variables_renamed == right.variables_renamed &&
+        left.loop_counters_named == right.loop_counters_named &&
+        left.api_call_names_applied == right.api_call_names_applied &&
+        left.type_based_names_applied == right.type_based_names_applied &&
+        left.string_reference_names_applied == right.string_reference_names_applied &&
+        left.constants_folded == right.constants_folded &&
+        left.identities_simplified == right.identities_simplified &&
+        left.casts_simplified == right.casts_simplified &&
+        left.double_negations_simplified == right.double_negations_simplified &&
+        left.comparisons_normalized == right.comparisons_normalized &&
+        left.compound_assignments_marked == right.compound_assignments_marked &&
+        left.temporaries_inlined == right.temporaries_inlined &&
+        left.copies_propagated == right.copies_propagated &&
+        left.dead_stores_eliminated == right.dead_stores_eliminated &&
+        left.nodes_removed == right.nodes_removed;
+}
+
+bool same_ast_nodes(const typed_pseudocode_ast_v2_t& left,
+                    const typed_pseudocode_ast_v2_t& right)
+{
+    if (left.root_node_id != right.root_node_id || left.body_node_id != right.body_node_id ||
+        left.nodes.size() != right.nodes.size())
+        return false;
+    for (std::size_t index = 0; index < left.nodes.size(); ++index) {
+        const auto& a = left.nodes[index];
+        const auto& b = right.nodes[index];
+        if (a.id != b.id || a.kind != b.kind || a.type_id != b.type_id ||
+            a.child_ids != b.child_ids || a.stable_text != b.stable_text)
+            return false;
+    }
+    return true;
+}
+
+void verify_readability_golden_output(const decompiler_entity_key_t& entity_value)
+{
+    const auto types = golden_type_graph(entity_value);
+    const auto source = golden_ast(entity_value, types);
+    require(validate_typed_pseudocode_ast(source).valid(),
+        "readability golden fixture is not a valid typed AST");
+
+    auto first_ast = source;
+    const auto first = apply_readability_transforms(first_ast, types, {});
+    require(first.transformed && first.succeeded(),
+        "readability golden fixture produced no transforms");
+    auto second_ast = source;
+    const auto second = apply_readability_transforms(second_ast, types, {});
+    require(second.transformed && second.succeeded(),
+        "readability golden second run produced no transforms");
+    require(first.diagnostics.empty() && second.diagnostics.empty(),
+        "readability golden transforms emitted diagnostics");
+    require(same_transform_metrics(first.metrics, second.metrics) &&
+            same_ast_nodes(first_ast, second_ast) &&
+            stable_serialization_hash(first_ast) == stable_serialization_hash(second_ast),
+        "readability golden transforms are not byte-identical across two runs");
+
+    const auto& metrics = first.metrics;
+    require(metrics.variables_renamed == 8 && metrics.type_based_names_applied == 4 &&
+            metrics.loop_counters_named == 0 && metrics.api_call_names_applied == 0 &&
+            metrics.string_reference_names_applied == 0,
+        "readability golden renaming counters diverged");
+    require(metrics.constants_folded == 1 && metrics.identities_simplified == 1 &&
+            metrics.casts_simplified == 0 && metrics.double_negations_simplified == 0 &&
+            metrics.comparisons_normalized == 0 && metrics.compound_assignments_marked == 0,
+        "readability golden simplification counters diverged");
+    require(metrics.temporaries_inlined == 2 && metrics.copies_propagated == 2 &&
+            metrics.dead_stores_eliminated == 4 && metrics.nodes_removed == 12,
+        "readability golden def-use counters diverged");
+
+    require(first_ast.root_node_id == 1 && first_ast.body_node_id == 2 &&
+            first_ast.nodes.size() == 6,
+        "readability golden output shape diverged");
+    const auto& nodes = first_ast.nodes;
+    require(nodes[0].id == 1 &&
+            nodes[0].kind == typed_pseudocode_ast_node_kind_t::function_definition &&
+            nodes[0].child_ids == std::vector<std::uint64_t>{2} &&
+            nodes[0].stable_text == "readability_golden_fixture",
+        "readability golden function node diverged");
+    require(nodes[1].id == 2 &&
+            nodes[1].kind == typed_pseudocode_ast_node_kind_t::compound_statement &&
+            nodes[1].child_ids == std::vector<std::uint64_t>{17},
+        "readability golden body node diverged");
+    require(nodes[2].id == 9 &&
+            nodes[2].kind == typed_pseudocode_ast_node_kind_t::identifier &&
+            nodes[2].stable_text == "global_count" && nodes[2].child_ids.empty(),
+        "readability golden copy-propagated identifier diverged");
+    require(nodes[3].id == 10 &&
+            nodes[3].kind == typed_pseudocode_ast_node_kind_t::literal &&
+            nodes[3].stable_text == "5" && nodes[3].child_ids.empty(),
+        "readability golden folded literal diverged");
+    require(nodes[4].id == 17 &&
+            nodes[4].kind == typed_pseudocode_ast_node_kind_t::return_statement &&
+            nodes[4].child_ids == std::vector<std::uint64_t>{18},
+        "readability golden return node diverged");
+    require(nodes[5].id == 18 &&
+            nodes[5].kind == typed_pseudocode_ast_node_kind_t::binary_expression &&
+            nodes[5].stable_text == "&" &&
+            nodes[5].child_ids == (std::vector<std::uint64_t>{9, 10}),
+        "readability golden surviving expression diverged");
+    require(std::none_of(nodes.begin(), nodes.end(), [](const typed_pseudocode_ast_node_t& value) {
+            return value.stable_text == "local_4" || value.stable_text == "local_8" ||
+                value.stable_text == "local_12" || value.stable_text == "local_16";
+        }), "readability golden output retained generated identifier names");
+    require(validate_typed_pseudocode_ast(first_ast).valid(),
+        "readability golden output is not a valid typed AST");
+}
+
 void verify_baseline_capture(
     const typed_pseudocode_ast_v2_t& valid_ast,
     const decompiler_document_t& document)
@@ -503,6 +701,7 @@ void run_decompiler_readability_harness()
     verify_null_and_fabricated_rejection(valid_document, empty_ast, empty_document);
     verify_diagnostic_and_mapping_preservation(valid_ast, valid_document);
     verify_bounded_deterministic_view(valid_document);
+    verify_readability_golden_output(entity_value);
     verify_baseline_capture(valid_ast, valid_document);
     verify_pseudocode_document_delivery(valid_document);
     verify_reconstructor_gate(valid_document, empty_document);

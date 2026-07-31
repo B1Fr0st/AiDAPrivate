@@ -92,7 +92,8 @@ enum class decompiler_diagnostic_code_t : std::uint16_t {
     malformed_ast = 17,
     malformed_document = 18,
     cache_key_rejected = 19,
-    source_map_rejected = 20
+    source_map_rejected = 20,
+    partial_decompilation = 21
 };
 
 enum class decompiler_fact_provenance_t : std::uint8_t {
@@ -241,6 +242,15 @@ enum class decompiler_profile_id_t : std::uint8_t {
     fast = 1,
     balanced = 2,
     thorough = 3
+};
+
+enum class decompiler_semantic_proof_availability_t : std::uint8_t {
+    not_requested = 1,
+    ready = 2,
+    triton_unavailable = 3,
+    z3_unavailable = 4,
+    z3_not_linked = 5,
+    adapter_denied = 6
 };
 
 enum class decompiler_cache_stage_t : std::uint8_t {
@@ -534,13 +544,58 @@ struct decompiler_document_source_map_t {
     std::vector<source_coordinate_t> coordinates;
 };
 
+struct readability_transform_settings_t {
+    bool enable_variable_renaming = true;
+    bool enable_expression_simplification = true;
+    bool enable_temporary_coalescing = true;
+    bool enable_loop_counter_naming = true;
+    bool enable_api_call_naming = true;
+    bool enable_type_based_naming = true;
+    bool enable_string_reference_naming = true;
+    bool enable_constant_folding = true;
+    bool enable_identity_simplification = true;
+    bool enable_cast_simplification = true;
+    bool enable_comparison_normalization = true;
+    bool enable_compound_assignment_marking = true;
+    bool enable_double_negation_simplification = true;
+    bool enable_single_use_inlining = true;
+    bool enable_copy_propagation = true;
+    bool enable_dead_store_elimination = true;
+    std::size_t max_transform_iterations = 4;
+    std::size_t max_expression_depth = 256;
+
+    bool operator==(const readability_transform_settings_t& other) const noexcept
+    {
+        return enable_variable_renaming == other.enable_variable_renaming &&
+            enable_expression_simplification == other.enable_expression_simplification &&
+            enable_temporary_coalescing == other.enable_temporary_coalescing &&
+            enable_loop_counter_naming == other.enable_loop_counter_naming &&
+            enable_api_call_naming == other.enable_api_call_naming &&
+            enable_type_based_naming == other.enable_type_based_naming &&
+            enable_string_reference_naming == other.enable_string_reference_naming &&
+            enable_constant_folding == other.enable_constant_folding &&
+            enable_identity_simplification == other.enable_identity_simplification &&
+            enable_cast_simplification == other.enable_cast_simplification &&
+            enable_comparison_normalization == other.enable_comparison_normalization &&
+            enable_compound_assignment_marking == other.enable_compound_assignment_marking &&
+            enable_double_negation_simplification == other.enable_double_negation_simplification &&
+            enable_single_use_inlining == other.enable_single_use_inlining &&
+            enable_copy_propagation == other.enable_copy_propagation &&
+            enable_dead_store_elimination == other.enable_dead_store_elimination &&
+            max_transform_iterations == other.max_transform_iterations &&
+            max_expression_depth == other.max_expression_depth;
+    }
+    bool operator!=(const readability_transform_settings_t& other) const noexcept { return !(*this == other); }
+};
+
 struct decompiler_renderer_settings_t {
-    std::uint32_t schema_version = 1;
+    std::uint32_t schema_version = 2;
     std::string style_id;
     std::uint32_t indentation_spaces = 4;
     bool emit_type_annotations = true;
     bool emit_provenance_annotations = true;
     bool emit_unknown_tokens = true;
+    readability_transform_settings_t readability;
 };
 
 struct decompiler_document_t {

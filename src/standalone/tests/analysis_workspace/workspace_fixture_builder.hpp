@@ -1103,13 +1103,19 @@ inline std::shared_ptr<analysis_metrics_t> analyze_workspace_instrumented(
     std::atomic<bool> runtime_cancelled{false};
     auto run = [&](auto callable) {
         auto result = callable();
+        const auto statistics = workspace->source_provider().window_cache_statistics();
+        if (statistics) {
+            analyzer.value()->metrics()->set_max(analysis_metric_t::mapped_window_bytes_peak,
+                statistics->cached_window_bytes);
+            analyzer.value()->metrics()->set_max(analysis_metric_t::mapped_window_bytes_global_peak,
+                statistics->global_mapped_window_bytes);
+        }
         if (!result)
             throw fixture_error_t(result.error().stable_code() + ":" + result.error().message);
     };
     run([&] { return analyzer.value()->parse_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->seed_phase(runtime_cancelled); });
-    for (std::uint32_t lane = 0; lane < analyzer.value()->decode_lane_count(); ++lane)
-        run([&] { return analyzer.value()->decode_lane_phase(lane, runtime_cancelled); });
+    run([&] { return analyzer.value()->decode_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->decode_merge_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->data_discovery_phase(runtime_cancelled); });
     run([&] { return analyzer.value()->function_recovery_phase(runtime_cancelled); });

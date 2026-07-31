@@ -27,6 +27,7 @@ struct schema_v9_harness_summary_t {
 schema_v9_fixture_result_t run_golden_v8_migration();
 schema_v9_fixture_result_t run_interrupted_commit();
 schema_v9_fixture_result_t run_corruption_detection();
+schema_v9_fixture_result_t run_packed_page_known_answer();
 schema_v9_fixture_result_t run_rollback_after_failed_migration();
 schema_v9_fixture_result_t run_fixed_width_address();
 schema_v9_fixture_result_t run_concurrent_reader();

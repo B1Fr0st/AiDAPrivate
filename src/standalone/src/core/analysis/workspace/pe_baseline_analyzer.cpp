@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <array>
 #include <limits>
-#include <map>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -176,8 +175,7 @@ workspace_result_t<std::vector<coverage_span_t>> build_managed_bytecode_coverage
     return workspace_result_t<std::vector<coverage_span_t>>::success(std::move(coverage));
 }
 
-bool executable_rva(const workspace_image_t& image, std::uint64_t rva) {
-    const auto ranges = executable_ranges(image);
+bool executable_rva_in(const std::vector<image_range_t>& ranges, std::uint64_t rva) {
     const auto found = std::upper_bound(ranges.begin(), ranges.end(), rva,
         [](std::uint64_t value, const image_range_t& range) { return value < range.start; });
     if (found == ranges.begin())
@@ -185,6 +183,135 @@ bool executable_rva(const workspace_image_t& image, std::uint64_t rva) {
     const auto& range = *std::prev(found);
     return rva >= range.start && rva < range.end;
 }
+
+std::uint64_t seed_key_mix(std::uint64_t key) noexcept {
+    key *= 0x9E3779B97F4A7C15ULL;
+    key ^= key >> 33U;
+    return key;
+}
+
+class seed_candidate_set_t final {
+public:
+    struct entry_t {
+        std::uint64_t key = 0;
+        function_seed_t seed;
+    };
+
+    workspace_result_t<void> reserve(std::uint64_t estimate, const char* phase) {
+        std::uint64_t target = 0;
+        if (!checked_mul_u64((std::max<std::uint64_t>)(estimate, 1ULL), 2ULL, target)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::range_overflow,
+                "function seed dedup accounting overflows", phase));
+        }
+        std::uint64_t capacity = 16;
+        while (capacity < target)
+            capacity <<= 1U;
+        slots_.assign(static_cast<std::size_t>(capacity), slot_t{});
+        mask_ = capacity - 1ULL;
+        return workspace_result_t<void>::success();
+    }
+
+    workspace_result_t<void> add(function_seed_t&& seed, std::uint64_t rva,
+                                 std::uint64_t max_count, const char* phase) {
+        if (rva >= (1ULL << 56) - 1ULL) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "function seed address exceeds the dedup key space", phase));
+        }
+        const auto raw = (rva << 8U) |
+            static_cast<std::uint64_t>(static_cast<std::uint8_t>(seed.kind));
+        return add_keyed(raw + 1ULL, std::move(seed), max_count, phase);
+    }
+
+    workspace_result_t<void> add_keyed(std::uint64_t key, function_seed_t&& seed,
+                                       std::uint64_t max_count, const char* phase) {
+        if (slots_.empty()) {
+            auto initialized = reserve(16, phase);
+            if (!initialized)
+                return initialized;
+        }
+        if ((entries_.size() + 1ULL) * 4ULL >= slots_.size() * 3ULL) {
+            auto grown = grow();
+            if (!grown)
+                return grown;
+        }
+        auto slot = static_cast<std::size_t>(seed_key_mix(key) & mask_);
+        for (;;) {
+            auto& entry = slots_[slot];
+            if (entry.stored_key == key) {
+                auto& existing = entries_[entry.index].seed;
+                if (stronger_seed_evidence(seed.provenance, seed.confidence,
+                        seed.stable_source_id, existing.provenance,
+                        existing.confidence, existing.stable_source_id))
+                    existing = std::move(seed);
+                return workspace_result_t<void>::success();
+            }
+            if (entry.stored_key == 0) {
+                entry.stored_key = key;
+                entry.index = static_cast<std::uint32_t>(entries_.size());
+                entries_.push_back(entry_t{key, std::move(seed)});
+                if (entries_.size() > max_count) {
+                    return workspace_result_t<void>::failure(make_workspace_error(
+                        workspace_error_code_t::limit_exceeded,
+                        "function seed count exceeds analysis budget", phase));
+                }
+                return workspace_result_t<void>::success();
+            }
+            slot = (slot + 1U) & mask_;
+        }
+    }
+
+    std::size_t size() const noexcept { return entries_.size(); }
+
+    std::vector<entry_t>& entries() noexcept { return entries_; }
+
+    std::vector<function_seed_t> take_sorted(std::uint32_t workers) {
+        parallel_sort(entries_.begin(), entries_.end(),
+            [](const entry_t& lhs, const entry_t& rhs) { return lhs.key < rhs.key; },
+            workers);
+        std::vector<function_seed_t> seeds;
+        seeds.reserve(entries_.size());
+        for (auto& entry : entries_)
+            seeds.push_back(std::move(entry.seed));
+        return seeds;
+    }
+
+private:
+    struct slot_t {
+        std::uint64_t stored_key = 0;
+        std::uint32_t index = 0;
+    };
+
+    workspace_result_t<void> grow() {
+        std::uint64_t capacity = slots_.size() * 2ULL;
+        if (capacity < 16ULL)
+            capacity = 16ULL;
+        std::vector<slot_t> rebuilt;
+        rebuilt.assign(static_cast<std::size_t>(capacity), slot_t{});
+        const auto mask = capacity - 1ULL;
+        for (std::size_t index = 0; index < entries_.size(); ++index) {
+            auto slot = static_cast<std::size_t>(seed_key_mix(entries_[index].key) & mask);
+            while (rebuilt[slot].stored_key != 0)
+                slot = (slot + 1U) & mask;
+            rebuilt[slot].stored_key = entries_[index].key;
+            rebuilt[slot].index = static_cast<std::uint32_t>(index);
+        }
+        slots_ = std::move(rebuilt);
+        mask_ = mask;
+        return workspace_result_t<void>::success();
+    }
+
+    std::vector<slot_t> slots_;
+    std::vector<entry_t> entries_;
+    std::uint64_t mask_ = 0;
+};
+
+struct seed_producer_output_t {
+    seed_candidate_set_t candidates;
+    std::uint64_t next_source = 0;
+    std::optional<workspace_error_t> error;
+};
 
 bool supports_x86_tile_decode(const arch_decoder_registration_t& registration) noexcept {
     const auto& key = registration.key;
@@ -212,7 +339,8 @@ workspace_error_t cancellation_error(const cancellation_token_t& local,
 }
 
 workspace_result_t<void> validate_coverage_linear_cancellable(
-    const analysis_snapshot_t& snapshot, const cancellation_token_t& cancel) {
+    const analysis_snapshot_t& snapshot, std::uint32_t workers,
+    const cancellation_token_t& cancel) {
     if (!snapshot.normalized_image) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
@@ -230,7 +358,7 @@ workspace_result_t<void> validate_coverage_linear_cancellable(
         [](const coverage_span_t& span) {
             return span.start.space <= address_space_id_t::relative_virtual;
         });
-    const auto shards = parallel_shards(ranges.size(), 0);
+    const auto shards = parallel_shards(ranges.size(), workers);
     return parallel_validate_shards(shards, 1,
         [&](std::size_t, const parallel_shard_t& shard) -> ordered_error_t {
             ordered_error_t result;
@@ -388,84 +516,110 @@ workspace_result_t<image_layout_index_t> build_baseline_image_layout(
 workspace_result_t<std::vector<coverage_span_t>> build_canonical_decode_coverage(
     const workspace_image_t& image, const image_layout_index_t& layout,
     const std::vector<instruction_record_t>& instructions, std::uint64_t maximum_spans,
-    const cancellation_token_t& cancel) {
-    std::vector<coverage_span_t> coverage;
-    const auto append = [&](std::uint64_t start, std::uint64_t size,
-                            coverage_reason_t reason, fact_provenance_t provenance,
-                            std::uint8_t confidence, tile_coverage_detail_t detail)
-        -> workspace_result_t<void> {
-        if (size == 0)
-            return workspace_result_t<void>::success();
-        if (coverage.size() >= maximum_spans) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "canonical decode coverage exceeds analysis budget", "decode_merge"));
-        }
-        coverage_span_t span;
-        span.start = rva_address(image, start);
-        span.size = size;
-        span.reason = reason;
-        span.provenance = provenance;
-        span.confidence = confidence;
-        span.detail_code = static_cast<std::uint32_t>(detail);
-        coverage.push_back(std::move(span));
-        return workspace_result_t<void>::success();
-    };
+    std::uint32_t workers, const cancellation_token_t& cancel) {
+    std::vector<const image_layout_mapping_t*> executable_mappings;
     for (const auto& mapping : layout.mappings()) {
         if ((mapping.permissions & image_permission_execute) == 0 ||
             mapping.virtual_size == 0)
             continue;
-        if (cancel.stop_requested())
-            return workspace_result_t<std::vector<coverage_span_t>>::failure(
-                cancellation_error(cancel, cancel, "decode_merge"));
-        const auto initialized = (std::min)(mapping.file_size, mapping.virtual_size);
-        std::uint64_t initialized_end = 0;
-        std::uint64_t mapping_end = 0;
-        if (!checked_add_u64(mapping.rva, initialized, initialized_end) ||
-            !checked_add_u64(mapping.rva, mapping.virtual_size, mapping_end)) {
+        executable_mappings.push_back(&mapping);
+    }
+    const auto mapping_shards = parallel_shards(executable_mappings.size(), workers);
+    struct shard_output_t {
+        std::vector<coverage_span_t> spans;
+    };
+    std::vector<shard_output_t> shard_outputs(mapping_shards.size());
+    auto built = parallel_run_shards(mapping_shards,
+        [&](std::size_t shard_index, parallel_shard_t range) -> workspace_result_t<void> {
+            auto& output = shard_outputs[shard_index];
+            for (std::size_t mapping_index = range.begin; mapping_index < range.end;
+                 ++mapping_index) {
+                if (cancel.stop_requested()) {
+                    return workspace_result_t<void>::failure(
+                        cancellation_error(cancel, cancel, "decode_merge"));
+                }
+                const auto& mapping = *executable_mappings[mapping_index];
+                const auto append = [&](std::uint64_t start, std::uint64_t size,
+                                        coverage_reason_t reason,
+                                        fact_provenance_t provenance,
+                                        std::uint8_t confidence,
+                                        tile_coverage_detail_t detail) {
+                    if (size == 0)
+                        return;
+                    coverage_span_t span;
+                    span.start = rva_address(image, start);
+                    span.size = size;
+                    span.reason = reason;
+                    span.provenance = provenance;
+                    span.confidence = confidence;
+                    span.detail_code = static_cast<std::uint32_t>(detail);
+                    output.spans.push_back(std::move(span));
+                };
+                const auto initialized = (std::min)(mapping.file_size, mapping.virtual_size);
+                std::uint64_t initialized_end = 0;
+                std::uint64_t mapping_end = 0;
+                if (!checked_add_u64(mapping.rva, initialized, initialized_end) ||
+                    !checked_add_u64(mapping.rva, mapping.virtual_size, mapping_end)) {
+                    return workspace_result_t<void>::failure(
+                        make_workspace_error(workspace_error_code_t::range_overflow,
+                            "canonical decode coverage range overflowed", "decode_merge"));
+                }
+                auto found = std::lower_bound(instructions.begin(), instructions.end(),
+                    mapping.rva,
+                    [](const instruction_record_t& instruction, std::uint64_t rva) {
+                        return instruction.address.value < rva;
+                    });
+                std::uint64_t cursor = mapping.rva;
+                while (found != instructions.end() && found->address.value < initialized_end) {
+                    std::uint64_t instruction_end = 0;
+                    if (!checked_add_u64(found->address.value, found->length,
+                            instruction_end) ||
+                        found->address.value < cursor || instruction_end > initialized_end) {
+                        return workspace_result_t<void>::failure(
+                            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                "tile decode instruction crosses canonical mapping ownership",
+                                "decode_merge"));
+                    }
+                    append(cursor, found->address.value - cursor,
+                        coverage_reason_t::undecodable, fact_provenance_t::gap_recovery, 25,
+                        tile_coverage_detail_t::undecodable_gap);
+                    append(found->address.value, found->length,
+                        coverage_reason_t::decoded, found->provenance, found->confidence,
+                        tile_coverage_detail_t::none);
+                    cursor = instruction_end;
+                    ++found;
+                }
+                append(cursor, initialized_end - cursor,
+                    coverage_reason_t::undecodable, fact_provenance_t::gap_recovery, 25,
+                    tile_coverage_detail_t::undecodable_gap);
+                append(initialized_end, mapping_end - initialized_end,
+                    coverage_reason_t::undecodable, fact_provenance_t::linear_validation, 100,
+                    tile_coverage_detail_t::zero_fill);
+            }
+            return workspace_result_t<void>::success();
+        }, cancel);
+    if (!built)
+        return workspace_result_t<std::vector<coverage_span_t>>::failure(built.error());
+    std::uint64_t total_spans = 0;
+    for (const auto& output : shard_outputs) {
+        if (!checked_add_u64(total_spans,
+                static_cast<std::uint64_t>(output.spans.size()), total_spans)) {
             return workspace_result_t<std::vector<coverage_span_t>>::failure(
                 make_workspace_error(workspace_error_code_t::range_overflow,
-                    "canonical decode coverage range overflowed", "decode_merge"));
+                    "canonical decode coverage accounting overflowed", "decode_merge"));
         }
-        auto found = std::lower_bound(instructions.begin(), instructions.end(), mapping.rva,
-            [](const instruction_record_t& instruction, std::uint64_t rva) {
-                return instruction.address.value < rva;
-            });
-        std::uint64_t cursor = mapping.rva;
-        while (found != instructions.end() && found->address.value < initialized_end) {
-            std::uint64_t instruction_end = 0;
-            if (!checked_add_u64(found->address.value, found->length, instruction_end) ||
-                found->address.value < cursor || instruction_end > initialized_end) {
-                return workspace_result_t<std::vector<coverage_span_t>>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                        "tile decode instruction crosses canonical mapping ownership",
-                        "decode_merge"));
-            }
-            auto gap = append(cursor, found->address.value - cursor,
-                coverage_reason_t::undecodable, fact_provenance_t::gap_recovery, 25,
-                tile_coverage_detail_t::undecodable_gap);
-            if (!gap)
-                return workspace_result_t<std::vector<coverage_span_t>>::failure(gap.error());
-            auto accepted = append(found->address.value, found->length,
-                coverage_reason_t::decoded, found->provenance, found->confidence,
-                tile_coverage_detail_t::none);
-            if (!accepted)
-                return workspace_result_t<std::vector<coverage_span_t>>::failure(
-                    accepted.error());
-            cursor = instruction_end;
-            ++found;
-        }
-        auto tail = append(cursor, initialized_end - cursor,
-            coverage_reason_t::undecodable, fact_provenance_t::gap_recovery, 25,
-            tile_coverage_detail_t::undecodable_gap);
-        if (!tail)
-            return workspace_result_t<std::vector<coverage_span_t>>::failure(tail.error());
-        auto zero_fill = append(initialized_end, mapping_end - initialized_end,
-            coverage_reason_t::undecodable, fact_provenance_t::linear_validation, 100,
-            tile_coverage_detail_t::zero_fill);
-        if (!zero_fill)
-            return workspace_result_t<std::vector<coverage_span_t>>::failure(
-                zero_fill.error());
+    }
+    if (total_spans > maximum_spans) {
+        return workspace_result_t<std::vector<coverage_span_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "canonical decode coverage exceeds analysis budget", "decode_merge"));
+    }
+    std::vector<coverage_span_t> coverage;
+    coverage.reserve(static_cast<std::size_t>(total_spans));
+    for (auto& output : shard_outputs) {
+        coverage.insert(coverage.end(),
+            std::make_move_iterator(output.spans.begin()),
+            std::make_move_iterator(output.spans.end()));
     }
     return workspace_result_t<std::vector<coverage_span_t>>::success(std::move(coverage));
 }
@@ -516,6 +670,7 @@ build_indirect_call_candidates(
     const std::vector<data_pointer_fact_t>& pointers,
     std::uint64_t maximum_candidates,
     std::uint32_t cancellation_check_interval,
+    std::uint32_t workers,
     const cancellation_token_t& cancel)
 {
     if (maximum_candidates == 0 || cancellation_check_interval == 0) {
@@ -531,82 +686,125 @@ build_indirect_call_candidates(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                 "data pointer facts are not ordered by slot", "call_graph_evidence"));
     }
-    std::vector<indirect_call_candidate_t> candidates;
-    std::uint64_t checks = 0;
-    for (const auto& instruction : instructions) {
-        if (++checks >= cancellation_check_interval) {
-            checks = 0;
-            if (cancel.stop_requested()) {
-                return workspace_result_t<
-                    std::vector<indirect_call_candidate_t>>::failure(
-                    cancellation_error(cancel, cancel, "call_graph_evidence"));
-            }
-        }
-        if ((instruction.flow_flags & flow_indirect) == 0 ||
-            (instruction.flow_flags & (flow_call | flow_branch)) == 0)
-            continue;
-        std::uint64_t target_end = 0;
-        if (!checked_add_u64(instruction.target_fact_begin,
-                instruction.target_fact_count, target_end) ||
-            target_end > targets.size()) {
-            return workspace_result_t<
-                std::vector<indirect_call_candidate_t>>::failure(
-                make_workspace_error(workspace_error_code_t::integrity_failure,
-                    "indirect call target range is invalid", "call_graph_evidence"));
-        }
-        for (std::uint64_t target_index = instruction.target_fact_begin;
-             target_index < target_end; ++target_index) {
-            const auto& target = targets[static_cast<std::size_t>(target_index)];
-            if (target.instruction_id != 0 &&
-                target.instruction_id != instruction.id) {
-                return workspace_result_t<
-                    std::vector<indirect_call_candidate_t>>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                        "indirect call target owner is invalid",
-                        "call_graph_evidence"));
-            }
-            if (target.kind != target_kind_record_t::data)
-                continue;
-            auto pointer = std::lower_bound(pointers.begin(), pointers.end(),
-                target.target,
-                [](const data_pointer_fact_t& fact, const address_t& slot) {
-                    return fact.slot < slot;
-                });
-            for (; pointer != pointers.end() && pointer->slot == target.target;
-                 ++pointer) {
-                if (++checks >= cancellation_check_interval) {
-                    checks = 0;
-                    if (cancel.stop_requested()) {
-                        return workspace_result_t<
-                            std::vector<indirect_call_candidate_t>>::failure(
-                            cancellation_error(
-                                cancel, cancel, "call_graph_evidence"));
-                    }
+    const auto instruction_shards = parallel_shards(instructions.size(), workers);
+    struct shard_output_t {
+        std::uint64_t count = 0;
+        std::vector<indirect_call_candidate_t> candidates;
+    };
+    std::vector<shard_output_t> shard_outputs(instruction_shards.size());
+    const auto scan_shard = [&](std::size_t shard_index, parallel_shard_t range,
+                                bool emit) -> workspace_result_t<void> {
+        auto& output = shard_outputs[shard_index];
+        if (emit)
+            output.candidates.reserve(static_cast<std::size_t>(output.count));
+        std::uint64_t checks = 0;
+        for (std::size_t instruction_index = range.begin;
+             instruction_index < range.end; ++instruction_index) {
+            if (++checks >= cancellation_check_interval) {
+                checks = 0;
+                if (cancel.stop_requested()) {
+                    return workspace_result_t<void>::failure(
+                        cancellation_error(cancel, cancel, "call_graph_evidence"));
                 }
-                if (candidates.size() >= maximum_candidates) {
-                    return workspace_result_t<
-                        std::vector<indirect_call_candidate_t>>::failure(
-                        make_workspace_error(workspace_error_code_t::limit_exceeded,
-                            "indirect call candidate storage exceeds analysis budget",
+            }
+            const auto& instruction = instructions[instruction_index];
+            if ((instruction.flow_flags & flow_indirect) == 0 ||
+                (instruction.flow_flags & (flow_call | flow_branch)) == 0)
+                continue;
+            std::uint64_t target_end = 0;
+            if (!checked_add_u64(instruction.target_fact_begin,
+                    instruction.target_fact_count, target_end) ||
+                target_end > targets.size()) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                        "indirect call target range is invalid", "call_graph_evidence"));
+            }
+            for (std::uint64_t target_index = instruction.target_fact_begin;
+                 target_index < target_end; ++target_index) {
+                const auto& target = targets[static_cast<std::size_t>(target_index)];
+                if (target.instruction_id != 0 &&
+                    target.instruction_id != instruction.id) {
+                    return workspace_result_t<void>::failure(
+                        make_workspace_error(workspace_error_code_t::integrity_failure,
+                            "indirect call target owner is invalid",
                             "call_graph_evidence"));
                 }
-                indirect_call_candidate_t candidate;
-                candidate.instruction_id = instruction.id;
-                candidate.call_site = instruction.address;
-                candidate.target = pointer->target;
-                candidate.kind =
-                    pointer->candidate_kind == data_candidate_kind_t::relocation_slot
-                        ? indirect_call_candidate_kind_t::relocation
-                        : pointer->candidate_kind ==
-                                data_candidate_kind_t::import_address_slot
-                            ? indirect_call_candidate_kind_t::import_slot
-                            : indirect_call_candidate_kind_t::pointer_scan;
-                candidate.provenance = pointer->provenance;
-                candidate.confidence = pointer->confidence;
-                candidate.stable_source_id = pointer->id;
-                candidates.push_back(std::move(candidate));
+                if (target.kind != target_kind_record_t::data)
+                    continue;
+                auto pointer = std::lower_bound(pointers.begin(), pointers.end(),
+                    target.target,
+                    [](const data_pointer_fact_t& fact, const address_t& slot) {
+                        return fact.slot < slot;
+                    });
+                for (; pointer != pointers.end() && pointer->slot == target.target;
+                     ++pointer) {
+                    if (++checks >= cancellation_check_interval) {
+                        checks = 0;
+                        if (cancel.stop_requested()) {
+                            return workspace_result_t<void>::failure(
+                                cancellation_error(
+                                    cancel, cancel, "call_graph_evidence"));
+                        }
+                    }
+                    if (!emit) {
+                        ++output.count;
+                        continue;
+                    }
+                    indirect_call_candidate_t candidate;
+                    candidate.instruction_id = instruction.id;
+                    candidate.call_site = instruction.address;
+                    candidate.target = pointer->target;
+                    candidate.kind =
+                        pointer->candidate_kind == data_candidate_kind_t::relocation_slot
+                            ? indirect_call_candidate_kind_t::relocation
+                            : pointer->candidate_kind ==
+                                    data_candidate_kind_t::import_address_slot
+                                ? indirect_call_candidate_kind_t::import_slot
+                                : indirect_call_candidate_kind_t::pointer_scan;
+                    candidate.provenance = pointer->provenance;
+                    candidate.confidence = pointer->confidence;
+                    candidate.stable_source_id = pointer->id;
+                    output.candidates.push_back(std::move(candidate));
+                }
             }
         }
+        return workspace_result_t<void>::success();
+    };
+    auto counted = parallel_run_shards(instruction_shards,
+        [&](std::size_t shard_index, parallel_shard_t range) {
+            return scan_shard(shard_index, range, false);
+        }, cancel);
+    if (!counted)
+        return workspace_result_t<std::vector<indirect_call_candidate_t>>::failure(
+            counted.error());
+    std::uint64_t total_candidates = 0;
+    for (const auto& output : shard_outputs) {
+        if (!checked_add_u64(total_candidates, output.count, total_candidates)) {
+            return workspace_result_t<std::vector<indirect_call_candidate_t>>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                    "indirect call candidate accounting overflowed",
+                    "call_graph_evidence"));
+        }
+    }
+    if (total_candidates > maximum_candidates) {
+        return workspace_result_t<std::vector<indirect_call_candidate_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "indirect call candidate storage exceeds analysis budget",
+                "call_graph_evidence"));
+    }
+    auto emitted = parallel_run_shards(instruction_shards,
+        [&](std::size_t shard_index, parallel_shard_t range) {
+            return scan_shard(shard_index, range, true);
+        }, cancel);
+    if (!emitted)
+        return workspace_result_t<std::vector<indirect_call_candidate_t>>::failure(
+            emitted.error());
+    std::vector<indirect_call_candidate_t> candidates;
+    candidates.reserve(static_cast<std::size_t>(total_candidates));
+    for (auto& output : shard_outputs) {
+        candidates.insert(candidates.end(),
+            std::make_move_iterator(output.candidates.begin()),
+            std::make_move_iterator(output.candidates.end()));
     }
     return workspace_result_t<std::vector<indirect_call_candidate_t>>::success(
         std::move(candidates));
@@ -639,18 +837,14 @@ fact_provenance_t legacy_type_provenance(metadata_provenance_t provenance) noexc
 workspace_result_t<std::uint64_t> tile_decode_memory_bytes(
     const tile_decode_orchestration_result_t& result)
 {
-    if (!result.packed_store) {
-        return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
-            workspace_error_code_t::integrity_failure,
-            "tile decode packed publication is unavailable", "memory_budget"));
-    }
     std::uint64_t total = sizeof(result);
-    if (!checked_add_u64(total, sizeof(packed_analysis_store_t), total) ||
-        !checked_add_u64(total,
-            result.packed_store->size_accounting().reserved_bytes, total)) {
-        return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
-            workspace_error_code_t::range_overflow,
-            "tile decode memory accounting overflows", "memory_budget"));
+    for (const auto& shard : result.packed_shards) {
+        if (!checked_add_u64(total, sizeof(packed_analysis_shard_t), total) ||
+            !checked_add_u64(total, shard.size_accounting().reserved_bytes, total)) {
+            return workspace_result_t<std::uint64_t>::failure(make_workspace_error(
+                workspace_error_code_t::range_overflow,
+                "tile decode memory accounting overflows", "memory_budget"));
+        }
     }
     const auto add = [&total](std::uint64_t count, std::uint64_t width)
         -> workspace_result_t<void> {
@@ -687,99 +881,6 @@ std::uint64_t saturated_double_u64(std::uint64_t value) noexcept {
     return checked_add_u64(value, value, doubled)
         ? doubled : (std::numeric_limits<std::uint64_t>::max)();
 }
-
-class lane_seed_exchange_t final : public decode_lane_seed_exchange_t {
-public:
-    void configure(std::uint64_t tile_count, std::uint32_t lane_count) noexcept {
-        tile_count_ = tile_count;
-        lane_count_ = (std::min)(lane_count, kMaxLanes);
-        for (std::uint32_t lane = 0; lane < lane_count_; ++lane)
-            lane_active_[lane].store(true, std::memory_order_release);
-        active_lanes_.store(lane_count_, std::memory_order_release);
-    }
-
-    void forward_seed(std::uint32_t,
-                      decode_lane_seed_envelope_t envelope) override {
-        const auto target = lane_of_tile(envelope.seed.tile_id);
-        auto& mailbox = mailboxes_[target];
-        std::lock_guard<std::mutex> lock(mailbox.mutex);
-        if (!lane_active_[target].exchange(true, std::memory_order_acq_rel))
-            active_lanes_.fetch_add(1, std::memory_order_acq_rel);
-        mailbox.envelopes.push_back(std::move(envelope));
-    }
-
-    std::size_t drain_seeds(std::uint32_t lane_id,
-        std::vector<decode_lane_seed_envelope_t>& out) override {
-        if (lane_id >= kMaxLanes)
-            return 0;
-        auto& mailbox = mailboxes_[lane_id];
-        std::lock_guard<std::mutex> lock(mailbox.mutex);
-        const auto count = mailbox.envelopes.size();
-        if (count != 0) {
-            if (!lane_active_[lane_id].exchange(true, std::memory_order_acq_rel))
-                active_lanes_.fetch_add(1, std::memory_order_acq_rel);
-            out.insert(out.end(),
-                std::make_move_iterator(mailbox.envelopes.begin()),
-                std::make_move_iterator(mailbox.envelopes.end()));
-            mailbox.envelopes.clear();
-        }
-        return count;
-    }
-
-    void note_recursive_activity(std::uint32_t lane_id, bool active) override {
-        if (lane_id >= kMaxLanes)
-            return;
-        if (active) {
-            if (!lane_active_[lane_id].exchange(true, std::memory_order_acq_rel))
-                active_lanes_.fetch_add(1, std::memory_order_acq_rel);
-        } else {
-            auto& mailbox = mailboxes_[lane_id];
-            std::lock_guard<std::mutex> lock(mailbox.mutex);
-            if (!mailbox.envelopes.empty())
-                return;
-            if (lane_active_[lane_id].exchange(false, std::memory_order_acq_rel))
-                active_lanes_.fetch_sub(1, std::memory_order_acq_rel);
-        }
-    }
-
-    bool drained(std::uint32_t lane_id) override {
-        if (lane_id >= kMaxLanes)
-            return active_lanes_.load(std::memory_order_acquire) == 0;
-        if (active_lanes_.load(std::memory_order_acquire) != 0)
-            return false;
-        const auto lanes = (std::min)(lane_count_, kMaxLanes);
-        for (std::uint32_t lane = 0; lane < lanes; ++lane) {
-            auto& mailbox = mailboxes_[lane];
-            std::lock_guard<std::mutex> lock(mailbox.mutex);
-            if (!mailbox.envelopes.empty())
-                return false;
-        }
-        return active_lanes_.load(std::memory_order_acquire) == 0;
-    }
-
-private:
-    static constexpr std::uint32_t kMaxLanes = 64;
-
-    struct mailbox_t {
-        std::mutex mutex;
-        std::vector<decode_lane_seed_envelope_t> envelopes;
-    };
-
-    std::uint32_t lane_of_tile(decode_tile_id_t tile_id) const noexcept {
-        if (tile_count_ == 0 || lane_count_ <= 1)
-            return 0;
-        const auto lane = (static_cast<std::uint64_t>(tile_id) *
-            static_cast<std::uint64_t>(lane_count_)) / tile_count_;
-        return static_cast<std::uint32_t>((std::min<std::uint64_t>)(lane,
-            static_cast<std::uint64_t>(lane_count_ - 1U)));
-    }
-
-    std::array<mailbox_t, kMaxLanes> mailboxes_;
-    std::array<std::atomic<bool>, kMaxLanes> lane_active_{};
-    std::atomic<std::uint32_t> active_lanes_{0};
-    std::uint64_t tile_count_ = 0;
-    std::uint32_t lane_count_ = 0;
-};
 
 enum class baseline_progress_slot_t : std::size_t {
     parse = 0,
@@ -840,7 +941,8 @@ workspace_result_t<void> baseline_analysis_settings_t::validate() const {
         max_string_scan_bytes == 0 || max_string_value_bytes < minimum_string_length ||
         max_strings == 0 || max_trace_instructions == 0 || cancellation_check_interval == 0 ||
         string_cancellation_interval_bytes == 0 || minimum_string_length == 0 ||
-        decode_worker_lanes > 64 || task_priority < 0 || task_priority > 7 ||
+        decode_worker_lanes > 64 || fact_pass_worker_budget > 64 ||
+        task_priority < 0 || task_priority > 7 ||
         tile_decode_limits.target_tile_bytes == 0 || tile_decode_limits.maximum_tiles == 0 ||
         tile_decode_limits.maximum_frontier_seeds == 0 ||
         tile_decode_limits.maximum_frontier_wave == 0 ||
@@ -962,6 +1064,7 @@ std::string baseline_analysis_settings_t::canonical_json() const {
         << ",\"max_string_value_bytes\":" << max_string_value_bytes
         << ",\"max_strings\":" << max_strings
         << ",\"decode_worker_lanes\":" << decode_worker_lanes
+        << ",\"fact_pass_worker_budget\":" << fact_pass_worker_budget
         << ",\"max_trace_instructions\":" << max_trace_instructions
         << ",\"cancellation_check_interval\":" << cancellation_check_interval
         << ",\"string_cancellation_interval_bytes\":" << string_cancellation_interval_bytes
@@ -1085,11 +1188,9 @@ struct pe_baseline_analyzer_t::impl_t {
     std::shared_ptr<analysis_snapshot_t> draft;
     std::shared_ptr<const analysis_snapshot_t> final_snapshot;
     std::vector<function_seed_t> seeds;
-    std::vector<tile_decode_orchestration_result_t> tile_results;
-    lane_seed_exchange_t lane_seed_exchange;
-    std::once_flag decode_lane_once;
+    std::optional<tile_decode_orchestration_result_t> tile_result;
     std::optional<executable_decode_partition_t> decode_partition;
-    std::optional<workspace_error_t> decode_lane_error;
+    std::optional<workspace_error_t> decode_partition_error;
     std::uint32_t decode_workers = 1;
     std::shared_ptr<const data_discovery_result_t> data_result;
     function_recovery_result_t function_result;
@@ -1118,53 +1219,27 @@ struct pe_baseline_analyzer_t::impl_t {
         : workspace(std::move(value)), settings(std::move(configured)),
           expected_generation(generation), expected_analysis_revision(analysis_revision),
           cancellation(deadline), metrics(std::make_shared<analysis_metrics_t>(generation)) {
-        auto lanes = settings.decode_worker_lanes;
-        if (lanes == 0) {
-            const auto hardware = std::max(1U, std::thread::hardware_concurrency());
-            lanes = std::min(16U, std::max(2U, hardware));
-        }
-        decode_workers = lanes;
+        const auto hardware = (std::max)(1U, std::thread::hardware_concurrency());
+        decode_workers = settings.decode_worker_lanes != 0
+            ? (std::min)(64U, (std::max)(2U, settings.decode_worker_lanes))
+            : (std::min)(64U, (std::max)(2U, hardware));
     }
 
-    std::uint32_t lane_total() const noexcept {
-        const auto executable = executable_bytes();
-        const auto target = (std::max)(1ULL, settings.tile_decode_limits.target_tile_bytes);
-        const auto estimated_tiles = (std::max<std::uint64_t>)(1ULL, executable / target);
-        return static_cast<std::uint32_t>((std::min<std::uint64_t>)(decode_workers,
-            estimated_tiles));
-    }
-
-    workspace_result_t<void> ensure_decode_lane_state(
+    workspace_result_t<void> ensure_decode_partition_state(
         const tile_decode_executor_capabilities_t& capabilities,
         const tile_decode_orchestrator_limits_t& limits) {
-        std::call_once(decode_lane_once, [&] {
-            auto partition = partition_executable_decode_ranges(*image_layout,
-                capabilities, limits, cancellation.token());
-            if (!partition) {
-                decode_lane_error = partition.error();
-                return;
-            }
-            decode_partition = partition.take_value();
-            const auto lanes = lane_total();
-            tile_results.resize(lanes);
-            lane_seed_exchange.configure(
-                static_cast<std::uint64_t>(decode_partition->tiles.size()), lanes);
-        });
-        if (decode_lane_error)
-            return workspace_result_t<void>::failure(*decode_lane_error);
+        if (decode_partition_error)
+            return workspace_result_t<void>::failure(*decode_partition_error);
+        if (decode_partition)
+            return workspace_result_t<void>::success();
+        auto partition = partition_executable_decode_ranges(*image_layout,
+            capabilities, limits, cancellation.token());
+        if (!partition) {
+            decode_partition_error = partition.error();
+            return workspace_result_t<void>::failure(*decode_partition_error);
+        }
+        decode_partition = partition.take_value();
         return workspace_result_t<void>::success();
-    }
-
-    decode_tile_range_t decode_lane_range(std::uint32_t lane) const noexcept {
-        const auto lanes = (std::max)(1U, lane_total());
-        const auto tiles = decode_partition
-            ? static_cast<std::uint64_t>(decode_partition->tiles.size()) : 0ULL;
-        decode_tile_range_t range;
-        range.begin = static_cast<decode_tile_id_t>(
-            (tiles * static_cast<std::uint64_t>(lane)) / lanes);
-        range.end = static_cast<decode_tile_id_t>(
-            (tiles * (static_cast<std::uint64_t>(lane) + 1ULL)) / lanes);
-        return range;
     }
 
     workspace_result_t<void> ensure_active(const std::atomic<bool>& runtime_cancel,
@@ -1344,8 +1419,8 @@ workspace_result_t<std::shared_ptr<pe_baseline_analyzer_t>> pe_baseline_analyzer
                 expected_generation, expected_analysis_revision, deadline))));
 }
 
-std::uint32_t pe_baseline_analyzer_t::decode_lane_count() const noexcept {
-    return impl_->lane_total();
+std::uint32_t pe_baseline_analyzer_t::decode_worker_budget() const noexcept {
+    return impl_->decode_workers;
 }
 
 std::uint64_t pe_baseline_analyzer_t::expected_generation() const noexcept {
@@ -1473,13 +1548,45 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
         impl_->metrics->end_phase(measurement, 0, 0, 0, 1, !progress.has_value());
         return progress;
     }
-    std::map<std::pair<std::uint64_t, std::uint8_t>, function_seed_t> candidates;
-    const auto add = [&](const address_t& address, function_seed_kind_t kind,
-        fact_provenance_t provenance, std::uint8_t confidence, std::uint64_t source,
-        std::optional<address_t> known_end, std::string name, bool noreturn)
-        -> workspace_result_t<void> {
+    const auto exec_ranges = executable_ranges(*impl_->image);
+    const auto pe_image = impl_->workspace->image();
+    const auto prior = impl_->workspace->snapshot();
+    const bool prior_active = prior &&
+        prior->generation == impl_->expected_generation;
+    std::uint64_t producer_bounds[6] = {
+        static_cast<std::uint64_t>(impl_->image->entry_points.size()),
+        pe_image ? static_cast<std::uint64_t>(pe_image->runtime_functions().size()) : 0ULL,
+        static_cast<std::uint64_t>(impl_->image->exports.size()),
+        static_cast<std::uint64_t>(impl_->image->symbols.size()),
+        static_cast<std::uint64_t>(impl_->image->relocations.size()),
+        prior_active ? static_cast<std::uint64_t>(prior->symbols.size()) : 0ULL};
+    std::array<seed_producer_output_t, 6> producer_outputs;
+    {
+        std::uint64_t source_base = 1;
+        for (std::size_t index = 0; index < producer_outputs.size(); ++index) {
+            producer_outputs[index].next_source = source_base;
+            if (!checked_add_u64(source_base, producer_bounds[index], source_base)) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::range_overflow,
+                    "function seed source identifier accounting overflows", "seed"));
+            }
+            const auto estimate = (std::min)(producer_bounds[index],
+                impl_->settings.max_seed_count + 1ULL);
+            auto reserved = producer_outputs[index].candidates.reserve(estimate, "seed");
+            if (!reserved)
+                return reserved;
+        }
+    }
+    const auto token = impl_->cancellation.token();
+    const auto cancellation_stride =
+        (std::max)(1U, impl_->settings.cancellation_check_interval);
+    const auto add_seed = [&](seed_producer_output_t& output, const address_t& address,
+        function_seed_kind_t kind, fact_provenance_t provenance,
+        std::uint8_t confidence, std::optional<address_t> known_end,
+        std::string name, bool noreturn) -> workspace_result_t<void> {
+        const auto source = output.next_source++;
         const auto rva = to_rva(*impl_->image, address);
-        if (!rva || !executable_rva(*impl_->image, *rva))
+        if (!rva || !executable_rva_in(exec_ranges, *rva))
             return workspace_result_t<void>::success();
         function_seed_t seed;
         seed.address = rva_address(*impl_->image, *rva);
@@ -1494,100 +1601,200 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
         seed.stable_source_id = source;
         seed.name = std::move(name);
         seed.noreturn = noreturn;
-        const auto key = std::make_pair(*rva, static_cast<std::uint8_t>(kind));
-        const auto found = candidates.find(key);
-        if (found == candidates.end() || stronger_seed_evidence(seed.provenance,
-                seed.confidence, seed.stable_source_id, found->second.provenance,
-                found->second.confidence, found->second.stable_source_id))
-            candidates[key] = std::move(seed);
-        if (candidates.size() > impl_->settings.max_seed_count) {
-            return workspace_result_t<void>::failure(make_workspace_error(
-                workspace_error_code_t::limit_exceeded,
-                "function seed count exceeds analysis budget", "seed"));
-        }
-        return workspace_result_t<void>::success();
+        return output.candidates.add(std::move(seed), *rva,
+            impl_->settings.max_seed_count, "seed");
     };
-    std::uint64_t source = 1;
-    for (const auto& entry : impl_->image->entry_points) {
-        auto added = add(entry.address, function_seed_kind_t::image_entry,
-            fact_provenance_t::image_entry, 100, source++, std::nullopt, entry.provenance, false);
-        if (!added)
-            return added;
-    }
-    if (const auto pe_image = impl_->workspace->image()) {
-        std::uint32_t checks = 0;
-        for (const auto& runtime_function : pe_image->runtime_functions()) {
-            if (++checks >= impl_->settings.cancellation_check_interval) {
-                checks = 0;
-                const auto token = impl_->cancellation.token();
-                if (token.stop_requested()) {
-                    return workspace_result_t<void>::failure(
-                        cancellation_error(token, token, "seed"));
+    const auto run_producer = [&](std::size_t index) {
+        auto& output = producer_outputs[index];
+        std::uint64_t checks = 0;
+        const auto cancelled = [&]() {
+            return token.stop_requested();
+        };
+        const auto fail_with = [&](workspace_error_t error) {
+            if (!output.error)
+                output.error = std::move(error);
+        };
+        switch (index) {
+            case 0: {
+                for (const auto& entry : impl_->image->entry_points) {
+                    if (++checks >= cancellation_stride) {
+                        checks = 0;
+                        if (cancelled()) {
+                            fail_with(cancellation_error(token, token, "seed"));
+                            return;
+                        }
+                    }
+                    auto added = add_seed(output, entry.address,
+                        function_seed_kind_t::image_entry, fact_provenance_t::image_entry,
+                        100, std::nullopt, entry.provenance, false);
+                    if (!added) {
+                        fail_with(added.error());
+                        return;
+                    }
                 }
+                break;
             }
-            if (runtime_function.end_rva <= runtime_function.begin_rva) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::integrity_failure,
-                    "PE runtime function range is invalid", "seed"));
+            case 1: {
+                if (!pe_image)
+                    break;
+                for (const auto& runtime_function : pe_image->runtime_functions()) {
+                    if (++checks >= cancellation_stride) {
+                        checks = 0;
+                        if (cancelled()) {
+                            fail_with(cancellation_error(token, token, "seed"));
+                            return;
+                        }
+                    }
+                    if (runtime_function.end_rva <= runtime_function.begin_rva) {
+                        fail_with(make_workspace_error(
+                            workspace_error_code_t::integrity_failure,
+                            "PE runtime function range is invalid", "seed"));
+                        return;
+                    }
+                    auto added = add_seed(output,
+                        rva_address(*impl_->image, runtime_function.begin_rva),
+                        function_seed_kind_t::unwind_range,
+                        fact_provenance_t::unwind_metadata, 98,
+                        std::optional<address_t>{rva_address(*impl_->image,
+                            runtime_function.end_rva)}, {}, false);
+                    if (!added) {
+                        fail_with(added.error());
+                        return;
+                    }
+                }
+                break;
             }
-            auto added = add(rva_address(*impl_->image,
-                    runtime_function.begin_rva),
-                function_seed_kind_t::unwind_range,
-                fact_provenance_t::unwind_metadata, 98, source++,
-                std::optional<address_t>{rva_address(*impl_->image,
-                    runtime_function.end_rva)}, {}, false);
-            if (!added)
-                return added;
+            case 2: {
+                for (const auto& exported : impl_->image->exports) {
+                    if (exported.forwarder)
+                        continue;
+                    if (++checks >= cancellation_stride) {
+                        checks = 0;
+                        if (cancelled()) {
+                            fail_with(cancellation_error(token, token, "seed"));
+                            return;
+                        }
+                    }
+                    auto added = add_seed(output, exported.address,
+                        function_seed_kind_t::export_entry,
+                        fact_provenance_t::export_entry, 100, std::nullopt,
+                        exported.name.value_or(std::string{}), false);
+                    if (!added) {
+                        fail_with(added.error());
+                        return;
+                    }
+                }
+                break;
+            }
+            case 3: {
+                for (const auto& symbol : impl_->image->symbols) {
+                    if (!symbol.defined ||
+                        (symbol.kind != image_symbol_kind_t::function &&
+                         symbol.kind != image_symbol_kind_t::debug_symbol))
+                        continue;
+                    if (++checks >= cancellation_stride) {
+                        checks = 0;
+                        if (cancelled()) {
+                            fail_with(cancellation_error(token, token, "seed"));
+                            return;
+                        }
+                    }
+                    std::optional<address_t> known_end;
+                    if (symbol.size != 0) {
+                        const auto start = to_rva(*impl_->image, symbol.address);
+                        std::uint64_t end = 0;
+                        if (start && checked_add_u64(*start, symbol.size, end))
+                            known_end = rva_address(*impl_->image, end);
+                    }
+                    auto added = add_seed(output, symbol.address,
+                        function_seed_kind_t::debug_symbol,
+                        fact_provenance_t::debug_symbol, 95, known_end, symbol.name,
+                        false);
+                    if (!added) {
+                        fail_with(added.error());
+                        return;
+                    }
+                }
+                break;
+            }
+            case 4: {
+                for (const auto& relocation : impl_->image->relocations) {
+                    if (!relocation.target)
+                        continue;
+                    if (++checks >= cancellation_stride) {
+                        checks = 0;
+                        if (cancelled()) {
+                            fail_with(cancellation_error(token, token, "seed"));
+                            return;
+                        }
+                    }
+                    auto added = add_seed(output, *relocation.target,
+                        function_seed_kind_t::relocation_target,
+                        fact_provenance_t::relocation, 70, std::nullopt, {}, false);
+                    if (!added) {
+                        fail_with(added.error());
+                        return;
+                    }
+                }
+                break;
+            }
+            case 5: {
+                if (!prior_active)
+                    break;
+                for (const auto& symbol : prior->symbols) {
+                    if (symbol.kind != symbol_kind_t::function &&
+                        symbol.kind != symbol_kind_t::debug_symbol)
+                        continue;
+                    if (++checks >= cancellation_stride) {
+                        checks = 0;
+                        if (cancelled()) {
+                            fail_with(cancellation_error(token, token, "seed"));
+                            return;
+                        }
+                    }
+                    auto added = add_seed(output, symbol.address,
+                        function_seed_kind_t::debug_symbol, symbol.provenance,
+                        symbol.confidence, std::nullopt, symbol.name, false);
+                    if (!added) {
+                        fail_with(added.error());
+                        return;
+                    }
+                }
+                break;
+            }
+        }
+    };
+    const auto fact_workers = impl_->settings.fact_pass_worker_budget;
+    parallel_executor_t::run(producer_outputs.size(), fact_workers,
+        "baseline.seed", run_producer);
+    for (auto& output : producer_outputs) {
+        if (output.error)
+            return workspace_result_t<void>::failure(std::move(*output.error));
+    }
+    std::uint64_t merged_estimate = 0;
+    for (const auto& output : producer_outputs) {
+        if (!checked_add_u64(merged_estimate,
+                static_cast<std::uint64_t>(output.candidates.size()), merged_estimate)) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::range_overflow,
+                "function seed dedup accounting overflows", "seed"));
         }
     }
-    for (const auto& exported : impl_->image->exports) {
-        if (exported.forwarder)
-            continue;
-        auto added = add(exported.address, function_seed_kind_t::export_entry,
-            fact_provenance_t::export_entry, 100, source++, std::nullopt,
-            exported.name.value_or(std::string{}), false);
-        if (!added)
-            return added;
-    }
-    for (const auto& symbol : impl_->image->symbols) {
-        if (!symbol.defined || (symbol.kind != image_symbol_kind_t::function &&
-            symbol.kind != image_symbol_kind_t::debug_symbol))
-            continue;
-        std::optional<address_t> known_end;
-        if (symbol.size != 0) {
-            const auto start = to_rva(*impl_->image, symbol.address);
-            std::uint64_t end = 0;
-            if (start && checked_add_u64(*start, symbol.size, end))
-                known_end = rva_address(*impl_->image, end);
+    seed_candidate_set_t merged;
+    auto merged_reserved = merged.reserve(
+        (std::min)(merged_estimate, impl_->settings.max_seed_count + 1ULL), "seed");
+    if (!merged_reserved)
+        return merged_reserved;
+    for (auto& output : producer_outputs) {
+        for (auto& entry : output.candidates.entries()) {
+            auto inserted = merged.add_keyed(entry.key, std::move(entry.seed),
+                impl_->settings.max_seed_count, "seed");
+            if (!inserted)
+                return inserted;
         }
-        auto added = add(symbol.address, function_seed_kind_t::debug_symbol,
-            fact_provenance_t::debug_symbol, 95, source++, known_end, symbol.name, false);
-        if (!added)
-            return added;
+        output.candidates = seed_candidate_set_t{};
     }
-    for (const auto& relocation : impl_->image->relocations) {
-        if (!relocation.target)
-            continue;
-        auto added = add(*relocation.target, function_seed_kind_t::relocation_target,
-            fact_provenance_t::relocation, 70, source++, std::nullopt, {}, false);
-        if (!added)
-            return added;
-    }
-    const auto prior = impl_->workspace->snapshot();
-    if (prior && prior->generation == impl_->expected_generation) {
-        for (const auto& symbol : prior->symbols) {
-            if (symbol.kind != symbol_kind_t::function && symbol.kind != symbol_kind_t::debug_symbol)
-                continue;
-            auto added = add(symbol.address, function_seed_kind_t::debug_symbol,
-                symbol.provenance, symbol.confidence, source++, std::nullopt, symbol.name, false);
-            if (!added)
-                return added;
-        }
-    }
-    impl_->seeds.clear();
-    impl_->seeds.reserve(candidates.size());
-    for (auto& candidate : candidates)
-        impl_->seeds.push_back(std::move(candidate.second));
+    impl_->seeds = merged.take_sorted(fact_workers);
     auto progress = impl_->update_progress_slot(baseline_progress_slot_t::seed,
         "seed", impl_->seeds.size(), impl_->seeds.size(), 0,
         impl_->executable_bytes());
@@ -1596,8 +1803,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::seed_phase(const std::atomic<bo
     return progress;
 }
 
-workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t lane,
-    const std::atomic<bool>& runtime_cancel) {
+workspace_result_t<void> pe_baseline_analyzer_t::decode_phase(const std::atomic<bool>& runtime_cancel) {
     auto measurement = impl_->metrics->begin_phase(baseline_phase_t::decode);
     phase_completion_guard_t guard(*impl_->metrics, measurement);
     auto node_window = impl_->node_guard(baseline_progress_slot_t::decode);
@@ -1640,15 +1846,14 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
     if (!orchestrator)
         return workspace_result_t<void>::failure(orchestrator.error());
 
-    const auto lane_total = (std::max)(1U, impl_->lane_total());
-    const auto lane_workers = (std::max)(1U, impl_->decode_workers / lane_total);
+    const auto workers = (std::max)(1U, impl_->decode_workers);
     production_tile_decode_executor_options_t options;
     options.decoder_key = impl_->decoder_key;
-    options.worker_count = lane_workers;
+    options.worker_count = workers;
     options.maximum_frontier_wave = limits.maximum_frontier_wave;
     options.analysis_budget.max_queued_tasks =
         static_cast<std::uint32_t>(executor_queue_limit);
-    options.analysis_budget.max_worker_slots = lane_workers + 1U;
+    options.analysis_budget.max_worker_slots = workers + 1U;
     options.analysis_budget.reserved_control_worker_slots = 1;
     options.analysis_budget.max_private_bytes = impl_->settings.max_analysis_memory_bytes;
     options.analysis_budget.max_mapped_window_bytes =
@@ -1718,11 +1923,10 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
     if (!executor)
         return workspace_result_t<void>::failure(executor.error());
 
-    auto lane_state = impl_->ensure_decode_lane_state(executor.value()->capabilities(),
-        limits);
-    if (!lane_state)
-        return lane_state;
-    const auto lane_range = impl_->decode_lane_range(lane);
+    auto partition_state = impl_->ensure_decode_partition_state(
+        executor.value()->capabilities(), limits);
+    if (!partition_state)
+        return partition_state;
 
     std::vector<tile_decode_seed_t> decode_seeds;
     decode_seeds.reserve(impl_->seeds.size());
@@ -1730,15 +1934,13 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
         decode_seeds.push_back(
             {seed.address, seed.provenance, seed.confidence, seed.stable_source_id});
     }
-    auto decoded = orchestrator.value().run(*impl_->provider_snapshot,
-        *impl_->image_layout, std::move(decode_seeds), *executor.value(),
-        impl_->cancellation.token(),
-        lane_total > 1U ? &lane_range : nullptr,
-        lane_total > 1U ? &impl_->lane_seed_exchange : nullptr, lane);
+    auto decoded = orchestrator.value().run_shared(*impl_->provider_snapshot,
+        *impl_->image_layout, *impl_->decode_partition, std::move(decode_seeds),
+        *executor.value(), impl_->cancellation.token());
     if (!decoded)
         return workspace_result_t<void>::failure(decoded.error());
     auto result = decoded.take_value();
-    if (!result.packed_store) {
+    if (result.packed_shards.empty() && result.statistics.accepted_instructions != 0) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
             "tile decode omitted its packed publication", "decode"));
@@ -1753,7 +1955,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_lane_phase(std::uint32_t
     const auto decoded_count = result.statistics.accepted_instructions;
     const auto initialized_bytes = result.statistics.initialized_executable_bytes;
     const auto lane_wall_ns = result.statistics.lane_wall_ns;
-    impl_->tile_results[lane] = std::move(result);
+    impl_->tile_result = std::move(result);
     impl_->metrics->set_max(analysis_metric_t::decode_lane_wall_ns_max, lane_wall_ns);
     impl_->metrics->end_phase(measurement, initialized_bytes, retained.value(),
         decoded_count, 1, false);
@@ -1776,8 +1978,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
     std::uint64_t merge_ns = 0;
     if (impl_->native_decode_applicable) {
         const auto merge_start = std::chrono::steady_clock::now();
-        const auto lane_total = impl_->tile_results.size();
-        if (lane_total == 0) {
+        if (!impl_->tile_result) {
             return workspace_result_t<void>::failure(make_workspace_error(
                 workspace_error_code_t::integrity_failure,
                 "tile decode merge publication is unavailable", "decode_merge"));
@@ -1788,139 +1989,22 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
         const auto r0 = current.value() >= impl_->settings.max_analysis_memory_bytes
             ? 0ULL
             : impl_->settings.max_analysis_memory_bytes - current.value();
-        if (lane_total == 1) {
-            if (!impl_->tile_results[0].packed_store) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::integrity_failure,
-                    "tile decode merge publication is unavailable", "decode_merge"));
-            }
-            auto materialized = decode_materializer::materialize(
-                impl_->tile_results[0], *impl_->draft, r0,
-                impl_->cancellation.token());
-            if (!materialized)
-                return materialized;
-        } else {
-            std::uint64_t instruction_total = 0;
-            std::uint64_t operand_total = 0;
-            std::uint64_t target_total = 0;
-            std::uint64_t delay_total = 0;
-            for (const auto& lane_result : impl_->tile_results) {
-                if (!lane_result.packed_store) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::integrity_failure,
-                        "tile decode merge publication is unavailable", "decode_merge"));
-                }
-                if (!checked_add_u64(instruction_total,
-                        static_cast<std::uint64_t>(
-                            lane_result.packed_store->instruction_count()),
-                        instruction_total) ||
-                    !checked_add_u64(operand_total,
-                        static_cast<std::uint64_t>(
-                            lane_result.packed_store->operand_count()),
-                        operand_total) ||
-                    !checked_add_u64(target_total,
-                        static_cast<std::uint64_t>(
-                            lane_result.packed_store->target_fact_count()),
-                        target_total) ||
-                    !checked_add_u64(delay_total,
-                        static_cast<std::uint64_t>(
-                            lane_result.delay_slot_counts.size()),
-                        delay_total)) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::range_overflow,
-                        "tile decode merge accounting overflows", "decode_merge"));
-                }
-            }
-            impl_->draft->instructions.reserve(
-                static_cast<std::size_t>(instruction_total));
-            impl_->draft->operand_facts.reserve(static_cast<std::size_t>(operand_total));
-            impl_->draft->target_facts.reserve(static_cast<std::size_t>(target_total));
-            impl_->draft->delay_slot_counts.reserve(static_cast<std::size_t>(delay_total));
-            std::uint64_t instruction_offset = 0;
-            std::uint64_t operand_offset = 0;
-            std::uint64_t target_offset = 0;
-            for (auto& lane_result : impl_->tile_results) {
-                analysis_snapshot_t lane_snapshot;
-                auto materialized = decode_materializer::materialize(lane_result,
-                    lane_snapshot, r0, impl_->cancellation.token());
-                if (!materialized)
-                    return materialized;
-                for (auto& instruction : lane_snapshot.instructions) {
-                    instruction.id += instruction_offset;
-                    std::uint64_t operand_begin = 0;
-                    std::uint64_t target_begin = 0;
-                    if (!checked_add_u64(
-                            static_cast<std::uint64_t>(instruction.operand_fact_begin),
-                            operand_offset, operand_begin) ||
-                        operand_begin >
-                            (std::numeric_limits<std::uint32_t>::max)()) {
-                        return workspace_result_t<void>::failure(make_workspace_error(
-                            workspace_error_code_t::limit_exceeded,
-                            "tile decode operand table exceeds Compact IR capacity",
-                            "decode_merge"));
-                    }
-                    if (!checked_add_u64(
-                            static_cast<std::uint64_t>(instruction.target_fact_begin),
-                            target_offset, target_begin) ||
-                        target_begin >
-                            (std::numeric_limits<std::uint32_t>::max)()) {
-                        return workspace_result_t<void>::failure(make_workspace_error(
-                            workspace_error_code_t::limit_exceeded,
-                            "tile decode target table exceeds Compact IR capacity",
-                            "decode_merge"));
-                    }
-                    instruction.operand_fact_begin =
-                        static_cast<std::uint32_t>(operand_begin);
-                    instruction.target_fact_begin =
-                        static_cast<std::uint32_t>(target_begin);
-                    impl_->draft->instructions.push_back(std::move(instruction));
-                }
-                for (auto& operand : lane_snapshot.operand_facts) {
-                    operand.instruction_id += instruction_offset;
-                    impl_->draft->operand_facts.push_back(std::move(operand));
-                }
-                for (auto& target : lane_snapshot.target_facts) {
-                    target.instruction_id += instruction_offset;
-                    impl_->draft->target_facts.push_back(std::move(target));
-                }
-                impl_->draft->delay_slot_counts.insert(
-                    impl_->draft->delay_slot_counts.end(),
-                    std::make_move_iterator(lane_snapshot.delay_slot_counts.begin()),
-                    std::make_move_iterator(lane_snapshot.delay_slot_counts.end()));
-                instruction_offset += static_cast<std::uint64_t>(
-                    lane_snapshot.instructions.size());
-                operand_offset += static_cast<std::uint64_t>(
-                    lane_snapshot.operand_facts.size());
-                target_offset += static_cast<std::uint64_t>(
-                    lane_snapshot.target_facts.size());
-            }
-        }
-        auto coverage = build_canonical_decode_coverage(*impl_->image, *impl_->image_layout,
-            impl_->draft->instructions, impl_->settings.max_coverage_spans,
+        auto materialized = decode_materializer::materialize(*impl_->tile_result,
+            *impl_->draft, r0, impl_->settings.fact_pass_worker_budget,
             impl_->cancellation.token());
+        if (!materialized)
+            return materialized;
+        auto coverage = build_canonical_decode_coverage(*impl_->image,
+            *impl_->image_layout, impl_->draft->instructions,
+            impl_->settings.max_coverage_spans,
+            impl_->settings.fact_pass_worker_budget, impl_->cancellation.token());
         if (!coverage)
             return workspace_result_t<void>::failure(coverage.error());
         impl_->draft->coverage = coverage.take_value();
         merge_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - merge_start).count());
-        tile_decode_orchestrator_statistics_t decode_stats;
-        for (const auto& lane_result : impl_->tile_results) {
-            const auto& stats = lane_result.statistics;
-            decode_stats.recursive_requests += stats.recursive_requests;
-            decode_stats.gap_requests += stats.gap_requests;
-            decode_stats.accepted_tiles += stats.accepted_tiles;
-            decode_stats.frontier_waves += stats.frontier_waves;
-            decode_stats.attempted_bytes += stats.attempted_bytes;
-            decode_stats.cross_tile_edges += stats.cross_tile_edges;
-            decode_stats.invalid_bytes += stats.invalid_bytes;
-            decode_stats.invalid_runs += stats.invalid_runs;
-            decode_stats.duplicate_instruction_candidates +=
-                stats.duplicate_instruction_candidates;
-            decode_stats.overlap_instruction_candidates +=
-                stats.overlap_instruction_candidates;
-            decode_stats.frontier.unique_seed_count += stats.frontier.unique_seed_count;
-        }
+        const auto& decode_stats = impl_->tile_result->statistics;
         impl_->metrics->add(analysis_metric_t::decode_tiles,
             decode_stats.accepted_tiles);
         impl_->metrics->add(analysis_metric_t::decode_requests,
@@ -1941,6 +2025,21 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
         impl_->metrics->add(analysis_metric_t::decode_bytes_attempted,
             decode_stats.attempted_bytes);
         impl_->metrics->add(analysis_metric_t::decode_merge_ns, merge_ns);
+        ::diag::log_tagged_fmt("baseline_pipeline",
+            "decode_merge_shards shards=%llu instructions=%llu operands=%llu targets=%llu merge_wall_us=%llu recursive_us=%llu gap_us=%llu reconcile_us=%llu edges_us=%llu build_us=%llu apply_stalls=%llu steals=%llu backpressure_waits=%llu",
+            static_cast<unsigned long long>(impl_->tile_result->shards.size()),
+            static_cast<unsigned long long>(impl_->draft->instructions.size()),
+            static_cast<unsigned long long>(impl_->draft->operand_facts.size()),
+            static_cast<unsigned long long>(impl_->draft->target_facts.size()),
+            static_cast<unsigned long long>(merge_ns / 1000ULL),
+            static_cast<unsigned long long>(decode_stats.recursive_phase_wall_ns / 1000ULL),
+            static_cast<unsigned long long>(decode_stats.gap_phase_wall_ns / 1000ULL),
+            static_cast<unsigned long long>(decode_stats.reconcile_phase_wall_ns / 1000ULL),
+            static_cast<unsigned long long>(decode_stats.edges_phase_wall_ns / 1000ULL),
+            static_cast<unsigned long long>(decode_stats.build_phase_wall_ns / 1000ULL),
+            static_cast<unsigned long long>(decode_stats.apply_stall_count),
+            static_cast<unsigned long long>(decode_stats.worker_steal_count),
+            static_cast<unsigned long long>(decode_stats.worker_backpressure_wait_count));
     } else {
         auto coverage = build_managed_bytecode_coverage(*impl_->image,
             impl_->settings.max_coverage_spans, impl_->cancellation.token());
@@ -1948,7 +2047,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
             return workspace_result_t<void>::failure(coverage.error());
         impl_->draft->coverage = coverage.take_value();
     }
-    impl_->tile_results.clear();
+    impl_->tile_result.reset();
     impl_->decode_partition.reset();
 
     impl_->metrics->set(analysis_metric_t::instructions, impl_->draft->instructions.size());
@@ -2160,7 +2259,8 @@ workspace_result_t<void> pe_baseline_analyzer_t::functions_phase(
     auto indirect_candidates = build_indirect_call_candidates(
         impl_->draft->instructions, impl_->draft->target_facts,
         impl_->data_result->pointer_facts, maximum_indirect_candidates,
-        limits.cancellation_check_interval, impl_->cancellation.token());
+        limits.cancellation_check_interval, impl_->settings.fact_pass_worker_budget,
+        impl_->cancellation.token());
     if (!indirect_candidates)
         return workspace_result_t<void>::failure(indirect_candidates.error());
     auto graph = call_graph_builder_t::build(impl_->draft->instructions,
@@ -2509,7 +2609,8 @@ workspace_result_t<void> pe_baseline_analyzer_t::search_index_phase(
     if (!source_valid)
         return source_valid;
     impl_->draft->baseline_complete = true;
-    auto coverage = validate_coverage_linear_cancellable(*impl_->draft, impl_->cancellation.token());
+    auto coverage = validate_coverage_linear_cancellable(*impl_->draft,
+        impl_->settings.fact_pass_worker_budget, impl_->cancellation.token());
     if (!coverage)
         return coverage;
     auto validated = validate_analysis_snapshot(*impl_->draft, true, impl_->cancellation.token());

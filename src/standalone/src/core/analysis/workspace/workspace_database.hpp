@@ -21,7 +21,7 @@ struct sqlite3;
 
 namespace aida::analysis {
 
-inline constexpr std::uint32_t workspace_database_schema_version = workspace_schema_v9_version;
+inline constexpr std::uint32_t workspace_database_schema_version = workspace_schema_v10_version;
 inline constexpr std::uint32_t workspace_instruction_blob_version = 2;
 inline constexpr std::uint64_t workspace_decompiler_cache_record_limit = 64ULL << 20;
 inline constexpr std::uint64_t workspace_search_blob_limit = 8ULL << 30;
@@ -46,6 +46,10 @@ struct workspace_database_options_t {
     std::uint32_t packed_stream_page_size = 256U << 10;
     std::uint64_t packed_staging_memory_budget_bytes = 1ULL << 30;
     bool packed_finalize_full_revalidation = false;
+    std::uint32_t packed_page_compression_level = packed_page_zstd_level_default;
+    std::uint64_t reopen_range_budget_bytes = 1ULL << 30;
+    std::uint64_t pdb_persistence_max_stored_bytes =
+        pdb_symbol_modules_max_stored_bytes;
 };
 
 struct decompiler_cache_key_t {
@@ -104,6 +108,15 @@ struct workspace_database_snapshot_t {
     bool staging_active = false;
     std::uint64_t cumulative_pages_written = 0;
     std::uint64_t wal_bytes_peak = 0;
+    std::uint64_t last_commit_pages_v3 = 0;
+    std::uint64_t cumulative_pages_v3 = 0;
+    std::uint64_t last_commit_page_stored_bytes = 0;
+    std::uint64_t cumulative_page_stored_bytes = 0;
+    std::uint64_t last_commit_page_logical_bytes = 0;
+    std::uint64_t cumulative_page_logical_bytes = 0;
+    std::uint64_t pdb_modules_stored = 0;
+    std::uint64_t pdb_modules_skipped = 0;
+    std::uint64_t pdb_modules_loaded = 0;
 };
 
 struct staged_domain_stats_t {
@@ -308,6 +321,12 @@ public:
     persistence_ticket_t invalidate_pipeline_cache(
         std::optional<std::vector<std::uint64_t>> function_rvas,
         cancellation_token_t cancel = {});
+
+    persistence_ticket_t store_pdb_symbol_modules(
+        pdb_symbol_module_record_t record,
+        cancellation_token_t cancel = {});
+    workspace_result_t<std::vector<pdb_symbol_module_record_t>>
+        load_pdb_symbol_modules(const cancellation_token_t& cancel = {}) const;
 
     workspace_database_snapshot_t snapshot() const;
 

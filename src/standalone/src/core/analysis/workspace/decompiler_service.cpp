@@ -1233,10 +1233,10 @@ decompiler_service_v2_result_t decompiler_service_t::render_typed_pseudocode_v2(
     append_v2_diagnostics(result, ast_build.diagnostics);
     if (!ast_build.succeeded() || !ast_build.ast)
         return result;
-    if (hir.entity.kind == decompiler_entity_kind_t::native_function) {
-        readability_transform_settings_t readability_settings;
+    if (hir.entity.kind == decompiler_entity_kind_t::native_function &&
+        readability_transforms_enabled(request.renderer.settings.readability)) {
         auto readability_result = apply_readability_transforms(
-            *ast_build.ast, type_graph, readability_settings);
+            *ast_build.ast, type_graph, to_rt_settings(request.renderer.settings.readability));
         append_v2_diagnostics(result, readability_result.diagnostics);
         if (readability_result.succeeded()) {
             ::diag::log_tagged_fmt("decompiler", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u",

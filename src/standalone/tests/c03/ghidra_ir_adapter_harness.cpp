@@ -2,6 +2,7 @@
 #include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decompiler/providers/ghidra_ir_adapter.hpp"
+#include "../../src/core/disasm/ghidra_decompiler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -567,6 +568,89 @@ void verify_invalid_capture()
     require(!result.succeeded() && !result.diagnostics.empty(), "empty p-code block must fail closed");
 }
 
+ghidra_ir_adapter::capture_request_t arch_session_request()
+{
+    auto source = fixture("x86:LE:64:default", architecture_id_t::x86_64,
+        architecture_mode_t::x86_64, endian_t::little);
+    auto request = source.request;
+    request.return_type_id = 0;
+    return request;
+}
+
+void verify_arch_session_equivalence()
+{
+    const std::vector<std::uint8_t> function_bytes{
+        0x55, 0x48, 0x89, 0xE5, 0xB8, 0x05, 0x00, 0x00,
+        0x00, 0x83, 0xC0, 0x03, 0x5D, 0xC3};
+    const std::uint64_t image_base = 0x140000000ULL;
+    const std::uint64_t image_size = 0x2000;
+    const std::uint64_t entry_addr = image_base + 0x1000;
+    const auto request = arch_session_request();
+    require(validate_decompiler_entity_key(request.entity).valid(),
+        "arch session fixture entity is invalid");
+    ghidra_decompiler::ghidra_decompile_result_limits_t limits;
+    const auto make_regions = [&]() {
+        std::vector<aida_ghidra::region_t> regions;
+        aida_ghidra::region_t region;
+        region.start_va = entry_addr;
+        region.data = function_bytes;
+        regions.push_back(std::move(region));
+        return regions;
+    };
+    const auto fresh = ghidra_decompiler::decompile_isolated_regions(
+        make_regions(), image_base, image_size, entry_addr, "x86:LE:64:default",
+        architecture_mode_t::x86_64, nullptr, std::nullopt, limits, request);
+    require(!fresh.is_error && fresh.typed_artifacts.has_value(),
+        "fresh isolated-region decompilation failed: " + fresh.error_text);
+    require(!fresh.typed_artifacts->hir.blocks.empty(),
+        "fresh isolated-region decompilation produced an empty HIR");
+
+    ghidra_decompiler::arch_pool_key_t key;
+    key.language_id = request.language.language_id;
+    key.compiler_spec_id = request.language.compiler_spec_id;
+    key.architecture_mode = request.language.mode;
+    key.endian = request.language.endian;
+    key.snapshot_hash = stable_serialization_hash("arch-session-equivalence");
+    auto created = ghidra_decompiler::make_arch_session_entry(
+        make_regions(), image_base, image_size, key, false);
+    require(created.ok && created.entry,
+        "arch session entry creation failed: " + created.error_text);
+    const auto reuse_first = ghidra_decompiler::decompile_isolated_regions_reusing(
+        *created.entry, entry_addr, nullptr, std::nullopt, limits, request);
+    require(!reuse_first.is_error && reuse_first.typed_artifacts.has_value(),
+        "first session-reuse decompilation failed: " + reuse_first.error_text);
+    const auto reuse_second = ghidra_decompiler::decompile_isolated_regions_reusing(
+        *created.entry, entry_addr, nullptr, std::nullopt, limits, request);
+    require(!reuse_second.is_error && reuse_second.typed_artifacts.has_value(),
+        "second session-reuse decompilation failed: " + reuse_second.error_text);
+    require(created.entry->jobs_completed == 2,
+        "arch session reuse did not execute both decompilations on the pooled session");
+
+    const auto fresh_serialized = ghidra_ir_adapter::serialize_artifacts(*fresh.typed_artifacts);
+    const auto reuse_first_serialized =
+        ghidra_ir_adapter::serialize_artifacts(*reuse_first.typed_artifacts);
+    const auto reuse_second_serialized =
+        ghidra_ir_adapter::serialize_artifacts(*reuse_second.typed_artifacts);
+    require(!fresh_serialized.empty() && fresh_serialized == reuse_first_serialized &&
+            reuse_first_serialized == reuse_second_serialized,
+        "fresh and session-reuse typed artifacts are not byte-identical");
+    require(stable_serialization_hash(fresh.typed_artifacts->provider_ir) ==
+            stable_serialization_hash(reuse_first.typed_artifacts->provider_ir) &&
+            stable_serialization_hash(reuse_first.typed_artifacts->provider_ir) ==
+            stable_serialization_hash(reuse_second.typed_artifacts->provider_ir),
+        "provider IR diverged between fresh and session-reuse decompilation");
+    require(stable_serialization_hash(fresh.typed_artifacts->hir) ==
+            stable_serialization_hash(reuse_first.typed_artifacts->hir) &&
+            stable_serialization_hash(reuse_first.typed_artifacts->hir) ==
+            stable_serialization_hash(reuse_second.typed_artifacts->hir),
+        "HIR diverged between fresh and session-reuse decompilation");
+    require(stable_serialization_hash(fresh.typed_artifacts->type_graph) ==
+            stable_serialization_hash(reuse_first.typed_artifacts->type_graph) &&
+            stable_serialization_hash(reuse_first.typed_artifacts->type_graph) ==
+            stable_serialization_hash(reuse_second.typed_artifacts->type_graph),
+        "type graph diverged between fresh and session-reuse decompilation");
+}
+
 }
 
 void run_ghidra_ir_adapter_harness()
@@ -576,6 +660,7 @@ void run_ghidra_ir_adapter_harness()
     verify_native_liveness_and_lossless_provider_ir();
     verify_native_order_and_hash_determinism();
     verify_invalid_capture();
+    verify_arch_session_equivalence();
 }
 
 }

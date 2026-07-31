@@ -44,6 +44,8 @@ struct semantic_refinement_fact_t {
 
 struct semantic_refinement_result_t {
     semantic_refinement_status_t status = semantic_refinement_status_t::input_rejected;
+    decompiler_semantic_proof_availability_t availability =
+        decompiler_semantic_proof_availability_t::not_requested;
     std::vector<semantic_refinement_fact_t> facts;
     std::vector<decompiler_unknown_t> unknowns;
     std::vector<decompiler_diagnostic_t> diagnostics;

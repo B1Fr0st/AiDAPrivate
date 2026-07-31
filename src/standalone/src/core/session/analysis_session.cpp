@@ -520,9 +520,12 @@ session_summary_t summarize_session_at(std::size_t index) {
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
+#include "../analysis/analysis_budget.hpp"
+#include "../analysis/mapped_window_cache.hpp"
 #include "../analysis/stealth_engine.hpp"
 #include "../analysis/pdb_downloader.hpp"
 #include "../analysis/symbol_store.hpp"
@@ -733,6 +736,32 @@ workspace_database_versions_t database_versions(const analysis_workspace_t& work
     return versions;
 }
 
+const aida::analysis::adaptive_analysis_budget_fields_t& adaptive_budget_fields()
+{
+    static const aida::analysis::adaptive_analysis_budget_fields_t fields = [] {
+        const auto envelope = aida::analysis::host_memory_envelope();
+        const auto computed = aida::analysis::adaptive_analysis_budget_fields(envelope);
+        aida::analysis::mapped_window_cache_t::set_adaptive_window_ceiling(
+            computed.window_cache_per_file_bytes, computed.window_cache_global_bytes);
+        diag::log_tagged_fmt("analysis_session",
+            "adaptive_budget total_phys=%llu avail_phys=%llu reserve_os=%llu usable=%llu max_analysis_memory=%llu staging_budget=%llu generation_quota=%llu window_cache_file=%llu window_cache_global=%llu pdb_persistence_cap=%llu reopen_range_budget=%llu low_memory=%d",
+            static_cast<unsigned long long>(envelope.total_phys),
+            static_cast<unsigned long long>(envelope.avail_phys),
+            static_cast<unsigned long long>(envelope.reserve_os_bytes),
+            static_cast<unsigned long long>(envelope.usable_bytes),
+            static_cast<unsigned long long>(computed.max_analysis_memory_bytes),
+            static_cast<unsigned long long>(computed.packed_staging_memory_budget_bytes),
+            static_cast<unsigned long long>(computed.packed_generation_quota_bytes),
+            static_cast<unsigned long long>(computed.window_cache_per_file_bytes),
+            static_cast<unsigned long long>(computed.window_cache_global_bytes),
+            static_cast<unsigned long long>(computed.pdb_persistence_total_bytes),
+            static_cast<unsigned long long>(computed.reopen_range_budget_bytes),
+            computed.low_memory ? 1 : 0);
+        return computed;
+    }();
+    return fields;
+}
+
 workspace_result_t<void> install_workspace_services(
     const std::shared_ptr<analysis_workspace_t>& workspace,
     std::shared_ptr<workspace_database_t>& database_out)
@@ -740,6 +769,11 @@ workspace_result_t<void> install_workspace_services(
     workspace_database_options_t expected;
     expected.identity = workspace->identity_handle();
     expected.versions = database_versions(*workspace);
+    const auto& adaptive = adaptive_budget_fields();
+    expected.packed_generation_quota_bytes = adaptive.packed_generation_quota_bytes;
+    expected.packed_staging_memory_budget_bytes = adaptive.packed_staging_memory_budget_bytes;
+    expected.reopen_range_budget_bytes = adaptive.reopen_range_budget_bytes;
+    expected.pdb_persistence_max_stored_bytes = adaptive.pdb_persistence_total_bytes;
     auto validate_database = [&](const std::shared_ptr<workspace_database_t>& database)
         -> workspace_result_t<void> {
         if (!database || !database->options().identity ||
@@ -1233,6 +1267,118 @@ bool pdb_identity_matches(const pdb_info_header_t& actual,
     return false;
 }
 
+std::string lowered_module_key(const std::string& module_name)
+{
+    std::string key = module_name;
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return key;
+}
+
+std::optional<aida::analysis::pdb_symbol_module_record_t> build_pdb_persistence_record(
+    const symbol_store::module_symbols_t& module,
+    const pdb_info_header_t& pdb_identity,
+    const BY_HANDLE_FILE_INFORMATION& file_identity,
+    std::uint64_t file_size)
+{
+    if (module.module_name.empty() || module.size == 0 ||
+        module.pdb.symbols.size() > 4 * 1024 * 1024 ||
+        module.pdb.structs.size() > 1024 * 1024 ||
+        module.pdb.enums.size() > 1024 * 1024) {
+        diag::log_tagged_fmt("analysis_session",
+            "pdb_persistence_store_skipped reason=module_invariants module=%s",
+            module.module_name.c_str());
+        return std::nullopt;
+    }
+    std::array<std::uint8_t, 16> file_id{};
+    std::memcpy(file_id.data(), &file_identity.nFileIndexLow,
+        sizeof(file_identity.nFileIndexLow));
+    std::memcpy(file_id.data() + sizeof(file_identity.nFileIndexLow),
+        &file_identity.nFileIndexHigh, sizeof(file_identity.nFileIndexHigh));
+    const std::uint64_t last_write_100ns =
+        (static_cast<std::uint64_t>(file_identity.ftLastWriteTime.dwHighDateTime) << 32) |
+        static_cast<std::uint64_t>(file_identity.ftLastWriteTime.dwLowDateTime);
+    const std::uint32_t source_line_count = module.pdb.source_lines
+        ? static_cast<std::uint32_t>(module.pdb.source_lines->lines.size()) : 0;
+    symbol_store::pdb_module_persist_header_t header;
+    header.module_name = module.module_name;
+    header.base = module.base;
+    header.size = module.size;
+    header.pdb_guid = pdb_identity.guid;
+    header.pdb_age = pdb_identity.age;
+    header.pdb_path = module.pdb_path;
+    header.pdb_file_size = file_size;
+    header.pdb_volume_serial = static_cast<std::uint64_t>(file_identity.dwVolumeSerialNumber);
+    header.pdb_file_id = file_id;
+    header.pdb_last_write_100ns = last_write_100ns;
+    header.symbol_count = static_cast<std::uint32_t>(module.pdb.symbols.size());
+    header.struct_count = static_cast<std::uint32_t>(module.pdb.structs.size());
+    header.enum_count = static_cast<std::uint32_t>(module.pdb.enums.size());
+    header.source_line_count = source_line_count;
+    auto payload = symbol_store::serialize_module(header, module, false);
+    if (!payload) {
+        diag::log_tagged_fmt("analysis_session",
+            "pdb_persistence_store_skipped reason=serialize_failed module=%s",
+            module.module_name.c_str());
+        return std::nullopt;
+    }
+    aida::analysis::pdb_symbol_module_record_t record;
+    record.module_key = lowered_module_key(module.module_name);
+    record.module_name = module.module_name;
+    record.base = module.base;
+    record.size = module.size;
+    record.pdb_guid = pdb_identity.guid;
+    record.pdb_age = pdb_identity.age;
+    record.pdb_path = module.pdb_path;
+    record.pdb_file_size = file_size;
+    record.pdb_volume_serial = header.pdb_volume_serial;
+    record.pdb_file_id = file_id;
+    record.pdb_last_write_100ns = last_write_100ns;
+    record.symbol_count = header.symbol_count;
+    record.struct_count = header.struct_count;
+    record.enum_count = header.enum_count;
+    record.payload = std::move(*payload);
+    if (module.pdb.source_lines) {
+        auto source_lines =
+            symbol_store::serialize_module_source_lines(*module.pdb.source_lines);
+        if (!source_lines) {
+            diag::log_tagged_fmt("analysis_session",
+                "pdb_persistence_store_skipped reason=serialize_source_lines_failed module=%s",
+                module.module_name.c_str());
+            return std::nullopt;
+        }
+        record.source_lines = std::move(*source_lines);
+    }
+    return record;
+}
+
+void enqueue_pdb_persistence_record(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    aida::analysis::pdb_symbol_module_record_t record)
+{
+    if (!workspace) return;
+    auto database = workspace->database();
+    if (!database) {
+        diag::log_tagged_fmt("analysis_session",
+            "pdb_persistence_store_skipped reason=no_database module=%s",
+            record.module_name.c_str());
+        return;
+    }
+    const std::uint64_t payload_bytes =
+        static_cast<std::uint64_t>(record.payload.size());
+    const std::uint64_t source_line_bytes = record.source_lines
+        ? static_cast<std::uint64_t>(record.source_lines->size()) : 0;
+    const std::string module_name = record.module_name;
+    database->store_pdb_symbol_modules(std::move(record),
+        workspace->cancellation_token());
+    diag::log_tagged_fmt("analysis_session",
+        "pdb_persistence_store_submitted module=%s payload_bytes=%llu source_line_bytes=%llu",
+        module_name.c_str(),
+        static_cast<unsigned long long>(payload_bytes),
+        static_cast<unsigned long long>(source_line_bytes));
+}
+
 std::optional<pdb_binding_t> pdb_binding_for_workspace(
     const std::shared_ptr<analysis_workspace_t>& workspace)
 {
@@ -1701,7 +1847,13 @@ workspace_result_t<void> submit_pdb_task(
                 prompt->committing = true;
                 prompt->status = "Publishing PDB";
             }
+            auto persistence_record = build_pdb_persistence_record(
+                module, pdb_identity, file_identity, file_size);
             const bool published = symbols->upsert_module(std::move(module));
+            if (published && persistence_record) {
+                enqueue_pdb_persistence_record(workspace,
+                    std::move(*persistence_record));
+            }
             std::lock_guard<std::mutex> lock(prompt->mutex);
             prompt->committing = false;
             if (prompt->generation != generation || !prompt->loading ||
@@ -1744,6 +1896,172 @@ workspace_result_t<void> submit_pdb_task(
             binding->prompt->task_id = submitted.task_id;
     }
     return workspace_result_t<void>::success();
+}
+
+void submit_pdb_restore(const std::string& session_id,
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    const std::shared_ptr<symbol_store::workspace_state_t>& symbols,
+    const std::shared_ptr<pdb_session_state_t>& pdb_state,
+    std::string local_candidate)
+{
+    auto submit_local_parse = [&]() {
+        if (local_candidate.empty() || !workspace) return;
+        pdb_task_request_t request;
+        request.local_path = std::move(local_candidate);
+        const auto queued = submit_pdb_task(workspace, std::move(request));
+        if (!queued) {
+            diag::log_tagged_fmt("analysis_session",
+                "local_pdb_submit_failed session=%s code=%s message=%s",
+                session_id.c_str(), queued.error().stable_code().c_str(),
+                queued.error().message.c_str());
+        }
+    };
+    auto database = workspace ? workspace->database() : nullptr;
+    if (!workspace || !database || !symbols || !pdb_state) {
+        submit_local_parse();
+        return;
+    }
+    std::vector<pdb_expected_identity_t> expected_identities;
+    const std::uint64_t image_base = workspace->identity().image_base();
+    std::uint64_t image_size = 0;
+    if (const auto image = workspace->image()) {
+        image_size = image->image_size();
+        for (const auto& record : image->codeview_records()) {
+            if (record.pdb_path.empty()) continue;
+            pdb_expected_identity_t expected;
+            expected.guid = record.guid;
+            expected.signature = record.timestamp;
+            expected.age = record.age;
+            expected.uses_guid = std::any_of(record.guid.begin(), record.guid.end(),
+                [](std::uint8_t value) { return value != 0; });
+            if (expected_identities.size() < 64)
+                expected_identities.push_back(expected);
+        }
+    }
+    const auto binary_id = workspace->identity().binary_id();
+    const std::uint64_t workspace_generation = workspace->generation();
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "analysis_session";
+    submission.label = "analysis_session.workspace_pdb_restore";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.body = [workspace, database, symbols, pdb_state, session_id,
+        local_candidate, expected_identities = std::move(expected_identities),
+        image_base, image_size, binary_id, workspace_generation]() mutable {
+        auto submit_local = [&]() {
+            if (local_candidate.empty()) return;
+            pdb_task_request_t request;
+            request.local_path = std::move(local_candidate);
+            const auto queued = submit_pdb_task(workspace, std::move(request));
+            if (!queued) {
+                diag::log_tagged_fmt("analysis_session",
+                    "local_pdb_submit_failed session=%s code=%s message=%s",
+                    session_id.c_str(), queued.error().stable_code().c_str(),
+                    queued.error().message.c_str());
+            }
+        };
+        auto current = [&]() {
+            return !workspace->cancellation_token().stop_requested() &&
+                !workspace->closing() && !workspace->closed() &&
+                workspace->generation() == workspace_generation &&
+                workspace->identity().binary_id() == binary_id &&
+                symbols->binary_id() == binary_id &&
+                analysis_session::symbols_for_workspace(workspace) == symbols;
+        };
+        if (!current()) return;
+        std::uint64_t rows = 0;
+        std::uint64_t restored = 0;
+        std::uint64_t skipped = 0;
+        auto loaded = database->load_pdb_symbol_modules(workspace->cancellation_token());
+        if (loaded) {
+            rows = loaded.value().size();
+            for (auto& record : loaded.value()) {
+                if (!current()) break;
+                if (record.module_key.empty() ||
+                    record.module_key != lowered_module_key(record.module_name) ||
+                    record.size == 0 || record.base != image_base ||
+                    record.size != image_size) {
+                    ++skipped;
+                    continue;
+                }
+                pdb_info_header_t actual{};
+                actual.age = record.pdb_age;
+                actual.guid = record.pdb_guid;
+                if (!pdb_identity_matches(actual, expected_identities)) {
+                    ++skipped;
+                    continue;
+                }
+                symbol_store::pdb_persist_reader_t reader(record.payload);
+                symbol_store::pdb_module_persist_header_t persisted_header;
+                auto module = symbol_store::deserialize_module(reader, &persisted_header);
+                if (!module ||
+                    persisted_header.module_name != record.module_name ||
+                    persisted_header.base != record.base ||
+                    persisted_header.size != record.size ||
+                    persisted_header.pdb_guid != record.pdb_guid ||
+                    persisted_header.pdb_age != record.pdb_age ||
+                    persisted_header.symbol_count != record.symbol_count ||
+                    persisted_header.struct_count != record.struct_count ||
+                    persisted_header.enum_count != record.enum_count) {
+                    ++skipped;
+                    continue;
+                }
+                if (record.source_lines) {
+                    symbol_store::pdb_persist_reader_t lines_reader(*record.source_lines);
+                    auto source_lines =
+                        symbol_store::deserialize_module_source_lines(lines_reader);
+                    if (!source_lines || !*source_lines ||
+                        (*source_lines)->lines.size() !=
+                            persisted_header.source_line_count) {
+                        ++skipped;
+                        continue;
+                    }
+                    module->pdb.source_lines = std::move(*source_lines);
+                } else if (persisted_header.source_line_count != 0) {
+                    ++skipped;
+                    continue;
+                }
+                module->status_text = "Restored persisted workspace PDB";
+                if (!symbols->upsert_module(std::move(*module))) {
+                    ++skipped;
+                    continue;
+                }
+                ++restored;
+            }
+        }
+        diag::log_tagged_fmt("analysis_session",
+            "pdb_persistence_restore session=%s binary_id=%s rows=%llu restored=%llu skipped=%llu",
+            session_id.c_str(), binary_id.to_hex().c_str(),
+            static_cast<unsigned long long>(rows),
+            static_cast<unsigned long long>(restored),
+            static_cast<unsigned long long>(skipped));
+        if (restored != 0) {
+            if (current()) {
+                std::lock_guard<std::mutex> lock(pdb_state->mutex);
+                if (pdb_state->binary_id == binary_id &&
+                    pdb_state->workspace_generation == workspace_generation &&
+                    !pdb_state->loading) {
+                    pdb_state->remote_pending = false;
+                    pdb_state->local_pending = false;
+                    pdb_state->failed = false;
+                    pdb_state->declined = false;
+                    pdb_state->progress_percent = 100;
+                    pdb_state->status = "Restored persisted workspace PDB";
+                    pdb_state->reason.clear();
+                }
+            }
+            return;
+        }
+        submit_local();
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        diag::log_tagged_fmt("analysis_session",
+            "pdb_persistence_restore_submit_failed session=%s reason=%s",
+            session_id.c_str(), submitted.reject_reason.c_str());
+        submit_local_parse();
+    }
 }
 
 bool bind_workspace(const std::string& session_id,
@@ -1853,17 +2171,8 @@ bool bind_workspace(const std::string& session_id,
             std::lock_guard<std::mutex> lock(pdb_state->mutex);
             local_candidate = pdb_state->local_candidate;
         }
-        if (!local_candidate.empty()) {
-            pdb_task_request_t request;
-            request.local_path = std::move(local_candidate);
-            const auto queued = submit_pdb_task(workspace, std::move(request));
-            if (!queued) {
-                diag::log_tagged_fmt("analysis_session",
-                    "local_pdb_submit_failed session=%s code=%s message=%s",
-                    session_id.c_str(), queued.error().stable_code().c_str(),
-                    queued.error().message.c_str());
-            }
-        }
+        submit_pdb_restore(session_id, workspace, symbols, pdb_state,
+            std::move(local_candidate));
     }
     if (selected) {
         const auto selection = workspace_registry().select_for_ui(
@@ -2457,6 +2766,16 @@ acquire_static_workspace(const std::string& path,
         return fail(std::move(error));
     }
     baseline_analysis_settings_t settings;
+    const auto& adaptive = adaptive_budget_fields();
+    settings.max_analysis_memory_bytes = adaptive.max_analysis_memory_bytes;
+    if (adaptive.low_memory) {
+        const std::uint32_t hardware_lanes = std::thread::hardware_concurrency();
+        settings.decode_worker_lanes = (std::clamp)(hardware_lanes / 2u, 2u, 8u);
+        settings.overlap_strings_with_decode = false;
+        diag::log_tagged_fmt("analysis_session",
+            "adaptive_budget_low_memory decode_worker_lanes=%u overlap_strings_with_decode=0 hardware_concurrency=%u",
+            settings.decode_worker_lanes, hardware_lanes);
+    }
     open_static_workspace_request_t request;
     request.source_path = path;
     request.bin_name = derive_filename(path);

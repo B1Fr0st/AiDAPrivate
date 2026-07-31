@@ -332,7 +332,8 @@ bool equal_renderer(
            left.indentation_spaces == right.indentation_spaces &&
            left.emit_type_annotations == right.emit_type_annotations &&
            left.emit_provenance_annotations == right.emit_provenance_annotations &&
-           left.emit_unknown_tokens == right.emit_unknown_tokens;
+           left.emit_unknown_tokens == right.emit_unknown_tokens &&
+           left.readability == right.readability;
 }
 
 bool coordinate_matches(

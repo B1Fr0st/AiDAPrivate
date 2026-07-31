@@ -155,7 +155,7 @@ struct phase_node_schedule_t {
     std::shared_ptr<baseline_graph_schedule_t> graph;
     std::uint64_t node_id = 0;
     std::vector<std::uint64_t> dependencies;
-    std::uint64_t decode_lane_count = 0;
+    std::uint64_t decode_worker_budget = 0;
 };
 
 class busy_slot_guard_t final {
@@ -264,13 +264,13 @@ phase_body(std::shared_ptr<baseline_job_state_t> state, Callable callable,
                 schedule.graph->node_finished_ns[schedule.node_id] = finished_ns;
             }
             if (terminal) {
-                if (schedule.graph && schedule.decode_lane_count != 0) {
+                if (schedule.graph && schedule.decode_worker_budget != 0) {
                     const auto submitted =
                         schedule.graph->submitted_ns.load(std::memory_order_acquire);
                     const auto completed_ns = analysis_metrics_t::steady_now_ns();
                     if (submitted != 0 && completed_ns >= submitted) {
                         std::uint64_t scheduled_ns = 0;
-                        if (checked_mul_u64(schedule.decode_lane_count,
+                        if (checked_mul_u64(schedule.decode_worker_budget,
                                 completed_ns - submitted, scheduled_ns)) {
                             analyzer->metrics()->add(
                                 analysis_metric_t::worker_slots_scheduled_ns,
@@ -378,7 +378,7 @@ baseline_analysis_service_t::start(
     };
     auto graph_schedule = std::make_shared<baseline_graph_schedule_t>();
     std::vector<std::string> labels;
-    labels.reserve(analyzer->decode_lane_count() + 14);
+    labels.reserve(15);
     auto add_node = [&](std::uint64_t id, std::string label,
                         std::vector<std::uint64_t> dependencies,
                         std::function<void(
@@ -397,19 +397,12 @@ baseline_analysis_service_t::start(
     add_node(2, "baseline.seed", {1}, phase_body(state,
         [](auto& value, const auto& cancel) { return value.seed_phase(cancel); },
         {graph_schedule, 2, {1}}));
-    std::vector<std::uint64_t> decode_nodes;
-    decode_nodes.reserve(analyzer->decode_lane_count());
-    for (std::uint32_t lane = 0; lane < analyzer->decode_lane_count(); ++lane) {
-        const auto node_id = 100ULL + lane;
-        decode_nodes.push_back(node_id);
-        add_node(node_id, "baseline.decode." + std::to_string(lane), {2},
-            phase_body(state, [lane](auto& value, const auto& cancel) {
-                return value.decode_lane_phase(lane, cancel);
-            }, {graph_schedule, node_id, {2}}));
-    }
-    add_node(200, "baseline.decode_merge", decode_nodes, phase_body(state,
+    add_node(100, "baseline.decode", {2}, phase_body(state,
+        [](auto& value, const auto& cancel) { return value.decode_phase(cancel); },
+        {graph_schedule, 100, {2}}));
+    add_node(200, "baseline.decode_merge", {100}, phase_body(state,
         [](auto& value, const auto& cancel) { return value.decode_merge_phase(cancel); },
-        {graph_schedule, 200, decode_nodes}));
+        {graph_schedule, 200, {100}}));
     if (enable_parallel_fact_passes) {
         const auto strings_dependency = overlap_strings_with_decode ? 1ULL : 200ULL;
         add_node(3, "baseline.strings_data", {strings_dependency},
@@ -479,7 +472,7 @@ baseline_analysis_service_t::start(
     add_node(300, "baseline.publish_ready", {290}, phase_body(state,
         [](auto& value, const auto& cancel) { return value.publish_ready_phase(cancel); },
         {graph_schedule, 300, {290},
-            static_cast<std::uint64_t>(decode_nodes.size())}, true));
+            static_cast<std::uint64_t>(analyzer->decode_worker_budget())}, true));
     graph_schedule->submitted_ns.store(analysis_metrics_t::steady_now_ns(),
         std::memory_order_release);
     analyzer->metrics()->set(analysis_metric_t::tasks_scheduled, graph.nodes.size());

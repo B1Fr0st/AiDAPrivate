@@ -785,6 +785,335 @@ schema_v9_fixture_result_t run_corruption_detection() {
     return result;
 }
 
+schema_v9_fixture_result_t run_packed_page_known_answer() {
+    schema_v9_fixture_result_t result;
+    result.name = "packed_page_known_answer";
+
+    auto run = [&]() {
+        struct crc_case_t {
+            std::vector<std::uint8_t> data;
+            std::uint32_t expected;
+        };
+        std::vector<crc_case_t> crc_cases;
+        crc_cases.push_back({{}, 0x00000000U});
+        crc_cases.push_back({{'1', '2', '3', '4', '5', '6', '7', '8', '9'}, 0xE3069283U});
+        {
+            const std::string fox = "The quick brown fox jumps over the lazy dog";
+            crc_cases.push_back({std::vector<std::uint8_t>(fox.begin(), fox.end()), 0x22620404U});
+        }
+        crc_cases.push_back({std::vector<std::uint8_t>(32, 0x00), 0x8A9136AAU});
+        crc_cases.push_back({std::vector<std::uint8_t>(32, 0xFF), 0x62A8AB43U});
+        {
+            std::vector<std::uint8_t> iota(256);
+            for (std::size_t index = 0; index < iota.size(); ++index)
+                iota[index] = static_cast<std::uint8_t>(index);
+            crc_cases.push_back({std::move(iota), 0x9C44184BU});
+        }
+        for (const auto& crc_case : crc_cases) {
+            if (crc32c(crc_case.data.data(), crc_case.data.size()) != crc_case.expected) {
+                result.message = "crc32c known-answer vector diverged";
+                return;
+            }
+            const auto cancellable = crc32c_cancellable(
+                crc_case.data.data(), crc_case.data.size(), {});
+            if (!cancellable || cancellable.value() != crc_case.expected) {
+                result.message = "cancellable crc32c known-answer vector diverged";
+                return;
+            }
+        }
+
+        const auto read_u32_le = [](const std::uint8_t* data) {
+            return static_cast<std::uint32_t>(data[0]) |
+                (static_cast<std::uint32_t>(data[1]) << 8U) |
+                (static_cast<std::uint32_t>(data[2]) << 16U) |
+                (static_cast<std::uint32_t>(data[3]) << 24U);
+        };
+        const auto read_u64_le = [](const std::uint8_t* data) {
+            std::uint64_t value = 0;
+            for (std::size_t index = 0; index < 8; ++index)
+                value |= static_cast<std::uint64_t>(data[index]) << (index * 8);
+            return value;
+        };
+        const auto write_u64_le = [](std::uint8_t* data, std::uint64_t value) {
+            for (unsigned shift = 0; shift < 64; shift += 8)
+                data[shift / 8] = static_cast<std::uint8_t>(value >> shift);
+        };
+        const auto make_page = [](std::uint32_t page_type, std::uint32_t page_index,
+                                  std::uint32_t page_count, std::uint64_t generation,
+                                  std::uint64_t analysis_revision, std::uint64_t overlay_revision,
+                                  const packed_record_page_prefix_t& prefix,
+                                  const std::vector<std::uint8_t>& content) {
+            packed_page_t page;
+            page.header.magic = packed_page_magic;
+            page.header.page_type = page_type;
+            page.header.page_index = page_index;
+            page.header.page_count = page_count;
+            page.header.generation = generation;
+            page.header.analysis_revision = analysis_revision;
+            page.header.overlay_revision = overlay_revision;
+            const auto encoded_prefix = prefix.encode();
+            page.payload.assign(encoded_prefix.begin(), encoded_prefix.end());
+            page.payload.insert(page.payload.end(), content.begin(), content.end());
+            return page;
+        };
+        const auto reseal_checksum = [](packed_page_t& page) {
+            page.header.payload_length = static_cast<std::uint32_t>(page.payload.size());
+            const auto encoded = page.header.encode();
+            std::vector<std::uint8_t> covered(encoded.begin(), encoded.begin() + 48);
+            covered.insert(covered.end(), page.payload.begin(), page.payload.end());
+            page.header.checksum = crc32c(covered.data(), covered.size());
+        };
+
+        packed_record_page_prefix_t empty_prefix;
+        const std::vector<std::uint8_t> digits{'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+        auto kat1 = make_page(static_cast<std::uint32_t>(packed_page_type_t::instructions),
+            0, 1, 42, 2, 1, empty_prefix, digits);
+        auto kat1_sealed = packed_page_codec_t::seal_page(kat1);
+        if (!kat1_sealed) {
+            result.message = "first golden page failed to seal";
+            return;
+        }
+        if (kat1.header.version != packed_page_blob_version ||
+            kat1.header.payload_length != 41 ||
+            kat1.header.checksum != 0xB428A205U) {
+            result.message = "first golden page checksum diverged from the committed vector";
+            return;
+        }
+        auto kat1_again = make_page(static_cast<std::uint32_t>(packed_page_type_t::instructions),
+            0, 1, 42, 2, 1, empty_prefix, digits);
+        if (!packed_page_codec_t::seal_page(kat1_again) ||
+            kat1_again.header.checksum != kat1.header.checksum ||
+            kat1_again.payload != kat1.payload) {
+            result.message = "golden page sealing is not deterministic";
+            return;
+        }
+        packed_record_page_prefix_t kat2_prefix;
+        kat2_prefix.ordinal_begin = 5;
+        kat2_prefix.record_count = 2;
+        kat2_prefix.address_value_min = 0x1000;
+        kat2_prefix.address_value_max = 0x2000;
+        const std::string kat2_text = "The quick brown fox jumps over the lazy dog";
+        const std::vector<std::uint8_t> kat2_content(kat2_text.begin(), kat2_text.end());
+        auto kat2 = make_page(static_cast<std::uint32_t>(packed_page_type_t::strings),
+            3, 7, 0xA1DA0004ULL, 17, 9, kat2_prefix, kat2_content);
+        if (!packed_page_codec_t::seal_page(kat2)) {
+            result.message = "second golden page failed to seal";
+            return;
+        }
+        if (kat2.header.payload_length != 75 || kat2.header.checksum != 0xAFFD3907U) {
+            result.message = "second golden page checksum diverged from the committed vector";
+            return;
+        }
+        if (!packed_page_codec_t::verify_page(kat1) ||
+            !packed_page_codec_t::verify_page(kat2)) {
+            result.message = "golden pages failed verification after sealing";
+            return;
+        }
+        const auto kat1_decoded = packed_page_codec_t::decode_page_content(kat1);
+        if (!kat1_decoded || kat1_decoded.value() != digits) {
+            result.message = "golden v2 page content did not round-trip byte-identically";
+            return;
+        }
+
+        std::vector<std::uint8_t> small_content(2048);
+        for (std::size_t index = 0; index < small_content.size(); ++index)
+            small_content[index] = static_cast<std::uint8_t>((index * 13 + 5) & 0xFF);
+        auto small_page = make_page(static_cast<std::uint32_t>(packed_page_type_t::operands),
+            0, 1, 43, 3, 1, empty_prefix, small_content);
+        const auto small_payload_before = small_page.payload;
+        if (!packed_page_codec_t::seal_page_v3(small_page, packed_page_zstd_level_default)) {
+            result.message = "small page failed v3 sealing";
+            return;
+        }
+        if (small_page.header.version != packed_page_blob_version ||
+            small_page.payload != small_payload_before) {
+            result.message = "sub-threshold page was compressed instead of staying v2";
+            return;
+        }
+        if (!packed_page_codec_t::verify_page(small_page)) {
+            result.message = "small v2 page failed verification";
+            return;
+        }
+        const auto small_decoded = packed_page_codec_t::decode_page_content(small_page);
+        if (!small_decoded || small_decoded.value() != small_content) {
+            result.message = "small v2 page content did not round-trip byte-identically";
+            return;
+        }
+
+        std::vector<std::uint8_t> compressible(65536);
+        for (std::size_t index = 0; index < compressible.size(); ++index)
+            compressible[index] = static_cast<std::uint8_t>((index * 37) & 0xFF);
+        auto v3_page = make_page(static_cast<std::uint32_t>(packed_page_type_t::instructions),
+            0, 1, 44, 5, 2, empty_prefix, compressible);
+        if (!packed_page_codec_t::seal_page_v3(v3_page, packed_page_zstd_level_default)) {
+            result.message = "compressible page failed v3 sealing";
+            return;
+        }
+        if (v3_page.header.version != packed_page_blob_version_v3) {
+            result.message = "compressible page did not select the v3 frame";
+            return;
+        }
+        if (v3_page.payload.size() >= packed_record_page_prefix_size + compressible.size() ||
+            v3_page.payload.size() < packed_record_page_prefix_size +
+                packed_page_frame_header_size + packed_page_zstd_min_frame) {
+            result.message = "v3 frame did not shrink the payload within bounded limits";
+            return;
+        }
+        if (read_u32_le(v3_page.payload.data() + packed_record_page_prefix_size) !=
+                packed_page_frame_magic ||
+            read_u32_le(v3_page.payload.data() + packed_record_page_prefix_size + 4) !=
+                packed_page_codec_zstd ||
+            read_u64_le(v3_page.payload.data() + packed_record_page_prefix_size + 8) !=
+                compressible.size()) {
+            result.message = "v3 frame header fields diverged";
+            return;
+        }
+        if (!packed_page_codec_t::verify_page(v3_page)) {
+            result.message = "v3 page failed verification";
+            return;
+        }
+        const auto v3_decoded = packed_page_codec_t::decode_page_content(v3_page);
+        if (!v3_decoded || v3_decoded.value() != compressible) {
+            result.message = "v3 page content did not round-trip byte-identically";
+            return;
+        }
+        const auto v3_record_payload = packed_page_codec_t::record_payload(v3_page);
+        if (!v3_record_payload || v3_record_payload.value() != compressible) {
+            result.message = "v3 record payload alias diverged from the decoded content";
+            return;
+        }
+
+        std::vector<std::uint8_t> entropy(65536);
+        std::uint64_t entropy_state = 0x9E3779B97F4A7C15ULL;
+        for (auto& byte : entropy) {
+            entropy_state += 0x9E3779B97F4A7C15ULL;
+            std::uint64_t mixed = entropy_state;
+            mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBULL;
+            mixed ^= (mixed >> 31);
+            byte = static_cast<std::uint8_t>(mixed);
+        }
+        auto entropy_page = make_page(static_cast<std::uint32_t>(packed_page_type_t::edges),
+            0, 1, 45, 6, 3, empty_prefix, entropy);
+        const auto entropy_payload_before = entropy_page.payload;
+        if (!packed_page_codec_t::seal_page_v3(entropy_page, packed_page_zstd_level_default)) {
+            result.message = "high-entropy page failed v3 sealing";
+            return;
+        }
+        if (entropy_page.header.version != packed_page_blob_version ||
+            entropy_page.payload != entropy_payload_before) {
+            result.message = "high-entropy page was compressed despite the strict-shrink rule";
+            return;
+        }
+        if (!packed_page_codec_t::verify_page(entropy_page)) {
+            result.message = "high-entropy v2 page failed verification";
+            return;
+        }
+        const auto entropy_decoded = packed_page_codec_t::decode_page_content(entropy_page);
+        if (!entropy_decoded || entropy_decoded.value() != entropy) {
+            result.message = "high-entropy page content did not round-trip byte-identically";
+            return;
+        }
+
+        auto v2_corrupted = kat1;
+        v2_corrupted.payload.back() ^= 0xFF;
+        if (packed_page_codec_t::verify_page(v2_corrupted)) {
+            result.message = "payload-corrupted v2 page passed verification";
+            return;
+        }
+        auto v3_corrupted = v3_page;
+        v3_corrupted.payload[packed_record_page_prefix_size +
+            packed_page_frame_header_size + 2] ^= 0xFF;
+        if (packed_page_codec_t::verify_page(v3_corrupted)) {
+            result.message = "payload-corrupted v3 page passed verification";
+            return;
+        }
+        auto reserved_corrupted = kat1;
+        reserved_corrupted.header.reserved[3] = 0x01;
+        if (packed_page_codec_t::verify_page(reserved_corrupted)) {
+            result.message = "reserved-byte page passed verification";
+            return;
+        }
+
+        auto zero_length_frame = v3_page;
+        write_u64_le(zero_length_frame.payload.data() + packed_record_page_prefix_size + 8, 0);
+        reseal_checksum(zero_length_frame);
+        if (packed_page_codec_t::verify_page(zero_length_frame)) {
+            result.message = "zero-content-length v3 frame passed verification";
+            return;
+        }
+        auto oversized_frame = v3_page;
+        write_u64_le(oversized_frame.payload.data() + packed_record_page_prefix_size + 8,
+            static_cast<std::uint64_t>(packed_page_max_payload) + 1ULL);
+        reseal_checksum(oversized_frame);
+        if (packed_page_codec_t::verify_page(oversized_frame)) {
+            result.message = "oversized-content-length v3 frame passed verification";
+            return;
+        }
+        auto wrong_codec_frame = v3_page;
+        wrong_codec_frame.payload[packed_record_page_prefix_size + 4] = 0;
+        reseal_checksum(wrong_codec_frame);
+        if (packed_page_codec_t::verify_page(wrong_codec_frame)) {
+            result.message = "wrong-codec v3 frame passed verification";
+            return;
+        }
+        auto wrong_magic_frame = v3_page;
+        wrong_magic_frame.payload[packed_record_page_prefix_size] ^=
+            static_cast<std::uint8_t>(packed_page_frame_magic & 0xFFU);
+        reseal_checksum(wrong_magic_frame);
+        if (packed_page_codec_t::verify_page(wrong_magic_frame)) {
+            result.message = "wrong-magic v3 frame passed verification";
+            return;
+        }
+        auto truncated_frame = make_page(
+            static_cast<std::uint32_t>(packed_page_type_t::instructions),
+            0, 1, 46, 1, 1, empty_prefix, small_content);
+        truncated_frame.header.version = packed_page_blob_version_v3;
+        truncated_frame.payload.resize(packed_record_page_prefix_size +
+            packed_page_frame_header_size + packed_page_zstd_min_frame - 1);
+        reseal_checksum(truncated_frame);
+        if (packed_page_codec_t::verify_page(truncated_frame)) {
+            result.message = "truncated v3 frame passed verification";
+            return;
+        }
+        auto checkpoint_v3 = v3_page;
+        checkpoint_v3.header.page_type = packed_page_checkpoint_type;
+        reseal_checksum(checkpoint_v3);
+        if (packed_page_codec_t::verify_page(checkpoint_v3)) {
+            result.message = "checkpoint page passed v3 frame verification";
+            return;
+        }
+
+        packed_page_encode_options_t kat_options;
+        kat_options.generation = 99;
+        kat_options.analysis_revision = 4;
+        kat_options.overlay_revision = 2;
+        kat_options.page_size = 256;
+        std::vector<std::uint8_t> batch_data(1000);
+        for (std::size_t index = 0; index < batch_data.size(); ++index)
+            batch_data[index] = static_cast<std::uint8_t>((index * 31 + 7) & 0xFF);
+        auto kat_batch = packed_page_codec_t::encode_batch(
+            packed_page_type_t::functions, batch_data, kat_options);
+        if (!kat_batch) {
+            result.message = "fixed-options batch failed to encode";
+            return;
+        }
+        if (!packed_page_codec_t::verify_batch(kat_batch.value())) {
+            result.message = "fixed-options batch failed verification";
+            return;
+        }
+        const auto batch_decoded = packed_page_codec_t::decode_batch(kat_batch.value());
+        if (!batch_decoded || batch_decoded.value() != batch_data) {
+            result.message = "fixed-options batch payload did not round-trip byte-identically";
+            return;
+        }
+        result.passed = true;
+        result.message = "crc32c vectors, golden v2 checksums, v2/v3 selection, decode round-trips, and frame rejection cases all matched";
+    };
+    result.elapsed_us = measure_us(run);
+    return result;
+}
+
 schema_v9_fixture_result_t run_rollback_after_failed_migration() {
     schema_v9_fixture_result_t result;
     result.name = "rollback_after_failed_migration";
@@ -1871,6 +2200,7 @@ schema_v9_harness_summary_t run_all_schema_v9_fixtures() {
     results.push_back(run_partial_v9_repair());
     results.push_back(run_interrupted_commit());
     results.push_back(run_corruption_detection());
+    results.push_back(run_packed_page_known_answer());
     results.push_back(run_rollback_after_failed_migration());
     results.push_back(run_fixed_width_address());
     results.push_back(run_concurrent_reader());

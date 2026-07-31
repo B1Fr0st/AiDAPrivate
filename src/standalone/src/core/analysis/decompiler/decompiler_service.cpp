@@ -1581,6 +1581,19 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             refinement_request.queries = std::move(semantic_queries);
             const auto refinement = state_->semantic_refiner->refine(refinement_request, operation_cancel);
             append_diagnostics(diagnostics, refinement.diagnostics);
+            result.semantic_proof_availability = refinement.availability;
+            {
+                std::lock_guard lock(state_->metrics_mutex);
+                ++state_->metrics.semantic_proof_requests;
+                if (refinement.availability != decompiler_semantic_proof_availability_t::ready &&
+                    refinement.availability != decompiler_semantic_proof_availability_t::not_requested)
+                    ++state_->metrics.semantic_proof_adapter_denials;
+            }
+            ::diag::log_tagged_fmt("decompiler",
+                "semantic_proof_availability state=%u adapter_invocations=%u refiner_status=%u",
+                static_cast<unsigned int>(refinement.availability),
+                static_cast<unsigned int>(refinement.adapter_invocations),
+                static_cast<unsigned int>(refinement.status));
             if (refinement.status == semantic_refinement_status_t::cancelled) {
                 result.diagnostics = std::move(diagnostics);
                 return finish(operation_cancel.deadline_exceeded()
@@ -1618,6 +1631,22 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             return finish(ast_build.ast && ast_build.ast->nodes.size() > budget->max_ast_nodes
                 ? decompiler_pipeline_status_t::resource_limit
                 : decompiler_pipeline_status_t::normalization_failed);
+        }
+        if (hir.entity.kind == decompiler_entity_kind_t::native_function &&
+            readability_transforms_enabled(renderer.readability)) {
+            auto readability_result = apply_readability_transforms(
+                *ast_build.ast, type_graph, to_rt_settings(renderer.readability));
+            append_diagnostics(diagnostics, readability_result.diagnostics);
+            if (readability_result.succeeded()) {
+                ::diag::log_tagged_fmt("decompiler", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u",
+                    static_cast<unsigned int>(readability_result.metrics.variables_renamed),
+                    static_cast<unsigned int>(readability_result.metrics.constants_folded),
+                    static_cast<unsigned int>(readability_result.metrics.identities_simplified),
+                    static_cast<unsigned int>(readability_result.metrics.temporaries_inlined),
+                    static_cast<unsigned int>(readability_result.metrics.dead_stores_eliminated));
+            } else {
+                ::diag::log_tagged_fmt("decompiler", "readability_transforms status=warning_no_transform continuing_with_unmodified_ast");
+            }
         }
 
         decompiler_normalized_cache_value_t normalized;

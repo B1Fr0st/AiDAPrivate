@@ -917,8 +917,8 @@ budget_failure_signature_t deterministic_budget_failure(
         results.push_back(analyzer.value()->parse_phase(runtime_cancelled));
         if (results.back())
             results.push_back(analyzer.value()->seed_phase(runtime_cancelled));
-        for (std::uint32_t lane = 0; results.back() && lane < analyzer.value()->decode_lane_count(); ++lane)
-            results.push_back(analyzer.value()->decode_lane_phase(lane, runtime_cancelled));
+        if (results.back())
+            results.push_back(analyzer.value()->decode_phase(runtime_cancelled));
         if (results.back())
             results.push_back(analyzer.value()->decode_merge_phase(runtime_cancelled));
         const auto failure = std::find_if(results.begin(), results.end(),

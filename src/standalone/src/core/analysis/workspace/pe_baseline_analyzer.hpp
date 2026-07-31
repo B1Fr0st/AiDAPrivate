@@ -43,6 +43,7 @@ struct baseline_analysis_settings_t {
     std::uint64_t max_string_value_bytes = 1ULL << 20;
     std::uint64_t max_strings = 1ULL << 25;
     std::uint32_t decode_worker_lanes = 0;
+    std::uint32_t fact_pass_worker_budget = 0;
     std::uint32_t max_trace_instructions = 1U << 20;
     std::uint32_t cancellation_check_interval = 256;
     std::uint32_t string_cancellation_interval_bytes = 64U * 1024U;
@@ -70,14 +71,14 @@ public:
     pe_baseline_analyzer_t(const pe_baseline_analyzer_t&) = delete;
     pe_baseline_analyzer_t& operator=(const pe_baseline_analyzer_t&) = delete;
 
-    std::uint32_t decode_lane_count() const noexcept;
+    std::uint32_t decode_worker_budget() const noexcept;
     std::uint64_t expected_generation() const noexcept;
     std::shared_ptr<analysis_metrics_t> metrics() const noexcept;
     workspace_result_t<void> parse_phase(
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> seed_phase(
         const std::atomic<bool>& runtime_cancel_requested);
-    workspace_result_t<void> decode_lane_phase(std::uint32_t lane,
+    workspace_result_t<void> decode_phase(
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> decode_merge_phase(
         const std::atomic<bool>& runtime_cancel_requested);

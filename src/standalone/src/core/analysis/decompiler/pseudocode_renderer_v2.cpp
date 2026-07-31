@@ -169,7 +169,7 @@ private:
         if (request_.limits.max_ast_nodes == 0 || request_.limits.max_output_bytes == 0 || request_.limits.max_tokens == 0 ||
             request_.limits.max_source_maps == 0 || request_.limits.max_nesting == 0 ||
             request_.limits.max_output_bytes > std::numeric_limits<std::uint32_t>::max() ||
-            settings_.schema_version != 1 || settings_.style_id.empty() || settings_.indentation_spaces == 0 ||
+            settings_.schema_version != 2 || settings_.style_id.empty() || settings_.indentation_spaces == 0 ||
             settings_.indentation_spaces > 16) {
             fail(decompiler_diagnostic_code_t::invalid_contract, "decompiler.renderer.v2.request", nullptr);
             return false;
@@ -805,6 +805,16 @@ decompiler_renderer_settings_t pseudocode_renderer_v2_style_settings(
         result.emit_type_annotations = true;
         result.emit_provenance_annotations = false;
         result.emit_unknown_tokens = true;
+        result.readability.enable_expression_simplification = false;
+        result.readability.enable_temporary_coalescing = false;
+        result.readability.enable_identity_simplification = false;
+        result.readability.enable_cast_simplification = false;
+        result.readability.enable_comparison_normalization = false;
+        result.readability.enable_compound_assignment_marking = false;
+        result.readability.enable_double_negation_simplification = false;
+        result.readability.enable_single_use_inlining = false;
+        result.readability.enable_copy_propagation = false;
+        result.readability.enable_dead_store_elimination = false;
         break;
     case pseudocode_renderer_v2_style_profile_t::balanced:
         result.style_id = "aida.pseudocode.v2.balanced";
@@ -819,6 +829,7 @@ decompiler_renderer_settings_t pseudocode_renderer_v2_style_settings(
         result.emit_type_annotations = true;
         result.emit_provenance_annotations = true;
         result.emit_unknown_tokens = true;
+        result.readability.max_transform_iterations = 8;
         break;
     }
     return result;

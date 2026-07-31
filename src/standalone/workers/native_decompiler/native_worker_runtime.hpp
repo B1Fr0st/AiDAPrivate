@@ -23,7 +23,7 @@ namespace aida::analysis::native_worker::runtime {
 inline constexpr char k_provider_name[] = "aida-native-decompiler";
 inline constexpr char k_provider_version[] = "2";
 inline constexpr char k_worker_build_id[] = "aida-native-decompiler-worker-v3";
-inline constexpr char k_worker_build_hash_material[] = "aida-native-decompiler-worker-build-v3|bounded-printc-evidence";
+inline constexpr char k_worker_build_hash_material[] = "aida-native-decompiler-worker-build-v3|bounded-printc-evidence|arch-session-reuse|ast-v2-partial-degradation|readability-transforms|fixateglobals-knob";
 
 struct startup_t {
     HANDLE read_handle = nullptr;

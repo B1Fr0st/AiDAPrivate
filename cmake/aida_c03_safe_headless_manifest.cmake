@@ -954,6 +954,7 @@ function(aida_c03_register_worker_targets application_target)
         "${STANDALONE_ROOT}/core/analysis/decompiler/providers/dalvik_ssa.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/providers/ghidra_ir_adapter.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/providers/jvm_ssa.cpp"
+        "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_readability.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer_v2.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast_v2.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_pretty_xml_encode.cpp"
@@ -1935,6 +1936,24 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
             "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         ARGUMENTS "determinism" "32" "0xA1DA0003"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_determinism_hw_harness PACKAGE A06 TIMEOUT 2400
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "determinism_hw" "32" "0xA1DA0005"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_synthetic_256mb_harness PACKAGE A06 TIMEOUT 2400
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "synthetic" "256" "0xA1DA0004"
         LINK_LIBRARIES bcrypt)
 
     set(_aida_managed_consumer_sources

@@ -12,6 +12,7 @@
 #include "../../src/core/mcp/compat/c03_compatibility_registration.hpp"
 #include "../../src/core/mcp/registry/tool_registry.hpp"
 #include "../../src/core/analysis/tile_decode_orchestrator.hpp"
+#include "../../src/core/analysis/benchmark/benchmark_runner.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2152,6 +2153,63 @@ int run_determinism_mode(std::uint32_t code_mb, std::uint64_t seed,
     return program_sla.value("overall", std::string()) == "FAIL" ? 1 : 0;
 }
 
+int run_determinism_hw_mode(std::uint32_t code_mb, std::uint64_t seed,
+                            const std::optional<std::filesystem::path>& out)
+{
+    benchmark::benchmark_run_request_t request;
+    request.mode = benchmark::benchmark_mode_t::synthetic;
+    request.synthetic_code_bytes = static_cast<std::uint64_t>(code_mb) * 1024ULL * 1024ULL;
+    request.synthetic_seed = seed;
+    request.run_determinism_stage = true;
+    request.determinism_runs = 2;
+    const auto result = benchmark::run_benchmark(request);
+    if (!result.ok)
+        throw fixture_error_t("production determinism-hw benchmark failed: " + result.error);
+    json scorecard;
+    try {
+        scorecard = json::parse(result.scorecard_json);
+    } catch (const json::exception& exception) {
+        throw fixture_error_t(std::string("production determinism-hw scorecard is invalid: ") +
+            exception.what());
+    }
+    const auto hardware = (std::max)(1U, std::thread::hardware_concurrency());
+    const std::uint32_t expected_budget = (std::min)(64U, (std::max)(2U, hardware));
+    if (!scorecard["determinism"].is_object() ||
+        !scorecard["determinism"]["runs"].is_array() ||
+        scorecard["determinism"]["runs"].size() != 3)
+        throw fixture_error_t("production determinism-hw stage did not execute the default budget plan");
+    const std::array<std::uint32_t, 3> expected_budgets{1U, expected_budget, expected_budget};
+    std::string first_hash;
+    for (std::size_t index = 0; index < expected_budgets.size(); ++index) {
+        const auto& run = scorecard["determinism"]["runs"][index];
+        if (run.value("budget", 0U) != expected_budgets[index])
+            throw fixture_error_t("production determinism-hw stage used a non-default worker budget");
+        const auto hash = run.value("snapshot_sha256", std::string());
+        if (hash.empty())
+            throw fixture_error_t("production determinism-hw stage omitted a snapshot digest");
+        if (index == 0)
+            first_hash = hash;
+        else if (hash != first_hash)
+            throw fixture_error_t("production determinism-hw snapshot digests diverged across budgets");
+    }
+    if (!scorecard["determinism"].value("match", false))
+        throw fixture_error_t("production determinism-hw stage reported a digest mismatch");
+    if (!scorecard["sla"].is_object() || !scorecard["sla"]["verdicts"].is_array())
+        throw fixture_error_t("production determinism-hw scorecard omitted its SLA verdicts");
+    bool determinism_pass = false;
+    for (const auto& verdict : scorecard["sla"]["verdicts"]) {
+        if (verdict.value("key", std::string()) == "determinism_hash_match") {
+            determinism_pass = verdict.value("verdict", std::string()) == "PASS" &&
+                verdict.value("actual", false);
+            break;
+        }
+    }
+    if (!determinism_pass)
+        throw fixture_error_t("production determinism-hw SLA key determinism_hash_match did not PASS");
+    emit_benchmark_report(scorecard, out);
+    return 0;
+}
+
 int run_compare_mode(const std::filesystem::path& baseline_path,
                      const std::filesystem::path& candidate_path,
                      const std::optional<std::filesystem::path>& out)
@@ -2304,7 +2362,7 @@ int main(int argc, char** argv)
         }
         if (args.empty())
             throw aida::analysis::test_fixture::fixture_error_t(
-                "usage: analysis_benchmark_harness <deterministic_component|release_sla|synthetic|scaling|determinism|compare> ...");
+                "usage: analysis_benchmark_harness <deterministic_component|release_sla|synthetic|scaling|determinism|determinism_hw|compare> ...");
         const std::string& mode = args[0];
         if ((mode == "deterministic_component" || mode == "release_sla") && args.size() == 2)
             return run_legacy_mode(mode, std::filesystem::u8path(args[1]), out_path);
@@ -2329,11 +2387,13 @@ int main(int argc, char** argv)
         }
         if (mode == "determinism" && args.size() == 3)
             return run_determinism_mode(parse_code_mb(args[1]), parse_seed_hex(args[2]), out_path);
+        if (mode == "determinism_hw" && args.size() == 3)
+            return run_determinism_hw_mode(parse_code_mb(args[1]), parse_seed_hex(args[2]), out_path);
         if (mode == "compare" && args.size() == 3)
             return run_compare_mode(std::filesystem::u8path(args[1]),
                 std::filesystem::u8path(args[2]), out_path);
         throw aida::analysis::test_fixture::fixture_error_t(
-            "usage: analysis_benchmark_harness <deterministic_component|release_sla> <fixture> [--out <report.json>] | synthetic <code_mb> <seed_hex> [--lanes N] [--out <report.json>] | scaling <code_mb> <seed_hex> <lanes_csv> [--out <report.json>] | determinism <code_mb> <seed_hex> [--out <report.json>] | compare <baseline.json> <candidate.json> [--out <verdict.json>]");
+            "usage: analysis_benchmark_harness <deterministic_component|release_sla> <fixture> [--out <report.json>] | synthetic <code_mb> <seed_hex> [--lanes N] [--out <report.json>] | scaling <code_mb> <seed_hex> <lanes_csv> [--out <report.json>] | determinism <code_mb> <seed_hex> [--out <report.json>] | determinism_hw <code_mb> <seed_hex> [--out <report.json>] | compare <baseline.json> <candidate.json> [--out <verdict.json>]");
     } catch (const std::exception& error) {
         aida::analysis::c03_test::assertion_telemetry::record_exception(
             error.what());

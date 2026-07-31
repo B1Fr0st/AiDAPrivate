@@ -16,6 +16,7 @@
 #include <bcrypt.h>
 
 #include <sqlite3.h>
+#include <zstd.h>
 
 #include <algorithm>
 #include <charconv>
@@ -2011,7 +2012,7 @@ workspace_result_t<void> migrate_schema(sqlite3* database,
                            "workspace database schema is newer than this engine",
                            "workspace_database.schema"));
     }
-    const bool ensure_existing_v9 = version == workspace_database_schema_version;
+    const bool ensure_existing = version == workspace_database_schema_version;
     invalidate_derived_facts = version > 0 && version < 6;
     while (version < workspace_database_schema_version) {
         auto begin = begin_immediate(database, "workspace_database.schema");
@@ -2026,6 +2027,7 @@ workspace_result_t<void> migrate_schema(sqlite3* database,
         else if (version == 6) migrated = create_schema_v7(database);
         else if (version == 7) migrated = create_schema_v8(database);
         else if (version == 8) migrated = create_schema_v9(database);
+        else if (version == 9) migrated = create_schema_v10(database);
         if (!migrated) {
             rollback(database, "workspace_database.schema");
             return migrated;
@@ -2043,11 +2045,11 @@ workspace_result_t<void> migrate_schema(sqlite3* database,
             return committed;
         }
     }
-    if (ensure_existing_v9) {
+    if (ensure_existing) {
         auto begin = begin_immediate(database, "workspace_database.schema");
         if (!begin)
             return begin;
-        auto ensured = create_schema_v9(database);
+        auto ensured = create_schema_v10(database);
         if (!ensured) {
             rollback(database, "workspace_database.schema");
             return ensured;
@@ -3802,6 +3804,15 @@ struct workspace_database_t::connection_state_t {
     std::atomic<std::uint64_t> staging_resident_bytes{0};
     std::atomic<std::uint64_t> cumulative_pages_written{0};
     std::atomic<std::uint64_t> wal_bytes_peak{0};
+    std::atomic<std::uint64_t> last_commit_pages_v3{0};
+    std::atomic<std::uint64_t> cumulative_pages_v3{0};
+    std::atomic<std::uint64_t> last_commit_page_stored_bytes{0};
+    std::atomic<std::uint64_t> cumulative_page_stored_bytes{0};
+    std::atomic<std::uint64_t> last_commit_page_logical_bytes{0};
+    std::atomic<std::uint64_t> cumulative_page_logical_bytes{0};
+    std::atomic<std::uint64_t> pdb_modules_stored{0};
+    std::atomic<std::uint64_t> pdb_modules_skipped{0};
+    std::atomic<std::uint64_t> pdb_modules_loaded{0};
 
     ~connection_state_t() {
         std::lock_guard<std::mutex> lock(close_mutex);
@@ -4754,6 +4765,20 @@ constexpr std::uint32_t kFinalizeChunkMaxPages = 256;
 constexpr std::uint64_t kFinalizeChunkMaxWalBytes = 64ULL << 20;
 constexpr std::uint32_t kFinalizeMaxRetries = 3;
 constexpr std::uint64_t kFinalizeManifestWireFixedBytes = 109;
+constexpr std::uint32_t kReopenParallelMinPages = 64;
+constexpr std::uint64_t kReopenStrideMinRecords = 1ULL << 16;
+constexpr std::uint64_t kReopenStrideLaneRecords = 1ULL << 15;
+constexpr std::uint64_t kPackedInstructionRecordBytes = 58;
+constexpr std::uint64_t kPackedOperandRecordBytes = 85;
+constexpr std::uint64_t kPackedTargetRecordBytes = 49;
+constexpr std::uint64_t kPackedEdgeRecordMinBytes = 52;
+constexpr std::uint64_t kPackedEdgeRecordMaxBytes = 60;
+constexpr std::uint64_t kPackedXrefRecordBytes = 43;
+constexpr std::uint64_t kPackedBasicBlockRecordBytes = 58;
+constexpr std::uint64_t kPackedFunctionRecordMinBytes = 77;
+constexpr std::uint64_t kPackedFunctionChunkRecordBytes = 60;
+constexpr std::uint64_t kPackedFunctionMembershipRecordBytes = 33;
+constexpr std::uint64_t kPackedCoverageRecordBytes = 31;
 constexpr std::uint64_t kManagedDomainWireFixedBytes = 244;
 constexpr std::uint64_t kManagedArtifactWireBytes = 73;
 constexpr std::uint64_t kManagedMethodWireBytes = 33;
@@ -5480,6 +5505,8 @@ workspace_result_t<void> run_staging_finalize(
     std::vector<std::uint8_t> checksum_bytes(
         static_cast<std::size_t>(totals.page_count) * 4U, 0);
     bool pages_already_staged = false;
+    std::uint64_t sealed_stored_bytes = 0;
+    std::uint64_t sealed_pages_v3 = 0;
     {
         auto existing = read_packed_generation(
             database, staging->generation, false,
@@ -5540,6 +5567,36 @@ workspace_result_t<void> run_staging_finalize(
                     packed_baseline_error(
                         workspace_error_code_t::integrity_failure,
                         "existing staged packed generation has an inconsistent page count"));
+            }
+            {
+                statement_t stored_totals;
+                auto prepared_totals = stored_totals.prepare(database,
+                    "SELECT COALESCE(SUM(payload_length),0),COALESCE(SUM(CASE WHEN logical_length IS NULL OR logical_length=0 THEN 0 ELSE 1 END),0) FROM packed_pages WHERE generation=?1",
+                    "workspace_database.persist.packed");
+                if (!prepared_totals)
+                    return prepared_totals;
+                auto bound_totals = stored_totals.bind_uint(1, staging->generation);
+                if (!bound_totals)
+                    return bound_totals;
+                const int totals_status = sqlite3_step(stored_totals.get());
+                if (totals_status != SQLITE_ROW) {
+                    return workspace_result_t<void>::failure(database_error(
+                        database, totals_status,
+                        "unable to re-read staged page byte totals",
+                        "workspace_database.persist.packed"));
+                }
+                const auto stored_bytes =
+                    sqlite3_column_int64(stored_totals.get(), 0);
+                const auto stored_v3 =
+                    sqlite3_column_int64(stored_totals.get(), 1);
+                if (stored_bytes < 0 || stored_v3 < 0) {
+                    return workspace_result_t<void>::failure(
+                        packed_baseline_error(
+                            workspace_error_code_t::integrity_failure,
+                            "existing staged packed generation byte totals are invalid"));
+                }
+                sealed_stored_bytes = static_cast<std::uint64_t>(stored_bytes);
+                sealed_pages_v3 = static_cast<std::uint64_t>(stored_v3);
             }
             pages_already_staged = true;
         }
@@ -5709,13 +5766,15 @@ workspace_result_t<void> run_staging_finalize(
         }
         const auto hardware = std::thread::hardware_concurrency();
         const std::uint32_t seal_workers = static_cast<std::uint32_t>(
-            (std::max)(2U, (std::min)(8U, hardware == 0 ? 2U : hardware / 2U)));
+            (std::max)(2U, (std::min)(16U, hardware == 0 ? 2U : hardware)));
+        const int seal_compression_level =
+            static_cast<int>(options.packed_page_compression_level);
         for (std::uint32_t worker = 0; worker < seal_workers; ++worker) {
             aida::infra::taskflow_runtime::graph_node_descriptor_t node;
             node.node_id = ++node_id;
             node.label = "analysis.persistence.finalize_seal_page";
             node.cancellable_body = [staging, &totals, &work_ring, &sealed_ring,
-                                     &cancel](
+                                     &cancel, seal_compression_level](
                 const aida::infra::taskflow_runtime::cancellation_token_t&) {
                 for (;;) {
                     if (staging->failed.load(std::memory_order_acquire))
@@ -5731,8 +5790,10 @@ workspace_result_t<void> run_staging_finalize(
                     page.header.page_index = job.page_index;
                     page.header.page_count = totals.page_count;
                     page.payload = std::move(job.page.payload);
-                    auto sealed = packed_page_codec_t::seal_page(
-                        page, [&cancel, staging] {
+                    const std::uint32_t logical_length =
+                        static_cast<std::uint32_t>(page.payload.size());
+                    auto sealed = packed_page_codec_t::seal_page_v3(
+                        page, seal_compression_level, [&cancel, staging] {
                             return cancel.stop_requested() ||
                                    staging->failed.load(std::memory_order_acquire);
                         });
@@ -5747,6 +5808,10 @@ workspace_result_t<void> run_staging_finalize(
                     row.page_count = page.header.page_count;
                     row.page_type = page.header.page_type;
                     row.payload_length = page.header.payload_length;
+                    row.logical_length =
+                        page.header.version == packed_page_blob_version_v3
+                            ? logical_length
+                            : 0U;
                     row.checksum = page.header.checksum;
                     row.payload = std::move(page.payload);
                     packed_page_index_row_t index;
@@ -5778,8 +5843,8 @@ workspace_result_t<void> run_staging_finalize(
         }
         statement_t page_statement;
         auto prepared = page_statement.prepare(database, R"SQL(
-INSERT INTO packed_pages(generation,page_index,page_count,page_type,payload_length,checksum,payload)
-VALUES(?1,?2,?3,?4,?5,?6,?7)
+INSERT INTO packed_pages(generation,page_index,page_count,page_type,payload_length,checksum,payload,logical_length)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
 )SQL", "workspace_database.persist.packed.page");
         if (!prepared) {
             work_ring.close();
@@ -5884,6 +5949,12 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
             if (result) result = page_statement.bind_int(6, item.row.checksum);
             if (result) result = page_statement.bind_blob(7, item.row.payload.data(),
                                                           item.row.payload.size());
+            if (result) {
+                result = item.row.logical_length != 0
+                    ? page_statement.bind_int(
+                          8, static_cast<std::int64_t>(item.row.logical_length))
+                    : page_statement.bind_null(8);
+            }
             if (result) result = page_statement.step_done();
             if (result) result = page_statement.reset();
             if (result) result = index_statement.bind_uint(1, item.index.generation);
@@ -5907,6 +5978,8 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
             ++consumed;
             ++chunk_pages;
             chunk_bytes += item.row.payload_length;
+            sealed_stored_bytes += item.row.payload_length;
+            sealed_pages_v3 += item.row.logical_length != 0 ? 1ULL : 0ULL;
             if (chunk_pages >= kFinalizeChunkMaxPages ||
                 chunk_bytes >= kFinalizeChunkMaxWalBytes) {
                 auto flushed = flush_chunk();
@@ -6081,6 +6154,16 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
     conn.candidate_pending.store(true, std::memory_order_release);
     conn.cumulative_pages_written.fetch_add(totals.page_count,
                                             std::memory_order_acq_rel);
+    conn.last_commit_pages_v3.store(sealed_pages_v3, std::memory_order_release);
+    conn.last_commit_page_stored_bytes.store(sealed_stored_bytes,
+                                             std::memory_order_release);
+    conn.last_commit_page_logical_bytes.store(totals.total_payload_bytes,
+                                              std::memory_order_release);
+    saturating_atomic_add(conn.cumulative_pages_v3, sealed_pages_v3);
+    saturating_atomic_add(conn.cumulative_page_stored_bytes,
+                          sealed_stored_bytes);
+    saturating_atomic_add(conn.cumulative_page_logical_bytes,
+                          totals.total_payload_bytes);
     {
         std::lock_guard<std::mutex> lock(conn.staging_mutex);
         auto current = conn.active_staging.lock();
@@ -6613,12 +6696,13 @@ struct decoded_packed_baseline_t {
 };
 
 workspace_result_t<std::vector<std::uint8_t>> read_packed_domain_payload(
-    sqlite3* database, std::uint64_t generation, packed_page_type_t domain,
+    sqlite3* database, const packed_generation_record_t& generation,
+    packed_page_type_t domain,
     std::uint64_t maximum_bytes, const cancellation_token_t& cancel) {
     std::vector<std::uint8_t> payload;
     std::uint64_t expected_ordinal = 0;
     auto visited = visit_packed_domain_pages(
-        database, generation, domain,
+        database, generation.generation, domain,
         [&](const packed_page_row_t& page,
             const packed_page_index_row_t& index) -> workspace_result_t<void> {
             if (cancel.stop_requested())
@@ -6632,8 +6716,32 @@ workspace_result_t<std::vector<std::uint8_t>> read_packed_domain_payload(
                         workspace_error_code_t::integrity_failure,
                         "packed domain record ordinals are not contiguous"));
             }
-            const auto content_size =
-                page.payload.size() - packed_record_page_prefix_size;
+            const std::uint8_t* content_data = nullptr;
+            std::size_t content_size = 0;
+            std::vector<std::uint8_t> decompressed;
+            if (page.logical_length == 0) {
+                content_data = page.payload.data() + packed_record_page_prefix_size;
+                content_size = page.payload.size() - packed_record_page_prefix_size;
+            } else {
+                packed_page_t decoded_page;
+                decoded_page.header.generation = page.generation;
+                decoded_page.header.analysis_revision = generation.analysis_revision;
+                decoded_page.header.overlay_revision = generation.overlay_revision;
+                decoded_page.header.version = packed_page_blob_version_v3;
+                decoded_page.header.page_type = page.page_type;
+                decoded_page.header.page_index = page.page_index;
+                decoded_page.header.page_count = page.page_count;
+                decoded_page.header.payload_length = page.payload_length;
+                decoded_page.header.checksum = page.checksum;
+                decoded_page.payload = page.payload;
+                auto content = packed_page_codec_t::decode_page_content(
+                    decoded_page, [&cancel] { return cancel.stop_requested(); });
+                if (!content)
+                    return workspace_result_t<void>::failure(content.error());
+                decompressed = std::move(content.value());
+                content_data = decompressed.data();
+                content_size = decompressed.size();
+            }
             std::uint64_t updated = 0;
             if (!checked_add_u64(payload.size(), content_size, updated) ||
                 updated > maximum_bytes ||
@@ -6646,10 +6754,8 @@ workspace_result_t<std::vector<std::uint8_t>> read_packed_domain_payload(
             }
             try {
                 payload.reserve(static_cast<std::size_t>(updated));
-                payload.insert(
-                    payload.end(),
-                    page.payload.begin() + packed_record_page_prefix_size,
-                    page.payload.end());
+                payload.insert(payload.end(), content_data,
+                               content_data + content_size);
             } catch (const std::bad_alloc&) {
                 return workspace_result_t<void>::failure(
                     packed_baseline_error(
@@ -7018,8 +7124,538 @@ const std::vector<std::vector<packed_page_type_t>>& packed_reopen_domain_tasks()
 struct packed_domain_decode_result_t {
     analysis_snapshot_t snapshot;
     std::uint64_t decoded_records = 0;
+    std::uint32_t domain_mask = 0;
     std::optional<workspace_error_t> error;
 };
+
+struct packed_domain_page_stats_t {
+    bool present = false;
+    std::uint32_t page_count = 0;
+    std::uint64_t logical_bytes = 0;
+};
+
+workspace_result_t<void> read_packed_domain_page_stats(
+    sqlite3* database, std::uint64_t generation,
+    std::array<packed_domain_page_stats_t, 20>& stats,
+    const cancellation_token_t& cancel) {
+    statement_t statement;
+    auto prepared = statement.prepare(database, R"SQL(
+SELECT page_type,COUNT(*),COALESCE(SUM(COALESCE(NULLIF(logical_length,0),payload_length)),0)
+FROM packed_pages WHERE generation=?1 GROUP BY page_type
+)SQL", "workspace_database.load.packed_stats");
+    if (!prepared)
+        return prepared;
+    auto bound = statement.bind_uint(1, generation);
+    if (!bound)
+        return bound;
+    for (;;) {
+        if (cancel.stop_requested())
+            return workspace_result_t<void>::failure(
+                packed_baseline_cancelled(cancel));
+        const int status = sqlite3_step(statement.get());
+        if (status == SQLITE_DONE)
+            break;
+        if (status != SQLITE_ROW) {
+            return workspace_result_t<void>::failure(database_error(
+                database, status, "unable to read packed domain page statistics",
+                "workspace_database.load.packed_stats"));
+        }
+        const auto page_type = sqlite3_column_int64(statement.get(), 0);
+        const auto page_count = sqlite3_column_int64(statement.get(), 1);
+        const auto logical_bytes = sqlite3_column_int64(statement.get(), 2);
+        if (page_type < static_cast<std::int64_t>(packed_page_type_t::instructions) ||
+            page_type > static_cast<std::int64_t>(packed_page_last_data_type) ||
+            page_count <= 0 ||
+            page_count > static_cast<std::int64_t>(packed_generation_max_pages) ||
+            logical_bytes < 0) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "packed domain page statistics are inconsistent"));
+        }
+        auto& entry = stats[static_cast<std::size_t>(page_type)];
+        entry.present = true;
+        entry.page_count = static_cast<std::uint32_t>(page_count);
+        entry.logical_bytes = static_cast<std::uint64_t>(logical_bytes);
+    }
+    return workspace_result_t<void>::success();
+}
+
+class packed_reopen_admission_t final {
+public:
+    explicit packed_reopen_admission_t(std::uint64_t budget) : budget_(budget) {}
+
+    packed_reopen_admission_t(const packed_reopen_admission_t&) = delete;
+    packed_reopen_admission_t& operator=(const packed_reopen_admission_t&) = delete;
+
+    class permit_t final {
+    public:
+        permit_t(packed_reopen_admission_t& gate, std::uint64_t bytes)
+            : gate_(&gate), bytes_(bytes) {
+            std::unique_lock<std::mutex> lock(gate.mutex_);
+            gate.cv_.wait(lock, [&] {
+                return gate.admitted_bytes_ == 0 ||
+                       (gate.admitted_bytes_ <= gate.budget_ &&
+                        bytes <= gate.budget_ - gate.admitted_bytes_);
+            });
+            gate.admitted_bytes_ += bytes;
+        }
+
+        ~permit_t() {
+            std::lock_guard<std::mutex> lock(gate_->mutex_);
+            gate_->admitted_bytes_ -= bytes_;
+            gate_->cv_.notify_all();
+        }
+
+        permit_t(const permit_t&) = delete;
+        permit_t& operator=(const permit_t&) = delete;
+
+    private:
+        packed_reopen_admission_t* gate_;
+        std::uint64_t bytes_;
+    };
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::uint64_t admitted_bytes_ = 0;
+    std::uint64_t budget_ = 0;
+};
+
+struct packed_domain_range_output_t {
+    std::vector<std::uint8_t> bytes;
+    std::uint64_t first_ordinal = 0;
+    std::uint64_t next_ordinal = 0;
+    std::uint32_t pages_seen = 0;
+    std::optional<workspace_error_t> error;
+};
+
+workspace_result_t<void> read_packed_domain_page_range(
+    sqlite3* database, const packed_generation_record_t& generation,
+    packed_page_type_t domain, std::uint32_t page_begin, std::uint32_t page_end,
+    packed_domain_range_output_t& output, std::uint64_t maximum_bytes,
+    const cancellation_token_t& cancel) {
+    const auto encoded_domain = static_cast<std::uint32_t>(domain);
+    statement_t statement;
+    auto prepared = statement.prepare(database, R"SQL(
+SELECT p.generation,p.page_index,p.page_count,p.page_type,p.payload_length,p.checksum,p.payload,
+       i.domain,i.ordinal_begin,i.count,i.address_value_min,i.address_value_max,p.logical_length
+FROM packed_pages p
+JOIN packed_page_index i ON i.generation=p.generation AND i.page_index=p.page_index
+JOIN packed_generations g ON g.generation=p.generation AND g.committed=1
+WHERE p.generation=?1 AND p.page_type=?2 AND p.page_index>=?3 AND p.page_index<?4
+ORDER BY p.page_index
+)SQL", "workspace_database.load.packed_range");
+    if (!prepared)
+        return prepared;
+    auto result = statement.bind_uint(1, generation.generation);
+    if (result) result = statement.bind_int(2, encoded_domain);
+    if (result) result = statement.bind_int(3, page_begin);
+    if (result) result = statement.bind_int(4, page_end);
+    if (!result)
+        return result;
+    bool first_page = true;
+    std::uint64_t accumulated_bytes = 0;
+    for (;;) {
+        if (cancel.stop_requested())
+            return workspace_result_t<void>::failure(
+                packed_baseline_cancelled(cancel));
+        const int status = sqlite3_step(statement.get());
+        if (status == SQLITE_DONE)
+            break;
+        if (status != SQLITE_ROW) {
+            return workspace_result_t<void>::failure(database_error(
+                database, status, "unable to read packed domain page range",
+                "workspace_database.load.packed_range"));
+        }
+        packed_page_row_t page;
+        page.generation = static_cast<std::uint64_t>(
+            sqlite3_column_int64(statement.get(), 0));
+        page.page_index = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 1));
+        page.page_count = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 2));
+        page.page_type = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 3));
+        page.payload_length = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 4));
+        page.checksum = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 5));
+        const void* blob = sqlite3_column_blob(statement.get(), 6);
+        const int blob_size = sqlite3_column_bytes(statement.get(), 6);
+        packed_page_index_row_t index;
+        index.generation = page.generation;
+        index.domain = static_cast<std::uint16_t>(
+            sqlite3_column_int(statement.get(), 7));
+        index.ordinal_begin = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 8));
+        index.count = static_cast<std::uint32_t>(
+            sqlite3_column_int64(statement.get(), 9));
+        index.page_index = page.page_index;
+        index.address_value_min = static_cast<std::uint64_t>(
+            sqlite3_column_int64(statement.get(), 10));
+        index.address_value_max = static_cast<std::uint64_t>(
+            sqlite3_column_int64(statement.get(), 11));
+        std::uint32_t logical_length = 0;
+        if (sqlite3_column_type(statement.get(), 12) != SQLITE_NULL) {
+            const auto declared_logical_length =
+                sqlite3_column_int64(statement.get(), 12);
+            if (declared_logical_length <
+                    static_cast<std::int64_t>(packed_record_page_prefix_size) ||
+                declared_logical_length >
+                    static_cast<std::int64_t>(packed_page_max_payload)) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed domain page logical length is invalid"));
+            }
+            logical_length = static_cast<std::uint32_t>(declared_logical_length);
+        }
+        page.logical_length = logical_length;
+        if (blob_size < static_cast<int>(packed_record_page_prefix_size) ||
+            blob_size > static_cast<int>(packed_page_max_payload) || !blob ||
+            page.payload_length != static_cast<std::uint32_t>(blob_size) ||
+            page.page_index != page_begin + output.pages_seen ||
+            page.page_type != encoded_domain) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "packed domain page range row is malformed"));
+        }
+        page.payload.assign(static_cast<const std::uint8_t*>(blob),
+                            static_cast<const std::uint8_t*>(blob) + blob_size);
+        auto prefix = packed_record_page_prefix_t::decode(
+            page.payload.data(), page.payload.size());
+        if (!prefix || index.domain != encoded_domain ||
+            index.ordinal_begin != prefix->ordinal_begin ||
+            index.count != prefix->record_count ||
+            index.address_value_min != prefix->address_value_min ||
+            index.address_value_max != prefix->address_value_max) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "packed domain page range index is inconsistent"));
+        }
+        packed_page_t decoded_page;
+        decoded_page.header.generation = page.generation;
+        decoded_page.header.analysis_revision = generation.analysis_revision;
+        decoded_page.header.overlay_revision = generation.overlay_revision;
+        decoded_page.header.version = logical_length != 0
+            ? packed_page_blob_version_v3 : packed_page_blob_version;
+        decoded_page.header.page_type = page.page_type;
+        decoded_page.header.page_index = page.page_index;
+        decoded_page.header.page_count = page.page_count;
+        decoded_page.header.payload_length = page.payload_length;
+        decoded_page.header.checksum = page.checksum;
+        decoded_page.payload = std::move(page.payload);
+        auto content = packed_page_codec_t::decode_page_content(
+            decoded_page, [&cancel] { return cancel.stop_requested(); });
+        if (!content)
+            return workspace_result_t<void>::failure(content.error());
+        if (logical_length != 0 &&
+            content.value().size() + packed_record_page_prefix_size !=
+                logical_length) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "packed domain page logical length does not match its frame"));
+        }
+        if (first_page) {
+            output.first_ordinal = index.ordinal_begin;
+            output.next_ordinal = index.ordinal_begin;
+            first_page = false;
+        }
+        if (index.ordinal_begin != output.next_ordinal ||
+            !checked_add_u64(output.next_ordinal, index.count,
+                             output.next_ordinal)) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "packed domain record ordinals are not contiguous"));
+        }
+        if (!checked_add_u64(accumulated_bytes, content.value().size(),
+                             accumulated_bytes) ||
+            accumulated_bytes > maximum_bytes ||
+            accumulated_bytes > static_cast<std::uint64_t>(
+                (std::numeric_limits<std::size_t>::max)())) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "packed domain exceeds its bounded reopen budget"));
+        }
+        try {
+            output.bytes.reserve(accumulated_bytes);
+            output.bytes.insert(
+                output.bytes.end(),
+                std::make_move_iterator(content.value().begin()),
+                std::make_move_iterator(content.value().end()));
+        } catch (const std::bad_alloc&) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "packed domain reopen allocation failed"));
+        }
+        ++output.pages_seen;
+    }
+    if (page_begin + output.pages_seen != page_end) {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::integrity_failure,
+                "packed domain page range is truncated"));
+    }
+    return workspace_result_t<void>::success();
+}
+
+struct packed_stride_segment_t {
+    std::uint64_t count = 0;
+    std::uint64_t stride = 0;
+    std::uint64_t byte_offset = 0;
+};
+
+struct packed_stride_layout_t {
+    std::array<packed_stride_segment_t, 2> segments{};
+    std::size_t segment_count = 0;
+};
+
+std::optional<packed_stride_layout_t> packed_domain_stride_layout(
+    packed_page_type_t domain, const std::vector<std::uint8_t>& payload,
+    std::uint64_t maximum_records, const cancellation_token_t& cancel) {
+    packed_stride_layout_t layout;
+    packed_payload_reader_t reader(payload, cancel, maximum_records);
+    read_domain_header(reader, domain);
+    if (reader.failed())
+        return std::nullopt;
+    const auto single_segment = [&](std::uint64_t stride) -> bool {
+        const auto count = reader.count();
+        if (reader.failed())
+            return false;
+        std::uint64_t expected = 0;
+        if (!checked_mul_u64(count, stride, expected) ||
+            expected != reader.remaining_bytes())
+            return false;
+        layout.segments[0] = {count, stride,
+                              static_cast<std::uint64_t>(reader.offset())};
+        layout.segment_count = 1;
+        return true;
+    };
+    const auto dual_segment = [&](std::uint64_t first_stride,
+                                  std::uint64_t second_stride) -> bool {
+        const auto count = reader.count();
+        if (reader.failed())
+            return false;
+        std::uint64_t first_bytes = 0;
+        if (!checked_mul_u64(count, first_stride, first_bytes))
+            return false;
+        layout.segments[0] = {count, first_stride,
+                              static_cast<std::uint64_t>(reader.offset())};
+        reader.skip_bytes(first_bytes);
+        if (reader.failed())
+            return false;
+        const auto second_offset = static_cast<std::uint64_t>(reader.offset());
+        const auto second_count = reader.count();
+        if (reader.failed())
+            return false;
+        std::uint64_t second_bytes = 0;
+        if (!checked_mul_u64(second_count, second_stride, second_bytes) ||
+            second_bytes != reader.remaining_bytes())
+            return false;
+        layout.segments[1] = {second_count, second_stride,
+                              second_offset + sizeof(std::uint64_t)};
+        layout.segment_count = 2;
+        return true;
+    };
+    bool laid_out = false;
+    switch (domain) {
+    case packed_page_type_t::instructions:
+        laid_out = dual_segment(kPackedInstructionRecordBytes, 1);
+        break;
+    case packed_page_type_t::operands:
+        laid_out = single_segment(kPackedOperandRecordBytes);
+        break;
+    case packed_page_type_t::target_facts:
+        laid_out = single_segment(kPackedTargetRecordBytes);
+        break;
+    case packed_page_type_t::edges: {
+        const auto count = reader.count();
+        if (reader.failed() || count == 0)
+            return std::nullopt;
+        const std::uint64_t remaining = reader.remaining_bytes();
+        if (remaining % count != 0)
+            return std::nullopt;
+        const std::uint64_t stride = remaining / count;
+        if (stride != kPackedEdgeRecordMinBytes &&
+            stride != kPackedEdgeRecordMaxBytes)
+            return std::nullopt;
+        layout.segments[0] = {count, stride,
+                              static_cast<std::uint64_t>(reader.offset())};
+        layout.segment_count = 1;
+        laid_out = true;
+        break;
+    }
+    case packed_page_type_t::basic_blocks:
+        laid_out = single_segment(kPackedBasicBlockRecordBytes);
+        break;
+    case packed_page_type_t::functions: {
+        const auto count = reader.count();
+        if (reader.failed() || count == 0)
+            return std::nullopt;
+        const std::uint64_t remaining = reader.remaining_bytes();
+        if (remaining % count != 0)
+            return std::nullopt;
+        const std::uint64_t stride = remaining / count;
+        if (stride < kPackedFunctionRecordMinBytes)
+            return std::nullopt;
+        layout.segments[0] = {count, stride,
+                              static_cast<std::uint64_t>(reader.offset())};
+        layout.segment_count = 1;
+        laid_out = true;
+        break;
+    }
+    case packed_page_type_t::function_chunks:
+        laid_out = dual_segment(kPackedFunctionChunkRecordBytes,
+                                kPackedFunctionMembershipRecordBytes);
+        break;
+    case packed_page_type_t::xrefs:
+        laid_out = single_segment(kPackedXrefRecordBytes);
+        break;
+    case packed_page_type_t::coverage:
+        laid_out = single_segment(kPackedCoverageRecordBytes);
+        break;
+    default:
+        return std::nullopt;
+    }
+    if (!laid_out)
+        return std::nullopt;
+    std::uint64_t total_records = 0;
+    bool engaged = false;
+    for (std::size_t segment = 0; segment < layout.segment_count; ++segment) {
+        if (!checked_add_u64(total_records, layout.segments[segment].count,
+                             total_records) ||
+            total_records > maximum_records)
+            return std::nullopt;
+        if (layout.segments[segment].count >= kReopenStrideMinRecords)
+            engaged = true;
+    }
+    if (!engaged)
+        return std::nullopt;
+    return layout;
+}
+
+workspace_result_t<void> decode_packed_domain_segment_range(
+    packed_page_type_t domain, std::size_t segment_index,
+    const std::vector<std::uint8_t>& payload,
+    const packed_stride_segment_t& segment,
+    std::uint64_t ordinal_begin, std::uint64_t ordinal_end,
+    std::uint64_t maximum_records, analysis_snapshot_t& output,
+    std::uint64_t& decoded_records,
+    const cancellation_token_t& cancel) {
+    std::uint64_t sub_records = 0;
+    packed_payload_reader_t reader(payload, cancel, maximum_records,
+                                   &sub_records);
+    reader.skip_bytes(segment.byte_offset + ordinal_begin * segment.stride);
+    if (reader.failed())
+        return reader.finish();
+    std::uint64_t ordinal_current = ordinal_begin;
+    const auto misaligned = []() {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::integrity_failure,
+                "packed domain stride decode lost record alignment"));
+    };
+    const auto aligned = [&]() {
+        return !reader.failed() &&
+               reader.offset() == segment.byte_offset +
+                   (ordinal_current + 1ULL) * segment.stride;
+    };
+    switch (domain) {
+    case packed_page_type_t::instructions:
+        if (segment_index == 0) {
+            output.instructions.reserve(ordinal_end - ordinal_begin);
+            for (; ordinal_current < ordinal_end; ++ordinal_current) {
+                output.instructions.push_back(read_instruction(reader));
+                if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+            }
+        } else {
+            output.delay_slot_counts.reserve(ordinal_end - ordinal_begin);
+            for (; ordinal_current < ordinal_end; ++ordinal_current) {
+                output.delay_slot_counts.push_back(reader.u8());
+                if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+            }
+        }
+        break;
+    case packed_page_type_t::operands:
+        output.operand_facts.reserve(ordinal_end - ordinal_begin);
+        for (; ordinal_current < ordinal_end; ++ordinal_current) {
+            output.operand_facts.push_back(read_operand(reader));
+            if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+        }
+        break;
+    case packed_page_type_t::target_facts:
+        output.target_facts.reserve(ordinal_end - ordinal_begin);
+        for (; ordinal_current < ordinal_end; ++ordinal_current) {
+            output.target_facts.push_back(read_target(reader));
+            if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+        }
+        break;
+    case packed_page_type_t::edges:
+        output.edges.reserve(ordinal_end - ordinal_begin);
+        for (; ordinal_current < ordinal_end; ++ordinal_current) {
+            output.edges.push_back(read_edge(reader));
+            if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+        }
+        break;
+    case packed_page_type_t::basic_blocks:
+        output.blocks.reserve(ordinal_end - ordinal_begin);
+        for (; ordinal_current < ordinal_end; ++ordinal_current) {
+            output.blocks.push_back(read_block(reader));
+            if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+        }
+        break;
+    case packed_page_type_t::functions:
+        output.functions.reserve(ordinal_end - ordinal_begin);
+        for (; ordinal_current < ordinal_end; ++ordinal_current) {
+            output.functions.push_back(read_function(reader));
+            if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+        }
+        break;
+    case packed_page_type_t::function_chunks:
+        if (segment_index == 0) {
+            output.function_chunks.reserve(ordinal_end - ordinal_begin);
+            for (; ordinal_current < ordinal_end; ++ordinal_current) {
+                output.function_chunks.push_back(read_function_chunk(reader));
+                if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+            }
+        } else {
+            output.function_block_memberships.reserve(ordinal_end - ordinal_begin);
+            for (; ordinal_current < ordinal_end; ++ordinal_current) {
+                output.function_block_memberships.push_back(
+                    read_function_membership(reader));
+                if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+            }
+        }
+        break;
+    case packed_page_type_t::xrefs:
+        output.xrefs.reserve(ordinal_end - ordinal_begin);
+        for (; ordinal_current < ordinal_end; ++ordinal_current) {
+            output.xrefs.push_back(read_xref(reader));
+            if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+        }
+        break;
+    case packed_page_type_t::coverage:
+        output.coverage.reserve(ordinal_end - ordinal_begin);
+        for (; ordinal_current < ordinal_end; ++ordinal_current) {
+            output.coverage.push_back(read_coverage(reader));
+            if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+        }
+        break;
+    default:
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::invalid_argument,
+                                  "packed baseline stride domain is unsupported"));
+    }
+    decoded_records = (ordinal_end - ordinal_begin) + sub_records;
+    return workspace_result_t<void>::success();
+}
 
 workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
     const workspace_database_t::connection_state_t& conn,
@@ -7062,7 +7698,193 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
                 "packed baseline manifest does not match the workspace identity"));
     }
     const auto& tasks = packed_reopen_domain_tasks();
-    std::vector<std::shared_ptr<packed_domain_decode_result_t>> results(tasks.size());
+    const auto hardware = std::thread::hardware_concurrency();
+    const std::uint32_t reopen_lanes =
+        (std::max)(2U, (std::min)(16U, hardware == 0 ? 2U : hardware));
+    constexpr std::uint32_t baseline_domain_count =
+        static_cast<std::uint32_t>(packed_page_baseline_last_data_type);
+    std::array<packed_domain_page_stats_t, 20> domain_stats{};
+    {
+        auto stats_connection = open_reader_connection(conn.path, options);
+        if (!stats_connection) {
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                stats_connection.error());
+        }
+        sqlite3* stats_database = stats_connection.take_value();
+        auto stats = read_packed_domain_page_stats(
+            stats_database, generation.generation, domain_stats, cancel);
+        sqlite3_close_v2(stats_database);
+        if (!stats) {
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                stats.error());
+        }
+    }
+    std::array<bool, 20> domain_materialized{};
+    bool any_materialized = false;
+    for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+         ++encoded) {
+        if (static_cast<packed_page_type_t>(encoded) ==
+            packed_page_type_t::search_index)
+            continue;
+        domain_materialized[encoded] =
+            domain_stats[encoded].present &&
+            domain_stats[encoded].page_count >= kReopenParallelMinPages;
+        any_materialized = any_materialized || domain_materialized[encoded];
+    }
+    std::array<std::vector<std::uint8_t>, 20> domain_payloads;
+    if (any_materialized) {
+        std::array<std::vector<packed_domain_range_output_t>, 20> range_outputs;
+        packed_reopen_admission_t admission(options.reopen_range_budget_bytes);
+        aida::infra::taskflow_runtime::graph_descriptor_t range_graph;
+        range_graph.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+        range_graph.owner_subsystem = "analysis_persistence";
+        range_graph.label = "analysis.persistence.reopen_pages";
+        range_graph.phase = "persistence";
+        range_graph.priority = 2;
+        std::uint64_t range_node_id = 0;
+        for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+             ++encoded) {
+            if (!domain_materialized[encoded])
+                continue;
+            const auto& stat = domain_stats[encoded];
+            const std::uint32_t range_count = static_cast<std::uint32_t>(
+                (std::min<std::uint64_t>)(reopen_lanes,
+                    (stat.page_count + kReopenParallelMinPages - 1ULL) /
+                        kReopenParallelMinPages));
+            const auto domain = static_cast<packed_page_type_t>(encoded);
+            auto& outputs = range_outputs[encoded];
+            outputs.resize(range_count);
+            for (std::uint32_t range = 0; range < range_count; ++range) {
+                const std::uint32_t page_begin =
+                    stat.page_count * range / range_count;
+                const std::uint32_t page_end =
+                    stat.page_count * (range + 1U) / range_count;
+                const std::uint64_t estimate =
+                    stat.logical_bytes * (page_end - page_begin) /
+                        stat.page_count + packed_page_max_payload;
+                auto& output = outputs[range];
+                aida::infra::taskflow_runtime::graph_node_descriptor_t node;
+                node.node_id = ++range_node_id;
+                node.label = "analysis.persistence.reopen_page_range";
+                node.cancellable_body = [&conn, &options, &generation, domain,
+                                         page_begin, page_end, estimate,
+                                         maximum_domain_bytes, &cancel,
+                                         &admission, &output](
+                    const aida::infra::taskflow_runtime::cancellation_token_t&) {
+                    packed_reopen_admission_t::permit_t permit(
+                        admission, estimate);
+                    if (cancel.stop_requested()) {
+                        output.error = packed_baseline_cancelled(cancel);
+                        return;
+                    }
+                    auto opened = open_reader_connection(conn.path, options);
+                    if (!opened) {
+                        output.error = opened.error();
+                        return;
+                    }
+                    sqlite3* database = opened.take_value();
+                    auto read = read_packed_domain_page_range(
+                        database, generation, domain, page_begin, page_end,
+                        output, maximum_domain_bytes, cancel);
+                    sqlite3_close_v2(database);
+                    if (!read)
+                        output.error = read.error();
+                };
+                range_graph.nodes.push_back(std::move(node));
+            }
+        }
+        auto range_submission = aida::infra::taskflow_runtime::submit_graph(
+            std::move(range_graph));
+        if (!range_submission.submitted) {
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::persistence_failure,
+                    std::string("packed baseline reopen page dispatch was rejected: ") +
+                        range_submission.reject_reason));
+        }
+        for (;;) {
+            const auto waited = aida::infra::taskflow_runtime::wait_for(
+                range_submission.handle, 50);
+            if (waited.completed)
+                break;
+            if (cancel.stop_requested())
+                aida::infra::taskflow_runtime::cancel(range_submission.handle);
+        }
+        for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+             ++encoded) {
+            if (!domain_materialized[encoded])
+                continue;
+            const auto& stat = domain_stats[encoded];
+            const auto& outputs = range_outputs[encoded];
+            const std::uint32_t range_count =
+                static_cast<std::uint32_t>(outputs.size());
+            auto& payload = domain_payloads[encoded];
+            std::uint64_t expected_ordinal = 0;
+            std::uint32_t pages_seen = 0;
+            std::uint64_t total_bytes = 0;
+            try {
+                payload.reserve(static_cast<std::size_t>(
+                    (std::min)(stat.logical_bytes, maximum_domain_bytes)));
+            } catch (const std::bad_alloc&) {
+                return workspace_result_t<decoded_packed_baseline_t>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::limit_exceeded,
+                        "packed domain reopen allocation failed"));
+            }
+            for (std::uint32_t range = 0; range < range_count; ++range) {
+                auto& output = outputs[range];
+                if (output.error) {
+                    return workspace_result_t<decoded_packed_baseline_t>::failure(
+                        *output.error);
+                }
+                const std::uint32_t expected_pages =
+                    stat.page_count * (range + 1U) / range_count -
+                    stat.page_count * range / range_count;
+                if (output.pages_seen != expected_pages ||
+                    (range == 0 && output.first_ordinal != 0) ||
+                    output.first_ordinal != expected_ordinal) {
+                    return workspace_result_t<decoded_packed_baseline_t>::failure(
+                        packed_baseline_error(
+                            workspace_error_code_t::integrity_failure,
+                            "packed domain page ranges are not contiguous"));
+                }
+                expected_ordinal = output.next_ordinal;
+                pages_seen += output.pages_seen;
+                if (!checked_add_u64(total_bytes, output.bytes.size(),
+                                     total_bytes) ||
+                    total_bytes > maximum_domain_bytes) {
+                    return workspace_result_t<decoded_packed_baseline_t>::failure(
+                        packed_baseline_error(
+                            workspace_error_code_t::limit_exceeded,
+                            "packed domain exceeds its bounded reopen budget"));
+                }
+                try {
+                    payload.insert(
+                        payload.end(),
+                        std::make_move_iterator(output.bytes.begin()),
+                        std::make_move_iterator(output.bytes.end()));
+                } catch (const std::bad_alloc&) {
+                    return workspace_result_t<decoded_packed_baseline_t>::failure(
+                        packed_baseline_error(
+                            workspace_error_code_t::limit_exceeded,
+                            "packed domain reopen allocation failed"));
+                }
+            }
+            if (pages_seen != stat.page_count) {
+                return workspace_result_t<decoded_packed_baseline_t>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed domain page count changed during reopen"));
+            }
+        }
+        if (cancel.stop_requested()) {
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                packed_baseline_cancelled(cancel));
+        }
+    }
+    std::vector<std::shared_ptr<packed_domain_decode_result_t>> group_results;
+    std::array<std::vector<std::shared_ptr<packed_domain_decode_result_t>>, 20>
+        domain_units;
     aida::infra::taskflow_runtime::graph_descriptor_t graph;
     graph.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
     graph.owner_subsystem = "analysis_persistence";
@@ -7070,15 +7892,25 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
     graph.phase = "persistence";
     graph.priority = 2;
     std::uint64_t node_id = 0;
-    const std::uint64_t generation_id = generation.generation;
     for (std::size_t task_index = 0; task_index < tasks.size(); ++task_index) {
+        std::vector<packed_page_type_t> remaining;
+        std::uint32_t remaining_mask = 0;
+        for (const auto domain : tasks[task_index]) {
+            if (!domain_materialized[static_cast<std::uint32_t>(domain)]) {
+                remaining.push_back(domain);
+                remaining_mask |= 1U << static_cast<std::uint32_t>(domain);
+            }
+        }
+        if (remaining.empty())
+            continue;
         auto result = std::make_shared<packed_domain_decode_result_t>();
-        results[task_index] = result;
+        result->domain_mask = remaining_mask;
+        group_results.push_back(result);
         aida::infra::taskflow_runtime::graph_node_descriptor_t node;
         node.node_id = ++node_id;
         node.label = "analysis.persistence.reopen_domain";
-        node.cancellable_body = [&conn, &options, generation_id, maximum_records,
-                                 maximum_domain_bytes, &cancel, &tasks, task_index,
+        node.cancellable_body = [&conn, &options, &generation, maximum_records,
+                                 maximum_domain_bytes, &cancel, remaining,
                                  result](
             const aida::infra::taskflow_runtime::cancellation_token_t&) {
             auto opened = open_reader_connection(conn.path, options);
@@ -7087,13 +7919,13 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
                 return;
             }
             sqlite3* database = opened.take_value();
-            for (const auto domain : tasks[task_index]) {
+            for (const auto domain : remaining) {
                 if (cancel.stop_requested()) {
                     result->error = packed_baseline_cancelled(cancel);
                     break;
                 }
                 auto payload = read_packed_domain_payload(
-                    database, generation_id, domain, maximum_domain_bytes, cancel);
+                    database, generation, domain, maximum_domain_bytes, cancel);
                 if (!payload) {
                     result->error = payload.error();
                     break;
@@ -7109,6 +7941,82 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
             sqlite3_close_v2(database);
         };
         graph.nodes.push_back(std::move(node));
+    }
+    for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+         ++encoded) {
+        if (!domain_materialized[encoded])
+            continue;
+        const auto domain = static_cast<packed_page_type_t>(encoded);
+        const std::uint32_t mask = 1U << encoded;
+        const auto& payload = domain_payloads[encoded];
+        auto& units = domain_units[encoded];
+        auto layout = packed_domain_stride_layout(
+            domain, payload, maximum_records, cancel);
+        if (!layout) {
+            auto result = std::make_shared<packed_domain_decode_result_t>();
+            result->domain_mask = mask;
+            units.push_back(result);
+            aida::infra::taskflow_runtime::graph_node_descriptor_t node;
+            node.node_id = ++node_id;
+            node.label = "analysis.persistence.reopen_domain";
+            node.cancellable_body = [domain, &payload, maximum_records, &cancel,
+                                     result](
+                const aida::infra::taskflow_runtime::cancellation_token_t&) {
+                auto decoded = decode_packed_domain_into(
+                    domain, payload, result->snapshot, maximum_records,
+                    &result->decoded_records, cancel);
+                if (!decoded)
+                    result->error = decoded.error();
+            };
+            graph.nodes.push_back(std::move(node));
+            continue;
+        }
+        for (std::size_t segment_index = 0;
+             segment_index < layout->segment_count; ++segment_index) {
+            const auto segment = layout->segments[segment_index];
+            const std::uint64_t lane_count =
+                segment.count >= kReopenStrideMinRecords
+                    ? (std::min<std::uint64_t>)(reopen_lanes,
+                          (std::max<std::uint64_t>)(
+                              1ULL, segment.count / kReopenStrideLaneRecords))
+                    : 1ULL;
+            for (std::uint64_t lane = 0; lane < lane_count; ++lane) {
+                const std::uint64_t ordinal_begin =
+                    segment.count * lane / lane_count;
+                const std::uint64_t ordinal_end =
+                    segment.count * (lane + 1ULL) / lane_count;
+                auto result = std::make_shared<packed_domain_decode_result_t>();
+                result->domain_mask = mask;
+                units.push_back(result);
+                aida::infra::taskflow_runtime::graph_node_descriptor_t node;
+                node.node_id = ++node_id;
+                node.label = "analysis.persistence.reopen_domain_records";
+                node.cancellable_body = [domain, segment_index, &payload,
+                                         segment, ordinal_begin, ordinal_end,
+                                         maximum_records, &cancel, result](
+                    const aida::infra::taskflow_runtime::cancellation_token_t&) {
+                    try {
+                        auto decoded = decode_packed_domain_segment_range(
+                            domain, segment_index, payload, segment,
+                            ordinal_begin, ordinal_end, maximum_records,
+                            result->snapshot, result->decoded_records, cancel);
+                        if (!decoded)
+                            result->error = decoded.error();
+                    } catch (const std::bad_alloc&) {
+                        result->error = packed_baseline_error(
+                            workspace_error_code_t::limit_exceeded,
+                            "packed domain reopen allocation failed");
+                    }
+                };
+                graph.nodes.push_back(std::move(node));
+            }
+        }
+    }
+    if (graph.nodes.empty()) {
+        return workspace_result_t<decoded_packed_baseline_t>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::integrity_failure,
+                "packed baseline reopen produced no domain work"));
     }
     auto submission = aida::infra::taskflow_runtime::submit_graph(std::move(graph));
     if (!submission.submitted) {
@@ -7126,6 +8034,53 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
         if (cancel.stop_requested())
             aida::infra::taskflow_runtime::cancel(submission.handle);
     }
+    std::array<std::shared_ptr<packed_domain_decode_result_t>, 20>
+        domain_fallback;
+    for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+         ++encoded) {
+        const auto& units = domain_units[encoded];
+        if (units.size() <= 1)
+            continue;
+        bool unit_failed = false;
+        for (const auto& unit : units) {
+            if (unit->error) {
+                unit_failed = true;
+                break;
+            }
+        }
+        if (!unit_failed)
+            continue;
+        if (cancel.stop_requested()) {
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                packed_baseline_cancelled(cancel));
+        }
+        auto fallback = std::make_shared<packed_domain_decode_result_t>();
+        fallback->domain_mask = 1U << encoded;
+        auto decoded = decode_packed_domain_into(
+            static_cast<packed_page_type_t>(encoded), domain_payloads[encoded],
+            fallback->snapshot, maximum_records, &fallback->decoded_records,
+            cancel);
+        if (!decoded) {
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                decoded.error());
+        }
+        domain_fallback[encoded] = fallback;
+    }
+    std::vector<const packed_domain_decode_result_t*> merge_sources;
+    merge_sources.reserve(group_results.size() + 64U);
+    for (const auto& result : group_results)
+        merge_sources.push_back(result.get());
+    for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+         ++encoded) {
+        if (!domain_materialized[encoded])
+            continue;
+        if (domain_fallback[encoded]) {
+            merge_sources.push_back(domain_fallback[encoded].get());
+            continue;
+        }
+        for (const auto& unit : domain_units[encoded])
+            merge_sources.push_back(unit.get());
+    }
     auto snapshot = std::make_shared<analysis_snapshot_t>();
     snapshot->binary_id = manifest.binary_id;
     snapshot->load_profile_hash = manifest.load_profile_hash;
@@ -7136,20 +8091,21 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
     snapshot->normalized_image = std::move(normalized_image);
     snapshot->image = std::move(pe_adapter);
     std::uint64_t decoded_records = 0;
-    for (std::size_t task_index = 0; task_index < tasks.size(); ++task_index) {
-        auto& result = *results[task_index];
-        if (result.error) {
+    constexpr std::uint32_t call_graph_mask =
+        1U << static_cast<std::uint32_t>(packed_page_type_t::call_graph);
+    for (const auto* result : merge_sources) {
+        if (result->error) {
             return workspace_result_t<decoded_packed_baseline_t>::failure(
-                *result.error);
+                *result->error);
         }
-        if (!checked_add_u64(decoded_records, result.decoded_records,
+        if (!checked_add_u64(decoded_records, result->decoded_records,
                              decoded_records)) {
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 packed_baseline_error(
                     workspace_error_code_t::limit_exceeded,
                     "packed baseline record count overflows its reopen budget"));
         }
-        auto& source = result.snapshot;
+        auto& source = result->snapshot;
         const auto merge_into = [](auto& destination, auto& source_vector) {
             if (destination.empty())
                 destination = std::move(source_vector);
@@ -7189,14 +8145,12 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
                    source.rich_facts.metadata_conflicts);
         merge_into(snapshot->rich_facts.type_candidates,
                    source.rich_facts.type_candidates);
-        for (const auto task_domain : tasks[task_index]) {
-            if (task_domain == packed_page_type_t::call_graph) {
-                snapshot->call_graph.indirect_site_count =
-                    source.call_graph.indirect_site_count;
-                snapshot->call_graph.unresolved_site_count =
-                    source.call_graph.unresolved_site_count;
-                snapshot->call_graph.bounded = source.call_graph.bounded;
-            }
+        if ((result->domain_mask & call_graph_mask) != 0) {
+            snapshot->call_graph.indirect_site_count =
+                source.call_graph.indirect_site_count;
+            snapshot->call_graph.unresolved_site_count =
+                source.call_graph.unresolved_site_count;
+            snapshot->call_graph.bounded = source.call_graph.bounded;
         }
     }
     if (decoded_records > maximum_records) {
@@ -7362,7 +8316,13 @@ workspace_database_t::open(workspace_database_options_t options) {
         options.packed_staging_memory_budget_bytes <
             4ULL * packed_page_max_payload ||
         options.packed_staging_memory_budget_bytes >
-            packed_generation_max_payload_bytes) {
+            packed_generation_max_payload_bytes ||
+        options.packed_page_compression_level >
+            static_cast<std::uint32_t>(ZSTD_maxCLevel()) ||
+        options.reopen_range_budget_bytes < 64ULL << 20 ||
+        options.pdb_persistence_max_stored_bytes == 0 ||
+        options.pdb_persistence_max_stored_bytes >
+            pdb_symbol_modules_max_stored_bytes) {
         return workspace_result_t<std::shared_ptr<workspace_database_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "database identity, versions, checkpoint, and chunk limits are required",
@@ -9324,7 +10284,7 @@ workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> ima
         const std::size_t range_count = (std::min<std::size_t>)(
             instruction_blobs.size(),
             static_cast<std::size_t>((std::max)(
-                2U, (std::min)(8U, hardware == 0 ? 2U : hardware / 2U))));
+                2U, (std::min)(16U, hardware == 0 ? 2U : hardware))));
         std::vector<std::vector<std::vector<instruction_record_t>>> chunk_outputs(
             range_count);
         std::vector<std::optional<workspace_error_t>> range_errors(range_count);
@@ -9608,7 +10568,7 @@ workspace_database_t::load_managed_publication(
             if (!managed_expected)
                 return workspace_result_t<void>::success();
             auto payload = read_packed_domain_payload(
-                database, expected_generation,
+                database, *generation.value(),
                 packed_page_type_t::managed_publication,
                 managed_publication_max_payload_bytes, cancel);
             if (!payload)
@@ -9694,7 +10654,7 @@ workspace_database_t::load_search_products(
                 if (!manifest.value().baseline_complete)
                     return workspace_result_t<void>::success();
                 auto payload = read_packed_domain_payload(
-                    database, expected_generation,
+                    database, *record.value(),
                     packed_page_type_t::search_index,
                     options_.packed_generation_quota_bytes, cancel);
                 if (!payload)
@@ -10288,6 +11248,134 @@ persistence_ticket_t workspace_database_t::invalidate_pipeline_cache(
         }, std::move(cancel), 0, persistence_priority_t::deferred);
 }
 
+persistence_ticket_t workspace_database_t::store_pdb_symbol_modules(
+    pdb_symbol_module_record_t record, cancellation_token_t cancel) {
+    auto state = state_;
+    const std::uint64_t reservation_bytes =
+        static_cast<std::uint64_t>(record.payload.size()) +
+        (record.source_lines
+             ? static_cast<std::uint64_t>(record.source_lines->size()) : 0ULL);
+    const std::uint64_t stored_cap = options_.pdb_persistence_max_stored_bytes;
+    return enqueue_write("analysis.persistence.pdb_modules.store",
+        [state, record = std::move(record), stored_cap](
+            sqlite3* database, const cancellation_token_t& token) {
+            const auto stop = [&token] { return token.stop_requested(); };
+            if (stop()) {
+                auto error = make_workspace_error(
+                    token.deadline_exceeded()
+                        ? workspace_error_code_t::deadline_exceeded
+                        : workspace_error_code_t::cancelled,
+                    "pdb symbol module store was cancelled",
+                    "workspace_database.pdb_modules.store");
+                error.deadline = token.deadline_exceeded();
+                error.cancellation = !error.deadline;
+                return workspace_result_t<void>::failure(std::move(error));
+            }
+            std::uint64_t other_stored_bytes = 0;
+            {
+                statement_t caps;
+                auto prepared = caps.prepare(database,
+                    "SELECT COALESCE(SUM(length(payload)+COALESCE(length(source_lines),0)),0) FROM pdb_symbol_modules WHERE module_key<>?1",
+                    "workspace_database.pdb_modules.store");
+                if (!prepared)
+                    return prepared;
+                auto bound = caps.bind_text(1, record.module_key);
+                if (!bound)
+                    return bound;
+                const int status = sqlite3_step(caps.get());
+                if (status != SQLITE_ROW) {
+                    return workspace_result_t<void>::failure(database_error(
+                        database, status,
+                        "unable to bound pdb symbol module stored bytes",
+                        "workspace_database.pdb_modules.store"));
+                }
+                const auto other_bytes = sqlite3_column_int64(caps.get(), 0);
+                if (other_bytes < 0) {
+                    return workspace_result_t<void>::failure(
+                        make_workspace_error(
+                            workspace_error_code_t::integrity_failure,
+                            "pdb symbol module stored byte total is invalid",
+                            "workspace_database.pdb_modules.store"));
+                }
+                other_stored_bytes = static_cast<std::uint64_t>(other_bytes);
+            }
+            std::uint64_t prospective_bytes = 0;
+            if (!checked_add_u64(
+                    other_stored_bytes,
+                    static_cast<std::uint64_t>(record.payload.size()) +
+                        (record.source_lines
+                             ? static_cast<std::uint64_t>(
+                                   record.source_lines->size())
+                             : 0ULL) +
+                        128ULL,
+                    prospective_bytes)) {
+                state->pdb_modules_skipped.fetch_add(
+                    1, std::memory_order_acq_rel);
+                return workspace_result_t<void>::success();
+            }
+            if (prospective_bytes > stored_cap) {
+                state->pdb_modules_skipped.fetch_add(
+                    1, std::memory_order_acq_rel);
+                return workspace_result_t<void>::success();
+            }
+            auto written = write_pdb_symbol_module(database, record, stop);
+            if (!written)
+                return workspace_result_t<void>::failure(written.error());
+            if (written.value()) {
+                state->pdb_modules_stored.fetch_add(
+                    1, std::memory_order_acq_rel);
+            } else {
+                state->pdb_modules_skipped.fetch_add(
+                    1, std::memory_order_acq_rel);
+            }
+            return workspace_result_t<void>::success();
+        }, std::move(cancel), reservation_bytes,
+        persistence_priority_t::deferred);
+}
+
+workspace_result_t<std::vector<pdb_symbol_module_record_t>>
+workspace_database_t::load_pdb_symbol_modules(
+    const cancellation_token_t& cancel) const {
+    if (cancel.stop_requested()) {
+        auto error = make_workspace_error(
+            cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
+                                       : workspace_error_code_t::cancelled,
+            "pdb symbol module read was cancelled",
+            "workspace_database.pdb_modules.read");
+        error.deadline = cancel.deadline_exceeded();
+        error.cancellation = !error.deadline;
+        return workspace_result_t<std::vector<pdb_symbol_module_record_t>>::failure(
+            std::move(error));
+    }
+    std::vector<pdb_symbol_module_record_t> records;
+    auto result = with_reader([&](sqlite3* database) {
+        auto read = read_pdb_symbol_modules(
+            database, [&cancel] { return cancel.stop_requested(); });
+        if (!read)
+            return workspace_result_t<void>::failure(read.error());
+        records = read.take_value();
+        return workspace_result_t<void>::success();
+    }, cancel);
+    if (!result)
+        return workspace_result_t<std::vector<pdb_symbol_module_record_t>>::failure(
+            result.error());
+    if (cancel.stop_requested()) {
+        auto error = make_workspace_error(
+            cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
+                                       : workspace_error_code_t::cancelled,
+            "pdb symbol module read was cancelled",
+            "workspace_database.pdb_modules.read");
+        error.deadline = cancel.deadline_exceeded();
+        error.cancellation = !error.deadline;
+        return workspace_result_t<std::vector<pdb_symbol_module_record_t>>::failure(
+            std::move(error));
+    }
+    state_->pdb_modules_loaded.fetch_add(
+        static_cast<std::uint64_t>(records.size()), std::memory_order_acq_rel);
+    return workspace_result_t<std::vector<pdb_symbol_module_record_t>>::success(
+        std::move(records));
+}
+
 workspace_database_snapshot_t workspace_database_t::snapshot() const {
     workspace_database_snapshot_t result;
     result.path = state_->path;
@@ -10324,6 +11412,15 @@ workspace_database_snapshot_t workspace_database_t::snapshot() const {
         }
     }
     result.cumulative_pages_written = state_->cumulative_pages_written.load(std::memory_order_acquire);
+    result.last_commit_pages_v3 = state_->last_commit_pages_v3.load(std::memory_order_acquire);
+    result.cumulative_pages_v3 = state_->cumulative_pages_v3.load(std::memory_order_acquire);
+    result.last_commit_page_stored_bytes = state_->last_commit_page_stored_bytes.load(std::memory_order_acquire);
+    result.cumulative_page_stored_bytes = state_->cumulative_page_stored_bytes.load(std::memory_order_acquire);
+    result.last_commit_page_logical_bytes = state_->last_commit_page_logical_bytes.load(std::memory_order_acquire);
+    result.cumulative_page_logical_bytes = state_->cumulative_page_logical_bytes.load(std::memory_order_acquire);
+    result.pdb_modules_stored = state_->pdb_modules_stored.load(std::memory_order_acquire);
+    result.pdb_modules_skipped = state_->pdb_modules_skipped.load(std::memory_order_acquire);
+    result.pdb_modules_loaded = state_->pdb_modules_loaded.load(std::memory_order_acquire);
     std::error_code error;
     result.database_bytes = std::filesystem::file_size(std::filesystem::u8path(state_->path), error);
     if (error) result.database_bytes = 0;

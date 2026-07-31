@@ -254,6 +254,7 @@ analysis_once_result_t run_analysis_once(const open_static_workspace_request_t& 
 
         baseline_analysis_settings_t settings;
         settings.decode_worker_lanes = worker_budget;
+        settings.fact_pass_worker_budget = worker_budget;
         auto started = baseline_analysis_service_t::start(outcome.workspace, settings);
         if (!started)
             throw std::runtime_error("baseline analysis submission failed: " +
@@ -764,7 +765,7 @@ std::string stage_config_fingerprint()
 std::uint32_t hardware_default_budget() noexcept
 {
     const auto hardware = (std::max)(1U, std::thread::hardware_concurrency());
-    return (std::min)(16U, (std::max)(2U, hardware));
+    return (std::min)(64U, (std::max)(2U, hardware));
 }
 
 struct stage_run_measurement_t {

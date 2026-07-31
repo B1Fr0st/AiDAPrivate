@@ -4,6 +4,7 @@
 #include "../../src/core/analysis/decompiler/providers/dalvik_ssa.hpp"
 #include "../../src/core/analysis/decompiler/providers/ghidra_ir_adapter.hpp"
 #include "../../src/core/analysis/decompiler/providers/jvm_ssa.hpp"
+#include "../../src/core/analysis/decompiler/pseudocode_readability.hpp"
 #include "../../src/core/analysis/decompiler/pseudocode_renderer_v2.hpp"
 #include "../../src/core/analysis/decompiler/typed_ast_v2.hpp"
 #include "../../src/core/disasm/ghidra_decompiler.hpp"
@@ -68,6 +69,7 @@ ghidra_decompiler::arch_session_entry_t* arch_session_acquire(
     std::vector<native_provider_snapshot_range_t>& source_ranges,
     std::uint64_t image_base,
     std::uint64_t image_size,
+    bool keep_fixateglobals,
     std::string& error_text)
 {
     for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
@@ -97,7 +99,7 @@ ghidra_decompiler::arch_session_entry_t* arch_session_acquire(
         regions.push_back(std::move(region));
     }
     auto created = ghidra_decompiler::make_arch_session_entry(
-        std::move(regions), image_base, image_size, std::move(key));
+        std::move(regions), image_base, image_size, std::move(key), keep_fixateglobals);
     if (!created.ok) {
         error_text = std::move(created.error_text);
         diag::log_tagged_fmt("dec",
@@ -225,6 +227,7 @@ std::optional<provider_output_t> execute_native(
     limits.max_result_bytes = (std::min<std::uint64_t>)(
         limits.max_result_bytes, job.profile.max_memory_bytes);
     limits.capture_printc_evidence = job.request_printc_evidence;
+    limits.keep_fixateglobals = job.profile.profile == decompiler_profile_id_t::thorough;
     ghidra_decompiler::ghidra_result_t output;
     bool executed = false;
     auto& cache = arch_session_cache();
@@ -235,9 +238,10 @@ std::optional<provider_output_t> execute_native(
         key.architecture_mode = job.cache_key.language.mode;
         key.endian = job.cache_key.language.endian;
         key.snapshot_hash = job.snapshot_hash;
+        key.keep_fixateglobals = limits.keep_fixateglobals;
         std::string pool_error;
         if (auto* pooled = arch_session_acquire(cache, std::move(key), snapshot->ranges,
-                snapshot->image_base, snapshot->image_size, pool_error)) {
+                snapshot->image_base, snapshot->image_size, limits.keep_fixateglobals, pool_error)) {
             output = ghidra_decompiler::decompile_isolated_regions_reusing(
                 *pooled, entry, cancelled, deadline, limits, capture);
         } else {
@@ -397,13 +401,30 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
         job.profile.max_hir_nodes, (std::numeric_limits<std::size_t>::max)()));
     ast_request.limits.max_ast_nodes = static_cast<std::size_t>((std::min<std::uint64_t>)(
         job.profile.max_ast_nodes, (std::numeric_limits<std::size_t>::max)()));
-    const auto ast = build_typed_ast_v2(output->hir, output->type_graph, ast_request);
+    auto ast = build_typed_ast_v2(output->hir, output->type_graph, ast_request);
     if (!ast.succeeded() || !ast.ast) {
         result.diagnostics = ast.diagnostics;
         if (result.diagnostics.empty())
             result.diagnostics.push_back(failure(decompiler_diagnostic_code_t::malformed_ast,
                 "decompiler.isolated_worker.typed_ast"));
         return result;
+    }
+    std::vector<decompiler_diagnostic_t> readability_diagnostics;
+    if (output->hir.entity.kind == decompiler_entity_kind_t::native_function &&
+        readability_transforms_enabled(job.cache_key.renderer.readability)) {
+        auto readability_result = apply_readability_transforms(
+            *ast.ast, output->type_graph, to_rt_settings(job.cache_key.renderer.readability));
+        readability_diagnostics = std::move(readability_result.diagnostics);
+        if (readability_result.succeeded()) {
+            diag::log_tagged_fmt("dec", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u",
+                static_cast<unsigned int>(readability_result.metrics.variables_renamed),
+                static_cast<unsigned int>(readability_result.metrics.constants_folded),
+                static_cast<unsigned int>(readability_result.metrics.identities_simplified),
+                static_cast<unsigned int>(readability_result.metrics.temporaries_inlined),
+                static_cast<unsigned int>(readability_result.metrics.dead_stores_eliminated));
+        } else {
+            diag::log_tagged_fmt("dec", "readability_transforms status=warning_no_transform continuing_with_unmodified_ast");
+        }
     }
     pseudocode_renderer_v2_request_t render_request;
     render_request.profile = job.profile.profile;
@@ -426,6 +447,8 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
         output->hir.diagnostics.begin(), output->hir.diagnostics.end());
     result.document->diagnostics.insert(result.document->diagnostics.end(),
         output->type_graph.diagnostics.begin(), output->type_graph.diagnostics.end());
+    result.document->diagnostics.insert(result.document->diagnostics.end(),
+        readability_diagnostics.begin(), readability_diagnostics.end());
     for (std::uint32_t index = 0; index < result.document->diagnostics.size(); ++index)
         result.document->diagnostics[index].ordinal = index + 1U;
     if (!validate_decompiler_document(*result.document).valid()) {

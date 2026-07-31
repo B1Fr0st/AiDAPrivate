@@ -525,16 +525,16 @@ namespace disasm
 
     inline std::string open_file_dialog(HWND owner)
     {
-        char buf[MAX_PATH] = {};
+        std::string buf(32768, '\0');
         static const char k_filter[] =
             "PE Files (*.exe;*.dll;*.sys;*.bin)\0*.exe;*.dll;*.sys;*.bin\0"
             "All files (*.*)\0*.*\0\0";
         if (win32_dialog::show_open_file_dialog(owner,
                 "Open PE File",
                 k_filter,
-                buf, sizeof(buf),
+                buf.data(), buf.size(),
                 "disasm::open_file_dialog"))
-            return std::string(buf);
+            return std::string(buf.c_str());
         return {};
     }
 

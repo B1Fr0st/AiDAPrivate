@@ -989,7 +989,7 @@ private:
     {
         decompiler_diagnostic_t diagnostic;
         diagnostic.severity = decompiler_diagnostic_severity_t::warning;
-        diagnostic.code = decompiler_diagnostic_code_t::malformed_ast;
+        diagnostic.code = decompiler_diagnostic_code_t::partial_decompilation;
         diagnostic.localization_key = "decompiler.ast.v2.partial_decompilation";
         diagnostic.localization_arguments = {failure_key};
         diagnostic.coordinate = translate_coordinate(coordinate,
@@ -2839,6 +2839,7 @@ typed_ast_v2_build_result_t build_typed_ast_v2(
     result.type_graph_hash = stable_serialization_hash(type_graph);
     ast_builder_t builder(hir, type_graph, request, result);
     builder.run();
+    result.partial = builder.degraded_region_count() != 0;
     if (result.succeeded() && builder.degraded_region_count() != 0) {
         diag::log_tagged_fmt("dec_ast",
             "typed_ast_v2_build partial=1 regions=%u nodes=%zu",

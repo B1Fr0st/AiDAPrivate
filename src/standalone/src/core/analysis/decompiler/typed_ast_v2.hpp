@@ -28,6 +28,7 @@ struct typed_ast_v2_build_result_t {
     std::vector<decompiler_unknown_t> unknowns;
     sha256_digest_t hir_hash;
     sha256_digest_t type_graph_hash;
+    bool partial = false;
 
     bool succeeded() const noexcept;
 };

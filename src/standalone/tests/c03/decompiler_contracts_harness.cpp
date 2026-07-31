@@ -662,7 +662,7 @@ void verify_cache_identity_dimensions(const decompiler_pipeline_cache_key_t& cac
     require_distinct([](auto& value) { value.provider_ir_schema_version = 2; }, "cache hash ignored provider IR schema version");
     require_distinct([](auto& value) { value.type_graph_schema_version = 2; }, "cache hash ignored type graph schema version");
 
-    require_distinct([](auto& value) { value.renderer.schema_version = 2; }, "cache hash ignored renderer schema version");
+    require_distinct([](auto& value) { value.renderer.schema_version = 1; }, "cache hash ignored renderer schema version");
 
     auto invalid_provider_ir_schema = cache;
     invalid_provider_ir_schema.provider_ir_schema_version = 0;

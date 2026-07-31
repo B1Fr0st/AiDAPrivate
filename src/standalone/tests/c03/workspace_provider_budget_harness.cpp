@@ -8,6 +8,7 @@
 
 #include "../analysis_workspace/workspace_fixture_builder.hpp"
 
+#include "../../src/core/analysis/analysis_budget.hpp"
 #include "../../src/core/analysis/mapped_window_cache.hpp"
 #include "../../src/core/analysis/provider_snapshot.hpp"
 #include "../../src/core/analysis/spill_provider.hpp"
@@ -276,17 +277,18 @@ analysis_run_outcome_t run_instrumented(const std::shared_ptr<analysis_workspace
     };
     bool ok = run_phase("parse", [&] { return analyzer->parse_phase(runtime_cancelled); });
     ok = ok && run_phase("seed", [&] { return analyzer->seed_phase(runtime_cancelled); });
-    for (std::uint32_t lane = 0; ok && lane < analyzer->decode_lane_count(); ++lane)
-        ok = ok && run_phase("decode_lane", [&] { return analyzer->decode_lane_phase(lane, runtime_cancelled); });
+    ok = ok && run_phase("decode", [&] { return analyzer->decode_phase(runtime_cancelled); });
     ok = ok && run_phase("decode_merge", [&] { return analyzer->decode_merge_phase(runtime_cancelled); });
-    ok = ok && run_phase("blocks", [&] { return analyzer->blocks_phase(runtime_cancelled); });
+    ok = ok && run_phase("data_discovery", [&] { return analyzer->data_discovery_phase(runtime_cancelled); });
+    ok = ok && run_phase("function_recovery", [&] { return analyzer->function_recovery_phase(runtime_cancelled); });
     ok = ok && run_phase("functions", [&] { return analyzer->functions_phase(runtime_cancelled); });
     ok = ok && run_phase("cfg_calls", [&] { return analyzer->cfg_calls_phase(runtime_cancelled); });
     ok = ok && run_phase("xrefs", [&] { return analyzer->xrefs_phase(runtime_cancelled); });
     ok = ok && run_phase("strings_data", [&] { return analyzer->strings_data_phase(runtime_cancelled); });
     ok = ok && run_phase("metadata_symbols_types", [&] { return analyzer->metadata_symbols_types_phase(runtime_cancelled); });
     ok = ok && run_phase("search_index", [&] { return analyzer->search_index_phase(runtime_cancelled); });
-    ok = ok && run_phase("persistence", [&] { return analyzer->persistence_phase(runtime_cancelled); });
+    ok = ok && run_phase("persistence_submit", [&] { return analyzer->persistence_submit_phase(runtime_cancelled); });
+    ok = ok && run_phase("persistence_commit", [&] { return analyzer->persistence_commit_phase(runtime_cancelled); });
     ok = ok && run_phase("publish_ready", [&] { return analyzer->publish_ready_phase(runtime_cancelled); });
     outcome.completed = ok;
     return outcome;
@@ -405,9 +407,9 @@ std::uint64_t full_walk_bytes(const analysis_snapshot_t& snapshot) {
 }
 
 int gate_order_index(const std::string& phase) {
-    static const char* order[] = {"decode_merge", "blocks", "functions", "cfg_calls", "xrefs",
-        "strings_data", "metadata_symbols_types", "search_index"};
-    for (int index = 0; index < 8; ++index) {
+    static const char* order[] = {"decode_merge", "data_discovery", "function_recovery",
+        "functions", "cfg_calls", "xrefs", "strings_data", "metadata_symbols_types", "search_index"};
+    for (int index = 0; index < 9; ++index) {
         if (phase == order[index])
             return index;
     }
@@ -1269,6 +1271,103 @@ void verify_memory_ceiling_300mb(const std::filesystem::path& root) {
             "local-file 300 MiB analysis leaked a temporary spill artifact");
 }
 
+struct adaptive_budget_case_t {
+    std::uint64_t total_phys;
+    std::uint64_t usable_bytes;
+    std::uint64_t max_analysis_memory_bytes;
+    std::uint64_t packed_staging_memory_budget_bytes;
+    std::uint64_t packed_generation_quota_bytes;
+    std::uint64_t window_cache_per_file_bytes;
+    std::uint64_t window_cache_global_bytes;
+    std::uint64_t pdb_persistence_total_bytes;
+    std::uint64_t reopen_range_budget_bytes;
+    bool low_memory;
+};
+
+host_memory_envelope_t synthetic_memory_envelope(std::uint64_t total_phys) {
+    host_memory_envelope_t envelope;
+    envelope.total_phys = total_phys;
+    envelope.avail_phys = total_phys;
+    envelope.reserve_os_bytes = (std::min)(
+        (std::max)(total_phys / 4ULL, 4ULL * kGiB), 16ULL * kGiB);
+    envelope.usable_bytes = total_phys > envelope.reserve_os_bytes
+        ? total_phys - envelope.reserve_os_bytes : 0;
+    return envelope;
+}
+
+bool same_budget_fields(const adaptive_analysis_budget_fields_t& left,
+                        const adaptive_analysis_budget_fields_t& right) {
+    return left.max_analysis_memory_bytes == right.max_analysis_memory_bytes &&
+        left.packed_staging_memory_budget_bytes == right.packed_staging_memory_budget_bytes &&
+        left.packed_generation_quota_bytes == right.packed_generation_quota_bytes &&
+        left.window_cache_per_file_bytes == right.window_cache_per_file_bytes &&
+        left.window_cache_global_bytes == right.window_cache_global_bytes &&
+        left.pdb_persistence_total_bytes == right.pdb_persistence_total_bytes &&
+        left.reopen_range_budget_bytes == right.reopen_range_budget_bytes &&
+        left.low_memory == right.low_memory;
+}
+
+void verify_adaptive_budget_formula() {
+    static const adaptive_budget_case_t cases[] = {
+        {4294967296ULL, 0ULL, 8589934592ULL, 536870912ULL, 8589934592ULL, 268435456ULL, 1073741824ULL, 268435456ULL, 1073741824ULL, true},
+        {8589934592ULL, 4294967296ULL, 8589934592ULL, 536870912ULL, 8589934592ULL, 268435456ULL, 1073741824ULL, 268435456ULL, 1073741824ULL, true},
+        {17179869184ULL, 12884901888ULL, 8589934592ULL, 805306368ULL, 8589934592ULL, 402653184ULL, 1073741824ULL, 402653184ULL, 1610612736ULL, true},
+        {21474836480ULL, 16106127360ULL, 8589934592ULL, 1006632960ULL, 8589934592ULL, 503316480ULL, 1073741824ULL, 503316480ULL, 2013265920ULL, true},
+        {25769803775ULL, 19327352832ULL, 9663676416ULL, 1207959552ULL, 9663676416ULL, 603979776ULL, 1207959552ULL, 603979776ULL, 2415919104ULL, true},
+        {25769803776ULL, 19327352832ULL, 9663676416ULL, 1207959552ULL, 9663676416ULL, 603979776ULL, 1207959552ULL, 603979776ULL, 2415919104ULL, false},
+        {34359738368ULL, 25769803776ULL, 12884901888ULL, 1610612736ULL, 12884901888ULL, 805306368ULL, 1610612736ULL, 805306368ULL, 3221225472ULL, false},
+        {51539607552ULL, 38654705664ULL, 19327352832ULL, 2415919104ULL, 17179869184ULL, 1207959552ULL, 2415919104ULL, 1073741824ULL, 4831838208ULL, false},
+        {68719476736ULL, 51539607552ULL, 25769803776ULL, 3221225472ULL, 17179869184ULL, 1610612736ULL, 3221225472ULL, 1073741824ULL, 6442450944ULL, false},
+        {137438953472ULL, 120259084288ULL, 51539607552ULL, 4294967296ULL, 17179869184ULL, 2147483648ULL, 4294967296ULL, 1073741824ULL, 8589934592ULL, false}};
+    for (const auto& test : cases) {
+        const auto envelope = synthetic_memory_envelope(test.total_phys);
+        require(envelope.usable_bytes == test.usable_bytes,
+                "synthetic envelope usable bytes diverged from the reserve formula at total " +
+                    std::to_string(test.total_phys));
+        const auto first = adaptive_analysis_budget_fields(envelope);
+        const auto second = adaptive_analysis_budget_fields(envelope);
+        require(same_budget_fields(first, second),
+                "adaptive budget fields are not deterministic at total " +
+                    std::to_string(test.total_phys));
+        require(first.max_analysis_memory_bytes == test.max_analysis_memory_bytes &&
+                first.packed_staging_memory_budget_bytes == test.packed_staging_memory_budget_bytes &&
+                first.packed_generation_quota_bytes == test.packed_generation_quota_bytes &&
+                first.window_cache_per_file_bytes == test.window_cache_per_file_bytes &&
+                first.window_cache_global_bytes == test.window_cache_global_bytes &&
+                first.pdb_persistence_total_bytes == test.pdb_persistence_total_bytes &&
+                first.reopen_range_budget_bytes == test.reopen_range_budget_bytes &&
+                first.low_memory == test.low_memory,
+                "adaptive budget row diverged at total " + std::to_string(test.total_phys) +
+                    ": mam=" + std::to_string(first.max_analysis_memory_bytes) +
+                    " staging=" + std::to_string(first.packed_staging_memory_budget_bytes) +
+                    " quota=" + std::to_string(first.packed_generation_quota_bytes) +
+                    " wpf=" + std::to_string(first.window_cache_per_file_bytes) +
+                    " wg=" + std::to_string(first.window_cache_global_bytes) +
+                    " pdb=" + std::to_string(first.pdb_persistence_total_bytes) +
+                    " reopen=" + std::to_string(first.reopen_range_budget_bytes) +
+                    " low=" + (first.low_memory ? std::string("true") : std::string("false")));
+        require(first.max_analysis_memory_bytes >= 8ULL * kGiB &&
+                first.max_analysis_memory_bytes <= 48ULL * kGiB &&
+                first.packed_staging_memory_budget_bytes >= 512ULL * kMiB &&
+                first.packed_staging_memory_budget_bytes <= 4ULL * kGiB &&
+                first.packed_generation_quota_bytes >= 8ULL * kGiB &&
+                first.packed_generation_quota_bytes <= 16ULL * kGiB &&
+                first.window_cache_per_file_bytes >= 256ULL * kMiB &&
+                first.window_cache_per_file_bytes <= 2ULL * kGiB &&
+                first.window_cache_global_bytes >= 1ULL * kGiB &&
+                first.window_cache_global_bytes <= 4ULL * kGiB &&
+                first.pdb_persistence_total_bytes >= 256ULL * kMiB &&
+                first.pdb_persistence_total_bytes <= 1ULL * kGiB &&
+                first.reopen_range_budget_bytes >= 1ULL * kGiB &&
+                first.reopen_range_budget_bytes <= 8ULL * kGiB,
+                "adaptive budget fields escaped their clamp envelope at total " +
+                    std::to_string(test.total_phys));
+        require(first.window_cache_per_file_bytes <= first.window_cache_global_bytes,
+                "per-file window cache exceeds the global window cache at total " +
+                    std::to_string(test.total_phys));
+    }
+}
+
 }
 
 int main()
@@ -1294,6 +1393,7 @@ int main()
         phase("eviction_smoke", [&] { verify_eviction_smoke(root.path()); });
         phase("global_cap_exhaustion", [&] { verify_global_cap_exhaustion(root.path()); });
         phase("budget_validation_matrix", [&] { verify_budget_validation_matrix(); });
+        phase("adaptive_budget_formula", [&] { verify_adaptive_budget_formula(); });
         phase("budget_gates_sweep", [&] { verify_budget_gates_sweep(root.path()); });
         phase("ledger_parity", [&] { verify_ledger_parity(root.path()); });
         phase("regression_surfaces", [&] { verify_regression_surfaces(root.path()); });

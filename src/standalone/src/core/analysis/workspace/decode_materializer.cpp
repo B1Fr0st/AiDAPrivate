@@ -9,10 +9,10 @@
 #include "compact_ir.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -37,330 +37,209 @@ workspace_error_t materialize_cancellation_error(const cancellation_token_t& can
     return error;
 }
 
-void atomic_min_u32(std::atomic<std::uint32_t>& slot, std::uint32_t value) noexcept {
-    auto current = slot.load(std::memory_order_relaxed);
-    while (current > value &&
-           !slot.compare_exchange_weak(current, value, std::memory_order_acq_rel,
-               std::memory_order_relaxed)) {
-    }
+workspace_error_t materialize_integrity_error(std::string message) {
+    return make_workspace_error(workspace_error_code_t::integrity_failure,
+        std::move(message), "decode_merge");
 }
 
-std::uint64_t retag_mix(std::uint64_t key) noexcept {
-    key *= 0x9E3779B97F4A7C15ULL;
-    key ^= key >> 33U;
-    return key;
+workspace_error_t materialize_limit_error(const char* message) {
+    return make_workspace_error(workspace_error_code_t::limit_exceeded,
+        message, "decode_merge");
 }
 
-class id_retag_table_t {
-public:
-    void initialize(std::size_t count, std::uint32_t workers,
-                    const cancellation_token_t& cancel) {
-        std::uint64_t capacity = 16;
-        const std::uint64_t target = static_cast<std::uint64_t>(count) * 2ULL;
-        while (capacity < target)
-            capacity <<= 1U;
-        mask_ = capacity - 1ULL;
-        keys_.resize(static_cast<std::size_t>(capacity));
-        vals_.resize(static_cast<std::size_t>(capacity));
-        const auto shards = parallel_shards(static_cast<std::size_t>(capacity), workers);
-        auto initialized = parallel_run_shards(shards,
-            [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
-                for (std::size_t index = range.begin; index < range.end; ++index) {
-                    keys_[index].store((std::numeric_limits<std::uint64_t>::max)(),
-                        std::memory_order_relaxed);
-                    vals_[index].store(0U, std::memory_order_relaxed);
-                }
-                return workspace_result_t<void>::success();
-            }, cancel);
-        static_cast<void>(initialized);
+workspace_result_t<std::uint32_t> resolve_instruction_owner(
+    std::uint64_t packed_id, std::uint16_t shard_id, std::uint64_t instruction_count,
+    const char* row_kind) {
+    const auto domain = packed_id >> 48U;
+    const auto shard = static_cast<std::uint16_t>((packed_id >> 32U) & 0xffffULL);
+    const auto ordinal = packed_id & 0xffffffffULL;
+    if (packed_id == 0 ||
+        domain != static_cast<std::uint64_t>(packed_entity_domain_t::instruction) ||
+        ordinal == 0 || ordinal > instruction_count) {
+        std::string message = "tile decode ";
+        message += row_kind;
+        message += " references an unknown instruction";
+        return workspace_result_t<std::uint32_t>::failure(
+            materialize_integrity_error(std::move(message)));
     }
-
-    void insert(std::uint64_t key, std::uint32_t ordinal_plus_one) noexcept {
-        auto slot = static_cast<std::size_t>(retag_mix(key) & mask_);
-        for (;;) {
-            const auto existing = keys_[slot].load(std::memory_order_acquire);
-            if (existing == key) {
-                atomic_min_u32(vals_[slot], ordinal_plus_one);
-                return;
-            }
-            if (existing == (std::numeric_limits<std::uint64_t>::max)()) {
-                auto expected = (std::numeric_limits<std::uint64_t>::max)();
-                if (keys_[slot].compare_exchange_strong(expected, key,
-                        std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    vals_[slot].store(ordinal_plus_one, std::memory_order_release);
-                    return;
-                }
-                continue;
-            }
-            slot = (slot + 1) & mask_;
-        }
+    if (shard != shard_id) {
+        std::string message = "tile decode ";
+        message += row_kind;
+        message += " references an instruction outside its shard";
+        return workspace_result_t<std::uint32_t>::failure(
+            materialize_integrity_error(std::move(message)));
     }
+    return workspace_result_t<std::uint32_t>::success(
+        static_cast<std::uint32_t>(ordinal - 1ULL));
+}
 
-    void finish(std::uint32_t) noexcept {}
-
-    std::uint32_t find(std::uint64_t key) const noexcept {
-        auto slot = static_cast<std::size_t>(retag_mix(key) & mask_);
-        for (;;) {
-            const auto existing = keys_[slot].load(std::memory_order_acquire);
-            if (existing == (std::numeric_limits<std::uint64_t>::max)())
-                return 0;
-            if (existing == key)
-                return vals_[slot].load(std::memory_order_acquire);
-            slot = (slot + 1) & mask_;
-        }
-    }
-
-private:
-    std::vector<std::atomic<std::uint64_t>> keys_;
-    std::vector<std::atomic<std::uint32_t>> vals_;
-    std::uint64_t mask_ = 0;
+struct shard_base_ordinals_t {
+    std::vector<std::uint64_t> instruction_bases;
+    std::vector<std::uint64_t> operand_bases;
+    std::vector<std::uint64_t> target_bases;
+    std::uint64_t instruction_total = 0;
+    std::uint64_t operand_total = 0;
+    std::uint64_t target_total = 0;
 };
 
-struct id_retag_record_t {
-    std::uint64_t key = 0;
-    std::uint32_t ordinal_plus_one = 0;
-    std::uint32_t reserved = 0;
-};
-
-class id_retag_sorted_t {
-public:
-    void initialize(std::size_t count, std::uint32_t, const cancellation_token_t&) {
-        records_.resize(count);
-    }
-
-    void insert_at(std::size_t index, std::uint64_t key,
-                   std::uint32_t ordinal_plus_one) noexcept {
-        records_[index] = {key, ordinal_plus_one, 0U};
-    }
-
-    void finish(std::uint32_t workers) {
-        parallel_sort(records_.begin(), records_.end(),
-            [](const id_retag_record_t& lhs, const id_retag_record_t& rhs) {
-                if (lhs.key != rhs.key)
-                    return lhs.key < rhs.key;
-                return lhs.ordinal_plus_one < rhs.ordinal_plus_one;
-            }, workers);
-    }
-
-    std::uint32_t find(std::uint64_t key) const noexcept {
-        std::size_t lo = 0;
-        std::size_t hi = records_.size();
-        while (lo < hi) {
-            const auto mid = lo + (hi - lo) / 2;
-            if (records_[mid].key < key)
-                lo = mid + 1;
-            else
-                hi = mid;
+workspace_result_t<shard_base_ordinals_t> compute_shard_bases(
+    const std::vector<packed_analysis_shard_t>& shards) {
+    shard_base_ordinals_t bases;
+    bases.instruction_bases.reserve(shards.size());
+    bases.operand_bases.reserve(shards.size());
+    bases.target_bases.reserve(shards.size());
+    for (const auto& shard : shards) {
+        bases.instruction_bases.push_back(bases.instruction_total);
+        bases.operand_bases.push_back(bases.operand_total);
+        bases.target_bases.push_back(bases.target_total);
+        if (!checked_add_u64(bases.instruction_total,
+                static_cast<std::uint64_t>(shard.instruction_count()),
+                bases.instruction_total) ||
+            !checked_add_u64(bases.operand_total,
+                static_cast<std::uint64_t>(shard.operand_count()),
+                bases.operand_total) ||
+            !checked_add_u64(bases.target_total,
+                static_cast<std::uint64_t>(shard.target_fact_count()),
+                bases.target_total)) {
+            return workspace_result_t<shard_base_ordinals_t>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                    "tile decode merge accounting overflows", "decode_merge"));
         }
-        if (lo < records_.size() && records_[lo].key == key)
-            return records_[lo].ordinal_plus_one;
-        return 0;
     }
-
-private:
-    std::vector<id_retag_record_t> records_;
-};
-
-void retag_record(id_retag_table_t& table, std::size_t, std::uint64_t key,
-                  std::uint32_t ordinal_plus_one) noexcept {
-    table.insert(key, ordinal_plus_one);
+    return workspace_result_t<shard_base_ordinals_t>::success(std::move(bases));
 }
 
-void retag_record(id_retag_sorted_t& sorted, std::size_t index, std::uint64_t key,
-                  std::uint32_t ordinal_plus_one) noexcept {
-    sorted.insert_at(index, key, ordinal_plus_one);
-}
-
-template <typename Retag>
-workspace_result_t<void> materialize_copy(
-    tile_decode_orchestration_result_t& decoded, analysis_snapshot_t& snapshot,
-    std::uint32_t workers, const cancellation_token_t& cancel, Retag& retag) {
+workspace_result_t<void> materialize_shard_rows(
+    packed_analysis_shard_t& shard, analysis_snapshot_t& snapshot,
+    std::uint64_t instruction_base, std::uint64_t operand_base,
+    std::uint64_t target_base, const cancellation_token_t& cancel) {
+    auto validated = shard.validate();
+    if (!validated) {
+        auto error = materialize_integrity_error(
+            "tile decode packed shard validation failed");
+        error.details.emplace_back("shard", std::to_string(shard.shard_id()));
+        error.details.emplace_back("packed_code",
+            std::to_string(static_cast<unsigned>(validated.error().code)));
+        return workspace_result_t<void>::failure(std::move(error));
+    }
+    const auto view = shard.compatibility_view();
+    const auto shard_id = shard.shard_id();
     const auto instruction_count =
-        static_cast<std::size_t>(decoded.packed_store->instruction_count());
-    const auto operand_count =
-        static_cast<std::size_t>(decoded.packed_store->operand_count());
-    const auto target_count =
-        static_cast<std::size_t>(decoded.packed_store->target_fact_count());
-    snapshot.instructions.clear();
-    snapshot.operand_facts.clear();
-    snapshot.target_facts.clear();
-    snapshot.instructions.resize(instruction_count);
-    snapshot.operand_facts.resize(operand_count);
-    snapshot.target_facts.resize(target_count);
-    const auto instruction_shards = parallel_shards(instruction_count, workers);
-    auto instructions_done = parallel_run_shards(instruction_shards,
-        [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
-            const auto view = decoded.packed_store->compatibility_view();
-            std::uint64_t polls = 0;
-            for (std::size_t index = range.begin; index < range.end; ++index) {
-                if (++polls >= kCancellationStride) {
-                    polls = 0;
-                    if (cancel.stop_requested())
-                        return workspace_result_t<void>::failure(
-                            materialize_cancellation_error(cancel));
-                }
-                auto instruction = view.instruction(index);
-                if (!instruction) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::integrity_failure,
-                        "tile decode instruction compatibility row is missing",
-                        "decode_merge"));
-                }
-                const auto original = instruction->id;
-                instruction->id = kInstructionEntityTag |
-                    static_cast<std::uint64_t>(index + 1);
-                retag_record(retag, index, original,
-                    static_cast<std::uint32_t>(index + 1));
-                snapshot.instructions[index] = std::move(*instruction);
-            }
-            return workspace_result_t<void>::success();
-        }, cancel);
-    if (!instructions_done)
-        return instructions_done;
-    retag.finish(workers);
-    const auto operand_shards = parallel_shards(operand_count, workers);
-    auto operands_done = parallel_run_shards(operand_shards,
-        [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
-            const auto view = decoded.packed_store->compatibility_view();
-            std::uint64_t polls = 0;
-            for (std::size_t index = range.begin; index < range.end; ++index) {
-                if (++polls >= kCancellationStride) {
-                    polls = 0;
-                    if (cancel.stop_requested())
-                        return workspace_result_t<void>::failure(
-                            materialize_cancellation_error(cancel));
-                }
-                auto operand = view.operand(index);
-                if (!operand) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::integrity_failure,
-                        "tile decode operand compatibility row is missing",
-                        "decode_merge"));
-                }
-                const auto owner = retag.find(operand->instruction_id);
-                if (owner == 0) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::integrity_failure,
-                        "tile decode operand references an unknown instruction",
-                        "decode_merge"));
-                }
-                operand->instruction_id = kInstructionEntityTag |
-                    static_cast<std::uint64_t>(owner);
-                snapshot.operand_facts[index] = std::move(*operand);
-            }
-            return workspace_result_t<void>::success();
-        }, cancel);
-    if (!operands_done)
-        return operands_done;
-    const auto target_shards = parallel_shards(target_count, workers);
-    auto targets_done = parallel_run_shards(target_shards,
-        [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
-            const auto view = decoded.packed_store->compatibility_view();
-            std::uint64_t polls = 0;
-            for (std::size_t index = range.begin; index < range.end; ++index) {
-                if (++polls >= kCancellationStride) {
-                    polls = 0;
-                    if (cancel.stop_requested())
-                        return workspace_result_t<void>::failure(
-                            materialize_cancellation_error(cancel));
-                }
-                auto target = view.target_fact(index);
-                if (!target) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::integrity_failure,
-                        "tile decode target compatibility row is missing",
-                        "decode_merge"));
-                }
-                const auto owner = retag.find(target->instruction_id);
-                if (owner == 0) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::integrity_failure,
-                        "tile decode target references an unknown instruction",
-                        "decode_merge"));
-                }
-                target->instruction_id = kInstructionEntityTag |
-                    static_cast<std::uint64_t>(owner);
-                snapshot.target_facts[index] = std::move(*target);
-            }
-            return workspace_result_t<void>::success();
-        }, cancel);
-    if (!targets_done)
-        return targets_done;
-    std::vector<std::pair<std::size_t, std::size_t>> ranges(instruction_shards.size());
-    auto bounds_done = parallel_run_shards(instruction_shards,
-        [&](std::size_t shard, parallel_shard_t range) -> workspace_result_t<void> {
-            const auto& facts = snapshot.target_facts;
-            const auto first_owner = kInstructionEntityTag |
-                static_cast<std::uint64_t>(range.begin + 1);
-            std::size_t lo = 0;
-            std::size_t hi = facts.size();
-            while (lo < hi) {
-                const auto mid = lo + (hi - lo) / 2;
-                if (facts[mid].instruction_id < first_owner)
-                    lo = mid + 1;
-                else
-                    hi = mid;
-            }
-            std::size_t cursor = lo;
-            const auto begin_cursor = cursor;
-            std::uint64_t polls = 0;
-            for (std::size_t index = range.begin; index < range.end; ++index) {
-                if (++polls >= kCancellationStride) {
-                    polls = 0;
-                    if (cancel.stop_requested())
-                        return workspace_result_t<void>::failure(
-                            materialize_cancellation_error(cancel));
-                }
-                if (cursor > (std::numeric_limits<std::uint32_t>::max)()) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::limit_exceeded,
-                        "tile decode target table exceeds Compact IR capacity",
-                        "decode_merge"));
-                }
-                const auto owner = kInstructionEntityTag |
-                    static_cast<std::uint64_t>(index + 1);
-                const auto begin = cursor;
-                while (cursor < facts.size() &&
-                       facts[cursor].instruction_id == owner)
-                    ++cursor;
-                const auto count = cursor - begin;
-                if (count > (std::numeric_limits<std::uint16_t>::max)()) {
-                    return workspace_result_t<void>::failure(make_workspace_error(
-                        workspace_error_code_t::limit_exceeded,
-                        "tile decode target count exceeds Compact IR capacity",
-                        "decode_merge"));
-                }
-                snapshot.instructions[index].target_fact_begin =
-                    static_cast<std::uint32_t>(begin);
-                snapshot.instructions[index].target_fact_count =
-                    static_cast<std::uint16_t>(count);
-            }
-            ranges[shard] = {begin_cursor, cursor};
-            return workspace_result_t<void>::success();
-        }, cancel);
-    if (!bounds_done)
-        return bounds_done;
-    std::size_t expected = 0;
-    bool grouped = true;
-    for (const auto& range : ranges) {
-        if (range.first != expected) {
-            grouped = false;
-            break;
+        static_cast<std::uint64_t>(shard.instruction_count());
+    const auto operand_count = static_cast<std::uint64_t>(shard.operand_count());
+    const auto target_count = static_cast<std::uint64_t>(shard.target_fact_count());
+    std::uint64_t operand_cursor = 0;
+    std::uint64_t target_cursor = 0;
+    std::uint64_t polls = 0;
+    for (std::uint64_t index = 0; index < instruction_count; ++index) {
+        if (++polls >= kCancellationStride) {
+            polls = 0;
+            if (cancel.stop_requested())
+                return workspace_result_t<void>::failure(
+                    materialize_cancellation_error(cancel));
         }
-        expected = range.second;
+        auto instruction = view.instruction(static_cast<std::size_t>(index));
+        if (!instruction) {
+            return workspace_result_t<void>::failure(materialize_integrity_error(
+                "tile decode instruction compatibility row is missing"));
+        }
+        instruction->id = kInstructionEntityTag | (instruction_base + index + 1ULL);
+        const auto operand_first = operand_cursor;
+        while (operand_cursor < operand_count) {
+            if (++polls >= kCancellationStride) {
+                polls = 0;
+                if (cancel.stop_requested())
+                    return workspace_result_t<void>::failure(
+                        materialize_cancellation_error(cancel));
+            }
+            auto operand = view.operand(static_cast<std::size_t>(operand_cursor));
+            if (!operand) {
+                return workspace_result_t<void>::failure(materialize_integrity_error(
+                    "tile decode operand compatibility row is missing"));
+            }
+            auto owner = resolve_instruction_owner(operand->instruction_id,
+                shard_id, instruction_count, "operand");
+            if (!owner)
+                return workspace_result_t<void>::failure(owner.error());
+            if (owner.value() > index)
+                break;
+            if (owner.value() < index) {
+                return workspace_result_t<void>::failure(materialize_integrity_error(
+                    "tile decode operand rows are not grouped by instruction"));
+            }
+            operand->instruction_id = kInstructionEntityTag |
+                (instruction_base + static_cast<std::uint64_t>(owner.value()) + 1ULL);
+            snapshot.operand_facts[static_cast<std::size_t>(operand_base + operand_cursor)] =
+                std::move(*operand);
+            ++operand_cursor;
+        }
+        const auto operand_group = operand_cursor - operand_first;
+        if (operand_group > (std::numeric_limits<std::uint16_t>::max)()) {
+            return workspace_result_t<void>::failure(materialize_limit_error(
+                "tile decode operand count exceeds Compact IR capacity"));
+        }
+        if (operand_base + operand_first >
+            (std::numeric_limits<std::uint32_t>::max)()) {
+            return workspace_result_t<void>::failure(materialize_limit_error(
+                "tile decode operand table exceeds Compact IR capacity"));
+        }
+        instruction->operand_fact_begin =
+            static_cast<std::uint32_t>(operand_base + operand_first);
+        instruction->operand_fact_count = static_cast<std::uint16_t>(operand_group);
+        const auto target_first = target_cursor;
+        while (target_cursor < target_count) {
+            if (++polls >= kCancellationStride) {
+                polls = 0;
+                if (cancel.stop_requested())
+                    return workspace_result_t<void>::failure(
+                        materialize_cancellation_error(cancel));
+            }
+            auto target = view.target_fact(static_cast<std::size_t>(target_cursor));
+            if (!target) {
+                return workspace_result_t<void>::failure(materialize_integrity_error(
+                    "tile decode target compatibility row is missing"));
+            }
+            auto owner = resolve_instruction_owner(target->instruction_id,
+                shard_id, instruction_count, "target");
+            if (!owner)
+                return workspace_result_t<void>::failure(owner.error());
+            if (owner.value() > index)
+                break;
+            if (owner.value() < index) {
+                return workspace_result_t<void>::failure(materialize_integrity_error(
+                    "tile decode target rows are not grouped by instruction"));
+            }
+            target->instruction_id = kInstructionEntityTag |
+                (instruction_base + static_cast<std::uint64_t>(owner.value()) + 1ULL);
+            snapshot.target_facts[static_cast<std::size_t>(target_base + target_cursor)] =
+                std::move(*target);
+            ++target_cursor;
+        }
+        const auto target_group = target_cursor - target_first;
+        if (target_group > (std::numeric_limits<std::uint16_t>::max)()) {
+            return workspace_result_t<void>::failure(materialize_limit_error(
+                "tile decode target count exceeds Compact IR capacity"));
+        }
+        if (target_base + target_first >
+            (std::numeric_limits<std::uint32_t>::max)()) {
+            return workspace_result_t<void>::failure(materialize_limit_error(
+                "tile decode target table exceeds Compact IR capacity"));
+        }
+        instruction->target_fact_begin =
+            static_cast<std::uint32_t>(target_base + target_first);
+        instruction->target_fact_count = static_cast<std::uint16_t>(target_group);
+        snapshot.instructions[static_cast<std::size_t>(instruction_base + index)] =
+            std::move(*instruction);
     }
-    if (!grouped || expected != snapshot.target_facts.size()) {
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::integrity_failure,
-            "tile decode target rows are not grouped by instruction", "decode_merge"));
+    if (operand_cursor != operand_count) {
+        return workspace_result_t<void>::failure(materialize_integrity_error(
+            "tile decode operand rows are not grouped by instruction"));
     }
-    if (decoded.delay_slot_counts.size() != snapshot.instructions.size()) {
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::integrity_failure,
-            "tile decode delay-slot metadata is not instruction-aligned", "decode_merge"));
+    if (target_cursor != target_count) {
+        return workspace_result_t<void>::failure(materialize_integrity_error(
+            "tile decode target rows are not grouped by instruction"));
     }
-    snapshot.delay_slot_counts = std::move(decoded.delay_slot_counts);
-    decoded.packed_store.reset();
+    shard.release();
     return workspace_result_t<void>::success();
 }
 
@@ -370,29 +249,70 @@ namespace decode_materializer {
 
 workspace_result_t<void> materialize(
     tile_decode_orchestration_result_t& decoded, analysis_snapshot_t& snapshot,
-    std::uint64_t remaining_budget_bytes, const cancellation_token_t& cancel) {
-    if (!decoded.packed_store || !decoded.packed_store->valid()) {
+    std::uint64_t remaining_budget_bytes, std::uint32_t workers,
+    const cancellation_token_t& cancel) {
+    auto bases = compute_shard_bases(decoded.packed_shards);
+    if (!bases)
+        return workspace_result_t<void>::failure(bases.error());
+    auto ordinals = bases.take_value();
+    std::uint64_t required_bytes = 0;
+    std::uint64_t term = 0;
+    if (!checked_mul_u64(ordinals.instruction_total,
+            static_cast<std::uint64_t>(sizeof(instruction_record_t)), term) ||
+        !checked_add_u64(required_bytes, term, required_bytes) ||
+        !checked_mul_u64(ordinals.operand_total,
+            static_cast<std::uint64_t>(sizeof(operand_fact_t)), term) ||
+        !checked_add_u64(required_bytes, term, required_bytes) ||
+        !checked_mul_u64(ordinals.target_total,
+            static_cast<std::uint64_t>(sizeof(target_fact_t)), term) ||
+        !checked_add_u64(required_bytes, term, required_bytes) ||
+        !checked_add_u64(required_bytes,
+            static_cast<std::uint64_t>(decoded.delay_slot_counts.size()),
+            required_bytes)) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "tile decode memory accounting overflows", "memory_budget"));
+    }
+    if (required_bytes > remaining_budget_bytes) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "decoded snapshot exceeds analysis memory budget", "decode_merge"));
+    }
+    snapshot.instructions.clear();
+    snapshot.operand_facts.clear();
+    snapshot.target_facts.clear();
+    snapshot.instructions.resize(static_cast<std::size_t>(ordinals.instruction_total));
+    snapshot.operand_facts.resize(static_cast<std::size_t>(ordinals.operand_total));
+    snapshot.target_facts.resize(static_cast<std::size_t>(ordinals.target_total));
+    const auto shard_ranges =
+        parallel_shards(decoded.packed_shards.size(), workers);
+    auto materialized = parallel_run_shards(shard_ranges,
+        [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
+            for (std::size_t shard_index = range.begin; shard_index < range.end;
+                 ++shard_index) {
+                if (cancel.stop_requested())
+                    return workspace_result_t<void>::failure(
+                        materialize_cancellation_error(cancel));
+                auto consumed = materialize_shard_rows(
+                    decoded.packed_shards[shard_index], snapshot,
+                    ordinals.instruction_bases[shard_index],
+                    ordinals.operand_bases[shard_index],
+                    ordinals.target_bases[shard_index], cancel);
+                if (!consumed)
+                    return consumed;
+            }
+            return workspace_result_t<void>::success();
+        }, cancel);
+    if (!materialized)
+        return materialized;
+    if (decoded.delay_slot_counts.size() != snapshot.instructions.size()) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
-            "tile decode did not publish a valid packed store", "decode_merge"));
+            "tile decode delay-slot metadata is not instruction-aligned", "decode_merge"));
     }
-    auto validated = decoded.packed_store->validate();
-    if (!validated) {
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::integrity_failure,
-            "tile decode packed store validation failed", "decode_merge"));
-    }
-    const auto workers = parallel_worker_count();
-    const auto count =
-        static_cast<std::size_t>(decoded.packed_store->instruction_count());
-    if (remaining_budget_bytes < kLowMemoryR0Bytes) {
-        id_retag_sorted_t retag;
-        retag.initialize(count, workers, cancel);
-        return materialize_copy(decoded, snapshot, workers, cancel, retag);
-    }
-    id_retag_table_t retag;
-    retag.initialize(count, workers, cancel);
-    return materialize_copy(decoded, snapshot, workers, cancel, retag);
+    snapshot.delay_slot_counts = std::move(decoded.delay_slot_counts);
+    decoded.packed_shards.clear();
+    return workspace_result_t<void>::success();
 }
 
 }

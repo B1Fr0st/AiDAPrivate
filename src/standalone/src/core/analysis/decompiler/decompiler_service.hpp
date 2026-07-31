@@ -115,6 +115,8 @@ struct decompiler_pipeline_result_t {
     std::shared_ptr<const decompiler_rendered_cache_value_t> rendered_stage;
     std::optional<pseudocode_readability_report_t> readability;
     std::optional<decompiler_cache_stage_t> cache_hit_stage;
+    decompiler_semantic_proof_availability_t semantic_proof_availability =
+        decompiler_semantic_proof_availability_t::not_requested;
     std::vector<decompiler_diagnostic_t> diagnostics;
     std::uint64_t elapsed_wall_clock_ms = 0;
 
@@ -151,6 +153,8 @@ struct decompiler_pipeline_service_snapshot_t {
     std::uint64_t provider_ir_cache_hits = 0;
     std::uint64_t normalized_cache_hits = 0;
     std::uint64_t rendered_cache_hits = 0;
+    std::uint64_t semantic_proof_requests = 0;
+    std::uint64_t semantic_proof_adapter_denials = 0;
     std::size_t active_requests = 0;
     bool accepting = false;
 };

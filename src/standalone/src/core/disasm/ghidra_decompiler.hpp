@@ -95,6 +95,7 @@ struct ghidra_decompile_result_limits_t {
 	size_t max_callees = 65536;
 	uint64_t max_result_bytes = 16ULL * 1024ULL * 1024ULL;
 	bool capture_printc_evidence = false;
+	bool keep_fixateglobals = false;
 };
 
 struct ghidra_adapter_decompile_cache_key_t {
@@ -1058,7 +1059,8 @@ struct prepared_arch_t {
 	                std::vector<aida_ghidra::region_t> extra_regions = {},
 	                uint64_t total_image_size = 0,
 	                aida::analysis::architecture_mode_t architecture_mode =
-					aida::analysis::architecture_mode_t::unknown)
+					aida::analysis::architecture_mode_t::unknown,
+	                bool keep_fixateglobals = false)
 	{
 		const auto init_started = std::chrono::steady_clock::now();
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
@@ -1069,6 +1071,7 @@ struct prepared_arch_t {
 			loader->add_region(reg.start_va, std::move(reg.data));
 		}
 		arch = std::make_unique<aida_ghidra::architecture_t>(sleigh_id, &err);
+		arch->set_keep_fixateglobals(keep_fixateglobals);
 		arch->take_loader(std::move(loader));
 
 		ghidra::DocumentStorage store;
@@ -1088,7 +1091,8 @@ struct prepared_arch_t {
 		uint64_t load_base,
 		std::function<bool()> cancel_check,
 		const std::string& sleigh_id,
-		std::vector<aida_ghidra::provider_patch_t> patches = {})
+		std::vector<aida_ghidra::provider_patch_t> patches = {},
+		bool keep_fixateglobals = false)
 	{
 		const auto init_started = std::chrono::steady_clock::now();
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
@@ -1096,6 +1100,7 @@ struct prepared_arch_t {
 			std::move(cancel_check),
 			std::move(patches));
 		arch = std::make_unique<aida_ghidra::architecture_t>(sleigh_id, &err);
+		arch->set_keep_fixateglobals(keep_fixateglobals);
 		arch->take_loader(std::move(loader));
 
 		ghidra::DocumentStorage store;
@@ -1108,7 +1113,8 @@ struct prepared_arch_t {
 		aida::analysis::address_space_id_t address_space,
 		aida::analysis::architecture_mode_t architecture_mode,
 		std::function<bool()> cancel_check,
-		const std::string& sleigh_id)
+		const std::string& sleigh_id,
+		bool keep_fixateglobals = false)
 	{
 #if defined(AIDA_C03_ISOLATED_NATIVE_DECOMPILER_WORKER)
 		static_cast<void>(image);
@@ -1116,6 +1122,7 @@ struct prepared_arch_t {
 		static_cast<void>(architecture_mode);
 		static_cast<void>(cancel_check);
 		static_cast<void>(sleigh_id);
+		static_cast<void>(keep_fixateglobals);
 		throw ghidra::LowlevelError("normalized workspace decompilation is unavailable in the isolated worker");
 #else
 		if (!image)
@@ -1132,6 +1139,7 @@ struct prepared_arch_t {
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
 			std::move(image), address_space, std::move(cancel_check));
 		arch = std::make_unique<aida_ghidra::architecture_t>(sleigh_id, &err);
+		arch->set_keep_fixateglobals(keep_fixateglobals);
 		arch->take_loader(std::move(loader));
 
 		ghidra::DocumentStorage store;
@@ -1706,7 +1714,7 @@ inline ghidra_result_t decompile_isolated_buffer(
 	}
 	try {
 		detail::prepared_arch_t prepared(data, size, base_addr, nullptr, cancel, sleigh_id,
-			{}, 0, typed_request.language.mode);
+			{}, 0, typed_request.language.mode, result_limits.keep_fixateglobals);
 		result = detail::do_decompile(prepared.arch.get(), entry_addr, cancel, deadline,
 			result_limits, &typed_request);
 	} catch (ghidra::LowlevelError& error) {
@@ -1774,7 +1782,8 @@ inline ghidra_result_t decompile_isolated_regions(
 		auto primary = std::move(regions[entry_region]);
 		regions.erase(regions.begin() + static_cast<std::ptrdiff_t>(entry_region));
 		detail::prepared_arch_t prepared(primary.data.data(), primary.data.size(),
-			primary.start_va, nullptr, cancel, sleigh_id, std::move(regions), image_size);
+			primary.start_va, nullptr, cancel, sleigh_id, std::move(regions), image_size,
+			aida::analysis::architecture_mode_t::unknown, result_limits.keep_fixateglobals);
 		detail::prepared_arch_t::apply_execution_mode(*prepared.arch,
 			architecture_mode, image_base, image_size);
 		result = detail::do_decompile(prepared.arch.get(), entry_addr, cancel, deadline,
@@ -1800,13 +1809,15 @@ struct arch_pool_key_t {
 		aida::analysis::architecture_mode_t::unknown;
 	aida::analysis::endian_t endian = aida::analysis::endian_t::little;
 	aida::analysis::sha256_digest_t snapshot_hash;
+	bool keep_fixateglobals = false;
 
 	bool matches(const arch_pool_key_t& other) const noexcept
 	{
 		return language_id == other.language_id &&
 			compiler_spec_id == other.compiler_spec_id &&
 			architecture_mode == other.architecture_mode && endian == other.endian &&
-			snapshot_hash.constant_time_equal(other.snapshot_hash);
+			snapshot_hash.constant_time_equal(other.snapshot_hash) &&
+			keep_fixateglobals == other.keep_fixateglobals;
 	}
 };
 
@@ -1932,7 +1943,8 @@ inline arch_session_entry_create_t make_arch_session_entry(
 	std::vector<aida_ghidra::region_t> regions,
 	uint64_t image_base,
 	uint64_t image_size,
-	arch_pool_key_t key)
+	arch_pool_key_t key,
+	bool keep_fixateglobals)
 {
 	arch_session_entry_create_t output;
 	if (regions.empty() || image_size == 0 || key.language_id.empty()) {
@@ -1962,7 +1974,8 @@ inline arch_session_entry_create_t make_arch_session_entry(
 		entry->prepared = std::make_unique<detail::prepared_arch_t>(
 			nullptr, 0, 0,
 			nullptr, &entry->loader_cancel, entry->key.language_id,
-			std::move(regions), image_size);
+			std::move(regions), image_size,
+			aida::analysis::architecture_mode_t::unknown, keep_fixateglobals);
 		detail::prepared_arch_t::apply_execution_mode(*entry->prepared->arch,
 			entry->key.architecture_mode, image_base, image_size);
 		entry->arch_init_ms = entry->prepared->init_ms;
@@ -2092,7 +2105,8 @@ inline ghidra_result_t decompile_workspace(
 
 	try {
 		detail::prepared_arch_t prepared(load_image, address_space,
-			identity.architecture_mode(), cancel_check, descriptor->sleigh_id);
+			identity.architecture_mode(), cancel_check, descriptor->sleigh_id,
+			result_limits.keep_fixateglobals);
 		aida_ghidra::populate_from_workspace(prepared.arch->symbol_database(),
 			identity, snapshot ? snapshot->image.get() : nullptr, snapshot.get());
 		if ((cancel && cancel->load(std::memory_order_acquire)) ||
@@ -2383,6 +2397,7 @@ make_ghidra_adapter_decompile_cache_key(
 		append_number(static_cast<uint64_t>(request.result_limits.max_callees));
 		append_number(request.result_limits.max_result_bytes);
 		append_number(request.result_limits.capture_printc_evidence ? 1U : 0U);
+		append_number(request.result_limits.keep_fixateglobals ? 1U : 0U);
 		auto digest = aida::analysis::sha256_text(material, cancel);
 		if (!digest) {
 			return aida::analysis::workspace_result_t<ghidra_adapter_decompile_cache_key_t>::failure(

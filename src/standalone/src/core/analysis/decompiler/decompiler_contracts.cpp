@@ -4,6 +4,7 @@
 #include <array>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -708,6 +709,59 @@ bool read_document_source_map(canonical_reader_t& reader, decompiler_document_so
     return read_token_range(reader, value.document_range) && read_vector(reader, value.coordinates, read_coordinate);
 }
 
+void write_readability_settings(canonical_writer_t& writer, const readability_transform_settings_t& value)
+{
+    writer.boolean(value.enable_variable_renaming);
+    writer.boolean(value.enable_expression_simplification);
+    writer.boolean(value.enable_temporary_coalescing);
+    writer.boolean(value.enable_loop_counter_naming);
+    writer.boolean(value.enable_api_call_naming);
+    writer.boolean(value.enable_type_based_naming);
+    writer.boolean(value.enable_string_reference_naming);
+    writer.boolean(value.enable_constant_folding);
+    writer.boolean(value.enable_identity_simplification);
+    writer.boolean(value.enable_cast_simplification);
+    writer.boolean(value.enable_comparison_normalization);
+    writer.boolean(value.enable_compound_assignment_marking);
+    writer.boolean(value.enable_double_negation_simplification);
+    writer.boolean(value.enable_single_use_inlining);
+    writer.boolean(value.enable_copy_propagation);
+    writer.boolean(value.enable_dead_store_elimination);
+    writer.u32(value.max_transform_iterations > (std::numeric_limits<std::uint32_t>::max)()
+        ? (std::numeric_limits<std::uint32_t>::max)()
+        : static_cast<std::uint32_t>(value.max_transform_iterations));
+    writer.u32(value.max_expression_depth > (std::numeric_limits<std::uint32_t>::max)()
+        ? (std::numeric_limits<std::uint32_t>::max)()
+        : static_cast<std::uint32_t>(value.max_expression_depth));
+}
+
+bool read_readability_settings(canonical_reader_t& reader, readability_transform_settings_t& value)
+{
+    std::uint32_t iterations = 0;
+    std::uint32_t depth = 0;
+    if (!(reader.boolean(value.enable_variable_renaming) &&
+        reader.boolean(value.enable_expression_simplification) &&
+        reader.boolean(value.enable_temporary_coalescing) &&
+        reader.boolean(value.enable_loop_counter_naming) &&
+        reader.boolean(value.enable_api_call_naming) &&
+        reader.boolean(value.enable_type_based_naming) &&
+        reader.boolean(value.enable_string_reference_naming) &&
+        reader.boolean(value.enable_constant_folding) &&
+        reader.boolean(value.enable_identity_simplification) &&
+        reader.boolean(value.enable_cast_simplification) &&
+        reader.boolean(value.enable_comparison_normalization) &&
+        reader.boolean(value.enable_compound_assignment_marking) &&
+        reader.boolean(value.enable_double_negation_simplification) &&
+        reader.boolean(value.enable_single_use_inlining) &&
+        reader.boolean(value.enable_copy_propagation) &&
+        reader.boolean(value.enable_dead_store_elimination) &&
+        reader.u32(iterations) && reader.u32(depth)))
+        return false;
+    value.max_transform_iterations = iterations;
+    value.max_expression_depth = depth;
+    return true;
+}
+
 void write_renderer(canonical_writer_t& writer, const decompiler_renderer_settings_t& value)
 {
     writer.u32(value.schema_version);
@@ -716,13 +770,18 @@ void write_renderer(canonical_writer_t& writer, const decompiler_renderer_settin
     writer.boolean(value.emit_type_annotations);
     writer.boolean(value.emit_provenance_annotations);
     writer.boolean(value.emit_unknown_tokens);
+    write_readability_settings(writer, value.readability);
 }
 
 bool read_renderer(canonical_reader_t& reader, decompiler_renderer_settings_t& value)
 {
-    return reader.u32(value.schema_version) && reader.string(value.style_id) &&
+    if (!(reader.u32(value.schema_version) && reader.string(value.style_id) &&
         reader.u32(value.indentation_spaces) && reader.boolean(value.emit_type_annotations) &&
-        reader.boolean(value.emit_provenance_annotations) && reader.boolean(value.emit_unknown_tokens);
+        reader.boolean(value.emit_provenance_annotations) && reader.boolean(value.emit_unknown_tokens)))
+        return false;
+    if (value.schema_version != 2)
+        return false;
+    return read_readability_settings(reader, value.readability);
 }
 
 void write_profile(canonical_writer_t& writer, const decompiler_profile_budget_t& value)
@@ -919,8 +978,10 @@ bool language_matches_entity(const decompiler_language_identity_t& language, con
 
 bool valid_renderer(const decompiler_renderer_settings_t& value) noexcept
 {
-    return value.schema_version == 1 && !value.style_id.empty() && value.indentation_spaces >= 1 &&
-        value.indentation_spaces <= 16;
+    return value.schema_version == 2 && !value.style_id.empty() && value.indentation_spaces >= 1 &&
+        value.indentation_spaces <= 16 &&
+        value.readability.max_transform_iterations >= 1 && value.readability.max_transform_iterations <= 16 &&
+        value.readability.max_expression_depth >= 16 && value.readability.max_expression_depth <= 4096;
 }
 
 bool valid_diagnostic_severity(decompiler_diagnostic_severity_t value) noexcept
@@ -933,7 +994,7 @@ bool valid_diagnostic_severity(decompiler_diagnostic_severity_t value) noexcept
 bool valid_diagnostic_code(decompiler_diagnostic_code_t value) noexcept
 {
     return value >= decompiler_diagnostic_code_t::invalid_contract &&
-        value <= decompiler_diagnostic_code_t::source_map_rejected;
+        value <= decompiler_diagnostic_code_t::partial_decompilation;
 }
 
 bool valid_diagnostic(const decompiler_diagnostic_t& value)

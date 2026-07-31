@@ -12,27 +12,6 @@ namespace aida::analysis {
 
 constexpr std::uint32_t k_pseudocode_readability_schema_version = 2;
 
-struct readability_transform_settings_t {
-    bool enable_variable_renaming = true;
-    bool enable_expression_simplification = true;
-    bool enable_temporary_coalescing = true;
-    bool enable_loop_counter_naming = true;
-    bool enable_api_call_naming = true;
-    bool enable_type_based_naming = true;
-    bool enable_string_reference_naming = true;
-    bool enable_constant_folding = true;
-    bool enable_identity_simplification = true;
-    bool enable_cast_simplification = true;
-    bool enable_comparison_normalization = true;
-    bool enable_compound_assignment_marking = true;
-    bool enable_double_negation_simplification = true;
-    bool enable_single_use_inlining = true;
-    bool enable_copy_propagation = true;
-    bool enable_dead_store_elimination = true;
-    std::size_t max_transform_iterations = 4;
-    std::size_t max_expression_depth = 256;
-};
-
 struct readability_transform_metrics_t {
     std::uint64_t variables_renamed = 0;
     std::uint64_t loop_counters_named = 0;
@@ -63,6 +42,10 @@ readability_transform_result_t apply_readability_transforms(
     typed_pseudocode_ast_v2_t& ast,
     const type_graph_t& type_graph,
     const readability_transform_settings_t& settings = {});
+
+bool readability_transforms_enabled(const readability_transform_settings_t& settings) noexcept;
+
+readability_transform_settings_t to_rt_settings(const readability_transform_settings_t& settings) noexcept;
 
 enum class pseudocode_baseline_provider_t : std::uint8_t {
     ghidra_printc = 1,
