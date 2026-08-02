@@ -147,6 +147,7 @@ bool binary_bitvector_opcode(triton_z3_ir_opcode_t value) noexcept
     case triton_z3_ir_opcode_t::shift_left:
     case triton_z3_ir_opcode_t::logical_shift_right:
     case triton_z3_ir_opcode_t::arithmetic_shift_right:
+    case triton_z3_ir_opcode_t::multiply:
         return true;
     default:
         return false;
@@ -431,6 +432,9 @@ public:
                     break;
                 case triton_z3_ir_opcode_t::arithmetic_shift_right:
                     expression = ast->bvashr(expressions[node.lhs_id], expressions[node.rhs_id]);
+                    break;
+                case triton_z3_ir_opcode_t::multiply:
+                    expression = ast->bvmul(expressions[node.lhs_id], expressions[node.rhs_id]);
                     break;
                 case triton_z3_ir_opcode_t::equal:
                     expression = ast->equal(expressions[node.lhs_id], expressions[node.rhs_id]);

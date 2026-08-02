@@ -356,6 +356,13 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va, bo
 
 namespace disasm
 {
+    struct format_page_decoder_cache_t
+    {
+        aida::analysis::architecture_mode_t mode =
+            aida::analysis::architecture_mode_t::unknown;
+        std::unique_ptr<aida::analysis::worker_owned_x86_decoder_t> decoder;
+    };
+
     inline bool bind_workspace(const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
                                DisasmFile& out)
     {
@@ -429,9 +436,16 @@ namespace disasm
                                      "Instruction publication does not match the workspace generation",
                                      "disasm.format_page"));
         }
-        auto decoder = worker_owned_x86_decoder_t::create(image->architecture_mode());
-        if (!decoder)
-            return workspace_result_t<std::vector<AsmInstr>>::failure(decoder.error());
+        thread_local format_page_decoder_cache_t decoder_cache;
+        const auto decoder_mode = image->architecture_mode();
+        if (decoder_cache.decoder == nullptr || decoder_cache.mode != decoder_mode) {
+            auto created = worker_owned_x86_decoder_t::create(decoder_mode);
+            if (!created)
+                return workspace_result_t<std::vector<AsmInstr>>::failure(created.error());
+            decoder_cache.decoder = std::move(created.value());
+            decoder_cache.mode = decoder_mode;
+        }
+        auto* decoder = decoder_cache.decoder.get();
         const size_t remaining = publication->snapshot->instructions.size() - offset;
         const size_t end = offset + (std::min)(remaining, count);
         std::vector<AsmInstr> result;
@@ -447,7 +461,7 @@ namespace disasm
                 return workspace_result_t<std::vector<AsmInstr>>::failure(std::move(error));
             }
             const auto& record = publication->snapshot->instructions[index];
-            auto text = decoder.value()->format_one(workspace->provider(), *image, record, {}, cancel);
+            auto text = decoder->format_one(workspace->provider(), *image, record, {}, cancel);
             if (!text)
                 return workspace_result_t<std::vector<AsmInstr>>::failure(text.error());
             AsmInstr formatted;

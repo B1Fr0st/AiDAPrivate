@@ -61,6 +61,13 @@ struct decompiler_profile_policy_t {
 
 decompiler_profile_policy_t default_decompiler_profile_policy();
 
+std::shared_ptr<const decompiler_render_evidence_t> build_render_evidence_from_sidecar(
+    const void* sidecar_data,
+    std::size_t sidecar_size,
+    std::uint64_t image_base);
+
+void build_render_evidence_typelib_overlay(decompiler_render_evidence_t& evidence);
+
 enum class decompiler_rendered_probe_stage_t : std::uint8_t {
     none = 0,
     memory_rendered = 1,
@@ -135,6 +142,8 @@ struct decompiler_pipeline_service_config_t {
     pseudocode_readability_limits_t readability_limits;
     bool require_complete_source_map = true;
     bool batch_rendered_only_memory_cache = true;
+    bool batch_attestation_enabled = true;
+    std::uint32_t batch_attestation_sample_rate = 8;
     std::shared_ptr<workspace_database_t> database;
     std::shared_ptr<analysis_metrics_t> metrics_sink;
 };
@@ -163,6 +172,9 @@ struct decompiler_pipeline_service_snapshot_t {
     std::uint64_t attest_stage_completed = 0;
     std::size_t attest_in_flight = 0;
     std::size_t attest_in_flight_peak = 0;
+    std::uint64_t attestation_sampled_full = 0;
+    std::uint64_t attestation_validated = 0;
+    std::uint64_t attestation_mismatch = 0;
 };
 
 class decompiler_pipeline_service_t final {

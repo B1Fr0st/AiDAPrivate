@@ -525,6 +525,62 @@ void verify_readability_golden_output(const decompiler_entity_key_t& entity_valu
         "readability golden output is not a valid typed AST");
 }
 
+void verify_new_pass_parity_on_golden(const decompiler_entity_key_t& entity_value)
+{
+    const auto types = golden_type_graph(entity_value);
+    const auto source = golden_ast(entity_value, types);
+    readability_transform_settings_t explicit_new_passes;
+    explicit_new_passes.enable_string_literal_substitution = true;
+    explicit_new_passes.enable_cast_idiom_folding = true;
+    explicit_new_passes.enable_bit_operation_idioms = true;
+    explicit_new_passes.enable_loop_intrinsic_idioms = true;
+    explicit_new_passes.enable_magic_division_recognition = true;
+    auto explicit_ast = source;
+    const auto explicit_result = apply_readability_transforms(explicit_ast, types, explicit_new_passes);
+    readability_transform_settings_t disabled_new_passes;
+    disabled_new_passes.enable_string_literal_substitution = false;
+    disabled_new_passes.enable_cast_idiom_folding = false;
+    disabled_new_passes.enable_bit_operation_idioms = false;
+    disabled_new_passes.enable_loop_intrinsic_idioms = false;
+    disabled_new_passes.enable_magic_division_recognition = false;
+    auto disabled_ast = source;
+    const auto disabled_result = apply_readability_transforms(disabled_ast, types, disabled_new_passes);
+    require(explicit_result.diagnostics.empty() && disabled_result.diagnostics.empty(),
+        "new readability passes emitted diagnostics on the golden fixture");
+    require(same_transform_metrics(explicit_result.metrics, disabled_result.metrics) &&
+            explicit_result.metrics.string_literals_inlined == 0 &&
+            explicit_result.metrics.cast_masks_folded == 0 &&
+            explicit_result.metrics.bit_operation_idioms_rewritten == 0 &&
+            explicit_result.metrics.loop_intrinsics_rewritten == 0 &&
+            explicit_result.metrics.magic_divisions_recognized == 0 &&
+            explicit_result.metrics.global_scalar_comments_injected == 0,
+        "new readability passes changed golden metrics or fired without matching patterns");
+    require(same_ast_nodes(explicit_ast, disabled_ast) &&
+            stable_serialization_hash(explicit_ast) == stable_serialization_hash(disabled_ast),
+        "new readability passes are not proven no-ops on the golden fixture");
+    require(explicit_result.metrics.dead_stores_eliminated == 4 &&
+            explicit_result.metrics.nodes_removed == 12,
+        "linearized def-use passes changed golden dead-store or compaction counters");
+
+    readability_transform_settings_t raised_cap = to_rt_settings({});
+    require(raised_cap.max_transform_nodes == 250000 &&
+            raised_cap.max_transform_work_units == 4000000,
+        "readability settings clamp diverged from the 250k-node/4M-work defaults");
+    readability_transform_settings_t clamped;
+    clamped.max_transform_nodes = 1;
+    clamped.max_transform_work_units = 1;
+    const auto clamped_result = to_rt_settings(clamped);
+    require(clamped_result.max_transform_nodes == 10000 &&
+            clamped_result.max_transform_work_units == 65536,
+        "readability settings clamp lost its floor bounds");
+    clamped.max_transform_nodes = 10000000;
+    clamped.max_transform_work_units = std::numeric_limits<std::size_t>::max();
+    const auto clamped_ceiling = to_rt_settings(clamped);
+    require(clamped_ceiling.max_transform_nodes == 500000 &&
+            clamped_ceiling.max_transform_work_units == (std::size_t{1} << 26),
+        "readability settings clamp lost its ceiling bounds");
+}
+
 void verify_baseline_capture(
     const typed_pseudocode_ast_v2_t& valid_ast,
     const decompiler_document_t& document)
@@ -702,6 +758,7 @@ void run_decompiler_readability_harness()
     verify_diagnostic_and_mapping_preservation(valid_ast, valid_document);
     verify_bounded_deterministic_view(valid_document);
     verify_readability_golden_output(entity_value);
+    verify_new_pass_parity_on_golden(entity_value);
     verify_baseline_capture(valid_ast, valid_document);
     verify_pseudocode_document_delivery(valid_document);
     verify_reconstructor_gate(valid_document, empty_document);

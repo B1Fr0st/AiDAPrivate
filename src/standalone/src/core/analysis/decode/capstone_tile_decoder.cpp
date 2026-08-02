@@ -26,6 +26,16 @@ std::uint64_t combine(std::uint64_t seed, std::uint64_t value) noexcept
     return mix(seed ^ (mix(value) + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U)));
 }
 
+bool same_identity_fields(const byte_provider_identity_t& lhs,
+                          const byte_provider_identity_t& rhs) noexcept
+{
+    return lhs.normalized_source == rhs.normalized_source &&
+           lhs.size == rhs.size &&
+           lhs.volume_serial == rhs.volume_serial &&
+           lhs.file_id == rhs.file_id &&
+           lhs.last_write_time_100ns == rhs.last_write_time_100ns;
+}
+
 bool exceeds(std::uint64_t current, std::uint64_t requested, std::uint64_t limit) noexcept
 {
     return current > limit || requested > limit - current;
@@ -378,9 +388,18 @@ workspace_result_t<capstone_tile_result_t> worker_owned_capstone_tile_decoder_t:
                                    tile_limits_, snapshot);
     if (!valid)
         return workspace_result_t<capstone_tile_result_t>::failure(valid.error());
-    auto source_valid = snapshot.validate_source();
-    if (!source_valid)
-        return workspace_result_t<capstone_tile_result_t>::failure(source_valid.error());
+    bool validated_this_call = false;
+    if (!source_validated_ || source_generation_ != snapshot.generation() ||
+        !same_identity_fields(source_identity_, snapshot.source_identity())) {
+        auto source_valid = snapshot.validate_source();
+        if (!source_valid)
+            return workspace_result_t<capstone_tile_result_t>::failure(
+                source_valid.error());
+        source_validated_ = true;
+        source_generation_ = snapshot.generation();
+        source_identity_ = snapshot.source_identity();
+        validated_this_call = true;
+    }
     const std::uint64_t minimum = worker_->registration().limits.minimum_instruction_bytes;
     if (identity.byte_count / minimum + (identity.byte_count % minimum == 0 ? 0 : 1) >
         tile_limits_.maximum_instruction_records) {
@@ -398,6 +417,7 @@ workspace_result_t<capstone_tile_result_t> worker_owned_capstone_tile_decoder_t:
         result.usage.input_bytes = identity.byte_count;
         result.usage.snapshot_window_leases = 1;
         result.usage.snapshot_window_bytes = identity.byte_count;
+        result.usage.source_validations = validated_this_call ? 1 : 0;
         const std::size_t record_capacity = static_cast<std::size_t>(
             identity.byte_count / minimum + (identity.byte_count % minimum == 0 ? 0 : 1));
         result.instructions.reserve(record_capacity);

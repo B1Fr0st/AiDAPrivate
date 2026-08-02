@@ -145,6 +145,7 @@ struct fact_page_cache_t::state_t {
     std::atomic<std::uint64_t> admissions{0};
     std::atomic<std::uint64_t> admission_rejections{0};
     std::atomic<std::uint64_t> evictions{0};
+    std::atomic<std::uint64_t> bypass_decodes{0};
     std::uint64_t drop_calls{0};
     std::uint64_t dropped_pages{0};
     std::uint64_t dropped_bytes{0};
@@ -388,6 +389,10 @@ std::uint64_t fact_page_cache_t::ceiling() const noexcept {
     return state_->ceiling_bytes.load(std::memory_order_acquire);
 }
 
+void fact_page_cache_t::record_bypass() noexcept {
+    state_->bypass_decodes.fetch_add(1, std::memory_order_relaxed);
+}
+
 void fact_page_cache_t::trim() noexcept {
     std::uint64_t removed = 0;
     std::uint64_t removed_bytes = 0;
@@ -431,6 +436,7 @@ fact_page_cache_statistics_t fact_page_cache_t::statistics() const noexcept {
     result.admission_rejections =
         state_->admission_rejections.load(std::memory_order_relaxed);
     result.evictions = state_->evictions.load(std::memory_order_relaxed);
+    result.bypass_decodes = state_->bypass_decodes.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(state_->drop_mutex);
         result.drop_calls = state_->drop_calls;

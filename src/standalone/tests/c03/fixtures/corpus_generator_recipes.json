@@ -53,6 +53,7 @@
     {"id":"raw-ppc32-be","format":"raw_code","architecture":"ppc","architecture_identity":"ppc32","mode":"32","endian":"big","file_kind":"fragment","semantic_profile":"native_zero"},
     {"id":"raw-ppc64-be","format":"raw_code","architecture":"ppc","architecture_identity":"ppc64","mode":"64","endian":"big","file_kind":"fragment","semantic_profile":"native_zero"},
     {"id":"raw-riscv32-le","format":"raw_code","architecture":"riscv","architecture_identity":"riscv32","mode":"32","endian":"little","file_kind":"fragment","semantic_profile":"native_zero"},
-    {"id":"raw-riscv64-le","format":"raw_code","architecture":"riscv","architecture_identity":"riscv64","mode":"64","endian":"little","file_kind":"fragment","semantic_profile":"native_zero"}
+    {"id":"raw-riscv64-le","format":"raw_code","architecture":"riscv","architecture_identity":"riscv64","mode":"64","endian":"little","file_kind":"fragment","semantic_profile":"native_zero"},
+    {"id":"pe32plus-x64-idiom","format":"pe32plus","architecture":"x64","architecture_identity":"x64","mode":"64","endian":"little","file_kind":"executable","semantic_profile":"native_idiom_kernel"}
   ]
 }

@@ -40,6 +40,45 @@ struct pe_parse_limits_t {
     std::uint64_t max_dynamic_relocation_bytes = 256ULL * 1024ULL * 1024ULL;
     std::uint64_t max_total_metadata_bytes = 256ULL * 1024ULL * 1024ULL;
 
+    static constexpr std::uint32_t clamp_u32(std::uint64_t value,
+                                             std::uint32_t floor_value,
+                                             std::uint32_t ceiling_value) noexcept {
+        return value < floor_value ? floor_value
+            : value > ceiling_value ? ceiling_value
+            : static_cast<std::uint32_t>(value);
+    }
+
+    static constexpr std::uint64_t clamp_u64(std::uint64_t value,
+                                             std::uint64_t floor_value,
+                                             std::uint64_t ceiling_value) noexcept {
+        return value < floor_value ? floor_value
+            : value > ceiling_value ? ceiling_value
+            : value;
+    }
+
+    static pe_parse_limits_t scaled_to_image(std::uint64_t image_bytes) noexcept {
+        constexpr std::uint32_t kRelocationFloor = 1U << 22;
+        constexpr std::uint32_t kRelocationCeiling = 64U << 20;
+        constexpr std::uint32_t kRuntimeFloor = 1U << 22;
+        constexpr std::uint32_t kRuntimeCeiling = 32U << 20;
+        constexpr std::uint64_t kMetadataFloor = 256ULL * 1024ULL * 1024ULL;
+        constexpr std::uint64_t kMetadataCeiling = 1024ULL * 1024ULL * 1024ULL;
+        constexpr std::uint64_t kUnwindFloor = 1ULL << 24;
+        constexpr std::uint64_t kUnwindCeiling = 128ULL << 20;
+        pe_parse_limits_t limits;
+        limits.max_relocations =
+            clamp_u32(image_bytes / 64ULL, kRelocationFloor, kRelocationCeiling);
+        limits.max_runtime_functions =
+            clamp_u32(image_bytes / 128ULL, kRuntimeFloor, kRuntimeCeiling);
+        limits.max_total_metadata_bytes =
+            clamp_u64(image_bytes / 2ULL, kMetadataFloor, kMetadataCeiling);
+        limits.max_dynamic_relocation_bytes =
+            clamp_u64(image_bytes / 2ULL, kMetadataFloor, kMetadataCeiling);
+        limits.max_unwind_codes =
+            clamp_u64(image_bytes / 256ULL, kUnwindFloor, kUnwindCeiling);
+        return limits;
+    }
+
     friend bool operator==(const pe_parse_limits_t& lhs,
                            const pe_parse_limits_t& rhs) noexcept {
         return lhs.max_sections == rhs.max_sections &&
@@ -399,6 +438,13 @@ private:
 workspace_result_t<std::shared_ptr<const pe_image_t>>
 parse_pe_image(const byte_provider_t& provider, const pe_parse_limits_t& limits = {},
                const cancellation_token_t& cancel = {});
+
+inline pe_parse_limits_t pe_parse_limits_for_provider(
+    const byte_provider_t& provider, const pe_parse_limits_t& limits = {}) noexcept {
+    return limits == pe_parse_limits_t{}
+        ? pe_parse_limits_t::scaled_to_image(provider.size())
+        : limits;
+}
 
 workspace_result_t<std::shared_ptr<const workspace_image_t>>
 normalize_pe_image(const pe_image_t& image, const byte_provider_t& provider,

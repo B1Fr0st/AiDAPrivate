@@ -3,7 +3,16 @@
 #include "artifact_store.hpp"
 #include "../../helpers/diag_log.hpp"
 
+#include "../analysis/flirt/flirt_engine.hpp"
+#include "../analysis/flirt/flirt_signature_db.hpp"
+#include "../analysis/flirt/static_recognition_service.hpp"
+#include "../analysis/workspace/analysis_workspace.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
+#include "../infra/cancellation_watchdog.hpp"
+
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <sstream>
 
@@ -756,6 +765,352 @@ tool_result_t export_signatures(const json& params)
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok("Signatures exported.", result);
 }
+struct static_section_view_t
+{
+    std::uint64_t virtual_address = 0;
+    std::uint64_t virtual_size = 0;
+    std::uint64_t file_offset = 0;
+    std::uint64_t file_size = 0;
+    std::uint32_t permissions = 0;
+};
+
+const static_section_view_t* static_find_section(const std::vector<static_section_view_t>& sections,
+                                                 std::uint64_t rva)
+{
+    std::size_t lo = 0;
+    std::size_t hi = sections.size();
+    while (lo < hi)
+    {
+        const std::size_t mid = (lo + hi) / 2;
+        if (sections[mid].virtual_address <= rva)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo == 0)
+        return nullptr;
+    const static_section_view_t& section = sections[lo - 1];
+    if (rva < section.virtual_address || rva - section.virtual_address >= section.virtual_size)
+        return nullptr;
+    return &section;
+}
+
+std::vector<static_section_view_t> static_sections_for(const aida::analysis::workspace_image_t& image)
+{
+    std::vector<static_section_view_t> sections;
+    sections.reserve(image.sections.size());
+    for (const auto& section : image.sections)
+    {
+        if (section.virtual_size == 0 || section.file_size == 0)
+            continue;
+        static_section_view_t view;
+        view.virtual_address = section.virtual_address;
+        view.virtual_size = section.virtual_size;
+        view.file_offset = section.file_offset;
+        view.file_size = section.file_size;
+        view.permissions = section.permissions;
+        sections.push_back(view);
+    }
+    std::sort(sections.begin(), sections.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.virtual_address < rhs.virtual_address;
+    });
+    return sections;
+}
+
+tool_result_t scan_static(const json& params)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    if (!unsafe_confirmed(params))
+        return sigs_guard_required("scan_static", params, started_ms);
+    using aida::analysis::workspace_registry;
+    std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
+    const std::string binary_id_text = lower_ascii(trim_ascii(string_param(params, "binary_id")));
+    if (!binary_id_text.empty())
+    {
+        const auto id = aida::analysis::binary_id_t::from_hex(binary_id_text);
+        if (!id)
+            return tool_result_t::error("'binary_id' is not a valid 64-hex binary id.");
+        workspace = workspace_registry().find_by_binary_id(*id);
+    }
+    else
+    {
+        const std::string target = trim_ascii(string_param(params, "target"));
+        if (!target.empty())
+        {
+            auto exact = workspace_registry().find_by_exact_name_or_path(target);
+            if (exact.size() == 1)
+            {
+                workspace = exact.front();
+            }
+            else
+            {
+                const std::string wanted = lower_ascii(target);
+                for (const auto& candidate : workspace_registry().list())
+                {
+                    const auto& identity = candidate->identity();
+                    const std::string name = lower_ascii(identity.bin_name());
+                    const std::string path = lower_ascii(identity.normalized_source_path());
+                    if ((!name.empty() && name.find(wanted) != std::string::npos) ||
+                        (!path.empty() && path.find(wanted) != std::string::npos))
+                    {
+                        if (workspace)
+                            return tool_result_t::error("'target' matched multiple workspaces.");
+                        workspace = candidate;
+                    }
+                }
+            }
+        }
+        else
+        {
+            workspace = workspace_registry().selected_for_ui();
+        }
+    }
+    if (!workspace)
+        return tool_result_t::error("scan_static could not resolve a workspace.");
+    if (workspace->target_kind() != aida::analysis::target_kind_t::static_file)
+        return tool_result_t::error("scan_static requires a static-file workspace.");
+    const auto snapshot = workspace->snapshot();
+    const auto image = workspace->normalized_image();
+    const auto provider = workspace->provider_handle();
+    if (!snapshot || !image || !provider)
+        return tool_result_t::error("scan_static requires a published baseline snapshot.");
+    aida::analysis::static_recognition::ensure_attached(workspace);
+    const std::uint64_t max_results = numeric_param(params, "max_results", 128, 1, 65536);
+    std::string mode = lower_ascii(trim_ascii(string_param(params, "mode", "functions")));
+    if (mode != "sections")
+        mode = "functions";
+    diag::log_tagged_fmt("sigs",
+                         "scan_static enter generation=%llu mode=%s max_results=%llu deadline_remaining_ms=%llu diag_id=%s",
+                         static_cast<unsigned long long>(snapshot->generation),
+                         mode.c_str(),
+                         static_cast<unsigned long long>(max_results),
+                         static_cast<unsigned long long>(deadline_remaining_ms()),
+                         mcp_standalone::current_call_diag_id());
+    const auto sections = static_sections_for(*image);
+    json out;
+    out["workspace"] = workspace->identity().bin_name();
+    out["binary_id"] = snapshot->binary_id.to_hex();
+    out["generation"] = snapshot->generation;
+    out["mode"] = mode;
+    out["function_count"] = snapshot->functions.size();
+
+    const std::string source = lower_ascii(trim_ascii(string_param(params, "source")));
+    if (source == "db")
+    {
+        if (mode == "sections")
+            return tool_result_t::error("source='db' supports mode='functions' only.");
+        const auto db = aida::analysis::flirt::flirt_signature_db_t::load_embedded();
+        if (!db || db->empty())
+        {
+            out["status"] = "db_absent";
+            out["matches"] = json::array();
+            out["match_count"] = 0;
+            out["elapsed_ms"] = GetTickCount64() - started_ms;
+            diag::log_tagged_fmt("sigs", "scan_static db_absent elapsed_ms=%llu",
+                                 static_cast<unsigned long long>(GetTickCount64() - started_ms));
+            return tool_result_t::ok("FLIRT signature database is not embedded.", out);
+        }
+        aida::analysis::flirt::flirt_scan_request_t request;
+        request.snapshot = snapshot.get();
+        request.image = image.get();
+        request.pe = snapshot->image.get();
+        request.provider = provider;
+        request.db = db.get();
+        aida::analysis::cancellation_source_t scan_cancel;
+        if (const std::uint64_t call_deadline_ms = mcp_standalone::current_call_deadline_ms();
+            call_deadline_ms != 0)
+        {
+            const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
+            scan_cancel.set_deadline(std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(call_deadline_ms > now_ms ? call_deadline_ms - now_ms : 0));
+        }
+        aida::infra::cancellation_watchdog::watch_id_t scan_watch;
+        if (std::atomic<bool>* const observed = mcp_standalone::current_cancel_token())
+        {
+            aida::infra::cancellation_watchdog::watch_descriptor_t watch;
+            watch.external_flag = observed;
+            watch.on_fire = [source_snapshot = scan_cancel]() mutable {
+                source_snapshot.request_cancel();
+            };
+            scan_watch = aida::infra::cancellation_watchdog::register_watch(std::move(watch));
+        }
+        auto scanned = aida::analysis::flirt::flirt_scan(request, scan_cancel.token());
+        if (scan_watch.valid())
+            aida::infra::cancellation_watchdog::unregister_watch(scan_watch);
+        if (!scanned)
+            return tool_result_t::error("FLIRT static scan failed: " + scanned.error().message);
+        const auto& scan = scanned.value();
+        json matches = json::array();
+        for (const auto& match : scan.matches)
+        {
+            if (matches.size() >= max_results)
+                break;
+            matches.push_back(json{
+                {"rva", sa_format_address(match.rva)},
+                {"name", match.name},
+                {"tier", match.tier},
+                {"confidence", match.confidence},
+                {"is_noreturn", match.is_noreturn}
+            });
+        }
+        out["status"] = scan.status == aida::analysis::flirt::k_flirt_status_completed ? "found" :
+            scan.status == aida::analysis::flirt::k_flirt_status_cancelled ? "cancelled" : "error";
+        out["matches"] = std::move(matches);
+        out["match_count"] = scan.matches.size();
+        out["functions_considered"] = scan.functions_considered;
+        out["functions_skipped_thunk"] = scan.functions_skipped_thunk;
+        out["functions_skipped_short"] = scan.functions_skipped_short;
+        out["candidates_tested"] = scan.candidates_tested;
+        out["ambiguous"] = scan.ambiguous;
+        out["rejected_reloc"] = scan.rejected_reloc;
+        out["db_entries"] = db->entry_count();
+        out["db_toolset"] = db->toolset();
+        out["cancelled"] = scan.status == aida::analysis::flirt::k_flirt_status_cancelled;
+        out["elapsed_ms"] = GetTickCount64() - started_ms;
+        diag::log_tagged_fmt("sigs",
+                             "scan_static db exit status=%u matches=%zu elapsed_ms=%llu",
+                             static_cast<unsigned int>(scan.status),
+                             scan.matches.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return tool_result_t::ok(out);
+    }
+
+    std::string pattern_text = string_param(params, "pattern");
+    std::string signature_name = string_param(params, "name");
+    if (pattern_text.empty())
+    {
+        const std::string signature_id = string_param(params, "signature_id");
+        if (signature_id.empty())
+            return tool_result_t::error("scan_static requires 'pattern', 'signature_id', or source='db'.");
+        const auto records = store::load_signatures();
+        const auto found = std::find_if(records.begin(), records.end(), [&](const auto& record) {
+            return record.id == signature_id;
+        });
+        if (found == records.end())
+            return tool_result_t::error("'signature_id' did not match a stored signature.");
+        pattern_text = found->pattern;
+        if (signature_name.empty())
+            signature_name = found->name;
+    }
+    std::vector<parsed_pattern_byte_t> pattern;
+    std::string err;
+    if (!parse_pattern(pattern_text, pattern, &err))
+        return tool_result_t::error("Invalid pattern: " + err);
+    if (pattern.empty() || pattern.size() > 64)
+        return tool_result_t::error("scan_static pattern length must be within [1,64] bytes.");
+
+    json match_arr = json::array();
+    std::uint64_t bytes_scanned = 0;
+    bool cancelled = false;
+    bool deadline_hit = false;
+    if (mode == "functions")
+    {
+        for (const auto& function : snapshot->functions)
+        {
+            if ((match_arr.size() & 0xFFu) == 0 && sigs_call_cancelled("scan_static_functions", 0, started_ms))
+            {
+                cancelled = mcp_standalone::current_call_cancelled();
+                deadline_hit = !cancelled;
+                break;
+            }
+            if (match_arr.size() >= max_results)
+                break;
+            const std::uint64_t rva = function.start.value;
+            const auto* section = static_find_section(sections, rva);
+            if (!section)
+                continue;
+            const std::uint64_t file_offset = section->file_offset + (rva - section->virtual_address);
+            const std::uint64_t available = section->file_offset + section->file_size - file_offset;
+            if (available < pattern.size())
+                continue;
+            auto leased = provider->lease(file_offset, pattern.size());
+            if (!leased || leased.value().size() < pattern.size())
+                continue;
+            std::uint8_t buffer[64]{};
+            leased.value().copy_to(buffer, pattern.size());
+            bytes_scanned += pattern.size();
+            if (!pattern_matches(buffer, pattern.size(), pattern))
+                continue;
+            match_arr.push_back(json{{"rva", sa_format_address(rva)},
+                                     {"function_end_rva", sa_format_address(function.end.value)}});
+        }
+    }
+    else
+    {
+        const std::uint64_t max_scan_bytes = numeric_param(params, "max_scan_bytes", 256ull << 20, 4096, 1ull << 31);
+        for (const auto& section : sections)
+        {
+            if ((section.permissions & aida::analysis::image_permission_execute) == 0)
+                continue;
+            if (match_arr.size() >= max_results || bytes_scanned >= max_scan_bytes)
+                break;
+            std::uint64_t cursor = section.file_offset;
+            const std::uint64_t section_end = section.file_offset + section.file_size;
+            std::uint64_t section_rva_cursor = section.virtual_address;
+            const std::uint64_t overlap = pattern.size() - 1;
+            bool first_chunk = true;
+            while (cursor < section_end && match_arr.size() < max_results && bytes_scanned < max_scan_bytes)
+            {
+                if (sigs_call_cancelled("scan_static_sections", 0, started_ms))
+                {
+                    cancelled = mcp_standalone::current_call_cancelled();
+                    deadline_hit = !cancelled;
+                    break;
+                }
+                const std::uint64_t chunk = (std::min<std::uint64_t>)(16ull << 20, section_end - cursor);
+                if (!first_chunk && chunk <= overlap)
+                    break;
+                auto leased = provider->lease(cursor, chunk);
+                if (!leased || leased.value().empty())
+                    break;
+                const std::size_t size = leased.value().size();
+                std::vector<std::uint8_t> bytes(size);
+                leased.value().copy_to(bytes.data(), size);
+                for (std::size_t i = 0; i + pattern.size() <= bytes.size(); ++i)
+                {
+                    if ((i & 0xFFFu) == 0 && sigs_call_cancelled("scan_static_sections", 0, started_ms))
+                    {
+                        cancelled = mcp_standalone::current_call_cancelled();
+                        deadline_hit = !cancelled;
+                        break;
+                    }
+                    if (!pattern_matches(bytes.data() + i, bytes.size() - i, pattern))
+                        continue;
+                    match_arr.push_back(json{{"rva", sa_format_address(section_rva_cursor + i)}});
+                    if (match_arr.size() >= max_results)
+                        break;
+                }
+                if (cancelled || deadline_hit)
+                    break;
+                const std::uint64_t advance = size > overlap ? size - overlap : size;
+                bytes_scanned += first_chunk ? size : advance;
+                first_chunk = false;
+                cursor += advance;
+                section_rva_cursor += advance;
+            }
+            if (cancelled || deadline_hit)
+                break;
+        }
+    }
+    out["status"] = cancelled || deadline_hit ? "cancelled" : match_arr.empty() ? "not_found" : "found";
+    out["name"] = signature_name;
+    out["pattern_bytes"] = pattern.size();
+    out["matches"] = std::move(match_arr);
+    out["match_count"] = out["matches"].size();
+    out["scan_bytes"] = bytes_scanned;
+    out["cancelled"] = cancelled;
+    out["deadline_hit"] = deadline_hit;
+    out["elapsed_ms"] = GetTickCount64() - started_ms;
+    diag::log_tagged_fmt("sigs",
+                         "scan_static exit mode=%s pattern_bytes=%zu matches=%zu scan_bytes=%llu status=%s elapsed_ms=%llu",
+                         mode.c_str(),
+                         pattern.size(),
+                         out["match_count"].get<std::size_t>(),
+                         static_cast<unsigned long long>(bytes_scanned),
+                         out["status"].get<std::string>().c_str(),
+                         static_cast<unsigned long long>(GetTickCount64() - started_ms));
+    return tool_result_t::ok(out);
+}
 }
 
 tool_result_t manage(const json& params)
@@ -771,6 +1126,7 @@ tool_result_t manage(const json& params)
     if (action == "save") return save_signature(p);
     if (action == "list") return list_signatures(p);
     if (action == "scan_all") return scan_all(p);
+    if (action == "scan_static") return scan_static(p);
     if (action == "import") return import_signatures(p);
     if (action == "export") return export_signatures(p);
     diag::log_tagged_fmt("sigs",

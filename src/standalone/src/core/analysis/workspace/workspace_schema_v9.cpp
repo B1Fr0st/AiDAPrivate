@@ -335,7 +335,7 @@ CREATE TABLE packed_generations_v9_upgrade(
     overlay_revision INTEGER NOT NULL,
     shard_count INTEGER NOT NULL CHECK(shard_count BETWEEN 1 AND 19),
     total_payload_bytes INTEGER NOT NULL CHECK(total_payload_bytes BETWEEN 0 AND 17179869184),
-    total_records INTEGER NOT NULL CHECK(total_records BETWEEN 0 AND 200000000),
+    total_records INTEGER NOT NULL CHECK(total_records BETWEEN 0 AND 1000000000),
     batch_checksum INTEGER NOT NULL,
     created_utc_ms INTEGER NOT NULL,
     committed INTEGER NOT NULL CHECK(committed IN (0,1)),
@@ -1457,7 +1457,7 @@ CREATE TABLE IF NOT EXISTS packed_generations(
     overlay_revision INTEGER NOT NULL,
     shard_count INTEGER NOT NULL CHECK(shard_count BETWEEN 1 AND 19),
     total_payload_bytes INTEGER NOT NULL CHECK(total_payload_bytes BETWEEN 0 AND 17179869184),
-    total_records INTEGER NOT NULL CHECK(total_records BETWEEN 0 AND 200000000),
+    total_records INTEGER NOT NULL CHECK(total_records BETWEEN 0 AND 1000000000),
     batch_checksum INTEGER NOT NULL,
     created_utc_ms INTEGER NOT NULL,
     committed INTEGER NOT NULL CHECK(committed IN (0,1)),
@@ -1798,6 +1798,157 @@ CREATE TABLE IF NOT EXISTS pdb_symbol_modules(
     if (!created)
         return created;
     return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> create_schema_v11(sqlite3* database) {
+    if (!database) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "schema v11 migration requires an open database",
+            "workspace_schema_v11.migrate"));
+    }
+    auto base = create_schema_v10(database);
+    if (!base)
+        return base;
+    auto chunks = exec_sql_v9(database, R"SQL(
+CREATE TABLE IF NOT EXISTS operand_fact_chunks(
+    chunk_id INTEGER PRIMARY KEY,
+    start_value INTEGER NOT NULL,
+    end_value INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    blob_version INTEGER NOT NULL,
+    payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS target_fact_chunks(
+    chunk_id INTEGER PRIMARY KEY,
+    start_value INTEGER NOT NULL,
+    end_value INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    blob_version INTEGER NOT NULL,
+    payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS edge_chunks(
+    chunk_id INTEGER PRIMARY KEY,
+    start_value INTEGER NOT NULL,
+    end_value INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    blob_version INTEGER NOT NULL,
+    payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS xref_chunks(
+    chunk_id INTEGER PRIMARY KEY,
+    start_value INTEGER NOT NULL,
+    end_value INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    blob_version INTEGER NOT NULL,
+    payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alternate_operand_fact_chunks(
+    chunk_id INTEGER PRIMARY KEY,
+    start_value INTEGER NOT NULL,
+    end_value INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    blob_version INTEGER NOT NULL,
+    payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alternate_target_fact_chunks(
+    chunk_id INTEGER PRIMARY KEY,
+    start_value INTEGER NOT NULL,
+    end_value INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    blob_version INTEGER NOT NULL,
+    payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alternate_edge_chunks(
+    chunk_id INTEGER PRIMARY KEY,
+    start_value INTEGER NOT NULL,
+    end_value INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    blob_version INTEGER NOT NULL,
+    payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alternate_xref_chunks(
+    chunk_id INTEGER PRIMARY KEY,
+    start_value INTEGER NOT NULL,
+    end_value INTEGER NOT NULL,
+    record_count INTEGER NOT NULL,
+    blob_version INTEGER NOT NULL,
+    payload BLOB NOT NULL
+);
+)SQL", "workspace_schema_v11.fact_chunks");
+    if (!chunks)
+        return chunks;
+    auto exists = table_exists_v9(database, "packed_generations");
+    if (!exists)
+        return workspace_result_t<void>::failure(exists.error());
+    if (!exists.value())
+        return workspace_result_t<void>::success();
+    std::string table_sql;
+    {
+        v9_statement_t statement;
+        auto prepared = statement.prepare(database,
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='packed_generations'",
+            "workspace_schema_v11.inspect");
+        if (!prepared)
+            return workspace_result_t<void>::failure(prepared.error());
+        const int status = sqlite3_step(statement.get());
+        if (status == SQLITE_ROW)
+            table_sql = column_text_v9(statement.get(), 0);
+        else if (status != SQLITE_DONE) {
+            return workspace_result_t<void>::failure(schema_v9_error(
+                database, status, "unable to inspect packed_generations schema",
+                "workspace_schema_v11.inspect"));
+        }
+    }
+    if (table_sql.find("1000000000") != std::string::npos)
+        return workspace_result_t<void>::success();
+    auto savepoint = exec_sql_v9(
+        database, "SAVEPOINT aida_packed_generations_v11",
+        "workspace_schema_v11.begin");
+    if (!savepoint)
+        return savepoint;
+    auto migrated = exec_sql_v9(database, R"SQL(
+DROP TABLE IF EXISTS packed_generations_v11_upgrade;
+CREATE TABLE packed_generations_v11_upgrade(
+    generation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation INTEGER NOT NULL CHECK(generation<>0),
+    analysis_revision INTEGER NOT NULL,
+    overlay_revision INTEGER NOT NULL,
+    shard_count INTEGER NOT NULL CHECK(shard_count BETWEEN 1 AND 19),
+    total_payload_bytes INTEGER NOT NULL CHECK(total_payload_bytes BETWEEN 0 AND 17179869184),
+    total_records INTEGER NOT NULL CHECK(total_records BETWEEN 0 AND 1000000000),
+    batch_checksum INTEGER NOT NULL,
+    created_utc_ms INTEGER NOT NULL,
+    committed INTEGER NOT NULL CHECK(committed IN (0,1)),
+    payload_blob BLOB NOT NULL CHECK(length(payload_blob)<=16777216)
+);
+INSERT INTO packed_generations_v11_upgrade(
+    generation,analysis_revision,overlay_revision,shard_count,total_payload_bytes,
+    total_records,batch_checksum,created_utc_ms,committed,payload_blob)
+SELECT generation,analysis_revision,overlay_revision,shard_count,total_payload_bytes,
+       total_records,batch_checksum,created_utc_ms,committed,payload_blob
+FROM packed_generations;
+DROP TABLE packed_generations;
+ALTER TABLE packed_generations_v11_upgrade RENAME TO packed_generations;
+CREATE UNIQUE INDEX IF NOT EXISTS packed_generations_generation ON packed_generations(generation);
+CREATE INDEX IF NOT EXISTS packed_generations_revisions ON packed_generations(analysis_revision,overlay_revision);
+)SQL", "workspace_schema_v11.packed_generations");
+    if (!migrated) {
+        auto rolled_back = exec_sql_v9(
+            database, "ROLLBACK TO aida_packed_generations_v11",
+            "workspace_schema_v11.rollback");
+        auto released = exec_sql_v9(
+            database, "RELEASE aida_packed_generations_v11",
+            "workspace_schema_v11.release");
+        if (!rolled_back)
+            return rolled_back;
+        if (!released)
+            return released;
+        return migrated;
+    }
+    return exec_sql_v9(
+        database, "RELEASE aida_packed_generations_v11",
+        "workspace_schema_v11.commit");
 }
 
 workspace_result_t<void> write_packed_generation(

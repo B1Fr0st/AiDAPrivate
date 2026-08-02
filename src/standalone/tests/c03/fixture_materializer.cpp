@@ -89,7 +89,8 @@ namespace
             value == "native_conditional_add" || value == "native_sum" ||
             value == "native_zero" || value == "managed_cli" ||
             value == "managed_cli_readytorun" || value == "jvm_fixture" ||
-            value == "dalvik_fixture", "fixture recipe semantic profile is unsupported");
+            value == "dalvik_fixture" || value == "native_idiom_kernel",
+            "fixture recipe semantic profile is unsupported");
         return value;
     }
 
@@ -97,9 +98,11 @@ namespace
     {
         const auto profile = semantic_profile(recipe);
         require(profile == "native_conditional_dispatch" ||
-            profile == "native_conditional_add" || profile == "native_sum",
+            profile == "native_conditional_add" || profile == "native_sum" ||
+            profile == "native_idiom_kernel",
             "native symbol requested for a non-native semantic profile");
-        return profile == "native_sum" ? std::string_view{"fixture_sum"} :
+        return profile == "native_idiom_kernel" ? std::string_view{"fixture_idiom"} :
+            profile == "native_sum" ? std::string_view{"fixture_sum"} :
             std::string_view{"fixture_add"};
     }
 
@@ -114,6 +117,16 @@ namespace
                     0x2b, 0xc1, 0xc3, 0x8d, 0x04, 0x11, 0xc3};
         throw materialization_error_t(
             "conditional-add semantic profile requires x86 or x64");
+    }
+
+    bytes_t idiom_kernel_code(std::string_view architecture)
+    {
+        if (architecture == "x64")
+            return {0x83, 0xf9, 0x01, 0x74, 0x0b, 0x83, 0xf9, 0x02, 0x74, 0x0c,
+                    0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3, 0xb8, 0x0a, 0x00, 0x00,
+                    0x00, 0xc3, 0xb8, 0x14, 0x00, 0x00, 0x00, 0xc3};
+        throw materialization_error_t(
+            "idiom-kernel semantic profile requires x64");
     }
 
     bytes_t make_cli_metadata()
@@ -361,7 +374,8 @@ namespace
                 "managed PE semantic profile disagrees with its ReadyToRun identity");
         } else {
             require(profile == "native_conditional_dispatch" ||
-                profile == "native_conditional_add" || profile == "native_sum",
+                profile == "native_conditional_add" || profile == "native_sum" ||
+                profile == "native_idiom_kernel",
                 "native PE semantic profile is invalid");
         }
         const std::size_t optional_size = is_64 ? 0xf0 : 0xe0;
@@ -409,7 +423,8 @@ namespace
         put_unsigned(bytes, section + 36, 0x60000020, 4, false);
         bytes_t code;
         if (!managed) {
-            code = profile == "native_conditional_dispatch" ||
+            code = profile == "native_idiom_kernel" ? idiom_kernel_code(architecture) :
+                profile == "native_conditional_dispatch" ||
                     profile == "native_conditional_add" ?
                 conditional_add_code(architecture) :
                 native_code(architecture == "arm64ec" || architecture == "arm64x" ?

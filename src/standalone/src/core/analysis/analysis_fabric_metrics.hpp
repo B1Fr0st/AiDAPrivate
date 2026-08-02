@@ -28,6 +28,8 @@ struct analysis_fabric_domain_snapshot_t final {
     std::uint64_t workers = 0;
     std::uint64_t oldest_active_ms = 0;
     std::uint64_t fairness_wait_ns_total = 0;
+    std::uint64_t fairness_wait_p50_ns = 0;
+    std::uint64_t fairness_wait_p95_ns = 0;
     std::array<std::uint64_t, analysis_fabric_priority_lane_count> lane_depth{};
     std::array<std::uint64_t, analysis_fabric_priority_lane_count> lane_admitted{};
 };

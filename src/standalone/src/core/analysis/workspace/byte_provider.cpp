@@ -11,12 +11,14 @@
 
 #include "../mapped_window_cache.hpp"
 #include "../provider_snapshot.hpp"
+#include "../../infra/win_thread.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -282,6 +284,9 @@ struct mapped_file_provider_t::state_t {
     bool pin_active = false;
     std::mutex pin_mutex;
     std::vector<std::uint64_t> pin_tokens;
+    std::shared_future<workspace_result_t<sha256_digest_t>> deferred_hash;
+    std::shared_ptr<const sha256_digest_t> ready_digest;
+    mutable std::mutex hash_mutex;
 };
 
 std::vector<provider_pin_range_t> compute_admission_pin_ranges(
@@ -494,6 +499,8 @@ mapped_file_provider_t::open(const std::string& utf8_path,
         return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
             snapshot.error());
     bool pin_active = false;
+    std::shared_ptr<const sha256_digest_t> ready_digest;
+    std::shared_future<workspace_result_t<sha256_digest_t>> deferred_hash;
     if (options.pin_local_file_snapshot) {
         sha256_digest_t digest;
         auto memoized = content_hash_memo().lookup(identity);
@@ -507,7 +514,59 @@ mapped_file_provider_t::open(const std::string& utf8_path,
                 static_cast<unsigned long long>(memo_miss_count().load(std::memory_order_relaxed)),
                 content_hash_memo().size());
             digest = *memoized;
-        } else {
+        }
+        bool hash_resolved = memoized.has_value();
+        if (!hash_resolved && options.defer_content_hash) {
+            const auto misses = memo_miss_count().fetch_add(1, std::memory_order_relaxed) + 1;
+            ::diag::log_tagged_fmt("byte_provider",
+                "content_hash_deferred source='%s' size=%llu hits=%llu misses=%llu entries=%zu",
+                identity.normalized_source.c_str(),
+                static_cast<unsigned long long>(identity.size),
+                static_cast<unsigned long long>(memo_hit_count().load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(misses),
+                content_hash_memo().size());
+            auto revalidated = cache->revalidate();
+            if (!revalidated)
+                return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
+                    revalidated.error());
+            identity.immutable_snapshot = true;
+            pin_active = true;
+            auto promise = std::make_shared<
+                std::promise<workspace_result_t<sha256_digest_t>>>();
+            deferred_hash = promise->get_future().share();
+            const auto hash_identity = identity;
+            const auto hash_snapshot = snapshot.value();
+            const auto hash_started = std::chrono::steady_clock::now();
+            const auto started_ok = aida::infra::win_thread::start_detached(
+                [promise, hash_identity, hash_snapshot, hash_started]() mutable {
+                    auto computed = hash_snapshot->compute_content_sha256();
+                    const auto elapsed_us = static_cast<unsigned long long>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - hash_started).count());
+                    if (computed) {
+                        content_hash_memo().insert(hash_identity,
+                                                   computed.value());
+                        promise->set_value(
+                            workspace_result_t<sha256_digest_t>::success(
+                                computed.take_value()));
+                    } else {
+                        promise->set_value(
+                            workspace_result_t<sha256_digest_t>::failure(
+                                computed.error()));
+                    }
+                    ::diag::log_tagged_fmt("byte_provider",
+                        "content_hash_ready source='%s' us=%llu",
+                        hash_identity.normalized_source.c_str(), elapsed_us);
+                }, nullptr, aida::infra::win_thread::default_stack_reserve,
+                "content_hash");
+            if (!started_ok) {
+                return workspace_result_t<
+                    std::shared_ptr<mapped_file_provider_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::provider_unavailable,
+                                         "deferred content hash worker failed to start",
+                                         "byte_provider_open"));
+            }
+        } else if (!hash_resolved) {
             const auto misses = memo_miss_count().fetch_add(1, std::memory_order_relaxed) + 1;
             ::diag::log_tagged_fmt("byte_provider",
                 "content_hash_memo miss source='%s' size=%llu hits=%llu misses=%llu entries=%zu",
@@ -521,16 +580,21 @@ mapped_file_provider_t::open(const std::string& utf8_path,
                 return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
                     computed.error());
             digest = computed.take_value();
+            hash_resolved = true;
         }
-        auto revalidated = cache->revalidate();
-        if (!revalidated)
-            return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
-                revalidated.error());
-        if (!memoized)
-            content_hash_memo().insert(identity, digest);
-        identity.content_sha256 = digest;
-        identity.immutable_snapshot = true;
-        pin_active = true;
+        if (!pin_active) {
+            auto revalidated = cache->revalidate();
+            if (!revalidated)
+                return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::failure(
+                    revalidated.error());
+            if (!memoized && hash_resolved)
+                content_hash_memo().insert(identity, digest);
+            identity.content_sha256 = digest;
+            identity.immutable_snapshot = true;
+            pin_active = true;
+        }
+        if (hash_resolved)
+            ready_digest = std::make_shared<const sha256_digest_t>(digest);
     } else {
         identity.immutable_snapshot = false;
         identity.content_sha256 = snapshot.value()->identity().content_sha256;
@@ -542,6 +606,8 @@ mapped_file_provider_t::open(const std::string& utf8_path,
         state->identity = std::move(identity);
         state->options = options;
         state->pin_active = pin_active;
+        state->deferred_hash = std::move(deferred_hash);
+        state->ready_digest = std::move(ready_digest);
         return workspace_result_t<std::shared_ptr<mapped_file_provider_t>>::success(
             std::shared_ptr<mapped_file_provider_t>(new mapped_file_provider_t(std::move(state))));
     } catch (const std::bad_alloc&) {
@@ -568,6 +634,58 @@ mapped_file_provider_t::~mapped_file_provider_t() {
 
 const byte_provider_identity_t& mapped_file_provider_t::identity() const noexcept {
     return state_->identity;
+}
+
+bool mapped_file_provider_t::content_hash_ready() const noexcept {
+    if (!state_)
+        return false;
+    if (state_->identity.content_sha256.has_value())
+        return true;
+    return std::atomic_load_explicit(&state_->ready_digest,
+                                     std::memory_order_acquire) != nullptr;
+}
+
+workspace_result_t<sha256_digest_t> mapped_file_provider_t::await_content_hash(
+    const cancellation_token_t& cancel) const {
+    if (!state_) {
+        return workspace_result_t<sha256_digest_t>::failure(
+            make_workspace_error(workspace_error_code_t::provider_unavailable,
+                                 "mapped-file provider is not initialized",
+                                 "byte_provider_hash"));
+    }
+    if (state_->identity.content_sha256)
+        return workspace_result_t<sha256_digest_t>::success(
+            *state_->identity.content_sha256);
+    if (auto ready = std::atomic_load_explicit(&state_->ready_digest,
+                                               std::memory_order_acquire))
+        return workspace_result_t<sha256_digest_t>::success(*ready);
+    auto future = state_->deferred_hash;
+    if (!future.valid()) {
+        return workspace_result_t<sha256_digest_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "mapped-file provider content hash is unavailable",
+                                 "byte_provider_hash"));
+    }
+    for (;;) {
+        if (cancel.stop_requested())
+            return workspace_result_t<sha256_digest_t>::failure(
+                stop_error(cancel, "byte_provider_hash"));
+        if (future.wait_for(std::chrono::milliseconds(10)) ==
+            std::future_status::ready)
+            break;
+    }
+    auto computed = future.get();
+    if (!computed)
+        return workspace_result_t<sha256_digest_t>::failure(computed.error());
+    auto digest = std::make_shared<const sha256_digest_t>(computed.take_value());
+    {
+        std::lock_guard<std::mutex> lock(state_->hash_mutex);
+        if (!state_->identity.content_sha256)
+            state_->identity.content_sha256 = *digest;
+        std::atomic_store_explicit(&state_->ready_digest, digest,
+                                   std::memory_order_release);
+    }
+    return workspace_result_t<sha256_digest_t>::success(*digest);
 }
 
 std::uint64_t mapped_file_provider_t::size() const noexcept {

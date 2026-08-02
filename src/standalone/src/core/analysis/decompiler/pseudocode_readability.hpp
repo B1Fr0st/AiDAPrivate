@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace aida::analysis {
@@ -35,6 +36,12 @@ struct readability_transform_metrics_t {
     std::uint64_t string_comments_injected = 0;
     std::uint64_t user_comments_injected = 0;
     std::uint64_t nodes_removed = 0;
+    std::uint64_t string_literals_inlined = 0;
+    std::uint64_t global_scalar_comments_injected = 0;
+    std::uint64_t cast_masks_folded = 0;
+    std::uint64_t bit_operation_idioms_rewritten = 0;
+    std::uint64_t loop_intrinsics_rewritten = 0;
+    std::uint64_t magic_divisions_recognized = 0;
 };
 
 struct readability_transform_result_t {
@@ -44,6 +51,18 @@ struct readability_transform_result_t {
 
     bool succeeded() const noexcept;
 };
+
+struct pseudocode_local_rename_result_t {
+    bool applied = false;
+    std::uint64_t nodes_renamed = 0;
+    std::vector<decompiler_diagnostic_t> diagnostics;
+};
+
+pseudocode_local_rename_result_t apply_pseudocode_local_rename(
+    typed_pseudocode_ast_v2_t& ast,
+    const type_graph_t& type_graph,
+    std::string_view old_name,
+    std::string_view new_name);
 
 readability_transform_result_t apply_readability_transforms(
     typed_pseudocode_ast_v2_t& ast,

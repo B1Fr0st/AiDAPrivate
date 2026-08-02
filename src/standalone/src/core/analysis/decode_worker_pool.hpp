@@ -19,6 +19,7 @@ struct decode_worker_pool_statistics_t final {
     std::uint64_t backpressure_wait_count = 0;
     std::uint64_t inline_drain_count = 0;
     std::uint64_t max_queue_depth_seen = 0;
+    std::uint64_t lane_clamp_count = 0;
 };
 
 class decode_worker_pool_t final {
@@ -59,9 +60,10 @@ public:
     void clear_completion_signal() noexcept;
     decode_worker_pool_statistics_t statistics() const noexcept;
 
-private:
     struct worker_state_t;
     struct impl_t;
+
+private:
     explicit decode_worker_pool_t(std::unique_ptr<impl_t> impl) noexcept;
 
     std::unique_ptr<impl_t> impl_;

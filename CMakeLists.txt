@@ -952,6 +952,41 @@ if(NOT TARGET MemPDB)
     message(FATAL_ERROR "AiDA: vendored MemPDB did not provide a linkable target")
 endif()
 
+set(AIDA_MIMALLOC_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/mimalloc-LICENSE.txt")
+foreach(_aida_required_mimalloc_dependency IN ITEMS
+        "${DEPS_DIR}/mimalloc/CMakeLists.txt"
+        "${DEPS_DIR}/mimalloc/include/mimalloc.h"
+        "${DEPS_DIR}/mimalloc/include/mimalloc-new-delete.h"
+        "${DEPS_DIR}/mimalloc/LICENSE"
+        "${AIDA_MIMALLOC_LICENSE_FILE}")
+    if(NOT EXISTS "${_aida_required_mimalloc_dependency}")
+        message(FATAL_ERROR "AiDA: required pinned mimalloc dependency or notice is missing: ${_aida_required_mimalloc_dependency}")
+    endif()
+endforeach()
+aida_require_analysis_file_sha256(
+    "${DEPS_DIR}/mimalloc/LICENSE"
+    "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9")
+aida_require_analysis_text_sha256(
+    "${AIDA_MIMALLOC_LICENSE_FILE}"
+    "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9")
+set(MI_OVERRIDE OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(MI_PADDING OFF CACHE BOOL "" FORCE)
+set(MI_SECURE OFF CACHE BOOL "" FORCE)
+set(MI_SECURE_FULL OFF CACHE BOOL "" FORCE)
+set(MI_WIN_REDIRECT OFF CACHE BOOL "" FORCE)
+set(MI_WIN_INIT_USE_RAW_DLLMAIN OFF CACHE BOOL "" FORCE)
+set(MI_WIN_INIT_USE_TLS_DLLMAIN OFF CACHE BOOL "" FORCE)
+set(MI_DEBUG OFF CACHE BOOL "" FORCE)
+set(MI_DEBUG_INTERNAL OFF CACHE BOOL "" FORCE)
+set(MI_GUARDED OFF CACHE BOOL "" FORCE)
+add_subdirectory("${DEPS_DIR}/mimalloc" "${CMAKE_BINARY_DIR}/.deps/mimalloc")
+aida_use_static_msvc_runtime(mimalloc-static)
+
 if(TARGET nlohmann_json OR TARGET nlohmann_json::nlohmann_json)
     message(FATAL_ERROR "AiDA: an unexpected nlohmann/json target exists before pinned local integration")
 endif()
@@ -1901,6 +1936,7 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/analysis/workspace/analysis_metrics.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/function_recovery.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/xref_builder.cpp"
+            "${STANDALONE_ROOT}/core/analysis/workspace/publication_indexes.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/search_index.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/pe_baseline_analyzer.cpp"
             "${STANDALONE_ROOT}/core/analysis/workspace/baseline_pipeline.cpp"
@@ -1953,6 +1989,8 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/ai/provider_transforms.cpp"
             "${STANDALONE_ROOT}/core/ai/provider_view.cpp"
             "${STANDALONE_ROOT}/core/infra/event_bus.cpp"
+            "${STANDALONE_ROOT}/core/infra/host_topology.cpp"
+            "${STANDALONE_ROOT}/core/infra/allocator.cpp"
             "${STANDALONE_ROOT}/core/analysis/binary_map.cpp"
             "${STANDALONE_ROOT}/core/session/session_store.cpp"
             "${STANDALONE_ROOT}/core/ai/agent_registry.cpp"
@@ -2341,6 +2379,7 @@ if(WIN32)
             "${Z3_LIBRARIES}"
             capstone::capstone
             MemPDB
+            mimalloc-static
             nlohmann_json_schema_validator::validator
             libdecomp_aida
             freetype
@@ -2577,6 +2616,9 @@ if(WIN32)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${AIDA_PCRE2_LICENSE_FILE}"
                 "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/PCRE2-LICENCE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_MIMALLOC_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/mimalloc-LICENSE.txt"
             COMMENT "Staging pinned analysis dependency notices beside AiDAStandalone..."
             VERBATIM
         )

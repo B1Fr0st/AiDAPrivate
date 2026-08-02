@@ -159,6 +159,17 @@ public:
         const function_recovery_limits_t& limits,
         const cancellation_token_t& cancel);
 
+    static workspace_result_t<function_recovery_result_t> recover(
+        const workspace_image_t& image,
+        const byte_provider_t& provider,
+        const std::vector<instruction_record_t>& instructions,
+        const operand_fact_store_t& operands,
+        const std::vector<target_fact_t>& targets,
+        const function_seed_evidence_t& evidence,
+        const std::vector<std::uint8_t>& delay_slot_counts,
+        const function_recovery_limits_t& limits,
+        const cancellation_token_t& cancel);
+
     static workspace_result_t<block_recovery_result_t> build_blocks(
         const workspace_image_t& image,
         const std::vector<instruction_record_t>& instructions,

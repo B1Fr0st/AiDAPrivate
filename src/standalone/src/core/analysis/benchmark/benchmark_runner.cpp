@@ -5,6 +5,7 @@
 #include "../../../../tests/analysis_workspace/large_pe_fixture_builder.hpp"
 
 #include "../workspace/baseline_pipeline.hpp"
+#include "../workspace/paged_snapshot_view.hpp"
 #include "../workspace/search_index.hpp"
 #include "../workspace/workspace_registry.hpp"
 #include "../decompiler/decompile_batch_orchestrator.hpp"
@@ -508,7 +509,7 @@ analysis_once_result_t run_analysis_once(const open_static_workspace_request_t& 
         outcome.file_bytes = outcome.workspace->provider().size();
         outcome.decode_window_ns = outcome.windows.decode_wall_ns() +
             outcome.windows.merge_wall_ns();
-        outcome.instruction_count = outcome.snapshot->instructions.size();
+        outcome.instruction_count = instructions_view(*outcome.snapshot).size();
         sampler_guard.sampler = nullptr;
         return outcome;
     } catch (...) {
@@ -681,7 +682,8 @@ void walk_membership(determinism_walker_t& walk,
     walk.boolean(record.shared);
 }
 
-void walk_function(determinism_walker_t& walk, const function_record_t& record)
+void walk_function(determinism_walker_t& walk, const analysis_snapshot_t& snapshot,
+                   const function_record_t& record)
 {
     walk.u64(record.id);
     walk.address(record.start);
@@ -697,8 +699,9 @@ void walk_function(determinism_walker_t& walk, const function_record_t& record)
     walk.u8(record.confidence);
     walk.boolean(record.thunk);
     walk.boolean(record.noreturn);
-    walk.u64(record.chunks.size());
-    for (const auto& chunk : record.chunks) {
+    const auto ranges = snapshot.function_chunks_of(record);
+    walk.u64(ranges.size());
+    for (const auto& chunk : ranges) {
         walk.u64(chunk.rva_start);
         walk.u64(chunk.rva_end);
         walk.u8(chunk.chunk_kind);
@@ -910,7 +913,12 @@ void walk_coverage(determinism_walker_t& walk, const coverage_span_t& record)
     walk.u32(record.detail_code);
 }
 
-std::string snapshot_determinism_sha256(const analysis_snapshot_t& snapshot)
+struct determinism_walk_result_t {
+    std::optional<std::string> sha256;
+    std::string failure;
+};
+
+determinism_walk_result_t snapshot_determinism_sha256(const analysis_snapshot_t& snapshot)
 {
     constexpr std::uint32_t field_walk_version = 1;
     determinism_walker_t walk;
@@ -922,18 +930,41 @@ std::string snapshot_determinism_sha256(const analysis_snapshot_t& snapshot)
     walk.u64(snapshot.analysis_revision);
     walk.u64(snapshot.overlay_revision);
     walk.boolean(snapshot.baseline_complete);
-    walk.u64(snapshot.instructions.size());
-    for (const auto& record : snapshot.instructions)
-        walk_instruction(walk, record);
+    const auto instruction_rows = instructions_view(snapshot);
+    const auto operand_rows = operand_facts_view(snapshot);
+    const auto target_rows = target_facts_view(snapshot);
+    fact_page_pin_t instruction_pin;
+    fact_page_pin_t operand_pin;
+    fact_page_pin_t target_pin;
+    const auto walk_failure = [](const workspace_error_t& error) {
+        determinism_walk_result_t result;
+        result.failure = error.stable_code() + ":" + error.message;
+        return result;
+    };
+    walk.u64(instruction_rows.size());
+    for (std::uint64_t ordinal = 0; ordinal < instruction_rows.size(); ++ordinal) {
+        const auto record = instruction_rows.at(ordinal, instruction_pin);
+        if (!record)
+            return walk_failure(record.error());
+        walk_instruction(walk, *record.value());
+    }
     walk.u64(snapshot.delay_slot_counts.size());
     if (!snapshot.delay_slot_counts.empty())
         walk.bytes(snapshot.delay_slot_counts.data(), snapshot.delay_slot_counts.size());
-    walk.u64(snapshot.operand_facts.size());
-    for (const auto& record : snapshot.operand_facts)
-        walk_operand_fact(walk, record);
-    walk.u64(snapshot.target_facts.size());
-    for (const auto& record : snapshot.target_facts)
-        walk_target_fact(walk, record);
+    walk.u64(operand_rows.size());
+    for (std::uint64_t ordinal = 0; ordinal < operand_rows.size(); ++ordinal) {
+        const auto record = operand_rows.at(ordinal, operand_pin);
+        if (!record)
+            return walk_failure(record.error());
+        walk_operand_fact(walk, *record.value());
+    }
+    walk.u64(target_rows.size());
+    for (std::uint64_t ordinal = 0; ordinal < target_rows.size(); ++ordinal) {
+        const auto record = target_rows.at(ordinal, target_pin);
+        if (!record)
+            return walk_failure(record.error());
+        walk_target_fact(walk, *record.value());
+    }
     walk.u64(snapshot.blocks.size());
     for (const auto& record : snapshot.blocks)
         walk_block(walk, record);
@@ -945,7 +976,7 @@ std::string snapshot_determinism_sha256(const analysis_snapshot_t& snapshot)
         walk_membership(walk, record);
     walk.u64(snapshot.functions.size());
     for (const auto& record : snapshot.functions)
-        walk_function(walk, record);
+        walk_function(walk, snapshot, record);
     walk.u64(snapshot.edges.size());
     for (const auto& record : snapshot.edges)
         walk_edge(walk, record);
@@ -964,7 +995,9 @@ std::string snapshot_determinism_sha256(const analysis_snapshot_t& snapshot)
     for (const auto& record : snapshot.coverage)
         walk_coverage(walk, record);
     const auto digest = walk.stream.finish();
-    return test_fixture::detail::large_pe_hex(digest.data(), digest.size());
+    determinism_walk_result_t result;
+    result.sha256 = test_fixture::detail::large_pe_hex(digest.data(), digest.size());
+    return result;
 }
 
 std::string stage_config_fingerprint()
@@ -991,6 +1024,8 @@ struct stage_run_measurement_t {
     std::uint64_t decoded_bytes = 0;
     std::uint64_t instruction_count = 0;
     std::string snapshot_sha256;
+    bool snapshot_walk_complete = true;
+    std::string snapshot_walk_failure;
     std::shared_ptr<const analysis_metrics_snapshot_t> harvested_metrics;
 };
 
@@ -1007,7 +1042,11 @@ stage_run_measurement_t run_stage_measurement(
     measurement.instruction_count = once.instruction_count;
     measurement.harvested_metrics = std::move(once.harvested_metrics);
     try {
-        measurement.snapshot_sha256 = snapshot_determinism_sha256(*once.snapshot);
+        auto walk_result = snapshot_determinism_sha256(*once.snapshot);
+        measurement.snapshot_walk_complete = walk_result.sha256.has_value();
+        measurement.snapshot_walk_failure = std::move(walk_result.failure);
+        if (walk_result.sha256)
+            measurement.snapshot_sha256 = std::move(*walk_result.sha256);
     } catch (...) {
         try { close_benchmark_workspace(once.workspace, true); } catch (...) {}
         throw;
@@ -1034,6 +1073,7 @@ struct parallel_decompile_stage_t {
     std::uint64_t latency_samples = 0;
     bool truncated = false;
     double funcs_per_s = 0.0;
+    double wall_per_s = 0.0;
     json latency_p50_ns = nullptr;
     json latency_p95_ns = nullptr;
 };
@@ -1155,6 +1195,10 @@ parallel_decompile_stage_t run_parallel_decompile_stage(
         stage.funcs_per_s = static_cast<double>(stage.completed) * 1000000000.0 /
             static_cast<double>(stage.wall_ns);
     }
+    if (stage_wall_ns != 0) {
+        stage.wall_per_s = static_cast<double>(stage.completed) * 1000000000.0 /
+            static_cast<double>(stage_wall_ns);
+    }
     if (reservoir.size() == 0 && stage.completed >= 2 && stage.wall_ns != 0) {
         reservoir.push((std::max<std::uint64_t>)(1, stage.slots_effective_peak) *
             stage.wall_ns / stage.completed);
@@ -1163,13 +1207,14 @@ parallel_decompile_stage_t run_parallel_decompile_stage(
     stage.latency_p50_ns = reservoir.percentile(0.50);
     stage.latency_p95_ns = reservoir.percentile(0.95);
     diag::log_tagged_fmt("benchmark",
-        "decompile_stage_end completed=%llu failed=%llu cancelled=%llu total=%llu wall_ms=%llu funcs_s=%.2f slots=%llu slots_effective_peak=%llu truncated=%d cancel=%d drain_cancelled=%d",
+        "decompile_stage_end completed=%llu failed=%llu cancelled=%llu total=%llu wall_ms=%llu funcs_s=%.2f wall_per_s=%.2f slots=%llu slots_effective_peak=%llu truncated=%d cancel=%d drain_cancelled=%d",
         static_cast<unsigned long long>(stage.completed),
         static_cast<unsigned long long>(stage.failed),
         static_cast<unsigned long long>(stage.cancelled),
         static_cast<unsigned long long>(stage.total),
         static_cast<unsigned long long>(stage.wall_ns / 1000000ULL),
         stage.funcs_per_s,
+        stage.wall_per_s,
         static_cast<unsigned long long>(stage.slots),
         static_cast<unsigned long long>(stage.slots_effective_peak),
         stage.truncated ? 1 : 0,
@@ -1197,8 +1242,10 @@ const json& program_sla_thresholds()
         {"incremental_private_bytes_max", 8589934592ULL},
         {"workspace_mapped_bytes_max", 1073741824ULL},
         {"global_mapped_bytes_max", 2147483648ULL},
-        {"decompile_all_funcs_per_s_min", 5.0},
-        {"decompile_all_funcs_per_s_stretch", 10.0},
+        {"decompile_all_funcs_per_s_min", 12.0},
+        {"decompile_all_funcs_per_s_stretch", 16.0},
+        {"decompile_all_funcs_wall_per_s_min", 100.0},
+        {"decompile_all_funcs_wall_per_s_stretch", 140.0},
         {"scaling_wall16_over_wall1_max", 0.20},
         {"scaling_efficiency_16_min", 0.5},
         {"determinism_hash_match", true}
@@ -1511,6 +1558,7 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         const auto image = workspace->normalized_image();
         const std::uint64_t code_bytes = primary.code_bytes;
         const auto snapshot = primary.snapshot;
+        const std::uint64_t instruction_count = instructions_view(*snapshot).size();
         const auto search = workspace->search_index();
         const auto database = workspace->database()->snapshot();
         const std::uint64_t decoded_bytes = primary.decoded_bytes;
@@ -1527,6 +1575,7 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             request.synthetic_seed, primary.decompile_orchestrator_owned, cancel);
         const bool batch_ran = decompile_stage.ran;
         const double batch_funcs_per_s = decompile_stage.funcs_per_s;
+        const double batch_wall_per_s = decompile_stage.wall_per_s;
 
         std::vector<std::uint64_t> query_samples;
         if (search) {
@@ -1687,7 +1736,11 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                     {"phases_status", run.harvested_metrics
                         ? json("measured") : json(
                             "not_applicable:workspace_baseline_metrics_publication_unavailable")},
-                    {"snapshot_sha256", run.snapshot_sha256}});
+                    {"snapshot_sha256", run.snapshot_walk_complete
+                        ? json(run.snapshot_sha256) : json(nullptr)},
+                    {"walk_complete", run.snapshot_walk_complete},
+                    {"walk_failure", run.snapshot_walk_complete
+                        ? json(nullptr) : json(run.snapshot_walk_failure)}});
                 if (run.budget <= 16)
                     n16 = (std::max)(n16, run.budget);
                 if (run.budget == 16 && !has_budget16) {
@@ -1730,26 +1783,45 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 scaling_gate_applicable ? 1 : 0, static_cast<unsigned>(n16),
                 static_cast<unsigned>(host_logical), wall16_text.c_str(), eff16_text.c_str());
 
+            std::string determinism_walk_failure;
+            bool determinism_walk_failed = false;
+            for (const auto& run : stage_runs) {
+                if (!run.snapshot_walk_complete) {
+                    determinism_walk_failed = true;
+                    if (determinism_walk_failure.empty())
+                        determinism_walk_failure = run.snapshot_walk_failure;
+                }
+            }
             determinism_measured = stage_runs.size() >= 2;
-            determinism_match = determinism_measured;
-            for (std::size_t index = 1; index < stage_runs.size(); ++index) {
-                if (stage_runs[index].snapshot_sha256 != stage_runs.front().snapshot_sha256)
-                    determinism_match = false;
+            determinism_match = determinism_measured && !determinism_walk_failed;
+            if (determinism_measured && !determinism_walk_failed) {
+                for (std::size_t index = 1; index < stage_runs.size(); ++index) {
+                    if (stage_runs[index].snapshot_sha256 != stage_runs.front().snapshot_sha256)
+                        determinism_match = false;
+                }
             }
             json hash_runs = json::array();
             for (std::size_t index = 0; index < stage_runs.size(); ++index) {
                 hash_runs.push_back(json{{"label", "run_" + std::to_string(index)},
                     {"budget", stage_runs[index].budget},
-                    {"snapshot_sha256", stage_runs[index].snapshot_sha256}});
+                    {"snapshot_sha256", stage_runs[index].snapshot_walk_complete
+                        ? json(stage_runs[index].snapshot_sha256) : json(nullptr)},
+                    {"walk_complete", stage_runs[index].snapshot_walk_complete},
+                    {"walk_failure", stage_runs[index].snapshot_walk_complete
+                        ? json(nullptr) : json(stage_runs[index].snapshot_walk_failure)}});
             }
             determinism_block = json{{"runs", std::move(hash_runs)},
                 {"match", determinism_measured ? json(determinism_match) : json(nullptr)},
+                {"walk_failed", determinism_walk_failed},
+                {"walk_failure", determinism_walk_failed
+                    ? json(determinism_walk_failure) : json(nullptr)},
                 {"field_walk", json{{"contract", "aida.hyperperf.benchmark-determinism-walk"},
                     {"version", 1}}},
                 {"config_fingerprint", stage_config_fingerprint()}};
             diag::log_tagged_fmt("benchmark",
-                "determinism runs=%zu match=%d stage_wall_ms=%llu",
+                "determinism runs=%zu match=%d walk_failed=%d stage_wall_ms=%llu",
                 stage_runs.size(), determinism_match ? 1 : 0,
+                determinism_walk_failed ? 1 : 0,
                 static_cast<unsigned long long>(nanoseconds_since(stage_begin) / 1000000ULL));
         }
 
@@ -1779,7 +1851,7 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             : json(static_cast<double>(file_bytes) * 1000000000.0 /
                 static_cast<double>(analysis_wall_ns));
         const json instructions_s = decode_effective_ns == 0 ? json(nullptr)
-            : json(static_cast<double>(snapshot->instructions.size()) / decode_wall_s);
+            : json(static_cast<double>(instruction_count) / decode_wall_s);
         const json publish_ms = harvested_available
             ? json(static_cast<double>(
                 harvested->phases[static_cast<std::size_t>(
@@ -1872,6 +1944,18 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             verdicts.push_back(verdict_entry("decompile_all_funcs_per_s_stretch",
                 thresholds["decompile_all_funcs_per_s_stretch"], nullptr, "NOT_MEASURED"));
         }
+        push_min("decompile_all_funcs_wall_per_s_min",
+            thresholds["decompile_all_funcs_wall_per_s_min"].get<double>(),
+            batch_ran ? json(batch_wall_per_s) : json(nullptr));
+        if (batch_ran) {
+            verdicts.push_back(verdict_entry("decompile_all_funcs_wall_per_s_stretch",
+                thresholds["decompile_all_funcs_wall_per_s_stretch"], batch_wall_per_s,
+                batch_wall_per_s >= thresholds["decompile_all_funcs_wall_per_s_stretch"].get<double>()
+                    ? "PASS" : "WARN"));
+        } else {
+            verdicts.push_back(verdict_entry("decompile_all_funcs_wall_per_s_stretch",
+                thresholds["decompile_all_funcs_wall_per_s_stretch"], nullptr, "NOT_MEASURED"));
+        }
         if (scaling_gate_applicable) {
             verdicts.push_back(verdict_entry("scaling_wall16_over_wall1_max",
                 thresholds["scaling_wall16_over_wall1_max"], scaling_wall16_over_wall1,
@@ -1918,12 +2002,12 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             "baseline_analysis", static_cast<unsigned long long>(analysis_wall_ns / 1000000ULL),
             static_cast<unsigned long long>((process_cpu_ns_now() - cpu_begin) / 1000000ULL),
             static_cast<unsigned long long>(file_bytes),
-            static_cast<unsigned long long>(snapshot->instructions.size()));
+            static_cast<unsigned long long>(instruction_count));
         diag::log_tagged_fmt("benchmark",
             "phase name=%s wall_ms=%llu cpu_ms=%llu bytes_in=%llu work_items=%llu",
             "decode_window", static_cast<unsigned long long>(decode_window_ns / 1000000ULL),
             0ULL, static_cast<unsigned long long>(decoded_bytes),
-            static_cast<unsigned long long>(snapshot->instructions.size()));
+            static_cast<unsigned long long>(instruction_count));
         if (batch_ran) {
             diag::log_tagged_fmt("benchmark",
                 "phase name=%s wall_ms=%llu cpu_ms=%llu bytes_in=%llu work_items=%llu",
@@ -1973,7 +2057,7 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         SYSTEM_INFO host_system{};
         GetNativeSystemInfo(&host_system);
         const auto host_logical =
-            static_cast<std::uint64_t>((std::max)(1U, host_system.dwNumberOfProcessors));
+            static_cast<std::uint64_t>((std::max<DWORD>)(1, host_system.dwNumberOfProcessors));
         const std::uint64_t slots_busy_ns = harvested_available
             ? harvested->value(analysis_metric_t::worker_slots_busy_ns) : 0;
         const std::uint64_t slots_scheduled_ns = harvested_available
@@ -2150,6 +2234,7 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"total", decompile_stage.total},
                 {"wall_ns", decompile_stage.wall_ns},
                 {"funcs_per_s", decompile_stage.funcs_per_s},
+                {"wall_per_s", decompile_stage.wall_per_s},
                 {"p50_ns", decompile_stage.latency_p50_ns},
                 {"p95_ns", decompile_stage.latency_p95_ns},
                 {"latency_model", "interval_throughput_derived_service_time"},
@@ -2169,7 +2254,8 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"status", "not_applicable"},
                 {"reason", decompile_stage.unavailable_reason.empty()
                     ? "decompile_stage_not_run" : decompile_stage.unavailable_reason},
-                {"funcs_per_s", nullptr}};
+                {"funcs_per_s", nullptr},
+                {"wall_per_s", nullptr}};
         }
 
         const json phase_budgets_block = evaluate_phase_budgets(
@@ -2236,7 +2322,9 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"index_bytes_per_s", index_bps},
                 {"persist_bytes_per_s", persist_bps},
                 {"decompile_all_funcs_per_s",
-                    batch_ran ? json(batch_funcs_per_s) : json(nullptr)}}},
+                    batch_ran ? json(batch_funcs_per_s) : json(nullptr)},
+                {"decompile_all_funcs_wall_per_s",
+                    batch_ran ? json(batch_wall_per_s) : json(nullptr)}}},
             {"worker_pool", std::move(worker_pool_block)},
             {"decode_detail", std::move(decode_detail_block)},
             {"memory", std::move(memory_block)},
@@ -2248,7 +2336,7 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"indexed_query_p95_ms", query_p95_ms},
                 {"decompile_p95_ms", decompile_p95_ms},
                 {"cancellation_request_to_completion_ms", nullptr}}},
-            {"counts", json{{"instructions", snapshot->instructions.size()},
+            {"counts", json{{"instructions", instruction_count},
                 {"blocks", snapshot->blocks.size()},
                 {"functions", snapshot->functions.size()},
                 {"edges", snapshot->edges.size()},

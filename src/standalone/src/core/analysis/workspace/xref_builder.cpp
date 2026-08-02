@@ -1,7 +1,9 @@
 #include "xref_builder.hpp"
 
 #include "checked_range.hpp"
+#include "paged_snapshot_view.hpp"
 #include "parallel_pass.hpp"
+#include "record_span.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -120,20 +122,88 @@ bool valid_address(const address_t& address) noexcept {
            workspace_architecture_mode_matches(address.architecture, address.mode);
 }
 
+paged_table_t<instruction_record_t> instruction_rows_view(
+    const std::vector<instruction_record_t>& instructions) {
+    return paged_table_t<instruction_record_t>::resident(
+        record_span_t<const instruction_record_t>(instructions.data(), instructions.size()));
+}
+
+paged_table_t<operand_fact_t> operand_rows_view(
+    const std::vector<operand_fact_t>& operands) {
+    return paged_table_t<operand_fact_t>::resident(
+        record_span_t<const operand_fact_t>(operands.data(), operands.size()));
+}
+
+paged_table_t<operand_fact_t> operand_rows_view(
+    const operand_fact_store_t& operands,
+    const std::vector<instruction_record_t>& instructions) {
+    return paged_table_t<operand_fact_t>::resident_operands(&operands, &instructions);
+}
+
+paged_table_t<target_fact_t> target_rows_view(
+    const std::vector<target_fact_t>& targets) {
+    return paged_table_t<target_fact_t>::resident(
+        record_span_t<const target_fact_t>(targets.data(), targets.size()));
+}
+
+data_discovery_limits_t data_limits_from_xref(const xref_build_limits_t& limits,
+                                              std::uint64_t pointer_seed_count) {
+    data_discovery_limits_t data_limits;
+    data_limits.max_candidates = limits.max_data_candidates;
+    data_limits.max_pointer_facts = limits.max_pointer_facts;
+    data_limits.max_conflicts = limits.max_data_conflicts;
+    data_limits.max_pointer_seeds =
+        (std::max<std::uint64_t>)(1, pointer_seed_count);
+    data_limits.max_pointer_scan_bytes = limits.max_pointer_scan_bytes;
+    data_limits.max_result_bytes = limits.max_result_bytes;
+    data_limits.read_window_bytes = limits.read_window_bytes;
+    data_limits.cancellation_check_interval = limits.cancellation_check_interval;
+    return data_limits;
+}
+
+workspace_result_t<void> reject_silent_empty_views(
+    const analysis_snapshot_t& snapshot,
+    const paged_table_t<instruction_record_t>& instructions,
+    const paged_table_t<operand_fact_t>& operands,
+    const paged_table_t<target_fact_t>& targets) {
+    const auto paged_count = [&snapshot](fact_domain_t domain) {
+        const auto index = static_cast<std::size_t>(domain);
+        return index < fact_domain_count
+            ? snapshot.paged_domain_counts[index]
+            : std::uint64_t{0};
+    };
+    if ((instructions.empty() && paged_count(fact_domain_t::instructions) != 0) ||
+        (operands.empty() && paged_count(fact_domain_t::operand_facts) != 0) ||
+        (targets.empty() && paged_count(fact_domain_t::target_facts) != 0)) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "snapshot fact views are empty while paged domains record facts",
+            "xrefs"));
+    }
+    return workspace_result_t<void>::success();
+}
+
 std::uint8_t operand_access(const instruction_record_t& instruction,
                             const target_fact_t& target,
-                            const std::vector<operand_fact_t>& operands) noexcept {
+                            const paged_table_t<operand_fact_t>& operands,
+                            fact_page_pin_t& pin) noexcept {
     std::uint64_t end = 0;
     if (!checked_add_u64(instruction.operand_fact_begin,
             instruction.operand_fact_count, end) || end > operands.size())
         return 0;
     const operand_fact_t* by_index = nullptr;
+    operand_fact_t by_index_value;
     for (std::uint64_t index = instruction.operand_fact_begin; index < end; ++index) {
-        const auto& operand = operands[static_cast<std::size_t>(index)];
+        const auto row = operands.at(index, pin);
+        if (!row)
+            return 0;
+        const auto& operand = *row.value();
         if (target.operand_fact_id != 0 && operand.id == target.operand_fact_id)
             return operand.access;
-        if (operand.operand_index == target.operand_index)
-            by_index = &operand;
+        if (operand.operand_index == target.operand_index) {
+            by_index_value = operand;
+            by_index = &by_index_value;
+        }
     }
     return by_index ? by_index->access : 0;
 }
@@ -217,9 +287,9 @@ workspace_result_t<std::uint64_t> validate_and_accumulate(
 
 workspace_result_t<xref_build_result_t> build_core(
     const workspace_image_t& image,
-    const std::vector<instruction_record_t>& instructions,
-    const std::vector<operand_fact_t>& operands,
-    const std::vector<target_fact_t>& targets,
+    const paged_table_t<instruction_record_t>& instructions,
+    const paged_table_t<operand_fact_t>& operands,
+    const paged_table_t<target_fact_t>& targets,
     const data_discovery_result_t& data,
     std::vector<type_reference_fact_t> type_references,
     const xref_build_limits_t& limits,
@@ -273,6 +343,13 @@ workspace_result_t<xref_build_result_t> build_core(
     const auto instruction_fn = [&](std::size_t index, parallel_shard_t shard)
         -> workspace_result_t<void> {
         auto& output = instruction_outputs[index];
+        const auto instruction_span = instructions.resident_span();
+        const auto target_span = targets.resident_span();
+        const bool instructions_resident = instructions.resident();
+        const bool targets_resident = targets.resident();
+        fact_page_pin_t instruction_pin;
+        fact_page_pin_t target_pin;
+        fact_page_pin_t operand_pin;
         std::uint32_t checks = 0;
         for (std::size_t i = shard.begin; i < shard.end; ++i) {
             if (++checks >= kShardCancellationStride) {
@@ -280,47 +357,64 @@ workspace_result_t<xref_build_result_t> build_core(
                 if (cancel.stop_requested())
                     return workspace_result_t<void>::failure(stop_error(cancel));
             }
-            const auto& instruction = instructions[i];
+            const instruction_record_t* instruction = nullptr;
+            if (instructions_resident) {
+                instruction = &instruction_span[i];
+            } else {
+                auto row = instructions.at(i, instruction_pin, cancel);
+                if (!row)
+                    return workspace_result_t<void>::failure(row.error());
+                instruction = row.value();
+            }
             std::uint64_t operand_end = 0;
             std::uint64_t target_end = 0;
-            if (!checked_add_u64(instruction.operand_fact_begin,
-                    instruction.operand_fact_count, operand_end) || operand_end > operands.size() ||
-                !checked_add_u64(instruction.target_fact_begin,
-                    instruction.target_fact_count, target_end) || target_end > targets.size()) {
+            if (!checked_add_u64(instruction->operand_fact_begin,
+                    instruction->operand_fact_count, operand_end) || operand_end > operands.size() ||
+                !checked_add_u64(instruction->target_fact_begin,
+                    instruction->target_fact_count, target_end) || target_end > targets.size()) {
                 return workspace_result_t<void>::failure(make_workspace_error(
                     workspace_error_code_t::integrity_failure,
                     "instruction fact range is invalid", "xrefs"));
             }
-            for (std::uint64_t fact = instruction.target_fact_begin; fact < target_end; ++fact) {
-                const auto& target = targets[static_cast<std::size_t>(fact)];
-                if (!valid_address(instruction.address) || !valid_address(target.target) ||
-                    (target.instruction_id != 0 && target.instruction_id != instruction.id)) {
+            for (std::uint64_t fact = instruction->target_fact_begin; fact < target_end; ++fact) {
+                const target_fact_t* target = nullptr;
+                if (targets_resident) {
+                    target = &target_span[static_cast<std::size_t>(fact)];
+                } else {
+                    auto row = targets.at(fact, target_pin, cancel);
+                    if (!row)
+                        return workspace_result_t<void>::failure(row.error());
+                    target = row.value();
+                }
+                if (!valid_address(instruction->address) || !valid_address(target->target) ||
+                    (target->instruction_id != 0 && target->instruction_id != instruction->id)) {
                     return workspace_result_t<void>::failure(make_workspace_error(
                         workspace_error_code_t::integrity_failure,
                         "xref target fact is invalid", "xrefs"));
                 }
-                const auto target_rva = to_rva(image, target.target);
-                const bool imported_call = target.kind == target_kind_record_t::call &&
+                const auto target_rva = to_rva(image, target->target);
+                const bool imported_call = target->kind == target_kind_record_t::call &&
                     target_rva && import_rvas.count(*target_rva) > 0;
                 auto make_xref = [&](xref_kind_t kind) {
                     xref_record_t xref;
-                    xref.source = instruction.address;
-                    xref.target = target.target;
+                    xref.source = instruction->address;
+                    xref.target = target->target;
                     xref.kind = kind;
                     xref.provenance = imported_call
-                        ? fact_provenance_t::relocation : instruction.provenance;
+                        ? fact_provenance_t::relocation : instruction->provenance;
                     xref.confidence = imported_call
-                        ? (std::min)(instruction.confidence, static_cast<std::uint8_t>(95))
-                        : instruction.confidence;
+                        ? (std::min)(instruction->confidence, static_cast<std::uint8_t>(95))
+                        : instruction->confidence;
                     return xref;
                 };
-                if (target.kind == target_kind_record_t::call) {
+                if (target->kind == target_kind_record_t::call) {
                     output.xrefs.push_back(make_xref(xref_kind_t::call));
-                } else if (target.kind == target_kind_record_t::branch ||
-                           target.kind == target_kind_record_t::fallthrough) {
+                } else if (target->kind == target_kind_record_t::branch ||
+                           target->kind == target_kind_record_t::fallthrough) {
                     output.xrefs.push_back(make_xref(xref_kind_t::code));
                 } else {
-                    const auto access = operand_access(instruction, target, operands);
+                    const auto access = operand_access(
+                        *instruction, *target, operands, operand_pin);
                     if ((access & 1U) != 0)
                         output.xrefs.push_back(make_xref(xref_kind_t::read));
                     if ((access & 2U) != 0) {
@@ -586,21 +680,50 @@ workspace_result_t<xref_build_result_t> xref_builder_t::build(
     const std::vector<data_pointer_seed_t>& pointer_seeds,
     const std::vector<type_reference_fact_t>& type_references,
     const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
-    data_discovery_limits_t data_limits;
-    data_limits.max_candidates = limits.max_data_candidates;
-    data_limits.max_pointer_facts = limits.max_pointer_facts;
-    data_limits.max_conflicts = limits.max_data_conflicts;
-    data_limits.max_pointer_seeds = (std::max<std::uint64_t>)(1, pointer_seeds.size());
-    data_limits.max_pointer_scan_bytes = limits.max_pointer_scan_bytes;
-    data_limits.max_result_bytes = limits.max_result_bytes;
-    data_limits.read_window_bytes = limits.read_window_bytes;
-    data_limits.cancellation_check_interval = limits.cancellation_check_interval;
+    const auto data_limits = data_limits_from_xref(limits, pointer_seeds.size());
     auto data = data_discovery_t::discover(image, provider, instructions, targets,
         pointer_seeds, data_limits, cancel);
     if (!data)
         return workspace_result_t<xref_build_result_t>::failure(data.error());
     return build(image, instructions, operands, targets, data.take_value(),
         type_references, limits, cancel);
+}
+
+workspace_result_t<xref_build_result_t> xref_builder_t::build(
+    const workspace_image_t& image, const byte_provider_t& provider,
+    const std::vector<instruction_record_t>& instructions,
+    const operand_fact_store_t& operands,
+    const std::vector<target_fact_t>& targets,
+    const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
+    const auto data_limits = data_limits_from_xref(limits, 0);
+    auto data = data_discovery_t::discover(image, provider, instructions, targets,
+        data_limits, cancel);
+    if (!data)
+        return workspace_result_t<xref_build_result_t>::failure(data.error());
+    return build(image, instructions, operands, targets,
+        std::make_shared<data_discovery_result_t>(data.take_value()), {},
+        limits, cancel);
+}
+
+workspace_result_t<xref_build_result_t> xref_builder_t::build(
+    const workspace_image_t& image, const byte_provider_t& provider,
+    const analysis_snapshot_t& snapshot,
+    const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
+    if (snapshot_domain_is_paged(snapshot, fact_domain_t::instructions) ||
+        snapshot_domain_is_paged(snapshot, fact_domain_t::operand_facts) ||
+        snapshot_domain_is_paged(snapshot, fact_domain_t::target_facts)) {
+        return workspace_result_t<xref_build_result_t>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "provider xref build requires resident instruction and target facts",
+            "xrefs"));
+    }
+    const auto views_valid = reject_silent_empty_views(snapshot,
+        instructions_view(snapshot), operand_facts_view(snapshot),
+        target_facts_view(snapshot));
+    if (!views_valid)
+        return workspace_result_t<xref_build_result_t>::failure(views_valid.error());
+    return build(image, provider, snapshot.instructions, snapshot.operand_facts,
+        snapshot.target_facts, limits, cancel);
 }
 
 workspace_result_t<xref_build_result_t> xref_builder_t::build(
@@ -612,7 +735,8 @@ workspace_result_t<xref_build_result_t> xref_builder_t::build(
     std::vector<type_reference_fact_t> type_references,
     const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
     try {
-        auto built = build_core(image, instructions, operands, targets, data,
+        auto built = build_core(image, instruction_rows_view(instructions),
+            operand_rows_view(operands), target_rows_view(targets), data,
             std::move(type_references), limits, cancel);
         if (!built)
             return workspace_result_t<xref_build_result_t>::failure(built.error());
@@ -632,11 +756,13 @@ workspace_result_t<xref_build_result_t> xref_builder_t::build(
     }
 }
 
-workspace_result_t<xref_build_result_t> xref_builder_t::build(
+namespace {
+
+workspace_result_t<xref_build_result_t> build_with_shared_data(
     const workspace_image_t& image,
-    const std::vector<instruction_record_t>& instructions,
-    const std::vector<operand_fact_t>& operands,
-    const std::vector<target_fact_t>& targets,
+    const paged_table_t<instruction_record_t>& instructions,
+    const paged_table_t<operand_fact_t>& operands,
+    const paged_table_t<target_fact_t>& targets,
     std::shared_ptr<const data_discovery_result_t> data,
     std::vector<type_reference_fact_t> type_references,
     const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
@@ -664,6 +790,51 @@ workspace_result_t<xref_build_result_t> xref_builder_t::build(
             workspace_error_code_t::limit_exceeded,
             "xref analysis allocation length is unsupported", "xrefs"));
     }
+}
+
+}
+
+workspace_result_t<xref_build_result_t> xref_builder_t::build(
+    const workspace_image_t& image,
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<operand_fact_t>& operands,
+    const std::vector<target_fact_t>& targets,
+    std::shared_ptr<const data_discovery_result_t> data,
+    std::vector<type_reference_fact_t> type_references,
+    const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
+    return build_with_shared_data(image, instruction_rows_view(instructions),
+        operand_rows_view(operands), target_rows_view(targets), data,
+        std::move(type_references), limits, cancel);
+}
+
+workspace_result_t<xref_build_result_t> xref_builder_t::build(
+    const workspace_image_t& image,
+    const std::vector<instruction_record_t>& instructions,
+    const operand_fact_store_t& operands,
+    const std::vector<target_fact_t>& targets,
+    std::shared_ptr<const data_discovery_result_t> data,
+    std::vector<type_reference_fact_t> type_references,
+    const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
+    return build_with_shared_data(image, instruction_rows_view(instructions),
+        operand_rows_view(operands, instructions), target_rows_view(targets), data,
+        std::move(type_references), limits, cancel);
+}
+
+workspace_result_t<xref_build_result_t> xref_builder_t::build(
+    const workspace_image_t& image,
+    const analysis_snapshot_t& snapshot,
+    std::shared_ptr<const data_discovery_result_t> data,
+    std::vector<type_reference_fact_t> type_references,
+    const xref_build_limits_t& limits, const cancellation_token_t& cancel) {
+    auto instructions = instructions_view(snapshot);
+    auto operands = operand_facts_view(snapshot);
+    auto targets = target_facts_view(snapshot);
+    const auto views_valid = reject_silent_empty_views(
+        snapshot, instructions, operands, targets);
+    if (!views_valid)
+        return workspace_result_t<xref_build_result_t>::failure(views_valid.error());
+    return build_with_shared_data(image, instructions, operands, targets, data,
+        std::move(type_references), limits, cancel);
 }
 
 workspace_result_t<void> xref_builder_t::publish_xrefs(

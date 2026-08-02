@@ -2,6 +2,8 @@
 
 #include "checked_range.hpp"
 #include "packed_page_codec.hpp"
+#include "paged_fact_staging.hpp"
+#include "paged_snapshot_view.hpp"
 #include "sqlite_reader_pool.hpp"
 #include "sqlite_statement_cache.hpp"
 #include "../decompiler/managed_entity_binding.hpp"
@@ -607,6 +609,52 @@ void write_operand(packed_payload_writer_t& writer,
     writer.u8(static_cast<std::uint8_t>(record.address_resolution));
 }
 
+void snapshot_repair_operand_instruction_ordinals(
+    analysis_snapshot_t& snapshot) noexcept {
+    bool any_sentinel = false;
+    for (const auto& hot : snapshot.operand_facts.hot) {
+        if (hot.instruction_ordinal == 0xFFFFFFFFU) {
+            any_sentinel = true;
+            break;
+        }
+    }
+    if (!any_sentinel)
+        return;
+    std::uint64_t operand_cursor = 0;
+    for (std::size_t ordinal = 0; ordinal < snapshot.instructions.size(); ++ordinal) {
+        const auto& instruction = snapshot.instructions[ordinal];
+        const auto begin = instruction.operand_fact_begin;
+        const auto end = (std::max<std::uint64_t>)(
+            static_cast<std::uint64_t>(begin),
+            static_cast<std::uint64_t>(begin) + instruction.operand_fact_count);
+        operand_cursor = (std::max)(operand_cursor,
+                                    static_cast<std::uint64_t>(begin));
+        while (operand_cursor < end &&
+               operand_cursor < snapshot.operand_facts.hot.size()) {
+            snapshot.operand_facts.hot[static_cast<std::size_t>(operand_cursor)]
+                .instruction_ordinal = static_cast<std::uint32_t>(ordinal);
+            ++operand_cursor;
+        }
+    }
+}
+
+void snapshot_operand_append(analysis_snapshot_t& snapshot,
+                             const operand_fact_t& record) {
+    std::uint32_t instruction_ordinal = 0xFFFFFFFFU;
+    if ((record.instruction_id >> 56U) == (instruction_entity_tag >> 56U) &&
+        (record.instruction_id & entity_ordinal_mask) != 0) {
+        instruction_ordinal = static_cast<std::uint32_t>(
+            (record.instruction_id & entity_ordinal_mask) - 1ULL);
+    }
+    auto parts = operand_fact_split(record, instruction_ordinal);
+    if (parts.has_cold) {
+        snapshot.operand_facts.cold.push_back(parts.cold);
+        parts.hot.cold_index =
+            static_cast<std::uint32_t>(snapshot.operand_facts.cold.size());
+    }
+    snapshot.operand_facts.hot.push_back(parts.hot);
+}
+
 void write_target(packed_payload_writer_t& writer,
                   const target_fact_t& record) {
     writer.u64(record.instruction_id);
@@ -734,6 +782,18 @@ void write_coverage(packed_payload_writer_t& writer,
     writer.u8(static_cast<std::uint8_t>(record.provenance));
     writer.u8(record.confidence);
     writer.u32(record.detail_code);
+}
+
+void write_address_expression(packed_payload_writer_t& writer,
+                              const address_expression_record_t& record) {
+    writer.u16(record.components);
+    writer.u16(record.base_reg);
+    writer.u16(record.index_reg);
+    writer.u16(record.segment_reg);
+    writer.u8(record.kind);
+    writer.u8(record.resolution);
+    writer.u8(record.scale);
+    writer.u8(record.disp_class);
 }
 
 void write_data_candidate(packed_payload_writer_t& writer,
@@ -1112,6 +1172,19 @@ coverage_span_t read_coverage(packed_payload_reader_t& reader) {
     record.provenance = static_cast<fact_provenance_t>(reader.u8());
     record.confidence = reader.u8();
     record.detail_code = reader.u32();
+    return record;
+}
+
+address_expression_record_t read_address_expression(packed_payload_reader_t& reader) {
+    address_expression_record_t record;
+    record.components = reader.u16();
+    record.base_reg = reader.u16();
+    record.index_reg = reader.u16();
+    record.segment_reg = reader.u16();
+    record.kind = reader.u8();
+    record.resolution = reader.u8();
+    record.scale = reader.u8();
+    record.disp_class = reader.u8();
     return record;
 }
 
@@ -1809,6 +1882,110 @@ workspace_result_t<void> decode_instruction_chunk(
     return workspace_result_t<void>::success();
 }
 
+constexpr std::uint32_t kFactChunkBlobMagic = 0x4B484346U;
+constexpr std::uint32_t kFactChunkBlobVersion = 1;
+constexpr std::uint64_t kFactChunkEdgeRecordBytes = 49;
+
+void append_fact_chunk_header(std::vector<std::uint8_t>& output,
+                              std::uint64_t count, std::uint64_t stride) {
+    append_u32(output, kFactChunkBlobMagic);
+    append_u32(output, kFactChunkBlobVersion);
+    append_u64(output, count);
+    append_u64(output, stride);
+}
+
+std::vector<std::uint8_t> encode_edge_chunk_record(const edge_record_t& record) {
+    std::vector<std::uint8_t> output;
+    output.reserve(static_cast<std::size_t>(kFactChunkEdgeRecordBytes));
+    append_u64(output, record.id);
+    append_u64(output, record.source_entity);
+    append_u64(output, record.target_entity.has_value() ? *record.target_entity : 0);
+    append_u8(output, static_cast<std::uint8_t>(record.source.space));
+    append_u64(output, record.source.value);
+    append_u8(output, static_cast<std::uint8_t>(record.source.architecture));
+    append_u8(output, static_cast<std::uint8_t>(record.source.mode));
+    append_u8(output, static_cast<std::uint8_t>(record.target.space));
+    append_u64(output, record.target.value);
+    append_u8(output, static_cast<std::uint8_t>(record.target.architecture));
+    append_u8(output, static_cast<std::uint8_t>(record.target.mode));
+    append_u8(output, static_cast<std::uint8_t>(record.kind));
+    append_u8(output, static_cast<std::uint8_t>(record.provenance));
+    append_u8(output, record.confidence);
+    return output;
+}
+
+edge_record_t decode_edge_chunk_record(const std::uint8_t* data) {
+    edge_record_t record;
+    const auto* cursor = data;
+    std::uint64_t raw = 0;
+    std::memcpy(&raw, cursor, sizeof(raw)); cursor += sizeof(raw);
+    record.id = raw;
+    std::memcpy(&raw, cursor, sizeof(raw)); cursor += sizeof(raw);
+    record.source_entity = raw;
+    std::memcpy(&raw, cursor, sizeof(raw)); cursor += sizeof(raw);
+    if (raw != 0)
+        record.target_entity = raw;
+    record.source.space = static_cast<address_space_id_t>(*cursor++);
+    std::memcpy(&raw, cursor, sizeof(raw)); cursor += sizeof(raw);
+    record.source.value = raw;
+    record.source.architecture = static_cast<architecture_id_t>(*cursor++);
+    record.source.mode = static_cast<architecture_mode_t>(*cursor++);
+    record.target.space = static_cast<address_space_id_t>(*cursor++);
+    std::memcpy(&raw, cursor, sizeof(raw)); cursor += sizeof(raw);
+    record.target.value = raw;
+    record.target.architecture = static_cast<architecture_id_t>(*cursor++);
+    record.target.mode = static_cast<architecture_mode_t>(*cursor++);
+    record.kind = static_cast<edge_kind_t>(*cursor++);
+    record.provenance = static_cast<fact_provenance_t>(*cursor++);
+    record.confidence = *cursor++;
+    return record;
+}
+
+workspace_result_t<void> decode_fact_chunk_envelope(
+    const void* data, std::size_t size, std::uint64_t expected_stride,
+    std::uint64_t max_chunk_records, std::uint64_t& count_out,
+    const std::uint8_t*& records_out, const char* phase) {
+    const auto* cursor = static_cast<const std::uint8_t*>(data);
+    const auto* end = cursor + size;
+    auto magic = read_unsigned_le<std::uint32_t>(cursor, end);
+    if (!magic || magic.value() != kFactChunkBlobMagic) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "fact chunk magic is invalid", phase));
+    }
+    auto version = read_unsigned_le<std::uint32_t>(cursor, end);
+    if (!version || version.value() == 0 ||
+        version.value() > kFactChunkBlobVersion) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "fact chunk version is unsupported", phase));
+    }
+    auto count_result = read_unsigned_le<std::uint64_t>(cursor, end);
+    if (!count_result || count_result.value() == 0 ||
+        count_result.value() > max_chunk_records) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "fact chunk record count is invalid", phase));
+    }
+    auto stride_result = read_unsigned_le<std::uint64_t>(cursor, end);
+    if (!stride_result || stride_result.value() != expected_stride) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "fact chunk record stride is invalid", phase));
+    }
+    const std::uint64_t count = count_result.value();
+    std::uint64_t encoded_records_size = 0;
+    if (!checked_mul_u64(count, expected_stride, encoded_records_size) ||
+        encoded_records_size != static_cast<std::uint64_t>(end - cursor)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "fact chunk record payload is malformed", phase));
+    }
+    count_out = count;
+    records_out = cursor;
+    return workspace_result_t<void>::success();
+}
+
 workspace_result_t<std::string> database_path_for(const workspace_identity_t& identity) {
     PWSTR raw = nullptr;
     const HRESULT status = SHGetKnownFolderPath(FOLDERID_RoamingAppData,
@@ -2085,6 +2262,7 @@ workspace_result_t<void> migrate_schema(sqlite3* database,
         else if (version == 7) migrated = create_schema_v8(database);
         else if (version == 8) migrated = create_schema_v9(database);
         else if (version == 9) migrated = create_schema_v10(database);
+        else if (version == 10) migrated = create_schema_v11(database);
         if (!migrated) {
             rollback(database, "workspace_database.schema");
             return migrated;
@@ -2106,7 +2284,7 @@ workspace_result_t<void> migrate_schema(sqlite3* database,
         auto begin = begin_immediate(database, "workspace_database.schema");
         if (!begin)
             return begin;
-        auto ensured = create_schema_v10(database);
+        auto ensured = create_schema_v11(database);
         if (!ensured) {
             rollback(database, "workspace_database.schema");
             return ensured;
@@ -2321,8 +2499,8 @@ workspace_result_t<void> initialize_identity_and_versions(
 
     if (invalidate) {
         auto cleared = exec_sql(database, R"SQL(
-DELETE FROM call_graph_conflicts;DELETE FROM call_graph_edges;DELETE FROM call_candidates;DELETE FROM call_sites;DELETE FROM call_graph_nodes;DELETE FROM call_graph_state;DELETE FROM data_pointer_facts;DELETE FROM data_conflicts;DELETE FROM rich_data_candidates;DELETE FROM type_references;DELETE FROM metadata_conflicts;DELETE FROM symbol_type_candidates;DELETE FROM switch_cases;DELETE FROM switches;DELETE FROM segments;DELETE FROM instruction_chunks;DELETE FROM operand_facts;DELETE FROM target_facts;DELETE FROM function_block_memberships;DELETE FROM function_chunks;DELETE FROM functions;DELETE FROM blocks;DELETE FROM edges;DELETE FROM xrefs;DELETE FROM strings;DELETE FROM symbols;DELETE FROM coverage;DELETE FROM data_candidates;DELETE FROM type_candidates;DELETE FROM search_index_blob;DELETE FROM analysis_state;
-DELETE FROM alternate_call_graph_conflicts;DELETE FROM alternate_call_graph_edges;DELETE FROM alternate_call_candidates;DELETE FROM alternate_call_sites;DELETE FROM alternate_call_graph_nodes;DELETE FROM alternate_call_graph_state;DELETE FROM alternate_data_pointer_facts;DELETE FROM alternate_data_conflicts;DELETE FROM alternate_rich_data_candidates;DELETE FROM alternate_type_references;DELETE FROM alternate_metadata_conflicts;DELETE FROM alternate_symbol_type_candidates;DELETE FROM alternate_switch_cases;DELETE FROM alternate_switches;DELETE FROM alternate_segments;DELETE FROM alternate_instruction_chunks;DELETE FROM alternate_operand_facts;DELETE FROM alternate_target_facts;DELETE FROM alternate_function_block_memberships;DELETE FROM alternate_function_chunks;DELETE FROM alternate_functions;DELETE FROM alternate_blocks;DELETE FROM alternate_edges;DELETE FROM alternate_xrefs;DELETE FROM alternate_strings;DELETE FROM alternate_symbols;DELETE FROM alternate_coverage;DELETE FROM alternate_data_candidates;DELETE FROM alternate_type_candidates;DELETE FROM alternate_search_index_blob;DELETE FROM alternate_analysis_state;
+DELETE FROM call_graph_conflicts;DELETE FROM call_graph_edges;DELETE FROM call_candidates;DELETE FROM call_sites;DELETE FROM call_graph_nodes;DELETE FROM call_graph_state;DELETE FROM data_pointer_facts;DELETE FROM data_conflicts;DELETE FROM rich_data_candidates;DELETE FROM type_references;DELETE FROM metadata_conflicts;DELETE FROM symbol_type_candidates;DELETE FROM switch_cases;DELETE FROM switches;DELETE FROM segments;DELETE FROM instruction_chunks;DELETE FROM operand_facts;DELETE FROM operand_fact_chunks;DELETE FROM target_facts;DELETE FROM target_fact_chunks;DELETE FROM function_block_memberships;DELETE FROM function_chunks;DELETE FROM functions;DELETE FROM blocks;DELETE FROM edges;DELETE FROM edge_chunks;DELETE FROM xrefs;DELETE FROM xref_chunks;DELETE FROM strings;DELETE FROM symbols;DELETE FROM coverage;DELETE FROM data_candidates;DELETE FROM type_candidates;DELETE FROM search_index_blob;DELETE FROM analysis_state;
+DELETE FROM alternate_call_graph_conflicts;DELETE FROM alternate_call_graph_edges;DELETE FROM alternate_call_candidates;DELETE FROM alternate_call_sites;DELETE FROM alternate_call_graph_nodes;DELETE FROM alternate_call_graph_state;DELETE FROM alternate_data_pointer_facts;DELETE FROM alternate_data_conflicts;DELETE FROM alternate_rich_data_candidates;DELETE FROM alternate_type_references;DELETE FROM alternate_metadata_conflicts;DELETE FROM alternate_symbol_type_candidates;DELETE FROM alternate_switch_cases;DELETE FROM alternate_switches;DELETE FROM alternate_segments;DELETE FROM alternate_instruction_chunks;DELETE FROM alternate_operand_facts;DELETE FROM alternate_operand_fact_chunks;DELETE FROM alternate_target_facts;DELETE FROM alternate_target_fact_chunks;DELETE FROM alternate_function_block_memberships;DELETE FROM alternate_function_chunks;DELETE FROM alternate_functions;DELETE FROM alternate_blocks;DELETE FROM alternate_edges;DELETE FROM alternate_edge_chunks;DELETE FROM alternate_xrefs;DELETE FROM alternate_xref_chunks;DELETE FROM alternate_strings;DELETE FROM alternate_symbols;DELETE FROM alternate_coverage;DELETE FROM alternate_data_candidates;DELETE FROM alternate_type_candidates;DELETE FROM alternate_search_index_blob;DELETE FROM alternate_analysis_state;
 UPDATE workspace_commit_state SET active_slot=0,committed_token='',committed_generation=0,committed_analysis_revision=0,committed_overlay_revision=0,candidate_slot=NULL,candidate_token=NULL,candidate_generation=NULL,candidate_analysis_revision=NULL,candidate_overlay_revision=NULL,candidate_ready=0,updated_utc_ms=0 WHERE singleton=1;
 DELETE FROM packed_page_index;DELETE FROM packed_pages;DELETE FROM packed_generations;
 DELETE FROM decompiler_cache;DELETE FROM decompiler_cache_v9;
@@ -2884,6 +3062,71 @@ workspace_result_t<void> stage_managed_publication_domain(
     const cancellation_token_t& cancel,
     persistence_commit_metrics_t* commit_metrics);
 
+using fact_chunk_record_encode_t = std::function<std::vector<std::uint8_t>(std::size_t)>;
+using fact_chunk_record_key_t = std::function<std::uint64_t(std::size_t)>;
+
+workspace_result_t<void> persist_fact_chunks(
+    sqlite3* database, std::uint8_t target_slot, const char* table,
+    std::uint64_t record_total, std::size_t chunk_records,
+    std::uint64_t record_stride, const fact_chunk_record_encode_t& encode,
+    const fact_chunk_record_key_t& key, const char* phase,
+    const cancellation_token_t& cancel) {
+    if (record_total == 0)
+        return workspace_result_t<void>::success();
+    statement_t chunk_statement;
+    const std::string chunk_insert = "INSERT INTO " +
+        slot_table(target_slot, table) +
+        "(chunk_id,start_value,end_value,record_count,blob_version,payload) VALUES(?1,?2,?3,?4,?5,?6)";
+    auto prepared = chunk_statement.prepare(database, chunk_insert.c_str(), phase);
+    if (!prepared)
+        return prepared;
+    std::uint64_t chunk_id = 1;
+    for (std::size_t begin_index = 0; begin_index < record_total;
+         begin_index += chunk_records) {
+        if (cancel.stop_requested()) {
+            auto error = make_workspace_error(cancel.deadline_exceeded()
+                                                  ? workspace_error_code_t::deadline_exceeded
+                                                  : workspace_error_code_t::cancelled,
+                                              "fact chunk persistence cancelled", phase);
+            error.deadline = cancel.deadline_exceeded();
+            error.cancellation = !error.deadline;
+            return workspace_result_t<void>::failure(std::move(error));
+        }
+        const std::size_t end_index = static_cast<std::size_t>((std::min)(
+            record_total, static_cast<std::uint64_t>(begin_index + chunk_records)));
+        std::vector<std::uint8_t> payload;
+        const std::size_t count = end_index - begin_index;
+        payload.reserve(24 + count * record_stride);
+        append_fact_chunk_header(payload, count, record_stride);
+        for (std::size_t index = begin_index; index < end_index; ++index) {
+            auto record_bytes = encode(index);
+            if (record_bytes.size() != record_stride) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "fact chunk record encoder returned an irregular record", phase));
+            }
+            payload.insert(payload.end(), record_bytes.begin(), record_bytes.end());
+        }
+        auto result = chunk_statement.bind_uint(1, chunk_id++);
+        if (!result) return result;
+        result = chunk_statement.bind_uint(2, key(begin_index));
+        if (!result) return result;
+        result = chunk_statement.bind_uint(3, key(end_index - 1));
+        if (!result) return result;
+        result = chunk_statement.bind_uint(4, count);
+        if (!result) return result;
+        result = chunk_statement.bind_uint(5, kFactChunkBlobVersion);
+        if (!result) return result;
+        result = chunk_statement.bind_blob(6, payload.data(), payload.size());
+        if (!result) return result;
+        result = chunk_statement.step_done();
+        if (!result) return result;
+        result = chunk_statement.reset();
+        if (!result) return result;
+    }
+    return workspace_result_t<void>::success();
+}
+
 workspace_result_t<void> persist_snapshot_impl(
     sqlite3* database, const analysis_snapshot_t& snapshot,
     const persisted_search_products_t* search_products,
@@ -3025,9 +3268,10 @@ workspace_result_t<void> persist_snapshot_impl(
     };
     if (!add_logical_bytes(settings_json.size()) ||
         !add_logical_bytes(metrics_json.size()) ||
-        !add_vector_storage(snapshot.instructions.size(), sizeof(instruction_record_t)) ||
-        !add_vector_storage(snapshot.operand_facts.size(), sizeof(operand_fact_t)) ||
-        !add_vector_storage(snapshot.target_facts.size(), sizeof(target_fact_t)) ||
+!add_vector_storage(snapshot.instructions.size(), sizeof(instruction_record_t)) ||
+!add_vector_storage(snapshot.operand_facts.hot.size(), sizeof(operand_fact_hot_t)) ||
+!add_vector_storage(snapshot.operand_facts.cold.size(), sizeof(operand_fact_cold_t)) ||
+!add_vector_storage(snapshot.target_facts.size(), sizeof(target_fact_t)) ||
         !add_vector_storage(snapshot.function_chunks.size(), sizeof(function_chunk_record_t)) ||
         !add_vector_storage(snapshot.function_block_memberships.size(),
                             sizeof(function_block_membership_record_t)) ||
@@ -3330,43 +3574,19 @@ workspace_result_t<void> persist_snapshot_impl(
         result = chunk_statement.reset(); if (!result) { rollback(database, "workspace_database.persist"); return result; }
     }
 
-    result = insert_many(database,
-        "INSERT INTO " + slot_table(target_slot, "operand_facts") + "(instruction_id,operand_index,entity_id,address_expression_id,decoder_operand_id,kind,access,visibility,encoding,memory_type,access_width,bit_width,access_width_bits,access_count,element_width_bits,element_count,address_width_bits,reg,segment_reg,base_reg,index_reg,scale,relative,signed_value,has_displacement,has_resolved_expression_value,displacement,immediate,resolved_expression_value,address_components,address_expression,address_resolution) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)",
-        snapshot.operand_facts.size(), [&snapshot](statement_t& statement, std::size_t index) {
-            const auto& fact = snapshot.operand_facts[index];
-            auto current = statement.bind_uint(1, fact.instruction_id); if (!current) return current;
-            current = statement.bind_uint(2, fact.operand_index); if (!current) return current;
-            current = statement.bind_uint(3, fact.id); if (!current) return current;
-            current = statement.bind_uint(4, fact.address_expression_id); if (!current) return current;
-            current = statement.bind_uint(5, fact.decoder_operand_id); if (!current) return current;
-            current = statement.bind_int(6, static_cast<std::int64_t>(fact.kind)); if (!current) return current;
-            current = statement.bind_uint(7, fact.access); if (!current) return current;
-            current = statement.bind_uint(8, fact.visibility); if (!current) return current;
-            current = statement.bind_uint(9, fact.encoding); if (!current) return current;
-            current = statement.bind_uint(10, fact.memory_type); if (!current) return current;
-            current = statement.bind_uint(11, fact.access_width); if (!current) return current;
-            current = statement.bind_uint(12, fact.bit_width); if (!current) return current;
-            current = statement.bind_uint(13, fact.access_width_bits); if (!current) return current;
-            current = statement.bind_uint(14, fact.access_count); if (!current) return current;
-            current = statement.bind_uint(15, fact.element_width_bits); if (!current) return current;
-            current = statement.bind_uint(16, fact.element_count); if (!current) return current;
-            current = statement.bind_uint(17, fact.address_width_bits); if (!current) return current;
-            current = statement.bind_uint(18, fact.reg); if (!current) return current;
-            current = statement.bind_uint(19, fact.segment_reg); if (!current) return current;
-            current = statement.bind_uint(20, fact.base_reg); if (!current) return current;
-            current = statement.bind_uint(21, fact.index_reg); if (!current) return current;
-            current = statement.bind_uint(22, fact.scale); if (!current) return current;
-            current = statement.bind_int(23, fact.relative ? 1 : 0); if (!current) return current;
-            current = statement.bind_int(24, fact.signed_value ? 1 : 0); if (!current) return current;
-            current = statement.bind_int(25, fact.has_displacement ? 1 : 0); if (!current) return current;
-            current = statement.bind_int(26, fact.has_resolved_expression_value ? 1 : 0); if (!current) return current;
-            current = statement.bind_int(27, fact.displacement); if (!current) return current;
-            current = statement.bind_uint(28, fact.immediate); if (!current) return current;
-            current = statement.bind_uint(29, fact.resolved_expression_value); if (!current) return current;
-            current = statement.bind_uint(30, fact.address_components); if (!current) return current;
-            current = statement.bind_int(31, static_cast<std::int64_t>(fact.address_expression)); if (!current) return current;
-            return statement.bind_int(32, static_cast<std::int64_t>(fact.address_resolution));
-        }, cancel, "workspace_database.persist.operands");
+    result = persist_fact_chunks(database, target_slot, "operand_fact_chunks",
+        snapshot.operand_facts.size(), chunk_records, packed_operand_stream_record_bytes,
+        [&snapshot](std::size_t index) {
+            return encode_packed_operand_record(operand_fact_materialize(
+                snapshot.operand_facts, index, snapshot.instructions));
+        },
+        [&snapshot](std::size_t index) {
+            const auto& hot = snapshot.operand_facts.hot[index];
+            return hot.instruction_ordinal != 0xFFFFFFFFU
+                ? static_cast<std::uint64_t>(hot.instruction_ordinal)
+                : static_cast<std::uint64_t>(index);
+        },
+        "workspace_database.persist.operands", cancel);
     if (!result) { rollback(database, "workspace_database.persist"); return result; }
 
     if (search_products) {
@@ -3487,25 +3707,15 @@ workspace_result_t<void> persist_snapshot_impl(
         }
     }
 
-    std::unordered_map<entity_id_t, std::uint32_t> target_indexes;
-    result = insert_many(database,
-        "INSERT INTO " + slot_table(target_slot, "target_facts") + "(instruction_id,target_index,operand_fact_id,address_expression_id,target_space,target_value,target_arch,target_mode,kind,resolution,operand_index,access_width_bits,access_count,direct,is_external) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-        snapshot.target_facts.size(), [&snapshot, &target_indexes](statement_t& statement, std::size_t index) {
-            const auto& fact = snapshot.target_facts[index];
-            const std::uint32_t target_index = target_indexes[fact.instruction_id]++;
-            auto current = statement.bind_uint(1, fact.instruction_id); if (!current) return current;
-            current = statement.bind_uint(2, target_index); if (!current) return current;
-            current = statement.bind_uint(3, fact.operand_fact_id); if (!current) return current;
-            current = statement.bind_uint(4, fact.address_expression_id); if (!current) return current;
-            current = bind_address(statement, 5, fact.target); if (!current) return current;
-            current = statement.bind_int(9, static_cast<std::int64_t>(fact.kind)); if (!current) return current;
-            current = statement.bind_int(10, static_cast<std::int64_t>(fact.resolution)); if (!current) return current;
-            current = statement.bind_uint(11, fact.operand_index); if (!current) return current;
-            current = statement.bind_uint(12, fact.access_width_bits); if (!current) return current;
-            current = statement.bind_uint(13, fact.access_count); if (!current) return current;
-            current = statement.bind_int(14, fact.direct ? 1 : 0); if (!current) return current;
-            return statement.bind_int(15, fact.is_external ? 1 : 0);
-        }, cancel, "workspace_database.persist.targets");
+    result = persist_fact_chunks(database, target_slot, "target_fact_chunks",
+        snapshot.target_facts.size(), chunk_records, packed_target_stream_record_bytes,
+        [&snapshot](std::size_t index) {
+            return encode_packed_target_record(snapshot.target_facts[index]);
+        },
+        [&snapshot](std::size_t index) {
+            return snapshot.target_facts[index].instruction_id;
+        },
+        "workspace_database.persist.targets", cancel);
     if (!result) { rollback(database, "workspace_database.persist"); return result; }
 
     result = insert_many(database,
@@ -3576,32 +3786,26 @@ workspace_result_t<void> persist_snapshot_impl(
         }, cancel, "workspace_database.persist.function_block_memberships");
     if (!result) { rollback(database, "workspace_database.persist"); return result; }
 
-    result = insert_many(database,
-        "INSERT INTO " + slot_table(target_slot, "edges") + "(entity_id,source_entity,target_entity,source_space,source_value,source_arch,source_mode,target_space,target_value,target_arch,target_mode,kind,provenance,confidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-        snapshot.edges.size(), [&snapshot](statement_t& statement, std::size_t index) {
-            const auto& record = snapshot.edges[index];
-            auto current = statement.bind_uint(1, record.id); if (!current) return current;
-            current = statement.bind_uint(2, record.source_entity); if (!current) return current;
-            if (record.target_entity) current = statement.bind_uint(3, *record.target_entity); else current = statement.bind_null(3); if (!current) return current;
-            current = bind_address(statement, 4, record.source); if (!current) return current;
-            current = bind_address(statement, 8, record.target); if (!current) return current;
-            current = statement.bind_int(12, static_cast<std::int64_t>(record.kind)); if (!current) return current;
-            current = statement.bind_int(13, static_cast<std::int64_t>(record.provenance)); if (!current) return current;
-            return statement.bind_uint(14, record.confidence);
-        }, cancel, "workspace_database.persist.edges");
+    result = persist_fact_chunks(database, target_slot, "edge_chunks",
+        snapshot.edges.size(), chunk_records, kFactChunkEdgeRecordBytes,
+        [&snapshot](std::size_t index) {
+            return encode_edge_chunk_record(snapshot.edges[index]);
+        },
+        [&snapshot](std::size_t index) {
+            return snapshot.edges[index].source.value;
+        },
+        "workspace_database.persist.edges", cancel);
     if (!result) { rollback(database, "workspace_database.persist"); return result; }
 
-    result = insert_many(database,
-        "INSERT INTO " + slot_table(target_slot, "xrefs") + "(entity_id,source_space,source_value,source_arch,source_mode,target_space,target_value,target_arch,target_mode,kind,provenance,confidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        snapshot.xrefs.size(), [&snapshot](statement_t& statement, std::size_t index) {
-            const auto& record = snapshot.xrefs[index];
-            auto current = statement.bind_uint(1, record.id); if (!current) return current;
-            current = bind_address(statement, 2, record.source); if (!current) return current;
-            current = bind_address(statement, 6, record.target); if (!current) return current;
-            current = statement.bind_int(10, static_cast<std::int64_t>(record.kind)); if (!current) return current;
-            current = statement.bind_int(11, static_cast<std::int64_t>(record.provenance)); if (!current) return current;
-            return statement.bind_uint(12, record.confidence);
-        }, cancel, "workspace_database.persist.xrefs");
+    result = persist_fact_chunks(database, target_slot, "xref_chunks",
+        snapshot.xrefs.size(), chunk_records, packed_xref_stream_record_bytes,
+        [&snapshot](std::size_t index) {
+            return encode_packed_xref_record(snapshot.xrefs[index]);
+        },
+        [&snapshot](std::size_t index) {
+            return snapshot.xrefs[index].source.value;
+        },
+        "workspace_database.persist.xrefs", cancel);
     if (!result) { rollback(database, "workspace_database.persist"); return result; }
 
     result = insert_many(database,
@@ -3833,6 +4037,117 @@ workspace_result_t<void> set_writer_synchronous(sqlite3* database, int mode,
     return exec_sql(database, sql.c_str(), phase);
 }
 
+}
+
+namespace {
+
+template <typename Record, typename Reader>
+workspace_result_t<Record> decode_packed_record_impl(
+    const std::uint8_t* data, std::size_t size, Reader read) {
+    if (!data || size == 0) {
+        return workspace_result_t<Record>::failure(packed_baseline_error(
+            workspace_error_code_t::invalid_argument,
+            "packed record decode received an empty byte range"));
+    }
+    const std::vector<std::uint8_t> bytes(data, data + size);
+    cancellation_token_t cancel;
+    packed_payload_reader_t reader(bytes, cancel, 1);
+    Record record = read(reader);
+    if (reader.failed())
+        return workspace_result_t<Record>::failure(reader.finish().error());
+    return workspace_result_t<Record>::success(std::move(record));
+}
+
+}
+
+workspace_result_t<instruction_record_t> decode_packed_instruction_record(
+    const std::uint8_t* data, std::size_t size) {
+    return decode_packed_record_impl<instruction_record_t>(data, size,
+        [](packed_payload_reader_t& reader) { return read_instruction(reader); });
+}
+
+workspace_result_t<operand_fact_t> decode_packed_operand_record(
+    const std::uint8_t* data, std::size_t size) {
+    return decode_packed_record_impl<operand_fact_t>(data, size,
+        [](packed_payload_reader_t& reader) { return read_operand(reader); });
+}
+
+workspace_result_t<target_fact_t> decode_packed_target_record(
+    const std::uint8_t* data, std::size_t size) {
+    return decode_packed_record_impl<target_fact_t>(data, size,
+        [](packed_payload_reader_t& reader) { return read_target(reader); });
+}
+
+workspace_result_t<edge_record_t> decode_packed_edge_record(
+    const std::uint8_t* data, std::size_t size) {
+    return decode_packed_record_impl<edge_record_t>(data, size,
+        [](packed_payload_reader_t& reader) { return read_edge(reader); });
+}
+
+workspace_result_t<xref_record_t> decode_packed_xref_record(
+    const std::uint8_t* data, std::size_t size) {
+    return decode_packed_record_impl<xref_record_t>(data, size,
+        [](packed_payload_reader_t& reader) { return read_xref(reader); });
+}
+
+namespace {
+
+template <typename Writer>
+std::vector<std::uint8_t> encode_packed_record_impl(Writer write) {
+    std::vector<std::uint8_t> bytes;
+    cancellation_token_t cancel;
+    packed_payload_writer_t writer(cancel,
+        [&bytes](const std::uint8_t* data, std::size_t size) {
+            bytes.insert(bytes.end(), data, data + size);
+            return workspace_result_t<void>::success();
+        }, {}, packed_page_max_payload);
+    write(writer);
+    auto finished = writer.finish_stream();
+    (void)finished;
+    return bytes;
+}
+
+}
+
+std::vector<std::uint8_t> encode_packed_instruction_record(
+    const instruction_record_t& record) {
+    return encode_packed_record_impl(
+        [&](packed_payload_writer_t& writer) { write_instruction(writer, record); });
+}
+
+std::vector<std::uint8_t> encode_packed_operand_record(const operand_fact_t& record) {
+    return encode_packed_record_impl(
+        [&](packed_payload_writer_t& writer) { write_operand(writer, record); });
+}
+
+std::vector<std::uint8_t> encode_packed_target_record(const target_fact_t& record) {
+    return encode_packed_record_impl(
+        [&](packed_payload_writer_t& writer) { write_target(writer, record); });
+}
+
+std::vector<std::uint8_t> encode_packed_xref_record(const xref_record_t& record) {
+    return encode_packed_record_impl(
+        [&](packed_payload_writer_t& writer) { write_xref(writer, record); });
+}
+
+std::array<std::uint8_t, packed_domain_stream_header_bytes>
+encode_packed_domain_stream_header(packed_page_type_t domain,
+                                   std::uint64_t record_count) {
+    std::array<std::uint8_t, packed_domain_stream_header_bytes> bytes{};
+    cancellation_token_t cancel;
+    std::vector<std::uint8_t> out;
+    packed_payload_writer_t writer(cancel,
+        [&out](const std::uint8_t* data, std::size_t size) {
+            out.insert(out.end(), data, data + size);
+            return workspace_result_t<void>::success();
+        }, {}, packed_page_max_payload);
+    write_domain_header(writer, domain);
+    writer.count(record_count);
+    auto finished = writer.finish_stream();
+    (void)finished;
+    const auto copy = (std::min)(out.size(), bytes.size());
+    std::memcpy(bytes.data(), out.data(), copy);
+    return bytes;
 }
 
 struct workspace_database_t::connection_state_t {
@@ -4359,9 +4674,11 @@ workspace_result_t<void> write_packed_baseline_domain_stream(
         break;
     case packed_page_type_t::operands:
         writer.count(snapshot.operand_facts.size());
-        for (const auto& record : snapshot.operand_facts) {
+        for (std::uint64_t ordinal = 0; ordinal < snapshot.operand_facts.size();
+             ++ordinal) {
             begin();
-            write_operand(writer, record);
+            write_operand(writer, operand_fact_materialize(
+                snapshot.operand_facts, ordinal, snapshot.instructions));
         }
         break;
     case packed_page_type_t::target_facts:
@@ -4393,7 +4710,11 @@ workspace_result_t<void> write_packed_baseline_domain_stream(
         }
         break;
     case packed_page_type_t::address_expressions:
-        writer.count(0);
+        writer.count(snapshot.address_expressions.size());
+        for (const auto& record : snapshot.address_expressions) {
+            begin();
+            write_address_expression(writer, record);
+        }
         break;
     case packed_page_type_t::basic_blocks:
         writer.count(snapshot.blocks.size());
@@ -4406,7 +4727,14 @@ workspace_result_t<void> write_packed_baseline_domain_stream(
         writer.count(snapshot.functions.size());
         for (const auto& record : snapshot.functions) {
             begin(record.start);
-            write_function(writer, record);
+            if (record.chunks.empty() && record.chunk_count != 0) {
+                function_record_t materialized = record;
+                const auto ranges = snapshot.function_chunks_of(record);
+                materialized.chunks.assign(ranges.begin(), ranges.end());
+                write_function(writer, materialized);
+            } else {
+                write_function(writer, record);
+            }
         }
         break;
     case packed_page_type_t::function_chunks:
@@ -4941,6 +5269,7 @@ constexpr std::uint64_t kPackedTargetRecordBytes = 49;
 constexpr std::uint64_t kPackedEdgeRecordMinBytes = 52;
 constexpr std::uint64_t kPackedEdgeRecordMaxBytes = 60;
 constexpr std::uint64_t kPackedXrefRecordBytes = 43;
+constexpr std::uint64_t kPackedAddressExpressionRecordBytes = 12;
 constexpr std::uint64_t kPackedBasicBlockRecordBytes = 58;
 constexpr std::uint64_t kPackedFunctionRecordMinBytes = 77;
 constexpr std::uint64_t kPackedFunctionChunkRecordBytes = 60;
@@ -5042,6 +5371,14 @@ struct workspace_snapshot_staging_t::state_t {
 };
 
 namespace {
+
+workspace_result_t<void> bind_committed_page_source(
+    sqlite3* database,
+    workspace_database_t::connection_state_t& conn,
+    const workspace_database_options_t& options,
+    const std::shared_ptr<workspace_snapshot_staging_t::state_t>& staging,
+    const packed_generation_record_t& generation_record,
+    const cancellation_token_t& cancel);
 
 workspace_result_t<void> spill_staging_domain(
     sqlite3* database,
@@ -5189,6 +5526,77 @@ workspace_result_t<void> serialize_staging_domain(
     const packed_publish_stop_predicate_t stop_predicate = [&cancel] {
         return cancel.stop_requested();
     };
+    const auto prestaged_domain = [](packed_page_type_t page_domain)
+        -> std::optional<fact_domain_t> {
+        switch (page_domain) {
+        case packed_page_type_t::instructions:
+            return fact_domain_t::instructions;
+        case packed_page_type_t::operands:
+            return fact_domain_t::operand_facts;
+        case packed_page_type_t::target_facts:
+            return fact_domain_t::target_facts;
+        default:
+            return std::nullopt;
+        }
+    }(domain);
+    if (prestaged_domain && staging->snapshot->paged_staging &&
+        staging->snapshot->paged_domain_counts[static_cast<std::size_t>(
+            *prestaged_domain)] != 0) {
+        const auto fact_domain = *prestaged_domain;
+        auto source = staging->snapshot->paged_staging;
+        auto contiguous = source->validate_contiguous(fact_domain);
+        if (!contiguous)
+            return contiguous;
+        auto copied = source->for_each_page(fact_domain,
+            [&conn, staging, &domain_state, budget, &cancel](
+                const paged_fact_page_meta_t& meta,
+                const std::vector<std::uint8_t>& payload)
+                -> workspace_result_t<void> {
+                staged_page_t page;
+                page.ordinal_begin =
+                    static_cast<std::uint32_t>(meta.ordinal_begin);
+                page.record_count = meta.record_count;
+                page.address_value_min = meta.address_value_min;
+                page.address_value_max = meta.address_value_max;
+                const auto page_bytes =
+                    static_cast<std::uint64_t>(payload.size());
+                page.payload = payload;
+                {
+                    std::lock_guard<std::mutex> lock(domain_state.mutex);
+                    domain_state.pages.push_back(std::move(page));
+                    domain_state.resident_bytes += page_bytes;
+                    domain_state.records += meta.record_count;
+                    domain_state.payload_bytes += page_bytes;
+                }
+                conn.staging_resident_bytes.fetch_add(page_bytes,
+                                                    std::memory_order_acq_rel);
+                std::unique_lock<std::mutex> spill_lock(staging->spill_mutex);
+                while (!staging->failed.load(std::memory_order_acquire) &&
+                       conn.staging_resident_bytes.load(std::memory_order_acquire) >
+                           budget &&
+                       !cancel.stop_requested()) {
+                    staging->spill_requested = true;
+                    staging->spill_cv.wait_for(spill_lock,
+                                               std::chrono::milliseconds(10));
+                }
+                if (staging->failed.load(std::memory_order_acquire))
+                    return workspace_result_t<void>::failure(
+                        staging->current_failure());
+                if (cancel.stop_requested())
+                    return workspace_result_t<void>::failure(
+                        packed_baseline_cancelled(cancel));
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!copied)
+            return copied;
+        const auto elapsed = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count());
+        std::lock_guard<std::mutex> lock(domain_state.mutex);
+        domain_state.serialize_us = elapsed;
+        domain_state.complete = true;
+        return workspace_result_t<void>::success();
+    }
     packed_domain_page_buffer_t buffer(
         options.packed_stream_page_size,
         [&conn, staging, &domain_state, budget, &cancel](
@@ -5260,6 +5668,18 @@ workspace_result_t<void> serialize_staging_domain(
     domain_state.serialize_us = elapsed;
     domain_state.complete = true;
     return workspace_result_t<void>::success();
+}
+
+void release_handed_off_paged_domains(
+    const std::shared_ptr<workspace_snapshot_staging_t::state_t>& staging) noexcept {
+    if (!staging->snapshot || !staging->snapshot->paged_staging)
+        return;
+    for (std::size_t index = 0; index < fact_domain_count; ++index) {
+        if (staging->snapshot->paged_domain_counts[index] == 0)
+            continue;
+        staging->snapshot->paged_staging->release(
+            static_cast<fact_domain_t>(index));
+    }
 }
 
 workspace_result_t<void> run_staging_serialization(
@@ -6304,6 +6724,11 @@ VALUES(?1,?2,?3,?4,?5,?6,?7)
                            "snapshot committed but passive WAL checkpoint failed",
                            "workspace_database.checkpoint"));
     }
+    auto bound_page_source = bind_committed_page_source(
+        database, conn, options, staging, generation_record, cancel);
+    if (!bound_page_source)
+        return workspace_result_t<void>::failure(bound_page_source.error());
+    release_handed_off_paged_domains(staging);
     int writes_after = 0;
     status = sqlite3_db_status(database, SQLITE_DBSTATUS_CACHE_WRITE,
                                &writes_after, &highwater, 0);
@@ -7038,9 +7463,9 @@ workspace_result_t<void> decode_packed_domain_into(
         packed_payload_reader_t reader(payload, cancel, maximum_records, &decoded_records);
         read_domain_header(reader, packed_page_type_t::operands);
         const auto count = reader.count();
-        snapshot->operand_facts.reserve(count);
+        snapshot->operand_facts.hot.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
-            snapshot->operand_facts.push_back(read_operand(reader));
+            snapshot_operand_append(*snapshot, read_operand(reader));
         auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<void>::failure(
@@ -7097,8 +7522,10 @@ workspace_result_t<void> decode_packed_domain_into(
     if (domain == packed_page_type_t::address_expressions) {
         packed_payload_reader_t reader(payload, cancel, maximum_records, &decoded_records);
         read_domain_header(reader, packed_page_type_t::address_expressions);
-        if (reader.count() != 0)
-            reader.reject("packed address-expression compatibility domain is not empty");
+        const auto count = reader.count();
+        snapshot->address_expressions.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            snapshot->address_expressions.push_back(read_address_expression(reader));
         auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<void>::failure(
@@ -7347,6 +7774,149 @@ FROM packed_pages WHERE generation=?1 GROUP BY page_type
         entry.logical_bytes = static_cast<std::uint64_t>(logical_bytes);
     }
     return workspace_result_t<void>::success();
+}
+
+std::uint64_t reopen_resident_projection_bytes(
+    packed_page_type_t domain, std::uint64_t logical_bytes) noexcept {
+    std::uint64_t numerator = 1;
+    std::uint64_t denominator = 1;
+    switch (domain) {
+    case packed_page_type_t::instructions:
+        numerator = static_cast<std::uint64_t>(sizeof(instruction_record_t)) + 1;
+        denominator = kPackedInstructionRecordBytes + 1;
+        break;
+    case packed_page_type_t::operands:
+        numerator = static_cast<std::uint64_t>(sizeof(operand_fact_hot_t)) +
+            static_cast<std::uint64_t>(sizeof(operand_fact_cold_t));
+        denominator = kPackedOperandRecordBytes;
+        break;
+    case packed_page_type_t::target_facts:
+        numerator = static_cast<std::uint64_t>(sizeof(target_fact_t));
+        denominator = kPackedTargetRecordBytes;
+        break;
+    case packed_page_type_t::edges:
+        numerator = static_cast<std::uint64_t>(sizeof(edge_record_t));
+        denominator = kPackedEdgeRecordMinBytes;
+        break;
+    case packed_page_type_t::xrefs:
+        numerator = static_cast<std::uint64_t>(sizeof(xref_record_t));
+        denominator = kPackedXrefRecordBytes;
+        break;
+    default:
+        return logical_bytes;
+    }
+    const std::uint64_t scaled =
+        logical_bytes > (0xFFFFFFFFFFFFFFFFULL / numerator)
+            ? 0xFFFFFFFFFFFFFFFFULL
+            : logical_bytes * numerator;
+    const std::uint64_t quotient = scaled / denominator;
+    if (scaled - quotient * denominator != 0 &&
+        quotient < 0xFFFFFFFFFFFFFFFFULL)
+        return quotient + 1;
+    return quotient;
+}
+
+workspace_result_t<std::vector<std::uint8_t>> reopen_paged_delay_slot_tail(
+    const paged_domain_source_t& source, std::uint64_t instruction_total,
+    std::uint64_t stream_bytes, std::uint64_t maximum_records,
+    const cancellation_token_t& cancel) {
+    if (instruction_total == 0 || instruction_total > maximum_records)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                "packed paged instruction domain record count is inconsistent"));
+    std::uint64_t record_bytes = 0;
+    std::uint64_t tail_offset = 0;
+    if (!checked_mul_u64(instruction_total, kPackedInstructionRecordBytes,
+            record_bytes) ||
+        !checked_add_u64(packed_domain_stream_header_bytes, record_bytes,
+            tail_offset) ||
+        tail_offset > stream_bytes ||
+        stream_bytes - tail_offset < sizeof(std::uint64_t) ||
+        stream_bytes - tail_offset > sizeof(std::uint64_t) + instruction_total)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                "packed paged instruction delay-slot tail is out of range"));
+    const std::uint64_t tail_span = stream_bytes - tail_offset;
+    std::uint64_t accumulated = 0;
+    std::uint64_t page_ordinal = source.page_count(fact_domain_t::instructions);
+    std::vector<std::vector<std::uint8_t>> tail_pages;
+    try {
+        while (accumulated < tail_span) {
+            if (page_ordinal == 0)
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    packed_baseline_error(workspace_error_code_t::integrity_failure,
+                        "packed paged instruction delay-slot tail is truncated"));
+            --page_ordinal;
+            auto content = source.fetch_page_content(
+                fact_domain_t::instructions, page_ordinal, cancel);
+            if (!content)
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    content.error());
+            const auto page_bytes =
+                static_cast<std::uint64_t>(content.value().size());
+            if (page_bytes > stream_bytes - accumulated)
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    packed_baseline_error(workspace_error_code_t::integrity_failure,
+                        "packed paged instruction domain content grew during reopen"));
+            accumulated += page_bytes;
+            tail_pages.push_back(content.take_value());
+        }
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                "packed paged instruction delay-slot tail allocation failed"));
+    }
+    if (page_ordinal == 0 && accumulated != stream_bytes)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                "packed paged instruction domain content does not match its index"));
+    std::vector<std::uint8_t> tail;
+    try {
+        tail.resize(static_cast<std::size_t>(tail_span));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                "packed paged instruction delay-slot tail allocation failed"));
+    }
+    std::uint64_t written = 0;
+    for (auto page = tail_pages.rbegin();
+         page != tail_pages.rend() && written < tail_span; ++page) {
+        const std::uint64_t take = (std::min)(
+            static_cast<std::uint64_t>(page->size()), tail_span - written);
+        std::memcpy(tail.data() + tail_span - written - take,
+                    page->data() + page->size() - take,
+                    static_cast<std::size_t>(take));
+        written += take;
+    }
+    if (written != tail_span)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                "packed paged instruction delay-slot tail is truncated"));
+    std::uint64_t tail_records = 0;
+    packed_payload_reader_t reader(tail, cancel, maximum_records, &tail_records);
+    const auto count = reader.count();
+    std::vector<std::uint8_t> values;
+    if (count != 0) {
+        if (static_cast<std::uint64_t>(count) != instruction_total)
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                packed_baseline_error(workspace_error_code_t::integrity_failure,
+                    "packed paged instruction delay-slot count does not align with instructions"));
+        try {
+            values.reserve(count);
+            for (std::size_t index = 0; index < count; ++index)
+                values.push_back(reader.u8());
+        } catch (const std::bad_alloc&) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                    "packed paged instruction delay-slot tail allocation failed"));
+        }
+    }
+    auto finished = reader.finish();
+    if (!finished)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            finished.error());
+    return workspace_result_t<std::vector<std::uint8_t>>::success(
+        std::move(values));
 }
 
 class packed_reopen_admission_t final {
@@ -7690,6 +8260,9 @@ std::optional<packed_stride_layout_t> packed_domain_stride_layout(
     case packed_page_type_t::xrefs:
         laid_out = single_segment(kPackedXrefRecordBytes);
         break;
+    case packed_page_type_t::address_expressions:
+        laid_out = single_segment(kPackedAddressExpressionRecordBytes);
+        break;
     case packed_page_type_t::coverage:
         laid_out = single_segment(kPackedCoverageRecordBytes);
         break;
@@ -7756,9 +8329,9 @@ workspace_result_t<void> decode_packed_domain_segment_range(
         }
         break;
     case packed_page_type_t::operands:
-        output.operand_facts.reserve(ordinal_end - ordinal_begin);
+        output.operand_facts.hot.reserve(ordinal_end - ordinal_begin);
         for (; ordinal_current < ordinal_end; ++ordinal_current) {
-            output.operand_facts.push_back(read_operand(reader));
+            snapshot_operand_append(output, read_operand(reader));
             if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
         }
         break;
@@ -7813,6 +8386,13 @@ workspace_result_t<void> decode_packed_domain_segment_range(
             if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
         }
         break;
+    case packed_page_type_t::address_expressions:
+        output.address_expressions.reserve(ordinal_end - ordinal_begin);
+        for (; ordinal_current < ordinal_end; ++ordinal_current) {
+            output.address_expressions.push_back(read_address_expression(reader));
+            if (!aligned()) return reader.failed() ? reader.finish() : misaligned();
+        }
+        break;
     case packed_page_type_t::coverage:
         output.coverage.reserve(ordinal_end - ordinal_begin);
         for (; ordinal_current < ordinal_end; ++ordinal_current) {
@@ -7826,6 +8406,405 @@ workspace_result_t<void> decode_packed_domain_segment_range(
                                   "packed baseline stride domain is unsupported"));
     }
     decoded_records = (ordinal_end - ordinal_begin) + sub_records;
+    return workspace_result_t<void>::success();
+}
+
+std::optional<packed_page_type_t> paged_view_packed_domain(
+    fact_domain_t domain) noexcept {
+    switch (domain) {
+    case fact_domain_t::instructions:
+        return packed_page_type_t::instructions;
+    case fact_domain_t::operand_facts:
+        return packed_page_type_t::operands;
+    case fact_domain_t::target_facts:
+        return packed_page_type_t::target_facts;
+    case fact_domain_t::edges:
+        return packed_page_type_t::edges;
+    case fact_domain_t::xrefs:
+        return packed_page_type_t::xrefs;
+    default:
+        return std::nullopt;
+    }
+}
+
+std::optional<fact_domain_t> paged_view_fact_domain(
+    packed_page_type_t domain) noexcept {
+    switch (domain) {
+    case packed_page_type_t::instructions:
+        return fact_domain_t::instructions;
+    case packed_page_type_t::operands:
+        return fact_domain_t::operand_facts;
+    case packed_page_type_t::target_facts:
+        return fact_domain_t::target_facts;
+    case packed_page_type_t::edges:
+        return fact_domain_t::edges;
+    case packed_page_type_t::xrefs:
+        return fact_domain_t::xrefs;
+    default:
+        return std::nullopt;
+    }
+}
+
+class database_page_source_t final : public paged_domain_source_t {
+public:
+    database_page_source_t(
+        std::string path, workspace_database_options_t options,
+        packed_generation_record_t generation,
+        std::array<std::vector<packed_page_index_row_t>, 20> domain_pages,
+        std::array<std::uint64_t, 20> domain_records,
+        std::array<std::uint64_t, 20> logical_bytes,
+        std::uint64_t content_page_bytes,
+        bool require_committed_generation = true)
+        : path_(std::move(path)), options_(std::move(options)),
+          generation_(std::move(generation)),
+          domain_pages_(std::move(domain_pages)),
+          domain_records_(std::move(domain_records)),
+          logical_bytes_(std::move(logical_bytes)),
+          content_page_bytes_(content_page_bytes),
+          require_committed_generation_(require_committed_generation) {}
+
+    ~database_page_source_t() override {
+        if (reader_connection_ != nullptr) {
+            sqlite_statement_cache_unregister(reader_connection_);
+            reader_statements_.reset();
+            sqlite3_close_v2(reader_connection_);
+            reader_connection_ = nullptr;
+        }
+    }
+
+    std::uint64_t record_count(fact_domain_t domain) const noexcept override {
+        const auto packed = paged_view_packed_domain(domain);
+        if (!packed)
+            return 0;
+        return domain_records_[static_cast<std::size_t>(*packed)];
+    }
+
+    std::uint64_t page_count(fact_domain_t domain) const noexcept override {
+        const auto packed = paged_view_packed_domain(domain);
+        if (!packed)
+            return 0;
+        return domain_pages_[static_cast<std::size_t>(*packed)].size();
+    }
+
+    std::uint64_t content_page_bytes() const noexcept override {
+        return content_page_bytes_;
+    }
+
+    std::uint64_t total_content_bytes(fact_domain_t domain) const noexcept override {
+        const auto packed = paged_view_packed_domain(domain);
+        if (!packed)
+            return 0;
+        return logical_bytes_[static_cast<std::size_t>(*packed)];
+    }
+
+    workspace_result_t<paged_fact_page_meta_t> page_meta(
+        fact_domain_t domain, std::uint64_t page_ordinal,
+        const cancellation_token_t& cancel) const override {
+        if (cancel.stop_requested())
+            return workspace_result_t<paged_fact_page_meta_t>::failure(
+                packed_baseline_cancelled(cancel));
+        const auto packed = paged_view_packed_domain(domain);
+        if (!packed) {
+            return workspace_result_t<paged_fact_page_meta_t>::failure(
+                packed_baseline_error(workspace_error_code_t::invalid_argument,
+                    "database page source domain is unsupported"));
+        }
+        const auto& rows = domain_pages_[static_cast<std::size_t>(*packed)];
+        if (page_ordinal >= rows.size()) {
+            return workspace_result_t<paged_fact_page_meta_t>::failure(
+                packed_baseline_error(workspace_error_code_t::range_overflow,
+                    "database page source page ordinal is out of range"));
+        }
+        const auto& row = rows[static_cast<std::size_t>(page_ordinal)];
+        paged_fact_page_meta_t meta;
+        meta.ordinal_begin = row.ordinal_begin;
+        meta.record_count = row.count;
+        meta.address_value_min = row.address_value_min;
+        meta.address_value_max = row.address_value_max;
+        return workspace_result_t<paged_fact_page_meta_t>::success(meta);
+    }
+
+    workspace_result_t<std::vector<std::uint8_t>> fetch_page_content(
+        fact_domain_t domain, std::uint64_t page_ordinal,
+        const cancellation_token_t& cancel) const override {
+        if (cancel.stop_requested()) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                packed_baseline_cancelled(cancel));
+        }
+        const auto packed = paged_view_packed_domain(domain);
+        if (!packed) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                packed_baseline_error(workspace_error_code_t::invalid_argument,
+                    "database page source domain is unsupported"));
+        }
+        const auto& rows = domain_pages_[static_cast<std::size_t>(*packed)];
+        if (page_ordinal >= rows.size()) {
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                packed_baseline_error(workspace_error_code_t::range_overflow,
+                    "database page source page ordinal is out of range"));
+        }
+        const std::uint32_t page_index =
+            rows[static_cast<std::size_t>(page_ordinal)].page_index;
+        packed_page_t decoded_page;
+        std::int64_t logical_length = 0;
+        {
+            std::lock_guard<std::mutex> connection_lock(connection_mutex_);
+            if (reader_connection_ == nullptr) {
+                auto opened = open_reader_connection(path_, options_);
+                if (!opened)
+                    return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                        opened.error());
+                reader_connection_ = opened.take_value();
+                reader_statements_ = std::make_shared<sqlite_statement_cache_t>(8);
+                sqlite_statement_cache_register(reader_connection_,
+                                                reader_statements_);
+            }
+            sqlite3* database = reader_connection_;
+            statement_t statement;
+            auto prepared = require_committed_generation_
+                ? statement.prepare(database, R"SQL(
+SELECT p.page_count,p.payload_length,p.checksum,p.payload,COALESCE(p.logical_length,0)
+FROM packed_pages p
+JOIN packed_generations g ON g.generation=p.generation AND g.committed=1
+WHERE p.generation=?1 AND p.page_index=?2
+)SQL", "workspace_database.load.packed_page")
+                : statement.prepare(database, R"SQL(
+SELECT p.page_count,p.payload_length,p.checksum,p.payload,COALESCE(p.logical_length,0)
+FROM packed_pages p
+WHERE p.generation=?1 AND p.page_index=?2
+)SQL", "workspace_database.load.packed_page");
+            if (!prepared)
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    prepared.error());
+            auto bound = statement.bind_uint(1, generation_.generation);
+            if (bound)
+                bound = statement.bind_uint(2, page_index);
+            if (!bound)
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(bound.error());
+            const int status = sqlite3_step(statement.get());
+            if (status != SQLITE_ROW)
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    packed_baseline_error(workspace_error_code_t::integrity_failure,
+                        "database page source page is missing"));
+            decoded_page.header.generation = generation_.generation;
+            decoded_page.header.analysis_revision = generation_.analysis_revision;
+            decoded_page.header.overlay_revision = generation_.overlay_revision;
+            decoded_page.header.page_count = static_cast<std::uint32_t>(
+                sqlite3_column_int64(statement.get(), 0));
+            decoded_page.header.payload_length = static_cast<std::uint32_t>(
+                sqlite3_column_int64(statement.get(), 1));
+            decoded_page.header.checksum = static_cast<std::uint32_t>(
+                sqlite3_column_int64(statement.get(), 2));
+            const void* blob = sqlite3_column_blob(statement.get(), 3);
+            const int blob_size = sqlite3_column_bytes(statement.get(), 3);
+            logical_length = sqlite3_column_int64(statement.get(), 4);
+            decoded_page.header.page_type = static_cast<std::uint32_t>(*packed);
+            decoded_page.header.page_index = page_index;
+            if (!blob || blob_size < static_cast<int>(packed_record_page_prefix_size) ||
+                blob_size > static_cast<int>(packed_page_max_payload) ||
+                decoded_page.header.payload_length != static_cast<std::uint32_t>(blob_size) ||
+                logical_length < 0 ||
+                logical_length > static_cast<std::int64_t>(packed_page_max_payload))
+                return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                    packed_baseline_error(workspace_error_code_t::integrity_failure,
+                        "database page source page row is malformed"));
+            decoded_page.payload.assign(static_cast<const std::uint8_t*>(blob),
+                                        static_cast<const std::uint8_t*>(blob) + blob_size);
+        }
+        decoded_page.header.version = logical_length == 0
+            ? packed_page_blob_version
+            : packed_page_blob_version_v3;
+        auto decoded_content = packed_page_codec_t::decode_page_content(
+            decoded_page, [&cancel] { return cancel.stop_requested(); });
+        if (!decoded_content)
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                decoded_content.error());
+        return workspace_result_t<std::vector<std::uint8_t>>::success(
+            decoded_content.take_value());
+    }
+
+private:
+    std::string path_;
+    workspace_database_options_t options_;
+    packed_generation_record_t generation_;
+    std::array<std::vector<packed_page_index_row_t>, 20> domain_pages_;
+    std::array<std::uint64_t, 20> domain_records_;
+    std::array<std::uint64_t, 20> logical_bytes_{};
+    std::uint64_t content_page_bytes_ = 0;
+    bool require_committed_generation_ = true;
+    mutable std::mutex connection_mutex_;
+    mutable sqlite3* reader_connection_ = nullptr;
+    mutable std::shared_ptr<sqlite_statement_cache_t> reader_statements_;
+};
+
+workspace_result_t<std::uint64_t> read_paged_domain_stream_record_count(
+    sqlite3* database, const packed_generation_record_t& generation,
+    std::uint32_t encoded_domain, std::uint32_t first_page_index,
+    const cancellation_token_t& cancel) {
+    statement_t statement;
+    auto prepared = statement.prepare(database,
+        "SELECT payload,COALESCE(logical_length,0),checksum,payload_length,page_count FROM packed_pages WHERE generation=?1 AND page_index=?2",
+        "workspace_database.load.packed_page");
+    if (!prepared)
+        return workspace_result_t<std::uint64_t>::failure(prepared.error());
+    auto bound = statement.bind_uint(1, generation.generation);
+    if (bound)
+        bound = statement.bind_uint(2, first_page_index);
+    if (!bound)
+        return workspace_result_t<std::uint64_t>::failure(bound.error());
+    if (sqlite3_step(statement.get()) != SQLITE_ROW) {
+        return workspace_result_t<std::uint64_t>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                "packed paged domain first page is missing"));
+    }
+    const void* blob = sqlite3_column_blob(statement.get(), 0);
+    const int blob_size = sqlite3_column_bytes(statement.get(), 0);
+    const auto logical_length = sqlite3_column_int64(statement.get(), 1);
+    const auto stored_checksum = static_cast<std::uint32_t>(
+        sqlite3_column_int64(statement.get(), 2));
+    const auto stored_payload_length = static_cast<std::uint32_t>(
+        sqlite3_column_int64(statement.get(), 3));
+    const auto stored_page_count = static_cast<std::uint32_t>(
+        sqlite3_column_int64(statement.get(), 4));
+    if (!blob || blob_size <
+            static_cast<int>(packed_record_page_prefix_size +
+                             packed_domain_stream_header_bytes) ||
+        blob_size > static_cast<int>(packed_page_max_payload) ||
+        stored_payload_length != static_cast<std::uint32_t>(blob_size) ||
+        logical_length < 0 ||
+        logical_length > static_cast<std::int64_t>(packed_page_max_payload)) {
+        return workspace_result_t<std::uint64_t>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                "packed paged domain first page is truncated"));
+    }
+    packed_page_t page;
+    page.header.generation = generation.generation;
+    page.header.analysis_revision = generation.analysis_revision;
+    page.header.overlay_revision = generation.overlay_revision;
+    page.header.version = logical_length == 0
+        ? packed_page_blob_version
+        : packed_page_blob_version_v3;
+    page.header.page_type = encoded_domain;
+    page.header.page_index = first_page_index;
+    page.header.page_count = stored_page_count;
+    page.header.payload_length = stored_payload_length;
+    page.header.checksum = stored_checksum;
+    page.payload.assign(static_cast<const std::uint8_t*>(blob),
+                        static_cast<const std::uint8_t*>(blob) + blob_size);
+    auto decoded = packed_page_codec_t::decode_page_content(
+        page, [&cancel] { return cancel.stop_requested(); });
+    if (!decoded)
+        return workspace_result_t<std::uint64_t>::failure(decoded.error());
+    if (decoded.value().size() < packed_domain_stream_header_bytes) {
+        return workspace_result_t<std::uint64_t>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                "packed paged domain first page header is truncated"));
+    }
+    std::uint64_t record_count = 0;
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        record_count |= static_cast<std::uint64_t>(
+            decoded.value()[8 + shift / 8]) << shift;
+    }
+    return workspace_result_t<std::uint64_t>::success(record_count);
+}
+
+workspace_result_t<void> bind_committed_page_source(
+    sqlite3* database,
+    workspace_database_t::connection_state_t& conn,
+    const workspace_database_options_t& options,
+    const std::shared_ptr<workspace_snapshot_staging_t::state_t>& staging,
+    const packed_generation_record_t& generation_record,
+    const cancellation_token_t& cancel) {
+    std::array<bool, 20> domain_paged{};
+    bool any_paged = false;
+    for (std::size_t index = 0; index < fact_domain_count; ++index) {
+        if (staging->snapshot->paged_domain_counts[index] == 0)
+            continue;
+        const auto packed = paged_view_packed_domain(
+            static_cast<fact_domain_t>(index));
+        if (!packed)
+            continue;
+        domain_paged[static_cast<std::size_t>(*packed)] = true;
+        any_paged = true;
+    }
+    if (!any_paged)
+        return workspace_result_t<void>::success();
+    std::array<packed_domain_page_stats_t, 20> domain_stats{};
+    auto stats = read_packed_domain_page_stats(
+        database, staging->generation, domain_stats, cancel);
+    if (!stats)
+        return workspace_result_t<void>::failure(stats.error());
+    auto index_rows = read_packed_page_index(
+        database, staging->generation, false,
+        [&cancel] { return cancel.stop_requested(); });
+    if (!index_rows)
+        return workspace_result_t<void>::failure(index_rows.error());
+    std::array<std::vector<packed_page_index_row_t>, 20> page_rows{};
+    std::array<std::uint64_t, 20> domain_records{};
+    std::array<std::uint64_t, 20> domain_content_bytes{};
+    for (auto& row : index_rows.value()) {
+        const auto fact_domain = paged_view_fact_domain(
+            static_cast<packed_page_type_t>(row.domain));
+        if (!fact_domain || !domain_paged[static_cast<std::size_t>(row.domain)])
+            continue;
+        page_rows[static_cast<std::size_t>(row.domain)].push_back(row);
+    }
+    for (std::size_t encoded = 1; encoded < page_rows.size(); ++encoded) {
+        if (!domain_paged[encoded])
+            continue;
+        auto& rows = page_rows[encoded];
+        std::sort(rows.begin(), rows.end(),
+            [](const packed_page_index_row_t& lhs,
+               const packed_page_index_row_t& rhs) {
+                return lhs.ordinal_begin < rhs.ordinal_begin;
+            });
+        std::uint64_t expected_ordinal = 0;
+        bool contiguous = true;
+        for (const auto& row : rows) {
+            if (row.ordinal_begin != expected_ordinal) {
+                contiguous = false;
+                break;
+            }
+            expected_ordinal += row.count;
+        }
+        if (!contiguous || rows.empty() || !domain_stats[encoded].present) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "committed packed paged domain page index is inconsistent"));
+        }
+        const auto fact_domain = *paged_view_fact_domain(
+            static_cast<packed_page_type_t>(encoded));
+        auto record_count = read_paged_domain_stream_record_count(
+            database, generation_record, static_cast<std::uint32_t>(encoded),
+            rows.front().page_index, cancel);
+        if (!record_count)
+            return workspace_result_t<void>::failure(record_count.error());
+        if (record_count.value() != staging->snapshot->paged_domain_counts[
+                static_cast<std::size_t>(fact_domain)]) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "committed packed paged domain record count is inconsistent"));
+        }
+        domain_records[encoded] = record_count.value();
+        const auto logical = domain_stats[encoded].logical_bytes;
+        const auto prefixes = static_cast<std::uint64_t>(rows.size()) *
+            packed_record_page_prefix_size;
+        domain_content_bytes[encoded] = logical >= prefixes ? logical - prefixes : 0;
+    }
+    auto committed_page_source = std::shared_ptr<const paged_domain_source_t>(
+        new database_page_source_t(conn.path, options, generation_record,
+                                   std::move(page_rows),
+                                   std::move(domain_records),
+                                   std::move(domain_content_bytes),
+                                   options.packed_stream_page_size -
+                                       packed_page_header_size -
+                                       packed_record_page_prefix_size,
+                                   false));
+    std::atomic_store_explicit(&staging->snapshot->persisted_page_source.source,
+                               std::move(committed_page_source),
+                               std::memory_order_release);
     return workspace_result_t<void>::success();
 }
 
@@ -7902,6 +8881,151 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
             domain_stats[encoded].present &&
             domain_stats[encoded].page_count >= kReopenParallelMinPages;
         any_materialized = any_materialized || domain_materialized[encoded];
+    }
+    std::array<fact_domain_projection_t, fact_domain_count> reopen_projections{};
+    for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+         ++encoded) {
+        const auto fact_domain =
+            paged_view_fact_domain(static_cast<packed_page_type_t>(encoded));
+        if (!fact_domain || !domain_stats[encoded].present)
+            continue;
+        reopen_projections[static_cast<std::size_t>(*fact_domain)] = {
+            1, reopen_resident_projection_bytes(
+                   static_cast<packed_page_type_t>(encoded),
+                   domain_stats[encoded].logical_bytes)};
+    }
+    const auto reopen_plan = fact_residency_select(reopen_projections,
+        fact_resident_budget_bytes(host_memory_envelope()));
+    std::array<bool, 20> domain_paged{};
+    bool any_paged = false;
+    for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+         ++encoded) {
+        const auto fact_domain =
+            paged_view_fact_domain(static_cast<packed_page_type_t>(encoded));
+        if (!fact_domain || !domain_stats[encoded].present)
+            continue;
+        if (reopen_plan.domains[static_cast<std::size_t>(*fact_domain)].mode ==
+            fact_residency_mode_t::paged) {
+            domain_paged[encoded] = true;
+            any_paged = true;
+            if (domain_materialized[encoded]) {
+                domain_materialized[encoded] = false;
+                any_materialized = false;
+                for (std::uint32_t probe = 1; probe <= baseline_domain_count;
+                     ++probe) {
+                    if (static_cast<packed_page_type_t>(probe) ==
+                        packed_page_type_t::search_index)
+                        continue;
+                    if (domain_materialized[probe]) {
+                        any_materialized = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    std::shared_ptr<const paged_domain_source_t> reopen_page_source;
+    std::array<std::uint64_t, 20> reopen_domain_records{};
+    std::array<std::uint64_t, 20> reopen_domain_content_bytes{};
+    std::vector<std::uint8_t> reopen_delay_slot_counts;
+    if (any_paged) {
+        std::array<std::vector<packed_page_index_row_t>, 20> page_rows{};
+        std::array<std::uint64_t, 20> page_records{};
+        std::array<std::uint64_t, 20> page_logical{};
+        auto index_connection = open_reader_connection(conn.path, options);
+        if (!index_connection) {
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                index_connection.error());
+        }
+        sqlite3* index_database = index_connection.take_value();
+        auto index_rows = read_packed_page_index(
+            index_database, generation.generation, true,
+            [&cancel] { return cancel.stop_requested(); });
+        if (!index_rows) {
+            sqlite3_close_v2(index_database);
+            return workspace_result_t<decoded_packed_baseline_t>::failure(
+                index_rows.error());
+        }
+        for (auto& row : index_rows.value()) {
+            const auto fact_domain = paged_view_fact_domain(
+                static_cast<packed_page_type_t>(row.domain));
+            if (!fact_domain ||
+                !domain_paged[static_cast<std::size_t>(row.domain)])
+                continue;
+            page_rows[static_cast<std::size_t>(row.domain)].push_back(row);
+        }
+        for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+             ++encoded) {
+            if (!domain_paged[encoded])
+                continue;
+            auto& rows = page_rows[encoded];
+            std::sort(rows.begin(), rows.end(),
+                [](const packed_page_index_row_t& lhs,
+                   const packed_page_index_row_t& rhs) {
+                    return lhs.ordinal_begin < rhs.ordinal_begin;
+                });
+            std::uint64_t expected_ordinal = 0;
+            bool contiguous = true;
+            for (const auto& row : rows) {
+                if (row.ordinal_begin != expected_ordinal) {
+                    contiguous = false;
+                    break;
+                }
+                expected_ordinal += row.count;
+            }
+            if (!contiguous) {
+                sqlite3_close_v2(index_database);
+                return workspace_result_t<decoded_packed_baseline_t>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed paged domain page index is not contiguous"));
+            }
+            if (rows.empty()) {
+                sqlite3_close_v2(index_database);
+                return workspace_result_t<decoded_packed_baseline_t>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed paged domain has no page index rows"));
+            }
+            auto record_count_result = read_paged_domain_stream_record_count(
+                index_database, generation, static_cast<std::uint32_t>(encoded),
+                rows.front().page_index, cancel);
+            if (!record_count_result) {
+                sqlite3_close_v2(index_database);
+                return workspace_result_t<decoded_packed_baseline_t>::failure(
+                    record_count_result.error());
+            }
+            const auto record_count = record_count_result.value();
+            page_records[encoded] = record_count;
+            const auto logical = domain_stats[encoded].logical_bytes;
+            const auto prefixes = static_cast<std::uint64_t>(rows.size()) *
+                packed_record_page_prefix_size;
+            page_logical[encoded] = logical >= prefixes ? logical - prefixes : 0;
+            reopen_domain_records[encoded] = record_count;
+            reopen_domain_content_bytes[encoded] = page_logical[encoded];
+        }
+        sqlite3_close_v2(index_database);
+        reopen_page_source = std::shared_ptr<const paged_domain_source_t>(
+            new database_page_source_t(conn.path, options, generation,
+                                       std::move(page_rows),
+                                       std::move(reopen_domain_records),
+                                       std::move(reopen_domain_content_bytes),
+                                       options.packed_stream_page_size -
+                                           packed_page_header_size -
+                                           packed_record_page_prefix_size));
+        if (domain_paged[static_cast<std::uint32_t>(
+                packed_page_type_t::instructions)]) {
+            auto delay_tail = reopen_paged_delay_slot_tail(
+                *reopen_page_source,
+                reopen_page_source->record_count(fact_domain_t::instructions),
+                reopen_page_source->total_content_bytes(
+                    fact_domain_t::instructions),
+                maximum_records, cancel);
+            if (!delay_tail)
+                return workspace_result_t<decoded_packed_baseline_t>::failure(
+                    delay_tail.error());
+            reopen_delay_slot_counts = delay_tail.take_value();
+        }
     }
     std::array<std::vector<std::uint8_t>, 20> domain_payloads;
     if (any_materialized) {
@@ -8068,7 +9192,8 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
         std::vector<packed_page_type_t> remaining;
         std::uint32_t remaining_mask = 0;
         for (const auto domain : tasks[task_index]) {
-            if (!domain_materialized[static_cast<std::uint32_t>(domain)]) {
+            if (!domain_materialized[static_cast<std::uint32_t>(domain)] &&
+                !domain_paged[static_cast<std::uint32_t>(domain)]) {
                 remaining.push_back(domain);
                 remaining_mask |= 1U << static_cast<std::uint32_t>(domain);
             }
@@ -8288,7 +9413,22 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
         };
         merge_into(snapshot->instructions, source.instructions);
         merge_into(snapshot->delay_slot_counts, source.delay_slot_counts);
-        merge_into(snapshot->operand_facts, source.operand_facts);
+        {
+            const std::size_t cold_base = snapshot->operand_facts.cold.size();
+            const std::size_t hot_begin = snapshot->operand_facts.hot.size();
+            merge_into(snapshot->operand_facts.hot, source.operand_facts.hot);
+            merge_into(snapshot->operand_facts.cold, source.operand_facts.cold);
+            if (cold_base != 0) {
+                for (std::size_t index = hot_begin;
+                     index < snapshot->operand_facts.hot.size(); ++index) {
+                    auto& hot = snapshot->operand_facts.hot[index];
+                    if (hot.cold_index != 0) {
+                        hot.cold_index = static_cast<std::uint32_t>(
+                            cold_base + hot.cold_index);
+                    }
+                }
+            }
+        }
         merge_into(snapshot->target_facts, source.target_facts);
         merge_into(snapshot->edges, source.edges);
         merge_into(snapshot->strings, source.strings);
@@ -8299,6 +9439,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
         merge_into(snapshot->function_block_memberships,
                    source.function_block_memberships);
         merge_into(snapshot->xrefs, source.xrefs);
+        merge_into(snapshot->address_expressions, source.address_expressions);
         merge_into(snapshot->coverage, source.coverage);
         merge_into(snapshot->call_graph.nodes, source.call_graph.nodes);
         merge_into(snapshot->call_graph.call_sites, source.call_graph.call_sites);
@@ -8331,6 +9472,62 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_generation(
                 workspace_error_code_t::limit_exceeded,
                 "packed baseline record count exceeds its bounded reopen budget"));
     }
+    {
+        std::uint64_t total_chunks = 0;
+        for (const auto& function : snapshot->functions)
+            total_chunks += function.chunks.size();
+        if (total_chunks != 0) {
+            snapshot->function_chunk_ranges.reserve(
+                static_cast<std::size_t>(total_chunks));
+            for (auto& function : snapshot->functions) {
+                if (function.chunks.empty())
+                    continue;
+                if (static_cast<std::uint64_t>(function.first_chunk) !=
+                    snapshot->function_chunk_ranges.size() ||
+                    function.chunk_count != function.chunks.size())
+                    continue;
+                for (const auto& range : function.chunks)
+                    snapshot->function_chunk_ranges.push_back(range);
+                std::vector<address_range_t>().swap(function.chunks);
+            }
+            std::uint64_t remaining_chunk_bytes = 0;
+            bool chunk_bytes_overflow = false;
+            for (const auto& function : snapshot->functions) {
+                std::uint64_t bytes = 0;
+                if (!checked_mul_u64(
+                        static_cast<std::uint64_t>(function.chunks.capacity()),
+                        static_cast<std::uint64_t>(sizeof(address_range_t)), bytes) ||
+                    !checked_add_u64(remaining_chunk_bytes, bytes,
+                                     remaining_chunk_bytes)) {
+                    chunk_bytes_overflow = true;
+                    break;
+                }
+            }
+            if (chunk_bytes_overflow) {
+                return workspace_result_t<decoded_packed_baseline_t>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::range_overflow,
+                        "analysis memory accounting overflows"));
+            }
+            snapshot->function_chunk_bytes = remaining_chunk_bytes;
+        }
+    }
+    if (any_paged) {
+        snapshot->residency_plan = reopen_plan;
+        snapshot->persisted_page_source.source = reopen_page_source;
+        if (!reopen_delay_slot_counts.empty())
+            snapshot->delay_slot_counts = std::move(reopen_delay_slot_counts);
+        for (std::uint32_t encoded = 1; encoded <= baseline_domain_count;
+             ++encoded) {
+            if (!domain_paged[encoded])
+                continue;
+            const auto fact_domain =
+                paged_view_fact_domain(static_cast<packed_page_type_t>(encoded));
+            snapshot->paged_domain_counts[static_cast<std::size_t>(
+                *fact_domain)] = reopen_domain_records[encoded];
+        }
+    }
+    snapshot_repair_operand_instruction_ordinals(*snapshot);
     auto validated = validate_analysis_snapshot(
         *snapshot, snapshot->baseline_complete, cancel);
     if (!validated)
@@ -9692,6 +10889,94 @@ workspace_result_t<void> read_snapshot_fact_rows(
     }
 }
 
+using fact_chunk_record_reader_t =
+    std::function<workspace_result_t<void>(const std::uint8_t*)>;
+
+workspace_result_t<bool> read_snapshot_fact_chunks(
+    sqlite3* database, std::uint8_t active_slot, const char* table,
+    std::uint64_t record_stride, std::uint64_t max_chunk_records,
+    std::uint64_t& total_rows, std::uint64_t maximum_records,
+    const cancellation_token_t& cancel, const char* phase,
+    const fact_chunk_record_reader_t& record_reader) {
+    std::uint64_t chunk_rows = 0;
+    {
+        statement_t count_statement;
+        const std::string count_sql = "SELECT COUNT(*) FROM " +
+            slot_table(active_slot, table);
+        auto prepared = count_statement.prepare(database, count_sql.c_str(), phase);
+        if (!prepared)
+            return workspace_result_t<bool>::failure(prepared.error());
+        const int status = sqlite3_step(count_statement.get());
+        if (status != SQLITE_ROW)
+            return workspace_result_t<bool>::failure(database_error(
+                database, status, "unable to count persisted fact chunks", phase));
+        chunk_rows = static_cast<std::uint64_t>(
+            sqlite3_column_int64(count_statement.get(), 0));
+    }
+    if (chunk_rows == 0)
+        return workspace_result_t<bool>::success(false);
+    statement_t statement;
+    const std::string sql = "SELECT payload FROM " +
+        slot_table(active_slot, table) + " ORDER BY chunk_id";
+    auto prepared = statement.prepare(database, sql.c_str(), phase);
+    if (!prepared)
+        return workspace_result_t<bool>::failure(prepared.error());
+    std::size_t row = 0;
+    for (;;) {
+        if ((row++ & 255U) == 0 && cancel.stop_requested()) {
+            auto error = make_workspace_error(cancel.deadline_exceeded()
+                                                  ? workspace_error_code_t::deadline_exceeded
+                                                  : workspace_error_code_t::cancelled,
+                                              "snapshot reopen cancelled", phase);
+            error.deadline = cancel.deadline_exceeded();
+            error.cancellation = !error.deadline;
+            return workspace_result_t<bool>::failure(std::move(error));
+        }
+        const int step_status = sqlite3_step(statement.get());
+        if (step_status == SQLITE_DONE)
+            break;
+        if (step_status != SQLITE_ROW)
+            return workspace_result_t<bool>::failure(database_error(
+                database, step_status, "unable to read persisted fact chunk", phase));
+        const void* payload = sqlite3_column_blob(statement.get(), 0);
+        const int bytes = sqlite3_column_bytes(statement.get(), 0);
+        if (!payload || bytes <= 0) {
+            return workspace_result_t<bool>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "persisted fact chunk is empty", phase));
+        }
+        std::uint64_t count = 0;
+        const std::uint8_t* records = nullptr;
+        auto envelope = decode_fact_chunk_envelope(
+            payload, static_cast<std::size_t>(bytes), record_stride,
+            max_chunk_records, count, records, phase);
+        if (!envelope)
+            return workspace_result_t<bool>::failure(envelope.error());
+        if (count > maximum_records - (std::min)(total_rows, maximum_records) ||
+            total_rows + count > maximum_records) {
+            return workspace_result_t<bool>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "persisted fact rows exceed the reopen budget", phase));
+        }
+        total_rows += count;
+        for (std::uint64_t index = 0; index < count; ++index) {
+            if ((index & 1023ULL) == 0 && cancel.stop_requested()) {
+                auto error = make_workspace_error(cancel.deadline_exceeded()
+                                                      ? workspace_error_code_t::deadline_exceeded
+                                                      : workspace_error_code_t::cancelled,
+                                                  "snapshot reopen cancelled", phase);
+                error.deadline = cancel.deadline_exceeded();
+                error.cancellation = !error.deadline;
+                return workspace_result_t<bool>::failure(std::move(error));
+            }
+            auto decoded = record_reader(records + index * record_stride);
+            if (!decoded)
+                return workspace_result_t<bool>::failure(decoded.error());
+        }
+    }
+    return workspace_result_t<bool>::success(true);
+}
+
 struct relational_group_task_t {
     relational_group_output_t output;
     std::vector<std::pair<std::uint64_t, std::vector<std::uint8_t>>> instruction_blobs;
@@ -9752,7 +11037,39 @@ workspace_result_t<void> load_relational_operands_targets(
     sqlite3* database, std::uint8_t active_slot, relational_group_output_t& output,
     std::uint64_t maximum_records, const cancellation_token_t& cancel) {
     auto& loaded = output.snapshot;
-    auto result = read_snapshot_fact_rows(database,
+    auto operand_chunks = read_snapshot_fact_chunks(
+        database, active_slot, "operand_fact_chunks",
+        packed_operand_stream_record_bytes, kMaximumInstructionChunkRecords,
+        output.total_rows, maximum_records, cancel,
+        "workspace_database.load.operands",
+        [&loaded](const std::uint8_t* record_bytes) -> workspace_result_t<void> {
+            auto decoded = decode_packed_operand_record(
+                record_bytes, packed_operand_stream_record_bytes);
+            if (!decoded)
+                return workspace_result_t<void>::failure(decoded.error());
+            snapshot_operand_append(*loaded, decoded.take_value());
+            return workspace_result_t<void>::success();
+        });
+    if (!operand_chunks)
+        return workspace_result_t<void>::failure(operand_chunks.error());
+    auto target_chunks = read_snapshot_fact_chunks(
+        database, active_slot, "target_fact_chunks",
+        packed_target_stream_record_bytes, kMaximumInstructionChunkRecords,
+        output.total_rows, maximum_records, cancel,
+        "workspace_database.load.targets",
+        [&loaded](const std::uint8_t* record_bytes) -> workspace_result_t<void> {
+            auto decoded = decode_packed_target_record(
+                record_bytes, packed_target_stream_record_bytes);
+            if (!decoded)
+                return workspace_result_t<void>::failure(decoded.error());
+            loaded->target_facts.push_back(decoded.take_value());
+            return workspace_result_t<void>::success();
+        });
+    if (!target_chunks)
+        return workspace_result_t<void>::failure(target_chunks.error());
+    workspace_result_t<void> result = workspace_result_t<void>::success();
+    if (!operand_chunks.value())
+        result = read_snapshot_fact_rows(database,
         "SELECT instruction_id,operand_index,entity_id,address_expression_id,decoder_operand_id,kind,access,visibility,encoding,memory_type,access_width,bit_width,access_width_bits,access_count,element_width_bits,element_count,address_width_bits,reg,segment_reg,base_reg,index_reg,scale,relative,signed_value,has_displacement,has_resolved_expression_value,displacement,immediate,resolved_expression_value,address_components,address_expression,address_resolution FROM " + slot_table(active_slot, "operand_facts") + " ORDER BY instruction_id,operand_index",
         "workspace_database.load.operands", output.total_rows, maximum_records, cancel,
         [&](sqlite3_stmt* statement) -> workspace_result_t<void> {
@@ -9797,11 +11114,12 @@ workspace_result_t<void> load_relational_operands_targets(
             fact.address_components = static_cast<std::uint16_t>(sqlite3_column_int(statement, 29));
             fact.address_expression = static_cast<address_expression_kind_t>(sqlite3_column_int(statement, 30));
             fact.address_resolution = static_cast<target_resolution_t>(sqlite3_column_int(statement, 31));
-            loaded->operand_facts.push_back(fact);
+            snapshot_operand_append(*loaded, fact);
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
-    result = read_snapshot_fact_rows(database,
+    if (!target_chunks.value())
+        result = read_snapshot_fact_rows(database,
         "SELECT instruction_id,operand_fact_id,address_expression_id,target_space,target_value,target_arch,target_mode,kind,resolution,operand_index,access_width_bits,access_count,direct,is_external FROM " + slot_table(active_slot, "target_facts") + " ORDER BY instruction_id,target_index",
         "workspace_database.load.targets", output.total_rows, maximum_records, cancel,
         [&](sqlite3_stmt* statement) -> workspace_result_t<void> {
@@ -9908,7 +11226,33 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
     sqlite3* database, std::uint8_t active_slot, relational_group_output_t& output,
     std::uint64_t maximum_records, const cancellation_token_t& cancel) {
     auto& loaded = output.snapshot;
-    auto result = read_snapshot_fact_rows(database,
+    auto edge_chunks = read_snapshot_fact_chunks(
+        database, active_slot, "edge_chunks", kFactChunkEdgeRecordBytes,
+        kMaximumInstructionChunkRecords, output.total_rows, maximum_records, cancel,
+        "workspace_database.load.edges",
+        [&loaded](const std::uint8_t* record_bytes) -> workspace_result_t<void> {
+            loaded->edges.push_back(decode_edge_chunk_record(record_bytes));
+            return workspace_result_t<void>::success();
+        });
+    if (!edge_chunks)
+        return workspace_result_t<void>::failure(edge_chunks.error());
+    auto xref_chunks = read_snapshot_fact_chunks(
+        database, active_slot, "xref_chunks", packed_xref_stream_record_bytes,
+        kMaximumInstructionChunkRecords, output.total_rows, maximum_records, cancel,
+        "workspace_database.load.xrefs",
+        [&loaded](const std::uint8_t* record_bytes) -> workspace_result_t<void> {
+            auto decoded = decode_packed_xref_record(
+                record_bytes, packed_xref_stream_record_bytes);
+            if (!decoded)
+                return workspace_result_t<void>::failure(decoded.error());
+            loaded->xrefs.push_back(decoded.take_value());
+            return workspace_result_t<void>::success();
+        });
+    if (!xref_chunks)
+        return workspace_result_t<void>::failure(xref_chunks.error());
+    workspace_result_t<void> result = workspace_result_t<void>::success();
+    if (!edge_chunks.value())
+        result = read_snapshot_fact_rows(database,
         "SELECT entity_id,source_entity,target_entity,source_space,source_value,source_arch,source_mode,target_space,target_value,target_arch,target_mode,kind,provenance,confidence FROM " + slot_table(active_slot, "edges") + " ORDER BY source_value,target_value,entity_id",
         "workspace_database.load.edges", output.total_rows, maximum_records, cancel,
         [&](sqlite3_stmt* statement) -> workspace_result_t<void> {
@@ -9926,7 +11270,8 @@ workspace_result_t<void> load_relational_edges_xrefs_call_graph(
             return workspace_result_t<void>::success();
         });
     if (!result) return result;
-    result = read_snapshot_fact_rows(database,
+    if (!xref_chunks.value())
+        result = read_snapshot_fact_rows(database,
         "SELECT entity_id,source_space,source_value,source_arch,source_mode,target_space,target_value,target_arch,target_mode,kind,provenance,confidence FROM " + slot_table(active_slot, "xrefs") + " ORDER BY source_value,target_value,entity_id",
         "workspace_database.load.xrefs", output.total_rows, maximum_records, cancel,
         [&](sqlite3_stmt* statement) -> workspace_result_t<void> {
@@ -10591,6 +11936,7 @@ workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> ima
     loaded->symbols = std::move(group_tasks[4]->output.snapshot.symbols);
     loaded->coverage = std::move(group_tasks[4]->output.snapshot.coverage);
     loaded->rich_facts = std::move(group_tasks[4]->output.snapshot.rich_facts);
+    snapshot_repair_operand_instruction_ordinals(*loaded);
     auto recheck = with_reader([&](sqlite3* database) -> workspace_result_t<void> {
         auto commit_state = read_commit_state(database, "workspace_database.load");
         if (!commit_state)

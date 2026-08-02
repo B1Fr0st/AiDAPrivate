@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace aida::analysis::api_prototypes {
 
@@ -675,6 +676,378 @@ inline constexpr api_prototype_entry_t k_entries[] = {
     { "crt", "_byteswap64", "ULONGLONG __cdecl _byteswap64(ULONGLONG value)", false, true },
     { "crt", "_byteswap_ulong", "ULONG __cdecl _byteswap_ulong(ULONG value)", false, true },
     { "crt", "_byteswap_ushort", "USHORT __cdecl _byteswap_ushort(USHORT value)", false, true },
+    { "crt", "vprintf", "int __cdecl vprintf(LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vfprintf", "int __cdecl vfprintf(LPVOID stream, LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vsprintf", "int __cdecl vsprintf(LPSTR buffer, LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vwprintf", "int __cdecl vwprintf(LPCWSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vfwprintf", "int __cdecl vfwprintf(LPVOID stream, LPCWSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vswprintf", "int __cdecl vswprintf(LPWSTR buffer, SIZE_T count, LPCWSTR format, ULONG_PTR args)", false, true },
+    { "crt", "printf_s", "int __cdecl printf_s(LPCSTR format, ...)", false, true },
+    { "crt", "fprintf_s", "int __cdecl fprintf_s(LPVOID stream, LPCSTR format, ...)", false, true },
+    { "crt", "wprintf_s", "int __cdecl wprintf_s(LPCWSTR format, ...)", false, true },
+    { "crt", "fwprintf_s", "int __cdecl fwprintf_s(LPVOID stream, LPCWSTR format, ...)", false, true },
+    { "crt", "vprintf_s", "int __cdecl vprintf_s(LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vfprintf_s", "int __cdecl vfprintf_s(LPVOID stream, LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vsprintf_s", "int __cdecl vsprintf_s(LPSTR buffer, SIZE_T sizeOfBuffer, LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vsnprintf_s", "int __cdecl vsnprintf_s(LPSTR buffer, SIZE_T sizeOfBuffer, SIZE_T count, LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "_vsnprintf", "int __cdecl _vsnprintf(LPSTR buffer, SIZE_T count, LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "_vsnwprintf", "int __cdecl _vsnwprintf(LPWSTR buffer, SIZE_T count, LPCWSTR format, ULONG_PTR args)", false, true },
+    { "crt", "_snprintf", "int __cdecl _snprintf(LPSTR buffer, SIZE_T count, LPCSTR format, ...)", false, true },
+    { "crt", "_snwprintf", "int __cdecl _snwprintf(LPWSTR buffer, SIZE_T count, LPCWSTR format, ...)", false, true },
+    { "crt", "_scprintf", "int __cdecl _scprintf(LPCSTR format, ...)", false, true },
+    { "crt", "_scwprintf", "int __cdecl _scwprintf(LPCWSTR format, ...)", false, true },
+    { "crt", "_vscprintf", "int __cdecl _vscprintf(LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "_vscwprintf", "int __cdecl _vscwprintf(LPCWSTR format, ULONG_PTR args)", false, true },
+    { "crt", "scanf", "int __cdecl scanf(LPCSTR format, ...)", false, true },
+    { "crt", "wscanf", "int __cdecl wscanf(LPCWSTR format, ...)", false, true },
+    { "crt", "fscanf", "int __cdecl fscanf(LPVOID stream, LPCSTR format, ...)", false, true },
+    { "crt", "fwscanf", "int __cdecl fwscanf(LPVOID stream, LPCWSTR format, ...)", false, true },
+    { "crt", "scanf_s", "int __cdecl scanf_s(LPCSTR format, ...)", false, true },
+    { "crt", "wscanf_s", "int __cdecl wscanf_s(LPCWSTR format, ...)", false, true },
+    { "crt", "fscanf_s", "int __cdecl fscanf_s(LPVOID stream, LPCSTR format, ...)", false, true },
+    { "crt", "fwscanf_s", "int __cdecl fwscanf_s(LPVOID stream, LPCWSTR format, ...)", false, true },
+    { "crt", "sscanf_s", "int __cdecl sscanf_s(LPCSTR buffer, LPCSTR format, ...)", false, true },
+    { "crt", "swscanf_s", "int __cdecl swscanf_s(LPCWSTR buffer, LPCWSTR format, ...)", false, true },
+    { "crt", "_snscanf", "int __cdecl _snscanf(LPCSTR buffer, SIZE_T count, LPCSTR format, ...)", false, true },
+    { "crt", "_snwscanf", "int __cdecl _snwscanf(LPCWSTR buffer, SIZE_T count, LPCWSTR format, ...)", false, true },
+    { "crt", "_snscanf_s", "int __cdecl _snscanf_s(LPCSTR buffer, SIZE_T count, LPCSTR format, ...)", false, true },
+    { "crt", "_snwscanf_s", "int __cdecl _snwscanf_s(LPCWSTR buffer, SIZE_T count, LPCWSTR format, ...)", false, true },
+    { "crt", "vscanf", "int __cdecl vscanf(LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vfscanf", "int __cdecl vfscanf(LPVOID stream, LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "vsscanf", "int __cdecl vsscanf(LPCSTR buffer, LPCSTR format, ULONG_PTR args)", false, true },
+    { "crt", "strtok", "LPSTR __cdecl strtok(LPSTR str, LPCSTR delimiters)", false, true },
+    { "crt", "strtok_s", "LPSTR __cdecl strtok_s(LPSTR str, LPCSTR delimiters, LPVOID context)", false, true },
+    { "crt", "wcstok", "LPWSTR __cdecl wcstok(LPWSTR str, LPCWSTR delimiters)", false, true },
+    { "crt", "wcstok_s", "LPWSTR __cdecl wcstok_s(LPWSTR str, LPCWSTR delimiters, LPVOID context)", false, true },
+    { "crt", "strspn", "SIZE_T __cdecl strspn(LPCSTR str, LPCSTR control)", false, true },
+    { "crt", "strcspn", "SIZE_T __cdecl strcspn(LPCSTR str, LPCSTR control)", false, true },
+    { "crt", "strpbrk", "LPSTR __cdecl strpbrk(LPCSTR str, LPCSTR control)", false, true },
+    { "crt", "wcsspn", "SIZE_T __cdecl wcsspn(LPCWSTR str, LPCWSTR control)", false, true },
+    { "crt", "wcscspn", "SIZE_T __cdecl wcscspn(LPCWSTR str, LPCWSTR control)", false, true },
+    { "crt", "wcspbrk", "LPWSTR __cdecl wcspbrk(LPCWSTR str, LPCWSTR control)", false, true },
+    { "crt", "strcoll", "int __cdecl strcoll(LPCSTR lhs, LPCSTR rhs)", false, true },
+    { "crt", "wcscoll", "int __cdecl wcscoll(LPCWSTR lhs, LPCWSTR rhs)", false, true },
+    { "crt", "_stricoll", "int __cdecl _stricoll(LPCSTR lhs, LPCSTR rhs)", false, true },
+    { "crt", "_wcsicoll", "int __cdecl _wcsicoll(LPCWSTR lhs, LPCWSTR rhs)", false, true },
+    { "crt", "strxfrm", "SIZE_T __cdecl strxfrm(LPSTR dest, LPCSTR src, SIZE_T count)", false, true },
+    { "crt", "wcsxfrm", "SIZE_T __cdecl wcsxfrm(LPWSTR dest, LPCWSTR src, SIZE_T count)", false, true },
+    { "crt", "strncat_s", "int __cdecl strncat_s(LPSTR dest, SIZE_T destsz, LPCSTR src, SIZE_T count)", false, true },
+    { "crt", "wcsncat_s", "int __cdecl wcsncat_s(LPWSTR dest, SIZE_T destsz, LPCWSTR src, SIZE_T count)", false, true },
+    { "crt", "strdup", "LPSTR __cdecl strdup(LPCSTR src)", false, true },
+    { "crt", "_strndup", "LPSTR __cdecl _strndup(LPCSTR src, SIZE_T size)", false, true },
+    { "crt", "_strrev", "LPSTR __cdecl _strrev(LPSTR str)", false, true },
+    { "crt", "_wcsrev", "LPWSTR __cdecl _wcsrev(LPWSTR str)", false, true },
+    { "crt", "_strlwr", "LPSTR __cdecl _strlwr(LPSTR str)", false, true },
+    { "crt", "_strlwr_s", "int __cdecl _strlwr_s(LPSTR str, SIZE_T size)", false, true },
+    { "crt", "_strupr", "LPSTR __cdecl _strupr(LPSTR str)", false, true },
+    { "crt", "_strupr_s", "int __cdecl _strupr_s(LPSTR str, SIZE_T size)", false, true },
+    { "crt", "_wcslwr", "LPWSTR __cdecl _wcslwr(LPWSTR str)", false, true },
+    { "crt", "_wcslwr_s", "int __cdecl _wcslwr_s(LPWSTR str, SIZE_T size)", false, true },
+    { "crt", "_wcsupr", "LPWSTR __cdecl _wcsupr(LPWSTR str)", false, true },
+    { "crt", "_wcsupr_s", "int __cdecl _wcsupr_s(LPWSTR str, SIZE_T size)", false, true },
+    { "crt", "_strnset", "LPSTR __cdecl _strnset(LPSTR str, int c, SIZE_T count)", false, true },
+    { "crt", "_wcsnset", "LPWSTR __cdecl _wcsnset(LPWSTR str, unsigned short c, SIZE_T count)", false, true },
+    { "crt", "_strset", "LPSTR __cdecl _strset(LPSTR str, int c)", false, true },
+    { "crt", "_wcsset", "LPWSTR __cdecl _wcsset(LPWSTR str, unsigned short c)", false, true },
+    { "crt", "memicmp", "int __cdecl memicmp(LPCVOID lhs, LPCVOID rhs, SIZE_T count)", false, true },
+    { "crt", "_memicmp", "int __cdecl _memicmp(LPCVOID lhs, LPCVOID rhs, SIZE_T count)", false, true },
+    { "crt", "_memccpy", "LPVOID __cdecl _memccpy(LPVOID dest, LPCVOID src, int c, SIZE_T count)", false, true },
+    { "crt", "memcpy_s", "int __cdecl memcpy_s(LPVOID dest, SIZE_T destsz, LPCVOID src, SIZE_T count)", false, true },
+    { "crt", "memmove_s", "int __cdecl memmove_s(LPVOID dest, SIZE_T destsz, LPCVOID src, SIZE_T count)", false, true },
+    { "crt", "wmemcpy", "LPWSTR __cdecl wmemcpy(LPWSTR dest, LPCWSTR src, SIZE_T count)", false, true },
+    { "crt", "wmemmove", "LPWSTR __cdecl wmemmove(LPWSTR dest, LPCWSTR src, SIZE_T count)", false, true },
+    { "crt", "wmemcmp", "int __cdecl wmemcmp(LPCWSTR lhs, LPCWSTR rhs, SIZE_T count)", false, true },
+    { "crt", "wmemchr", "LPWSTR __cdecl wmemchr(LPCWSTR ptr, unsigned short ch, SIZE_T count)", false, true },
+    { "crt", "wmemset", "LPWSTR __cdecl wmemset(LPWSTR dest, unsigned short c, SIZE_T count)", false, true },
+    { "crt", "_itoa", "LPSTR __cdecl _itoa(int value, LPSTR buffer, int radix)", false, true },
+    { "crt", "_itow", "LPWSTR __cdecl _itow(int value, LPWSTR buffer, int radix)", false, true },
+    { "crt", "_i64toa", "LPSTR __cdecl _i64toa(LONGLONG value, LPSTR buffer, int radix)", false, true },
+    { "crt", "_i64tow", "LPWSTR __cdecl _i64tow(LONGLONG value, LPWSTR buffer, int radix)", false, true },
+    { "crt", "_ui64toa", "LPSTR __cdecl _ui64toa(ULONGLONG value, LPSTR buffer, int radix)", false, true },
+    { "crt", "_ui64tow", "LPWSTR __cdecl _ui64tow(ULONGLONG value, LPWSTR buffer, int radix)", false, true },
+    { "crt", "_ltoa", "LPSTR __cdecl _ltoa(LONG value, LPSTR buffer, int radix)", false, true },
+    { "crt", "_ltow", "LPWSTR __cdecl _ltow(LONG value, LPWSTR buffer, int radix)", false, true },
+    { "crt", "_ultoa", "LPSTR __cdecl _ultoa(ULONG value, LPSTR buffer, int radix)", false, true },
+    { "crt", "_ultow", "LPWSTR __cdecl _ultow(ULONG value, LPWSTR buffer, int radix)", false, true },
+    { "crt", "_itoa_s", "int __cdecl _itoa_s(int value, LPSTR buffer, SIZE_T sizeInBytes, int radix)", false, true },
+    { "crt", "_itow_s", "int __cdecl _itow_s(int value, LPWSTR buffer, SIZE_T sizeInWords, int radix)", false, true },
+    { "crt", "_i64toa_s", "int __cdecl _i64toa_s(LONGLONG value, LPSTR buffer, SIZE_T sizeInBytes, int radix)", false, true },
+    { "crt", "_ui64toa_s", "int __cdecl _ui64toa_s(ULONGLONG value, LPSTR buffer, SIZE_T sizeInBytes, int radix)", false, true },
+    { "crt", "_ltoa_s", "int __cdecl _ltoa_s(LONG value, LPSTR buffer, SIZE_T sizeInBytes, int radix)", false, true },
+    { "crt", "_ltow_s", "int __cdecl _ltow_s(LONG value, LPWSTR buffer, SIZE_T sizeInWords, int radix)", false, true },
+    { "crt", "_ultoa_s", "int __cdecl _ultoa_s(ULONG value, LPSTR buffer, SIZE_T sizeInBytes, int radix)", false, true },
+    { "crt", "_ultow_s", "int __cdecl _ultow_s(ULONG value, LPWSTR buffer, SIZE_T sizeInWords, int radix)", false, true },
+    { "crt", "_gcvt", "LPSTR __cdecl _gcvt(double value, int digits, LPSTR buffer)", false, true },
+    { "crt", "_gcvt_s", "int __cdecl _gcvt_s(LPSTR buffer, SIZE_T sizeInBytes, double value, int digits)", false, true },
+    { "crt", "_fcvt", "LPSTR __cdecl _fcvt(double value, int count, LPVOID dec, LPVOID sign)", false, true },
+    { "crt", "_fcvt_s", "int __cdecl _fcvt_s(LPSTR buffer, SIZE_T sizeInBytes, double value, int count, LPVOID dec, LPVOID sign)", false, true },
+    { "crt", "_ecvt", "LPSTR __cdecl _ecvt(double value, int count, LPVOID dec, LPVOID sign)", false, true },
+    { "crt", "_ecvt_s", "int __cdecl _ecvt_s(LPSTR buffer, SIZE_T sizeInBytes, double value, int count, LPVOID dec, LPVOID sign)", false, true },
+    { "crt", "strtof", "float __cdecl strtof(LPCSTR str, LPVOID endptr)", false, true },
+    { "crt", "strtold", "double __cdecl strtold(LPCSTR str, LPVOID endptr)", false, true },
+    { "crt", "wcstod", "double __cdecl wcstod(LPCWSTR str, LPVOID endptr)", false, true },
+    { "crt", "wcstof", "float __cdecl wcstof(LPCWSTR str, LPVOID endptr)", false, true },
+    { "crt", "wcstold", "double __cdecl wcstold(LPCWSTR str, LPVOID endptr)", false, true },
+    { "crt", "wcstoll", "LONGLONG __cdecl wcstoll(LPCWSTR str, LPVOID endptr, int base)", false, true },
+    { "crt", "wcstoull", "ULONGLONG __cdecl wcstoull(LPCWSTR str, LPVOID endptr, int base)", false, true },
+    { "crt", "_wtoi", "int __cdecl _wtoi(LPCWSTR str)", false, true },
+    { "crt", "_wtol", "LONG __cdecl _wtol(LPCWSTR str)", false, true },
+    { "crt", "_wtoll", "LONGLONG __cdecl _wtoll(LPCWSTR str)", false, true },
+    { "crt", "_wtof", "double __cdecl _wtof(LPCWSTR str)", false, true },
+    { "crt", "_atoi64", "LONGLONG __cdecl _atoi64(LPCSTR str)", false, true },
+    { "crt", "_rotl", "UINT __cdecl _rotl(UINT value, int shift)", false, true },
+    { "crt", "_rotr", "UINT __cdecl _rotr(UINT value, int shift)", false, true },
+    { "crt", "_rotl64", "ULONGLONG __cdecl _rotl64(ULONGLONG value, int shift)", false, true },
+    { "crt", "_rotr64", "ULONGLONG __cdecl _rotr64(ULONGLONG value, int shift)", false, true },
+    { "crt", "_byteswap_uint64", "ULONGLONG __cdecl _byteswap_uint64(ULONGLONG value)", false, true },
+    { "crt", "_BitScanForward", "UCHAR __cdecl _BitScanForward(LPVOID index, ULONG mask)", false, true },
+    { "crt", "_BitScanReverse", "UCHAR __cdecl _BitScanReverse(LPVOID index, ULONG mask)", false, true },
+    { "crt", "_BitScanForward64", "UCHAR __cdecl _BitScanForward64(LPVOID index, ULONGLONG mask)", false, true },
+    { "crt", "_BitScanReverse64", "UCHAR __cdecl _BitScanReverse64(LPVOID index, ULONGLONG mask)", false, true },
+    { "crt", "__popcnt", "int __cdecl __popcnt(UINT value)", false, true },
+    { "crt", "__popcnt64", "LONGLONG __cdecl __popcnt64(ULONGLONG value)", false, true },
+    { "crt", "__security_check_cookie", "void __cdecl __security_check_cookie(ULONG_PTR cookie)", false, true },
+    { "crt", "_CxxThrowException", "void __cdecl _CxxThrowException(LPVOID pExceptionObject, LPVOID pThrowInfo)", true, true },
+    { "crt", "terminate", "void __cdecl terminate(void)", true, true },
+    { "crt", "unexpected", "void __cdecl unexpected(void)", true, true },
+    { "crt", "_invalid_parameter_noinfo", "void __cdecl _invalid_parameter_noinfo(void)", true, true },
+    { "crt", "_invoke_watson", "void __cdecl _invoke_watson(LPCWSTR expression, LPCWSTR functionName, LPCWSTR fileName, UINT lineNo, ULONG_PTR reserved)", true, true },
+    { "crt", "_set_abort_behavior", "UINT __cdecl _set_abort_behavior(UINT flags, UINT mask)", false, true },
+    { "crt", "setlocale", "LPSTR __cdecl setlocale(int category, LPCSTR locale)", false, true },
+    { "crt", "_wsetlocale", "LPWSTR __cdecl _wsetlocale(int category, LPCWSTR locale)", false, true },
+    { "crt", "localeconv", "LPVOID __cdecl localeconv(void)", false, true },
+    { "crt", "_configthreadlocale", "int __cdecl _configthreadlocale(int per_thread_locale_type)", false, true },
+    { "crt", "tmpnam", "LPSTR __cdecl tmpnam(LPSTR str)", false, true },
+    { "crt", "_wtmpnam", "LPWSTR __cdecl _wtmpnam(LPWSTR str)", false, true },
+    { "crt", "tmpnam_s", "int __cdecl tmpnam_s(LPSTR str, SIZE_T sizeInBytes)", false, true },
+    { "crt", "_wtmpnam_s", "int __cdecl _wtmpnam_s(LPWSTR str, SIZE_T sizeInWords)", false, true },
+    { "crt", "tmpfile", "LPVOID __cdecl tmpfile(void)", false, true },
+    { "crt", "tmpfile_s", "int __cdecl tmpfile_s(LPVOID pFile)", false, true },
+    { "crt", "_tempnam", "LPSTR __cdecl _tempnam(LPCSTR dir, LPCSTR prefix)", false, true },
+    { "crt", "_wtempnam", "LPWSTR __cdecl _wtempnam(LPCWSTR dir, LPCWSTR prefix)", false, true },
+    { "crt", "getenv", "LPSTR __cdecl getenv(LPCSTR varname)", false, true },
+    { "crt", "_wgetenv", "LPWSTR __cdecl _wgetenv(LPCWSTR varname)", false, true },
+    { "crt", "getenv_s", "int __cdecl getenv_s(LPVOID requiredSize, LPSTR buffer, SIZE_T sizeInBytes, LPCSTR varname)", false, true },
+    { "crt", "_wgetenv_s", "int __cdecl _wgetenv_s(LPVOID requiredSize, LPWSTR buffer, SIZE_T sizeInWords, LPCWSTR varname)", false, true },
+    { "crt", "_putenv", "int __cdecl _putenv(LPCSTR envstring)", false, true },
+    { "crt", "_wputenv", "int __cdecl _wputenv(LPCWSTR envstring)", false, true },
+    { "crt", "_putenv_s", "int __cdecl _putenv_s(LPCSTR varname, LPCSTR value_string)", false, true },
+    { "crt", "_wputenv_s", "int __cdecl _wputenv_s(LPCWSTR varname, LPCWSTR value_string)", false, true },
+    { "crt", "_dupenv_s", "int __cdecl _dupenv_s(LPVOID pBuffer, LPVOID size, LPCSTR varname)", false, true },
+    { "crt", "_wdupenv_s", "int __cdecl _wdupenv_s(LPVOID pBuffer, LPVOID size, LPCWSTR varname)", false, true },
+    { "crt", "system", "int __cdecl system(LPCSTR command)", false, true },
+    { "crt", "_wsystem", "int __cdecl _wsystem(LPCWSTR command)", false, true },
+    { "crt", "_flushall", "int __cdecl _flushall(void)", false, true },
+    { "crt", "setvbuf", "int __cdecl setvbuf(LPVOID stream, LPSTR buffer, int mode, SIZE_T size)", false, true },
+    { "crt", "setbuf", "void __cdecl setbuf(LPVOID stream, LPSTR buffer)", false, true },
+    { "crt", "ungetc", "int __cdecl ungetc(int c, LPVOID stream)", false, true },
+    { "crt", "ungetwc", "unsigned short __cdecl ungetwc(unsigned short c, LPVOID stream)", false, true },
+    { "crt", "_ungetch", "int __cdecl _ungetch(int c)", false, true },
+    { "crt", "_ungetwch", "unsigned short __cdecl _ungetwch(unsigned short c)", false, true },
+    { "crt", "clearerr", "void __cdecl clearerr(LPVOID stream)", false, true },
+    { "crt", "feof", "int __cdecl feof(LPVOID stream)", false, true },
+    { "crt", "ferror", "int __cdecl ferror(LPVOID stream)", false, true },
+    { "crt", "rewind", "void __cdecl rewind(LPVOID stream)", false, true },
+    { "crt", "freopen", "LPVOID __cdecl freopen(LPCSTR filename, LPCSTR mode, LPVOID stream)", false, true },
+    { "crt", "_wfreopen", "LPVOID __cdecl _wfreopen(LPCWSTR filename, LPCWSTR mode, LPVOID stream)", false, true },
+    { "crt", "freopen_s", "int __cdecl freopen_s(LPVOID pFile, LPCSTR filename, LPCSTR mode, LPVOID stream)", false, true },
+    { "crt", "_wfreopen_s", "int __cdecl _wfreopen_s(LPVOID pFile, LPCWSTR filename, LPCWSTR mode, LPVOID stream)", false, true },
+    { "crt", "_fdopen", "LPVOID __cdecl _fdopen(int fd, LPCSTR mode)", false, true },
+    { "crt", "_wfdopen", "LPVOID __cdecl _wfdopen(int fd, LPCWSTR mode)", false, true },
+    { "crt", "_rmtmp", "int __cdecl _rmtmp(void)", false, true },
+    { "crt", "_fileno", "int __cdecl _fileno(LPVOID stream)", false, true },
+    { "crt", "_commit", "int __cdecl _commit(int fd)", false, true },
+    { "crt", "_write", "int __cdecl _write(int fd, LPCVOID buffer, UINT count)", false, true },
+    { "crt", "_read", "int __cdecl _read(int fd, LPVOID buffer, UINT count)", false, true },
+    { "crt", "_close", "int __cdecl _close(int fd)", false, true },
+    { "crt", "_creat", "int __cdecl _creat(LPCSTR filename, int pmode)", false, true },
+    { "crt", "_wcreat", "int __cdecl _wcreat(LPCWSTR filename, int pmode)", false, true },
+    { "crt", "_open", "int __cdecl _open(LPCSTR filename, int oflag, ...)", false, true },
+    { "crt", "_wopen", "int __cdecl _wopen(LPCWSTR filename, int oflag, ...)", false, true },
+    { "crt", "_sopen", "int __cdecl _sopen(LPCSTR filename, int oflag, int shflag, ...)", false, true },
+    { "crt", "_wsopen", "int __cdecl _wsopen(LPCWSTR filename, int oflag, int shflag, ...)", false, true },
+    { "crt", "_sopen_s", "int __cdecl _sopen_s(LPVOID pfh, LPCSTR filename, int oflag, int shflag, int pmode)", false, true },
+    { "crt", "_wsopen_s", "int __cdecl _wsopen_s(LPVOID pfh, LPCWSTR filename, int oflag, int shflag, int pmode)", false, true },
+    { "crt", "_lseek", "LONG __cdecl _lseek(int fd, LONG offset, int origin)", false, true },
+    { "crt", "_lseeki64", "LONGLONG __cdecl _lseeki64(int fd, LONGLONG offset, int origin)", false, true },
+    { "crt", "_tell", "LONG __cdecl _tell(int fd)", false, true },
+    { "crt", "_telli64", "LONGLONG __cdecl _telli64(int fd)", false, true },
+    { "crt", "_eof", "int __cdecl _eof(int fd)", false, true },
+    { "crt", "_isatty", "int __cdecl _isatty(int fd)", false, true },
+    { "crt", "_dup", "int __cdecl _dup(int fd)", false, true },
+    { "crt", "_dup2", "int __cdecl _dup2(int fd1, int fd2)", false, true },
+    { "crt", "_setmode", "int __cdecl _setmode(int fd, int mode)", false, true },
+    { "crt", "_mktemp", "LPSTR __cdecl _mktemp(LPSTR templateName)", false, true },
+    { "crt", "_wmktemp", "LPWSTR __cdecl _wmktemp(LPWSTR templateName)", false, true },
+    { "crt", "_mktemp_s", "int __cdecl _mktemp_s(LPSTR templateName, SIZE_T sizeInBytes)", false, true },
+    { "crt", "_wmktemp_s", "int __cdecl _wmktemp_s(LPWSTR templateName, SIZE_T sizeInWords)", false, true },
+    { "crt", "_open_osfhandle", "int __cdecl _open_osfhandle(ULONG_PTR osfhandle, int flags)", false, true },
+    { "crt", "_get_osfhandle", "ULONG_PTR __cdecl _get_osfhandle(int fd)", false, true },
+    { "crt", "fgetws", "LPWSTR __cdecl fgetws(LPWSTR buffer, int count, LPVOID stream)", false, true },
+    { "crt", "fputws", "int __cdecl fputws(LPCWSTR str, LPVOID stream)", false, true },
+    { "crt", "_putws", "int __cdecl _putws(LPCWSTR str)", false, true },
+    { "crt", "getwc", "unsigned short __cdecl getwc(LPVOID stream)", false, true },
+    { "crt", "putwc", "unsigned short __cdecl putwc(unsigned short c, LPVOID stream)", false, true },
+    { "crt", "getc", "int __cdecl getc(LPVOID stream)", false, true },
+    { "crt", "putc", "int __cdecl putc(int c, LPVOID stream)", false, true },
+    { "crt", "getchar", "int __cdecl getchar(void)", false, true },
+    { "crt", "getwchar", "unsigned short __cdecl getwchar(void)", false, true },
+    { "crt", "putwchar", "unsigned short __cdecl putwchar(unsigned short c)", false, true },
+    { "crt", "_gets_s", "LPSTR __cdecl _gets_s(LPSTR buffer, SIZE_T sizeInBytes)", false, true },
+    { "crt", "_getws_s", "LPWSTR __cdecl _getws_s(LPWSTR buffer, SIZE_T sizeInWords)", false, true },
+    { "crt", "_getch", "int __cdecl _getch(void)", false, true },
+    { "crt", "_getwch", "unsigned short __cdecl _getwch(void)", false, true },
+    { "crt", "_getche", "int __cdecl _getche(void)", false, true },
+    { "crt", "_getwche", "unsigned short __cdecl _getwche(void)", false, true },
+    { "crt", "_putch", "int __cdecl _putch(int c)", false, true },
+    { "crt", "_putwch", "unsigned short __cdecl _putwch(unsigned short c)", false, true },
+    { "crt", "_cputs", "int __cdecl _cputs(LPCSTR str)", false, true },
+    { "crt", "_cputws", "int __cdecl _cputws(LPCWSTR str)", false, true },
+    { "crt", "_kbhit", "int __cdecl _kbhit(void)", false, true },
+    { "crt", "_rmdir", "int __cdecl _rmdir(LPCSTR dirname)", false, true },
+    { "crt", "_wrmdir", "int __cdecl _wrmdir(LPCWSTR dirname)", false, true },
+    { "crt", "_chdir", "int __cdecl _chdir(LPCSTR dirname)", false, true },
+    { "crt", "_wchdir", "int __cdecl _wchdir(LPCWSTR dirname)", false, true },
+    { "crt", "_mkdir", "int __cdecl _mkdir(LPCSTR dirname)", false, true },
+    { "crt", "_wmkdir", "int __cdecl _wmkdir(LPCWSTR dirname)", false, true },
+    { "crt", "_getcwd", "LPSTR __cdecl _getcwd(LPSTR buffer, int maxlen)", false, true },
+    { "crt", "_wgetcwd", "LPWSTR __cdecl _wgetcwd(LPWSTR buffer, int maxlen)", false, true },
+    { "crt", "_chdrive", "int __cdecl _chdrive(int drive)", false, true },
+    { "crt", "_getdrive", "int __cdecl _getdrive(void)", false, true },
+    { "crt", "_access", "int __cdecl _access(LPCSTR filename, int mode)", false, true },
+    { "crt", "_waccess", "int __cdecl _waccess(LPCWSTR filename, int mode)", false, true },
+    { "crt", "_access_s", "int __cdecl _access_s(LPCSTR filename, int mode)", false, true },
+    { "crt", "_waccess_s", "int __cdecl _waccess_s(LPCWSTR filename, int mode)", false, true },
+    { "crt", "_chmod", "int __cdecl _chmod(LPCSTR filename, int pmode)", false, true },
+    { "crt", "_wchmod", "int __cdecl _wchmod(LPCWSTR filename, int pmode)", false, true },
+    { "crt", "_unlink", "int __cdecl _unlink(LPCSTR filename)", false, true },
+    { "crt", "_wunlink", "int __cdecl _wunlink(LPCWSTR filename)", false, true },
+    { "crt", "_stat64", "int __cdecl _stat64(LPCSTR filename, LPVOID stat)", false, true },
+    { "crt", "_wstat64", "int __cdecl _wstat64(LPCWSTR filename, LPVOID stat)", false, true },
+    { "crt", "_stati64", "int __cdecl _stati64(LPCSTR filename, LPVOID stat)", false, true },
+    { "crt", "_wstati64", "int __cdecl _wstati64(LPCWSTR filename, LPVOID stat)", false, true },
+    { "crt", "_makepath", "void __cdecl _makepath(LPSTR path, LPCSTR drive, LPCSTR dir, LPCSTR fname, LPCSTR ext)", false, true },
+    { "crt", "_wmakepath", "void __cdecl _wmakepath(LPWSTR path, LPCWSTR drive, LPCWSTR dir, LPCWSTR fname, LPCWSTR ext)", false, true },
+    { "crt", "_makepath_s", "int __cdecl _makepath_s(LPSTR path, SIZE_T sizeInBytes, LPCSTR drive, LPCSTR dir, LPCSTR fname, LPCSTR ext)", false, true },
+    { "crt", "_wmakepath_s", "int __cdecl _wmakepath_s(LPWSTR path, SIZE_T sizeInWords, LPCWSTR drive, LPCWSTR dir, LPCWSTR fname, LPCWSTR ext)", false, true },
+    { "crt", "_splitpath", "void __cdecl _splitpath(LPCSTR path, LPSTR drive, LPSTR dir, LPSTR fname, LPSTR ext)", false, true },
+    { "crt", "_wsplitpath", "void __cdecl _wsplitpath(LPCWSTR path, LPWSTR drive, LPWSTR dir, LPWSTR fname, LPWSTR ext)", false, true },
+    { "crt", "_splitpath_s", "int __cdecl _splitpath_s(LPCSTR path, LPSTR drive, SIZE_T driveSizeInBytes, LPSTR dir, SIZE_T dirSizeInBytes, LPSTR fname, SIZE_T nameSizeInBytes, LPSTR ext, SIZE_T extSizeInBytes)", false, true },
+    { "crt", "_wsplitpath_s", "int __cdecl _wsplitpath_s(LPCWSTR path, LPWSTR drive, SIZE_T driveSizeInWords, LPWSTR dir, SIZE_T dirSizeInWords, LPWSTR fname, SIZE_T nameSizeInWords, LPWSTR ext, SIZE_T extSizeInWords)", false, true },
+    { "crt", "_fullpath", "LPSTR __cdecl _fullpath(LPSTR absPath, LPCSTR relPath, SIZE_T maxLength)", false, true },
+    { "crt", "_wfullpath", "LPWSTR __cdecl _wfullpath(LPWSTR absPath, LPCWSTR relPath, SIZE_T maxLength)", false, true },
+    { "crt", "_searchenv", "void __cdecl _searchenv(LPCSTR filename, LPCSTR varname, LPSTR pathname)", false, true },
+    { "crt", "_wsearchenv", "void __cdecl _wsearchenv(LPCWSTR filename, LPCWSTR varname, LPWSTR pathname)", false, true },
+    { "crt", "_searchenv_s", "int __cdecl _searchenv_s(LPCSTR filename, LPCSTR varname, LPSTR pathname, SIZE_T sizeInBytes)", false, true },
+    { "crt", "_wsearchenv_s", "int __cdecl _wsearchenv_s(LPCWSTR filename, LPCWSTR varname, LPWSTR pathname, SIZE_T sizeInWords)", false, true },
+    { "crt", "mblen", "int __cdecl mblen(LPCSTR str, SIZE_T sizeInBytes)", false, true },
+    { "crt", "mbtowc", "int __cdecl mbtowc(LPVOID wchar, LPCSTR mbchar, SIZE_T count)", false, true },
+    { "crt", "wctomb", "int __cdecl wctomb(LPSTR mbchar, unsigned short wchar)", false, true },
+    { "crt", "mbstowcs", "SIZE_T __cdecl mbstowcs(LPWSTR wcstr, LPCSTR mbstr, SIZE_T count)", false, true },
+    { "crt", "wcstombs", "SIZE_T __cdecl wcstombs(LPSTR mbstr, LPCWSTR wcstr, SIZE_T count)", false, true },
+    { "crt", "mbstowcs_s", "int __cdecl mbstowcs_s(LPVOID pReturnValue, LPWSTR wcstr, SIZE_T sizeInWords, LPCSTR mbstr, SIZE_T count)", false, true },
+    { "crt", "wcstombs_s", "int __cdecl wcstombs_s(LPVOID pReturnValue, LPSTR mbstr, SIZE_T sizeInBytes, LPCWSTR wcstr, SIZE_T count)", false, true },
+    { "crt", "_mbstrlen", "SIZE_T __cdecl _mbstrlen(LPCSTR str)", false, true },
+    { "crt", "acos", "double __cdecl acos(double x)", false, true },
+    { "crt", "asin", "double __cdecl asin(double x)", false, true },
+    { "crt", "atan", "double __cdecl atan(double x)", false, true },
+    { "crt", "cosh", "double __cdecl cosh(double x)", false, true },
+    { "crt", "sinh", "double __cdecl sinh(double x)", false, true },
+    { "crt", "tanh", "double __cdecl tanh(double x)", false, true },
+    { "crt", "acosh", "double __cdecl acosh(double x)", false, true },
+    { "crt", "asinh", "double __cdecl asinh(double x)", false, true },
+    { "crt", "atanh", "double __cdecl atanh(double x)", false, true },
+    { "crt", "cbrt", "double __cdecl cbrt(double x)", false, true },
+    { "crt", "hypot", "double __cdecl hypot(double x, double y)", false, true },
+    { "crt", "copysign", "double __cdecl copysign(double x, double y)", false, true },
+    { "crt", "_copysign", "double __cdecl _copysign(double x, double y)", false, true },
+    { "crt", "exp2", "double __cdecl exp2(double x)", false, true },
+    { "crt", "expm1", "double __cdecl expm1(double x)", false, true },
+    { "crt", "log1p", "double __cdecl log1p(double x)", false, true },
+    { "crt", "lgamma", "double __cdecl lgamma(double x)", false, true },
+    { "crt", "tgamma", "double __cdecl tgamma(double x)", false, true },
+    { "crt", "erf", "double __cdecl erf(double x)", false, true },
+    { "crt", "erfc", "double __cdecl erfc(double x)", false, true },
+    { "crt", "remainder", "double __cdecl remainder(double x, double y)", false, true },
+    { "crt", "remquo", "double __cdecl remquo(double x, double y, LPVOID quo)", false, true },
+    { "crt", "rint", "double __cdecl rint(double x)", false, true },
+    { "crt", "lrint", "LONG __cdecl lrint(double x)", false, true },
+    { "crt", "llrint", "LONGLONG __cdecl llrint(double x)", false, true },
+    { "crt", "lround", "LONG __cdecl lround(double x)", false, true },
+    { "crt", "llround", "LONGLONG __cdecl llround(double x)", false, true },
+    { "crt", "trunc", "double __cdecl trunc(double x)", false, true },
+    { "crt", "nearbyint", "double __cdecl nearbyint(double x)", false, true },
+    { "crt", "fdim", "double __cdecl fdim(double x, double y)", false, true },
+    { "crt", "fmax", "double __cdecl fmax(double x, double y)", false, true },
+    { "crt", "fmin", "double __cdecl fmin(double x, double y)", false, true },
+    { "crt", "fma", "double __cdecl fma(double x, double y, double z)", false, true },
+    { "crt", "nextafter", "double __cdecl nextafter(double x, double y)", false, true },
+    { "crt", "_nextafter", "double __cdecl _nextafter(double x, double y)", false, true },
+    { "crt", "scalbn", "double __cdecl scalbn(double x, int exp)", false, true },
+    { "crt", "scalbln", "double __cdecl scalbln(double x, LONG exp)", false, true },
+    { "crt", "ilogb", "int __cdecl ilogb(double x)", false, true },
+    { "crt", "_logb", "double __cdecl _logb(double x)", false, true },
+    { "crt", "_fpclass", "int __cdecl _fpclass(double x)", false, true },
+    { "crt", "_isnan", "int __cdecl _isnan(double x)", false, true },
+    { "crt", "_finite", "int __cdecl _finite(double x)", false, true },
+    { "crt", "_chgsign", "double __cdecl _chgsign(double x)", false, true },
+    { "crt", "_scalb", "double __cdecl _scalb(double x, LONG exp)", false, true },
+    { "crt", "_j0", "double __cdecl _j0(double x)", false, true },
+    { "crt", "_j1", "double __cdecl _j1(double x)", false, true },
+    { "crt", "_jn", "double __cdecl _jn(int n, double x)", false, true },
+    { "crt", "_y0", "double __cdecl _y0(double x)", false, true },
+    { "crt", "_y1", "double __cdecl _y1(double x)", false, true },
+    { "crt", "_yn", "double __cdecl _yn(int n, double x)", false, true },
+    { "crt", "iswalnum", "int __cdecl iswalnum(unsigned short c)", false, true },
+    { "crt", "iswprint", "int __cdecl iswprint(unsigned short c)", false, true },
+    { "crt", "iswcntrl", "int __cdecl iswcntrl(unsigned short c)", false, true },
+    { "crt", "iswupper", "int __cdecl iswupper(unsigned short c)", false, true },
+    { "crt", "iswlower", "int __cdecl iswlower(unsigned short c)", false, true },
+    { "crt", "iswxdigit", "int __cdecl iswxdigit(unsigned short c)", false, true },
+    { "crt", "iswascii", "int __cdecl iswascii(unsigned short c)", false, true },
+    { "crt", "isascii", "int __cdecl isascii(int c)", false, true },
+    { "crt", "__isascii", "int __cdecl __isascii(int c)", false, true },
+    { "crt", "isblank", "int __cdecl isblank(int c)", false, true },
+    { "crt", "iswblank", "int __cdecl iswblank(unsigned short c)", false, true },
+    { "crt", "_tolower", "int __cdecl _tolower(int c)", false, true },
+    { "crt", "_toupper", "int __cdecl _toupper(int c)", false, true },
+    { "crt", "signal", "LPVOID __cdecl signal(int sig, LPVOID func)", false, true },
+    { "crt", "raise", "int __cdecl raise(int sig)", false, true },
+    { "crt", "_tzset", "void __cdecl _tzset(void)", false, true },
+    { "crt", "_strdate", "LPSTR __cdecl _strdate(LPSTR datestr)", false, true },
+    { "crt", "_strtime", "LPSTR __cdecl _strtime(LPSTR timestr)", false, true },
+    { "crt", "_wstrdate", "LPWSTR __cdecl _wstrdate(LPWSTR datestr)", false, true },
+    { "crt", "_wstrtime", "LPWSTR __cdecl _wstrtime(LPWSTR timestr)", false, true },
+    { "crt", "asctime", "LPSTR __cdecl asctime(LPVOID timeptr)", false, true },
+    { "crt", "_wasctime", "LPWSTR __cdecl _wasctime(LPVOID timeptr)", false, true },
+    { "crt", "asctime_s", "int __cdecl asctime_s(LPSTR buffer, SIZE_T sizeInBytes, LPVOID timeptr)", false, true },
+    { "crt", "_wasctime_s", "int __cdecl _wasctime_s(LPWSTR buffer, SIZE_T sizeInWords, LPVOID timeptr)", false, true },
+    { "crt", "ctime", "LPSTR __cdecl ctime(LPVOID timer)", false, true },
+    { "crt", "_wctime", "LPWSTR __cdecl _wctime(LPVOID timer)", false, true },
+    { "crt", "ctime_s", "int __cdecl ctime_s(LPSTR buffer, SIZE_T sizeInBytes, LPVOID timer)", false, true },
+    { "crt", "_wctime_s", "int __cdecl _wctime_s(LPWSTR buffer, SIZE_T sizeInWords, LPVOID timer)", false, true },
+    { "crt", "_mkgmtime", "__int64 __cdecl _mkgmtime(LPVOID timeptr)", false, true },
+    { "crt", "gmtime_s", "int __cdecl gmtime_s(LPVOID result, LPVOID timer)", false, true },
+    { "crt", "localtime_s", "int __cdecl localtime_s(LPVOID result, LPVOID timer)", false, true },
+    { "crt", "_wcserror_s", "int __cdecl _wcserror_s(LPWSTR buffer, SIZE_T sizeInWords, int errnum)", false, true },
+    { "crt", "strerror_s", "int __cdecl strerror_s(LPSTR buffer, SIZE_T sizeInBytes, int errnum)", false, true },
+    { "crt", "_strerror_s", "int __cdecl _strerror_s(LPSTR buffer, SIZE_T sizeInBytes, LPCSTR strErrMsg)", false, true },
+    { "crt", "_expand", "LPVOID __cdecl _expand(LPVOID ptr, SIZE_T size)", false, true },
+    { "crt", "_recalloc", "LPVOID __cdecl _recalloc(LPVOID ptr, SIZE_T num, SIZE_T size)", false, true },
+    { "crt", "_aligned_msize", "SIZE_T __cdecl _aligned_msize(LPVOID ptr, SIZE_T alignment, SIZE_T offset)", false, true },
+    { "crt", "_heapchk", "int __cdecl _heapchk(void)", false, true },
+    { "crt", "_heapmin", "int __cdecl _heapmin(void)", false, true },
+    { "crt", "_heapset", "int __cdecl _heapset(UINT fill)", false, true },
+    { "crt", "bsearch_s", "LPVOID __cdecl bsearch_s(LPCVOID key, LPCVOID base, SIZE_T num, SIZE_T size, LPVOID compar, LPVOID context)", false, true },
+    { "crt", "qsort_s", "void __cdecl qsort_s(LPVOID base, SIZE_T num, SIZE_T size, LPVOID compar, LPVOID context)", false, true },
+    { "crt", "rand_s", "int __cdecl rand_s(LPVOID randomValue)", false, true },
+    { "crt", "_controlfp", "UINT __cdecl _controlfp(UINT newControl, UINT mask)", false, true },
+    { "crt", "_control87", "UINT __cdecl _control87(UINT newControl, UINT mask)", false, true },
+    { "crt", "_statusfp", "UINT __cdecl _statusfp(void)", false, true },
+    { "crt", "_clearfp", "UINT __cdecl _clearfp(void)", false, true },
+    { "crt", "_fpreset", "void __cdecl _fpreset(void)", false, true },
+    { "crt", "_set_printf_count_output", "int __cdecl _set_printf_count_output(int enable)", false, true },
+    { "crt", "_get_printf_count_output", "int __cdecl _get_printf_count_output(void)", false, true },
 };
 
 struct api_prototype_t {
@@ -715,27 +1088,71 @@ inline bool module_is_crt(std::string_view module) noexcept
     return module.size() > 12 && iequals(module.substr(0, 12), "api-ms-win-crt");
 }
 
+struct lookup_index_t {
+    std::unordered_map<std::string, std::uint32_t> module_keyed;
+    std::unordered_map<std::string, std::uint32_t> crt_keyed;
+};
+
+inline const lookup_index_t& lookup_index()
+{
+    static const lookup_index_t index = [] {
+        lookup_index_t built;
+        constexpr std::uint32_t count = static_cast<std::uint32_t>(sizeof(k_entries) / sizeof(k_entries[0]));
+        built.module_keyed.reserve(count * 2);
+        built.crt_keyed.reserve(count);
+        const auto lower = [](const char* text) {
+            std::string out(text ? text : "");
+            for (auto& ch : out)
+                if (ch >= 'A' && ch <= 'Z')
+                    ch = static_cast<char>(ch - 'A' + 'a');
+            return out;
+        };
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto& entry = k_entries[i];
+            if (!entry.signature || entry.signature[0] == '\0' || !entry.name || entry.name[0] == '\0')
+                continue;
+            if (entry.is_crt) {
+                built.crt_keyed.emplace(lower(entry.name), i);
+                continue;
+            }
+            std::string key = lower(entry.module);
+            const std::string_view module_view(key);
+            const std::string_view normalized = normalized_module(module_view);
+            if (normalized.size() != key.size())
+                key.resize(normalized.size());
+            key.push_back('\x1f');
+            key.append(entry.name);
+            built.module_keyed.emplace(std::move(key), i);
+        }
+        return built;
+    }();
+    return index;
+}
+
 inline std::optional<api_prototype_t> find(std::string_view module, std::string_view name) noexcept
 {
     if (name.empty() || name.size() > 256 || module.empty() || module.size() > 260)
         return std::nullopt;
     const std::string_view base = normalized_module(module);
-    for (const auto& entry : k_entries) {
-        if (entry.is_crt || !entry.signature || entry.signature[0] == '\0')
-            continue;
-        if (name != entry.name)
-            continue;
-        std::string_view entry_module = normalized_module(entry.module);
-        if (iequals(base, entry_module))
-            return api_prototype_t{entry.signature, entry.is_noreturn};
+    std::string key;
+    key.reserve(base.size() + 1 + name.size());
+    for (const char ch : base)
+        key.push_back((ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch);
+    key.push_back('\x1f');
+    key.append(name.data(), name.size());
+    const auto& index = lookup_index();
+    const auto found = index.module_keyed.find(key);
+    if (found != index.module_keyed.end()) {
+        const auto& entry = k_entries[found->second];
+        return api_prototype_t{entry.signature, entry.is_noreturn};
     }
     if (!module_is_crt(module))
         return std::nullopt;
-    for (const auto& entry : k_entries) {
-        if (!entry.is_crt || !entry.signature || entry.signature[0] == '\0')
-            continue;
-        if (name == entry.name)
-            return api_prototype_t{entry.signature, entry.is_noreturn};
+    std::string crt_key(name.data(), name.size());
+    const auto crt_found = index.crt_keyed.find(crt_key);
+    if (crt_found != index.crt_keyed.end()) {
+        const auto& entry = k_entries[crt_found->second];
+        return api_prototype_t{entry.signature, entry.is_noreturn};
     }
     return std::nullopt;
 }

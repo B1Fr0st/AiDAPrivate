@@ -35,6 +35,12 @@ struct projection_invalidation_set_t;
 struct managed_artifact_publication_t;
 struct workspace_overlay_presentation_t;
 
+namespace publication_indexes {
+class publication_indexes_t;
+}
+
+using query_index_bundle_t = publication_indexes::publication_indexes_t;
+
 workspace_result_t<void> validate_analysis_snapshot_parallel(
     const analysis_snapshot_t& snapshot,
     bool require_complete_coverage,
@@ -108,12 +114,15 @@ struct analysis_publication_t final {
                            std::shared_ptr<const managed_artifact_publication_t>
                                managed_artifacts_value = {},
                            std::shared_ptr<const workspace_overlay_presentation_t>
-                               overlay_presentation_value = {}) noexcept
+                               overlay_presentation_value = {},
+                           std::shared_ptr<const query_index_bundle_t>
+                               query_indexes_value = {}) noexcept
         : snapshot(std::move(snapshot_value)),
           provider(std::move(provider_value)),
           search_index(std::move(search_index_value)),
           managed_artifacts(std::move(managed_artifacts_value)),
           overlay_presentation(std::move(overlay_presentation_value)),
+          query_indexes(std::move(query_indexes_value)),
           binary_id(snapshot ? snapshot->binary_id : binary_id_t{}),
           load_profile_hash(snapshot ? snapshot->load_profile_hash : sha256_digest_t{}),
           generation(snapshot ? snapshot->generation : 0),
@@ -128,6 +137,7 @@ struct analysis_publication_t final {
     const std::shared_ptr<search_index_t> search_index;
     const std::shared_ptr<const managed_artifact_publication_t> managed_artifacts;
     const std::shared_ptr<const workspace_overlay_presentation_t> overlay_presentation;
+    const std::shared_ptr<const query_index_bundle_t> query_indexes;
     const binary_id_t binary_id;
     const sha256_digest_t load_profile_hash;
     const std::uint64_t generation;

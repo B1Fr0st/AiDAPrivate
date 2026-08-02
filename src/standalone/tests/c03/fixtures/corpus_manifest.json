@@ -3,14 +3,14 @@
   "schema_version":2,
   "corpus_id":"aida-c03-license-clean-static-analysis-v2",
   "license_policy":{"allowed_spdx":["CC0-1.0","MIT","Apache-2.0","BSD-2-Clause","BSD-3-Clause","ISC","Zlib"],"redistribution_required":true},
-  "generator_source":{"path":"src/standalone/tests/c03/fixtures/corpus_generator_recipes.json","sha256":"38e9a3df65d3609b179e088fedc7a374158b4cf8fa91a86bca8798b335354237","license":"CC0-1.0"},
-  "materializer_source":{"path":"src/standalone/tests/c03/fixture_materializer.cpp","sha256":"cfbdd58c7a94bd795ab642574abf29f4c863e768e1ae28c7692100a93fd2b987","license":"CC0-1.0"},
-  "ground_truth_source":{"path":"src/standalone/tests/c03/fixtures/corpus_ground_truth.json","sha256":"87f1d7b252713b4cd32645d9154b479f19dbfc599fc1760df3086361a18d7036","license":"CC0-1.0"},
+  "generator_source":{"path":"src/standalone/tests/c03/fixtures/corpus_generator_recipes.json","sha256":"d83fea9f4ff34194c50d340e58e292cf35913d8ebc2f13c2be411b621d3643cc","license":"CC0-1.0"},
+  "materializer_source":{"path":"src/standalone/tests/c03/fixture_materializer.cpp","sha256":"e01fb803404dbb55a501d77c6f1404867e059253802c27ee250d636401149d07","license":"CC0-1.0"},
+  "ground_truth_source":{"path":"src/standalone/tests/c03/fixtures/corpus_ground_truth.json","sha256":"189a26f4c43cb74639aa23af09430a93e9718dbd055cf5368188c20e2bdb2124","license":"CC0-1.0"},
   "target_execution_forbidden":true,
   "fixture_defaults":{
-    "source":{"kind":"deterministic_recipe","locator":"src/standalone/tests/c03/fixtures/corpus_generator_recipes.json","sha256":"38e9a3df65d3609b179e088fedc7a374158b4cf8fa91a86bca8798b335354237"},
+    "source":{"kind":"deterministic_recipe","locator":"src/standalone/tests/c03/fixtures/corpus_generator_recipes.json","sha256":"d83fea9f4ff34194c50d340e58e292cf35913d8ebc2f13c2be411b621d3643cc"},
     "license":{"spdx":"CC0-1.0","redistribution":true},
-    "artifact_binding":{"status":"deterministic_recipe","algorithm":"sha256","content_hash_required":true,"recipes_sha256":"38e9a3df65d3609b179e088fedc7a374158b4cf8fa91a86bca8798b335354237","materializer_sha256":"cfbdd58c7a94bd795ab642574abf29f4c863e768e1ae28c7692100a93fd2b987","ground_truth_sha256":"87f1d7b252713b4cd32645d9154b479f19dbfc599fc1760df3086361a18d7036"},
+    "artifact_binding":{"status":"deterministic_recipe","algorithm":"sha256","content_hash_required":true,"recipes_sha256":"d83fea9f4ff34194c50d340e58e292cf35913d8ebc2f13c2be411b621d3643cc","materializer_sha256":"e01fb803404dbb55a501d77c6f1404867e059253802c27ee250d636401149d07","ground_truth_sha256":"189a26f4c43cb74639aa23af09430a93e9718dbd055cf5368188c20e2bdb2124"},
     "semantic_facts":{"entity_kinds":["function","basic_block","symbol","type"],"edge_kinds":["cfg","call","xref","contains"],"metadata_kinds":["identity","mapping","relocation","exception","debug","runtime"],"identity_kind":"static_artifact","facts_revision":2},
     "evidence_domains":["static_analysis","decompiler_quality","overlay_projection","compatibility_contract","malformed_input"],
     "resource_limits":{"max_input_bytes":67108864,"max_private_bytes":536870912,"max_mapped_bytes":134217728,"max_wall_ms":5000}
@@ -68,7 +68,8 @@
     {"id":"raw-ppc32-be","format":"raw_code","architecture":"ppc","architecture_identity":"ppc32","mode":"32","endian":"big"},
     {"id":"raw-ppc64-be","format":"raw_code","architecture":"ppc","architecture_identity":"ppc64","mode":"64","endian":"big"},
     {"id":"raw-riscv32-le","format":"raw_code","architecture":"riscv","architecture_identity":"riscv32","mode":"32","endian":"little"},
-    {"id":"raw-riscv64-le","format":"raw_code","architecture":"riscv","architecture_identity":"riscv64","mode":"64","endian":"little"}
+    {"id":"raw-riscv64-le","format":"raw_code","architecture":"riscv","architecture_identity":"riscv64","mode":"64","endian":"little"},
+    {"id":"pe32plus-x64-idiom","format":"pe32plus","architecture":"x64","architecture_identity":"x64","mode":"64","endian":"little"}
   ],
   "malformed_case_manifest":{"path":"src/standalone/tests/c03/fixtures/malformed_cases.json","sha256":"d672173e5280439947226e19d99b4167fffd4f76773ef766bacef569c8c97ec1"}
 }

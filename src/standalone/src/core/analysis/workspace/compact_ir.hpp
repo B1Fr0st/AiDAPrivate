@@ -1,9 +1,15 @@
 #pragma once
 
 #include "checked_range.hpp"
+#include "fact_residency.hpp"
+#include "record_span.hpp"
 #include "snapshot_tables.hpp"
 #include "workspace_types.hpp"
 
+#include "../packed_string_pool.hpp"
+
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -16,10 +22,15 @@ namespace aida::analysis {
 
 class byte_provider_t;
 class pe_image_t;
+class paged_fact_staging_t;
+class paged_domain_source_t;
 
 using entity_id_t = std::uint64_t;
 
 inline constexpr std::uint64_t entity_ordinal_mask = 0x00FFFFFFFFFFFFFFULL;
+inline constexpr std::uint64_t instruction_entity_tag = 1ULL << 56;
+inline constexpr std::uint64_t operand_entity_tag = 2ULL << 56;
+inline constexpr std::uint64_t address_expression_entity_tag = 6ULL << 56;
 inline constexpr std::uint64_t call_site_entity_tag = 15ULL << 56;
 inline constexpr std::uint64_t call_candidate_entity_tag = 16ULL << 56;
 inline constexpr std::uint64_t call_edge_entity_tag = 17ULL << 56;
@@ -155,6 +166,261 @@ struct operand_fact_t {
     target_resolution_t address_resolution = target_resolution_t::unresolved_indirect;
 };
 
+inline constexpr std::uint16_t operand_hot_kind_shift = 0;
+inline constexpr std::uint16_t operand_hot_access_shift = 3;
+inline constexpr std::uint16_t operand_hot_scale_shift = 7;
+inline constexpr std::uint16_t operand_hot_relative_bit = 11;
+inline constexpr std::uint16_t operand_hot_signed_bit = 12;
+inline constexpr std::uint16_t operand_hot_displacement_bit = 13;
+inline constexpr std::uint16_t operand_hot_memory_type_shift = 14;
+inline constexpr std::uint8_t operand_cold_has_resolved_bit = 1U;
+
+struct operand_fact_hot_t {
+    std::uint64_t value = 0;
+    std::uint32_t instruction_ordinal = 0;
+    std::uint32_t cold_index = 0;
+    std::uint16_t reg = 0;
+    std::uint16_t base_reg = 0;
+    std::uint16_t index_reg = 0;
+    std::uint16_t flags = 0;
+    std::uint8_t operand_index = 0;
+    std::uint8_t access_width = 0;
+    std::uint8_t segment_reg = 0;
+    std::uint8_t width_class = 0;
+    std::uint8_t memory_type_wide = 0;
+    std::uint8_t segment_reg_hi = 0;
+    std::uint8_t reserved[2]{};
+};
+
+struct operand_fact_cold_t {
+    std::uint64_t resolved_expression_value = 0;
+    std::uint32_t expression_ordinal = 0;
+    std::uint16_t bit_width = 0;
+    std::uint16_t access_width_bits = 0;
+    std::uint16_t element_width_bits = 0;
+    std::uint16_t address_components = 0;
+    std::uint16_t access_count = 0;
+    std::uint16_t element_count = 0;
+    std::uint8_t address_expression = 0;
+    std::uint8_t address_resolution = 0;
+    std::uint8_t visibility = 0;
+    std::uint8_t encoding = 0;
+    std::uint8_t decoder_operand_id = 0;
+    std::uint8_t address_width_bits = 0;
+    std::uint8_t flags = 0;
+    std::uint8_t reserved = 0;
+};
+
+struct address_expression_record_t {
+    std::uint16_t components = 0;
+    std::uint16_t base_reg = 0;
+    std::uint16_t index_reg = 0;
+    std::uint16_t segment_reg = 0;
+    std::uint8_t kind = 0;
+    std::uint8_t resolution = 0;
+    std::uint8_t scale = 0;
+    std::uint8_t disp_class = 0;
+};
+
+struct operand_fact_store_t {
+    snapshot_table_t<operand_fact_hot_t> hot;
+    snapshot_table_t<operand_fact_cold_t> cold;
+
+    std::size_t size() const noexcept { return hot.size(); }
+    bool empty() const noexcept { return hot.empty(); }
+    void clear() noexcept {
+        hot.clear();
+        cold.clear();
+    }
+    void append(const operand_fact_t& fact, std::uint32_t instruction_ordinal);
+};
+
+inline void reserve_exact(operand_fact_store_t& store, std::size_t hot_count,
+                          std::size_t cold_count) {
+    reserve_exact(store.hot, hot_count);
+    reserve_exact(store.cold, cold_count);
+}
+
+inline void resize_uninitialized(operand_fact_store_t& store, std::size_t hot_count,
+                                 std::size_t cold_count) {
+    resize_uninitialized(store.hot, hot_count);
+    resize_uninitialized(store.cold, cold_count);
+}
+
+inline std::uint8_t operand_hot_width_class(std::uint16_t bit_width) noexcept {
+    if (bit_width == 0 || (bit_width & (bit_width - 1U)) != 0)
+        return 0;
+    std::uint8_t shift = 0;
+    std::uint16_t value = bit_width;
+    while (value > 1U) {
+        value >>= 1U;
+        ++shift;
+    }
+    return static_cast<std::uint8_t>(shift + 1U);
+}
+
+inline std::uint16_t operand_hot_width_bits(std::uint8_t width_class) noexcept {
+    return width_class == 0
+        ? static_cast<std::uint16_t>(0)
+        : static_cast<std::uint16_t>(1U << (width_class - 1U));
+}
+
+struct operand_fact_split_t {
+    operand_fact_hot_t hot;
+    operand_fact_cold_t cold;
+    bool has_cold = false;
+};
+
+inline operand_fact_split_t operand_fact_split(
+    const operand_fact_t& fact, std::uint32_t instruction_ordinal) noexcept {
+    operand_fact_split_t parts;
+    auto& hot = parts.hot;
+    hot.value = fact.has_displacement
+        ? static_cast<std::uint64_t>(fact.displacement)
+        : fact.immediate;
+    hot.instruction_ordinal = instruction_ordinal;
+    hot.reg = fact.reg;
+    hot.base_reg = fact.base_reg;
+    hot.index_reg = fact.index_reg;
+    std::uint16_t flags = static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(fact.kind) & 0x7U) << operand_hot_kind_shift);
+    flags |= static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(fact.access) & 0xFU) << operand_hot_access_shift);
+    flags |= static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(fact.scale) & 0xFU) << operand_hot_scale_shift);
+    if (fact.relative)
+        flags |= static_cast<std::uint16_t>(1U << operand_hot_relative_bit);
+    if (fact.signed_value)
+        flags |= static_cast<std::uint16_t>(1U << operand_hot_signed_bit);
+    if (fact.has_displacement)
+        flags |= static_cast<std::uint16_t>(1U << operand_hot_displacement_bit);
+    if (fact.memory_type <= 3U) {
+        flags |= static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(fact.memory_type) & 0x3U)
+            << operand_hot_memory_type_shift);
+        hot.memory_type_wide = 0;
+    } else {
+        hot.memory_type_wide = fact.memory_type;
+    }
+    hot.flags = flags;
+    hot.operand_index = fact.operand_index;
+    hot.access_width = fact.access_width;
+    hot.segment_reg = static_cast<std::uint8_t>(fact.segment_reg & 0xFFU);
+    hot.segment_reg_hi = static_cast<std::uint8_t>(fact.segment_reg >> 8U);
+    hot.width_class = operand_hot_width_class(fact.bit_width);
+    auto& cold = parts.cold;
+    cold.resolved_expression_value = fact.resolved_expression_value;
+    cold.bit_width = fact.bit_width;
+    cold.access_width_bits = fact.access_width_bits;
+    cold.element_width_bits = fact.element_width_bits;
+    cold.address_components = fact.address_components;
+    cold.access_count = fact.access_count;
+    cold.element_count = fact.element_count;
+    cold.address_expression = static_cast<std::uint8_t>(fact.address_expression);
+    cold.address_resolution = static_cast<std::uint8_t>(fact.address_resolution);
+    cold.visibility = fact.visibility;
+    cold.encoding = fact.encoding;
+    cold.decoder_operand_id = fact.decoder_operand_id;
+    cold.address_width_bits = static_cast<std::uint8_t>(fact.address_width_bits & 0xFFU);
+    if (entity_domain(fact.address_expression_id) ==
+            static_cast<std::uint8_t>(address_expression_entity_tag >> 56U) &&
+        entity_ordinal(fact.address_expression_id) != 0) {
+        cold.expression_ordinal = static_cast<std::uint32_t>(
+            entity_ordinal(fact.address_expression_id));
+    }
+    if (fact.has_resolved_expression_value)
+        cold.flags |= operand_cold_has_resolved_bit;
+    const bool needs_cold = fact.has_resolved_expression_value ||
+        fact.resolved_expression_value != 0 ||
+        fact.address_expression_id != 0 ||
+        fact.address_expression != address_expression_kind_t::none ||
+        fact.address_resolution != target_resolution_t::unresolved_indirect ||
+        hot.width_class == 0 && fact.bit_width != 0 ||
+        fact.access_width_bits != 0 || fact.element_width_bits != 0 ||
+        fact.address_components != address_component_none ||
+        fact.access_count != 0 || fact.element_count != 0 ||
+        fact.visibility != 0 || fact.encoding != 0 ||
+        fact.decoder_operand_id != 0 || fact.address_width_bits != 0;
+    parts.has_cold = needs_cold;
+    return parts;
+}
+
+inline void operand_fact_store_t::append(
+    const operand_fact_t& fact, std::uint32_t instruction_ordinal) {
+    auto parts = operand_fact_split(fact, instruction_ordinal);
+    if (parts.has_cold) {
+        cold.push_back(parts.cold);
+        parts.hot.cold_index = static_cast<std::uint32_t>(cold.size());
+    }
+    hot.push_back(parts.hot);
+}
+
+inline operand_fact_t operand_fact_materialize(
+    const operand_fact_hot_t& hot, const operand_fact_cold_t* cold,
+    entity_id_t id, entity_id_t instruction_id) noexcept {
+    operand_fact_t fact;
+    fact.id = id;
+    fact.instruction_id = instruction_id;
+    fact.displacement = 0;
+    fact.immediate = 0;
+    const bool has_displacement =
+        (hot.flags & static_cast<std::uint16_t>(1U << operand_hot_displacement_bit)) != 0;
+    if (has_displacement)
+        fact.displacement = static_cast<std::int64_t>(hot.value);
+    else
+        fact.immediate = hot.value;
+    fact.bit_width = cold != nullptr
+        ? (hot.width_class != 0 ? operand_hot_width_bits(hot.width_class)
+                                : cold->bit_width)
+        : operand_hot_width_bits(hot.width_class);
+    fact.reg = hot.reg;
+    fact.base_reg = hot.base_reg;
+    fact.index_reg = hot.index_reg;
+    fact.segment_reg = static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(hot.segment_reg_hi) << 8U) | hot.segment_reg);
+    fact.operand_index = hot.operand_index;
+    fact.access_width = hot.access_width;
+    fact.kind = static_cast<operand_kind_t>(
+        (hot.flags >> operand_hot_kind_shift) & 0x7U);
+    fact.access = static_cast<std::uint8_t>(
+        (hot.flags >> operand_hot_access_shift) & 0xFU);
+    fact.scale = static_cast<std::uint8_t>(
+        (hot.flags >> operand_hot_scale_shift) & 0xFU);
+    fact.relative =
+        (hot.flags & static_cast<std::uint16_t>(1U << operand_hot_relative_bit)) != 0;
+    fact.signed_value =
+        (hot.flags & static_cast<std::uint16_t>(1U << operand_hot_signed_bit)) != 0;
+    fact.has_displacement = has_displacement;
+    fact.memory_type = hot.memory_type_wide != 0
+        ? hot.memory_type_wide
+        : static_cast<std::uint8_t>(
+              (hot.flags >> operand_hot_memory_type_shift) & 0x3U);
+    fact.resolved_expression_value =
+        cold != nullptr ? cold->resolved_expression_value : 0;
+    fact.access_width_bits = cold != nullptr ? cold->access_width_bits : 0;
+    fact.element_width_bits = cold != nullptr ? cold->element_width_bits : 0;
+    fact.address_components =
+        cold != nullptr ? cold->address_components : address_component_none;
+    fact.access_count = cold != nullptr ? cold->access_count : 0;
+    fact.element_count = cold != nullptr ? cold->element_count : 0;
+    fact.address_expression = cold != nullptr
+        ? static_cast<address_expression_kind_t>(cold->address_expression)
+        : address_expression_kind_t::none;
+    fact.address_resolution = cold != nullptr
+        ? static_cast<target_resolution_t>(cold->address_resolution)
+        : target_resolution_t::unresolved_indirect;
+    fact.visibility = cold != nullptr ? cold->visibility : 0;
+    fact.encoding = cold != nullptr ? cold->encoding : 0;
+    fact.decoder_operand_id = cold != nullptr ? cold->decoder_operand_id : 0;
+    fact.address_width_bits = cold != nullptr ? cold->address_width_bits : 0;
+    fact.has_resolved_expression_value = cold != nullptr &&
+        (cold->flags & operand_cold_has_resolved_bit) != 0;
+    fact.address_expression_id = cold != nullptr && cold->expression_ordinal != 0
+        ? address_expression_entity_tag | cold->expression_ordinal
+        : 0;
+    return fact;
+}
+
 struct target_fact_t {
     entity_id_t instruction_id = 0;
     entity_id_t operand_fact_id = 0;
@@ -196,6 +462,23 @@ struct basic_block_record_t {
     fact_provenance_t provenance = fact_provenance_t::unknown;
     std::uint8_t confidence = 0;
 };
+
+inline operand_fact_t operand_fact_materialize(
+    const operand_fact_store_t& store, std::uint64_t ordinal,
+    const snapshot_table_t<instruction_record_t>& instructions) noexcept {
+    const auto& hot = store.hot[static_cast<std::size_t>(ordinal)];
+    const operand_fact_cold_t* cold = nullptr;
+    if (hot.cold_index != 0 &&
+        static_cast<std::size_t>(hot.cold_index - 1U) < store.cold.size())
+        cold = &store.cold[static_cast<std::size_t>(hot.cold_index - 1U)];
+    entity_id_t instruction_id = instruction_entity_tag | (hot.instruction_ordinal + 1ULL);
+    if (hot.instruction_ordinal < instructions.size() &&
+        instructions[static_cast<std::size_t>(hot.instruction_ordinal)].id != 0)
+        instruction_id =
+            instructions[static_cast<std::size_t>(hot.instruction_ordinal)].id;
+    return operand_fact_materialize(hot, cold,
+        operand_entity_tag | (ordinal & entity_ordinal_mask), instruction_id);
+}
 
 struct function_chunk_record_t {
     entity_id_t id = 0;
@@ -619,6 +902,23 @@ struct coverage_span_t {
     std::uint8_t confidence = 0;
 };
 
+struct snapshot_page_source_holder_t {
+    snapshot_page_source_holder_t() = default;
+    snapshot_page_source_holder_t(const snapshot_page_source_holder_t& other) noexcept {
+        std::atomic_store_explicit(
+            &source, std::atomic_load_explicit(&other.source, std::memory_order_acquire),
+            std::memory_order_release);
+    }
+    snapshot_page_source_holder_t& operator=(
+        const snapshot_page_source_holder_t& other) noexcept {
+        std::atomic_store_explicit(
+            &source, std::atomic_load_explicit(&other.source, std::memory_order_acquire),
+            std::memory_order_release);
+        return *this;
+    }
+    std::shared_ptr<const paged_domain_source_t> source;
+};
+
 struct analysis_snapshot_t {
     binary_id_t binary_id;
     sha256_digest_t load_profile_hash;
@@ -630,7 +930,7 @@ struct analysis_snapshot_t {
     std::shared_ptr<const pe_image_t> image;
     snapshot_table_t<instruction_record_t> instructions;
     std::vector<std::uint8_t> delay_slot_counts;
-    snapshot_table_t<operand_fact_t> operand_facts;
+    operand_fact_store_t operand_facts;
     snapshot_table_t<target_fact_t> target_facts;
     snapshot_table_t<basic_block_record_t> blocks;
     snapshot_table_t<function_chunk_record_t> function_chunks;
@@ -643,12 +943,34 @@ struct analysis_snapshot_t {
     std::vector<symbol_record_t> symbols;
     analysis_rich_fact_publication_t rich_facts;
     snapshot_table_t<coverage_span_t> coverage;
+    snapshot_table_t<address_expression_record_t> address_expressions;
+    snapshot_table_t<address_range_t> function_chunk_ranges;
+    fact_residency_plan_t residency_plan;
+    std::array<std::uint64_t, fact_domain_count> paged_domain_counts{};
+    std::shared_ptr<paged_fact_staging_t> paged_staging;
+    mutable snapshot_page_source_holder_t persisted_page_source;
+    std::shared_ptr<const packed_string_pool_t> string_pool;
     std::uint64_t string_value_bytes = 0;
     std::uint64_t symbol_name_bytes = 0;
     std::uint64_t function_chunk_bytes = 0;
     std::uint64_t type_candidate_text_bytes = 0;
     std::uint64_t type_reference_key_bytes = 0;
     std::uint64_t metadata_conflict_text_bytes = 0;
+
+    record_span_t<const address_range_t> function_chunks_of(
+        const function_record_t& function) const noexcept {
+        if (!function.chunks.empty())
+            return record_span_t<const address_range_t>(
+                function.chunks.data(), function.chunks.size());
+        if (function.chunk_count == 0)
+            return {};
+        const std::uint64_t begin = function.first_chunk;
+        if (begin >= function_chunk_ranges.size() ||
+            function.chunk_count > function_chunk_ranges.size() - begin)
+            return {};
+        return record_span_t<const address_range_t>(
+            function_chunk_ranges.data() + begin, function.chunk_count);
+    }
 };
 
 static_assert(sizeof(instruction_record_t) == 56,
@@ -661,6 +983,22 @@ static_assert(sizeof(operand_fact_t) == 88,
               "operand_fact_t must remain 88 bytes for compact snapshot residency");
 static_assert(offsetof(operand_fact_t, displacement) == 24,
               "operand_fact_t displacement must stay at offset 24");
+static_assert(sizeof(operand_fact_hot_t) == 32,
+              "operand_fact_hot_t must remain 32 bytes for compact snapshot residency");
+static_assert(std::is_trivially_copyable<operand_fact_hot_t>::value,
+              "operand_fact_hot_t must remain trivially copyable");
+static_assert(sizeof(operand_fact_cold_t) == 32,
+              "operand_fact_cold_t must remain 32 bytes for compact snapshot residency");
+static_assert(std::is_trivially_copyable<operand_fact_cold_t>::value,
+              "operand_fact_cold_t must remain trivially copyable");
+static_assert(sizeof(address_expression_record_t) == 12,
+              "address_expression_record_t must remain 12 bytes");
+static_assert(std::is_trivially_copyable<address_expression_record_t>::value,
+              "address_expression_record_t must remain trivially copyable");
+static_assert(sizeof(address_range_t) == 24,
+              "address_range_t must remain 24 bytes");
+static_assert(std::is_trivially_copyable<address_range_t>::value,
+              "address_range_t must remain trivially copyable");
 static_assert(sizeof(target_fact_t) == 48,
               "target_fact_t must remain 48 bytes for compact snapshot residency");
 static_assert(offsetof(target_fact_t, target) == 24,
@@ -752,6 +1090,21 @@ static_assert(!snapshot_table_noinit_stage_v ||
 static_assert(!snapshot_table_noinit_stage_v ||
               snapshot_table_noinit_safe_v<coverage_span_t>,
               "coverage must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<operand_fact_hot_t>,
+              "operand hot records must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<operand_fact_cold_t>,
+              "operand cold records must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<address_expression_record_t>,
+              "address expression records must stay noinit-safe when the stage-2 allocator is active");
+static_assert(!snapshot_table_noinit_stage_v ||
+              snapshot_table_noinit_safe_v<address_range_t>,
+              "function chunk ranges must stay noinit-safe when the stage-2 allocator is active");
+
+std::uint64_t paged_fact_staging_resident_bytes(
+    const paged_fact_staging_t* staging) noexcept;
 
 inline workspace_result_t<std::uint64_t> snapshot_memory_accounted_bytes(
     const analysis_snapshot_t& snapshot) {
@@ -771,7 +1124,8 @@ inline workspace_result_t<std::uint64_t> snapshot_memory_accounted_bytes(
     const std::pair<std::uint64_t, std::uint64_t> allocations[] = {
         {snapshot.instructions.capacity(), sizeof(instruction_record_t)},
         {snapshot.delay_slot_counts.capacity(), sizeof(std::uint8_t)},
-        {snapshot.operand_facts.capacity(), sizeof(operand_fact_t)},
+        {snapshot.operand_facts.hot.capacity(), sizeof(operand_fact_hot_t)},
+        {snapshot.operand_facts.cold.capacity(), sizeof(operand_fact_cold_t)},
         {snapshot.target_facts.capacity(), sizeof(target_fact_t)},
         {snapshot.blocks.capacity(), sizeof(basic_block_record_t)},
         {snapshot.function_chunks.capacity(), sizeof(function_chunk_record_t)},
@@ -792,7 +1146,9 @@ inline workspace_result_t<std::uint64_t> snapshot_memory_accounted_bytes(
         {snapshot.rich_facts.type_candidates.capacity(), sizeof(symbol_type_candidate_record_t)},
         {snapshot.rich_facts.type_references.capacity(), sizeof(type_reference_fact_t)},
         {snapshot.rich_facts.metadata_conflicts.capacity(), sizeof(metadata_conflict_record_t)},
-        {snapshot.coverage.capacity(), sizeof(coverage_span_t)}};
+        {snapshot.coverage.capacity(), sizeof(coverage_span_t)},
+        {snapshot.address_expressions.capacity(), sizeof(address_expression_record_t)},
+        {snapshot.function_chunk_ranges.capacity(), sizeof(address_range_t)}};
     for (const auto& allocation : allocations) {
         auto added = add(allocation.first, allocation.second);
         if (!added)
@@ -807,6 +1163,17 @@ inline workspace_result_t<std::uint64_t> snapshot_memory_accounted_bytes(
         snapshot.metadata_conflict_text_bytes};
     for (const std::uint64_t bytes : ledger) {
         auto added = add(bytes, 1);
+        if (!added)
+            return workspace_result_t<std::uint64_t>::failure(added.error());
+    }
+    if (snapshot.string_pool) {
+        auto added = add(snapshot.string_pool->size_accounting().reserved_bytes, 1);
+        if (!added)
+            return workspace_result_t<std::uint64_t>::failure(added.error());
+    }
+    if (snapshot.paged_staging) {
+        auto added = add(
+            paged_fact_staging_resident_bytes(snapshot.paged_staging.get()), 1);
         if (!added)
             return workspace_result_t<std::uint64_t>::failure(added.error());
     }

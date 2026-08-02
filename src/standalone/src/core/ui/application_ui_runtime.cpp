@@ -3178,6 +3178,20 @@ void initialize(runtime_t& rt) {
             [](const interaction_context_t&) { return analysis_selection_capability(); }),
         true, retained_check_state("analysis.modify.rename"),
         "category.analysis.modify", "Analysis / Modify");
+    register_action(rt, "analysis.modify.rename_local", "Rename Local Identifier...",
+        "Rename the selected function-local identifier in pseudocode; the disassembly keeps the original name",
+        all_surfaces,
+        retained_or_handler("analysis.modify.rename_local", [](const action_invocation_t&) {
+            return action_handler_result_t::failed(
+                "Select a function-local identifier token in the Pseudocode view to rename it");
+        }), retained_or_capability("analysis.modify.rename_local",
+            [](const interaction_context_t&) {
+                return capability_state_t::unavailable(
+                    "Select a function-local identifier token in the Pseudocode view to rename it",
+                    false);
+            }),
+        false, retained_check_state("analysis.modify.rename_local"),
+        "category.analysis.modify", "Analysis / Modify");
     register_action(rt, "analysis.modify.comment", "Edit Analysis Comment...",
         "Add or edit the selected address comment through the reversible overlay",
         all_surfaces,
@@ -5968,6 +5982,9 @@ void initialize(runtime_t& rt) {
         "section.analysis.modify", "Modify", context_menu_group_t::modify_run, 3, {
             analysis_context_menu_action("analysis.modify.rename", 0, nullptr, "Rename",
                 "Rename the selected symbol"),
+            analysis_context_menu_action("analysis.modify.rename_local", 1, nullptr,
+                "Rename Local",
+                "Rename the selected function-local identifier in pseudocode"),
             analysis_context_menu_action("analysis.modify.retype", 1, nullptr, "Set Type",
                 "Apply a type to the selected analysis entity"),
             analysis_context_menu_action("analysis.modify.comment", 2, nullptr, "Edit Comment",

@@ -1,4 +1,5 @@
 #include "advanced_cfg.hpp"
+#include "paged_snapshot_view.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -137,6 +138,7 @@ struct function_view_t {
     const function_record_t* function = nullptr;
     std::vector<block_view_t> blocks;
     std::vector<const edge_record_t*> edges;
+    std::vector<instruction_record_t> paged_terminals;
     std::unordered_map<entity_id_t, std::size_t> block_index_by_id;
     std::unordered_map<address_t, std::size_t, address_hash_t> block_index_by_address;
     std::uint64_t input_block_count = 0;
@@ -215,8 +217,14 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
                                                            std::uint64_t function_rva,
                                                            const advanced_cfg_budget_t& budget,
                                                            cfg_poller_t& poller) {
+    const auto instruction_rows = instructions_view(snapshot);
+    const auto operand_rows = operand_facts_view(snapshot);
+    const auto target_rows = target_facts_view(snapshot);
+    fact_page_pin_t instruction_pin;
+    fact_page_pin_t operand_pin;
+    fact_page_pin_t target_pin;
     if (!snapshot.delay_slot_counts.empty() &&
-        snapshot.delay_slot_counts.size() != snapshot.instructions.size()) {
+        snapshot.delay_slot_counts.size() != instruction_rows.size()) {
         return workspace_result_t<function_view_t>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
             "delay-slot column does not align with the instruction table",
@@ -309,6 +317,8 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
     });
 
     std::uint64_t remaining_instructions = budget.max_instructions;
+    if (!instruction_rows.resident())
+        view.paged_terminals.reserve(view.blocks.size());
     for (std::size_t index = 0; index < view.blocks.size(); ++index) {
         auto& selected_block = view.blocks[index];
         const auto& block = *selected_block.record;
@@ -318,8 +328,8 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
         if (block.id == 0 || block.end.value <= block.start.value ||
             !same_domain(block.start, block.end) || !same_domain(block.start, function->start) ||
             block.instruction_count == 0 || !valid_quality(block.provenance, block.confidence) ||
-            block.first_instruction > snapshot.instructions.size() ||
-            block.instruction_count > snapshot.instructions.size() - block.first_instruction) {
+            block.first_instruction > instruction_rows.size() ||
+            block.instruction_count > instruction_rows.size() - block.first_instruction) {
             return workspace_result_t<function_view_t>::failure(make_workspace_error(
                 workspace_error_code_t::integrity_failure,
                 "basic-block record is malformed or incomplete", "advanced_cfg.block_validation"));
@@ -350,24 +360,30 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
             if (!stopped)
                 return workspace_result_t<function_view_t>::failure(stopped.error());
             const auto instruction_index = static_cast<std::size_t>(block.first_instruction) + offset;
-            const auto& instruction = snapshot.instructions[instruction_index];
+            auto instruction_row = instruction_rows.at(instruction_index, instruction_pin);
+            if (!instruction_row)
+                return workspace_result_t<function_view_t>::failure(instruction_row.error());
+            const auto& instruction = *instruction_row.value();
             if (instruction.id == 0 || instruction.length == 0 ||
                 !address_in_block(instruction.address, block) ||
                 instruction.length > block.end.value - instruction.address.value ||
                 !valid_quality(instruction.provenance, instruction.confidence) ||
-                instruction.operand_fact_begin > snapshot.operand_facts.size() ||
+                instruction.operand_fact_begin > operand_rows.size() ||
                 instruction.operand_fact_count >
-                    snapshot.operand_facts.size() - instruction.operand_fact_begin ||
-                instruction.target_fact_begin > snapshot.target_facts.size() ||
+                    operand_rows.size() - instruction.operand_fact_begin ||
+                instruction.target_fact_begin > target_rows.size() ||
                 instruction.target_fact_count >
-                    snapshot.target_facts.size() - instruction.target_fact_begin) {
+                    target_rows.size() - instruction.target_fact_begin) {
                 return workspace_result_t<function_view_t>::failure(make_workspace_error(
                     workspace_error_code_t::integrity_failure,
                     "instruction record is malformed or incomplete", "advanced_cfg.instruction_validation"));
             }
             for (std::uint16_t operand = 0; operand < instruction.operand_fact_count; ++operand) {
                 const auto fact_index = static_cast<std::size_t>(instruction.operand_fact_begin) + operand;
-                const auto& fact = snapshot.operand_facts[fact_index];
+                auto fact_row = operand_rows.at(fact_index, operand_pin);
+                if (!fact_row)
+                    return workspace_result_t<function_view_t>::failure(fact_row.error());
+                const auto& fact = *fact_row.value();
                 if (fact.instruction_id != instruction.id) {
                     return workspace_result_t<function_view_t>::failure(make_workspace_error(
                         workspace_error_code_t::integrity_failure,
@@ -376,7 +392,10 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
             }
             for (std::uint16_t target = 0; target < instruction.target_fact_count; ++target) {
                 const auto fact_index = static_cast<std::size_t>(instruction.target_fact_begin) + target;
-                const auto& fact = snapshot.target_facts[fact_index];
+                auto fact_row = target_rows.at(fact_index, target_pin);
+                if (!fact_row)
+                    return workspace_result_t<function_view_t>::failure(fact_row.error());
+                const auto& fact = *fact_row.value();
                 if (fact.instruction_id != instruction.id) {
                     return workspace_result_t<function_view_t>::failure(make_workspace_error(
                         workspace_error_code_t::integrity_failure,
@@ -391,20 +410,32 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
                 static_cast<std::size_t>(block.first_instruction);
             const auto instruction_end =
                 first_instruction + block.instruction_count;
-            selected_block.terminal_instruction =
-                &snapshot.instructions[instruction_end - 1];
+            std::size_t terminal_ordinal = instruction_end - 1;
             for (std::size_t instruction = instruction_end;
                  instruction > first_instruction; --instruction) {
-                const auto& candidate = snapshot.instructions[instruction - 1];
+                auto candidate_row = instruction_rows.at(instruction - 1, instruction_pin);
+                if (!candidate_row)
+                    return workspace_result_t<function_view_t>::failure(candidate_row.error());
+                const auto& candidate = *candidate_row.value();
                 if ((candidate.flow_flags &
                      (flow_branch | flow_call | flow_return |
                       flow_interrupt | flow_terminal)) != 0) {
-                    selected_block.terminal_instruction = &candidate;
+                    terminal_ordinal = instruction - 1;
                     if (!snapshot.delay_slot_counts.empty())
                         selected_block.delay_slot_count =
                             snapshot.delay_slot_counts[instruction - 1];
                     break;
                 }
+            }
+            if (instruction_rows.resident()) {
+                selected_block.terminal_instruction =
+                    &instruction_rows.resident_span()[terminal_ordinal];
+            } else {
+                auto terminal_row = instruction_rows.at(terminal_ordinal, instruction_pin);
+                if (!terminal_row)
+                    return workspace_result_t<function_view_t>::failure(terminal_row.error());
+                view.paged_terminals.push_back(*terminal_row.value());
+                selected_block.terminal_instruction = &view.paged_terminals.back();
             }
         } else {
             remaining_instructions = 0;
@@ -516,6 +547,8 @@ workspace_result_t<void> build_cfg_edges(const analysis_snapshot_t& snapshot,
                                          cfg_analysis_result_t& result,
                                          evidence_writer_t& writer,
                                          cfg_poller_t& poller) {
+    const auto target_rows = target_facts_view(snapshot);
+    fact_page_pin_t target_pin;
     for (const auto* raw : view.edges) {
         auto stopped = poller.poll("advanced_cfg.edge_validation");
         if (!stopped)
@@ -593,8 +626,11 @@ workspace_result_t<void> build_cfg_edges(const analysis_snapshot_t& snapshot,
             }
         }
         for (std::uint16_t index = 0; index < terminal->target_fact_count; ++index) {
-            const auto fact_index = static_cast<std::size_t>(terminal->target_fact_begin) + index;
-            const auto& target = snapshot.target_facts[fact_index];
+            const auto fact_index = static_cast<std::uint64_t>(terminal->target_fact_begin) + index;
+            auto target_row = target_rows.at(fact_index, target_pin);
+            if (!target_row)
+                return workspace_result_t<void>::failure(target_row.error());
+            const auto& target = *target_row.value();
             const auto block_target = view.block_index_by_address.find(target.target);
             const auto* function_target = resolve_function(catalog, std::nullopt, target.target);
             if (target.kind == target_kind_record_t::call) {
@@ -1060,6 +1096,10 @@ workspace_result_t<void> derive_switches(const analysis_snapshot_t& snapshot,
                                           cfg_analysis_result_t& result,
                                           evidence_writer_t& writer,
                                           cfg_poller_t& poller) {
+    const auto operand_rows = operand_facts_view(snapshot);
+    const auto target_rows = target_facts_view(snapshot);
+    fact_page_pin_t operand_pin;
+    fact_page_pin_t target_pin;
     for (const auto& block_view : view.blocks) {
         auto stopped = poller.poll("advanced_cfg.switches");
         if (!stopped)
@@ -1075,8 +1115,11 @@ workspace_result_t<void> derive_switches(const analysis_snapshot_t& snapshot,
         recovered.dispatch_rva = instruction->address.value;
         recovered.quality = quality_from(instruction->provenance, instruction->confidence);
         for (std::uint16_t operand = 0; operand < instruction->operand_fact_count; ++operand) {
-            const auto fact_index = static_cast<std::size_t>(instruction->operand_fact_begin) + operand;
-            const auto& fact = snapshot.operand_facts[fact_index];
+            const auto fact_index = static_cast<std::uint64_t>(instruction->operand_fact_begin) + operand;
+            auto fact_row = operand_rows.at(fact_index, operand_pin);
+            if (!fact_row)
+                return workspace_result_t<void>::failure(fact_row.error());
+            const auto& fact = *fact_row.value();
             if (fact.kind != operand_kind_t::memory ||
                 fact.address_expression != address_expression_kind_t::base_index_displacement ||
                 !fact.has_resolved_expression_value) {
@@ -1092,8 +1135,11 @@ workspace_result_t<void> derive_switches(const analysis_snapshot_t& snapshot,
             break;
         }
         for (std::uint16_t target = 0; target < instruction->target_fact_count; ++target) {
-            const auto fact_index = static_cast<std::size_t>(instruction->target_fact_begin) + target;
-            const auto& fact = snapshot.target_facts[fact_index];
+            const auto fact_index = static_cast<std::uint64_t>(instruction->target_fact_begin) + target;
+            auto target_row = target_rows.at(fact_index, target_pin);
+            if (!target_row)
+                return workspace_result_t<void>::failure(target_row.error());
+            const auto& fact = *target_row.value();
             if (fact.kind != target_kind_record_t::branch)
                 continue;
             switch_case_t item;
@@ -1186,6 +1232,8 @@ workspace_result_t<void> derive_calls(const analysis_snapshot_t& snapshot,
         result.callgraph_edges.push_back(std::move(edge));
         return true;
     };
+    const auto target_rows = target_facts_view(snapshot);
+    fact_page_pin_t target_pin;
     for (const auto& edge : result.cfg_edges) {
         auto stopped = poller.poll("advanced_cfg.callgraph_edges");
         if (!stopped)
@@ -1218,8 +1266,11 @@ workspace_result_t<void> derive_calls(const analysis_snapshot_t& snapshot,
             continue;
         const auto quality = quality_from(instruction->provenance, instruction->confidence);
         for (std::uint16_t index = 0; index < instruction->target_fact_count; ++index) {
-            const auto fact_index = static_cast<std::size_t>(instruction->target_fact_begin) + index;
-            const auto& target = snapshot.target_facts[fact_index];
+            const auto fact_index = static_cast<std::uint64_t>(instruction->target_fact_begin) + index;
+            auto target_row = target_rows.at(fact_index, target_pin);
+            if (!target_row)
+                return workspace_result_t<void>::failure(target_row.error());
+            const auto& target = *target_row.value();
             const auto* target_function = resolve_function(catalog, std::nullopt, target.target);
             const bool nonconditional_branch = (instruction->flow_flags & flow_branch) != 0 &&
                 (instruction->flow_flags & (flow_conditional | flow_return)) == 0;

@@ -45,6 +45,8 @@
 #include "../diagnostics/metadata_ring.hpp"
 #include "../runtime/manual_map_tls.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "allocator.hpp"
+#include "host_topology.hpp"
 #include "win_thread.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -325,13 +327,21 @@ struct pool_t {
     std::array<std::uint64_t, 8> lane_dispatched{};
     std::uint64_t lane_in_flight = 0;
     std::atomic<std::uint64_t> fairness_wait_ns_total{0};
+    std::atomic<bool> priority_elevated{false};
+    std::atomic<std::uint32_t> priority_generation{0};
+    std::atomic<std::uint64_t> last_pressure_ms{0};
+    std::array<std::atomic<std::uint64_t>, 1024> fairness_wait_ns_ring;
+    std::atomic<std::uint32_t> fairness_wait_ns_ring_next{0};
 
     pool_t(const char* pool_name_in, const char* log_tag_in, const char* default_label_in, pool_family_t family_in, int configured_pool_size_in) noexcept
         : pool_name(pool_name_in),
           log_tag(log_tag_in),
           default_label(default_label_in),
           family(family_in),
-          configured_pool_size(configured_pool_size_in) {}
+          configured_pool_size(configured_pool_size_in) {
+        for (auto& slot : fairness_wait_ns_ring)
+            slot.store(0u, std::memory_order_relaxed);
+    }
 };
 
 struct graph_node_record_t {
@@ -473,6 +483,60 @@ inline std::uint64_t now_ns() {
         std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+struct hot_log_gate_t {
+    std::atomic<std::uint64_t> total{0};
+    std::atomic<std::uint64_t> suppressed{0};
+    std::atomic<std::uint64_t> last_emit_ms{0};
+};
+
+inline bool fabric_log_verbose() noexcept {
+    static const bool verbose = diag::env_flag_enabled("AIDA_FABRIC_LOG_VERBOSE");
+    return verbose;
+}
+
+inline hot_log_gate_t& hot_log_gate_for(const char* key) noexcept {
+    struct slot_t {
+        std::atomic<const char*> key{nullptr};
+        hot_log_gate_t gate;
+    };
+    static slot_t slots[16];
+    const char* wanted = key && *key ? key : "default";
+    for (std::size_t i = 0; i < 16; ++i) {
+        const char* expected = nullptr;
+        if (slots[i].key.compare_exchange_strong(expected, wanted,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return slots[i].gate;
+        if (expected != nullptr && std::strcmp(expected, wanted) == 0)
+            return slots[i].gate;
+    }
+    return slots[15].gate;
+}
+
+inline bool hot_log_should_emit(hot_log_gate_t& gate, std::uint64_t& out_suppressed) noexcept {
+    const std::uint64_t total = gate.total.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    const std::uint64_t now = now_ms();
+    if (total == 1u) {
+        gate.last_emit_ms.store(now, std::memory_order_release);
+        out_suppressed = 0u;
+        return true;
+    }
+    const std::uint64_t last = gate.last_emit_ms.load(std::memory_order_acquire);
+    const bool count_hit = gate.suppressed.load(std::memory_order_acquire) >= 511u;
+    const bool time_hit = now < last || now - last >= 2000u;
+    if (count_hit || time_hit) {
+        out_suppressed = gate.suppressed.exchange(0u, std::memory_order_acq_rel);
+        gate.last_emit_ms.store(now, std::memory_order_release);
+        return true;
+    }
+    gate.suppressed.fetch_add(1u, std::memory_order_acq_rel);
+    out_suppressed = 0u;
+    return false;
+}
+
+inline std::uint64_t hot_log_gate_total(const hot_log_gate_t& gate) noexcept {
+    return gate.total.load(std::memory_order_acquire);
+}
+
 inline int normalized_priority(int priority) {
     return (std::max)(0, (std::min)(7, priority));
 }
@@ -506,7 +570,7 @@ inline unsigned fabric_host_worker_count() {
 }
 
 inline int feature_worker_pool_size() {
-    return clamp_pool_size((fabric_host_worker_count() * 6u + 9u) / 10u, 4u, 48u);
+    return clamp_pool_size(host_topology::recommended_compute_threads(), 2u, 48u);
 }
 
 inline int general_pool_size() {
@@ -572,6 +636,59 @@ inline bool below_normal_priority_pool(const pool_t& p) {
     return &p == &domain_pool(executor_domain_t::feature_worker) ||
            &p == &domain_pool(executor_domain_t::external_tool) ||
            &p == &domain_pool(executor_domain_t::long_running);
+}
+
+inline constexpr std::uint64_t kPoolPriorityQuiescentMs = 2000;
+
+inline std::uint32_t& pool_priority_tls_generation() noexcept {
+    static thread_local std::uint32_t generation = 0;
+    return generation;
+}
+
+inline void evaluate_pool_priority(pool_t& p) noexcept {
+    if (!below_normal_priority_pool(p))
+        return;
+    const std::uint64_t workers =
+        static_cast<std::uint64_t>(p.worker_count.load(std::memory_order_acquire));
+    if (workers == 0)
+        return;
+    const std::uint64_t active =
+        static_cast<std::uint64_t>(p.active_tasks.load(std::memory_order_acquire));
+    const std::uint64_t pending = p.pending_tasks.load(std::memory_order_acquire);
+    const std::uint64_t now = now_ms();
+    if (active >= workers && pending != 0) {
+        p.last_pressure_ms.store(now, std::memory_order_release);
+        bool expected = false;
+        if (p.priority_elevated.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            p.priority_generation.fetch_add(1u, std::memory_order_acq_rel);
+        return;
+    }
+    const std::uint64_t last = p.last_pressure_ms.load(std::memory_order_acquire);
+    if (now < last || now - last < kPoolPriorityQuiescentMs)
+        return;
+    bool expected = true;
+    if (p.priority_elevated.compare_exchange_strong(expected, false,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        p.priority_generation.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+inline void apply_pool_priority_from_worker(pool_t& p) noexcept {
+    if (!below_normal_priority_pool(p))
+        return;
+    const std::uint32_t generation = p.priority_generation.load(std::memory_order_acquire);
+    if (pool_priority_tls_generation() == generation)
+        return;
+    pool_priority_tls_generation() = generation;
+    const bool elevated = p.priority_elevated.load(std::memory_order_acquire);
+    SetThreadPriority(GetCurrentThread(),
+        elevated ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+    diag::log_tagged_fmt(safe_log_tag(p),
+        "fabric_pool_priority pool=%s tid=%lu level=%s generation=%u",
+        safe_pool_name(p),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        elevated ? "normal" : "below_normal",
+        static_cast<unsigned>(generation));
 }
 
 inline std::uint64_t filetime_to_100ns(const FILETIME& ft)
@@ -730,8 +847,12 @@ inline void worker_interface_t::scheduler_prologue(tf::Worker& worker) {
     const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
     if (!p)
         return;
-    if (below_normal_priority_pool(*p))
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    if (below_normal_priority_pool(*p)) {
+        const bool elevated = p->priority_elevated.load(std::memory_order_acquire);
+        SetThreadPriority(GetCurrentThread(),
+            elevated ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+        pool_priority_tls_generation() = p->priority_generation.load(std::memory_order_acquire);
+    }
     if (!tls_ready) {
         diag::log_tagged_fmt(safe_log_tag(*p),
             "taskflow_worker_tls_unavailable phase=worker_start pool=%s worker_id=%zu tid=%lu",
@@ -798,6 +919,8 @@ inline void initialize_pool(pool_t& p, int pool_size) {
         p.executor.reset(new tf::Executor(static_cast<std::size_t>(pool_size), std::unique_ptr<tf::WorkerInterface>(new worker_interface_t(&p))));
         p.worker_count.store(p.executor ? p.executor->num_workers() : 0, std::memory_order_release);
         p.stop_accepting.store(false, std::memory_order_release);
+        allocator::initialize();
+        host_topology::log_topology_once();
         diag::log_tagged_fmt(safe_log_tag(p),
             "taskflow_pool_started pool=%s workers=%zu configured_pool_size=%d tf_version=%d tid=%lu",
             safe_pool_name(p),
@@ -806,13 +929,15 @@ inline void initialize_pool(pool_t& p, int pool_size) {
             TF_VERSION,
             static_cast<unsigned long>(GetCurrentThreadId()));
         diag::log_tagged_fmt(safe_log_tag(p),
-            "fabric_pool_sized pool=%s host=%u workers=%zu pending_capacity=%zu per_target_pending_capacity=%zu admission_capacity=%zu tid=%lu",
+            "fabric_pool_sized pool=%s host=%u workers=%zu pending_capacity=%zu per_target_pending_capacity=%zu admission_capacity=%zu topology_logical=%u topology_compute=%u tid=%lu",
             safe_pool_name(p),
             static_cast<unsigned>(fabric_host_worker_count()),
             p.worker_count.load(std::memory_order_acquire),
             static_cast<unsigned long long>(p.pending_capacity),
             static_cast<unsigned long long>(p.per_target_pending_capacity),
             static_cast<unsigned long long>(p.admission_capacity),
+            static_cast<unsigned>(host_topology::current().logical_cores),
+            static_cast<unsigned>(host_topology::recommended_compute_threads()),
             static_cast<unsigned long>(GetCurrentThreadId()));
         if (below_normal_priority_pool(p)) {
             diag::log_tagged_fmt(safe_log_tag(p),
@@ -910,6 +1035,7 @@ inline void start_record(const std::shared_ptr<job_record_t>& record, std::uint6
     pool_t* p = record ? record->pool : nullptr;
     if (!record || !p)
         return;
+    apply_pool_priority_from_worker(*p);
     p->active_tasks.fetch_add(1u, std::memory_order_acq_rel);
     p->started_tasks.fetch_add(1u, std::memory_order_acq_rel);
     decrement_atomic_if_nonzero(p->pending_tasks);
@@ -930,8 +1056,12 @@ inline void start_record(const std::shared_ptr<job_record_t>& record, std::uint6
         if (record->state == job_state_t::queued || record->state == job_state_t::not_started)
             record->state = job_state_t::running;
     }
-    if (fairness_recorded)
+    if (fairness_recorded) {
         p->fairness_wait_ns_total.fetch_add(fairness_wait_ns, std::memory_order_acq_rel);
+        const std::uint32_t ring_slot =
+            p->fairness_wait_ns_ring_next.fetch_add(1u, std::memory_order_acq_rel);
+        p->fairness_wait_ns_ring[ring_slot & 1023u].store(fairness_wait_ns, std::memory_order_release);
+    }
     const bool task_tls_ready = aida::manual_map_tls::ensure_current_thread();
     const DWORD tid = GetCurrentThreadId();
     if (!task_tls_ready) {
@@ -991,6 +1121,7 @@ inline void finish_started_record(const std::shared_ptr<job_record_t>& record, s
         }
         pump_lanes(*p);
     }
+    evaluate_pool_priority(*p);
 }
 
 inline void invoke_body(const std::function<void()>& body, const std::function<void(const cancellation_token_t&)>& cancellable_body, const std::shared_ptr<cancellation_token_t>& token) {
@@ -1081,15 +1212,34 @@ inline void execute_single_record(const std::shared_ptr<job_record_t>& record) {
             record->cancel_token->requested.store(true, std::memory_order_release);
     }
     finish_started_record(record, active_id, final_state, exception_text);
-    diag::log_tagged_fmt(safe_log_tag(*record->pool),
-        "taskflow_job_finish job_id=%llu state=%s label=%s owner=%s domain=%s err=%.300s tid=%lu",
-        static_cast<unsigned long long>(record->id),
-        job_state_name(final_state),
-        record->label.c_str(),
-        record->owner_subsystem.c_str(),
-        domain_name(record->domain),
-        exception_text.empty() ? "<none>" : exception_text.c_str(),
-        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (final_state == job_state_t::completed) {
+        std::uint64_t finish_suppressed = 0;
+        auto& finish_gate = hot_log_gate_for("taskflow_job_finish");
+        const bool finish_emit = hot_log_should_emit(finish_gate, finish_suppressed);
+        if (finish_emit || fabric_log_verbose()) {
+            diag::log_tagged_fmt(safe_log_tag(*record->pool),
+                "taskflow_job_finish job_id=%llu state=%s label=%s owner=%s domain=%s err=%.300s suppressed=%llu total=%llu tid=%lu",
+                static_cast<unsigned long long>(record->id),
+                job_state_name(final_state),
+                record->label.c_str(),
+                record->owner_subsystem.c_str(),
+                domain_name(record->domain),
+                exception_text.empty() ? "<none>" : exception_text.c_str(),
+                static_cast<unsigned long long>(finish_suppressed),
+                static_cast<unsigned long long>(hot_log_gate_total(finish_gate)),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+    } else {
+        diag::log_tagged_fmt(safe_log_tag(*record->pool),
+            "taskflow_job_finish job_id=%llu state=%s label=%s owner=%s domain=%s err=%.300s tid=%lu",
+            static_cast<unsigned long long>(record->id),
+            job_state_name(final_state),
+            record->label.c_str(),
+            record->owner_subsystem.c_str(),
+            domain_name(record->domain),
+            exception_text.empty() ? "<none>" : exception_text.c_str(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
 }
 
 inline void execute_graph_node(const std::shared_ptr<job_record_t>& record, std::size_t node_index) {
@@ -1379,15 +1529,22 @@ inline void pump_lanes(pool_t& p) {
                     ++p.lane_in_flight;
                     ++p.lane_dispatched[lane_index];
                     p.posted_tasks.fetch_add(1u, std::memory_order_acq_rel);
-                    diag::log_tagged_fmt(safe_log_tag(p),
-                        "fabric_lane_dispatch job_id=%llu pool=%s lane=%zu in_flight=%llu owner=%s label=%s tid=%lu",
-                        static_cast<unsigned long long>(record->id),
-                        safe_pool_name(p),
-                        lane_index,
-                        static_cast<unsigned long long>(p.lane_in_flight),
-                        record->owner_subsystem.c_str(),
-                        record->label.c_str(),
-                        static_cast<unsigned long>(GetCurrentThreadId()));
+                    std::uint64_t dispatch_suppressed = 0;
+                    auto& dispatch_gate = hot_log_gate_for("fabric_lane_dispatch");
+                    const bool dispatch_emit = hot_log_should_emit(dispatch_gate, dispatch_suppressed);
+                    if (dispatch_emit || fabric_log_verbose()) {
+                        diag::log_tagged_fmt(safe_log_tag(p),
+                            "fabric_lane_dispatch job_id=%llu pool=%s lane=%zu in_flight=%llu owner=%s label=%s suppressed=%llu total=%llu tid=%lu",
+                            static_cast<unsigned long long>(record->id),
+                            safe_pool_name(p),
+                            lane_index,
+                            static_cast<unsigned long long>(p.lane_in_flight),
+                            record->owner_subsystem.c_str(),
+                            record->label.c_str(),
+                            static_cast<unsigned long long>(dispatch_suppressed),
+                            static_cast<unsigned long long>(hot_log_gate_total(dispatch_gate)),
+                            static_cast<unsigned long>(GetCurrentThreadId()));
+                    }
                 } catch (const std::exception& ex) {
                     record->fabric_lane_dispatched.store(false, std::memory_order_release);
                     {
@@ -1427,6 +1584,7 @@ inline void pump_lanes(pool_t& p) {
             record->label.c_str(),
             static_cast<unsigned long>(GetCurrentThreadId()));
     }
+    evaluate_pool_priority(p);
 }
 
 inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_t&& desc) {
@@ -1493,16 +1651,23 @@ inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_
                 g_total_submitted.fetch_add(1u, std::memory_order_acq_rel);
                 result.submitted = true;
                 result.handle.id = record->id;
-                diag::log_tagged_fmt(safe_log_tag(p),
-                    "fabric_lane_enqueue job_id=%llu pool=%s lane=%zu lane_depth=%llu queued_total=%llu owner=%s label=%s tid=%lu",
-                    static_cast<unsigned long long>(record->id),
-                    safe_pool_name(p),
-                    lane_index,
-                    static_cast<unsigned long long>(p.lane_depth[lane_index]),
-                    static_cast<unsigned long long>(queued_total + 1u),
-                    record->owner_subsystem.c_str(),
-                    record->label.c_str(),
-                    static_cast<unsigned long>(GetCurrentThreadId()));
+                std::uint64_t enqueue_suppressed = 0;
+                auto& enqueue_gate = hot_log_gate_for("fabric_lane_enqueue");
+                const bool enqueue_emit = hot_log_should_emit(enqueue_gate, enqueue_suppressed);
+                if (enqueue_emit || fabric_log_verbose()) {
+                    diag::log_tagged_fmt(safe_log_tag(p),
+                        "fabric_lane_enqueue job_id=%llu pool=%s lane=%zu lane_depth=%llu queued_total=%llu owner=%s label=%s suppressed=%llu total=%llu tid=%lu",
+                        static_cast<unsigned long long>(record->id),
+                        safe_pool_name(p),
+                        lane_index,
+                        static_cast<unsigned long long>(p.lane_depth[lane_index]),
+                        static_cast<unsigned long long>(queued_total + 1u),
+                        record->owner_subsystem.c_str(),
+                        record->label.c_str(),
+                        static_cast<unsigned long long>(enqueue_suppressed),
+                        static_cast<unsigned long long>(hot_log_gate_total(enqueue_gate)),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
             }
         }
     } catch (const std::exception& ex) {
@@ -1538,16 +1703,24 @@ inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_
                 static_cast<unsigned long>(GetCurrentThreadId()));
         }
     } else {
-        diag::log_tagged_fmt(safe_log_tag(p),
-            "taskflow_submit job_id=%llu pool=%s owner=%s label=%s domain=%s deadline_ms=%llu priority=%d tid=%lu",
-            static_cast<unsigned long long>(record->id),
-            safe_pool_name(p),
-            record->owner_subsystem.c_str(),
-            record->label.c_str(),
-            domain_name(record->domain),
-            static_cast<unsigned long long>(record->deadline_ms),
-            record->priority,
-            static_cast<unsigned long>(GetCurrentThreadId()));
+        std::uint64_t submit_suppressed = 0;
+        auto& submit_gate = hot_log_gate_for("taskflow_submit");
+        const bool submit_emit = hot_log_should_emit(submit_gate, submit_suppressed);
+        if (submit_emit || fabric_log_verbose()) {
+            diag::log_tagged_fmt(safe_log_tag(p),
+                "taskflow_submit job_id=%llu pool=%s owner=%s label=%s domain=%s deadline_ms=%llu priority=%d suppressed=%llu total=%llu tid=%lu",
+                static_cast<unsigned long long>(record->id),
+                safe_pool_name(p),
+                record->owner_subsystem.c_str(),
+                record->label.c_str(),
+                domain_name(record->domain),
+                static_cast<unsigned long long>(record->deadline_ms),
+                record->priority,
+                static_cast<unsigned long long>(submit_suppressed),
+                static_cast<unsigned long long>(hot_log_gate_total(submit_gate)),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
+        evaluate_pool_priority(p);
         pump_lanes(p);
     }
     return result;
@@ -2095,6 +2268,45 @@ inline stats_t stats_for(pool_t& p, int pool_size, const char* pool_name) {
 inline stats_t domain_stats(executor_domain_t d) {
     pool_t& p = domain_pool(d);
     return stats_for(p, p.configured_pool_size, safe_pool_name(p));
+}
+
+inline std::uint32_t pool_live_worker_count(executor_domain_t domain) noexcept {
+    pool_t& p = domain_pool(domain);
+    const std::size_t live = p.worker_count.load(std::memory_order_acquire);
+    if (live != 0)
+        return static_cast<std::uint32_t>(live);
+    const int configured = p.configured_pool_size;
+    return configured > 0 ? static_cast<std::uint32_t>(configured) : 0u;
+}
+
+inline std::uint32_t analysis_compute_capacity() noexcept {
+    const std::uint32_t live = pool_live_worker_count(executor_domain_t::feature_worker);
+    if (live < 2u)
+        return 2u;
+    if (live > 64u)
+        return 64u;
+    return live;
+}
+
+inline std::uint64_t fairness_wait_percentile_ns(executor_domain_t domain, double rank) noexcept {
+    pool_t& p = domain_pool(domain);
+    std::array<std::uint64_t, 1024> samples{};
+    const std::uint64_t written =
+        static_cast<std::uint64_t>(p.fairness_wait_ns_ring_next.load(std::memory_order_acquire));
+    const std::size_t count = written < 1024u ? static_cast<std::size_t>(written) : 1024u;
+    if (count == 0)
+        return 0;
+    for (std::size_t i = 0; i < count; ++i)
+        samples[i] = p.fairness_wait_ns_ring[i].load(std::memory_order_acquire);
+    std::sort(samples.begin(), samples.begin() + static_cast<std::ptrdiff_t>(count));
+    double clamped_rank = rank;
+    if (clamped_rank < 0.0)
+        clamped_rank = 0.0;
+    if (clamped_rank > 1.0)
+        clamped_rank = 1.0;
+    const std::size_t index =
+        static_cast<std::size_t>(static_cast<double>(count - 1u) * clamped_rank);
+    return samples[index];
 }
 
 inline std::vector<stuck_worker_diag_t> stuck_workers_for(pool_t& p, const char* pool_name, std::uint64_t threshold_ms, std::size_t max_records) {

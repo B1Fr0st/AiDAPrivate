@@ -420,6 +420,45 @@ void verify_x86_fixture(const std::filesystem::path& root)
             "x86 relative call target was not relocated");
 }
 
+void verify_source_validation_memoized(const std::filesystem::path& root)
+{
+    const std::vector<std::uint8_t> bytes{0x90, 0x90, 0xC3};
+    write_fixture(root / "x64_tile_memo.bin", bytes);
+    auto source = require_value(
+        mapped_file_provider_t::open((root / "x64_tile_memo.bin").u8string()),
+        "memoization fixture provider could not be opened");
+    const auto first_snapshot = require_value(
+        provider_snapshot_t::capture(source),
+        "memoization fixture first capture failed");
+    const auto second_snapshot = require_value(
+        provider_snapshot_t::capture(source),
+        "memoization fixture second capture failed");
+    require(first_snapshot->generation() != second_snapshot->generation(),
+            "memoization fixture snapshots share a generation");
+    auto decoder = require_value(worker_owned_x86_tile_decoder_t::create(
+        architecture_mode_t::x86_64), "memoization x64 tile worker could not be created");
+    const auto request = request_for(
+        relative_address(0x1000, architecture_mode_t::x86_64),
+        bytes.size(), 0x140000000ULL, 0x4000);
+    const auto first = require_value(
+        decoder->decode_tile(*first_snapshot, request),
+        "memoization first decode failed");
+    const auto second = require_value(
+        decoder->decode_tile(*first_snapshot, request),
+        "memoization second decode failed");
+    require(first.usage.source_validations == 1,
+            "first decode did not validate the snapshot source");
+    require(second.usage.source_validations == 0,
+            "second decode revalidated a memoized snapshot source");
+    require(first.usage.source_validations + second.usage.source_validations == 1,
+            "worker validated more than once per snapshot generation");
+    const auto regenerated = require_value(
+        decoder->decode_tile(*second_snapshot, request),
+        "memoization regenerated decode failed");
+    require(regenerated.usage.source_validations == 1,
+            "a new snapshot generation did not force revalidation");
+}
+
 }
 
 int run_x86_tile_decoder_harness()
@@ -433,6 +472,7 @@ int run_x86_tile_decoder_harness()
         std::filesystem::create_directories(root);
         verify_x64_fixture(root);
         verify_x86_fixture(root);
+        verify_source_validation_memoized(root);
         std::filesystem::remove_all(root, cleanup_error);
         std::cout << "x86 tile decoder harness passed\n";
         return 0;

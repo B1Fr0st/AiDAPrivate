@@ -91,6 +91,17 @@ workspace_result_t<std::shared_ptr<provider_snapshot_t>> provider_snapshot_t::ca
         return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "snapshot source is null", "provider_snapshot_capture"));
+    if (const auto mapped =
+            std::dynamic_pointer_cast<const mapped_file_provider_t>(source)) {
+        if (mapped->content_pin_active() &&
+            !source->identity().content_sha256) {
+            auto awaited = mapped->await_content_hash(cancel);
+            if (!awaited) {
+                return workspace_result_t<
+                    std::shared_ptr<provider_snapshot_t>>::failure(awaited.error());
+            }
+        }
+    }
     const byte_provider_identity_t source_identity = source->identity();
     if (!source_identity.immutable_snapshot)
         return workspace_result_t<std::shared_ptr<provider_snapshot_t>>::failure(

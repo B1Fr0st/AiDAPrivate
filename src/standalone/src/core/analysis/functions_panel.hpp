@@ -24,6 +24,7 @@
 #include "../disasm/rename_dialog.hpp"
 #include "../disasm/comment_dialog.hpp"
 #include "workspace/overlay_journal.hpp"
+#include "workspace/publication_indexes.hpp"
 #include "workspace/workspace_registry.hpp"
 #include "../session/analysis_session.hpp"
 
@@ -316,42 +317,57 @@ namespace functions_panel {
 						}
 					}
 				}
+				const auto indexes = aida::analysis::publication_indexes::for_publication(
+					publication, workspace->cancellation_token());
+				const bool use_index = indexes && indexes->functions_sorted_disjoint();
+				if (!use_index) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					diag::log_tagged_fmt("functions_panel",
+						"workspace_projection_index_fallback binary_id=%s reason=%s",
+						workspace->identity().binary_id().to_hex().c_str(),
+						indexes ? "functions_unverified" : "index_unavailable");
+#endif
+				}
 				std::vector<const aida::analysis::function_record_t*> ordered;
 				ordered.reserve(snapshot->functions.size());
 				for (const auto& function : snapshot->functions)
 					ordered.push_back(&function);
-				std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
-					return left->start < right->start;
-				});
-				auto enclosing = [&](const aida::analysis::address_t& address)
-					-> const aida::analysis::function_record_t* {
-					auto found = std::upper_bound(ordered.begin(), ordered.end(), address,
-						[](const auto& value, const auto* function) {
-							return value < function->start;
-						});
-					if (found == ordered.begin()) return nullptr;
-					--found;
-					const auto* function = *found;
-					if (address.space != function->start.space ||
-						address.value < function->start.value ||
-						address.value >= function->end.value)
-						return nullptr;
-					return function;
-				};
+				if (!use_index) {
+					std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+						return left->start < right->start;
+					});
+				}
 				std::unordered_map<aida::analysis::entity_id_t, uint32_t> calls_in;
 				std::unordered_map<aida::analysis::entity_id_t, uint32_t> calls_out;
-				for (const auto& edge : snapshot->edges) {
-					if (workspace->cancellation_token().stop_requested()) {
-						state_handle->building.store(false, std::memory_order_release);
-						return;
+				if (!use_index) {
+					auto enclosing = [&](const aida::analysis::address_t& address)
+						-> const aida::analysis::function_record_t* {
+						auto found = std::upper_bound(ordered.begin(), ordered.end(), address,
+							[](const auto& value, const auto* function) {
+								return value < function->start;
+							});
+						if (found == ordered.begin()) return nullptr;
+						--found;
+						const auto* function = *found;
+						if (address.space != function->start.space ||
+							address.value < function->start.value ||
+							address.value >= function->end.value)
+							return nullptr;
+						return function;
+					};
+					for (const auto& edge : snapshot->edges) {
+						if (workspace->cancellation_token().stop_requested()) {
+							state_handle->building.store(false, std::memory_order_release);
+							return;
+						}
+						if (edge.kind != aida::analysis::edge_kind_t::call &&
+							edge.kind != aida::analysis::edge_kind_t::tail_call)
+							continue;
+						const auto* caller = enclosing(edge.source);
+						const auto* callee = enclosing(edge.target);
+						if (caller && calls_out[caller->id] != UINT32_MAX) ++calls_out[caller->id];
+						if (callee && calls_in[callee->id] != UINT32_MAX) ++calls_in[callee->id];
 					}
-					if (edge.kind != aida::analysis::edge_kind_t::call &&
-						edge.kind != aida::analysis::edge_kind_t::tail_call)
-						continue;
-					const auto* caller = enclosing(edge.source);
-					const auto* callee = enclosing(edge.target);
-					if (caller && calls_out[caller->id] != UINT32_MAX) ++calls_out[caller->id];
-					if (callee && calls_in[callee->id] != UINT32_MAX) ++calls_in[callee->id];
 				}
 				std::vector<function_entry_t> entries;
 				entries.reserve(ordered.size());
@@ -402,8 +418,16 @@ namespace functions_panel {
 						const auto* section = image->section_for_rva(function_rva);
 						if (section) entry.section = section->name;
 					}
-					entry.calls_in = calls_in[function->id];
-					entry.calls_out = calls_out[function->id];
+					if (use_index) {
+						const auto ordinal = static_cast<std::size_t>(
+							function - snapshot->functions.data());
+						const auto degree = indexes->function_call_degree(ordinal);
+						entry.calls_in = degree.first;
+						entry.calls_out = degree.second;
+					} else {
+						entry.calls_in = calls_in[function->id];
+						entry.calls_out = calls_out[function->id];
+					}
 					entries.push_back(std::move(entry));
 				}
 				{

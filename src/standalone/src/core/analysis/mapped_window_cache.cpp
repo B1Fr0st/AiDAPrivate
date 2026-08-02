@@ -181,7 +181,7 @@ workspace_result_t<byte_provider_identity_t> query_current_path_identity(
     const std::string& source, const char* phase) {
     auto wide_result = utf8_to_wide(source);
     if (!wide_result)
-        return workspace_result_t<std::wstring>::failure(wide_result.error());
+        return workspace_result_t<byte_provider_identity_t>::failure(wide_result.error());
     const std::wstring api_path = create_file_api_path(wide_result.value());
     HANDLE raw_file = CreateFileW(api_path.c_str(), FILE_READ_ATTRIBUTES,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -882,7 +882,7 @@ workspace_result_t<byte_view_t> mapped_window_cache_t::lease(
     std::uint64_t offset, std::uint64_t size_value,
     const cancellation_token_t& cancel) const {
     struct lease_timing_guard_t {
-        const state_t& state;
+        state_t& state;
         std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
         ~lease_timing_guard_t() {
             const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1115,6 +1115,127 @@ workspace_result_t<void> mapped_window_cache_t::trim() {
 
 mapped_window_cache_statistics_t mapped_window_cache_t::statistics() const noexcept {
     return state_->statistics();
+}
+
+struct delete_on_close_spill_file_t::state_t {
+    unique_handle_t file;
+    std::uint64_t written_bytes = 0;
+    mutable std::mutex io_mutex;
+};
+
+delete_on_close_spill_file_t::delete_on_close_spill_file_t(
+    std::shared_ptr<state_t> state)
+    : state_(std::move(state)) {}
+
+delete_on_close_spill_file_t::~delete_on_close_spill_file_t() = default;
+
+workspace_result_t<std::unique_ptr<delete_on_close_spill_file_t>>
+delete_on_close_spill_file_t::create() {
+    wchar_t temp_directory[MAX_PATH + 1];
+    const auto directory_length =
+        GetTempPathW(static_cast<DWORD>(MAX_PATH), temp_directory);
+    if (directory_length == 0 || directory_length > MAX_PATH) {
+        return workspace_result_t<std::unique_ptr<delete_on_close_spill_file_t>>::failure(
+            make_workspace_error(workspace_error_code_t::persistence_failure,
+                                 "unable to locate the temporary directory",
+                                 "spill_file"));
+    }
+    wchar_t temp_path[MAX_PATH + 1];
+    if (GetTempFileNameW(temp_directory, L"afs", 0, temp_path) == 0) {
+        return workspace_result_t<std::unique_ptr<delete_on_close_spill_file_t>>::failure(
+            make_workspace_error(workspace_error_code_t::persistence_failure,
+                                 "unable to allocate a spill file name",
+                                 "spill_file"));
+    }
+    const std::wstring api_path = create_file_api_path(temp_path);
+    HANDLE raw_file = CreateFileW(api_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+        0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (raw_file == INVALID_HANDLE_VALUE) {
+        return workspace_result_t<std::unique_ptr<delete_on_close_spill_file_t>>::failure(
+            make_workspace_error(workspace_error_code_t::persistence_failure,
+                                 "unable to create the delete-on-close spill file",
+                                 "spill_file"));
+    }
+    auto state = std::make_shared<state_t>();
+    state->file.reset(raw_file);
+    state->written_bytes = 0;
+    ::diag::log_tagged_fmt("mapped_window_cache", "spill_file_created");
+    return workspace_result_t<std::unique_ptr<delete_on_close_spill_file_t>>::success(
+        std::unique_ptr<delete_on_close_spill_file_t>(
+            new delete_on_close_spill_file_t(std::move(state))));
+}
+
+workspace_result_t<void> delete_on_close_spill_file_t::write_at(
+    std::uint64_t offset, const std::uint8_t* data, std::size_t size) {
+    if (!state_ || !state_->file.get() || (!data && size != 0)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "spill file write received an invalid range",
+                                 "spill_file"));
+    }
+    std::size_t written_total = 0;
+    while (written_total < size) {
+        const auto chunk = static_cast<DWORD>((std::min)(
+            size - written_total, static_cast<std::size_t>(1ULL << 30)));
+        OVERLAPPED overlapped{};
+        overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFFULL);
+        overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32U);
+        DWORD written = 0;
+        if (!WriteFile(state_->file.get(), data + written_total, chunk, &written,
+                       &overlapped) || written != chunk) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::persistence_failure,
+                                     "spill file write failed", "spill_file"));
+        }
+        written_total += written;
+        offset += written;
+    }
+    std::lock_guard<std::mutex> lock(state_->io_mutex);
+    const auto end = offset;
+    if (end > state_->written_bytes)
+        state_->written_bytes = end;
+    provider_metrics_relay::record_spill_write(size);
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> delete_on_close_spill_file_t::read_at(
+    std::uint64_t offset, std::uint8_t* data, std::size_t size) const {
+    if (!state_ || !state_->file.get() || (!data && size != 0)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "spill file read received an invalid range",
+                                 "spill_file"));
+    }
+    if (offset > state_->written_bytes || size > state_->written_bytes - offset) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "spill file read exceeds the written range",
+                                 "spill_file"));
+    }
+    std::size_t read_total = 0;
+    while (read_total < size) {
+        const auto chunk = static_cast<DWORD>((std::min)(
+            size - read_total, static_cast<std::size_t>(1ULL << 30)));
+        OVERLAPPED overlapped{};
+        overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFFULL);
+        overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32U);
+        DWORD read_count = 0;
+        if (!ReadFile(state_->file.get(), data + read_total, chunk, &read_count,
+                      &overlapped) || read_count != chunk) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::persistence_failure,
+                                     "spill file read failed", "spill_file"));
+        }
+        read_total += read_count;
+        offset += read_count;
+    }
+    provider_metrics_relay::record_spill_read(size);
+    return workspace_result_t<void>::success();
+}
+
+std::uint64_t delete_on_close_spill_file_t::written_bytes() const noexcept {
+    return state_ ? state_->written_bytes : 0;
 }
 
 }

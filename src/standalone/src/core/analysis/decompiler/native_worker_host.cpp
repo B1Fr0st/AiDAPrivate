@@ -1,5 +1,6 @@
 #include "native_worker_host.hpp"
 
+#include "decompiler_service.hpp"
 #include "generation_snapshot_store.hpp"
 #include "isolated_worker_codec.hpp"
 #include "providers/dalvik_ssa.hpp"
@@ -14,6 +15,7 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <objbase.h>
+#include <psapi.h>
 #include <sddl.h>
 #include <shlobj.h>
 #include <userenv.h>
@@ -44,6 +46,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "psapi.lib")
 
 namespace aida::analysis::native_worker {
 namespace {
@@ -1539,14 +1542,20 @@ private:
 };
 
 bool configure_job(HANDLE job, const decompiler_profile_budget_t& profile, DWORD& error,
-                   std::uint64_t session_cpu_backstop_ms = 0)
+                   std::uint64_t session_cpu_backstop_ms = 0,
+                   std::uint64_t session_envelope_max_memory_bytes = 0)
 {
     const std::uint64_t effective_cpu_ms = session_cpu_backstop_ms != 0
         ? session_cpu_backstop_ms
         : profile.max_cpu_ms;
-    if (profile.max_memory_bytes == 0 || effective_cpu_ms == 0 ||
+    const std::uint64_t memory_limit = session_envelope_max_memory_bytes != 0
+        ? session_envelope_max_memory_bytes
+        : profile.max_memory_bytes;
+    if (memory_limit == 0 || effective_cpu_ms == 0 ||
         (session_cpu_backstop_ms != 0 && session_cpu_backstop_ms < profile.max_cpu_ms) ||
-        profile.max_memory_bytes > static_cast<std::uint64_t>((std::numeric_limits<SIZE_T>::max)()) ||
+        (session_envelope_max_memory_bytes != 0 &&
+            session_envelope_max_memory_bytes < profile.max_memory_bytes) ||
+        memory_limit > static_cast<std::uint64_t>((std::numeric_limits<SIZE_T>::max)()) ||
         effective_cpu_ms > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)() / 10000)) {
         error = ERROR_INVALID_PARAMETER;
         return false;
@@ -1560,8 +1569,8 @@ bool configure_job(HANDLE job, const decompiler_profile_budget_t& profile, DWORD
         JOB_OBJECT_LIMIT_PROCESS_TIME;
     limits.BasicLimitInformation.ActiveProcessLimit = 1;
     limits.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart = static_cast<LONGLONG>(effective_cpu_ms * 10000);
-    limits.ProcessMemoryLimit = static_cast<SIZE_T>(profile.max_memory_bytes);
-    limits.JobMemoryLimit = static_cast<SIZE_T>(profile.max_memory_bytes);
+    limits.ProcessMemoryLimit = static_cast<SIZE_T>(memory_limit);
+    limits.JobMemoryLimit = static_cast<SIZE_T>(memory_limit);
     if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
         error = GetLastError();
         return false;
@@ -1699,7 +1708,8 @@ bool create_pipe_pair(handle_t& child_end, handle_t& parent_end, bool child_read
 bool launch_worker(const native_worker_verified_package_t& verified,
                    const native_worker_execution_request_t& request,
                    const native_worker_host_limits_t& host_limits, worker_instance_t& worker,
-                   native_worker_execution_result_t& result, std::uint64_t session_cpu_backstop_ms = 0)
+                   native_worker_execution_result_t& result, std::uint64_t session_cpu_backstop_ms = 0,
+                   std::uint64_t session_envelope_max_memory_bytes = 0)
 {
     handle_t child_read;
     handle_t parent_write;
@@ -1734,7 +1744,8 @@ bool launch_worker(const native_worker_verified_package_t& verified,
         return false;
     }
     worker.job.reset(CreateJobObjectW(nullptr, nullptr));
-    if (!worker.job || !configure_job(worker.job.get(), request.profile, error, session_cpu_backstop_ms)) {
+    if (!worker.job || !configure_job(worker.job.get(), request.profile, error, session_cpu_backstop_ms,
+            session_envelope_max_memory_bytes)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected, "native_worker.job", "job limits could not be applied", error);
         return false;
     }
@@ -3810,6 +3821,7 @@ struct native_worker_host_t::session_state_t {
     std::uint32_t max_jobs_per_session = 0;
     std::uint64_t cpu_backstop_ms = 0;
     std::uint64_t cpu_base_ms = 0;
+    std::uint64_t memory_envelope_bytes = 0;
     std::chrono::steady_clock::time_point launched_steady;
     std::shared_ptr<std::atomic<bool>> preempt;
     bool healthy = true;
@@ -3848,7 +3860,8 @@ void native_worker_host_t::session_terminate(session_state_t& session, DWORD exi
 }
 
 bool native_worker_host_t::session_launch(const native_worker_execution_request_t& input,
-    std::uint32_t max_jobs_per_session, session_state_t& session, native_worker_execution_result_t& result)
+    std::uint32_t max_jobs_per_session, std::uint64_t session_envelope_max_memory_bytes,
+    session_state_t& session, native_worker_execution_result_t& result)
 {
     if (stopped_.load(std::memory_order_acquire)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::host_stopped, "native_worker.execute", "worker host is stopped");
@@ -3860,8 +3873,11 @@ bool native_worker_host_t::session_launch(const native_worker_execution_request_
         limits_.max_concurrent_workers == 0 || limits_.startup_timeout.count() <= 0 ||
         limits_.cancellation_grace.count() < 0 || limits_.poll_interval.count() <= 0 || input.job_id == 0 ||
         max_jobs_per_session == 0 ||
+        session_envelope_max_memory_bytes == 0 ||
+        session_envelope_max_memory_bytes > k_decompiler_profile_max_memory_bytes ||
+        session_envelope_max_memory_bytes < input.profile.max_memory_bytes ||
         !input.snapshot.valid() || input.snapshot.bytes->size() > limits_.max_snapshot_bytes ||
-        input.snapshot.bytes->size() > input.profile.max_memory_bytes) {
+        input.snapshot.bytes->size() > session_envelope_max_memory_bytes) {
         append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request, "native_worker.request", "worker request or host limits are invalid");
         return false;
     }
@@ -3959,8 +3975,9 @@ bool native_worker_host_t::session_launch(const native_worker_execution_request_
     }
     session.worker_generation = worker_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     result.worker_generation = session.worker_generation;
-    const std::uint64_t backstop = session_cpu_backstop_for(max_jobs_per_session, request.profile.max_cpu_ms);
-    if (!launch_worker(*verified, request, limits_, session.worker, result, backstop)) {
+    const std::uint64_t backstop = session_cpu_backstop_for(max_jobs_per_session, k_decompiler_profile_max_cpu_ms);
+    if (!launch_worker(*verified, request, limits_, session.worker, result, backstop,
+            session_envelope_max_memory_bytes)) {
         result.worker_process_id = session.worker.process_id;
         if (session.worker.process)
             terminate_worker(session.worker, ERROR_ACCESS_DENIED, result, true);
@@ -4022,6 +4039,7 @@ bool native_worker_host_t::session_launch(const native_worker_execution_request_
     session.max_jobs_per_session = max_jobs_per_session;
     session.cpu_backstop_ms = backstop;
     session.cpu_base_ms = request.profile.max_cpu_ms;
+    session.memory_envelope_bytes = session_envelope_max_memory_bytes;
     session.launched_steady = std::chrono::steady_clock::now();
     session.preempt.reset();
     session.healthy = true;
@@ -4094,7 +4112,8 @@ native_worker_execution_result_t native_worker_host_t::execute_on_session(
         const std::uint64_t backstop = session_cpu_backstop_for(session.max_jobs_per_session, input.profile.max_cpu_ms);
         if (backstop > session.cpu_backstop_ms) {
             DWORD error = ERROR_SUCCESS;
-            if (!configure_job(session.worker.job.get(), input.profile, error, backstop)) {
+            if (!configure_job(session.worker.job.get(), input.profile, error, backstop,
+                    session.memory_envelope_bytes)) {
                 append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected,
                     "native_worker.session_job", "session CPU backstop could not be raised", error, true);
                 session.healthy = false;
@@ -4275,13 +4294,6 @@ struct worker_pool_key_t {
     std::string workspace_id;
     std::uint64_t generation = 0;
     sha256_digest_t snapshot_hash;
-    decompiler_profile_id_t profile = decompiler_profile_id_t::balanced;
-    std::uint64_t max_memory_bytes = 0;
-    std::uint64_t max_provider_ir_nodes = 0;
-    std::uint64_t max_hir_nodes = 0;
-    std::uint64_t max_ast_nodes = 0;
-    std::uint32_t max_semantic_queries = 0;
-    bool semantic_proofs_enabled = false;
 };
 
 int digest_order(const sha256_digest_t& left, const sha256_digest_t& right) noexcept
@@ -4295,36 +4307,14 @@ bool operator<(const worker_pool_key_t& left, const worker_pool_key_t& right) no
         return left.workspace_id < right.workspace_id;
     if (left.generation != right.generation)
         return left.generation < right.generation;
-    const int digest = digest_order(left.snapshot_hash, right.snapshot_hash);
-    if (digest != 0)
-        return digest < 0;
-    if (left.profile != right.profile)
-        return left.profile < right.profile;
-    if (left.max_memory_bytes != right.max_memory_bytes)
-        return left.max_memory_bytes < right.max_memory_bytes;
-    if (left.max_provider_ir_nodes != right.max_provider_ir_nodes)
-        return left.max_provider_ir_nodes < right.max_provider_ir_nodes;
-    if (left.max_hir_nodes != right.max_hir_nodes)
-        return left.max_hir_nodes < right.max_hir_nodes;
-    if (left.max_ast_nodes != right.max_ast_nodes)
-        return left.max_ast_nodes < right.max_ast_nodes;
-    if (left.max_semantic_queries != right.max_semantic_queries)
-        return left.max_semantic_queries < right.max_semantic_queries;
-    return left.semantic_proofs_enabled < right.semantic_proofs_enabled;
+    return digest_order(left.snapshot_hash, right.snapshot_hash) < 0;
 }
 
 bool operator==(const worker_pool_key_t& left, const worker_pool_key_t& right) noexcept
 {
     return left.workspace_id == right.workspace_id &&
         left.generation == right.generation &&
-        digest_order(left.snapshot_hash, right.snapshot_hash) == 0 &&
-        left.profile == right.profile &&
-        left.max_memory_bytes == right.max_memory_bytes &&
-        left.max_provider_ir_nodes == right.max_provider_ir_nodes &&
-        left.max_hir_nodes == right.max_hir_nodes &&
-        left.max_ast_nodes == right.max_ast_nodes &&
-        left.max_semantic_queries == right.max_semantic_queries &&
-        left.semantic_proofs_enabled == right.semantic_proofs_enabled;
+        digest_order(left.snapshot_hash, right.snapshot_hash) == 0;
 }
 
 worker_pool_key_t make_worker_pool_key(const decompiler_provider_request_t& request,
@@ -4334,14 +4324,32 @@ worker_pool_key_t make_worker_pool_key(const decompiler_provider_request_t& requ
     key.workspace_id = request.cache_key.workspace_id;
     key.generation = request.cache_key.workspace_generation;
     key.snapshot_hash = snapshot_hash;
-    key.profile = request.cache_key.profile.profile;
-    key.max_memory_bytes = request.cache_key.profile.max_memory_bytes;
-    key.max_provider_ir_nodes = request.cache_key.profile.max_provider_ir_nodes;
-    key.max_hir_nodes = request.cache_key.profile.max_hir_nodes;
-    key.max_ast_nodes = request.cache_key.profile.max_ast_nodes;
-    key.max_semantic_queries = request.cache_key.profile.max_semantic_queries;
-    key.semantic_proofs_enabled = request.cache_key.profile.semantic_proofs_enabled;
     return key;
+}
+
+std::mutex g_native_worker_private_mutex;
+std::uint64_t g_native_worker_private_ema = 0;
+std::uint64_t g_native_worker_private_samples = 0;
+
+void sample_native_worker_private_bytes(HANDLE process) noexcept
+{
+    if (process == nullptr)
+        return;
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    if (!K32GetProcessMemoryInfo(process,
+            reinterpret_cast<PPROCESS_MEMORY_COUNTERS>(&counters), sizeof(counters)))
+        return;
+    const std::uint64_t sample = static_cast<std::uint64_t>(counters.PagefileUsage);
+    std::lock_guard lock(g_native_worker_private_mutex);
+    if (g_native_worker_private_samples == 0 || g_native_worker_private_ema == 0) {
+        g_native_worker_private_ema = sample;
+    } else {
+        const double folded = static_cast<double>(g_native_worker_private_ema) +
+            (static_cast<double>(sample) - static_cast<double>(g_native_worker_private_ema)) / 8.0;
+        g_native_worker_private_ema = folded <= 0.0 ? sample
+            : static_cast<std::uint64_t>(folded);
+    }
+    ++g_native_worker_private_samples;
 }
 
 struct worker_session_record_t {
@@ -4371,6 +4379,7 @@ struct pooled_native_worker_provider_host_t::state_t {
     std::shared_ptr<decompiler_isolated_provider_host_t> fallback;
     std::shared_ptr<native_worker_host_t> host;
     native_worker_session_pool_config_t config;
+    std::uint64_t session_envelope_max_memory_bytes = 0;
     mutable std::mutex mutex;
     std::condition_variable wake;
     std::map<worker_pool_key_t, std::deque<std::shared_ptr<worker_session_record_t>>> idle;
@@ -4502,7 +4511,7 @@ struct pooled_native_worker_provider_host_t::state_t {
                 std::exception_ptr launch_exception;
                 try {
                     launched = host->session_launch(request, config.max_jobs_per_session,
-                        *session, launch_result);
+                        session_envelope_max_memory_bytes, *session, launch_result);
                 } catch (...) {
                     launch_exception = std::current_exception();
                 }
@@ -4612,6 +4621,8 @@ struct pooled_native_worker_provider_host_t::state_t {
     {
         if (!record)
             return;
+        if (record->session)
+            sample_native_worker_private_bytes(record->session->worker.process.get());
         std::lock_guard lock(mutex);
         if (record->busy) {
             record->busy = false;
@@ -4699,6 +4710,13 @@ pooled_native_worker_provider_host_t::pooled_native_worker_provider_host_t(
         state_->config.batch_slots = 1;
     if (state_->config.max_jobs_per_session == 0)
         state_->config.max_jobs_per_session = 8192;
+    const auto policy = default_decompiler_profile_policy();
+    state_->session_envelope_max_memory_bytes = (std::max)({policy.fast.max_memory_bytes,
+        policy.balanced.max_memory_bytes, policy.thorough.max_memory_bytes});
+    diag::log_tagged_fmt("dec_batch",
+        "pool_session_envelope memory_bytes=%llu cpu_backstop_ms=%llu",
+        static_cast<unsigned long long>(state_->session_envelope_max_memory_bytes),
+        static_cast<unsigned long long>(k_decompiler_profile_max_cpu_ms));
 }
 
 pooled_native_worker_provider_host_t::~pooled_native_worker_provider_host_t()
@@ -4851,6 +4869,18 @@ std::shared_ptr<decompiler_isolated_provider_host_t> create_pooled_native_worker
         static_cast<long long>(config.max_session_lifetime.count()));
     return std::make_shared<pooled_native_worker_provider_host_t>(
         runtime.provider_host, std::move(session_host), config);
+}
+
+std::uint64_t native_worker_measured_private_bytes() noexcept
+{
+    std::lock_guard lock(g_native_worker_private_mutex);
+    return g_native_worker_private_ema;
+}
+
+std::uint64_t native_worker_measured_private_samples() noexcept
+{
+    std::lock_guard lock(g_native_worker_private_mutex);
+    return g_native_worker_private_samples;
 }
 
 }

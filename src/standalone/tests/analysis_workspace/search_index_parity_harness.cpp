@@ -378,7 +378,8 @@ fixture_model_t make_model(std::uint64_t seed, const fixture_scale_t& scale,
         fact.kind = kind;
         fact.immediate = value;
         fact.bit_width = 64;
-        snapshot->operand_facts.push_back(fact);
+        snapshot->operand_facts.append(fact,
+            static_cast<std::uint32_t>(instruction_id - 1U));
     };
     entity_id_t operand_id = 900001;
     push_operand(operand_id++, 1, operand_kind_t::immediate, 0x1234U);
@@ -635,7 +636,10 @@ oracle_t build_oracle(const fixture_model_t& model) {
         }
         return std::nullopt;
     };
-    for (const auto& operand : model.snapshot->operand_facts) {
+    const auto& operand_fact_store = model.snapshot->operand_facts;
+    for (std::size_t index = 0; index < operand_fact_store.size(); ++index) {
+        const auto operand = operand_fact_materialize(operand_fact_store, index,
+            model.snapshot->instructions);
         if (operand.kind != operand_kind_t::immediate)
             continue;
         const auto reference = instruction_reference(operand.instruction_id);

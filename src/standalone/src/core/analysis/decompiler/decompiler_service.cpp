@@ -2,24 +2,41 @@
 
 #include "native_worker_host.hpp"
 
+#include "../builtin_typelib.hpp"
+#include "../flirt/static_recognition_service.hpp"
 #include "../workspace/analysis_metrics.hpp"
+#include "../workspace/pe_image.hpp"
 #include "../workspace/workspace_database.hpp"
+#include "../workspace/workspace_registry.hpp"
 #include "../../infra/cancellation_watchdog.hpp"
 #include "../../../helpers/diag_log.hpp"
 #include "../../../../workers/native_decompiler/snapshot_sidecar.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#include <bcrypt.h>
+
+#pragma comment(lib, "bcrypt.lib")
 
 namespace aida::analysis {
 namespace {
@@ -51,6 +68,10 @@ struct service_state_data_t {
     double dispatch_stage_ewm_ms = 0.0;
     double attest_stage_ewm_ms = 0.0;
     std::uint64_t attest_ratio_samples = 0;
+    std::array<std::uint8_t, 32> attestation_sample_key{};
+    std::uint64_t attestation_sampled_full = 0;
+    std::uint64_t attestation_validated = 0;
+    std::uint64_t attestation_mismatch = 0;
     mutable std::mutex evidence_mutex;
     std::unordered_map<std::string, render_evidence_cache_entry_t> evidence_cache;
     std::uint64_t evidence_clock = 0;
@@ -405,6 +426,74 @@ void attest_ratio_sample(
     ++state.attest_ratio_samples;
 }
 
+BCRYPT_ALG_HANDLE attestation_hmac_provider() noexcept
+{
+    static BCRYPT_ALG_HANDLE handle = [] {
+        BCRYPT_ALG_HANDLE opened = nullptr;
+        if (BCryptOpenAlgorithmProvider(&opened, BCRYPT_SHA256_ALGORITHM, nullptr,
+                BCRYPT_ALG_HANDLE_HMAC_FLAG) != 0)
+            return static_cast<BCRYPT_ALG_HANDLE>(nullptr);
+        return opened;
+    }();
+    return handle;
+}
+
+bool attestation_hmac_sha256(
+    const std::array<std::uint8_t, 32>& key,
+    const void* data,
+    const std::size_t data_size,
+    std::array<std::uint8_t, 32>& out) noexcept
+{
+    BCRYPT_ALG_HANDLE provider = attestation_hmac_provider();
+    if (provider == nullptr)
+        return false;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptCreateHash(provider, &hash, nullptr, 0,
+            const_cast<PUCHAR>(key.data()), static_cast<ULONG>(key.size()), 0) != 0 || hash == nullptr)
+        return false;
+    bool ok = data_size <= static_cast<std::size_t>((std::numeric_limits<ULONG>::max)()) &&
+        BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<void*>(data)),
+            static_cast<ULONG>(data_size), 0) == 0 &&
+        BCryptFinishHash(hash, out.data(), static_cast<ULONG>(out.size()), 0) == 0;
+    BCryptDestroyHash(hash);
+    return ok;
+}
+
+void attestation_message_append_u64(std::string& message, const std::uint64_t value)
+{
+    for (unsigned shift = 0; shift < 64; shift += 8)
+        message.push_back(static_cast<char>((value >> shift) & 0xffU));
+}
+
+bool attestation_sampled_for_job(
+    const service_state_data_t& state,
+    const decompiler_pipeline_request_t& request,
+    const decompiler_provider_identity_t& provider,
+    const std::uint64_t function_rva) noexcept
+{
+    const std::uint32_t rate = state.config.batch_attestation_sample_rate;
+    if (rate <= 1)
+        return true;
+    std::string message;
+    message.reserve(request.workspace_id.size() + 1 + 24 + provider.provider_binary_hash.bytes.size());
+    message.append(request.workspace_id);
+    message.push_back('\x1f');
+    attestation_message_append_u64(message, request.workspace_generation);
+    attestation_message_append_u64(message, request.analysis_revision);
+    attestation_message_append_u64(message, function_rva);
+    message.append(reinterpret_cast<const char*>(provider.provider_binary_hash.bytes.data()),
+        provider.provider_binary_hash.bytes.size());
+    std::array<std::uint8_t, 32> tag{};
+    if (!attestation_hmac_sha256(state.attestation_sample_key, message.data(), message.size(), tag)) {
+        ::diag::log_tagged_fmt("decompiler", "attestation_sampler_hmac_failed fail_closed=full");
+        return true;
+    }
+    std::uint64_t selector = 0;
+    for (unsigned index = 0; index < 8; ++index)
+        selector |= static_cast<std::uint64_t>(tag[index]) << (index * 8);
+    return selector % rate == 0;
+}
+
 class attest_slot_t final {
 public:
     attest_slot_t() = default;
@@ -504,56 +593,330 @@ bool equivalent_attested_document(
            serialize_decompiler_document(canonical_rendered);
 }
 
+constexpr std::size_t k_semantic_condition_max_ir_nodes = 24;
+
+struct semantic_condition_encoder_t {
+    const type_graph_t* types = nullptr;
+    std::unordered_map<std::uint64_t, const hir_value_t*> values;
+    std::unordered_map<std::uint64_t, std::uint32_t> memo;
+    triton_z3_static_ir_t ir;
+    bool unsupported = false;
+
+    std::uint32_t add_node(triton_z3_ir_opcode_t opcode, std::uint32_t width,
+                           std::uint64_t literal, std::string symbol,
+                           std::uint32_t lhs, std::uint32_t rhs) {
+        if (unsupported || ir.nodes.size() >= k_semantic_condition_max_ir_nodes) {
+            unsupported = true;
+            return 0;
+        }
+        triton_z3_ir_node_t node;
+        node.id = static_cast<std::uint32_t>(ir.nodes.size() + 1);
+        node.opcode = opcode;
+        node.bit_width = width;
+        node.literal = literal;
+        node.symbol = std::move(symbol);
+        node.lhs_id = lhs;
+        node.rhs_id = rhs;
+        ir.nodes.push_back(std::move(node));
+        return ir.nodes.back().id;
+    }
+
+    std::uint32_t value_width(const hir_value_t& value) const {
+        if (types && value.type_id != 0) {
+            if (const auto* node = type_graph::find_type_node(*types, value.type_id)) {
+                if (node->byte_size && *node->byte_size != 0 && *node->byte_size <= 8)
+                    return static_cast<std::uint32_t>(*node->byte_size * 8);
+            }
+        }
+        return 64;
+    }
+
+    static bool parse_literal(std::string_view text, std::uint64_t& out) noexcept {
+        if (text.empty())
+            return false;
+        auto begin = text.data();
+        auto end = begin + text.size();
+        int base = 10;
+        if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+            begin += 2;
+            base = 16;
+        }
+        const auto parsed = std::from_chars(begin, end, out, base);
+        return parsed.ec == std::errc{} && parsed.ptr == end;
+    }
+
+    static std::string operator_token(const hir_value_t& value) {
+        std::string token = value.stable_value;
+        std::string lowered;
+        lowered.reserve(token.size());
+        for (const char ch : token)
+            if (ch >= 'A' && ch <= 'Z')
+                lowered.push_back(static_cast<char>(ch - 'A' + 'a'));
+            else if (ch != ' ' && ch != '\t')
+                lowered.push_back(ch);
+        return lowered;
+    }
+
+    std::uint32_t encode(std::uint64_t value_id, std::uint32_t depth) {
+        if (unsupported || depth > k_semantic_condition_max_ir_nodes) {
+            unsupported = true;
+            return 0;
+        }
+        const auto memoized = memo.find(value_id);
+        if (memoized != memo.end())
+            return memoized->second;
+        const auto found = values.find(value_id);
+        if (found == values.end() || !found->second) {
+            unsupported = true;
+            return 0;
+        }
+        const hir_value_t& value = *found->second;
+        std::uint32_t node_id = 0;
+        switch (value.kind) {
+        case hir_node_kind_t::literal: {
+            std::uint64_t literal = 0;
+            if (!parse_literal(value.stable_value, literal)) {
+                unsupported = true;
+                return 0;
+            }
+            node_id = add_node(triton_z3_ir_opcode_t::bitvector_constant, 64, literal, {}, 0, 0);
+            break;
+        }
+        case hir_node_kind_t::parameter:
+        case hir_node_kind_t::local:
+        case hir_node_kind_t::reference: {
+            node_id = add_node(triton_z3_ir_opcode_t::symbolic_variable,
+                               value_width(value), 0, "v" + std::to_string(value.id), 0, 0);
+            break;
+        }
+        case hir_node_kind_t::cast: {
+            if (value.operand_ids.size() != 1) {
+                unsupported = true;
+                return 0;
+            }
+            const auto operand = values.find(value.operand_ids.front());
+            if (operand == values.end() || !operand->second ||
+                value_width(value) != value_width(*operand->second)) {
+                unsupported = true;
+                return 0;
+            }
+            node_id = encode(value.operand_ids.front(), depth + 1);
+            break;
+        }
+        case hir_node_kind_t::unary: {
+            if (value.operand_ids.size() != 1) {
+                unsupported = true;
+                return 0;
+            }
+            const std::uint32_t operand = encode(value.operand_ids.front(), depth + 1);
+            if (unsupported)
+                return 0;
+            const std::string op = operator_token(value);
+            const std::uint32_t width = value_width(value);
+            if (op == "-") {
+                const std::uint32_t zero = add_node(
+                    triton_z3_ir_opcode_t::bitvector_constant, width, 0, {}, 0, 0);
+                node_id = add_node(triton_z3_ir_opcode_t::subtract, width, 0, {}, zero, operand);
+            } else if (op == "~") {
+                const std::uint64_t ones = width == 64 ? ~std::uint64_t{0}
+                    : ((std::uint64_t{1} << width) - 1);
+                const std::uint32_t all_ones = add_node(
+                    triton_z3_ir_opcode_t::bitvector_constant, width, ones, {}, 0, 0);
+                node_id = add_node(triton_z3_ir_opcode_t::bitwise_xor, width, 0, {}, operand, all_ones);
+            } else if (op == "!") {
+                const std::uint32_t zero = add_node(
+                    triton_z3_ir_opcode_t::bitvector_constant, width, 0, {}, 0, 0);
+                node_id = add_node(triton_z3_ir_opcode_t::equal, 1, 0, {}, operand, zero);
+            } else {
+                unsupported = true;
+                return 0;
+            }
+            break;
+        }
+        case hir_node_kind_t::binary: {
+            if (value.operand_ids.size() != 2) {
+                unsupported = true;
+                return 0;
+            }
+            const std::uint32_t lhs = encode(value.operand_ids[0], depth + 1);
+            const std::uint32_t rhs = encode(value.operand_ids[1], depth + 1);
+            if (unsupported)
+                return 0;
+            const std::string op = operator_token(value);
+            const std::uint32_t width = value_width(value);
+            const auto binary_width = [&](triton_z3_ir_opcode_t opcode) {
+                return add_node(opcode, width, 0, {}, lhs, rhs);
+            };
+            const auto zero = [&] {
+                return add_node(triton_z3_ir_opcode_t::bitvector_constant, width, 0, {}, 0, 0);
+            };
+            const auto compare1 = [&](triton_z3_ir_opcode_t opcode, std::uint32_t a, std::uint32_t b) {
+                return add_node(opcode, 1, 0, {}, a, b);
+            };
+            if (op == "+") node_id = binary_width(triton_z3_ir_opcode_t::add);
+            else if (op == "-") node_id = binary_width(triton_z3_ir_opcode_t::subtract);
+            else if (op == "*") node_id = binary_width(triton_z3_ir_opcode_t::multiply);
+            else if (op == "&") node_id = binary_width(triton_z3_ir_opcode_t::bitwise_and);
+            else if (op == "|") node_id = binary_width(triton_z3_ir_opcode_t::bitwise_or);
+            else if (op == "^") node_id = binary_width(triton_z3_ir_opcode_t::bitwise_xor);
+            else if (op == "<<") node_id = binary_width(triton_z3_ir_opcode_t::shift_left);
+            else if (op == ">>") node_id = binary_width(triton_z3_ir_opcode_t::logical_shift_right);
+            else if (op == ">>a" || op == "sar") node_id = binary_width(triton_z3_ir_opcode_t::arithmetic_shift_right);
+            else if (op == "==") node_id = compare1(triton_z3_ir_opcode_t::equal, lhs, rhs);
+            else if (op == "!=") node_id = compare1(triton_z3_ir_opcode_t::distinct, lhs, rhs);
+            else if (op == "<u") node_id = compare1(triton_z3_ir_opcode_t::unsigned_less_than, lhs, rhs);
+            else if (op == "<" || op == "<s") node_id = compare1(triton_z3_ir_opcode_t::signed_less_than, lhs, rhs);
+            else if (op == ">u") node_id = compare1(triton_z3_ir_opcode_t::unsigned_less_than, rhs, lhs);
+            else if (op == ">" || op == ">s") node_id = compare1(triton_z3_ir_opcode_t::signed_less_than, rhs, lhs);
+            else if (op == "<=u") {
+                const std::uint32_t inner = compare1(triton_z3_ir_opcode_t::unsigned_less_than, rhs, lhs);
+                node_id = add_node(triton_z3_ir_opcode_t::logical_not, 1, 0, {}, inner, 0);
+            } else if (op == "<=" || op == "<=s") {
+                const std::uint32_t inner = compare1(triton_z3_ir_opcode_t::signed_less_than, rhs, lhs);
+                node_id = add_node(triton_z3_ir_opcode_t::logical_not, 1, 0, {}, inner, 0);
+            } else if (op == ">=u") {
+                const std::uint32_t inner = compare1(triton_z3_ir_opcode_t::unsigned_less_than, lhs, rhs);
+                node_id = add_node(triton_z3_ir_opcode_t::logical_not, 1, 0, {}, inner, 0);
+            } else if (op == ">=" || op == ">=s") {
+                const std::uint32_t inner = compare1(triton_z3_ir_opcode_t::signed_less_than, lhs, rhs);
+                node_id = add_node(triton_z3_ir_opcode_t::logical_not, 1, 0, {}, inner, 0);
+            } else if (op == "&&") {
+                const std::uint32_t lhs_bool = compare1(triton_z3_ir_opcode_t::distinct, lhs, zero());
+                const std::uint32_t rhs_bool = compare1(triton_z3_ir_opcode_t::distinct, rhs, zero());
+                node_id = add_node(triton_z3_ir_opcode_t::logical_and, 1, 0, {}, lhs_bool, rhs_bool);
+            } else if (op == "||") {
+                const std::uint32_t lhs_bool = compare1(triton_z3_ir_opcode_t::distinct, lhs, zero());
+                const std::uint32_t rhs_bool = compare1(triton_z3_ir_opcode_t::distinct, rhs, zero());
+                const std::uint32_t lhs_not = add_node(triton_z3_ir_opcode_t::logical_not, 1, 0, {}, lhs_bool, 0);
+                const std::uint32_t rhs_not = add_node(triton_z3_ir_opcode_t::logical_not, 1, 0, {}, rhs_bool, 0);
+                const std::uint32_t both = add_node(triton_z3_ir_opcode_t::logical_and, 1, 0, {}, lhs_not, rhs_not);
+                node_id = add_node(triton_z3_ir_opcode_t::logical_not, 1, 0, {}, both, 0);
+            } else {
+                unsupported = true;
+                return 0;
+            }
+            break;
+        }
+        default:
+            unsupported = true;
+            return 0;
+        }
+        if (!unsupported && node_id != 0)
+            memo.emplace(value_id, node_id);
+        return node_id;
+    }
+};
+
+std::uint64_t semantic_ir_structural_hash(const triton_z3_static_ir_t& ir) noexcept
+{
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto mix = [&hash](const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        for (std::size_t index = 0; index < size; ++index) {
+            hash ^= bytes[index];
+            hash *= 1099511628211ULL;
+        }
+    };
+    for (const auto& node : ir.nodes) {
+        const std::uint8_t opcode = static_cast<std::uint8_t>(node.opcode);
+        mix(&opcode, sizeof(opcode));
+        mix(&node.bit_width, sizeof(node.bit_width));
+        mix(&node.literal, sizeof(node.literal));
+        mix(node.symbol.data(), node.symbol.size());
+        const std::uint8_t terminator = 0xFF;
+        mix(&terminator, sizeof(terminator));
+        mix(&node.lhs_id, sizeof(node.lhs_id));
+        mix(&node.rhs_id, sizeof(node.rhs_id));
+    }
+    return hash;
+}
+
 std::vector<semantic_refinement_query_t> produce_semantic_queries(
     const hir_function_t& hir,
+    const type_graph_t& type_graph,
     const std::uint32_t maximum)
 {
     std::vector<semantic_refinement_query_t> result;
     if (maximum == 0)
         return result;
     result.reserve((std::min<std::size_t>)(maximum, 256));
+    std::unordered_map<std::uint64_t, const hir_value_t*> values;
+    bool collision = false;
+    for (const auto& block : hir.blocks) {
+        for (const auto& value : block.values) {
+            if (!values.emplace(value.id, &value).second)
+                collision = true;
+        }
+    }
+    if (collision) {
+        ::diag::log_tagged_fmt("decompiler",
+            "semantic_producer skipped reason=hir_value_id_collision");
+        return result;
+    }
+    std::unordered_set<std::uint64_t> emitted;
     for (const auto& block : hir.blocks) {
         for (const auto& value : block.values) {
             if (result.size() >= maximum)
                 return result;
-            if (value.kind != hir_node_kind_t::literal || value.stable_value.empty() ||
+            if ((value.kind != hir_node_kind_t::branch && value.kind != hir_node_kind_t::conditional) ||
+                value.operand_ids.empty() ||
                 value.coordinate.layer != decompiler_coordinate_layer_t::hir)
                 continue;
-            std::uint64_t literal = 0;
-            auto begin = value.stable_value.data();
-            auto end = begin + value.stable_value.size();
-            int base = 10;
-            if (value.stable_value.size() > 2 && value.stable_value[0] == '0' &&
-                (value.stable_value[1] == 'x' || value.stable_value[1] == 'X')) {
-                begin += 2;
-                base = 16;
+            const std::uint64_t condition_id = value.operand_ids.front();
+            const auto condition = values.find(condition_id);
+            if (condition == values.end() || !condition->second)
+                continue;
+            semantic_condition_encoder_t encoder;
+            encoder.types = &type_graph;
+            encoder.values = values;
+            encoder.ir.domain = triton_z3_semantic_domain_t::condition;
+            const std::uint32_t encoded = encoder.encode(condition_id, 0);
+            if (encoder.unsupported || encoded == 0 || encoder.ir.nodes.empty())
+                continue;
+            std::uint32_t condition_node = encoded;
+            const auto& encoded_root = encoder.ir.nodes.back();
+            if (encoded_root.bit_width != 1) {
+                triton_z3_ir_node_t zero;
+                zero.id = static_cast<std::uint32_t>(encoder.ir.nodes.size() + 1);
+                zero.opcode = triton_z3_ir_opcode_t::bitvector_constant;
+                zero.bit_width = encoded_root.bit_width;
+                zero.literal = 0;
+                encoder.ir.nodes.push_back(zero);
+                triton_z3_ir_node_t wrapped;
+                wrapped.id = static_cast<std::uint32_t>(encoder.ir.nodes.size() + 1);
+                wrapped.opcode = triton_z3_ir_opcode_t::distinct;
+                wrapped.bit_width = 1;
+                wrapped.lhs_id = encoded;
+                wrapped.rhs_id = zero.id;
+                encoder.ir.nodes.push_back(wrapped);
+                condition_node = wrapped.id;
             }
-            const auto parsed = std::from_chars(begin, end, literal, base);
-            if (parsed.ec != std::errc{} || parsed.ptr != end)
+            triton_z3_ir_node_t one;
+            one.id = static_cast<std::uint32_t>(encoder.ir.nodes.size() + 1);
+            one.opcode = triton_z3_ir_opcode_t::bitvector_constant;
+            one.bit_width = 1;
+            one.literal = 0;
+            encoder.ir.nodes.push_back(one);
+            triton_z3_ir_node_t root;
+            root.id = static_cast<std::uint32_t>(encoder.ir.nodes.size() + 1);
+            root.opcode = triton_z3_ir_opcode_t::equal;
+            root.bit_width = 1;
+            root.lhs_id = condition_node;
+            root.rhs_id = one.id;
+            encoder.ir.nodes.push_back(root);
+            encoder.ir.root_node_id = root.id;
+            if (!valid_triton_z3_static_ir(encoder.ir))
+                continue;
+            const std::uint64_t structural = semantic_ir_structural_hash(encoder.ir);
+            if (!emitted.insert(structural).second)
                 continue;
             semantic_refinement_query_t query;
             query.ordinal = static_cast<std::uint64_t>(result.size() + 1);
-            query.stable_id = "literal_" + std::to_string(value.id);
+            query.stable_id = "branchcond_" + std::to_string(value.id);
             query.coordinate = value.coordinate;
-            query.refinement_key = "literal_constant_" + std::to_string(value.id);
-            query.static_ir.domain = triton_z3_semantic_domain_t::constant;
-            triton_z3_ir_node_t observed;
-            observed.id = 1;
-            observed.opcode = triton_z3_ir_opcode_t::bitvector_constant;
-            observed.bit_width = 64;
-            observed.literal = literal;
-            triton_z3_ir_node_t expected = observed;
-            expected.id = 2;
-            triton_z3_ir_node_t equality;
-            equality.id = 3;
-            equality.opcode = triton_z3_ir_opcode_t::equal;
-            equality.bit_width = 1;
-            equality.lhs_id = observed.id;
-            equality.rhs_id = expected.id;
-            query.static_ir.nodes = {observed, expected, equality};
-            query.static_ir.root_node_id = equality.id;
-            if (valid_triton_z3_static_ir(query.static_ir))
-                result.push_back(std::move(query));
+            query.refinement_key = "branch_cond_eq0.v" + std::to_string(value.id);
+            query.static_ir = std::move(encoder.ir);
+            result.push_back(std::move(query));
         }
     }
     return result;
@@ -603,22 +966,35 @@ decompiler_renderer_settings_t renderer_settings(const decompiler_pipeline_reque
     return {};
 }
 
-std::string sidecar_unresolved_text(const std::uint64_t image_base, const std::uint64_t rva)
+std::string sidecar_hex_text(std::uint64_t value)
 {
-    if (rva > (std::numeric_limits<std::uint64_t>::max)() - image_base)
-        return {};
-    std::string text = "sub_";
     static constexpr char k_hex[] = "0123456789abcdef";
-    std::uint64_t value = image_base + rva;
     char digits[16];
     std::size_t count = 0;
     do {
         digits[count++] = k_hex[value & 0xFULL];
         value >>= 4U;
     } while (value != 0 && count < 16);
+    std::string text;
+    text.reserve(count);
     while (count != 0)
         text.push_back(digits[--count]);
     return text;
+}
+
+std::string sidecar_prefixed_unresolved_text(
+    const char* prefix,
+    const std::uint64_t image_base,
+    const std::uint64_t rva)
+{
+    if (rva > (std::numeric_limits<std::uint64_t>::max)() - image_base)
+        return {};
+    return std::string(prefix) + sidecar_hex_text(image_base + rva);
+}
+
+std::string sidecar_unresolved_text(const std::uint64_t image_base, const std::uint64_t rva)
+{
+    return sidecar_prefixed_unresolved_text("sub_", image_base, rva);
 }
 
 bool sidecar_identifier_text(const std::string& text) noexcept
@@ -760,104 +1136,29 @@ std::optional<sidecar_prototype_parse_t> parse_sidecar_prototype_text(const std:
     return result;
 }
 
-std::shared_ptr<const decompiler_render_evidence_t> build_render_evidence_from_sidecar(
-    const void* sidecar_data,
-    const std::size_t sidecar_size,
-    const std::uint64_t image_base)
+std::shared_ptr<const static_recognition::recognition_records_t>
+recognition_records_for_sidecar(const std::uint64_t image_base) noexcept
 {
-    namespace sidecar_ns = native_worker::snapshot_sidecar;
-    if (sidecar_data == nullptr || sidecar_size == 0)
-        return nullptr;
-    const auto decoded = sidecar_ns::decode(sidecar_data, sidecar_size);
-    if (!decoded)
-        return nullptr;
-    std::unordered_set<std::uint64_t> noreturn_rvas;
-    noreturn_rvas.reserve(decoded->noreturn.size());
-    for (const auto rva : decoded->noreturn)
-        noreturn_rvas.insert(rva);
-    decompiler_render_evidence_t evidence;
-    evidence.symbols.reserve(decoded->names.size() + decoded->imports.size());
-    const auto noreturn_at = [&noreturn_rvas](const std::uint64_t rva) {
-        return noreturn_rvas.find(rva) != noreturn_rvas.end();
-    };
-    for (const auto& record : decoded->names) {
-        if (record.rva == 0 || record.name.empty() ||
-            (record.kind != sidecar_ns::name_kind_t::function &&
-             record.kind != sidecar_ns::name_kind_t::import &&
-             record.kind != sidecar_ns::name_kind_t::export_))
-            continue;
-        auto unresolved = sidecar_unresolved_text(image_base, record.rva);
-        if (unresolved.empty())
-            continue;
-        decompiler_symbol_evidence_t symbol;
-        symbol.unresolved_text = std::move(unresolved);
-        symbol.resolved_name = record.name;
-        symbol.is_import = record.kind == sidecar_ns::name_kind_t::import;
-        symbol.is_noreturn = record.is_noreturn || noreturn_at(record.rva);
-        symbol.confidence = 255;
-        evidence.symbols.push_back(std::move(symbol));
-    }
-    for (const auto& record : decoded->imports) {
-        if (record.thunk_rva == 0 || record.name.empty())
-            continue;
-        auto unresolved = sidecar_unresolved_text(image_base, record.thunk_rva);
-        if (unresolved.empty())
-            continue;
-        decompiler_symbol_evidence_t symbol;
-        symbol.unresolved_text = std::move(unresolved);
-        symbol.resolved_name = record.name;
-        symbol.module_name = record.module;
-        symbol.is_import = true;
-        symbol.is_noreturn = record.is_noreturn || noreturn_at(record.thunk_rva);
-        symbol.confidence = 255;
-        evidence.symbols.push_back(std::move(symbol));
-    }
-    evidence.prototypes.reserve(decoded->prototypes.size());
-    for (const auto& record : decoded->prototypes) {
-        if (record.prototype.empty())
-            continue;
-        const auto parsed = parse_sidecar_prototype_text(record.prototype);
-        if (!parsed)
-            continue;
-        decompiler_prototype_evidence_t prototype;
-        prototype.api_name = !record.name.empty() ? record.name : parsed->name;
-        if (prototype.api_name.empty())
-            continue;
-        prototype.return_type_display = parsed->return_type;
-        prototype.argument_names = parsed->argument_names;
-        prototype.argument_type_displays = parsed->argument_types;
-        prototype.is_variadic = parsed->is_variadic;
-        prototype.is_noreturn = record.is_noreturn || noreturn_at(record.rva);
-        prototype.confidence = record.confidence;
-        evidence.prototypes.push_back(std::move(prototype));
-    }
-    const auto symbol_order = [](const decompiler_symbol_evidence_t& left,
-                                 const decompiler_symbol_evidence_t& right) {
-        return std::tie(left.unresolved_text, left.resolved_name, left.module_name) <
-               std::tie(right.unresolved_text, right.resolved_name, right.module_name);
-    };
-    std::sort(evidence.symbols.begin(), evidence.symbols.end(), symbol_order);
-    evidence.symbols.erase(
-        std::unique(evidence.symbols.begin(), evidence.symbols.end(),
-            [](const auto& left, const auto& right) {
-                return left.unresolved_text == right.unresolved_text &&
-                       left.resolved_name == right.resolved_name &&
-                       left.module_name == right.module_name &&
-                       left.is_import == right.is_import;
-            }),
-        evidence.symbols.end());
-    std::sort(evidence.prototypes.begin(), evidence.prototypes.end(),
-        [](const auto& left, const auto& right) {
-            return left.api_name < right.api_name;
-        });
-    if (evidence.empty())
-        return nullptr;
-    if (!validate_decompiler_render_evidence(evidence).valid())
-        return nullptr;
+    if (image_base == 0)
+        return {};
     try {
-        return std::make_shared<const decompiler_render_evidence_t>(std::move(evidence));
+        std::shared_ptr<analysis_workspace_t> matched;
+        std::size_t matches = 0;
+        for (const auto& workspace : workspace_registry().list()) {
+            if (!workspace || workspace->closing() || workspace->closed() ||
+                workspace->target_kind() != target_kind_t::static_file)
+                continue;
+            const auto image = workspace->image();
+            if (!image || image->image_base() != image_base)
+                continue;
+            matched = workspace;
+            ++matches;
+        }
+        if (matches != 1 || !matched)
+            return {};
+        return static_recognition::records_for(matched);
     } catch (...) {
-        return nullptr;
+        return {};
     }
 }
 
@@ -894,6 +1195,13 @@ std::shared_ptr<const decompiler_render_evidence_t> resolve_render_evidence(
         views.sidecar.data(), views.sidecar.size(), views.image_base);
     if (!evidence)
         return nullptr;
+    try {
+        auto merged = std::make_shared<decompiler_render_evidence_t>(*evidence);
+        build_render_evidence_typelib_overlay(*merged);
+        if (validate_decompiler_render_evidence(*merged).valid())
+            evidence = std::move(merged);
+    } catch (...) {
+    }
     {
         std::lock_guard lock(state.evidence_mutex);
         const auto found = state.evidence_cache.find(cache_key);
@@ -916,8 +1224,10 @@ std::shared_ptr<const decompiler_render_evidence_t> resolve_render_evidence(
         entry.touch = ++state.evidence_clock;
         state.evidence_cache.emplace(cache_key, std::move(entry));
         ::diag::log_tagged_fmt("decompiler",
-            "render_evidence_built snapshot_hash=%s symbols=%zu prototypes=%zu",
-            cache_key.c_str(), evidence->symbols.size(), evidence->prototypes.size());
+            "render_evidence_built snapshot_hash=%s symbols=%zu prototypes=%zu strings=%zu members=%zu vtables=%zu comments=%zu scalars=%zu",
+            cache_key.c_str(), evidence->symbols.size(), evidence->prototypes.size(),
+            evidence->strings.size(), evidence->members.size(), evidence->vtable_slots.size(),
+            evidence->user_comments.size(), evidence->global_scalars.size());
     }
     return evidence;
 }
@@ -1486,7 +1796,8 @@ void persist_rendered_row(
     service_state_data_t& state,
     const decompiler_pipeline_request_t& request,
     const decompiler_pipeline_cache_key_t& rendered_key,
-    const decompiler_rendered_cache_value_t& rendered) noexcept
+    const decompiler_rendered_cache_value_t& rendered,
+    std::string serialized) noexcept
 {
     if (!state.config.database)
         return;
@@ -1497,6 +1808,10 @@ void persist_rendered_row(
         const std::string canonical = serialize_decompiler_pipeline_cache_key(rendered_key);
         if (canonical.empty())
             return;
+        if (serialized.empty())
+            serialized = serialize_decompiler_rendered_cache_value(rendered);
+        if (serialized.empty())
+            return;
         decompiler_pipeline_cache_v1_row_t row;
         const auto* key_begin = reinterpret_cast<const std::uint8_t*>(canonical.data());
         row.cache_key.assign(key_begin, key_begin + canonical.size());
@@ -1506,7 +1821,6 @@ void persist_rendered_row(
         row.analysis_revision = request.analysis_revision;
         row.overlay_revision = request.cache_identity.overlay_revision;
         row.function_rva = function_rva;
-        const auto serialized = serialize_decompiler_rendered_cache_value(rendered);
         const auto* value_begin = reinterpret_cast<const std::uint8_t*>(serialized.data());
         row.value.assign(value_begin, value_begin + serialized.size());
         row.diagnostics = serialize_diagnostics_blob(rendered.diagnostics);
@@ -1525,6 +1839,394 @@ void persist_rendered_row(
     }
 }
 
+}
+
+std::shared_ptr<const decompiler_render_evidence_t> build_render_evidence_from_sidecar(
+    const void* sidecar_data,
+    const std::size_t sidecar_size,
+    const std::uint64_t image_base)
+{
+    namespace sidecar_ns = native_worker::snapshot_sidecar;
+    if (sidecar_data == nullptr || sidecar_size == 0)
+        return nullptr;
+    const auto decoded = sidecar_ns::decode(sidecar_data, sidecar_size);
+    if (!decoded)
+        return nullptr;
+    std::unordered_set<std::uint64_t> noreturn_rvas;
+    noreturn_rvas.reserve(decoded->noreturn.size());
+    for (const auto rva : decoded->noreturn)
+        noreturn_rvas.insert(rva);
+    decompiler_render_evidence_t evidence;
+    evidence.symbols.reserve(decoded->names.size() + decoded->imports.size());
+    const auto noreturn_at = [&noreturn_rvas](const std::uint64_t rva) {
+        return noreturn_rvas.find(rva) != noreturn_rvas.end();
+    };
+    const auto clamp_confidence = [](const std::uint8_t confidence) {
+        return confidence > 100 ? static_cast<std::uint8_t>(100) : confidence;
+    };
+    const auto absolute_address = [image_base](const std::uint64_t rva) {
+        return rva > (std::numeric_limits<std::uint64_t>::max)() - image_base
+            ? std::uint64_t{0} : image_base + rva;
+    };
+    for (const auto& record : decoded->names) {
+        if (record.rva == 0 || record.name.empty())
+            continue;
+        const char* prefix = nullptr;
+        switch (record.kind) {
+        case sidecar_ns::name_kind_t::function:
+        case sidecar_ns::name_kind_t::import:
+        case sidecar_ns::name_kind_t::export_:
+            prefix = "sub_";
+            break;
+        case sidecar_ns::name_kind_t::data:
+            prefix = "DAT_";
+            break;
+        case sidecar_ns::name_kind_t::label:
+            prefix = "LAB_";
+            break;
+        default:
+            break;
+        }
+        if (prefix == nullptr)
+            continue;
+        auto unresolved = sidecar_prefixed_unresolved_text(prefix, image_base, record.rva);
+        if (unresolved.empty())
+            continue;
+        decompiler_symbol_evidence_t symbol;
+        symbol.unresolved_text = std::move(unresolved);
+        symbol.resolved_name = record.name;
+        symbol.is_import = record.kind == sidecar_ns::name_kind_t::import;
+        symbol.is_noreturn = record.is_noreturn || noreturn_at(record.rva);
+        symbol.confidence = 100;
+        evidence.symbols.push_back(std::move(symbol));
+    }
+    for (const auto& record : decoded->imports) {
+        if (record.thunk_rva == 0 || record.name.empty())
+            continue;
+        auto unresolved = sidecar_unresolved_text(image_base, record.thunk_rva);
+        if (unresolved.empty())
+            continue;
+        decompiler_symbol_evidence_t symbol;
+        symbol.unresolved_text = std::move(unresolved);
+        symbol.resolved_name = record.name;
+        symbol.module_name = record.module;
+        symbol.is_import = true;
+        symbol.is_noreturn = record.is_noreturn || noreturn_at(record.thunk_rva);
+        symbol.confidence = 100;
+        evidence.symbols.push_back(std::move(symbol));
+    }
+    evidence.prototypes.reserve(decoded->prototypes.size());
+    for (const auto& record : decoded->prototypes) {
+        if (record.prototype.empty())
+            continue;
+        const auto parsed = parse_sidecar_prototype_text(record.prototype);
+        if (!parsed)
+            continue;
+        decompiler_prototype_evidence_t prototype;
+        prototype.api_name = !record.name.empty() ? record.name : parsed->name;
+        if (prototype.api_name.empty())
+            continue;
+        prototype.return_type_display = parsed->return_type;
+        prototype.argument_names = parsed->argument_names;
+        prototype.argument_type_displays = parsed->argument_types;
+        prototype.is_variadic = parsed->is_variadic;
+        prototype.is_noreturn = record.is_noreturn || noreturn_at(record.rva);
+        prototype.confidence = clamp_confidence(record.confidence);
+        evidence.prototypes.push_back(std::move(prototype));
+    }
+    evidence.strings.reserve(decoded->strings.size());
+    for (const auto& record : decoded->strings) {
+        if (record.rva == 0 || record.content.empty())
+            continue;
+        const std::uint64_t address = absolute_address(record.rva);
+        if (address == 0)
+            continue;
+        auto reference = sidecar_unresolved_text(image_base, record.rva);
+        if (reference.empty())
+            continue;
+        decompiler_string_evidence_t entry;
+        entry.reference_text = std::move(reference);
+        entry.utf8_content = record.content;
+        entry.is_wide = record.is_wide();
+        entry.confidence = clamp_confidence(record.confidence);
+        entry.absolute_address = address;
+        entry.truncated = record.truncated();
+        entry.original_byte_length = record.original_byte_length;
+        evidence.strings.push_back(std::move(entry));
+    }
+    evidence.global_scalars.reserve(decoded->global_scalars.size());
+    for (const auto& record : decoded->global_scalars) {
+        if (record.rva == 0 || record.size_log2 > 3U)
+            continue;
+        const std::uint64_t address = absolute_address(record.rva);
+        if (address == 0)
+            continue;
+        decompiler_global_scalar_evidence_t entry;
+        entry.absolute_address = address;
+        entry.value = record.value;
+        entry.size_log2 = record.size_log2;
+        evidence.global_scalars.push_back(entry);
+    }
+    evidence.members.reserve(decoded->members.size());
+    for (const auto& record : decoded->members) {
+        if (record.field_name.empty())
+            continue;
+        decompiler_member_evidence_t entry;
+        entry.object_type_canonical = record.object_type_canonical;
+        entry.byte_offset = record.byte_offset;
+        entry.field_name = record.field_name;
+        entry.selector_hint = record.selector_hint;
+        entry.confidence = clamp_confidence(record.confidence);
+        evidence.members.push_back(std::move(entry));
+    }
+    if (!decoded->vtables.empty()) {
+        std::unordered_map<std::uint64_t, std::string> names_by_rva;
+        names_by_rva.reserve(decoded->names.size());
+        for (const auto& record : decoded->names) {
+            if (record.rva != 0 && !record.name.empty())
+                names_by_rva.emplace(record.rva, record.name);
+        }
+        evidence.vtable_slots.reserve(decoded->vtables.size());
+        for (const auto& record : decoded->vtables) {
+            if (record.method_name.empty())
+                continue;
+            const std::uint64_t address = absolute_address(record.vtable_rva);
+            if (address == 0)
+                continue;
+            decompiler_vtable_slot_evidence_t entry;
+            const auto named = names_by_rva.find(record.vtable_rva);
+            entry.vtable_selector = named != names_by_rva.end()
+                ? named->second
+                : "vtable_" + sidecar_hex_text(record.vtable_rva);
+            entry.slot_index = record.slot_index;
+            entry.method_name = record.method_name;
+            entry.confidence = clamp_confidence(record.confidence);
+            entry.vtable_rva = address;
+            evidence.vtable_slots.push_back(std::move(entry));
+        }
+    }
+    evidence.user_comments.reserve(decoded->comments.size());
+    for (const auto& record : decoded->comments) {
+        if (record.rva == 0 || record.text.empty())
+            continue;
+        const std::uint64_t address = absolute_address(record.rva);
+        if (address == 0)
+            continue;
+        decompiler_user_comment_evidence_t entry;
+        entry.comment_text = record.text;
+        entry.before_statement = record.before_statement();
+        entry.confidence = 100;
+        entry.rva = address;
+        entry.function_rva = 0;
+        evidence.user_comments.push_back(std::move(entry));
+    }
+    if (const auto recognition = recognition_records_for_sidecar(image_base)) {
+        if (!recognition->names.empty()) {
+            std::unordered_set<std::string> symbol_texts;
+            symbol_texts.reserve(evidence.symbols.size() + recognition->names.size());
+            for (const auto& symbol : evidence.symbols)
+                symbol_texts.insert(symbol.unresolved_text);
+            for (const auto& record : recognition->names) {
+                if (evidence.symbols.size() >= k_decompiler_render_evidence_max_entries)
+                    break;
+                if (record.rva == 0 || record.name.empty() ||
+                    record.name.size() > k_decompiler_render_evidence_max_text_bytes)
+                    continue;
+                auto unresolved = sidecar_unresolved_text(image_base, record.rva);
+                if (unresolved.empty() || !symbol_texts.insert(unresolved).second)
+                    continue;
+                decompiler_symbol_evidence_t symbol;
+                symbol.unresolved_text = std::move(unresolved);
+                symbol.resolved_name = record.name;
+                symbol.is_import = false;
+                symbol.is_noreturn = noreturn_at(record.rva);
+                symbol.confidence = clamp_confidence(record.confidence);
+                evidence.symbols.push_back(std::move(symbol));
+            }
+        }
+        if (!recognition->prototypes.empty()) {
+            std::unordered_set<std::uint64_t> prototype_rvas;
+            prototype_rvas.reserve(decoded->prototypes.size() + recognition->prototypes.size());
+            for (const auto& record : decoded->prototypes)
+                prototype_rvas.insert(record.rva);
+            for (const auto& record : recognition->prototypes) {
+                if (evidence.prototypes.size() >= k_decompiler_render_evidence_max_entries)
+                    break;
+                if (record.rva == 0 || record.prototype_text.empty() ||
+                    prototype_rvas.count(record.rva) != 0)
+                    continue;
+                const auto parsed = parse_sidecar_prototype_text(record.prototype_text);
+                if (!parsed)
+                    continue;
+                decompiler_prototype_evidence_t prototype;
+                prototype.api_name = !record.name.empty() ? record.name : parsed->name;
+                if (prototype.api_name.empty())
+                    continue;
+                prototype.return_type_display = parsed->return_type;
+                prototype.argument_names = parsed->argument_names;
+                prototype.argument_type_displays = parsed->argument_types;
+                prototype.is_variadic = parsed->is_variadic;
+                prototype.is_noreturn = record.is_noreturn || noreturn_at(record.rva);
+                prototype.confidence = clamp_confidence(record.confidence);
+                prototype_rvas.insert(record.rva);
+                evidence.prototypes.push_back(std::move(prototype));
+            }
+        }
+        if (!recognition->vtable_slots.empty()) {
+            std::unordered_map<std::uint64_t, std::string> names_by_rva;
+            names_by_rva.reserve(decoded->names.size());
+            for (const auto& record : decoded->names) {
+                if (record.rva != 0 && !record.name.empty())
+                    names_by_rva.emplace(record.rva, record.name);
+            }
+            std::set<std::pair<std::uint64_t, std::uint64_t>> occupied_slots;
+            for (const auto& slot : evidence.vtable_slots)
+                occupied_slots.emplace(slot.vtable_rva, slot.slot_index);
+            for (const auto& record : recognition->vtable_slots) {
+                if (evidence.vtable_slots.size() >= k_decompiler_render_evidence_max_entries)
+                    break;
+                if (record.method_name.empty() ||
+                    record.method_name.size() > k_decompiler_render_evidence_max_text_bytes)
+                    continue;
+                const std::uint64_t address = absolute_address(record.vtable_rva);
+                if (address == 0)
+                    continue;
+                if (!occupied_slots.emplace(address, record.slot_index).second)
+                    continue;
+                decompiler_vtable_slot_evidence_t entry;
+                const auto named = names_by_rva.find(record.vtable_rva);
+                entry.vtable_selector = named != names_by_rva.end()
+                    ? named->second
+                    : "vtable_" + sidecar_hex_text(record.vtable_rva);
+                entry.slot_index = record.slot_index;
+                entry.method_name = record.method_name;
+                entry.confidence = clamp_confidence(record.confidence);
+                entry.vtable_rva = address;
+                evidence.vtable_slots.push_back(std::move(entry));
+            }
+        }
+    }
+    const auto symbol_order = [](const decompiler_symbol_evidence_t& left,
+                                 const decompiler_symbol_evidence_t& right) {
+        return std::tie(left.unresolved_text, left.resolved_name, left.module_name) <
+               std::tie(right.unresolved_text, right.resolved_name, right.module_name);
+    };
+    std::sort(evidence.symbols.begin(), evidence.symbols.end(), symbol_order);
+    evidence.symbols.erase(
+        std::unique(evidence.symbols.begin(), evidence.symbols.end(),
+            [](const auto& left, const auto& right) {
+                return left.unresolved_text == right.unresolved_text &&
+                       left.resolved_name == right.resolved_name &&
+                       left.module_name == right.module_name &&
+                       left.is_import == right.is_import;
+            }),
+        evidence.symbols.end());
+    std::sort(evidence.prototypes.begin(), evidence.prototypes.end(),
+        [](const auto& left, const auto& right) {
+            return left.api_name < right.api_name;
+        });
+    std::sort(evidence.strings.begin(), evidence.strings.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.absolute_address, left.utf8_content) <
+                   std::tie(right.absolute_address, right.utf8_content);
+        });
+    evidence.strings.erase(
+        std::unique(evidence.strings.begin(), evidence.strings.end(),
+            [](const auto& left, const auto& right) {
+                return left.absolute_address == right.absolute_address &&
+                       left.utf8_content == right.utf8_content;
+            }),
+        evidence.strings.end());
+    std::sort(evidence.global_scalars.begin(), evidence.global_scalars.end(),
+        [](const auto& left, const auto& right) {
+            return left.absolute_address < right.absolute_address;
+        });
+    evidence.global_scalars.erase(
+        std::unique(evidence.global_scalars.begin(), evidence.global_scalars.end(),
+            [](const auto& left, const auto& right) {
+                return left.absolute_address == right.absolute_address &&
+                       left.size_log2 == right.size_log2 &&
+                       left.value == right.value;
+            }),
+        evidence.global_scalars.end());
+    std::sort(evidence.members.begin(), evidence.members.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.object_type_canonical, left.byte_offset, left.field_name) <
+                   std::tie(right.object_type_canonical, right.byte_offset, right.field_name);
+        });
+    evidence.members.erase(
+        std::unique(evidence.members.begin(), evidence.members.end(),
+            [](const auto& left, const auto& right) {
+                return left.object_type_canonical == right.object_type_canonical &&
+                       left.byte_offset == right.byte_offset &&
+                       left.field_name == right.field_name;
+            }),
+        evidence.members.end());
+    std::sort(evidence.vtable_slots.begin(), evidence.vtable_slots.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.vtable_selector, left.slot_index, left.method_name) <
+                   std::tie(right.vtable_selector, right.slot_index, right.method_name);
+        });
+    evidence.vtable_slots.erase(
+        std::unique(evidence.vtable_slots.begin(), evidence.vtable_slots.end(),
+            [](const auto& left, const auto& right) {
+                return left.vtable_selector == right.vtable_selector &&
+                       left.slot_index == right.slot_index &&
+                       left.method_name == right.method_name;
+            }),
+        evidence.vtable_slots.end());
+    std::sort(evidence.user_comments.begin(), evidence.user_comments.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.rva, left.before_statement, left.comment_text) <
+                   std::tie(right.rva, right.before_statement, right.comment_text);
+        });
+    evidence.user_comments.erase(
+        std::unique(evidence.user_comments.begin(), evidence.user_comments.end(),
+            [](const auto& left, const auto& right) {
+                return left.rva == right.rva &&
+                       left.before_statement == right.before_statement &&
+                       left.comment_text == right.comment_text;
+            }),
+        evidence.user_comments.end());
+    if (evidence.empty())
+        return nullptr;
+    if (!validate_decompiler_render_evidence(evidence).valid())
+        return nullptr;
+    try {
+        return std::make_shared<const decompiler_render_evidence_t>(std::move(evidence));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void build_render_evidence_typelib_overlay(decompiler_render_evidence_t& evidence)
+{
+    std::set<std::pair<std::string, std::uint64_t>> occupied;
+    for (const auto& entry : evidence.members)
+        occupied.emplace(entry.object_type_canonical, entry.byte_offset);
+    for (const auto& structure : builtin_typelib::kBuiltinStructs) {
+        if (structure.name == nullptr || structure.members == nullptr)
+            continue;
+        const std::string canonical(structure.name);
+        for (std::size_t index = 0; index < structure.member_count; ++index) {
+            const auto& member = structure.members[index];
+            if (member.name == nullptr || member.name[0] == '\0')
+                continue;
+            if (!occupied.emplace(canonical, member.offset).second)
+                continue;
+            decompiler_member_evidence_t entry;
+            entry.object_type_canonical = canonical;
+            entry.byte_offset = member.offset;
+            entry.field_name = member.name;
+            entry.confidence = 100;
+            evidence.members.push_back(std::move(entry));
+        }
+    }
+    std::sort(evidence.members.begin(), evidence.members.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.object_type_canonical, left.byte_offset, left.field_name) <
+                   std::tie(right.object_type_canonical, right.byte_offset, right.field_name);
+        });
 }
 
 struct decompiler_pipeline_service_t::state_t : service_state_data_t {
@@ -1586,6 +2288,16 @@ workspace_result_t<std::shared_ptr<decompiler_pipeline_service_t>> decompiler_pi
             ? std::move(semantic_refiner)
             : std::make_shared<semantic_refiner_t>();
         state->config = std::move(config);
+        if (state->config.batch_attestation_sample_rate == 0)
+            state->config.batch_attestation_sample_rate = 1;
+        if (BCryptGenRandom(nullptr, state->attestation_sample_key.data(),
+                static_cast<ULONG>(state->attestation_sample_key.size()),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            ::diag::log_tagged_fmt("decompiler", "attestation_sample_key_rng_failed");
+            return workspace_result_t<std::shared_ptr<decompiler_pipeline_service_t>>::failure(
+                service_error(workspace_error_code_t::integrity_failure,
+                              "decompiler service attestation sampler key could not be generated"));
+        }
         state->metrics.accepting = true;
         return workspace_result_t<std::shared_ptr<decompiler_pipeline_service_t>>::success(
             std::shared_ptr<decompiler_pipeline_service_t>(new decompiler_pipeline_service_t(std::move(state))));
@@ -1625,6 +2337,8 @@ struct pipeline_operation_t {
     decompiler_pipeline_cache_key_t rendered_key;
     std::optional<decompiler_document_t> attested_document;
     bool deferred_intermediate_cache_writes = false;
+    bool attestation_sampled = false;
+    bool attestation_validated = false;
     request_slot_t slot;
     std::uint64_t dispatch_stage_ms = 0;
     decompiler_pipeline_service_t::decompiler_completion_t completion;
@@ -1736,6 +2450,16 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
         return decompiler_pipeline_status_t::provider_unavailable;
     }
     result.provider = route.value().descriptor;
+    std::uint64_t attestation_rva = 0;
+    op.attestation_sampled =
+        request.invocation == decompiler_pipeline_invocation_t::background_batch &&
+        route.value().descriptor.isolated &&
+        native_entity_rva(request.entity, attestation_rva) &&
+        request.type_evidence.empty() &&
+        state.config.batch_attestation_enabled &&
+        state.config.batch_attestation_sample_rate > 1 &&
+        attestation_sampled_for_job(state, request, route.value().descriptor.identity,
+            attestation_rva);
     op.renderer = renderer_settings(request);
     op.evidence = resolve_render_evidence(state, request);
     op.provider_key = make_cache_key(
@@ -2068,6 +2792,133 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
     return std::nullopt;
 }
 
+bool renderer_settings_equal(
+    const decompiler_renderer_settings_t& left,
+    const decompiler_renderer_settings_t& right) noexcept
+{
+    return left.schema_version == right.schema_version && left.style_id == right.style_id &&
+           left.indentation_spaces == right.indentation_spaces &&
+           left.emit_type_annotations == right.emit_type_annotations &&
+           left.emit_provenance_annotations == right.emit_provenance_annotations &&
+           left.emit_unknown_tokens == right.emit_unknown_tokens &&
+           left.emit_comments == right.emit_comments &&
+           left.emit_resolved_symbols == right.emit_resolved_symbols &&
+           left.emit_enum_case_names == right.emit_enum_case_names &&
+           left.readability == right.readability;
+}
+
+void record_attestation_mismatch(
+    service_state_data_t& state,
+    const decompiler_pipeline_request_t& request,
+    const pipeline_operation_t& op) noexcept
+{
+    std::uint64_t function_rva = 0;
+    native_entity_rva(request.entity, function_rva);
+    const auto identity_hash = stable_serialization_hash(op.provider_key).to_hex();
+    {
+        std::lock_guard lock(state.attest_mutex);
+        ++state.attestation_mismatch;
+    }
+    ::diag::log_tagged_fmt("decompiler",
+        "attestation_mismatch function_rva=0x%llx generation=%llu job_identity_hash=%s",
+        static_cast<unsigned long long>(function_rva),
+        static_cast<unsigned long long>(request.workspace_generation),
+        identity_hash.c_str());
+}
+
+decompiler_pipeline_status_t pipeline_back_attestation_validated(
+    pipeline_operation_t& op,
+    std::vector<semantic_refinement_fact_t> semantic_facts,
+    std::vector<decompiler_diagnostic_t> diagnostics)
+{
+    auto& state = *op.state;
+    auto& request = op.request;
+    auto& result = op.result;
+    const auto& renderer = op.renderer;
+
+    if (!state.cache->is_current_generation(request.workspace_id, request.workspace_generation)) {
+        diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::cache_key_rejected,
+            "decompiler.pipeline.generation.stale"));
+        result.diagnostics = std::move(diagnostics);
+        return decompiler_pipeline_status_t::stale_generation;
+    }
+    if (op.operation_cancel.stop_requested()) {
+        diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            op.operation_cancel.deadline_exceeded() ? decompiler_diagnostic_code_t::deadline_exceeded
+                                                    : decompiler_diagnostic_code_t::cancelled,
+            "decompiler.pipeline.cancelled.before_render"));
+        result.diagnostics = std::move(diagnostics);
+        return op.operation_cancel.deadline_exceeded()
+            ? decompiler_pipeline_status_t::deadline_exceeded
+            : decompiler_pipeline_status_t::cancelled;
+    }
+    if (!op.attested_document || !result.provider_stage) {
+        diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.pipeline.provider.attested_document_required"));
+        result.diagnostics = std::move(diagnostics);
+        return decompiler_pipeline_status_t::provider_failed;
+    }
+    const auto& worker_document = *op.attested_document;
+    if (!validate_decompiler_document(worker_document).valid() ||
+        worker_document.entity != request.entity ||
+        worker_document.profile != request.profile ||
+        !renderer_settings_equal(worker_document.renderer, renderer)) {
+        diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.pipeline.provider.attested_document_binding"));
+        result.diagnostics = std::move(diagnostics);
+        record_attestation_mismatch(state, request, op);
+        return decompiler_pipeline_status_t::provider_failed;
+    }
+    auto readability = readability_report(worker_document, state.config);
+    if (!readability) {
+        diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::malformed_document,
+            "decompiler.pipeline.readability.rejected"));
+        result.diagnostics = std::move(diagnostics);
+        return decompiler_pipeline_status_t::rendering_failed;
+    }
+    result.readability = readability.take_value();
+
+    decompiler_rendered_cache_value_t rendered;
+    rendered.document = std::move(*op.attested_document);
+    rendered.semantic_facts = std::move(semantic_facts);
+    rendered.diagnostics = std::move(diagnostics);
+    normalize_diagnostics(rendered.diagnostics, state.config.max_diagnostics);
+    rendered.provider_wall_clock_ms = result.provider_stage->provider_wall_clock_ms;
+    rendered.provider_cpu_ms = result.provider_stage->provider_cpu_ms;
+    rendered.provider_peak_memory_bytes = result.provider_stage->provider_peak_memory_bytes;
+    result.rendered_stage = std::make_shared<const decompiler_rendered_cache_value_t>(rendered);
+    result.diagnostics = result.rendered_stage->diagnostics;
+    if (cache_writes_enabled(request.cache_mode)) {
+        std::string serialized;
+        auto stored = state.cache->store_rendered(op.rendered_key, std::move(rendered), &serialized);
+        if (!stored) {
+            result.diagnostics.push_back(cache_failure_diagnostic(stored.error()));
+            if (stored.error().code == workspace_error_code_t::stale_generation ||
+                stored.error().code == workspace_error_code_t::integrity_failure)
+                return cache_error_status(stored.error());
+        }
+        persist_rendered_row(state, request, op.rendered_key, *result.rendered_stage,
+            std::move(serialized));
+    }
+    if (!state.cache->is_current_generation(request.workspace_id, request.workspace_generation)) {
+        result.diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::cache_key_rejected,
+            "decompiler.pipeline.generation.stale"));
+        return decompiler_pipeline_status_t::stale_generation;
+    }
+    return decompiler_pipeline_status_t::completed;
+}
+
 decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
 {
     auto& state = *op.state;
@@ -2084,6 +2935,17 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
             "decompiler.pipeline.generation.stale"));
         return decompiler_pipeline_status_t::stale_generation;
     }
+
+    const bool batch_validated_attestation =
+        request.invocation == decompiler_pipeline_invocation_t::background_batch &&
+        !op.attestation_sampled &&
+        op.attested_document.has_value() &&
+        request.type_evidence.empty() &&
+        state.config.batch_attestation_enabled &&
+        state.config.batch_attestation_sample_rate > 1 &&
+        !result.normalized_stage;
+    std::vector<semantic_refinement_fact_t> attestation_facts;
+    std::vector<decompiler_diagnostic_t> attestation_diagnostics;
 
     if (!result.normalized_stage) {
         auto hir = result.provider_stage->provider_hir
@@ -2130,7 +2992,7 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
         auto semantic_queries = result.provider_stage->semantic_queries;
         if (budget.profile == decompiler_profile_id_t::thorough &&
             budget.semantic_proofs_enabled && semantic_queries.empty())
-            semantic_queries = produce_semantic_queries(hir, budget.max_semantic_queries);
+            semantic_queries = produce_semantic_queries(hir, type_graph, budget.max_semantic_queries);
         if (budget.profile == decompiler_profile_id_t::thorough &&
             budget.semantic_proofs_enabled && !semantic_queries.empty()) {
             semantic_refinement_request_t refinement_request;
@@ -2169,6 +3031,11 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
             semantic_facts = refinement.facts;
         }
 
+        if (batch_validated_attestation) {
+            attestation_facts = std::move(semantic_facts);
+            attestation_diagnostics = std::move(diagnostics);
+        }
+        if (!batch_validated_attestation) {
         typed_ast_v2_build_request_t ast_request;
         ast_request.limits = state.config.ast_limits;
         ast_request.limits.max_hir_values = static_cast<std::size_t>(
@@ -2200,12 +3067,17 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
                       *ast_build.ast, type_graph, to_rt_settings(renderer.readability));
             append_diagnostics(diagnostics, readability_result.diagnostics);
             if (readability_result.succeeded()) {
-                ::diag::log_tagged_fmt("decompiler", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u evidence=%d",
+                ::diag::log_tagged_fmt("decompiler", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u string_literals=%u cast_masks=%u bit_ops=%u loop_intrinsics=%u magic_divisions=%u evidence=%d",
                     static_cast<unsigned int>(readability_result.metrics.variables_renamed),
                     static_cast<unsigned int>(readability_result.metrics.constants_folded),
                     static_cast<unsigned int>(readability_result.metrics.identities_simplified),
                     static_cast<unsigned int>(readability_result.metrics.temporaries_inlined),
                     static_cast<unsigned int>(readability_result.metrics.dead_stores_eliminated),
+                    static_cast<unsigned int>(readability_result.metrics.string_literals_inlined),
+                    static_cast<unsigned int>(readability_result.metrics.cast_masks_folded),
+                    static_cast<unsigned int>(readability_result.metrics.bit_operation_idioms_rewritten),
+                    static_cast<unsigned int>(readability_result.metrics.loop_intrinsics_rewritten),
+                    static_cast<unsigned int>(readability_result.metrics.magic_divisions_recognized),
                     transform_evidence ? 1 : 0);
             } else {
                 ::diag::log_tagged_fmt("decompiler", "readability_transforms status=warning_no_transform continuing_with_unmodified_ast");
@@ -2245,6 +3117,13 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
                     return cache_error_status(stored.error());
             }
         }
+        }
+    }
+
+    if (batch_validated_attestation) {
+        op.attestation_validated = true;
+        return pipeline_back_attestation_validated(
+            op, std::move(attestation_facts), std::move(attestation_diagnostics));
     }
 
     if (!state.cache->is_current_generation(request.workspace_id, request.workspace_generation)) {
@@ -2307,6 +3186,7 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
             decompiler_diagnostic_code_t::worker_protocol_failure,
             "decompiler.pipeline.provider.attested_document_mismatch"));
         result.diagnostics = std::move(diagnostics);
+        record_attestation_mismatch(state, request, op);
         return decompiler_pipeline_status_t::provider_failed;
     }
     if (op.deferred_intermediate_cache_writes && cache_writes_enabled(request.cache_mode) &&
@@ -2344,14 +3224,16 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
     result.rendered_stage = std::make_shared<const decompiler_rendered_cache_value_t>(rendered);
     result.diagnostics = result.rendered_stage->diagnostics;
     if (cache_writes_enabled(request.cache_mode)) {
-        auto stored = state.cache->store_rendered(op.rendered_key, std::move(rendered));
+        std::string serialized;
+        auto stored = state.cache->store_rendered(op.rendered_key, std::move(rendered), &serialized);
         if (!stored) {
             result.diagnostics.push_back(cache_failure_diagnostic(stored.error()));
             if (stored.error().code == workspace_error_code_t::stale_generation ||
                 stored.error().code == workspace_error_code_t::integrity_failure)
                 return cache_error_status(stored.error());
         }
-        persist_rendered_row(state, request, op.rendered_key, *result.rendered_stage);
+        persist_rendered_row(state, request, op.rendered_key, *result.rendered_stage,
+            std::move(serialized));
     }
     if (!state.cache->is_current_generation(request.workspace_id, request.workspace_generation)) {
         result.diagnostics.push_back(pipeline_diagnostic(
@@ -2372,6 +3254,15 @@ decompiler_pipeline_status_t pipeline_back(pipeline_operation_t& op)
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - back_started).count()));
     attest_ratio_sample(*op.state, dispatch_ms, attest_ms);
+    if (status == decompiler_pipeline_status_t::completed &&
+        op.request.invocation == decompiler_pipeline_invocation_t::background_batch &&
+        op.attested_document.has_value()) {
+        std::lock_guard lock(op.state->attest_mutex);
+        if (op.attestation_sampled)
+            ++op.state->attestation_sampled_full;
+        else if (op.attestation_validated)
+            ++op.state->attestation_validated;
+    }
     return status;
 }
 
@@ -2611,6 +3502,9 @@ decompiler_pipeline_service_snapshot_t decompiler_pipeline_service_t::snapshot()
         result.attest_stage_completed = state_->attest_completed;
         result.attest_in_flight = state_->attest_in_flight;
         result.attest_in_flight_peak = state_->attest_in_flight_peak;
+        result.attestation_sampled_full = state_->attestation_sampled_full;
+        result.attestation_validated = state_->attestation_validated;
+        result.attestation_mismatch = state_->attestation_mismatch;
     }
     return result;
 }

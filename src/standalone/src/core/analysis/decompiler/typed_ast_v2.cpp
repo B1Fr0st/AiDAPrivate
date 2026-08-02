@@ -1374,6 +1374,50 @@ private:
                 }
             }
         }
+        if (!case_table_resolved && descriptor && !descriptor->cases.empty()) {
+            const auto parse_numeric = [](const std::string& raw, std::uint64_t& numeric) {
+                const char* begin = raw.data();
+                const char* end = begin + raw.size();
+                auto parsed = std::from_chars(begin, end, numeric);
+                if (parsed.ec == std::errc{} && parsed.ptr == end)
+                    return true;
+                if (raw.size() > 2 && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) {
+                    parsed = std::from_chars(begin + 2, end, numeric, 16);
+                    return parsed.ec == std::errc{} && parsed.ptr == end;
+                }
+                return false;
+            };
+            std::vector<std::uint64_t> case_values;
+            case_values.reserve(descriptor->cases.size());
+            for (const auto& entry : descriptor->cases) {
+                std::uint64_t numeric = 0;
+                if (parse_numeric(entry.value, numeric))
+                    case_values.push_back(numeric);
+            }
+            if (case_values.size() >= 2) {
+                std::size_t best_matches = 0;
+                auto best_table = builtin_typelib::equate_table_id_t::ntstatus;
+                for (std::uint8_t table_id = 1;
+                     table_id <= static_cast<std::uint8_t>(builtin_typelib::equate_table_id_t::key_access);
+                     ++table_id) {
+                    const auto table = static_cast<builtin_typelib::equate_table_id_t>(table_id);
+                    std::size_t matches = 0;
+                    for (const auto value : case_values) {
+                        std::string named;
+                        if (builtin_typelib::lookup_equate_table(table, value, named))
+                            ++matches;
+                    }
+                    if (matches > best_matches) {
+                        best_matches = matches;
+                        best_table = table;
+                    }
+                }
+                if (best_matches >= 2 && best_matches * 5 >= case_values.size() * 3) {
+                    case_table = best_table;
+                    case_table_resolved = true;
+                }
+            }
+        }
         const auto case_value_text = [case_table, case_table_resolved](
                 const std::string& raw) {
             if (!case_table_resolved)

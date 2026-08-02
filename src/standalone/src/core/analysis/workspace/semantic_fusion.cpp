@@ -1,4 +1,7 @@
 #include "semantic_fusion.hpp"
+#include "paged_snapshot_view.hpp"
+
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -640,11 +643,29 @@ void collection_abstain(workspace_collection_t& collection,
     collection.abstentions.push_back(std::move(abstention));
 }
 
-workspace_collection_t collect_workspace_evidence(const analysis_workspace_t& workspace,
-                                                   const analysis_snapshot_t& snapshot,
-                                                   const semantic_scope_key_t& scope,
-                                                   const semantic_fusion_request_t& request,
-                                                   const cancellation_token_t& cancel) {
+void log_paged_view_failure(const char* stage, const char* record, std::uint64_t ordinal,
+                            std::uint64_t rows, const workspace_error_t& error) {
+    std::string evidence;
+    for (const auto& detail : error.details) {
+        if (!evidence.empty())
+            evidence.push_back(' ');
+        evidence.append(detail.first);
+        evidence.push_back('=');
+        evidence.append(detail.second);
+    }
+    diag::log_tagged_fmt("semantic_fusion",
+        "paged_view_failure stage=%s record=%s ordinal=%llu rows=%llu code=%s phase='%s' message='%s' evidence='%s'",
+        stage, record, static_cast<unsigned long long>(ordinal),
+        static_cast<unsigned long long>(rows), error.stable_code().c_str(),
+        error.phase.c_str(), error.message.c_str(), evidence.c_str());
+}
+
+workspace_result_t<workspace_collection_t> collect_workspace_evidence(
+    const analysis_workspace_t& workspace,
+    const analysis_snapshot_t& snapshot,
+    const semantic_scope_key_t& scope,
+    const semantic_fusion_request_t& request,
+    const cancellation_token_t& cancel) {
     workspace_collection_t collection;
     const function_record_t* function = nullptr;
     const std::uint64_t expected_address = request.function_address ? request.function_address->value
@@ -662,7 +683,7 @@ workspace_collection_t collect_workspace_evidence(const analysis_workspace_t& wo
         subject.address = scope.function_address;
         collection_abstain(collection, request.budget, semantic_fact_kind_t::metadata, subject,
                            semantic_abstention_reason_t::target_not_found);
-        return collection;
+        return workspace_result_t<workspace_collection_t>::success(std::move(collection));
     }
 
     std::vector<const basic_block_record_t*> blocks;
@@ -676,13 +697,42 @@ workspace_collection_t collect_workspace_evidence(const analysis_workspace_t& wo
         return lhs->id < rhs->id;
     });
 
+    const auto instruction_rows = instructions_view(snapshot);
+    const auto operand_rows = operand_facts_view(snapshot);
+    const auto target_rows = target_facts_view(snapshot);
+    fact_page_pin_t instruction_pin;
+    fact_page_pin_t operand_pin;
+    fact_page_pin_t target_pin;
     std::vector<const instruction_record_t*> instructions;
-    for (const auto* block : blocks) {
-        for (std::uint32_t offset = 0; offset < block->instruction_count; ++offset) {
-            const std::uint64_t index = static_cast<std::uint64_t>(block->first_instruction) + offset;
-            if (index < snapshot.instructions.size())
-                instructions.push_back(&snapshot.instructions[static_cast<std::size_t>(index)]);
+    std::vector<instruction_record_t> paged_instructions;
+    if (instruction_rows.resident()) {
+        const auto resident = instruction_rows.resident_span();
+        for (const auto* block : blocks) {
+            for (std::uint32_t offset = 0; offset < block->instruction_count; ++offset) {
+                const std::uint64_t index = static_cast<std::uint64_t>(block->first_instruction) + offset;
+                if (index < resident.size())
+                    instructions.push_back(&resident[static_cast<std::size_t>(index)]);
+            }
         }
+    } else {
+        for (const auto* block : blocks) {
+            for (std::uint32_t offset = 0; offset < block->instruction_count; ++offset) {
+                const std::uint64_t index = static_cast<std::uint64_t>(block->first_instruction) + offset;
+                if (index >= instruction_rows.size())
+                    continue;
+                auto instruction_row = instruction_rows.at(index, instruction_pin);
+                if (!instruction_row) {
+                    log_paged_view_failure("collect_workspace_evidence", "instruction", index,
+                                           instruction_rows.size(), instruction_row.error());
+                    return workspace_result_t<workspace_collection_t>::failure(
+                        instruction_row.error());
+                }
+                paged_instructions.push_back(*instruction_row.value());
+            }
+        }
+        instructions.reserve(paged_instructions.size());
+        for (const auto& record : paged_instructions)
+            instructions.push_back(&record);
     }
     std::sort(instructions.begin(), instructions.end(), [](const auto* lhs, const auto* rhs) {
         if (lhs->address != rhs->address)
@@ -718,11 +768,11 @@ workspace_collection_t collect_workspace_evidence(const analysis_workspace_t& wo
             if (cancel.deadline_exceeded()) {
                 collection.cancelled = true;
                 collection.deadline_exceeded = true;
-                return collection;
+                return workspace_result_t<workspace_collection_t>::success(std::move(collection));
             }
             if (cancel.cancellation_requested() || cancel.stop_requested()) {
                 collection.cancelled = true;
-                return collection;
+                return workspace_result_t<workspace_collection_t>::success(std::move(collection));
             }
         }
 
@@ -738,9 +788,15 @@ workspace_collection_t collect_workspace_evidence(const analysis_workspace_t& wo
              ++operand_offset) {
             const std::uint64_t operand_index =
                 static_cast<std::uint64_t>(instruction.operand_fact_begin) + operand_offset;
-            if (operand_index >= snapshot.operand_facts.size())
+            if (operand_index >= operand_rows.size())
                 break;
-            const operand_fact_t& operand = snapshot.operand_facts[static_cast<std::size_t>(operand_index)];
+            auto operand_row = operand_rows.at(operand_index, operand_pin);
+            if (!operand_row) {
+                log_paged_view_failure("collect_workspace_evidence", "operand", operand_index,
+                                       operand_rows.size(), operand_row.error());
+                return workspace_result_t<workspace_collection_t>::failure(operand_row.error());
+            }
+            const operand_fact_t& operand = *operand_row.value();
             const semantic_location_t location = location_from_operand(operand);
 
             if (operand.kind == operand_kind_t::reg) {
@@ -890,9 +946,15 @@ workspace_collection_t collect_workspace_evidence(const analysis_workspace_t& wo
              ++target_offset) {
             const std::uint64_t target_index =
                 static_cast<std::uint64_t>(instruction.target_fact_begin) + target_offset;
-            if (target_index >= snapshot.target_facts.size())
+            if (target_index >= target_rows.size())
                 break;
-            const target_fact_t& target = snapshot.target_facts[static_cast<std::size_t>(target_index)];
+            auto target_row = target_rows.at(target_index, target_pin);
+            if (!target_row) {
+                log_paged_view_failure("collect_workspace_evidence", "target", target_index,
+                                       target_rows.size(), target_row.error());
+                return workspace_result_t<workspace_collection_t>::failure(target_row.error());
+            }
+            const target_fact_t& target = *target_row.value();
             if (target.kind == target_kind_record_t::data ||
                 target.kind == target_kind_record_t::fallthrough)
                 continue;
@@ -1022,7 +1084,7 @@ workspace_collection_t collect_workspace_evidence(const analysis_workspace_t& wo
         append(std::move(thunk));
     }
 
-    return collection;
+    return workspace_result_t<workspace_collection_t>::success(std::move(collection));
 }
 
 void append_collection_abstentions(semantic_fusion_result_t& result,
@@ -1427,7 +1489,10 @@ workspace_result_t<semantic_fusion_result_t> fuse_semantic_evidence(
     workspace_collection_t collection;
     if (request.derive_workspace_evidence) {
         if (snapshot) {
-            collection = collect_workspace_evidence(workspace, *snapshot, scope, request, cancel);
+            auto collected = collect_workspace_evidence(workspace, *snapshot, scope, request, cancel);
+            if (!collected)
+                return workspace_result_t<semantic_fusion_result_t>::failure(collected.error());
+            collection = collected.take_value();
             evidence.insert(evidence.end(), collection.evidence.begin(), collection.evidence.end());
         } else {
             semantic_subject_t subject;

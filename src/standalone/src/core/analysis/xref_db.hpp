@@ -2,16 +2,14 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <limits>
-#include <map>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "workspace/string_arena.hpp"
+#include "workspace/publication_indexes.hpp"
 #include "xref_engine.hpp"
 
 namespace xref_db {
@@ -154,6 +152,13 @@ inline aida::analysis::workspace_result_t<module_index_t> build_module_index(
 	if (stopped(workspace, cancel))
 		return workspace_result_t<module_index_t>::failure(
 			cancellation_error(workspace, cancel, "xref_db.workspace_index"));
+	auto indexes = publication_indexes::for_publication_result(publication, cancel);
+	if (!indexes) {
+		if (indexes.error().cancellation || indexes.error().deadline)
+			return workspace_result_t<module_index_t>::failure(
+				cancellation_error(workspace, cancel, "xref_db.workspace_index"));
+		return workspace_result_t<module_index_t>::failure(indexes.error());
+	}
 	const auto& snapshot = publication->snapshot;
 	const auto& image = snapshot->image;
 	module_index_t result;
@@ -163,32 +168,35 @@ inline aida::analysis::workspace_result_t<module_index_t> build_module_index(
 		image->image_size(), (std::numeric_limits<uint32_t>::max)()));
 	result.timestamp = image->timestamp();
 	result.built = snapshot->baseline_complete;
-	size_t visited = 0;
-	for (const auto& record : snapshot->xrefs) {
-		if ((++visited & 0xFFFu) == 0 && stopped(workspace, cancel))
+	auto pairs = indexes.value()->module_index_pairs(
+		[&workspace](const address_t& address) {
+			return xref_engine::workspace_display_address(workspace, address);
+		},
+		[](xref_kind_t kind) {
+			return static_cast<int>(xref_engine::workspace_xref_type(kind));
+		},
+		cancel,
+		[&workspace, &cancel] { return detail::stopped(workspace, cancel); });
+	if (!pairs) {
+		if (pairs.error().cancellation || pairs.error().deadline)
 			return workspace_result_t<module_index_t>::failure(
 				cancellation_error(workspace, cancel, "xref_db.workspace_index"));
-		xref_entry_v2_t entry;
-		entry.from_addr = xref_engine::workspace_display_address(workspace, record.source);
-		entry.to_addr = xref_engine::workspace_display_address(workspace, record.target);
-		if (entry.from_addr == 0 || entry.to_addr == 0) continue;
-		entry.type = xref_engine::workspace_xref_type(record.kind);
-		result.to_sorted.push_back(entry);
-		result.from_sorted.push_back(entry);
-		++result.total_xrefs;
+		return workspace_result_t<module_index_t>::failure(pairs.error());
 	}
-	auto to_order = [](const xref_entry_v2_t& left, const xref_entry_v2_t& right) {
-		if (left.to_addr != right.to_addr) return left.to_addr < right.to_addr;
-		if (left.from_addr != right.from_addr) return left.from_addr < right.from_addr;
-		return static_cast<int>(left.type) < static_cast<int>(right.type);
+	const auto fill = [](const std::vector<publication_indexes::module_entry_t>& source,
+		std::vector<xref_entry_v2_t>& output) {
+		output.reserve(source.size());
+		for (const auto& item : source) {
+			xref_entry_v2_t entry;
+			entry.from_addr = item.from;
+			entry.to_addr = item.to;
+			entry.type = static_cast<xref_engine::xref_type_t>(item.type);
+			output.push_back(entry);
+		}
 	};
-	auto from_order = [](const xref_entry_v2_t& left, const xref_entry_v2_t& right) {
-		if (left.from_addr != right.from_addr) return left.from_addr < right.from_addr;
-		if (left.to_addr != right.to_addr) return left.to_addr < right.to_addr;
-		return static_cast<int>(left.type) < static_cast<int>(right.type);
-	};
-	std::sort(result.to_sorted.begin(), result.to_sorted.end(), to_order);
-	std::sort(result.from_sorted.begin(), result.from_sorted.end(), from_order);
+	fill(pairs.value().first, result.to_sorted);
+	fill(pairs.value().second, result.from_sorted);
+	result.total_xrefs = result.from_sorted.size();
 	return workspace_result_t<module_index_t>::success(std::move(result));
 }
 
@@ -224,16 +232,19 @@ inline aida::analysis::workspace_result_t<std::vector<xref_entry_t>> query_xrefs
 		return workspace_result_t<std::vector<xref_entry_t>>::failure(publication.error());
 	if (limit == 0)
 		return workspace_result_t<std::vector<xref_entry_t>>::success({});
+	auto indexes = publication_indexes::for_publication_result(publication.value(), cancel);
+	if (!indexes)
+		return workspace_result_t<std::vector<xref_entry_t>>::failure(indexes.error());
+	const auto& xrefs = publication.value()->snapshot->xrefs;
 	std::vector<xref_entry_t> result;
 	result.reserve((std::min)(limit, publication.value()->snapshot->xrefs.size()));
+	const auto range = indexes.value()->xrefs_to(normalized.value());
 	size_t visited = 0;
-	for (const auto& record : publication.value()->snapshot->xrefs) {
+	for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
 		if ((++visited & 0xFFFu) == 0 && detail::stopped(workspace, cancel))
 			return workspace_result_t<std::vector<xref_entry_t>>::failure(
 				detail::cancellation_error(workspace, cancel, "xref_db.query_to"));
-		if (record.target.space != normalized.value().space ||
-			record.target.value != normalized.value().value)
-			continue;
+		const auto& record = xrefs[indexes.value()->xref_to_entry(ordinal)];
 		xref_entry_t entry;
 		entry.from_addr = xref_engine::workspace_display_address(workspace, record.source);
 		entry.to_addr = xref_engine::workspace_display_address(workspace, record.target);
@@ -264,16 +275,19 @@ inline aida::analysis::workspace_result_t<std::vector<xref_entry_t>> query_xrefs
 		return workspace_result_t<std::vector<xref_entry_t>>::failure(publication.error());
 	if (limit == 0)
 		return workspace_result_t<std::vector<xref_entry_t>>::success({});
+	auto indexes = publication_indexes::for_publication_result(publication.value(), cancel);
+	if (!indexes)
+		return workspace_result_t<std::vector<xref_entry_t>>::failure(indexes.error());
+	const auto& xrefs = publication.value()->snapshot->xrefs;
 	std::vector<xref_entry_t> result;
 	result.reserve((std::min)(limit, publication.value()->snapshot->xrefs.size()));
+	const auto range = indexes.value()->xrefs_from(normalized.value());
 	size_t visited = 0;
-	for (const auto& record : publication.value()->snapshot->xrefs) {
+	for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
 		if ((++visited & 0xFFFu) == 0 && detail::stopped(workspace, cancel))
 			return workspace_result_t<std::vector<xref_entry_t>>::failure(
 				detail::cancellation_error(workspace, cancel, "xref_db.query_from"));
-		if (record.source.space != normalized.value().space ||
-			record.source.value != normalized.value().value)
-			continue;
+		const auto& record = xrefs[indexes.value()->xref_from_entry(ordinal)];
 		xref_entry_t entry;
 		entry.from_addr = xref_engine::workspace_display_address(workspace, record.source);
 		entry.to_addr = xref_engine::workspace_display_address(workspace, record.target);
@@ -301,83 +315,22 @@ inline aida::analysis::workspace_result_t<std::vector<call_graph_node_t>> build_
 	if (!publication)
 		return workspace_result_t<std::vector<call_graph_node_t>>::failure(
 			publication.error());
-	const auto& snapshot = publication.value()->snapshot;
-	std::vector<const function_record_t*> functions;
-	functions.reserve(snapshot->functions.size());
-	for (const auto& function : snapshot->functions) functions.push_back(&function);
-	std::sort(functions.begin(), functions.end(), [](const auto* left, const auto* right) {
-		return left->start < right->start;
-	});
-	std::unordered_map<entity_id_t, std::string> names;
-	names.reserve(snapshot->symbols.size());
-	for (const auto& symbol : snapshot->symbols) {
-		if (!symbol.name.empty()) names.emplace(symbol.id, symbol.name);
-	}
-	std::map<uint64_t, call_graph_node_t> nodes;
-	auto enclosing = [&](const address_t& address) -> const function_record_t* {
-		auto found = std::upper_bound(functions.begin(), functions.end(), address,
-			[](const auto& value, const auto* function) { return value < function->start; });
-		if (found == functions.begin()) return nullptr;
-		--found;
-		const auto* function = *found;
-		if (address.space != function->start.space ||
-			address.value < function->start.value ||
-			address.value >= function->end.value)
-			return nullptr;
-		return function;
-	};
-	auto assign_name = [&](call_graph_node_t& node, const function_record_t* function) {
-		if (!node.name.empty()) return;
-		if (function && function->symbol_id) {
-			const auto found = names.find(*function->symbol_id);
-			if (found != names.end()) node.name = found->second;
-		}
-		if (node.name.empty()) {
-			char text[32]{};
-			std::snprintf(text, sizeof(text), "sub_%llX",
-				static_cast<unsigned long long>(node.addr));
-			node.name = text;
-		}
-	};
-	size_t visited = 0;
-	for (const auto& edge : snapshot->xrefs) {
-		if ((++visited & 0xFFFu) == 0 && detail::stopped(workspace, cancel))
+	auto indexes = publication_indexes::for_publication_result(publication.value(), cancel);
+	if (!indexes) {
+		if (indexes.error().cancellation || indexes.error().deadline)
 			return workspace_result_t<std::vector<call_graph_node_t>>::failure(
 				detail::cancellation_error(workspace, cancel, "xref_db.call_graph"));
-		if (edge.kind != xref_kind_t::call) continue;
-		const auto* caller_function = enclosing(edge.source);
-		const auto* callee_function = enclosing(edge.target);
-		const address_t& caller_address = caller_function ? caller_function->start : edge.source;
-		const address_t& callee_address = callee_function ? callee_function->start : edge.target;
-		const uint64_t caller = xref_engine::workspace_display_address(workspace, caller_address);
-		const uint64_t callee = xref_engine::workspace_display_address(workspace, callee_address);
-		if (caller == 0 || callee == 0) continue;
-			auto& caller_node = nodes[caller];
-			caller_node.addr = caller;
-			auto& callee_node = nodes[callee];
-			callee_node.addr = callee;
-			assign_name(caller_node, caller_function);
-			assign_name(callee_node, callee_function);
-			if (std::find(caller_node.callees.begin(), caller_node.callees.end(), callee)
-				== caller_node.callees.end())
-				caller_node.callees.push_back(callee);
-			if (std::find(callee_node.callers.begin(), callee_node.callers.end(), caller)
-				== callee_node.callers.end())
-				callee_node.callers.push_back(caller);
-			if (nodes.size() > max_nodes) {
-				return workspace_result_t<std::vector<call_graph_node_t>>::failure(
-					make_workspace_error(workspace_error_code_t::limit_exceeded,
-						"Call graph exceeded its node limit", "xref_db.call_graph"));
-			}
+		return workspace_result_t<std::vector<call_graph_node_t>>::failure(indexes.error());
 	}
-	std::vector<call_graph_node_t> result;
-	result.reserve(nodes.size());
-	for (auto& item : nodes) {
-		std::sort(item.second.callees.begin(), item.second.callees.end());
-		std::sort(item.second.callers.begin(), item.second.callers.end());
-		result.push_back(std::move(item.second));
+	auto graph = indexes.value()->call_graph(max_nodes, cancel,
+		[&workspace, &cancel] { return detail::stopped(workspace, cancel); });
+	if (!graph) {
+		if (graph.error().cancellation || graph.error().deadline)
+			return workspace_result_t<std::vector<call_graph_node_t>>::failure(
+				detail::cancellation_error(workspace, cancel, "xref_db.call_graph"));
+		return workspace_result_t<std::vector<call_graph_node_t>>::failure(graph.error());
 	}
-	return workspace_result_t<std::vector<call_graph_node_t>>::success(std::move(result));
+	return workspace_result_t<std::vector<call_graph_node_t>>::success(*graph.value());
 }
 
 inline size_t total_indexed_xrefs(

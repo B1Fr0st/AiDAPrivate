@@ -4,6 +4,10 @@
 
 #include "../../infra/taskflow_runtime.hpp"
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../infra/host_topology.hpp"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -27,8 +31,12 @@ struct parallel_shard_t {
 };
 
 inline std::uint32_t parallel_worker_count() noexcept {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    return aida::infra::host_topology::recommended_compute_threads();
+#else
     const auto hardware = std::thread::hardware_concurrency();
     return (std::min<std::uint32_t>)(64U, (std::max<std::uint32_t>)(1U, hardware));
+#endif
 }
 
 inline std::vector<parallel_shard_t> parallel_shards(std::size_t count,

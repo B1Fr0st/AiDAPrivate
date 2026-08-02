@@ -27,6 +27,7 @@
 #include "zydis_disasm.hpp"
 #include "../analysis/workspace/live_snapshot_provider.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
+#include "../analysis/workspace/publication_indexes.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../session/analysis_session.hpp"
 
@@ -282,11 +283,12 @@ namespace function_index {
 		}
 		if (names.publication && names.publication->snapshot &&
 			names.publication->generation == names.workspace->generation()) {
-			for (const auto& symbol : names.publication->snapshot->symbols) {
-				if (symbol.address.space == normalized.value().space &&
-					symbol.address.value == normalized.value().value &&
-					!symbol.name.empty())
-					return symbol.name;
+			const auto indexes = aida::analysis::publication_indexes::for_publication(
+				names.publication, {});
+			if (indexes) {
+				const auto* symbol = indexes->symbol_exact_named(normalized.value());
+				if (symbol)
+					return symbol->name;
 			}
 		}
 		return {};
@@ -461,18 +463,19 @@ namespace function_index {
 		auto normalized = normalize_workspace_address(workspace, address);
 		if (!normalized)
 			return workspace_result_t<function_record_t>::failure(normalized.error());
-		auto snapshot = workspace->snapshot();
+		auto publication = workspace->analysis_publication();
+		auto snapshot = publication ? publication->snapshot : nullptr;
 		if (!snapshot) {
 			return workspace_result_t<function_record_t>::failure(make_workspace_error(
 				workspace_error_code_t::analysis_in_progress,
 				"Function index is not published yet", "function_index.lookup"));
 		}
-		for (const auto& function : snapshot->functions) {
-			if (function.start.space != normalized.value().space) continue;
-			if (normalized.value().value >= function.start.value &&
-				normalized.value().value < function.end.value)
-				return workspace_result_t<function_record_t>::success(function);
-		}
+		auto indexes = aida::analysis::publication_indexes::for_publication_result(
+			publication, {});
+		if (!indexes)
+			return workspace_result_t<function_record_t>::failure(indexes.error());
+		if (const auto* function = indexes.value()->function_containing(normalized.value()))
+			return workspace_result_t<function_record_t>::success(*function);
 		auto error = make_workspace_error(workspace_error_code_t::target_not_found,
 			"Address is not inside a published function", "function_index.lookup");
 		error.address = normalized.value();
@@ -762,15 +765,17 @@ namespace function_index {
 	{
 		std::vector<aida::analysis::address_t> targets;
 		auto function = workspace_function_for(workspace, address);
-		auto snapshot = workspace ? workspace->snapshot() : nullptr;
+		auto publication = workspace ? workspace->analysis_publication() : nullptr;
+		auto snapshot = publication ? publication->snapshot : nullptr;
 		if (!function || !snapshot) return targets;
-		for (const auto& edge : snapshot->edges) {
+		auto indexes = aida::analysis::publication_indexes::for_publication(
+			publication, {});
+		if (!indexes) return targets;
+		const auto range = indexes->call_edges_from(function.value());
+		for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
+			const auto& edge = snapshot->edges[indexes->call_edge_entry(ordinal)];
 			if (edge.kind != aida::analysis::edge_kind_t::call &&
 				edge.kind != aida::analysis::edge_kind_t::tail_call)
-				continue;
-			if (edge.source.space != function.value().start.space ||
-				edge.source.value < function.value().start.value ||
-				edge.source.value >= function.value().end.value)
 				continue;
 			targets.push_back(edge.target);
 		}
@@ -800,15 +805,14 @@ namespace function_index {
 		const aida::analysis::address_t& address)
 	{
 		auto normalized = normalize_workspace_address(workspace, address);
-		auto snapshot = workspace ? workspace->snapshot() : nullptr;
+		auto publication = workspace ? workspace->analysis_publication() : nullptr;
+		auto snapshot = publication ? publication->snapshot : nullptr;
 		if (!normalized || !snapshot) return {};
-		for (const auto& symbol : snapshot->symbols) {
-			if (symbol.address.space == normalized.value().space &&
-				symbol.address.value == normalized.value().value &&
-				symbol.kind != aida::analysis::symbol_kind_t::function)
-				return symbol.name;
-		}
-		return {};
+		const auto indexes = aida::analysis::publication_indexes::for_publication(
+			publication, {});
+		if (!indexes) return {};
+		const auto* symbol = indexes->data_symbol_exact(normalized.value());
+		return symbol ? symbol->name : std::string();
 	}
 
 	namespace detail {
@@ -3691,13 +3695,10 @@ namespace function_index {
 			publication->generation != workspace->generation())
 			return rows;
 		const function_record_t* function = nullptr;
-		for (const auto& candidate : publication->snapshot->functions) {
-			if (candidate.start.space == normalized.value().space &&
-				candidate.start.value == normalized.value().value) {
-				function = &candidate;
-				break;
-			}
-		}
+		const auto indexes = aida::analysis::publication_indexes::for_publication(
+			publication, {});
+		if (indexes)
+			function = indexes->function_at_exact_start(normalized.value());
 		if (!function) return rows;
 		const uint64_t display_address = workspace_display_address(
 			workspace, function->start);

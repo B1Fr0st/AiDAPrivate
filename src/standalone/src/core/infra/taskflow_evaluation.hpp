@@ -33,6 +33,13 @@ inline constexpr const char* kTaskflowIntegrationReason = "Taskflow v3.11.0 is C
 inline constexpr const char* kTaskflowCompletionReason = "Standalone-wide MCP, Test Lab, startup graph, producer-domain, and security lifecycle scheduling now uses the central Taskflow runtime/executor architecture with legacy queue wrappers removed";
 inline constexpr const char* kTaskflowRejectionReason = "none_integration_complete";
 
+inline constexpr bool kTaskflowHostTopologyServiceIntegrated = true;
+inline constexpr bool kTaskflowFeatureWorkerTopologySized = true;
+inline constexpr bool kTaskflowDynamicPoolPriorityEnabled = true;
+inline constexpr bool kTaskflowHotLogDigestGatingEnabled = true;
+inline constexpr bool kTaskflowFairnessWaitRingEnabled = true;
+inline constexpr bool kTaskflowMimallocNewDeleteOverrideIntegrated = true;
+
 inline constexpr const char* kTaskflowSourceEvidenceExecutor = ".deps/taskflow/taskflow/core/executor.hpp:_spawn starts workers through aida::infra::win_thread::joinable_thread_t and maps workers by GetCurrentThreadId";
 inline constexpr const char* kTaskflowSourceEvidenceWorkerThread = ".deps/taskflow/taskflow/core/worker.hpp stores aida::infra::win_thread::joinable_thread_t _thread";
 inline constexpr const char* kTaskflowSourceEvidenceRuntime = "taskflow_runtime.hpp defines task_descriptor_t, job_handle_t, executor_domain_t, submit, submit_graph, cancel, wait_for, check_deadlines, active_snapshot, snapshot_json_string, all_pools_quiescent, and shutdown";

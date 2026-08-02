@@ -52,6 +52,8 @@ std::uint64_t elapsed_ns(std::chrono::steady_clock::time_point begin) {
         std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
 }
 
+constexpr std::size_t kCandidateShardFloor = 4096;
+
 std::size_t pass_shard_count(std::size_t items, std::size_t items_per_shard) {
     if (items == 0)
         return 0;

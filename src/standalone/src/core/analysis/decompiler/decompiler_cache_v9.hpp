@@ -122,6 +122,10 @@ public:
     workspace_result_t<void> store_rendered(
         decompiler_pipeline_cache_key_t key,
         decompiler_rendered_cache_value_t value);
+    workspace_result_t<void> store_rendered(
+        decompiler_pipeline_cache_key_t key,
+        decompiler_rendered_cache_value_t value,
+        std::string* serialized_out);
 
     workspace_result_t<void> invalidate_stage(
         const std::string& workspace_id,

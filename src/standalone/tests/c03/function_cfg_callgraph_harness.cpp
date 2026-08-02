@@ -734,7 +734,8 @@ void append_cfg_instruction(analysis_snapshot_t& snapshot, std::uint64_t rva,
         instruction.operand_fact_begin =
             static_cast<std::uint32_t>(snapshot.operand_facts.size());
         instruction.operand_fact_count = 1;
-        snapshot.operand_facts.push_back(std::move(operand));
+        snapshot.operand_facts.append(operand,
+            static_cast<std::uint32_t>(snapshot.instructions.size()));
     }
     instruction.target_fact_begin =
         static_cast<std::uint32_t>(snapshot.target_facts.size());

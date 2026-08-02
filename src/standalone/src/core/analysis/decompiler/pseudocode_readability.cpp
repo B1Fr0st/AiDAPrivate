@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <optional>
@@ -887,8 +888,8 @@ struct rt_def_use_entry_t {
     bool has_side_effects = false;
 };
 
-constexpr std::size_t k_max_transform_nodes = 10000;
 constexpr std::size_t k_max_parent_chain_depth = 512;
+constexpr std::size_t k_max_member_chain_depth = 8;
 
 class rt_transformer_t {
 public:
@@ -912,7 +913,7 @@ public:
                 "readability.empty_ast", std::nullopt));
             return result;
         }
-        if (ast_.nodes.size() > k_max_transform_nodes) {
+        if (ast_.nodes.size() > settings_.max_transform_nodes) {
             result.diagnostics.push_back(rt_make_diagnostic(
                 decompiler_diagnostic_code_t::resource_limit,
                 "readability.node_limit_exceeded", std::nullopt));
@@ -922,20 +923,22 @@ public:
         build_evidence_maps();
         next_node_id_ = ast_.nodes.back().id + 1;
         collect_variable_info(ast_.root_node_id, 0, false, false);
-        if (settings_.enable_loop_counter_naming)
+        if (settings_.enable_loop_counter_naming && !work_budget_exceeded_)
             detect_loop_counters(ast_.root_node_id, 0);
-        if (settings_.enable_api_call_naming)
+        if (settings_.enable_api_call_naming && !work_budget_exceeded_)
             detect_api_calls(ast_.root_node_id);
-        if (settings_.enable_string_reference_naming)
+        if (settings_.enable_string_reference_naming && !work_budget_exceeded_)
             detect_string_references(ast_.root_node_id);
-        if (settings_.enable_type_based_naming)
+        if (settings_.enable_type_based_naming && !work_budget_exceeded_)
             compute_type_based_names();
         compute_final_suggested_names();
 
-        if (settings_.enable_variable_renaming && !variables_.empty())
+        if (settings_.enable_variable_renaming && !variables_.empty() && !work_budget_exceeded_)
             apply_renaming();
 
         for (std::size_t iteration = 0; iteration < settings_.max_transform_iterations; ++iteration) {
+            if (work_budget_exceeded_)
+                break;
             bool changed = false;
             if (settings_.enable_expression_simplification)
                 changed = simplify_expressions(ast_.root_node_id, 0, false) || changed;
@@ -944,6 +947,7 @@ public:
                 uses_.clear();
                 std::unordered_set<std::uint64_t> def_use_visited;
                 collect_def_use(ast_.root_node_id, 0, def_use_visited);
+                index_def_use();
                 if (settings_.enable_single_use_inlining)
                     changed = apply_single_use_inlining() || changed;
                 if (settings_.enable_copy_propagation)
@@ -955,20 +959,37 @@ public:
                 break;
         }
 
-        if (settings_.enable_member_name_propagation) {
+        if (settings_.enable_member_name_propagation && !work_budget_exceeded_) {
             apply_member_name_propagation();
             build_index();
         }
-        if (settings_.enable_min_max_idioms) {
+        if (settings_.enable_cast_idiom_folding && !work_budget_exceeded_) {
+            apply_cast_idiom_folding();
+            build_index();
+        }
+        if ((settings_.enable_bit_operation_idioms || settings_.enable_magic_division_recognition) &&
+            !work_budget_exceeded_) {
+            apply_bit_operation_idioms();
+            build_index();
+        }
+        if (settings_.enable_loop_intrinsic_idioms && !work_budget_exceeded_) {
+            apply_loop_intrinsic_idioms();
+            build_index();
+        }
+        if (settings_.enable_string_literal_substitution && !work_budget_exceeded_) {
+            apply_string_literal_substitution();
+            build_index();
+        }
+        if (settings_.enable_min_max_idioms && !work_budget_exceeded_) {
             apply_min_max_idioms();
             build_index();
         }
-        if (settings_.enable_declaration_at_first_use) {
+        if (settings_.enable_declaration_at_first_use && !work_budget_exceeded_) {
             apply_declaration_at_first_use();
             build_index();
         }
-        if (settings_.enable_string_comment_injection || settings_.enable_user_comment_injection ||
-            settings_.enable_idiom_recognition) {
+        if ((settings_.enable_string_comment_injection || settings_.enable_user_comment_injection ||
+             settings_.enable_idiom_recognition) && !work_budget_exceeded_) {
             apply_comment_injection();
             build_index();
         }
@@ -984,7 +1005,10 @@ public:
             metrics_.member_accesses_rewritten > 0 || metrics_.min_max_idioms_rewritten > 0 ||
             metrics_.idioms_recognized > 0 || metrics_.declarations_relocated > 0 ||
             metrics_.string_comments_injected > 0 || metrics_.user_comments_injected > 0 ||
-            metrics_.nodes_removed > 0;
+            metrics_.nodes_removed > 0 || metrics_.string_literals_inlined > 0 ||
+            metrics_.global_scalar_comments_injected > 0 || metrics_.cast_masks_folded > 0 ||
+            metrics_.bit_operation_idioms_rewritten > 0 || metrics_.loop_intrinsics_rewritten > 0 ||
+            metrics_.magic_divisions_recognized > 0;
         result.metrics = metrics_;
         result.diagnostics = std::move(diagnostics_);
         return result;
@@ -1003,15 +1027,41 @@ private:
     std::map<std::string, rt_variable_info_t> variables_;
     std::vector<rt_def_use_entry_t> definitions_;
     std::unordered_map<std::string, std::vector<std::uint64_t>> uses_;
+    std::unordered_map<std::string, std::uint32_t> definition_counts_;
+    std::unordered_map<std::string, std::vector<std::size_t>> definitions_by_variable_;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> pending_compound_removals_;
     std::unordered_map<std::string, std::string> symbol_names_;
     std::unordered_map<std::string, std::vector<std::string>> prototype_params_;
-    std::unordered_map<std::string, std::string> string_literals_;
+    std::unordered_map<std::string, const decompiler_string_evidence_t*> string_literals_;
+    std::unordered_map<std::uint64_t, const decompiler_string_evidence_t*> string_addresses_;
+    std::unordered_map<std::uint64_t, const decompiler_global_scalar_evidence_t*> global_scalars_;
     std::unordered_map<std::string, std::string> member_overlay_;
+    std::unordered_map<std::uint64_t, std::vector<const decompiler_type_edge_t*>> member_edges_;
     std::unordered_map<std::string, std::vector<std::string>> user_comments_before_;
     std::unordered_map<std::string, std::vector<std::string>> user_comments_after_;
+    std::vector<std::pair<std::uint64_t, std::string>> rva_comments_before_;
+    std::vector<std::pair<std::uint64_t, std::string>> rva_comments_after_;
     std::uint64_t next_node_id_ = 1;
     std::size_t comments_injected_ = 0;
     std::uint32_t diagnostic_ordinal_ = 1;
+    std::size_t work_units_ = 0;
+    bool work_budget_exceeded_ = false;
+    bool member_edges_built_ = false;
+
+    bool consume_work(const std::size_t units = 1)
+    {
+        if (work_budget_exceeded_)
+            return false;
+        work_units_ += units;
+        if (work_units_ > settings_.max_transform_work_units) {
+            work_budget_exceeded_ = true;
+            diagnostics_.push_back(rt_make_diagnostic(
+                decompiler_diagnostic_code_t::resource_limit,
+                "readability.work_budget_exceeded", std::nullopt));
+            return false;
+        }
+        return true;
+    }
 
     decompiler_diagnostic_t rt_make_diagnostic(
         decompiler_diagnostic_code_t code,
@@ -1085,10 +1135,18 @@ private:
                 break;
             if (entry.reference_text.empty() || entry.utf8_content.empty())
                 continue;
-            string_literals_.emplace(entry.reference_text, entry.utf8_content);
+            string_literals_.emplace(entry.reference_text, &entry);
             const auto stripped = strip_reference_marker(entry.reference_text);
             if (stripped != entry.reference_text)
-                string_literals_.emplace(stripped, entry.utf8_content);
+                string_literals_.emplace(stripped, &entry);
+            if (entry.absolute_address != 0 && string_addresses_.size() < k_max_evidence_map_entries)
+                string_addresses_.emplace(entry.absolute_address, &entry);
+        }
+        for (const auto& entry : evidence_.global_scalars) {
+            if (global_scalars_.size() >= k_max_evidence_map_entries)
+                break;
+            if (entry.absolute_address != 0 && entry.size_log2 <= 3U)
+                global_scalars_.emplace(entry.absolute_address, &entry);
         }
         for (const auto& entry : evidence_.members) {
             if (member_overlay_.size() >= k_max_evidence_map_entries)
@@ -1101,13 +1159,29 @@ private:
                     member_overlay_selector_key(entry.object_type_canonical, entry.selector_hint), entry.field_name);
         }
         for (const auto& entry : evidence_.user_comments) {
-            if (entry.anchor_text.empty() || entry.comment_text.empty())
+            if (entry.comment_text.empty())
+                continue;
+            if (entry.rva != 0) {
+                auto& target = entry.before_statement ? rva_comments_before_ : rva_comments_after_;
+                if (target.size() < k_max_evidence_map_entries)
+                    target.emplace_back(entry.rva, entry.comment_text);
+                continue;
+            }
+            if (entry.anchor_text.empty())
                 continue;
             auto& target = entry.before_statement ? user_comments_before_ : user_comments_after_;
             auto& list = target[entry.anchor_text];
             if (list.size() < 8)
                 list.push_back(entry.comment_text);
         }
+        const auto order_rva_comments = [](std::vector<std::pair<std::uint64_t, std::string>>& values) {
+            std::sort(values.begin(), values.end(),
+                [](const auto& left, const auto& right) {
+                    return std::tie(left.first, left.second) < std::tie(right.first, right.second);
+                });
+        };
+        order_rva_comments(rva_comments_before_);
+        order_rva_comments(rva_comments_after_);
     }
 
     static std::string member_overlay_key(const std::string& canonical, const std::uint64_t byte_offset)
@@ -1136,7 +1210,67 @@ private:
         return rt_suggest_api_name(resolved, index);
     }
 
-    std::optional<std::string> lookup_string_literal(const std::string& reference_text) const
+    static std::optional<std::uint64_t> parse_address_candidate(const std::string& text)
+    {
+        if (text.empty())
+            return std::nullopt;
+        std::string candidate = strip_reference_marker(text);
+        if (candidate.empty())
+            return std::nullopt;
+        std::size_t offset = 0;
+        int base = 10;
+        if (candidate.size() > 2 && candidate[0] == '0' &&
+            (candidate[1] == 'x' || candidate[1] == 'X')) {
+            base = 16;
+            offset = 2;
+        } else {
+            for (const char* prefix : {"DAT_", "off_", "unk_", "DAT-", "off-", "unk-"}) {
+                const auto length = std::strlen(prefix);
+                if (candidate.size() > length && candidate.compare(0, length, prefix) == 0) {
+                    base = 16;
+                    offset = length;
+                    break;
+                }
+            }
+        }
+        if (offset >= candidate.size() || candidate.size() - offset > 16)
+            return std::nullopt;
+        std::uint64_t value = 0;
+        for (std::size_t index = offset; index < candidate.size(); ++index) {
+            const char character = candidate[index];
+            const auto digit = base == 16
+                ? (character >= '0' && character <= '9' ? character - '0'
+                    : character >= 'a' && character <= 'f' ? character - 'a' + 10
+                    : character >= 'A' && character <= 'F' ? character - 'A' + 10 : -1)
+                : (character >= '0' && character <= '9' ? character - '0' : -1);
+            if (digit < 0)
+                return std::nullopt;
+            if (value > (std::numeric_limits<std::uint64_t>::max)() / 16ULL)
+                return std::nullopt;
+            value = value * static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(digit);
+        }
+        return value;
+    }
+
+    static bool generated_data_identifier(const std::string& text)
+    {
+        for (const char* prefix : {"DAT_", "off_", "unk_"}) {
+            const auto length = std::strlen(prefix);
+            if (text.size() > length && text.compare(0, length, prefix) == 0)
+                return true;
+        }
+        return false;
+    }
+
+    const decompiler_string_evidence_t* lookup_string_address(std::uint64_t address) const
+    {
+        if (address == 0 || string_addresses_.empty())
+            return nullptr;
+        const auto it = string_addresses_.find(address);
+        return it == string_addresses_.end() ? nullptr : it->second;
+    }
+
+    const decompiler_string_evidence_t* lookup_string_literal(const std::string& reference_text) const
     {
         const auto direct = string_literals_.find(reference_text);
         if (direct != string_literals_.end())
@@ -1147,7 +1281,11 @@ private:
             if (alternate != string_literals_.end())
                 return alternate->second;
         }
-        return std::nullopt;
+        if (!string_addresses_.empty()) {
+            if (const auto address = parse_address_candidate(reference_text))
+                return lookup_string_address(*address);
+        }
+        return nullptr;
     }
 
     std::uint64_t make_node(
@@ -1184,7 +1322,7 @@ private:
                                      std::unordered_set<std::uint64_t>& visited)
     {
         if (depth >= settings_.max_expression_depth ||
-            !visited.insert(node_id).second)
+            !visited.insert(node_id).second || !consume_work())
             return;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -1255,7 +1393,7 @@ private:
                                     std::size_t traversal_depth)
     {
         if (traversal_depth >= settings_.max_expression_depth ||
-            !visited.insert(node_id).second)
+            !visited.insert(node_id).second || !consume_work())
             return;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -1331,7 +1469,7 @@ private:
                                         std::size_t depth)
     {
         if (depth >= settings_.max_expression_depth ||
-            !visited.insert(node_id).second)
+            !visited.insert(node_id).second || !consume_work())
             return;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -1353,7 +1491,7 @@ private:
                                            std::size_t depth)
     {
         if (depth >= settings_.max_expression_depth ||
-            !visited.insert(node_id).second)
+            !visited.insert(node_id).second || !consume_work())
             return false;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -1378,7 +1516,7 @@ private:
                                            std::size_t depth)
     {
         if (depth >= settings_.max_expression_depth ||
-            !visited.insert(node_id).second)
+            !visited.insert(node_id).second || !consume_work())
             return false;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -1414,7 +1552,7 @@ private:
                                 std::size_t depth)
     {
         if (depth >= settings_.max_expression_depth ||
-            !visited.insert(node_id).second)
+            !visited.insert(node_id).second || !consume_work())
             return;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -1452,7 +1590,7 @@ private:
                                         std::size_t depth)
     {
         if (depth >= settings_.max_expression_depth ||
-            !visited.insert(node_id).second)
+            !visited.insert(node_id).second || !consume_work())
             return;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -1469,8 +1607,8 @@ private:
                     suggest_string_variable_name(n->stable_text, content);
                 }
             } else if (init != nullptr && init->kind == typed_pseudocode_ast_node_kind_t::identifier) {
-                if (const auto content = lookup_string_literal(init->stable_text))
-                    suggest_string_variable_name(n->stable_text, *content);
+                if (const auto* entry = lookup_string_literal(init->stable_text))
+                    suggest_string_variable_name(n->stable_text, entry->utf8_content);
             }
         }
         for (const auto child_id : n->child_ids)
@@ -1507,6 +1645,41 @@ private:
             const auto suggested = rt_suggest_type_name(type_it->second->display_name);
             if (suggested)
                 info.type_suggested_name = *suggested;
+        }
+        suggest_this_pointer_name();
+    }
+
+    void suggest_this_pointer_name()
+    {
+        const auto* function = node(ast_.root_node_id);
+        if (function == nullptr ||
+            function->kind != typed_pseudocode_ast_node_kind_t::function_definition ||
+            function->child_ids.size() < 2)
+            return;
+        for (std::size_t index = 0; index + 1 < function->child_ids.size(); ++index) {
+            const auto* parameter = node(function->child_ids[index]);
+            if (parameter == nullptr ||
+                parameter->kind != typed_pseudocode_ast_node_kind_t::declaration)
+                continue;
+            const auto it = variables_.find(parameter->stable_text);
+            if (it == variables_.end() || !it->second.is_parameter || !it->second.is_generated ||
+                it->second.type_id == 0)
+                continue;
+            const auto type_it = types_.find(it->second.type_id);
+            if (type_it == types_.end() ||
+                type_it->second->kind != decompiler_type_kind_t::pointer)
+                continue;
+            const auto* pointee = type_graph::find_pointee_edge(type_graph_, it->second.type_id);
+            if (pointee == nullptr)
+                continue;
+            const auto pointee_it = types_.find(pointee->target_type_id);
+            if (pointee_it == types_.end() ||
+                (pointee_it->second->kind != decompiler_type_kind_t::structure &&
+                 pointee_it->second->kind != decompiler_type_kind_t::class_type &&
+                 pointee_it->second->kind != decompiler_type_kind_t::union_type))
+                continue;
+            it->second.type_suggested_name = "this";
+            return;
         }
     }
 
@@ -1593,7 +1766,7 @@ private:
                                     std::unordered_set<std::uint64_t>& visited)
     {
         if (depth >= settings_.max_expression_depth ||
-            !visited.insert(node_id).second)
+            !visited.insert(node_id).second || !consume_work())
             return false;
         auto* n = node(node_id);
         if (n == nullptr)
@@ -1839,6 +2012,21 @@ private:
         return true;
     }
 
+    bool canonical_types_equal(const std::uint64_t left_id, const std::uint64_t right_id) const
+    {
+        if (left_id == right_id && left_id != 0)
+            return true;
+        const auto left_it = types_.find(left_id);
+        const auto right_it = types_.find(right_id);
+        if (left_it == types_.end() || right_it == types_.end())
+            return false;
+        const auto* left = left_it->second;
+        const auto* right = right_it->second;
+        if (left->kind != right->kind || left->canonical_name.empty() || right->canonical_name.empty())
+            return false;
+        return left->canonical_name == right->canonical_name;
+    }
+
     bool try_simplify_redundant_cast(typed_pseudocode_ast_node_t& n)
     {
         if (n.child_ids.size() != 1)
@@ -1871,7 +2059,191 @@ private:
                 }
             }
         }
+        if (canonical_types_equal(child->type_id, n.type_id) &&
+            child->kind != typed_pseudocode_ast_node_kind_t::cast_expression) {
+            copy_node_content(n, *child);
+            ++metrics_.casts_simplified;
+            return true;
+        }
         return false;
+    }
+
+    bool unsigned_mask_for_width(const decompiler_type_node_t* type, std::uint64_t& mask) const
+    {
+        if (type == nullptr || type->kind != decompiler_type_kind_t::unsigned_integer ||
+            !type->byte_size.has_value())
+            return false;
+        const auto size = *type->byte_size;
+        if (size != 1 && size != 2 && size != 4)
+            return false;
+        mask = size == 1 ? 0xFFULL : size == 2 ? 0xFFFFULL : 0xFFFFFFFFULL;
+        return true;
+    }
+
+    bool literal_unsigned_value(const typed_pseudocode_ast_node_t* value, std::uint64_t& result) const
+    {
+        if (value == nullptr || value->kind != typed_pseudocode_ast_node_kind_t::literal)
+            return false;
+        const auto parsed = rt_parse_signed(value->stable_text);
+        if (!parsed || *parsed < 0)
+            return false;
+        result = static_cast<std::uint64_t>(*parsed);
+        return true;
+    }
+
+    bool try_fold_cast_mask(typed_pseudocode_ast_node_t& n)
+    {
+        const auto* operand = node(n.child_ids[0]);
+        if (operand == nullptr ||
+            operand->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            operand->stable_text != "&" || operand->child_ids.size() != 2)
+            return false;
+        std::uint64_t mask = 0;
+        const auto type_it = types_.find(n.type_id);
+        if (type_it == types_.end() || !unsigned_mask_for_width(type_it->second, mask))
+            return false;
+        std::uint64_t applied = 0;
+        const auto* left = node(operand->child_ids[0]);
+        const auto* right = node(operand->child_ids[1]);
+        const bool right_mask = literal_unsigned_value(right, applied) && applied == mask;
+        if (!right_mask && !(literal_unsigned_value(left, applied) && applied == mask))
+            return false;
+        const auto operand_children = operand->child_ids;
+        n.kind = typed_pseudocode_ast_node_kind_t::binary_expression;
+        n.stable_text = "&";
+        n.child_ids = operand_children;
+        ++metrics_.cast_masks_folded;
+        return true;
+    }
+
+    bool try_normalize_comparison_casts(typed_pseudocode_ast_node_t& n)
+    {
+        if (n.child_ids.size() != 2)
+            return false;
+        if (n.stable_text != "==" && n.stable_text != "!=")
+            return false;
+        const auto* left = node(n.child_ids[0]);
+        const auto* right = node(n.child_ids[1]);
+        if (left == nullptr || right == nullptr)
+            return false;
+        bool changed = false;
+        for (std::size_t side = 0; side < 2; ++side) {
+            const auto* cast = node(n.child_ids[side]);
+            if (cast == nullptr ||
+                cast->kind != typed_pseudocode_ast_node_kind_t::cast_expression ||
+                cast->child_ids.size() != 1)
+                continue;
+            const auto* operand = node(cast->child_ids[0]);
+            if (operand == nullptr)
+                continue;
+            if (!canonical_types_equal(operand->type_id, cast->type_id))
+                continue;
+            auto* mutable_cast = node(n.child_ids[side]);
+            copy_node_content(*mutable_cast, *operand);
+            ++metrics_.casts_simplified;
+            changed = true;
+        }
+        if (changed)
+            return true;
+        for (std::size_t side = 0; side < 2; ++side) {
+            const auto* cast = node(n.child_ids[side]);
+            if (cast == nullptr ||
+                cast->kind != typed_pseudocode_ast_node_kind_t::cast_expression ||
+                cast->child_ids.size() != 1)
+                continue;
+            const auto* operand = node(cast->child_ids[0]);
+            if (operand == nullptr || operand->kind != typed_pseudocode_ast_node_kind_t::literal)
+                continue;
+            const auto* other = node(n.child_ids[side ^ 1]);
+            if (other == nullptr)
+                continue;
+            const auto type_it = types_.find(cast->type_id);
+            const auto other_it = types_.find(other->type_id);
+            if (type_it == types_.end() || other_it == types_.end() ||
+                !canonical_types_equal(cast->type_id, other->type_id))
+                continue;
+            const auto* cast_type = type_it->second;
+            if (cast_type->kind != decompiler_type_kind_t::unsigned_integer &&
+                cast_type->kind != decompiler_type_kind_t::signed_integer)
+                continue;
+            if (!cast_type->byte_size.has_value() || *cast_type->byte_size == 0 ||
+                *cast_type->byte_size > 8)
+                continue;
+            const auto parsed = rt_parse_signed(operand->stable_text);
+            if (!parsed)
+                continue;
+            const auto bits = *cast_type->byte_size * 8;
+            if (bits < 64) {
+                if (cast_type->kind == decompiler_type_kind_t::unsigned_integer) {
+                    if (*parsed < 0 || static_cast<std::uint64_t>(*parsed) >= (1ULL << bits))
+                        continue;
+                } else {
+                    const auto low = -(static_cast<std::int64_t>(1) << (bits - 1));
+                    const auto high = (static_cast<std::int64_t>(1) << (bits - 1)) - 1;
+                    if (*parsed < low || *parsed > high)
+                        continue;
+                }
+            }
+            auto* mutable_cast = node(n.child_ids[side]);
+            copy_node_content(*mutable_cast, *operand);
+            ++metrics_.casts_simplified;
+            changed = true;
+        }
+        return changed;
+    }
+
+    bool try_cleanup_reinterpret_deref(typed_pseudocode_ast_node_t& n)
+    {
+        if (n.child_ids.size() != 1)
+            return false;
+        const auto* cast = node(n.child_ids[0]);
+        if (cast == nullptr ||
+            cast->kind != typed_pseudocode_ast_node_kind_t::cast_expression ||
+            cast->child_ids.size() != 1)
+            return false;
+        const auto* address_of = node(cast->child_ids[0]);
+        if (address_of == nullptr ||
+            address_of->kind != typed_pseudocode_ast_node_kind_t::unary_expression ||
+            address_of->stable_text != "&" || address_of->child_ids.size() != 1)
+            return false;
+        const auto* operand = node(address_of->child_ids[0]);
+        if (operand == nullptr || operand->kind != typed_pseudocode_ast_node_kind_t::identifier)
+            return false;
+        if (variables_.find(operand->stable_text) == variables_.end())
+            return false;
+        const auto operand_it = types_.find(operand->type_id);
+        const auto cast_it = types_.find(cast->type_id);
+        if (operand_it == types_.end() || cast_it == types_.end())
+            return false;
+        const auto* operand_type = operand_it->second;
+        const auto* cast_type = cast_it->second;
+        const auto integer_kind = [](const decompiler_type_kind_t kind) {
+            return kind == decompiler_type_kind_t::signed_integer ||
+                   kind == decompiler_type_kind_t::unsigned_integer;
+        };
+        if (!integer_kind(operand_type->kind) || !integer_kind(cast_type->kind) ||
+            !operand_type->byte_size.has_value() || !cast_type->byte_size.has_value() ||
+            *operand_type->byte_size != *cast_type->byte_size)
+            return false;
+        copy_node_content(n, *operand);
+        ++metrics_.casts_simplified;
+        return true;
+    }
+
+    void apply_cast_idiom_folding()
+    {
+        for (auto& n : ast_.nodes) {
+            if (!consume_work())
+                return;
+            if (n.kind == typed_pseudocode_ast_node_kind_t::cast_expression &&
+                n.child_ids.size() == 1)
+                try_fold_cast_mask(n);
+            else if (n.kind == typed_pseudocode_ast_node_kind_t::binary_expression)
+                try_normalize_comparison_casts(n);
+            else if (n.kind == typed_pseudocode_ast_node_kind_t::unary_expression &&
+                     n.stable_text == "*" && n.child_ids.size() == 1)
+                try_cleanup_reinterpret_deref(n);
+        }
     }
 
     bool try_mark_compound_assignment(typed_pseudocode_ast_node_t& n)
@@ -1933,7 +2305,7 @@ private:
     void collect_def_use(std::uint64_t node_id, std::uint64_t parent_statement_id,
                          std::unordered_set<std::uint64_t>& visited)
     {
-        if (!visited.insert(node_id).second)
+        if (!visited.insert(node_id).second || !consume_work())
             return;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -2006,13 +2378,26 @@ private:
             collect_def_use(child_id, parent_statement_id, visited);
     }
 
+    void index_def_use()
+    {
+        definition_counts_.clear();
+        definitions_by_variable_.clear();
+        for (std::size_t index = 0; index < definitions_.size(); ++index) {
+            ++definition_counts_[definitions_[index].variable];
+            definitions_by_variable_[definitions_[index].variable].push_back(index);
+        }
+    }
+
     std::size_t count_definitions(const std::string& var) const
     {
-        std::size_t count = 0;
-        for (const auto& def : definitions_)
-            if (def.variable == var)
-                ++count;
-        return count;
+        const auto it = definition_counts_.find(var);
+        return it == definition_counts_.end() ? 0 : it->second;
+    }
+
+    const std::vector<std::size_t>* definitions_for(const std::string& var) const
+    {
+        const auto it = definitions_by_variable_.find(var);
+        return it == definitions_by_variable_.end() ? nullptr : &it->second;
     }
 
     std::size_t count_uses(const std::string& var) const
@@ -2053,16 +2438,42 @@ private:
         const auto it = std::find(compound->child_ids.begin(), compound->child_ids.end(), statement_id);
         if (it == compound->child_ids.end())
             return false;
-        if (compound_id == ast_.body_node_id && compound->child_ids.size() <= 1)
-            return false;
-        compound->child_ids.erase(it);
+        pending_compound_removals_[compound_id].push_back(statement_id);
         return true;
+    }
+
+    void flush_compound_removals()
+    {
+        for (auto& [compound_id, removals] : pending_compound_removals_) {
+            auto* compound = node(compound_id);
+            if (compound == nullptr)
+                continue;
+            std::unordered_set<std::uint64_t> removed;
+            for (const auto statement_id : removals) {
+                if (compound_id == ast_.body_node_id &&
+                    compound->child_ids.size() - removed.size() <= 1)
+                    continue;
+                removed.insert(statement_id);
+            }
+            if (removed.empty())
+                continue;
+            std::vector<std::uint64_t> kept;
+            kept.reserve(compound->child_ids.size() - removed.size());
+            for (const auto child_id : compound->child_ids) {
+                if (removed.find(child_id) == removed.end())
+                    kept.push_back(child_id);
+            }
+            compound->child_ids = std::move(kept);
+        }
+        pending_compound_removals_.clear();
     }
 
     bool apply_single_use_inlining()
     {
         bool changed = false;
         for (const auto& def : definitions_) {
+            if (!consume_work())
+                break;
             if (count_definitions(def.variable) != 1)
                 continue;
             if (count_uses(def.variable) != 1)
@@ -2087,9 +2498,12 @@ private:
             copy_node_content(*use_node, *init_node);
             remove_statement_from_compound(def.statement_id);
             uses_.erase(def.variable);
+            definition_counts_.erase(def.variable);
+            definitions_by_variable_.erase(def.variable);
             ++metrics_.temporaries_inlined;
             changed = true;
         }
+        flush_compound_removals();
         return changed;
     }
 
@@ -2097,6 +2511,8 @@ private:
     {
         bool changed = false;
         for (const auto& def : definitions_) {
+            if (!consume_work())
+                break;
             if (def.has_side_effects)
                 continue;
             if (def.initializer_node_id == 0)
@@ -2131,42 +2547,119 @@ private:
         bool changed = false;
         std::set<std::string> processed;
         for (const auto& def : definitions_) {
+            if (!consume_work())
+                break;
             if (processed.find(def.variable) != processed.end())
                 continue;
             processed.insert(def.variable);
             if (count_uses(def.variable) > 0)
                 continue;
-            std::size_t def_count = count_definitions(def.variable);
-            if (def_count == 0)
+            const auto* entries = definitions_for(def.variable);
+            if (entries == nullptr || entries->empty())
                 continue;
             bool all_safe = true;
-            for (const auto& d : definitions_) {
-                if (d.variable == def.variable && d.has_side_effects) {
+            for (const auto index : *entries) {
+                if (definitions_[index].has_side_effects) {
                     all_safe = false;
                     break;
                 }
             }
             if (!all_safe)
                 continue;
-            for (const auto& d : definitions_) {
-                if (d.variable != def.variable)
-                    continue;
-                remove_statement_from_compound(d.statement_id);
+            for (const auto index : *entries) {
+                remove_statement_from_compound(definitions_[index].statement_id);
                 ++metrics_.dead_stores_eliminated;
                 changed = true;
             }
         }
+        flush_compound_removals();
         return changed;
+    }
+
+    void build_member_edge_index()
+    {
+        if (member_edges_built_)
+            return;
+        member_edges_built_ = true;
+        for (const auto& edge : type_graph_.edges) {
+            if (edge.kind != decompiler_type_edge_kind_t::member || !edge.byte_offset.has_value())
+                continue;
+            member_edges_[edge.source_type_id].push_back(&edge);
+        }
+    }
+
+    const decompiler_type_edge_t* best_member_at(
+        const std::uint64_t struct_type_id,
+        const std::uint64_t byte_offset,
+        const std::uint64_t preferred_type_id,
+        const bool union_object) const
+    {
+        const auto it = member_edges_.find(struct_type_id);
+        if (it == member_edges_.end())
+            return nullptr;
+        const decompiler_type_edge_t* best = nullptr;
+        std::size_t candidates = 0;
+        for (const auto* edge : it->second) {
+            if (*edge->byte_offset != byte_offset)
+                continue;
+            ++candidates;
+            if (best == nullptr || edge->confidence > best->confidence)
+                best = edge;
+        }
+        if (best == nullptr)
+            return nullptr;
+        if (!union_object || candidates < 2)
+            return best;
+        const decompiler_type_edge_t* typed = nullptr;
+        for (const auto* edge : it->second) {
+            if (*edge->byte_offset != byte_offset)
+                continue;
+            const auto edge_type = types_.find(edge->target_type_id);
+            const auto read_type = types_.find(preferred_type_id);
+            if (edge_type == types_.end() || read_type == types_.end())
+                continue;
+            const auto* et = edge_type->second;
+            const auto* rt = read_type->second;
+            if (et->kind != rt->kind || et->is_signed != rt->is_signed ||
+                !et->byte_size.has_value() || !rt->byte_size.has_value() ||
+                *et->byte_size != *rt->byte_size)
+                continue;
+            if (typed != nullptr)
+                return nullptr;
+            typed = edge;
+        }
+        return typed;
     }
 
     void apply_member_name_propagation()
     {
-        for (auto& n : ast_.nodes) {
-            if (n.kind == typed_pseudocode_ast_node_kind_t::member_expression && n.child_ids.size() == 1)
-                try_rename_member_selector(n);
-            else if (n.kind == typed_pseudocode_ast_node_kind_t::unary_expression && n.stable_text == "*" &&
-                     n.child_ids.size() == 1)
-                try_rewrite_deref_member(n);
+        build_member_edge_index();
+        for (std::size_t depth = 0; depth < k_max_member_chain_depth; ++depth) {
+            bool changed = false;
+            for (std::size_t index = 0; index < ast_.nodes.size(); ++index) {
+                if (!consume_work())
+                    return;
+                auto& n = ast_.nodes[index];
+                if (n.kind == typed_pseudocode_ast_node_kind_t::member_expression && n.child_ids.size() == 1) {
+                    const std::string before = n.stable_text;
+                    try_rename_member_selector(n);
+                    changed = changed || n.stable_text != before;
+                } else if (n.kind == typed_pseudocode_ast_node_kind_t::unary_expression &&
+                           n.stable_text == "*" && n.child_ids.size() == 1) {
+                    const auto node_id = n.id;
+                    const auto before_kind = n.kind;
+                    const auto before_text = n.stable_text;
+                    try_rewrite_chain_member(n);
+                    auto* refreshed = node(node_id);
+                    if (refreshed == nullptr)
+                        continue;
+                    if (refreshed->kind == before_kind)
+                        try_rewrite_deref_member(*refreshed);
+                    changed = changed || refreshed->kind != before_kind || refreshed->stable_text != before_text;
+                }
+            }
+            if (!changed)
+                break;
         }
     }
 
@@ -2266,7 +2759,8 @@ private:
         const auto* struct_type = struct_type_for_object(object->type_id, struct_type_id);
         if (struct_type == nullptr)
             return;
-        const auto* member = type_graph::find_member_edge_by_offset(type_graph_, struct_type_id, *offset);
+        const auto* member = best_member_at(struct_type_id, *offset, n.type_id,
+            struct_type->kind == decompiler_type_kind_t::union_type);
         if (member != nullptr && usable_field_name(member->stable_name)) {
             n.stable_text = member->stable_name;
             ++metrics_.member_names_propagated;
@@ -2312,7 +2806,8 @@ private:
             return;
         std::string field_name;
         std::uint64_t field_type_id = 0;
-        const auto* member = type_graph::find_member_edge_by_offset(type_graph_, struct_type_id, offset);
+        const auto* member = best_member_at(struct_type_id, offset, n.type_id,
+            struct_type->kind == decompiler_type_kind_t::union_type);
         if (member != nullptr && usable_field_name(member->stable_name)) {
             field_name = member->stable_name;
             if (types_.find(member->target_type_id) != types_.end())
@@ -2330,6 +2825,884 @@ private:
         n.child_ids = {base_id};
         n.stable_text = std::move(field_name);
         ++metrics_.member_accesses_rewritten;
+    }
+
+    const typed_pseudocode_ast_node_t* unwrap_cast(const typed_pseudocode_ast_node_t* value) const
+    {
+        if (value != nullptr && value->kind == typed_pseudocode_ast_node_kind_t::cast_expression &&
+            value->child_ids.size() == 1)
+            return node(value->child_ids[0]);
+        return value;
+    }
+
+    bool literal_offset(const typed_pseudocode_ast_node_t* value, std::uint64_t& offset) const
+    {
+        if (value == nullptr || value->kind != typed_pseudocode_ast_node_kind_t::literal)
+            return false;
+        const auto parsed = rt_parse_signed(value->stable_text);
+        if (!parsed || *parsed < 0 ||
+            static_cast<std::uint64_t>(*parsed) > (std::numeric_limits<std::uint32_t>::max)())
+            return false;
+        offset = static_cast<std::uint64_t>(*parsed);
+        return true;
+    }
+
+    void rewrite_to_member(typed_pseudocode_ast_node_t& n,
+                           const std::uint64_t base_id,
+                           const std::uint64_t struct_type_id,
+                           const decompiler_type_node_t& struct_type,
+                           const std::uint64_t offset)
+    {
+        std::string field_name;
+        std::uint64_t field_type_id = 0;
+        const auto* member = best_member_at(struct_type_id, offset, n.type_id,
+            struct_type.kind == decompiler_type_kind_t::union_type);
+        if (member != nullptr && usable_field_name(member->stable_name)) {
+            field_name = member->stable_name;
+            if (types_.find(member->target_type_id) != types_.end())
+                field_type_id = member->target_type_id;
+        } else if (const auto overlay = overlay_field_name(struct_type.canonical_name, offset, {})) {
+            if (usable_field_name(*overlay))
+                field_name = *overlay;
+        }
+        if (field_name.empty())
+            return;
+        n.kind = typed_pseudocode_ast_node_kind_t::member_expression;
+        if (field_type_id != 0)
+            n.type_id = field_type_id;
+        n.child_ids = {base_id};
+        n.stable_text = std::move(field_name);
+        ++metrics_.member_accesses_rewritten;
+    }
+
+    void try_rewrite_chain_member(typed_pseudocode_ast_node_t& n)
+    {
+        const auto* address_node = unwrap_cast(node(n.child_ids[0]));
+        if (address_node == nullptr ||
+            address_node->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            address_node->stable_text != "+" || address_node->child_ids.size() != 2)
+            return;
+        const auto* first = node(address_node->child_ids[0]);
+        const auto* second = node(address_node->child_ids[1]);
+        if (first == nullptr || second == nullptr)
+            return;
+        if (second->kind == typed_pseudocode_ast_node_kind_t::literal) {
+            if (first->kind == typed_pseudocode_ast_node_kind_t::member_expression ||
+                first->kind == typed_pseudocode_ast_node_kind_t::index_expression) {
+                std::uint64_t offset = 0;
+                if (!literal_offset(second, offset))
+                    return;
+                std::uint64_t struct_type_id = 0;
+                const auto* struct_type = struct_type_for_object(first->type_id, struct_type_id);
+                if (struct_type == nullptr)
+                    return;
+                rewrite_to_member(n, address_node->child_ids[0], struct_type_id, *struct_type, offset);
+                return;
+            }
+            if (first->kind == typed_pseudocode_ast_node_kind_t::binary_expression &&
+                first->stable_text == "+" && first->child_ids.size() == 2) {
+                std::uint64_t offset = 0;
+                if (!literal_offset(second, offset))
+                    return;
+                try_rewrite_array_member(n, first->child_ids[0], first->child_ids[1], offset);
+                return;
+            }
+            return;
+        }
+        if (first->kind != typed_pseudocode_ast_node_kind_t::literal &&
+            second->kind == typed_pseudocode_ast_node_kind_t::binary_expression &&
+            second->stable_text == "+" && second->child_ids.size() == 2) {
+            const auto* inner_first = node(second->child_ids[0]);
+            const auto* inner_second = node(second->child_ids[1]);
+            if (inner_first == nullptr || inner_second == nullptr)
+                return;
+            if (inner_first->kind == typed_pseudocode_ast_node_kind_t::literal) {
+                std::uint64_t offset = 0;
+                if (!literal_offset(inner_first, offset))
+                    return;
+                try_rewrite_array_member(n, address_node->child_ids[0], second->child_ids[1], offset);
+            }
+        }
+    }
+
+    void try_rewrite_array_member(typed_pseudocode_ast_node_t& n,
+                                  const std::uint64_t left_candidate_id,
+                                  const std::uint64_t right_candidate_id,
+                                  const std::uint64_t offset)
+    {
+        std::uint64_t base_candidate_id = 0;
+        std::uint64_t scaled_candidate_id = 0;
+        const auto* left_candidate = node(left_candidate_id);
+        const auto* right_candidate = node(right_candidate_id);
+        if (right_candidate != nullptr &&
+            right_candidate->kind == typed_pseudocode_ast_node_kind_t::binary_expression &&
+            right_candidate->stable_text == "*" && right_candidate->child_ids.size() == 2) {
+            base_candidate_id = left_candidate_id;
+            scaled_candidate_id = right_candidate_id;
+        } else if (left_candidate != nullptr &&
+                   left_candidate->kind == typed_pseudocode_ast_node_kind_t::binary_expression &&
+                   left_candidate->stable_text == "*" && left_candidate->child_ids.size() == 2) {
+            base_candidate_id = right_candidate_id;
+            scaled_candidate_id = left_candidate_id;
+        } else {
+            return;
+        }
+        const auto* scaled = node(scaled_candidate_id);
+        if (scaled == nullptr)
+            return;
+        const auto* scale_left = node(scaled->child_ids[0]);
+        const auto* scale_right = node(scaled->child_ids[1]);
+        if (scale_left == nullptr || scale_right == nullptr)
+            return;
+        std::uint64_t index_id = 0;
+        std::uint64_t element_size = 0;
+        if (scale_right->kind == typed_pseudocode_ast_node_kind_t::literal &&
+            literal_offset(scale_right, element_size) && element_size != 0)
+            index_id = scaled->child_ids[0];
+        else if (scale_left->kind == typed_pseudocode_ast_node_kind_t::literal &&
+                 literal_offset(scale_left, element_size) && element_size != 0)
+            index_id = scaled->child_ids[1];
+        else
+            return;
+        const auto* base = node(base_candidate_id);
+        if (base == nullptr)
+            return;
+        std::uint64_t struct_type_id = 0;
+        const auto* struct_type = struct_type_for_object(base->type_id, struct_type_id);
+        if (struct_type == nullptr || !struct_type->byte_size.has_value() ||
+            *struct_type->byte_size != element_size)
+            return;
+        std::string field_name;
+        std::uint64_t field_type_id = 0;
+        const auto* member = best_member_at(struct_type_id, offset, n.type_id,
+            struct_type->kind == decompiler_type_kind_t::union_type);
+        if (member != nullptr && usable_field_name(member->stable_name)) {
+            field_name = member->stable_name;
+            if (types_.find(member->target_type_id) != types_.end())
+                field_type_id = member->target_type_id;
+        } else if (const auto overlay = overlay_field_name(struct_type->canonical_name, offset, {})) {
+            if (usable_field_name(*overlay))
+                field_name = *overlay;
+        }
+        if (field_name.empty())
+            return;
+        const std::uint64_t node_id = n.id;
+        const auto index_expr = make_node(typed_pseudocode_ast_node_kind_t::index_expression,
+            struct_type_id, {base_candidate_id, index_id}, {}, n.coordinate, n.confidence, n.provenance);
+        auto* mutable_node = node(node_id);
+        if (mutable_node == nullptr)
+            return;
+        mutable_node->kind = typed_pseudocode_ast_node_kind_t::member_expression;
+        if (field_type_id != 0)
+            mutable_node->type_id = field_type_id;
+        mutable_node->child_ids = {index_expr};
+        mutable_node->stable_text = std::move(field_name);
+        ++metrics_.member_accesses_rewritten;
+    }
+
+    struct magic_division_entry_t {
+        std::uint32_t divisor;
+        std::uint32_t multiplier;
+        std::uint8_t total_shift;
+    };
+
+    static const magic_division_entry_t* lookup_magic_division(
+        const std::uint64_t multiplier, const std::uint64_t total_shift)
+    {
+        static constexpr magic_division_entry_t k_magic_table[] = {
+            {3, 0xAAAAAAABU, 33}, {5, 0xCCCCCCCDU, 34}, {6, 0xAAAAAAABU, 34},
+            {9, 0x38E38E39U, 33}, {10, 0xCCCCCCCDU, 35}, {11, 0xBA2E8BA3U, 35},
+            {12, 0xAAAAAAABU, 35}, {13, 0x4EC4EC4FU, 34}, {15, 0x88888889U, 35},
+            {100, 0x51EB851FU, 37}, {1000, 0x10624DD3U, 38},
+        };
+        for (const auto& entry : k_magic_table) {
+            if (entry.multiplier == multiplier && entry.total_shift == total_shift)
+                return &entry;
+        }
+        return nullptr;
+    }
+
+    std::uint64_t integer_width_bits(const std::uint64_t type_id) const
+    {
+        const auto type_it = types_.find(type_id);
+        if (type_it == types_.end() || !type_it->second->byte_size.has_value())
+            return 0;
+        const auto* type = type_it->second;
+        if (type->kind != decompiler_type_kind_t::signed_integer &&
+            type->kind != decompiler_type_kind_t::unsigned_integer)
+            return 0;
+        return *type->byte_size * 8;
+    }
+
+    bool unsigned_or_unknown_integer(const std::uint64_t type_id, const std::uint64_t width) const
+    {
+        const auto type_it = types_.find(type_id);
+        if (type_it == types_.end())
+            return true;
+        const auto* type = type_it->second;
+        if (type->kind == decompiler_type_kind_t::unknown)
+            return true;
+        if (type->kind != decompiler_type_kind_t::unsigned_integer)
+            return false;
+        return !type->byte_size.has_value() || *type->byte_size == width / 8;
+    }
+
+    void rewrite_to_intrinsic_call(typed_pseudocode_ast_node_t& n,
+                                   std::string callee_name,
+                                   const std::vector<std::uint64_t>& argument_ids)
+    {
+        const std::uint64_t node_id = n.id;
+        const auto callee = make_node(typed_pseudocode_ast_node_kind_t::identifier,
+            n.type_id, {}, std::move(callee_name), n.coordinate, n.confidence, n.provenance);
+        std::vector<std::uint64_t> children{callee};
+        children.insert(children.end(), argument_ids.begin(), argument_ids.end());
+        auto* mutable_node = node(node_id);
+        if (mutable_node == nullptr)
+            return;
+        mutable_node->kind = typed_pseudocode_ast_node_kind_t::call_expression;
+        mutable_node->stable_text.clear();
+        mutable_node->child_ids = std::move(children);
+    }
+
+    bool try_rewrite_rotate(typed_pseudocode_ast_node_t& n)
+    {
+        if (n.child_ids.size() != 2 || n.stable_text != "|")
+            return false;
+        const auto* left = node(n.child_ids[0]);
+        const auto* right = node(n.child_ids[1]);
+        if (left == nullptr || right == nullptr ||
+            left->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            right->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            left->child_ids.size() != 2 || right->child_ids.size() != 2)
+            return false;
+        const typed_pseudocode_ast_node_t* shl = nullptr;
+        const typed_pseudocode_ast_node_t* shr = nullptr;
+        bool left_rotate = false;
+        if (left->stable_text == "<<" && right->stable_text == ">>") {
+            shl = left;
+            shr = right;
+            left_rotate = true;
+        } else if (left->stable_text == ">>" && right->stable_text == "<<") {
+            shl = right;
+            shr = left;
+            left_rotate = false;
+        } else {
+            return false;
+        }
+        const auto* shl_value = node(shl->child_ids[0]);
+        const auto* shl_amount = node(shl->child_ids[1]);
+        const auto* shr_value = node(shr->child_ids[0]);
+        const auto* shr_amount = node(shr->child_ids[1]);
+        if (shl_value == nullptr || shr_value == nullptr ||
+            !expressions_equivalent(shl->child_ids[0], shr->child_ids[0], 0))
+            return false;
+        std::uint64_t forward = 0;
+        std::uint64_t backward = 0;
+        if (!literal_unsigned_value(shl_amount, forward) ||
+            !literal_unsigned_value(shr_amount, backward))
+            return false;
+        const auto width = integer_width_bits(shl_value->type_id);
+        if ((width != 16 && width != 32 && width != 64) || forward == 0 || backward == 0 ||
+            forward + backward != width || forward >= width)
+            return false;
+        if (rt_node_has_side_effects(ast_, shl->child_ids[0], id_index_))
+            return false;
+        const std::uint64_t value_id = left_rotate ? left->child_ids[0] : right->child_ids[0];
+        const std::uint64_t amount_id = left_rotate ? left->child_ids[1] : right->child_ids[1];
+        rewrite_to_intrinsic_call(n, left_rotate ? "_rotl" : "_rotr", {value_id, amount_id});
+        ++metrics_.bit_operation_idioms_rewritten;
+        return true;
+    }
+
+    bool match_bswap_mask_shift(const typed_pseudocode_ast_node_t* term,
+                                const bool expect_shifted_mask,
+                                const std::uint64_t expect_mask,
+                                const std::uint64_t expect_shift,
+                                std::uint64_t& value_id)
+    {
+        if (term == nullptr || term->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            term->child_ids.size() != 2)
+            return false;
+        const typed_pseudocode_ast_node_t* mask_expr = nullptr;
+        if (!expect_shifted_mask) {
+            if (term->stable_text != "<<")
+                return false;
+            std::uint64_t amount = 0;
+            const auto* amount_node = node(term->child_ids[1]);
+            if (!literal_unsigned_value(amount_node, amount) || amount != expect_shift)
+                return false;
+            mask_expr = node(term->child_ids[0]);
+        } else {
+            if (term->stable_text != "&")
+                return false;
+            mask_expr = term;
+        }
+        if (mask_expr == nullptr ||
+            mask_expr->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            mask_expr->stable_text != "&" || mask_expr->child_ids.size() != 2)
+            return false;
+        const auto* mask_value = node(mask_expr->child_ids[0]);
+        const auto* mask_literal = node(mask_expr->child_ids[1]);
+        std::uint64_t candidate_id = 0;
+        if (expect_shifted_mask) {
+            if (mask_value == nullptr ||
+                mask_value->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+                mask_value->stable_text != ">>" || mask_value->child_ids.size() != 2)
+                return false;
+            std::uint64_t shift = 0;
+            const auto* shift_amount_node = node(mask_value->child_ids[1]);
+            if (!literal_unsigned_value(shift_amount_node, shift) || shift != expect_shift)
+                return false;
+            candidate_id = mask_value->child_ids[0];
+        } else {
+            candidate_id = mask_expr->child_ids[0];
+        }
+        std::uint64_t applied_mask = 0;
+        if (!literal_unsigned_value(mask_literal, applied_mask) || applied_mask != expect_mask)
+            return false;
+        if (candidate_id == 0)
+            return false;
+        if (value_id == 0) {
+            value_id = candidate_id;
+            return true;
+        }
+        return expressions_equivalent(value_id, candidate_id, 0);
+    }
+
+    bool try_rewrite_bswap(typed_pseudocode_ast_node_t& n)
+    {
+        if (n.child_ids.size() != 2 || n.stable_text != "|")
+            return false;
+        const auto* left = node(n.child_ids[0]);
+        const auto* right = node(n.child_ids[1]);
+        if (left == nullptr || right == nullptr ||
+            left->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            left->stable_text != "|" || left->child_ids.size() != 2)
+            return false;
+        const auto* middle = node(left->child_ids[0]);
+        if (middle == nullptr ||
+            middle->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            middle->stable_text != "|" || middle->child_ids.size() != 2)
+            return false;
+        const typed_pseudocode_ast_node_t* terms[4] = {
+            node(middle->child_ids[0]), node(middle->child_ids[1]),
+            node(left->child_ids[1]), right};
+        std::uint64_t value_id = 0;
+        static constexpr struct {
+            bool shifted_mask;
+            std::uint64_t mask;
+            std::uint64_t shift;
+        } k_term_shapes[4] = {
+            {false, 0xFFULL, 24}, {false, 0xFF00ULL, 8},
+            {true, 0xFF00ULL, 8}, {true, 0xFFULL, 24},
+        };
+        bool matched[4] = {false, false, false, false};
+        std::size_t matched_count = 0;
+        for (const auto* term : terms) {
+            bool term_matched = false;
+            for (std::size_t shape = 0; shape < 4 && !term_matched; ++shape) {
+                if (matched[shape])
+                    continue;
+                if (match_bswap_mask_shift(term, k_term_shapes[shape].shifted_mask,
+                        k_term_shapes[shape].mask, k_term_shapes[shape].shift, value_id)) {
+                    matched[shape] = true;
+                    term_matched = true;
+                    ++matched_count;
+                }
+            }
+            if (!term_matched)
+                return false;
+        }
+        if (matched_count != 4 || value_id == 0)
+            return false;
+        const auto* value = node(value_id);
+        if (value == nullptr)
+            return false;
+        const auto type_it = types_.find(value->type_id);
+        if (type_it == types_.end() || !type_it->second->byte_size.has_value() ||
+            *type_it->second->byte_size != 4)
+            return false;
+        if (rt_node_has_side_effects(ast_, value_id, id_index_))
+            return false;
+        rewrite_to_intrinsic_call(n, "_byteswap_ulong", {value_id});
+        ++metrics_.bit_operation_idioms_rewritten;
+        return true;
+    }
+
+    bool try_rewrite_magic_division(typed_pseudocode_ast_node_t& n)
+    {
+        if (n.child_ids.size() != 2 || n.stable_text != ">>")
+            return false;
+        const auto* multiply = node(n.child_ids[0]);
+        const auto* shift_node = node(n.child_ids[1]);
+        if (multiply == nullptr || shift_node == nullptr ||
+            multiply->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            multiply->stable_text != "*" || multiply->child_ids.size() != 2)
+            return false;
+        std::uint64_t total_shift = 0;
+        if (!literal_unsigned_value(shift_node, total_shift) ||
+            total_shift < 33 || total_shift > 38)
+            return false;
+        const auto* left = node(multiply->child_ids[0]);
+        const auto* right = node(multiply->child_ids[1]);
+        if (left == nullptr || right == nullptr)
+            return false;
+        const typed_pseudocode_ast_node_t* value_node = nullptr;
+        std::uint64_t multiplier = 0;
+        if (literal_unsigned_value(right, multiplier))
+            value_node = left;
+        else if (literal_unsigned_value(left, multiplier))
+            value_node = right;
+        else
+            return false;
+        const auto* entry = lookup_magic_division(multiplier, total_shift);
+        if (entry == nullptr)
+            return false;
+        const typed_pseudocode_ast_node_t* dividend = value_node;
+        if (dividend->kind == typed_pseudocode_ast_node_kind_t::cast_expression &&
+            dividend->child_ids.size() == 1) {
+            if (const auto* unwrapped = node(dividend->child_ids[0]))
+                dividend = unwrapped;
+        }
+        if (dividend == nullptr)
+            return false;
+        const auto multiply_type_it = types_.find(multiply->type_id);
+        if (multiply_type_it != types_.end() &&
+            multiply_type_it->second->byte_size.has_value() &&
+            *multiply_type_it->second->byte_size != 8)
+            return false;
+        if (!unsigned_or_unknown_integer(dividend->type_id, 32))
+            return false;
+        const std::uint64_t node_id = n.id;
+        const std::uint64_t dividend_id = dividend->id;
+        const auto divisor_literal = make_node(typed_pseudocode_ast_node_kind_t::literal,
+            n.type_id, {}, std::to_string(entry->divisor), n.coordinate, n.confidence, n.provenance);
+        auto* mutable_node = node(node_id);
+        if (mutable_node == nullptr)
+            return false;
+        mutable_node->stable_text = "/";
+        mutable_node->child_ids = {dividend_id, divisor_literal};
+        ++metrics_.magic_divisions_recognized;
+        return true;
+    }
+
+    void apply_bit_operation_idioms()
+    {
+        for (std::size_t index = 0; index < ast_.nodes.size(); ++index) {
+            if (!consume_work())
+                return;
+            auto& n = ast_.nodes[index];
+            if (n.kind != typed_pseudocode_ast_node_kind_t::binary_expression)
+                continue;
+            const std::uint64_t node_id = n.id;
+            if (settings_.enable_bit_operation_idioms && n.stable_text == "|") {
+                if (try_rewrite_rotate(n))
+                    continue;
+                try_rewrite_bswap(n);
+            }
+            if (!settings_.enable_magic_division_recognition)
+                continue;
+            auto* refreshed = node(node_id);
+            if (refreshed == nullptr ||
+                refreshed->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+                refreshed->stable_text != ">>")
+                continue;
+            try_rewrite_magic_division(*refreshed);
+        }
+    }
+
+    struct loop_intrinsic_match_t {
+        std::uint64_t destination_id = 0;
+        std::uint64_t source_id = 0;
+        std::uint64_t value_id = 0;
+        std::uint64_t high_id = 0;
+        std::uint64_t low_id = 0;
+        std::uint64_t element_size = 1;
+        bool is_memcpy = false;
+    };
+
+    bool extract_loop_increment(const typed_pseudocode_ast_node_t* node_value,
+                                const std::string& counter) const
+    {
+        if (node_value == nullptr)
+            return false;
+        if (node_value->kind == typed_pseudocode_ast_node_kind_t::unary_expression &&
+            node_value->stable_text == "++" && node_value->child_ids.size() == 1) {
+            const auto* operand = node(node_value->child_ids[0]);
+            return operand != nullptr &&
+                operand->kind == typed_pseudocode_ast_node_kind_t::identifier &&
+                operand->stable_text == counter;
+        }
+        if (node_value->kind == typed_pseudocode_ast_node_kind_t::assignment_expression &&
+            (node_value->stable_text == "=" || node_value->stable_text == "+=") &&
+            node_value->child_ids.size() == 2) {
+            const auto* target = node(node_value->child_ids[0]);
+            if (target == nullptr ||
+                target->kind != typed_pseudocode_ast_node_kind_t::identifier ||
+                target->stable_text != counter)
+                return false;
+            const auto* value = node(node_value->child_ids[1]);
+            if (node_value->stable_text == "+=") {
+                std::uint64_t amount = 0;
+                return literal_unsigned_value(value, amount) && amount == 1;
+            }
+            if (value == nullptr ||
+                value->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+                value->stable_text != "+" || value->child_ids.size() != 2)
+                return false;
+            const auto* left = node(value->child_ids[0]);
+            const auto* right = node(value->child_ids[1]);
+            std::uint64_t amount = 0;
+            const bool left_counter = left != nullptr &&
+                left->kind == typed_pseudocode_ast_node_kind_t::identifier &&
+                left->stable_text == counter;
+            const bool right_counter = right != nullptr &&
+                right->kind == typed_pseudocode_ast_node_kind_t::identifier &&
+                right->stable_text == counter;
+            return (left_counter && literal_unsigned_value(right, amount) && amount == 1) ||
+                   (right_counter && literal_unsigned_value(left, amount) && amount == 1);
+        }
+        return false;
+    }
+
+    std::uint64_t count_identifier_occurrences(std::uint64_t node_id,
+                                               const std::string& name,
+                                               std::unordered_set<std::uint64_t>& visited,
+                                               std::size_t depth) const
+    {
+        if (depth >= 64 || !visited.insert(node_id).second)
+            return 0;
+        const auto* n = node(node_id);
+        if (n == nullptr)
+            return 0;
+        std::uint64_t count = (n->kind == typed_pseudocode_ast_node_kind_t::identifier &&
+            n->stable_text == name) ? 1 : 0;
+        for (const auto child_id : n->child_ids)
+            count += count_identifier_occurrences(child_id, name, visited, depth + 1);
+        return count;
+    }
+
+    bool match_loop_store(const typed_pseudocode_ast_node_t* statement,
+                          const std::string& counter,
+                          loop_intrinsic_match_t& match) const
+    {
+        if (statement == nullptr ||
+            statement->kind != typed_pseudocode_ast_node_kind_t::expression_statement ||
+            statement->child_ids.size() != 1)
+            return false;
+        const auto* assignment = node(statement->child_ids[0]);
+        if (assignment == nullptr ||
+            assignment->kind != typed_pseudocode_ast_node_kind_t::assignment_expression ||
+            assignment->stable_text != "=" || assignment->child_ids.size() != 2)
+            return false;
+        const auto* target = node(assignment->child_ids[0]);
+        if (target == nullptr ||
+            target->kind != typed_pseudocode_ast_node_kind_t::index_expression ||
+            target->child_ids.size() != 2)
+            return false;
+        const auto* destination = node(target->child_ids[0]);
+        const auto* subscript = node(target->child_ids[1]);
+        if (destination == nullptr || subscript == nullptr ||
+            destination->kind != typed_pseudocode_ast_node_kind_t::identifier ||
+            subscript->kind != typed_pseudocode_ast_node_kind_t::identifier ||
+            subscript->stable_text != counter)
+            return false;
+        match.destination_id = target->child_ids[0];
+        const auto* value = node(assignment->child_ids[1]);
+        if (value == nullptr)
+            return false;
+        if (value->kind == typed_pseudocode_ast_node_kind_t::index_expression &&
+            value->child_ids.size() == 2) {
+            const auto* source = node(value->child_ids[0]);
+            const auto* source_subscript = node(value->child_ids[1]);
+            if (source == nullptr || source_subscript == nullptr ||
+                source->kind != typed_pseudocode_ast_node_kind_t::identifier ||
+                source_subscript->kind != typed_pseudocode_ast_node_kind_t::identifier ||
+                source_subscript->stable_text != counter ||
+                source->stable_text == destination->stable_text)
+                return false;
+            match.is_memcpy = true;
+            match.source_id = value->child_ids[0];
+            match.value_id = 0;
+        } else {
+            std::unordered_set<std::uint64_t> visited;
+            if (count_identifier_occurrences(assignment->child_ids[1], counter, visited, 0) != 0)
+                return false;
+            match.is_memcpy = false;
+            match.value_id = assignment->child_ids[1];
+        }
+        if (rt_node_has_side_effects(ast_, target->child_ids[0], id_index_))
+            return false;
+        if (match.is_memcpy && rt_node_has_side_effects(ast_, match.source_id, id_index_))
+            return false;
+        if (!match.is_memcpy && rt_node_has_side_effects(ast_, match.value_id, id_index_))
+            return false;
+        return true;
+    }
+
+    bool element_size_for(const std::uint64_t identifier_id, std::uint64_t& element_size) const
+    {
+        const auto* identifier = node(identifier_id);
+        if (identifier == nullptr)
+            return false;
+        const auto type_it = types_.find(identifier->type_id);
+        if (type_it == types_.end() ||
+            type_it->second->kind != decompiler_type_kind_t::pointer)
+            return false;
+        const auto* pointee = type_graph::find_pointee_edge(type_graph_, identifier->type_id);
+        if (pointee == nullptr)
+            return false;
+        const auto pointee_it = types_.find(pointee->target_type_id);
+        if (pointee_it == types_.end() || !pointee_it->second->byte_size.has_value() ||
+            *pointee_it->second->byte_size == 0)
+            return false;
+        element_size = *pointee_it->second->byte_size;
+        return true;
+    }
+
+    void rewrite_loop_to_intrinsic(typed_pseudocode_ast_node_t& loop_node,
+                                   loop_intrinsic_match_t& match)
+    {
+        const std::uint64_t loop_id = loop_node.id;
+        const auto loop_type_id = loop_node.type_id;
+        const auto loop_coordinate = loop_node.coordinate;
+        const auto loop_confidence = loop_node.confidence;
+        const auto loop_provenance = loop_node.provenance;
+        const auto needs_multiply = match.element_size != 1;
+        const auto low_is_zero = [this](const std::uint64_t id) {
+            const auto* low = node(id);
+            std::uint64_t value = 0;
+            return low != nullptr && low->kind == typed_pseudocode_ast_node_kind_t::literal &&
+                literal_unsigned_value(low, value) && value == 0;
+        };
+        std::uint64_t count_expr = 0;
+        if (low_is_zero(match.low_id)) {
+            count_expr = match.high_id;
+        } else {
+            count_expr = make_node(typed_pseudocode_ast_node_kind_t::binary_expression,
+                loop_type_id, {match.high_id, match.low_id}, "-",
+                loop_coordinate, loop_confidence, loop_provenance);
+        }
+        std::uint64_t size_expr = count_expr;
+        if (needs_multiply) {
+            const auto element_literal = make_node(typed_pseudocode_ast_node_kind_t::literal,
+                loop_type_id, {}, std::to_string(match.element_size),
+                loop_coordinate, loop_confidence, loop_provenance);
+            size_expr = make_node(typed_pseudocode_ast_node_kind_t::binary_expression,
+                loop_type_id, {count_expr, element_literal}, "*",
+                loop_coordinate, loop_confidence, loop_provenance);
+        }
+        const auto callee = make_node(typed_pseudocode_ast_node_kind_t::identifier,
+            loop_type_id, {}, match.is_memcpy ? "memcpy" : "memset",
+            loop_coordinate, loop_confidence, loop_provenance);
+        std::vector<std::uint64_t> call_children{callee, match.destination_id};
+        call_children.push_back(match.is_memcpy ? match.source_id : match.value_id);
+        call_children.push_back(size_expr);
+        const auto call = make_node(typed_pseudocode_ast_node_kind_t::call_expression,
+            loop_type_id, std::move(call_children), {},
+            loop_coordinate, loop_confidence, loop_provenance);
+        auto* mutable_loop = node(loop_id);
+        if (mutable_loop == nullptr)
+            return;
+        mutable_loop->kind = typed_pseudocode_ast_node_kind_t::expression_statement;
+        mutable_loop->stable_text.clear();
+        mutable_loop->child_ids = {call};
+        ++metrics_.loop_intrinsics_rewritten;
+    }
+
+    bool try_rewrite_for_loop_intrinsic(typed_pseudocode_ast_node_t& n)
+    {
+        if (n.child_ids.size() != 4)
+            return false;
+        const auto* init = node(n.child_ids[0]);
+        if (init == nullptr)
+            return false;
+        std::string counter;
+        std::uint64_t low_id = 0;
+        if (init->kind == typed_pseudocode_ast_node_kind_t::declaration &&
+            init->child_ids.size() == 1) {
+            counter = init->stable_text;
+            low_id = init->child_ids[0];
+        } else {
+            const typed_pseudocode_ast_node_t* init_expression = init;
+            if (init->kind == typed_pseudocode_ast_node_kind_t::expression_statement &&
+                init->child_ids.size() == 1)
+                init_expression = node(init->child_ids[0]);
+            if (init_expression == nullptr ||
+                init_expression->kind != typed_pseudocode_ast_node_kind_t::assignment_expression ||
+                init_expression->stable_text != "=" || init_expression->child_ids.size() != 2)
+                return false;
+            const auto* target = node(init_expression->child_ids[0]);
+            if (target == nullptr ||
+                target->kind != typed_pseudocode_ast_node_kind_t::identifier)
+                return false;
+            counter = target->stable_text;
+            low_id = init_expression->child_ids[1];
+        }
+        if (counter.empty() || low_id == 0)
+            return false;
+        const auto* condition = node(n.child_ids[1]);
+        if (condition == nullptr ||
+            condition->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            (condition->stable_text != "<" && condition->stable_text != "!=") ||
+            condition->child_ids.size() != 2)
+            return false;
+        const auto* condition_counter = node(condition->child_ids[0]);
+        if (condition_counter == nullptr ||
+            condition_counter->kind != typed_pseudocode_ast_node_kind_t::identifier ||
+            condition_counter->stable_text != counter)
+            return false;
+        const std::uint64_t high_id = condition->child_ids[1];
+        {
+            std::unordered_set<std::uint64_t> visited;
+            if (count_identifier_occurrences(high_id, counter, visited, 0) != 0)
+                return false;
+        }
+        if (rt_node_has_side_effects(ast_, high_id, id_index_) ||
+            rt_node_has_side_effects(ast_, low_id, id_index_))
+            return false;
+        const auto* iteration = node(n.child_ids[2]);
+        if (!extract_loop_increment(iteration, counter))
+            return false;
+        const auto* body = node(n.child_ids[3]);
+        if (body == nullptr ||
+            body->kind != typed_pseudocode_ast_node_kind_t::compound_statement ||
+            body->child_ids.size() != 1)
+            return false;
+        loop_intrinsic_match_t match;
+        const auto* store = node(body->child_ids[0]);
+        if (!match_loop_store(store, counter, match))
+            return false;
+        {
+            std::unordered_set<std::uint64_t> total_visited;
+            const auto total = count_identifier_occurrences(ast_.root_node_id, counter, total_visited, 0);
+            std::unordered_set<std::uint64_t> loop_visited;
+            const auto in_loop = count_identifier_occurrences(n.id, counter, loop_visited, 0);
+            if (total != in_loop)
+                return false;
+        }
+        match.high_id = high_id;
+        match.low_id = low_id;
+        std::uint64_t element_size = 0;
+        if (!element_size_for(match.destination_id, element_size))
+            return false;
+        if (match.is_memcpy) {
+            std::uint64_t source_element_size = 0;
+            if (!element_size_for(match.source_id, source_element_size) ||
+                source_element_size != element_size)
+                return false;
+        }
+        match.element_size = element_size;
+        rewrite_loop_to_intrinsic(n, match);
+        return true;
+    }
+
+    bool try_rewrite_while_loop_intrinsic(typed_pseudocode_ast_node_t& n,
+                                          const typed_pseudocode_ast_node_t* preceding)
+    {
+        if (preceding == nullptr ||
+            preceding->kind != typed_pseudocode_ast_node_kind_t::expression_statement ||
+            preceding->child_ids.size() != 1)
+            return false;
+        const auto* init_expression = node(preceding->child_ids[0]);
+        if (init_expression == nullptr ||
+            init_expression->kind != typed_pseudocode_ast_node_kind_t::assignment_expression ||
+            init_expression->stable_text != "=" || init_expression->child_ids.size() != 2)
+            return false;
+        const auto* init_target = node(init_expression->child_ids[0]);
+        if (init_target == nullptr ||
+            init_target->kind != typed_pseudocode_ast_node_kind_t::identifier)
+            return false;
+        const std::string counter = init_target->stable_text;
+        const std::uint64_t low_id = init_expression->child_ids[1];
+        const auto* condition = node(n.child_ids[0]);
+        if (condition == nullptr ||
+            condition->kind != typed_pseudocode_ast_node_kind_t::binary_expression ||
+            condition->stable_text != "<" || condition->child_ids.size() != 2)
+            return false;
+        const auto* condition_counter = node(condition->child_ids[0]);
+        if (condition_counter == nullptr ||
+            condition_counter->kind != typed_pseudocode_ast_node_kind_t::identifier ||
+            condition_counter->stable_text != counter)
+            return false;
+        const std::uint64_t high_id = condition->child_ids[1];
+        {
+            std::unordered_set<std::uint64_t> visited;
+            if (count_identifier_occurrences(high_id, counter, visited, 0) != 0)
+                return false;
+        }
+        if (rt_node_has_side_effects(ast_, high_id, id_index_) ||
+            rt_node_has_side_effects(ast_, low_id, id_index_))
+            return false;
+        const auto* body = node(n.child_ids[1]);
+        if (body == nullptr ||
+            body->kind != typed_pseudocode_ast_node_kind_t::compound_statement ||
+            body->child_ids.size() != 2)
+            return false;
+        const auto* store = node(body->child_ids[0]);
+        loop_intrinsic_match_t match;
+        if (!match_loop_store(store, counter, match))
+            return false;
+        const auto* increment_statement = node(body->child_ids[1]);
+        if (increment_statement == nullptr ||
+            increment_statement->kind != typed_pseudocode_ast_node_kind_t::expression_statement ||
+            increment_statement->child_ids.size() != 1 ||
+            !extract_loop_increment(node(increment_statement->child_ids[0]), counter))
+            return false;
+        {
+            std::unordered_set<std::uint64_t> total_visited;
+            const auto total = count_identifier_occurrences(ast_.root_node_id, counter, total_visited, 0);
+            std::unordered_set<std::uint64_t> loop_visited;
+            const auto in_loop = count_identifier_occurrences(n.id, counter, loop_visited, 0);
+            std::unordered_set<std::uint64_t> init_visited;
+            const auto in_init = count_identifier_occurrences(preceding->id, counter, init_visited, 0);
+            if (total != in_loop + in_init)
+                return false;
+        }
+        match.high_id = high_id;
+        match.low_id = low_id;
+        std::uint64_t element_size = 0;
+        if (!element_size_for(match.destination_id, element_size))
+            return false;
+        if (match.is_memcpy) {
+            std::uint64_t source_element_size = 0;
+            if (!element_size_for(match.source_id, source_element_size) ||
+                source_element_size != element_size)
+                return false;
+        }
+        match.element_size = element_size;
+        const std::uint64_t preceding_id = preceding->id;
+        rewrite_loop_to_intrinsic(n, match);
+        remove_statement_from_compound(preceding_id);
+        flush_compound_removals();
+        return true;
+    }
+
+    void apply_loop_intrinsic_idioms()
+    {
+        std::vector<std::uint64_t> compounds;
+        collect_compound_ids(ast_.body_node_id, compounds, 0);
+        for (const auto compound_id : compounds) {
+            if (!consume_work())
+                return;
+            const auto* compound = node(compound_id);
+            if (compound == nullptr ||
+                compound->kind != typed_pseudocode_ast_node_kind_t::compound_statement)
+                continue;
+            const auto children = compound->child_ids;
+            for (std::size_t index = 0; index < children.size(); ++index) {
+                auto* statement = node(children[index]);
+                if (statement == nullptr)
+                    continue;
+                if (statement->kind == typed_pseudocode_ast_node_kind_t::for_statement) {
+                    try_rewrite_for_loop_intrinsic(*statement);
+                    continue;
+                }
+                if (statement->kind == typed_pseudocode_ast_node_kind_t::while_statement &&
+                    statement->child_ids.size() == 2 && index > 0)
+                    try_rewrite_while_loop_intrinsic(*statement, node(children[index - 1]));
+            }
+        }
     }
 
     void apply_min_max_idioms()
@@ -2475,9 +3848,10 @@ private:
 
     bool subtree_has_jump_target(std::uint64_t node_id,
                                  std::unordered_set<std::uint64_t>& visited,
-                                 std::size_t depth) const
+                                 std::size_t depth)
     {
-        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second)
+        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second ||
+            !consume_work())
             return false;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -2710,9 +4084,18 @@ private:
         return escaped;
     }
 
-    std::string quoted_string_comment(const std::string& content) const
+    static std::string truncation_suffix(const bool truncated, const std::uint32_t original_byte_length)
     {
-        return "\"" + escape_comment_bytes(utf8_safe_prefix(content, settings_.max_comment_bytes)) + "\"";
+        if (!truncated)
+            return {};
+        return "...[" + std::to_string(original_byte_length) + " bytes]";
+    }
+
+    std::string quoted_string_comment(const std::string& content, const bool truncated,
+                                      const std::uint32_t original_byte_length) const
+    {
+        return "\"" + escape_comment_bytes(utf8_safe_prefix(content, settings_.max_comment_bytes)) +
+            truncation_suffix(truncated, original_byte_length) + "\"";
     }
 
     std::string plain_comment_text(const std::string& text) const
@@ -2728,9 +4111,9 @@ private:
         return utf8_safe_prefix(cleaned, settings_.max_comment_bytes);
     }
 
-    void collect_compound_ids(std::uint64_t node_id, std::vector<std::uint64_t>& out, std::size_t depth) const
+    void collect_compound_ids(std::uint64_t node_id, std::vector<std::uint64_t>& out, std::size_t depth)
     {
-        if (depth >= settings_.max_expression_depth)
+        if (depth >= settings_.max_expression_depth || !consume_work())
             return;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -2741,46 +4124,48 @@ private:
             collect_compound_ids(child_id, out, depth + 1);
     }
 
-    std::optional<std::string> find_string_reference(std::uint64_t node_id) const
+    const decompiler_string_evidence_t* find_string_reference(std::uint64_t node_id)
     {
         std::unordered_set<std::uint64_t> visited;
         return find_string_reference_impl(node_id, visited, 0);
     }
 
-    std::optional<std::string> find_string_reference_impl(std::uint64_t node_id,
+    const decompiler_string_evidence_t* find_string_reference_impl(std::uint64_t node_id,
                                                           std::unordered_set<std::uint64_t>& visited,
-                                                          std::size_t depth) const
+                                                          std::size_t depth)
     {
-        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second)
-            return std::nullopt;
+        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second ||
+            !consume_work())
+            return nullptr;
         const auto* n = node(node_id);
         if (n == nullptr)
-            return std::nullopt;
+            return nullptr;
         if ((n->kind == typed_pseudocode_ast_node_kind_t::identifier ||
              n->kind == typed_pseudocode_ast_node_kind_t::literal) &&
             !(n->kind == typed_pseudocode_ast_node_kind_t::literal && !n->stable_text.empty() &&
               n->stable_text.front() == '"')) {
-            if (const auto content = lookup_string_literal(n->stable_text))
-                return content;
+            if (const auto* entry = lookup_string_literal(n->stable_text))
+                return entry;
         }
         for (const auto child_id : n->child_ids) {
-            if (const auto found = find_string_reference_impl(child_id, visited, depth + 1))
+            if (const auto* found = find_string_reference_impl(child_id, visited, depth + 1))
                 return found;
         }
-        return std::nullopt;
+        return nullptr;
     }
 
-    std::optional<std::string> find_statement_idiom(std::uint64_t node_id) const
+    std::optional<std::string> find_statement_idiom(std::uint64_t node_id)
     {
         std::unordered_set<std::uint64_t> visited;
         return find_statement_idiom_impl(node_id, visited, 0);
     }
 
     std::optional<std::string> find_statement_idiom_impl(std::uint64_t node_id,
-                                                         std::unordered_set<std::uint64_t>& visited,
-                                                         std::size_t depth) const
+                                                          std::unordered_set<std::uint64_t>& visited,
+                                                          std::size_t depth)
     {
-        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second)
+        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second ||
+            !consume_work())
             return std::nullopt;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -2794,12 +4179,122 @@ private:
         return std::nullopt;
     }
 
+    std::string quoted_string_literal_text(const std::string& content, const bool is_wide,
+                                           const bool truncated, const std::uint32_t original_byte_length) const
+    {
+        return (is_wide ? "L\"" : "\"") +
+            escape_comment_bytes(utf8_safe_prefix(content, settings_.max_comment_bytes)) +
+            truncation_suffix(truncated, original_byte_length) + "\"";
+    }
+
+    bool string_usage_context(const std::uint64_t node_id) const
+    {
+        const auto parent_it = parent_map_.find(node_id);
+        if (parent_it == parent_map_.end())
+            return false;
+        const auto* parent = node(parent_it->second.first);
+        if (parent == nullptr)
+            return false;
+        if (parent->kind == typed_pseudocode_ast_node_kind_t::cast_expression)
+            return true;
+        if (parent->kind == typed_pseudocode_ast_node_kind_t::call_expression &&
+            parent_it->second.second > 0)
+            return true;
+        const auto* self = node(node_id);
+        if (self != nullptr && self->type_id != 0) {
+            const auto type_it = types_.find(self->type_id);
+            if (type_it != types_.end() && type_it->second->kind == decompiler_type_kind_t::pointer)
+                return true;
+        }
+        return false;
+    }
+
+    void apply_string_literal_substitution()
+    {
+        if (string_addresses_.empty())
+            return;
+        for (auto& n : ast_.nodes) {
+            if (!consume_work())
+                break;
+            if (n.kind == typed_pseudocode_ast_node_kind_t::literal &&
+                !n.stable_text.empty() && n.stable_text.front() != '"') {
+                const auto address = parse_address_candidate(n.stable_text);
+                if (!address)
+                    continue;
+                const auto* entry = lookup_string_address(*address);
+                if (entry == nullptr || entry->utf8_content.empty())
+                    continue;
+                if (!string_usage_context(n.id))
+                    continue;
+                n.stable_text = quoted_string_literal_text(entry->utf8_content, entry->is_wide,
+                    entry->truncated, entry->original_byte_length);
+                ++metrics_.string_literals_inlined;
+                continue;
+            }
+            if (n.kind == typed_pseudocode_ast_node_kind_t::identifier &&
+                generated_data_identifier(n.stable_text)) {
+                const auto address = parse_address_candidate(n.stable_text);
+                if (!address)
+                    continue;
+                const auto* entry = lookup_string_address(*address);
+                if (entry == nullptr || entry->utf8_content.empty())
+                    continue;
+                if (!string_usage_context(n.id))
+                    continue;
+                n.kind = typed_pseudocode_ast_node_kind_t::literal;
+                n.stable_text = quoted_string_literal_text(entry->utf8_content, entry->is_wide,
+                    entry->truncated, entry->original_byte_length);
+                ++metrics_.string_literals_inlined;
+            }
+        }
+    }
+
+    std::optional<std::string> find_scalar_reference(std::uint64_t node_id)
+    {
+        std::unordered_set<std::uint64_t> visited;
+        return find_scalar_reference_impl(node_id, visited, 0);
+    }
+
+    std::optional<std::string> find_scalar_reference_impl(std::uint64_t node_id,
+                                                          std::unordered_set<std::uint64_t>& visited,
+                                                          std::size_t depth)
+    {
+        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second ||
+            !consume_work())
+            return std::nullopt;
+        const auto* n = node(node_id);
+        if (n == nullptr)
+            return std::nullopt;
+        if ((n->kind == typed_pseudocode_ast_node_kind_t::identifier ||
+             n->kind == typed_pseudocode_ast_node_kind_t::literal) &&
+            (n->kind != typed_pseudocode_ast_node_kind_t::literal || n->stable_text.empty() ||
+             n->stable_text.front() != '"')) {
+            if (const auto address = parse_address_candidate(n->stable_text)) {
+                const auto it = global_scalars_.find(*address);
+                if (it != global_scalars_.end()) {
+                    const auto* entry = it->second;
+                    char buffer[64]{};
+                    std::snprintf(buffer, sizeof(buffer), "= %llu (0x%llx)",
+                        static_cast<unsigned long long>(entry->value),
+                        static_cast<unsigned long long>(entry->value));
+                    return std::string(buffer);
+                }
+            }
+        }
+        for (const auto child_id : n->child_ids) {
+            if (const auto found = find_scalar_reference_impl(child_id, visited, depth + 1))
+                return found;
+        }
+        return std::nullopt;
+    }
+
     void collect_anchor_texts(std::uint64_t node_id,
                               std::vector<std::string>& anchors,
                               std::unordered_set<std::uint64_t>& visited,
-                              std::size_t depth) const
+                              std::size_t depth)
     {
-        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second)
+        if (depth >= settings_.max_expression_depth || !visited.insert(node_id).second ||
+            !consume_work())
             return;
         const auto* n = node(node_id);
         if (n == nullptr)
@@ -2814,7 +4309,7 @@ private:
             collect_anchor_texts(child_id, anchors, visited, depth + 1);
     }
 
-    std::vector<std::string> anchor_texts_for(std::uint64_t statement_id) const
+    std::vector<std::string> anchor_texts_for(std::uint64_t statement_id)
     {
         std::vector<std::string> anchors;
         std::unordered_set<std::uint64_t> visited;
@@ -2862,6 +4357,38 @@ private:
         }
     }
 
+    void emit_rva_user_comments(
+        std::uint64_t anchor_statement_id,
+        const std::vector<std::pair<std::uint64_t, std::string>>& comment_list,
+        std::vector<std::uint64_t>& updated,
+        const std::uint64_t type_id,
+        const source_coordinate_t& coordinate,
+        std::uint64_t& metric_counter)
+    {
+        if (comment_list.empty())
+            return;
+        const auto* statement = node(anchor_statement_id);
+        if (statement == nullptr || !statement->coordinate.address_range)
+            return;
+        const std::uint64_t begin = statement->coordinate.address_range->begin.value;
+        const std::uint64_t end = statement->coordinate.address_range->end.value;
+        if (end <= begin)
+            return;
+        const auto first = std::lower_bound(comment_list.begin(), comment_list.end(), begin,
+            [](const auto& entry, const std::uint64_t address) {
+                return entry.first < address;
+            });
+        std::size_t emitted_for_statement = 0;
+        for (auto it = first; it != comment_list.end() && it->first < end; ++it) {
+            if (comments_injected_ >= settings_.max_comments_per_function || emitted_for_statement >= 4)
+                return;
+            append_comment_node(updated, plain_comment_text(it->second), type_id, coordinate,
+                decompiler_fact_provenance_t::user_overlay);
+            ++emitted_for_statement;
+            ++metric_counter;
+        }
+    }
+
     void apply_comment_injection()
     {
         comments_injected_ = 0;
@@ -2895,13 +4422,24 @@ private:
                 emit_anchored_user_comments(statement_id, user_comments_before_, updated,
                     statement_type_id, statement_coordinate, metrics_.user_comments_injected);
             }
+            if (settings_.enable_user_comment_injection)
+                emit_rva_user_comments(statement_id, rva_comments_before_, updated,
+                    statement_type_id, statement_coordinate, metrics_.user_comments_injected);
             updated.push_back(statement_id);
             if (comments_injected_ < settings_.max_comments_per_function) {
                 std::string trailing;
                 if (settings_.enable_string_comment_injection && !string_literals_.empty()) {
-                    if (const auto content = find_string_reference(statement_id)) {
-                        trailing = quoted_string_comment(*content);
+                    if (const auto* entry = find_string_reference(statement_id)) {
+                        trailing = quoted_string_comment(entry->utf8_content, entry->truncated,
+                            entry->original_byte_length);
                         ++metrics_.string_comments_injected;
+                    }
+                }
+                if (trailing.empty() && settings_.enable_string_comment_injection &&
+                    !global_scalars_.empty()) {
+                    if (const auto scalar = find_scalar_reference(statement_id)) {
+                        trailing = *scalar;
+                        ++metrics_.global_scalar_comments_injected;
                     }
                 }
                 if (trailing.empty() && settings_.enable_idiom_recognition) {
@@ -2916,6 +4454,8 @@ private:
             }
             if (settings_.enable_user_comment_injection) {
                 emit_anchored_user_comments(statement_id, user_comments_after_, updated,
+                    statement_type_id, statement_coordinate, metrics_.user_comments_injected);
+                emit_rva_user_comments(statement_id, rva_comments_after_, updated,
                     statement_type_id, statement_coordinate, metrics_.user_comments_injected);
                 if (index + 1 < original.size())
                     emit_anchored_user_comments(original[index + 1], user_comments_before_, updated,
@@ -3121,7 +4661,10 @@ bool readability_transforms_enabled(const readability_transform_settings_t& sett
         settings.enable_copy_propagation || settings.enable_dead_store_elimination ||
         settings.enable_member_name_propagation || settings.enable_min_max_idioms ||
         settings.enable_idiom_recognition || settings.enable_declaration_at_first_use ||
-        settings.enable_string_comment_injection || settings.enable_user_comment_injection;
+        settings.enable_string_comment_injection || settings.enable_user_comment_injection ||
+        settings.enable_string_literal_substitution || settings.enable_cast_idiom_folding ||
+        settings.enable_bit_operation_idioms || settings.enable_loop_intrinsic_idioms ||
+        settings.enable_magic_division_recognition;
 }
 
 readability_transform_settings_t to_rt_settings(const readability_transform_settings_t& settings) noexcept
@@ -3143,6 +4686,14 @@ readability_transform_settings_t to_rt_settings(const readability_transform_sett
         result.max_comments_per_function = 1;
     if (result.max_comments_per_function > 4096)
         result.max_comments_per_function = 4096;
+    if (result.max_transform_nodes < 10000)
+        result.max_transform_nodes = 10000;
+    if (result.max_transform_nodes > 500000)
+        result.max_transform_nodes = 500000;
+    if (result.max_transform_work_units < 65536)
+        result.max_transform_work_units = 65536;
+    if (result.max_transform_work_units > (std::size_t{1} << 26))
+        result.max_transform_work_units = (std::size_t{1} << 26);
     return result;
 }
 
@@ -3172,6 +4723,139 @@ pseudocode_readability_result_t analyze_pseudocode_readability(
     const pseudocode_readability_request_t& request)
 {
     return analyze_pseudocode_readability(&ast, &document, request);
+}
+
+namespace {
+
+bool local_rename_c_keyword(std::string_view name) noexcept
+{
+    static constexpr std::string_view k_keywords[] = {
+        "auto", "break", "case", "char", "const", "continue", "default", "do", "double",
+        "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long",
+        "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct",
+        "switch", "typedef", "union", "unsigned", "void", "volatile", "while",
+        "_Alignas", "_Alignof", "_Atomic", "_Bool", "_Complex", "_Generic", "_Imaginary",
+        "_Noreturn", "_Static_assert", "_Thread_local",
+        "__int8", "__int16", "__int32", "__int64", "__declspec", "__cdecl", "__stdcall",
+        "__fastcall", "__thiscall", "__vectorcall", "__forceinline", "__unaligned",
+        "memset", "memcpy", "memmove", "_rotl", "_rotr", "_byteswap_ulong",
+        "_byteswap_uint64", "_byteswap_ushort", "min", "max",
+    };
+    for (const auto keyword : k_keywords) {
+        if (name == keyword)
+            return true;
+    }
+    return false;
+}
+
+bool local_rename_identifier_valid(std::string_view name) noexcept
+{
+    if (name.empty() || name.size() > 128)
+        return false;
+    const auto letter = [](const char value) {
+        return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || value == '_';
+    };
+    if (!letter(name.front()))
+        return false;
+    return std::all_of(name.begin() + 1, name.end(), [&](const char value) {
+        return letter(value) || (value >= '0' && value <= '9');
+    });
+}
+
+decompiler_diagnostic_t local_rename_diagnostic(std::string key, const std::uint32_t ordinal)
+{
+    decompiler_diagnostic_t result;
+    result.severity = decompiler_diagnostic_severity_t::warning;
+    result.code = decompiler_diagnostic_code_t::invalid_contract;
+    result.localization_key = std::move(key);
+    result.confidence = 100;
+    result.ordinal = ordinal;
+    return result;
+}
+
+}
+
+pseudocode_local_rename_result_t apply_pseudocode_local_rename(
+    typed_pseudocode_ast_v2_t& ast,
+    const type_graph_t& type_graph,
+    std::string_view old_name,
+    std::string_view new_name)
+{
+    static_cast<void>(type_graph);
+    pseudocode_local_rename_result_t result;
+    std::uint32_t ordinal = 1;
+    const auto reject = [&result, &ordinal](const char* key) {
+        result.diagnostics.push_back(local_rename_diagnostic(key, ordinal++));
+        return result;
+    };
+    if (ast.nodes.empty() || old_name.empty() || old_name == new_name)
+        return reject("readability.local_rename.identity");
+    if (!local_rename_identifier_valid(old_name) || !local_rename_identifier_valid(new_name))
+        return reject("readability.local_rename.identifier");
+    if (local_rename_c_keyword(new_name))
+        return reject("readability.local_rename.keyword");
+    std::unordered_map<std::uint64_t, std::size_t> index;
+    index.reserve(ast.nodes.size());
+    for (std::size_t node_index = 0; node_index < ast.nodes.size(); ++node_index)
+        index.emplace(ast.nodes[node_index].id, node_index);
+    const auto root = index.find(ast.root_node_id);
+    if (root == index.end())
+        return reject("readability.local_rename.root");
+    if (ast.nodes[root->second].stable_text == old_name)
+        return reject("readability.local_rename.function");
+    std::size_t matches = 0;
+    for (const auto& node_value : ast.nodes) {
+        if (node_value.stable_text.empty())
+            continue;
+        if (node_value.kind == typed_pseudocode_ast_node_kind_t::member_expression &&
+            node_value.stable_text == old_name)
+            return reject("readability.local_rename.member_selector");
+        if (node_value.stable_text == new_name &&
+            (node_value.kind == typed_pseudocode_ast_node_kind_t::declaration ||
+             node_value.kind == typed_pseudocode_ast_node_kind_t::identifier ||
+             node_value.kind == typed_pseudocode_ast_node_kind_t::member_expression ||
+             node_value.kind == typed_pseudocode_ast_node_kind_t::function_definition))
+            return reject("readability.local_rename.collision");
+        if ((node_value.kind == typed_pseudocode_ast_node_kind_t::declaration ||
+             node_value.kind == typed_pseudocode_ast_node_kind_t::identifier) &&
+            node_value.stable_text == old_name)
+            ++matches;
+    }
+    if (matches == 0)
+        return reject("readability.local_rename.absent");
+    std::unordered_map<std::uint64_t, std::uint64_t> parents;
+    parents.reserve(ast.nodes.size());
+    for (const auto& node_value : ast.nodes) {
+        for (const auto child_id : node_value.child_ids)
+            parents.emplace(child_id, node_value.id);
+    }
+    for (const auto& node_value : ast.nodes) {
+        if (node_value.kind != typed_pseudocode_ast_node_kind_t::identifier ||
+            node_value.stable_text != old_name)
+            continue;
+        const auto parent = parents.find(node_value.id);
+        if (parent == parents.end())
+            continue;
+        const auto parent_node = index.find(parent->second);
+        if (parent_node == index.end())
+            continue;
+        const auto& parent_value = ast.nodes[parent_node->second];
+        if (parent_value.kind == typed_pseudocode_ast_node_kind_t::call_expression &&
+            !parent_value.child_ids.empty() && parent_value.child_ids.front() == node_value.id)
+            return reject("readability.local_rename.resolved_callee");
+    }
+    std::uint64_t renamed = 0;
+    for (auto& node_value : ast.nodes) {
+        if ((node_value.kind == typed_pseudocode_ast_node_kind_t::declaration ||
+             node_value.kind == typed_pseudocode_ast_node_kind_t::identifier) &&
+            node_value.stable_text == old_name) {
+            node_value.stable_text = std::string(new_name);
+            ++renamed;
+        }
+    }
+    result.applied = renamed != 0;
+    result.nodes_renamed = renamed;
+    return result;
 }
 
 }

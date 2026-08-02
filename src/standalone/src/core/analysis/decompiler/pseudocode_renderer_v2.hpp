@@ -51,6 +51,12 @@ pseudocode_renderer_v2_result_t render_pseudocode_v2(
     const type_graph_t& type_graph,
     const pseudocode_renderer_v2_request_t& request = {});
 
+pseudocode_renderer_v2_result_t rerender_document_with_local_renames(
+    const decompiler_document_t& source,
+    const type_graph_t& type_graph,
+    const pseudocode_renderer_v2_request_t& request,
+    const std::vector<std::pair<std::string, std::string>>& renames);
+
 std::string serialize_pseudocode_document_v2(const decompiler_document_t& document);
 
 decompiler_contract_decode_result_t<decompiler_document_t> deserialize_pseudocode_document_v2(const std::string& bytes);

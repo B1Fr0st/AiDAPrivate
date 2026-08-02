@@ -58,6 +58,7 @@ struct capstone_tile_decode_usage_t final {
     std::uint64_t coverage_spans = 0;
     std::uint64_t snapshot_window_leases = 0;
     std::uint64_t snapshot_window_bytes = 0;
+    std::uint64_t source_validations = 0;
 };
 
 struct capstone_tile_result_t final {
@@ -110,6 +111,9 @@ private:
 
     std::unique_ptr<worker_owned_arch_decoder_t> worker_;
     capstone_tile_decode_limits_t tile_limits_;
+    bool source_validated_ = false;
+    std::uint64_t source_generation_ = 0;
+    byte_provider_identity_t source_identity_{};
 };
 
 }

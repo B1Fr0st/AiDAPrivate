@@ -17,10 +17,15 @@
 
 #include "imgui/imgui.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -28,6 +33,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <knownfolders.h>
+#include <shlobj.h>
 
 namespace pseudocode_view {
 
@@ -48,7 +56,10 @@ struct tab_t {
     pseudocode_cache_state_t state = pseudocode_cache_state_t::empty;
     std::string error;
     bool error_acknowledged = false;
+    std::uint64_t renames_applied_job_id = 0;
 };
+
+using local_rename_map_t = std::map<std::string, std::string>;
 
 struct state_t {
     std::mutex mutex;
@@ -58,7 +69,84 @@ struct state_t {
     std::uint32_t selected_token_begin = 0;
     std::uint32_t selected_token_end = 0;
     std::uint64_t generation = 0;
+    bool renames_loaded = false;
+    aida::analysis::binary_id_t binary_id;
+    std::map<std::string, local_rename_map_t> local_renames;
 };
+
+std::filesystem::path local_rename_store_path(
+    const aida::analysis::binary_id_t& binary_id)
+{
+    wchar_t* appdata = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
+        auto dir = std::filesystem::path(appdata) / L"AiDA" / L"pseudocode_renames";
+        CoTaskMemFree(appdata);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const auto name = binary_id.to_hex() + ".json";
+        return dir / name;
+    }
+    return std::filesystem::current_path() / ("aida_pseudocode_renames_" + binary_id.to_hex() + ".json");
+}
+
+void load_local_renames(state_t& state, const aida::analysis::binary_id_t& binary_id)
+{
+    if (state.renames_loaded)
+        return;
+    state.renames_loaded = true;
+    std::error_code ec;
+    const auto path = local_rename_store_path(binary_id);
+    if (!std::filesystem::exists(path, ec))
+        return;
+    try {
+        nlohmann::json document = nlohmann::json::parse(std::ifstream(path));
+        if (!document.is_object() || !document.contains("renames") ||
+            !document["renames"].is_object())
+            return;
+        for (const auto& [identity, entries] : document["renames"].items()) {
+            if (!entries.is_object() || identity.empty())
+                continue;
+            local_rename_map_t map;
+            for (const auto& [old_name, new_name] : entries.items()) {
+                if (!old_name.empty() && new_name.is_string() && !new_name.get<std::string>().empty())
+                    map.emplace(old_name, new_name.get<std::string>());
+            }
+            if (!map.empty())
+                state.local_renames.emplace(identity, std::move(map));
+        }
+    } catch (...) {
+    }
+}
+
+void save_local_renames(const state_t& state, const aida::analysis::binary_id_t& binary_id)
+{
+    nlohmann::json document;
+    document["version"] = 1;
+    auto& renames = document["renames"];
+    for (const auto& [identity, map] : state.local_renames) {
+        if (map.empty())
+            continue;
+        auto& entries = renames[identity];
+        for (const auto& [old_name, new_name] : map)
+            entries[old_name] = new_name;
+    }
+    const auto path = local_rename_store_path(binary_id);
+    const auto temporary = path.parent_path() / (path.filename().string() + ".tmp");
+    try {
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            output << document.dump(2);
+            output.flush();
+            if (!output)
+                return;
+        }
+        std::error_code ec;
+        std::filesystem::rename(temporary, path, ec);
+        if (ec)
+            std::filesystem::remove(temporary, ec);
+    } catch (...) {
+    }
+}
 
 std::mutex& state_registry_mutex()
 {
@@ -80,13 +168,21 @@ std::shared_ptr<state_t> state_for(
     if (!context.workspace)
         return {};
     const auto binary_id = context.workspace->identity().binary_id();
-    std::lock_guard<std::mutex> lock(state_registry_mutex());
-    auto& registry = state_registry();
-    const auto found = registry.find(binary_id);
-    if (found != registry.end())
-        return found->second;
-    auto created = std::make_shared<state_t>();
-    registry.emplace(binary_id, created);
+    std::shared_ptr<state_t> created;
+    {
+        std::lock_guard<std::mutex> lock(state_registry_mutex());
+        auto& registry = state_registry();
+        const auto found = registry.find(binary_id);
+        if (found != registry.end())
+            return found->second;
+        created = std::make_shared<state_t>();
+        registry.emplace(binary_id, created);
+    }
+    {
+        std::lock_guard<std::mutex> lock(created->mutex);
+        created->binary_id = binary_id;
+        load_local_renames(*created, binary_id);
+    }
     return created;
 }
 
@@ -262,6 +358,7 @@ void refresh_tab_states(
     aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
     const std::shared_ptr<state_t>& state)
 {
+    const auto binary_id = state->binary_id;
     std::lock_guard<std::mutex> lock(state->mutex);
     for (auto& tab : state->tabs) {
         if (!tab.has_request)
@@ -292,6 +389,8 @@ void refresh_tab_states(
         } else if (tab.state == pseudocode_cache_state_t::cached) {
             tab.error.clear();
             tab.error_acknowledged = false;
+            if (tab.renames_applied_job_id != tab.job_id)
+                reapply_tab_local_renames(model, tab, state, binary_id);
         }
     }
     if (state->active >= 0 &&
@@ -432,6 +531,199 @@ token_for_position(
     return nullptr;
 }
 
+bool local_rename_identifier_text(const std::string& value)
+{
+    if (value.empty() || value.size() > 128)
+        return false;
+    const auto letter = [](const char character) {
+        return (character >= 'a' && character <= 'z') ||
+               (character >= 'A' && character <= 'Z') || character == '_';
+    };
+    if (!letter(value.front()))
+        return false;
+    return std::all_of(value.begin() + 1, value.end(), [&](const char character) {
+        return letter(character) || (character >= '0' && character <= '9');
+    });
+}
+
+std::string local_rename_candidate(
+    const aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
+    const aida::workbench::pseudocode_document::pseudocode_page_t& page,
+    std::uint32_t token_begin)
+{
+    const auto* cached = model.cached_document();
+    if (!cached || !cached->document)
+        return {};
+    const aida::workbench::pseudocode_document::pseudocode_token_view_t* token = nullptr;
+    for (const auto& candidate : page.tokens) {
+        if (candidate.range.begin == token_begin) {
+            token = &candidate;
+            break;
+        }
+    }
+    if (token == nullptr ||
+        token->kind != aida::analysis::decompiler_document_token_kind_t::identifier ||
+        !local_rename_identifier_text(token->text))
+        return {};
+    const auto& ast = cached->document->ast;
+    std::unordered_map<std::uint64_t, const aida::analysis::typed_pseudocode_ast_node_t*> by_id;
+    by_id.reserve(ast.nodes.size());
+    for (const auto& node : ast.nodes)
+        by_id.emplace(node.id, &node);
+    const aida::analysis::typed_pseudocode_ast_node_t* ast_node = nullptr;
+    const aida::analysis::typed_pseudocode_ast_node_t* root = nullptr;
+    const auto node_it = by_id.find(token->ast_node_id);
+    if (node_it != by_id.end())
+        ast_node = node_it->second;
+    const auto root_it = by_id.find(ast.root_node_id);
+    if (root_it != by_id.end())
+        root = root_it->second;
+    std::unordered_map<std::uint64_t, const aida::analysis::typed_pseudocode_ast_node_t*> parents;
+    parents.reserve(ast.nodes.size());
+    for (const auto& node : ast.nodes) {
+        for (const auto child_id : node.child_ids)
+            parents.emplace(child_id, &node);
+    }
+    if (ast_node == nullptr ||
+        (ast_node->kind != aida::analysis::typed_pseudocode_ast_node_kind_t::declaration &&
+         ast_node->kind != aida::analysis::typed_pseudocode_ast_node_kind_t::identifier) ||
+        ast_node->stable_text != token->text)
+        return {};
+    if (root != nullptr && root->stable_text == token->text)
+        return {};
+    const auto parent = parents.find(ast_node->id);
+    if (parent != parents.end() &&
+        parent->second->kind == aida::analysis::typed_pseudocode_ast_node_kind_t::call_expression &&
+        !parent->second->child_ids.empty() &&
+        parent->second->child_ids.front() == ast_node->id)
+        return {};
+    return token->text;
+}
+
+struct local_rename_prompt_t {
+    bool open = false;
+    bool focus = false;
+    std::string old_name;
+    std::string error;
+    char new_name[129]{};
+};
+
+local_rename_prompt_t& local_rename_prompt_state()
+{
+    static local_rename_prompt_t value;
+    return value;
+}
+
+void open_local_rename_prompt(std::string old_name)
+{
+    auto& prompt = local_rename_prompt_state();
+    prompt.open = true;
+    prompt.focus = true;
+    prompt.old_name = std::move(old_name);
+    prompt.error.clear();
+    std::snprintf(prompt.new_name, sizeof(prompt.new_name), "%s", prompt.old_name.c_str());
+}
+
+void submit_local_rename_prompt(
+    const disasm_view::workspace_context_t& context,
+    aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
+    const std::shared_ptr<state_t>& state)
+{
+    auto& prompt = local_rename_prompt_state();
+    const std::string new_name = prompt.new_name;
+    if (new_name.empty()) {
+        prompt.error = "The new name cannot be empty";
+        return;
+    }
+    std::uint64_t renamed = 0;
+    const auto applied = model.apply_local_rename(prompt.old_name, new_name, renamed);
+    if (!applied || renamed == 0) {
+        prompt.error = "The name is not a renameable function-local identifier " +
+            std::to_string(static_cast<unsigned>(applied.code));
+        return;
+    }
+    const auto binary_id = context.workspace->identity().binary_id();
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->active >= 0 &&
+            static_cast<std::size_t>(state->active) < state->tabs.size()) {
+            auto& tab = state->tabs[static_cast<std::size_t>(state->active)];
+            auto& map = state->local_renames[tab_identity(tab)];
+            map[prompt.old_name] = new_name;
+            tab.renames_applied_job_id = tab.job_id;
+        }
+        save_local_renames(*state, binary_id);
+    }
+    prompt.open = false;
+    prompt.error.clear();
+}
+
+void reapply_tab_local_renames(
+    aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
+    tab_t& tab,
+    const std::shared_ptr<state_t>& state,
+    const aida::analysis::binary_id_t& binary_id)
+{
+    const auto identity = tab_identity(tab);
+    const auto found = state->local_renames.find(identity);
+    if (found == state->local_renames.end() || found->second.empty()) {
+        tab.renames_applied_job_id = tab.job_id;
+        return;
+    }
+    bool map_changed = false;
+    for (auto iterator = found->second.begin(); iterator != found->second.end();) {
+        std::uint64_t renamed = 0;
+        const auto applied = model.apply_local_rename(iterator->first, iterator->second, renamed);
+        if (!applied || renamed == 0) {
+            iterator = found->second.erase(iterator);
+            map_changed = true;
+        } else {
+            ++iterator;
+        }
+    }
+    if (found->second.empty()) {
+        state->local_renames.erase(found);
+        map_changed = true;
+    }
+    if (map_changed)
+        save_local_renames(*state, binary_id);
+    tab.renames_applied_job_id = tab.job_id;
+}
+
+void render_local_rename_prompt(
+    const disasm_view::workspace_context_t& context,
+    aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
+    const std::shared_ptr<state_t>& state)
+{
+    auto& prompt = local_rename_prompt_state();
+    if (!prompt.open)
+        return;
+    ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_Appearing);
+    bool open = true;
+    if (ImGui::Begin("Rename Local##pseudocode", &open,
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Rename pseudocode-local '%s'", prompt.old_name.c_str());
+        ImGui::TextDisabled("Pseudocode only: the disassembly view keeps the original name.");
+        if (prompt.focus) {
+            ImGui::SetKeyboardFocusHere();
+            prompt.focus = false;
+        }
+        const bool submitted = ImGui::InputText("##pseudocode_rename_local_name",
+            prompt.new_name, sizeof(prompt.new_name), ImGuiInputTextFlags_EnterReturnsTrue);
+        if (!prompt.error.empty())
+            aida::ui::inline_notice("pseudocode_rename_local_error", "Rename rejected",
+                prompt.error.c_str(), aida::ui::status_kind_t::error);
+        if (submitted || ImGui::Button("Apply"))
+            submit_local_rename_prompt(context, model, state);
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel"))
+            prompt.open = false;
+    }
+    ImGui::End();
+    if (!open)
+        prompt.open = false;
+}
+
 std::optional<std::uint64_t> token_source_address(
     aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
     const aida::workbench::pseudocode_document::pseudocode_token_view_t* token,
@@ -471,7 +763,8 @@ auto make_line_context_menu(
     const std::shared_ptr<state_t>& state,
     int selected_line,
     std::uint32_t selected_token_begin,
-    std::uint32_t selected_token_end)
+    std::uint32_t selected_token_end,
+    std::string rename_candidate = {})
     -> aida::ui::analysis_context_menu::context_t
 {
     using namespace aida::ui::analysis_context_menu;
@@ -593,6 +886,17 @@ auto make_line_context_menu(
     menu.actions["analysis.modify.retype"].capability =
         capability_state_t::unavailable(
             "Use Types > Apply Type until canonical type-entry validation is available here");
+    if (!rename_candidate.empty()) {
+        menu.actions["analysis.modify.rename_local"].invoke =
+            [rename_candidate = std::move(rename_candidate)]() {
+                open_local_rename_prompt(rename_candidate);
+                return action_handler_result_t::completed();
+            };
+    } else {
+        menu.actions["analysis.modify.rename_local"].capability =
+            capability_state_t::unavailable(
+                "Select a function-local identifier token to rename it in pseudocode");
+    }
     return menu;
 }
 
@@ -605,12 +909,14 @@ void open_line_context_menu(
     int selected_line,
     std::uint32_t selected_token_begin,
     std::uint32_t selected_token_end,
-    aida::ui::context_menu_open_origin_t origin)
+    aida::ui::context_menu_open_origin_t origin,
+    std::string rename_candidate = {})
 {
     aida::ui::analysis_context_menu::open(
         make_line_context_menu(context, line, source_address,
             std::move(token_text), state, selected_line,
-            selected_token_begin, selected_token_end), origin);
+            selected_token_begin, selected_token_end,
+            std::move(rename_candidate)), origin);
 }
 
 void persist_line_selection(
@@ -1371,6 +1677,7 @@ void render(float, float, float width, float height,
         clipper.Begin(line_count, row_height);
         std::optional<std::uint64_t> selected_source_address;
         std::string selected_token_text;
+        std::string selected_rename_candidate;
         std::optional<aida::ui::analysis_context_menu::context_t>
             selected_shortcut_context;
         while (clipper.Step()) {
@@ -1514,10 +1821,13 @@ void render(float, float, float width, float height,
                                 selected_token_begin - line.text_begin,
                                 selected_token_end - selected_token_begin);
                         }
+                        selected_rename_candidate = local_rename_candidate(
+                            *workbench.pseudocode_document, page, selected_token_begin);
                         selected_shortcut_context = make_line_context_menu(
                             context, line, selected_source_address,
                             selected_token_text, state, line_index,
-                            selected_token_begin, selected_token_end);
+                            selected_token_begin, selected_token_end,
+                            selected_rename_candidate);
                     }
                     if (hovered_token && hovered && source_address) {
                         ImGui::SetTooltip("%s\nMapped address  0x%s\nEnter: disassembly   Space: graph",
@@ -1577,11 +1887,15 @@ void render(float, float, float width, float height,
                             : source_address;
                         const auto token_text = hovered_token
                             ? hovered_token->text : selected_token_text;
+                        const auto rename_candidate = right_clicked && hovered_token
+                            ? local_rename_candidate(*workbench.pseudocode_document, page,
+                                hovered_token->range.begin)
+                            : selected_rename_candidate;
                         open_line_context_menu(context, line, menu_source,
                             token_text, state, static_cast<int>(line_index),
                             selected_token_begin, selected_token_end, right_clicked
                                 ? aida::ui::context_menu_open_origin_t::pointer
-                                : menu_origin);
+                                : menu_origin, rename_candidate);
                     }
                     ImGui::PopID();
                 }
@@ -1600,6 +1914,12 @@ void render(float, float, float width, float height,
                 aida::ui::analysis_context_menu::execute_shortcut(
                     std::move(*selected_shortcut_context), "analysis.copy.text");
         }
+        if (code_focused && !selected_rename_candidate.empty()) {
+            const auto& io = ImGui::GetIO();
+            if (!io.WantTextInput && !io.KeyCtrl && !io.KeyAlt && !io.KeyShift &&
+                ImGui::IsKeyPressed(ImGuiKey_N, false))
+                open_local_rename_prompt(selected_rename_candidate);
+        }
     }
     aida::ui::analysis_context_menu::render();
     ImGui::PopStyleColor();
@@ -1607,6 +1927,7 @@ void render(float, float, float width, float height,
     ImGui::PopID();
     comment_dialog::render();
     rename_dialog::render();
+    render_local_rename_prompt(context, *workbench.pseudocode_document, state);
 }
 
 void render(float pos_x, float pos_y, float width, float height,

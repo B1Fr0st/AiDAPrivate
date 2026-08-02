@@ -5,6 +5,7 @@
 #include "../analysis/decompiler/decompiler_ui_integration.hpp"
 #include "../analysis/workspace/analysis_workspace.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
+#include "../analysis/workspace/paged_snapshot_view.hpp"
 #include "../infra/executor.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
@@ -997,9 +998,13 @@ public:
 
     std::uint64_t total_rows(std::uint64_t generation) const noexcept override
     {
-        if (!generation_current(generation))
+        try {
+            if (!generation_current(generation))
+                return 0;
+            return analysis::instructions_view(*lease_.publication->snapshot).size();
+        } catch (...) {
             return 0;
-        return lease_.publication->snapshot->instructions.size();
+        }
     }
 
     bool row_at(std::uint64_t generation, std::uint64_t ordinal,
@@ -1007,12 +1012,17 @@ public:
     {
         output = {};
         try {
-            if (!generation_current(generation) ||
-                ordinal >= lease_.publication->snapshot->instructions.size())
+            if (!generation_current(generation))
                 return false;
             const auto& snapshot = *lease_.publication->snapshot;
-            const auto& instruction =
-                snapshot.instructions[static_cast<std::size_t>(ordinal)];
+            const auto instructions = analysis::instructions_view(snapshot);
+            if (ordinal >= instructions.size())
+                return false;
+            analysis::fact_page_pin_t instruction_pin;
+            auto instruction_row = instructions.at(ordinal, instruction_pin, {});
+            if (!instruction_row)
+                return false;
+            const auto& instruction = *instruction_row.value();
             if (instruction.length == 0)
                 return false;
             output.id = {ordinal + 1U};
@@ -1021,14 +1031,18 @@ public:
             output.mnemonic = "mnemonic_" +
                               std::to_string(instruction.mnemonic_id);
 
+            const auto operands = analysis::operand_facts_view(snapshot);
             const auto operand_begin = instruction.operand_fact_begin;
             const auto operand_count = instruction.operand_fact_count;
-            if (operand_begin > snapshot.operand_facts.size() ||
-                operand_count > snapshot.operand_facts.size() - operand_begin)
+            if (operand_begin > operands.size() ||
+                operand_count > operands.size() - operand_begin)
                 return false;
+            analysis::fact_page_pin_t operand_pin;
             for (std::uint32_t index = 0; index < operand_count; ++index) {
-                const auto text = render_operand(
-                    snapshot.operand_facts[operand_begin + index]);
+                auto operand_row = operands.at(operand_begin + index, operand_pin, {});
+                if (!operand_row)
+                    return false;
+                const auto text = render_operand(*operand_row.value());
                 if (text.empty())
                     continue;
                 if (!output.operands.empty())
@@ -1036,13 +1050,18 @@ public:
                 output.operands += text;
             }
 
+            const auto targets = analysis::target_facts_view(snapshot);
             const auto target_begin = instruction.target_fact_begin;
             const auto target_count = instruction.target_fact_count;
-            if (target_begin > snapshot.target_facts.size() ||
-                target_count > snapshot.target_facts.size() - target_begin)
+            if (target_begin > targets.size() ||
+                target_count > targets.size() - target_begin)
                 return false;
+            analysis::fact_page_pin_t target_pin;
             for (std::uint32_t index = 0; index < target_count; ++index) {
-                const auto& target = snapshot.target_facts[target_begin + index];
+                auto target_row = targets.at(target_begin + index, target_pin, {});
+                if (!target_row)
+                    return false;
+                const auto& target = *target_row.value();
                 if (target.kind == analysis::target_kind_record_t::call &&
                     !output.has_call_target) {
                     output.has_call_target = true;
@@ -1077,22 +1096,32 @@ public:
         try {
             if (!generation_current(generation))
                 return false;
-            const auto& instructions =
-                lease_.publication->snapshot->instructions;
-            const auto upper = std::upper_bound(
-                instructions.begin(), instructions.end(), address,
-                [](std::uint64_t value,
-                   const analysis::instruction_record_t& instruction) {
-                    return value < instruction.address.value;
-                });
-            if (upper == instructions.begin())
+            const auto instructions =
+                analysis::instructions_view(*lease_.publication->snapshot);
+            analysis::fact_page_pin_t pin;
+            std::uint64_t lower = 0;
+            std::uint64_t upper = instructions.size();
+            while (lower < upper) {
+                const std::uint64_t mid = lower + (upper - lower) / 2;
+                auto row = instructions.at(mid, pin, {});
+                if (!row)
+                    return false;
+                if (row.value()->address.value <= address)
+                    lower = mid + 1;
+                else
+                    upper = mid;
+            }
+            if (lower == 0)
                 return false;
-            const auto candidate = upper - 1;
-            if (candidate->length == 0 || address < candidate->address.value ||
-                address - candidate->address.value >= candidate->length)
+            const std::uint64_t candidate = lower - 1;
+            auto row = instructions.at(candidate, pin, {});
+            if (!row)
                 return false;
-            ordinal = static_cast<std::uint64_t>(
-                candidate - instructions.begin());
+            const auto& instruction = *row.value();
+            if (instruction.length == 0 || address < instruction.address.value ||
+                address - instruction.address.value >= instruction.length)
+                return false;
+            ordinal = candidate;
             return row_at(generation, ordinal, output);
         } catch (...) {
             output = {};
@@ -1115,8 +1144,17 @@ public:
         std::uint64_t ordinal = 0;
         if (!row_by_address(generation, address, row, ordinal))
             return false;
-        output = lease_.publication->snapshot->instructions[
-            static_cast<std::size_t>(ordinal)].address;
+        try {
+            const auto instructions =
+                analysis::instructions_view(*lease_.publication->snapshot);
+            analysis::fact_page_pin_t pin;
+            auto instruction_row = instructions.at(ordinal, pin, {});
+            if (!instruction_row)
+                return false;
+            output = instruction_row.value()->address;
+        } catch (...) {
+            return false;
+        }
         output.value = address;
         return true;
     }
@@ -3017,10 +3055,16 @@ diff_document::diff_source_result_t append_snapshot_diff_entities(
     diff_entity_map_t& output)
 {
     output.clear();
-    for (const auto& instruction : snapshot.instructions) {
+    const auto instructions = analysis::instructions_view(snapshot);
+    analysis::fact_page_pin_t instruction_pin;
+    for (std::uint64_t ordinal = 0; ordinal < instructions.size(); ++ordinal) {
         if ((output.size() & 0xFFU) == 0U && cancellation &&
             cancellation->cancelled())
             return diff_document::diff_source_result_t::cancelled;
+        auto instruction_row = instructions.at(ordinal, instruction_pin, {});
+        if (!instruction_row)
+            return diff_document::diff_source_result_t::rejected;
+        const auto& instruction = *instruction_row.value();
         const auto identity = instruction.id != 0
             ? instruction.id : instruction.address.value;
         std::ostringstream value;
@@ -3672,13 +3716,80 @@ std::vector<analysis::decompiler_diagnostic_t> pseudocode_diagnostics(
     return diagnostics;
 }
 
+struct pseudocode_render_evidence_entry_t final {
+    std::shared_ptr<const analysis::type_graph_t> type_graph;
+    std::shared_ptr<const analysis::decompiler_render_evidence_t> evidence;
+};
+
+struct pseudocode_render_evidence_store_t final {
+    std::mutex mutex;
+    std::map<std::string, pseudocode_render_evidence_entry_t> entries;
+    std::deque<std::string> order;
+};
+
+constexpr std::size_t k_workbench_pseudocode_render_evidence_max_entries = 128;
+
+std::string pseudocode_render_evidence_key(
+    const analysis::decompiler_entity_key_t& entity,
+    std::uint64_t generation,
+    std::uint64_t analysis_revision,
+    std::uint64_t overlay_revision)
+{
+    std::string key = analysis::stable_serialization_hash(entity).to_hex();
+    key.reserve(key.size() + 80);
+    key.push_back('|');
+    key.append(std::to_string(generation));
+    key.push_back('|');
+    key.append(std::to_string(analysis_revision));
+    key.push_back('|');
+    key.append(std::to_string(overlay_revision));
+    return key;
+}
+
+void pseudocode_render_evidence_store_put(
+    pseudocode_render_evidence_store_t& store,
+    std::string key,
+    pseudocode_render_evidence_entry_t entry)
+{
+    if (!entry.type_graph)
+        return;
+    std::lock_guard<std::mutex> lock(store.mutex);
+    const auto existing = store.entries.find(key);
+    if (existing != store.entries.end()) {
+        existing->second = std::move(entry);
+        const auto position = std::find(store.order.begin(), store.order.end(), key);
+        if (position != store.order.end())
+            store.order.erase(position);
+        store.order.push_back(std::move(key));
+    } else {
+        store.order.push_back(key);
+        store.entries.emplace(std::move(key), std::move(entry));
+    }
+    while (!store.order.empty() &&
+           store.order.size() > k_workbench_pseudocode_render_evidence_max_entries) {
+        store.entries.erase(store.order.front());
+        store.order.pop_front();
+    }
+}
+
+pseudocode_render_evidence_entry_t pseudocode_render_evidence_store_get(
+    pseudocode_render_evidence_store_t& store,
+    const std::string& key)
+{
+    std::lock_guard<std::mutex> lock(store.mutex);
+    const auto found = store.entries.find(key);
+    return found == store.entries.end()
+        ? pseudocode_render_evidence_entry_t{} : found->second;
+}
+
 class production_pseudocode_source_t final
     : public pseudocode_document::pseudocode_source_adapter_t {
 public:
     explicit production_pseudocode_source_t(analysis_document_lease_t lease)
         : lease_(std::move(lease)),
           policy_(analysis::default_decompiler_profile_policy()),
-          jobs_(std::make_shared<job_registry_t>())
+          jobs_(std::make_shared<job_registry_t>()),
+          render_evidence_store_(std::make_shared<pseudocode_render_evidence_store_t>())
     {
         const auto workspace = lease_.source
             ? lease_.source->analysis_workspace() : nullptr;
@@ -3758,6 +3869,27 @@ public:
         } catch (...) {
             return false;
         }
+    }
+
+    pseudocode_document::pseudocode_render_evidence_bundle_t render_evidence(
+        const pseudocode_document::pseudocode_request_t& request) const override
+    {
+        pseudocode_document::pseudocode_render_evidence_bundle_t bundle;
+        try {
+            if (!request.binding || !render_evidence_store_)
+                return bundle;
+            const auto entry = pseudocode_render_evidence_store_get(
+                *render_evidence_store_,
+                pseudocode_render_evidence_key(request.entity,
+                    request.workspace_generation,
+                    request.binding->analysis_revision,
+                    request.binding->overlay_revision));
+            bundle.type_graph = entry.type_graph;
+            bundle.evidence = entry.evidence;
+        } catch (...) {
+            return {};
+        }
+        return bundle;
     }
 
     workbench_error_t resolve_request(
@@ -3921,8 +4053,10 @@ public:
             found->second.payload = std::move(payload);
         };
         const auto registry = jobs_;
+        const auto render_evidence_store = render_evidence_store_;
         submission.body = [decompiler, source, publication, request,
-                           workspace, cancellation, registry, job_id]() mutable {
+                           workspace, cancellation, registry, render_evidence_store,
+                           job_id]() mutable {
             pseudocode_job_payload_t payload;
             try {
                 if (cancellation->token().stop_requested()) {
@@ -3990,6 +4124,23 @@ public:
                             analysis::decompiler_diagnostic_code_t::cache_key_rejected,
                             "workbench.pseudocode.stale_generation", true));
                     } else {
+                        pseudocode_render_evidence_entry_t evidence_entry;
+                        if (result.value().normalized_stage) {
+                            const auto& stage = result.value().normalized_stage;
+                            evidence_entry.type_graph =
+                                std::shared_ptr<const analysis::type_graph_t>(
+                                    stage, &stage->type_graph);
+                            evidence_entry.evidence = stage->evidence;
+                        }
+                        if (!evidence_entry.evidence && result.value().provider_stage)
+                            evidence_entry.evidence =
+                                result.value().provider_stage->evidence;
+                        pseudocode_render_evidence_store_put(*render_evidence_store,
+                            pseudocode_render_evidence_key(request.entity,
+                                request.workspace_generation,
+                                request.binding->analysis_revision,
+                                request.binding->overlay_revision),
+                            std::move(evidence_entry));
                         payload.document = *result.value().document;
                         payload.succeeded = true;
                     }
@@ -4149,6 +4300,7 @@ private:
     analysis::decompiler_profile_policy_t policy_;
     std::shared_ptr<analysis::decompiler_ui_integration_t> decompiler_;
     std::shared_ptr<job_registry_t> jobs_;
+    std::shared_ptr<pseudocode_render_evidence_store_t> render_evidence_store_;
 };
 #endif
 

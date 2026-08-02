@@ -61,6 +61,7 @@ struct fact_page_cache_statistics_t final {
     std::uint64_t dropped_pages = 0;
     std::uint64_t dropped_bytes = 0;
     std::uint64_t trims = 0;
+    std::uint64_t bypass_decodes = 0;
 };
 
 struct fact_page_coherence_notification_t final {
@@ -108,6 +109,7 @@ public:
     void set_ceiling(std::uint64_t bytes) noexcept;
     std::uint64_t ceiling() const noexcept;
     void trim() noexcept;
+    void record_bypass() noexcept;
     fact_page_cache_statistics_t statistics() const noexcept;
 
 private:

@@ -79,7 +79,7 @@ public:
         std::uint64_t maximum_unique_seeds,
         std::atomic<std::uint64_t>* shared_unique_seed_count);
 
-    decode_frontier_t() = default;
+    decode_frontier_t();
     decode_frontier_t(decode_frontier_t&&) noexcept;
     decode_frontier_t& operator=(decode_frontier_t&&) noexcept;
     ~decode_frontier_t();

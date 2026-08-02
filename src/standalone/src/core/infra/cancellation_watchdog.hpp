@@ -221,7 +221,7 @@ watch_id_t register_watch(watch_descriptor_t desc) noexcept {
     std::uint32_t generation = reg.next_generation.fetch_add(1u, std::memory_order_acq_rel) + 1u;
     if (generation == 0)
         generation = reg.next_generation.fetch_add(1u, std::memory_order_acq_rel) + 1u;
-    watch_slot_t& slot = reg.slots[slot_index];
+    detail::watch_slot_t& slot = reg.slots[slot_index];
     slot.deadline_ms = desc.deadline_ms;
     slot.source_token = std::move(desc.source_token);
     slot.external_flag = desc.external_flag;

@@ -430,7 +430,8 @@ void test_rich_fact_publication_and_metadata_conflicts()
     snapshot.normalized_image = std::make_shared<const workspace_image_t>(image);
     append_instruction_facts(snapshot);
     auto xrefs = require_value(xref_builder_t::build(image, snapshot.instructions,
-        snapshot.operand_facts, snapshot.target_facts, std::move(data),
+        snapshot.operand_facts, snapshot.target_facts,
+        std::make_shared<data_discovery_result_t>(std::move(data)),
         symbols.type_references, {}, {}), "xref construction failed");
     require(xrefs.duplicate_xrefs != 0 && !xrefs.data_pointer_facts.empty(),
             "xref construction dropped duplicate accounting or pointer facts");

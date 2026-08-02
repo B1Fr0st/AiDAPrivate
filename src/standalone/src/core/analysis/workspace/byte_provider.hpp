@@ -210,6 +210,7 @@ struct mapped_file_provider_options_t {
     std::uint64_t read_chunk_size = 4ULL * 1024ULL * 1024ULL;
     bool pin_local_file_snapshot = true;
     bool pin_sections = true;
+    bool defer_content_hash = false;
 };
 
 struct provider_pin_range_t final {
@@ -241,6 +242,9 @@ public:
     workspace_result_t<void> revalidate() const;
     workspace_result_t<void> pin_ranges(
         const std::vector<provider_pin_range_t>& ranges) const;
+    bool content_hash_ready() const noexcept;
+    workspace_result_t<sha256_digest_t> await_content_hash(
+        const cancellation_token_t& cancel = {}) const;
 
 private:
     struct state_t;

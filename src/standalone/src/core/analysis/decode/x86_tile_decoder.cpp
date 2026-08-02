@@ -86,6 +86,15 @@ bool mode_matches_address(architecture_mode_t mode, const address_t& address) no
            address.architecture == architecture_id_t::x86 && address.mode == mode;
 }
 
+bool same_identity_fields(const byte_provider_identity_t& lhs,
+                          const byte_provider_identity_t& rhs) noexcept {
+    return lhs.normalized_source == rhs.normalized_source &&
+           lhs.size == rhs.size &&
+           lhs.volume_serial == rhs.volume_serial &&
+           lhs.file_id == rhs.file_id &&
+           lhs.last_write_time_100ns == rhs.last_write_time_100ns;
+}
+
 workspace_result_t<void> validate_limits(const x86_tile_decode_limits_t& limits,
                                          const x86_tile_decode_request_t& request) {
     const bool invalid = limits.maximum_window_bytes == 0 ||
@@ -482,6 +491,9 @@ workspace_result_t<void> append_decoded_instruction(
 struct worker_owned_x86_tile_decoder_t::impl_t {
     architecture_mode_t mode = architecture_mode_t::unknown;
     ZydisDecoder decoder{};
+    bool source_validated = false;
+    std::uint64_t source_generation = 0;
+    byte_provider_identity_t source_identity{};
 };
 
 workspace_result_t<std::unique_ptr<worker_owned_x86_tile_decoder_t>>
@@ -574,9 +586,19 @@ worker_owned_x86_tile_decoder_t::decode_tile(
     auto runtime_start = runtime_start_for(request);
     if (!runtime_start)
         return workspace_result_t<x86_tile_decode_result_t>::failure(runtime_start.error());
-    auto source_valid = snapshot.validate_source();
-    if (!source_valid)
-        return workspace_result_t<x86_tile_decode_result_t>::failure(source_valid.error());
+    bool validated_this_call = false;
+    if (!impl_->source_validated ||
+        impl_->source_generation != snapshot.generation() ||
+        !same_identity_fields(impl_->source_identity, snapshot.source_identity())) {
+        auto source_valid = snapshot.validate_source();
+        if (!source_valid)
+            return workspace_result_t<x86_tile_decode_result_t>::failure(
+                source_valid.error());
+        impl_->source_validated = true;
+        impl_->source_generation = snapshot.generation();
+        impl_->source_identity = snapshot.source_identity();
+        validated_this_call = true;
+    }
     if (cancel.stop_requested()) {
         return workspace_result_t<x86_tile_decode_result_t>::failure(stop_error(cancel, request));
     }
@@ -603,6 +625,7 @@ worker_owned_x86_tile_decoder_t::decode_tile(
         output.usage.input_bytes = request.byte_count;
         output.usage.snapshot_window_leases = 1;
         output.usage.snapshot_window_bytes = request.byte_count;
+        output.usage.source_validations = validated_this_call ? 1 : 0;
         const auto window_size = static_cast<std::size_t>(request.byte_count);
         const auto instruction_reserve = (std::min)({window_size,
             static_cast<std::size_t>(request.limits.maximum_instructions),

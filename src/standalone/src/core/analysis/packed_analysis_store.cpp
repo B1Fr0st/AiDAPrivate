@@ -1931,6 +1931,51 @@ void packed_analysis_shard_t::release() noexcept
 
 namespace {
 
+template <typename T>
+void release_column_vector(std::vector<T>& values) noexcept
+{
+    std::vector<T>().swap(values);
+}
+
+bool domain_mask_has(std::uint32_t mask, fact_domain_t domain) noexcept
+{
+    return (mask & (1U << static_cast<std::uint32_t>(domain))) != 0;
+}
+
+}
+
+void packed_analysis_shard_t::release_domains(std::uint32_t domain_mask) noexcept
+{
+    if (!impl_)
+        return;
+    if (domain_mask_has(domain_mask, fact_domain_t::instructions))
+        release_column_vector(impl_->instructions);
+    if (domain_mask_has(domain_mask, fact_domain_t::operand_facts)) {
+        release_column_vector(impl_->operands);
+        release_column_vector(impl_->address_expressions);
+    }
+    if (domain_mask_has(domain_mask, fact_domain_t::edges))
+        release_column_vector(impl_->edges);
+    if (domain_mask_has(domain_mask, fact_domain_t::strings))
+        release_column_vector(impl_->string_records);
+    if (domain_mask_has(domain_mask, fact_domain_t::symbols))
+        release_column_vector(impl_->symbols);
+    if (domain_mask_has(domain_mask, fact_domain_t::blocks))
+        release_column_vector(impl_->basic_blocks);
+    if (domain_mask_has(domain_mask, fact_domain_t::functions))
+        release_column_vector(impl_->functions);
+    if (domain_mask_has(domain_mask, fact_domain_t::function_chunks))
+        release_column_vector(impl_->function_chunks);
+    if (domain_mask_has(domain_mask, fact_domain_t::target_facts))
+        release_column_vector(impl_->target_facts);
+    if (domain_mask_has(domain_mask, fact_domain_t::xrefs))
+        release_column_vector(impl_->xrefs);
+    if (domain_mask_has(domain_mask, fact_domain_t::coverage))
+        release_column_vector(impl_->coverage_spans);
+}
+
+namespace {
+
 std::optional<packed_entity_id_t> shard_row_id(packed_entity_domain_t domain,
                                                std::uint16_t shard,
                                                entity_id_t source_id) noexcept
@@ -2988,6 +3033,36 @@ packed_size_accounting_t packed_analysis_store_t::size_accounting() const noexce
                                     function_payload, function_chunk_payload,
                                     target_fact_payload, xref_payload, coverage_payload,
                                     payload, reserved};
+}
+
+void packed_analysis_store_t::release_domains(std::uint32_t domain_mask) noexcept
+{
+    if (!impl_)
+        return;
+    if (domain_mask_has(domain_mask, fact_domain_t::instructions))
+        impl_->instructions = instruction_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::operand_facts)) {
+        impl_->operands = operand_columns_t{};
+        impl_->address_expressions = address_expression_columns_t{};
+    }
+    if (domain_mask_has(domain_mask, fact_domain_t::edges))
+        impl_->edges = edge_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::strings))
+        impl_->string_records = string_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::symbols))
+        impl_->symbols = symbol_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::blocks))
+        impl_->basic_blocks = basic_block_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::functions))
+        impl_->functions = function_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::function_chunks))
+        impl_->function_chunks = function_chunk_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::target_facts))
+        impl_->target_facts = target_fact_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::xrefs))
+        impl_->xrefs = xref_columns_t{};
+    if (domain_mask_has(domain_mask, fact_domain_t::coverage))
+        impl_->coverage_spans = coverage_columns_t{};
 }
 
 packed_store_result_t<void> packed_analysis_store_t::validate() const

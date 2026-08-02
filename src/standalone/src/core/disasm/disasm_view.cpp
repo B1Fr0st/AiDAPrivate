@@ -14,6 +14,7 @@
 #include "../analysis/source_reconstruct_view.hpp"
 #endif
 #include "../analysis/workspace/overlay_journal.hpp"
+#include "../analysis/workspace/publication_indexes.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../analysis/workspace/x86_decoder.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
@@ -2505,19 +2506,26 @@ void open_xrefs(std::uint64_t value, const workspace_context_t& context) {
     std::vector<xref_popup_entry_t> results;
     results.reserve(256);
     constexpr std::size_t maximum_results = 10000;
-    for (const auto& xref : context.publication->snapshot->xrefs) {
-        if (context.workspace->cancellation_token().stop_requested())
-            break;
-        if (xref.target != *address)
-            continue;
-        xref_popup_entry_t entry;
-        entry.addr = runtime_address(context, xref.source).value_or(xref.source.value);
-        entry.type = static_cast<int>(xref.kind);
-        entry.module_name = context.workspace->identity().bin_name();
-        entry.function_name = resolve_name(context, xref.source);
-        results.push_back(std::move(entry));
-        if (results.size() >= maximum_results)
-            break;
+    const auto indexes = aida::analysis::publication_indexes::for_publication(
+        context.publication, context.workspace->cancellation_token());
+    if (indexes) {
+        const auto& xrefs = context.publication->snapshot->xrefs;
+        const auto range = indexes->xrefs_to(*address);
+        for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
+            if (context.workspace->cancellation_token().stop_requested())
+                break;
+            const auto& xref = xrefs[indexes->xref_to_entry(ordinal)];
+            if (xref.target != *address)
+                continue;
+            xref_popup_entry_t entry;
+            entry.addr = runtime_address(context, xref.source).value_or(xref.source.value);
+            entry.type = static_cast<int>(xref.kind);
+            entry.module_name = context.workspace->identity().bin_name();
+            entry.function_name = resolve_name(context, xref.source);
+            results.push_back(std::move(entry));
+            if (results.size() >= maximum_results)
+                break;
+        }
     }
     const auto result_count = results.size();
     {
@@ -2540,20 +2548,27 @@ void open_xrefs(std::uint64_t value, const workspace_context_t& context) {
         std::vector<xref_popup_entry_t> results;
         results.reserve(256);
         constexpr std::size_t maximum_results = 10000;
-        for (const auto& xref : context.publication->snapshot->xrefs) {
-            if (cancel.requested.load(std::memory_order_acquire) ||
-                context.workspace->cancellation_token().stop_requested())
-                break;
-            if (xref.target != address)
-                continue;
-            xref_popup_entry_t entry;
-            entry.addr = runtime_address(context, xref.source).value_or(xref.source.value);
-            entry.type = static_cast<int>(xref.kind);
-            entry.module_name = context.workspace->identity().bin_name();
-            entry.function_name = resolve_name(context, xref.source);
-            results.push_back(std::move(entry));
-            if (results.size() >= maximum_results)
-                break;
+        const auto indexes = aida::analysis::publication_indexes::for_publication(
+            context.publication, context.workspace->cancellation_token());
+        if (indexes) {
+            const auto& xrefs = context.publication->snapshot->xrefs;
+            const auto range = indexes->xrefs_to(address);
+            for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
+                if (cancel.requested.load(std::memory_order_acquire) ||
+                    context.workspace->cancellation_token().stop_requested())
+                    break;
+                const auto& xref = xrefs[indexes->xref_to_entry(ordinal)];
+                if (xref.target != address)
+                    continue;
+                xref_popup_entry_t entry;
+                entry.addr = runtime_address(context, xref.source).value_or(xref.source.value);
+                entry.type = static_cast<int>(xref.kind);
+                entry.module_name = context.workspace->identity().bin_name();
+                entry.function_name = resolve_name(context, xref.source);
+                results.push_back(std::move(entry));
+                if (results.size() >= maximum_results)
+                    break;
+            }
         }
         {
             std::lock_guard<std::mutex> lock(context.view->mutex);

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "function_index.hpp"
+#include "../analysis/workspace/publication_indexes.hpp"
 
 namespace xref_index {
 
@@ -76,19 +77,22 @@ namespace xref_index {
 		if (cancel.stop_requested() || workspace_cancel.stop_requested())
 			return workspace_result_t<std::vector<annotation_t>>::failure(
 				cancellation_error());
+		auto indexes = publication_indexes::for_publication_result(publication, cancel);
+		if (!indexes)
+			return workspace_result_t<std::vector<annotation_t>>::failure(indexes.error());
 		const auto& snapshot = publication->snapshot;
+		const auto& xrefs = snapshot->xrefs;
 		const auto names = function_index::workspace_name_snapshot(workspace);
 		std::vector<annotation_t> result;
 		result.reserve((std::min)(limit, snapshot->xrefs.size()));
+		const auto range = indexes.value()->xrefs_to(normalized.value());
 		size_t visited = 0;
-		for (const auto& xref : snapshot->xrefs) {
+		for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
 			if ((++visited & 0xFFFu) == 0 &&
 				(cancel.stop_requested() || workspace_cancel.stop_requested()))
 				return workspace_result_t<std::vector<annotation_t>>::failure(
 					cancellation_error());
-			if (xref.target.space != normalized.value().space ||
-				xref.target.value != normalized.value().value)
-				continue;
+			const auto& xref = xrefs[indexes.value()->xref_to_entry(ordinal)];
 			annotation_t item;
 			item.kind = xref.kind == xref_kind_t::read ||
 				xref.kind == xref_kind_t::write ||
@@ -121,17 +125,12 @@ namespace xref_index {
 			publication->binary_id != workspace->identity().binary_id() ||
 			publication->generation != workspace->generation()) return false;
 		const auto workspace_cancel = workspace->cancellation_token();
-		size_t count = 0;
-		size_t visited = 0;
-		for (const auto& xref : publication->snapshot->xrefs) {
-			if ((++visited & 0xFFFu) == 0 &&
-				(cancel.stop_requested() || workspace_cancel.stop_requested()))
-				return false;
-			if (xref.target.space == normalized.value().space &&
-				xref.target.value == normalized.value().value && ++count > returned)
-				return true;
-		}
-		return false;
+		if (cancel.stop_requested() || workspace_cancel.stop_requested())
+			return false;
+		const auto indexes = aida::analysis::publication_indexes::for_publication(publication, cancel);
+		if (!indexes)
+			return false;
+		return indexes->xref_count_to(normalized.value()) > returned;
 	}
 
 }

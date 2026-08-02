@@ -361,7 +361,8 @@ std::uint64_t full_walk_bytes(const analysis_snapshot_t& snapshot) {
     const std::pair<std::uint64_t, std::uint64_t> allocations[] = {
         {snapshot.instructions.capacity(), sizeof(instruction_record_t)},
         {snapshot.delay_slot_counts.capacity(), sizeof(std::uint8_t)},
-        {snapshot.operand_facts.capacity(), sizeof(operand_fact_t)},
+        {snapshot.operand_facts.hot.capacity(), sizeof(operand_fact_hot_t)},
+        {snapshot.operand_facts.cold.capacity(), sizeof(operand_fact_cold_t)},
         {snapshot.target_facts.capacity(), sizeof(target_fact_t)},
         {snapshot.blocks.capacity(), sizeof(basic_block_record_t)},
         {snapshot.function_chunks.capacity(), sizeof(function_chunk_record_t)},

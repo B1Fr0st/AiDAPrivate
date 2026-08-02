@@ -7,6 +7,7 @@
 #include "workspace_schema_v9.hpp"
 
 #include <chrono>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -21,10 +22,17 @@ struct sqlite3;
 
 namespace aida::analysis {
 
-inline constexpr std::uint32_t workspace_database_schema_version = workspace_schema_v10_version;
+inline constexpr std::uint32_t workspace_database_schema_version = workspace_schema_v11_version;
 inline constexpr std::uint32_t workspace_instruction_blob_version = 2;
 inline constexpr std::uint64_t workspace_decompiler_cache_record_limit = 64ULL << 20;
 inline constexpr std::uint64_t workspace_search_blob_limit = 8ULL << 30;
+inline constexpr std::uint64_t packed_domain_stream_header_bytes = 16;
+inline constexpr std::uint64_t packed_instruction_stream_record_bytes = 58;
+inline constexpr std::uint64_t packed_operand_stream_record_bytes = 85;
+inline constexpr std::uint64_t packed_target_stream_record_bytes = 49;
+inline constexpr std::uint64_t packed_edge_stream_record_min_bytes = 52;
+inline constexpr std::uint64_t packed_edge_stream_record_max_bytes = 60;
+inline constexpr std::uint64_t packed_xref_stream_record_bytes = 43;
 
 struct workspace_database_versions_t {
     std::string engine_version;
@@ -40,7 +48,7 @@ struct workspace_database_options_t {
     std::uint32_t candidate_operation_timeout_ms = 5000;
     std::uint32_t passive_checkpoint_pages = 4096;
     std::uint64_t instruction_chunk_records = 4096;
-    std::uint64_t max_persisted_fact_records = 200000000;
+    std::uint64_t max_persisted_fact_records = 1000000000;
     std::uint64_t packed_generation_quota_bytes =
         packed_generation_default_quota_bytes;
     std::uint32_t packed_stream_page_size = 256U << 10;
@@ -169,6 +177,26 @@ workspace_result_t<std::shared_ptr<search_index_t>> restore_persisted_search_ind
 
 workspace_result_t<void> migrate_workspace_database_schema(
     sqlite3* database, bool& invalidate_derived_facts);
+
+workspace_result_t<instruction_record_t> decode_packed_instruction_record(
+    const std::uint8_t* data, std::size_t size);
+workspace_result_t<operand_fact_t> decode_packed_operand_record(
+    const std::uint8_t* data, std::size_t size);
+workspace_result_t<target_fact_t> decode_packed_target_record(
+    const std::uint8_t* data, std::size_t size);
+workspace_result_t<edge_record_t> decode_packed_edge_record(
+    const std::uint8_t* data, std::size_t size);
+workspace_result_t<xref_record_t> decode_packed_xref_record(
+    const std::uint8_t* data, std::size_t size);
+
+std::vector<std::uint8_t> encode_packed_instruction_record(
+    const instruction_record_t& record);
+std::vector<std::uint8_t> encode_packed_operand_record(const operand_fact_t& record);
+std::vector<std::uint8_t> encode_packed_target_record(const target_fact_t& record);
+std::vector<std::uint8_t> encode_packed_xref_record(const xref_record_t& record);
+std::array<std::uint8_t, packed_domain_stream_header_bytes>
+encode_packed_domain_stream_header(packed_page_type_t domain,
+                                   std::uint64_t record_count);
 
 class workspace_database_t;
 

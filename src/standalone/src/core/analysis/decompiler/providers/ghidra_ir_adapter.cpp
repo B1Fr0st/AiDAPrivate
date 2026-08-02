@@ -1693,6 +1693,8 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
             signature += parameter_type_id == 0 ? "unknown" : type_name_for_id(parameter_type_id);
             if (parameter_type_id != 0) {
                 auto name = parameter ? bounded_utf8(parameter->getName()) : std::string{};
+                if (prototype.hasThisPointer() && parameter && parameter->isThisPointer())
+                    name = "this";
                 if (name.empty())
                     name = "parameter." + std::to_string(index);
                 parameters.emplace_back(parameter_type_id, std::move(name));
@@ -1927,7 +1929,8 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         }
     }
     const auto collect_high = [&capture, &high_ids, &high_value_ids, &ensure_type, &associated_high,
-                               &formal_parameter, native_entity, &code_coordinate, runtime_entry](
+                               &formal_parameter, native_entity, &code_coordinate, runtime_entry,
+                               &function](
                                const ghidra::Varnode* node,
                                const std::uint64_t value_id) {
         if (!node || node->isAnnotation() || node->isConstant())
@@ -1954,6 +1957,8 @@ extraction_result_t extract(const ghidra::Funcdata& function, const capture_requ
         variable.stable_name = symbol_name(high->getSymbol());
         if (variable.stable_name.empty() && parameter)
             variable.stable_name = bounded_utf8(parameter->getName());
+        if (parameter && function.getFuncProto().hasThisPointer() && parameter->isThisPointer())
+            variable.stable_name = "this";
         if (variable.stable_name.empty()) {
             variable.stable_name = (is_parameter ? "parameter_" : "local_") + std::to_string(id);
             variable.confidence = (std::min)(datatype_confidence(recovered_type), std::uint8_t{75});

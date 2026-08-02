@@ -13,6 +13,10 @@
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../analysis/workspace/advanced_cfg.hpp"
 #include "../analysis/workspace/calling_convention.hpp"
+#include "../analysis/workspace/compact_ir.hpp"
+#include "../analysis/workspace/fact_residency.hpp"
+#include "../analysis/workspace/paged_fact_staging.hpp"
+#include "../analysis/workspace/publication_indexes.hpp"
 #include "../analysis/workspace/decompiler_feedback.hpp"
 #include "../analysis/workspace/decompiler_service.hpp"
 #include "../analysis/workspace/pseudocode_readability.hpp"
@@ -5095,6 +5099,290 @@ static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& pass
     failed.fetch_add(1);
 }
 
+static void test_memory_scale_hot_cold_golden(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    using namespace aida::analysis;
+    std::vector<operand_fact_t> golden;
+    const auto append = [&](operand_fact_t record) {
+        golden.push_back(record);
+        auto& last = golden.back();
+        last.id = operand_entity_tag | (golden.size() - 1);
+        last.instruction_id = instruction_entity_tag |
+            ((golden.size() - 1) / 2 + 1);
+    };
+    operand_fact_t base;
+    base.operand_index = 0;
+    base.decoder_operand_id = 1;
+    base.kind = operand_kind_t::reg;
+    base.access = 1;
+    base.visibility = 2;
+    base.encoding = 3;
+    base.memory_type = 1;
+    base.access_width = 8;
+    base.bit_width = 64;
+    base.access_width_bits = 64;
+    base.reg = 7;
+    append(base);
+    operand_fact_t memory = base;
+    memory.operand_index = 1;
+    memory.kind = operand_kind_t::memory;
+    memory.segment_reg = 71;
+    memory.base_reg = 5;
+    memory.index_reg = 6;
+    memory.scale = 8;
+    memory.displacement = -4096;
+    memory.has_displacement = true;
+    memory.address_components = address_component_base | address_component_index |
+        address_component_scale | address_component_displacement;
+    memory.address_expression = address_expression_kind_t::base_index_displacement;
+    memory.address_resolution = target_resolution_t::image_relative;
+    memory.address_width_bits = 64;
+    memory.address_expression_id = address_expression_entity_tag | 3ULL;
+    append(memory);
+    operand_fact_t wide = base;
+    wide.operand_index = 2;
+    wide.memory_type = 4;
+    wide.bit_width = 80;
+    wide.access = 13;
+    wide.resolved_expression_value = 0xDEADBEEFCAFEULL;
+    wide.has_resolved_expression_value = true;
+    wide.element_width_bits = 16;
+    wide.element_count = 8;
+    wide.access_count = 2;
+    append(wide);
+    operand_fact_t segment = base;
+    segment.operand_index = 3;
+    segment.segment_reg = 300;
+    segment.immediate = 0x1122334455667788ULL;
+    segment.signed_value = true;
+    segment.relative = true;
+    append(segment);
+    operand_fact_store_t store;
+    store.hot.reserve(golden.size());
+    std::vector<instruction_record_t> instructions(2);
+    for (std::size_t index = 0; index < instructions.size(); ++index)
+        instructions[index].id = instruction_entity_tag | (index + 1);
+    for (std::size_t index = 0; index < golden.size(); ++index) {
+        auto parts = operand_fact_split(golden[index],
+            static_cast<std::uint32_t>(index / 2));
+        if (parts.has_cold) {
+            store.cold.push_back(parts.cold);
+            parts.hot.cold_index = static_cast<std::uint32_t>(store.cold.size());
+        }
+        store.hot.push_back(parts.hot);
+    }
+    bool identical = true;
+    std::size_t mismatch = golden.size();
+    for (std::size_t index = 0; index < golden.size() && identical; ++index) {
+        const auto rebuilt = operand_fact_materialize(store, index, instructions);
+        const auto& expected = golden[index];
+        if (rebuilt.id != expected.id ||
+            rebuilt.instruction_id != expected.instruction_id ||
+            rebuilt.address_expression_id != expected.address_expression_id ||
+            rebuilt.displacement != expected.displacement ||
+            rebuilt.immediate != expected.immediate ||
+            rebuilt.resolved_expression_value != expected.resolved_expression_value ||
+            rebuilt.bit_width != expected.bit_width ||
+            rebuilt.access_width_bits != expected.access_width_bits ||
+            rebuilt.element_width_bits != expected.element_width_bits ||
+            rebuilt.reg != expected.reg || rebuilt.segment_reg != expected.segment_reg ||
+            rebuilt.base_reg != expected.base_reg || rebuilt.index_reg != expected.index_reg ||
+            rebuilt.address_components != expected.address_components ||
+            rebuilt.access_count != expected.access_count ||
+            rebuilt.element_count != expected.element_count ||
+            rebuilt.address_width_bits != expected.address_width_bits ||
+            rebuilt.operand_index != expected.operand_index ||
+            rebuilt.decoder_operand_id != expected.decoder_operand_id ||
+            rebuilt.kind != expected.kind || rebuilt.access != expected.access ||
+            rebuilt.visibility != expected.visibility ||
+            rebuilt.encoding != expected.encoding ||
+            rebuilt.memory_type != expected.memory_type ||
+            rebuilt.access_width != expected.access_width ||
+            rebuilt.scale != expected.scale || rebuilt.relative != expected.relative ||
+            rebuilt.signed_value != expected.signed_value ||
+            rebuilt.has_displacement != expected.has_displacement ||
+            rebuilt.has_resolved_expression_value != expected.has_resolved_expression_value ||
+            rebuilt.address_expression != expected.address_expression ||
+            rebuilt.address_resolution != expected.address_resolution) {
+            identical = false;
+            mismatch = index;
+        }
+    }
+    if (identical) {
+        log_msg(hf, "memory_scale", "PASS -- hot/cold golden round-trip records=%zu cold=%zu",
+            golden.size(), store.cold.size());
+        passed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "memory_scale", "FAIL -- hot/cold golden round-trip mismatch at record=%zu",
+        mismatch);
+    failed.fetch_add(1);
+}
+
+static void test_memory_scale_residency_plan(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    using namespace aida::analysis;
+    std::array<fact_domain_projection_t, fact_domain_count> projections{};
+    projections[static_cast<std::size_t>(fact_domain_t::instructions)] = {
+        47500000ULL, sizeof(instruction_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::operand_facts)] = {
+        109000000ULL, 45};
+    projections[static_cast<std::size_t>(fact_domain_t::target_facts)] = {
+        16600000ULL, sizeof(target_fact_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::edges)] = {
+        17800000ULL, sizeof(edge_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::xrefs)] = {
+        23800000ULL, sizeof(xref_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::blocks)] = {
+        7100000ULL, sizeof(basic_block_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::functions)] = {
+        1190000ULL, sizeof(function_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::function_chunks)] = {
+        1500000ULL, sizeof(function_chunk_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::function_block_memberships)] = {
+        7100000ULL, sizeof(function_block_membership_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::strings)] = {
+        300000ULL, sizeof(string_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::symbols)] = {
+        400000ULL, sizeof(symbol_record_t)};
+    projections[static_cast<std::size_t>(fact_domain_t::coverage)] = {
+        50000ULL, sizeof(coverage_span_t)};
+    host_memory_envelope_t small;
+    small.usable_bytes = 4ULL << 30;
+    const auto small_budget = fact_resident_budget_bytes(small);
+    const auto small_plan = fact_residency_select(projections, small_budget);
+    host_memory_envelope_t large;
+    large.usable_bytes = 60ULL << 30;
+    const auto large_budget = fact_resident_budget_bytes(large);
+    const auto large_plan = fact_residency_select(projections, large_budget);
+    const bool small_pages =
+        small_plan.domains[static_cast<std::size_t>(
+            fact_domain_t::instructions)].mode == fact_residency_mode_t::paged &&
+        small_plan.resident_bytes <= small_budget &&
+        small_plan.paged_bytes != 0;
+    const std::uint64_t projected_total =
+        projections[static_cast<std::size_t>(fact_domain_t::instructions)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::operand_facts)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::target_facts)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::edges)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::xrefs)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::blocks)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::functions)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::function_chunks)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::function_block_memberships)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::strings)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::symbols)].projected_bytes() +
+        projections[static_cast<std::size_t>(fact_domain_t::coverage)].projected_bytes();
+    const bool large_resident =
+        large_plan.resident_bytes == projected_total &&
+        !large_plan.any_paged();
+    if (small_pages && large_resident) {
+        log_msg(hf, "memory_scale",
+            "PASS -- residency plan small_budget=%llu small_resident=%llu small_paged=%llu large_budget=%llu large_resident=%llu",
+            static_cast<unsigned long long>(small_budget),
+            static_cast<unsigned long long>(small_plan.resident_bytes),
+            static_cast<unsigned long long>(small_plan.paged_bytes),
+            static_cast<unsigned long long>(large_budget),
+            static_cast<unsigned long long>(large_plan.resident_bytes));
+        passed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "memory_scale",
+        "FAIL -- residency plan small_pages=%d small_resident=%llu small_budget=%llu large_resident=%llu projected_total=%llu large_budget=%llu",
+        small_pages ? 1 : 0,
+        static_cast<unsigned long long>(small_plan.resident_bytes),
+        static_cast<unsigned long long>(small_budget),
+        static_cast<unsigned long long>(large_plan.resident_bytes),
+        static_cast<unsigned long long>(projected_total),
+        static_cast<unsigned long long>(large_budget));
+    failed.fetch_add(1);
+}
+
+static void test_memory_scale_paged_staging(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    using namespace aida::analysis;
+    auto staging = paged_fact_staging_t::create(64ULL << 10);
+    if (!staging) {
+        log_msg(hf, "memory_scale", "FAIL -- staging create failed");
+        failed.fetch_add(1);
+        return;
+    }
+    auto store = staging.take_value();
+    std::uint64_t expected_ordinal = 0;
+    for (std::uint32_t page = 0; page < 8; ++page) {
+        std::vector<std::uint8_t> payload(32ULL << 10, static_cast<std::uint8_t>(page + 1));
+        paged_fact_page_meta_t meta;
+        meta.ordinal_begin = expected_ordinal;
+        meta.record_count = 64;
+        meta.address_value_min = page * 0x1000ULL;
+        meta.address_value_max = meta.address_value_min + 0xFFFULL;
+        expected_ordinal += meta.record_count;
+        auto staged = store->stage_page(fact_domain_t::operand_facts,
+                                        std::move(payload), meta, {});
+        if (!staged) {
+            log_msg(hf, "memory_scale", "FAIL -- stage_page page=%lu code=%d",
+                static_cast<unsigned long>(page), static_cast<int>(staged.error().code));
+            failed.fetch_add(1);
+            return;
+        }
+    }
+    const auto resident = store->resident_bytes();
+    const auto spilled = store->spilled_bytes();
+    auto contiguous = store->validate_contiguous(fact_domain_t::operand_facts);
+    if (!contiguous) {
+        log_msg(hf, "memory_scale", "FAIL -- staging contiguity rejected");
+        failed.fetch_add(1);
+        return;
+    }
+    bool visit_ok = resident != 0 && spilled != 0;
+    std::uint64_t visited_pages = 0;
+    std::uint64_t visited_records = 0;
+    auto visited = store->for_each_page(fact_domain_t::operand_facts,
+        [&](const paged_fact_page_meta_t& meta,
+            const std::vector<std::uint8_t>& payload) -> workspace_result_t<void> {
+            if (meta.ordinal_begin != visited_records ||
+                meta.record_count != 64 || payload.size() != (32ULL << 10) ||
+                payload[0] != static_cast<std::uint8_t>(visited_pages + 1)) {
+                visit_ok = false;
+            }
+            visited_records += meta.record_count;
+            ++visited_pages;
+            return workspace_result_t<void>::success();
+        }, {});
+    if (!visited)
+        visit_ok = false;
+    visit_ok = visit_ok && visited_pages == 8 && visited_records == expected_ordinal;
+    paged_fact_page_meta_t meta;
+    auto payload = store->page_payload(fact_domain_t::operand_facts, 3, meta, {});
+    visit_ok = visit_ok && payload && payload.value().size() == (32ULL << 10) &&
+        payload.value()[0] == 4;
+    if (visit_ok) {
+        log_msg(hf, "memory_scale",
+            "PASS -- staging spill/readback resident=%llu spilled=%llu pages=%llu",
+            static_cast<unsigned long long>(resident),
+            static_cast<unsigned long long>(spilled),
+            static_cast<unsigned long long>(visited_pages));
+        passed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "memory_scale",
+        "FAIL -- staging spill/readback resident=%llu spilled=%llu pages=%llu records=%llu",
+        static_cast<unsigned long long>(resident),
+        static_cast<unsigned long long>(spilled),
+        static_cast<unsigned long long>(visited_pages),
+        static_cast<unsigned long long>(visited_records));
+    failed.fetch_add(1);
+}
+
+static void test_memory_scale_publication_index_differential(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    std::string detail;
+    if (aida::analysis::publication_indexes::differential_selftest(detail)) {
+        log_msg(hf, "memory_scale", "PASS -- publication index differential selftest");
+        passed.fetch_add(1);
+        return;
+    }
+    log_msg(hf, "memory_scale", "FAIL -- publication index differential selftest: %s",
+        detail.c_str());
+    failed.fetch_add(1);
+}
+
 using analysis_test_fn_t = void (*)(HANDLE, std::atomic<int>&, std::atomic<int>&);
 
 struct analysis_test_entry_t {
@@ -5289,6 +5577,10 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "quality_pseudocode_typed",    test_pseudocode_typed_ast_rendering },
         { "quality_type_evidence",       test_type_recovery_semantic_cfg_cc_binding, 15000 },
         { "quality_service_errors",      test_stale_revisions_and_decompiler_errors },
+        { "memory_scale_hot_cold_golden", test_memory_scale_hot_cold_golden },
+        { "memory_scale_residency_plan", test_memory_scale_residency_plan },
+        { "memory_scale_paged_staging",  test_memory_scale_paged_staging, 20000 },
+        { "memory_scale_publication_index_differential", test_memory_scale_publication_index_differential, 60000 },
 
         { "analysis_hub_tab_symbolic",   test_analysis_hub_tab_symbolic   },
         { "analysis_hub_tab_taint",      test_analysis_hub_tab_taint      },

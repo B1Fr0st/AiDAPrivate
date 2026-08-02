@@ -38,7 +38,8 @@ enum class triton_z3_ir_opcode_t : std::uint8_t {
     unsigned_less_than = 13,
     signed_less_than = 14,
     logical_not = 15,
-    logical_and = 16
+    logical_and = 16,
+    multiply = 17
 };
 
 enum class triton_z3_proof_status_t : std::uint8_t {

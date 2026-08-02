@@ -17,6 +17,7 @@ namespace aida::analysis {
 
 inline constexpr std::uint32_t workspace_schema_v9_version = 9;
 inline constexpr std::uint32_t workspace_schema_v10_version = 10;
+inline constexpr std::uint32_t workspace_schema_v11_version = 11;
 inline constexpr std::uint32_t packed_page_magic = 0x5041434BU;
 inline constexpr std::uint32_t packed_page_blob_version = 2;
 inline constexpr std::uint32_t packed_page_blob_version_v3 = 3;
@@ -31,7 +32,7 @@ inline constexpr std::uint32_t packed_page_header_size = 64;
 inline constexpr std::uint32_t packed_page_max_payload = 1U << 20;
 inline constexpr std::uint64_t packed_generation_max_payload_bytes = 16ULL << 30;
 inline constexpr std::uint64_t packed_generation_default_quota_bytes = 8ULL << 30;
-inline constexpr std::uint64_t packed_generation_max_records = 200000000ULL;
+inline constexpr std::uint64_t packed_generation_max_records = 1000000000ULL;
 inline constexpr std::uint32_t packed_generation_max_pages = 131072;
 inline constexpr std::uint32_t packed_generation_max_index_rows = 131072;
 inline constexpr std::uint64_t packed_generation_max_metadata_bytes = 16ULL << 20;
@@ -267,6 +268,7 @@ struct fixed_width_address_t {
 
 workspace_result_t<void> create_schema_v9(sqlite3* database);
 workspace_result_t<void> create_schema_v10(sqlite3* database);
+workspace_result_t<void> create_schema_v11(sqlite3* database);
 workspace_result_t<void> ensure_managed_overlay_identity_schema_v9(
     sqlite3* database);
 

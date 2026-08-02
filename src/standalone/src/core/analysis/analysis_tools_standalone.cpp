@@ -9,6 +9,7 @@
 #include "../disasm/ghidra_decompiler.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "benchmark/benchmark_runner.hpp"
+#include "benchmark/benchmark_scorecard.hpp"
 #include "crypto_scanner.hpp"
 #include "aob_generator.hpp"
 #include "struct_recon_engine.hpp"

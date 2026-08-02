@@ -2,7 +2,7 @@
 
 #include "decompiler_provider_registry.hpp"
 #include "isolated_worker_codec.hpp"
-
+#include <windows.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -513,6 +513,7 @@ public:
     struct session_state_t;
     bool session_launch(const native_worker_execution_request_t& request,
                         std::uint32_t max_jobs_per_session,
+                        std::uint64_t session_envelope_max_memory_bytes,
                         session_state_t& session, native_worker_execution_result_t& result);
     native_worker_execution_result_t execute_on_session(session_state_t& session,
                                                         const native_worker_execution_request_t& request);
@@ -593,5 +594,8 @@ private:
 std::shared_ptr<decompiler_isolated_provider_host_t> create_pooled_native_worker_provider_host(
     const packaged_native_worker_runtime_t& runtime,
     native_worker_session_pool_config_t config = {});
+
+std::uint64_t native_worker_measured_private_bytes() noexcept;
+std::uint64_t native_worker_measured_private_samples() noexcept;
 
 }

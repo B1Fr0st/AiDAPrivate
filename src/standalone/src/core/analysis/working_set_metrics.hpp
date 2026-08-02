@@ -1,6 +1,7 @@
 #pragma once
 
 #include "workspace/analysis_metrics.hpp"
+#include "workspace/workspace_types.hpp"
 
 #include <array>
 #include <chrono>

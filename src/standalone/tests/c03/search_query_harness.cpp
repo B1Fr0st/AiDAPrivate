@@ -224,8 +224,8 @@ std::shared_ptr<analysis_snapshot_t> analysis_snapshot(
         flow_call | flow_indirect));
     snapshot->instructions.push_back(instruction(304, 0x3030, 0xC3,
         flow_return | flow_terminal));
-    snapshot->operand_facts.push_back(immediate(701, 302, 0x1234));
-    snapshot->operand_facts.push_back(immediate(702, 303, 0x5678));
+    snapshot->operand_facts.append(immediate(701, 302, 0x1234), 1);
+    snapshot->operand_facts.append(immediate(702, 303, 0x5678), 2);
     return snapshot;
 }
 

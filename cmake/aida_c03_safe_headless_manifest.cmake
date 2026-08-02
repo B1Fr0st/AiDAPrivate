@@ -204,7 +204,10 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/workspace/c03_analysis_contracts.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/data_discovery.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/decode_materializer.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/paged_fact_staging.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/paged_snapshot_view.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/packed_page_codec.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/publication_indexes.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/query_index.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/regex_query.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/string_arena.cpp"
@@ -226,6 +229,8 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_scope.cpp"
     "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_architecture.cpp"
     "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_code_xml_parse.cpp"
+    "${STANDALONE_ROOT}/core/infra/host_topology.cpp"
+    "${STANDALONE_ROOT}/core/infra/allocator.cpp"
     "${STANDALONE_ROOT}/core/mcp/calculator_tool.cpp"
     "${STANDALONE_ROOT}/core/mcp/ida_compat_mut.cpp"
     "${STANDALONE_ROOT}/core/mcp/ida_compat_read.cpp"
@@ -291,6 +296,10 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/testlab/test_lab_features_c03_safe_headless.cpp"
     "${CMAKE_SOURCE_DIR}/src/shared/hardware_id/hardware_id_v2.cpp"
     "${CMAKE_SOURCE_DIR}/src/shared/telemetry/telemetry_client.cpp"
+    "${STANDALONE_ROOT}/core/analysis/flirt/flirt_engine.cpp"
+    "${STANDALONE_ROOT}/core/analysis/flirt/flirt_signature_db.cpp"
+    "${STANDALONE_ROOT}/core/analysis/flirt/static_recognition_service.cpp"
+    "${STANDALONE_ROOT}/core/analysis/flirt/type_seed_exporter.cpp"
 )
 list(REMOVE_DUPLICATES AIDA_C03_PRODUCTION_STANDALONE_SOURCES)
 
@@ -339,9 +348,12 @@ set(AIDA_C03_COMPILER_MATRIX_CM_03
     "${STANDALONE_ROOT}/core/analysis/workspace/xref_builder.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/data_discovery.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/decode_materializer.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/paged_fact_staging.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/paged_snapshot_view.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/string_discovery_simd_avx2.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/symbol_type_candidates.cpp"
+    "${STANDALONE_ROOT}/core/analysis/workspace/publication_indexes.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/query_index.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/regex_query.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/search_index.cpp"
@@ -351,7 +363,10 @@ set(AIDA_C03_COMPILER_MATRIX_CM_03
     "${STANDALONE_ROOT}/core/analysis/incremental_reanalysis.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/patched_export.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/pe_baseline_analyzer.cpp"
-    "${STANDALONE_ROOT}/core/analysis/working_set_governor.cpp")
+    "${STANDALONE_ROOT}/core/analysis/working_set_governor.cpp"
+    "${STANDALONE_ROOT}/core/infra/host_topology.cpp"
+    "${STANDALONE_ROOT}/core/infra/allocator.cpp"
+    )
 set(AIDA_C03_COMPILER_MATRIX_CM_04
     "${STANDALONE_ROOT}/core/analysis/readers/pe_coff_reader.cpp"
     "${STANDALONE_ROOT}/core/analysis/readers/elf_reader.cpp"
@@ -431,7 +446,11 @@ set(AIDA_C03_COMPILER_MATRIX_CM_09
     "${STANDALONE_ROOT}/core/workbench/adapters/pseudocode_document.cpp"
     "${STANDALONE_ROOT}/core/disasm/pseudocode_view.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/decompiler_service.cpp"
-    "${STANDALONE_ROOT}/core/analysis/workspace/pseudocode_readability.cpp")
+    "${STANDALONE_ROOT}/core/analysis/workspace/pseudocode_readability.cpp"
+    "${STANDALONE_ROOT}/core/analysis/flirt/flirt_engine.cpp"
+    "${STANDALONE_ROOT}/core/analysis/flirt/flirt_signature_db.cpp"
+    "${STANDALONE_ROOT}/core/analysis/flirt/static_recognition_service.cpp"
+    "${STANDALONE_ROOT}/core/analysis/flirt/type_seed_exporter.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_10
     "${STANDALONE_ROOT}/core/mcp/protocol/mcp_result.cpp"
     "${STANDALONE_ROOT}/core/mcp/protocol/schema_runtime.cpp"
@@ -1296,6 +1315,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         zlibstatic libzstd_static liblzma pcre2-8
         brotlidec brotlienc brotlicommon llhttp_static nghttp2_static lua54_static
         aida_openssl_ssl_mt aida_openssl_crypto_mt
+        mimalloc-static
         bcrypt crypt32 advapi32 userenv ws2_32 shell32 ole32 Shlwapi
         cabinet cfgmgr32 dnsapi gdiplus iphlpapi ntdll Psapi setupapi version winhttp wintrust)
     set_target_properties(aida_c03_safe_headless_runtime PROPERTIES
@@ -1477,6 +1497,9 @@ function(aida_c03_register_safe_headless_targets application_target)
     aida_c03_register_manifest_entry(
         TARGET aida_c03_c07_decompiler_readability_harness PACKAGE C07
         SOURCES "${AIDA_C03_TEST_ROOT}/decompiler_readability_harness.cpp")
+    aida_c03_register_manifest_entry(
+        TARGET aida_c03_c07_pseudocode_quality_differential_harness PACKAGE C07
+        SOURCES "${AIDA_C03_TEST_ROOT}/pseudocode_quality_differential_harness.cpp")
 
     set(_aida_mcp_harness_sources
         "${AIDA_C03_MCP_TEST_ROOT}/contract_generation_harness.cpp"
@@ -1600,18 +1623,36 @@ function(aida_c03_register_safe_headless_targets application_target)
         INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/src"
         RUNTIME_FILES ${_aida_anti_tamper_runtime})
 
+    aida_c03_register_manifest_entry(
+        TARGET aida_c03_srec_api_prototype_lookup_harness PACKAGE SREC
+        SOURCES "${AIDA_C03_TEST_ROOT}/api_prototype_lookup_harness.cpp")
+    aida_c03_register_manifest_entry(
+        TARGET aida_c03_srec_flirt_engine_harness PACKAGE SREC
+        SOURCES "${AIDA_C03_TEST_ROOT}/flirt_engine_harness.cpp")
+    aida_c03_register_manifest_entry(
+        TARGET aida_c03_srec_rtti_static_harness PACKAGE SREC
+        SOURCES "${AIDA_C03_TEST_ROOT}/rtti_static_harness.cpp")
+    aida_c03_register_manifest_entry(
+        TARGET aida_c03_srec_type_seed_exporter_harness PACKAGE SREC
+        SOURCES "${AIDA_C03_TEST_ROOT}/type_seed_exporter_harness.cpp")
+    aida_c03_register_manifest_entry(
+        TARGET aida_c03_srec_flirt_db_builder PACKAGE SREC ARGS_ENTRY
+        SOURCES
+            "${AIDA_C03_TEST_ROOT}/flirt_db_builder_main.cpp"
+            "${STANDALONE_ROOT}/core/analysis/flirt/flirt_db_builder.cpp")
+
     get_property(_aida_manifest_targets GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGETS)
     get_property(_aida_manifest_records GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGET_RECORDS)
     list(LENGTH _aida_manifest_targets _aida_manifest_target_count)
     list(LENGTH _aida_manifest_records _aida_manifest_record_count)
-    if(NOT _aida_manifest_target_count EQUAL 52 OR NOT _aida_manifest_record_count EQUAL 52)
+    if(NOT _aida_manifest_target_count EQUAL 58 OR NOT _aida_manifest_record_count EQUAL 58)
         message(WARNING "AiDA C03 canonical manifest cardinality is invalid: targets=${_aida_manifest_target_count}, records=${_aida_manifest_record_count}")
     endif()
     file(READ "${AIDA_C03_SAFE_HEADLESS_INVENTORY}" _aida_inventory_json)
     string(JSON _aida_inventory_schema GET "${_aida_inventory_json}" schema)
     string(JSON _aida_inventory_count LENGTH "${_aida_inventory_json}" entries)
     if(NOT _aida_inventory_schema STREQUAL "aida.c03.safe-headless.inventory.v1" OR
-       NOT _aida_inventory_count EQUAL 52)
+       NOT _aida_inventory_count EQUAL 58)
         message(WARNING "AiDA C03 safe-headless inventory identity or cardinality is invalid")
     endif()
     math(EXPR _aida_inventory_last "${_aida_inventory_count} - 1")
@@ -1637,13 +1678,13 @@ function(aida_c03_register_safe_headless_targets application_target)
     string(JSON _aida_assertion_entries_length LENGTH "${_aida_assertion_inventory_json}" entries)
     if(NOT _aida_assertion_inventory_schema STREQUAL "aida.c03.safe-headless.assertion-sites.v1" OR
        NOT _aida_assertion_inventory_version EQUAL 1 OR
-       NOT _aida_assertion_entry_count EQUAL 52 OR
-       NOT _aida_assertion_entries_length EQUAL 52 OR
+       NOT _aida_assertion_entry_count EQUAL 58 OR
+       NOT _aida_assertion_entries_length EQUAL 58 OR
        NOT _aida_assertion_pending_count EQUAL 0)
         message(WARNING "AiDA C03 assertion telemetry inventory identity, cardinality, or handoff state is invalid")
     endif()
     set(_aida_assertion_targets)
-    foreach(_aida_index RANGE 0 51)
+    foreach(_aida_index RANGE 0 57)
         string(JSON _aida_assertion_target GET "${_aida_assertion_inventory_json}" entries ${_aida_index} target)
         if(_aida_assertion_target IN_LIST _aida_assertion_targets OR
            NOT _aida_assertion_target IN_LIST _aida_manifest_targets)

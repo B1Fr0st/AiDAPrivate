@@ -8,6 +8,7 @@
 #include "search_index.hpp"
 
 #include "checked_range.hpp"
+#include "paged_snapshot_view.hpp"
 #include "parallel_pass.hpp"
 #include "pe_image.hpp"
 #include "../working_set_governor.hpp"
@@ -769,6 +770,8 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
                     "search index snapshot identity or revision is incomplete",
                     "search_index"));
         }
+        const auto instruction_rows = instructions_view(*snapshot);
+        const auto operand_rows = operand_facts_view(*snapshot);
         if (instruction_class_only && instruction_index) {
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 make_workspace_error(workspace_error_code_t::invalid_argument,
@@ -790,7 +793,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
             effective_limits.max_results_per_query > (1U << 20) ||
             effective_limits.cancellation_check_interval == 0 ||
             effective_limits.max_entries > std::numeric_limits<std::uint32_t>::max() ||
-            snapshot->instructions.size() > std::numeric_limits<std::uint32_t>::max()) {
+            instruction_rows.size() > std::numeric_limits<std::uint32_t>::max()) {
             return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
                 make_workspace_error(workspace_error_code_t::invalid_argument,
                     "search index limits or compact instruction count are invalid",
@@ -802,10 +805,10 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
 
         std::uint64_t prospective_entries = 0;
         const std::array<std::uint64_t, 6> entry_counts = instruction_class_only
-            ? std::array<std::uint64_t, 6>{0, 0, snapshot->instructions.size(), 0, 0, 0}
+            ? std::array<std::uint64_t, 6>{0, 0, instruction_rows.size(), 0, 0, 0}
             : std::array<std::uint64_t, 6>{
                 snapshot->symbols.size(), snapshot->strings.size(),
-                snapshot->instructions.size(), data_candidates.size(), switches.size(),
+                instruction_rows.size(), data_candidates.size(), switches.size(),
                 types.size()};
         for (const auto count : entry_counts) {
             std::uint64_t updated = 0;
@@ -905,10 +908,10 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
 
         std::array<std::size_t, 6> class_sizes{
             impl->snapshot->symbols.size(), impl->snapshot->strings.size(),
-            impl->types.size(), impl->snapshot->instructions.size(),
+            impl->types.size(), static_cast<std::size_t>(instruction_rows.size()),
             impl->data_candidates.size(), impl->switches.size()};
         if (instruction_class_only)
-            class_sizes = {0, 0, 0, impl->snapshot->instructions.size(), 0, 0};
+            class_sizes = {0, 0, 0, static_cast<std::size_t>(instruction_rows.size()), 0, 0};
         else if (instruction_index)
             class_sizes[3] = 0;
         std::vector<record_task_t> tasks;
@@ -930,6 +933,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
 
         const auto run_record_task = [&](record_task_t& task) -> workspace_result_t<void> {
             task.records.reserve(task.end - task.begin);
+            fact_page_pin_t instruction_pin;
             std::uint64_t cancellation_checks = 0;
             for (std::size_t index = task.begin; index < task.end; ++index) {
                 if (++cancellation_checks >= effective_limits.cancellation_check_interval) {
@@ -976,12 +980,20 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
                     break;
                 }
                 case 3: {
-                    const auto& instruction = impl->snapshot->instructions[index];
+                    const instruction_record_t* instruction = nullptr;
+                    if (instruction_rows.resident()) {
+                        instruction = &instruction_rows.resident_span()[index];
+                    } else {
+                        auto instruction_row = instruction_rows.at(index, instruction_pin, cancel);
+                        if (!instruction_row)
+                            return workspace_result_t<void>::failure(instruction_row.error());
+                        instruction = instruction_row.value();
+                    }
                     kind = search_entity_kind_t::instruction;
-                    entity_id = instruction.id;
-                    address = instruction.address;
-                    numeric_value = instruction.opcode_id;
-                    auxiliary_flags = instruction.flow_flags;
+                    entity_id = instruction->id;
+                    address = instruction->address;
+                    numeric_value = instruction->opcode_id;
+                    auxiliary_flags = instruction->flow_flags;
                     break;
                 }
                 case 4: {
@@ -1196,8 +1208,8 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
         impl->address_references.reserve(impl->records.size());
         impl->entity_kind_references.reserve(impl->records.size());
         impl->entity_id_references.reserve(impl->records.size());
-        impl->instruction_references.reserve(impl->snapshot->instructions.size());
-        impl->opcode_references.reserve(impl->snapshot->instructions.size());
+        impl->instruction_references.reserve(static_cast<std::size_t>(instruction_rows.size()));
+        impl->opcode_references.reserve(static_cast<std::size_t>(instruction_rows.size()));
         struct reference_slot_t {
             std::vector<std::uint32_t> address;
             std::vector<std::uint32_t> entity_kind;
@@ -1313,13 +1325,14 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
                 return lhs.key != rhs.key ? lhs.key < rhs.key : lhs.record < rhs.record;
             }, worker_count);
 
-        impl->immediate_references.reserve(impl->snapshot->operand_facts.size());
+        impl->immediate_references.reserve(static_cast<std::size_t>(operand_rows.size()));
         const auto operand_shards = parallel_shards(
-            impl->snapshot->operand_facts.size(), worker_count);
+            static_cast<std::size_t>(operand_rows.size()), worker_count);
         std::vector<std::vector<packed_key64_reference_t>> immediate_slots(
             operand_shards.size());
         auto immediates = parallel_run_shards(operand_shards,
             [&](std::size_t shard_index, const parallel_shard_t& shard) {
+                fact_page_pin_t operand_pin;
                 std::uint64_t checks = 0;
                 for (std::size_t index = shard.begin; index < shard.end; ++index) {
                     if (++checks >= effective_limits.cancellation_check_interval) {
@@ -1328,7 +1341,10 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build_impl(
                             return workspace_result_t<void>::failure(
                                 stop_error(cancel, "search_index"));
                     }
-                    const auto& operand = impl->snapshot->operand_facts[index];
+                    auto operand_row = operand_rows.at(index, operand_pin, cancel);
+                    if (!operand_row)
+                        return workspace_result_t<void>::failure(operand_row.error());
+                    const auto& operand = *operand_row.value();
                     if (operand.kind != operand_kind_t::immediate)
                         continue;
                     const auto reference = impl->instruction_reference(operand.instruction_id);
@@ -2053,9 +2069,10 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::restore(
         trigram_valid = trigram_valid &&
             next_posting == impl->trigram_postings.size();
         std::uint64_t expected_records = 0;
+        const auto instruction_rows = instructions_view(*snapshot);
         const std::array<std::uint64_t, 6> source_counts{
             snapshot->symbols.size(), snapshot->strings.size(),
-            snapshot->instructions.size(), data_candidates.size(),
+            instruction_rows.size(), data_candidates.size(),
             switches.size(), types.size()};
         bool source_count_valid = true;
         for (const auto count : source_counts) {
@@ -2090,8 +2107,8 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::restore(
             impl->entity_kind_references.size() != impl->records.size() ||
             impl->entity_id_references.size() != impl->records.size() ||
             impl->instruction_references.size() !=
-                snapshot->instructions.size() ||
-            impl->opcode_references.size() != snapshot->instructions.size() ||
+                instruction_rows.size() ||
+            impl->opcode_references.size() != instruction_rows.size() ||
             !references_unique(impl->address_references) ||
             !references_unique(impl->entity_kind_references) ||
             !references_unique(impl->entity_id_references) ||

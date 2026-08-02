@@ -16,6 +16,7 @@
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "workspace/analysis_workspace.hpp"
+#include "workspace/publication_indexes.hpp"
 
 namespace xref_engine {
 
@@ -203,17 +204,21 @@ inline aida::analysis::workspace_result_t<std::vector<xref_t>> find_xrefs_to(
 	};
 	if (cancel.stop_requested() || workspace_cancel.stop_requested())
 		return workspace_result_t<std::vector<xref_t>>::failure(cancellation_error());
+	auto indexes = aida::analysis::publication_indexes::for_publication_result(
+		publication, cancel);
+	if (!indexes)
+		return workspace_result_t<std::vector<xref_t>>::failure(indexes.error());
 	const auto& snapshot = publication->snapshot;
+	const auto& xrefs = snapshot->xrefs;
 	std::vector<xref_t> result;
 	result.reserve((std::min)(limit, snapshot->xrefs.size()));
+	const auto range = indexes.value()->xrefs_to(normalized.value());
 	size_t visited = 0;
-	for (const auto& entry : snapshot->xrefs) {
+	for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
 		if ((++visited & 0xFFFu) == 0 &&
 			(cancel.stop_requested() || workspace_cancel.stop_requested()))
 			return workspace_result_t<std::vector<xref_t>>::failure(cancellation_error());
-		if (entry.target.space != normalized.value().space ||
-			entry.target.value != normalized.value().value)
-			continue;
+		const auto& entry = xrefs[indexes.value()->xref_to_entry(ordinal)];
 		xref_t item;
 		item.from_addr = workspace_display_address(workspace, entry.source);
 		item.to_addr = workspace_display_address(workspace, entry.target);
@@ -270,17 +275,21 @@ inline aida::analysis::workspace_result_t<std::vector<xref_t>> find_xrefs_from(
 	};
 	if (cancel.stop_requested() || workspace_cancel.stop_requested())
 		return workspace_result_t<std::vector<xref_t>>::failure(cancellation_error());
+	auto indexes = aida::analysis::publication_indexes::for_publication_result(
+		publication, cancel);
+	if (!indexes)
+		return workspace_result_t<std::vector<xref_t>>::failure(indexes.error());
 	const auto& snapshot = publication->snapshot;
+	const auto& xrefs = snapshot->xrefs;
 	std::vector<xref_t> result;
 	result.reserve((std::min)(limit, snapshot->xrefs.size()));
+	const auto range = indexes.value()->xrefs_from(normalized.value());
 	size_t visited = 0;
-	for (const auto& entry : snapshot->xrefs) {
+	for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
 		if ((++visited & 0xFFFu) == 0 &&
 			(cancel.stop_requested() || workspace_cancel.stop_requested()))
 			return workspace_result_t<std::vector<xref_t>>::failure(cancellation_error());
-		if (entry.source.space != normalized.value().space ||
-			entry.source.value != normalized.value().value)
-			continue;
+		const auto& entry = xrefs[indexes.value()->xref_from_entry(ordinal)];
 		xref_t item;
 		item.from_addr = workspace_display_address(workspace, entry.source);
 		item.to_addr = workspace_display_address(workspace, entry.target);

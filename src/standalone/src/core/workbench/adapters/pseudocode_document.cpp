@@ -1,5 +1,7 @@
 #include "pseudocode_document.hpp"
 
+#include "../../analysis/decompiler/pseudocode_renderer_v2.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -1192,6 +1194,64 @@ void pseudocode_document_model_t::refresh() noexcept
     }
 }
 
+pseudocode_error_t pseudocode_document_model_t::apply_local_rename(
+    const std::string& old_name,
+    const std::string& new_name,
+    std::uint64_t& nodes_renamed)
+{
+    nodes_renamed = 0;
+    if (old_name.empty() || new_name.empty() || old_name == new_name)
+        return fail(pseudocode_error_code_t::invalid_argument);
+    if (!lease_current(bound_generation_))
+        return stale();
+    if (!active_ || active_->state != pseudocode_cache_state_t::cached || !active_->document)
+        return fail(pseudocode_error_code_t::cache_miss);
+    if (!entry_current(*active_))
+        return stale();
+    pseudocode_request_t request;
+    request.entity = active_->entity;
+    request.binding = active_->binding;
+    request.profile = active_->profile_info.profile;
+    request.workspace_generation = active_->workspace_generation;
+    request.timeout_ms = k_pseudocode_document_default_timeout_ms;
+    const auto bundle = source_->render_evidence(request);
+    if (!bundle.type_graph)
+        return fail(pseudocode_error_code_t::adapter_rejected, active_->job_id);
+    aida::analysis::pseudocode_renderer_v2_request_t render_request;
+    render_request.profile = active_->profile_info.profile;
+    render_request.settings = active_->document->renderer;
+    render_request.evidence = bundle.evidence;
+    render_request.require_complete_source_map = true;
+    const std::vector<std::pair<std::string, std::string>> renames{{old_name, new_name}};
+    auto rendered = aida::analysis::rerender_document_with_local_renames(
+        *active_->document, *bundle.type_graph, render_request, renames);
+    if (!rendered.succeeded() || !rendered.document)
+        return fail(pseudocode_error_code_t::invalid_argument, active_->job_id);
+    const auto count_named = [&new_name](const aida::analysis::decompiler_document_t& document) {
+        std::uint64_t count = 0;
+        for (const auto& node : document.ast.nodes) {
+            if ((node.kind == aida::analysis::typed_pseudocode_ast_node_kind_t::declaration ||
+                 node.kind == aida::analysis::typed_pseudocode_ast_node_kind_t::identifier) &&
+                node.stable_text == new_name)
+                ++count;
+        }
+        return count;
+    };
+    const std::uint64_t renamed = count_named(*rendered.document) - count_named(*active_->document);
+    auto replacement = std::make_shared<aida::analysis::decompiler_document_t>(
+        std::move(*rendered.document));
+    const auto validation = validate_document(*replacement, *active_);
+    if (!validation)
+        return validation;
+    active_->document = std::move(replacement);
+    split_lines();
+    rebuild_address_map();
+    if (!entry_current(*active_))
+        return stale();
+    nodes_renamed = renamed;
+    return {};
+}
+
 pseudocode_command_result_t pseudocode_document_model_t::execute(
     const pseudocode_command_t& command)
 {
@@ -1258,6 +1318,13 @@ pseudocode_command_result_t pseudocode_document_model_t::execute(
         if (require_lease()) {
             result.error = resolve_token(command.resolve_token, result.address_map_entry);
             result.changed = result.error.ok();
+        }
+        break;
+    case pseudocode_command_kind_t::rename_local:
+        if (require_lease()) {
+            result.error = apply_local_rename(
+                command.rename_old_name, command.rename_new_name, result.nodes_renamed);
+            result.changed = result.error.ok() && result.nodes_renamed != 0;
         }
         break;
     default:

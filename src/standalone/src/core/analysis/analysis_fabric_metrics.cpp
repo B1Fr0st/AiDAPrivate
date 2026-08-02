@@ -257,6 +257,8 @@ analysis_fabric_metrics_snapshot_t analysis_fabric_metrics_snapshot() noexcept {
         entry.workers = stats.workers;
         entry.oldest_active_ms = stats.oldest_active_ms;
         entry.fairness_wait_ns_total = stats.fairness_wait_ns_total;
+        entry.fairness_wait_p50_ns = rt::fairness_wait_percentile_ns(domain, 0.5);
+        entry.fairness_wait_p95_ns = rt::fairness_wait_percentile_ns(domain, 0.95);
         for (std::size_t lane = 0; lane < analysis_fabric_priority_lane_count; ++lane) {
             entry.lane_depth[lane] = stats.lane_depth[lane];
             entry.lane_admitted[lane] = stats.lane_admitted[lane];
@@ -284,7 +286,7 @@ std::string analysis_fabric_metrics_snapshot_t::to_json() const {
         if (index > 0)
             out += ",";
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-            "{\"name\":\"%s\",\"queue_depth\":%llu,\"in_flight\":%llu,\"busy_worker_ms\":%llu,\"posted\":%llu,\"started\":%llu,\"finished\":%llu,\"rejected\":%llu,\"cancelled\":%llu,\"failed\":%llu,\"timed_out\":%llu,\"active\":%llu,\"workers\":%llu,\"oldest_active_ms\":%llu,\"fairness_wait_ns_total\":%llu,\"lane_depth\":[",
+            "{\"name\":\"%s\",\"queue_depth\":%llu,\"in_flight\":%llu,\"busy_worker_ms\":%llu,\"posted\":%llu,\"started\":%llu,\"finished\":%llu,\"rejected\":%llu,\"cancelled\":%llu,\"failed\":%llu,\"timed_out\":%llu,\"active\":%llu,\"workers\":%llu,\"oldest_active_ms\":%llu,\"fairness_wait_ns_total\":%llu,\"fairness_wait_p50_ns\":%llu,\"fairness_wait_p95_ns\":%llu,\"lane_depth\":[",
             aida::infra::taskflow_runtime::domain_name(
                 static_cast<aida::infra::taskflow_runtime::executor_domain_t>(index)),
             static_cast<unsigned long long>(entry.queue_depth),
@@ -300,7 +302,9 @@ std::string analysis_fabric_metrics_snapshot_t::to_json() const {
             static_cast<unsigned long long>(entry.active),
             static_cast<unsigned long long>(entry.workers),
             static_cast<unsigned long long>(entry.oldest_active_ms),
-            static_cast<unsigned long long>(entry.fairness_wait_ns_total));
+            static_cast<unsigned long long>(entry.fairness_wait_ns_total),
+            static_cast<unsigned long long>(entry.fairness_wait_p50_ns),
+            static_cast<unsigned long long>(entry.fairness_wait_p95_ns));
         out += buf;
         for (std::size_t lane = 0; lane < analysis_fabric_priority_lane_count; ++lane) {
             if (lane > 0)

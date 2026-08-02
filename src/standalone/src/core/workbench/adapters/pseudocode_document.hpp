@@ -163,6 +163,11 @@ struct pseudocode_profile_info_t {
     std::uint64_t elapsed_ms = 0;
 };
 
+struct pseudocode_render_evidence_bundle_t {
+    std::shared_ptr<const aida::analysis::decompiler_render_evidence_t> evidence;
+    std::shared_ptr<const aida::analysis::type_graph_t> type_graph;
+};
+
 class pseudocode_source_adapter_t {
 public:
     virtual ~pseudocode_source_adapter_t() = default;
@@ -173,6 +178,12 @@ public:
             binding) const noexcept
     {
         return !binding || generation_current(binding->generation);
+    }
+    virtual pseudocode_render_evidence_bundle_t render_evidence(
+        const pseudocode_request_t& request) const
+    {
+        static_cast<void>(request);
+        return {};
     }
     virtual workbench_error_t resolve_request(
         std::uint64_t function_address,
@@ -246,7 +257,8 @@ enum class pseudocode_command_kind_t : std::uint8_t {
     clear_selection = 5,
     refresh = 6,
     resolve_address = 7,
-    resolve_token = 8
+    resolve_token = 8,
+    rename_local = 9
 };
 
 struct pseudocode_command_t {
@@ -258,6 +270,8 @@ struct pseudocode_command_t {
     pseudocode_selection_t selection;
     std::uint64_t resolve_address = 0;
     std::uint32_t resolve_token = 0;
+    std::string rename_old_name;
+    std::string rename_new_name;
 };
 
 struct pseudocode_command_result_t {
@@ -267,6 +281,7 @@ struct pseudocode_command_result_t {
     pseudocode_selection_t selection;
     pseudocode_address_map_entry_t address_map_entry;
     std::uint64_t job_id = 0;
+    std::uint64_t nodes_renamed = 0;
     bool changed = false;
 };
 
@@ -304,6 +319,10 @@ public:
     pseudocode_error_t resolve_token(
         std::uint32_t token_begin,
         pseudocode_address_map_entry_t& output) const;
+    pseudocode_error_t apply_local_rename(
+        const std::string& old_name,
+        const std::string& new_name,
+        std::uint64_t& nodes_renamed);
     void refresh() noexcept;
 
     pseudocode_command_result_t execute(const pseudocode_command_t& command);

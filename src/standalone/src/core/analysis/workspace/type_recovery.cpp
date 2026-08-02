@@ -1,7 +1,10 @@
 #include "type_recovery.hpp"
 
 #include "analysis_metrics.hpp"
+#include "paged_snapshot_view.hpp"
 #include "parallel_pass.hpp"
+
+#include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +23,7 @@ namespace {
 struct function_view_t {
     const function_record_t* function = nullptr;
     std::vector<const instruction_record_t*> instructions;
+    std::vector<instruction_record_t> paged_instructions;
     std::vector<std::uint64_t> call_targets;
 };
 
@@ -436,8 +440,25 @@ bool is_direct_memory_expression(const operand_fact_t& operand) {
             operand.address_resolution != target_resolution_t::unresolved_indirect);
 }
 
-function_view_t extract_function_view(const analysis_snapshot_t& snapshot,
-                                      const function_record_t& function) {
+void log_paged_view_failure(const char* stage, const char* record, std::uint64_t ordinal,
+                            std::uint64_t rows, const workspace_error_t& error) {
+    std::string evidence;
+    for (const auto& detail : error.details) {
+        if (!evidence.empty())
+            evidence.push_back(' ');
+        evidence.append(detail.first);
+        evidence.push_back('=');
+        evidence.append(detail.second);
+    }
+    diag::log_tagged_fmt("type_recovery",
+        "paged_view_failure stage=%s record=%s ordinal=%llu rows=%llu code=%s phase='%s' message='%s' evidence='%s'",
+        stage, record, static_cast<unsigned long long>(ordinal),
+        static_cast<unsigned long long>(rows), error.stable_code().c_str(),
+        error.phase.c_str(), error.message.c_str(), evidence.c_str());
+}
+
+workspace_result_t<function_view_t> extract_function_view(const analysis_snapshot_t& snapshot,
+                                                          const function_record_t& function) {
     function_view_t view;
     view.function = &function;
     std::vector<const basic_block_record_t*> blocks;
@@ -448,12 +469,38 @@ function_view_t extract_function_view(const analysis_snapshot_t& snapshot,
     std::sort(blocks.begin(), blocks.end(), [](const auto* lhs, const auto* rhs) {
         return std::tie(lhs->start, lhs->id) < std::tie(rhs->start, rhs->id);
     });
-    for (const auto* block : blocks) {
-        for (std::uint32_t index = 0; index < block->instruction_count; ++index) {
-            const auto instruction_index = static_cast<std::uint64_t>(block->first_instruction) + index;
-            if (instruction_index < snapshot.instructions.size())
-                view.instructions.push_back(&snapshot.instructions[static_cast<std::size_t>(instruction_index)]);
+    const auto instruction_rows = instructions_view(snapshot);
+    const auto target_rows = target_facts_view(snapshot);
+    fact_page_pin_t instruction_pin;
+    fact_page_pin_t target_pin;
+    if (instruction_rows.resident()) {
+        const auto resident = instruction_rows.resident_span();
+        for (const auto* block : blocks) {
+            for (std::uint32_t index = 0; index < block->instruction_count; ++index) {
+                const auto instruction_index = static_cast<std::uint64_t>(block->first_instruction) + index;
+                if (instruction_index < resident.size())
+                    view.instructions.push_back(&resident[static_cast<std::size_t>(instruction_index)]);
+            }
         }
+    } else {
+        for (const auto* block : blocks) {
+            for (std::uint32_t index = 0; index < block->instruction_count; ++index) {
+                const auto instruction_index = static_cast<std::uint64_t>(block->first_instruction) + index;
+                if (instruction_index >= instruction_rows.size())
+                    continue;
+                auto instruction_row = instruction_rows.at(instruction_index, instruction_pin);
+                if (!instruction_row) {
+                    log_paged_view_failure("extract_function_view", "instruction",
+                                           instruction_index, instruction_rows.size(),
+                                           instruction_row.error());
+                    return workspace_result_t<function_view_t>::failure(instruction_row.error());
+                }
+                view.paged_instructions.push_back(*instruction_row.value());
+            }
+        }
+        view.instructions.reserve(view.paged_instructions.size());
+        for (const auto& record : view.paged_instructions)
+            view.instructions.push_back(&record);
     }
     std::sort(view.instructions.begin(), view.instructions.end(), [](const auto* lhs, const auto* rhs) {
         return std::tie(lhs->address, lhs->id) < std::tie(rhs->address, rhs->id);
@@ -465,9 +512,15 @@ function_view_t extract_function_view(const analysis_snapshot_t& snapshot,
             continue;
         const auto target_end = std::min<std::uint64_t>(
             static_cast<std::uint64_t>(instruction->target_fact_begin) + instruction->target_fact_count,
-            snapshot.target_facts.size());
+            target_rows.size());
         for (std::uint64_t index = instruction->target_fact_begin; index < target_end; ++index) {
-            const auto& target = snapshot.target_facts[static_cast<std::size_t>(index)];
+            auto target_row = target_rows.at(index, target_pin);
+            if (!target_row) {
+                log_paged_view_failure("extract_function_view", "target", index,
+                                       target_rows.size(), target_row.error());
+                return workspace_result_t<function_view_t>::failure(target_row.error());
+            }
+            const auto& target = *target_row.value();
             if (target.kind == target_kind_record_t::call)
                 view.call_targets.push_back(target.target.value);
         }
@@ -475,7 +528,7 @@ function_view_t extract_function_view(const analysis_snapshot_t& snapshot,
     std::sort(view.call_targets.begin(), view.call_targets.end());
     view.call_targets.erase(std::unique(view.call_targets.begin(), view.call_targets.end()),
                             view.call_targets.end());
-    return view;
+    return workspace_result_t<function_view_t>::success(std::move(view));
 }
 
 const function_record_t* find_function(const std::vector<const function_record_t*>& functions,
@@ -1859,30 +1912,40 @@ void append_memory_evidence(const analysis_workspace_t& workspace,
     }
 }
 
-void collect_function_evidence(const analysis_workspace_t& workspace,
-                               const analysis_snapshot_t& snapshot,
-                               const function_view_t& view,
-                               std::uint16_t pointer_bits,
-                               collector_t& collector,
-                               std::vector<call_record_t>& calls) {
+workspace_result_t<void> collect_function_evidence(const analysis_workspace_t& workspace,
+                                                   const analysis_snapshot_t& snapshot,
+                                                   const function_view_t& view,
+                                                   std::uint16_t pointer_bits,
+                                                   collector_t& collector,
+                                                   std::vector<call_record_t>& calls) {
     if (!view.function)
-        return;
+        return workspace_result_t<void>::success();
+    const auto operand_rows = operand_facts_view(snapshot);
+    const auto target_rows = target_facts_view(snapshot);
+    fact_page_pin_t operand_pin;
+    fact_page_pin_t target_pin;
     for (const auto* instruction : view.instructions) {
         if (collector.poller.poll()) {
             collector.stopped = true;
-            return;
+            return workspace_result_t<void>::success();
         }
         if (!collector.consume_work_unit())
-            return;
+            return workspace_result_t<void>::success();
         std::vector<type_subject_t> reads;
         std::vector<type_subject_t> writes;
         bool has_immediate = false;
         type_descriptor_t immediate = unknown_descriptor();
         const auto operand_end = std::min<std::uint64_t>(
             static_cast<std::uint64_t>(instruction->operand_fact_begin) + instruction->operand_fact_count,
-            snapshot.operand_facts.size());
+            operand_rows.size());
         for (std::uint64_t index = instruction->operand_fact_begin; index < operand_end; ++index) {
-            const auto& operand = snapshot.operand_facts[static_cast<std::size_t>(index)];
+            auto operand_row = operand_rows.at(index, operand_pin);
+            if (!operand_row) {
+                log_paged_view_failure("collect_function_evidence", "operand", index,
+                                       operand_rows.size(), operand_row.error());
+                return workspace_result_t<void>::failure(operand_row.error());
+            }
+            const auto& operand = *operand_row.value();
             if (operand.kind == operand_kind_t::reg) {
                 append_local_width_evidence(workspace, *view.function, *instruction, operand, collector);
                 const auto subject = make_local_subject(workspace, *view.function, operand.reg);
@@ -1902,7 +1965,7 @@ void collect_function_evidence(const analysis_workspace_t& workspace,
                 }
             }
             if (collector.stopped)
-                return;
+                return workspace_result_t<void>::success();
         }
         std::sort(reads.begin(), reads.end(), [](const auto& lhs, const auto& rhs) {
             return subject_material(lhs) < subject_material(rhs);
@@ -1943,16 +2006,22 @@ void collect_function_evidence(const analysis_workspace_t& workspace,
                 collector.append_constraint(std::move(assignment));
             }
             if (collector.stopped)
-                return;
+                return workspace_result_t<void>::success();
         }
         if ((instruction->flow_flags & flow_call) == 0)
             continue;
         std::vector<std::uint64_t> targets;
         const auto target_end = std::min<std::uint64_t>(
             static_cast<std::uint64_t>(instruction->target_fact_begin) + instruction->target_fact_count,
-            snapshot.target_facts.size());
+            target_rows.size());
         for (std::uint64_t index = instruction->target_fact_begin; index < target_end; ++index) {
-            const auto& target = snapshot.target_facts[static_cast<std::size_t>(index)];
+            auto target_row = target_rows.at(index, target_pin);
+            if (!target_row) {
+                log_paged_view_failure("collect_function_evidence", "target", index,
+                                       target_rows.size(), target_row.error());
+                return workspace_result_t<void>::failure(target_row.error());
+            }
+            const auto& target = *target_row.value();
             if (target.kind == target_kind_record_t::call)
                 targets.push_back(target.target.value);
         }
@@ -2024,9 +2093,10 @@ void collect_function_evidence(const analysis_workspace_t& workspace,
                 collector.append_constraint(std::move(returned));
             }
             if (collector.stopped)
-                return;
+                return workspace_result_t<void>::success();
         }
     }
+    return workspace_result_t<void>::success();
 }
 
 void build_aggregates(type_recovery_result_t& result, const type_recovery_limits_t& limits,
@@ -2493,6 +2563,7 @@ recover_with_snapshot(const analysis_workspace_t& workspace,
     std::sort(injected.begin(), injected.end(), evidence_less);
     for (auto& evidence : injected) {
         collector.append_evidence(std::move(evidence));
+        ++result.injected_evidence_count;
         if (collector.stopped)
             return workspace_result_t<type_recovery_result_t>::success(std::move(result));
         if (collector.work_limited)
@@ -2529,6 +2600,7 @@ recover_with_snapshot(const analysis_workspace_t& workspace,
     if (!snapshot) {
         canonicalize_evidence(result);
         if (!result.evidence.empty() && resolve_evidence(result, limits, poller)) {
+            build_runtime_metadata(result, limits, poller);
             build_prototypes(result, limits, calls, calling_convention, poller);
             result.status = result.bounded ? type_recovery_status_t::result_limited
                                             : type_recovery_status_t::complete;
@@ -2546,6 +2618,7 @@ recover_with_snapshot(const analysis_workspace_t& workspace,
     if (!root) {
         canonicalize_evidence(result);
         if (!result.evidence.empty() && resolve_evidence(result, limits, poller)) {
+            build_runtime_metadata(result, limits, poller);
             build_prototypes(result, limits, calls, calling_convention, poller);
             result.status = result.bounded ? type_recovery_status_t::result_limited
                                             : type_recovery_status_t::partial;
@@ -2570,8 +2643,13 @@ recover_with_snapshot(const analysis_workspace_t& workspace,
             result.bounded = true;
             break;
         }
-        const auto view = extract_function_view(*snapshot, *item.function);
-        collect_function_evidence(workspace, *snapshot, view, pointer_bits, collector, calls);
+        auto view = extract_function_view(*snapshot, *item.function);
+        if (!view)
+            return workspace_result_t<type_recovery_result_t>::failure(view.error());
+        auto evidence_collection = collect_function_evidence(workspace, *snapshot, view.value(),
+                                                             pointer_bits, collector, calls);
+        if (!evidence_collection)
+            return workspace_result_t<type_recovery_result_t>::failure(evidence_collection.error());
         ++result.interprocedural_functions;
         if (collector.stopped)
             return workspace_result_t<type_recovery_result_t>::success(std::move(result));
@@ -2579,7 +2657,7 @@ recover_with_snapshot(const analysis_workspace_t& workspace,
             break;
         if (!request.include_interprocedural || item.depth >= limits.max_interprocedural_depth)
             continue;
-        for (const auto target : view.call_targets) {
+        for (const auto target : view.value().call_targets) {
             if (const auto* function = find_function(functions, target))
                 pending.push_back({function, item.depth + 1});
         }

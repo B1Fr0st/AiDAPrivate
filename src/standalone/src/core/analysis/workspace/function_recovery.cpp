@@ -1,7 +1,9 @@
 #include "function_recovery.hpp"
 
 #include "checked_range.hpp"
+#include "paged_snapshot_view.hpp"
 #include "parallel_pass.hpp"
+#include "record_span.hpp"
 
 #include <algorithm>
 #include <array>
@@ -327,19 +329,24 @@ workspace_result_t<void> validate_instruction_stream(
     const std::vector<target_fact_t>& targets,
     const std::vector<std::uint8_t>& delay_slot_counts)
 {
-    if (!delay_slot_counts.empty() && delay_slot_counts.size() != instructions.size()) {
+    const auto instruction_rows = paged_table_t<instruction_record_t>::resident(
+        record_span_t<const instruction_record_t>(instructions.data(), instructions.size()));
+    const auto target_rows = paged_table_t<target_fact_t>::resident(
+        record_span_t<const target_fact_t>(targets.data(), targets.size()));
+    const auto instruction_stream = instruction_rows.resident_span();
+    if (!delay_slot_counts.empty() && delay_slot_counts.size() != instruction_rows.size()) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::invalid_argument,
             "delay-slot column does not align with the instruction stream", "blocks"));
     }
-    if (instructions.size() > (std::numeric_limits<std::uint32_t>::max)()) {
+    if (instruction_rows.size() > (std::numeric_limits<std::uint32_t>::max)()) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::limit_exceeded,
             "instruction stream exceeds compact block indexing", "blocks"));
     }
     std::uint64_t previous_end = 0;
-    for (std::size_t index = 0; index < instructions.size(); ++index) {
-        const auto& instruction = instructions[index];
+    for (std::size_t index = 0; index < instruction_stream.size(); ++index) {
+        const auto& instruction = instruction_stream[index];
         if (instruction.id == 0 ||
             instruction.address.space != address_space_id_t::relative_virtual ||
             instruction.address.architecture != image.architecture ||
@@ -354,7 +361,7 @@ workspace_result_t<void> validate_instruction_stream(
         }
         std::uint64_t target_end = 0;
         if (!checked_add_u64(instruction.target_fact_begin,
-                instruction.target_fact_count, target_end) || target_end > targets.size()) {
+                instruction.target_fact_count, target_end) || target_end > target_rows.size()) {
             auto error = make_workspace_error(workspace_error_code_t::integrity_failure,
                 "instruction target-fact range is invalid", "blocks");
             error.address = instruction.address;
@@ -373,7 +380,7 @@ workspace_result_t<void> validate_instruction_stream(
         if (delay_count == 0)
             continue;
         if ((instruction.flow_flags & kControlFlowMask) == 0 ||
-            delay_count > 2 || index + delay_count >= instructions.size()) {
+            delay_count > 2 || index + delay_count >= instruction_stream.size()) {
             auto error = make_workspace_error(workspace_error_code_t::integrity_failure,
                 "delay-slot metadata is invalid for its transfer instruction", "blocks");
             error.address = instruction.address;
@@ -381,7 +388,7 @@ workspace_result_t<void> validate_instruction_stream(
         }
         auto expected = end;
         for (std::size_t offset = 1; offset <= delay_count; ++offset) {
-            const auto& slot = instructions[index + offset];
+            const auto& slot = instruction_stream[index + offset];
             if (slot.address.value != expected ||
                 (slot.flow_flags & kControlFlowMask) != 0) {
                 auto error = make_workspace_error(workspace_error_code_t::integrity_failure,
@@ -1606,11 +1613,14 @@ workspace_result_t<std::vector<function_seed_t>> function_recovery_t::converge_s
     }
 }
 
-workspace_result_t<function_recovery_result_t> function_recovery_t::recover(
+namespace {
+
+template <typename Operands>
+workspace_result_t<function_recovery_result_t> recover_with_operands(
     const workspace_image_t& image,
     const byte_provider_t& provider,
     const std::vector<instruction_record_t>& instructions,
-    const std::vector<operand_fact_t>& operands,
+    const Operands& operands,
     const std::vector<target_fact_t>& targets,
     const function_seed_evidence_t& evidence,
     const std::vector<std::uint8_t>& delay_slot_counts,
@@ -1629,8 +1639,8 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover(
         blocks.take_value(), limits, cancel);
     if (!functions)
         return workspace_result_t<function_recovery_result_t>::failure(functions.error());
-    auto finalized = finalize_cfg_calls(image, provider, instructions, operands, targets,
-        functions.take_value(), limits, cancel);
+    auto finalized = finalize_cfg_calls_with_operands(image, provider, instructions,
+        operands, targets, functions.take_value(), limits, cancel);
     if (!finalized)
         return finalized;
     finalized.value().converged_seed_count = converged_seed_count;
@@ -1638,6 +1648,49 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover(
         std::count_if(delay_slot_counts.begin(), delay_slot_counts.end(),
             [](std::uint8_t count) { return count != 0; }));
     return finalized;
+}
+
+template <typename Operands>
+workspace_result_t<function_recovery_result_t> finalize_cfg_calls_with_operands(
+    const workspace_image_t& image,
+    const byte_provider_t& provider,
+    const std::vector<instruction_record_t>& instructions,
+    const Operands&,
+    const std::vector<target_fact_t>& targets,
+    function_recovery_result_t result,
+    const function_recovery_limits_t& limits,
+    const cancellation_token_t& cancel);
+
+}
+
+workspace_result_t<function_recovery_result_t> function_recovery_t::recover(
+    const workspace_image_t& image,
+    const byte_provider_t& provider,
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<operand_fact_t>& operands,
+    const std::vector<target_fact_t>& targets,
+    const function_seed_evidence_t& evidence,
+    const std::vector<std::uint8_t>& delay_slot_counts,
+    const function_recovery_limits_t& limits,
+    const cancellation_token_t& cancel)
+{
+    return recover_with_operands(image, provider, instructions, operands, targets,
+        evidence, delay_slot_counts, limits, cancel);
+}
+
+workspace_result_t<function_recovery_result_t> function_recovery_t::recover(
+    const workspace_image_t& image,
+    const byte_provider_t& provider,
+    const std::vector<instruction_record_t>& instructions,
+    const operand_fact_store_t& operands,
+    const std::vector<target_fact_t>& targets,
+    const function_seed_evidence_t& evidence,
+    const std::vector<std::uint8_t>& delay_slot_counts,
+    const function_recovery_limits_t& limits,
+    const cancellation_token_t& cancel)
+{
+    return recover_with_operands(image, provider, instructions, operands, targets,
+        evidence, delay_slot_counts, limits, cancel);
 }
 
 workspace_result_t<block_recovery_result_t> function_recovery_t::build_blocks(
@@ -3162,11 +3215,14 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::recover_func
     return workspace_result_t<function_recovery_result_t>::success(std::move(result));
 }
 
-workspace_result_t<function_recovery_result_t> function_recovery_t::finalize_cfg_calls(
+namespace {
+
+template <typename Operands>
+workspace_result_t<function_recovery_result_t> finalize_cfg_calls_with_operands(
     const workspace_image_t& image,
     const byte_provider_t&,
     const std::vector<instruction_record_t>& instructions,
-    const std::vector<operand_fact_t>&,
+    const Operands&,
     const std::vector<target_fact_t>& targets,
     function_recovery_result_t result,
     const function_recovery_limits_t& limits,
@@ -3400,6 +3456,22 @@ workspace_result_t<function_recovery_result_t> function_recovery_t::finalize_cfg
             kEdgeEntityTag | static_cast<std::uint64_t>(index + 1);
     result.shard_merge_ns += merge_clock.elapsed_ns();
     return workspace_result_t<function_recovery_result_t>::success(std::move(result));
+}
+
+}
+
+workspace_result_t<function_recovery_result_t> function_recovery_t::finalize_cfg_calls(
+    const workspace_image_t& image,
+    const byte_provider_t& provider,
+    const std::vector<instruction_record_t>& instructions,
+    const std::vector<operand_fact_t>& operands,
+    const std::vector<target_fact_t>& targets,
+    function_recovery_result_t result,
+    const function_recovery_limits_t& limits,
+    const cancellation_token_t& cancel)
+{
+    return finalize_cfg_calls_with_operands(image, provider, instructions,
+        operands, targets, std::move(result), limits, cancel);
 }
 
 }

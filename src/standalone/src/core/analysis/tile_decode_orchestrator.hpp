@@ -128,7 +128,7 @@ struct tile_decode_orchestrator_limits_t final {
     std::uint64_t maximum_edges = 128'000'000;
     std::uint64_t maximum_coverage_spans = 16'000'000;
     bool seed_executable_range_starts = true;
-    tile_decode_pipeline_mode_t pipeline_mode = tile_decode_pipeline_mode_t::gated;
+    tile_decode_pipeline_mode_t pipeline_mode = tile_decode_pipeline_mode_t::pipelined;
     tile_invalid_run_policy_t invalid_run_policy;
 };
 
@@ -201,6 +201,7 @@ struct tile_decode_orchestrator_statistics_t final {
     std::uint64_t invalid_bytes = 0;
     std::uint64_t invalid_runs = 0;
     std::uint64_t frontier_waves = 0;
+    std::uint64_t wave_seeds_coalesced = 0;
     std::uint64_t attempted_bytes = 0;
     std::uint64_t accepted_tiles = 0;
     std::uint64_t lane_wall_ns = 0;

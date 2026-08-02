@@ -524,6 +524,7 @@ public:
     packed_analysis_shard_compatibility_view_t compatibility_view() const noexcept;
 
     void release() noexcept;
+    void release_domains(std::uint32_t domain_mask) noexcept;
 
 private:
     struct impl_t;
@@ -657,6 +658,8 @@ public:
     std::optional<packed_xref_view_t> xref(std::size_t index) const;
     std::optional<packed_coverage_view_t> coverage(std::size_t index) const;
     packed_analysis_compatibility_view_t compatibility_view() const noexcept;
+
+    void release_domains(std::uint32_t domain_mask) noexcept;
 
 private:
     struct impl_t;

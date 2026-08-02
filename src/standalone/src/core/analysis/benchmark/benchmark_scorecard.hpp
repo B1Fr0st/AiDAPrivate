@@ -239,7 +239,7 @@ inline nlohmann::json compare_scorecards(const nlohmann::json& baseline,
     static const char* const informational_keys[] = {
         "file_bytes_per_s", "decode_bytes_per_s", "instructions_per_s",
         "functions_per_s", "index_bytes_per_s", "persist_bytes_per_s",
-        "decompile_all_funcs_per_s"};
+        "decompile_all_funcs_per_s", "decompile_all_funcs_wall_per_s"};
     json informational = json::array();
     for (const char* key : informational_keys) {
         const json baseline_value = baseline.contains("throughput")

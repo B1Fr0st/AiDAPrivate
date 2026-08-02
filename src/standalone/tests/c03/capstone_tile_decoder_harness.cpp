@@ -474,6 +474,45 @@ void test_deterministic_records_and_cancellation()
             "Capstone tile decode ignored cancellation after worker creation");
 }
 
+void test_source_validation_memoized()
+{
+    const auto arm = key(architecture_id_t::arm, architecture_mode_t::arm_a32,
+                         endian_t::little, 32);
+    auto decoder = worker_owned_capstone_tile_decoder_t::create(arm);
+    require(static_cast<bool>(decoder),
+            "memoization Capstone tile decoder creation failed");
+    const std::vector<std::uint8_t> bytes{0x00, 0x00, 0x00, 0xea};
+    mapped_fixture_t fixture(bytes);
+    const auto first = decoder.value()->decode_tile(
+        fixture.snapshot(), identity(arm, bytes.size(), fixture.snapshot().generation()));
+    require(static_cast<bool>(first), "memoization first Capstone decode failed");
+    const auto second = decoder.value()->decode_tile(
+        fixture.snapshot(), identity(arm, bytes.size(), fixture.snapshot().generation()));
+    require(static_cast<bool>(second), "memoization second Capstone decode failed");
+    require(first.value().usage.source_validations == 1,
+            "first Capstone decode did not validate the snapshot source");
+    require(second.value().usage.source_validations == 0,
+            "second Capstone decode revalidated a memoized snapshot source");
+    require(first.value().usage.source_validations +
+                second.value().usage.source_validations == 1,
+            "Capstone worker validated more than once per snapshot generation");
+
+    auto regenerated_snapshot = provider_snapshot_t::capture(
+        fixture.snapshot().source());
+    require(static_cast<bool>(regenerated_snapshot),
+            "memoization fixture regeneration capture failed");
+    require(regenerated_snapshot.value()->generation() !=
+                fixture.snapshot().generation(),
+            "memoization regenerated snapshot shares a generation");
+    const auto regenerated = decoder.value()->decode_tile(
+        *regenerated_snapshot.value(),
+        identity(arm, bytes.size(), regenerated_snapshot.value()->generation()));
+    require(static_cast<bool>(regenerated),
+            "memoization regenerated Capstone decode failed");
+    require(regenerated.value().usage.source_validations == 1,
+            "a new snapshot generation did not force Capstone revalidation");
+}
+
 }
 
 bool run_capstone_tile_decoder_harness(std::string& failure)
@@ -483,6 +522,7 @@ bool run_capstone_tile_decoder_harness(std::string& failure)
         test_mode_endian_identity();
         test_malformed_progress_and_limits();
         test_deterministic_records_and_cancellation();
+        test_source_validation_memoized();
         return true;
     } catch (const std::exception& error) {
 		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../ai/standalone_chat.hpp"
+#include "../analysis/workspace/paged_snapshot_view.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../editor/code_editor.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
@@ -395,15 +396,44 @@ inline inspector_view_snapshot_t capture_inspector_snapshot(
     const aida::analysis::instruction_record_t* instruction = nullptr;
     const aida::analysis::function_record_t* function = nullptr;
     const aida::analysis::symbol_record_t* symbol = nullptr;
+    aida::analysis::instruction_record_t paged_instruction{};
     if (snapshot && output.has_rva) {
-        const auto instruction_it = std::lower_bound(snapshot->instructions.begin(),
-            snapshot->instructions.end(), output.rva,
-            [](const auto& candidate, std::uint64_t address) {
-                return candidate.address.value < address;
-            });
-        if (instruction_it != snapshot->instructions.end() &&
-            instruction_it->address.value == output.rva)
-            instruction = &*instruction_it;
+        const auto instruction_rows = aida::analysis::instructions_view(*snapshot);
+        if (instruction_rows.resident()) {
+            const auto resident = instruction_rows.resident_span();
+            const auto instruction_it = std::lower_bound(resident.begin(),
+                resident.end(), output.rva,
+                [](const auto& candidate, std::uint64_t address) {
+                    return candidate.address.value < address;
+                });
+            if (instruction_it != resident.end() &&
+                instruction_it->address.value == output.rva)
+                instruction = &*instruction_it;
+        } else {
+            aida::analysis::fact_page_pin_t lookup_pin;
+            std::uint64_t low = 0;
+            std::uint64_t high = instruction_rows.size();
+            bool lookup_failed = false;
+            while (low < high) {
+                const std::uint64_t middle = low + (high - low) / 2ULL;
+                auto row = instruction_rows.at(middle, lookup_pin);
+                if (!row) {
+                    lookup_failed = true;
+                    break;
+                }
+                if (row.value()->address.value < output.rva)
+                    low = middle + 1ULL;
+                else
+                    high = middle;
+            }
+            if (!lookup_failed && low < instruction_rows.size()) {
+                auto row = instruction_rows.at(low, lookup_pin);
+                if (row && row.value()->address.value == output.rva) {
+                    paged_instruction = *row.value();
+                    instruction = &paged_instruction;
+                }
+            }
+        }
         const auto symbol_it = std::lower_bound(snapshot->symbols.begin(), snapshot->symbols.end(),
             output.rva, [](const auto& candidate, std::uint64_t address) {
                 return candidate.address.value < address;
@@ -467,22 +497,28 @@ inline inspector_view_snapshot_t capture_inspector_snapshot(
             unavailable(output.bytes,
                 "The selected instruction cannot be mapped to a readable provider offset.");
 
-        if (snapshot && instruction->operand_fact_begin <= snapshot->operand_facts.size() &&
-            instruction->operand_fact_count <= snapshot->operand_facts.size() -
-                instruction->operand_fact_begin) {
-            for (std::uint16_t index = 0; index < instruction->operand_fact_count; ++index) {
-                const auto& operand = snapshot->operand_facts[
-                    instruction->operand_fact_begin + index];
-                std::string value = operand_kind_label(operand.kind);
-                if (operand.kind == aida::analysis::operand_kind_t::immediate ||
-                    operand.kind == aida::analysis::operand_kind_t::pointer)
-                    value += " " + hexadecimal(operand.immediate);
-                else if (operand.has_resolved_expression_value)
-                    value += " -> " + hexadecimal(operand.resolved_expression_value);
-                if (operand.bit_width != 0)
-                    value += " · " + std::to_string(operand.bit_width) + " bit";
-                output.operands.push_back({"Operand " + std::to_string(operand.operand_index),
-                    std::move(value), "Canonical decoded operand fact."});
+        if (snapshot) {
+            const auto operand_rows = aida::analysis::operand_facts_view(*snapshot);
+            aida::analysis::fact_page_pin_t operand_pin;
+            if (instruction->operand_fact_begin <= operand_rows.size() &&
+                instruction->operand_fact_count <= operand_rows.size() -
+                    instruction->operand_fact_begin) {
+                for (std::uint16_t index = 0; index < instruction->operand_fact_count; ++index) {
+                    auto operand_row = operand_rows.at(instruction->operand_fact_begin + index, operand_pin);
+                    if (!operand_row)
+                        break;
+                    const auto& operand = *operand_row.value();
+                    std::string value = operand_kind_label(operand.kind);
+                    if (operand.kind == aida::analysis::operand_kind_t::immediate ||
+                        operand.kind == aida::analysis::operand_kind_t::pointer)
+                        value += " " + hexadecimal(operand.immediate);
+                    else if (operand.has_resolved_expression_value)
+                        value += " -> " + hexadecimal(operand.resolved_expression_value);
+                    if (operand.bit_width != 0)
+                        value += " · " + std::to_string(operand.bit_width) + " bit";
+                    output.operands.push_back({"Operand " + std::to_string(operand.operand_index),
+                        std::move(value), "Canonical decoded operand fact."});
+                }
             }
         }
     } else {
@@ -496,22 +532,28 @@ inline inspector_view_snapshot_t capture_inspector_snapshot(
             : "No analysis publication matches the active selection revision.");
 
     if (snapshot && output.has_rva) {
-        if (instruction && instruction->target_fact_begin <= snapshot->target_facts.size() &&
-            instruction->target_fact_count <= snapshot->target_facts.size() -
-                instruction->target_fact_begin) {
-            for (std::uint16_t index = 0; index < instruction->target_fact_count; ++index) {
-                const auto& target = snapshot->target_facts[
-                    instruction->target_fact_begin + index];
-                const auto target_address = hexadecimal(
-                    presentation_address(identity, target.target.value));
-                output.xrefs.push_back({"Outgoing",
-                    std::string(target_kind_label(target.kind)) + " · " + target_address,
-                    target.direct ? "Direct decoded target fact."
-                                  : "Resolved indirect target fact."});
-                if (target.kind == aida::analysis::target_kind_record_t::call)
-                    output.calls.push_back({"Calls", target_address,
-                        target.direct ? "Direct decoded call target."
-                                      : "Resolved indirect call target."});
+        if (instruction) {
+            const auto target_rows = aida::analysis::target_facts_view(*snapshot);
+            aida::analysis::fact_page_pin_t target_pin;
+            if (instruction->target_fact_begin <= target_rows.size() &&
+                instruction->target_fact_count <= target_rows.size() -
+                    instruction->target_fact_begin) {
+                for (std::uint16_t index = 0; index < instruction->target_fact_count; ++index) {
+                    auto target_row = target_rows.at(instruction->target_fact_begin + index, target_pin);
+                    if (!target_row)
+                        break;
+                    const auto& target = *target_row.value();
+                    const auto target_address = hexadecimal(
+                        presentation_address(identity, target.target.value));
+                    output.xrefs.push_back({"Outgoing",
+                        std::string(target_kind_label(target.kind)) + " · " + target_address,
+                        target.direct ? "Direct decoded target fact."
+                                      : "Resolved indirect target fact."});
+                    if (target.kind == aida::analysis::target_kind_record_t::call)
+                        output.calls.push_back({"Calls", target_address,
+                            target.direct ? "Direct decoded call target."
+                                          : "Resolved indirect call target."});
+                }
             }
         }
         if (!snapshot->xrefs.empty())

@@ -659,6 +659,41 @@ void verify_expression_fixture(const decompiler_entity_key_t& entity_value, cons
     require_source_map_coverage(*rendered.document);
 }
 
+void verify_local_rename_rerender(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
+{
+    const auto ast = for_loop_ast(entity_value, types);
+    pseudocode_renderer_v2_request_t request;
+    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+    const auto canonical = render_pseudocode_v2(ast, types, request);
+    require(canonical.succeeded(), "renderer rejected the rename fixture");
+    const std::vector<std::pair<std::string, std::string>> renames{{"i", "index"}};
+    const auto renamed = rerender_document_with_local_renames(*canonical.document, types, request, renames);
+    require(renamed.succeeded() && renamed.document.has_value(),
+        "rerender with local renames rejected a valid rename");
+    const std::string expected =
+        "int for_fixture() {\n"
+        "    for (int index = 0; index < 10; index = index + 1) {\n"
+        "        break;\n"
+        "    }\n"
+        "}\n";
+    require(renamed.document->rendered_text == expected,
+        "rerender with local renames did not rewrite every use of the local");
+    require(renamed.document->ast_hash == stable_serialization_hash(renamed.document->ast),
+        "rerender with local renames broke the AST hash binding");
+    require(validate_decompiler_document(*renamed.document).valid(),
+        "rerender with local renames produced an invalid document");
+    require_source_map_coverage(*renamed.document);
+
+    const std::vector<std::pair<std::string, std::string>> keyword_rename{{"i", "int"}};
+    const auto rejected = rerender_document_with_local_renames(*canonical.document, types, request, keyword_rename);
+    require(!rejected.succeeded() && !rejected.document.has_value() && !rejected.diagnostics.empty(),
+        "rerender with local renames accepted a keyword name");
+    const std::vector<std::pair<std::string, std::string>> absent_rename{{"absent_local", "other"}};
+    const auto absent = rerender_document_with_local_renames(*canonical.document, types, request, absent_rename);
+    require(!absent.succeeded() && !absent.document.has_value(),
+        "rerender with local renames accepted an absent identifier");
+}
+
 typed_pseudocode_ast_v2_t compact_loop_ast(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     typed_pseudocode_ast_v2_t result;
@@ -761,6 +796,7 @@ void run_pseudocode_renderer_harness()
     verify_for_loop_fixture(entity_value, types);
     verify_switch_fixture(entity_value, types);
     verify_expression_fixture(entity_value, types);
+    verify_local_rename_rerender(entity_value, types);
     verify_compact_profile_fixture(entity_value, types);
     verify_audit_profile_fixture(entity_value, types);
 }

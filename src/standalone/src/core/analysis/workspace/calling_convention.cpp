@@ -1,5 +1,6 @@
 #include "calling_convention.hpp"
 
+#include "paged_snapshot_view.hpp"
 #include "parallel_pass.hpp"
 
 #include <Zydis/Zydis.h>
@@ -33,6 +34,7 @@ struct function_instruction_t {
 struct function_view_t {
     const function_record_t* function = nullptr;
     std::vector<function_instruction_t> instructions;
+    std::vector<instruction_record_t> paged_instructions;
 };
 
 struct abi_profile_t {
@@ -579,6 +581,7 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
             "calling convention inference could not find the requested function", "calling_convention.function"));
     }
 
+    const auto instruction_rows = instructions_view(snapshot);
     std::map<std::size_t, entity_id_t> instruction_blocks;
     for (std::size_t block_index = 0; block_index < snapshot.blocks.size(); ++block_index) {
         if ((block_index & 127U) == 0 && cancelled(cancel))
@@ -588,7 +591,7 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
             continue;
         const std::size_t first = block.first_instruction;
         const std::size_t count = block.instruction_count;
-        if (first > snapshot.instructions.size() || count > snapshot.instructions.size() - first) {
+        if (first > instruction_rows.size() || count > instruction_rows.size() - first) {
             return workspace_result_t<function_view_t>::failure(make_workspace_error(
                 workspace_error_code_t::integrity_failure,
                 "function block instruction range exceeds the snapshot", "calling_convention.function"));
@@ -608,13 +611,27 @@ workspace_result_t<function_view_t> extract_function_view(const analysis_snapsho
     }
 
     view.instructions.reserve(instruction_blocks.size());
+    const bool resident_instructions = instruction_rows.resident();
+    if (!resident_instructions)
+        view.paged_instructions.reserve(instruction_blocks.size());
+    fact_page_pin_t instruction_pin;
     std::size_t record_index = 0;
     for (const auto& [index, block_id] : instruction_blocks) {
         if ((record_index++ & 127U) == 0 && cancelled(cancel)) {
             return workspace_result_t<function_view_t>::failure(
                 stopped_error(cancel, "calling_convention.function"));
         }
-        view.instructions.push_back(function_instruction_t{&snapshot.instructions[index], block_id});
+        if (resident_instructions) {
+            view.instructions.push_back(
+                function_instruction_t{&instruction_rows.resident_span()[index], block_id});
+            continue;
+        }
+        auto instruction_row = instruction_rows.at(index, instruction_pin, cancel);
+        if (!instruction_row)
+            return workspace_result_t<function_view_t>::failure(instruction_row.error());
+        view.paged_instructions.push_back(*instruction_row.value());
+        view.instructions.push_back(
+            function_instruction_t{&view.paged_instructions.back(), block_id});
     }
     std::stable_sort(view.instructions.begin(), view.instructions.end(),
                      [](const function_instruction_t& lhs, const function_instruction_t& rhs) {
@@ -928,6 +945,8 @@ infer_with_snapshot(const analysis_workspace_t& workspace,
     if (visit_limit < view.value().instructions.size())
         result.bounded = true;
 
+    const auto operand_rows = operand_facts_view(*snapshot);
+    fact_page_pin_t operand_pin;
     for (std::size_t instruction_index = 0; instruction_index < visit_limit; ++instruction_index) {
         if ((instruction_index & 63U) == 0) {
             if (cancelled(cancel)) {
@@ -943,8 +962,8 @@ infer_with_snapshot(const analysis_workspace_t& workspace,
         const auto& instruction = *item.instruction;
         const std::size_t operand_begin = instruction.operand_fact_begin;
         const std::size_t operand_count = instruction.operand_fact_count;
-        if (operand_begin > snapshot->operand_facts.size() ||
-            operand_count > snapshot->operand_facts.size() - operand_begin) {
+        if (operand_begin > operand_rows.size() ||
+            operand_count > operand_rows.size() - operand_begin) {
             return workspace_result_t<cc_analysis_result_t>::failure(make_workspace_error(
                 workspace_error_code_t::integrity_failure,
                 "instruction operand range exceeds the snapshot", "calling_convention.scan"));
@@ -955,7 +974,10 @@ infer_with_snapshot(const analysis_workspace_t& workspace,
         bool memory_read = false;
         bool memory_write = false;
         for (std::size_t operand_index = 0; operand_index < operand_count; ++operand_index) {
-            const auto& operand = snapshot->operand_facts[operand_begin + operand_index];
+            auto operand_row = operand_rows.at(operand_begin + operand_index, operand_pin, cancel);
+            if (!operand_row)
+                return workspace_result_t<cc_analysis_result_t>::failure(operand_row.error());
+            const auto& operand = *operand_row.value();
             const auto bit_width = operand.access_width_bits != 0 ? operand.access_width_bits : operand.bit_width;
             if (operand.kind == operand_kind_t::reg) {
                 const auto reg = canonical_register(workspace.identity().architecture(), operand.reg);
@@ -1049,7 +1071,10 @@ infer_with_snapshot(const analysis_workspace_t& workspace,
             result.frame.epilogue_start_rva = instruction.address.value;
         }
         for (std::size_t operand_index = 0; operand_index < operand_count; ++operand_index) {
-            const auto& operand = snapshot->operand_facts[operand_begin + operand_index];
+            auto operand_row = operand_rows.at(operand_begin + operand_index, operand_pin, cancel);
+            if (!operand_row)
+                return workspace_result_t<cc_analysis_result_t>::failure(operand_row.error());
+            const auto& operand = *operand_row.value();
             if (operand.kind == operand_kind_t::immediate && operand.immediate != 0)
                 has_callee_cleanup = true;
         }

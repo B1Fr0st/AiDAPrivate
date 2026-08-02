@@ -315,7 +315,8 @@ std::optional<provider_output_t> execute_native(
     limits.max_result_bytes = (std::min<std::uint64_t>)(
         limits.max_result_bytes, job.profile.max_memory_bytes);
     limits.capture_printc_evidence = job.request_printc_evidence;
-    limits.keep_fixateglobals = job.profile.profile == decompiler_profile_id_t::thorough;
+    limits.keep_fixateglobals = job.profile.profile == decompiler_profile_id_t::thorough ||
+        job.profile.profile == decompiler_profile_id_t::balanced;
     ghidra_decompiler::ghidra_result_t output;
     bool executed = false;
     auto& cache = arch_session_cache();

@@ -36,6 +36,27 @@ void record_memory_pressure_event() noexcept;
 
 }
 
+class delete_on_close_spill_file_t final {
+public:
+    static workspace_result_t<std::unique_ptr<delete_on_close_spill_file_t>> create();
+
+    ~delete_on_close_spill_file_t();
+    delete_on_close_spill_file_t(const delete_on_close_spill_file_t&) = delete;
+    delete_on_close_spill_file_t& operator=(const delete_on_close_spill_file_t&) = delete;
+
+    workspace_result_t<void> write_at(std::uint64_t offset, const std::uint8_t* data,
+                                      std::size_t size);
+    workspace_result_t<void> read_at(std::uint64_t offset, std::uint8_t* data,
+                                     std::size_t size) const;
+    std::uint64_t written_bytes() const noexcept;
+
+private:
+    struct state_t;
+    explicit delete_on_close_spill_file_t(std::shared_ptr<state_t> state);
+
+    std::shared_ptr<state_t> state_;
+};
+
 class mapped_window_cache_t final : public byte_provider_t {
 public:
     static workspace_result_t<std::shared_ptr<mapped_window_cache_t>>

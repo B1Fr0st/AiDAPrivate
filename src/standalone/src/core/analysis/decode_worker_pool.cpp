@@ -25,7 +25,11 @@ constexpr const char* kPhase = "decode_worker_pool";
 
 constexpr std::uint32_t kCppExceptionFatalCode = 0xFFFFFFFFu;
 
-constexpr auto kWakeBackstop = std::chrono::milliseconds(25);
+constexpr auto kIdleWakeBackstop = std::chrono::milliseconds(5);
+
+constexpr auto kBackpressureWakeBackstop = std::chrono::milliseconds(2);
+
+constexpr auto kCompletionWakeBackstop = std::chrono::milliseconds(2);
 
 constexpr std::uint32_t kLaneJoinTimeoutMs = 15000;
 
@@ -91,6 +95,7 @@ struct decode_worker_pool_t::impl_t final {
     std::atomic<std::uint64_t> backpressure_wait_count{0};
     std::atomic<std::uint64_t> inline_drain_count{0};
     std::atomic<std::uint64_t> max_queue_depth_seen{0};
+    std::atomic<std::uint64_t> lane_clamp_count{0};
 };
 
 namespace {
@@ -368,7 +373,7 @@ void worker_main_body(decode_worker_pool_t::worker_state_t& worker,
                 break;
             {
                 std::unique_lock<std::mutex> lock(worker.mutex);
-                worker.cv.wait_for(lock, kWakeBackstop, [&] {
+                worker.cv.wait_for(lock, kIdleWakeBackstop, [&] {
                     return !worker.queue.empty() ||
                         lane_stop_requested(impl, lane_token) ||
                         impl.hook.load(std::memory_order_acquire) != nullptr;
@@ -433,6 +438,26 @@ decode_worker_pool_t::create(std::uint32_t worker_count,
             pool_error(workspace_error_code_t::invalid_argument,
                 "decode worker pool worker count is invalid"));
     }
+    const std::uint32_t requested_worker_count = worker_count;
+    std::uint64_t lane_clamps = 0;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::uint32_t fabric_capacity = rt::analysis_compute_capacity();
+    const std::uint32_t capacity_ceiling = (std::min<std::uint32_t>)(64u, fabric_capacity);
+    if (worker_count > capacity_ceiling)
+        ++lane_clamps;
+    worker_count = (std::min<std::uint32_t>)(worker_count, capacity_ceiling);
+    if (worker_count < 2u) {
+        ++lane_clamps;
+        worker_count = 2u;
+    }
+    if (lane_clamps != 0) {
+        ::diag::log_tagged_fmt(kPhase,
+            "lane_count_clamped requested=%u fabric_capacity=%u clamped=%u",
+            requested_worker_count, fabric_capacity, worker_count);
+    }
+#else
+    const std::uint32_t fabric_capacity = worker_count;
+#endif
     std::unique_ptr<impl_t> impl;
     try {
         impl = std::make_unique<impl_t>();
@@ -441,6 +466,7 @@ decode_worker_pool_t::create(std::uint32_t worker_count,
             pool_error(workspace_error_code_t::limit_exceeded,
                 "decode worker pool allocation failed"));
     }
+    impl->lane_clamp_count.store(lane_clamps, std::memory_order_relaxed);
     impl->options = options;
     impl->use_x86 =
         (options.decoder_key.architecture == architecture_id_t::x86 ||
@@ -503,8 +529,8 @@ decode_worker_pool_t::create(std::uint32_t worker_count,
         worker->lane_handle = submitted.handle;
     }
     ::diag::log_tagged_fmt(kPhase,
-        "pool_created workers=%u max_queue_depth=%u domain=feature_worker",
-        worker_count, impl->max_queue_depth);
+        "pool_created workers=%u max_queue_depth=%u domain=feature_worker requested=%u fabric_capacity=%u",
+        worker_count, impl->max_queue_depth, requested_worker_count, fabric_capacity);
     return workspace_result_t<std::unique_ptr<decode_worker_pool_t>>::success(
         std::unique_ptr<decode_worker_pool_t>(
             new decode_worker_pool_t(std::move(impl))));
@@ -595,7 +621,7 @@ workspace_result_t<void> decode_worker_pool_t::submit(
         impl.backpressure_wait_count.fetch_add(1, std::memory_order_relaxed);
         auto& target = *impl.workers[home];
         std::unique_lock<std::mutex> lock(target.mutex);
-        target.space_cv.wait_for(lock, kWakeBackstop, [&] {
+        target.space_cv.wait_for(lock, kBackpressureWakeBackstop, [&] {
             return target.queue.size() < impl.max_queue_depth ||
                 impl.stop.load(std::memory_order_acquire) ||
                 impl.cancellation.stop_requested() ||
@@ -623,7 +649,7 @@ bool decode_worker_pool_t::wait_completion(std::uint32_t shard_slot,
     auto& slot = *impl_->slots[
         static_cast<std::size_t>(shard_slot % maximum_shard_slots)];
     std::unique_lock<std::mutex> lock(slot.mutex);
-    slot.cv.wait_for(lock, kWakeBackstop, [&] {
+    slot.cv.wait_for(lock, kCompletionWakeBackstop, [&] {
         return !slot.completions.empty() ||
             impl_->stop.load(std::memory_order_acquire) ||
             impl_->seh_fatal.load(std::memory_order_acquire);
@@ -723,6 +749,8 @@ decode_worker_pool_statistics_t decode_worker_pool_t::statistics() const noexcep
         impl_->inline_drain_count.load(std::memory_order_relaxed);
     stats.max_queue_depth_seen =
         impl_->max_queue_depth_seen.load(std::memory_order_relaxed);
+    stats.lane_clamp_count =
+        impl_->lane_clamp_count.load(std::memory_order_relaxed);
     return stats;
 }
 

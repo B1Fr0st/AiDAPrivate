@@ -647,6 +647,30 @@ bool merge_instruction_sets(
     return merged.delay_slot_counts.size() == merged.instructions.size();
 }
 
+bool merge_instruction_sets(
+    const workspace_image_t& image,
+    const std::vector<projected_range_t>& ranges,
+    const std::vector<instruction_record_t>& retained_instructions,
+    const operand_fact_store_t& retained_operand_store,
+    const std::vector<target_fact_t>& retained_targets,
+    const std::vector<std::uint8_t>& retained_delay_slots,
+    std::vector<instruction_record_t> new_instructions,
+    std::vector<operand_fact_t> new_operands,
+    std::vector<target_fact_t> new_targets,
+    std::vector<std::uint8_t> new_delay_slots,
+    merged_instruction_set_t& merged) {
+    std::vector<operand_fact_t> retained_operands;
+    retained_operands.reserve(retained_operand_store.size());
+    for (std::uint64_t ordinal = 0; ordinal < retained_operand_store.size(); ++ordinal) {
+        retained_operands.push_back(operand_fact_materialize(
+            retained_operand_store, ordinal, retained_instructions));
+    }
+    return merge_instruction_sets(image, ranges, retained_instructions,
+        retained_operands, retained_targets, retained_delay_slots,
+        std::move(new_instructions), std::move(new_operands),
+        std::move(new_targets), std::move(new_delay_slots), merged);
+}
+
 bool merge_coverage_spans(
     const workspace_image_t& image,
     const std::vector<projected_range_t>& ranges,
@@ -1293,7 +1317,28 @@ incremental_reanalysis_executor_t::execute(
     }
 
     merged->instructions = std::move(merged_set.instructions);
-    merged->operand_facts = std::move(merged_set.operand_facts);
+    merged->operand_facts.clear();
+    merged->operand_facts.hot.reserve(merged_set.operand_facts.size());
+    for (std::size_t instruction_ordinal = 0;
+         instruction_ordinal < merged->instructions.size(); ++instruction_ordinal) {
+        const auto& instruction = merged->instructions[instruction_ordinal];
+        const auto fact_begin = instruction.operand_fact_begin;
+        const auto fact_end = static_cast<std::uint64_t>(fact_begin) +
+            instruction.operand_fact_count;
+        for (std::uint64_t fact = fact_begin;
+             fact < fact_end && fact < merged_set.operand_facts.size(); ++fact) {
+            auto parts = operand_fact_split(
+                merged_set.operand_facts[static_cast<std::size_t>(fact)],
+                static_cast<std::uint32_t>(instruction_ordinal));
+            if (parts.has_cold) {
+                merged->operand_facts.cold.push_back(parts.cold);
+                parts.hot.cold_index = static_cast<std::uint32_t>(
+                    merged->operand_facts.cold.size());
+            }
+            merged->operand_facts.hot.push_back(parts.hot);
+        }
+    }
+    merged_set.operand_facts.clear();
     merged->target_facts = std::move(merged_set.target_facts);
     merged->delay_slot_counts = std::move(merged_set.delay_slot_counts);
 
@@ -1400,11 +1445,8 @@ incremental_reanalysis_executor_t::execute(
             xref_limits.max_data_conflicts,
             settings.baseline_settings.data_limits.max_conflicts);
 
-        std::vector<type_reference_fact_t> type_references;
         auto xref_built = xref_builder_t::build(
-            image, *projected_provider,
-            merged->instructions, merged->operand_facts,
-            merged->target_facts, xref_limits, cancel);
+            image, *projected_provider, *merged, xref_limits, cancel);
         if (!xref_built) {
             result.fallback_to_full = true;
             result.ok = true;

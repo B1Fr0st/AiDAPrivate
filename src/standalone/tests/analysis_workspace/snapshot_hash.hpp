@@ -254,7 +254,8 @@ inline void hash_membership(fnv1a64_t& hash,
     hash.boolean(record.shared);
 }
 
-inline void hash_function(fnv1a64_t& hash, const function_record_t& record)
+inline void hash_function(fnv1a64_t& hash, const analysis_snapshot_t& snapshot,
+                          const function_record_t& record)
 {
     hash.u64(record.id);
     hash.address(record.start);
@@ -270,8 +271,9 @@ inline void hash_function(fnv1a64_t& hash, const function_record_t& record)
     hash.byte(record.confidence);
     hash.boolean(record.thunk);
     hash.boolean(record.noreturn);
-    hash.u64(record.chunks.size());
-    for (const auto& chunk : record.chunks) {
+    const auto chunks = snapshot.function_chunks_of(record);
+    hash.u64(chunks.size());
+    for (const auto& chunk : chunks) {
         hash.u64(chunk.rva_start);
         hash.u64(chunk.rva_end);
         hash.byte(chunk.chunk_kind);
@@ -458,6 +460,17 @@ inline snapshot_hash_class_digest_t hash_vector(const std::vector<T>& values,
     return {static_cast<std::uint64_t>(values.size()), hash.value()};
 }
 
+inline snapshot_hash_class_digest_t hash_operand_facts(
+    const operand_fact_store_t& facts,
+    const snapshot_table_t<instruction_record_t>& instructions)
+{
+    fnv1a64_t hash;
+    hash.u64(facts.size());
+    for (std::size_t index = 0; index < facts.size(); ++index)
+        hash_operand_fact(hash, operand_fact_materialize(facts, index, instructions));
+    return {static_cast<std::uint64_t>(facts.size()), hash.value()};
+}
+
 }
 
 inline snapshot_hash_result_t compute_snapshot_hash(const snapshot_hash_input_t& input)
@@ -477,8 +490,8 @@ inline snapshot_hash_result_t compute_snapshot_hash(const snapshot_hash_input_t&
         classes["delay_slot_counts"] = {
             static_cast<std::uint64_t>(snapshot.delay_slot_counts.size()), hash.value()};
     }
-    classes["operand_facts"] = detail::hash_vector(snapshot.operand_facts,
-        detail::hash_operand_fact);
+    classes["operand_facts"] = detail::hash_operand_facts(snapshot.operand_facts,
+        snapshot.instructions);
     classes["target_facts"] = detail::hash_vector(snapshot.target_facts,
         detail::hash_target_fact);
     classes["blocks"] = detail::hash_vector(snapshot.blocks,
@@ -489,7 +502,9 @@ inline snapshot_hash_result_t compute_snapshot_hash(const snapshot_hash_input_t&
         detail::hash_vector(snapshot.function_block_memberships,
             detail::hash_membership);
     classes["functions"] = detail::hash_vector(snapshot.functions,
-        detail::hash_function);
+        [&snapshot](fnv1a64_t& hash, const function_record_t& record) {
+            detail::hash_function(hash, snapshot, record);
+        });
     classes["edges"] = detail::hash_vector(snapshot.edges,
         detail::hash_edge);
     {

@@ -19,7 +19,7 @@ constexpr std::uint32_t k_type_graph_schema_version = 1;
 constexpr std::uint32_t k_typed_pseudocode_ast_schema_version = 2;
 constexpr std::uint32_t k_decompiler_document_schema_version = 1;
 constexpr std::uint32_t k_decompiler_cache_key_schema_version = 2;
-constexpr std::uint32_t k_decompiler_render_evidence_schema_version = 1;
+constexpr std::uint32_t k_decompiler_render_evidence_schema_version = 2;
 constexpr std::size_t k_decompiler_render_evidence_max_entries = 1U << 20;
 constexpr std::size_t k_decompiler_render_evidence_max_text_bytes = 4096;
 constexpr std::uint32_t k_decompiler_worker_protocol_version = 3;
@@ -572,10 +572,17 @@ struct readability_transform_settings_t {
     bool enable_declaration_at_first_use = true;
     bool enable_string_comment_injection = true;
     bool enable_user_comment_injection = true;
+    bool enable_string_literal_substitution = true;
+    bool enable_cast_idiom_folding = true;
+    bool enable_bit_operation_idioms = true;
+    bool enable_loop_intrinsic_idioms = true;
+    bool enable_magic_division_recognition = true;
     std::size_t max_transform_iterations = 4;
     std::size_t max_expression_depth = 256;
     std::size_t max_comment_bytes = 96;
     std::size_t max_comments_per_function = 256;
+    std::size_t max_transform_nodes = 250000;
+    std::size_t max_transform_work_units = 4000000;
 
     bool operator==(const readability_transform_settings_t& other) const noexcept
     {
@@ -601,16 +608,23 @@ struct readability_transform_settings_t {
             enable_declaration_at_first_use == other.enable_declaration_at_first_use &&
             enable_string_comment_injection == other.enable_string_comment_injection &&
             enable_user_comment_injection == other.enable_user_comment_injection &&
+            enable_string_literal_substitution == other.enable_string_literal_substitution &&
+            enable_cast_idiom_folding == other.enable_cast_idiom_folding &&
+            enable_bit_operation_idioms == other.enable_bit_operation_idioms &&
+            enable_loop_intrinsic_idioms == other.enable_loop_intrinsic_idioms &&
+            enable_magic_division_recognition == other.enable_magic_division_recognition &&
             max_transform_iterations == other.max_transform_iterations &&
             max_expression_depth == other.max_expression_depth &&
             max_comment_bytes == other.max_comment_bytes &&
-            max_comments_per_function == other.max_comments_per_function;
+            max_comments_per_function == other.max_comments_per_function &&
+            max_transform_nodes == other.max_transform_nodes &&
+            max_transform_work_units == other.max_transform_work_units;
     }
     bool operator!=(const readability_transform_settings_t& other) const noexcept { return !(*this == other); }
 };
 
 struct decompiler_renderer_settings_t {
-    std::uint32_t schema_version = 3;
+    std::uint32_t schema_version = 4;
     std::string style_id;
     std::uint32_t indentation_spaces = 4;
     bool emit_type_annotations = true;
@@ -771,6 +785,9 @@ struct decompiler_string_evidence_t {
     std::string utf8_content;
     bool is_wide = false;
     std::uint8_t confidence = 0;
+    std::uint64_t absolute_address = 0;
+    bool truncated = false;
+    std::uint32_t original_byte_length = 0;
 };
 
 struct decompiler_member_evidence_t {
@@ -786,6 +803,7 @@ struct decompiler_vtable_slot_evidence_t {
     std::uint64_t slot_index = 0;
     std::string method_name;
     std::uint8_t confidence = 0;
+    std::uint64_t vtable_rva = 0;
 };
 
 struct decompiler_user_comment_evidence_t {
@@ -793,6 +811,14 @@ struct decompiler_user_comment_evidence_t {
     std::string comment_text;
     bool before_statement = false;
     std::uint8_t confidence = 0;
+    std::uint64_t rva = 0;
+    std::uint64_t function_rva = 0;
+};
+
+struct decompiler_global_scalar_evidence_t {
+    std::uint64_t absolute_address = 0;
+    std::uint64_t value = 0;
+    std::uint8_t size_log2 = 0;
 };
 
 struct decompiler_render_evidence_t {
@@ -803,6 +829,7 @@ struct decompiler_render_evidence_t {
     std::vector<decompiler_member_evidence_t> members;
     std::vector<decompiler_vtable_slot_evidence_t> vtable_slots;
     std::vector<decompiler_user_comment_evidence_t> user_comments;
+    std::vector<decompiler_global_scalar_evidence_t> global_scalars;
 
     bool empty() const noexcept;
 };
@@ -817,7 +844,12 @@ enum class decompiler_render_pass_id_t : std::uint8_t {
     idiom_comment_recognition = 7,
     symbol_resolution_rendering = 8,
     enum_case_name_rendering = 9,
-    vtable_call_rendering = 10
+    vtable_call_rendering = 10,
+    string_literal_substitution = 11,
+    cast_idiom_folding = 12,
+    bit_operation_idioms = 13,
+    loop_intrinsic_idioms = 14,
+    magic_division_recognition = 15
 };
 
 constexpr std::uint32_t k_decompiler_render_pass_revision_readability_transforms = 1;
@@ -830,6 +862,11 @@ constexpr std::uint32_t k_decompiler_render_pass_revision_idiom_comment_recognit
 constexpr std::uint32_t k_decompiler_render_pass_revision_symbol_resolution_rendering = 1;
 constexpr std::uint32_t k_decompiler_render_pass_revision_enum_case_name_rendering = 1;
 constexpr std::uint32_t k_decompiler_render_pass_revision_vtable_call_rendering = 1;
+constexpr std::uint32_t k_decompiler_render_pass_revision_string_literal_substitution = 1;
+constexpr std::uint32_t k_decompiler_render_pass_revision_cast_idiom_folding = 1;
+constexpr std::uint32_t k_decompiler_render_pass_revision_bit_operation_idioms = 1;
+constexpr std::uint32_t k_decompiler_render_pass_revision_loop_intrinsic_idioms = 1;
+constexpr std::uint32_t k_decompiler_render_pass_revision_magic_division_recognition = 1;
 
 struct decompiler_render_pass_registration_t {
     decompiler_render_pass_id_t id = decompiler_render_pass_id_t::readability_transforms;

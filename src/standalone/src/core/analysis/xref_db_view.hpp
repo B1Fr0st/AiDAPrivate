@@ -2,6 +2,8 @@
 
 #include "../disasm/disasm_view.hpp"
 #include "../infra/taskflow_runtime.hpp"
+#include "../../helpers/diag_log.hpp"
+#include "workspace/publication_indexes.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/analysis_context_menu.hpp"
 #include "../ui/application_view_registry.hpp"
@@ -141,14 +143,27 @@ inline void submit_query(const disasm_view::workspace_context_t& context,
         constexpr std::size_t maximum_results = 100000;
         results.reserve((std::min)(context.publication->snapshot->xrefs.size(),
             static_cast<std::size_t>(1024)));
-        for (const auto& xref : context.publication->snapshot->xrefs) {
-            if (runtime_cancel.requested.load(std::memory_order_acquire) ||
-                cancellation->token().stop_requested())
-                break;
-            if ((query_to && xref.target == address) || (!query_to && xref.source == address))
-                results.push_back({xref.source, xref.target, xref.kind});
-            if (results.size() >= maximum_results)
-                break;
+        const auto indexes = aida::analysis::publication_indexes::for_publication(
+            context.publication, cancellation->token());
+        if (indexes) {
+            const auto& xrefs = context.publication->snapshot->xrefs;
+            const auto range = query_to ? indexes->xrefs_to(address)
+                : indexes->xrefs_from(address);
+            for (std::uint32_t ordinal = range.begin; ordinal < range.end; ++ordinal) {
+                if (runtime_cancel.requested.load(std::memory_order_acquire) ||
+                    cancellation->token().stop_requested())
+                    break;
+                const auto& xref = xrefs[query_to ? indexes->xref_to_entry(ordinal)
+                    : indexes->xref_from_entry(ordinal)];
+                if ((query_to && xref.target == address) || (!query_to && xref.source == address))
+                    results.push_back({xref.source, xref.target, xref.kind});
+                if (results.size() >= maximum_results)
+                    break;
+            }
+        } else {
+            diag::log_tagged_fmt("xref_db_view",
+                "index_unavailable address=%llx query_to=%d",
+                static_cast<unsigned long long>(address.value), query_to ? 1 : 0);
         }
         {
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -157,6 +172,8 @@ inline void submit_query(const disasm_view::workspace_context_t& context,
                 state->visible_results.reset();
                 ++state->results_version;
                 state->visible_version = 0;
+                if (!indexes)
+                    state->error = "index unavailable";
             }
         }
         state->searching.store(false, std::memory_order_release);

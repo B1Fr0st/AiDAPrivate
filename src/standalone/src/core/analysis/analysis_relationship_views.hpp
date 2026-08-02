@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis_list_views.hpp"
+#include "workspace/paged_snapshot_view.hpp"
 #include "../ui/empty_state.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/theme.hpp"
@@ -152,16 +153,33 @@ inline void advance_projection(state_t& state,
                                const disasm_view::workspace_context_t& context) {
     if (state.complete || !context.publication || !context.publication->snapshot) return;
     const auto& snapshot = *context.publication->snapshot;
+    const auto instruction_rows = aida::analysis::instructions_view(snapshot);
+    const auto operand_rows = aida::analysis::operand_facts_view(snapshot);
+    aida::analysis::fact_page_pin_t instruction_pin;
+    aida::analysis::fact_page_pin_t operand_pin;
+    const bool resident_instructions = instruction_rows.resident();
     const std::size_t begin = state.instruction_cursor;
-    const std::size_t end = (std::min)(snapshot.instructions.size(), begin + 2048U);
+    const std::size_t end = (std::min)(static_cast<std::size_t>(instruction_rows.size()), begin + 2048U);
     disasm_view::request_format_range(context, begin, end);
     for (std::size_t index = begin; index < end; ++index) {
-        const auto& instruction = snapshot.instructions[index];
+        const aida::analysis::instruction_record_t* instruction_record = nullptr;
+        if (resident_instructions) {
+            instruction_record = &instruction_rows.resident_span()[index];
+        } else {
+            auto instruction_row = instruction_rows.at(index, instruction_pin);
+            if (!instruction_row)
+                break;
+            instruction_record = instruction_row.value();
+        }
+        const auto& instruction = *instruction_record;
         const std::size_t operand_begin = instruction.operand_fact_begin;
-        const std::size_t operand_end = (std::min)(snapshot.operand_facts.size(),
+        const std::size_t operand_end = (std::min)(static_cast<std::size_t>(operand_rows.size()),
             operand_begin + static_cast<std::size_t>(instruction.operand_fact_count));
         for (std::size_t operand_index = operand_begin; operand_index < operand_end; ++operand_index) {
-            const auto& operand = snapshot.operand_facts[operand_index];
+            auto operand_row = operand_rows.at(operand_index, operand_pin);
+            if (!operand_row)
+                break;
+            const auto& operand = *operand_row.value();
             if (operand.kind != aida::analysis::operand_kind_t::memory || operand.segment_reg == 0)
                 continue;
             const auto runtime = disasm_view::runtime_address(context, instruction.address);
@@ -202,7 +220,7 @@ inline void advance_projection(state_t& state,
         }
     }
     state.instruction_cursor = end;
-    state.complete = end >= snapshot.instructions.size();
+    state.complete = static_cast<std::uint64_t>(end) >= instruction_rows.size();
     state.filter_dirty = true;
 }
 
@@ -288,7 +306,8 @@ inline void render() {
             "Filter register, address, instruction...", false, ImVec2(0.0f, 25.0f)))
         state->filter_dirty = true;
     if (!state->complete) {
-        const auto total = context.publication->snapshot->instructions.size();
+        const auto total = aida::analysis::instructions_view(
+            *context.publication->snapshot).size();
         const float fraction = total == 0 ? 1.0f :
             static_cast<float>(state->instruction_cursor) / static_cast<float>(total);
         ImGui::ProgressBar(fraction, ImVec2(-1.0f, 3.0f), "");
@@ -605,8 +624,13 @@ inline std::uint64_t default_root(const disasm_view::workspace_context_t& contex
         return analysis_list_views::runtime_address_value(context, snapshot.functions.front().start);
     if (!snapshot.symbols.empty())
         return analysis_list_views::runtime_address_value(context, snapshot.symbols.front().address);
-    if (!snapshot.xrefs.empty())
-        return analysis_list_views::runtime_address_value(context, snapshot.xrefs.front().source);
+    const auto xref_rows = aida::analysis::xrefs_view(snapshot);
+    if (!xref_rows.empty()) {
+        aida::analysis::fact_page_pin_t xref_pin;
+        auto first = xref_rows.at(0, xref_pin);
+        if (first)
+            return analysis_list_views::runtime_address_value(context, first.value()->source);
+    }
     return 0;
 }
 
@@ -704,22 +728,35 @@ inline void advance_projection(state_t& state,
                                const disasm_view::workspace_context_t& context) {
     if (state.complete || !context.publication || !context.publication->snapshot) return;
     const auto& snapshot = *context.publication->snapshot;
+    static_assert(aida::analysis::fact_domain_count == 12);
+    const auto xref_rows = aida::analysis::xrefs_view(snapshot);
+    const auto edge_rows = aida::analysis::edges_view(snapshot);
+    aida::analysis::fact_page_pin_t xref_pin;
+    aida::analysis::fact_page_pin_t edge_pin;
     std::size_t budget = 1024;
-    while (budget != 0 && !state.capped && state.xref_cursor < snapshot.xrefs.size()) {
-        const auto& item = snapshot.xrefs[state.xref_cursor++];
-        consume_relation(state, context, item.source, item.target, relation_kind_t::xref);
+    while (budget != 0 && !state.capped && state.xref_cursor < xref_rows.size()) {
+        auto xref_row = xref_rows.at(state.xref_cursor, xref_pin);
+        if (!xref_row)
+            break;
+        ++state.xref_cursor;
+        consume_relation(state, context, xref_row.value()->source, xref_row.value()->target,
+                         relation_kind_t::xref);
         --budget;
     }
-    while (budget != 0 && !state.capped && state.xref_cursor >= snapshot.xrefs.size() &&
+    while (budget != 0 && !state.capped && state.xref_cursor >= xref_rows.size() &&
            state.call_cursor < snapshot.call_graph.edges.size()) {
         const auto& item = snapshot.call_graph.edges[state.call_cursor++];
         consume_relation(state, context, item.call_site, item.target, relation_kind_t::call);
         --budget;
     }
-    while (budget != 0 && !state.capped && state.xref_cursor >= snapshot.xrefs.size() &&
+    while (budget != 0 && !state.capped && state.xref_cursor >= xref_rows.size() &&
            state.call_cursor >= snapshot.call_graph.edges.size() &&
-           state.edge_cursor < snapshot.edges.size()) {
-        const auto& item = snapshot.edges[state.edge_cursor++];
+           state.edge_cursor < edge_rows.size()) {
+        auto edge_row = edge_rows.at(state.edge_cursor, edge_pin);
+        if (!edge_row)
+            break;
+        ++state.edge_cursor;
+        const auto& item = *edge_row.value();
         consume_relation(state, context, item.source, item.target,
             item.kind == aida::analysis::edge_kind_t::call ||
             item.kind == aida::analysis::edge_kind_t::tail_call
@@ -730,9 +767,9 @@ inline void advance_projection(state_t& state,
         state.complete = true;
         return;
     }
-    if (state.xref_cursor >= snapshot.xrefs.size() &&
+    if (state.xref_cursor >= xref_rows.size() &&
         state.call_cursor >= snapshot.call_graph.edges.size() &&
-        state.edge_cursor >= snapshot.edges.size())
+        state.edge_cursor >= edge_rows.size())
         finish_pass(state);
 }
 
@@ -1001,8 +1038,10 @@ inline void render() {
         state->filter_dirty = true;
     if (!state->complete) {
         const auto& snapshot = *context.publication->snapshot;
-        const std::size_t total = snapshot.xrefs.size() + snapshot.call_graph.edges.size() +
-            snapshot.edges.size();
+        const std::size_t total =
+            static_cast<std::size_t>(aida::analysis::xrefs_view(snapshot).size()) +
+            snapshot.call_graph.edges.size() +
+            static_cast<std::size_t>(aida::analysis::edges_view(snapshot).size());
         const std::size_t current = state->xref_cursor + state->call_cursor + state->edge_cursor;
         const float pass_fraction = total == 0 ? 1.0f :
             static_cast<float>(current) / static_cast<float>(total);

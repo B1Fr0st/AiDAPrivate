@@ -156,7 +156,7 @@ std::shared_ptr<analysis_snapshot_t> make_fixture(const fixture_params_t& params
             operand.kind = operand_kind_t::immediate;
             operand.bit_width = 64;
             operand.immediate = 0x1234;
-            snapshot->operand_facts.push_back(operand);
+            snapshot->operand_facts.append(operand, index);
 
             target_fact_t target;
             target.instruction_id = record.id;
@@ -496,15 +496,16 @@ void verify_mutation_matrix() {
             snapshot.instructions.back().operand_fact_count = 2;
         }, "instruction fact range exceeds its table");
     add("orphan_instruction_facts", [](analysis_snapshot_t& snapshot) {
-            auto extra = snapshot.operand_facts.back();
-            extra.id = tagged_id(11, 0xFFFFULL);
-            snapshot.operand_facts.push_back(extra);
+            const auto extra = operand_fact_materialize(snapshot.operand_facts,
+                snapshot.operand_facts.size() - 1, snapshot.instructions);
+            snapshot.operand_facts.append(extra,
+                static_cast<std::uint32_t>(snapshot.instructions.size() - 1));
         }, "snapshot contains orphan instruction facts");
     add("operand_wrong_instruction", [](analysis_snapshot_t& snapshot) {
-            snapshot.operand_facts[100].operand_index = 5;
+            snapshot.operand_facts.hot[100].operand_index = 5;
         }, "operand fact belongs to a different instruction");
     add("operand_memory_facts_on_nonmemory", [](analysis_snapshot_t& snapshot) {
-            snapshot.operand_facts[101].base_reg = 3;
+            snapshot.operand_facts.hot[101].base_reg = 3;
         }, "non-memory operand contains memory-only facts");
     add("target_fact_invalid", [](analysis_snapshot_t& snapshot) {
             snapshot.target_facts[150].kind = static_cast<target_kind_record_t>(99);

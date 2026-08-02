@@ -999,4 +999,176 @@ tool_result_t scan_objects(const json& params)
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
 }
+
+namespace
+{
+class static_slot_image_reader_t
+{
+public:
+    static_slot_image_reader_t(const aida::analysis::workspace_image_t& image,
+                               const aida::analysis::byte_provider_t& provider)
+        : provider_(provider)
+    {
+        base_ = image.image_base;
+        pointer_size_ = image.address_width_bits == 32 ? 4u : 8u;
+        for (const auto& section : image.sections)
+        {
+            if (section.virtual_size == 0 || section.file_size == 0)
+                continue;
+            section_view_t view;
+            view.va = image.image_base + section.virtual_address;
+            view.size = (std::min<std::uint64_t>)(section.virtual_size, section.file_size);
+            view.file_offset = section.file_offset;
+            view.permissions = section.permissions;
+            sections_.push_back(view);
+        }
+        std::sort(sections_.begin(), sections_.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.va < rhs.va;
+        });
+    }
+
+    std::uint32_t pointer_size() const { return pointer_size_; }
+
+    bool read_pointer(std::uint64_t va, std::uint64_t& out) const
+    {
+        out = 0;
+        const section_view_t* section = find_section(va);
+        if (!section || (section->permissions & aida::analysis::image_permission_read) == 0)
+            return false;
+        const std::uint64_t available = section->va + section->size - va;
+        if (available < pointer_size_)
+            return false;
+        auto leased = provider_.lease(section->file_offset + (va - section->va), pointer_size_);
+        if (!leased || leased.value().size() < pointer_size_)
+            return false;
+        std::uint8_t buffer[8]{};
+        leased.value().copy_to(buffer, pointer_size_);
+        if (pointer_size_ == 4)
+        {
+            std::uint32_t value = 0;
+            std::memcpy(&value, buffer, sizeof(value));
+            out = value;
+            return true;
+        }
+        std::memcpy(&out, buffer, sizeof(out));
+        return true;
+    }
+
+    bool executable_va(std::uint64_t va) const
+    {
+        const section_view_t* section = find_section(va);
+        return section && (section->permissions & aida::analysis::image_permission_execute) != 0;
+    }
+
+private:
+    struct section_view_t
+    {
+        std::uint64_t va = 0;
+        std::uint64_t size = 0;
+        std::uint64_t file_offset = 0;
+        std::uint32_t permissions = 0;
+    };
+
+    const section_view_t* find_section(std::uint64_t va) const
+    {
+        std::size_t lo = 0;
+        std::size_t hi = sections_.size();
+        while (lo < hi)
+        {
+            const std::size_t mid = (lo + hi) / 2;
+            if (sections_[mid].va <= va)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo == 0)
+            return nullptr;
+        const section_view_t& section = sections_[lo - 1];
+        if (va < section.va || va - section.va >= section.size)
+            return nullptr;
+        return &section;
+    }
+
+    const aida::analysis::byte_provider_t& provider_;
+    std::uint64_t base_ = 0;
+    std::uint32_t pointer_size_ = 8;
+    std::vector<section_view_t> sections_;
+};
+}
+
+aida::analysis::workspace_result_t<static_vtable_slots_result_t> extract_slots_static(
+    const aida::analysis::workspace_image_t& image,
+    const aida::analysis::byte_provider_t& provider,
+    const re::rtti::static_rtti_result_t& rtti,
+    const std::vector<std::uint64_t>* function_starts_rva_sorted,
+    const aida::analysis::cancellation_token_t& cancel)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    static_vtable_slots_result_t result;
+    auto finish = [&](std::uint8_t status) {
+        result.status = status;
+        result.elapsed_ms = static_cast<double>(GetTickCount64() - started_ms);
+        diag::log_tagged_fmt("vmt",
+                             "extract_slots_static exit status=%u vtables=%llu slots=%zu elapsed_ms=%llu",
+                             static_cast<unsigned int>(status),
+                             static_cast<unsigned long long>(result.vtables_validated),
+                             result.slots.size(),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return aida::analysis::workspace_result_t<static_vtable_slots_result_t>::success(std::move(result));
+    };
+    if (image.address_width_bits != 64 && image.address_width_bits != 32)
+        return finish(k_static_vtables_no_vtables);
+    if (cancel.stop_requested())
+        return finish(k_static_vtables_cancelled);
+    static_slot_image_reader_t reader(image, provider);
+    if (reader.pointer_size() != 8 && reader.pointer_size() != 4)
+        return finish(k_static_vtables_no_vtables);
+    std::vector<std::uint64_t> vtable_rvas;
+    for (const auto& type : rtti.types)
+        for (const auto vtable_rva : type.vtable_rvas)
+            vtable_rvas.push_back(vtable_rva);
+    std::sort(vtable_rvas.begin(), vtable_rvas.end());
+    vtable_rvas.erase(std::unique(vtable_rvas.begin(), vtable_rvas.end()), vtable_rvas.end());
+    diag::log_tagged_fmt("vmt",
+                         "extract_slots_static enter vtables=%zu pointer_size=%u",
+                         vtable_rvas.size(), reader.pointer_size());
+    const auto on_function_start = [&](std::uint64_t rva) {
+        if (!function_starts_rva_sorted || function_starts_rva_sorted->empty())
+            return false;
+        return std::binary_search(function_starts_rva_sorted->begin(),
+                                  function_starts_rva_sorted->end(), rva);
+    };
+    for (const auto vtable_rva : vtable_rvas)
+    {
+        if (cancel.stop_requested())
+            return finish(k_static_vtables_cancelled);
+        const std::uint64_t vtable_va = image.image_base + vtable_rva;
+        std::vector<static_vfunc_slot_t> vtable_slots;
+        for (std::uint64_t index = 0; index < k_static_vtable_max_entries; ++index)
+        {
+            if ((index & 0xFFu) == 0 && cancel.stop_requested())
+                return finish(k_static_vtables_cancelled);
+            std::uint64_t target = 0;
+            if (!reader.read_pointer(vtable_va + index * reader.pointer_size(), target))
+                break;
+            if (target == 0 || target < image.image_base)
+                break;
+            const std::uint64_t target_rva = target - image.image_base;
+            if (!reader.executable_va(target))
+                break;
+            static_vfunc_slot_t slot;
+            slot.vtable_rva = vtable_rva;
+            slot.slot_index = index;
+            slot.function_rva = target_rva;
+            slot.confidence = on_function_start(target_rva) ? 200 : 160;
+            vtable_slots.push_back(slot);
+        }
+        if (vtable_slots.size() < k_static_vtable_min_entries)
+            continue;
+        ++result.vtables_validated;
+        for (auto& slot : vtable_slots)
+            result.slots.push_back(slot);
+    }
+    return finish(result.slots.empty() ? k_static_vtables_no_vtables : k_static_vtables_completed);
+}
 }

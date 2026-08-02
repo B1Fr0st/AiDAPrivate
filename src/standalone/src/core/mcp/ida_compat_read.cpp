@@ -207,7 +207,7 @@ namespace mcp_standalone::ida_compat
         const function_record_t* find_func_in(const analysis_snapshot_t& s, std::uint64_t rva) {
             for (const auto& f : s.functions) {
                 if (rva >= f.start.value && rva < f.end.value) return &f;
-                for (const auto& c : f.chunks) if (rva >= c.rva_start && rva < c.rva_end) return &f;
+                for (const auto& c : s.function_chunks_of(f)) if (rva >= c.rva_start && rva < c.rva_end) return &f;
             }
             return nullptr;
         }
@@ -1318,7 +1318,7 @@ namespace mcp_standalone::ida_compat
             j["name"] = func_name(s, ov, f); j["size"] = f.end.value - f.start.value;
             j["blocks"] = f.block_count; j["chunks"] = f.chunk_count;
             j["thunk"] = f.thunk; j["noreturn"] = f.noreturn; j["provenance"] = prov_str(f.provenance);
-            if (f.chunks.size() > 1) { json ch = json::array(); for (const auto& c : f.chunks) ch.push_back({{"start",hex_str(c.rva_start)},{"end",hex_str(c.rva_end)}}); j["chunk_ranges"] = ch; }
+            const auto f_ranges = s.function_chunks_of(f); if (f_ranges.size() > 1) { json ch = json::array(); for (const auto& c : f_ranges) ch.push_back({{"start",hex_str(c.rva_start)},{"end",hex_str(c.rva_end)}}); j["chunk_ranges"] = ch; }
             return j;
         }
 

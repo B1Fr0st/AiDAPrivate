@@ -56,6 +56,7 @@ struct x86_tile_decode_usage_t final {
     std::uint64_t coverage_spans = 0;
     std::uint64_t snapshot_window_leases = 0;
     std::uint64_t snapshot_window_bytes = 0;
+    std::uint64_t source_validations = 0;
 };
 
 struct x86_tile_decode_result_t final {

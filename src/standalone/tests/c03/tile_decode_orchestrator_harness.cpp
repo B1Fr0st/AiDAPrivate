@@ -1635,6 +1635,124 @@ void test_randomized_scheduling_byte_identical()
     }
 }
 
+void test_wave_coalescing_request_count()
+{
+    std::vector<std::uint8_t> text(0x400, 0x90);
+    std::vector<std::uint8_t> file_bytes(0x1000, 0x00);
+    std::copy(text.begin(), text.end(), file_bytes.begin() + 0x400);
+
+    mapped_fixture_t fixture(file_bytes);
+    auto layout = build_layout(0x1000, text.size(), 0x400, file_bytes.size());
+    auto limits = small_limits();
+    limits.target_tile_bytes = 256;
+
+    auto orch_result = tile_decode_orchestrator_t::create(limits);
+    require(orch_result.has_value(), "coalescing orchestrator create failed");
+
+    std::vector<tile_decode_seed_t> seeds;
+    for (std::uint64_t index = 0; index < 3; ++index) {
+        tile_decode_seed_t seed;
+        seed.address = rva_address(0x1000 + index * 0x10);
+        seed.provenance = fact_provenance_t::export_entry;
+        seed.confidence = 100;
+        seed.stable_source_id = index + 1;
+        seeds.push_back(seed);
+    }
+
+    mock_tile_decode_executor_t executor;
+    auto run_result = orch_result.value().run(
+        fixture.snapshot(), layout, seeds, executor);
+    require(run_result.has_value(), "coalescing decode run failed");
+
+    const auto& result = run_result.value();
+    const auto tile_count = static_cast<std::size_t>(text.size() / 256);
+    require(executor.observed_requests().size() <= 2 * tile_count,
+            "wave coalescing did not collapse the seed-to-request amplification");
+    require(result.statistics.attempted_bytes <=
+                text.size() + text.size() / 4,
+            "wave coalescing did not bound attempted decode bytes");
+    require(result.statistics.wave_seeds_coalesced > 0,
+            "wave coalescing statistic did not track skipped seeds");
+    require(result.statistics.accepted_instructions == text.size(),
+            "wave coalescing lost decoded instruction coverage");
+    require(result.packed_store != nullptr &&
+                result.packed_store->instruction_count() == text.size(),
+            "wave coalescing lost packed instruction coverage");
+}
+
+void test_out_of_order_apply_byte_identical()
+{
+    std::vector<std::uint8_t> text(0x400, 0x90);
+    text[0x000] = 0xE8;
+    text[0x001] = 0x10;
+    text[0x002] = 0x00;
+    text[0x003] = 0x00;
+    text[0x004] = 0x00;
+    text[0x005] = 0x90;
+    text[0x006] = 0xC3;
+    text[0x015] = 0x90;
+    text[0x016] = 0xC3;
+    text[0x200] = 0xE9;
+    text[0x201] = 0x00;
+    text[0x202] = 0xFE;
+    text[0x203] = 0xFF;
+    text[0x204] = 0xFF;
+    text[0x205] = 0xC3;
+
+    std::vector<std::uint8_t> file_bytes(0x1000, 0x00);
+    std::copy(text.begin(), text.end(), file_bytes.begin() + 0x400);
+
+    mapped_fixture_t fixture(file_bytes);
+    auto layout = build_layout(0x1000, 0x400, 0x400, 0x1000);
+
+    std::vector<tile_decode_seed_t> seeds;
+    for (int i = 0; i < 4; ++i) {
+        tile_decode_seed_t seed;
+        seed.address = rva_address(0x1000 + i * 0x100);
+        seed.provenance = fact_provenance_t::export_entry;
+        seed.confidence = 100;
+        seed.stable_source_id = static_cast<std::uint64_t>(i + 1);
+        seeds.push_back(seed);
+    }
+
+    std::vector<std::uint8_t> reference_bytes;
+    {
+        auto limits = small_limits();
+        limits.target_tile_bytes = 256;
+        auto orch_result = tile_decode_orchestrator_t::create(limits);
+        require(orch_result.has_value(),
+                "out-of-order apply reference orchestrator create failed");
+        mock_tile_decode_executor_options_t options;
+        options.reverse_completions = false;
+        mock_tile_decode_executor_t executor(options);
+        auto run_result = orch_result.value().run(
+            fixture.snapshot(), layout, seeds, executor);
+        require(run_result.has_value(),
+                "out-of-order apply reference run failed");
+        reference_bytes = orchestration_bytes(run_result.value());
+    }
+
+    for (const auto mode : {tile_decode_pipeline_mode_t::pipelined,
+                            tile_decode_pipeline_mode_t::gated}) {
+        auto limits = small_limits();
+        limits.target_tile_bytes = 256;
+        limits.pipeline_mode = mode;
+        auto orch_result = tile_decode_orchestrator_t::create(limits);
+        require(orch_result.has_value(),
+                "out-of-order apply orchestrator create failed");
+        mock_tile_decode_executor_options_t options;
+        options.reverse_completions = true;
+        mock_tile_decode_executor_t executor(options);
+        auto run_result = orch_result.value().run(
+            fixture.snapshot(), layout, seeds, executor);
+        require(run_result.has_value(),
+                "out-of-order apply reversed run failed");
+        const auto bytes = orchestration_bytes(run_result.value());
+        require(bytes == reference_bytes,
+                "out-of-order tile apply is not byte-identical to in-order apply");
+    }
+}
+
 }
 
 bool run_tile_decode_orchestrator_harness(std::string& failure)
@@ -1653,6 +1771,8 @@ bool run_tile_decode_orchestrator_harness(std::string& failure)
         test_in_flight_cancellation();
         test_shard_output();
         test_randomized_scheduling_byte_identical();
+        test_wave_coalescing_request_count();
+        test_out_of_order_apply_byte_identical();
         return true;
     } catch (const std::exception& error) {
 		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());

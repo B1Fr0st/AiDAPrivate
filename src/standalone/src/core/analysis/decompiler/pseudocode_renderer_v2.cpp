@@ -1,5 +1,7 @@
 #include "pseudocode_renderer_v2.hpp"
 
+#include "pseudocode_readability.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <limits>
@@ -169,7 +171,8 @@ private:
         if (request_.limits.max_ast_nodes == 0 || request_.limits.max_output_bytes == 0 || request_.limits.max_tokens == 0 ||
             request_.limits.max_source_maps == 0 || request_.limits.max_nesting == 0 ||
             request_.limits.max_output_bytes > std::numeric_limits<std::uint32_t>::max() ||
-            (settings_.schema_version != 2 && settings_.schema_version != 3) || settings_.style_id.empty() ||
+            (settings_.schema_version != 2 && settings_.schema_version != 3 && settings_.schema_version != 4) ||
+            settings_.style_id.empty() ||
             settings_.indentation_spaces == 0 || settings_.indentation_spaces > 16) {
             fail(decompiler_diagnostic_code_t::invalid_contract, "decompiler.renderer.v2.request", nullptr);
             return false;
@@ -1068,6 +1071,52 @@ pseudocode_renderer_v2_result_t render_pseudocode_v2(
     const pseudocode_renderer_v2_request_t& request)
 {
     return renderer_t(ast, type_graph, request).run();
+}
+
+pseudocode_renderer_v2_result_t rerender_document_with_local_renames(
+    const decompiler_document_t& source,
+    const type_graph_t& type_graph,
+    const pseudocode_renderer_v2_request_t& request,
+    const std::vector<std::pair<std::string, std::string>>& renames)
+{
+    pseudocode_renderer_v2_result_t result;
+    auto ast = source.ast;
+    std::uint32_t ordinal = 1;
+    for (const auto& [old_name, new_name] : renames) {
+        auto rename = apply_pseudocode_local_rename(ast, type_graph, old_name, new_name);
+        for (auto& diagnostic : rename.diagnostics) {
+            diagnostic.ordinal = ordinal++;
+            result.diagnostics.push_back(std::move(diagnostic));
+        }
+        if (!rename.applied) {
+            if (result.diagnostics.empty()) {
+                result.diagnostics.push_back(renderer_diagnostic(
+                    decompiler_diagnostic_code_t::invalid_contract,
+                    "decompiler.renderer.v2.local_rename", ordinal++));
+            }
+            return result;
+        }
+    }
+    const auto ast_validation = validate_typed_pseudocode_ast(ast);
+    if (!ast_validation.valid()) {
+        result.diagnostics.insert(result.diagnostics.end(),
+            ast_validation.diagnostics.begin(), ast_validation.diagnostics.end());
+        return result;
+    }
+    result = render_pseudocode_v2(ast, type_graph, request);
+    if (!result.succeeded() || !result.document)
+        return result;
+    const auto document_validation = validate_decompiler_document(*result.document);
+    if (!document_validation.valid() ||
+        result.document->ast_hash != stable_serialization_hash(result.document->ast) ||
+        stable_serialization_hash(result.document->ast) != stable_serialization_hash(ast)) {
+        result.document.reset();
+        result.diagnostics.push_back(renderer_diagnostic(
+            decompiler_diagnostic_code_t::malformed_document,
+            "decompiler.renderer.v2.local_rename_binding", ordinal));
+        return result;
+    }
+    return result;
 }
 
 std::string serialize_pseudocode_document_v2(const decompiler_document_t& document)

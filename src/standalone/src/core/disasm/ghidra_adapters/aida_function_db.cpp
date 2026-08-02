@@ -541,7 +541,7 @@ void populate_from_sidecar(
 	uint64_t image_base,
 	uint64_t image_size)
 {
-	namespace sidecar = aida::analysis::native_worker::snapshot_sidecar;
+	namespace sidecar_ns = aida::analysis::native_worker::snapshot_sidecar;
 	db.clear();
 	db.image_base = image_base;
 	db.image_size = image_size;
@@ -563,14 +563,14 @@ void populate_from_sidecar(
 		symbol.name = sanitize_symbol_name(record.name);
 		symbol.display_name = record.name;
 		switch (record.kind) {
-		case sidecar::name_kind_t::function: symbol.kind = symbol_kind_t::function; break;
-		case sidecar::name_kind_t::import: symbol.kind = symbol_kind_t::import; break;
-		case sidecar::name_kind_t::export_: symbol.kind = symbol_kind_t::export_; break;
-		case sidecar::name_kind_t::data: symbol.kind = symbol_kind_t::data; break;
-		case sidecar::name_kind_t::label: symbol.kind = symbol_kind_t::label; break;
+		case sidecar_ns::name_kind_t::function: symbol.kind = symbol_kind_t::function; break;
+		case sidecar_ns::name_kind_t::import: symbol.kind = symbol_kind_t::import; break;
+		case sidecar_ns::name_kind_t::export_: symbol.kind = symbol_kind_t::export_; break;
+		case sidecar_ns::name_kind_t::data: symbol.kind = symbol_kind_t::data; break;
+		case sidecar_ns::name_kind_t::label: symbol.kind = symbol_kind_t::label; break;
 		default: symbol.kind = symbol_kind_t::unknown; break;
 		}
-		symbol.is_external = record.kind == sidecar::name_kind_t::import;
+		symbol.is_external = record.kind == sidecar_ns::name_kind_t::import;
 		symbol.is_noreturn = record.is_noreturn || name_is_noreturn_default(record.name);
 		db.add_symbol(std::move(symbol));
 	}
@@ -969,7 +969,8 @@ ghidra_function_database_t::create(
                         "analysis snapshot contains an invalid function range for Ghidra",
                         "ghidra.function_db.functions"));
             }
-            for (const auto& chunk : source.chunks) {
+            const auto source_ranges = snapshot.function_chunks_of(source);
+            for (const auto& chunk : source_ranges) {
                 if (chunk.rva_start >= chunk.rva_end || chunk.rva_end > image.image_size) {
                     return workspace_result_t<std::shared_ptr<const ghidra_function_database_t>>::failure(
                         make_workspace_error(workspace_error_code_t::integrity_failure,
@@ -1015,7 +1016,7 @@ ghidra_function_database_t::create(
             record.confidence = source.confidence;
             record.thunk = source.thunk;
             record.noreturn = source.noreturn;
-            record.chunks = source.chunks;
+            record.chunks.assign(source_ranges.begin(), source_ranges.end());
             functions.push_back(std::move(record));
         }
         std::sort(functions.begin(), functions.end(), function_order);

@@ -34,18 +34,6 @@ struct vtable_record_t
     int score = 0;
 };
 
-struct base_class_record_t
-{
-    std::string name;
-    std::string decorated_name;
-    std::uint64_t type_descriptor_va = 0;
-    std::uint64_t base_descriptor_va = 0;
-    std::int32_t mdisp = 0;
-    std::int32_t pdisp = 0;
-    std::int32_t vdisp = 0;
-    std::uint32_t attributes = 0;
-};
-
 struct base_classes_result_t
 {
     std::vector<std::string> names;
@@ -110,11 +98,18 @@ struct rtti_scan_context_t
     std::size_t vtable_count = 0;
     std::uint64_t bytes_scanned = 0;
     std::vector<json> scanned_modules;
+    const aida::analysis::cancellation_token_t* external_cancel = nullptr;
 
     bool stop(const char* stage)
     {
         if (cancelled || deadline_hit)
             return true;
+        if (external_cancel && external_cancel->stop_requested())
+        {
+            cancelled = true;
+            stop_stage = stage ? stage : "";
+            return true;
+        }
         if (mcp_standalone::current_call_cancelled())
         {
             cancelled = true;
@@ -332,6 +327,73 @@ bool read_pointer_remote(std::uint32_t pid, std::uint64_t address, std::uint32_t
     return false;
 }
 
+struct rtti_byte_source_t
+{
+    virtual ~rtti_byte_source_t() = default;
+    virtual bool read_bytes_at(std::uint64_t va, std::size_t size, std::vector<std::uint8_t>& out) = 0;
+    virtual bool read_u32_at(std::uint64_t va, std::uint32_t& out) = 0;
+    virtual bool read_i32_at(std::uint64_t va, std::int32_t& out) = 0;
+    virtual bool read_ptr_at(std::uint64_t va, std::uint32_t pointer_size, std::uint64_t& out) = 0;
+    virtual bool readable(std::uint64_t va) const = 0;
+    virtual std::uint32_t region_permissions(std::uint64_t va) = 0;
+    virtual bool load_layout(const driver_bridge::module_info_t& module, module_layout_t& out) = 0;
+    virtual bool section_bytes(const module_section_t& section, std::vector<std::uint8_t>& out) = 0;
+};
+
+class live_rtti_source_t final : public rtti_byte_source_t
+{
+public:
+    explicit live_rtti_source_t(std::uint32_t pid) : pid_(pid) {}
+
+    bool read_bytes_at(std::uint64_t va, std::size_t size, std::vector<std::uint8_t>& out) override
+    {
+        return read_bytes(pid_, va, size, out);
+    }
+
+    bool read_u32_at(std::uint64_t va, std::uint32_t& out) override
+    {
+        return read_u32(pid_, va, out);
+    }
+
+    bool read_i32_at(std::uint64_t va, std::int32_t& out) override
+    {
+        return read_i32(pid_, va, out);
+    }
+
+    bool read_ptr_at(std::uint64_t va, std::uint32_t pointer_size, std::uint64_t& out) override
+    {
+        return read_pointer_remote(pid_, va, pointer_size, out);
+    }
+
+    bool readable(std::uint64_t va) const override;
+
+    std::uint32_t region_permissions(std::uint64_t va) override
+    {
+        driver_bridge::memory_region_t region{};
+        if (!query_region(pid_, va, region))
+            return 0;
+        std::uint32_t permissions = 1;
+        if (is_readable(region))
+            permissions |= 2;
+        if (is_executable(region))
+            permissions |= 4;
+        return permissions;
+    }
+
+    bool load_layout(const driver_bridge::module_info_t& module, module_layout_t& out) override
+    {
+        return load_module_layout(pid_, module, out);
+    }
+
+    bool section_bytes(const module_section_t& section, std::vector<std::uint8_t>& out) override
+    {
+        return read_bytes(pid_, section.va, static_cast<std::size_t>(section.size), out);
+    }
+
+private:
+    std::uint32_t pid_ = 0;
+};
+
 std::uint64_t rva_to_va(const driver_bridge::module_info_t& module, std::int32_t rva)
 {
     if (rva <= 0)
@@ -363,19 +425,24 @@ bool readable_address(std::uint32_t pid, std::uint64_t va)
     return read_bytes(pid, va, 1, probe) && !probe.empty();
 }
 
-bool read_type_descriptor_name(std::uint32_t pid, const module_layout_t& layout, std::uint64_t td_va, std::string& decorated)
+bool live_rtti_source_t::readable(std::uint64_t va) const
+{
+    return readable_address(pid_, va);
+}
+
+bool read_type_descriptor_name(rtti_byte_source_t& source, const module_layout_t& layout, std::uint64_t td_va, std::string& decorated)
 {
     decorated.clear();
     const std::size_t name_offset = type_descriptor_name_offset(layout);
-    if (!readable_address(pid, td_va + name_offset))
+    if (!source.readable(td_va + name_offset))
         return false;
     std::vector<std::uint8_t> name_bytes;
-    return read_bytes(pid, td_va + name_offset, 512, name_bytes) &&
+    return source.read_bytes_at(td_va + name_offset, 512, name_bytes) &&
         read_c_string_from_buffer(name_bytes, 0, decorated) &&
         valid_rtti_prefix(name_bytes, 0);
 }
 
-bool parse_col_from_bytes(std::uint32_t pid,
+bool parse_col_from_bytes(rtti_byte_source_t& source,
                           const module_layout_t& layout,
                           std::uint64_t col_va,
                           const std::uint8_t* bytes,
@@ -401,7 +468,7 @@ bool parse_col_from_bytes(std::uint32_t pid,
         const std::uint64_t chd_va = rva_to_va(layout.module, chd_rva);
         const std::uint64_t self_va = rva_to_va(layout.module, self_rva);
         const bool self_ok = self_va == 0 || self_va == col_va || va_in_module(layout.module, self_va);
-        if (td_va != 0 && va_in_module(layout.module, td_va) && self_ok && read_type_descriptor_name(pid, layout, td_va, decorated))
+        if (td_va != 0 && va_in_module(layout.module, td_va) && self_ok && read_type_descriptor_name(source, layout, td_va, decorated))
         {
             out.signature = signature;
             out.col_va = col_va;
@@ -425,7 +492,7 @@ bool parse_col_from_bytes(std::uint32_t pid,
         std::memcpy(&chd32, bytes + 16, sizeof(chd32));
         const std::uint64_t td_va = td32;
         const std::uint64_t chd_va = chd32;
-        if (td_va != 0 && va_in_module(layout.module, td_va) && read_type_descriptor_name(pid, layout, td_va, decorated))
+        if (td_va != 0 && va_in_module(layout.module, td_va) && read_type_descriptor_name(source, layout, td_va, decorated))
         {
             out.signature = signature;
             out.col_va = col_va;
@@ -452,7 +519,7 @@ bool parse_col_from_bytes(std::uint32_t pid,
             std::uint64_t chd_va = 0;
             std::memcpy(&td_va, bytes + pointer_offset, sizeof(td_va));
             std::memcpy(&chd_va, bytes + pointer_offset + 8, sizeof(chd_va));
-            if (!plausible_user_va(td_va) || !read_type_descriptor_name(pid, layout, td_va, decorated))
+            if (!plausible_user_va(td_va) || !read_type_descriptor_name(source, layout, td_va, decorated))
                 continue;
             out.signature = signature;
             out.col_va = col_va;
@@ -472,16 +539,16 @@ bool parse_col_from_bytes(std::uint32_t pid,
     return false;
 }
 
-bool read_col_info(std::uint32_t pid,
+bool read_col_info(rtti_byte_source_t& source,
                    const module_layout_t& layout,
                    std::uint64_t col_va,
                    col_info_t& out,
                    std::string* decorated_name = nullptr)
 {
     std::vector<std::uint8_t> bytes;
-    if (!read_bytes(pid, col_va, 40, bytes) || bytes.size() < 20)
+    if (!source.read_bytes_at(col_va, 40, bytes) || bytes.size() < 20)
         return false;
-    return parse_col_from_bytes(pid, layout, col_va, bytes.data(), bytes.size(), out, decorated_name);
+    return parse_col_from_bytes(source, layout, col_va, bytes.data(), bytes.size(), out, decorated_name);
 }
 
 std::optional<driver_bridge::module_info_t> find_module_by_base(std::uint32_t pid, std::uint64_t base)
@@ -517,7 +584,7 @@ int module_scan_priority(const driver_bridge::module_info_t& module)
     return 10;
 }
 
-base_classes_result_t read_base_classes(std::uint32_t pid,
+base_classes_result_t read_base_classes(rtti_byte_source_t& source,
                                          const module_layout_t& layout,
                                          const col_info_t& col,
                                          std::size_t max_bases)
@@ -526,18 +593,18 @@ base_classes_result_t read_base_classes(std::uint32_t pid,
     if (col.hierarchy_descriptor_va == 0)
         return bases;
     std::uint32_t base_count = 0;
-    if (!read_u32(pid, col.hierarchy_descriptor_va + 8, base_count))
+    if (!source.read_u32_at(col.hierarchy_descriptor_va + 8, base_count))
         return bases;
     base_count = std::min<std::uint32_t>(base_count, static_cast<std::uint32_t>(max_bases));
     std::uint64_t base_array_va = 0;
     if (col.relative)
     {
         std::int32_t base_array_rva = 0;
-        if (!read_i32(pid, col.hierarchy_descriptor_va + 12, base_array_rva))
+        if (!source.read_i32_at(col.hierarchy_descriptor_va + 12, base_array_rva))
             return bases;
         base_array_va = rva_to_va(layout.module, base_array_rva);
     }
-    else if (!read_pointer_remote(pid, col.hierarchy_descriptor_va + 12, layout.pointer_size, base_array_va))
+    else if (!source.read_ptr_at(col.hierarchy_descriptor_va + 12, layout.pointer_size, base_array_va))
     {
         return bases;
     }
@@ -549,11 +616,11 @@ base_classes_result_t read_base_classes(std::uint32_t pid,
         if (col.relative)
         {
             std::int32_t base_desc_rva = 0;
-            if (!read_i32(pid, base_array_va + i * 4, base_desc_rva))
+            if (!source.read_i32_at(base_array_va + i * 4, base_desc_rva))
                 break;
             base_desc_va = rva_to_va(layout.module, base_desc_rva);
         }
-        else if (!read_pointer_remote(pid, base_array_va + static_cast<std::uint64_t>(i) * layout.pointer_size, layout.pointer_size, base_desc_va))
+        else if (!source.read_ptr_at(base_array_va + static_cast<std::uint64_t>(i) * layout.pointer_size, layout.pointer_size, base_desc_va))
         {
             break;
         }
@@ -563,28 +630,28 @@ base_classes_result_t read_base_classes(std::uint32_t pid,
         if (col.relative)
         {
             std::int32_t td_rva = 0;
-            if (!read_i32(pid, base_desc_va, td_rva))
+            if (!source.read_i32_at(base_desc_va, td_rva))
                 continue;
             td_va = rva_to_va(layout.module, td_rva);
         }
-        else if (!read_pointer_remote(pid, base_desc_va, layout.pointer_size, td_va))
+        else if (!source.read_ptr_at(base_desc_va, layout.pointer_size, td_va))
         {
             continue;
         }
         if (td_va == 0)
             continue;
         std::string decorated;
-        if (!read_type_descriptor_name(pid, layout, td_va, decorated))
+        if (!read_type_descriptor_name(source, layout, td_va, decorated))
             continue;
         base_class_record_t record;
         record.name = undecorate_rtti_name(decorated);
         record.decorated_name = decorated;
         record.type_descriptor_va = td_va;
         record.base_descriptor_va = base_desc_va;
-        read_i32(pid, base_desc_va + 8, record.mdisp);
-        read_i32(pid, base_desc_va + 12, record.pdisp);
-        read_i32(pid, base_desc_va + 16, record.vdisp);
-        read_u32(pid, base_desc_va + 20, record.attributes);
+        source.read_i32_at(base_desc_va + 8, record.mdisp);
+        source.read_i32_at(base_desc_va + 12, record.pdisp);
+        source.read_i32_at(base_desc_va + 16, record.vdisp);
+        source.read_u32_at(base_desc_va + 20, record.attributes);
         bases.names.push_back(record.name);
         bases.records.push_back(std::move(record));
     }
@@ -623,7 +690,7 @@ void add_col_record(type_info_t& type, const col_info_t& col)
     }
 }
 
-bool validate_vtable(std::uint32_t pid,
+bool validate_vtable(rtti_byte_source_t& source,
                      const module_layout_t& layout,
                      std::uint64_t vtable_va,
                      vtable_record_t& out)
@@ -635,17 +702,17 @@ bool validate_vtable(std::uint32_t pid,
     for (std::size_t i = 0; i < max_slots; ++i)
     {
         std::uint64_t target = 0;
-        if (!read_pointer_remote(pid, vtable_va + static_cast<std::uint64_t>(i) * layout.pointer_size, layout.pointer_size, target))
+        if (!source.read_ptr_at(vtable_va + static_cast<std::uint64_t>(i) * layout.pointer_size, layout.pointer_size, target))
             break;
         if (target == 0)
             continue;
         ++out.sampled_slots;
-        driver_bridge::memory_region_t region{};
-        if (!query_region(pid, target, region))
+        const std::uint32_t permissions = source.region_permissions(target);
+        if (permissions == 0)
             continue;
-        if (is_readable(region) || is_executable(region))
+        if ((permissions & 2) != 0 || (permissions & 4) != 0)
             ++out.readable_slots;
-        if (is_executable(region))
+        if ((permissions & 4) != 0)
             ++out.executable_slots;
     }
     if (out.executable_slots == 0)
@@ -956,12 +1023,13 @@ bool type_from_vtable(std::uint32_t pid,
                          sa_format_address(module.base).c_str(),
                          sa_format_address(vtable_va).c_str());
     module_layout_t layout;
-    if (!load_module_layout(pid, module, layout) || layout.pointer_size == 0)
+    live_rtti_source_t source(pid);
+    if (!source.load_layout(module, layout) || layout.pointer_size == 0)
         return false;
     if (vtable_va < layout.pointer_size)
         return false;
     std::uint64_t col_va = 0;
-    if (!read_pointer_remote(pid, vtable_va - layout.pointer_size, layout.pointer_size, col_va) || col_va == 0)
+    if (!source.read_ptr_at(vtable_va - layout.pointer_size, layout.pointer_size, col_va) || col_va == 0)
     {
         diag::log_tagged_fmt("rtti",
                              "type_from_vtable col_read_failed pid=%u vtable=%s elapsed_ms=%llu",
@@ -970,7 +1038,7 @@ bool type_from_vtable(std::uint32_t pid,
                              static_cast<unsigned long long>(GetTickCount64() - started_ms));
         return false;
     }
-    if (!readable_address(pid, col_va))
+    if (!source.readable(col_va))
     {
         diag::log_tagged_fmt("rtti",
                              "type_from_vtable col_unreadable pid=%u vtable=%s col=%s elapsed_ms=%llu",
@@ -982,7 +1050,7 @@ bool type_from_vtable(std::uint32_t pid,
     }
     col_info_t col{};
     std::string decorated;
-    if (!read_col_info(pid, layout, col_va, col, &decorated))
+    if (!read_col_info(source, layout, col_va, col, &decorated))
     {
         diag::log_tagged_fmt("rtti",
                              "type_from_vtable invalid_col pid=%u vtable=%s col=%s elapsed_ms=%llu",
@@ -1002,7 +1070,7 @@ bool type_from_vtable(std::uint32_t pid,
     add_col_record(out, col);
     vtable_record_t vt;
     const bool can_validate_vtable = !budget_exhausted("before_validate_vtable") && remaining_ms() > 750;
-    if (can_validate_vtable && validate_vtable(pid, layout, vtable_va, vt))
+    if (can_validate_vtable && validate_vtable(source, layout, vtable_va, vt))
     {
         vt.vtable_va = vtable_va;
         vt.complete_object_locator_va = col_va;
@@ -1020,7 +1088,7 @@ bool type_from_vtable(std::uint32_t pid,
         add_vtable_record(out, vt);
     }
     if (!budget_exhausted("before_base_classes") && remaining_ms() > 500)
-        apply_base_classes(out, read_base_classes(pid, layout, col, 16));
+        apply_base_classes(out, read_base_classes(source, layout, col, 16));
     out.module_name = module.name;
     diag::log_tagged_fmt("rtti",
                          "type_from_vtable exit pid=%u type=%s decorated=%s vtable=%s col=%s td=%s hierarchy=%s bases=%zu signature=%u relative=%d self_match=%d pointer_size=%u remaining_ms=%llu elapsed_ms=%llu",
@@ -1047,11 +1115,12 @@ bool type_from_col(std::uint32_t pid,
                    type_info_t& out)
 {
     module_layout_t layout;
-    if (!load_module_layout(pid, module, layout) || layout.pointer_size == 0)
+    live_rtti_source_t source(pid);
+    if (!source.load_layout(module, layout) || layout.pointer_size == 0)
         return false;
     col_info_t col{};
     std::string decorated;
-    if (!read_col_info(pid, layout, col_va, col, &decorated))
+    if (!read_col_info(source, layout, col_va, col, &decorated))
         return false;
     out = {};
     out.decorated_name = decorated;
@@ -1063,7 +1132,7 @@ bool type_from_col(std::uint32_t pid,
     add_col_record(out, col);
     const std::uint64_t deadline = mcp_standalone::current_call_deadline_ms();
     if (!mcp_standalone::current_call_cancelled() && (deadline == 0 || GetTickCount64() + 500 < deadline))
-        apply_base_classes(out, read_base_classes(pid, layout, col, 16));
+        apply_base_classes(out, read_base_classes(source, layout, col, 16));
     return true;
 }
 
@@ -1073,10 +1142,11 @@ bool type_from_type_descriptor(std::uint32_t pid,
                                type_info_t& out)
 {
     module_layout_t layout;
-    if (!load_module_layout(pid, module, layout) || layout.pointer_size == 0)
+    live_rtti_source_t source(pid);
+    if (!source.load_layout(module, layout) || layout.pointer_size == 0)
         return false;
     std::string decorated;
-    if (!read_type_descriptor_name(pid, layout, type_descriptor_va, decorated))
+    if (!read_type_descriptor_name(source, layout, type_descriptor_va, decorated))
         return false;
     out = {};
     out.decorated_name = decorated;
@@ -1087,9 +1157,11 @@ bool type_from_type_descriptor(std::uint32_t pid,
 }
 
 std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
+                                     rtti_byte_source_t& source,
                                      const driver_bridge::module_info_t& module,
                                      bool deep_scan,
-                                     std::size_t max_unfiltered)
+                                     std::size_t max_unfiltered,
+                                     std::uint64_t max_section_bytes)
 {
     std::vector<type_info_t> out;
     json module_diag;
@@ -1102,7 +1174,7 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
     const std::uint64_t module_started_ms = GetTickCount64();
     ++ctx.scanned_module_count;
     module_layout_t layout;
-    if (!load_module_layout(ctx.pid, module, layout))
+    if (!source.load_layout(module, layout))
     {
         module_diag["loaded_layout"] = false;
         module_diag["elapsed_ms"] = GetTickCount64() - module_started_ms;
@@ -1126,10 +1198,10 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
         auto found = section_bytes.find(section.va);
         if (found != section_bytes.end())
             return &found->second;
-        if (section.size == 0 || section.size > 64ull * 1024ull * 1024ull)
+        if (section.size == 0 || section.size > max_section_bytes)
             return nullptr;
         std::vector<std::uint8_t> bytes;
-        if (!read_bytes(ctx.pid, section.va, static_cast<std::size_t>(section.size), bytes))
+        if (!source.section_bytes(section, bytes))
             return nullptr;
         if (ctx.stop("rtti_section_read_complete"))
             return nullptr;
@@ -1155,7 +1227,7 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
         const std::size_t before = info.cols.size();
         add_col_record(info, col);
         if (info.cols.size() != before)
-            apply_base_classes(info, read_base_classes(ctx.pid, layout, col, 64));
+            apply_base_classes(info, read_base_classes(source, layout, col, 64));
     };
     const std::size_t name_offset = type_descriptor_name_offset(layout);
     for (const auto& section : sections)
@@ -1180,7 +1252,7 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
             const std::uint64_t td_va = section.va + i - name_offset;
             std::uint64_t typeinfo_vftable = 0;
             read_pointer_from_buffer(bytes, i - name_offset, layout.pointer_size, typeinfo_vftable);
-            if (typeinfo_vftable != 0 && !readable_address(ctx.pid, typeinfo_vftable))
+            if (typeinfo_vftable != 0 && !source.readable(typeinfo_vftable))
                 continue;
             ensure_type(td_va, decorated);
         }
@@ -1231,7 +1303,7 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
             col_info_t col{};
             std::string decorated;
             const std::uint64_t col_va = section.va + col_offset;
-            if (!parse_col_from_bytes(ctx.pid, layout, col_va, bytes.data() + col_offset, bytes.size() - col_offset, col, &decorated))
+            if (!parse_col_from_bytes(source, layout, col_va, bytes.data() + col_offset, bytes.size() - col_offset, col, &decorated))
                 continue;
             add_col_to_type(col, decorated);
         }
@@ -1265,7 +1337,7 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
                 col_info_t col{};
                 std::string decorated;
                 const std::uint64_t col_va = section.va + i;
-                if (!parse_col_from_bytes(ctx.pid, layout, col_va, bytes.data() + i, bytes.size() - i, col, &decorated))
+                if (!parse_col_from_bytes(source, layout, col_va, bytes.data() + i, bytes.size() - i, col, &decorated))
                     continue;
                 add_col_to_type(col, decorated);
             }
@@ -1302,7 +1374,7 @@ std::vector<type_info_t> scan_module(rtti_scan_context_t& ctx,
                     continue;
                 const std::uint64_t vtable_va = section.va + i + layout.pointer_size;
                 vtable_record_t record;
-                if (!validate_vtable(ctx.pid, layout, vtable_va, record))
+                if (!validate_vtable(source, layout, vtable_va, record))
                     continue;
                 record.vtable_va = vtable_va;
                 record.complete_object_locator_va = value;
@@ -1729,6 +1801,7 @@ scan_result_t scan_types(const json& params)
     ctx.pid = scope.pid();
     ctx.started_ms = started_ms;
     ctx.timeout_ms = timeout_ms;
+    live_rtti_source_t live_source(scope.pid());
     std::map<std::uint64_t, type_info_t> all_by_td;
     auto merge_found = [&](const type_info_t& type) {
         if (type.type_descriptor_va == 0)
@@ -1895,7 +1968,8 @@ scan_result_t scan_types(const json& params)
                              (deep_scan || has_exact_col) ? 1 : 0,
                              0ULL,
                              static_cast<unsigned long long>(GetTickCount64() - started_ms));
-        auto partial = scan_module(ctx, module, deep_scan || has_exact_col, max_unfiltered);
+        auto partial = scan_module(ctx, live_source, module, deep_scan || has_exact_col, max_unfiltered,
+                                   64ull * 1024ull * 1024ull);
         const std::uint64_t module_elapsed_ms = GetTickCount64() - module_started_ms;
         diag::log_tagged_fmt("rtti",
                              "scan_module exit pid=%u tid=%lu module=%s base=%s size=%llu deep=%d types_found=%zu elapsed_ms_in_call=%llu total_ms_since_handler_enter=%llu",
@@ -2929,5 +3003,265 @@ tool_result_t find_constructor(const json& params)
                          cancelled ? 1 : 0,
                          static_cast<unsigned long long>(GetTickCount64() - started_ms));
     return tool_result_t::ok(result);
+}
+
+namespace
+{
+class static_rtti_source_t final : public rtti_byte_source_t
+{
+public:
+    static_rtti_source_t(const aida::analysis::workspace_image_t& image,
+                         const aida::analysis::byte_provider_t& provider)
+        : image_(image), provider_(provider)
+    {
+        layout_.module.base = image_.image_base;
+        layout_.module.size = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>)(image_.image_size, 0xFFFFFFFFull));
+        layout_.module.name = "static_image";
+        layout_.pointer_size = image_.address_width_bits == 32 ? 4u : 8u;
+        layout_.is_pe32_plus = layout_.pointer_size == 8;
+        layout_.machine = layout_.is_pe32_plus ? static_cast<std::uint16_t>(0x8664)
+                                               : static_cast<std::uint16_t>(0x014C);
+        layout_.optional_magic = layout_.is_pe32_plus ? static_cast<std::uint16_t>(0x20B)
+                                                      : static_cast<std::uint16_t>(0x10B);
+        for (const auto& section : image_.sections)
+        {
+            if (section.virtual_size == 0 || section.file_size == 0)
+                continue;
+            module_section_t view;
+            view.name = section.name;
+            view.va = image_.image_base + section.virtual_address;
+            view.size = (std::min<std::uint64_t>)(section.virtual_size, section.file_size);
+            if ((section.permissions & aida::analysis::image_permission_read) != 0)
+                view.characteristics |= IMAGE_SCN_MEM_READ;
+            if ((section.permissions & aida::analysis::image_permission_write) != 0)
+                view.characteristics |= IMAGE_SCN_MEM_WRITE;
+            if ((section.permissions & aida::analysis::image_permission_execute) != 0)
+                view.characteristics |= IMAGE_SCN_MEM_EXECUTE;
+            file_section_t record;
+            record.va = view.va;
+            record.size = view.size;
+            record.file_offset = section.file_offset;
+            record.characteristics = view.characteristics;
+            file_sections_.push_back(record);
+            layout_.sections.push_back(std::move(view));
+        }
+        std::sort(file_sections_.begin(), file_sections_.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.va < rhs.va;
+        });
+    }
+
+    bool read_bytes_at(std::uint64_t va, std::size_t size, std::vector<std::uint8_t>& out) override
+    {
+        out.clear();
+        const file_section_t* section = find_section(va);
+        if (!section || size == 0)
+            return false;
+        const std::uint64_t available = section->va + section->size - va;
+        const std::uint64_t wanted = (std::min<std::uint64_t>)(size, available);
+        const std::uint64_t offset = section->file_offset + (va - section->va);
+        auto leased = provider_.lease(offset, wanted);
+        if (!leased || leased.value().empty())
+            return false;
+        out.resize(static_cast<std::size_t>(leased.value().size()));
+        leased.value().copy_to(out.data(), out.size());
+        return !out.empty();
+    }
+
+    bool read_u32_at(std::uint64_t va, std::uint32_t& out) override
+    {
+        std::vector<std::uint8_t> bytes;
+        if (!read_bytes_at(va, sizeof(out), bytes) || bytes.size() < sizeof(out))
+            return false;
+        std::memcpy(&out, bytes.data(), sizeof(out));
+        return true;
+    }
+
+    bool read_i32_at(std::uint64_t va, std::int32_t& out) override
+    {
+        std::uint32_t value = 0;
+        if (!read_u32_at(va, value))
+            return false;
+        out = static_cast<std::int32_t>(value);
+        return true;
+    }
+
+    bool read_ptr_at(std::uint64_t va, std::uint32_t pointer_size, std::uint64_t& out) override
+    {
+        out = 0;
+        if (pointer_size != 4 && pointer_size != 8)
+            return false;
+        std::vector<std::uint8_t> bytes;
+        if (!read_bytes_at(va, pointer_size, bytes) || bytes.size() < pointer_size)
+            return false;
+        if (pointer_size == 4)
+        {
+            std::uint32_t value = 0;
+            std::memcpy(&value, bytes.data(), sizeof(value));
+            out = value;
+            return true;
+        }
+        std::memcpy(&out, bytes.data(), sizeof(out));
+        return true;
+    }
+
+    bool readable(std::uint64_t va) const override
+    {
+        const file_section_t* section = find_section(va);
+        return section && (section->characteristics & IMAGE_SCN_MEM_READ) != 0;
+    }
+
+    std::uint32_t region_permissions(std::uint64_t va) override
+    {
+        const file_section_t* section = find_section(va);
+        if (!section)
+            return 0;
+        std::uint32_t permissions = 1;
+        if ((section->characteristics & IMAGE_SCN_MEM_READ) != 0)
+            permissions |= 2;
+        if ((section->characteristics & IMAGE_SCN_MEM_EXECUTE) != 0)
+            permissions |= 4;
+        return permissions;
+    }
+
+    bool load_layout(const driver_bridge::module_info_t&, module_layout_t& out) override
+    {
+        out = layout_;
+        return true;
+    }
+
+    bool section_bytes(const module_section_t& section, std::vector<std::uint8_t>& out) override
+    {
+        out.clear();
+        for (const auto& record : file_sections_)
+        {
+            if (record.va != section.va)
+                continue;
+            auto leased = provider_.lease(record.file_offset, record.size);
+            if (!leased || leased.value().empty())
+                return false;
+            out.resize(static_cast<std::size_t>(leased.value().size()));
+            leased.value().copy_to(out.data(), out.size());
+            return !out.empty();
+        }
+        return false;
+    }
+
+private:
+    struct file_section_t
+    {
+        std::uint64_t va = 0;
+        std::uint64_t size = 0;
+        std::uint64_t file_offset = 0;
+        std::uint32_t characteristics = 0;
+    };
+
+    const file_section_t* find_section(std::uint64_t va) const
+    {
+        std::size_t lo = 0;
+        std::size_t hi = file_sections_.size();
+        while (lo < hi)
+        {
+            const std::size_t mid = (lo + hi) / 2;
+            if (file_sections_[mid].va <= va)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo == 0)
+            return nullptr;
+        const file_section_t& section = file_sections_[lo - 1];
+        if (va < section.va || va - section.va >= section.size)
+            return nullptr;
+        return &section;
+    }
+
+    const aida::analysis::workspace_image_t& image_;
+    const aida::analysis::byte_provider_t& provider_;
+    module_layout_t layout_;
+    std::vector<file_section_t> file_sections_;
+};
+
+}
+
+aida::analysis::workspace_result_t<static_rtti_result_t> scan_static_image(
+    const aida::analysis::workspace_image_t& image,
+    const aida::analysis::byte_provider_t& provider,
+    const static_rtti_limits_t& limits,
+    const aida::analysis::cancellation_token_t& cancel)
+{
+    const std::uint64_t started_ms = GetTickCount64();
+    static_rtti_result_t result;
+    auto finish = [&](std::uint8_t status) {
+        result.status = status;
+        result.elapsed_ms = static_cast<double>(GetTickCount64() - started_ms);
+        diag::log_tagged_fmt("rtti",
+                             "scan_static exit status=%u types=%zu bytes=%llu elapsed_ms=%llu",
+                             static_cast<unsigned int>(status),
+                             result.types.size(),
+                             static_cast<unsigned long long>(result.bytes_scanned),
+                             static_cast<unsigned long long>(GetTickCount64() - started_ms));
+        return aida::analysis::workspace_result_t<static_rtti_result_t>::success(std::move(result));
+    };
+    if (image.address_width_bits != 64 && image.address_width_bits != 32)
+        return finish(k_static_rtti_unsupported_format);
+    if (cancel.stop_requested())
+        return finish(k_static_rtti_cancelled);
+    diag::log_tagged_fmt("rtti",
+                         "scan_static enter sections=%zu image_size=%llu deep=%d",
+                         image.sections.size(),
+                         static_cast<unsigned long long>(image.image_size),
+                         limits.deep_scan ? 1 : 0);
+    static_rtti_source_t source(image, provider);
+    driver_bridge::module_info_t module{};
+    module.base = image.image_base;
+    module.size = static_cast<std::uint32_t>(
+        (std::min<std::uint64_t>)(image.image_size, 0xFFFFFFFFull));
+    module.name = "static_image";
+    rtti_scan_context_t ctx;
+    ctx.started_ms = started_ms;
+    ctx.external_cancel = &cancel;
+    auto found = scan_module(ctx, source, module, limits.deep_scan, limits.max_types,
+                             limits.max_section_bytes);
+    result.bytes_scanned = ctx.bytes_scanned;
+    if (ctx.cancelled)
+        return finish(k_static_rtti_cancelled);
+    result.types.reserve(found.size());
+    for (auto& type : found)
+    {
+        static_rtti_type_t out;
+        out.name = std::move(type.name);
+        out.decorated_name = std::move(type.decorated_name);
+        out.type_descriptor_rva = type.type_descriptor_va >= image.image_base
+            ? type.type_descriptor_va - image.image_base : 0;
+        out.col_rva = type.col_va >= image.image_base ? type.col_va - image.image_base : 0;
+        out.bases = std::move(type.base_class_records);
+        if (out.bases.size() > limits.max_base_classes)
+            out.bases.resize(limits.max_base_classes);
+        for (auto& base : out.bases)
+        {
+            if (base.type_descriptor_va >= image.image_base)
+                base.type_descriptor_va -= image.image_base;
+            if (base.base_descriptor_va >= image.image_base)
+                base.base_descriptor_va -= image.image_base;
+        }
+        std::uint64_t vtable_count = 0;
+        for (const auto& vtable : type.vtables)
+        {
+            if (vtable_count >= limits.max_vtables)
+                break;
+            if (vtable.vtable_va >= image.image_base)
+            {
+                out.vtable_rvas.push_back(vtable.vtable_va - image.image_base);
+                ++vtable_count;
+            }
+        }
+        std::sort(out.vtable_rvas.begin(), out.vtable_rvas.end());
+        out.vtable_rvas.erase(std::unique(out.vtable_rvas.begin(), out.vtable_rvas.end()),
+                              out.vtable_rvas.end());
+        out.score = type.best_col_score + type.best_vtable_score;
+        result.types.push_back(std::move(out));
+    }
+    return finish(result.types.empty() ? k_static_rtti_no_rtti : k_static_rtti_completed);
 }
 }

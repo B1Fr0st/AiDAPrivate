@@ -12,6 +12,7 @@
 #include "pseudocode_renderer_v2.hpp"
 #include "typed_ast_v2.hpp"
 
+#include "../flirt/static_recognition_service.hpp"
 #include "../workspace/decompiler_feedback.hpp"
 #include "../workspace/decompiler_service.hpp"
 #include "../../../helpers/diag_log.hpp"
@@ -1683,7 +1684,8 @@ decompiler_ui_integration_t::create_production(
             native_worker::create_pooled_native_worker_provider_host(runtime.value(), pool_config);
         config.service_config.isolated_provider_host = pooled_native_host;
         config.service_config.max_parallel_requests =
-            pool_config.batch_slots + pool_config.interactive_reserved_slots + 1;
+            (std::min<std::size_t>)(64, static_cast<std::size_t>(logical_cores)) +
+            pool_config.interactive_reserved_slots + 1;
         config.service_config.database = workspace->database();
         config.service_config.metrics_sink = workspace->background_metrics();
         auto service = decompiler_pipeline_service_t::create(
@@ -2024,6 +2026,12 @@ decompiler_ui_integration_t::build_pipeline_request(
         *snapshot, pipeline_request.entity, spans, image->image_base);
     if (!type_evidence.candidates.empty())
         pipeline_request.type_evidence.push_back(std::move(type_evidence));
+    auto recognition_seed_batches = static_recognition::type_seed_batches_for(
+        std::const_pointer_cast<analysis_workspace_t>(workspace.shared_from_this()),
+        pipeline_request.entity,
+        pipeline_request.workspace_generation, 70);
+    for (auto& seed_batch : recognition_seed_batches)
+        pipeline_request.type_evidence.push_back(std::move(seed_batch));
     pipeline_request.deadline = request.deadline;
     return workspace_result_t<decompiler_pipeline_request_t>::success(
         std::move(pipeline_request));
@@ -2243,6 +2251,11 @@ workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
         *snapshot, pipeline_request.entity, spans, image->image_base);
     if (!type_evidence.candidates.empty())
         pipeline_request.type_evidence.push_back(std::move(type_evidence));
+    auto recognition_seed_batches = static_recognition::type_seed_batches_for(
+        workspace.shared_from_this(), pipeline_request.entity,
+        pipeline_request.workspace_generation, 70);
+    for (auto& seed_batch : recognition_seed_batches)
+        pipeline_request.type_evidence.push_back(std::move(seed_batch));
     pipeline_request.deadline = deadline;
     return workspace_result_t<decompiler_pipeline_request_t>::success(
         std::move(pipeline_request));

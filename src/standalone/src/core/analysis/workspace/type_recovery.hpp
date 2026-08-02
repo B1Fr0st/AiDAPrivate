@@ -437,6 +437,7 @@ struct type_recovery_result_t {
     std::uint64_t types_recovered = 0;
     std::uint64_t structs_recovered = 0;
     std::uint64_t vtables_recovered = 0;
+    std::uint64_t injected_evidence_count = 0;
     type_recovery_status_t status = type_recovery_status_t::no_evidence;
     bool bounded = false;
     bool cancelled = false;

@@ -2431,11 +2431,12 @@ const pe_section_t* pe_image_t::section_for_file_offset(std::uint64_t offset,
 workspace_result_t<std::shared_ptr<const pe_image_t>>
 parse_pe_image(const byte_provider_t& provider, const pe_parse_limits_t& limits,
                const cancellation_token_t& cancel) {
-    auto profile = validate_pe_parser_profile(make_pe_parser_profile(limits));
+    const auto scaled = pe_parse_limits_for_provider(provider, limits);
+    auto profile = validate_pe_parser_profile(make_pe_parser_profile(scaled));
     if (!profile)
         return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(
             profile.error());
-    return pe_parser_t(provider, limits, cancel).parse();
+    return pe_parser_t(provider, scaled, cancel).parse();
 }
 
 workspace_result_t<std::shared_ptr<const workspace_image_t>>

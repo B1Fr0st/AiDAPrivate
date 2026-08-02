@@ -2001,7 +2001,7 @@ struct arch_session_entry_t {
 	std::unordered_set<ghidra::FunctionSymbol*> pinned_symbols;
 	ghidra::FunctionSymbol* job_function_symbol = nullptr;
 	uint32_t jobs_since_purge = 0;
-	session_job_guard_t guard;
+	detail::session_job_guard_t guard;
 
 	arch_session_entry_t() = default;
 	arch_session_entry_t(const arch_session_entry_t&) = delete;

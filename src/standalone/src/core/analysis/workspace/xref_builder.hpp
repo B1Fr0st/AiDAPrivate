@@ -64,6 +64,22 @@ public:
 
     static workspace_result_t<xref_build_result_t> build(
         const workspace_image_t& image,
+        const byte_provider_t& provider,
+        const std::vector<instruction_record_t>& instructions,
+        const operand_fact_store_t& operands,
+        const std::vector<target_fact_t>& targets,
+        const xref_build_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<xref_build_result_t> build(
+        const workspace_image_t& image,
+        const byte_provider_t& provider,
+        const analysis_snapshot_t& snapshot,
+        const xref_build_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<xref_build_result_t> build(
+        const workspace_image_t& image,
         const std::vector<instruction_record_t>& instructions,
         const std::vector<operand_fact_t>& operands,
         const std::vector<target_fact_t>& targets,
@@ -77,6 +93,24 @@ public:
         const std::vector<instruction_record_t>& instructions,
         const std::vector<operand_fact_t>& operands,
         const std::vector<target_fact_t>& targets,
+        std::shared_ptr<const data_discovery_result_t> data,
+        std::vector<type_reference_fact_t> type_references,
+        const xref_build_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<xref_build_result_t> build(
+        const workspace_image_t& image,
+        const std::vector<instruction_record_t>& instructions,
+        const operand_fact_store_t& operands,
+        const std::vector<target_fact_t>& targets,
+        std::shared_ptr<const data_discovery_result_t> data,
+        std::vector<type_reference_fact_t> type_references,
+        const xref_build_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<xref_build_result_t> build(
+        const workspace_image_t& image,
+        const analysis_snapshot_t& snapshot,
         std::shared_ptr<const data_discovery_result_t> data,
         std::vector<type_reference_fact_t> type_references,
         const xref_build_limits_t& limits,

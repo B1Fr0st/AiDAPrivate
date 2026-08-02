@@ -62,6 +62,7 @@
     {"id":"persistence.schema_v9","category":"persistence","requirement_ids":["PERF-08"],"source_target":"aida_c03_c05_schema_v9_harness"},
     {"id":"decompiler.service","category":"decompiler","requirement_ids":["DEC-01","DEC-04","DEC-10"],"source_target":"aida_c03_c06_decompiler_service_harness"},
     {"id":"decompiler.readability","category":"decompiler","requirement_ids":["DEC-09","DEC-10"],"source_target":"aida_c03_c07_decompiler_readability_harness"},
+    {"id":"decompiler.quality_differential","category":"decompiler","requirement_ids":["DEC-09","DEC-10"],"source_target":"aida_c03_c07_pseudocode_quality_differential_harness"},
     {"id":"mcp.compatibility_union","category":"mcp","requirement_ids":["MCP-01","MCP-06","MCP-07","MCP-09","MCP-10"],"source_target":"aida_c03_c08_c19_mcp_compatibility_harness"},
     {"id":"mcp.client_auth","category":"security","requirement_ids":["MCP-05","SEC-01"],"source_target":"aida_c03_security_mcp_client_auth_harness"},
     {"id":"workbench.documents","category":"workbench","requirement_ids":["WB-01","WB-02","WB-03"],"source_target":"aida_c03_c20_c22_workbench_documents_harness"},
@@ -73,6 +74,11 @@
     {"id":"decompiler.quality_scorer","category":"decompiler","requirement_ids":["DEC-10","HAR-03"],"source_target":"aida_c03_a06_decompiler_quality_scorer_harness"},
     {"id":"performance.sla_receipt","category":"performance","requirement_ids":["PERF-09","PERF-10","HAR-03"],"source_target":"aida_c03_a06_benchmark_sla_receipt_harness"},
     {"id":"surface.reconciliation","category":"surface","requirement_ids":["SURF-01"],"source_target":"aida_c03_surface_reconciliation_harness"},
-    {"id":"security.anti_tamper","category":"security","requirement_ids":["SEC-01","VER-02"],"source_target":"aida_c03_anti_tamper_integrity_harness"}
+    {"id":"security.anti_tamper","category":"security","requirement_ids":["SEC-01","VER-02"],"source_target":"aida_c03_anti_tamper_integrity_harness"},
+    {"id":"srec.api_prototype_lookup","category":"recovery","requirement_ids":["REC-01"],"source_target":"aida_c03_srec_api_prototype_lookup_harness"},
+    {"id":"srec.flirt_engine","category":"recovery","requirement_ids":["REC-01"],"source_target":"aida_c03_srec_flirt_engine_harness"},
+    {"id":"srec.rtti_static","category":"recovery","requirement_ids":["REC-02"],"source_target":"aida_c03_srec_rtti_static_harness"},
+    {"id":"srec.type_seed_exporter","category":"recovery","requirement_ids":["REC-01","REC-02"],"source_target":"aida_c03_srec_type_seed_exporter_harness"},
+    {"id":"srec.flirt_db_builder","category":"recovery","requirement_ids":["REC-01"],"source_target":"aida_c03_srec_flirt_db_builder"}
   ]
 }

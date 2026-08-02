@@ -312,28 +312,35 @@ inline submit_result_t submit(submission_t&& sub) {
     if (g_shutdown_requested.load(std::memory_order_acquire))
         return reject_submission(sub, "executor_shutdown_requested");
 
-    diag::log_tagged_fmt("executor",
-        "EXECUTOR-SUBMIT owner=%s label=%s domain=%s queue=%s priority=%d thread_class=%s deadline_ms=%llu capacity_lease=%llu no_capacity_reason=%s session=%s target=%s target_pid=%u lease_token=%llu generation=%llu diag_id=%s request_id=%s ui_access=%s failure_policy=%s shutdown_policy=%s tid=%lu",
-        sub.owner_subsystem,
-        sub.label,
-        domain_name(sub.domain),
-        domain_to_queue_name(sub.domain),
-        sub.priority,
-        sub.thread_class ? sub.thread_class : "<none>",
-        static_cast<unsigned long long>(sub.deadline_ms),
-        static_cast<unsigned long long>(sub.capacity_lease),
-        sub.no_capacity_reason ? sub.no_capacity_reason : "<none>",
-        sub.session_id ? sub.session_id : "<none>",
-        sub.target_id ? sub.target_id : "<none>",
-        static_cast<unsigned>(sub.target_pid),
-        static_cast<unsigned long long>(sub.lease_token),
-        static_cast<unsigned long long>(sub.generation),
-        sub.diagnostic_id ? sub.diagnostic_id : "<none>",
-        sub.request_id ? sub.request_id : "<none>",
-        sub.ui_access_policy ? sub.ui_access_policy : "none",
-        sub.failure_policy ? sub.failure_policy : "reject_not_started",
-        sub.shutdown_policy ? sub.shutdown_policy : "drain",
-        static_cast<unsigned long>(GetCurrentThreadId()));
+    std::uint64_t submit_gate_suppressed = 0;
+    auto& submit_gate = aida::infra::taskflow_runtime::hot_log_gate_for("executor_submit");
+    const bool submit_gate_open = aida::infra::taskflow_runtime::hot_log_should_emit(submit_gate, submit_gate_suppressed);
+    if (submit_gate_open || aida::infra::taskflow_runtime::fabric_log_verbose()) {
+        diag::log_tagged_fmt("executor",
+            "EXECUTOR-SUBMIT owner=%s label=%s domain=%s queue=%s priority=%d thread_class=%s deadline_ms=%llu capacity_lease=%llu no_capacity_reason=%s session=%s target=%s target_pid=%u lease_token=%llu generation=%llu diag_id=%s request_id=%s ui_access=%s failure_policy=%s shutdown_policy=%s suppressed=%llu total=%llu tid=%lu",
+            sub.owner_subsystem,
+            sub.label,
+            domain_name(sub.domain),
+            domain_to_queue_name(sub.domain),
+            sub.priority,
+            sub.thread_class ? sub.thread_class : "<none>",
+            static_cast<unsigned long long>(sub.deadline_ms),
+            static_cast<unsigned long long>(sub.capacity_lease),
+            sub.no_capacity_reason ? sub.no_capacity_reason : "<none>",
+            sub.session_id ? sub.session_id : "<none>",
+            sub.target_id ? sub.target_id : "<none>",
+            static_cast<unsigned>(sub.target_pid),
+            static_cast<unsigned long long>(sub.lease_token),
+            static_cast<unsigned long long>(sub.generation),
+            sub.diagnostic_id ? sub.diagnostic_id : "<none>",
+            sub.request_id ? sub.request_id : "<none>",
+            sub.ui_access_policy ? sub.ui_access_policy : "none",
+            sub.failure_policy ? sub.failure_policy : "reject_not_started",
+            sub.shutdown_policy ? sub.shutdown_policy : "drain",
+            static_cast<unsigned long long>(submit_gate_suppressed),
+            static_cast<unsigned long long>(aida::infra::taskflow_runtime::hot_log_gate_total(submit_gate)),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
 
     auto owner = std::string(sub.owner_subsystem);
     auto label = std::string(sub.label);
@@ -361,13 +368,20 @@ inline submit_result_t submit(submission_t&& sub) {
     desc.failure_policy = sub.failure_policy;
     desc.shutdown_policy = sub.shutdown_policy;
     desc.body = [owner, label, domain, body = std::move(body)]() mutable {
-        diag::log_tagged_fmt("executor",
-            "EXECUTOR-START owner=%s label=%s domain=%s queue=%s tid=%lu note=start_observed_via_taskflow_runtime",
-            owner.c_str(),
-            label.c_str(),
-            domain_name(domain),
-            domain_to_queue_name(domain),
-            static_cast<unsigned long>(GetCurrentThreadId()));
+        std::uint64_t start_gate_suppressed = 0;
+        auto& start_gate = aida::infra::taskflow_runtime::hot_log_gate_for("executor_start");
+        const bool start_gate_open = aida::infra::taskflow_runtime::hot_log_should_emit(start_gate, start_gate_suppressed);
+        if (start_gate_open || aida::infra::taskflow_runtime::fabric_log_verbose()) {
+            diag::log_tagged_fmt("executor",
+                "EXECUTOR-START owner=%s label=%s domain=%s queue=%s suppressed=%llu total=%llu tid=%lu note=start_observed_via_taskflow_runtime",
+                owner.c_str(),
+                label.c_str(),
+                domain_name(domain),
+                domain_to_queue_name(domain),
+                static_cast<unsigned long long>(start_gate_suppressed),
+                static_cast<unsigned long long>(aida::infra::taskflow_runtime::hot_log_gate_total(start_gate)),
+                static_cast<unsigned long>(GetCurrentThreadId()));
+        }
         bool exception_path = false;
         struct scoped_finish_t {
             const std::string& owner;
@@ -375,14 +389,30 @@ inline submit_result_t submit(submission_t&& sub) {
             domain_t domain;
             bool& exception_path;
             ~scoped_finish_t() {
-                diag::log_tagged_fmt("executor",
-                    exception_path ? "EXECUTOR-FINISH-EXCEPTION owner=%s label=%s domain=%s queue=%s tid=%lu note=body_exception_recorded_by_runtime"
-                                   : "EXECUTOR-FINISH owner=%s label=%s domain=%s queue=%s tid=%lu note=finish_observed_via_taskflow_runtime",
-                    owner.c_str(),
-                    label.c_str(),
-                    domain_name(domain),
-                    domain_to_queue_name(domain),
-                    static_cast<unsigned long>(GetCurrentThreadId()));
+                if (exception_path) {
+                    diag::log_tagged_fmt("executor",
+                        "EXECUTOR-FINISH-EXCEPTION owner=%s label=%s domain=%s queue=%s tid=%lu note=body_exception_recorded_by_runtime",
+                        owner.c_str(),
+                        label.c_str(),
+                        domain_name(domain),
+                        domain_to_queue_name(domain),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                    return;
+                }
+                std::uint64_t finish_gate_suppressed = 0;
+                auto& finish_gate = aida::infra::taskflow_runtime::hot_log_gate_for("executor_finish");
+                const bool finish_gate_open = aida::infra::taskflow_runtime::hot_log_should_emit(finish_gate, finish_gate_suppressed);
+                if (finish_gate_open || aida::infra::taskflow_runtime::fabric_log_verbose()) {
+                    diag::log_tagged_fmt("executor",
+                        "EXECUTOR-FINISH owner=%s label=%s domain=%s queue=%s suppressed=%llu total=%llu tid=%lu note=finish_observed_via_taskflow_runtime",
+                        owner.c_str(),
+                        label.c_str(),
+                        domain_name(domain),
+                        domain_to_queue_name(domain),
+                        static_cast<unsigned long long>(finish_gate_suppressed),
+                        static_cast<unsigned long long>(aida::infra::taskflow_runtime::hot_log_gate_total(finish_gate)),
+                        static_cast<unsigned long>(GetCurrentThreadId()));
+                }
             }
         } finish_guard{owner, label, domain, exception_path};
         try {

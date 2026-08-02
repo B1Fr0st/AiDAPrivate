@@ -2417,7 +2417,7 @@ projection_invalidation_hook_result_t invalidate_decompiler_cache(
             for (const auto& range : request.affected_ranges) {
                 if (range.size == 0)
                     continue;
-                for (const auto& chunk : function.chunks) {
+                for (const auto& chunk : publication->snapshot->function_chunks_of(function)) {
                     const projected_range_t chunk_range{
                         chunk.rva_start,
                         chunk.rva_end > chunk.rva_start

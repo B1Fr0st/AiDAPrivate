@@ -3,6 +3,9 @@
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 #include "../core/analysis/workspace/overlay_journal.hpp"
+#include "../core/analysis/workspace/paged_fact_staging.hpp"
+#include "../core/analysis/workspace/paged_snapshot_view.hpp"
+#include "../core/analysis/workspace/workspace_database.hpp"
 #include "../core/workbench/workbench_shell_integration.hpp"
 
 #include <Zydis/Zydis.h>
@@ -1534,7 +1537,24 @@ std::shared_ptr<const analysis::analysis_snapshot_t> analysis_snapshot(
     snapshot->image = pe;
     snapshot->instructions = corpus.instructions;
     snapshot->delay_slot_counts.assign(corpus.instructions.size(), 0);
-    snapshot->operand_facts = corpus.operand_facts;
+    snapshot->operand_facts.hot.reserve(corpus.operand_facts.size());
+    for (const auto& instruction : snapshot->instructions) {
+        const auto operand_begin = instruction.operand_fact_begin;
+        const auto operand_end = static_cast<std::uint64_t>(operand_begin) +
+            instruction.operand_fact_count;
+        for (std::uint64_t fact = operand_begin; fact < operand_end &&
+             fact < corpus.operand_facts.size(); ++fact) {
+            auto parts = analysis::operand_fact_split(
+                corpus.operand_facts[static_cast<std::size_t>(fact)],
+                static_cast<std::uint32_t>(&instruction - snapshot->instructions.data()));
+            if (parts.has_cold) {
+                snapshot->operand_facts.cold.push_back(parts.cold);
+                parts.hot.cold_index = static_cast<std::uint32_t>(
+                    snapshot->operand_facts.cold.size());
+            }
+            snapshot->operand_facts.hot.push_back(parts.hot);
+        }
+    }
     snapshot->target_facts = corpus.target_facts;
     snapshot->blocks = corpus.blocks;
     snapshot->functions = corpus.functions;
@@ -1544,6 +1564,120 @@ std::shared_ptr<const analysis::analysis_snapshot_t> analysis_snapshot(
     snapshot->symbols = corpus.symbols;
     snapshot->coverage = corpus.coverage;
     return snapshot;
+}
+
+void verify_paged_residency_parity(
+    const std::shared_ptr<const analysis::analysis_snapshot_t>& resident) {
+    namespace analysis = aida::analysis;
+    auto staging_created = analysis::paged_fact_staging_t::create(
+        1ULL << 30, 0);
+    preview_fixture_require(static_cast<bool>(staging_created),
+        "preview paged staging create");
+    auto staging = staging_created.take_value();
+    const std::uint64_t content_capacity = staging->content_page_bytes();
+    const auto header = analysis::encode_packed_domain_stream_header(
+        analysis::packed_page_type_t::operands, resident->operand_facts.size());
+    std::vector<std::uint8_t> stream;
+    stream.insert(stream.end(), header.begin(), header.end());
+    for (std::uint64_t ordinal = 0; ordinal < resident->operand_facts.size();
+         ++ordinal) {
+        auto record = analysis::operand_fact_materialize(
+            resident->operand_facts, ordinal, resident->instructions);
+        auto bytes = analysis::encode_packed_operand_record(record);
+        stream.insert(stream.end(), bytes.begin(), bytes.end());
+    }
+    std::uint64_t ordinal_begin = 0;
+    std::uint64_t records_started = 0;
+    for (std::size_t offset = 0; offset < stream.size();) {
+        const std::size_t count = (std::min)(
+            static_cast<std::size_t>(content_capacity), stream.size() - offset);
+        const std::uint64_t stream_base = offset;
+        std::uint32_t page_records = 0;
+        while (records_started + page_records < resident->operand_facts.size() &&
+               analysis::packed_domain_stream_header_bytes +
+                   (records_started + page_records) *
+                       analysis::packed_operand_stream_record_bytes <
+                   stream_base + count) {
+            ++page_records;
+        }
+        analysis::packed_record_page_prefix_t prefix;
+        prefix.ordinal_begin = static_cast<std::uint32_t>(ordinal_begin);
+        prefix.record_count = page_records;
+        const auto encoded_prefix = prefix.encode();
+        std::vector<std::uint8_t> payload;
+        payload.insert(payload.end(), encoded_prefix.begin(), encoded_prefix.end());
+        payload.insert(payload.end(), stream.begin() + offset,
+                       stream.begin() + offset + count);
+        analysis::paged_fact_page_meta_t meta;
+        meta.ordinal_begin = prefix.ordinal_begin;
+        meta.record_count = prefix.record_count;
+        auto staged = staging->stage_page(
+            analysis::fact_domain_t::operand_facts, std::move(payload), meta, {});
+        if (!staged)
+            preview_fixture_failure("preview paged staging stage_page",
+                                    staged.error());
+        ordinal_begin += page_records;
+        records_started += page_records;
+        offset += count;
+    }
+    auto contiguous = staging->validate_contiguous(
+        analysis::fact_domain_t::operand_facts);
+    preview_fixture_require(static_cast<bool>(contiguous),
+        "preview paged staging contiguity");
+    auto paged = std::make_shared<analysis::analysis_snapshot_t>(*resident);
+    paged->operand_facts.clear();
+    paged->paged_staging = staging;
+    paged->residency_plan.domains[static_cast<std::size_t>(
+        analysis::fact_domain_t::operand_facts)].mode =
+        analysis::fact_residency_mode_t::paged;
+    paged->paged_domain_counts[static_cast<std::size_t>(
+        analysis::fact_domain_t::operand_facts)] = resident->operand_facts.size();
+    auto resident_view = analysis::operand_facts_view(*resident);
+    auto paged_view = analysis::operand_facts_view(*paged);
+    preview_fixture_require(paged_view.size() == resident_view.size() &&
+        !paged_view.resident() && resident_view.resident(),
+        "preview paged view shape");
+    analysis::fact_page_pin_t resident_pin;
+    analysis::fact_page_pin_t paged_pin;
+    bool parity = true;
+    for (std::uint64_t ordinal = 0; ordinal < resident_view.size(); ++ordinal) {
+        auto expected = resident_view.at(ordinal, resident_pin, {});
+        auto actual = paged_view.at(ordinal, paged_pin, {});
+        if (!expected || !actual) {
+            parity = false;
+            break;
+        }
+        const auto& lhs = *expected.value();
+        const auto& rhs = *actual.value();
+        if (lhs.id != rhs.id || lhs.instruction_id != rhs.instruction_id ||
+            lhs.displacement != rhs.displacement || lhs.immediate != rhs.immediate ||
+            lhs.resolved_expression_value != rhs.resolved_expression_value ||
+            lhs.bit_width != rhs.bit_width ||
+            lhs.access_width_bits != rhs.access_width_bits ||
+            lhs.reg != rhs.reg || lhs.segment_reg != rhs.segment_reg ||
+            lhs.base_reg != rhs.base_reg || lhs.index_reg != rhs.index_reg ||
+            lhs.address_components != rhs.address_components ||
+            lhs.access_count != rhs.access_count ||
+            lhs.element_count != rhs.element_count ||
+            lhs.address_width_bits != rhs.address_width_bits ||
+            lhs.operand_index != rhs.operand_index ||
+            lhs.decoder_operand_id != rhs.decoder_operand_id ||
+            lhs.kind != rhs.kind || lhs.access != rhs.access ||
+            lhs.visibility != rhs.visibility || lhs.encoding != rhs.encoding ||
+            lhs.memory_type != rhs.memory_type ||
+            lhs.access_width != rhs.access_width || lhs.scale != rhs.scale ||
+            lhs.relative != rhs.relative || lhs.signed_value != rhs.signed_value ||
+            lhs.has_displacement != rhs.has_displacement ||
+            lhs.has_resolved_expression_value != rhs.has_resolved_expression_value ||
+            lhs.address_expression != rhs.address_expression ||
+            lhs.address_resolution != rhs.address_resolution ||
+            lhs.address_expression_id != rhs.address_expression_id ||
+            lhs.element_width_bits != rhs.element_width_bits) {
+            parity = false;
+            break;
+        }
+    }
+    preview_fixture_require(parity, "preview paged residency parity");
 }
 
 [[noreturn]] void preview_fixture_failure(
@@ -1680,6 +1814,7 @@ workspace_preview_fixture_t make_fixture(bool live_process) {
                                        fixture.source_path, corpus);
     auto snapshot = analysis_snapshot(binary_id, profile_hash, normalized, pe,
                                       corpus);
+    verify_paged_residency_parity(snapshot);
     auto created = analysis::analysis_workspace_t::create_preview(
         std::move(identity), std::move(provider), std::move(normalized),
         std::move(pe), std::move(snapshot));

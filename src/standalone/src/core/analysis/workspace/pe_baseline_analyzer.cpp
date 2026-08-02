@@ -1233,13 +1233,20 @@ struct pe_baseline_analyzer_t::impl_t {
           expected_generation(generation), expected_analysis_revision(analysis_revision),
           cancellation(deadline), metrics(std::make_shared<analysis_metrics_t>(generation)) {
         const auto hardware = (std::max)(1U, std::thread::hardware_concurrency());
-        const auto fabric_stats = aida::infra::taskflow_runtime::domain_stats(
-            aida::infra::taskflow_runtime::executor_domain_t::feature_worker);
-        const auto fabric_lease = fabric_stats.pool_size > 0
-            ? static_cast<std::uint32_t>(fabric_stats.pool_size) : hardware;
+        std::uint32_t compute_capacity =
+            (std::min)(64U, (std::max)(2U, hardware));
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        compute_capacity =
+            aida::infra::taskflow_runtime::analysis_compute_capacity();
+#endif
         decode_workers = settings.decode_worker_lanes != 0
             ? (std::min)(64U, (std::max)(2U, settings.decode_worker_lanes))
-            : (std::min)(64U, (std::max)(2U, (std::max)(hardware, fabric_lease)));
+            : (std::min)(64U, (std::max)(2U,
+                compute_capacity > 2U ? compute_capacity - 1U : compute_capacity));
+        ::diag::log_tagged_fmt("baseline_pipeline",
+            "decode_workers lanes=%u pool=%u hardware=%u override=%u",
+            decode_workers, compute_capacity, hardware,
+            settings.decode_worker_lanes);
     }
 
     workspace_result_t<void> ensure_decode_partition_state(
@@ -2569,9 +2576,9 @@ workspace_result_t<void> pe_baseline_analyzer_t::xrefs_phase(
     limits.cancellation_check_interval = (std::min)(
         limits.cancellation_check_interval,
         impl_->settings.cancellation_check_interval);
-    auto built = xref_builder_t::build(*impl_->image, impl_->draft->instructions,
-        impl_->draft->operand_facts, impl_->draft->target_facts, impl_->data_result,
-        std::vector<type_reference_fact_t>{}, limits, impl_->cancellation.token());
+    auto built = xref_builder_t::build(*impl_->image, *impl_->draft,
+        impl_->data_result, std::vector<type_reference_fact_t>{}, limits,
+        impl_->cancellation.token());
     if (!built)
         return workspace_result_t<void>::failure(built.error());
     impl_->xref_result = built.take_value();

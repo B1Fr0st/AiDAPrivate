@@ -287,6 +287,8 @@ workspace_result_t<decode_frontier_t> decode_frontier_t::build(
     }
 }
 
+decode_frontier_t::decode_frontier_t() = default;
+
 decode_frontier_t::decode_frontier_t(std::unique_ptr<impl_t> impl) noexcept
     : impl_(std::move(impl))
 {

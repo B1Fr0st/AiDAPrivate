@@ -12,8 +12,13 @@ namespace builtin_typelib {
 
 using entry_t = std::pair<uint64_t, const char*>;
 
-inline constexpr std::array<entry_t, 73> kNtstatusTable = {{
+inline constexpr std::array<entry_t, 78> kNtstatusTable = {{
 	{ 0x00000000ull, "STATUS_SUCCESS" },
+	{ 0x00000080ull, "STATUS_ABANDONED_WAIT_0" },
+	{ 0x000000C0ull, "STATUS_USER_APC" },
+	{ 0x00000101ull, "STATUS_ALERTED" },
+	{ 0x00000102ull, "STATUS_TIMEOUT" },
+	{ 0x00000103ull, "STATUS_PENDING" },
 	{ 0x40000005ull, "STATUS_BUFFER_OVERFLOW" },
 	{ 0x4000000Aull, "STATUS_LOCAL_USER_SESSION_KEY" },
 	{ 0x40000016ull, "STATUS_NOTIFY_CLEANUP" },
@@ -518,6 +523,39 @@ inline constexpr member_desc_t kMembers_IMAGE_SECTION_HEADER[] = {
 	{ "NumberOfLinenumbers",  "WORD",  34, 2, false, false, 0 },
 	{ "Characteristics",      "DWORD", 36, 4, false, false, 0 },
 };
+inline constexpr member_desc_t kMembers_RTL_CRITICAL_SECTION[] = {
+	{ "DebugInfo",      "PVOID",     0,  8, true,  false, 0 },
+	{ "LockCount",      "LONG",      8,  4, false, false, 0 },
+	{ "RecursionCount", "LONG",      12, 4, false, false, 0 },
+	{ "OwningThread",   "HANDLE",    16, 8, true,  false, 0 },
+	{ "LockSemaphore",  "HANDLE",    24, 8, true,  false, 0 },
+	{ "SpinCount",      "ULONG_PTR", 32, 8, false, false, 0 },
+};
+inline constexpr member_desc_t kMembers_SYSTEM_INFO[] = {
+	{ "wProcessorArchitecture",      "WORD",      0,  2, false, false, 0 },
+	{ "wReserved",                   "WORD",      2,  2, false, false, 0 },
+	{ "dwPageSize",                  "DWORD",     4,  4, false, false, 0 },
+	{ "lpMinimumApplicationAddress", "PVOID",     8,  8, true,  false, 0 },
+	{ "lpMaximumApplicationAddress", "PVOID",     16, 8, true,  false, 0 },
+	{ "dwActiveProcessorMask",       "ULONG_PTR", 24, 8, false, false, 0 },
+	{ "dwNumberOfProcessors",        "DWORD",     32, 4, false, false, 0 },
+	{ "dwProcessorType",             "DWORD",     36, 4, false, false, 0 },
+	{ "dwAllocationGranularity",     "DWORD",     40, 4, false, false, 0 },
+	{ "wProcessorLevel",             "WORD",      44, 2, false, false, 0 },
+	{ "wProcessorRevision",          "WORD",      46, 2, false, false, 0 },
+};
+inline constexpr member_desc_t kMembers_WIN32_FIND_DATAW[] = {
+	{ "dwFileAttributes",    "DWORD",    0,   4,   false, false, 0   },
+	{ "ftCreationTime",      "FILETIME", 4,   8,   false, false, 0   },
+	{ "ftLastAccessTime",    "FILETIME", 12,  8,   false, false, 0   },
+	{ "ftLastWriteTime",     "FILETIME", 20,  8,   false, false, 0   },
+	{ "nFileSizeHigh",       "DWORD",    28,  4,   false, false, 0   },
+	{ "nFileSizeLow",        "DWORD",    32,  4,   false, false, 0   },
+	{ "dwReserved0",         "DWORD",    36,  4,   false, false, 0   },
+	{ "dwReserved1",         "DWORD",    40,  4,   false, false, 0   },
+	{ "cFileName",           "WCHAR",    44,  520, false, true,  260 },
+	{ "cAlternateFileName",  "WCHAR",    564, 28,  false, true,  14  },
+};
 
 inline constexpr struct_desc_t kBuiltinStructs[] = {
 	{ "POINT",                       "mssdk",  8,    false, kMembers_POINT,                       sizeof(kMembers_POINT) / sizeof(kMembers_POINT[0])                       },
@@ -547,7 +585,10 @@ inline constexpr struct_desc_t kBuiltinStructs[] = {
 	{ "IMAGE_DOS_HEADER",            "mssdk",  64,   false, kMembers_IMAGE_DOS_HEADER,            sizeof(kMembers_IMAGE_DOS_HEADER) / sizeof(kMembers_IMAGE_DOS_HEADER[0]) },
 	{ "IMAGE_FILE_HEADER",           "mssdk",  20,   false, kMembers_IMAGE_FILE_HEADER,           sizeof(kMembers_IMAGE_FILE_HEADER) / sizeof(kMembers_IMAGE_FILE_HEADER[0]) },
 	{ "IMAGE_DATA_DIRECTORY",        "mssdk",  8,    false, kMembers_IMAGE_DATA_DIRECTORY,        sizeof(kMembers_IMAGE_DATA_DIRECTORY) / sizeof(kMembers_IMAGE_DATA_DIRECTORY[0]) },
-	{ "IMAGE_SECTION_HEADER",        "mssdk",  40,   false, kMembers_IMAGE_SECTION_HEADER,        sizeof(kMembers_IMAGE_SECTION_HEADER) / sizeof(kMembers_IMAGE_SECTION_HEADER[0]) },
+	{ "IMAGE_SECTION_HEADER",        "mssdk",  40,   false, kMembers_IMAGE_SECTION_HEADER,         sizeof(kMembers_IMAGE_SECTION_HEADER) / sizeof(kMembers_IMAGE_SECTION_HEADER[0]) },
+	{ "RTL_CRITICAL_SECTION",        "ntddk",  40,   false, kMembers_RTL_CRITICAL_SECTION,         sizeof(kMembers_RTL_CRITICAL_SECTION) / sizeof(kMembers_RTL_CRITICAL_SECTION[0]) },
+	{ "SYSTEM_INFO",                 "mssdk",  48,   false, kMembers_SYSTEM_INFO,                  sizeof(kMembers_SYSTEM_INFO) / sizeof(kMembers_SYSTEM_INFO[0]) },
+	{ "WIN32_FIND_DATAW",            "mssdk",  592,  false, kMembers_WIN32_FIND_DATAW,             sizeof(kMembers_WIN32_FIND_DATAW) / sizeof(kMembers_WIN32_FIND_DATAW[0]) },
 };
 
 inline constexpr enum_value_desc_t kEnumValues_MemProtect[] = {
@@ -720,6 +761,9 @@ struct equate_match_t {
 
 inline constexpr entry_t kEquateNtstatus[] = {
 	{ 0x00000000ull, "STATUS_SUCCESS" },
+	{ 0x00000080ull, "STATUS_ABANDONED_WAIT_0" },
+	{ 0x000000C0ull, "STATUS_USER_APC" },
+	{ 0x00000102ull, "STATUS_TIMEOUT" },
 	{ 0x00000103ull, "STATUS_ALERTED" },
 	{ 0x00000104ull, "STATUS_TIMEOUT" },
 	{ 0x40000005ull, "STATUS_BUFFER_OVERFLOW" },
@@ -1093,6 +1137,8 @@ inline constexpr entry_t kEquateWin32Error[] = {
 	{ 566ull, "ERROR_THREAD_NOT_IN_PROCESS" },
 	{ 570ull, "ERROR_FILE_INVALID" },
 	{ 572ull, "ERROR_NO_SUCH_LOGON_SESSION" },
+	{ 995ull, "ERROR_OPERATION_ABORTED" },
+	{ 997ull, "ERROR_IO_PENDING" },
 	{ 998ull, "ERROR_NOACCESS" },
 	{ 1004ull, "ERROR_INVALID_FLAGS" },
 	{ 1005ull, "ERROR_UNRECOGNIZED_VOLUME" },

@@ -841,12 +841,294 @@ workspace_result_t<decompiler_cache_v9_lookup_t<T>> lookup_value(
     return workspace_result_t<decompiler_cache_v9_lookup_t<T>>::success({*typed});
 }
 
+std::uint64_t live_bytes_add(std::uint64_t left, std::uint64_t right) noexcept
+{
+    return right > (std::numeric_limits<std::uint64_t>::max)() - left
+        ? (std::numeric_limits<std::uint64_t>::max)() : left + right;
+}
+
+std::uint64_t live_bytes_string(const std::string& value) noexcept
+{
+    return live_bytes_add(static_cast<std::uint64_t>(sizeof(std::string)),
+        static_cast<std::uint64_t>(value.capacity()));
+}
+
+template <typename T>
+std::uint64_t live_bytes_vector(const std::vector<T>& values) noexcept
+{
+    const std::uint64_t capacity = static_cast<std::uint64_t>(values.capacity());
+    const std::uint64_t elements = capacity >
+            (std::numeric_limits<std::uint64_t>::max)() / sizeof(T)
+        ? (std::numeric_limits<std::uint64_t>::max)() : capacity * sizeof(T);
+    return live_bytes_add(static_cast<std::uint64_t>(sizeof(std::vector<T>)), elements);
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_entity_key_t& value) noexcept;
+
+std::uint64_t estimate_resident_bytes(const source_coordinate_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(source_coordinate_t)),
+        estimate_resident_bytes(value.entity));
+    if (value.source_origin)
+        total = live_bytes_add(total, live_bytes_string(value.source_origin->source_path));
+    return total;
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_entity_key_t& value) noexcept
+{
+    std::uint64_t total = sizeof(decompiler_entity_key_t);
+    if (const auto* native = std::get_if<native_decompiler_entity_identity_t>(&value.identity)) {
+        total = live_bytes_add(total, live_bytes_string(native->canonical_symbol));
+    } else if (const auto* cli = std::get_if<cli_decompiler_entity_identity_t>(&value.identity)) {
+        total = live_bytes_add(total, live_bytes_string(cli->assembly_identity));
+        total = live_bytes_add(total, live_bytes_string(cli->module_name));
+        total = live_bytes_add(total, live_bytes_string(cli->declaring_type));
+        total = live_bytes_add(total, live_bytes_string(cli->method_name));
+        total = live_bytes_add(total, live_bytes_string(cli->method_signature));
+    } else if (const auto* jvm = std::get_if<jvm_decompiler_entity_identity_t>(&value.identity)) {
+        total = live_bytes_add(total, live_bytes_string(jvm->class_internal_name));
+        total = live_bytes_add(total, live_bytes_string(jvm->method_name));
+        total = live_bytes_add(total, live_bytes_string(jvm->method_descriptor));
+    } else if (const auto* dalvik = std::get_if<dalvik_decompiler_entity_identity_t>(&value.identity)) {
+        total = live_bytes_add(total, live_bytes_string(dalvik->class_descriptor));
+        total = live_bytes_add(total, live_bytes_string(dalvik->method_name));
+        total = live_bytes_add(total, live_bytes_string(dalvik->prototype));
+    }
+    return total;
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_diagnostic_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(decompiler_diagnostic_t)),
+        live_bytes_string(value.localization_key));
+    total = live_bytes_add(total, live_bytes_vector(value.localization_arguments));
+    for (const auto& argument : value.localization_arguments)
+        total = live_bytes_add(total, live_bytes_string(argument));
+    if (value.coordinate)
+        total = live_bytes_add(total, estimate_resident_bytes(*value.coordinate));
+    return total;
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_unknown_t& value) noexcept
+{
+    return live_bytes_add(
+        live_bytes_add(static_cast<std::uint64_t>(sizeof(decompiler_unknown_t)),
+            live_bytes_string(value.stable_token)),
+        estimate_resident_bytes(value.coordinate));
+}
+
+template <typename T>
+std::uint64_t estimate_resident_bytes_vector(const std::vector<T>& values) noexcept;
+
+std::uint64_t estimate_resident_bytes(const provider_ir_value_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(provider_ir_value_t)),
+        live_bytes_vector(value.operand_ids));
+    total = live_bytes_add(total, live_bytes_string(value.stable_immediate));
+    total = live_bytes_add(total, live_bytes_string(value.stable_symbol));
+    return live_bytes_add(total, estimate_resident_bytes(value.coordinate));
+}
+
+std::uint64_t estimate_resident_bytes(const provider_ir_block_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(provider_ir_block_t)),
+        live_bytes_vector(value.predecessor_ids));
+    total = live_bytes_add(total, live_bytes_vector(value.successor_ids));
+    total = live_bytes_add(total, live_bytes_vector(value.exception_successor_ids));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.values));
+    return live_bytes_add(total, estimate_resident_bytes(value.coordinate));
+}
+
+std::uint64_t estimate_resident_bytes(const provider_ir_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(provider_ir_t)),
+        estimate_resident_bytes(value.entity));
+    total = live_bytes_add(total, live_bytes_string(value.provider.provider_name));
+    total = live_bytes_add(total, live_bytes_string(value.provider.provider_version));
+    total = live_bytes_add(total, live_bytes_string(value.provider.worker_build_id));
+    total = live_bytes_add(total, live_bytes_string(value.language.language_id));
+    total = live_bytes_add(total, live_bytes_string(value.language.language_version));
+    total = live_bytes_add(total, live_bytes_string(value.language.compiler_spec_id));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.blocks));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.source_coordinates));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.unknowns));
+    return live_bytes_add(total, estimate_resident_bytes_vector(value.diagnostics));
+}
+
+std::uint64_t estimate_resident_bytes(const hir_value_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(hir_value_t)),
+        live_bytes_vector(value.operand_ids));
+    total = live_bytes_add(total, live_bytes_string(value.stable_value));
+    return live_bytes_add(total, estimate_resident_bytes(value.coordinate));
+}
+
+std::uint64_t estimate_resident_bytes(const hir_variable_t& value) noexcept
+{
+    return live_bytes_add(
+        live_bytes_add(static_cast<std::uint64_t>(sizeof(hir_variable_t)),
+            live_bytes_string(value.stable_name)),
+        estimate_resident_bytes(value.coordinate));
+}
+
+std::uint64_t estimate_resident_bytes(const hir_block_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(hir_block_t)),
+        live_bytes_vector(value.predecessor_ids));
+    total = live_bytes_add(total, live_bytes_vector(value.successor_ids));
+    total = live_bytes_add(total, live_bytes_vector(value.exception_successor_ids));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.values));
+    return live_bytes_add(total, estimate_resident_bytes(value.coordinate));
+}
+
+std::uint64_t estimate_resident_bytes(const hir_function_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(hir_function_t)),
+        estimate_resident_bytes(value.entity));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.parameters));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.locals));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.blocks));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.source_coordinates));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.unknowns));
+    return live_bytes_add(total, estimate_resident_bytes_vector(value.diagnostics));
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_type_node_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(decompiler_type_node_t)),
+        live_bytes_string(value.canonical_name));
+    total = live_bytes_add(total, live_bytes_string(value.display_name));
+    return live_bytes_add(total, estimate_resident_bytes_vector(value.coordinates));
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_type_edge_t& value) noexcept
+{
+    return live_bytes_add(static_cast<std::uint64_t>(sizeof(decompiler_type_edge_t)),
+        live_bytes_string(value.stable_name));
+}
+
+std::uint64_t estimate_resident_bytes(const type_graph_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(type_graph_t)),
+        estimate_resident_bytes(value.entity));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.nodes));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.edges));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.unknowns));
+    return live_bytes_add(total, estimate_resident_bytes_vector(value.diagnostics));
+}
+
+std::uint64_t estimate_resident_bytes(const typed_pseudocode_ast_node_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(
+        static_cast<std::uint64_t>(sizeof(typed_pseudocode_ast_node_t)),
+        live_bytes_vector(value.child_ids));
+    total = live_bytes_add(total, live_bytes_string(value.stable_text));
+    return live_bytes_add(total, estimate_resident_bytes(value.coordinate));
+}
+
+std::uint64_t estimate_resident_bytes(const typed_pseudocode_ast_v2_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(
+        static_cast<std::uint64_t>(sizeof(typed_pseudocode_ast_v2_t)),
+        estimate_resident_bytes(value.entity));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.nodes));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.source_coordinates));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.unknowns));
+    return live_bytes_add(total, estimate_resident_bytes_vector(value.diagnostics));
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_document_source_map_t& value) noexcept
+{
+    return live_bytes_add(
+        static_cast<std::uint64_t>(sizeof(decompiler_document_source_map_t)),
+        estimate_resident_bytes_vector(value.coordinates));
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_document_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(static_cast<std::uint64_t>(sizeof(decompiler_document_t)),
+        estimate_resident_bytes(value.entity));
+    total = live_bytes_add(total, estimate_resident_bytes(value.ast));
+    total = live_bytes_add(total, live_bytes_string(value.renderer.style_id));
+    total = live_bytes_add(total, live_bytes_string(value.rendered_text));
+    total = live_bytes_add(total, live_bytes_vector(value.tokens));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.source_maps));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.unknowns));
+    return live_bytes_add(total, estimate_resident_bytes_vector(value.diagnostics));
+}
+
+std::uint64_t estimate_resident_bytes(const semantic_refinement_query_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(
+        static_cast<std::uint64_t>(sizeof(semantic_refinement_query_t)),
+        live_bytes_string(value.stable_id));
+    total = live_bytes_add(total, live_bytes_string(value.refinement_key));
+    total = live_bytes_add(total, estimate_resident_bytes(value.coordinate));
+    total = live_bytes_add(total, live_bytes_vector(value.static_ir.nodes));
+    for (const auto& node : value.static_ir.nodes)
+        total = live_bytes_add(total, live_bytes_string(node.symbol));
+    return total;
+}
+
+std::uint64_t estimate_resident_bytes(const semantic_refinement_fact_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(
+        static_cast<std::uint64_t>(sizeof(semantic_refinement_fact_t)),
+        live_bytes_string(value.stable_id));
+    total = live_bytes_add(total, live_bytes_string(value.refinement_key));
+    return live_bytes_add(total, estimate_resident_bytes(value.coordinate));
+}
+
+template <typename T>
+std::uint64_t estimate_resident_bytes_vector(const std::vector<T>& values) noexcept
+{
+    std::uint64_t total = live_bytes_vector(values);
+    for (const auto& value : values)
+        total = live_bytes_add(total, estimate_resident_bytes(value));
+    return total;
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_provider_ir_cache_value_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(
+        static_cast<std::uint64_t>(sizeof(decompiler_provider_ir_cache_value_t)),
+        estimate_resident_bytes(value.provider_ir));
+    if (value.provider_hir)
+        total = live_bytes_add(total, estimate_resident_bytes(*value.provider_hir));
+    total = live_bytes_add(total, estimate_resident_bytes(value.provider_type_graph));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.semantic_queries));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.diagnostics));
+    return live_bytes_add(total, static_cast<std::uint64_t>(sizeof(value.evidence)));
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_normalized_cache_value_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(
+        static_cast<std::uint64_t>(sizeof(decompiler_normalized_cache_value_t)),
+        estimate_resident_bytes(value.hir));
+    total = live_bytes_add(total, estimate_resident_bytes(value.type_graph));
+    total = live_bytes_add(total, estimate_resident_bytes(value.ast));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.semantic_facts));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.diagnostics));
+    return live_bytes_add(total, static_cast<std::uint64_t>(sizeof(value.evidence)));
+}
+
+std::uint64_t estimate_resident_bytes(const decompiler_rendered_cache_value_t& value) noexcept
+{
+    std::uint64_t total = live_bytes_add(
+        static_cast<std::uint64_t>(sizeof(decompiler_rendered_cache_value_t)),
+        estimate_resident_bytes(value.document));
+    total = live_bytes_add(total, estimate_resident_bytes_vector(value.semantic_facts));
+    return live_bytes_add(total, estimate_resident_bytes_vector(value.diagnostics));
+}
+
 template <typename T>
 workspace_result_t<void> store_value(
     cache_state_data_t& state,
     decompiler_pipeline_cache_key_t key,
     T value,
-    const decompiler_cache_stage_t stage)
+    const decompiler_cache_stage_t stage,
+    std::string* serialized_out = nullptr)
 {
     const auto stage_idx = stage_index(stage);
     auto canonical = canonical_key(key, stage, state.limits);
@@ -861,6 +1143,7 @@ workspace_result_t<void> store_value(
                         "cache payload failed stage validation", key.workspace_id));
     }
 
+    const std::uint64_t estimated_payload_bytes = estimate_resident_bytes(value);
     std::string serialized;
     std::shared_ptr<const T> payload;
     try {
@@ -873,16 +1156,17 @@ workspace_result_t<void> store_value(
                         "cache payload allocation or serialization failed", key.workspace_id));
     }
     const auto key_bytes = static_cast<std::uint64_t>(canonical.value().size());
-    const auto payload_bytes = static_cast<std::uint64_t>(serialized.size());
-    if (payload_bytes > std::numeric_limits<std::uint64_t>::max() - key_bytes ||
-        payload_bytes + key_bytes > state.limits.max_entry_bytes) {
+    if (estimated_payload_bytes > (std::numeric_limits<std::uint64_t>::max)() - key_bytes ||
+        estimated_payload_bytes + key_bytes > state.limits.max_entry_bytes) {
         state.rejections[stage_idx].fetch_add(1, std::memory_order_acq_rel);
         return workspace_result_t<void>::failure(
             cache_error(workspace_error_code_t::limit_exceeded,
                         "cache payload exceeds the configured entry limit", key.workspace_id));
     }
-    const auto resident_bytes = payload_bytes + key_bytes;
+    const auto resident_bytes = estimated_payload_bytes + key_bytes;
     const auto content_hash = stable_serialization_hash(serialized);
+    if (serialized_out != nullptr)
+        *serialized_out = std::move(serialized);
 
     std::shared_ptr<cache_directory_entry_t> directory;
     {
@@ -1110,6 +1394,15 @@ workspace_result_t<void> decompiler_cache_v9_t::store_rendered(
     decompiler_rendered_cache_value_t value)
 {
     return store_value(*state_, std::move(key), std::move(value), decompiler_cache_stage_t::rendered_document);
+}
+
+workspace_result_t<void> decompiler_cache_v9_t::store_rendered(
+    decompiler_pipeline_cache_key_t key,
+    decompiler_rendered_cache_value_t value,
+    std::string* serialized_out)
+{
+    return store_value(*state_, std::move(key), std::move(value),
+        decompiler_cache_stage_t::rendered_document, serialized_out);
 }
 
 workspace_result_t<void> decompiler_cache_v9_t::invalidate_stage(
