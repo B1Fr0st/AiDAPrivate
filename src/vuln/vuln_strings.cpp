@@ -21,7 +21,6 @@
 
 #include "../agent_tools.hpp"
 #include "../ida_utils.hpp"
-#include "../obfuscation.hpp"
 #include "vuln_common.hpp"
 #include "vuln_signatures.hpp"
 #include "vuln_tools.hpp"
@@ -917,7 +916,7 @@ agent_tools::tool_result_t handle_find_hardcoded_credentials(const nlohmann::jso
 {
     int limit = extract_limit(params, 256);
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be a positive integer"));
+        return agent_tools::tool_result_t::error(std::string("limit must be a positive integer"));
     if (limit > 4096)
         limit = 4096;
 
@@ -929,9 +928,9 @@ agent_tools::tool_result_t handle_find_hardcoded_credentials(const nlohmann::jso
     data["limit"]         = limit;
     data["primary_cwe"]   = 798;
 
-    std::string msg = OBFSTR("Hardcoded-credential scan: ") +
+    std::string msg = std::string("Hardcoded-credential scan: ") +
                       std::to_string(findings.size()) +
-                      OBFSTR(" finding(s)");
+                      std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg, data);
 }
 
@@ -939,7 +938,7 @@ agent_tools::tool_result_t handle_find_weak_crypto(const nlohmann::json& params)
 {
     int limit = extract_limit(params, 256);
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be a positive integer"));
+        return agent_tools::tool_result_t::error(std::string("limit must be a positive integer"));
     if (limit > 4096)
         limit = 4096;
 
@@ -951,9 +950,9 @@ agent_tools::tool_result_t handle_find_weak_crypto(const nlohmann::json& params)
     data["limit"]         = limit;
     data["primary_cwe"]   = 327;
 
-    std::string msg = OBFSTR("Weak-crypto scan: ") +
+    std::string msg = std::string("Weak-crypto scan: ") +
                       std::to_string(findings.size()) +
-                      OBFSTR(" finding(s)");
+                      std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg, data);
 }
 
@@ -962,30 +961,30 @@ void register_tier1_string_tools()
     auto& registry = agent_tools::ToolRegistry::instance();
 
     registry.register_tool({
-        OBFSTR("find_hardcoded_credentials"),
-        OBFSTR("vuln"),
-        OBFSTR("Scan the loaded binary's string list for hardcoded credentials, API keys, "
+        std::string("find_hardcoded_credentials"),
+        std::string("vuln"),
+        std::string("Scan the loaded binary's string list for hardcoded credentials, API keys, "
                "tokens, PEM private keys, JWTs, and connection strings with embedded passwords. "
                "Combines a known-pattern regex set (CWE-798) with a high-entropy heuristic on "
                "named globals whose symbol matches secret-shaped naming."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 256, max 4096)"), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 256, max 4096)"), false},
         },
         handle_find_hardcoded_credentials,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_weak_crypto"),
-        OBFSTR("vuln"),
-        OBFSTR("Locate uses of broken or risky cryptographic primitives (MD4/MD5/SHA-1, "
+        std::string("find_weak_crypto"),
+        std::string("vuln"),
+        std::string("Locate uses of broken or risky cryptographic primitives (MD4/MD5/SHA-1, "
                "RC4/RC2/DES/3DES) by xref to known function names, plus heuristic detection "
                "of likely ECB-mode usage and hardcoded crypto keys (CWE-321/327/328) "
                "in the caller's decompiled body."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 256, max 4096)"), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 256, max 4096)"), false},
         },
         handle_find_weak_crypto,
         true,

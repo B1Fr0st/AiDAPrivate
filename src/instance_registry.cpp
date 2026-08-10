@@ -406,7 +406,7 @@ bool instance_registry_t::start(int port, const std::string& base_url,
 
     if (!ensure_dir_recursive(registry_dir()))
     {
-        msg(OBFSTR_C("AiDA MCP: Could not create registry dir %s\n"), registry_dir().c_str());
+        msg("AiDA MCP: Could not create registry dir %s\n", registry_dir().c_str());
         return false;
     }
 

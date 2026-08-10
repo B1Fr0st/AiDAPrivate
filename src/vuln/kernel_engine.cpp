@@ -25,7 +25,6 @@
 
 #include "../agent_tools.hpp"
 #include "../ida_utils.hpp"
-#include "../obfuscation.hpp"
 #include "microcode_engine.hpp"
 #include "vuln_common.hpp"
 #include "vuln_signatures.hpp"
@@ -1203,7 +1202,7 @@ agent_tools::tool_result_t handle_find_kernel_ioctl_handlers(const nlohmann::jso
     if (!is_kernel_driver())
     {
         return agent_tools::tool_result_t::error(
-            OBFSTR("Not a kernel driver - analyze_pe_headers + DriverEntry check failed"));
+            std::string("Not a kernel driver - analyze_pe_headers + DriverEntry check failed"));
     }
     ea_t entry_ea = locate_driver_entry();
     std::vector<ioctl_handler_t> handlers = find_ioctl_handlers();
@@ -1228,19 +1227,19 @@ agent_tools::tool_result_t handle_find_kernel_ioctl_handlers(const nlohmann::jso
     }
     data["dispatcher_handlers"] = std::move(arr);
     data["total_handlers"] = handlers.size();
-    std::string msg = OBFSTR("Kernel IOCTL dispatcher scan: ") +
+    std::string msg = std::string("Kernel IOCTL dispatcher scan: ") +
                       std::to_string(handlers.size()) +
-                      OBFSTR(" handler(s)");
+                      std::string(" handler(s)");
     return agent_tools::tool_result_t::ok(msg, data);
 }
 
 agent_tools::tool_result_t handle_find_user_pointer_deref(const nlohmann::json& params)
 {
     if (!is_kernel_driver())
-        return agent_tools::tool_result_t::error(OBFSTR("Not a kernel driver"));
+        return agent_tools::tool_result_t::error(std::string("Not a kernel driver"));
     int limit = extract_int_param(params, "limit", 64);
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be a positive integer"));
+        return agent_tools::tool_result_t::error(std::string("limit must be a positive integer"));
     if (limit > 4096)
         limit = 4096;
     std::vector<vuln_finding_t> findings = find_user_pointer_derefs(limit);
@@ -1249,9 +1248,9 @@ agent_tools::tool_result_t handle_find_user_pointer_deref(const nlohmann::json& 
     data["findings"] = findings_to_json(findings);
     data["limit"] = limit;
     data["primary_cwe"] = 822;
-    std::string msg = OBFSTR("User-pointer dereference scan: ") +
+    std::string msg = std::string("User-pointer dereference scan: ") +
                       std::to_string(findings.size()) +
-                      OBFSTR(" finding(s)");
+                      std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg, data);
 }
 
@@ -1260,9 +1259,9 @@ void register_tier1_kernel_tools()
     auto& registry = agent_tools::ToolRegistry::instance();
 
     registry.register_tool({
-        OBFSTR("find_kernel_ioctl_handlers"),
-        OBFSTR("vuln"),
-        OBFSTR("Detect a Windows kernel driver and enumerate its IRP_MJ_DEVICE_CONTROL "
+        std::string("find_kernel_ioctl_handlers"),
+        std::string("vuln"),
+        std::string("Detect a Windows kernel driver and enumerate its IRP_MJ_DEVICE_CONTROL "
                "dispatcher(s). Locates DriverEntry (export, named symbol, or shape match), "
                "decompiles it, and walks the C-tree for assignments to "
                "DriverObject->MajorFunction[14] (IRP_MJ_DEVICE_CONTROL). Loop-init and "
@@ -1278,9 +1277,9 @@ void register_tier1_kernel_tools()
     });
 
     registry.register_tool({
-        OBFSTR("find_user_pointer_deref"),
-        OBFSTR("vuln"),
-        OBFSTR("Find user-mode pointer dereferences in a Windows kernel driver's IOCTL "
+        std::string("find_user_pointer_deref"),
+        std::string("vuln"),
+        std::string("Find user-mode pointer dereferences in a Windows kernel driver's IOCTL "
                "dispatchers that occur without a preceding ProbeForRead/Write call. "
                "For every dispatcher the engine decompiles the handler, walks the C-tree "
                "for memptr accesses to known user-pointer fields (UserBuffer, "
@@ -1293,8 +1292,8 @@ void register_tier1_kernel_tools()
                "probe exists but its size cannot be statically proven to cover the "
                "dereferenced width."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 4096)"), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 4096)"), false},
         },
         handle_find_user_pointer_deref,
         true,

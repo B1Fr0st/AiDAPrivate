@@ -515,7 +515,7 @@ static constexpr int JSONRPC_INTERNAL_ERROR   = -32603;
 
 static const std::string& get_mcp_protocol_version()
 {
-    static const std::string v = OBFSTR("2025-06-18");
+    static const std::string v = std::string("2025-06-18");
     return v;
 }
 
@@ -720,8 +720,8 @@ static json build_mcp_tool_result_payload(const agent_tools::tool_result_t& tool
     if (!tool_result.output.empty())
     {
         content.push_back({
-            {OBFSTR_C("type"), "text"},
-            {OBFSTR_C("text"), sanitize_utf8(tool_result.output)}
+            {"type", "text"},
+            {"text", sanitize_utf8(tool_result.output)}
         });
     }
 
@@ -735,8 +735,8 @@ static json build_mcp_tool_result_payload(const agent_tools::tool_result_t& tool
             std::string preview = data_text.substr(0, MCP_OUTPUT_TEXT_LIMIT);
             preview += "\n\n[truncated: full JSON is available at " + url + "]";
             content.push_back({
-                {OBFSTR_C("type"), "text"},
-                {OBFSTR_C("text"), sanitize_utf8(preview)}
+                {"type", "text"},
+                {"text", sanitize_utf8(preview)}
             });
             result["structuredContent"] = json::object({
                 {"truncated", true},
@@ -755,8 +755,8 @@ static json build_mcp_tool_result_payload(const agent_tools::tool_result_t& tool
         else
         {
             content.push_back({
-                {OBFSTR_C("type"), "text"},
-                {OBFSTR_C("text"), sanitize_utf8(data_text)}
+                {"type", "text"},
+                {"text", sanitize_utf8(data_text)}
             });
             result["structuredContent"] = make_mcp_structured_content(tool_result.data);
         }
@@ -765,12 +765,12 @@ static json build_mcp_tool_result_payload(const agent_tools::tool_result_t& tool
     if (content.empty())
     {
         content.push_back({
-            {OBFSTR_C("type"), "text"},
-            {OBFSTR_C("text"), tool_result.success ? "Tool executed successfully (no output)." : "Tool execution failed (no details)."}
+            {"type", "text"},
+            {"text", tool_result.success ? "Tool executed successfully (no output)." : "Tool execution failed (no details)."}
         });
     }
 
-    result[OBFSTR_C("content")] = content;
+    result["content"] = content;
     if (!tool_result.success)
         result["isError"] = true;
     return result;
@@ -879,20 +879,20 @@ struct mcp_batch_exec_request_t : public exec_request_t
 static json make_jsonrpc_result(const json& id, const json& result)
 {
     return {
-        {OBFSTR_C("jsonrpc"), OBFSTR_C("2.0")},
-        {OBFSTR_C("id"),      id},
-        {OBFSTR_C("result"),  result}
+        {"jsonrpc", "2.0"},
+        {"id",      id},
+        {"result",  result}
     };
 }
 
 static json make_jsonrpc_error(const json& id, int code, const std::string& message)
 {
     return {
-        {OBFSTR_C("jsonrpc"), OBFSTR_C("2.0")},
-        {OBFSTR_C("id"),      id},
-        {OBFSTR_C("error"),   {
-            {OBFSTR_C("code"),    code},
-            {OBFSTR_C("message"), message}
+        {"jsonrpc", "2.0"},
+        {"id",      id},
+        {"error",   {
+            {"code",    code},
+            {"message", message}
         }}
     };
 }
@@ -1656,9 +1656,9 @@ static agent_tools::tool_result_t execute_tool_in_main_thread(
         ? (sync_total_ms - req.exec_ms)
         : 0;
 
-    msg(OBFSTR_C("AiDA PERF: mcp tool=%s mff=%s total=%llums exec=%llums queue=%llums\n"),
+    msg("AiDA PERF: mcp tool=%s mff=%s total=%llums exec=%llums queue=%llums\n",
         name.c_str(),
-        mff_flag == MFF_READ ? OBFSTR_C("READ") : OBFSTR_C("WRITE"),
+        mff_flag == MFF_READ ? "READ" : "WRITE",
         static_cast<unsigned long long>(sync_total_ms),
         static_cast<unsigned long long>(req.exec_ms),
         static_cast<unsigned long long>(queue_wait_ms));
@@ -2083,11 +2083,11 @@ static void audit_destructive_flag_drift()
         bool flag   = tool->destructive;
         if (legacy != flag)
         {
-            msg(OBFSTR_C("AiDA MCP: destructive flag drift for tool=%s legacy=%d flag=%d\n"),
+            msg("AiDA MCP: destructive flag drift for tool=%s legacy=%d flag=%d\n",
                 n.c_str(), int(legacy), int(flag));
             if (++warned > 32)
             {
-                msg(OBFSTR_C("AiDA MCP: ... further drift warnings suppressed\n"));
+                msg("AiDA MCP: ... further drift warnings suppressed\n");
                 break;
             }
         }
@@ -2130,17 +2130,17 @@ static json build_aggregator_tool_entries()
 
     {
         json input_schema;
-        input_schema[OBFSTR_C("type")] = "object";
+        input_schema["type"] = "object";
         input_schema["properties"] = json::object();
         json t;
-        t[OBFSTR_C("name")] = "list_ida_instances";
-        t[OBFSTR_C("description")] = "Enumerate every live IDA Pro instance currently exposing AiDA MCP. "
+        t["name"] = "list_ida_instances";
+        t["description"] = "Enumerate every live IDA Pro instance currently exposing AiDA MCP. "
             "Returns each peer's instance_id (UUID), pid (OS process id), display_name, idb_path, input_file, "
             "file_md5, file_sha256, processor, bitness, port, and base_url. Use the returned instance_id OR pid "
             "as the optional instance_id/pid argument on any tool to target a specific IDA, or call "
             "query_all_instances to fan out a tool to every instance at once.";
-        t[OBFSTR_C("inputSchema")] = input_schema;
-        t["outputSchema"] = json::object({{OBFSTR_C("type"), "object"}, {"additionalProperties", true}});
+        t["inputSchema"] = input_schema;
+        t["outputSchema"] = json::object({{"type", "object"}, {"additionalProperties", true}});
         json ann;
         ann["title"] = "List IDA Instances";
         ann["readOnlyHint"] = true;
@@ -2152,30 +2152,30 @@ static json build_aggregator_tool_entries()
     }
     {
         json input_schema;
-        input_schema[OBFSTR_C("type")] = "object";
+        input_schema["type"] = "object";
         json props;
         json p_tool;
-        p_tool[OBFSTR_C("type")] = "string";
-        p_tool[OBFSTR_C("description")] = "Tool name to invoke on every live IDA instance (e.g., get_binary_info, list_imports).";
+        p_tool["type"] = "string";
+        p_tool["description"] = "Tool name to invoke on every live IDA instance (e.g., get_binary_info, list_imports).";
         props["tool"] = p_tool;
         json p_args;
-        p_args[OBFSTR_C("type")] = "object";
-        p_args[OBFSTR_C("description")] = "Arguments object passed to the tool on each instance. Optional.";
+        p_args["type"] = "object";
+        p_args["description"] = "Arguments object passed to the tool on each instance. Optional.";
         props["arguments"] = p_args;
         json p_to;
-        p_to[OBFSTR_C("type")] = "integer";
-        p_to[OBFSTR_C("description")] = "Per-instance timeout in seconds (default 60).";
+        p_to["type"] = "integer";
+        p_to["description"] = "Per-instance timeout in seconds (default 60).";
         props["timeout_seconds"] = p_to;
         input_schema["properties"] = props;
         input_schema["required"] = json::array({"tool"});
         json t;
-        t[OBFSTR_C("name")] = "query_all_instances";
-        t[OBFSTR_C("description")] = "Run a single tool concurrently across every live IDA Pro instance and "
+        t["name"] = "query_all_instances";
+        t["description"] = "Run a single tool concurrently across every live IDA Pro instance and "
             "return a per-instance result map. Each entry contains {instance_id, display_name, input_file, "
             "ok, result_or_error}. Use this to compare or correlate findings across multiple binaries (e.g., "
             "checking imports/exports/strings across ntoskrnl.exe, ci.dll, and acpi.sys at the same time).";
-        t[OBFSTR_C("inputSchema")] = input_schema;
-        t["outputSchema"] = json::object({{OBFSTR_C("type"), "object"}, {"additionalProperties", true}});
+        t["inputSchema"] = input_schema;
+        t["outputSchema"] = json::object({{"type", "object"}, {"additionalProperties", true}});
         json ann;
         ann["title"] = "Query All Instances";
         ann["readOnlyHint"] = false;
@@ -2187,15 +2187,15 @@ static json build_aggregator_tool_entries()
     }
     {
         json input_schema;
-        input_schema[OBFSTR_C("type")] = "object";
+        input_schema["type"] = "object";
         input_schema["properties"] = json::object();
         json t;
-        t[OBFSTR_C("name")] = "get_local_instance_info";
-        t[OBFSTR_C("description")] = "Identify which IDA database the current MCP connection is bound to. "
+        t["name"] = "get_local_instance_info";
+        t["description"] = "Identify which IDA database the current MCP connection is bound to. "
             "Returns the local instance_id, display name, idb path, and input file metadata. Useful when "
             "an aggregator entry is the connected endpoint and the agent needs to know which IDA it just hit.";
-        t[OBFSTR_C("inputSchema")] = input_schema;
-        t["outputSchema"] = json::object({{OBFSTR_C("type"), "object"}, {"additionalProperties", true}});
+        t["inputSchema"] = input_schema;
+        t["outputSchema"] = json::object({{"type", "object"}, {"additionalProperties", true}});
         json ann;
         ann["title"] = "Get Local Instance Info";
         ann["readOnlyHint"] = true;
@@ -2221,15 +2221,15 @@ static json build_mcp_tools_list()
 #endif
 
     json instance_param;
-    instance_param[OBFSTR_C("type")] = "string";
-    instance_param[OBFSTR_C("description")] =
+    instance_param["type"] = "string";
+    instance_param["description"] =
         "Optional routing key. The IDA Pro instance_id (UUID from list_ida_instances) to target. "
         "Omit to run against the locally connected IDA. instance_id wins over pid if both are set. "
         "instance_id is stable across PID reuse.";
 
     json pid_param;
-    pid_param[OBFSTR_C("type")] = "integer";
-    pid_param[OBFSTR_C("description")] =
+    pid_param["type"] = "integer";
+    pid_param["description"] =
         "Optional routing key. The OS process id of the target IDA Pro instance "
         "(visible in Task Manager / ps and returned by list_ida_instances). Use this when you "
         "already know the IDA's pid; otherwise prefer instance_id. Ignored when instance_id is set.";
@@ -2242,7 +2242,7 @@ static json build_mcp_tools_list()
             continue;
 
         json input_schema = json::object();
-        input_schema[OBFSTR_C("type")] = "object";
+        input_schema["type"] = "object";
 
         json properties = json::object();
         json required_arr = json::array();
@@ -2250,14 +2250,14 @@ static json build_mcp_tools_list()
         for (const auto& param : tool->parameters)
         {
             json p;
-            p[OBFSTR_C("type")] = param.type;
-            p[OBFSTR_C("description")] = compact_tool_text(param.description, 160);
+            p["type"] = param.type;
+            p["description"] = compact_tool_text(param.description, 160);
             if (!param.enum_values.empty())
                 p["enum"] = param.enum_values;
             if (param.type == "array" && !param.items_schema.is_null())
                 p["items"] = param.items_schema;
             else if (param.type == "array")
-                p["items"] = json::object({{OBFSTR_C("type"), "object"}});
+                p["items"] = json::object({{"type", "object"}});
             properties[param.name] = p;
             if (param.required)
                 required_arr.push_back(param.name);
@@ -2278,9 +2278,9 @@ static json build_mcp_tools_list()
         annotations["openWorldHint"]   = (tool->name == "execute_python" || tool->name == "py_eval" || tool->name == "py_exec_file");
 
         json t;
-        t[OBFSTR_C("name")]        = tool->name;
-        t[OBFSTR_C("description")] = compact_tool_text(tool->description, 320);
-        t[OBFSTR_C("inputSchema")] = input_schema;
+        t["name"]        = tool->name;
+        t["description"] = compact_tool_text(tool->description, 320);
+        t["inputSchema"] = input_schema;
         t["visibility"] = tool->visibility;
         if (!tool->operations.empty())
         {
@@ -2302,7 +2302,7 @@ static json build_mcp_tools_list()
         else
         {
             t["outputSchema"] = json::object({
-                {OBFSTR_C("type"), "object"},
+                {"type", "object"},
                 {"additionalProperties", true}
             });
         }
@@ -2333,9 +2333,9 @@ static json build_mcp_resources_list()
     for (const auto& rdef : get_resource_definitions())
     {
         json r;
-        r[OBFSTR_C("uri")] = rdef.uri;
-        r[OBFSTR_C("name")] = rdef.name;
-        r[OBFSTR_C("description")] = rdef.description;
+        r["uri"] = rdef.uri;
+        r["name"] = rdef.name;
+        r["description"] = rdef.description;
         r["mimeType"] = rdef.mime_type;
         resources.push_back(r);
     }
@@ -2354,16 +2354,16 @@ static json build_mcp_prompts_catalog()
     for (const auto& pdef : get_prompt_definitions())
     {
         json p;
-        p[OBFSTR_C("name")] = pdef.name;
-        p[OBFSTR_C("description")] = pdef.description;
+        p["name"] = pdef.name;
+        p["description"] = pdef.description;
         if (!pdef.arguments.empty())
         {
             json args = json::array();
             for (const auto& arg : pdef.arguments)
             {
                 args.push_back({
-                    {OBFSTR_C("name"), arg.name},
-                    {OBFSTR_C("description"), arg.description},
+                    {"name", arg.name},
+                    {"description", arg.description},
                     {"required", arg.required}
                 });
             }
@@ -2386,19 +2386,19 @@ static json handle_initialize(const json& id, const json& )
     aida_ipc::trace_breadcrumb("ida_mcp_handle_initialize_enter");
 #endif
     json capabilities;
-    capabilities[OBFSTR_C("tools")]     = {{"listChanged", true}};
-    capabilities[OBFSTR_C("resources")] = {{"listChanged", true}};
-    capabilities[OBFSTR_C("prompts")]   = {{"listChanged", true}};
+    capabilities["tools"]     = {{"listChanged", true}};
+    capabilities["resources"] = {{"listChanged", true}};
+    capabilities["prompts"]   = {{"listChanged", true}};
     capabilities["logging"]   = json::object();
 
     json server_info;
-    server_info[OBFSTR_C("name")] = OBFSTR("aida-ida-mcp");
+    server_info["name"] = std::string("aida-ida-mcp");
     server_info["version"] = AIDA_VERSION;
 
     json result;
-    result[OBFSTR_C("protocolVersion")] = MCP_PROTOCOL_VERSION;
-    result[OBFSTR_C("capabilities")] = capabilities;
-    result[OBFSTR_C("serverInfo")] = server_info;
+    result["protocolVersion"] = MCP_PROTOCOL_VERSION;
+    result["capabilities"] = capabilities;
+    result["serverInfo"] = server_info;
     result["instructions"] = get_mcp_server_instructions();
 
     return make_jsonrpc_result(id, result);
@@ -2412,7 +2412,7 @@ static json handle_ping(const json& id)
 static json handle_tools_list(const json& id)
 {
     json result;
-    result[OBFSTR_C("tools")] = get_cached_mcp_tools_list();
+    result["tools"] = get_cached_mcp_tools_list();
     return make_jsonrpc_result(id, result);
 }
 
@@ -2421,11 +2421,11 @@ static json handle_tools_call(const json& id, const json& params)
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("ida_mcp_handle_tools_call_enter");
 #endif
-    if (!params.contains(OBFSTR_C("name")) || !params[OBFSTR_C("name")].is_string())
+    if (!params.contains("name") || !params["name"].is_string())
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
 
-    std::string tool_name = params[OBFSTR_C("name")].get<std::string>();
-    json arguments = params.contains(OBFSTR_C("arguments")) && params["arguments"].is_object()
+    std::string tool_name = params["name"].get<std::string>();
+    json arguments = params.contains("arguments") && params["arguments"].is_object()
                    ? params["arguments"]
                    : json::object();
 
@@ -2467,16 +2467,16 @@ static json handle_tools_call(const json& id, const json& params)
 static json handle_resources_list(const json& id)
 {
     json result;
-    result[OBFSTR_C("resources")] = get_cached_mcp_resources_list();
+    result["resources"] = get_cached_mcp_resources_list();
     return make_jsonrpc_result(id, result);
 }
 
 static json handle_resources_read(const json& id, const json& params)
 {
-    if (!params.contains(OBFSTR_C("uri")) || !params[OBFSTR_C("uri")].is_string())
+    if (!params.contains("uri") || !params["uri"].is_string())
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'uri'");
 
-    std::string uri = params[OBFSTR_C("uri")].get<std::string>();
+    std::string uri = params["uri"].get<std::string>();
 
     mcp_resource_def_t found;
     if (!resolve_mcp_resource_definition(uri, found))
@@ -2492,9 +2492,9 @@ static json handle_resources_read(const json& id, const json& params)
 
     json contents = json::array();
     contents.push_back({
-        {OBFSTR_C("uri"),      found.uri},
+        {"uri",      found.uri},
         {"mimeType", found.mime_type},
-        {OBFSTR_C("text"),     text_content}
+        {"text",     text_content}
     });
 
     json result;
@@ -2508,92 +2508,92 @@ static json handle_resources_templates_list(const json& id)
 
     templates.push_back({
         {"uriTemplate", "ida://function/{address}"},
-        {OBFSTR_C("name"), "Function by Address"},
-        {OBFSTR_C("description"), "Access a function's decompiled code by its hexadecimal address"},
+        {"name", "Function by Address"},
+        {"description", "Access a function's decompiled code by its hexadecimal address"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://address/{address}"},
-        {OBFSTR_C("name"), "Address Information"},
-        {OBFSTR_C("description"), "Get detailed information about any address in the binary"},
+        {"name", "Address Information"},
+        {"description", "Get detailed information about any address in the binary"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://struct/{name}"},
-        {OBFSTR_C("name"), "Struct by Name"},
-        {OBFSTR_C("description"), "Access struct or UDT details by type name"},
+        {"name", "Struct by Name"},
+        {"description", "Access struct or UDT details by type name"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://import/{name}"},
-        {OBFSTR_C("name"), "Import by Name"},
-        {OBFSTR_C("description"), "Access import details by import name or address"},
+        {"name", "Import by Name"},
+        {"description", "Access import details by import name or address"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://export/{name}"},
-        {OBFSTR_C("name"), "Export by Name"},
-        {OBFSTR_C("description"), "Query exports by name"},
+        {"name", "Export by Name"},
+        {"description", "Query exports by name"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://xrefs/from/{addr}"},
-        {OBFSTR_C("name"), "Xrefs From Address"},
-        {OBFSTR_C("description"), "Access outgoing cross-references from an address"},
+        {"name", "Xrefs From Address"},
+        {"description", "Access outgoing cross-references from an address"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://chain/reports/{report_id}?format={format}"},
-        {OBFSTR_C("name"), "Chain Report Export"},
-        {OBFSTR_C("description"), "Read a stored chain report as json, markdown, or sarif"},
+        {"name", "Chain Report Export"},
+        {"description", "Read a stored chain report as json, markdown, or sarif"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://reports/exports/{report_id}.{format}"},
-        {OBFSTR_C("name"), "Report Export"},
-        {OBFSTR_C("description"), "Read a stored report export by report id and extension"},
+        {"name", "Report Export"},
+        {"description", "Read a stored report export by report id and extension"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://jobs/{job_id}/result"},
-        {OBFSTR_C("name"), "Job Result"},
-        {OBFSTR_C("description"), "Read a stored MCP job result"},
+        {"name", "Job Result"},
+        {"description", "Read a stored MCP job result"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://jobs/{job_id}/events"},
-        {OBFSTR_C("name"), "Job Events"},
-        {OBFSTR_C("description"), "Read a stored MCP job event ring"},
+        {"name", "Job Events"},
+        {"description", "Read a stored MCP job event ring"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://corpus/{project_id}/manifest"},
-        {OBFSTR_C("name"), "Corpus Manifest"},
-        {OBFSTR_C("description"), "Read a project or current corpus manifest"},
+        {"name", "Corpus Manifest"},
+        {"description", "Read a project or current corpus manifest"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://cache/{area}/status"},
-        {OBFSTR_C("name"), "Cache Status"},
-        {OBFSTR_C("description"), "Read cache status for extraction, index, output, or all areas"},
+        {"name", "Cache Status"},
+        {"description", "Read cache status for extraction, index, output, or all areas"},
         {"mimeType", "application/json"}
     });
 
     templates.push_back({
         {"uriTemplate", "ida://evidence/{report_id}/{evidence_id}"},
-        {OBFSTR_C("name"), "Evidence Record"},
-        {OBFSTR_C("description"), "Read an evidence record emitted by a stored report"},
+        {"name", "Evidence Record"},
+        {"description", "Read an evidence record emitted by a stored report"},
         {"mimeType", "application/json"}
     });
 
@@ -2605,7 +2605,7 @@ static json handle_resources_templates_list(const json& id)
 static json handle_prompts_list(const json& id)
 {
     json result;
-    result[OBFSTR_C("prompts")] = get_cached_mcp_prompts_catalog();
+    result["prompts"] = get_cached_mcp_prompts_catalog();
     return make_jsonrpc_result(id, result);
 }
 
@@ -2656,10 +2656,10 @@ static std::string build_rag_section_from_result(const json& rag_result, bool re
 
 static json handle_prompts_get(const json& id, const json& params)
 {
-    if (!params.contains(OBFSTR_C("name")) || !params[OBFSTR_C("name")].is_string())
+    if (!params.contains("name") || !params["name"].is_string())
         return make_jsonrpc_error(id, JSONRPC_INVALID_PARAMS, "Missing required field: 'name'");
 
-    std::string name = params[OBFSTR_C("name")].get<std::string>();
+    std::string name = params["name"].get<std::string>();
     json arguments = params.value("arguments", json::object());
 
     const mcp_prompt_def_t* found = nullptr;
@@ -2747,7 +2747,7 @@ static json handle_prompts_get(const json& id, const json& params)
 
         messages.push_back({
             {"role", "user"},
-            {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), sanitize_utf8(prompt_text)}}}
+            {"content", {{"type", "text"}, {"text", sanitize_utf8(prompt_text)}}}
         });
     }
     else if (name == "binary_overview")
@@ -2777,7 +2777,7 @@ static json handle_prompts_get(const json& id, const json& params)
 
         messages.push_back({
             {"role", "user"},
-            {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), sanitize_utf8(overview)}}}
+            {"content", {{"type", "text"}, {"text", sanitize_utf8(overview)}}}
         });
     }
     else if (name == "explain_address")
@@ -2811,13 +2811,13 @@ static json handle_prompts_get(const json& id, const json& params)
 
         messages.push_back({
             {"role", "user"},
-            {OBFSTR_C("content"), {{OBFSTR_C("type"), "text"}, {OBFSTR_C("text"), sanitize_utf8(text)}}}
+            {"content", {{"type", "text"}, {"text", sanitize_utf8(text)}}}
         });
     }
 
     json result;
-    result[OBFSTR_C("description")] = found->description;
-    result[OBFSTR_C("messages")] = messages;
+    result["description"] = found->description;
+    result["messages"] = messages;
     return make_jsonrpc_result(id, result);
 }
 
@@ -2838,8 +2838,8 @@ static json handle_completion_complete(const json& id, const json& params)
             for (const auto& func : result.data)
             {
                 std::string display;
-                if (func.contains(OBFSTR_C("name")) && func[OBFSTR_C("name")].is_string())
-                    display = func[OBFSTR_C("name")].get<std::string>();
+                if (func.contains("name") && func["name"].is_string())
+                    display = func["name"].get<std::string>();
                 else if (func.contains("address") && func["address"].is_string())
                     display = func["address"].get<std::string>();
                 if (!display.empty())
@@ -2849,9 +2849,9 @@ static json handle_completion_complete(const json& id, const json& params)
     }
 
     json completion;
-    completion[OBFSTR_C("values")] = values;
-    completion[OBFSTR_C("total")] = values.size();
-    completion[OBFSTR_C("hasMore")] = false;
+    completion["values"] = values;
+    completion["total"] = values.size();
+    completion["hasMore"] = false;
     return make_jsonrpc_result(id, completion);
 }
 
@@ -2861,56 +2861,56 @@ static json dispatch_single_message(const json& msg)
     aida_ipc::trace_breadcrumb("ida_mcp_dispatch_enter");
 #endif
     if (!msg.is_object())
-        return make_jsonrpc_error(nullptr, JSONRPC_INVALID_REQUEST, OBFSTR("Request must be a JSON object"));
+        return make_jsonrpc_error(nullptr, JSONRPC_INVALID_REQUEST, std::string("Request must be a JSON object"));
 
-    std::string method = msg.value(OBFSTR_C("method"), "");
+    std::string method = msg.value("method", "");
     if (method.empty())
-        return make_jsonrpc_error(msg.value(OBFSTR_C("id"), json(nullptr)), JSONRPC_INVALID_REQUEST, OBFSTR("Missing 'method' field"));
+        return make_jsonrpc_error(msg.value("id", json(nullptr)), JSONRPC_INVALID_REQUEST, std::string("Missing 'method' field"));
 
-    json id = msg.contains(OBFSTR_C("id")) ? msg[OBFSTR_C("id")] : json(nullptr);
-    json params = msg.value(OBFSTR_C("params"), json::object());
-    bool is_notification = !msg.contains(OBFSTR_C("id"));
+    json id = msg.contains("id") ? msg["id"] : json(nullptr);
+    json params = msg.value("params", json::object());
+    bool is_notification = !msg.contains("id");
 
-    if (method == OBFSTR_C("initialize"))
+    if (method == "initialize")
         return handle_initialize(id, params);
 
-    if (method == OBFSTR_C("notifications/initialized"))
+    if (method == "notifications/initialized")
         return json();
 
-    if (method == OBFSTR_C("ping"))
+    if (method == "ping")
         return handle_ping(id);
 
-    if (method == OBFSTR_C("tools/list"))
+    if (method == "tools/list")
         return handle_tools_list(id);
 
-    if (method == OBFSTR_C("tools/call"))
+    if (method == "tools/call")
         return handle_tools_call(id, params);
 
-    if (method == OBFSTR_C("resources/list"))
+    if (method == "resources/list")
         return handle_resources_list(id);
 
-    if (method == OBFSTR_C("resources/read"))
+    if (method == "resources/read")
         return handle_resources_read(id, params);
 
-    if (method == OBFSTR_C("resources/templates/list"))
+    if (method == "resources/templates/list")
         return handle_resources_templates_list(id);
 
-    if (method == OBFSTR_C("prompts/list"))
+    if (method == "prompts/list")
         return handle_prompts_list(id);
 
-    if (method == OBFSTR_C("prompts/get"))
+    if (method == "prompts/get")
         return handle_prompts_get(id, params);
 
-    if (method == OBFSTR_C("completion/complete"))
+    if (method == "completion/complete")
         return handle_completion_complete(id, params);
 
-    if (method == OBFSTR_C("notifications/cancelled") || method == OBFSTR_C("logging/setLevel"))
+    if (method == "notifications/cancelled" || method == "logging/setLevel")
         return json();
 
     if (is_notification)
         return json();
 
-    return make_jsonrpc_error(id, JSONRPC_METHOD_NOT_FOUND, OBFSTR("Unknown method: ") + method);
+    return make_jsonrpc_error(id, JSONRPC_METHOD_NOT_FOUND, std::string("Unknown method: ") + method);
 }
 
 static std::string handle_mcp_body(const std::string& body)
@@ -3301,7 +3301,7 @@ bool mcp_server_t::start(int port)
 
     if (_running.load())
     {
-        msg(OBFSTR_C("AiDA MCP: Server is already running on port %d.\n"), _port);
+        msg("AiDA MCP: Server is already running on port %d.\n", _port);
         return true;
     }
 
@@ -3330,7 +3330,7 @@ bool mcp_server_t::start(int port)
     }
     catch (const std::exception& e)
     {
-        msg(OBFSTR_C("AiDA MCP: Failed to start server thread: %s\n"), e.what());
+        msg("AiDA MCP: Failed to start server thread: %s\n", e.what());
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("ida_mcp_start_thread_exception port=%d what=%s", port, e.what());
 #endif
@@ -3371,28 +3371,28 @@ bool mcp_server_t::start(int port)
         }
         else
         {
-            msg(OBFSTR_C("AiDA MCP: Warning - instance registry failed to start; multi-instance discovery disabled.\n"));
+            msg("AiDA MCP: Warning - instance registry failed to start; multi-instance discovery disabled.\n");
 #ifdef __NT__
             aida_ipc::trace_breadcrumb("ida_mcp_start_registry_fail port=%d", _port);
 #endif
         }
 
-        msg(OBFSTR_C("AiDA MCP: Server started on http://127.0.0.1:%d\n"), _port);
+        msg("AiDA MCP: Server started on http://127.0.0.1:%d\n", _port);
         if (port > 0 && _port != port)
-            msg(OBFSTR_C("AiDA MCP: Requested port %d was in use; bound to port %d instead.\n"), port, _port);
-        msg(OBFSTR_C("AiDA MCP: %zu tools available.\n"), tool_count);
-        msg(OBFSTR_C("AiDA MCP: Streamable HTTP  -> %s\n"), mcp_url.c_str());
-        msg(OBFSTR_C("AiDA MCP: Legacy SSE       -> %s\n"), sse_url.c_str());
+            msg("AiDA MCP: Requested port %d was in use; bound to port %d instead.\n", port, _port);
+        msg("AiDA MCP: %zu tools available.\n", tool_count);
+        msg("AiDA MCP: Streamable HTTP  -> %s\n", mcp_url.c_str());
+        msg("AiDA MCP: Legacy SSE       -> %s\n", sse_url.c_str());
         if (_registry)
         {
-            msg(OBFSTR_C("AiDA MCP: Instance ID         -> %s\n"), _registry->self_instance_id().c_str());
-            msg(OBFSTR_C("AiDA MCP: Config entry name   -> %s\n"), _registry->self_config_entry_name().c_str());
+            msg("AiDA MCP: Instance ID         -> %s\n", _registry->self_instance_id().c_str());
+            msg("AiDA MCP: Config entry name   -> %s\n", _registry->self_config_entry_name().c_str());
         }
         return true;
     }
     else if (_stop_requested.load() || _bind_failed.load())
     {
-        msg(OBFSTR_C("AiDA MCP: Server failed to start on port %d (no free local port found).\n"), port);
+        msg("AiDA MCP: Server failed to start on port %d (no free local port found).\n", port);
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("ida_mcp_start_bind_failed port=%d stop=%d bind_failed=%d",
                                    port, _stop_requested.load() ? 1 : 0, _bind_failed.load() ? 1 : 0);
@@ -3403,7 +3403,7 @@ bool mcp_server_t::start(int port)
     }
     else
     {
-        msg(OBFSTR_C("AiDA MCP: Server starting on port %d (async)...\n"), port);
+        msg("AiDA MCP: Server starting on port %d (async)...\n", port);
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("ida_mcp_start_async port=%d", port);
 #endif
@@ -3456,7 +3456,7 @@ void mcp_server_t::stop()
         _registry.reset();
     }
 
-    msg(OBFSTR_C("AiDA MCP: Server stopped.\n"));
+    msg("AiDA MCP: Server stopped.\n");
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("ida_mcp_stop_exit");
 #endif
@@ -3590,7 +3590,7 @@ void mcp_server_t::server_thread_func(int port)
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         json health;
         health["status"] = "ok";
-        health["server"] = OBFSTR("aida-ida-mcp");
+        health["server"] = std::string("aida-ida-mcp");
         health["version"] = AIDA_VERSION;
         health["tools_count"] = agent_tools::ToolRegistry::instance().get_tool_names().size();
         res.set_content(json_dump_safe(health), "application/json");
@@ -3720,9 +3720,9 @@ void mcp_server_t::server_thread_func(int port)
         for (const auto& rdef : get_resource_definitions())
         {
             resources.push_back({
-                {OBFSTR_C("uri"),         rdef.uri},
-                {OBFSTR_C("name"),        rdef.name},
-                {OBFSTR_C("description"), rdef.description},
+                {"uri",         rdef.uri},
+                {"name",        rdef.name},
+                {"description", rdef.description},
                 {"mimeType",    rdef.mime_type}
             });
         }
@@ -3748,12 +3748,12 @@ void mcp_server_t::server_thread_func(int port)
 
         auto tool_result = execute_resource_read(found);
         json resp;
-        resp[OBFSTR_C("uri")] = found.uri;
+        resp["uri"] = found.uri;
         resp["success"] = tool_result.success;
         if (!tool_result.data.is_null() && !tool_result.data.empty())
             resp["data"] = tool_result.data;
         else
-            resp[OBFSTR_C("text")] = sanitize_utf8(tool_result.output);
+            resp["text"] = sanitize_utf8(tool_result.output);
 
         res.set_content(json_dump_safe(resp, 2), "application/json");
     });
@@ -3910,7 +3910,7 @@ void mcp_server_t::server_thread_func(int port)
     if (bound_port <= 0)
     {
         if (!_stop_requested.load())
-            msg(OBFSTR_C("AiDA MCP: Failed to bind any port near %d and no fallback port was available.\n"), port);
+            msg("AiDA MCP: Failed to bind any port near %d and no fallback port was available.\n", port);
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("ida_mcp_bind_failed port=%d", port);
 #endif
@@ -3933,7 +3933,7 @@ void mcp_server_t::server_thread_func(int port)
     if (!svr.listen_after_bind())
     {
         if (!_stop_requested.load())
-            msg(OBFSTR_C("AiDA MCP: Listener terminated on 127.0.0.1:%d\n"), bound_port);
+            msg("AiDA MCP: Listener terminated on 127.0.0.1:%d\n", bound_port);
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("ida_mcp_listen_terminated port=%d", bound_port);
 #endif
@@ -4189,12 +4189,12 @@ static const mcp_client_def_t g_mcp_client_defs[] =
 #endif
 };
 
-static const std::string MCP_SERVER_NAME       = OBFSTR("aida-ida-mcp");
-static const std::string MCP_AGGREGATOR_NAME    = OBFSTR("aida-ida-mcp");
-static const std::string MCP_OLD_SERVER_NAME   = OBFSTR("AiDA-IDA-MCP");
-static const std::string MCP_OLD_PRO_PREFIX    = OBFSTR("AiDA-Pro-MCP");
-static const std::string MCP_INSTANCE_PREFIX    = OBFSTR("AiDA-IDA-MCP-");
-static const std::string MCP_OLD_INSTANCE_PREFIX = OBFSTR("aida-ida-");
+static const std::string MCP_SERVER_NAME       = std::string("aida-ida-mcp");
+static const std::string MCP_AGGREGATOR_NAME    = std::string("aida-ida-mcp");
+static const std::string MCP_OLD_SERVER_NAME   = std::string("AiDA-IDA-MCP");
+static const std::string MCP_OLD_PRO_PREFIX    = std::string("AiDA-Pro-MCP");
+static const std::string MCP_INSTANCE_PREFIX    = std::string("AiDA-IDA-MCP-");
+static const std::string MCP_OLD_INSTANCE_PREFIX = std::string("aida-ida-");
 
 struct mcp_entry_t
 {
@@ -4214,13 +4214,13 @@ static bool mcp_is_aida_managed_key(const std::string& key)
         return true;
     if (key == MCP_OLD_PRO_PREFIX)
         return true;
-    if (key == OBFSTR("aida-ida-all"))
+    if (key == std::string("aida-ida-all"))
         return true;
-    if (key == OBFSTR("camoufox-reverse-mcp"))
+    if (key == std::string("camoufox-reverse-mcp"))
         return true;
-    if (key == OBFSTR("camoufox_reverse_mcp"))
+    if (key == std::string("camoufox_reverse_mcp"))
         return true;
-    if (key == OBFSTR("camoufox-reverse"))
+    if (key == std::string("camoufox-reverse"))
         return true;
     if (key.size() >= MCP_INSTANCE_PREFIX.size()
         && key.compare(0, MCP_INSTANCE_PREFIX.size(), MCP_INSTANCE_PREFIX) == 0)
@@ -4545,7 +4545,7 @@ static bool mcp_write_mcpservers_url(
     for (const auto& e : entries)
     {
         json entry = json::object();
-        entry[OBFSTR_C("type")] = "http";
+        entry["type"] = "http";
         entry[url_key] = e.http_url;
         root[e.name] = entry;
     }
@@ -4575,7 +4575,7 @@ static bool mcp_write_opencode_json(const std::string& path,
     for (const auto& e : entries)
     {
         json entry;
-        entry[OBFSTR_C("type")] = "remote";
+        entry["type"] = "remote";
         entry["url"] = e.http_url;
         root[e.name] = entry;
     }
@@ -4606,7 +4606,7 @@ static bool mcp_write_cline_config(const std::string& path,
     for (const auto& e : entries)
     {
         json entry;
-        entry[OBFSTR_C("type")] = "http";
+        entry["type"] = "http";
         entry["url"] = e.http_url;
         root[e.name] = entry;
     }
@@ -4638,7 +4638,7 @@ static bool mcp_write_vscode_settings(const std::string& path,
     for (const auto& e : entries)
     {
         json entry;
-        entry[OBFSTR_C("type")] = "http";
+        entry["type"] = "http";
         entry["url"] = e.http_url;
         root[e.name] = entry;
     }
@@ -4668,7 +4668,7 @@ static bool mcp_write_vscode_mcp_json(const std::string& path,
     for (const auto& e : entries)
     {
         json entry;
-        entry[OBFSTR_C("type")] = "http";
+        entry["type"] = "http";
         entry["url"] = e.http_url;
         root[e.name] = entry;
     }
@@ -4729,21 +4729,21 @@ static bool mcp_write_codex_toml(const std::string& path,
 
     {
         const std::vector<std::string> names = {
-            OBFSTR("AiDA-Pro-MCP"),
-            OBFSTR("aida-ida-all"),
-            OBFSTR("camoufox-reverse-mcp"),
-            OBFSTR("camoufox_reverse_mcp"),
-            OBFSTR("camoufox-reverse"),
+            std::string("AiDA-Pro-MCP"),
+            std::string("aida-ida-all"),
+            std::string("camoufox-reverse-mcp"),
+            std::string("camoufox_reverse_mcp"),
+            std::string("camoufox-reverse"),
             MCP_OLD_SERVER_NAME,
             MCP_SERVER_NAME,
             MCP_AGGREGATOR_NAME
         };
         for (const auto& name : names)
-            strip_section(content, OBFSTR("[mcp_servers.") + name + "]");
+            strip_section(content, std::string("[mcp_servers.") + name + "]");
     }
 
     {
-        const std::string instance_marker_prefix = OBFSTR("[mcp_servers.") + MCP_INSTANCE_PREFIX;
+        const std::string instance_marker_prefix = std::string("[mcp_servers.") + MCP_INSTANCE_PREFIX;
         size_t pos = content.find(instance_marker_prefix);
         while (pos != std::string::npos)
         {
@@ -4758,7 +4758,7 @@ static bool mcp_write_codex_toml(const std::string& path,
     }
 
     {
-        const std::string instance_marker_prefix = OBFSTR("[mcp_servers.") + MCP_OLD_INSTANCE_PREFIX;
+        const std::string instance_marker_prefix = std::string("[mcp_servers.") + MCP_OLD_INSTANCE_PREFIX;
         size_t pos = content.find(instance_marker_prefix);
         while (pos != std::string::npos)
         {
@@ -4807,7 +4807,7 @@ static bool mcp_write_claude_code_json(const std::string& path,
     for (const auto& e : entries)
     {
         json entry;
-        entry[OBFSTR_C("type")] = "http";
+        entry["type"] = "http";
         entry["url"] = e.http_url;
         root[e.name] = entry;
     }
@@ -4858,7 +4858,7 @@ static void mcp_write_reference_config(
     const ida_instance_record_t& self_rec)
 {
     json config;
-    config["_comment"] = OBFSTR("MCP Server - Auto-configured endpoint. aida-ida-mcp is the IDA plugin entry and coexists with aida-standalone-mcp.");
+    config["_comment"] = std::string("MCP Server - Auto-configured endpoint. aida-ida-mcp is the IDA plugin entry and coexists with aida-standalone-mcp.");
     config["_version"] = AIDA_VERSION;
     config["self"] = {
         {"instance_id",       self_rec.instance_id},
@@ -4884,7 +4884,7 @@ static void mcp_write_reference_config(
     config["entries"] = arr;
 
     qstring config_file = get_user_idadir();
-    config_file.append(OBFSTR_C("/aida_mcp_config.json"));
+    config_file.append("/aida_mcp_config.json");
 
     try
     {
@@ -4898,7 +4898,7 @@ static void mcp_write_reference_config(
     }
     catch (...)
     {
-        msg(OBFSTR_C("AiDA MCP: Warning - could not write reference config file.\n"));
+        msg("AiDA MCP: Warning - could not write reference config file.\n");
     }
 }
 
@@ -4983,13 +4983,13 @@ void mcp_server_t::write_mcp_client_configs() const
         {
             written_paths.insert(expanded);
             ++configured_count;
-            msg(OBFSTR_C("AiDA MCP: [OK] %s -> %s (%zu entries)\n"),
+            msg("AiDA MCP: [OK] %s -> %s (%zu entries)\n",
                 def.name, expanded.c_str(), entries.size());
         }
         else
         {
             ++failed_count;
-            msg(OBFSTR_C("AiDA MCP: [FAIL] %s -> %s\n"), def.name, expanded.c_str());
+            msg("AiDA MCP: [FAIL] %s -> %s\n", def.name, expanded.c_str());
         }
     }
 

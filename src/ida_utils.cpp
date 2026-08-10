@@ -730,7 +730,7 @@ namespace ida_utils
             }
             catch (const vd_failure_t&)
             {
-                msg(OBFSTR_C("AiDA: Decompilation failed at 0x%llx, falling back to assembly.\n"), ea);
+                msg("AiDA: Decompilation failed at 0x%llx, falling back to assembly.\n", ea);
             }
         }
 
@@ -1344,8 +1344,8 @@ namespace ida_utils
             }
             else
             {
-                warning(OBFSTR_C("AI response did not contain a C++ struct definition.\n"
-                        "Full response:\n%s"), cpp_code.c_str());
+                warning("AI response did not contain a C++ struct definition.\n"
+                        "Full response:\n%s", cpp_code.c_str());
                 return;
             }
         }
@@ -1357,7 +1357,7 @@ namespace ida_utils
         static const std::regex struct_name_re("struct\\s+([a-zA-Z_][a-zA-Z0-9_]*)");
         if (!std::regex_search(struct_code, match_name, struct_name_re))
         {
-            warning(OBFSTR_C("AiDA: Could not find a valid struct name in the AI-generated code."));
+            warning("AiDA: Could not find a valid struct name in the AI-generated code.");
             msg("--- Invalid Code Snippet ---\n%s\n----------------------------\n", struct_code.c_str());
             return;
         }
@@ -1374,10 +1374,10 @@ namespace ida_utils
 
             if (choice == ASKBTN_YES)
             {
-                msg(OBFSTR_C("AiDA: Struct '%s' already exists, overwriting.\n"), final_struct_name.c_str());
+                msg("AiDA: Struct '%s' already exists, overwriting.\n", final_struct_name.c_str());
                 if (!del_named_type(idati, final_struct_name.c_str(), NTF_TYPE))
                 {
-                    warning(OBFSTR_C("AiDA: Failed to delete existing struct '%s'. Aborting overwrite."), final_struct_name.c_str());
+                    warning("AiDA: Failed to delete existing struct '%s'. Aborting overwrite.", final_struct_name.c_str());
                     return;
                 }
             }
@@ -1390,11 +1390,11 @@ namespace ida_utils
                     temp_qstr.sprnt("%s_%d", original_struct_name.c_str(), counter++);
                     final_struct_name = temp_qstr.c_str();
                 } while (get_type_ordinal(idati, final_struct_name.c_str()) != 0);
-                msg(OBFSTR_C("AiDA: Renaming to '%s' to avoid conflict.\n"), final_struct_name.c_str());
+                msg("AiDA: Renaming to '%s' to avoid conflict.\n", final_struct_name.c_str());
             }
             else
             {
-                msg(OBFSTR_C("AiDA: Struct creation cancelled by user.\n"));
+                msg("AiDA: Struct creation cancelled by user.\n");
                 return;
             }
         }
@@ -1408,11 +1408,11 @@ namespace ida_utils
 
         if (parse_decls(idati, struct_code.c_str(), msg, HTI_DCL) != 0)
         {
-            warning(OBFSTR_C("AiDA: Failed to parse the C++ struct. See the Output window for details and the code that was attempted."));
+            warning("AiDA: Failed to parse the C++ struct. See the Output window for details and the code that was attempted.");
             return;
         }
 
-        msg(OBFSTR_C("AiDA: Struct '%s' created/updated successfully.\n"), final_struct_name.c_str());
+        msg("AiDA: Struct '%s' created/updated successfully.\n", final_struct_name.c_str());
 
         uint32 ordinal = get_type_ordinal(idati, final_struct_name.c_str());
         if (ordinal != 0)
@@ -1423,13 +1423,13 @@ namespace ida_utils
         func_t* pfn = get_func(ea);
         if (pfn == nullptr)
         {
-            msg(OBFSTR_C("AiDA: No function at 0x%llx to apply type to.\n"), ea);
+            msg("AiDA: No function at 0x%llx to apply type to.\n", ea);
             return;
         }
 
         if (!init_hexrays_plugin() || !is_safely_decompilable(pfn))
         {
-            msg(OBFSTR_C("AiDA: Hex-Rays decompiler not available. Cannot automatically apply type to function arguments.\n"));
+            msg("AiDA: Hex-Rays decompiler not available. Cannot automatically apply type to function arguments.\n");
             return;
         }
 
@@ -1438,7 +1438,7 @@ namespace ida_utils
             cfuncptr_t cfunc = decompile_func(pfn, nullptr, DECOMP_NO_WAIT);
             if (cfunc == nullptr)
             {
-                warning(OBFSTR_C("AiDA: Could not decompile function at 0x%llx to apply type."), ea);
+                warning("AiDA: Could not decompile function at 0x%llx to apply type.", ea);
                 return;
             }
 
@@ -1482,27 +1482,27 @@ namespace ida_utils
 
                     if (modify_user_lvar_info(pfn->start_ea, MLI_TYPE, lsi))
                     {
-                        msg(OBFSTR_C("AiDA: Applied type '%s' to argument '%s'.\n"), new_type_str.c_str(), target_lvar->name.c_str());
+                        msg("AiDA: Applied type '%s' to argument '%s'.\n", new_type_str.c_str(), target_lvar->name.c_str());
                         mark_cfunc_dirty(pfn->start_ea, true);
                     }
                     else
                     {
-                        warning(OBFSTR_C("AiDA: Failed to apply type '%s' to lvar '%s'."), new_type_str.c_str(), target_lvar->name.c_str());
+                        warning("AiDA: Failed to apply type '%s' to lvar '%s'.", new_type_str.c_str(), target_lvar->name.c_str());
                     }
                 }
             }
             else
             {
-                msg(OBFSTR_C("AiDA: Could not find a suitable argument to apply the new struct type to.\n"));
+                msg("AiDA: Could not find a suitable argument to apply the new struct type to.\n");
             }
         }
         catch (const vd_failure_t&)
         {
-            warning(OBFSTR_C("AiDA: Decompilation failed, cannot automatically apply type."));
+            warning("AiDA: Decompilation failed, cannot automatically apply type.");
         }
         catch (const std::exception& e)
         {
-            warning(OBFSTR_C("AiDA: An unexpected error occurred during type application: %s"), e.what());
+            warning("AiDA: An unexpected error occurred during type application: %s", e.what());
         }
     }
     bool is_word_char(char c)
@@ -1553,7 +1553,7 @@ namespace ida_utils
         ea_t item_ea = get_item_head(ea);
         if (!get_name(&name, item_ea))
         {
-            warning(OBFSTR_C("AiDA: Please place the cursor inside a function or on a named data item."));
+            warning("AiDA: Please place the cursor inside a function or on a named data item.");
             return nullptr;
         }
 
@@ -1573,7 +1573,7 @@ namespace ida_utils
 
         if (func_eas.empty())
         {
-            warning(OBFSTR_C("AiDA: No code references found to '%s'. Action requires a function context."), name.c_str());
+            warning("AiDA: No code references found to '%s'. Action requires a function context.", name.c_str());
             return nullptr;
         }
 
@@ -1655,7 +1655,7 @@ namespace ida_utils
 #ifdef _WIN32
         if (!OpenClipboard(nullptr))
         {
-            warning(OBFSTR_C("AiDA: Could not open clipboard."));
+            warning("AiDA: Could not open clipboard.");
             return false;
         }
 
@@ -1666,14 +1666,14 @@ namespace ida_utils
 
         if (!EmptyClipboard())
         {
-            warning(OBFSTR_C("AiDA: Could not empty clipboard."));
+            warning("AiDA: Could not empty clipboard.");
             return false;
         }
 
         qwstring wtext;
         if (!utf8_utf16(&wtext, text.c_str()))
         {
-            warning(OBFSTR_C("AiDA: Failed to convert text to UTF-16 for clipboard."));
+            warning("AiDA: Failed to convert text to UTF-16 for clipboard.");
             return false;
         }
 
@@ -1681,14 +1681,14 @@ namespace ida_utils
         HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, (wlen + 1) * sizeof(wchar16_t));
         if (hg == nullptr)
         {
-            warning(OBFSTR_C("AiDA: GlobalAlloc failed for clipboard."));
+            warning("AiDA: GlobalAlloc failed for clipboard.");
             return false;
         }
 
         wchar16_t* locked_mem = (wchar16_t*)GlobalLock(hg);
         if (locked_mem == nullptr)
         {
-            warning(OBFSTR_C("AiDA: GlobalLock failed for clipboard."));
+            warning("AiDA: GlobalLock failed for clipboard.");
             GlobalFree(hg);
             return false;
         }
@@ -1698,7 +1698,7 @@ namespace ida_utils
 
         if (SetClipboardData(CF_UNICODETEXT, hg) == nullptr)
         {
-            warning(OBFSTR_C("AiDA: SetClipboardData failed."));
+            warning("AiDA: SetClipboardData failed.");
             GlobalFree(hg);
             return false;
         }
@@ -1717,10 +1717,10 @@ namespace ida_utils
                 return true;
             }
         }
-        warning(OBFSTR_C("AiDA: Could not find 'wl-copy' or 'xclip' to set clipboard."));
+        warning("AiDA: Could not find 'wl-copy' or 'xclip' to set clipboard.");
         return false;
 #else
-        warning(OBFSTR_C("AiDA: Clipboard copy not implemented for this platform."));
+        warning("AiDA: Clipboard copy not implemented for this platform.");
         return false;
 #endif
     }
@@ -1762,20 +1762,20 @@ namespace ida_utils
     {
         if (!init_hexrays_plugin())
         {
-            warning(OBFSTR_C("AiDA: Renaming requires the Hex-Rays decompiler."));
+            warning("AiDA: Renaming requires the Hex-Rays decompiler.");
             return "";
         }
 
         func_t* pfn = get_func(func_ea);
         if (pfn == nullptr)
         {
-            warning(OBFSTR_C("AiDA: Function at 0x%llx not found for renaming."), func_ea);
+            warning("AiDA: Function at 0x%llx not found for renaming.", func_ea);
             return "";
         }
 
         if (!is_safely_decompilable(pfn))
         {
-            warning(OBFSTR_C("AiDA: Function at 0x%llx is not decompilable (thunk/extern/tail)."), func_ea);
+            warning("AiDA: Function at 0x%llx is not decompilable (thunk/extern/tail).", func_ea);
             return "";
         }
 
@@ -1788,7 +1788,7 @@ namespace ida_utils
         catch (...) { cfunc = cfuncptr_t(nullptr); }
         if (cfunc == nullptr)
         {
-            warning(OBFSTR_C("AiDA: Decompilation failed for function at 0x%llx."), func_ea);
+            warning("AiDA: Decompilation failed for function at 0x%llx.", func_ea);
             return "";
         }
 
@@ -1886,7 +1886,7 @@ namespace ida_utils
                         }
                         else
                         {
-                            msg(OBFSTR_C("AiDA: Failed to rename local variable '%s' to '%s'.\n"), original_name.c_str(), new_name.c_str());
+                            msg("AiDA: Failed to rename local variable '%s' to '%s'.\n", original_name.c_str(), new_name.c_str());
                         }
                         break;
                     }
@@ -1926,7 +1926,7 @@ namespace ida_utils
                         }
                         else
                         {
-                            msg(OBFSTR_C("AiDA: Failed to rename '%s' to '%s'.\n"), original_name.c_str(), new_name.c_str());
+                            msg("AiDA: Failed to rename '%s' to '%s'.\n", original_name.c_str(), new_name.c_str());
                         }
                     }
                 }
@@ -1946,7 +1946,7 @@ namespace ida_utils
                     }
                     else
                     {
-                        msg(OBFSTR_C("AiDA: Failed to rename segment '%s' to '%s'.\n"), original_name.c_str(), new_name.c_str());
+                        msg("AiDA: Failed to rename segment '%s' to '%s'.\n", original_name.c_str(), new_name.c_str());
                     }
                 }
             }
@@ -1970,7 +1970,7 @@ namespace ida_utils
                         }
                         else
                         {
-                            msg(OBFSTR_C("AiDA: Failed to rename type '%s' to '%s'.\n"), original_name.c_str(), new_name.c_str());
+                            msg("AiDA: Failed to rename type '%s' to '%s'.\n", original_name.c_str(), new_name.c_str());
                         }
                     }
                 }
@@ -1979,7 +1979,7 @@ namespace ida_utils
 
         if (renamed_count > 0)
         {
-            msg(OBFSTR_C("AiDA: Applied %d renames.\n"), renamed_count);
+            msg("AiDA: Applied %d renames.\n", renamed_count);
             invalidate_rag_cache();
         }
 
@@ -2242,7 +2242,7 @@ namespace ida_utils
         if (max_len != 0 || !pfn)
         {
             json context = get_context_for_prompt(ea, include_struct_context, max_len);
-            if (context.contains(OBFSTR_C("ok")) && context[OBFSTR_C("ok")].is_boolean() && context[OBFSTR_C("ok")].get<bool>())
+            if (context.contains("ok") && context["ok"].is_boolean() && context["ok"].get<bool>())
             {
                 json rag = get_rag_context(ea, settings, &context);
                 context["binary_metadata"] = json_str(rag, "binary_metadata", "// No metadata available.");
@@ -2266,7 +2266,7 @@ namespace ida_utils
         }
 
         json context = get_context_for_prompt(ea, true, 0);
-        if (!(context.contains(OBFSTR_C("ok")) && context[OBFSTR_C("ok")].is_boolean() && context[OBFSTR_C("ok")].get<bool>()))
+        if (!(context.contains("ok") && context["ok"].is_boolean() && context["ok"].get<bool>()))
             return context;
 
         json rag = get_rag_context(ea, settings, &context);
@@ -2297,7 +2297,7 @@ namespace ida_utils
         }
         else
         {
-            warning(OBFSTR_C("AiDA: AI response did not contain a C++ type definition.\nFull response:\n%s"), cpp_code.c_str());
+            warning("AiDA: AI response did not contain a C++ type definition.\nFull response:\n%s", cpp_code.c_str());
             return;
         }
 
@@ -2313,7 +2313,7 @@ namespace ida_utils
         }
         else
         {
-            warning(OBFSTR_C("AiDA: Could not find a valid type name in the AI-generated code."));
+            warning("AiDA: Could not find a valid type name in the AI-generated code.");
             return;
         }
         std::string original_type_name = match_name[2].str();
@@ -2330,10 +2330,10 @@ namespace ida_utils
 
             if (choice == ASKBTN_YES)
             {
-                msg(OBFSTR_C("AiDA: Type '%s' already exists, overwriting.\n"), final_type_name.c_str());
+                msg("AiDA: Type '%s' already exists, overwriting.\n", final_type_name.c_str());
                 if (!del_named_type(idati, final_type_name.c_str(), NTF_TYPE))
                 {
-                    warning(OBFSTR_C("AiDA: Failed to delete existing type '%s'. Aborting."), final_type_name.c_str());
+                    warning("AiDA: Failed to delete existing type '%s'. Aborting.", final_type_name.c_str());
                     return;
                 }
             }
@@ -2346,11 +2346,11 @@ namespace ida_utils
                     temp_qstr.sprnt("%s_%d", original_type_name.c_str(), counter++);
                     final_type_name = temp_qstr.c_str();
                 } while (get_type_ordinal(idati, final_type_name.c_str()) != 0);
-                msg(OBFSTR_C("AiDA: Renaming to '%s' to avoid conflict.\n"), final_type_name.c_str());
+                msg("AiDA: Renaming to '%s' to avoid conflict.\n", final_type_name.c_str());
             }
             else
             {
-                msg(OBFSTR_C("AiDA: Type creation cancelled.\n"));
+                msg("AiDA: Type creation cancelled.\n");
                 return;
             }
         }
@@ -2367,11 +2367,11 @@ namespace ida_utils
 
         if (parse_decls(idati, struct_code.c_str(), msg, HTI_DCL) != 0)
         {
-            warning(OBFSTR_C("AiDA: Failed to parse the type definition. See Output window."));
+            warning("AiDA: Failed to parse the type definition. See Output window.");
             return;
         }
 
-        msg(OBFSTR_C("AiDA: Type '%s' created/updated successfully.\n"), final_type_name.c_str());
+        msg("AiDA: Type '%s' created/updated successfully.\n", final_type_name.c_str());
 
         invalidate_rag_cache();
 
@@ -2446,29 +2446,29 @@ namespace ida_utils
 
                     if (modify_user_lvar_info(pfn->start_ea, MLI_TYPE, lsi))
                     {
-                        msg(OBFSTR_C("AiDA: Applied type '%s' to argument '%s'.\n"),
+                        msg("AiDA: Applied type '%s' to argument '%s'.\n",
                             new_type_str.c_str(), target_lvar->name.c_str());
                         mark_cfunc_dirty(pfn->start_ea, true);
                     }
                     else
                     {
-                        warning(OBFSTR_C("AiDA: Failed to apply type '%s' to lvar '%s'."),
+                        warning("AiDA: Failed to apply type '%s' to lvar '%s'.",
                             new_type_str.c_str(), target_lvar->name.c_str());
                     }
                 }
             }
             else
             {
-                msg(OBFSTR_C("AiDA: No suitable argument found to apply the new type to.\n"));
+                msg("AiDA: No suitable argument found to apply the new type to.\n");
             }
         }
         catch (const vd_failure_t&)
         {
-            warning(OBFSTR_C("AiDA: Decompilation failed, cannot apply type."));
+            warning("AiDA: Decompilation failed, cannot apply type.");
         }
         catch (const std::exception& e)
         {
-            warning(OBFSTR_C("AiDA: Error during type application: %s"), e.what());
+            warning("AiDA: Error during type application: %s", e.what());
         }
     }
 
@@ -2480,18 +2480,18 @@ namespace ida_utils
         {
             if (!del_named_type(idati, struct_name.c_str(), NTF_TYPE))
             {
-                msg(OBFSTR_C("AiDA: Failed to delete existing type '%s' for update.\n"), struct_name.c_str());
+                msg("AiDA: Failed to delete existing type '%s' for update.\n", struct_name.c_str());
                 return false;
             }
         }
 
         if (parse_decls(idati, new_definition.c_str(), msg, HTI_DCL) != 0)
         {
-            msg(OBFSTR_C("AiDA: Failed to parse updated type definition for '%s'.\n"), struct_name.c_str());
+            msg("AiDA: Failed to parse updated type definition for '%s'.\n", struct_name.c_str());
             return false;
         }
 
-        msg(OBFSTR_C("AiDA: Type '%s' updated successfully.\n"), struct_name.c_str());
+        msg("AiDA: Type '%s' updated successfully.\n", struct_name.c_str());
         invalidate_rag_cache();
         return true;
     }

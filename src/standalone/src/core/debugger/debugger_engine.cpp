@@ -142,15 +142,13 @@ uint64_t register_context_mask(const std::string& lower) {
 bool kernel_target_operations_ready(const char* caller) {
 	std::string reason;
 	const bool ready = driver_bridge::using_kernel_driver() &&
-		driver_bridge::kernel_session_available(&reason) &&
-		driver_bridge::dynamic_ioctls_ready();
+		driver_bridge::kernel_session_available(&reason);
 	if (!ready) {
 		diag::log_tagged_fmt("dbg_engine",
-			"kernel_target_operations_fail_closed caller=%s loaded=%d kernel=%d dyn_ready=%d reason=%s status=%s last_error=%s",
+			"kernel_target_operations_fail_closed caller=%s loaded=%d kernel=%d reason=%s status=%s last_error=%s",
 			caller ? caller : "",
 			driver_bridge::is_loaded() ? 1 : 0,
 			driver_bridge::using_kernel_driver() ? 1 : 0,
-			driver_bridge::dynamic_ioctls_ready() ? 1 : 0,
 			reason.empty() ? "<empty>" : reason.c_str(),
 			driver_bridge::status().c_str(),
 			driver_bridge::last_error().c_str());
@@ -4876,13 +4874,11 @@ void sync_attached_state() {
 		std::string reason;
 		const bool using_kernel = driver_bridge::using_kernel_driver();
 		const bool session_avail = driver_bridge::kernel_session_available(&reason);
-		const bool dyn_ready = driver_bridge::dynamic_ioctls_ready();
 		diag::log_tagged_fmt("dbg_engine",
-			"sync_attached_state_fail pid=%u can_read_memory=0 using_kernel=%d session_avail=%d dyn_ready=%d reason=%s status=%s last_error=%s",
+			"sync_attached_state_fail pid=%u can_read_memory=0 using_kernel=%d session_avail=%d reason=%s status=%s last_error=%s",
 			live_pid,
 			using_kernel ? 1 : 0,
 			session_avail ? 1 : 0,
-			dyn_ready ? 1 : 0,
 			reason.empty() ? "<empty>" : reason.c_str(),
 			driver_bridge::status().c_str(),
 			driver_bridge::last_error().c_str());

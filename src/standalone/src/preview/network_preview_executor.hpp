@@ -6,10 +6,6 @@
 
 #include <cstring>
 
-namespace aida::manual_map_tls {
-inline bool ensure_current_thread() { return true; }
-}
-
 namespace aida::preview::network {
 
 inline void executor_receipt_observer(const infra::executor::submission_t& submission) {

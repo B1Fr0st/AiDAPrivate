@@ -6993,20 +6993,9 @@ int main(int, char**)
         GetCurrentProcessId(),
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
-    {
-        auto dyn = driver_bridge::dynamic_ioctl_state();
-        startup_log_critical_fmt("driver_bridge_launch_context before_post loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
-            dyn.loaded ? 1 : 0,
-            dyn.kernel ? 1 : 0,
-            dyn.connected ? 1 : 0,
-            dyn.ready ? 1 : 0,
-            dyn.instance_server_seed,
-            dyn.instance_ioctl_seed,
-            dyn.global_server_seed,
-            dyn.global_ioctl_seed,
-            dyn.ioctl_seed_hash,
-            dyn.heartbeat_ioctl_seed_hash);
-    }
+    startup_log_critical_fmt("driver_bridge_launch_context before_post loaded=%d kernel=%d",
+        driver_bridge::is_loaded() ? 1 : 0,
+        driver_bridge::using_kernel_driver() ? 1 : 0);
     const auto driver_submit_result = submit_main_executor_task(
         "startup",
         "startup.driver_bridge_init",
@@ -7022,21 +7011,10 @@ int main(int, char**)
         DWORD seh_dbi = seh_driver_bridge_initialize();
         if (seh_dbi != 0)
             diag::log_tagged_fmt("drv_init", "driver_bridge_initialize_seh code=0x%08X last_err=%lu", seh_dbi, GetLastError());
-        {
-            auto dyn = driver_bridge::dynamic_ioctl_state();
-            startup_log_critical_fmt("driver_bridge_launch_context after_initialize seh=0x%08X loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
-                seh_dbi,
-                dyn.loaded ? 1 : 0,
-                dyn.kernel ? 1 : 0,
-                dyn.connected ? 1 : 0,
-                dyn.ready ? 1 : 0,
-                dyn.instance_server_seed,
-                dyn.instance_ioctl_seed,
-                dyn.global_server_seed,
-                dyn.global_ioctl_seed,
-                dyn.ioctl_seed_hash,
-                dyn.heartbeat_ioctl_seed_hash);
-        }
+        startup_log_critical_fmt("driver_bridge_launch_context after_initialize seh=0x%08X loaded=%d kernel=%d",
+            seh_dbi,
+            driver_bridge::is_loaded() ? 1 : 0,
+            driver_bridge::using_kernel_driver() ? 1 : 0);
         startup_log_critical_fmt("driver_bridge_init_thread_exit seh=0x%08X loaded=%d kernel=%d status=%.160s elapsed_ms=%llu last_err=%lu",
             seh_dbi,
             driver_bridge::is_loaded() ? 1 : 0,

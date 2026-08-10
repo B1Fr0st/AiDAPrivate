@@ -407,22 +407,6 @@ struct settings_sa_t
     int         mcp_port = 29117;
     bool        mcp_enabled = true;
 
-    std::string license_key;
-    std::string license_plan;
-    std::string license_sig_payload;
-    std::string license_server_sig;
-    std::string license_session_token;
-    std::string license_server_nonce;
-    std::string license_client_nonce;
-    std::string license_hwid;
-    int64_t     license_issued_at = 0;
-    int64_t     license_ttl = 3600;
-    std::string license_key_seed;
-    std::string license_bind_proof;
-    std::string license_auth_hmac_key_b64;
-    int         license_signing_kid = 1;
-    bool        license_arc_load_ok = false;
-
     int         active_theme_idx = 0;
     int         active_custom_theme_idx = -1;
     int         editor_tab_size = 4;
@@ -1397,22 +1381,6 @@ struct settings_sa_t
         integer("mcp_port", mcp_port);
         boolean("mcp_enabled", mcp_enabled);
 
-        secret("license_key", license_key);
-        str("license_plan", license_plan);
-        str("license_sig_payload", license_sig_payload);
-        str("license_server_sig", license_server_sig);
-        str("license_session_token", license_session_token);
-        str("license_server_nonce", license_server_nonce);
-        str("license_client_nonce", license_client_nonce);
-        str("license_hwid", license_hwid);
-        i64("license_issued_at", license_issued_at);
-        i64("license_ttl", license_ttl);
-        secret("license_key_seed", license_key_seed);
-        secret("license_bind_proof", license_bind_proof);
-        secret("license_auth_hmac_key_b64", license_auth_hmac_key_b64);
-        integer("license_signing_kid", license_signing_kid);
-        boolean("license_arc_load_ok", license_arc_load_ok);
-
         integer("active_theme_idx", active_theme_idx);
         integer("active_custom_theme_idx", active_custom_theme_idx);
         integer("editor_tab_size", editor_tab_size);
@@ -1700,21 +1668,6 @@ struct settings_sa_t
         root["temperature"] = temperature;
         root["mcp_port"] = mcp_port;
         root["mcp_enabled"] = mcp_enabled;
-        root["license_key"] = sa_settings_detail::obfuscate_key(license_key);
-        root["license_plan"] = license_plan;
-        root["license_sig_payload"] = license_sig_payload;
-        root["license_server_sig"] = license_server_sig;
-        root["license_session_token"] = license_session_token;
-        root["license_server_nonce"] = license_server_nonce;
-        root["license_client_nonce"] = license_client_nonce;
-        root["license_hwid"] = license_hwid;
-        root["license_issued_at"] = license_issued_at;
-        root["license_ttl"] = license_ttl;
-        root["license_key_seed"] = sa_settings_detail::obfuscate_key(license_key_seed);
-        root["license_bind_proof"] = sa_settings_detail::obfuscate_key(license_bind_proof);
-        root["license_auth_hmac_key_b64"] = sa_settings_detail::obfuscate_key(license_auth_hmac_key_b64);
-        root["license_signing_kid"] = license_signing_kid;
-        root["license_arc_load_ok"] = license_arc_load_ok;
 
         root["active_theme_idx"] = active_theme_idx;
         root["active_custom_theme_idx"] = active_custom_theme_idx;

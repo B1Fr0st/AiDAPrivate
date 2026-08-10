@@ -30,7 +30,6 @@
 #include "../agent_tools.hpp"
 #include "../analysis_db.hpp"
 #include "../ida_utils.hpp"
-#include "../obfuscation.hpp"
 #include "vuln_common.hpp"
 #include "vuln_signatures.hpp"
 #include "vuln_tools.hpp"
@@ -2222,7 +2221,7 @@ agent_tools::tool_result_t handle_find_vulnerable_sinks(const json& params)
     const int limit_raw        = extract_int_param(params, "limit", 256);
     int limit = limit_raw;
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be a positive integer"));
+        return agent_tools::tool_result_t::error(std::string("limit must be a positive integer"));
     if (limit > 4096)
         limit = 4096;
 
@@ -2230,13 +2229,13 @@ agent_tools::tool_result_t handle_find_vulnerable_sinks(const json& params)
         category != "path_traversal" && category != "format_string")
     {
         return agent_tools::tool_result_t::error(
-            OBFSTR("category must be one of: all, buffer_overflow, command_injection, "
+            std::string("category must be one of: all, buffer_overflow, command_injection, "
                    "path_traversal, format_string"));
     }
 
     auto sinks = filter_sinks(category);
     if (sinks.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("No sinks resolved for category"));
+        return agent_tools::tool_result_t::error(std::string("No sinks resolved for category"));
 
     std::vector<std::string> names;
     names.reserve(sinks.size());
@@ -2263,7 +2262,7 @@ agent_tools::tool_result_t handle_find_vulnerable_sinks(const json& params)
         data["cached"] = true;
         const std::size_t count = data.value("count", static_cast<std::size_t>(0));
         std::ostringstream msg;
-        msg << OBFSTR("Vulnerable-sink scan (cached): ") << count << OBFSTR(" finding(s)");
+        msg << std::string("Vulnerable-sink scan (cached): ") << count << std::string(" finding(s)");
         return agent_tools::tool_result_t::ok(msg.str(), data);
     }
 
@@ -2344,7 +2343,7 @@ agent_tools::tool_result_t handle_find_vulnerable_sinks(const json& params)
     cache_store(analysis_type, cache_key, data);
 
     std::ostringstream msg;
-    msg << OBFSTR("Vulnerable-sink scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Vulnerable-sink scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2352,7 +2351,7 @@ agent_tools::tool_result_t handle_find_input_sources(const json& params)
 {
     int limit = extract_int_param(params, "limit", 256);
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be a positive integer"));
+        return agent_tools::tool_result_t::error(std::string("limit must be a positive integer"));
     if (limit > 4096)
         limit = 4096;
 
@@ -2383,8 +2382,8 @@ agent_tools::tool_result_t handle_find_input_sources(const json& params)
     data["by_source"] = std::move(bs);
 
     std::ostringstream msg;
-    msg << OBFSTR("Input-source enumeration: ") << data["count"].get<std::size_t>()
-        << OBFSTR(" callsite(s)");
+    msg << std::string("Input-source enumeration: ") << data["count"].get<std::size_t>()
+        << std::string(" callsite(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2392,12 +2391,12 @@ agent_tools::tool_result_t handle_find_format_string_bugs(const json& params)
 {
     int limit = extract_int_param(params, "limit", 256);
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be a positive integer"));
+        return agent_tools::tool_result_t::error(std::string("limit must be a positive integer"));
     if (limit > 4096)
         limit = 4096;
 
     if (!init_hexrays_plugin())
-        return agent_tools::tool_result_t::error(OBFSTR("Hex-Rays not available"));
+        return agent_tools::tool_result_t::error(std::string("Hex-Rays not available"));
 
     std::vector<vuln_finding_t> findings;
     decompile_cache_t cache;
@@ -2459,7 +2458,7 @@ agent_tools::tool_result_t handle_find_format_string_bugs(const json& params)
     data["primary_cwe"] = 134;
 
     std::ostringstream msg;
-    msg << OBFSTR("Format-string-bug scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Format-string-bug scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2541,7 +2540,7 @@ agent_tools::tool_result_t handle_find_command_injection_sites(const json& param
 {
     int limit = extract_int_param(params, "limit", 256);
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be a positive integer"));
+        return agent_tools::tool_result_t::error(std::string("limit must be a positive integer"));
     if (limit > 4096)
         limit = 4096;
 
@@ -2557,7 +2556,7 @@ agent_tools::tool_result_t handle_find_command_injection_sites(const json& param
     data["primary_cwe"] = 78;
 
     std::ostringstream msg;
-    msg << OBFSTR("Command-injection scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Command-injection scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2565,7 +2564,7 @@ agent_tools::tool_result_t handle_find_path_traversal_sites(const json& params)
 {
     int limit = extract_int_param(params, "limit", 256);
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be a positive integer"));
+        return agent_tools::tool_result_t::error(std::string("limit must be a positive integer"));
     if (limit > 4096)
         limit = 4096;
 
@@ -2581,7 +2580,7 @@ agent_tools::tool_result_t handle_find_path_traversal_sites(const json& params)
     data["primary_cwe"] = 22;
 
     std::ostringstream msg;
-    msg << OBFSTR("Path-traversal scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Path-traversal scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2591,12 +2590,12 @@ agent_tools::tool_result_t handle_find_calls_to(const json& params)
     if (names.empty())
         names = extract_names_param(params, "name");
     if (names.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("names must contain at least one symbol"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("names must contain at least one symbol"), "bad_param");
     if (names.size() > 256)
-        return agent_tools::tool_result_t::error(OBFSTR("find_calls_to accepts at most 256 names"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("find_calls_to accepts at most 256 names"), "bad_param");
     int limit = extract_int_param(params, "limit", 4096);
     if (limit <= 0)
-        return agent_tools::tool_result_t::error(OBFSTR("limit must be positive"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("limit must be positive"), "bad_param");
     if (limit > 16384)
         limit = 16384;
     std::vector<std::string> unresolved;
@@ -2611,7 +2610,7 @@ agent_tools::tool_result_t handle_find_calls_to(const json& params)
     data["unresolved_names"] = unresolved;
     data["count"] = calls.size();
     data["capped"] = capped;
-    return agent_tools::tool_result_t::ok(OBFSTR("Callsites found: ") + std::to_string(calls.size()), data);
+    return agent_tools::tool_result_t::ok(std::string("Callsites found: ") + std::to_string(calls.size()), data);
 }
 
 agent_tools::tool_result_t handle_summarize_validators_in_function(const json& params)
@@ -2619,12 +2618,12 @@ agent_tools::tool_result_t handle_summarize_validators_in_function(const json& p
     const std::string addr_s = extract_string_param(params, "address", "");
     auto parsed = agent_tools::helpers::parse_address(addr_s);
     if (!parsed.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("address is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("address is required"), "bad_param");
     func_t* pfn = get_func(*parsed);
     if (pfn == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("address does not lie inside a function"), "no_function_at_addr");
+        return agent_tools::tool_result_t::error(std::string("address does not lie inside a function"), "no_function_at_addr");
     validator_summary_t s = summarize_validators_in_function(pfn->start_ea);
-    return agent_tools::tool_result_t::ok(OBFSTR("Validator summary"), validator_summary_to_json(s));
+    return agent_tools::tool_result_t::ok(std::string("Validator summary"), validator_summary_to_json(s));
 }
 
 agent_tools::tool_result_t handle_reverse_slice_sink_to_sources(const json& params)
@@ -2632,14 +2631,14 @@ agent_tools::tool_result_t handle_reverse_slice_sink_to_sources(const json& para
     const std::string sink_s = extract_string_param(params, "sink_call_ea", "");
     auto parsed = agent_tools::helpers::parse_address(sink_s);
     if (!parsed.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("sink_call_ea is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("sink_call_ea is required"), "bad_param");
     json data = reverse_slice_sink_to_sources(*parsed,
         extract_int_param(params, "max_depth", 6),
         extract_string_param(params, "source_category", "network"),
         extract_int_param(params, "max_paths", 8),
         extract_bool_param(params, "require_no_validator", false),
         extract_bool_param(params, "require_pre_auth", false));
-    return agent_tools::tool_result_t::ok(OBFSTR("Reverse slice paths: ") +
+    return agent_tools::tool_result_t::ok(std::string("Reverse slice paths: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -2648,23 +2647,23 @@ agent_tools::tool_result_t handle_forward_reachability_source_to_sinks(const jso
     const std::string src_s = extract_string_param(params, "source_func_ea", "");
     auto parsed = agent_tools::helpers::parse_address(src_s);
     if (!parsed.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("source_func_ea is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("source_func_ea is required"), "bad_param");
     func_t* pfn = get_func(*parsed);
     if (pfn == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("source_func_ea does not lie inside a function"), "no_function_at_addr");
+        return agent_tools::tool_result_t::error(std::string("source_func_ea does not lie inside a function"), "no_function_at_addr");
     json data = forward_reachability_source_to_sinks(pfn->start_ea,
         extract_int_param(params, "max_depth", 6),
         extract_string_param(params, "sink_category", "all"),
         extract_int_param(params, "max_hits", 64),
         extract_bool_param(params, "require_no_validator", false));
-    return agent_tools::tool_result_t::ok(OBFSTR("Forward sink reachability: ") +
+    return agent_tools::tool_result_t::ok(std::string("Forward sink reachability: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
 agent_tools::tool_result_t handle_protocol_attack_surface_report(const json&)
 {
     json data = protocol_attack_surface_report();
-    return agent_tools::tool_result_t::ok(OBFSTR("Protocol attack surface report"), data);
+    return agent_tools::tool_result_t::ok(std::string("Protocol attack surface report"), data);
 }
 
 agent_tools::tool_result_t handle_find_pre_auth_paths(const json& params)
@@ -2675,7 +2674,7 @@ agent_tools::tool_result_t handle_find_pre_auth_paths(const json& params)
         extract_int_param(params, "max_depth", 6),
         extract_int_param(params, "max_paths", 32),
         extract_bool_param(params, "require_no_validator", true));
-    return agent_tools::tool_result_t::ok(OBFSTR("Pre-auth paths: ") +
+    return agent_tools::tool_result_t::ok(std::string("Pre-auth paths: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -2685,7 +2684,7 @@ agent_tools::tool_result_t handle_find_dispatch_tables(const json& params)
         extract_int_param(params, "min_entries", 4),
         extract_int_param(params, "max_entries", 256),
         extract_bool_param(params, "include_vtables", true));
-    return agent_tools::tool_result_t::ok(OBFSTR("Dispatch tables: ") +
+    return agent_tools::tool_result_t::ok(std::string("Dispatch tables: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -2694,21 +2693,21 @@ agent_tools::tool_result_t handle_find_parser_shaped_functions(const json& param
     json data = find_parser_shaped_functions(
         extract_int_param(params, "top_k", 50),
         extract_bool_param(params, "only_reachable_from_network", true));
-    return agent_tools::tool_result_t::ok(OBFSTR("Parser-shaped functions: ") +
+    return agent_tools::tool_result_t::ok(std::string("Parser-shaped functions: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
 agent_tools::tool_result_t handle_find_safearray_misuse(const json& params)
 {
     json data = find_safearray_misuse(extract_int_param(params, "limit", 64));
-    return agent_tools::tool_result_t::ok(OBFSTR("SAFEARRAY misuse candidates: ") +
+    return agent_tools::tool_result_t::ok(std::string("SAFEARRAY misuse candidates: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
 agent_tools::tool_result_t handle_find_int_overflow_alloc_from_input(const json& params)
 {
     json data = find_int_overflow_alloc_from_input(extract_int_param(params, "limit", 64));
-    return agent_tools::tool_result_t::ok(OBFSTR("Integer-overflow allocation candidates: ") +
+    return agent_tools::tool_result_t::ok(std::string("Integer-overflow allocation candidates: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -2716,7 +2715,7 @@ void register_tier1_callsite_tools()
 {
     auto& registry = agent_tools::ToolRegistry::instance();
     auto register_taint_required = [&](agent_tools::tool_definition_t def) {
-        def.required_indices = {OBFSTR("taint_engine")};
+        def.required_indices = {std::string("taint_engine")};
         registry.register_tool(def);
     };
     auto register_nondeterministic = [&](agent_tools::tool_definition_t def) {
@@ -2726,29 +2725,29 @@ void register_tier1_callsite_tools()
 
     {
         agent_tools::tool_param_t category_param;
-        category_param.name        = OBFSTR("category");
-        category_param.type        = OBFSTR("string");
-        category_param.description = OBFSTR("Sink category to enumerate. One of: all, "
+        category_param.name        = std::string("category");
+        category_param.type        = std::string("string");
+        category_param.description = std::string("Sink category to enumerate. One of: all, "
                                             "buffer_overflow, command_injection, path_traversal, "
                                             "format_string. Defaults to all.");
         category_param.required    = false;
         category_param.enum_values = {
-            OBFSTR("all"),
-            OBFSTR("buffer_overflow"),
-            OBFSTR("command_injection"),
-            OBFSTR("path_traversal"),
-            OBFSTR("format_string"),
+            std::string("all"),
+            std::string("buffer_overflow"),
+            std::string("command_injection"),
+            std::string("path_traversal"),
+            std::string("format_string"),
         };
         agent_tools::tool_param_t limit_param;
-        limit_param.name        = OBFSTR("limit");
-        limit_param.type        = OBFSTR("number");
-        limit_param.description = OBFSTR("Maximum number of findings to return (default 256, max 4096).");
+        limit_param.name        = std::string("limit");
+        limit_param.type        = std::string("number");
+        limit_param.description = std::string("Maximum number of findings to return (default 256, max 4096).");
         limit_param.required    = false;
 
         registry.register_tool({
-            OBFSTR("find_vulnerable_sinks"),
-            OBFSTR("vuln"),
-            OBFSTR("Enumerate calls to known dangerous sink functions across the binary. "
+            std::string("find_vulnerable_sinks"),
+            std::string("vuln"),
+            std::string("Enumerate calls to known dangerous sink functions across the binary. "
                    "Categories cover buffer overflow (strcpy/memcpy/sprintf/...), command injection "
                    "(system/exec*/CreateProcess/ShellExecute/...), path traversal (fopen/CreateFile/...), "
                    "and format-string sinks (printf/sprintf/...). Each finding records the caller, "
@@ -2761,15 +2760,15 @@ void register_tier1_callsite_tools()
 
     {
         agent_tools::tool_param_t limit_param;
-        limit_param.name        = OBFSTR("limit");
-        limit_param.type        = OBFSTR("number");
-        limit_param.description = OBFSTR("Maximum number of callsites to return (default 256, max 4096).");
+        limit_param.name        = std::string("limit");
+        limit_param.type        = std::string("number");
+        limit_param.description = std::string("Maximum number of callsites to return (default 256, max 4096).");
         limit_param.required    = false;
 
         registry.register_tool({
-            OBFSTR("find_input_sources"),
-            OBFSTR("vuln"),
-            OBFSTR("Enumerate callsites for known input-source functions (recv/recvfrom, ReadFile, "
+            std::string("find_input_sources"),
+            std::string("vuln"),
+            std::string("Enumerate callsites for known input-source functions (recv/recvfrom, ReadFile, "
                    "fread/fgets, scanf-family, getenv, GetCommandLine, RegQueryValueEx, "
                    "WinHttpReadData, etc.). These are the canonical taint origins for downstream "
                    "taint analysis."),
@@ -2781,15 +2780,15 @@ void register_tier1_callsite_tools()
 
     {
         agent_tools::tool_param_t limit_param;
-        limit_param.name        = OBFSTR("limit");
-        limit_param.type        = OBFSTR("number");
-        limit_param.description = OBFSTR("Maximum number of findings to return (default 256, max 4096).");
+        limit_param.name        = std::string("limit");
+        limit_param.type        = std::string("number");
+        limit_param.description = std::string("Maximum number of findings to return (default 256, max 4096).");
         limit_param.required    = false;
 
         registry.register_tool({
-            OBFSTR("find_format_string_bugs"),
-            OBFSTR("vuln"),
-            OBFSTR("Locate format-string vulnerabilities (CWE-134) by decompiling each caller of a "
+            std::string("find_format_string_bugs"),
+            std::string("vuln"),
+            std::string("Locate format-string vulnerabilities (CWE-134) by decompiling each caller of a "
                    "printf-family sink and confirming that the format-string argument at the "
                    "documented position is NOT a literal. Findings are emitted with severity=high "
                    "and confidence=likely."),
@@ -2801,15 +2800,15 @@ void register_tier1_callsite_tools()
 
     {
         agent_tools::tool_param_t limit_param;
-        limit_param.name        = OBFSTR("limit");
-        limit_param.type        = OBFSTR("number");
-        limit_param.description = OBFSTR("Maximum number of findings to return (default 256, max 4096).");
+        limit_param.name        = std::string("limit");
+        limit_param.type        = std::string("number");
+        limit_param.description = std::string("Maximum number of findings to return (default 256, max 4096).");
         limit_param.required    = false;
 
         registry.register_tool({
-            OBFSTR("find_command_injection_sites"),
-            OBFSTR("vuln"),
-            OBFSTR("Locate command-execution callsites (system/_wsystem/popen/exec*/CreateProcess*/"
+            std::string("find_command_injection_sites"),
+            std::string("vuln"),
+            std::string("Locate command-execution callsites (system/_wsystem/popen/exec*/CreateProcess*/"
                    "ShellExecute*/WinExec) and classify whether the command-line / file argument at "
                    "the documented position is a literal or a non-literal (likely attacker-influenced) "
                    "value. CWE-78."),
@@ -2821,15 +2820,15 @@ void register_tier1_callsite_tools()
 
     {
         agent_tools::tool_param_t limit_param;
-        limit_param.name        = OBFSTR("limit");
-        limit_param.type        = OBFSTR("number");
-        limit_param.description = OBFSTR("Maximum number of findings to return (default 256, max 4096).");
+        limit_param.name        = std::string("limit");
+        limit_param.type        = std::string("number");
+        limit_param.description = std::string("Maximum number of findings to return (default 256, max 4096).");
         limit_param.required    = false;
 
         registry.register_tool({
-            OBFSTR("find_path_traversal_sites"),
-            OBFSTR("vuln"),
-            OBFSTR("Locate filesystem-API callsites (fopen/_wfopen/open/CreateFile*/Move/Copy/Delete) "
+            std::string("find_path_traversal_sites"),
+            std::string("vuln"),
+            std::string("Locate filesystem-API callsites (fopen/_wfopen/open/CreateFile*/Move/Copy/Delete) "
                    "and classify whether the path argument at the documented position is a literal "
                    "or a non-literal (likely attacker-influenced) value. CWE-22."),
             { limit_param },
@@ -2839,125 +2838,125 @@ void register_tier1_callsite_tools()
     }
 
     registry.register_tool({
-        OBFSTR("find_calls_to"),
-        OBFSTR("vuln"),
-        OBFSTR("Resolve up to 256 target names through the cached import/export/function name index and return every code callsite xref with caller, callee, and summarized literal arguments."),
+        std::string("find_calls_to"),
+        std::string("vuln"),
+        std::string("Resolve up to 256 target names through the cached import/export/function name index and return every code callsite xref with caller, callee, and summarized literal arguments."),
         {
-            {OBFSTR("names"), OBFSTR("array"), OBFSTR("Target function/import names. Hard cap: 256."), true},
-            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum callsites to return (default 4096, max 16384)."), false},
+            {std::string("names"), std::string("array"), std::string("Target function/import names. Hard cap: 256."), true},
+            {std::string("limit"), std::string("number"), std::string("Maximum callsites to return (default 4096, max 16384)."), false},
         },
         handle_find_calls_to,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("summarize_validators_in_function"),
-        OBFSTR("vuln"),
-        OBFSTR("Summarize length validators, integer checked-math helpers, auth gates, and len/size/count comparisons in one function."),
+        std::string("summarize_validators_in_function"),
+        std::string("vuln"),
+        std::string("Summarize length validators, integer checked-math helpers, auth gates, and len/size/count comparisons in one function."),
         {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Address inside the function to summarize."), true},
+            {std::string("address"), std::string("string"), std::string("Address inside the function to summarize."), true},
         },
         handle_summarize_validators_in_function,
         true,
     });
 
     register_taint_required({
-        OBFSTR("reverse_slice_sink_to_sources"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Reverse BFS from a sink callsite through caller xrefs to protocol/input sources, annotating validators and auth gates seen along each path."),
+        std::string("reverse_slice_sink_to_sources"),
+        std::string("vuln_advanced"),
+        std::string("Reverse BFS from a sink callsite through caller xrefs to protocol/input sources, annotating validators and auth gates seen along each path."),
         {
-            {OBFSTR("sink_call_ea"), OBFSTR("string"), OBFSTR("Sink callsite address."), true},
-            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum caller depth (default 6, max 12)."), false},
-            {OBFSTR("source_category"), OBFSTR("string"), OBFSTR("Source family: network, rpc, com, alpc, pipe, socket, http, websocket, ndis, kernel_irp, input, all."), false},
-            {OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Maximum paths (default 8, max 32)."), false},
-            {OBFSTR("require_no_validator"), OBFSTR("boolean"), OBFSTR("Only return paths with no validator evidence."), false},
-            {OBFSTR("require_pre_auth"), OBFSTR("boolean"), OBFSTR("Only return paths with no auth-gate evidence."), false},
+            {std::string("sink_call_ea"), std::string("string"), std::string("Sink callsite address."), true},
+            {std::string("max_depth"), std::string("number"), std::string("Maximum caller depth (default 6, max 12)."), false},
+            {std::string("source_category"), std::string("string"), std::string("Source family: network, rpc, com, alpc, pipe, socket, http, websocket, ndis, kernel_irp, input, all."), false},
+            {std::string("max_paths"), std::string("number"), std::string("Maximum paths (default 8, max 32)."), false},
+            {std::string("require_no_validator"), std::string("boolean"), std::string("Only return paths with no validator evidence."), false},
+            {std::string("require_pre_auth"), std::string("boolean"), std::string("Only return paths with no auth-gate evidence."), false},
         },
         handle_reverse_slice_sink_to_sources,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("forward_reachability_source_to_sinks"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Forward BFS from a source function to dangerous sinks, returning sink hits and per-function validator annotations."),
+        std::string("forward_reachability_source_to_sinks"),
+        std::string("vuln_advanced"),
+        std::string("Forward BFS from a source function to dangerous sinks, returning sink hits and per-function validator annotations."),
         {
-            {OBFSTR("source_func_ea"), OBFSTR("string"), OBFSTR("Source function address."), true},
-            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum callee depth (default 6, max 12)."), false},
-            {OBFSTR("sink_category"), OBFSTR("string"), OBFSTR("Sink family: all, buffer_overflow, command_injection, path_traversal, format_string, safearray, deserialization."), false},
-            {OBFSTR("max_hits"), OBFSTR("number"), OBFSTR("Maximum sink hits (default 64, max 512)."), false},
-            {OBFSTR("require_no_validator"), OBFSTR("boolean"), OBFSTR("Only include sink functions with no validator evidence."), false},
+            {std::string("source_func_ea"), std::string("string"), std::string("Source function address."), true},
+            {std::string("max_depth"), std::string("number"), std::string("Maximum callee depth (default 6, max 12)."), false},
+            {std::string("sink_category"), std::string("string"), std::string("Sink family: all, buffer_overflow, command_injection, path_traversal, format_string, safearray, deserialization."), false},
+            {std::string("max_hits"), std::string("number"), std::string("Maximum sink hits (default 64, max 512)."), false},
+            {std::string("require_no_validator"), std::string("boolean"), std::string("Only include sink functions with no validator evidence."), false},
         },
         handle_forward_reachability_source_to_sinks,
         true,
     });
 
     register_nondeterministic({
-        OBFSTR("protocol_attack_surface_report"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Survey RPC, COM, ALPC, named pipe, socket, HTTP, WebSocket, NDIS/WSK, and kernel IRP ingress callsites, grouped by handler function with downstream sink counts."),
+        std::string("protocol_attack_surface_report"),
+        std::string("vuln_advanced"),
+        std::string("Survey RPC, COM, ALPC, named pipe, socket, HTTP, WebSocket, NDIS/WSK, and kernel IRP ingress callsites, grouped by handler function with downstream sink counts."),
         {},
         handle_protocol_attack_surface_report,
         true,
     });
 
     register_taint_required({
-        OBFSTR("find_pre_auth_paths"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Fan out from protocol/input ingress functions to sinks and return paths that do not pass an auth-gate; optionally require no validator evidence."),
+        std::string("find_pre_auth_paths"),
+        std::string("vuln_advanced"),
+        std::string("Fan out from protocol/input ingress functions to sinks and return paths that do not pass an auth-gate; optionally require no validator evidence."),
         {
-            {OBFSTR("source_category"), OBFSTR("string"), OBFSTR("Source family (default network)."), false},
-            {OBFSTR("sink_category"), OBFSTR("string"), OBFSTR("Sink family (default all)."), false},
-            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum depth (default 6)."), false},
-            {OBFSTR("max_paths"), OBFSTR("number"), OBFSTR("Maximum paths (default 32)."), false},
-            {OBFSTR("require_no_validator"), OBFSTR("boolean"), OBFSTR("Only return no-validator paths (default true)."), false},
+            {std::string("source_category"), std::string("string"), std::string("Source family (default network)."), false},
+            {std::string("sink_category"), std::string("string"), std::string("Sink family (default all)."), false},
+            {std::string("max_depth"), std::string("number"), std::string("Maximum depth (default 6)."), false},
+            {std::string("max_paths"), std::string("number"), std::string("Maximum paths (default 32)."), false},
+            {std::string("require_no_validator"), std::string("boolean"), std::string("Only return no-validator paths (default true)."), false},
         },
         handle_find_pre_auth_paths,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_dispatch_tables"),
-        OBFSTR("vuln"),
-        OBFSTR("Structurally scan read-only segments for pointer-sized arrays whose entries all resolve to function starts in code segments. Uses 8-byte slots for 64-bit IDBs and 4-byte slots for 32-bit IDBs."),
+        std::string("find_dispatch_tables"),
+        std::string("vuln"),
+        std::string("Structurally scan read-only segments for pointer-sized arrays whose entries all resolve to function starts in code segments. Uses 8-byte slots for 64-bit IDBs and 4-byte slots for 32-bit IDBs."),
         {
-            {OBFSTR("min_entries"), OBFSTR("number"), OBFSTR("Minimum consecutive function pointers (default 4)."), false},
-            {OBFSTR("max_entries"), OBFSTR("number"), OBFSTR("Maximum entries per table (default 256)."), false},
-            {OBFSTR("include_vtables"), OBFSTR("boolean"), OBFSTR("Include likely vtable-shaped arrays (default true)."), false},
+            {std::string("min_entries"), std::string("number"), std::string("Minimum consecutive function pointers (default 4)."), false},
+            {std::string("max_entries"), std::string("number"), std::string("Maximum entries per table (default 256)."), false},
+            {std::string("include_vtables"), std::string("boolean"), std::string("Include likely vtable-shaped arrays (default true)."), false},
         },
         handle_find_dispatch_tables,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_parser_shaped_functions"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Rank functions by parser-shaped control flow: loops, switch dispatch, non-literal indexing, copy calls inside loops, and byte operations."),
+        std::string("find_parser_shaped_functions"),
+        std::string("vuln_advanced"),
+        std::string("Rank functions by parser-shaped control flow: loops, switch dispatch, non-literal indexing, copy calls inside loops, and byte operations."),
         {
-            {OBFSTR("top_k"), OBFSTR("number"), OBFSTR("Maximum ranked functions (default 50)."), false},
-            {OBFSTR("only_reachable_from_network"), OBFSTR("boolean"), OBFSTR("Filter to attacker-reachable functions (default true)."), false},
+            {std::string("top_k"), std::string("number"), std::string("Maximum ranked functions (default 50)."), false},
+            {std::string("only_reachable_from_network"), std::string("boolean"), std::string("Filter to attacker-reachable functions (default true)."), false},
         },
         handle_find_parser_shaped_functions,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_safearray_misuse"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Find SAFEARRAY parser calls in functions lacking recognized checked integer math or bounds helpers."),
+        std::string("find_safearray_misuse"),
+        std::string("vuln_advanced"),
+        std::string("Find SAFEARRAY parser calls in functions lacking recognized checked integer math or bounds helpers."),
         {
-            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum findings (default 64)."), false},
+            {std::string("limit"), std::string("number"), std::string("Maximum findings (default 64)."), false},
         },
         handle_find_safearray_misuse,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_int_overflow_alloc_from_input"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Find allocation calls whose size arguments contain add/mul/shift arithmetic without checked integer helpers, prioritizing input-source functions."),
+        std::string("find_int_overflow_alloc_from_input"),
+        std::string("vuln_advanced"),
+        std::string("Find allocation calls whose size arguments contain add/mul/shift arithmetic without checked integer helpers, prioritizing input-source functions."),
         {
-            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum findings (default 64)."), false},
+            {std::string("limit"), std::string("number"), std::string("Maximum findings (default 64)."), false},
         },
         handle_find_int_overflow_alloc_from_input,
         true,

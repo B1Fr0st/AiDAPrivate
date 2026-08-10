@@ -2152,132 +2152,11 @@ void persist_workspace_state()
 }
 
 
-namespace {
-
-
-bool find_exe_code_section(HMODULE mod, std::uint64_t& out_base, std::uint32_t& out_size) {
-    const auto* base_ptr = reinterpret_cast<const std::uint8_t*>(mod);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base_ptr);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return false;
-
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base_ptr + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE)
-        return false;
-
-    const auto* section = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        const auto& current_section = section[static_cast<std::size_t>(i)];
-        if ((current_section.Characteristics & IMAGE_SCN_CNT_CODE) != 0
-            && current_section.Misc.VirtualSize > 0) {
-            out_base = reinterpret_cast<std::uint64_t>(mod) + current_section.VirtualAddress;
-            out_size = current_section.Misc.VirtualSize;
-            return true;
-        }
-    }
-    return false;
-}
-
-
-std::uint64_t hash_code_section(const void* data, std::size_t size) {
-    const auto* ptr = static_cast<const std::uint8_t*>(data);
-    std::uint64_t h1 = 0xFFFFFFFFULL;
-    std::uint64_t h2 = 0x85EBCA6BULL;
-
-    const std::size_t chunks = size / 8;
-    const auto* ptr64 = reinterpret_cast<const std::uint64_t*>(ptr);
-    for (std::size_t i = 0; i < chunks; ++i) {
-        h1 = _mm_crc32_u64(h1, ptr64[i]);
-        h2 = _mm_crc32_u64(h2, ptr64[i] ^ 0xA5A5A5A5A5A5A5A5ULL);
-    }
-
-    const std::size_t remaining = size % 8;
-    const auto* tail = ptr + chunks * 8;
-    for (std::size_t i = 0; i < remaining; ++i) {
-        h1 = _mm_crc32_u8(static_cast<std::uint32_t>(h1), tail[i]);
-        h2 = _mm_crc32_u8(static_cast<std::uint32_t>(h2), tail[i] ^ 0xA5u);
-    }
-
-    return (h1 & 0xFFFFFFFFULL) | ((h2 & 0xFFFFFFFFULL) << 32);
-}
-
-
-void register_standalone_protection() {
-    if (!driver_bridge::using_kernel_driver()) {
-        if (!driver_bridge::load_kernel_driver())
-            return;
-    }
-
-    auto dyn = driver_bridge::dynamic_ioctl_state();
-    if (!dyn.ready) {
-        diag::log_tagged_fmt("init_chat",
-            "preauth_skipped_dynamic_ioctl_not_ready phase=register_standalone_protection op=heartbeat loaded=%d kernel=%d connected=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
-            dyn.loaded ? 1 : 0,
-            dyn.kernel ? 1 : 0,
-            dyn.connected ? 1 : 0,
-            dyn.instance_server_seed,
-            dyn.instance_ioctl_seed,
-            dyn.global_server_seed,
-            dyn.global_ioctl_seed,
-            dyn.ioctl_seed_hash,
-            dyn.heartbeat_ioctl_seed_hash);
-        diag::log_tagged_fmt("init_chat", "register_standalone_protection_deferred dynamic_ioctl_ready=0");
-        return;
-    }
-
-    if (!driver_bridge::refresh_heartbeat())
-        return;
-
-    HMODULE exe_module = GetModuleHandleW(nullptr);
-    if (!exe_module)
-        return;
-
-    std::uint64_t text_base = 0;
-    std::uint32_t text_size = 0;
-    if (!find_exe_code_section(exe_module, text_base, text_size) || text_size == 0)
-        return;
-
-    std::uint64_t text_hash = hash_code_section(
-        reinterpret_cast<const void*>(text_base), text_size);
-    if (text_hash == 0)
-        return;
-
-    const bool protected_ok = driver_bridge::register_self_dll_protection(
-        reinterpret_cast<std::uint64_t>(exe_module),
-        text_base,
-        text_size,
-        text_hash,
-        2000
-    );
-    diag::log_tagged_fmt("init_chat",
-        "register_standalone_protection_result ok=%d image=0x%016llX text=0x%016llX text_size=0x%08X hash=0x%016llX",
-        protected_ok ? 1 : 0,
-        static_cast<unsigned long long>(reinterpret_cast<std::uint64_t>(exe_module)),
-        static_cast<unsigned long long>(text_base),
-        text_size,
-        static_cast<unsigned long long>(text_hash));
-}
-
-}
-
-
-
-
 __declspec(noinline) static DWORD seh_settings_load(settings_sa_t& s, bool& out_ok)
 {
     out_ok = false;
     __try {
         out_ok = s.load();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return GetExceptionCode();
-    }
-    return 0;
-}
-
-__declspec(noinline) static DWORD seh_register_standalone_protection_call()
-{
-    __try {
-        register_standalone_protection();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return GetExceptionCode();
     }
@@ -2455,46 +2334,14 @@ void init_standalone_chat()
     diag::log_tagged("init_chat", "marketplace_autoconnect_deferred_until_authorized_ide");
     diag::log_tagged("init_chat", "marketplace_load_installed_done");
 
-    {
-        auto dyn = driver_bridge::dynamic_ioctl_state();
-        diag::log_tagged_fmt("init_chat",
-            "driver_bridge_initialize_start run_id=%s loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X",
-            run_id.c_str(),
-            dyn.loaded ? 1 : 0,
-            dyn.kernel ? 1 : 0,
-            dyn.connected ? 1 : 0,
-            dyn.ready ? 1 : 0,
-            dyn.instance_server_seed,
-            dyn.instance_ioctl_seed,
-            dyn.global_server_seed,
-            dyn.global_ioctl_seed,
-            dyn.ioctl_seed_hash,
-            dyn.heartbeat_ioctl_seed_hash);
-    }
+    diag::log_tagged_fmt("init_chat", "driver_bridge_initialize_start run_id=%s", run_id.c_str());
     driver_bridge::initialize();
-    {
-        auto dyn = driver_bridge::dynamic_ioctl_state();
-        diag::log_tagged_fmt("init_chat",
-            "driver_bridge_initialize_done run_id=%s loaded=%d kernel=%d connected=%d dyn_ready=%d inst_seed=%u/%u global_seed=%u/%u ioctl_seed_hash=0x%08X hb_ioctl_seed_hash=0x%08X status=%.160s",
-            run_id.c_str(),
-            dyn.loaded ? 1 : 0,
-            dyn.kernel ? 1 : 0,
-            dyn.connected ? 1 : 0,
-            dyn.ready ? 1 : 0,
-            dyn.instance_server_seed,
-            dyn.instance_ioctl_seed,
-            dyn.global_server_seed,
-            dyn.global_ioctl_seed,
-            dyn.ioctl_seed_hash,
-            dyn.heartbeat_ioctl_seed_hash,
-            driver_bridge::status().c_str());
-    }
-
-    diag::log_tagged("init_chat", "register_standalone_protection_start");
-    DWORD seh_rsp = seh_register_standalone_protection_call();
-    if (seh_rsp != 0)
-        diag::log_tagged_fmt("init_chat", "register_standalone_protection_seh code=0x%08lX last_err=%lu", seh_rsp, GetLastError());
-    diag::log_tagged("init_chat", "register_standalone_protection_done");
+    diag::log_tagged_fmt("init_chat",
+        "driver_bridge_initialize_done run_id=%s loaded=%d kernel=%d status=%.160s",
+        run_id.c_str(),
+        driver_bridge::is_loaded() ? 1 : 0,
+        driver_bridge::using_kernel_driver() ? 1 : 0,
+        driver_bridge::status().c_str());
 
     diag::log_tagged("init_chat", "restore_workspace_state_start");
     DWORD seh_rws = seh_restore_workspace_state();

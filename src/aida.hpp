@@ -61,11 +61,9 @@ private:
     bool features_initialized = false;
     bool ui_listener_hooked = false;
     bool actions_registered = false;
-    qtimer_t self_watchdog_timer = nullptr;
     std::unique_ptr<aida::vuln::chain_verifier_service_t> chain_verifier_service;
     std::string disabled_detail;
 #ifdef __NT__
-    std::thread public_ip_thread;
     std::thread graphrag_load_thread;
 #endif
 };

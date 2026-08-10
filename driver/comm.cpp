@@ -47,9 +47,6 @@ typedef CLIENT_ID* PCLIENT_ID;
 namespace {
     std::atomic<std::uint64_t> g_remote_call_um_sequence{1};
 
-    using send_request_success_cb_t = void(*)();
-    std::atomic<send_request_success_cb_t> g_send_request_success_cb{nullptr};
-
     struct remote_call_um_attempt_diag_t {
         const char* failure_class = "none";
         DWORD gle = ERROR_SUCCESS;
@@ -2806,14 +2803,6 @@ std::uint64_t voyager::device_t::call_function_attempt(
     SetLastError(completed ? ERROR_SUCCESS : remote_call_um_failure_gle(g_remote_call_um_attempt_diag));
     return result;
 }
-void voyager::install_send_request_success_callback(voyager::send_request_success_callback_t callback) noexcept {
-    g_send_request_success_cb.store(reinterpret_cast<send_request_success_cb_t>(callback), std::memory_order_release);
-    diag::log_tagged_fmt("comm",
-        "send_request_success_callback_installed callback=%p local_pid=%lu local_tid=%lu",
-        reinterpret_cast<void*>(callback),
-        static_cast<unsigned long>(GetCurrentProcessId()),
-        static_cast<unsigned long>(GetCurrentThreadId()));
-}
 
 namespace {
 }
@@ -2874,8 +2863,6 @@ bool voyager::device_t::send_request(DWORD control_code, void* input, DWORD inpu
         return false;
     }
 
-    auto success_cb = g_send_request_success_cb.load(std::memory_order_acquire);
-    if (success_cb) success_cb();
     return true;
 }
 bool voyager::device_t::get_thread_context(std::uint32_t tid, thread_context& ctx) noexcept {

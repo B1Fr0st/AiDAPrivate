@@ -1287,43 +1287,6 @@ static bool driver_feature_ready(const char* feature, int iter = -1) {
     }
     if (!drv_ok)
         return false;
-
-    static std::atomic<uint64_t> s_bridge_cooldown_until_ms{0};
-    uint64_t now = static_cast<uint64_t>(GetTickCount64());
-    uint64_t cooldown_until = s_bridge_cooldown_until_ms.load(std::memory_order_acquire);
-    if (cooldown_until != 0 && now < cooldown_until) {
-        if (iter < 0 || iter <= 3 || (iter % 10) == 0) {
-            diag::log_tagged_fmt("network",
-                "%s_driver_gate bridge_cooldown iter=%d remaining_ms=%llu",
-                feature ? feature : "network",
-                iter,
-                static_cast<unsigned long long>(cooldown_until - now));
-        }
-        return false;
-    }
-
-    ::SetLastError(ERROR_SUCCESS);
-    bool bridge_ok = driver_bridge::refresh_heartbeat();
-    DWORD bridge_err = bridge_ok ? ERROR_SUCCESS : ::GetLastError();
-    if (!bridge_ok) {
-        constexpr uint64_t kBridgeFailureCooldownMs = 5000;
-        s_bridge_cooldown_until_ms.store(now + kBridgeFailureCooldownMs, std::memory_order_release);
-        diag::log_tagged_fmt("network",
-            "%s_driver_gate bridge_heartbeat_failed iter=%d err=%lu cooldown_ms=%llu",
-            feature ? feature : "network",
-            iter,
-            static_cast<unsigned long>(bridge_err),
-            static_cast<unsigned long long>(kBridgeFailureCooldownMs));
-        return false;
-    }
-
-    if (cooldown_until != 0) {
-        s_bridge_cooldown_until_ms.store(0, std::memory_order_release);
-        diag::log_tagged_fmt("network",
-            "%s_driver_gate bridge_heartbeat_recovered iter=%d",
-            feature ? feature : "network",
-            iter);
-    }
     return true;
 }
 

@@ -1649,9 +1649,6 @@ namespace voyager {
         static_assert(std::is_trivially_copyable_v<T>, "T must be trivially copyable for memory operations");
         write_raw(address, &value, sizeof(T));
     }
-
-    using send_request_success_callback_t = void(*)();
-    void install_send_request_success_callback(send_request_success_callback_t callback) noexcept;
 }
 
 inline std::unique_ptr<voyager::device_t> device = std::make_unique<voyager::device_t>();

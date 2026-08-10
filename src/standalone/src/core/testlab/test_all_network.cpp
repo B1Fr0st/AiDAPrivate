@@ -4331,12 +4331,14 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     bool drv_phase_barrier_ready = false;
     if (driver_bridge::using_kernel_driver()) {
         const ULONGLONG barrier_start = GetTickCount64();
-        drv_phase_barrier_ready = driver_bridge::require_dynamic_session_ready(5000);
+        std::string barrier_reason;
+        drv_phase_barrier_ready = driver_bridge::kernel_session_available(&barrier_reason);
         const ULONGLONG barrier_elapsed = GetTickCount64() - barrier_start;
         log_msg(hf, "net_phase",
-            "drv_phase_barrier ready=%d elapsed_ms=%llu timeout_ms=5000",
+            "drv_phase_barrier ready=%d elapsed_ms=%llu reason=\"%s\"",
             drv_phase_barrier_ready ? 1 : 0,
-            static_cast<unsigned long long>(barrier_elapsed));
+            static_cast<unsigned long long>(barrier_elapsed),
+            barrier_reason.empty() ? "<empty>" : barrier_reason.c_str());
     } else {
         log_msg(hf, "net_phase",
             "drv_phase_barrier skipped reason=kernel_driver_not_loaded driver_status=\"%s\" last_error=\"%s\"",
@@ -4346,7 +4348,7 @@ void phase_network_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& 
     if (driver_bridge::using_kernel_driver() && !drv_phase_barrier_ready) {
         const int aborted_test_count = 25;
         log_msg(hf, "net_phase",
-            "FAIL -- network phase aborted: kernel session not seeded after 5000ms; skipping %d drv_* tests as grouped failure",
+            "FAIL -- network phase aborted: kernel session unavailable; skipping %d drv_* tests as grouped failure",
             aborted_test_count);
         failed.fetch_add(1);
     } else {

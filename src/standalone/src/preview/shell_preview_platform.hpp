@@ -137,50 +137,6 @@ namespace diag
 	inline void log_tagged_critical_fmt(const char*, const char*, ...) {}
 }
 
-namespace anti_tamper
-{
-	namespace webhook
-	{
-		inline void write_log(const char*, const char*) {}
-	}
-
-	namespace state
-	{
-		struct state_t
-		{
-			std::atomic<bool> violation_latched{false};
-			std::atomic<bool> license_pending_activation{false};
-			std::atomic<bool> activation_hardening_done{true};
-			std::atomic<bool> driver_hardening_active{false};
-			std::atomic<bool> driver_hardening_done{true};
-			std::atomic<bool> initialized{true};
-			std::mutex mtx;
-			std::string violation_reason;
-			std::string violation_detail;
-		};
-
-		inline state_t& get()
-		{
-			static state_t value;
-			return value;
-		}
-	}
-}
-
-namespace standalone_license
-{
-	inline bool is_valid() { return true; }
-	inline bool is_arc_loaded() { return true; }
-	inline bool is_arc_download_in_progress() { return false; }
-	inline bool is_arc_transfer_in_progress() { return false; }
-	inline std::string last_error() { return "Preview fixture"; }
-}
-
-namespace session_health
-{
-	inline bool is_alive(std::uint32_t) { return true; }
-}
-
 namespace analysis_session
 {
 	inline bool has_active_target() { return true; }

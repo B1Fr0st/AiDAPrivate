@@ -29,7 +29,6 @@
 
 #include "../agent_tools.hpp"
 #include "../ida_utils.hpp"
-#include "../obfuscation.hpp"
 #include "microcode_engine.hpp"
 #include "taint_engine.hpp"
 #include "vuln_common.hpp"
@@ -1742,7 +1741,7 @@ std::vector<taint_path_t> TaintEngine::trace_paths(ea_t source_ea, ea_t sink_ea,
             s.ea          = sink_ea;
             s.func_ea     = source_func_ea;
             s.func_name   = func_name_for(source_func_ea);
-            s.description = OBFSTR("intraprocedural taint flow");
+            s.description = std::string("intraprocedural taint flow");
             s.condition.clear();
             p.steps.push_back(std::move(s));
             p.conditions = std::move(conditions);
@@ -1776,7 +1775,7 @@ std::vector<taint_path_t> TaintEngine::trace_paths(ea_t source_ea, ea_t sink_ea,
     s0.ea          = source_ea;
     s0.func_ea     = source_func_ea;
     s0.func_name   = func_name_for(source_func_ea);
-    s0.description = OBFSTR("input source observed");
+    s0.description = std::string("input source observed");
     start.steps.push_back(std::move(s0));
     queue.push_back(std::move(start));
 
@@ -1853,8 +1852,8 @@ std::vector<taint_path_t> TaintEngine::trace_paths(ea_t source_ea, ea_t sink_ea,
             st.ea          = hop_ea;
             st.func_ea     = next_ea;
             st.func_name   = func_name_for(next_ea);
-            st.description = OBFSTR("call hop from ") + func_name_for(cur.func_ea) +
-                              OBFSTR(" to ") + st.func_name;
+            st.description = std::string("call hop from ") + func_name_for(cur.func_ea) +
+                              std::string(" to ") + st.func_name;
             nf.steps.push_back(std::move(st));
             queue.push_back(std::move(nf));
             if (static_cast<int>(queue.size()) > max_paths * 8)
@@ -2809,7 +2808,7 @@ TaintEngine::trace_paths_reverse(ea_t sink_ea, int max_paths, int max_depth)
     taint_path_step_t s0;
     s0.ea = sink_ea; s0.func_ea = sink_func_ea;
     s0.func_name = func_name_for(sink_func_ea);
-    s0.description = OBFSTR("sink callsite");
+    s0.description = std::string("sink callsite");
     start.steps.push_back(std::move(s0));
     queue.push_back(std::move(start));
 
@@ -2854,7 +2853,7 @@ TaintEngine::trace_paths_reverse(ea_t sink_ea, int max_paths, int max_depth)
             taint_path_step_t st;
             st.ea = BADADDR; st.func_ea = parent;
             st.func_name = func_name_for(parent);
-            st.description = OBFSTR("caller hop");
+            st.description = std::string("caller hop");
             nf.steps.push_back(std::move(st));
             queue.push_back(std::move(nf));
         }
@@ -3489,7 +3488,7 @@ tool_result_t handle_trace_taint_path(const json& params)
     const std::string source_spec = extract_string_param(params, "source", std::string());
     const std::string sink_spec   = extract_string_param(params, "sink",   std::string());
     if (source_spec.empty() || sink_spec.empty())
-        return tool_result_t::error(OBFSTR("source and sink must be provided"));
+        return tool_result_t::error(std::string("source and sink must be provided"));
 
     int max_paths = extract_int_param(params, "max_paths", 16);
     if (max_paths <= 0) max_paths = 16;
@@ -3502,9 +3501,9 @@ tool_result_t handle_trace_taint_path(const json& params)
     ea_t source_ea = resolve_address_or_name(source_spec);
     ea_t sink_ea   = resolve_address_or_name(sink_spec);
     if (source_ea == BADADDR)
-        return tool_result_t::error(OBFSTR("Could not resolve source: ") + source_spec);
+        return tool_result_t::error(std::string("Could not resolve source: ") + source_spec);
     if (sink_ea == BADADDR)
-        return tool_result_t::error(OBFSTR("Could not resolve sink: ") + sink_spec);
+        return tool_result_t::error(std::string("Could not resolve sink: ") + sink_spec);
 
     std::vector<taint_path_t> paths;
     {
@@ -3528,7 +3527,7 @@ tool_result_t handle_trace_taint_path(const json& params)
     sanitize_json_utf8_inplace(data);
 
     std::ostringstream msg;
-    msg << OBFSTR("Taint path trace: ") << paths.size() << OBFSTR(" path(s)");
+    msg << std::string("Taint path trace: ") << paths.size() << std::string(" path(s)");
     return tool_result_t::ok(msg.str(), data);
 }
 
@@ -3551,7 +3550,7 @@ tool_result_t handle_find_uaf_candidates(const json& params)
     sanitize_json_utf8_inplace(data);
 
     std::ostringstream msg;
-    msg << OBFSTR("Use-after-free scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Use-after-free scan: ") << findings.size() << std::string(" finding(s)");
     return tool_result_t::ok(msg.str(), data);
 }
 
@@ -3574,7 +3573,7 @@ tool_result_t handle_find_double_free_candidates(const json& params)
     sanitize_json_utf8_inplace(data);
 
     std::ostringstream msg;
-    msg << OBFSTR("Double-free scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Double-free scan: ") << findings.size() << std::string(" finding(s)");
     return tool_result_t::ok(msg.str(), data);
 }
 
@@ -3597,7 +3596,7 @@ tool_result_t handle_find_use_after_realloc(const json& params)
     sanitize_json_utf8_inplace(data);
 
     std::ostringstream msg;
-    msg << OBFSTR("Use-after-realloc scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Use-after-realloc scan: ") << findings.size() << std::string(" finding(s)");
     return tool_result_t::ok(msg.str(), data);
 }
 
@@ -3620,7 +3619,7 @@ tool_result_t handle_find_uninit_use(const json& params)
     sanitize_json_utf8_inplace(data);
 
     std::ostringstream msg;
-    msg << OBFSTR("Uninitialized-use scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Uninitialized-use scan: ") << findings.size() << std::string(" finding(s)");
     return tool_result_t::ok(msg.str(), data);
 }
 
@@ -3643,7 +3642,7 @@ tool_result_t handle_find_integer_overflow_sites(const json& params)
     sanitize_json_utf8_inplace(data);
 
     std::ostringstream msg;
-    msg << OBFSTR("Integer-overflow scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Integer-overflow scan: ") << findings.size() << std::string(" finding(s)");
     return tool_result_t::ok(msg.str(), data);
 }
 
@@ -3654,9 +3653,9 @@ void register_tier1_taint_tools()
     auto& registry = agent_tools::ToolRegistry::instance();
 
     registry.register_tool({
-        OBFSTR("trace_taint_path"),
-        OBFSTR("vuln"),
-        OBFSTR("Compute interprocedural taint paths from a known input source callsite (recv/"
+        std::string("trace_taint_path"),
+        std::string("vuln"),
+        std::string("Compute interprocedural taint paths from a known input source callsite (recv/"
                "ReadFile/scanf/getenv/RegQuery/...) to a known dangerous sink callsite "
                "(strcpy/memcpy/system/CreateProcess/sprintf/...). Walks the binary's call graph "
                "and applies per-function taint summaries (parameter taint, returns_tainted, "
@@ -3667,14 +3666,14 @@ void register_tier1_taint_tools()
                "confidence assessment that downgrades to plausible when validators are present "
                "on the dominant route."),
         {
-            {OBFSTR("source"),    OBFSTR("string"),
-             OBFSTR("Address (0x...) or symbol name of the input-source callsite."), true},
-            {OBFSTR("sink"),      OBFSTR("string"),
-             OBFSTR("Address (0x...) or symbol name of the dangerous-sink callsite."), true},
-            {OBFSTR("max_paths"), OBFSTR("number"),
-             OBFSTR("Maximum number of paths to enumerate (default 16, max 64)."), false},
-            {OBFSTR("max_depth"), OBFSTR("number"),
-             OBFSTR("Maximum call-graph depth (default 10, max 16)."), false},
+            {std::string("source"),    std::string("string"),
+             std::string("Address (0x...) or symbol name of the input-source callsite."), true},
+            {std::string("sink"),      std::string("string"),
+             std::string("Address (0x...) or symbol name of the dangerous-sink callsite."), true},
+            {std::string("max_paths"), std::string("number"),
+             std::string("Maximum number of paths to enumerate (default 16, max 64)."), false},
+            {std::string("max_depth"), std::string("number"),
+             std::string("Maximum call-graph depth (default 10, max 16)."), false},
         },
         handle_trace_taint_path,
         true,
@@ -3686,80 +3685,80 @@ void register_tier2_taint_tools()
     auto& registry = agent_tools::ToolRegistry::instance();
 
     registry.register_tool({
-        OBFSTR("find_uaf_candidates"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Locate use-after-free candidates (CWE-416) by walking each function's microcode, "
+        std::string("find_uaf_candidates"),
+        std::string("vuln_advanced"),
+        std::string("Locate use-after-free candidates (CWE-416) by walking each function's microcode, "
                "tracking the freed pointer at every call to free/HeapFree/RtlFreeHeap/ExFreePool/"
                "operator delete and detecting subsequent dereferences (m_ldx/m_stx) or sink-arg "
                "uses without an intervening reassignment of the same pointer. Skips realloc-style "
                "calls because those have a separate engine."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_uaf_candidates,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_double_free_candidates"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Locate double-free candidates (CWE-415) by walking each function's microcode and "
+        std::string("find_double_free_candidates"),
+        std::string("vuln_advanced"),
+        std::string("Locate double-free candidates (CWE-415) by walking each function's microcode and "
                "flagging two distinct free-style calls applied to the same pointer without an "
                "intervening reassignment. Free signatures cover free/HeapFree/RtlFreeHeap/"
                "ExFreePool/ExFreePoolWithTag/operator delete and the corresponding mangled "
                "MSVC operator-delete symbols."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_double_free_candidates,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_use_after_realloc"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Locate use-after-realloc candidates (CWE-416) by walking each function's "
+        std::string("find_use_after_realloc"),
+        std::string("vuln_advanced"),
+        std::string("Locate use-after-realloc candidates (CWE-416) by walking each function's "
                "microcode for realloc/HeapReAlloc calls, capturing the input pointer, and "
                "checking whether that original handle is dereferenced after the realloc without "
                "an early-return check on the new pointer. Reports the realloc EA, the offending "
                "use EA, and the function context."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_use_after_realloc,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_uninit_use"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Locate uninitialized-variable reads (CWE-457) by walking each function's "
+        std::string("find_uninit_use"),
+        std::string("vuln_advanced"),
+        std::string("Locate uninitialized-variable reads (CWE-457) by walking each function's "
                "microcode for non-parameter local variables (mba.vars excluding mba.argidx) "
                "where any use precedes any reaching definition. Reports the variable name (or "
                "synthetic v<idx> for unnamed slots), the read EA, and the function context."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_uninit_use,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_integer_overflow_sites"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Locate integer-overflow sites (CWE-190) by running intraprocedural taint analysis, "
+        std::string("find_integer_overflow_sites"),
+        std::string("vuln_advanced"),
+        std::string("Locate integer-overflow sites (CWE-190) by running intraprocedural taint analysis, "
                "scanning each m_add/m_sub/m_mul whose operands are tainted by an input source, "
                "tracing the result through the def-use chain, and emitting a finding when the "
                "result reaches an allocation-size or memcpy-length sink (malloc/calloc/realloc/"
                "HeapAlloc/ExAllocatePool*/memcpy/memmove/snprintf/...) without an intervening "
                "overflow guard."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_integer_overflow_sites,
         true,

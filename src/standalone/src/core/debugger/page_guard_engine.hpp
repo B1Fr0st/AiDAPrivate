@@ -235,12 +235,11 @@ static inline bool kernel_operation_ready(uint32_t pid,
     const bool loaded = driver_bridge::is_loaded();
     const bool kernel = driver_bridge::using_kernel_driver();
     const bool session = driver_bridge::kernel_session_available(&session_reason);
-    const bool dyn_ready = driver_bridge::dynamic_ioctls_ready();
     const uint32_t active = driver_bridge::attached_pid();
-    const bool ok = pid != 0 && loaded && kernel && session && dyn_ready && active == pid;
+    const bool ok = pid != 0 && loaded && kernel && session && active == pid;
     if (!ok) {
         diag::log_tagged_fmt("pg_sniff",
-            "kernel_operation_fail_closed op=%s label=%s pid=%u active_pid=%u loaded=%d kernel=%d session=%d dyn_ready=%d reason=%s status=%s last_error=%s elapsed_ms=%llu",
+            "kernel_operation_fail_closed op=%s label=%s pid=%u active_pid=%u loaded=%d kernel=%d session=%d reason=%s status=%s last_error=%s elapsed_ms=%llu",
             operation ? operation : "",
             label ? label : "",
             pid,
@@ -248,7 +247,6 @@ static inline bool kernel_operation_ready(uint32_t pid,
             loaded ? 1 : 0,
             kernel ? 1 : 0,
             session ? 1 : 0,
-            dyn_ready ? 1 : 0,
             session_reason.empty() ? "<empty>" : session_reason.c_str(),
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str(),

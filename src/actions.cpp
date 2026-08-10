@@ -122,7 +122,7 @@ int idaapi action_handler::activate(action_activation_ctx_t* ctx)
     if (plugin == nullptr || !plugin->is_operational())
     {
         if (plugin != nullptr)
-            warning(OBFSTR_C("AiDA is loaded but disabled: %s"), plugin->disabled_reason().c_str());
+            warning("AiDA is loaded but disabled: %s", plugin->disabled_reason().c_str());
         return 1;
     }
     action_func(ctx, plugin);
@@ -150,9 +150,9 @@ void handle_copy_context(action_activation_ctx_t* ctx, aida_plugin_t*)
 
     nlohmann::json context = ida_utils::get_context_for_prompt(func_ea, true);
 
-    if (!(context.contains(OBFSTR_C("ok")) && context[OBFSTR_C("ok")].is_boolean() && context[OBFSTR_C("ok")].get<bool>()))
+    if (!(context.contains("ok") && context["ok"].is_boolean() && context["ok"].get<bool>()))
     {
-        warning(OBFSTR_C("AiDA: Failed to gather context: %s"), json_str(context, OBFSTR_C("message"), OBFSTR_C("Unknown error")).c_str());
+        warning("AiDA: Failed to gather context: %s", json_str(context, "message", "Unknown error").c_str());
         return;
     }
 
@@ -162,32 +162,32 @@ void handle_copy_context(action_activation_ctx_t* ctx, aida_plugin_t*)
     {
         qstring func_name;
         get_func_name(&func_name, func_ea);
-        msg(OBFSTR_C("AiDA: Context for function '%s' (0x%a) copied to clipboard.\n"), func_name.c_str(), func_ea);
+        msg("AiDA: Context for function '%s' (0x%a) copied to clipboard.\n", func_name.c_str(), func_ea);
     }
     else
     {
-        warning(OBFSTR_C("AiDA: Failed to copy context to clipboard."));
+        warning("AiDA: Failed to copy context to clipboard.");
     }
 }
 
 void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
 {
-    char* file_path = ask_file(true, OBFSTR_C("*.txt"), OBFSTR_C("Save database context to..."));
+    char* file_path = ask_file(true, "*.txt", "Save database context to...");
     if (file_path == nullptr)
     {
-        msg(OBFSTR_C("AiDA: Operation cancelled.\n"));
+        msg("AiDA: Operation cancelled.\n");
         return;
     }
 
     FILE* fp = qfopen(file_path, "w");
     if (fp == nullptr)
     {
-        warning(OBFSTR_C("AiDA: Could not open file for writing: %s"), file_path);
+        warning("AiDA: Could not open file for writing: %s", file_path);
         return;
     }
     file_janitor_t fj(fp);
 
-    show_wait_box(OBFSTR_C("HIDECANCEL\nExporting database context..."));
+    show_wait_box("HIDECANCEL\nExporting database context...");
 
     const size_t func_qty = get_func_qty();
     bool hexrays_available = init_hexrays_plugin();
@@ -196,11 +196,11 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
     {
         if (user_cancelled())
         {
-            msg(OBFSTR_C("AiDA: Database export cancelled by user.\n"));
+            msg("AiDA: Database export cancelled by user.\n");
             break;
         }
 
-        replace_wait_box(OBFSTR_C("Exporting function %zu of %zu..."), i + 1, func_qty);
+        replace_wait_box("Exporting function %zu of %zu...", i + 1, func_qty);
 
         func_entry_info_t fn_info;
         if (!get_func_entry_info_by_num(&fn_info, i))
@@ -213,11 +213,11 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
         qstring func_name;
         get_func_name(&func_name, func_start);
 
-        qfprintf(fp, OBFSTR_C("==================================================\n"));
-        qfprintf(fp, OBFSTR_C("Function: %s (0x%a)\n"), func_name.c_str(), func_start);
-        qfprintf(fp, OBFSTR_C("==================================================\n\n"));
+        qfprintf(fp, "==================================================\n");
+        qfprintf(fp, "Function: %s (0x%a)\n", func_name.c_str(), func_start);
+        qfprintf(fp, "==================================================\n\n");
 
-        qfprintf(fp, OBFSTR_C("--- Decompiled C/C++ Code ---\n"));
+        qfprintf(fp, "--- Decompiled C/C++ Code ---\n");
         const uint64 func_flags = fn_info.get_flags();
         segment_info_t seg_info;
         const bool in_external_segment = get_segment_info(&seg_info, func_start) && seg_info.get_type() == SEG_XTRN;
@@ -238,28 +238,28 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
                 }
                 else
                 {
-                    qfprintf(fp, OBFSTR_C("// Decompilation failed.\n\n"));
+                    qfprintf(fp, "// Decompilation failed.\n\n");
                 }
             }
             catch (const vd_failure_t&)
             {
-                qfprintf(fp, OBFSTR_C("// Decompilation failed.\n\n"));
+                qfprintf(fp, "// Decompilation failed.\n\n");
             }
             catch (...)
             {
-                qfprintf(fp, OBFSTR_C("// Decompilation crashed (access violation) – skipped.\n\n"));
+                qfprintf(fp, "// Decompilation crashed (access violation) – skipped.\n\n");
             }
         }
         else if (!hexrays_available)
         {
-            qfprintf(fp, OBFSTR_C("// Hex-Rays decompiler not available.\n\n"));
+            qfprintf(fp, "// Hex-Rays decompiler not available.\n\n");
         }
         else
         {
-            qfprintf(fp, OBFSTR_C("// Non-decompilable function (thunk/extern/tail) – skipped.\n\n"));
+            qfprintf(fp, "// Non-decompilable function (thunk/extern/tail) – skipped.\n\n");
         }
 
-        qfprintf(fp, OBFSTR_C("--- Disassembly ---\n"));
+        qfprintf(fp, "--- Disassembly ---\n");
         text_t disasm_text;
         gen_disasm_text(disasm_text, func_start, func_end, false);
         for (const twinline_t& tw_line : disasm_text)
@@ -270,7 +270,7 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
         }
         qfprintf(fp, "\n");
 
-        qfprintf(fp, OBFSTR_C("--- Referenced Strings ---\n"));
+        qfprintf(fp, "--- Referenced Strings ---\n");
         std::set<qstring> found_strings;
         function_item_iterator_t fii(func_start);
         for (bool ok = fii.first(); ok; ok = fii.next_head())
@@ -293,7 +293,7 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
 
         if (found_strings.empty())
         {
-            qfprintf(fp, OBFSTR_C("// No string literals referenced.\n"));
+            qfprintf(fp, "// No string literals referenced.\n");
         }
         else
         {
@@ -306,7 +306,7 @@ void handle_save_database_context(action_activation_ctx_t*, aida_plugin_t*)
     }
 
     hide_wait_box();
-    msg(OBFSTR_C("AiDA: Successfully saved database context to %s\n"), file_path);
+    msg("AiDA: Successfully saved database context to %s\n", file_path);
 }
 
 void handle_fix_analysis(action_activation_ctx_t* ctx, aida_plugin_t*)
@@ -321,5 +321,5 @@ void handle_fix_analysis(action_activation_ctx_t* ctx, aida_plugin_t*)
 
     qstring func_name;
     get_func_name(&func_name, func_ea);
-    msg(OBFSTR_C("AiDA: Cleaned decompilation for %s (0x%a).\n"), func_name.c_str(), func_ea);
+    msg("AiDA: Cleaned decompilation for %s (0x%a).\n", func_name.c_str(), func_ea);
 }

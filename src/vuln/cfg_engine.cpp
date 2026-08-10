@@ -59,7 +59,7 @@ constexpr int    kMaxConstScanBackBytes = 96;
 std::string fmt_addr(ea_t ea)
 {
     if (ea == BADADDR)
-        return std::string(OBFSTR("0x0"));
+        return std::string(std::string("0x0"));
     return agent_tools::helpers::format_address(ea);
 }
 
@@ -168,8 +168,8 @@ bool resolve_typeinfo(ea_t call_ea, indirect_target_t& out_t)
     {
         out_t.name = tstr.c_str();
     }
-    out_t.source = OBFSTR("typeinfo");
-    out_t.rationale = OBFSTR("Operand has function-pointer type info attached");
+    out_t.source = std::string("typeinfo");
+    out_t.rationale = std::string("Operand has function-pointer type info attached");
     out_t.target_ea = BADADDR;
     return true;
 }
@@ -194,8 +194,8 @@ bool resolve_direct_mem_operand(const insn_t& ins, indirect_target_t& out_t)
     out_t.name = demangle_or_name(target);
     if (out_t.name.empty())
         out_t.name = name_of(slot);
-    out_t.source = OBFSTR("global_fptr");
-    out_t.rationale = OBFSTR("Indirect call reads function pointer from a global slot pointing into a code segment");
+    out_t.source = std::string("global_fptr");
+    out_t.rationale = std::string("Indirect call reads function pointer from a global slot pointing into a code segment");
     return true;
 }
 
@@ -217,12 +217,12 @@ void resolve_xrefs(ea_t call_ea, std::vector<indirect_target_t>& out, std::strin
         indirect_target_t t;
         t.target_ea = xb.to;
         t.name = demangle_or_name(xb.to);
-        t.source = OBFSTR("xref_switch");
-        t.rationale = OBFSTR("IDA cross-reference resolved this indirect target (switch table or analyzer trace)");
+        t.source = std::string("xref_switch");
+        t.rationale = std::string("IDA cross-reference resolved this indirect target (switch table or analyzer trace)");
         size_t before = out.size();
         merge_targets(out, std::move(t));
         if (out.size() != before)
-            append_reason(reason, OBFSTR("xref_switch"));
+            append_reason(reason, std::string("xref_switch"));
     }
 }
 
@@ -346,12 +346,12 @@ void resolve_via_vtable(ea_t call_ea, ea_t func_ea, std::vector<indirect_target_
             indirect_target_t t;
             t.target_ea = vv.resolved_obj_ea;
             t.name = demangle_or_name(vv.resolved_obj_ea);
-            t.source = OBFSTR("hexrays_obj");
-            t.rationale = OBFSTR("Hex-Rays resolved indirect call to an object whose ea is a code-segment entry");
+            t.source = std::string("hexrays_obj");
+            t.rationale = std::string("Hex-Rays resolved indirect call to an object whose ea is a code-segment entry");
             size_t before = out.size();
             merge_targets(out, std::move(t));
             if (out.size() != before)
-                append_reason(reason, OBFSTR("hexrays_obj"));
+                append_reason(reason, std::string("hexrays_obj"));
             return;
         }
     }
@@ -390,12 +390,12 @@ void resolve_via_vtable(ea_t call_ea, ea_t func_ea, std::vector<indirect_target_
                 indirect_target_t t;
                 t.target_ea = v;
                 t.name = demangle_or_name(v);
-                t.source = OBFSTR("vtable");
-                t.rationale = OBFSTR("Hex-Rays vtable trace: candidate slot ") + fmt_addr(scan);
+                t.source = std::string("vtable");
+                t.rationale = std::string("Hex-Rays vtable trace: candidate slot ") + fmt_addr(scan);
                 size_t before = out.size();
                 merge_targets(out, std::move(t));
                 if (out.size() != before)
-                    append_reason(reason, OBFSTR("vtable"));
+                    append_reason(reason, std::string("vtable"));
             }
             scan += static_cast<ea_t>(ptr_sz);
         }
@@ -405,12 +405,12 @@ void resolve_via_vtable(ea_t call_ea, ea_t func_ea, std::vector<indirect_target_
     indirect_target_t t;
     t.target_ea = fn_addr;
     t.name = demangle_or_name(fn_addr);
-    t.source = OBFSTR("vtable");
-    t.rationale = OBFSTR("Hex-Rays resolved vtable slot at ") + fmt_addr(entry_ea);
+    t.source = std::string("vtable");
+    t.rationale = std::string("Hex-Rays resolved vtable slot at ") + fmt_addr(entry_ea);
     size_t before = out.size();
     merge_targets(out, std::move(t));
     if (out.size() != before)
-        append_reason(reason, OBFSTR("vtable"));
+        append_reason(reason, std::string("vtable"));
 
     ea_t col_ea = is_64 ? (vtable_base >= 8 ? vtable_base - 8 : BADADDR)
                         : (vtable_base >= 4 ? vtable_base - 4 : BADADDR);
@@ -445,12 +445,12 @@ void resolve_via_vtable(ea_t call_ea, ea_t func_ea, std::vector<indirect_target_
                         qstring dem;
                         if (demangle_name(&dem, tname, 0) > 0 && !dem.empty())
                             r.name = dem.c_str();
-                        r.source = OBFSTR("rtti");
-                        r.rationale = OBFSTR("MSVC RTTI class hierarchy descriptor at ") + fmt_addr(col_ptr);
+                        r.source = std::string("rtti");
+                        r.rationale = std::string("MSVC RTTI class hierarchy descriptor at ") + fmt_addr(col_ptr);
                         size_t before2 = out.size();
                         merge_targets(out, std::move(r));
                         if (out.size() != before2)
-                            append_reason(reason, OBFSTR("rtti"));
+                            append_reason(reason, std::string("rtti"));
                     }
                 }
             }
@@ -484,12 +484,12 @@ void resolve_via_microcode(ea_t call_ea, ea_t func_ea, std::vector<indirect_targ
                 indirect_target_t t;
                 t.target_ea = m->l.g;
                 t.name = demangle_or_name(m->l.g);
-                t.source = OBFSTR("microcode");
-                t.rationale = OBFSTR("Microcode call target is a global value (mop_v) in a code segment");
+                t.source = std::string("microcode");
+                t.rationale = std::string("Microcode call target is a global value (mop_v) in a code segment");
                 size_t before = out.size();
                 merge_targets(out, std::move(t));
                 if (out.size() != before)
-                    append_reason(reason, OBFSTR("microcode"));
+                    append_reason(reason, std::string("microcode"));
                 continue;
             }
 
@@ -534,12 +534,12 @@ void resolve_via_microcode(ea_t call_ea, ea_t func_ea, std::vector<indirect_targ
                     indirect_target_t t;
                     t.target_ea = cand;
                     t.name = demangle_or_name(cand);
-                    t.source = OBFSTR("microcode_ssa");
-                    t.rationale = OBFSTR("Microcode SSA def-use trace from call operand to constant function pointer at ") + fmt_addr(def_ea);
+                    t.source = std::string("microcode_ssa");
+                    t.rationale = std::string("Microcode SSA def-use trace from call operand to constant function pointer at ") + fmt_addr(def_ea);
                     size_t before = out.size();
                     merge_targets(out, std::move(t));
                     if (out.size() != before)
-                        append_reason(reason, OBFSTR("microcode_ssa"));
+                        append_reason(reason, std::string("microcode_ssa"));
                 }
                 if (out.size() >= kMaxTargetsPerCall)
                     break;
@@ -589,13 +589,13 @@ void resolve_via_constant_pool(ea_t call_ea, ea_t func_ea, std::vector<indirect_
             indirect_target_t t;
             t.target_ea = cand;
             t.name = demangle_or_name(cand);
-            t.source = OBFSTR("const_lea");
-            t.rationale = OBFSTR("Backwards scan found lea/mov of code address ") + fmt_addr(cand) + OBFSTR(" at ") + fmt_addr(prev);
+            t.source = std::string("const_lea");
+            t.rationale = std::string("Backwards scan found lea/mov of code address ") + fmt_addr(cand) + std::string(" at ") + fmt_addr(prev);
             size_t before = out.size();
             merge_targets(out, std::move(t));
             if (out.size() != before)
             {
-                append_reason(reason, OBFSTR("const_lea"));
+                append_reason(reason, std::string("const_lea"));
                 ++hits;
             }
         }
@@ -614,7 +614,7 @@ indirect_call_t analyze_indirect_call(ea_t call_ea, ea_t func_ea, const insn_t& 
         if (resolve_direct_mem_operand(ins, direct))
         {
             merge_targets(ic.targets, std::move(direct));
-            append_reason(ic.reason, OBFSTR("global_fptr"));
+            append_reason(ic.reason, std::string("global_fptr"));
         }
     }
 
@@ -622,7 +622,7 @@ indirect_call_t analyze_indirect_call(ea_t call_ea, ea_t func_ea, const insn_t& 
     if (resolve_typeinfo(call_ea, ti))
     {
         merge_targets(ic.targets, std::move(ti));
-        append_reason(ic.reason, OBFSTR("typeinfo"));
+        append_reason(ic.reason, std::string("typeinfo"));
     }
 
     resolve_xrefs(call_ea, ic.targets, ic.reason);
@@ -631,7 +631,7 @@ indirect_call_t analyze_indirect_call(ea_t call_ea, ea_t func_ea, const insn_t& 
     resolve_via_microcode(call_ea, func_ea, ic.targets, ic.reason);
 
     if (ic.reason.empty())
-        ic.reason = OBFSTR("unresolved");
+        ic.reason = std::string("unresolved");
 
     return ic;
 }
@@ -720,12 +720,12 @@ std::string describe_branch_kind(const qflow_chart_t& fc, int from_idx, int to_i
 {
     ea_t term_ea = block_terminator_ea(fc, from_idx);
     if (term_ea == BADADDR)
-        return std::string(OBFSTR("fallthrough"));
+        return std::string(std::string("fallthrough"));
     insn_t ins;
     if (decode_insn(&ins, term_ea) <= 0)
-        return std::string(OBFSTR("fallthrough"));
+        return std::string(std::string("fallthrough"));
     if (is_unconditional_jmp(ins))
-        return OBFSTR("unconditional_jmp@") + fmt_addr(term_ea);
+        return std::string("unconditional_jmp@") + fmt_addr(term_ea);
     if (is_conditional_jmp(ins))
     {
         ea_t taken = static_cast<ea_t>(ins.ops[0].addr);
@@ -734,14 +734,14 @@ std::string describe_branch_kind(const qflow_chart_t& fc, int from_idx, int to_i
         bool taken_to_tgt = (taken >= tgt.start_ea && taken < tgt.end_ea);
         bool taken_to_avoid = (taken >= bypassed.start_ea && taken < bypassed.end_ea);
         if (taken_to_tgt)
-            return OBFSTR("true_branch_at_") + fmt_addr(term_ea);
+            return std::string("true_branch_at_") + fmt_addr(term_ea);
         if (taken_to_avoid)
-            return OBFSTR("false_branch_at_") + fmt_addr(term_ea);
-        return OBFSTR("conditional_at_") + fmt_addr(term_ea);
+            return std::string("false_branch_at_") + fmt_addr(term_ea);
+        return std::string("conditional_at_") + fmt_addr(term_ea);
     }
     if (ins.itype == NN_call || ins.itype == NN_callni || ins.itype == NN_callfi)
-        return OBFSTR("post_call_at_") + fmt_addr(term_ea);
-    return OBFSTR("flow_at_") + fmt_addr(term_ea);
+        return std::string("post_call_at_") + fmt_addr(term_ea);
+    return std::string("flow_at_") + fmt_addr(term_ea);
 }
 
 std::vector<ea_t> collect_block_eas(const qflow_chart_t& fc, int idx)
@@ -1010,13 +1010,13 @@ std::string build_path_rationale(const qflow_chart_t& fc,
                                  ea_t sink_ea)
 {
     std::string r;
-    r += OBFSTR("Path enters function at block 0 and reaches sink ");
+    r += std::string("Path enters function at block 0 and reaches sink ");
     r += fmt_addr(sink_ea);
-    r += OBFSTR(" without traversing block ");
+    r += std::string(" without traversing block ");
     r += std::to_string(check_block);
-    r += OBFSTR(" (which contains the check at ");
+    r += std::string(" (which contains the check at ");
     r += fmt_addr(check_ea);
-    r += OBFSTR("). ");
+    r += std::string("). ");
 
     for (size_t i = 0; i + 1 < path_blocks.size(); ++i)
     {
@@ -1035,22 +1035,22 @@ std::string build_path_rationale(const qflow_chart_t& fc,
         if (!from_branches_to_check)
             continue;
         std::string kind = describe_branch_kind(fc, from_b, to_b, check_block);
-        r += OBFSTR("Block ");
+        r += std::string("Block ");
         r += std::to_string(from_b);
-        r += OBFSTR(" routes to block ");
+        r += std::string(" routes to block ");
         r += std::to_string(to_b);
-        r += OBFSTR(" via ");
+        r += std::string(" via ");
         r += kind;
-        r += OBFSTR(" instead of the check block. ");
+        r += std::string(" instead of the check block. ");
     }
 
     if (!path_blocks.empty())
     {
         int last_b = path_blocks.back();
         if (fc.is_ret_block(static_cast<size_t>(last_b)))
-            r += OBFSTR("Path terminates in a return block. ");
+            r += std::string("Path terminates in a return block. ");
         else if (fc.is_noret_block(static_cast<size_t>(last_b)))
-            r += OBFSTR("Path terminates in a noret block (early-return bypass). ");
+            r += std::string("Path terminates in a noret block (early-return bypass). ");
     }
 
     return r;
@@ -1501,7 +1501,7 @@ tool_result_t handler_enumerate_switch_dispatch(const json& params)
             {
                 auto p = agent_tools::helpers::parse_address(s);
                 if (!p.has_value())
-                    return tool_result_t::error(OBFSTR("Invalid address"), "bad_param");
+                    return tool_result_t::error(std::string("Invalid address"), "bad_param");
                 fea = *p;
             }
         }
@@ -1514,14 +1514,14 @@ tool_result_t handler_enumerate_switch_dispatch(const json& params)
     data["count"] = arr.size();
     data["dispatches"] = std::move(arr);
     sanitize_json_utf8_inplace(data);
-    return tool_result_t::ok(OBFSTR("Switch dispatchers: ") + std::to_string(data["count"].get<size_t>()), data);
+    return tool_result_t::ok(std::string("Switch dispatchers: ") + std::to_string(data["count"].get<size_t>()), data);
 }
 
 tool_result_t handler_list_dispatchers(const json& params)
 {
     json data = list_dispatchers(cfg_int_param(params, "top_n", 25));
     sanitize_json_utf8_inplace(data);
-    return tool_result_t::ok(OBFSTR("Dispatchers: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+    return tool_result_t::ok(std::string("Dispatchers: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
 tool_result_t handler_resolve_indirect_calls_batched(const json& params)
@@ -1539,7 +1539,7 @@ tool_result_t handler_resolve_indirect_calls_batched(const json& params)
         cfg_bool_param(params, "only_vtable", false),
         target_filter);
     sanitize_json_utf8_inplace(data);
-    return tool_result_t::ok(OBFSTR("Batched indirect calls: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+    return tool_result_t::ok(std::string("Batched indirect calls: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
 tool_result_t handler_enumerate_vtables(const json& params)
@@ -1547,7 +1547,7 @@ tool_result_t handler_enumerate_vtables(const json& params)
     json data = enumerate_vtables(cfg_int_param(params, "min_entries", 3),
                                   cfg_int_param(params, "max_entries", 256));
     sanitize_json_utf8_inplace(data);
-    return tool_result_t::ok(OBFSTR("Vtables: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
+    return tool_result_t::ok(std::string("Vtables: ") + std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
 tool_result_t handler_reachable_under_constraints(const json& params)
@@ -1556,7 +1556,7 @@ tool_result_t handler_reachable_under_constraints(const json& params)
     std::vector<ea_t> sinks = cfg_addr_array_param(params, "sinks");
     std::vector<ea_t> blocked = cfg_addr_array_param(params, "must_not_cross_funcs");
     if (sources.empty() || sinks.empty())
-        return tool_result_t::error(OBFSTR("sources and sinks must be non-empty arrays"), "bad_param");
+        return tool_result_t::error(std::string("sources and sinks must be non-empty arrays"), "bad_param");
     for (ea_t& s : sources)
     {
         func_t* pfn = get_func(s);
@@ -1578,7 +1578,7 @@ tool_result_t handler_reachable_under_constraints(const json& params)
     json data = reachable_under_constraints(sources, sinks, blocked,
                                             cfg_int_param(params, "max_depth", 6));
     sanitize_json_utf8_inplace(data);
-    return tool_result_t::ok(OBFSTR("Reachability pairs: ") +
+    return tool_result_t::ok(std::string("Reachability pairs: ") +
                              std::to_string(data["pairs_reachable"].size()), data);
 }
 
@@ -1588,21 +1588,21 @@ tool_result_t handler_postdominates(const json& params)
     if (funcs.empty())
         funcs = cfg_addr_array_param(params, "address");
     if (funcs.empty())
-        return tool_result_t::error(OBFSTR("func_ea is required"), "bad_param");
+        return tool_result_t::error(std::string("func_ea is required"), "bad_param");
     func_t* pfn = get_func(funcs.front());
     if (pfn == nullptr)
-        return tool_result_t::error(OBFSTR("func_ea does not lie inside a function"), "no_function_at_addr");
+        return tool_result_t::error(std::string("func_ea does not lie inside a function"), "no_function_at_addr");
     int from_block = cfg_int_param(params, "from_block", -1);
     int to_block = cfg_int_param(params, "to_block", -1);
     if (from_block < 0 || to_block < 0)
-        return tool_result_t::error(OBFSTR("from_block and to_block are required"), "bad_param");
+        return tool_result_t::error(std::string("from_block and to_block are required"), "bad_param");
     bool result = block_post_dominates(pfn->start_ea, from_block, to_block);
     json data;
     data["func_ea"] = fmt_addr(pfn->start_ea);
     data["from_block"] = from_block;
     data["to_block"] = to_block;
     data["postdominates"] = result;
-    return tool_result_t::ok(result ? OBFSTR("Postdominates") : OBFSTR("Does not postdominate"), data);
+    return tool_result_t::ok(result ? std::string("Postdominates") : std::string("Does not postdominate"), data);
 }
 
 tool_result_t handler_find_indirect_call_targets(const json& params)
@@ -1610,7 +1610,7 @@ tool_result_t handler_find_indirect_call_targets(const json& params)
     std::string addr_param = params.value("address", std::string());
     bool scan_all = false;
     ea_t target_func_ea = BADADDR;
-    if (addr_param.empty() || addr_param == OBFSTR("all") || addr_param == OBFSTR("ALL"))
+    if (addr_param.empty() || addr_param == std::string("all") || addr_param == std::string("ALL"))
     {
         scan_all = true;
     }
@@ -1618,7 +1618,7 @@ tool_result_t handler_find_indirect_call_targets(const json& params)
     {
         auto parsed = agent_tools::helpers::parse_address(addr_param);
         if (!parsed)
-            return tool_result_t::error(OBFSTR("Invalid address"));
+            return tool_result_t::error(std::string("Invalid address"));
         target_func_ea = *parsed;
     }
 
@@ -1647,7 +1647,7 @@ tool_result_t handler_find_indirect_call_targets(const json& params)
     {
         func_t* pfn = get_func(target_func_ea);
         if (!pfn)
-            return tool_result_t::error(OBFSTR("No function at ") + agent_tools::helpers::format_address(target_func_ea));
+            return tool_result_t::error(std::string("No function at ") + agent_tools::helpers::format_address(target_func_ea));
         auto v = scan_function(pfn->start_ea);
         for (auto& ic : v)
         {
@@ -1660,7 +1660,7 @@ tool_result_t handler_find_indirect_call_targets(const json& params)
     result["count"] = total_calls;
     result["calls"] = std::move(calls);
     sanitize_json_utf8_inplace(result);
-    return tool_result_t::ok(OBFSTR("Indirect call targets: ") + std::to_string(total_calls), result);
+    return tool_result_t::ok(std::string("Indirect call targets: ") + std::to_string(total_calls), result);
 }
 
 tool_result_t handler_find_check_bypass_paths(const json& params)
@@ -1676,7 +1676,7 @@ tool_result_t handler_find_check_bypass_paths(const json& params)
     auto pca = agent_tools::helpers::parse_address(ca);
     auto psa = agent_tools::helpers::parse_address(sa);
     if (!pca || !psa)
-        return tool_result_t::error(OBFSTR("Invalid check_address or sink_address"));
+        return tool_result_t::error(std::string("Invalid check_address or sink_address"));
 
     ea_t check_ea = *pca;
     ea_t sink_ea  = *psa;
@@ -1708,7 +1708,7 @@ tool_result_t handler_find_check_bypass_paths(const json& params)
     result["count"] = arr.size();
     result["paths"] = std::move(arr);
     sanitize_json_utf8_inplace(result);
-    return tool_result_t::ok(OBFSTR("Bypass paths: ") + std::to_string(result["count"].get<size_t>()), result);
+    return tool_result_t::ok(std::string("Bypass paths: ") + std::to_string(result["count"].get<size_t>()), result);
 }
 
 }
@@ -2041,99 +2041,99 @@ void register_tier1_cfg_tools()
     auto& registry = agent_tools::ToolRegistry::instance();
 
     registry.register_tool({
-        OBFSTR("find_indirect_call_targets"),
-        OBFSTR("vuln"),
-        OBFSTR("Enumerate every indirect call (callni/callfi/register/memory) in the given function (or 'all' to scan every function) and resolve targets via type-info, IDA xrefs, vtables (Hex-Rays), constant pool scans, microcode SSA def-use, and MSVC RTTI. Returns per-call resolved-target arrays plus the resolution method that succeeded."),
+        std::string("find_indirect_call_targets"),
+        std::string("vuln"),
+        std::string("Enumerate every indirect call (callni/callfi/register/memory) in the given function (or 'all' to scan every function) and resolve targets via type-info, IDA xrefs, vtables (Hex-Rays), constant pool scans, microcode SSA def-use, and MSVC RTTI. Returns per-call resolved-target arrays plus the resolution method that succeeded."),
         {
-            { OBFSTR("address"), OBFSTR("string"), OBFSTR("Function ea (0x...) or 'all' to scan every function"), true }
+            { std::string("address"), std::string("string"), std::string("Function ea (0x...) or 'all' to scan every function"), true }
         },
         handler_find_indirect_call_targets,
         true
     });
 
     registry.register_tool({
-        OBFSTR("find_check_bypass_paths"),
-        OBFSTR("vuln"),
-        OBFSTR("Enumerate paths through the function CFG that route AROUND a specific check (its block excluded from BFS/DFS) and still reach a sink. Both check_address and sink_address must be inside the same function. Returns block paths, ea traces, and a rationale describing how each path bypasses the check (true/false branch of a conditional, unconditional jmp, post-call edge, early-return)."),
+        std::string("find_check_bypass_paths"),
+        std::string("vuln"),
+        std::string("Enumerate paths through the function CFG that route AROUND a specific check (its block excluded from BFS/DFS) and still reach a sink. Both check_address and sink_address must be inside the same function. Returns block paths, ea traces, and a rationale describing how each path bypasses the check (true/false branch of a conditional, unconditional jmp, post-call edge, early-return)."),
         {
-            { OBFSTR("check_address"), OBFSTR("string"), OBFSTR("Address of the check / validator instruction"), true },
-            { OBFSTR("sink_address"),  OBFSTR("string"), OBFSTR("Address of the sink the attacker wants to reach"), true },
-            { OBFSTR("max_paths"),     OBFSTR("number"), OBFSTR("Max paths to return (default 8, max 64)"),         false }
+            { std::string("check_address"), std::string("string"), std::string("Address of the check / validator instruction"), true },
+            { std::string("sink_address"),  std::string("string"), std::string("Address of the sink the attacker wants to reach"), true },
+            { std::string("max_paths"),     std::string("number"), std::string("Max paths to return (default 8, max 64)"),         false }
         },
         handler_find_check_bypass_paths,
         true
     });
 
     registry.register_tool({
-        OBFSTR("enumerate_switch_dispatch"),
-        OBFSTR("vuln"),
-        OBFSTR("Enumerate switch dispatchers using disassembly switch_info_t/calc_switch_cases and Hex-Rays cit_switch cases. Address may be a function address or 'all'."),
+        std::string("enumerate_switch_dispatch"),
+        std::string("vuln"),
+        std::string("Enumerate switch dispatchers using disassembly switch_info_t/calc_switch_cases and Hex-Rays cit_switch cases. Address may be a function address or 'all'."),
         {
-            { OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or 'all' (default all)."), false },
+            { std::string("address"), std::string("string"), std::string("Function address or 'all' (default all)."), false },
         },
         handler_enumerate_switch_dispatch,
         true
     });
 
     registry.register_tool({
-        OBFSTR("list_dispatchers"),
-        OBFSTR("vuln"),
-        OBFSTR("Return the top switch dispatchers by case count from the dispatch cache, rebuilding it from switch_info_t and Hex-Rays switch data when stale."),
+        std::string("list_dispatchers"),
+        std::string("vuln"),
+        std::string("Return the top switch dispatchers by case count from the dispatch cache, rebuilding it from switch_info_t and Hex-Rays switch data when stale."),
         {
-            { OBFSTR("top_n"), OBFSTR("number"), OBFSTR("Maximum dispatchers to return (default 25, max 256)."), false },
+            { std::string("top_n"), std::string("number"), std::string("Maximum dispatchers to return (default 25, max 256)."), false },
         },
         handler_list_dispatchers,
         true
     });
 
     registry.register_tool({
-        OBFSTR("resolve_indirect_calls_batched"),
-        OBFSTR("vuln"),
-        OBFSTR("Batch version of indirect-call target resolution over multiple functions with server-side unresolved, vtable, and target-name filters."),
+        std::string("resolve_indirect_calls_batched"),
+        std::string("vuln"),
+        std::string("Batch version of indirect-call target resolution over multiple functions with server-side unresolved, vtable, and target-name filters."),
         {
-            { OBFSTR("functions"), OBFSTR("array"), OBFSTR("Function addresses. Empty scans every function up to the configured cap."), false },
-            { OBFSTR("only_unresolved"), OBFSTR("boolean"), OBFSTR("Only return indirect calls with no resolved targets."), false },
-            { OBFSTR("only_vtable"), OBFSTR("boolean"), OBFSTR("Only return vtable-derived indirect calls."), false },
-            { OBFSTR("target_name_filter"), OBFSTR("string"), OBFSTR("Case-insensitive substring filter over resolved target names."), false },
+            { std::string("functions"), std::string("array"), std::string("Function addresses. Empty scans every function up to the configured cap."), false },
+            { std::string("only_unresolved"), std::string("boolean"), std::string("Only return indirect calls with no resolved targets."), false },
+            { std::string("only_vtable"), std::string("boolean"), std::string("Only return vtable-derived indirect calls."), false },
+            { std::string("target_name_filter"), std::string("string"), std::string("Case-insensitive substring filter over resolved target names."), false },
         },
         handler_resolve_indirect_calls_batched,
         true
     });
 
     registry.register_tool({
-        OBFSTR("enumerate_vtables"),
-        OBFSTR("vuln"),
-        OBFSTR("Enumerate vtables from named vftable types and read-only pointer arrays that resolve to function starts, returning confidence per table."),
+        std::string("enumerate_vtables"),
+        std::string("vuln"),
+        std::string("Enumerate vtables from named vftable types and read-only pointer arrays that resolve to function starts, returning confidence per table."),
         {
-            { OBFSTR("min_entries"), OBFSTR("number"), OBFSTR("Minimum pointer-array entries (default 3)."), false },
-            { OBFSTR("max_entries"), OBFSTR("number"), OBFSTR("Maximum entries per table (default 256)."), false },
+            { std::string("min_entries"), std::string("number"), std::string("Minimum pointer-array entries (default 3)."), false },
+            { std::string("max_entries"), std::string("number"), std::string("Maximum entries per table (default 256)."), false },
         },
         handler_enumerate_vtables,
         true
     });
 
     registry.register_tool({
-        OBFSTR("reachable_under_constraints"),
-        OBFSTR("vuln"),
-        OBFSTR("Inter-procedural callgraph BFS from source functions to sink functions while pruning must_not_cross_funcs, capped at max_depth * 16 expansions per source."),
+        std::string("reachable_under_constraints"),
+        std::string("vuln"),
+        std::string("Inter-procedural callgraph BFS from source functions to sink functions while pruning must_not_cross_funcs, capped at max_depth * 16 expansions per source."),
         {
-            { OBFSTR("sources"), OBFSTR("array"), OBFSTR("Source function addresses."), true },
-            { OBFSTR("sinks"), OBFSTR("array"), OBFSTR("Sink function addresses."), true },
-            { OBFSTR("must_not_cross_funcs"), OBFSTR("array"), OBFSTR("Functions that block reachability."), false },
-            { OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum call depth (default 6, max 32)."), false },
+            { std::string("sources"), std::string("array"), std::string("Source function addresses."), true },
+            { std::string("sinks"), std::string("array"), std::string("Sink function addresses."), true },
+            { std::string("must_not_cross_funcs"), std::string("array"), std::string("Functions that block reachability."), false },
+            { std::string("max_depth"), std::string("number"), std::string("Maximum call depth (default 6, max 32)."), false },
         },
         handler_reachable_under_constraints,
         true
     });
 
     registry.register_tool({
-        OBFSTR("postdominates"),
-        OBFSTR("vuln"),
-        OBFSTR("Return whether one qflow_chart_t basic block postdominates another in a function."),
+        std::string("postdominates"),
+        std::string("vuln"),
+        std::string("Return whether one qflow_chart_t basic block postdominates another in a function."),
         {
-            { OBFSTR("func_ea"), OBFSTR("string"), OBFSTR("Function address."), true },
-            { OBFSTR("from_block"), OBFSTR("number"), OBFSTR("Block being tested."), true },
-            { OBFSTR("to_block"), OBFSTR("number"), OBFSTR("Candidate postdominator block."), true },
+            { std::string("func_ea"), std::string("string"), std::string("Function address."), true },
+            { std::string("from_block"), std::string("number"), std::string("Block being tested."), true },
+            { std::string("to_block"), std::string("number"), std::string("Candidate postdominator block."), true },
         },
         handler_postdominates,
         true

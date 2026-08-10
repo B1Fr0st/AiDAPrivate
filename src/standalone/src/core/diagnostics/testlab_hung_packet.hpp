@@ -41,8 +41,6 @@ struct hung_packet_context_t {
     std::size_t ui_dispatcher_backlog = 0;
     const char* work_queue_snapshot = nullptr;
     const char* critical_queue_snapshot = nullptr;
-    std::uint64_t license_liveness_ms = 0;
-    std::uint64_t arc_liveness_ms = 0;
     std::uint64_t driver_watchdog_ms = 0;
     const char* first_failure_marker = nullptr;
     const char* last_successful_marker = nullptr;
@@ -113,7 +111,7 @@ inline void log_hung_diagnostic_packet(const hung_packet_context_t& ctx) {
     utc_val.HighPart = system_time.dwHighDateTime;
 
     diag::log_tagged_critical_fmt("testlab",
-        "TESTLAB-HUNG-DIAGNOSTIC-PACKET run_id=%llu suite=%s domain=%s test=%s phase=%s step=%s step_start_ms=%llu step_elapsed_ms=%llu utc_100ns=%llu tick_ms=%llu elapsed_ms=%llu pid=%lu tid=%lu target_path=%s requested_cwd=%s effective_cwd=%s target_pid=%u driver_attached=%d cancellation=%d shutdown=%d mcp_active_leases=%zu mcp_active_requests=%zu downstream=%s ui_backlog=%zu work_queues={%.1400s} critical_queues={%.1400s} license_ms=%llu arc_ms=%llu driver_watchdog_ms=%llu first_failure=%s last_success=%s",
+        "TESTLAB-HUNG-DIAGNOSTIC-PACKET run_id=%llu suite=%s domain=%s test=%s phase=%s step=%s step_start_ms=%llu step_elapsed_ms=%llu utc_100ns=%llu tick_ms=%llu elapsed_ms=%llu pid=%lu tid=%lu target_path=%s requested_cwd=%s effective_cwd=%s target_pid=%u driver_attached=%d cancellation=%d shutdown=%d mcp_active_leases=%zu mcp_active_requests=%zu downstream=%s ui_backlog=%zu work_queues={%.1400s} critical_queues={%.1400s} driver_watchdog_ms=%llu first_failure=%s last_success=%s",
         static_cast<unsigned long long>(ctx.test_run_id),
         ctx.suite ? ctx.suite : "<null>",
         ctx.domain ? ctx.domain : "<null>",
@@ -140,8 +138,6 @@ inline void log_hung_diagnostic_packet(const hung_packet_context_t& ctx) {
         ctx.ui_dispatcher_backlog,
         ctx.work_queue_snapshot && ctx.work_queue_snapshot[0] ? ctx.work_queue_snapshot : "empty=1",
         ctx.critical_queue_snapshot && ctx.critical_queue_snapshot[0] ? ctx.critical_queue_snapshot : "empty=1",
-        static_cast<unsigned long long>(ctx.license_liveness_ms),
-        static_cast<unsigned long long>(ctx.arc_liveness_ms),
         static_cast<unsigned long long>(ctx.driver_watchdog_ms),
         ctx.first_failure_marker ? ctx.first_failure_marker : "<null>",
         ctx.last_successful_marker ? ctx.last_successful_marker : "<null>");

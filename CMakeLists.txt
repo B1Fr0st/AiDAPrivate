@@ -2775,7 +2775,6 @@ set(AIDA_HEADERS
     src/mcp_server.hpp
     src/multibinary_index.hpp
     src/multibinary_project.hpp
-    src/obfuscation.hpp
     src/settings.hpp
     src/driver_loader.hpp
     src/vuln/chain_binary_corpus.hpp

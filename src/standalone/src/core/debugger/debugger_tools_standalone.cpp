@@ -187,13 +187,11 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
     }
     std::string kernel_reason;
     const bool kernel_ready = driver_bridge::using_kernel_driver() &&
-        driver_bridge::kernel_session_available(&kernel_reason) &&
-        driver_bridge::dynamic_ioctls_ready();
+        driver_bridge::kernel_session_available(&kernel_reason);
     if (!kernel_ready) {
-        diag::log_tagged_fmt("dbg_tools", "ensure_attached: kernel path unavailable loaded=%d kernel=%d dyn_ready=%d reason=%s status=%s last_error=%s",
+        diag::log_tagged_fmt("dbg_tools", "ensure_attached: kernel path unavailable loaded=%d kernel=%d reason=%s status=%s last_error=%s",
             driver_bridge::is_loaded() ? 1 : 0,
             driver_bridge::using_kernel_driver() ? 1 : 0,
-            driver_bridge::dynamic_ioctls_ready() ? 1 : 0,
             kernel_reason.empty() ? "<empty>" : kernel_reason.c_str(),
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str());

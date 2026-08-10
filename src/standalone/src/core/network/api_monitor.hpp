@@ -1995,7 +1995,6 @@ inline bool arm_breakpoints_for_thread(uint32_t tid) {
         SetLastError(ERROR_SUCCESS);
         const bool before_ok = driver_bridge::get_thread_context(tid, before);
         const DWORD before_gle = before_ok ? ERROR_SUCCESS : GetLastError();
-        const auto dyn_before = driver_bridge::dynamic_ioctl_state();
         SetLastError(ERROR_SUCCESS);
         const bool set_ok = driver_bridge::set_hardware_breakpoint(tid, static_cast<int>(target.bp_index), target.address, 0, 0);
         const DWORD set_gle = set_ok ? ERROR_SUCCESS : GetLastError();
@@ -2013,7 +2012,7 @@ inline bool arm_breakpoints_for_thread(uint32_t tid) {
             armed = true;
         }
         diag::log_tagged_fmt("api_monitor",
-            "arm_thread tid=%u slot=%u type=execute len=1 driver_type=%d driver_size=%d api=%s addr=%s set_ok=%d set_gle=%lu before_ok=%d before_gle=%lu after_ok=%d after_gle=%lu verify_ok=%d slot_addr=%s slot_enabled=%d rip=%s dr0=%s dr1=%s dr2=%s dr3=%s dr6=0x%llX dr7=0x%llX dyn_loaded=%d dyn_kernel=%d dyn_connected=%d dyn_ready=%d dyn_instance_server_seed=0x%08X dyn_instance_ioctl_seed=0x%08X dyn_global_server_seed=0x%08X dyn_global_ioctl_seed=0x%08X dyn_ioctl_seed_hash=0x%08X dyn_heartbeat_seed_hash=0x%08X status=%s last_error=%s",
+            "arm_thread tid=%u slot=%u type=execute len=1 driver_type=%d driver_size=%d api=%s addr=%s set_ok=%d set_gle=%lu before_ok=%d before_gle=%lu after_ok=%d after_gle=%lu verify_ok=%d slot_addr=%s slot_enabled=%d rip=%s dr0=%s dr1=%s dr2=%s dr3=%s dr6=0x%llX dr7=0x%llX status=%s last_error=%s",
             tid,
             target.bp_index,
             0,
@@ -2036,16 +2035,6 @@ inline bool arm_breakpoints_for_thread(uint32_t tid) {
             hex_addr(after.dr3).c_str(),
             static_cast<unsigned long long>(after.dr6),
             static_cast<unsigned long long>(after.dr7),
-            dyn_before.loaded ? 1 : 0,
-            dyn_before.kernel ? 1 : 0,
-            dyn_before.connected ? 1 : 0,
-            dyn_before.ready ? 1 : 0,
-            dyn_before.instance_server_seed,
-            dyn_before.instance_ioctl_seed,
-            dyn_before.global_server_seed,
-            dyn_before.global_ioctl_seed,
-            dyn_before.ioctl_seed_hash,
-            dyn_before.heartbeat_ioctl_seed_hash,
             set_status.c_str(),
             set_last_error.c_str());
         if (set_ok) {
@@ -3330,19 +3319,6 @@ inline nlohmann::json status_json() {
     }
     j["armed_readback"] = std::move(armed_readback);
     j["armed_readback_count"] = readback_requests.size();
-    const auto dyn = driver_bridge::dynamic_ioctl_state();
-    j["dynamic_ioctl"] = {
-        {"loaded", dyn.loaded},
-        {"kernel", dyn.kernel},
-        {"connected", dyn.connected},
-        {"ready", dyn.ready},
-        {"instance_server_seed", dyn.instance_server_seed},
-        {"instance_ioctl_seed", dyn.instance_ioctl_seed},
-        {"global_server_seed", dyn.global_server_seed},
-        {"global_ioctl_seed", dyn.global_ioctl_seed},
-        {"ioctl_seed_hash", dyn.ioctl_seed_hash},
-        {"heartbeat_ioctl_seed_hash", dyn.heartbeat_ioctl_seed_hash}
-    };
     const auto wq = aida::network::executor_status::work_stats();
     const auto sq = aida::network::executor_status::service_stats();
     j["executor_work"] = {

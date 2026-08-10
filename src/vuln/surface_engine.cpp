@@ -34,7 +34,6 @@
 
 #include "../agent_tools.hpp"
 #include "../ida_utils.hpp"
-#include "../obfuscation.hpp"
 #include "microcode_engine.hpp"
 #include "taint_engine.hpp"
 #include "vuln_common.hpp"
@@ -61,7 +60,7 @@ constexpr int kMaxScannableFuncs  = 8192;
 std::string ea_to_hex(ea_t ea)
 {
     if (ea == BADADDR)
-        return std::string(OBFSTR("0x0"));
+        return std::string(std::string("0x0"));
     std::ostringstream ss;
     ss << "0x" << std::hex << std::uppercase << static_cast<std::uint64_t>(ea);
     return ss.str();
@@ -2551,11 +2550,11 @@ agent_tools::tool_result_t handle_analyze_function_attack_surface(const json& pa
 {
     auto addr = parse_addr_param(params, "address");
     if (!addr.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("address parameter is required"));
+        return agent_tools::tool_result_t::error(std::string("address parameter is required"));
     ea_t fea = *addr;
     func_t* pfn = get_func(fea);
     if (pfn == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("address does not lie inside a function"));
+        return agent_tools::tool_result_t::error(std::string("address does not lie inside a function"));
     fea = pfn->start_ea;
 
     attack_surface_score_t score;
@@ -2614,8 +2613,8 @@ agent_tools::tool_result_t handle_analyze_function_attack_surface(const json& pa
     data["breakdown"] = std::move(breakdown);
 
     std::ostringstream msg;
-    msg << OBFSTR("Attack-surface score: ") << score.total_score << OBFSTR("/100 (")
-        << score.classification << OBFSTR(")");
+    msg << std::string("Attack-surface score: ") << score.total_score << std::string("/100 (")
+        << score.classification << std::string(")");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2653,7 +2652,7 @@ agent_tools::tool_result_t handle_list_attacker_reachable_functions(const json& 
     data["total_input_sources"] = total_sources;
 
     std::ostringstream msg;
-    msg << OBFSTR("Attacker-reachable functions: ") << funcs.size();
+    msg << std::string("Attacker-reachable functions: ") << funcs.size();
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2661,10 +2660,10 @@ agent_tools::tool_result_t handle_classify_function_role(const json& params)
 {
     auto addr = parse_addr_param(params, "address");
     if (!addr.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("address parameter is required"));
+        return agent_tools::tool_result_t::error(std::string("address parameter is required"));
     func_t* pfn = get_func(*addr);
     if (pfn == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("address does not lie inside a function"));
+        return agent_tools::tool_result_t::error(std::string("address does not lie inside a function"));
     ea_t fea = pfn->start_ea;
 
     std::string role;
@@ -2679,7 +2678,7 @@ agent_tools::tool_result_t handle_classify_function_role(const json& params)
     data["role"]      = role;
 
     std::ostringstream msg;
-    msg << OBFSTR("Function role: ") << role;
+    msg << std::string("Function role: ") << role;
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2694,7 +2693,7 @@ agent_tools::tool_result_t handle_enumerate_callbacks(const json&)
     data["count"]    = findings.size();
     data["findings"] = findings_to_json_array(findings);
     std::ostringstream msg;
-    msg << OBFSTR("Callback registration scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Callback registration scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2710,7 +2709,7 @@ agent_tools::tool_result_t handle_find_writable_executable_pages(const json&)
     data["findings"]    = findings_to_json_array(findings);
     data["primary_cwe"] = 1188;
     std::ostringstream msg;
-    msg << OBFSTR("W^X violation scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("W^X violation scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2723,14 +2722,14 @@ agent_tools::tool_result_t handle_explain_vulnerability_chain(const json& params
                                   params["sink_address"].is_string()
         ? params["sink_address"].get<std::string>() : std::string();
     if (source_spec.empty() || sink_spec.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("source_address and sink_address required"));
+        return agent_tools::tool_result_t::error(std::string("source_address and sink_address required"));
 
     ea_t source_ea = resolve_address_or_name(source_spec);
     ea_t sink_ea   = resolve_address_or_name(sink_spec);
     if (source_ea == BADADDR)
-        return agent_tools::tool_result_t::error(OBFSTR("Could not resolve source address: ") + source_spec);
+        return agent_tools::tool_result_t::error(std::string("Could not resolve source address: ") + source_spec);
     if (sink_ea == BADADDR)
-        return agent_tools::tool_result_t::error(OBFSTR("Could not resolve sink address: ") + sink_spec);
+        return agent_tools::tool_result_t::error(std::string("Could not resolve sink address: ") + sink_spec);
 
     std::vector<aida::vuln::taint::taint_path_t> paths;
     {
@@ -2821,7 +2820,7 @@ agent_tools::tool_result_t handle_explain_vulnerability_chain(const json& params
     data["sink_func"]   = func_name_for(containing_func_ea(sink_ea));
 
     std::ostringstream msg;
-    msg << OBFSTR("Vulnerability chain explanation: ") << paths.size() << OBFSTR(" path(s)");
+    msg << std::string("Vulnerability chain explanation: ") << paths.size() << std::string(" path(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -2945,10 +2944,10 @@ agent_tools::tool_result_t handle_map_state_machine(const json& params)
 {
     auto addr = parse_addr_param(params, "address");
     if (!addr.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("address parameter is required"));
+        return agent_tools::tool_result_t::error(std::string("address parameter is required"));
     func_t* pfn = get_func(*addr);
     if (pfn == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("address does not lie inside a function"));
+        return agent_tools::tool_result_t::error(std::string("address does not lie inside a function"));
     ea_t fea = pfn->start_ea;
 
     cfuncptr_t cf(nullptr);
@@ -2957,7 +2956,7 @@ agent_tools::tool_result_t handle_map_state_machine(const json& params)
         cf = decompile_safe(fea);
     }
     if (!cf)
-        return agent_tools::tool_result_t::error(OBFSTR("Could not decompile function"));
+        return agent_tools::tool_result_t::error(std::string("Could not decompile function"));
 
     state_machine_visitor_t v(cf.operator->());
     v.apply_to(&cf->body, nullptr);
@@ -3000,8 +2999,8 @@ agent_tools::tool_result_t handle_map_state_machine(const json& params)
     data["findings"] = findings_to_json_array(findings);
 
     std::ostringstream msg;
-    msg << (v.subject_is_state ? OBFSTR("State machine detected: ")
-                                : OBFSTR("No state machine: "))
+    msg << (v.subject_is_state ? std::string("State machine detected: ")
+                                : std::string("No state machine: "))
         << func_name_for(fea);
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
@@ -3151,7 +3150,7 @@ agent_tools::tool_result_t handle_find_protocol_parser_bugs(const json& params)
     data["count"]    = findings.size();
     data["findings"] = findings_to_json_array(findings);
     std::ostringstream msg;
-    msg << OBFSTR("Protocol-parser bug scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Protocol-parser bug scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -3314,7 +3313,7 @@ agent_tools::tool_result_t handle_find_loose_bounds_checks(const json& params)
     data["findings"]    = findings_to_json_array(findings);
     data["primary_cwe"] = 839;
     std::ostringstream msg;
-    msg << OBFSTR("Loose bounds-check scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Loose bounds-check scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -3458,7 +3457,7 @@ agent_tools::tool_result_t handle_find_signed_unsigned_confusion(const json& par
     data["findings"]    = findings_to_json_array(findings);
     data["primary_cwe"] = 195;
     std::ostringstream msg;
-    msg << OBFSTR("Signed/unsigned-confusion scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Signed/unsigned-confusion scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -3626,7 +3625,7 @@ agent_tools::tool_result_t handle_find_missing_null_check(const json& params)
     data["findings"]    = findings_to_json_array(findings);
     data["primary_cwe"] = 476;
     std::ostringstream msg;
-    msg << OBFSTR("Missing-NULL-check scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Missing-NULL-check scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -3820,7 +3819,7 @@ agent_tools::tool_result_t handle_find_toctou_patterns(const json& params)
     data["findings"]    = findings_to_json_array(findings);
     data["primary_cwe"] = 367;
     std::ostringstream msg;
-    msg << OBFSTR("TOCTOU pattern scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("TOCTOU pattern scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -3981,7 +3980,7 @@ agent_tools::tool_result_t handle_find_arbitrary_rw_primitives(const json& param
     data["primary_cwe_write"] = 787;
     data["primary_cwe_read"]  = 125;
     std::ostringstream msg;
-    msg << OBFSTR("Arbitrary R/W primitive scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Arbitrary R/W primitive scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -4177,7 +4176,7 @@ agent_tools::tool_result_t handle_find_unsafe_deserializers(const json& params)
     data["findings"]    = findings_to_json_array(findings);
     data["primary_cwe"] = 502;
     std::ostringstream msg;
-    msg << OBFSTR("Unsafe-deserializer scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Unsafe-deserializer scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -4388,7 +4387,7 @@ agent_tools::tool_result_t handle_find_off_by_one_patterns(const json& params)
     data["findings"]    = findings_to_json_array(findings);
     data["primary_cwe"] = 193;
     std::ostringstream msg;
-    msg << OBFSTR("Off-by-one pattern scan: ") << findings.size() << OBFSTR(" finding(s)");
+    msg << std::string("Off-by-one pattern scan: ") << findings.size() << std::string(" finding(s)");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -4396,14 +4395,14 @@ agent_tools::tool_result_t handle_fingerprint_binary_attack_profile(const json&)
 {
     json data = fingerprint_binary_attack_profile();
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Binary attack profile"), data);
+    return agent_tools::tool_result_t::ok(std::string("Binary attack profile"), data);
 }
 
 agent_tools::tool_result_t handle_enumerate_ipc_endpoints(const json& params)
 {
     json data = enumerate_ipc_endpoints(json_string_array_param(params, "kinds"));
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("IPC endpoints: ") +
+    return agent_tools::tool_result_t::ok(std::string("IPC endpoints: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -4411,7 +4410,7 @@ agent_tools::tool_result_t handle_compute_pre_auth_handler_set(const json&)
 {
     json data = compute_pre_auth_handler_set();
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Pre-auth handlers: ") +
+    return agent_tools::tool_result_t::ok(std::string("Pre-auth handlers: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -4421,12 +4420,12 @@ agent_tools::tool_result_t handle_enumerate_handler_reachable_sinks(const json& 
     if (!addr.has_value())
         addr = parse_addr_param(params, "address");
     if (!addr.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("handler_ea is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("handler_ea is required"), "bad_param");
     json data = enumerate_handler_reachable_sinks(*addr,
         json_int_param_surface(params, "max_depth", 6),
         json_int_param_surface(params, "max_hits", 64));
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Reachable sinks: ") +
+    return agent_tools::tool_result_t::ok(std::string("Reachable sinks: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -4436,10 +4435,10 @@ agent_tools::tool_result_t handle_classify_exploit_primitive(const json& params)
     if (!addr.has_value())
         addr = parse_addr_param(params, "address");
     if (!addr.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("sink_ea is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("sink_ea is required"), "bad_param");
     json data = classify_exploit_primitive(*addr);
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Exploit primitive: ") + data.value("primitive", std::string("unknown")), data);
+    return agent_tools::tool_result_t::ok(std::string("Exploit primitive: ") + data.value("primitive", std::string("unknown")), data);
 }
 
 agent_tools::tool_result_t handle_find_protocol_routers(const json& params)
@@ -4447,7 +4446,7 @@ agent_tools::tool_result_t handle_find_protocol_routers(const json& params)
     json data = find_protocol_routers(json_int_param_surface(params, "min_cases", 4),
                                       json_int_param_surface(params, "max_results", 64));
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Protocol routers: ") +
+    return agent_tools::tool_result_t::ok(std::string("Protocol routers: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -4457,10 +4456,10 @@ agent_tools::tool_result_t handle_resolve_indirect_call_targets_workflow(const j
     if (!addr.has_value())
         addr = parse_addr_param(params, "address");
     if (!addr.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("call_ea is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("call_ea is required"), "bad_param");
     json data = resolve_indirect_call_targets(*addr);
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Indirect call targets: ") +
+    return agent_tools::tool_result_t::ok(std::string("Indirect call targets: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -4469,11 +4468,11 @@ agent_tools::tool_result_t handle_explain_vulnerability_chain_v2(const json& par
     auto src = parse_addr_param(params, "source_address");
     auto sink = parse_addr_param(params, "sink_address");
     if (!src.has_value() || !sink.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("source_address and sink_address are required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("source_address and sink_address are required"), "bad_param");
     json data = explain_vulnerability_chain_v2(*src, *sink,
         json_bool_param_surface(params, "require_pre_auth", false));
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Vulnerability chain v2"), data);
+    return agent_tools::tool_result_t::ok(std::string("Vulnerability chain v2"), data);
 }
 
 agent_tools::tool_result_t handle_hunt_remote_rce(const json& params)
@@ -4481,7 +4480,7 @@ agent_tools::tool_result_t handle_hunt_remote_rce(const json& params)
     json data = hunt_remote_rce(json_int_param_surface(params, "top_k", 10),
                                 json_bool_param_surface(params, "extract_constraints", false));
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Remote RCE hunt candidates: ") +
+    return agent_tools::tool_result_t::ok(std::string("Remote RCE hunt candidates: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -4491,7 +4490,7 @@ agent_tools::tool_result_t handle_rank_attack_surface(const json& params)
         ? params["role_filter"].get<std::string>() : std::string("all");
     json data = rank_attack_surface(json_int_param_surface(params, "limit", 50), role);
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Attack surface ranking: ") +
+    return agent_tools::tool_result_t::ok(std::string("Attack surface ranking: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -4501,7 +4500,7 @@ agent_tools::tool_result_t handle_add_dynamic_taint_source(const json& params)
     if (!addr.has_value())
         addr = parse_addr_param(params, "address");
     if (!addr.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("source_ea is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("source_ea is required"), "bad_param");
     std::string kind = params.is_object() && params.contains("kind") && params["kind"].is_string()
         ? params["kind"].get<std::string>() : std::string("dynamic");
     std::string name = params.is_object() && params.contains("name") && params["name"].is_string()
@@ -4509,15 +4508,15 @@ agent_tools::tool_result_t handle_add_dynamic_taint_source(const json& params)
     json data = add_dynamic_taint_source(*addr, kind, name);
     sanitize_json_utf8_inplace(data);
     if (!data.value("added", false))
-        return agent_tools::tool_result_t::error(OBFSTR("source_ea does not lie inside a function"), "no_function_at_addr");
-    return agent_tools::tool_result_t::ok(OBFSTR("Dynamic taint source added"), data);
+        return agent_tools::tool_result_t::error(std::string("source_ea does not lie inside a function"), "no_function_at_addr");
+    return agent_tools::tool_result_t::ok(std::string("Dynamic taint source added"), data);
 }
 
 agent_tools::tool_result_t handle_enumerate_callbacks_extended(const json&)
 {
     json data = enumerate_callbacks_extended();
     sanitize_json_utf8_inplace(data);
-    return agent_tools::tool_result_t::ok(OBFSTR("Extended callback scan: ") +
+    return agent_tools::tool_result_t::ok(std::string("Extended callback scan: ") +
                                           std::to_string(data.value("count", static_cast<std::size_t>(0))), data);
 }
 
@@ -4527,14 +4526,14 @@ void register_tier2_surface_tools()
 {
     auto& registry = agent_tools::ToolRegistry::instance();
     auto register_taint_required = [&](agent_tools::tool_definition_t def) {
-        def.required_indices = {OBFSTR("taint_engine")};
+        def.required_indices = {std::string("taint_engine")};
         registry.register_tool(def);
     };
 
     registry.register_tool({
-        OBFSTR("analyze_function_attack_surface"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Compute a 0-100 attack-surface score for the given function. Decomposes the score "
+        std::string("analyze_function_attack_surface"),
+        std::string("vuln_advanced"),
+        std::string("Compute a 0-100 attack-surface score for the given function. Decomposes the score "
                "into input_proximity (reverse-graph distance to input sources, max 25), sink_count "
                "(forward distance to dangerous sinks, max 25), missing_validators (parameters that "
                "flow to sinks without validation, max 20), complexity (log2 of cyclomatic, max 15), "
@@ -4542,47 +4541,47 @@ void register_tier2_surface_tools()
                "the function's classified role (allocator/deallocator/validator/parser/dispatcher/"
                "ioctl_handler/ipc_endpoint/callback/crypto/utility)."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Address (0x...) of the function to score."), true},
+            {std::string("address"), std::string("string"),
+             std::string("Address (0x...) of the function to score."), true},
         },
         handle_analyze_function_attack_surface,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("list_attacker_reachable_functions"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Enumerate every function reachable (via reverse call-graph BFS) from any known "
+        std::string("list_attacker_reachable_functions"),
+        std::string("vuln_advanced"),
+        std::string("Enumerate every function reachable (via reverse call-graph BFS) from any known "
                "input-source callsite. These are the functions that can directly or transitively "
                "process attacker-controlled bytes and therefore form the binary's primary attack "
                "surface."),
         {
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of functions to return (default 200, max 4096)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of functions to return (default 200, max 4096)."), false},
         },
         handle_list_attacker_reachable_functions,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("classify_function_role"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Heuristically label a function with a single role: allocator, deallocator, "
+        std::string("classify_function_role"),
+        std::string("vuln_advanced"),
+        std::string("Heuristically label a function with a single role: allocator, deallocator, "
                "validator, parser, dispatcher, ioctl_handler, ipc_endpoint, callback, crypto, or "
                "utility. Combines name signatures, callee-set heuristics, switch-shape analysis, "
                "and taint summaries."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Address (0x...) of the function to classify."), true},
+            {std::string("address"), std::string("string"),
+             std::string("Address (0x...) of the function to classify."), true},
         },
         handle_classify_function_role,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("enumerate_callbacks"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Find places where the binary registers a function pointer with the operating system "
+        std::string("enumerate_callbacks"),
+        std::string("vuln_advanced"),
+        std::string("Find places where the binary registers a function pointer with the operating system "
                "or another component. Covers SetWindowsHookEx*, CreateRemoteThread*, CreateThread, "
                "RtlCreateUserThread, IoRegisterDeviceInterface, KeInitializeDpc, KeInitializeTimer*, "
                "IoSetCompletionRoutine*, IoRegister*Notification, ExRegisterCallback, "
@@ -4597,9 +4596,9 @@ void register_tier2_surface_tools()
     });
 
     registry.register_tool({
-        OBFSTR("find_writable_executable_pages"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Identify segments and PE sections that are simultaneously writable and executable "
+        std::string("find_writable_executable_pages"),
+        std::string("vuln_advanced"),
+        std::string("Identify segments and PE sections that are simultaneously writable and executable "
                "(W^X violation, CWE-1188). Scans IDA segments via SEGPERM_EXEC|SEGPERM_WRITE and "
                "additionally walks the PE section table for IMAGE_SCN_MEM_EXECUTE | "
                "IMAGE_SCN_MEM_WRITE. Each match is emitted as a critical, confirmed finding."),
@@ -4609,290 +4608,290 @@ void register_tier2_surface_tools()
     });
 
     registry.register_tool({
-        OBFSTR("explain_vulnerability_chain"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Generate a markdown narrative plus structured JSON for taint paths from a source "
+        std::string("explain_vulnerability_chain"),
+        std::string("vuln_advanced"),
+        std::string("Generate a markdown narrative plus structured JSON for taint paths from a source "
                "callsite to a sink callsite. Each step in each path is annotated with the "
                "decompiled snippet at the step EA, accumulated path conditions, and the engine's "
                "summary text."),
         {
-            {OBFSTR("source_address"), OBFSTR("string"),
-             OBFSTR("Address (0x...) or symbol name of the input-source callsite."), true},
-            {OBFSTR("sink_address"),   OBFSTR("string"),
-             OBFSTR("Address (0x...) or symbol name of the dangerous-sink callsite."), true},
+            {std::string("source_address"), std::string("string"),
+             std::string("Address (0x...) or symbol name of the input-source callsite."), true},
+            {std::string("sink_address"),   std::string("string"),
+             std::string("Address (0x...) or symbol name of the dangerous-sink callsite."), true},
         },
         handle_explain_vulnerability_chain,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("map_state_machine"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect state-machine-like dispatch in the given function. A state machine is a "
+        std::string("map_state_machine"),
+        std::string("vuln_advanced"),
+        std::string("Detect state-machine-like dispatch in the given function. A state machine is a "
                "switch on a global / member field whose name resembles state/status/phase/mode/"
                "step/stage/fsm, with cases that update the same field. Returns the detected "
                "transitions and emits an info-level finding when at least one transition lacks an "
                "explicit guard, indicating possible illegal-state attacks."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Address (0x...) of the function to analyze."), true},
+            {std::string("address"), std::string("string"),
+             std::string("Address (0x...) of the function to analyze."), true},
         },
         handle_map_state_machine,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_protocol_parser_bugs"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect bugs in protocol parsers that consume externally-controlled input and "
+        std::string("find_protocol_parser_bugs"),
+        std::string("vuln_advanced"),
+        std::string("Detect bugs in protocol parsers that consume externally-controlled input and "
                "dispatch on length/type/cmd fields. Flags memcpy/memmove/RtlCopyMemory/RtlMoveMemory "
                "calls whose size argument is non-literal arithmetic on attacker-influenced data "
                "(CWE-130 length-not-checked) and detects size = n - 1 patterns flowing into a copy "
                "of n bytes (CWE-193 off-by-one)."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Optional address (0x...) of a single function to scan; default scans every function."),
+            {std::string("address"), std::string("string"),
+             std::string("Optional address (0x...) of a single function to scan; default scans every function."),
              false},
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_protocol_parser_bugs,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_loose_bounds_checks"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect if-conditions that compare an attacker-influenced value against a constant "
+        std::string("find_loose_bounds_checks"),
+        std::string("vuln_advanced"),
+        std::string("Detect if-conditions that compare an attacker-influenced value against a constant "
                "bound but use the wrong relational operator. Specifically flags signed comparisons "
                "(cot_sgt/sge/slt/sle) against an unsigned-typed lvar where a negative attacker "
                "value would slip through. CWE-839."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Optional address (0x...) of a single function to scan; default scans every function."),
+            {std::string("address"), std::string("string"),
+             std::string("Optional address (0x...) of a single function to scan; default scans every function."),
              false},
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_loose_bounds_checks,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_signed_unsigned_confusion"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect signed/unsigned comparisons whose operands have differing signedness "
+        std::string("find_signed_unsigned_confusion"),
+        std::string("vuln_advanced"),
+        std::string("Detect signed/unsigned comparisons whose operands have differing signedness "
                "(signed lvar vs unsigned lvar/literal, or vice versa). Implicit promotion to "
                "unsigned can suppress negative-value paths and bypass length checks. CWE-194/195."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Optional address (0x...) of a single function to scan; default scans every function."),
+            {std::string("address"), std::string("string"),
+             std::string("Optional address (0x...) of a single function to scan; default scans every function."),
              false},
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_signed_unsigned_confusion,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_missing_null_check"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect pointer dereferences that follow an allocator (malloc/calloc/realloc/"
+        std::string("find_missing_null_check"),
+        std::string("vuln_advanced"),
+        std::string("Detect pointer dereferences that follow an allocator (malloc/calloc/realloc/"
                "HeapAlloc/RtlAllocateHeap/LocalAlloc/GlobalAlloc/VirtualAlloc/ExAllocatePool*/operator new) "
                "without an intervening explicit null-check on the same pointer. CWE-476."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Optional address (0x...) of a single function to scan; default scans every function."),
+            {std::string("address"), std::string("string"),
+             std::string("Optional address (0x...) of a single function to scan; default scans every function."),
              false},
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_missing_null_check,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_toctou_patterns"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect Time-of-Check-to-Time-of-Use races in the same function: a check call "
+        std::string("find_toctou_patterns"),
+        std::string("vuln_advanced"),
+        std::string("Detect Time-of-Check-to-Time-of-Use races in the same function: a check call "
                "(GetFileAttributes*/PathFileExists*/_access/stat*/OpenFile/RegOpenKey*) followed by "
                "a use call (CreateFile*/fopen/_open/DeleteFile*/MoveFile*/CopyFile*) on the same "
                "identifier. CWE-367."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Optional address (0x...) of a single function to scan; default scans every function."),
+            {std::string("address"), std::string("string"),
+             std::string("Optional address (0x...) of a single function to scan; default scans every function."),
              false},
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_toctou_patterns,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_arbitrary_rw_primitives"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect microcode m_ldx/m_stx instructions whose effective address (and, for stores, "
+        std::string("find_arbitrary_rw_primitives"),
+        std::string("vuln_advanced"),
+        std::string("Detect microcode m_ldx/m_stx instructions whose effective address (and, for stores, "
                "value) traces back via def-use to a function parameter or input source. In a kernel "
                "context this yields high-confidence arbitrary-write/arbitrary-read primitives "
                "(CWE-787 / CWE-125)."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Optional address (0x...) of a single function to scan; default scans every function."),
+            {std::string("address"), std::string("string"),
+             std::string("Optional address (0x...) of a single function to scan; default scans every function."),
              false},
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_arbitrary_rw_primitives,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_unsafe_deserializers"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect calls to deserialization frameworks (BinaryFormatter::Deserialize, "
+        std::string("find_unsafe_deserializers"),
+        std::string("vuln_advanced"),
+        std::string("Detect calls to deserialization frameworks (BinaryFormatter::Deserialize, "
                "marshal::loads, pickle::loads, unserialize, ObjectInputStream::readObject, generic "
                "*deserialize*/*unmarshal*/*read_blob*/*from_bytes* helpers) whose first argument "
                "traces back to attacker-controlled bytes. Also flags wcsstr/strstr/memchr "
                "byte-dispatch loops over attacker buffers. CWE-502."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Optional address (0x...) of a single function to scan; default scans every function."),
+            {std::string("address"), std::string("string"),
+             std::string("Optional address (0x...) of a single function to scan; default scans every function."),
              false},
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_unsafe_deserializers,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_off_by_one_patterns"),
-        OBFSTR("vuln_advanced"),
-        OBFSTR("Detect off-by-one buffer-access patterns: for/while/do loops whose condition uses "
+        std::string("find_off_by_one_patterns"),
+        std::string("vuln_advanced"),
+        std::string("Detect off-by-one buffer-access patterns: for/while/do loops whose condition uses "
                "'<= bound' (cot_sle / cot_ule) instead of '< bound', and strncpy/wcsncpy/strncat/"
                "wcsncat calls of the form strncpy(dst, src, sizeof(dst)) which do not guarantee "
                "a trailing NUL terminator. CWE-193."),
         {
-            {OBFSTR("address"), OBFSTR("string"),
-             OBFSTR("Optional address (0x...) of a single function to scan; default scans every function."),
+            {std::string("address"), std::string("string"),
+             std::string("Optional address (0x...) of a single function to scan; default scans every function."),
              false},
-            {OBFSTR("limit"), OBFSTR("number"),
-             OBFSTR("Maximum number of findings to return (default 64, max 1024)."), false},
+            {std::string("limit"), std::string("number"),
+             std::string("Maximum number of findings to return (default 64, max 1024)."), false},
         },
         handle_find_off_by_one_patterns,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("fingerprint_binary_attack_profile"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("One-call binary attack-surface classifier using IDA file metadata, imports, endpoint callsites, and auth-gate evidence."),
+        std::string("fingerprint_binary_attack_profile"),
+        std::string("vuln_workflow"),
+        std::string("One-call binary attack-surface classifier using IDA file metadata, imports, endpoint callsites, and auth-gate evidence."),
         {},
         handle_fingerprint_binary_attack_profile,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("enumerate_ipc_endpoints"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Enumerate RPC, COM, ALPC, network, named-pipe, WSK/NDIS, and kernel IOCTL endpoints with handler EAs and recovery evidence."),
+        std::string("enumerate_ipc_endpoints"),
+        std::string("vuln_workflow"),
+        std::string("Enumerate RPC, COM, ALPC, network, named-pipe, WSK/NDIS, and kernel IOCTL endpoints with handler EAs and recovery evidence."),
         {
-            {OBFSTR("kinds"), OBFSTR("array"), OBFSTR("Optional endpoint kinds: rpc, com, alpc, socket, http, pipe, websocket, wsk, kernel_irp, all."), false},
+            {std::string("kinds"), std::string("array"), std::string("Optional endpoint kinds: rpc, com, alpc, socket, http, pipe, websocket, wsk, kernel_irp, all."), false},
         },
         handle_enumerate_ipc_endpoints,
         true,
     });
 
     register_taint_required({
-        OBFSTR("compute_pre_auth_handler_set"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Classify endpoint handlers as pre-auth when no recognized auth-gate helper is observed in the handler body."),
+        std::string("compute_pre_auth_handler_set"),
+        std::string("vuln_workflow"),
+        std::string("Classify endpoint handlers as pre-auth when no recognized auth-gate helper is observed in the handler body."),
         {},
         handle_compute_pre_auth_handler_set,
         true,
     });
 
     register_taint_required({
-        OBFSTR("enumerate_handler_reachable_sinks"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Walk the callgraph forward from an endpoint handler and collect reachable dangerous sink callsites with validator/auth annotations."),
+        std::string("enumerate_handler_reachable_sinks"),
+        std::string("vuln_workflow"),
+        std::string("Walk the callgraph forward from an endpoint handler and collect reachable dangerous sink callsites with validator/auth annotations."),
         {
-            {OBFSTR("handler_ea"), OBFSTR("string"), OBFSTR("Endpoint handler address."), true},
-            {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum call depth (default 6)."), false},
-            {OBFSTR("max_hits"), OBFSTR("number"), OBFSTR("Maximum sink hits (default 64)."), false},
+            {std::string("handler_ea"), std::string("string"), std::string("Endpoint handler address."), true},
+            {std::string("max_depth"), std::string("number"), std::string("Maximum call depth (default 6)."), false},
+            {std::string("max_hits"), std::string("number"), std::string("Maximum sink hits (default 64)."), false},
         },
         handle_enumerate_handler_reachable_sinks,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("classify_exploit_primitive"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Classify a sink callsite as stack/heap overflow, command injection, format string, type confusion, path traversal, or unknown."),
+        std::string("classify_exploit_primitive"),
+        std::string("vuln_workflow"),
+        std::string("Classify a sink callsite as stack/heap overflow, command injection, format string, type confusion, path traversal, or unknown."),
         {
-            {OBFSTR("sink_ea"), OBFSTR("string"), OBFSTR("Sink callsite address."), true},
+            {std::string("sink_ea"), std::string("string"), std::string("Sink callsite address."), true},
         },
         handle_classify_exploit_primitive,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("find_protocol_routers"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Find switch-on-opcode protocol routers via CFG switch dispatch enumeration and summarize handler reachability to sinks."),
+        std::string("find_protocol_routers"),
+        std::string("vuln_workflow"),
+        std::string("Find switch-on-opcode protocol routers via CFG switch dispatch enumeration and summarize handler reachability to sinks."),
         {
-            {OBFSTR("min_cases"), OBFSTR("number"), OBFSTR("Minimum switch cases (default 4)."), false},
-            {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum routers (default 64)."), false},
+            {std::string("min_cases"), std::string("number"), std::string("Minimum switch cases (default 4)."), false},
+            {std::string("max_results"), std::string("number"), std::string("Maximum routers (default 64)."), false},
         },
         handle_find_protocol_routers,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("resolve_indirect_call_targets"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Resolve one indirect call through existing typeinfo, vtable, RTTI, constant-pool, xref, and microcode SSA resolvers."),
+        std::string("resolve_indirect_call_targets"),
+        std::string("vuln_workflow"),
+        std::string("Resolve one indirect call through existing typeinfo, vtable, RTTI, constant-pool, xref, and microcode SSA resolvers."),
         {
-            {OBFSTR("call_ea"), OBFSTR("string"), OBFSTR("Indirect call address."), true},
+            {std::string("call_ea"), std::string("string"), std::string("Indirect call address."), true},
         },
         handle_resolve_indirect_call_targets_workflow,
         true,
     });
 
     register_taint_required({
-        OBFSTR("explain_vulnerability_chain_v2"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Explain a taint chain with pre-auth classification and per-step wire-field offset annotations when recovered."),
+        std::string("explain_vulnerability_chain_v2"),
+        std::string("vuln_workflow"),
+        std::string("Explain a taint chain with pre-auth classification and per-step wire-field offset annotations when recovered."),
         {
-            {OBFSTR("source_address"), OBFSTR("string"), OBFSTR("Source callsite address."), true},
-            {OBFSTR("sink_address"), OBFSTR("string"), OBFSTR("Sink callsite address."), true},
-            {OBFSTR("require_pre_auth"), OBFSTR("boolean"), OBFSTR("Filter out chains that are not pre-auth clean."), false},
+            {std::string("source_address"), std::string("string"), std::string("Source callsite address."), true},
+            {std::string("sink_address"), std::string("string"), std::string("Sink callsite address."), true},
+            {std::string("require_pre_auth"), std::string("boolean"), std::string("Filter out chains that are not pre-auth clean."), false},
         },
         handle_explain_vulnerability_chain_v2,
         true,
     });
 
     register_taint_required({
-        OBFSTR("hunt_remote_rce"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("End-to-end remote RCE hunt orchestrator: profile binary, enumerate endpoints, filter pre-auth handlers, collect reachable sinks, classify primitives, and rank candidates."),
+        std::string("hunt_remote_rce"),
+        std::string("vuln_workflow"),
+        std::string("End-to-end remote RCE hunt orchestrator: profile binary, enumerate endpoints, filter pre-auth handlers, collect reachable sinks, classify primitives, and rank candidates."),
         {
-            {OBFSTR("top_k"), OBFSTR("number"), OBFSTR("Maximum candidates (default 10)."), false},
-            {OBFSTR("extract_constraints"), OBFSTR("boolean"), OBFSTR("Request constraint extraction marker for the top candidates."), false},
+            {std::string("top_k"), std::string("number"), std::string("Maximum candidates (default 10)."), false},
+            {std::string("extract_constraints"), std::string("boolean"), std::string("Request constraint extraction marker for the top candidates."), false},
         },
         handle_hunt_remote_rce,
         true,
     });
 
     register_taint_required({
-        OBFSTR("rank_attack_surface"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Batch-score attacker-reachable functions and return the top ranked functions, optionally filtered by classified role."),
+        std::string("rank_attack_surface"),
+        std::string("vuln_workflow"),
+        std::string("Batch-score attacker-reachable functions and return the top ranked functions, optionally filtered by classified role."),
         {
-            {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum functions (default 50)."), false},
-            {OBFSTR("role_filter"), OBFSTR("string"), OBFSTR("Optional role filter or all."), false},
+            {std::string("limit"), std::string("number"), std::string("Maximum functions (default 50)."), false},
+            {std::string("role_filter"), std::string("string"), std::string("Optional role filter or all."), false},
         },
         handle_rank_attack_surface,
         true,
@@ -4900,13 +4899,13 @@ void register_tier2_surface_tools()
 
     {
         agent_tools::tool_definition_t def;
-        def.name = OBFSTR("add_dynamic_taint_source");
-        def.category = OBFSTR("vuln_workflow");
-        def.description = OBFSTR("Add a runtime session taint source for surface ranking and attacker reachability. Resets automatically when the input MD5 changes.");
+        def.name = std::string("add_dynamic_taint_source");
+        def.category = std::string("vuln_workflow");
+        def.description = std::string("Add a runtime session taint source for surface ranking and attacker reachability. Resets automatically when the input MD5 changes.");
         def.parameters = {
-            {OBFSTR("source_ea"), OBFSTR("string"), OBFSTR("Address inside the source function."), true},
-            {OBFSTR("kind"), OBFSTR("string"), OBFSTR("Source kind label."), false},
-            {OBFSTR("name"), OBFSTR("string"), OBFSTR("Optional display name."), false},
+            {std::string("source_ea"), std::string("string"), std::string("Address inside the source function."), true},
+            {std::string("kind"), std::string("string"), std::string("Source kind label."), false},
+            {std::string("name"), std::string("string"), std::string("Optional display name."), false},
         };
         def.handler = handle_add_dynamic_taint_source;
         def.read_only = false;
@@ -4916,9 +4915,9 @@ void register_tier2_surface_tools()
     }
 
     registry.register_tool({
-        OBFSTR("enumerate_callbacks_extended"),
-        OBFSTR("vuln_workflow"),
-        OBFSTR("Extended callback registration scan covering user-mode callbacks plus WSK, process/thread/image, registry, object, bugcheck, ETW, WMI, and minifilter callback registrations."),
+        std::string("enumerate_callbacks_extended"),
+        std::string("vuln_workflow"),
+        std::string("Extended callback registration scan covering user-mode callbacks plus WSK, process/thread/image, registry, object, bugcheck, ETW, WMI, and minifilter callback registrations."),
         {},
         handle_enumerate_callbacks_extended,
         true,

@@ -317,7 +317,6 @@ inline std::string json_str(const nlohmann::json& j, const std::string& key, con
     return sanitize_utf8(json_dump_safe(*it));
 }
 
-#include "obfuscation.hpp"
 #include "settings.hpp"
 #include "agent_tools.hpp"
 #include "ida_utils.hpp"

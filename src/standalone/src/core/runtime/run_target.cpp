@@ -1136,10 +1136,6 @@ bool try_register_kernel_sandbox_guard(uint32_t pid, bool log_network, bool bloc
 		"kernel_protect_sandbox pid=%u flags=0x%08X ok=%d", pid, flags, protect_ok ? 1 : 0);
 	if (protect_ok) any_ok = true;
 
-	bool permit_ok = driver_bridge::kernel_anti_dump_permit_pid(pid);
-	diag::log_tagged_critical_fmt("malware_safe",
-		"kernel_permit_for_observer pid=%u ok=%d", pid, permit_ok ? 1 : 0);
-
 	if (log_network) {
 		bool net_ok = driver_bridge::malware_safe_net_log(pid, true);
 		bool started = driver_bridge::start_capture(pid, 0, 0, nullptr, 1500);
@@ -1157,10 +1153,9 @@ void try_unregister_kernel_sandbox_guard(uint32_t pid) {
 	bool stopped = driver_bridge::stop_capture();
 	bool net_off = driver_bridge::malware_safe_net_log(pid, false);
 	bool unprotect = driver_bridge::malware_safe_unprotect_pid(pid, nullptr);
-	bool unpermit = driver_bridge::kernel_anti_dump_unpermit_pid(pid);
 	diag::log_tagged_critical_fmt("malware_safe",
-		"kernel_unregister pid=%u stop_capture=%d net_off=%d unprotect=%d unpermit=%d",
-		pid, stopped ? 1 : 0, net_off ? 1 : 0, unprotect ? 1 : 0, unpermit ? 1 : 0);
+		"kernel_unregister pid=%u stop_capture=%d net_off=%d unprotect=%d",
+		pid, stopped ? 1 : 0, net_off ? 1 : 0, unprotect ? 1 : 0);
 }
 
 bool launch_malware_safe_desktop(const launch_options_t& opts, launch_result_t& out);

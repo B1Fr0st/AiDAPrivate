@@ -485,9 +485,8 @@ capability_result_t evaluate(capability_t capability, const context_t& context) 
 	if (needs_kernel_session(capability)) {
 		std::string reason;
 		if (!driver_bridge::using_kernel_driver() ||
-			!driver_bridge::kernel_session_available(&reason) ||
-			!driver_bridge::dynamic_ioctls_ready())
-			return denied("A verified kernel session with dynamic IOCTLs is required.");
+			!driver_bridge::kernel_session_available(&reason))
+			return denied("A verified kernel session is required.");
 	}
 	return allowed();
 }

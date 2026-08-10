@@ -125,7 +125,7 @@ static int idaapi finish_populating_widget_popup(
         "aida:chain_verify_copy_result_json",
     };
 
-    const std::string menu_root = OBFSTR("AiDA/");
+    const std::string menu_root = std::string("AiDA/");
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("finish_populating_widget_popup_before_attach_loop count=%d", static_cast<int>(sizeof(kept_actions)/sizeof(kept_actions[0])));
 #endif
@@ -198,7 +198,7 @@ aida_plugin_t::aida_plugin_t(bool standalone_verified, const std::string& standa
     aida_ipc::trace_breadcrumb("constructor_enter standalone_verified=%d", standalone_verified ? 1 : 0);
     aida_ipc::trace_breadcrumb("constructor_standalone_failure=%s", standalone_failure.empty() ? "(empty)" : standalone_failure.c_str());
 #endif
-    msg(OBFSTR_C("--- Plugin Loading (v%s) ---\n"), AIDA_VERSION);
+    msg("--- Plugin Loading (v%s) ---\n", AIDA_VERSION);
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("constructor_after_version_msg");
     aida_ipc::trace_breadcrumb("constructor_before_chain_verifier_service_create");
@@ -218,7 +218,7 @@ aida_plugin_t::aida_plugin_t(bool standalone_verified, const std::string& standa
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("constructor_initialize_operational_failed disabled_detail=%s", disabled_detail.c_str());
 #endif
-        msg(OBFSTR_C("AiDA: plugin loaded in disabled mode. %s\n"), disabled_detail.c_str());
+        msg("AiDA: plugin loaded in disabled mode. %s\n", disabled_detail.c_str());
     }
 #ifdef __NT__
     else
@@ -379,7 +379,7 @@ bool aida_plugin_t::initialize_operational(bool interactive)
     aida_ipc::trace_breadcrumb("initialize_operational_features_initialized_true");
 #endif
 
-    msg(OBFSTR_C("--- Plugin Loaded Successfully ---\n"));
+    msg("--- Plugin Loaded Successfully ---\n");
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("initialize_operational_after_success_msg");
     aida_ipc::trace_breadcrumb("initialize_operational_before_graphrag_load");
@@ -403,11 +403,11 @@ bool aida_plugin_t::initialize_operational(bool interactive)
                 }
                 catch (const std::exception& ex)
                 {
-                    msg(OBFSTR_C("AiDA GraphRAG load worker unavailable: %s\n"), ex.what());
+                    msg("AiDA GraphRAG load worker unavailable: %s\n", ex.what());
                 }
                 catch (...)
                 {
-                    msg(OBFSTR_C("AiDA GraphRAG load worker unavailable.\n"));
+                    msg("AiDA GraphRAG load worker unavailable.\n");
                 }
             });
 #ifdef __NT__
@@ -416,14 +416,14 @@ bool aida_plugin_t::initialize_operational(bool interactive)
         }
         catch (const std::exception& ex)
         {
-            msg(OBFSTR_C("AiDA GraphRAG load worker unavailable: %s\n"), ex.what());
+            msg("AiDA GraphRAG load worker unavailable: %s\n", ex.what());
 #ifdef __NT__
             aida_ipc::trace_breadcrumb("initialize_operational_graphrag_thread_exception what=%s", ex.what());
 #endif
         }
         catch (...)
         {
-            msg(OBFSTR_C("AiDA GraphRAG load worker unavailable.\n"));
+            msg("AiDA GraphRAG load worker unavailable.\n");
 #ifdef __NT__
             aida_ipc::trace_breadcrumb("initialize_operational_graphrag_thread_unknown_exception");
 #endif
@@ -524,7 +524,7 @@ aida_plugin_t::~aida_plugin_t()
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("destructor_after_chain_verifier_reset");
 #endif
-    msg(OBFSTR_C("--- Plugin has been unloaded ---\n"));
+    msg("--- Plugin has been unloaded ---\n");
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("destructor_exit");
 #endif
@@ -541,7 +541,7 @@ bool idaapi aida_plugin_t::run(size_t)
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("run_ensure_operational_failed disabled_detail=%s", disabled_detail.c_str());
 #endif
-        warning(OBFSTR_C("AiDA is loaded but disabled: %s"), disabled_detail.c_str());
+        warning("AiDA is loaded but disabled: %s", disabled_detail.c_str());
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("run_return_false_disabled");
 #endif
@@ -551,7 +551,7 @@ bool idaapi aida_plugin_t::run(size_t)
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("run_ensure_operational_succeeded");
 #endif
-    info(OBFSTR_C("Plugin is active. Use the right-click context menu in a code view or the Tools menu."));
+    info("Plugin is active. Use the right-click context menu in a code view or the Tools menu.");
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("run_return_true");
 #endif
@@ -624,7 +624,7 @@ bool aida_plugin_t::start_mcp_server()
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("start_mcp_server_start_failed port=%d", g_settings.mcp_port);
 #endif
-        msg(OBFSTR_C("MCP: Could not start server on port %d.\n"), g_settings.mcp_port);
+        msg("MCP: Could not start server on port %d.\n", g_settings.mcp_port);
         mcp_server.reset();
 #ifdef __NT__
         aida_ipc::trace_breadcrumb("start_mcp_server_return_false");
@@ -697,12 +697,12 @@ void aida_plugin_t::register_actions()
     };
 
     const rt_action_def_t action_definitions[] = {
-        {OBFSTR("ai_assistant:copy_context"), OBFSTR("Copy function contents"), handle_copy_context, "Ctrl+Alt+X"},
-        {OBFSTR("ai_assistant:save_database_context"), OBFSTR("Save database context to file..."), handle_save_database_context, ""},
-        {OBFSTR("ai_assistant:fix_analysis"), OBFSTR("Fix Analysis (Clean Decompilation)"), handle_fix_analysis, "Ctrl+Alt+F"},
+        {std::string("ai_assistant:copy_context"), std::string("Copy function contents"), handle_copy_context, "Ctrl+Alt+X"},
+        {std::string("ai_assistant:save_database_context"), std::string("Save database context to file..."), handle_save_database_context, ""},
+        {std::string("ai_assistant:fix_analysis"), std::string("Fix Analysis (Clean Decompilation)"), handle_fix_analysis, "Ctrl+Alt+F"},
     };
 
-    const std::string menu_root = OBFSTR("AiDA/");
+    const std::string menu_root = std::string("AiDA/");
 
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("register_actions_before_registering_rt_actions count=%d", static_cast<int>(sizeof(action_definitions)/sizeof(action_definitions[0])));
@@ -725,7 +725,7 @@ void aida_plugin_t::register_actions()
 #ifdef __NT__
             aida_ipc::trace_breadcrumb("register_action_failed name=%s", def.name.c_str());
 #endif
-            msg(OBFSTR_C("Failed to register action %s\n"), def.name.c_str());
+            msg("Failed to register action %s\n", def.name.c_str());
             continue;
         }
         attach_action_to_menu(menu_root.c_str(), def.name.c_str(), SETMENU_APP);
@@ -746,14 +746,14 @@ void aida_plugin_t::register_actions()
     };
 
     const chain_action_def_t chain_action_definitions[] = {
-        {OBFSTR("aida:chain_verify_open_panel"), OBFSTR("Open Chain Verify"), aida::vuln::chain_verify_action_kind_t::open_panel, ""},
-        {OBFSTR("aida:chain_verify_current_function_as_link"), OBFSTR("Current Function As Chain Link"), aida::vuln::chain_verify_action_kind_t::current_function_as_link, "Ctrl+Alt+L"},
-        {OBFSTR("aida:chain_verify_start"), OBFSTR("Start Chain Verification"), aida::vuln::chain_verify_action_kind_t::start, "Ctrl+Alt+V"},
-        {OBFSTR("aida:chain_verify_cancel"), OBFSTR("Cancel Chain Verification"), aida::vuln::chain_verify_action_kind_t::cancel, ""},
-        {OBFSTR("aida:chain_verify_copy_result_json"), OBFSTR("Copy Chain Result JSON"), aida::vuln::chain_verify_action_kind_t::copy_result_json, ""},
+        {std::string("aida:chain_verify_open_panel"), std::string("Open Chain Verify"), aida::vuln::chain_verify_action_kind_t::open_panel, ""},
+        {std::string("aida:chain_verify_current_function_as_link"), std::string("Current Function As Chain Link"), aida::vuln::chain_verify_action_kind_t::current_function_as_link, "Ctrl+Alt+L"},
+        {std::string("aida:chain_verify_start"), std::string("Start Chain Verification"), aida::vuln::chain_verify_action_kind_t::start, "Ctrl+Alt+V"},
+        {std::string("aida:chain_verify_cancel"), std::string("Cancel Chain Verification"), aida::vuln::chain_verify_action_kind_t::cancel, ""},
+        {std::string("aida:chain_verify_copy_result_json"), std::string("Copy Chain Result JSON"), aida::vuln::chain_verify_action_kind_t::copy_result_json, ""},
     };
 
-    const std::string chain_menu_root = menu_root + OBFSTR("Chain Verify/");
+    const std::string chain_menu_root = menu_root + std::string("Chain Verify/");
 #ifdef __NT__
     aida_ipc::trace_breadcrumb("register_actions_before_registering_chain_actions count=%d", static_cast<int>(sizeof(chain_action_definitions)/sizeof(chain_action_definitions[0])));
 #endif
@@ -775,7 +775,7 @@ void aida_plugin_t::register_actions()
 #ifdef __NT__
             aida_ipc::trace_breadcrumb("register_chain_action_failed name=%s", def.name.c_str());
 #endif
-            msg(OBFSTR_C("Failed to register action %s\n"), def.name.c_str());
+            msg("Failed to register action %s\n", def.name.c_str());
             continue;
         }
         attach_action_to_menu(chain_menu_root.c_str(), def.name.c_str(), SETMENU_APP);

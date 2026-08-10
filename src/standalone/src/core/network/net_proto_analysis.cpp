@@ -316,23 +316,6 @@ std::string fmt_addr(std::uint64_t va)
     return os.str();
 }
 
-nlohmann::json dynamic_ioctl_state_json()
-{
-    const auto dyn = driver_bridge::dynamic_ioctl_state();
-    return nlohmann::json{
-        {"loaded", dyn.loaded},
-        {"kernel", dyn.kernel},
-        {"connected", dyn.connected},
-        {"ready", dyn.ready},
-        {"instance_server_seed", dyn.instance_server_seed},
-        {"instance_ioctl_seed", dyn.instance_ioctl_seed},
-        {"global_server_seed", dyn.global_server_seed},
-        {"global_ioctl_seed", dyn.global_ioctl_seed},
-        {"ioctl_seed_hash", dyn.ioctl_seed_hash},
-        {"heartbeat_ioctl_seed_hash", dyn.heartbeat_ioctl_seed_hash}
-    };
-}
-
 nlohmann::json memory_region_json(bool ok,
                                   const driver_bridge::memory_region_t& region,
                                   DWORD gle,
@@ -3858,7 +3841,6 @@ bool trace_serializer(const serializer_trace_options_t& input,
         return false;
     }
     const std::uint32_t active_pid_entry = driver_bridge::attached_pid();
-    const nlohmann::json dynamic_ioctl_entry = dynamic_ioctl_state_json();
     std::uint32_t pid = 0;
     if (!ensure_process_context(input.process_id, pid, error)) {
         out["process_id"] = input.process_id;
@@ -3872,8 +3854,6 @@ bool trace_serializer(const serializer_trace_options_t& input,
         out["driver_sniff_started"] = false;
         out["driver_status"] = driver_bridge::status();
         out["driver_last_error"] = driver_bridge::last_error();
-        out["dynamic_ioctl_entry"] = dynamic_ioctl_entry;
-        out["dynamic_ioctl_after_context"] = dynamic_ioctl_state_json();
         out["functional_success"] = false;
         out["zero_capture_reason"] = "process context unavailable before kernel serializer backend start";
         diag::log_tagged_fmt("net_proto",
@@ -3940,10 +3920,9 @@ bool trace_serializer(const serializer_trace_options_t& input,
     const std::string serializer_region_error = driver_bridge::last_error();
     const nlohmann::json serializer_region_payload = memory_region_json(serializer_region_ok, serializer_region, serializer_region_gle, serializer_region_error);
     const std::uint32_t active_pid_before_start = driver_bridge::attached_pid();
-    const nlohmann::json dynamic_ioctl_before_start = dynamic_ioctl_state_json();
 
     diag::log_tagged_fmt("net_proto",
-        "trace_serializer begin pid=%u requested_pid=%u active_entry=%u active_after_context=%u active_before_start=%u serializer=0x%llX region_ok=%d region_base=%s region_size=%llu region_protect=0x%X buffer_reg=%s size_reg=%s driver_buf=%u driver_size=%u tid=%u sample_ms=%u max_captures=%u dyn_ready=%d dyn_ioctl_seed_hash=0x%08X backend=driver_sniff_net_buffers",
+        "trace_serializer begin pid=%u requested_pid=%u active_entry=%u active_after_context=%u active_before_start=%u serializer=0x%llX region_ok=%d region_base=%s region_size=%llu region_protect=0x%X buffer_reg=%s size_reg=%s driver_buf=%u driver_size=%u tid=%u sample_ms=%u max_captures=%u backend=driver_sniff_net_buffers",
         pid,
         input.process_id,
         active_pid_entry,
@@ -3960,9 +3939,7 @@ bool trace_serializer(const serializer_trace_options_t& input,
         driver_size_reg,
         options.tid,
         options.sample_ms,
-        options.max_captures,
-        dynamic_ioctl_before_start.value("ready", false) ? 1 : 0,
-        dynamic_ioctl_before_start.value("ioctl_seed_hash", 0u));
+        options.max_captures);
 
     const std::uint64_t start_call_ms = static_cast<std::uint64_t>(GetTickCount64());
     SetLastError(ERROR_SUCCESS);
@@ -3997,14 +3974,10 @@ bool trace_serializer(const serializer_trace_options_t& input,
         out["active_pid_before_start"] = active_pid_before_start;
         out["active_pid_after_start"] = driver_bridge::attached_pid();
         out["serializer_region"] = serializer_region_payload;
-        out["dynamic_ioctl_entry"] = dynamic_ioctl_entry;
-        out["dynamic_ioctl_after_context"] = dynamic_ioctl_state_json();
-        out["dynamic_ioctl_before_start"] = dynamic_ioctl_before_start;
-        out["dynamic_ioctl_after_start"] = dynamic_ioctl_state_json();
         out["functional_success"] = false;
         out["zero_capture_reason"] = "kernel serializer buffer sniffing did not start";
         diag::log_tagged_fmt("net_proto",
-            "trace_serializer start_failed pid=%u active_before_start=%u active_after_start=%u serializer=0x%llX gle=%lu elapsed_ms=%llu error=%s status=%s last_error=%s region_ok=%d dyn_ready=%d",
+            "trace_serializer start_failed pid=%u active_before_start=%u active_after_start=%u serializer=0x%llX gle=%lu elapsed_ms=%llu error=%s status=%s last_error=%s region_ok=%d",
             pid,
             active_pid_before_start,
             driver_bridge::attached_pid(),
@@ -4014,15 +3987,13 @@ bool trace_serializer(const serializer_trace_options_t& input,
             error.c_str(),
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str(),
-            serializer_region_ok ? 1 : 0,
-            dynamic_ioctl_state_json().value("ready", false) ? 1 : 0);
+            serializer_region_ok ? 1 : 0);
         return false;
     }
     driver_sniff_started = true;
     const DWORD start_gle = GetLastError();
     const std::uint64_t start_elapsed_ms = static_cast<std::uint64_t>(GetTickCount64()) - start_call_ms;
     const std::uint32_t active_pid_after_start = driver_bridge::attached_pid();
-    const nlohmann::json dynamic_ioctl_after_start = dynamic_ioctl_state_json();
     bool sample_cancelled = false;
     bool sample_deadline_expired = false;
     const std::uint64_t sample_started_ms = static_cast<std::uint64_t>(GetTickCount64());
@@ -4130,10 +4101,6 @@ bool trace_serializer(const serializer_trace_options_t& input,
     out["active_pid_after_start"] = active_pid_after_start;
     out["active_pid_after_stop"] = driver_bridge::attached_pid();
     out["serializer_region"] = serializer_region_payload;
-    out["dynamic_ioctl_entry"] = dynamic_ioctl_entry;
-    out["dynamic_ioctl_after_context"] = dynamic_ioctl_state_json();
-    out["dynamic_ioctl_before_start"] = dynamic_ioctl_before_start;
-    out["dynamic_ioctl_after_start"] = dynamic_ioctl_after_start;
     out["driver_status"] = driver_bridge::status();
     out["driver_last_error"] = driver_bridge::last_error();
     if (samples.empty())

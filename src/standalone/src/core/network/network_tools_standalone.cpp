@@ -724,19 +724,13 @@ static void add_driver_request_fields(json& r, bool ok, DWORD gle = GetLastError
 }
 
 static std::string format_kernel_session_failure(const char* op, DWORD gle, const std::string& base_message = std::string()) {
-    const driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
     char buf[512];
     qsnprintf(buf, sizeof(buf),
-        "%s failure: gle=%lu inst_seed=%u/%u glob_seed=%u/%u dyn_ready=%d driver_loaded=%d driver_connected=%d",
+        "%s failure: gle=%lu driver_loaded=%d driver_connected=%d",
         (op && *op) ? op : "operation",
         static_cast<unsigned long>(gle),
-        dyn.instance_server_seed,
-        dyn.instance_ioctl_seed,
-        dyn.global_server_seed,
-        dyn.global_ioctl_seed,
-        dyn.ready ? 1 : 0,
-        dyn.loaded ? 1 : 0,
-        dyn.connected ? 1 : 0);
+        driver_bridge::is_loaded() ? 1 : 0,
+        driver_bridge::using_kernel_driver() ? 1 : 0);
     std::string s(buf);
     if (!base_message.empty()) {
         s += " [";
@@ -752,20 +746,12 @@ static std::string format_kernel_session_failure(const char* op, DWORD gle, cons
 }
 
 static void log_net_tools_failure(const char* op, DWORD gle) {
-    const driver_bridge::dynamic_ioctl_state_t dyn = driver_bridge::dynamic_ioctl_state();
     diag::log_tagged_critical_fmt("net_tools",
-        "%s_failure gle=%lu inst_seed=%u/%u glob_seed=%u/%u dyn_ready=%d ioctl_seed_hash=0x%08X heartbeat_ioctl_seed_hash=0x%08X driver_loaded=%d driver_connected=%d",
+        "%s_failure gle=%lu driver_loaded=%d driver_connected=%d",
         (op && *op) ? op : "operation",
         static_cast<unsigned long>(gle),
-        dyn.instance_server_seed,
-        dyn.instance_ioctl_seed,
-        dyn.global_server_seed,
-        dyn.global_ioctl_seed,
-        dyn.ready ? 1 : 0,
-        dyn.ioctl_seed_hash,
-        dyn.heartbeat_ioctl_seed_hash,
-        dyn.loaded ? 1 : 0,
-        dyn.connected ? 1 : 0);
+        driver_bridge::is_loaded() ? 1 : 0,
+        driver_bridge::using_kernel_driver() ? 1 : 0);
 }
 
 static json intercept_filter_criteria_json(std::uint32_t pid, std::uint32_t port, std::uint32_t protocol) {

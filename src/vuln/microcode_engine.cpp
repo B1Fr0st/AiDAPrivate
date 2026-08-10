@@ -27,7 +27,6 @@
 
 #include "../agent_tools.hpp"
 #include "../ida_utils.hpp"
-#include "../obfuscation.hpp"
 #include "microcode_engine.hpp"
 #include "symbolic_engine.hpp"
 #include "smt_solver.hpp"
@@ -1640,9 +1639,9 @@ agent_tools::tool_result_t handle_mc_path_smtlib(const nlohmann::json& params)
 
     aida::vuln::symbolic::SymbolicEngine sym;
     if (!sym.is_available())
-        return agent_tools::tool_result_t::error(OBFSTR("symbolic engine unavailable"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("symbolic engine unavailable"), "microcode_failed");
     if (!sym.load_function(*ea_opt, parse_maturity(maturity)))
-        return agent_tools::tool_result_t::error(OBFSTR("symbolic load failed: ") + std::string(sym.last_error()), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("symbolic load failed: ") + std::string(sym.last_error()), "microcode_failed");
 
     auto pcs = sym.collect_path_to(*sink_opt, max_branches);
     nlohmann::json data;
@@ -1652,7 +1651,7 @@ agent_tools::tool_result_t handle_mc_path_smtlib(const nlohmann::json& params)
     data["constraints"] = path_constraints_to_json(pcs);
     data["smt2_formula"] = sym.path_smtlib2(*sink_opt, max_branches);
     data["constraint_count"] = pcs.size();
-    return agent_tools::tool_result_t::ok(OBFSTR("Microcode path SMT-LIB2 generated"), data);
+    return agent_tools::tool_result_t::ok(std::string("Microcode path SMT-LIB2 generated"), data);
 }
 
 agent_tools::tool_result_t handle_mc_solve_path(const nlohmann::json& params)
@@ -1671,9 +1670,9 @@ agent_tools::tool_result_t handle_mc_solve_path(const nlohmann::json& params)
 
     aida::vuln::symbolic::SymbolicEngine sym;
     if (!sym.is_available())
-        return agent_tools::tool_result_t::error(OBFSTR("symbolic engine unavailable"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("symbolic engine unavailable"), "microcode_failed");
     if (!sym.load_function(*ea_opt, parse_maturity(maturity)))
-        return agent_tools::tool_result_t::error(OBFSTR("symbolic load failed: ") + std::string(sym.last_error()), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("symbolic load failed: ") + std::string(sym.last_error()), "microcode_failed");
 
     auto result = sym.solve_path_to(*sink_opt, extra, static_cast<uint32_t>(timeout_ms), max_branches);
     nlohmann::json data = aida::vuln::smt::to_json(result);
@@ -1681,8 +1680,8 @@ agent_tools::tool_result_t handle_mc_solve_path(const nlohmann::json& params)
     data["sink_ea"] = ea_to_hex(*sink_opt);
     data["maturity"] = maturity_str(parse_maturity(maturity));
     std::ostringstream msg;
-    msg << OBFSTR("Microcode path solve: ") << aida::vuln::smt::result_str(result.result)
-        << OBFSTR(" (solve_ms=") << result.solve_ms << OBFSTR(")");
+    msg << std::string("Microcode path solve: ") << aida::vuln::smt::result_str(result.result)
+        << std::string(" (solve_ms=") << result.solve_ms << std::string(")");
     return agent_tools::tool_result_t::ok(msg.str(), data);
 }
 
@@ -1694,13 +1693,13 @@ agent_tools::tool_result_t handle_mc_dataflow_ssa(const nlohmann::json& params)
         return err;
     const std::string variable = string_param(params, "variable");
     if (variable.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("variable is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("variable is required"), "bad_param");
     const std::string chain_kind = ascii_lower(string_param(params, "chain_kind", "ud"));
     const gctype_t gctype = parse_gctype(string_param(params, "gctype", "regs_stk"));
 
     auto handle = generate(*ea_opt, MMAT_LVARS);
     if (!handle.has_value() || handle->mba == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("Failed to generate microcode"), "microcode_failed");
     mba_t& mba = *handle->mba;
     mop_t target;
     nlohmann::json target_meta;
@@ -1710,10 +1709,10 @@ agent_tools::tool_result_t handle_mc_dataflow_ssa(const nlohmann::json& params)
 
     mbl_graph_t* graph = mba.get_graph();
     if (graph == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("microcode graph unavailable"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("microcode graph unavailable"), "microcode_failed");
     graph_chains_t* raw = chain_kind == "du" ? graph->get_du(gctype) : graph->get_ud(gctype);
     if (raw == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("use-def chains unavailable"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("use-def chains unavailable"), "microcode_failed");
     chain_keeper_t keeper(raw);
 
     nlohmann::json chains = nlohmann::json::array();
@@ -1745,7 +1744,7 @@ agent_tools::tool_result_t handle_mc_dataflow_ssa(const nlohmann::json& params)
     data["target"] = std::move(target_meta);
     data["chains"] = std::move(chains);
     data["chain_count"] = data["chains"].size();
-    return agent_tools::tool_result_t::ok(OBFSTR("Microcode SSA chains retrieved"), data);
+    return agent_tools::tool_result_t::ok(std::string("Microcode SSA chains retrieved"), data);
 }
 
 agent_tools::tool_result_t handle_mc_find_uses_in_range(const nlohmann::json& params)
@@ -1756,7 +1755,7 @@ agent_tools::tool_result_t handle_mc_find_uses_in_range(const nlohmann::json& pa
         return err;
     const std::string variable = string_param(params, "variable");
     if (variable.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("variable is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("variable is required"), "bad_param");
     auto from_opt = parse_required_address_param(params, "from_ea", err);
     if (!from_opt)
         return err;
@@ -1766,7 +1765,7 @@ agent_tools::tool_result_t handle_mc_find_uses_in_range(const nlohmann::json& pa
 
     auto handle = generate(*ea_opt, MMAT_LVARS);
     if (!handle.has_value() || handle->mba == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("Failed to generate microcode"), "microcode_failed");
     mba_t& mba = *handle->mba;
     mop_t target;
     nlohmann::json target_meta;
@@ -1816,7 +1815,7 @@ agent_tools::tool_result_t handle_mc_find_uses_in_range(const nlohmann::json& pa
     data["first_redefinition_ea"] = first_redef != nullptr ? ea_to_hex(first_redef->ea) : "";
     data["has_use"] = first_use != nullptr;
     data["has_redefinition"] = first_redef != nullptr;
-    return agent_tools::tool_result_t::ok(OBFSTR("Microcode range use/redefinition query complete"), data);
+    return agent_tools::tool_result_t::ok(std::string("Microcode range use/redefinition query complete"), data);
 }
 
 agent_tools::tool_result_t handle_mc_global_reachability(const nlohmann::json& params)
@@ -1827,17 +1826,17 @@ agent_tools::tool_result_t handle_mc_global_reachability(const nlohmann::json& p
         return err;
     const std::string variable = string_param(params, "variable");
     if (variable.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("variable is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("variable is required"), "bad_param");
     const int from_block = int_param(params, "from_block", 0, 0, 1000000);
     const int to_block = int_param(params, "to_block", -1, -1, 1000000);
     const bool write = parse_bool_param(params, "write", false);
 
     auto handle = generate(*ea_opt, MMAT_LVARS);
     if (!handle.has_value() || handle->mba == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("Failed to generate microcode"), "microcode_failed");
     mba_t& mba = *handle->mba;
     if (from_block >= mba.qty || (to_block >= 0 && to_block >= mba.qty))
-        return agent_tools::tool_result_t::error(OBFSTR("block index out of range"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("block index out of range"), "bad_param");
     mop_t target;
     nlohmann::json target_meta;
     std::string var_err;
@@ -1845,14 +1844,14 @@ agent_tools::tool_result_t handle_mc_global_reachability(const nlohmann::json& p
         return agent_tools::tool_result_t::error(var_err, "bad_param");
     mblock_t* blk = mba.get_mblock(static_cast<uint>(from_block));
     if (blk == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("source block unavailable"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("source block unavailable"), "bad_param");
     mlist_t list;
     if (!mlist_for_operand(*blk, target, false, MAY_ACCESS, list))
-        return agent_tools::tool_result_t::error(OBFSTR("variable has no SDK location list"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("variable has no SDK location list"), "bad_param");
 
     mbl_graph_t* graph = mba.get_graph();
     if (graph == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("microcode graph unavailable"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("microcode graph unavailable"), "microcode_failed");
     bool accessed = write
         ? graph->is_redefined_globally(list, from_block, to_block, nullptr, nullptr, parse_maymust(string_param(params, "maymust", "may")))
         : graph->is_used_globally(list, from_block, to_block, nullptr, nullptr, parse_maymust(string_param(params, "maymust", "may")));
@@ -1863,7 +1862,7 @@ agent_tools::tool_result_t handle_mc_global_reachability(const nlohmann::json& p
     data["to_block"] = to_block;
     data["access_type"] = write ? "write" : "read";
     data["reachable_access"] = accessed;
-    return agent_tools::tool_result_t::ok(OBFSTR("Microcode global reachability query complete"), data);
+    return agent_tools::tool_result_t::ok(std::string("Microcode global reachability query complete"), data);
 }
 
 agent_tools::tool_result_t handle_mc_recognize_kernel_sinks(const nlohmann::json& params)
@@ -1874,7 +1873,7 @@ agent_tools::tool_result_t handle_mc_recognize_kernel_sinks(const nlohmann::json
         return err;
     auto handle = generate(*ea_opt, MMAT_LVARS);
     if (!handle.has_value() || handle->mba == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("Failed to generate microcode"), "microcode_failed");
 
     nlohmann::json calls = nlohmann::json::array();
     traverse_topinsns(*handle->mba, [&](int block_serial, minsn_t& ins) -> bool {
@@ -1931,7 +1930,7 @@ agent_tools::tool_result_t handle_mc_recognize_kernel_sinks(const nlohmann::json
     data["function_ea"] = ea_to_hex(handle->func_ea);
     data["calls"] = std::move(calls);
     data["count"] = data["calls"].size();
-    return agent_tools::tool_result_t::ok(OBFSTR("Microcode kernel source/sink recognition complete"), data);
+    return agent_tools::tool_result_t::ok(std::string("Microcode kernel source/sink recognition complete"), data);
 }
 
 agent_tools::tool_result_t handle_mc_ioctl_dispatch_summary(const nlohmann::json& params)
@@ -1942,7 +1941,7 @@ agent_tools::tool_result_t handle_mc_ioctl_dispatch_summary(const nlohmann::json
         return err;
     auto handle = generate(*ea_opt, MMAT_LVARS);
     if (!handle.has_value() || handle->mba == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("Failed to generate microcode"), "microcode_failed");
 
     std::set<uint32_t> codes;
     traverse_topinsns(*handle->mba, [&](int, minsn_t& ins) -> bool {
@@ -1989,14 +1988,14 @@ agent_tools::tool_result_t handle_mc_ioctl_dispatch_summary(const nlohmann::json
     data["function_ea"] = ea_to_hex(handle->func_ea);
     data["ioctls"] = std::move(arr);
     data["count"] = data["ioctls"].size();
-    return agent_tools::tool_result_t::ok(OBFSTR("Microcode IOCTL dispatch summary complete"), data);
+    return agent_tools::tool_result_t::ok(std::string("Microcode IOCTL dispatch summary complete"), data);
 }
 
 agent_tools::tool_result_t handle_mc_set_input_constraint(const nlohmann::json& params)
 {
     const std::string name = string_param(params, "name");
     if (name.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("name is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("name is required"), "bad_param");
     nlohmann::json record = params;
     record["kind"] = "input_constraint";
     {
@@ -2006,7 +2005,7 @@ agent_tools::tool_result_t handle_mc_set_input_constraint(const nlohmann::json& 
     nlohmann::json data;
     data["name"] = name;
     data["constraint"] = std::move(record);
-    return agent_tools::tool_result_t::ok(OBFSTR("Microcode input constraint stored"), data);
+    return agent_tools::tool_result_t::ok(std::string("Microcode input constraint stored"), data);
 }
 
 agent_tools::tool_result_t handle_mc_assume_attacker_buffer(const nlohmann::json& params)
@@ -2025,14 +2024,14 @@ agent_tools::tool_result_t handle_mc_assume_attacker_buffer(const nlohmann::json
     nlohmann::json data;
     data["name"] = name;
     data["assumption"] = std::move(record);
-    return agent_tools::tool_result_t::ok(OBFSTR("Microcode attacker buffer assumption stored"), data);
+    return agent_tools::tool_result_t::ok(std::string("Microcode attacker buffer assumption stored"), data);
 }
 
 agent_tools::tool_result_t handle_mc_smt_bv_extremum(const nlohmann::json& params)
 {
     const std::string var = string_param(params, "variable");
     if (var.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("variable is required"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("variable is required"), "bad_param");
     const int width = int_param(params, "width", 64, 1, 64);
     const int timeout_ms = int_param(params, "timeout_ms", 5000, 100, 60000);
     const std::string formula = string_param(params, "formula");
@@ -2040,11 +2039,11 @@ agent_tools::tool_result_t handle_mc_smt_bv_extremum(const nlohmann::json& param
 
     aida::vuln::smt::SmtContext local;
     if (!local.is_available())
-        return agent_tools::tool_result_t::error(OBFSTR("SMT unavailable: ") + std::string(local.last_error()), "smt_unsat");
+        return agent_tools::tool_result_t::error(std::string("SMT unavailable: ") + std::string(local.last_error()), "smt_unsat");
     if (!local.declare_bv(var, width))
-        return agent_tools::tool_result_t::error(OBFSTR("SMT declaration failed: ") + std::string(local.last_error()), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("SMT declaration failed: ") + std::string(local.last_error()), "bad_param");
     if (!formula.empty() && !local.assert_smtlib2(formula))
-        return agent_tools::tool_result_t::error(OBFSTR("SMT formula rejected: ") + std::string(local.last_error()), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("SMT formula rejected: ") + std::string(local.last_error()), "bad_param");
     auto value = mode == "min" ? local.min_value_bv(var, width, static_cast<uint32_t>(timeout_ms))
                                : local.max_value_bv(var, width, static_cast<uint32_t>(timeout_ms));
     nlohmann::json data;
@@ -2054,7 +2053,7 @@ agent_tools::tool_result_t handle_mc_smt_bv_extremum(const nlohmann::json& param
     data["satisfiable"] = value.has_value();
     data["value"] = value.has_value() ? *value : 0;
     data["smtlib_dump"] = local.to_smtlib2();
-    return agent_tools::tool_result_t::ok(OBFSTR("Bit-vector extremum query complete"), data);
+    return agent_tools::tool_result_t::ok(std::string("Bit-vector extremum query complete"), data);
 }
 
 agent_tools::tool_result_t handle_query_value_ranges(const nlohmann::json& params)
@@ -2065,7 +2064,7 @@ agent_tools::tool_result_t handle_query_value_ranges(const nlohmann::json& param
         return err;
     auto handle = generate(*ea_opt, MMAT_LVARS);
     if (!handle.has_value() || handle->mba == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode"), "microcode_failed");
+        return agent_tools::tool_result_t::error(std::string("Failed to generate microcode"), "microcode_failed");
     mba_t& mba = *handle->mba;
     mblock_t* found_blk = nullptr;
     minsn_t* found_ins = nullptr;
@@ -2085,7 +2084,7 @@ agent_tools::tool_result_t handle_query_value_ranges(const nlohmann::json& param
         }
     }
     if (found_blk == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("instruction not found in microcode"), "bad_param");
+        return agent_tools::tool_result_t::error(std::string("instruction not found in microcode"), "bad_param");
 
     vivl_t vivl;
     const int width = int_param(params, "width", 8, 1, 8);
@@ -2094,7 +2093,7 @@ agent_tools::tool_result_t handle_query_value_ranges(const nlohmann::json& param
     {
         mreg_t mr = reg_name_to_mreg(reg);
         if (mr == mr_none)
-            return agent_tools::tool_result_t::error(OBFSTR("unknown register"), "bad_param");
+            return agent_tools::tool_result_t::error(std::string("unknown register"), "bad_param");
         vivl.set_reg(mr, width);
     }
     else
@@ -2120,7 +2119,7 @@ agent_tools::tool_result_t handle_query_value_ranges(const nlohmann::json& param
     data["all_values"] = ok && range.all_values();
     data["unknown"] = ok && range.is_unknown();
     data["empty"] = ok && range.empty();
-    return agent_tools::tool_result_t::ok(OBFSTR("Value range query complete"), data);
+    return agent_tools::tool_result_t::ok(std::string("Value range query complete"), data);
 }
 
 agent_tools::tool_result_t handle_decompile_with_microcode(const nlohmann::json& params)
@@ -2129,7 +2128,7 @@ agent_tools::tool_result_t handle_decompile_with_microcode(const nlohmann::json&
     if (params.contains("address") && params["address"].is_string())
         ea_opt = agent_tools::helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("Invalid or missing address"));
+        return agent_tools::tool_result_t::error(std::string("Invalid or missing address"));
 
     std::string maturity_str_in = "lvars";
     if (params.contains("maturity") && params["maturity"].is_string())
@@ -2166,10 +2165,10 @@ agent_tools::tool_result_t handle_decompile_with_microcode(const nlohmann::json&
 
     auto handle = generate(*ea_opt, mat);
     if (!handle.has_value() || handle->mba == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode for the function"));
+        return agent_tools::tool_result_t::error(std::string("Failed to generate microcode for the function"));
 
     nlohmann::json data = dump_mba(*handle->mba, offset, limit);
-    std::string msg = OBFSTR("Microcode generated at maturity ") + std::string(maturity_str(mat));
+    std::string msg = std::string("Microcode generated at maturity ") + std::string(maturity_str(mat));
     return agent_tools::tool_result_t::ok(msg, data);
 }
 
@@ -2179,23 +2178,23 @@ agent_tools::tool_result_t handle_get_microcode_dataflow(const nlohmann::json& p
     if (params.contains("address") && params["address"].is_string())
         ea_opt = agent_tools::helpers::parse_address(params["address"].get<std::string>());
     if (!ea_opt.has_value())
-        return agent_tools::tool_result_t::error(OBFSTR("Invalid or missing address"));
+        return agent_tools::tool_result_t::error(std::string("Invalid or missing address"));
 
     std::string variable;
     if (params.contains("variable") && params["variable"].is_string())
         variable = params["variable"].get<std::string>();
     if (variable.empty())
-        return agent_tools::tool_result_t::error(OBFSTR("Missing 'variable' parameter (lvar:NAME, lvar:INDEX, reg:NAME, stk:OFFSET)"));
+        return agent_tools::tool_result_t::error(std::string("Missing 'variable' parameter (lvar:NAME, lvar:INDEX, reg:NAME, stk:OFFSET)"));
 
     auto handle = generate(*ea_opt, MMAT_LVARS);
     if (!handle.has_value() || handle->mba == nullptr)
-        return agent_tools::tool_result_t::error(OBFSTR("Failed to generate microcode for the function"));
+        return agent_tools::tool_result_t::error(std::string("Failed to generate microcode for the function"));
 
     mba_t& mba = *handle->mba;
 
     auto colon = variable.find(':');
     if (colon == std::string::npos)
-        return agent_tools::tool_result_t::error(OBFSTR("Invalid variable spec; expected lvar:NAME or lvar:INDEX or reg:NAME or stk:OFFSET"));
+        return agent_tools::tool_result_t::error(std::string("Invalid variable spec; expected lvar:NAME or lvar:INDEX or reg:NAME or stk:OFFSET"));
 
     std::string kind  = ascii_lower(variable.substr(0, colon));
     std::string value = variable.substr(colon + 1);
@@ -2222,7 +2221,7 @@ agent_tools::tool_result_t handle_get_microcode_dataflow(const nlohmann::json& p
         if (idx < 0)
             idx = find_lvar_by_name(mba, value);
         if (idx < 0)
-            return agent_tools::tool_result_t::error(OBFSTR("lvar not found: ") + value);
+            return agent_tools::tool_result_t::error(std::string("lvar not found: ") + value);
         target_meta["lvar_idx"] = idx;
         if (idx >= 0 && static_cast<size_t>(idx) < mba.vars.size())
             target_meta["lvar_name"] = std::string(mba.vars[idx].name.c_str());
@@ -2232,7 +2231,7 @@ agent_tools::tool_result_t handle_get_microcode_dataflow(const nlohmann::json& p
     {
         mreg_t reg = reg_name_to_mreg(value);
         if (reg == mr_none)
-            return agent_tools::tool_result_t::error(OBFSTR("Unknown register: ") + value);
+            return agent_tools::tool_result_t::error(std::string("Unknown register: ") + value);
         target_meta["reg"] = static_cast<int>(reg);
         du = def_use_chain_for_reg(mba, reg);
     }
@@ -2240,13 +2239,13 @@ agent_tools::tool_result_t handle_get_microcode_dataflow(const nlohmann::json& p
     {
         std::int64_t off = 0;
         if (!parse_int64(value, off))
-            return agent_tools::tool_result_t::error(OBFSTR("Invalid stack offset (hex expected): ") + value);
+            return agent_tools::tool_result_t::error(std::string("Invalid stack offset (hex expected): ") + value);
         target_meta["stk_off"] = off;
         du = def_use_chain_for_stkvar(mba, static_cast<sval_t>(off));
     }
     else
     {
-        return agent_tools::tool_result_t::error(OBFSTR("Unknown variable kind: ") + kind);
+        return agent_tools::tool_result_t::error(std::string("Unknown variable kind: ") + kind);
     }
 
     nlohmann::json data = def_use_to_json(du);
@@ -2254,11 +2253,11 @@ agent_tools::tool_result_t handle_get_microcode_dataflow(const nlohmann::json& p
     data["func_ea"]  = ea_to_hex(handle->func_ea);
     data["maturity"] = maturity_str(handle->maturity);
 
-    std::string msg = OBFSTR("Dataflow: ") +
+    std::string msg = std::string("Dataflow: ") +
                       std::to_string(du.defs.size()) +
-                      OBFSTR(" def(s), ") +
+                      std::string(" def(s), ") +
                       std::to_string(du.uses.size()) +
-                      OBFSTR(" use(s)");
+                      std::string(" use(s)");
     return agent_tools::tool_result_t::ok(msg, data);
 }
 
@@ -2269,197 +2268,197 @@ void register_tier1_microcode_tools()
     auto& registry = agent_tools::ToolRegistry::instance();
 
     registry.register_tool({
-        OBFSTR("decompile_with_microcode"),
-        OBFSTR("vuln"),
-        OBFSTR("Generate Hex-Rays microcode for a function at a specified maturity level "
+        std::string("decompile_with_microcode"),
+        std::string("vuln"),
+        std::string("Generate Hex-Rays microcode for a function at a specified maturity level "
                "(generated/preoptimized/locopt/calls/glbopt1/glbopt2/glbopt3/lvars) and return "
                "a structured JSON dump of every basic block, control-flow edges, and decoded "
                "instructions with operand-level detail. Useful for low-level vulnerability "
                "analysis where C decompilation hides taint propagation, opaque predicates, or "
                "intermediate value-numbered locations."),
         {
-            {OBFSTR("address"),  OBFSTR("string"),
-             OBFSTR("Function address (0x...) or function name"), true},
-            {OBFSTR("maturity"), OBFSTR("string"),
-             OBFSTR("Microcode maturity level (default: lvars)"), false,
-             {OBFSTR("generated"), OBFSTR("preoptimized"), OBFSTR("locopt"),
-              OBFSTR("calls"), OBFSTR("glbopt1"), OBFSTR("glbopt2"),
-              OBFSTR("glbopt3"), OBFSTR("lvars")}},
-            {OBFSTR("offset"),   OBFSTR("number"),
-             OBFSTR("Skip this many top-level instructions before emitting (default 0)"), false},
-            {OBFSTR("limit"),    OBFSTR("number"),
-             OBFSTR("Maximum top-level instructions to return (default 2000, max 50000)"), false},
+            {std::string("address"),  std::string("string"),
+             std::string("Function address (0x...) or function name"), true},
+            {std::string("maturity"), std::string("string"),
+             std::string("Microcode maturity level (default: lvars)"), false,
+             {std::string("generated"), std::string("preoptimized"), std::string("locopt"),
+              std::string("calls"), std::string("glbopt1"), std::string("glbopt2"),
+              std::string("glbopt3"), std::string("lvars")}},
+            {std::string("offset"),   std::string("number"),
+             std::string("Skip this many top-level instructions before emitting (default 0)"), false},
+            {std::string("limit"),    std::string("number"),
+             std::string("Maximum top-level instructions to return (default 2000, max 50000)"), false},
         },
         handle_decompile_with_microcode,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("get_microcode_dataflow"),
-        OBFSTR("vuln"),
-        OBFSTR("Compute the def/use chain at MMAT_LVARS for a single named local variable, "
+        std::string("get_microcode_dataflow"),
+        std::string("vuln"),
+        std::string("Compute the def/use chain at MMAT_LVARS for a single named local variable, "
                "register, or stack slot inside a function. Returns the addresses of every "
                "definition and use, the linear reaching-definition pairs, and any conditional "
                "constraints encountered along the way. Inputs format: 'lvar:NAME', 'lvar:INDEX', "
                "'reg:NAME' (e.g. reg:rax), or 'stk:OFFSET' (decompiler-stkoff in hex)."),
         {
-            {OBFSTR("address"),  OBFSTR("string"),
-             OBFSTR("Function address (0x...) or function name"), true},
-            {OBFSTR("variable"), OBFSTR("string"),
-             OBFSTR("Variable spec: lvar:NAME or lvar:INDEX or reg:NAME or stk:OFFSET"), true},
+            {std::string("address"),  std::string("string"),
+             std::string("Function address (0x...) or function name"), true},
+            {std::string("variable"), std::string("string"),
+             std::string("Variable spec: lvar:NAME or lvar:INDEX or reg:NAME or stk:OFFSET"), true},
         },
         handle_get_microcode_dataflow,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("mc_path_smtlib"),
-        OBFSTR("vuln"),
-        OBFSTR("Collect branch predicates along a real microcode CFG path from function entry to sink_ea and emit SMT-LIB2."),
+        std::string("mc_path_smtlib"),
+        std::string("vuln"),
+        std::string("Collect branch predicates along a real microcode CFG path from function entry to sink_ea and emit SMT-LIB2."),
         {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
-            {OBFSTR("sink_ea"), OBFSTR("string"), OBFSTR("Target instruction address."), true},
-            {OBFSTR("maturity"), OBFSTR("string"), OBFSTR("Microcode maturity, default glbopt3."), false},
-            {OBFSTR("max_branches"), OBFSTR("number"), OBFSTR("Maximum branch predicates to emit."), false},
+            {std::string("address"), std::string("string"), std::string("Function address or name."), true},
+            {std::string("sink_ea"), std::string("string"), std::string("Target instruction address."), true},
+            {std::string("maturity"), std::string("string"), std::string("Microcode maturity, default glbopt3."), false},
+            {std::string("max_branches"), std::string("number"), std::string("Maximum branch predicates to emit."), false},
         },
         handle_mc_path_smtlib,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("mc_solve_path"),
-        OBFSTR("vuln"),
-        OBFSTR("Solve feasibility for a real microcode CFG path from function entry to sink_ea with optional extra SMT-LIB2 assertions."),
+        std::string("mc_solve_path"),
+        std::string("vuln"),
+        std::string("Solve feasibility for a real microcode CFG path from function entry to sink_ea with optional extra SMT-LIB2 assertions."),
         {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
-            {OBFSTR("sink_ea"), OBFSTR("string"), OBFSTR("Target instruction address."), true},
-            {OBFSTR("maturity"), OBFSTR("string"), OBFSTR("Microcode maturity, default glbopt3."), false},
-            {OBFSTR("extra_smtlib2_assertions"), OBFSTR("string"), OBFSTR("Additional SMT-LIB2 assertions."), false},
-            {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Solver timeout in milliseconds."), false},
-            {OBFSTR("max_branches"), OBFSTR("number"), OBFSTR("Maximum branch predicates to emit."), false},
+            {std::string("address"), std::string("string"), std::string("Function address or name."), true},
+            {std::string("sink_ea"), std::string("string"), std::string("Target instruction address."), true},
+            {std::string("maturity"), std::string("string"), std::string("Microcode maturity, default glbopt3."), false},
+            {std::string("extra_smtlib2_assertions"), std::string("string"), std::string("Additional SMT-LIB2 assertions."), false},
+            {std::string("timeout_ms"), std::string("number"), std::string("Solver timeout in milliseconds."), false},
+            {std::string("max_branches"), std::string("number"), std::string("Maximum branch predicates to emit."), false},
         },
         handle_mc_solve_path,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("mc_dataflow_ssa"),
-        OBFSTR("vuln"),
-        OBFSTR("Query Hex-Rays microcode use-def or def-use SSA chains for one lvar, register, or stack slot."),
+        std::string("mc_dataflow_ssa"),
+        std::string("vuln"),
+        std::string("Query Hex-Rays microcode use-def or def-use SSA chains for one lvar, register, or stack slot."),
         {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
-            {OBFSTR("variable"), OBFSTR("string"), OBFSTR("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
-            {OBFSTR("chain_kind"), OBFSTR("string"), OBFSTR("ud or du."), false},
-            {OBFSTR("gctype"), OBFSTR("string"), OBFSTR("regs_stk, asr, or xdsu."), false},
+            {std::string("address"), std::string("string"), std::string("Function address or name."), true},
+            {std::string("variable"), std::string("string"), std::string("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
+            {std::string("chain_kind"), std::string("string"), std::string("ud or du."), false},
+            {std::string("gctype"), std::string("string"), std::string("regs_stk, asr, or xdsu."), false},
         },
         handle_mc_dataflow_ssa,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("mc_find_uses_in_range"),
-        OBFSTR("vuln"),
-        OBFSTR("Use Hex-Rays microcode location lists to find first use and redefinition of a variable in an instruction range."),
+        std::string("mc_find_uses_in_range"),
+        std::string("vuln"),
+        std::string("Use Hex-Rays microcode location lists to find first use and redefinition of a variable in an instruction range."),
         {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
-            {OBFSTR("variable"), OBFSTR("string"), OBFSTR("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
-            {OBFSTR("from_ea"), OBFSTR("string"), OBFSTR("Range start instruction EA."), true},
-            {OBFSTR("to_ea"), OBFSTR("string"), OBFSTR("Range end instruction EA."), true},
-            {OBFSTR("maymust"), OBFSTR("string"), OBFSTR("may or must."), false},
+            {std::string("address"), std::string("string"), std::string("Function address or name."), true},
+            {std::string("variable"), std::string("string"), std::string("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
+            {std::string("from_ea"), std::string("string"), std::string("Range start instruction EA."), true},
+            {std::string("to_ea"), std::string("string"), std::string("Range end instruction EA."), true},
+            {std::string("maymust"), std::string("string"), std::string("may or must."), false},
         },
         handle_mc_find_uses_in_range,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("mc_global_reachability"),
-        OBFSTR("vuln"),
-        OBFSTR("Ask the Hex-Rays microcode graph whether a variable is read or written globally between blocks."),
+        std::string("mc_global_reachability"),
+        std::string("vuln"),
+        std::string("Ask the Hex-Rays microcode graph whether a variable is read or written globally between blocks."),
         {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
-            {OBFSTR("variable"), OBFSTR("string"), OBFSTR("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
-            {OBFSTR("from_block"), OBFSTR("number"), OBFSTR("Source microcode block serial."), false},
-            {OBFSTR("to_block"), OBFSTR("number"), OBFSTR("Destination microcode block serial, -1 for any."), false},
-            {OBFSTR("write"), OBFSTR("boolean"), OBFSTR("Check writes instead of reads."), false},
-            {OBFSTR("maymust"), OBFSTR("string"), OBFSTR("may or must."), false},
+            {std::string("address"), std::string("string"), std::string("Function address or name."), true},
+            {std::string("variable"), std::string("string"), std::string("Variable spec lvar:NAME, reg:rax, or stk:OFFSET."), true},
+            {std::string("from_block"), std::string("number"), std::string("Source microcode block serial."), false},
+            {std::string("to_block"), std::string("number"), std::string("Destination microcode block serial, -1 for any."), false},
+            {std::string("write"), std::string("boolean"), std::string("Check writes instead of reads."), false},
+            {std::string("maymust"), std::string("string"), std::string("may or must."), false},
         },
         handle_mc_global_reachability,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("mc_recognize_kernel_sinks"),
-        OBFSTR("vuln"),
-        OBFSTR("Classify microcode calls as kernel/user-input sources, sinks, or sanitizers using the signature database."),
+        std::string("mc_recognize_kernel_sinks"),
+        std::string("vuln"),
+        std::string("Classify microcode calls as kernel/user-input sources, sinks, or sanitizers using the signature database."),
         {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Function address or name."), true},
+            {std::string("address"), std::string("string"), std::string("Function address or name."), true},
         },
         handle_mc_recognize_kernel_sinks,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("mc_ioctl_dispatch_summary"),
-        OBFSTR("vuln"),
-        OBFSTR("Summarize IOCTL constants seen in a dispatcher function and decode method/access fields."),
+        std::string("mc_ioctl_dispatch_summary"),
+        std::string("vuln"),
+        std::string("Summarize IOCTL constants seen in a dispatcher function and decode method/access fields."),
         {
-            {OBFSTR("address"), OBFSTR("string"), OBFSTR("Dispatcher function address or name."), true},
+            {std::string("address"), std::string("string"), std::string("Dispatcher function address or name."), true},
         },
         handle_mc_ioctl_dispatch_summary,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("mc_set_input_constraint"),
-        OBFSTR("vuln"),
-        OBFSTR("Store a symbolic input constraint in the microcode analysis session."),
+        std::string("mc_set_input_constraint"),
+        std::string("vuln"),
+        std::string("Store a symbolic input constraint in the microcode analysis session."),
         {
-            {OBFSTR("name"), OBFSTR("string"), OBFSTR("Constraint name."), true},
-            {OBFSTR("width"), OBFSTR("number"), OBFSTR("Bit width."), false},
-            {OBFSTR("unsigned_lt"), OBFSTR("number"), OBFSTR("Unsigned upper bound."), false},
+            {std::string("name"), std::string("string"), std::string("Constraint name."), true},
+            {std::string("width"), std::string("number"), std::string("Bit width."), false},
+            {std::string("unsigned_lt"), std::string("number"), std::string("Unsigned upper bound."), false},
         },
         handle_mc_set_input_constraint,
         false,
     });
 
     registry.register_tool({
-        OBFSTR("mc_assume_attacker_buffer"),
-        OBFSTR("vuln"),
-        OBFSTR("Store an attacker-controlled buffer assumption for a function argument in the microcode analysis session."),
+        std::string("mc_assume_attacker_buffer"),
+        std::string("vuln"),
+        std::string("Store an attacker-controlled buffer assumption for a function argument in the microcode analysis session."),
         {
-            {OBFSTR("name"), OBFSTR("string"), OBFSTR("Assumption name."), false},
-            {OBFSTR("argidx"), OBFSTR("number"), OBFSTR("Function argument index."), true},
-            {OBFSTR("size"), OBFSTR("number"), OBFSTR("Symbolic byte length."), false},
+            {std::string("name"), std::string("string"), std::string("Assumption name."), false},
+            {std::string("argidx"), std::string("number"), std::string("Function argument index."), true},
+            {std::string("size"), std::string("number"), std::string("Symbolic byte length."), false},
         },
         handle_mc_assume_attacker_buffer,
         false,
     });
 
     registry.register_tool({
-        OBFSTR("mc_smt_bv_extremum"),
-        OBFSTR("vuln"),
-        OBFSTR("Use Z3 optimize to compute a min or max value for a bit-vector variable under optional SMT-LIB2 constraints."),
+        std::string("mc_smt_bv_extremum"),
+        std::string("vuln"),
+        std::string("Use Z3 optimize to compute a min or max value for a bit-vector variable under optional SMT-LIB2 constraints."),
         {
-            {OBFSTR("variable"), OBFSTR("string"), OBFSTR("Bit-vector variable name."), true},
-            {OBFSTR("width"), OBFSTR("number"), OBFSTR("Bit width, 1..64."), true},
-            {OBFSTR("mode"), OBFSTR("string"), OBFSTR("max or min."), false},
-            {OBFSTR("formula"), OBFSTR("string"), OBFSTR("Optional SMT-LIB2 assertions."), false},
-            {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Optimizer timeout in milliseconds."), false},
+            {std::string("variable"), std::string("string"), std::string("Bit-vector variable name."), true},
+            {std::string("width"), std::string("number"), std::string("Bit width, 1..64."), true},
+            {std::string("mode"), std::string("string"), std::string("max or min."), false},
+            {std::string("formula"), std::string("string"), std::string("Optional SMT-LIB2 assertions."), false},
+            {std::string("timeout_ms"), std::string("number"), std::string("Optimizer timeout in milliseconds."), false},
         },
         handle_mc_smt_bv_extremum,
         true,
     });
 
     registry.register_tool({
-        OBFSTR("query_value_ranges"),
-        OBFSTR("vuln"),
-        OBFSTR("Query Hex-Rays value ranges for a register or stack interval at a microcode instruction."),
+        std::string("query_value_ranges"),
+        std::string("vuln"),
+        std::string("Query Hex-Rays value ranges for a register or stack interval at a microcode instruction."),
         {
-            {OBFSTR("ea"), OBFSTR("string"), OBFSTR("Instruction address."), true},
-            {OBFSTR("reg"), OBFSTR("string"), OBFSTR("Register name."), false},
-            {OBFSTR("stkvar_offset"), OBFSTR("number"), OBFSTR("Stack offset if no register is provided."), false},
-            {OBFSTR("width"), OBFSTR("number"), OBFSTR("Width in bytes."), false},
-            {OBFSTR("position"), OBFSTR("string"), OBFSTR("start, end, or exact."), false},
+            {std::string("ea"), std::string("string"), std::string("Instruction address."), true},
+            {std::string("reg"), std::string("string"), std::string("Register name."), false},
+            {std::string("stkvar_offset"), std::string("number"), std::string("Stack offset if no register is provided."), false},
+            {std::string("width"), std::string("number"), std::string("Width in bytes."), false},
+            {std::string("position"), std::string("string"), std::string("start, end, or exact."), false},
         },
         handle_query_value_ranges,
         true,
