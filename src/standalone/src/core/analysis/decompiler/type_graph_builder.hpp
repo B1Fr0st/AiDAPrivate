@@ -3,7 +3,10 @@
 #include "decompiler_contracts.hpp"
 #include "metadata_provenance.hpp"
 
+#include "../../infra/fast_containers.hpp"
+
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -123,6 +126,8 @@ private:
         decompiler_fact_provenance_t provenance = decompiler_fact_provenance_t::unknown;
     };
 
+    using merged_node_map_t = aida::infra::fast_flat_map<std::string, merged_node_t>;
+
     decompiler_entity_key_t entity_;
     type_graph_builder_config_t config_;
     std::vector<type_seed_batch_t> batches_;
@@ -139,10 +144,11 @@ private:
                               const type_provenance_record_t& resolved_prov,
                               const type_provenance_record_t& rejected_prov);
     void merge_edges(merged_node_t& merged, const type_candidate_t& candidate);
-    void detect_recursive_types(std::unordered_map<std::string, merged_node_t>& merged_nodes);
-    void assign_stable_ids(std::unordered_map<std::string, merged_node_t>& merged_nodes,
+    void detect_recursive_types(merged_node_map_t& merged_nodes);
+    void assign_stable_ids(merged_node_map_t& merged_nodes,
                            std::vector<std::string>& sorted_names) const;
-    void resolve_edges(const std::unordered_map<std::string, merged_node_t>& merged_nodes,
+    void resolve_edges(const merged_node_map_t& merged_nodes,
+                       const std::vector<std::string>& sorted_names,
                        std::vector<merged_edge_t>& resolved_edges,
                        std::vector<decompiler_unknown_t>& unknowns);
     void enforce_bounds(std::vector<merged_node_t>& nodes,
@@ -171,6 +177,8 @@ workspace_result_t<type_graph_t> merge_type_evidence(
     const hir_function_t& live_hir,
     const type_graph_builder_config_t& config = {});
 
+// Precondition: graph.nodes is strictly increasing by id (enforced by
+// validate_type_graph on every entry path and by the merge path re-sort).
 const decompiler_type_node_t* find_type_node(const type_graph_t& graph, std::uint64_t type_id) noexcept;
 
 const decompiler_type_edge_t* find_member_edge_by_offset(
@@ -183,5 +191,31 @@ const decompiler_type_edge_t* find_pointee_edge(const type_graph_t& graph, std::
 
 const decompiler_type_edge_t* find_enumerator_edge(
     const type_graph_t& graph, std::uint64_t enum_type_id, std::uint64_t enumerator_value) noexcept;
+
+// Index over a type graph built once in O(N+E); returned pointers alias the
+// source graph, which must outlive the index. Lookups replicate the
+// confidence-winner semantics of the linear free functions above.
+class type_graph_index_t {
+public:
+    type_graph_index_t();
+    ~type_graph_index_t();
+    type_graph_index_t(type_graph_index_t&&) noexcept;
+    type_graph_index_t& operator=(type_graph_index_t&&) noexcept;
+    type_graph_index_t(const type_graph_index_t&) = delete;
+    type_graph_index_t& operator=(const type_graph_index_t&) = delete;
+
+    bool empty() const noexcept;
+    const decompiler_type_node_t* node(std::uint64_t type_id) const noexcept;
+    const decompiler_type_edge_t* members_at(std::uint64_t struct_type_id, std::uint64_t byte_offset) const noexcept;
+    const decompiler_type_edge_t* member_named(std::uint64_t struct_type_id, const std::string& member_name) const noexcept;
+    const decompiler_type_edge_t* pointee(std::uint64_t pointer_type_id) const noexcept;
+    const decompiler_type_edge_t* enumerator(std::uint64_t enum_type_id, std::uint64_t enumerator_value) const noexcept;
+
+private:
+    struct state_t;
+    std::unique_ptr<state_t> state_;
+};
+
+type_graph_index_t build_type_graph_index(const type_graph_t& graph);
 
 }

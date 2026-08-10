@@ -369,7 +369,11 @@ const char* analysis_metrics_t::metric_name(analysis_metric_t metric) noexcept {
         "decompile_batch_calls", "decompile_batch_completed",
         "decompile_batch_failed", "decompile_batch_cancelled",
         "decompile_batch_wall_ns", "decompile_batch_queue_depth_peak",
-        "decompile_memory_cache_hits", "decompile_persistent_cache_hits"
+        "decompile_memory_cache_hits", "decompile_persistent_cache_hits",
+        "decompile_batch_library_excluded", "memory_admission_grants",
+        "memory_admission_denials", "memory_admission_wait_ns_max",
+        "decompile_slots_requested", "decompile_slots_admitted",
+        "decompile_slots_denied"
     };
     static_assert(std::size(names) == analysis_metric_count);
     return names[metric_index(metric)];

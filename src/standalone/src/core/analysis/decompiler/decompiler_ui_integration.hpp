@@ -125,6 +125,8 @@ struct decompiler_ui_integration_metrics_t {
     std::uint64_t entity_resolutions = 0;
     std::uint64_t entity_resolution_failures = 0;
     std::uint64_t managed_capture_cache_hits = 0;
+    std::uint64_t native_identity_cache_hits = 0;
+    std::uint64_t native_identity_cache_misses = 0;
 };
 
 workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(

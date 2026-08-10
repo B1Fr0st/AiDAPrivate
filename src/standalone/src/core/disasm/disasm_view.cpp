@@ -163,13 +163,6 @@ std::optional<std::uint64_t> optional_value(
     return result.take_value();
 }
 
-std::optional<std::uint64_t> display_base_override(const workspace_context_t& context) {
-    if (!context.view)
-        return {};
-    std::lock_guard<std::mutex> lock(context.view->mutex);
-    return context.view->display_image_base;
-}
-
 std::uint64_t display_image_base(const workspace_context_t& context) {
     if (const auto value = display_base_override(context))
         return *value;
@@ -248,6 +241,120 @@ void publish_format_failure(const workspace_context_t& context,
     std::lock_guard<std::mutex> lock(context.view->mutex);
     context.view->pending_format_pages.erase(page_key);
     context.view->format_error = std::move(error);
+}
+
+bool operand_equals_ci(std::string_view left, std::string_view right) {
+    return left.size() == right.size() && std::equal(left.begin(), left.end(),
+        right.begin(), [](char l, char r) {
+            return std::tolower(static_cast<unsigned char>(l)) ==
+                std::tolower(static_cast<unsigned char>(r));
+        });
+}
+
+bool operand_word_char(char value) {
+    const auto current = static_cast<unsigned char>(value);
+    return std::isalnum(current) != 0 || value == '_' || value == '.' ||
+        value == '$' || value == '?' || value == '@' || value == '+' || value == '-';
+}
+
+operand_color_role_t classify_word_token(std::string_view token,
+                                         bool& has_name_candidate) {
+    static constexpr std::array<std::string_view, 33> registers{
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+        "ax", "bx", "cx", "dx", "al", "ah", "bl", "bh", "cl",
+        "ch", "dl", "dh", "rip", "eip", "cs", "ds", "ss"};
+    if (std::any_of(registers.begin(), registers.end(),
+            [&](std::string_view value) { return operand_equals_ci(token, value); }) ||
+        (token.size() >= 2 && (token[0] == 'r' || token[0] == 'R') &&
+         std::isdigit(static_cast<unsigned char>(token[1])) != 0))
+        return operand_color_role_t::reg;
+    if (!token.empty() &&
+        (std::isdigit(static_cast<unsigned char>(token.front())) != 0 ||
+         token.front() == '-' || token.front() == '+'))
+        return operand_color_role_t::imm;
+    static constexpr std::array<std::string_view, 10> type_tokens{
+        "byte", "word", "dword", "qword", "tbyte", "xmmword", "ymmword",
+        "zmmword", "ptr", "offset"};
+    if (std::any_of(type_tokens.begin(), type_tokens.end(),
+            [&](std::string_view value) { return operand_equals_ci(token, value); }))
+        return operand_color_role_t::keyword;
+    has_name_candidate = true;
+    return operand_color_role_t::name_candidate;
+}
+
+void tokenize_operands(std::string_view operands, std::uint32_t base_offset,
+                       std::vector<operand_token_t>& output,
+                       bool& has_name_sensitive_token) {
+    has_name_sensitive_token = false;
+    std::size_t position = 0;
+    const std::size_t limit = (std::min)(operands.size(),
+        static_cast<std::size_t>(512));
+    while (position < limit) {
+        const auto begin = position;
+        if (operands[position] == '"' || operands[position] == '\'') {
+            const char quote = operands[position++];
+            while (position < limit && operands[position] != quote)
+                ++position;
+            if (position < limit)
+                ++position;
+            output.push_back(operand_token_t{
+                base_offset + static_cast<std::uint32_t>(begin),
+                static_cast<std::uint32_t>(position - begin),
+                static_cast<std::uint8_t>(operand_color_role_t::string_ref)});
+            continue;
+        }
+        const bool word = operand_word_char(operands[position]);
+        ++position;
+        while (position < limit && operand_word_char(operands[position]) == word)
+            ++position;
+        const auto token = operands.substr(begin, position - begin);
+        operand_color_role_t role;
+        if (word) {
+            role = classify_word_token(token, has_name_sensitive_token);
+        } else {
+            role = (token.find('[') != std::string_view::npos ||
+                    token.find(']') != std::string_view::npos)
+                ? operand_color_role_t::reg_ptr : operand_color_role_t::plain;
+        }
+        output.push_back(operand_token_t{
+            base_offset + static_cast<std::uint32_t>(begin),
+            static_cast<std::uint32_t>(position - begin),
+            static_cast<std::uint8_t>(role)});
+    }
+}
+
+void tokenize_formatted_row(formatted_instruction_t& row) {
+    const std::string_view line(row.text);
+    const auto mnemonic_end = line.find_first_of(" \t");
+    row.tokens.clear();
+    if (mnemonic_end == std::string_view::npos) {
+        row.mnemonic_end = line.size();
+        return;
+    }
+    row.mnemonic_end = mnemonic_end;
+    bool has_name_sensitive_token = false;
+    tokenize_operands(line.substr(mnemonic_end),
+        static_cast<std::uint32_t>(mnemonic_end), row.tokens,
+        has_name_sensitive_token);
+}
+
+std::shared_ptr<const std::vector<bookmark_t>> cached_bookmark_snapshot(
+    const workspace_context_t& context) {
+    if (!context.view)
+        return {};
+    const void* publication_key = static_cast<const void*>(context.publication.get());
+    const std::uint64_t overlay_revision = context.publication
+        ? context.publication->overlay_revision : 0;
+    auto& cache = context.view->bookmark_cache;
+    if (cache.rows && cache.publication == publication_key &&
+        cache.overlay_revision == overlay_revision)
+        return cache.rows;
+    auto rows = std::make_shared<std::vector<bookmark_t>>(bookmark_snapshot(context));
+    cache.rows = rows;
+    cache.publication = publication_key;
+    cache.overlay_revision = overlay_revision;
+    return rows;
 }
 
 void request_format_page(const workspace_context_t& context,
@@ -329,10 +436,12 @@ void request_format_page(const workspace_context_t& context,
                     context.workspace->cancellation_token())
                 : decoder->format_one(context.workspace->provider(), *context.image,
                     instruction, options, context.workspace->cancellation_token());
-            if (formatted)
+            if (formatted) {
                 row.text = formatted.take_value();
-            else
+                tokenize_formatted_row(row);
+            } else {
                 row.error = formatted.error().stable_code() + ": " + formatted.error().message;
+            }
             const auto offset = offsets[index - begin];
             if (contiguous_lease) {
                 row.bytes = byte_text(page_view, minimum, offset, instruction.length);
@@ -352,6 +461,7 @@ void request_format_page(const workspace_context_t& context,
         for (auto& item : completed)
             context.view->formatted.insert_or_assign(item.first, std::move(item.second));
         context.view->format_error.clear();
+        context.view->formatted_revision.fetch_add(1, std::memory_order_acq_rel);
     };
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     const std::atomic<bool> cancelled{false};
@@ -685,6 +795,7 @@ bool queue_overlay_transaction(const workspace_context_t& source_context,
             std::lock_guard<std::mutex> lock(context.view->mutex);
             context.view->mutation_error = std::move(error);
             context.view->formatted.clear();
+            context.view->formatted_revision.fetch_add(1, std::memory_order_acq_rel);
             context.view->cached_overlay_revision = context.workspace->overlay_revision();
         } catch (...) {
         }
@@ -942,6 +1053,7 @@ bool queue_overlay_history(const workspace_context_t& source_context, bool redo,
             std::lock_guard<std::mutex> lock(context.view->mutex);
             context.view->mutation_error = std::move(error);
             context.view->formatted.clear();
+            context.view->formatted_revision.fetch_add(1, std::memory_order_acq_rel);
             context.view->cached_overlay_revision = context.workspace->overlay_revision();
         } catch (...) {
         }
@@ -1361,6 +1473,7 @@ workspace_context_t capture_workspace(
             context.view->cached_analysis_revision != context.publication->analysis_revision ||
             context.view->cached_overlay_revision != context.publication->overlay_revision) {
             context.view->formatted.clear();
+            context.view->formatted_revision.fetch_add(1, std::memory_order_acq_rel);
             context.view->pending_format_pages.clear();
             context.view->cached_generation = context.publication->generation;
             context.view->cached_analysis_revision = context.publication->analysis_revision;
@@ -1538,8 +1651,16 @@ std::optional<aida::analysis::address_t> typed_address(
     return {};
 }
 
-std::optional<std::uint64_t> runtime_address(
-    const workspace_context_t& context, const aida::analysis::address_t& address) {
+std::optional<std::uint64_t> display_base_override(const workspace_context_t& context) {
+    if (!context.view)
+        return {};
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    return context.view->display_image_base;
+}
+
+std::optional<std::uint64_t> runtime_address_with_base(
+    const workspace_context_t& context, const aida::analysis::address_t& address,
+    const std::optional<std::uint64_t>& base_override) {
     using aida::analysis::address_space_id_t;
     if (address.space == address_space_id_t::virtual_address ||
         address.space == address_space_id_t::live_virtual)
@@ -1547,19 +1668,24 @@ std::optional<std::uint64_t> runtime_address(
     if (!context.image)
         return {};
     if (address.space == address_space_id_t::relative_virtual) {
-        if (const auto base = display_base_override(context))
-            return checked_add(*base, address.value);
+        if (base_override)
+            return checked_add(*base_override, address.value);
         return optional_value(context.image->rva_to_va(address.value));
     }
     if (address.space == address_space_id_t::file_offset) {
         auto rva = optional_value(context.image->file_offset_to_rva(address.value));
         if (!rva)
             return {};
-        if (const auto base = display_base_override(context))
-            return checked_add(*base, *rva);
+        if (base_override)
+            return checked_add(*base_override, *rva);
         return optional_value(context.image->rva_to_va(*rva));
     }
     return {};
+}
+
+std::optional<std::uint64_t> runtime_address(
+    const workspace_context_t& context, const aida::analysis::address_t& address) {
+    return runtime_address_with_base(context, address, display_base_override(context));
 }
 
 std::optional<std::uint64_t> provider_offset(
@@ -2591,6 +2717,7 @@ void bump_format_generation(const workspace_context_t& context) {
     context.model->format_generation.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(context.view->mutex);
     context.view->formatted.clear();
+    context.view->formatted_revision.fetch_add(1, std::memory_order_acq_rel);
     context.view->pending_format_pages.clear();
 }
 
@@ -3134,6 +3261,50 @@ bool request_listing_export(const workspace_context_t& context, std::string* err
 #endif
 }
 
+namespace {
+
+float prefix_width_for(const workspace_context_t& context, ImFont* font,
+                       float code_size, int format) {
+    std::uint64_t sections_revision = 0;
+    if (context.image) {
+        const auto& sections = context.image->sections();
+        sections_revision = sections.size();
+        if (!sections.empty()) {
+            sections_revision ^=
+                sections.front().virtual_address * 0x9E3779B185EBCA87ULL;
+            sections_revision ^=
+                sections.back().virtual_address * 0xC2B2AE3D27D4EB4FULL;
+        }
+        sections_revision ^= static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(context.image.get()));
+    }
+    auto& cache = context.view->prefix_width_cache;
+    if (cache.valid && cache.addr_format == format && cache.font == font &&
+        cache.sections_revision == sections_revision)
+        return cache.width;
+    float width = font->CalcTextSizeA(code_size, FLT_MAX, 0.0f, ".text").x;
+    if (context.image) {
+        for (const auto& section : context.image->sections()) {
+            width = (std::max)(width, font->CalcTextSizeA(code_size, FLT_MAX,
+                0.0f, section.name.c_str()).x);
+        }
+    }
+    width += font->CalcTextSizeA(code_size, FLT_MAX, 0.0f, ":").x;
+    const char* label = format == static_cast<int>(addr_format_t::rva)
+        ? "+00000000"
+        : format == static_cast<int>(addr_format_t::file_offset)
+            ? "00000000" : "0000000000000000";
+    width += font->CalcTextSizeA(code_size, FLT_MAX, 0.0f, label).x;
+    cache.width = width;
+    cache.addr_format = format;
+    cache.font = font;
+    cache.sections_revision = sections_revision;
+    cache.valid = true;
+    return width;
+}
+
+}
+
 void render(float, float, float width, float height,
             float alpha, float, float, float,
             const workspace_context_t& context, float) {
@@ -3362,6 +3533,7 @@ void render(float, float, float width, float height,
         std::lock_guard<std::mutex> lock(context.view->mutex);
         context.view->format_error.clear();
         context.view->formatted.clear();
+        context.view->formatted_revision.fetch_add(1, std::memory_order_acq_rel);
         context.view->pending_format_pages.clear();
     }
     if (!export_error.empty()) {
@@ -3407,6 +3579,7 @@ void render(float, float, float width, float height,
                     context.view->rebase_error.clear();
                     context.view->rebase_popup_open = false;
                     context.view->formatted.clear();
+                    context.view->formatted_revision.fetch_add(1, std::memory_order_acq_rel);
                     context.view->pending_format_pages.clear();
                 }
                 context.model->format_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -3496,10 +3669,33 @@ void render(float, float, float width, float height,
             static_cast<std::size_t>(band_width));
         const std::size_t marker_step = (std::max)(static_cast<std::size_t>(1),
             (navigation_count + marker_budget - 1) / marker_budget);
-        std::optional<aida::analysis::address_t> band_selection;
-        {
-            std::lock_guard<std::mutex> lock(context.view->mutex);
-            band_selection = context.view->selection;
+        const auto* nav_key = static_cast<const void*>(&navigation_instructions);
+        const std::uint64_t nav_revision =
+            context.view->formatted_revision.load(std::memory_order_acquire);
+        auto& nav_cache = context.view->nav_band_cache;
+        if (nav_cache.instructions != nav_key ||
+            nav_cache.range_first != range->first ||
+            nav_cache.range_second != range->second ||
+            nav_cache.marker_step != marker_step ||
+            nav_cache.formatted_revision != nav_revision) {
+            std::unordered_map<std::size_t, std::string> marker_texts;
+            {
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                for (std::size_t offset = 0; offset < navigation_count;
+                     offset += marker_step) {
+                    const auto& marker = navigation_instructions[range->first + offset];
+                    if ((marker.flow_flags & (aida::analysis::flow_return |
+                            aida::analysis::flow_call |
+                            aida::analysis::flow_branch)) != 0)
+                        continue;
+                    const auto formatted = context.view->formatted.find(marker.id);
+                    if (formatted != context.view->formatted.end())
+                        marker_texts.emplace(offset, formatted->second.text);
+                }
+            }
+            nav_cache.colors.clear();
+            nav_cache.colors.reserve(
+                (navigation_count + marker_step - 1) / marker_step);
             for (std::size_t offset = 0; offset < navigation_count; offset += marker_step) {
                 const auto& marker = navigation_instructions[range->first + offset];
                 ImU32 color = theme.text_dim;
@@ -3510,21 +3706,39 @@ void render(float, float, float width, float height,
                 else if ((marker.flow_flags & aida::analysis::flow_branch) != 0)
                     color = disasm_theme::mnem_branch();
                 else {
-                    const auto formatted = context.view->formatted.find(marker.id);
-                    if (formatted != context.view->formatted.end()) {
-                        const auto& text = formatted->second.text;
-                        if (text.size() >= 3 &&
-                            (text[0] == 'n' || text[0] == 'N') &&
-                            (text[1] == 'o' || text[1] == 'O') &&
-                            (text[2] == 'p' || text[2] == 'P'))
+                    const auto text = marker_texts.find(offset);
+                    if (text != marker_texts.end()) {
+                        const auto& value = text->second;
+                        if (value.size() >= 3 &&
+                            (value[0] == 'n' || value[0] == 'N') &&
+                            (value[1] == 'o' || value[1] == 'O') &&
+                            (value[2] == 'p' || value[2] == 'P'))
                             color = disasm_theme::mnem_nop();
                     }
                 }
+                nav_cache.colors.push_back(color);
+            }
+            nav_cache.instructions = nav_key;
+            nav_cache.range_first = range->first;
+            nav_cache.range_second = range->second;
+            nav_cache.marker_step = marker_step;
+            nav_cache.formatted_revision = nav_revision;
+        }
+        std::optional<aida::analysis::address_t> band_selection;
+        {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            band_selection = context.view->selection;
+        }
+        {
+            std::size_t color_index = 0;
+            for (std::size_t offset = 0;
+                 offset < navigation_count && color_index < nav_cache.colors.size();
+                 offset += marker_step, ++color_index) {
                 const float x = band_min.x +
                     (static_cast<float>(offset) / static_cast<float>(navigation_count)) * band_width;
                 band_draw->AddRectFilled(ImVec2(x, band_min.y + 1.0f),
                     ImVec2((std::min)(x + 1.0f, band_max.x), band_max.y - 1.0f),
-                    aida::ui::with_alpha(color, alpha * 0.9f));
+                    aida::ui::with_alpha(nav_cache.colors[color_index], alpha * 0.9f));
             }
         }
         if (band_selection) {
@@ -3676,13 +3890,12 @@ void render(float, float, float width, float height,
     const float bytes_width = char_width * 31.0f;
     std::optional<aida::analysis::address_t> selection;
     bool scroll_to_selection = false;
-    std::vector<bookmark_t> bookmarks;
     {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         selection = context.view->selection;
         scroll_to_selection = context.view->scroll_to_selection;
     }
-    bookmarks = bookmark_snapshot(context);
+    const auto bookmarks = cached_bookmark_snapshot(context);
     if (scroll_to_selection && selection) {
         auto found = std::lower_bound(instructions.begin() + static_cast<std::ptrdiff_t>(range->first),
             instructions.begin() + static_cast<std::ptrdiff_t>(range->second), *selection,
@@ -3714,11 +3927,8 @@ void render(float, float, float width, float height,
             });
         return found == context.image->sections().end() ? nullptr : &*found;
     };
-    auto prefix_text = [&](const aida::analysis::address_t& address) {
-        const auto section = section_for(address);
-        return std::string(section ? section->name : ".text") + ":" +
-            address_label(context, address, static_cast<addr_format_t>(address_format));
-    };
+    const float prefix_width = prefix_width_for(context, code_font, code_size,
+        address_format);
     ImGuiListClipper clipper;
     clipper.Begin(count, row_height);
     while (clipper.Step()) {
@@ -3733,14 +3943,6 @@ void render(float, float, float width, float height,
             range->first + (std::min)(count_size, instruction_end));
         if (page_begin < page_end)
             request_format_page(context, page_begin, page_end);
-        float prefix_width = code_font->CalcTextSizeA(code_size, FLT_MAX, 0.0f,
-            address_format == static_cast<int>(addr_format_t::rva)
-                ? ".text:+00000000" : ".text:0000000000000000").x;
-        for (std::size_t sample = page_begin; sample < page_end; ++sample) {
-            const auto text = prefix_text(instructions[sample].address);
-            prefix_width = (std::max)(prefix_width,
-                code_font->CalcTextSizeA(code_size, FLT_MAX, 0.0f, text.c_str()).x);
-        }
         for (int virtual_row = clipper.DisplayStart; virtual_row < clipper.DisplayEnd; ++virtual_row) {
             if (virtual_row < 0)
                 continue;
@@ -3895,8 +4097,16 @@ void render(float, float, float width, float height,
                 draw_list->AddRectFilled(minimum, ImVec2(minimum.x + 3.0f, maximum.y),
                     aida::ui::with_alpha(theme.accent_u32, alpha));
             }
-            const bool bookmarked = std::any_of(bookmarks.begin(), bookmarks.end(),
-                [&](const bookmark_t& item) { return item.addr == instruction.address.value; });
+            bool bookmarked = false;
+            if (bookmarks) {
+                const auto mark = std::lower_bound(bookmarks->begin(), bookmarks->end(),
+                    instruction.address.value,
+                    [](const bookmark_t& item, std::uint64_t value) {
+                        return item.addr < value;
+                    });
+                bookmarked = mark != bookmarks->end() &&
+                    mark->addr == instruction.address.value;
+            }
             if (bookmarked) {
                 draw_list->AddRectFilled(ImVec2(minimum.x + 4.0f, minimum.y),
                     ImVec2(minimum.x + 7.0f, maximum.y),
@@ -3972,7 +4182,7 @@ void render(float, float, float width, float height,
             }
             if (formatted_ready && formatted.error.empty()) {
                 const std::string_view line(formatted.text);
-                const auto mnemonic_end = line.find_first_of(" \t");
+                const auto mnemonic_end = (std::min)(formatted.mnemonic_end, line.size());
                 const auto mnemonic = line.substr(0, mnemonic_end);
                 ImU32 mnemonic_color = disasm_theme::mnemonic();
                 if (!mnemonic.empty() && (mnemonic.front() == 'j' || mnemonic.front() == 'J'))
@@ -3986,96 +4196,52 @@ void render(float, float, float width, float height,
                     mnemonic.data(), mnemonic.data() + mnemonic.size());
                 cursor_x += code_font->CalcTextSizeA(code_size, FLT_MAX, 0.0f,
                     mnemonic.data(), mnemonic.data() + mnemonic.size()).x;
-                if (mnemonic_end != std::string_view::npos) {
-                    const auto operands = line.substr(mnemonic_end);
-                    auto equals_ci = [](std::string_view left, std::string_view right) {
-                        return left.size() == right.size() && std::equal(left.begin(), left.end(),
-                            right.begin(), [](char l, char r) {
-                                return std::tolower(static_cast<unsigned char>(l)) ==
-                                    std::tolower(static_cast<unsigned char>(r));
-                            });
-                    };
-                    auto token_color = [&](std::string_view token) {
-                        static constexpr std::array<std::string_view, 33> registers{
-                            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-                            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
-                            "ax", "bx", "cx", "dx", "al", "ah", "bl", "bh", "cl",
-                            "ch", "dl", "dh", "rip", "eip", "cs", "ds", "ss"};
-                        if (std::any_of(registers.begin(), registers.end(),
-                                [&](std::string_view value) { return equals_ci(token, value); }) ||
-                            (token.size() >= 2 && (token[0] == 'r' || token[0] == 'R') &&
-                             std::isdigit(static_cast<unsigned char>(token[1])) != 0))
-                            return disasm_theme::reg();
-                        if (!token.empty() &&
-                            (std::isdigit(static_cast<unsigned char>(token.front())) != 0 ||
-                             token.front() == '-' || token.front() == '+'))
-                            return disasm_theme::immediate_num();
-                        static constexpr std::array<std::string_view, 10> type_tokens{
-                            "byte", "word", "dword", "qword", "tbyte", "xmmword", "ymmword",
-                            "zmmword", "ptr", "offset"};
-                        if (std::any_of(type_tokens.begin(), type_tokens.end(),
-                                [&](std::string_view value) { return equals_ci(token, value); }))
-                            return disasm_theme::keyword();
-                        if (!name.empty() && equals_ci(token, name))
-                            return disasm_theme::func_name();
-                        if (token.size() > 4 &&
-                            (equals_ci(token.substr(0, 4), "sub_") ||
-                             equals_ci(token.substr(0, 4), "loc_") ||
-                             equals_ci(token.substr(0, 4), "off_")))
-                            return disasm_theme::sub_label();
-                        if (token.find('_') != std::string_view::npos)
-                            return disasm_theme::sub_label();
-                        return theme.text_secondary;
-                    };
-                    std::size_t operand_offset = 0;
-                    const std::size_t operand_limit = (std::min)(operands.size(),
-                        static_cast<std::size_t>(512));
-                    while (operand_offset < operand_limit) {
-                        const auto begin = operand_offset;
-                        if (operands[operand_offset] == '"' || operands[operand_offset] == '\'') {
-                            const char quote = operands[operand_offset++];
-                            while (operand_offset < operand_limit && operands[operand_offset] != quote)
-                                ++operand_offset;
-                            if (operand_offset < operand_limit)
-                                ++operand_offset;
-                            const auto token = operands.substr(begin, operand_offset - begin);
-                            draw_list->AddText(code_font, code_size, ImVec2(cursor_x, text_y),
-                                aida::ui::with_alpha(disasm_theme::string_ref(), alpha),
-                                token.data(), token.data() + token.size());
-                            cursor_x += code_font->CalcTextSizeA(code_size, FLT_MAX, 0.0f,
-                                token.data(), token.data() + token.size()).x;
-                            continue;
-                        }
-                        const auto current = static_cast<unsigned char>(operands[operand_offset]);
-                        const bool word = std::isalnum(current) != 0 || operands[operand_offset] == '_' ||
-                            operands[operand_offset] == '.' || operands[operand_offset] == '$' ||
-                            operands[operand_offset] == '?' || operands[operand_offset] == '@' ||
-                            operands[operand_offset] == '+' || operands[operand_offset] == '-';
-                        ++operand_offset;
-                        while (operand_offset < operand_limit) {
-                            const auto value = static_cast<unsigned char>(operands[operand_offset]);
-                            const bool next_word = std::isalnum(value) != 0 ||
-                                operands[operand_offset] == '_' || operands[operand_offset] == '.' ||
-                                operands[operand_offset] == '$' || operands[operand_offset] == '?' ||
-                                operands[operand_offset] == '@' || operands[operand_offset] == '+' ||
-                                operands[operand_offset] == '-';
-                            if (next_word != word)
-                                break;
-                            ++operand_offset;
-                        }
-                        const auto token = operands.substr(begin, operand_offset - begin);
-                        const bool memory_punctuation = !word &&
-                            (token.find('[') != std::string_view::npos ||
-                             token.find(']') != std::string_view::npos);
-                        const ImU32 color = word ? token_color(token)
-                            : memory_punctuation ? disasm_theme::reg_ptr()
-                            : theme.text_secondary;
-                        draw_list->AddText(code_font, code_size, ImVec2(cursor_x, text_y),
-                            aida::ui::with_alpha(color, alpha), token.data(),
-                            token.data() + token.size());
-                        cursor_x += code_font->CalcTextSizeA(code_size, FLT_MAX, 0.0f,
-                            token.data(), token.data() + token.size()).x;
+                for (const auto& token : formatted.tokens) {
+                    if (token.offset >= line.size())
+                        break;
+                    const auto token_length = (std::min)(
+                        static_cast<std::size_t>(token.length),
+                        line.size() - token.offset);
+                    const auto token_text = line.substr(token.offset, token_length);
+                    ImU32 token_color_value = theme.text_secondary;
+                    switch (static_cast<operand_color_role_t>(token.color_role)) {
+                    case operand_color_role_t::reg:
+                        token_color_value = disasm_theme::reg();
+                        break;
+                    case operand_color_role_t::imm:
+                        token_color_value = disasm_theme::immediate_num();
+                        break;
+                    case operand_color_role_t::keyword:
+                        token_color_value = disasm_theme::keyword();
+                        break;
+                    case operand_color_role_t::string_ref:
+                        token_color_value = disasm_theme::string_ref();
+                        break;
+                    case operand_color_role_t::reg_ptr:
+                        token_color_value = disasm_theme::reg_ptr();
+                        break;
+                    case operand_color_role_t::sub_label:
+                        token_color_value = disasm_theme::sub_label();
+                        break;
+                    case operand_color_role_t::name_candidate:
+                        if (!name.empty() && operand_equals_ci(token_text, name))
+                            token_color_value = disasm_theme::func_name();
+                        else if (token_text.size() > 4 &&
+                                 (operand_equals_ci(token_text.substr(0, 4), "sub_") ||
+                                  operand_equals_ci(token_text.substr(0, 4), "loc_") ||
+                                  operand_equals_ci(token_text.substr(0, 4), "off_")))
+                            token_color_value = disasm_theme::sub_label();
+                        else if (token_text.find('_') != std::string_view::npos)
+                            token_color_value = disasm_theme::sub_label();
+                        break;
+                    default:
+                        break;
                     }
+                    draw_list->AddText(code_font, code_size, ImVec2(cursor_x, text_y),
+                        aida::ui::with_alpha(token_color_value, alpha), token_text.data(),
+                        token_text.data() + token_text.size());
+                    cursor_x += code_font->CalcTextSizeA(code_size, FLT_MAX, 0.0f,
+                        token_text.data(), token_text.data() + token_text.size()).x;
                 }
             } else {
                 const char* pending = formatted_ready ? formatted.error.c_str() : "Formatting...";

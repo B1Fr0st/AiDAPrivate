@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <mutex>
 
 namespace aida::analysis::flirt {
 namespace {
@@ -287,39 +286,6 @@ std::shared_ptr<const flirt_signature_db_t> flirt_signature_db_t::load_embedded(
         return loaded.take_value();
     }();
     return cached;
-}
-
-workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>
-flirt_signature_db_t::load_from_file(const std::string& utf8_path)
-{
-    const bool absolute = utf8_path.size() > 2 &&
-        ((utf8_path[1] == ':' && (utf8_path[2] == '\\' || utf8_path[2] == '/')) ||
-         (utf8_path[0] == '/' && utf8_path[1] != '/'));
-    if (!absolute || utf8_path.find("..") != std::string::npos ||
-        utf8_path.rfind("\\\\", 0) == 0 || utf8_path.rfind("//", 0) == 0)
-        return workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>::failure(
-            make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "FLIRT database path must be an absolute local path",
-                                 "flirt.db.load"));
-    auto opened = mapped_file_provider_t::open(utf8_path);
-    if (!opened)
-        return workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>::failure(
-            std::move(opened.error()));
-    auto provider = opened.take_value();
-    if (provider->size() > (std::uint64_t{256} << 20))
-        return workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>::failure(
-            make_workspace_error(workspace_error_code_t::limit_exceeded,
-                                 "FLIRT database file exceeds 256MB", "flirt.db.load"));
-    auto bytes = provider->read_vector(0, provider->size(), std::uint64_t{256} << 20);
-    if (!bytes)
-        return workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>::failure(
-            std::move(bytes.error()));
-    auto loaded = load_from_blob(bytes.value().data(), bytes.value().size(), utf8_path);
-    if (!loaded)
-        return workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>::failure(
-            std::move(loaded.error()));
-    return workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>::success(
-        loaded.take_value());
 }
 
 bool flirt_signature_db_t::entry(std::uint32_t index, flirt_db_entry_view_t& out) const noexcept

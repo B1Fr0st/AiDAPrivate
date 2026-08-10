@@ -9,17 +9,21 @@
 #include "../ui/application_view_registry.hpp"
 #include "xref_db_view.hpp"
 #include "workspace/workspace_registry.hpp"
+#include "../infra/executor.hpp"
 #include "../ui/components.hpp"
 #include "../ui/empty_state.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/theme.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/studio_semantics.hpp"
+#else
+#include "../../helpers/diag_log.hpp"
 #endif
 #include "imgui/imgui.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +31,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -65,14 +70,24 @@ inline std::string semantic_row_identity(const row_t& row) {
 }
 #endif
 
+struct rows_snapshot_t {
+    std::vector<row_t> rows;
+    std::vector<std::size_t> visible;
+};
+
 struct state_t {
+    std::mutex mtx;
+    std::shared_ptr<const rows_snapshot_t> snapshot =
+        std::make_shared<const rows_snapshot_t>();
+    std::atomic<std::uint64_t> rebuild_serial{0};
+    std::atomic<bool> rebuilding{false};
     bool projected = false;
     std::uint64_t generation = 0;
     std::uint64_t revision = 0;
     std::uint64_t overlay_revision = 0;
-    std::vector<row_t> rows;
-    std::vector<std::size_t> visible;
     std::string filter_lower;
+    int submitted_sort_column = 0;
+    bool submitted_sort_ascending = true;
     char filter[192]{};
     bool filter_dirty = true;
     bool sort_dirty = true;
@@ -83,6 +98,7 @@ struct state_t {
     std::uint64_t selected_address = 0;
     std::size_t selected_source = static_cast<std::size_t>(-1);
     std::size_t context_source = static_cast<std::size_t>(-1);
+    std::shared_ptr<const rows_snapshot_t> adopted_snapshot;
 };
 
 struct descriptor_t {
@@ -140,6 +156,13 @@ inline std::string address_text(std::uint64_t address) {
 inline std::uint64_t runtime_address_value(const disasm_view::workspace_context_t& context,
                                            const aida::analysis::address_t& address) {
     return disasm_view::runtime_address(context, address).value_or(address.value);
+}
+
+inline std::uint64_t runtime_address_value(const disasm_view::workspace_context_t& context,
+                                           const aida::analysis::address_t& address,
+                                           const std::optional<std::uint64_t>& display_base) {
+    return disasm_view::runtime_address_with_base(context, address, display_base)
+        .value_or(address.value);
 }
 
 inline const char* string_encoding(aida::analysis::string_encoding_t encoding) {
@@ -206,23 +229,20 @@ inline std::shared_ptr<state_t> state_for(
     return value;
 }
 
-inline void rebuild_rows(domain_t domain, state_t& state,
-                         const disasm_view::workspace_context_t& context) {
+inline std::vector<row_t> project_rows(
+    domain_t domain, const disasm_view::workspace_context_t& context,
+    const std::optional<std::uint64_t>& display_base) {
     const auto publication = context.publication;
-    if (!publication || !publication->snapshot) return;
-    if (state.projected && state.generation == publication->generation &&
-        state.revision == publication->analysis_revision &&
-        state.overlay_revision == publication->overlay_revision)
-        return;
+    std::vector<row_t> rows;
+    if (!publication || !publication->snapshot) return rows;
     const auto& snapshot = *publication->snapshot;
     const auto normalized = snapshot.normalized_image;
-    std::vector<row_t> rows;
     if (domain == domain_t::imports && normalized) {
         rows.reserve(normalized->imports.size());
         for (const auto& item : normalized->imports) {
             const auto& source = item.address.value != 0 ? item.address : item.lookup_address;
             row_t row;
-            row.address = runtime_address_value(context, source);
+            row.address = runtime_address_value(context, source, display_base);
             row.has_address = row.address != 0;
             row.name = item.name.value_or(item.ordinal ? "Ordinal " + std::to_string(*item.ordinal) : "Unnamed import");
             row.context = item.library;
@@ -233,7 +253,7 @@ inline void rebuild_rows(domain_t domain, state_t& state,
         rows.reserve(normalized->exports.size());
         for (const auto& item : normalized->exports) {
             row_t row;
-            row.address = runtime_address_value(context, item.address);
+            row.address = runtime_address_value(context, item.address, display_base);
             row.has_address = row.address != 0;
             row.name = item.name.value_or("Ordinal " + std::to_string(item.ordinal));
             row.context = "Ordinal " + std::to_string(item.ordinal);
@@ -244,7 +264,7 @@ inline void rebuild_rows(domain_t domain, state_t& state,
         rows.reserve(snapshot.symbols.size());
         for (const auto& item : snapshot.symbols) {
             row_t row;
-            row.address = runtime_address_value(context, item.address);
+            row.address = runtime_address_value(context, item.address, display_base);
             row.has_address = row.address != 0;
             row.name = disasm_view::resolve_name(context, item.address);
             if (row.name.empty()) row.name = item.name.empty() ? "Unnamed symbol" : item.name;
@@ -256,7 +276,7 @@ inline void rebuild_rows(domain_t domain, state_t& state,
         rows.reserve(snapshot.strings.size());
         for (const auto& item : snapshot.strings) {
             row_t row;
-            row.address = runtime_address_value(context, item.address);
+            row.address = runtime_address_value(context, item.address, display_base);
             row.has_address = row.address != 0;
             row.name = item.value;
             row.context = string_encoding(item.encoding);
@@ -284,7 +304,7 @@ inline void rebuild_rows(domain_t domain, state_t& state,
         for (const auto& item : snapshot.rich_facts.type_candidates) {
             row_t row;
             if (item.address) {
-                row.address = runtime_address_value(context, *item.address);
+                row.address = runtime_address_value(context, *item.address, display_base);
                 row.has_address = row.address != 0;
             }
             row.name = item.display_name.empty() ? item.canonical_type : item.display_name;
@@ -296,16 +316,7 @@ inline void rebuild_rows(domain_t domain, state_t& state,
             rows.push_back(std::move(row));
         }
     }
-    state.rows = std::move(rows);
-    state.projected = true;
-    state.generation = publication->generation;
-    state.revision = publication->analysis_revision;
-    state.overlay_revision = publication->overlay_revision;
-    state.filter_dirty = true;
-    state.sort_dirty = true;
-    state.page = 0;
-    state.selected_source = static_cast<std::size_t>(-1);
-    state.selected_address = 0;
+    return rows;
 }
 
 inline int compare_text(const std::string& left, const std::string& right) {
@@ -321,31 +332,22 @@ inline int compare_text(const std::string& left, const std::string& right) {
     return 0;
 }
 
-inline void rebuild_visible(state_t& state) {
-    const std::string requested = lower(state.filter);
-    if (!state.filter_dirty && requested == state.filter_lower && !state.sort_dirty) return;
-    if (state.filter_dirty || requested != state.filter_lower) {
-        state.filter_lower = requested;
-        state.visible.clear();
-        state.visible.reserve(state.rows.size());
-        for (std::size_t index = 0; index < state.rows.size(); ++index) {
-            const auto& row = state.rows[index];
-            const bool match = requested.empty() || contains_case_insensitive(row.name, requested) ||
-                contains_case_insensitive(row.context, requested) ||
-                contains_case_insensitive(row.detail, requested) ||
-                (row.has_address && lower(address_text(row.address)).find(requested) != std::string::npos);
-            if (match) state.visible.push_back(index);
-        }
-        state.page = 0;
-        state.filter_dirty = false;
-        state.sort_dirty = true;
+inline std::vector<std::size_t> compute_visible(const std::vector<row_t>& rows,
+                                                const std::string& requested,
+                                                int column, bool ascending) {
+    std::vector<std::size_t> visible;
+    visible.reserve(rows.size());
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        const auto& row = rows[index];
+        const bool match = requested.empty() || contains_case_insensitive(row.name, requested) ||
+            contains_case_insensitive(row.context, requested) ||
+            contains_case_insensitive(row.detail, requested) ||
+            (row.has_address && lower(address_text(row.address)).find(requested) != std::string::npos);
+        if (match) visible.push_back(index);
     }
-    if (!state.sort_dirty) return;
-    const int column = state.sort_column;
-    const bool ascending = state.sort_ascending;
-    std::stable_sort(state.visible.begin(), state.visible.end(), [&](std::size_t left, std::size_t right) {
-        const auto& lhs = state.rows[left];
-        const auto& rhs = state.rows[right];
+    std::stable_sort(visible.begin(), visible.end(), [&](std::size_t left, std::size_t right) {
+        const auto& lhs = rows[left];
+        const auto& rhs = rows[right];
         int result = 0;
         if (column == 0) {
             if (lhs.address < rhs.address) result = -1;
@@ -356,12 +358,101 @@ inline void rebuild_visible(state_t& state) {
         if (result == 0) result = left < right ? -1 : (left > right ? 1 : 0);
         return ascending ? result < 0 : result > 0;
     });
-    if (state.selected_source != static_cast<std::size_t>(-1) &&
-        std::find(state.visible.begin(), state.visible.end(), state.selected_source) == state.visible.end()) {
-        state.selected_source = static_cast<std::size_t>(-1);
-        state.selected_address = 0;
+    return visible;
+}
+
+inline void submit_rebuild(domain_t domain, const std::shared_ptr<state_t>& state,
+                           const disasm_view::workspace_context_t& context) {
+    const auto publication = context.publication;
+    if (!publication || !publication->snapshot) return;
+    const std::string requested = lower(state->filter);
+    if (state->projected && state->generation == publication->generation &&
+        state->revision == publication->analysis_revision &&
+        state->overlay_revision == publication->overlay_revision &&
+        !state->filter_dirty && !state->sort_dirty &&
+        requested == state->filter_lower &&
+        state->sort_column == state->submitted_sort_column &&
+        state->sort_ascending == state->submitted_sort_ascending)
+        return;
+    state->projected = true;
+    state->generation = publication->generation;
+    state->revision = publication->analysis_revision;
+    state->overlay_revision = publication->overlay_revision;
+    state->filter_lower = requested;
+    state->filter_dirty = false;
+    state->sort_dirty = false;
+    state->submitted_sort_column = state->sort_column;
+    state->submitted_sort_ascending = state->sort_ascending;
+    const auto serial = state->rebuild_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    state->rebuilding.store(true, std::memory_order_release);
+    const auto display_base = disasm_view::display_base_override(context);
+    const int sort_column = state->sort_column;
+    const bool sort_ascending = state->sort_ascending;
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "analysis";
+    submission.label = "analysis.analysis_list_views.rebuild";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 2;
+    submission.generation = publication->generation;
+    submission.body = [domain, state, context, display_base, requested,
+                       sort_column, sort_ascending, serial]() {
+        auto next = std::make_shared<rows_snapshot_t>();
+        next->rows = project_rows(domain, context, display_base);
+        next->visible = compute_visible(next->rows, requested, sort_column, sort_ascending);
+        const auto rows_count = static_cast<unsigned long long>(next->rows.size());
+        const auto visible_count = static_cast<unsigned long long>(next->visible.size());
+        bool published = false;
+        {
+            std::lock_guard<std::mutex> lock(state->mtx);
+            if (state->rebuild_serial.load(std::memory_order_acquire) == serial) {
+                state->snapshot = std::move(next);
+                published = true;
+            }
+        }
+        if (published) {
+            state->rebuilding.store(false, std::memory_order_release);
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            diag::log_tagged_fmt("analysis_list",
+                "rebuild_publish serial=%llu domain=%u rows=%llu visible=%llu",
+                static_cast<unsigned long long>(serial),
+                static_cast<unsigned>(domain),
+                rows_count, visible_count);
+#endif
+        } else {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            diag::log_tagged_fmt("analysis_list",
+                "rebuild_stale_drop serial=%llu current=%llu domain=%u",
+                static_cast<unsigned long long>(serial),
+                static_cast<unsigned long long>(
+                    state->rebuild_serial.load(std::memory_order_acquire)),
+                static_cast<unsigned>(domain));
+#endif
+        }
+    };
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    auto preview_body = std::move(submission.body);
+    preview_body();
+#else
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        state->rebuilding.store(false, std::memory_order_release);
+        state->projected = false;
+        state->filter_dirty = true;
+        state->sort_dirty = true;
+        diag::log_tagged_fmt("analysis_list",
+            "rebuild_submit_failed serial=%llu domain=%u reason=%s",
+            static_cast<unsigned long long>(serial),
+            static_cast<unsigned>(domain),
+            submitted.reject_reason.c_str());
+        return;
     }
-    state.sort_dirty = false;
+    diag::log_tagged_fmt("analysis_list",
+        "rebuild_submit serial=%llu domain=%u filter=%s",
+        static_cast<unsigned long long>(serial),
+        static_cast<unsigned>(domain),
+        requested.c_str());
+#endif
 }
 
 inline void select_row(const row_t& row, state_t& state, std::size_t source,
@@ -547,10 +638,46 @@ inline void render(domain_t domain) {
         return;
     }
     const auto state = state_for(domain, workspace);
-    rebuild_rows(domain, *state, context);
-    rebuild_visible(*state);
+    submit_rebuild(domain, state, context);
+    std::shared_ptr<const rows_snapshot_t> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(state->mtx);
+        snapshot = state->snapshot;
+    }
+    if (snapshot != state->adopted_snapshot) {
+        std::size_t remapped = static_cast<std::size_t>(-1);
+        if (state->selected_source != static_cast<std::size_t>(-1)) {
+            const bool identity_stable = state->adopted_snapshot &&
+                state->selected_source < state->adopted_snapshot->rows.size() &&
+                state->selected_source < snapshot->rows.size() &&
+                row_identity(state->adopted_snapshot->rows[state->selected_source]) ==
+                    row_identity(snapshot->rows[state->selected_source]);
+            if (identity_stable) {
+                remapped = state->selected_source;
+            } else if (state->selected_address != 0) {
+                for (std::size_t index = 0; index < snapshot->rows.size(); ++index) {
+                    if (snapshot->rows[index].has_address &&
+                        snapshot->rows[index].address == state->selected_address) {
+                        remapped = index;
+                        break;
+                    }
+                }
+            }
+        }
+        if (remapped != static_cast<std::size_t>(-1) &&
+            std::find(snapshot->visible.begin(), snapshot->visible.end(), remapped) ==
+                snapshot->visible.end())
+            remapped = static_cast<std::size_t>(-1);
+        state->selected_source = remapped;
+        state->selected_address = remapped != static_cast<std::size_t>(-1) &&
+                snapshot->rows[remapped].has_address
+            ? snapshot->rows[remapped].address : 0;
+        state->adopted_snapshot = snapshot;
+    }
+    const auto& rows = snapshot->rows;
+    const auto& visible = snapshot->visible;
     auto page_count = (std::max<std::size_t>)(1,
-        (state->visible.size() + state->page_size - 1) / state->page_size);
+        (visible.size() + state->page_size - 1) / state->page_size);
     if (state->page >= page_count) state->page = page_count - 1;
     const float toolbar_start_y = ImGui::GetCursorScreenPos().y;
     const bool narrow_toolbar = available.x < 520.0f;
@@ -560,6 +687,10 @@ inline void render(domain_t domain) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(info.title);
     ImGui::PopFont();
+    if (state->rebuilding.load(std::memory_order_acquire)) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("refreshing");
+    }
     if (narrow_toolbar) {
         ImGui::SameLine();
         ImGui::BeginDisabled(state->page == 0);
@@ -571,19 +702,18 @@ inline void render(domain_t domain) {
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::TextDisabled("%zu/%zu | %zu", state->page + 1, page_count,
-            state->visible.size());
+            visible.size());
     } else {
         ImGui::SameLine();
     }
     ImGui::SetNextItemWidth(narrow_toolbar ? available.x
         : (std::max)(120.0f, available.x - 310.0f));
     if (aida::ui::input_text("##filter", state->filter, sizeof(state->filter),
-            "Filter by address, name, or detail...", false, ImVec2(0.0f, 25.0f)))
+            "Filter by address, name, or detail...", false, ImVec2(0.0f, 25.0f))) {
         state->filter_dirty = true;
-    rebuild_visible(*state);
-    page_count = (std::max<std::size_t>)(1,
-        (state->visible.size() + state->page_size - 1) / state->page_size);
-    if (state->page >= page_count) state->page = page_count - 1;
+        state->page = 0;
+        submit_rebuild(domain, state, context);
+    }
     if (!narrow_toolbar) {
         ImGui::SameLine();
         ImGui::BeginDisabled(state->page == 0);
@@ -594,14 +724,14 @@ inline void render(domain_t domain) {
         if (ImGui::SmallButton(">")) ++state->page;
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::TextDisabled("%zu/%zu | %zu", state->page + 1, page_count, state->visible.size());
+        ImGui::TextDisabled("%zu/%zu | %zu", state->page + 1, page_count, visible.size());
     }
     ImGui::PopStyleVar();
     const float toolbar_height = (std::max)(0.0f,
         ImGui::GetCursorScreenPos().y - toolbar_start_y);
     const float content_height = (std::max)(1.0f, available.y - toolbar_height);
 
-    if (state->rows.empty()) {
+    if (rows.empty()) {
         aida::ui::empty_state::config_t empty;
         empty.glyph = aida::ui::empty_state::glyph_t::binary_file;
         empty.title = info.empty_title;
@@ -611,7 +741,7 @@ inline void render(domain_t domain) {
         ImGui::PopID();
         return;
     }
-    if (state->visible.empty()) {
+    if (visible.empty()) {
         aida::ui::empty_state::config_t empty;
         empty.glyph = aida::ui::empty_state::glyph_t::search;
         empty.title = "No matches";
@@ -640,16 +770,16 @@ inline void render(domain_t domain) {
             state->sort_ascending = specs->Specs[0].SortDirection != ImGuiSortDirection_Descending;
             state->sort_dirty = true;
             specs->SpecsDirty = false;
-            rebuild_visible(*state);
+            submit_rebuild(domain, state, context);
         }
         const std::size_t first = state->page * state->page_size;
-        const std::size_t last = (std::min)(state->visible.size(), first + state->page_size);
+        const std::size_t last = (std::min)(visible.size(), first + state->page_size);
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(last - first), 22.0f);
         while (clipper.Step()) {
             for (int page_row = clipper.DisplayStart; page_row < clipper.DisplayEnd; ++page_row) {
-                const std::size_t source = state->visible[first + static_cast<std::size_t>(page_row)];
-                const auto& row = state->rows[source];
+                const std::size_t source = visible[first + static_cast<std::size_t>(page_row)];
+                const auto& row = rows[source];
                 ImGui::TableNextRow(0, 22.0f);
                 ImGui::TableSetColumnIndex(0);
                 ImGui::PushID(static_cast<int>(source));
@@ -694,8 +824,8 @@ inline void render(domain_t domain) {
         ImGui::EndTable();
     }
 
-    const row_t* selected = state->selected_source < state->rows.size()
-        ? &state->rows[state->selected_source] : nullptr;
+    const row_t* selected = state->selected_source < rows.size()
+        ? &rows[state->selected_source] : nullptr;
     const bool accepts_shortcuts = selected &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         !ImGui::IsAnyItemActive() && !ImGui::GetIO().WantTextInput;
@@ -707,31 +837,32 @@ inline void render(domain_t domain) {
         if (ImGui::IsKeyPressed(ImGuiKey_PageDown, false)) navigation_delta = 10;
         if (navigation_delta != 0 || ImGui::IsKeyPressed(ImGuiKey_Home, false) ||
             ImGui::IsKeyPressed(ImGuiKey_End, false)) {
-            auto current = std::find(state->visible.begin(), state->visible.end(), state->selected_source);
-            std::ptrdiff_t position = current == state->visible.end() ? 0 :
-                std::distance(state->visible.begin(), current);
+            auto current = std::find(visible.begin(), visible.end(), state->selected_source);
+            std::ptrdiff_t position = current == visible.end() ? 0 :
+                std::distance(visible.begin(), current);
             if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) position = 0;
             else if (ImGui::IsKeyPressed(ImGuiKey_End, false))
-                position = static_cast<std::ptrdiff_t>(state->visible.size() - 1);
+                position = static_cast<std::ptrdiff_t>(visible.size() - 1);
             else position = (std::max<std::ptrdiff_t>)(0,
-                (std::min<std::ptrdiff_t>)(static_cast<std::ptrdiff_t>(state->visible.size() - 1),
+                (std::min<std::ptrdiff_t>)(static_cast<std::ptrdiff_t>(visible.size() - 1),
                     position + navigation_delta));
-            const std::size_t source = state->visible[static_cast<std::size_t>(position)];
-            select_row(state->rows[source], *state, source, context);
+            const std::size_t source = visible[static_cast<std::size_t>(position)];
+            select_row(rows[source], *state, source, context);
             state->page = static_cast<std::size_t>(position) / state->page_size;
         }
-        selected = state->selected_source < state->rows.size()
-            ? &state->rows[state->selected_source] : nullptr;
+        selected = state->selected_source < rows.size()
+            ? &rows[state->selected_source] : nullptr;
     }
     aida::ui::context_menu_open_origin_t keyboard_origin{};
     const bool request_keyboard_context = selected && accepts_shortcuts &&
         aida::ui::analysis_context_menu::keyboard_request(keyboard_origin);
-    const auto selection_validator = [state, expected = state->selected_source,
+    const auto selection_validator = [state, snapshot,
+                                      expected = state->selected_source,
                                       identity = selected ? row_identity(*selected)
                                                           : row_identity(context_row)] {
-        return state->selected_source < state->rows.size() &&
+        return state->selected_source < snapshot->rows.size() &&
             state->selected_source == expected &&
-            row_identity(state->rows[state->selected_source]) == identity
+            row_identity(snapshot->rows[state->selected_source]) == identity
             ? aida::ui::capability_state_t::available()
             : aida::ui::capability_state_t::unavailable(
                 "The selected analysis-list entity changed");

@@ -1825,7 +1825,7 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		"Manage hyper-performance benchmark runs against synthetic or real artifacts. Actions: run_synthetic, run_real, status, last_result, compare.",
 		{{"action", "string", "run_synthetic|run_real|status|last_result|compare", true},
 		 {"payload", "object", "Action-specific parameters; top-level action-specific fields are also accepted.", false},
-		 {"code_mb", "integer", "Synthetic code size in MiB (8..256) for run_synthetic", false},
+		 {"code_mb", "integer", "Synthetic code size in MiB (8..320) for run_synthetic", false},
 		 {"seed", "string", "Hex seed for the deterministic synthetic generator", false},
 		 {"lanes", "integer", "Decode worker lanes (0 = engine default)", false},
 		 {"path", "string", "Real fixture path for run_real (300..500 MB program gate)", false},
@@ -1838,7 +1838,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 		 {"run_scaling_stage", "boolean", "Run the worker-budget scaling stage", false},
 		 {"run_determinism_stage", "boolean", "Run the snapshot determinism stage", false},
 		 {"scaling_worker_budgets", "string", "Comma-separated worker budgets for the scaling stage", false},
-		 {"determinism_runs", "integer", "Determinism repetitions at the tail budget (1..8)", false}},
+		 {"determinism_runs", "integer", "Determinism repetitions at the tail budget (1..8)", false},
+		 {"run_cancellation_stage", "boolean", "Run the cancellation p95 measurement stage (real mode; on by default)", false},
+		 {"cancellation_samples", "integer", "Cancellation measurement samples (1..8)", false}},
 		false,
 		[](const json& params) -> tool_result_t {
 			const std::string action = compat_action_name(params);
@@ -1881,8 +1883,8 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					request.mode = aida::analysis::benchmark::benchmark_mode_t::synthetic;
 					if (p.contains("code_mb") && p["code_mb"].is_number()) {
 						const auto code_mb = p["code_mb"].get<std::uint64_t>();
-						if (code_mb < 8 || code_mb > 256)
-							return tool_result_t::error("code_mb must be within 8..256");
+						if (code_mb < 8 || code_mb > 320)
+							return tool_result_t::error("code_mb must be within 8..320");
 						request.synthetic_code_bytes = code_mb * 1024ULL * 1024ULL;
 					}
 					if (p.contains("seed") && p["seed"].is_string()) {
@@ -1980,8 +1982,16 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 						return tool_result_t::error("determinism_runs must be within 1..8");
 					request.determinism_runs = static_cast<std::uint32_t>(runs);
 				}
+				if (p.contains("run_cancellation_stage") && p["run_cancellation_stage"].is_boolean())
+					request.run_cancellation_stage = p["run_cancellation_stage"].get<bool>();
+				if (p.contains("cancellation_samples") && p["cancellation_samples"].is_number()) {
+					const auto samples = p["cancellation_samples"].get<std::uint64_t>();
+					if (samples < 1 || samples > 8)
+						return tool_result_t::error("cancellation_samples must be within 1..8");
+					request.cancellation_samples = static_cast<std::uint32_t>(samples);
+				}
 				diag::log_tagged_fmt("analysis",
-					"analysis_benchmark_manage submit action=%s code_bytes=%llu seed=0x%llX lanes=%u path=%s relaxed=%d batch_lanes=%u sample_ms=%u baseline=%s record_baseline=%s scaling=%d determinism=%d",
+					"analysis_benchmark_manage submit action=%s code_bytes=%llu seed=0x%llX lanes=%u path=%s relaxed=%d batch_lanes=%u sample_ms=%u baseline=%s record_baseline=%s scaling=%d determinism=%d cancellation=%d cancellation_samples=%u",
 					action.c_str(),
 					static_cast<unsigned long long>(request.synthetic_code_bytes),
 					static_cast<unsigned long long>(request.synthetic_seed),
@@ -1993,7 +2003,9 @@ void register_analysis_tools(mcp_standalone::server_t& srv)
 					request.baseline_report_path.c_str(),
 					request.record_baseline_name.c_str(),
 					request.run_scaling_stage ? 1 : 0,
-					request.run_determinism_stage ? 1 : 0);
+					request.run_determinism_stage ? 1 : 0,
+					request.run_cancellation_stage ? 1 : 0,
+					static_cast<unsigned>(request.cancellation_samples));
 				if (!aida::analysis::benchmark::start_benchmark_async(request)) {
 					diag::log_tagged("analysis", "analysis_benchmark_manage refused already_active");
 					return tool_result_t::error("a benchmark run is already active");

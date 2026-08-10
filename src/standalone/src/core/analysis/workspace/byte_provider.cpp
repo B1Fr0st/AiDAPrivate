@@ -11,7 +11,7 @@
 
 #include "../mapped_window_cache.hpp"
 #include "../provider_snapshot.hpp"
-#include "../../infra/win_thread.hpp"
+#include "../../infra/taskflow_runtime.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -537,29 +537,35 @@ mapped_file_provider_t::open(const std::string& utf8_path,
             const auto hash_identity = identity;
             const auto hash_snapshot = snapshot.value();
             const auto hash_started = std::chrono::steady_clock::now();
-            const auto started_ok = aida::infra::win_thread::start_detached(
-                [promise, hash_identity, hash_snapshot, hash_started]() mutable {
-                    auto computed = hash_snapshot->compute_content_sha256();
-                    const auto elapsed_us = static_cast<unsigned long long>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - hash_started).count());
-                    if (computed) {
-                        content_hash_memo().insert(hash_identity,
-                                                   computed.value());
-                        promise->set_value(
-                            workspace_result_t<sha256_digest_t>::success(
-                                computed.take_value()));
-                    } else {
-                        promise->set_value(
-                            workspace_result_t<sha256_digest_t>::failure(
-                                computed.error()));
-                    }
-                    ::diag::log_tagged_fmt("byte_provider",
-                        "content_hash_ready source='%s' us=%llu",
-                        hash_identity.normalized_source.c_str(), elapsed_us);
-                }, nullptr, aida::infra::win_thread::default_stack_reserve,
-                "content_hash");
-            if (!started_ok) {
+            aida::infra::taskflow_runtime::task_descriptor_t hash_task;
+            hash_task.domain = aida::infra::taskflow_runtime::executor_domain_t::service;
+            hash_task.owner_subsystem = "analysis_workspace";
+            hash_task.label = "byte_provider.content_hash";
+            hash_task.thread_class = "bounded_provider_hash";
+            hash_task.priority = 2;
+            hash_task.shutdown_policy = "drain";
+            hash_task.body = [promise, hash_identity, hash_snapshot, hash_started]() mutable {
+                auto computed = hash_snapshot->compute_content_sha256();
+                const auto elapsed_us = static_cast<unsigned long long>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - hash_started).count());
+                if (computed) {
+                    content_hash_memo().insert(hash_identity,
+                                               computed.value());
+                    promise->set_value(
+                        workspace_result_t<sha256_digest_t>::success(
+                            computed.take_value()));
+                } else {
+                    promise->set_value(
+                        workspace_result_t<sha256_digest_t>::failure(
+                            computed.error()));
+                }
+                ::diag::log_tagged_fmt("byte_provider",
+                    "content_hash_ready source='%s' us=%llu",
+                    hash_identity.normalized_source.c_str(), elapsed_us);
+            };
+            const auto submitted = aida::infra::taskflow_runtime::submit(std::move(hash_task));
+            if (!submitted.submitted) {
                 return workspace_result_t<
                     std::shared_ptr<mapped_file_provider_t>>::failure(
                     make_workspace_error(workspace_error_code_t::provider_unavailable,

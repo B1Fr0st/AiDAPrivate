@@ -509,6 +509,7 @@ public:
     std::uint64_t worker_generation() const noexcept;
     const native_worker_host_limits_t& limits() const noexcept { return limits_; }
     std::shared_ptr<native_worker_host_t> for_session_pool(std::size_t max_concurrent_workers) const;
+    bool prime_appcontainer_acl() noexcept;
 
     struct session_state_t;
     bool session_launch(const native_worker_execution_request_t& request,
@@ -529,6 +530,9 @@ private:
     friend workspace_result_t<packaged_native_worker_runtime_t>
         create_packaged_native_worker_runtime(std::filesystem::path runtime_root);
 
+    bool verify_snapshot_hash(const std::shared_ptr<const std::vector<std::uint8_t>>& bytes,
+        const sha256_digest_t& expected, sha256_digest_t& out);
+
     native_worker_launch_contract_t contract_;
     native_worker_host_limits_t limits_;
     std::shared_ptr<const native_worker_verified_package_t> verified_package_;
@@ -538,6 +542,10 @@ private:
     std::atomic<std::uint64_t> worker_generation_{0};
     std::atomic<bool> stopped_{false};
     std::size_t active_workers_ = 0;
+    mutable std::mutex snapshot_verify_mutex_;
+    const void* snapshot_verify_ptr_ = nullptr;
+    std::uint64_t snapshot_verify_size_ = 0;
+    sha256_digest_t snapshot_verify_hash_{};
 };
 
 class native_worker_provider_host_t final : public decompiler_isolated_provider_host_t {
@@ -559,7 +567,7 @@ private:
 };
 
 struct native_worker_session_pool_config_t {
-    std::uint32_t max_jobs_per_session = 8192;
+    std::uint32_t max_jobs_per_session = 65536;
     std::chrono::milliseconds max_session_lifetime{2700000};
     std::size_t batch_slots = 48;
     std::size_t interactive_reserved_slots = 2;

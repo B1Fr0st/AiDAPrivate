@@ -3673,6 +3673,7 @@ struct pseudocode_job_payload_t final {
 };
 
 constexpr std::size_t k_workbench_pseudocode_max_inflight = 8;
+constexpr std::size_t k_workbench_pseudocode_max_pending_resolutions = 16;
 constexpr std::uint32_t k_workbench_pseudocode_teardown_budget_ms = 250;
 
 analysis::decompiler_diagnostic_t pseudocode_terminal_diagnostic(
@@ -3789,6 +3790,7 @@ public:
         : lease_(std::move(lease)),
           policy_(analysis::default_decompiler_profile_policy()),
           jobs_(std::make_shared<job_registry_t>()),
+          resolutions_(std::make_shared<resolution_registry_t>()),
           render_evidence_store_(std::make_shared<pseudocode_render_evidence_store_t>())
     {
         const auto workspace = lease_.source
@@ -3816,6 +3818,18 @@ public:
                     task_ids.push_back(job.task_id);
             }
         }
+        {
+            std::lock_guard<std::mutex> lock(resolutions_->mutex);
+            resolutions_->shutting_down = true;
+            task_ids.reserve(task_ids.size() + resolutions_->resolutions.size());
+            for (auto& [ticket, resolution] : resolutions_->resolutions) {
+                static_cast<void>(ticket);
+                resolution.cancellation->request_cancel();
+                resolution.cancelled = true;
+                if (resolution.task_id != 0)
+                    task_ids.push_back(resolution.task_id);
+            }
+        }
         for (const auto task_id : task_ids)
             static_cast<void>(aida::infra::executor::cancel(task_id));
         const auto deadline = std::chrono::steady_clock::now() +
@@ -3832,6 +3846,8 @@ public:
         }
         std::lock_guard<std::mutex> lock(jobs_->mutex);
         jobs_->jobs.clear();
+        std::lock_guard<std::mutex> resolution_lock(resolutions_->mutex);
+        resolutions_->resolutions.clear();
     }
 
     std::uint64_t current_generation() const noexcept override
@@ -3909,53 +3925,178 @@ public:
         std::uint64_t timeout_ms,
         pseudocode_document::pseudocode_request_t& output) const override
     {
-        output = {};
+        return resolve_request_impl(lease_.source, decompiler_,
+            profile_budget(profile), locator, profile, timeout_ms, output);
+    }
+
+    bool resolve_request_async_supported() const noexcept override
+    {
+        return true;
+    }
+
+    workbench_error_t submit_resolve_request(
+        analysis::decompiler_entity_locator_t locator,
+        analysis::decompiler_profile_id_t profile,
+        std::uint64_t timeout_ms, std::uint64_t resolve_ticket,
+        bool force_refresh) override
+    {
+        static_cast<void>(force_refresh);
         const auto budget = profile_budget(profile);
         const auto effective_timeout = (std::min)(
             timeout_ms, budget.max_wall_clock_ms);
-        const auto workspace = lease_.source
-            ? lease_.source->analysis_workspace()
-            : nullptr;
-        const auto subject = locator.address.value_or(locator.token.value_or(0));
-        if (timeout_ms == 0 || effective_timeout == 0 || !workspace ||
-            !decompiler_ || (locator.address.has_value() == locator.token.has_value()) ||
+        const auto source = lease_.source;
+        const auto workspace = source ? source->analysis_workspace() : nullptr;
+        const auto decompiler = decompiler_;
+        if (resolve_ticket == 0 || timeout_ms == 0 || effective_timeout == 0 ||
+            !workspace || !decompiler ||
+            (locator.address.has_value() == locator.token.has_value()) ||
             effective_timeout > static_cast<std::uint64_t>(
                 (std::chrono::milliseconds::max)().count()))
-            return shell_error(workbench_error_code_t::adapter_rejected, subject);
-
-        const auto deadline = std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(
-                static_cast<std::chrono::milliseconds::rep>(effective_timeout));
-        analysis::cancellation_source_t cancellation(deadline);
-        auto resolved = decompiler_->resolve_entity_at(locator, cancellation.token());
-        if (!resolved)
-            return shell_error(
-                resolved.error().code == analysis::workspace_error_code_t::target_ambiguous
-                    ? workbench_error_code_t::duplicate_identifier
-                    : workbench_error_code_t::invalid_document,
-                subject);
-        auto binding = resolved.take_value();
-        const auto publication = workspace->analysis_publication();
-        if (!publication ||
-            !lease_.source->generation_current(publication->generation) ||
-            publication->generation != binding.generation ||
-            publication->analysis_revision != binding.analysis_revision ||
-            publication->overlay_revision != binding.overlay_revision ||
-            workspace->overlay_revision() != binding.overlay_revision)
-            return shell_error(workbench_error_code_t::revision_mismatch,
-                               binding.generation);
-        auto validated = analysis::validate_generation_bound_entity(
-            workspace->identity(), *publication, binding, cancellation.token());
-        if (!validated)
-            return shell_error(workbench_error_code_t::revision_mismatch,
-                               binding.generation);
-
-        output.entity = binding.entity;
-        output.binding = std::move(binding);
-        output.profile = profile;
-        output.workspace_generation = publication->generation;
-        output.timeout_ms = effective_timeout;
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               resolve_ticket);
+        const auto registry = resolutions_;
+        auto cancellation = std::make_shared<analysis::cancellation_source_t>(
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(
+                static_cast<std::chrono::milliseconds::rep>(effective_timeout)));
+        try {
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            reap_resolutions_locked(*registry);
+            if (registry->shutting_down)
+                return shell_error(workbench_error_code_t::adapter_rejected,
+                                   resolve_ticket);
+            if (registry->resolutions.find(resolve_ticket) !=
+                registry->resolutions.end())
+                return shell_error(workbench_error_code_t::duplicate_identifier,
+                                   resolve_ticket);
+            if (registry->resolutions.size() >=
+                k_workbench_pseudocode_max_pending_resolutions)
+                return shell_error(workbench_error_code_t::adapter_rejected,
+                    static_cast<std::uint64_t>(registry->resolutions.size()));
+            const auto inserted = registry->resolutions.try_emplace(resolve_ticket);
+            if (!inserted.second)
+                return shell_error(workbench_error_code_t::duplicate_identifier,
+                                   resolve_ticket);
+            inserted.first->second.cancellation = cancellation;
+        } catch (...) {
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               resolve_ticket);
+        }
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "workbench_pseudocode";
+        submission.label = "workbench.pseudocode.resolve";
+        submission.thread_class = "bounded_decompiler";
+        submission.domain = aida::infra::executor::domain_t::feature_worker;
+        submission.priority = profile ==
+                analysis::decompiler_profile_id_t::fast ? 4 : 3;
+        const auto now_ms = static_cast<std::uint64_t>(::GetTickCount64());
+        submission.deadline_ms = effective_timeout >
+                (std::numeric_limits<std::uint64_t>::max)() - now_ms
+            ? (std::numeric_limits<std::uint64_t>::max)()
+            : now_ms + effective_timeout;
+        submission.generation = current_generation();
+        submission.ui_access_policy = "forbidden";
+        submission.failure_policy = "typed_diagnostic";
+        submission.shutdown_policy = "cancel_replaceable";
+        submission.cancel_hook = [cancellation, registry, resolve_ticket] {
+            cancellation->request_cancel();
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            const auto found = registry->resolutions.find(resolve_ticket);
+            if (found == registry->resolutions.end() || found->second.result)
+                return;
+            pseudocode_document::pseudocode_resolve_result_t result;
+            result.error = shell_error(workbench_error_code_t::adapter_rejected,
+                                       resolve_ticket);
+            found->second.result = std::move(result);
+        };
+        submission.body = [source, decompiler, budget, locator, profile,
+                           effective_timeout, cancellation, registry,
+                           resolve_ticket]() mutable {
+            pseudocode_document::pseudocode_resolve_result_t result;
+            try {
+                if (cancellation->token().stop_requested()) {
+                    result.error = shell_error(
+                        workbench_error_code_t::adapter_rejected, resolve_ticket);
+                } else {
+                    result.error = production_pseudocode_source_t::
+                        resolve_request_impl(source, decompiler, budget, locator,
+                            profile, effective_timeout, result.request);
+                }
+            } catch (...) {
+                result = {};
+                result.error = shell_error(
+                    workbench_error_code_t::adapter_rejected, resolve_ticket);
+            }
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            const auto found = registry->resolutions.find(resolve_ticket);
+            if (found == registry->resolutions.end())
+                return;
+            if (found->second.result)
+                return;
+            if (found->second.cancelled && result.error.ok()) {
+                result.request = {};
+                result.error = shell_error(
+                    workbench_error_code_t::adapter_rejected, resolve_ticket);
+            }
+            found->second.result = std::move(result);
+        };
+        const auto submitted = aida::infra::executor::submit(
+            std::move(submission));
+        if (!submitted.submitted) {
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            registry->resolutions.erase(resolve_ticket);
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               resolve_ticket);
+        }
+        {
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            const auto found = registry->resolutions.find(resolve_ticket);
+            if (found != registry->resolutions.end())
+                found->second.task_id = submitted.task_id;
+        }
+        diag::log_tagged_fmt("workbench",
+            "workbench.pseudocode.resolve submit ticket=%llu subject=0x%llX",
+            static_cast<unsigned long long>(resolve_ticket),
+            static_cast<unsigned long long>(
+                locator.address.value_or(locator.token.value_or(0))));
         return {};
+    }
+
+    bool poll_resolve_request(
+        std::uint64_t resolve_ticket,
+        pseudocode_document::pseudocode_resolve_result_t& output) override
+    {
+        output = {};
+        std::lock_guard<std::mutex> lock(resolutions_->mutex);
+        const auto found = resolutions_->resolutions.find(resolve_ticket);
+        if (found == resolutions_->resolutions.end() || !found->second.result)
+            return false;
+        output = std::move(*found->second.result);
+        resolutions_->resolutions.erase(found);
+        return true;
+    }
+
+    void cancel_resolve_request(std::uint64_t resolve_ticket) noexcept override
+    {
+        std::uint64_t task_id = 0;
+        try {
+            std::lock_guard<std::mutex> lock(resolutions_->mutex);
+            const auto found = resolutions_->resolutions.find(resolve_ticket);
+            if (found == resolutions_->resolutions.end())
+                return;
+            found->second.cancelled = true;
+            found->second.cancellation->request_cancel();
+            if (!found->second.result) {
+                pseudocode_document::pseudocode_resolve_result_t result;
+                result.error = shell_error(workbench_error_code_t::adapter_rejected,
+                                           resolve_ticket);
+                found->second.result = std::move(result);
+            }
+            task_id = found->second.task_id;
+        } catch (...) {
+            return;
+        }
+        if (task_id != 0)
+            static_cast<void>(aida::infra::executor::cancel(task_id));
     }
 
     workbench_error_t request_decompilation(
@@ -4284,6 +4425,19 @@ private:
         bool shutting_down = false;
     };
 
+    struct resolution_record_t final {
+        std::shared_ptr<analysis::cancellation_source_t> cancellation;
+        std::uint64_t task_id = 0;
+        std::optional<pseudocode_document::pseudocode_resolve_result_t> result;
+        bool cancelled = false;
+    };
+
+    struct resolution_registry_t final {
+        std::mutex mutex;
+        std::unordered_map<std::uint64_t, resolution_record_t> resolutions;
+        bool shutting_down = false;
+    };
+
     static void reap_cancelled_locked(job_registry_t& registry)
     {
         for (auto iterator = registry.jobs.begin();
@@ -4296,10 +4450,78 @@ private:
         }
     }
 
+    static void reap_resolutions_locked(resolution_registry_t& registry)
+    {
+        for (auto iterator = registry.resolutions.begin();
+             iterator != registry.resolutions.end();) {
+            if (!iterator->second.result || !iterator->second.cancelled) {
+                ++iterator;
+                continue;
+            }
+            iterator = registry.resolutions.erase(iterator);
+        }
+    }
+
+    static workbench_error_t resolve_request_impl(
+        const std::shared_ptr<workbench_analysis_source_t>& source,
+        const std::shared_ptr<analysis::decompiler_ui_integration_t>& decompiler,
+        const analysis::decompiler_profile_budget_t& budget,
+        const analysis::decompiler_entity_locator_t& locator,
+        analysis::decompiler_profile_id_t profile,
+        std::uint64_t timeout_ms,
+        pseudocode_document::pseudocode_request_t& output)
+    {
+        output = {};
+        const auto effective_timeout = (std::min)(
+            timeout_ms, budget.max_wall_clock_ms);
+        const auto workspace = source ? source->analysis_workspace() : nullptr;
+        const auto subject = locator.address.value_or(locator.token.value_or(0));
+        if (timeout_ms == 0 || effective_timeout == 0 || !workspace ||
+            !decompiler || (locator.address.has_value() == locator.token.has_value()) ||
+            effective_timeout > static_cast<std::uint64_t>(
+                (std::chrono::milliseconds::max)().count()))
+            return shell_error(workbench_error_code_t::adapter_rejected, subject);
+
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(
+                static_cast<std::chrono::milliseconds::rep>(effective_timeout));
+        analysis::cancellation_source_t cancellation(deadline);
+        auto resolved = decompiler->resolve_entity_at(locator, cancellation.token());
+        if (!resolved)
+            return shell_error(
+                resolved.error().code == analysis::workspace_error_code_t::target_ambiguous
+                    ? workbench_error_code_t::duplicate_identifier
+                    : workbench_error_code_t::invalid_document,
+                subject);
+        auto binding = resolved.take_value();
+        const auto publication = workspace->analysis_publication();
+        if (!publication ||
+            !source->generation_current(publication->generation) ||
+            publication->generation != binding.generation ||
+            publication->analysis_revision != binding.analysis_revision ||
+            publication->overlay_revision != binding.overlay_revision ||
+            workspace->overlay_revision() != binding.overlay_revision)
+            return shell_error(workbench_error_code_t::revision_mismatch,
+                               binding.generation);
+        auto validated = analysis::validate_generation_bound_entity(
+            workspace->identity(), *publication, binding, cancellation.token());
+        if (!validated)
+            return shell_error(workbench_error_code_t::revision_mismatch,
+                               binding.generation);
+
+        output.entity = binding.entity;
+        output.binding = std::move(binding);
+        output.profile = profile;
+        output.workspace_generation = publication->generation;
+        output.timeout_ms = effective_timeout;
+        return {};
+    }
+
     analysis_document_lease_t lease_;
     analysis::decompiler_profile_policy_t policy_;
     std::shared_ptr<analysis::decompiler_ui_integration_t> decompiler_;
     std::shared_ptr<job_registry_t> jobs_;
+    std::shared_ptr<resolution_registry_t> resolutions_;
     std::shared_ptr<pseudocode_render_evidence_store_t> render_evidence_store_;
 };
 #endif

@@ -1,11 +1,12 @@
 #include "pseudocode_renderer_harness.hpp"
 #include "assertion_telemetry/assertion_telemetry.hpp"
 
-#include "../../src/core/analysis/decompiler/pseudocode_renderer_v2.hpp"
+#include "../../src/core/analysis/decompiler/pseudocode_renderer.hpp"
 #include "../../src/core/analysis/workspace/decompiler_service.hpp"
 
 #include <algorithm>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -263,8 +264,8 @@ void require_deterministic_document(const decompiler_document_t& first,
 }
 
 struct local_v2_result_t {
-    typed_ast_v2_build_result_t ast_build;
-    std::optional<pseudocode_renderer_v2_result_t> rendering;
+    typed_ast_build_result_t ast_build;
+    std::optional<pseudocode_renderer_result_t> rendering;
     std::vector<decompiler_diagnostic_t> diagnostics;
 
     bool succeeded() const noexcept {
@@ -276,13 +277,13 @@ local_v2_result_t render_provider_document_v2_local(
     const provider_ir_t&,
     const hir_function_t& hir,
     const type_graph_t& type_graph,
-    const pseudocode_renderer_v2_request_t& request = {}) {
+    const pseudocode_renderer_request_t& request = {}) {
     local_v2_result_t result;
-    result.ast_build = build_typed_ast_v2(hir, type_graph);
+    result.ast_build = build_typed_ast(hir, type_graph);
     result.diagnostics = result.ast_build.diagnostics;
     if (!result.ast_build.succeeded())
         return result;
-    result.rendering = render_pseudocode_v2(*result.ast_build.ast, type_graph, request);
+    result.rendering = render_pseudocode(*result.ast_build.ast, type_graph, request);
     result.diagnostics.insert(result.diagnostics.end(),
         result.rendering->diagnostics.begin(), result.rendering->diagnostics.end());
     return result;
@@ -292,16 +293,16 @@ void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, c
 {
     const auto provider = provider_ir(entity_value);
     const auto hir = straight_line_hir(entity_value, types, provider);
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
     const auto first = render_provider_document_v2_local(provider, hir, types, request);
     const auto second = render_provider_document_v2_local(provider, hir, types, request);
     require(first.succeeded() && second.succeeded(), "decompiler service production V2 path rejected a proven straight-line body");
-    require(validate_typed_ast_v2_semantics(*first.ast_build.ast, types).valid(), "typed AST semantic validation failed");
+    require(validate_typed_ast_semantics(*first.ast_build.ast, types).valid(), "typed AST semantic validation failed");
     require(stable_serialization_hash(*first.ast_build.ast) == stable_serialization_hash(*second.ast_build.ast),
         "typed AST construction is nondeterministic");
-    const auto encoded_ast = serialize_typed_ast_v2(*first.ast_build.ast);
-    const auto decoded_ast = deserialize_typed_ast_v2(encoded_ast);
+    const auto encoded_ast = serialize_typed_ast(*first.ast_build.ast);
+    const auto decoded_ast = deserialize_typed_ast(encoded_ast);
     require(decoded_ast.valid(), "typed AST serialization did not round-trip");
     require(stable_serialization_hash(*first.ast_build.ast) == stable_serialization_hash(*decoded_ast.value),
         "typed AST serialization hash drifted");
@@ -363,11 +364,11 @@ void verify_generated_ast_fixture(const decompiler_entity_key_t& entity_value, c
 void verify_structured_semantic_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = structured_ast(entity_value, types);
-    require(validate_typed_ast_v2_semantics(ast, types).valid(), "structured control-flow AST was rejected");
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto rendered = render_pseudocode_v2(ast, types, request);
-    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(validate_typed_ast_semantics(ast, types).valid(), "structured control-flow AST was rejected");
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
     require(rendered.succeeded(), "renderer rejected structured control flow and exceptions");
     require(rendered_second.succeeded(), "second renderer pass rejected structured control flow and exceptions");
     const std::string expected =
@@ -446,11 +447,11 @@ typed_pseudocode_ast_v2_t while_loop_ast(const decompiler_entity_key_t& entity_v
 void verify_while_loop_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = while_loop_ast(entity_value, types);
-    require(validate_typed_ast_v2_semantics(ast, types).valid(), "while loop AST was rejected");
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto rendered = render_pseudocode_v2(ast, types, request);
-    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(validate_typed_ast_semantics(ast, types).valid(), "while loop AST was rejected");
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
     require(rendered.succeeded(), "renderer rejected while loop with break and continue");
     require(rendered_second.succeeded(), "second renderer pass rejected while loop");
     const std::string expected =
@@ -487,11 +488,11 @@ typed_pseudocode_ast_v2_t do_while_loop_ast(const decompiler_entity_key_t& entit
 void verify_do_while_loop_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = do_while_loop_ast(entity_value, types);
-    require(validate_typed_ast_v2_semantics(ast, types).valid(), "do-while loop AST was rejected");
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto rendered = render_pseudocode_v2(ast, types, request);
-    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(validate_typed_ast_semantics(ast, types).valid(), "do-while loop AST was rejected");
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
     require(rendered.succeeded(), "renderer rejected do-while loop with continue");
     require(rendered_second.succeeded(), "second renderer pass rejected do-while loop");
     const std::string expected =
@@ -537,11 +538,11 @@ typed_pseudocode_ast_v2_t for_loop_ast(const decompiler_entity_key_t& entity_val
 void verify_for_loop_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = for_loop_ast(entity_value, types);
-    require(validate_typed_ast_v2_semantics(ast, types).valid(), "for loop AST was rejected");
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto rendered = render_pseudocode_v2(ast, types, request);
-    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(validate_typed_ast_semantics(ast, types).valid(), "for loop AST was rejected");
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
     require(rendered.succeeded(), "renderer rejected for loop with declaration initializer");
     require(rendered_second.succeeded(), "second renderer pass rejected for loop");
     const std::string expected =
@@ -580,11 +581,11 @@ typed_pseudocode_ast_v2_t switch_ast(const decompiler_entity_key_t& entity_value
 void verify_switch_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = switch_ast(entity_value, types);
-    require(validate_typed_ast_v2_semantics(ast, types).valid(), "switch AST was rejected");
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto rendered = render_pseudocode_v2(ast, types, request);
-    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(validate_typed_ast_semantics(ast, types).valid(), "switch AST was rejected");
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
     require(rendered.succeeded(), "renderer rejected switch with case and default");
     require(rendered_second.succeeded(), "second renderer pass rejected switch");
     const std::string expected =
@@ -637,11 +638,11 @@ typed_pseudocode_ast_v2_t expression_ast(const decompiler_entity_key_t& entity_v
 void verify_expression_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = expression_ast(entity_value, types);
-    require(validate_typed_ast_v2_semantics(ast, types).valid(), "expression AST was rejected");
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto rendered = render_pseudocode_v2(ast, types, request);
-    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(validate_typed_ast_semantics(ast, types).valid(), "expression AST was rejected");
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
     require(rendered.succeeded(), "renderer rejected member, index, unary, and unknown expressions");
     require(rendered_second.succeeded(), "second renderer pass rejected expression fixture");
     const std::string expected =
@@ -662,9 +663,9 @@ void verify_expression_fixture(const decompiler_entity_key_t& entity_value, cons
 void verify_local_rename_rerender(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = for_loop_ast(entity_value, types);
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
-    const auto canonical = render_pseudocode_v2(ast, types, request);
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    const auto canonical = render_pseudocode(ast, types, request);
     require(canonical.succeeded(), "renderer rejected the rename fixture");
     const std::vector<std::pair<std::string, std::string>> renames{{"i", "index"}};
     const auto renamed = rerender_document_with_local_renames(*canonical.document, types, request, renames);
@@ -715,11 +716,11 @@ typed_pseudocode_ast_v2_t compact_loop_ast(const decompiler_entity_key_t& entity
 void verify_compact_profile_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = compact_loop_ast(entity_value, types);
-    require(validate_typed_ast_v2_semantics(ast, types).valid(), "compact profile AST was rejected");
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::compact);
-    const auto rendered = render_pseudocode_v2(ast, types, request);
-    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(validate_typed_ast_semantics(ast, types).valid(), "compact profile AST was rejected");
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::compact);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
     require(rendered.succeeded(), "renderer rejected compact profile while loop");
     require(rendered_second.succeeded(), "second renderer pass rejected compact profile");
     require(!rendered.document->renderer.emit_provenance_annotations, "compact profile emitted provenance annotations");
@@ -757,11 +758,11 @@ typed_pseudocode_ast_v2_t audit_loop_ast(const decompiler_entity_key_t& entity_v
 void verify_audit_profile_fixture(const decompiler_entity_key_t& entity_value, const type_graph_t& types)
 {
     const auto ast = audit_loop_ast(entity_value, types);
-    require(validate_typed_ast_v2_semantics(ast, types).valid(), "audit profile AST was rejected");
-    pseudocode_renderer_v2_request_t request;
-    request.settings = pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::audit);
-    const auto rendered = render_pseudocode_v2(ast, types, request);
-    const auto rendered_second = render_pseudocode_v2(ast, types, request);
+    require(validate_typed_ast_semantics(ast, types).valid(), "audit profile AST was rejected");
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::audit);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
     require(rendered.succeeded(), "renderer rejected audit profile while loop");
     require(rendered_second.succeeded(), "second renderer pass rejected audit profile");
     require(rendered.document->renderer.emit_provenance_annotations, "audit profile did not emit provenance annotations");
@@ -778,6 +779,263 @@ void verify_audit_profile_fixture(const decompiler_entity_key_t& entity_value, c
     require(rendered_second.document->rendered_text == expected, "second audit profile render drifted");
     require_deterministic_document(*rendered.document, *rendered_second.document);
     require_source_map_coverage(*rendered.document);
+}
+
+type_graph_t pointer_type_graph(const decompiler_entity_key_t& entity_value)
+{
+    auto result = type_graph(entity_value);
+    decompiler_type_node_t pointer;
+    pointer.id = 3;
+    pointer.kind = decompiler_type_kind_t::pointer;
+    pointer.canonical_name = "char*";
+    pointer.display_name = "char*";
+    pointer.byte_size = 8;
+    pointer.alignment = 8;
+    pointer.confidence = 100;
+    pointer.provenance = decompiler_fact_provenance_t::debug_metadata;
+    result.nodes.push_back(std::move(pointer));
+    return result;
+}
+
+void require_conditional_golden(
+    const typed_pseudocode_ast_v2_t& ast,
+    const type_graph_t& types,
+    const std::string& expected,
+    const char* message)
+{
+    require(validate_typed_ast_semantics(ast, types).valid(), message);
+    pseudocode_renderer_request_t request;
+    request.settings = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    const auto rendered = render_pseudocode(ast, types, request);
+    const auto rendered_second = render_pseudocode(ast, types, request);
+    require(rendered.succeeded() && rendered_second.succeeded(), message);
+    require(rendered.document->rendered_text == expected, message);
+    require(rendered_second.document->rendered_text == expected, message);
+    require_deterministic_document(*rendered.document, *rendered_second.document);
+    require_source_map_coverage(*rendered.document);
+}
+
+typed_pseudocode_ast_v2_t ternary_condition_ast(
+    const decompiler_entity_key_t& entity_value,
+    const type_graph_t& types,
+    const char* name)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-ternary-condition-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, name, entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {4}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::conditional_expression, 1, {5, 8, 9}, "?:", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::binary_expression, 2, {6, 7}, "||", entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "a", entity_value),
+        node(7, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "b", entity_value),
+        node(8, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "x", entity_value),
+        node(9, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "y", entity_value)};
+    return result;
+}
+
+typed_pseudocode_ast_v2_t ternary_assignment_ast(
+    const decompiler_entity_key_t& entity_value,
+    const type_graph_t& types,
+    const char* name)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-ternary-assignment-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, name, entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {4}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::assignment_expression, 1, {5, 6}, "=", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "x", entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::conditional_expression, 1, {7, 8, 9}, "?:", entity_value),
+        node(7, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "a", entity_value),
+        node(8, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "b", entity_value),
+        node(9, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "c", entity_value)};
+    return result;
+}
+
+typed_pseudocode_ast_v2_t ternary_or_left_ast(
+    const decompiler_entity_key_t& entity_value,
+    const type_graph_t& types,
+    const char* name)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-ternary-or-left-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, name, entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {4}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::binary_expression, 2, {5, 9}, "||", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::conditional_expression, 1, {6, 7, 8}, "?:", entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "a", entity_value),
+        node(7, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "b", entity_value),
+        node(8, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "c", entity_value),
+        node(9, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "d", entity_value)};
+    return result;
+}
+
+typed_pseudocode_ast_v2_t ternary_call_ast(
+    const decompiler_entity_key_t& entity_value,
+    const type_graph_t& types,
+    const char* name)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-ternary-call-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {2}, name, entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::expression_statement, 1, {4}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::call_expression, 1, {5, 6}, {}, entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "f", entity_value),
+        node(6, typed_pseudocode_ast_node_kind_t::conditional_expression, 1, {7, 8, 9}, "?:", entity_value),
+        node(7, typed_pseudocode_ast_node_kind_t::identifier, 2, {}, "a", entity_value),
+        node(8, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "b", entity_value),
+        node(9, typed_pseudocode_ast_node_kind_t::identifier, 1, {}, "c", entity_value)};
+    return result;
+}
+
+void verify_conditional_precedence_goldens(
+    const decompiler_entity_key_t& entity_value,
+    const type_graph_t& types)
+{
+    require_conditional_golden(
+        ternary_condition_ast(entity_value, types, "ternary_or_fixture"), types,
+        "int ternary_or_fixture() {\n"
+        "    (a || b) ? x : y;\n"
+        "}\n",
+        "ternary logical-or condition golden text drifted");
+    require_conditional_golden(
+        ternary_assignment_ast(entity_value, types, "ternary_assign_fixture"), types,
+        "int ternary_assign_fixture() {\n"
+        "    x = a ? b : c;\n"
+        "}\n",
+        "ternary assignment right-hand side golden text drifted");
+    require_conditional_golden(
+        ternary_or_left_ast(entity_value, types, "ternary_or_left_fixture"), types,
+        "int ternary_or_left_fixture() {\n"
+        "    (a ? b : c) || d;\n"
+        "}\n",
+        "ternary logical-or left operand golden text drifted");
+    require_conditional_golden(
+        ternary_call_ast(entity_value, types, "ternary_call_fixture"), types,
+        "int ternary_call_fixture() {\n"
+        "    f(a ? b : c);\n"
+        "}\n",
+        "ternary call argument golden text drifted");
+}
+
+typed_pseudocode_ast_v2_t qualified_method_ast(
+    const decompiler_entity_key_t& entity_value,
+    const type_graph_t& types,
+    const char* unresolved_name)
+{
+    typed_pseudocode_ast_v2_t result;
+    result.entity = entity_value;
+    result.hir_hash = stable_serialization_hash("c03-qualified-method-hir");
+    result.type_graph_hash = stable_serialization_hash(types);
+    result.root_node_id = 1;
+    result.body_node_id = 2;
+    result.nodes = {
+        node(1, typed_pseudocode_ast_node_kind_t::function_definition, 1, {5, 2}, unresolved_name, entity_value),
+        node(2, typed_pseudocode_ast_node_kind_t::compound_statement, 1, {3}, {}, entity_value),
+        node(3, typed_pseudocode_ast_node_kind_t::return_statement, 1, {4}, {}, entity_value),
+        node(4, typed_pseudocode_ast_node_kind_t::literal, 1, {}, "0", entity_value),
+        node(5, typed_pseudocode_ast_node_kind_t::declaration, 3, {}, "path", entity_value)};
+    return result;
+}
+
+std::shared_ptr<const decompiler_render_evidence_t> qualified_method_evidence()
+{
+    decompiler_render_evidence_t evidence;
+    decompiler_symbol_evidence_t symbol;
+    symbol.unresolved_text = "sub_140001000";
+    symbol.resolved_name = "Config::Load";
+    symbol.module_name = "fixture";
+    symbol.argument_count = 1;
+    symbol.confidence = 100;
+    evidence.symbols.push_back(std::move(symbol));
+    decompiler_prototype_evidence_t prototype;
+    prototype.api_name = "Config::Load";
+    prototype.return_type_display = "int";
+    prototype.argument_names = {"path"};
+    prototype.argument_type_displays = {"char*"};
+    prototype.calling_convention = "__thiscall";
+    prototype.class_qualifier = "Config";
+    prototype.confidence = 100;
+    evidence.prototypes.push_back(std::move(prototype));
+    return std::make_shared<const decompiler_render_evidence_t>(std::move(evidence));
+}
+
+void verify_qualified_method_fixtures(
+    const decompiler_entity_key_t& entity_value,
+    const type_graph_t& types)
+{
+    const auto ast = qualified_method_ast(entity_value, types, "sub_140001000");
+    require(validate_typed_ast_semantics(ast, types).valid(), "qualified method AST was rejected");
+    const auto evidence = qualified_method_evidence();
+
+    pseudocode_renderer_request_t balanced_request;
+    balanced_request.settings = pseudocode_renderer_style_settings(
+        pseudocode_renderer_style_profile_t::balanced);
+    balanced_request.evidence = evidence;
+    const auto balanced = render_pseudocode(ast, types, balanced_request);
+    const auto balanced_second = render_pseudocode(ast, types, balanced_request);
+    require(balanced.succeeded() && balanced_second.succeeded(),
+        "renderer rejected the qualified method definition");
+    const std::string balanced_expected =
+        "int Config::Load(char* path) {\n"
+        "    return 0;\n"
+        "}\n";
+    require(balanced.document->rendered_text == balanced_expected,
+        "qualified method definition golden text drifted");
+    require(balanced_second.document->rendered_text == balanced_expected,
+        "second qualified method definition render drifted");
+    require(!balanced.document->renderer.emit_calling_convention_annotations,
+        "balanced profile emitted calling-convention annotations");
+    require(balanced.document->rendered_text.find("__thiscall") == std::string::npos,
+        "balanced profile rendered a calling-convention keyword");
+    require_deterministic_document(*balanced.document, *balanced_second.document);
+    require_source_map_coverage(*balanced.document);
+
+    pseudocode_renderer_request_t audit_request;
+    audit_request.settings = pseudocode_renderer_style_settings(
+        pseudocode_renderer_style_profile_t::audit);
+    audit_request.evidence = evidence;
+    const auto audit = render_pseudocode(ast, types, audit_request);
+    const auto audit_second = render_pseudocode(ast, types, audit_request);
+    require(audit.succeeded() && audit_second.succeeded(),
+        "renderer rejected the audit qualified method definition");
+    require(audit.document->renderer.emit_calling_convention_annotations,
+        "audit profile did not enable calling-convention annotations");
+    const std::string audit_expected =
+        "[[aida::confidence(100), aida::provenance(semantic_proof)]]\n"
+        "int __thiscall Config::Load(char* path) {\n"
+        "    [[aida::confidence(100), aida::provenance(semantic_proof)]]\n"
+        "    return 0;\n"
+        "}\n";
+    require(audit.document->rendered_text == audit_expected,
+        "audit calling-convention golden text drifted");
+    require(audit_second.document->rendered_text == audit_expected,
+        "second audit calling-convention render drifted");
+    require_deterministic_document(*audit.document, *audit_second.document);
+    require_source_map_coverage(*audit.document);
 }
 
 }
@@ -799,6 +1057,8 @@ void run_pseudocode_renderer_harness()
     verify_local_rename_rerender(entity_value, types);
     verify_compact_profile_fixture(entity_value, types);
     verify_audit_profile_fixture(entity_value, types);
+    verify_conditional_precedence_goldens(entity_value, types);
+    verify_qualified_method_fixtures(entity_value, pointer_type_graph(entity_value));
 }
 
 }

@@ -9,10 +9,16 @@
 #include "../../re/rtti.hpp"
 #include "../../re/vmt.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
+
+namespace aida::analysis {
+struct type_recovery_result_t;
+}
 
 namespace aida::analysis::static_recognition {
 
@@ -73,7 +79,6 @@ struct static_recognition_settings_t {
     bool enable_vmt = true;
     flirt::flirt_scan_limits_t flirt_limits;
     re::rtti::static_rtti_limits_t rtti_limits;
-    std::string db_path;
 };
 
 void ensure_attached(const std::shared_ptr<analysis_workspace_t>& workspace);
@@ -82,6 +87,36 @@ workspace_result_t<std::shared_ptr<const recognition_records_t>>
 run_for_workspace(std::shared_ptr<analysis_workspace_t> workspace,
                   const static_recognition_settings_t& settings,
                   const cancellation_token_t& cancel);
+
+struct recognition_wait_result_t {
+    std::shared_ptr<const recognition_records_t> records;
+    bool ready = false;
+    bool timed_out = false;
+    double waited_ms = 0.0;
+};
+
+struct library_exclusion_set_t {
+    std::unordered_set<std::uint64_t> rvas;
+    std::uint64_t tier_candidates = 0;
+    std::uint64_t suppressed_named = 0;
+};
+
+recognition_wait_result_t wait_for_records(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    std::chrono::milliseconds timeout);
+
+library_exclusion_set_t build_library_exclusion(
+    const recognition_records_t& records,
+    const analysis_snapshot_t& snapshot);
+
+bool is_library_function(const library_exclusion_set_t& exclusion,
+                         std::uint64_t rva) noexcept;
+
+void note_recovered_types(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    std::uint64_t function_rva,
+    std::uint64_t generation,
+    std::shared_ptr<const type_recovery_result_t> recovered);
 
 std::shared_ptr<const recognition_records_t>
 records_for(const std::shared_ptr<analysis_workspace_t>& workspace);

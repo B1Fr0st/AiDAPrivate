@@ -1,4 +1,4 @@
-#include "typed_ast_v2.hpp"
+#include "typed_ast.hpp"
 
 #include "../../../helpers/diag_log.hpp"
 #include "../builtin_typelib.hpp"
@@ -38,7 +38,8 @@ bool is_expression_kind(const typed_pseudocode_ast_node_kind_t kind) noexcept
            kind == typed_pseudocode_ast_node_kind_t::index_expression ||
            kind == typed_pseudocode_ast_node_kind_t::identifier ||
            kind == typed_pseudocode_ast_node_kind_t::literal ||
-           kind == typed_pseudocode_ast_node_kind_t::unknown_expression;
+           kind == typed_pseudocode_ast_node_kind_t::unknown_expression ||
+           kind == typed_pseudocode_ast_node_kind_t::conditional_expression;
 }
 
 bool is_statement_kind(const typed_pseudocode_ast_node_kind_t kind) noexcept
@@ -110,7 +111,7 @@ decompiler_diagnostic_t make_diagnostic(
 }
 
 void append_validation_diagnostics(
-    typed_ast_v2_build_result_t& result,
+    typed_ast_build_result_t& result,
     const decompiler_contract_validation_t& validation)
 {
     result.diagnostics.insert(result.diagnostics.end(), validation.diagnostics.begin(), validation.diagnostics.end());
@@ -215,8 +216,8 @@ public:
     ast_builder_t(
         const hir_function_t& hir,
         const type_graph_t& type_graph,
-        const typed_ast_v2_build_request_t& request,
-        typed_ast_v2_build_result_t& result)
+        const typed_ast_build_request_t& request,
+        typed_ast_build_result_t& result)
         : hir_(hir), type_graph_(type_graph), request_(request), result_(result)
     {
     }
@@ -245,7 +246,7 @@ public:
         for (const auto& block : hir_.blocks)
             ast_.source_coordinates.push_back(translate_coordinate(block.coordinate, decompiler_coordinate_layer_t::typed_ast));
         append_diagnostics_and_unknowns();
-        const auto validation = validate_typed_ast_v2_semantics(ast_, type_graph_);
+        const auto validation = validate_typed_ast_semantics(ast_, type_graph_);
         if (!validation.valid()) {
             append_validation_diagnostics(result_, validation);
             return false;
@@ -630,11 +631,98 @@ private:
         return true;
     }
 
+    static constexpr std::uint32_t k_no_dominator = (std::numeric_limits<std::uint32_t>::max)();
+
+    static std::vector<std::uint32_t> lengauer_tarjan_idoms(
+        const std::vector<std::vector<std::uint32_t>>& successors,
+        const std::vector<std::vector<std::uint32_t>>& predecessors,
+        const std::uint32_t start)
+    {
+        const std::uint32_t node_count = static_cast<std::uint32_t>(successors.size());
+        std::vector<std::uint32_t> idom(node_count, k_no_dominator);
+        if (start >= node_count)
+            return idom;
+        std::vector<std::uint32_t> dfnum(node_count, 0);
+        std::vector<std::uint32_t> vertex(node_count + 1, 0);
+        std::vector<std::uint32_t> parent(node_count, 0);
+        std::vector<std::uint32_t> semi(node_count, 0);
+        std::vector<std::uint32_t> label(node_count, 0);
+        std::vector<std::uint32_t> ancestor(node_count, 0);
+        std::uint32_t visited = 0;
+        {
+            std::vector<std::pair<std::uint32_t, std::size_t>> stack;
+            dfnum[start] = ++visited;
+            vertex[visited] = start;
+            semi[start] = visited;
+            label[start] = start;
+            stack.emplace_back(start, 0);
+            while (!stack.empty()) {
+                auto& frame = stack.back();
+                const auto v = frame.first;
+                if (frame.second < successors[v].size()) {
+                    const auto w = successors[v][frame.second++];
+                    if (w < node_count && dfnum[w] == 0) {
+                        dfnum[w] = ++visited;
+                        vertex[visited] = w;
+                        semi[w] = visited;
+                        label[w] = w;
+                        parent[w] = v;
+                        stack.emplace_back(w, 0);
+                    }
+                    continue;
+                }
+                stack.pop_back();
+            }
+        }
+        std::vector<std::vector<std::uint32_t>> bucket(node_count);
+        const auto eval = [&](std::uint32_t v) {
+            if (ancestor[v] == 0)
+                return label[v];
+            std::vector<std::uint32_t> chain;
+            std::uint32_t x = v;
+            while (ancestor[x] != 0 && ancestor[ancestor[x]] != 0) {
+                chain.push_back(x);
+                x = ancestor[x];
+            }
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                const auto y = *it;
+                const auto a = ancestor[y];
+                if (semi[label[a]] < semi[label[y]])
+                    label[y] = label[a];
+                ancestor[y] = ancestor[a];
+            }
+            return label[v];
+        };
+        for (std::uint32_t i = visited; i >= 2; --i) {
+            const auto w = vertex[i];
+            for (const auto v : predecessors[w]) {
+                if (v >= node_count || dfnum[v] == 0)
+                    continue;
+                const auto u = eval(v);
+                if (semi[u] < semi[w])
+                    semi[w] = semi[u];
+            }
+            bucket[vertex[semi[w]]].push_back(w);
+            ancestor[w] = parent[w];
+            for (const auto v : bucket[parent[w]]) {
+                const auto u = eval(v);
+                idom[v] = semi[u] < semi[v] ? u : parent[w];
+            }
+            bucket[parent[w]].clear();
+        }
+        for (std::uint32_t i = 2; i <= visited; ++i) {
+            const auto w = vertex[i];
+            if (idom[w] == k_no_dominator)
+                idom[w] = parent[w];
+            else if (idom[w] != vertex[semi[w]])
+                idom[w] = idom[idom[w]];
+        }
+        idom[start] = k_no_dominator;
+        return idom;
+    }
+
     bool analyze_control_flow()
     {
-        std::set<std::uint64_t> all;
-        for (const auto& entry : blocks_)
-            all.insert(entry.first);
         std::set<std::uint64_t> normal_roots = exception_handler_entries_;
         normal_roots.insert(entry_block_id_);
         for (const auto& entry : blocks_) {
@@ -646,45 +734,39 @@ private:
                 return false;
             }
         }
-        for (const auto& entry : blocks_)
-            dominators_[entry.first] = normal_roots.find(entry.first) !=
-                normal_roots.end() ? std::set<std::uint64_t>{entry.first} : all;
-        bool changed = true;
-        std::size_t dom_iterations = 0;
-        const std::size_t max_dom_iterations = blocks_.size() + 1;
-        while (changed && dom_iterations < max_dom_iterations) {
-            changed = false;
-            ++dom_iterations;
+        block_ordinal_.clear();
+        ordinal_block_.clear();
+        ordinal_block_.push_back(0);
+        for (const auto& entry : blocks_) {
+            block_ordinal_.emplace(entry.first,
+                static_cast<std::uint32_t>(ordinal_block_.size()));
+            ordinal_block_.push_back(entry.first);
+        }
+        const auto node_count = static_cast<std::uint32_t>(ordinal_block_.size());
+        {
+            std::vector<std::vector<std::uint32_t>> successors(node_count);
+            std::vector<std::vector<std::uint32_t>> predecessors(node_count);
+            std::vector<std::uint32_t> roots;
+            roots.push_back(block_ordinal_.at(entry_block_id_));
+            for (const auto handler : exception_handler_entries_)
+                roots.push_back(block_ordinal_.at(handler));
+            for (const auto root : roots) {
+                successors[0].push_back(root);
+                predecessors[root].push_back(0);
+            }
             for (const auto& entry : blocks_) {
-                const auto id = entry.first;
-                const auto& predecessors = normal_predecessors_.at(id);
-                if (normal_roots.find(id) != normal_roots.end())
-                    continue;
-                if (predecessors.empty()) {
-                    fail(decompiler_diagnostic_code_t::malformed_ast,
-                        "decompiler.ast.v2.unreachable_block", entry.second->coordinate);
-                    return false;
-                }
-                auto intersection = dominators_.at(predecessors.front());
-                for (std::size_t index = 1; index < predecessors.size(); ++index) {
-                    std::set<std::uint64_t> next;
-                    std::set_intersection(intersection.begin(), intersection.end(),
-                        dominators_.at(predecessors[index]).begin(),
-                        dominators_.at(predecessors[index]).end(),
-                        std::inserter(next, next.begin()));
-                    intersection = std::move(next);
-                }
-                intersection.insert(id);
-                if (intersection != dominators_[id]) {
-                    dominators_[id] = std::move(intersection);
-                    changed = true;
+                const auto from = block_ordinal_.at(entry.first);
+                for (const auto successor : entry.second->successor_ids) {
+                    const auto to = block_ordinal_.at(successor);
+                    successors[from].push_back(to);
+                    predecessors[to].push_back(from);
                 }
             }
+            idom_block_ = lengauer_tarjan_idoms(successors, predecessors, 0);
         }
         for (const auto& entry : blocks_) {
             for (const auto successor : entry.second->successor_ids) {
-                if (dominators_.at(entry.first).find(successor) ==
-                    dominators_.at(entry.first).end())
+                if (!dominates(successor, entry.first))
                     continue;
                 auto& loop = loops_[successor];
                 loop.header = successor;
@@ -696,48 +778,70 @@ private:
                     const auto id = pending.back();
                     pending.pop_back();
                     for (const auto predecessor : normal_predecessors_.at(id)) {
-                        if (predecessor != successor &&
-                            dominators_.at(predecessor).find(successor) !=
-                                dominators_.at(predecessor).end() &&
+                        if (predecessor != successor && dominates(successor, predecessor) &&
                             loop.nodes.insert(predecessor).second)
                             pending.push_back(predecessor);
                     }
                 }
             }
         }
-        std::set<std::uint64_t> all_with_exit = all;
-        all_with_exit.insert(0);
-        postdominators_[0] = {0};
-        for (const auto& entry : blocks_)
-            postdominators_[entry.first] = all_with_exit;
-        changed = true;
-        std::size_t pdom_iterations = 0;
-        const std::size_t max_pdom_iterations = blocks_.size() + 1;
-        while (changed && pdom_iterations < max_pdom_iterations) {
-            changed = false;
-            ++pdom_iterations;
-            for (auto iterator = blocks_.rbegin(); iterator != blocks_.rend(); ++iterator) {
-                const auto id = iterator->first;
-                std::vector<std::uint64_t> successors = iterator->second->successor_ids;
-                if (successors.empty())
-                    successors.push_back(0);
-                auto intersection = postdominators_.at(successors.front());
-                for (std::size_t index = 1; index < successors.size(); ++index) {
-                    std::set<std::uint64_t> next;
-                    std::set_intersection(intersection.begin(), intersection.end(),
-                        postdominators_.at(successors[index]).begin(),
-                        postdominators_.at(successors[index]).end(),
-                        std::inserter(next, next.begin()));
-                    intersection = std::move(next);
+        {
+            std::vector<std::vector<std::uint32_t>> successors(node_count);
+            std::vector<std::vector<std::uint32_t>> predecessors(node_count);
+            for (const auto& entry : blocks_) {
+                const auto from = block_ordinal_.at(entry.first);
+                if (entry.second->successor_ids.empty()) {
+                    successors[0].push_back(from);
+                    predecessors[from].push_back(0);
+                    continue;
                 }
-                intersection.insert(id);
-                if (intersection != postdominators_[id]) {
-                    postdominators_[id] = std::move(intersection);
-                    changed = true;
+                for (const auto successor : entry.second->successor_ids) {
+                    const auto to = block_ordinal_.at(successor);
+                    successors[to].push_back(from);
+                    predecessors[from].push_back(to);
+                }
+            }
+            ipdom_block_ = lengauer_tarjan_idoms(successors, predecessors, 0);
+            ipdom_depth_.assign(node_count, 0);
+            ipdom_depth_[0] = 1;
+            for (std::uint32_t ordinal = 1; ordinal < node_count; ++ordinal) {
+                if (ipdom_block_[ordinal] == k_no_dominator)
+                    ipdom_block_[ordinal] = 0;
+            }
+            for (std::uint32_t ordinal = 1; ordinal < node_count; ++ordinal) {
+                if (ipdom_depth_[ordinal] != 0)
+                    continue;
+                std::vector<std::uint32_t> chain;
+                std::uint32_t cursor = ordinal;
+                for (std::size_t guard = 0; guard <= node_count && ipdom_depth_[cursor] == 0; ++guard) {
+                    chain.push_back(cursor);
+                    cursor = ipdom_block_[cursor];
+                }
+                while (!chain.empty()) {
+                    const auto current = chain.back();
+                    chain.pop_back();
+                    ipdom_depth_[current] = ipdom_depth_[ipdom_block_[current]] + 1;
                 }
             }
         }
         return true;
+    }
+
+    bool dominates(const std::uint64_t dominator, const std::uint64_t block_id) const
+    {
+        const auto target = block_ordinal_.find(dominator);
+        const auto source = block_ordinal_.find(block_id);
+        if (target == block_ordinal_.end() || source == block_ordinal_.end())
+            return false;
+        std::uint32_t cursor = source->second;
+        for (std::size_t guard = 0; guard <= ordinal_block_.size(); ++guard) {
+            if (cursor == target->second)
+                return true;
+            if (cursor == 0 || cursor == k_no_dominator)
+                return false;
+            cursor = idom_block_[cursor];
+        }
+        return false;
     }
 
     static bool supported_hir_kind(const hir_node_kind_t kind) noexcept
@@ -943,6 +1047,12 @@ private:
                     condition->confidence, condition->provenance);
                 if (gate == 0)
                     return false;
+                typed_ast_branch_bridge_entry_t bridge_entry;
+                bridge_entry.hir_value_id = condition->id;
+                bridge_entry.statement_node_id = gate;
+                bridge_entry.condition_node_id = gated_expression;
+                bridge_entry.polarity_inverted = descriptor->negated;
+                result_.branch_bridge.push_back(bridge_entry);
                 output.push_back(gate);
                 gated_successors.insert(descriptor->true_successor);
             }
@@ -1236,38 +1346,41 @@ private:
                                                const std::uint64_t right,
                                                const std::uint64_t current) const
     {
-        std::set<std::uint64_t> common;
-        std::set_intersection(postdominators_.at(left).begin(), postdominators_.at(left).end(),
-            postdominators_.at(right).begin(), postdominators_.at(right).end(),
-            std::inserter(common, common.begin()));
-        common.erase(current);
-        std::uint64_t best = 0;
-        std::size_t best_depth = 0;
-        for (const auto candidate : common) {
-            const auto depth = postdominators_.at(candidate).size();
-            if (depth > best_depth || (depth == best_depth && candidate < best)) {
-                best = candidate;
-                best_depth = depth;
-            }
+        const auto left_ordinal = block_ordinal_.find(left);
+        const auto right_ordinal = block_ordinal_.find(right);
+        if (left_ordinal == block_ordinal_.end() || right_ordinal == block_ordinal_.end())
+            return 0;
+        std::uint32_t ascending = left_ordinal->second;
+        std::uint32_t descending = right_ordinal->second;
+        for (std::size_t guard = 0; guard <= ordinal_block_.size(); ++guard) {
+            while (ascending != descending && ipdom_depth_[ascending] > ipdom_depth_[descending])
+                ascending = ipdom_block_[ascending];
+            while (ascending != descending && ipdom_depth_[descending] > ipdom_depth_[ascending])
+                descending = ipdom_block_[descending];
+            if (ascending == descending)
+                break;
+            ascending = ipdom_block_[ascending];
+            descending = ipdom_block_[descending];
         }
-        return best;
+        if (ascending != descending)
+            return 0;
+        std::uint64_t result = ordinal_block_[ascending];
+        if (result == current) {
+            const auto parent = ipdom_block_[ascending];
+            result = parent == k_no_dominator ? 0 : ordinal_block_[parent];
+        }
+        return result;
     }
 
     std::uint64_t immediate_postdominator(const std::uint64_t block_id) const
     {
-        const auto& pdoms = postdominators_.at(block_id);
-        std::uint64_t best = 0;
-        std::size_t best_depth = 0;
-        for (const auto candidate : pdoms) {
-            if (candidate == block_id)
-                continue;
-            const auto depth = postdominators_.at(candidate).size();
-            if (depth > best_depth || (depth == best_depth && candidate < best)) {
-                best = candidate;
-                best_depth = depth;
-            }
-        }
-        return best;
+        const auto ordinal = block_ordinal_.find(block_id);
+        if (ordinal == block_ordinal_.end())
+            return 0;
+        const auto parent = ipdom_block_[ordinal->second];
+        if (parent == k_no_dominator)
+            return 0;
+        return ordinal_block_[parent];
     }
 
     const typed_pseudocode_ast_node_t* node_by_id(const std::uint64_t id) const noexcept
@@ -2060,7 +2173,7 @@ private:
                 const auto successor = block->successor_ids.front();
                 if (successor == stop)
                     return true;
-                if (dominators_.at(current).find(successor) != dominators_.at(current).end()) {
+                if (dominates(successor, current)) {
                     emit_goto(successor, output, block->coordinate);
                     return true;
                 }
@@ -2117,12 +2230,14 @@ private:
                 output.push_back(statement);
             } else {
                 auto body_successor = true_successor;
+                bool arms_swapped = false;
                 if (true_statements.empty()) {
                     condition = append_negation(condition, *condition_value);
                     if (condition == 0)
                         return false;
                     std::swap(true_statements, false_statements);
                     body_successor = false_successor;
+                    arms_swapped = true;
                 }
                 const auto true_body = append_compound(std::move(true_statements),
                     blocks_.at(body_successor)->coordinate);
@@ -2148,6 +2263,12 @@ private:
                     aggregate_confidence(), decompiler_fact_provenance_t::provider_semantics);
                 if (condition == 0 || true_body == 0 || statement == 0)
                     return false;
+                typed_ast_branch_bridge_entry_t bridge_entry;
+                bridge_entry.hir_value_id = condition_value->id;
+                bridge_entry.statement_node_id = statement;
+                bridge_entry.condition_node_id = condition;
+                bridge_entry.polarity_inverted = descriptor->negated != arms_swapped;
+                result_.branch_bridge.push_back(bridge_entry);
                 output.push_back(statement);
             }
             current = join;
@@ -2629,8 +2750,8 @@ public:
 private:
     const hir_function_t& hir_;
     const type_graph_t& type_graph_;
-    const typed_ast_v2_build_request_t& request_;
-    typed_ast_v2_build_result_t& result_;
+    const typed_ast_build_request_t& request_;
+    typed_ast_build_result_t& result_;
     typed_pseudocode_ast_v2_t ast_;
     source_coordinate_t body_coordinate_;
     std::map<std::uint64_t, const decompiler_type_node_t*> types_;
@@ -2641,8 +2762,11 @@ private:
     std::map<std::uint64_t, std::size_t> use_counts_;
     std::map<std::uint64_t, std::vector<std::uint64_t>> normal_predecessors_;
     std::map<std::uint64_t, std::vector<std::uint64_t>> exception_predecessors_;
-    std::map<std::uint64_t, std::set<std::uint64_t>> dominators_;
-    std::map<std::uint64_t, std::set<std::uint64_t>> postdominators_;
+    std::map<std::uint64_t, std::uint32_t> block_ordinal_;
+    std::vector<std::uint64_t> ordinal_block_;
+    std::vector<std::uint32_t> idom_block_;
+    std::vector<std::uint32_t> ipdom_block_;
+    std::vector<std::uint32_t> ipdom_depth_;
     std::map<std::uint64_t, natural_loop_t> loops_;
     std::map<std::uint64_t, exception_region_t> exception_regions_;
     std::map<std::uint64_t, std::uint64_t> handler_region_owners_;
@@ -2683,12 +2807,12 @@ void append_semantic_error(
 
 }
 
-bool typed_ast_v2_build_result_t::succeeded() const noexcept
+bool typed_ast_build_result_t::succeeded() const noexcept
 {
     return ast.has_value();
 }
 
-std::string typed_ast_v2_node_layout(const typed_pseudocode_ast_node_kind_t kind)
+std::string typed_ast_node_layout(const typed_pseudocode_ast_node_kind_t kind)
 {
     switch (kind) {
     case typed_pseudocode_ast_node_kind_t::function_definition: return "parameter_declarations_then_body";
@@ -2722,11 +2846,12 @@ std::string typed_ast_v2_node_layout(const typed_pseudocode_ast_node_kind_t kind
     case typed_pseudocode_ast_node_kind_t::literal: return "empty";
     case typed_pseudocode_ast_node_kind_t::unknown_expression: return "empty";
     case typed_pseudocode_ast_node_kind_t::comment_statement: return "empty";
+    case typed_pseudocode_ast_node_kind_t::conditional_expression: return "condition_then_else";
     }
     return "invalid";
 }
 
-decompiler_contract_validation_t validate_typed_ast_v2_semantics(
+decompiler_contract_validation_t validate_typed_ast_semantics(
     const typed_pseudocode_ast_v2_t& ast,
     const type_graph_t& type_graph)
 {
@@ -2932,17 +3057,24 @@ decompiler_contract_validation_t validate_typed_ast_v2_semantics(
             if (!node.child_ids.empty() || !is_visible_text(node.stable_text))
                 append_semantic_error(result, &node, "decompiler.ast.v2.leaf_layout", ordinal);
             break;
+        case typed_pseudocode_ast_node_kind_t::conditional_expression:
+            if (node.child_ids.size() != 3)
+                append_semantic_error(result, &node, "decompiler.ast.v2.conditional_layout", ordinal);
+            require_expression(node, 0, "decompiler.ast.v2.conditional_condition");
+            require_expression(node, 1, "decompiler.ast.v2.conditional_then");
+            require_expression(node, 2, "decompiler.ast.v2.conditional_else");
+            break;
         }
     }
     return result;
 }
 
-typed_ast_v2_build_result_t build_typed_ast_v2(
+typed_ast_build_result_t build_typed_ast(
     const hir_function_t& hir,
     const type_graph_t& type_graph,
-    const typed_ast_v2_build_request_t& request)
+    const typed_ast_build_request_t& request)
 {
-    typed_ast_v2_build_result_t result;
+    typed_ast_build_result_t result;
     const auto hir_validation = validate_hir_function(hir);
     const auto type_validation = validate_type_graph(type_graph);
     if (!hir_validation.valid() || !type_validation.valid()) {
@@ -2957,19 +3089,19 @@ typed_ast_v2_build_result_t build_typed_ast_v2(
     result.partial = builder.degraded_region_count() != 0;
     if (result.succeeded() && builder.degraded_region_count() != 0) {
         diag::log_tagged_fmt("dec_ast",
-            "typed_ast_v2_build partial=1 regions=%u nodes=%zu",
+            "typed_ast_build partial=1 regions=%u nodes=%zu",
             builder.degraded_region_count(),
             result.ast ? result.ast->nodes.size() : static_cast<std::size_t>(0));
     }
     return result;
 }
 
-std::string serialize_typed_ast_v2(const typed_pseudocode_ast_v2_t& ast)
+std::string serialize_typed_ast(const typed_pseudocode_ast_v2_t& ast)
 {
     return serialize_typed_pseudocode_ast(ast);
 }
 
-decompiler_contract_decode_result_t<typed_pseudocode_ast_v2_t> deserialize_typed_ast_v2(const std::string& bytes)
+decompiler_contract_decode_result_t<typed_pseudocode_ast_v2_t> deserialize_typed_ast(const std::string& bytes)
 {
     return deserialize_typed_pseudocode_ast(bytes);
 }

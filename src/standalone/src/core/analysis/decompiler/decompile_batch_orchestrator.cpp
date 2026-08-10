@@ -5,9 +5,12 @@
 #include "decompiler_ui_integration.hpp"
 #include "generation_snapshot_store.hpp"
 #include "native_worker_host.hpp"
+#include "pseudocode_renderer.hpp"
 
+#include "../analysis_budget.hpp"
 #include "../builtin_typelib.hpp"
 #include "../flirt/static_recognition_service.hpp"
+#include "../working_set_governor.hpp"
 #include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
 #include "../../disasm/ghidra_adapters/aida_load_image.hpp"
 #include "../../infra/executor.hpp"
@@ -23,6 +26,8 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -48,6 +53,11 @@ constexpr std::uint64_t k_worker_snapshot_cap = 1024ULL << 20;
 constexpr std::uint64_t k_snapshot_header_floor = 1ULL << 20;
 constexpr std::uint64_t k_snapshot_read_quantum = 4ULL << 20;
 constexpr std::uint64_t k_snapshot_sidecar_absolute_cap = 64ULL << 20;
+constexpr std::uint64_t k_avail_guard_numerator = 3;
+constexpr std::uint64_t k_avail_guard_denominator = 4;
+constexpr std::uint64_t k_defer_budget_floor_bytes = 2ULL << 30;
+constexpr std::uint64_t k_snapshot_capture_shard_bytes = 32ULL << 20;
+constexpr std::size_t k_snapshot_capture_max_tasks = 8;
 
 struct batch_work_item_t {
     std::uint64_t function_id = 0;
@@ -143,11 +153,8 @@ bool result_retryable(const decompiler_pipeline_result_t& result) noexcept
 
 std::uint64_t resolve_memory_budget_bytes() noexcept
 {
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    std::uint64_t derived = 0;
-    if (GlobalMemoryStatusEx(&status) && status.ullTotalPhys != 0)
-        derived = status.ullTotalPhys / 4;
+    const auto envelope = host_memory_envelope();
+    const std::uint64_t derived = envelope.usable_bytes / 2;
     if (derived < k_memory_budget_floor_bytes)
         return k_memory_budget_floor_bytes;
     if (derived > k_memory_budget_cap_bytes)
@@ -161,6 +168,9 @@ struct decompile_batch_orchestrator_t::state_t {
     std::weak_ptr<analysis_workspace_t> workspace;
     std::shared_ptr<analysis_metrics_t> metrics;
     std::uint64_t memory_budget_bytes = 0;
+    std::uint64_t reserve_os_bytes = 0;
+    std::uint64_t governor_charge_bytes = 0;
+    std::shared_ptr<const generation_snapshot_store_t::entry_t> run_snapshot_pin;
 
     mutable std::mutex mutex;
     std::condition_variable wake;
@@ -343,6 +353,168 @@ struct in_flight_lease_t {
     std::uint64_t function_id = 0;
 };
 
+workspace_result_t<decompiler_pipeline_request_t> build_batch_pipeline_request(
+    const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& state,
+    analysis_workspace_t& workspace,
+    const std::shared_ptr<const analysis_publication_t>& publication,
+    const function_record_t& function,
+    const batch_work_item_t& item,
+    const cancellation_token_t& cancel)
+{
+    const auto architecture = publication->snapshot->normalized_image->architecture;
+    const std::uint64_t size_aware_ms = decompile_batch_orchestrator_t::compute_size_aware_deadline(
+        item.byte_size, architecture, decompile_deadline_lane_t::batch);
+    if (size_aware_ms > k_deadline_scaled_log_threshold_ms) {
+        diag::log_tagged_fmt("dec_batch",
+            "deadline_scaled function_rva=0x%llx byte_size=%llu est_insns=%llu deadline_ms=%llu",
+            static_cast<unsigned long long>(item.entry_rva),
+            static_cast<unsigned long long>(item.byte_size),
+            static_cast<unsigned long long>(estimate_instructions(item.byte_size, architecture)),
+            static_cast<unsigned long long>(size_aware_ms));
+    }
+    const auto policy = default_decompiler_profile_policy();
+    const decompiler_profile_id_t lane_profile = item.lane == 1
+        ? decompiler_profile_id_t::thorough
+        : item.lane == 2
+            ? decompiler_profile_id_t::balanced
+            : decompiler_profile_id_t::fast;
+    const decompiler_profile_budget_t* request_defaults =
+        lane_profile == decompiler_profile_id_t::thorough
+            ? &policy.thorough
+            : lane_profile == decompiler_profile_id_t::balanced ? &policy.balanced : &policy.fast;
+    decompiler_profile_id_t request_profile = lane_profile;
+    const std::uint64_t memory_floor_bytes = state->run_snapshot_bytes != 0
+        ? state->run_snapshot_bytes + k_batch_job_memory_headroom_bytes : 0;
+    if (memory_floor_bytes != 0 && request_defaults->max_memory_bytes < memory_floor_bytes) {
+        if (policy.balanced.max_memory_bytes >= memory_floor_bytes &&
+            policy.balanced.max_memory_bytes > request_defaults->max_memory_bytes) {
+            request_profile = decompiler_profile_id_t::balanced;
+            request_defaults = &policy.balanced;
+        }
+        if (request_defaults->max_memory_bytes < memory_floor_bytes &&
+            policy.thorough.max_memory_bytes > request_defaults->max_memory_bytes) {
+            request_profile = decompiler_profile_id_t::thorough;
+            request_defaults = &policy.thorough;
+        }
+    }
+    const std::uint64_t deadline_ms = (std::min)(
+        (std::max<std::uint64_t>)((std::min)(request_defaults->max_wall_clock_ms, size_aware_ms),
+            k_batch_deadline_floor_ms),
+        request_defaults->max_wall_clock_ms);
+    auto budget = *request_defaults;
+    budget.max_wall_clock_ms = deadline_ms;
+    budget.max_cpu_ms = (std::min)(request_defaults->max_cpu_ms,
+        (std::max<std::uint64_t>)(1000, deadline_ms / 2));
+    if (memory_floor_bytes != 0) {
+        budget.max_memory_bytes = (std::min)(
+            (std::max<std::uint64_t>)((std::max)(request_defaults->max_memory_bytes,
+                memory_floor_bytes), 1ULL << 20),
+            policy.thorough.max_memory_bytes);
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(deadline_ms);
+    return make_native_pipeline_request(workspace, publication, function,
+        decompiler_pipeline_invocation_t::background_batch,
+        decompiler_pipeline_cache_mode_t::read_write,
+        request_profile, budget, deadline, state->provider_context, cancel);
+}
+
+const decompiler_provider_identity_t* prefetch_provider_identity()
+{
+    static std::mutex identity_mutex;
+    static std::optional<decompiler_provider_identity_t> identity;
+    static bool resolved = false;
+    std::lock_guard lock(identity_mutex);
+    if (!resolved) {
+        resolved = true;
+        auto runtime = native_worker::create_packaged_native_worker_runtime();
+        if (runtime)
+            identity = runtime.value().provider;
+    }
+    return identity ? &*identity : nullptr;
+}
+
+std::shared_ptr<const decompiler_render_evidence_t> prefetch_render_evidence(
+    const std::shared_ptr<const decompiler_provider_context_t>& context)
+{
+    const auto* native = dynamic_cast<const ghidra_native_provider_context_t*>(context.get());
+    if (!native || !native->snapshot() || native->snapshot()->empty() ||
+        native->snapshot_hash().empty())
+        return nullptr;
+    native_worker::native_provider_snapshot_views_t views;
+    std::vector<decompiler_diagnostic_t> parse_diagnostics;
+    if (!native_worker::parse_native_provider_snapshot_views(
+            std::string_view(reinterpret_cast<const char*>(native->snapshot()->data()),
+                             native->snapshot()->size()), views, parse_diagnostics) ||
+        views.sidecar.empty())
+        return nullptr;
+    auto evidence = build_render_evidence_from_sidecar(
+        views.sidecar.data(), views.sidecar.size(), views.image_base);
+    if (!evidence)
+        return nullptr;
+    try {
+        auto merged = std::make_shared<decompiler_render_evidence_t>(*evidence);
+        build_render_evidence_typelib_overlay(*merged);
+        if (validate_decompiler_render_evidence(*merged).valid())
+            evidence = std::move(merged);
+    } catch (...) {
+    }
+    return evidence;
+}
+
+decompiler_pipeline_cache_key_t prefetch_rendered_key(
+    const decompiler_pipeline_request_t& request,
+    const decompiler_provider_identity_t& provider_identity,
+    const std::shared_ptr<const decompiler_render_evidence_t>& evidence)
+{
+    const auto renderer = pseudocode_renderer_style_settings(
+        request.profile == decompiler_profile_id_t::thorough
+            ? pseudocode_renderer_style_profile_t::audit
+            : request.profile == decompiler_profile_id_t::fast
+                ? pseudocode_renderer_style_profile_t::compact
+                : pseudocode_renderer_style_profile_t::balanced);
+    decompiler_pipeline_cache_key_t key;
+    key.stage = decompiler_cache_stage_t::rendered_document;
+    key.workspace_id = request.workspace_id;
+    key.workspace_generation = request.workspace_generation;
+    key.analysis_revision = request.analysis_revision;
+    key.entity = request.entity;
+    key.provider = provider_identity;
+    key.worker_protocol_hash = request.cache_identity.worker_protocol_hash;
+    key.language = request.language;
+    key.loader_layout_hash = request.cache_identity.loader_layout_hash;
+    key.function_bytes_hash = request.cache_identity.function_bytes_hash;
+    key.chunk_fingerprints = request.cache_identity.chunk_fingerprints;
+    key.metadata_revision = request.cache_identity.metadata_revision;
+    key.type_graph_revision = request.cache_identity.type_graph_revision;
+    key.overlay_revision = request.cache_identity.overlay_revision;
+    if (request.budget)
+        key.profile = *request.budget;
+    key.renderer = renderer;
+    key.dependencies = request.cache_identity.dependencies;
+    const auto pass_chain = decompiler_render_pass_chain(
+        renderer.readability, renderer, evidence.get());
+    decompiler_dependency_version_t pass_dependency;
+    pass_dependency.name = "aida.render.pass_chain";
+    pass_dependency.version = "1";
+    pass_dependency.content_hash = decompiler_render_pass_chain_hash(pass_chain);
+    key.dependencies.push_back(std::move(pass_dependency));
+    if (evidence) {
+        decompiler_dependency_version_t evidence_dependency;
+        evidence_dependency.name = "aida.render.evidence";
+        evidence_dependency.version =
+            std::to_string(k_decompiler_render_evidence_schema_version);
+        evidence_dependency.content_hash = stable_serialization_hash(*evidence);
+        key.dependencies.push_back(std::move(evidence_dependency));
+    }
+    std::sort(key.dependencies.begin(), key.dependencies.end(),
+        [](const decompiler_dependency_version_t& left,
+           const decompiler_dependency_version_t& right) {
+            return left.name < right.name;
+        });
+    return key;
+}
+
 void control_main(std::shared_ptr<decompile_batch_orchestrator_t::state_t> state)
 {
     std::unique_lock lock(state->mutex);
@@ -429,6 +601,14 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
         return;
     }
     const auto service = integration.value()->service();
+    const auto recognition_wait = static_recognition::wait_for_records(
+        workspace, std::chrono::milliseconds(10000));
+    if (recognition_wait.timed_out) {
+        diag::log_tagged_fmt("dec_batch",
+            "recognition_wait_timeout generation=%llu waited_ms=%.1f",
+            static_cast<unsigned long long>(publication->generation),
+            recognition_wait.waited_ms);
+    }
     mcp_standalone::downstream::producer_identity_t identity;
     identity.kind = mcp_standalone::downstream::producer_kind_t::decompiler;
     identity.tool_name = "decompile_batch_orchestrator";
@@ -447,9 +627,17 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
     diag::log_tagged_fmt("dec_batch",
         "FEATURE-WORKER-GROUP-ADMIT decompile_batch_orchestrator token=%llu",
         static_cast<unsigned long long>(admission.token()));
+    std::shared_ptr<const generation_snapshot_store_t::entry_t> snapshot_pin;
+    const auto release_snapshot_pin = [&snapshot_pin] {
+        if (snapshot_pin) {
+            generation_snapshot_store_t::instance().unpin(snapshot_pin);
+            snapshot_pin.reset();
+        }
+    };
     auto context = decompile_batch_orchestrator_t::capture_generation_provider_context(
-        workspace, publication, run_token);
+        workspace, publication, run_token, &snapshot_pin);
     if (!context) {
+        release_snapshot_pin();
         admission.release("capture_failed");
         abort_start(context.error().code == workspace_error_code_t::cancelled ||
             context.error().code == workspace_error_code_t::deadline_exceeded
@@ -470,11 +658,31 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
     const std::size_t slots_desired = (std::max<std::size_t>)(2,
         (std::min<std::size_t>)(k_absolute_slot_cap,
             static_cast<std::size_t>(fabric_capacity >= 3 ? fabric_capacity - 1 : 2)));
-    const std::uint64_t memory_admission_budget = state->memory_budget_bytes != 0
+    auto& governor = working_set_governor_t::instance();
+    const governor_zone_t zone = governor.refresh();
+    if (zone == governor_zone_t::red) {
+        release_snapshot_pin();
+        admission.release("governor_red_zone");
+        diag::log_tagged_fmt("dec_batch",
+            "run_deferred reason=governor_red_zone snapshot_bytes=%llu",
+            static_cast<unsigned long long>(snapshot_bytes));
+        abort_start("governor_red_zone");
+        return;
+    }
+    std::uint64_t memory_admission_budget = state->memory_budget_bytes != 0
         ? state->memory_budget_bytes : k_memory_budget_floor_bytes;
+    if (zone == governor_zone_t::yellow)
+        memory_admission_budget /= 2;
+    MEMORYSTATUSEX mem_status{};
+    mem_status.dwLength = sizeof(mem_status);
+    std::uint64_t avail_guard = 0;
+    if (GlobalMemoryStatusEx(&mem_status) && mem_status.ullAvailPhys > state->reserve_os_bytes)
+        avail_guard = (mem_status.ullAvailPhys - state->reserve_os_bytes) *
+            k_avail_guard_numerator / k_avail_guard_denominator;
+    memory_admission_budget = (std::min)(memory_admission_budget, avail_guard);
     const std::uint64_t measured_rss = native_worker::native_worker_measured_private_bytes();
     const std::uint64_t rss_samples = native_worker::native_worker_measured_private_samples();
-    const bool rss_measured = rss_samples >= 4 && measured_rss != 0;
+    const bool rss_measured = rss_samples >= 1 && measured_rss != 0;
     const std::uint64_t per_slot_bytes = rss_measured
         ? measured_rss + k_worker_rss_allowance_bytes
         : k_worker_rss_fallback_bytes;
@@ -492,6 +700,7 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
         return snapshot_term + slot_term;
     };
     if (slots_desired < 2) {
+        release_snapshot_pin();
         admission.release("slot_floor");
         diag::log_tagged_fmt("dec_batch",
             "run_deferred reason=slot_floor desired=%zu quota=%zu",
@@ -514,8 +723,25 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
             "slots_trimmed from=%zu to=%zu reason=memory_admission",
             slots_desired, slots);
     }
+    while (true) {
+        if (governor.check(working_set_metrics::subsystem_t::worker_snapshots,
+                memory_admission_bytes))
+            break;
+        if (slots <= 2) {
+            release_snapshot_pin();
+            admission.release("governor_worker_snapshots");
+            diag::log_tagged_fmt("dec_batch",
+                "run_deferred reason=governor_worker_snapshots slots=%zu admitted_bytes=%llu",
+                slots, static_cast<unsigned long long>(memory_admission_bytes));
+            abort_start("governor_worker_snapshots");
+            return;
+        }
+        slots = (std::max<std::size_t>)(2, slots / 2);
+        memory_admission_bytes = admission_bytes_for(
+            slots, snapshot_mapping_bytes, worker_resident_bytes);
+    }
     diag::log_tagged_fmt("dec_batch",
-        "budget_decision type=memory_admission formula=1*snapshot_bytes+slots*per_slot_rss shared_mapping=1 desired=%zu slots=%zu fabric_capacity=%u snapshot_bytes=%llu snapshot_term=%llu resident_term=%llu total=%llu budget=%llu per_slot=%llu measured_rss=%llu rss_samples=%llu rss_source=%s decision=%s",
+        "budget_decision type=memory_admission formula=1*snapshot_bytes+slots*per_slot_rss shared_mapping=1 desired=%zu slots=%zu fabric_capacity=%u snapshot_bytes=%llu snapshot_term=%llu resident_term=%llu total=%llu budget=%llu per_slot=%llu measured_rss=%llu rss_samples=%llu rss_source=%s decision=%s zone=%s avail_guard=%llu",
         slots_desired,
         slots,
         fabric_capacity,
@@ -528,7 +754,9 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
         static_cast<unsigned long long>(measured_rss),
         static_cast<unsigned long long>(rss_samples),
         rss_measured ? "measured" : "fallback",
-        memory_admission_bytes > memory_admission_budget ? "defer" : "admit");
+        memory_admission_bytes > memory_admission_budget ? "defer" : "admit",
+        governor_zone_name(zone),
+        static_cast<unsigned long long>(avail_guard));
     const auto floor_policy = default_decompiler_profile_policy();
     const std::uint64_t job_memory_floor_bytes = snapshot_bytes != 0
         ? snapshot_bytes + k_batch_job_memory_headroom_bytes : 0;
@@ -547,10 +775,13 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
             floor_policy.thorough.max_memory_bytes < job_memory_floor_bytes ? 1 : 0,
         static_cast<unsigned long long>(floor_policy.thorough.max_memory_bytes));
     if (memory_admission_bytes > memory_admission_budget) {
+        release_snapshot_pin();
         admission.release("memory_admission");
         diag::log_tagged_fmt("dec_batch",
-            "run_deferred reason=memory_admission slots=%zu snapshot_bytes=%llu",
-            slots, static_cast<unsigned long long>(snapshot_bytes));
+            "run_deferred reason=memory_admission slots=%zu snapshot_bytes=%llu budget=%llu admission_floor=%llu",
+            slots, static_cast<unsigned long long>(snapshot_bytes),
+            static_cast<unsigned long long>(memory_admission_budget),
+            static_cast<unsigned long long>(k_defer_budget_floor_bytes));
         abort_start("memory_admission");
         return;
     }
@@ -618,6 +849,11 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
             bfs.push_back(target);
         }
     }
+    static_recognition::library_exclusion_set_t library_exclusion;
+    if (recognition_wait.records)
+        library_exclusion = static_recognition::build_library_exclusion(
+            *recognition_wait.records, *snapshot);
+    std::uint64_t library_excluded = 0;
     std::vector<batch_work_item_t> worklist;
     worklist.reserve(snapshot->functions.size());
     for (const auto& function : snapshot->functions) {
@@ -625,6 +861,10 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
         item.function_id = function.id;
         item.entry_rva = rva_of(function.start, image_base);
         item.byte_size = function_byte_size(*snapshot, function);
+        if (static_recognition::is_library_function(library_exclusion, item.entry_rva)) {
+            ++library_excluded;
+            continue;
+        }
         if (lane1_ids.count(function.id)) {
             item.lane = 1;
             item.depth = 0;
@@ -648,6 +888,7 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
         return left.function_id < right.function_id;
     });
     if (run_token.stop_requested()) {
+        release_snapshot_pin();
         admission.release("cancelled");
         abort_start("cancelled");
         return;
@@ -706,22 +947,83 @@ void start_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& s
             state->run_active = true;
             state->last_started_generation = publication->generation;
             state->last_started_revision = publication->analysis_revision;
+            state->run_snapshot_pin = std::move(snapshot_pin);
         }
     }
     if (commit_cancelled) {
+        release_snapshot_pin();
         admission.release("cancelled");
         abort_start("cancelled");
         return;
     }
+    governor.charge(working_set_metrics::subsystem_t::worker_snapshots,
+        static_cast<std::int64_t>(memory_admission_bytes));
+    state->governor_charge_bytes = memory_admission_bytes;
     metrics_add(state->metrics, analysis_metric_t::decompile_batch_calls, 1);
+    metrics_add(state->metrics, analysis_metric_t::decompile_batch_library_excluded,
+        library_excluded);
     metrics_set_max(state->metrics, analysis_metric_t::decompile_batch_queue_depth_peak,
         static_cast<std::uint64_t>(state->worklist.size()));
     diag::log_tagged_fmt("dec_batch",
-        "run_start generation=%llu analysis_revision=%llu functions=%zu lanes=interactive,exports,depth,linear slots=%zu quota=%zu snapshot_bytes=%llu profile=lane_graduated deadlines=size_aware",
+        "run_start generation=%llu analysis_revision=%llu functions=%zu lanes=interactive,exports,depth,linear slots=%zu quota=%zu snapshot_bytes=%llu profile=lane_graduated deadlines=size_aware library_excluded=%llu library_candidates=%llu library_named_suppressed=%llu",
         static_cast<unsigned long long>(publication->generation),
         static_cast<unsigned long long>(publication->analysis_revision),
         state->worklist.size(), slots, quotas.decompiler_worker_group_size,
-        static_cast<unsigned long long>(snapshot_bytes));
+        static_cast<unsigned long long>(snapshot_bytes),
+        static_cast<unsigned long long>(library_excluded),
+        static_cast<unsigned long long>(library_exclusion.tier_candidates),
+        static_cast<unsigned long long>(library_exclusion.suppressed_named));
+    const std::size_t prefetch_target = (std::min<std::size_t>)(256,
+        (std::min)(state->worklist.size(), slots * 4));
+    if (prefetch_target != 0 && !run_token.stop_requested()) {
+        const auto* provider_identity = prefetch_provider_identity();
+        if (provider_identity) {
+            const auto evidence = prefetch_render_evidence(state->provider_context);
+            const std::string prefetch_workspace_id =
+                workspace->identity().binary_id().to_hex();
+            std::vector<decompiler_pipeline_cache_key_t> prefetch_keys;
+            prefetch_keys.reserve(prefetch_target);
+            std::size_t prefetch_skipped = 0;
+            for (std::size_t index = 0; index < prefetch_target; ++index) {
+                if (run_token.stop_requested())
+                    break;
+                const auto& item = state->worklist[index];
+                const auto found = state->functions_by_id.find(item.function_id);
+                if (found == state->functions_by_id.end() || !found->second) {
+                    ++prefetch_skipped;
+                    continue;
+                }
+                auto built = build_batch_pipeline_request(state, *workspace, publication,
+                    *found->second, item, run_token);
+                if (!built) {
+                    ++prefetch_skipped;
+                    continue;
+                }
+                auto key = prefetch_rendered_key(built.value(), *provider_identity, evidence);
+                if (!validate_decompiler_pipeline_cache_key(key).valid()) {
+                    ++prefetch_skipped;
+                    continue;
+                }
+                prefetch_keys.push_back(std::move(key));
+            }
+            std::size_t prefetch_chunks = 0;
+            for (std::size_t begin = 0; begin < prefetch_keys.size(); begin += 64) {
+                const std::size_t amount = (std::min<std::size_t>)(64,
+                    prefetch_keys.size() - begin);
+                std::vector<decompiler_pipeline_cache_key_t> chunk;
+                chunk.reserve(amount);
+                for (std::size_t offset = begin; offset < begin + amount; ++offset)
+                    chunk.push_back(std::move(prefetch_keys[offset]));
+                (void)service->prefetch_persistent_rendered(
+                    prefetch_workspace_id, publication->generation, std::move(chunk));
+                ++prefetch_chunks;
+            }
+            diag::log_tagged_fmt("dec_batch",
+                "rendered_prefetch generation=%llu items=%zu keys=%zu chunks=%zu skipped=%zu",
+                static_cast<unsigned long long>(publication->generation),
+                prefetch_target, prefetch_keys.size(), prefetch_chunks, prefetch_skipped);
+        }
+    }
     std::size_t submitted = 0;
     std::vector<aida::infra::taskflow_runtime::job_handle_t> spawned_handles;
     spawned_handles.reserve(slots);
@@ -935,6 +1237,16 @@ void finish_run(const std::shared_ptr<decompile_batch_orchestrator_t::state_t>& 
             static_cast<unsigned long long>(state->admission.token()));
         state->admission.release("completed");
     }
+    if (state->governor_charge_bytes != 0) {
+        working_set_governor_t::instance().charge(
+            working_set_metrics::subsystem_t::worker_snapshots,
+            -static_cast<std::int64_t>(state->governor_charge_bytes));
+        state->governor_charge_bytes = 0;
+    }
+    if (state->run_snapshot_pin) {
+        generation_snapshot_store_t::instance().unpin(state->run_snapshot_pin);
+        state->run_snapshot_pin.reset();
+    }
     state->run_active = false;
     state->run_starting = false;
     state->run_finishing = false;
@@ -1083,62 +1395,8 @@ void process_item_core(const std::shared_ptr<decompile_batch_orchestrator_t::sta
         metrics_add(state->metrics, analysis_metric_t::decompile_batch_cancelled, 1);
         return;
     }
-    const auto architecture = publication->snapshot->normalized_image->architecture;
-    const std::uint64_t size_aware_ms = decompile_batch_orchestrator_t::compute_size_aware_deadline(
-        item.byte_size, architecture, decompile_deadline_lane_t::batch);
-    if (size_aware_ms > k_deadline_scaled_log_threshold_ms) {
-        diag::log_tagged_fmt("dec_batch",
-            "deadline_scaled function_rva=0x%llx byte_size=%llu est_insns=%llu deadline_ms=%llu",
-            static_cast<unsigned long long>(item.entry_rva),
-            static_cast<unsigned long long>(item.byte_size),
-            static_cast<unsigned long long>(estimate_instructions(item.byte_size, architecture)),
-            static_cast<unsigned long long>(size_aware_ms));
-    }
-    const auto policy = default_decompiler_profile_policy();
-    const decompiler_profile_id_t lane_profile = item.lane == 1
-        ? decompiler_profile_id_t::thorough
-        : item.lane == 2
-            ? decompiler_profile_id_t::balanced
-            : decompiler_profile_id_t::fast;
-    const decompiler_profile_budget_t* request_defaults =
-        lane_profile == decompiler_profile_id_t::thorough
-            ? &policy.thorough
-            : lane_profile == decompiler_profile_id_t::balanced ? &policy.balanced : &policy.fast;
-    decompiler_profile_id_t request_profile = lane_profile;
-    const std::uint64_t memory_floor_bytes = state->run_snapshot_bytes != 0
-        ? state->run_snapshot_bytes + k_batch_job_memory_headroom_bytes : 0;
-    if (memory_floor_bytes != 0 && request_defaults->max_memory_bytes < memory_floor_bytes) {
-        if (policy.balanced.max_memory_bytes >= memory_floor_bytes &&
-            policy.balanced.max_memory_bytes > request_defaults->max_memory_bytes) {
-            request_profile = decompiler_profile_id_t::balanced;
-            request_defaults = &policy.balanced;
-        }
-        if (request_defaults->max_memory_bytes < memory_floor_bytes &&
-            policy.thorough.max_memory_bytes > request_defaults->max_memory_bytes) {
-            request_profile = decompiler_profile_id_t::thorough;
-            request_defaults = &policy.thorough;
-        }
-    }
-    const std::uint64_t deadline_ms = (std::min)(
-        (std::max<std::uint64_t>)((std::min)(request_defaults->max_wall_clock_ms, size_aware_ms),
-            k_batch_deadline_floor_ms),
-        request_defaults->max_wall_clock_ms);
-    auto budget = *request_defaults;
-    budget.max_wall_clock_ms = deadline_ms;
-    budget.max_cpu_ms = (std::min)(request_defaults->max_cpu_ms,
-        (std::max<std::uint64_t>)(1000, deadline_ms / 2));
-    if (memory_floor_bytes != 0) {
-        budget.max_memory_bytes = (std::min)(
-            (std::max<std::uint64_t>)((std::max)(request_defaults->max_memory_bytes,
-                memory_floor_bytes), 1ULL << 20),
-            policy.thorough.max_memory_bytes);
-    }
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(deadline_ms);
-    auto built = make_native_pipeline_request(*workspace, publication, function,
-        decompiler_pipeline_invocation_t::background_batch,
-        decompiler_pipeline_cache_mode_t::read_write,
-        request_profile, budget, deadline, state->provider_context, cancel);
+    auto built = build_batch_pipeline_request(state, *workspace, publication, function,
+        item, cancel);
     if (!built) {
         std::lock_guard lock(state->mutex);
         ++state->failed;
@@ -1311,11 +1569,14 @@ decompile_batch_orchestrator_t::create(
     state->workspace = workspace;
     state->metrics = std::move(metrics);
     state->memory_budget_bytes = resolve_memory_budget_bytes();
+    state->reserve_os_bytes = host_memory_envelope().reserve_os_bytes;
     diag::log_tagged_fmt("dec_batch",
-        "memory_budget_resolved budget=%llu source=physical_ram_quarter floor=%llu cap=%llu",
+        "memory_budget_resolved budget=%llu source=usable_half floor=%llu cap=%llu reserve_os=%llu usable=%llu",
         static_cast<unsigned long long>(state->memory_budget_bytes),
         static_cast<unsigned long long>(k_memory_budget_floor_bytes),
-        static_cast<unsigned long long>(k_memory_budget_cap_bytes));
+        static_cast<unsigned long long>(k_memory_budget_cap_bytes),
+        static_cast<unsigned long long>(state->reserve_os_bytes),
+        static_cast<unsigned long long>(host_memory_envelope().usable_bytes));
     auto orchestrator = std::shared_ptr<decompile_batch_orchestrator_t>(
         new decompile_batch_orchestrator_t(std::move(state)));
     auto attach_failure = [&orchestrator](workspace_error_t error) {
@@ -1541,7 +1802,8 @@ workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>
 decompile_batch_orchestrator_t::capture_generation_provider_context(
     const std::shared_ptr<analysis_workspace_t>& workspace,
     const std::shared_ptr<const analysis_publication_t>& publication,
-    const cancellation_token_t& cancel) try
+    const cancellation_token_t& cancel,
+    std::shared_ptr<const generation_snapshot_store_t::entry_t>* snapshot_pin_out) try
 {
     using result_t = workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>;
     if (!workspace || !publication || !publication->snapshot ||
@@ -1570,15 +1832,16 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
     if (!load_image)
         return result_t::failure(load_image.error());
     const auto thorough = default_decompiler_profile_policy().thorough;
+    const std::uint64_t profile_snapshot_cap = thorough.max_memory_bytes != 0
+        ? thorough.max_memory_bytes * 3 / 4 : k_batch_snapshot_absolute_cap;
     const std::uint64_t snapshot_limit = (std::min<std::uint64_t>)(k_batch_snapshot_absolute_cap,
-        (std::min<std::uint64_t>)(k_worker_snapshot_cap,
-            thorough.max_memory_bytes != 0 ? thorough.max_memory_bytes / 2 : k_batch_snapshot_absolute_cap));
+        (std::min<std::uint64_t>)(k_worker_snapshot_cap, profile_snapshot_cap));
     diag::log_tagged_fmt("dec_batch",
         "budget_decision type=snapshot_cap absolute_cap=%llu worker_cap=%llu profile_half_bytes=%llu effective_limit=%llu",
         static_cast<unsigned long long>(k_batch_snapshot_absolute_cap),
         static_cast<unsigned long long>(k_worker_snapshot_cap),
         static_cast<unsigned long long>(
-            thorough.max_memory_bytes != 0 ? thorough.max_memory_bytes / 2 : 0),
+            thorough.max_memory_bytes != 0 ? thorough.max_memory_bytes * 3 / 4 : 0),
         static_cast<unsigned long long>(snapshot_limit));
     const auto analysis_snapshot = publication->snapshot;
     std::vector<std::uint64_t> import_rvas;
@@ -1725,44 +1988,140 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
         }
         requested_bytes += size;
     }
-    native_worker::native_provider_snapshot_t snapshot;
-    snapshot.image_base = image->image_base;
-    snapshot.image_size = image->image_size;
-    snapshot.ranges.reserve(merged.size());
+    struct capture_shard_t {
+        std::uint64_t relative_virtual_address = 0;
+        std::uint64_t size = 0;
+        std::uint64_t staging_offset = 0;
+    };
+    std::vector<capture_shard_t> shards;
+    std::vector<std::uint64_t> range_staging_offsets;
+    std::uint64_t staging_total = 0;
     for (const auto& range : merged) {
-        if (cancel.stop_requested()) {
-            return result_t::failure(make_workspace_error(
-                cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
-                                           : workspace_error_code_t::cancelled,
-                "batch decompile provider capture was cancelled", "decompile_batch.capture"));
-        }
-        native_worker::native_provider_snapshot_range_t captured;
-        captured.relative_virtual_address = range.first;
-        captured.bytes.reserve(static_cast<std::size_t>(range.second - range.first));
+        range_staging_offsets.push_back(staging_total);
         for (std::uint64_t cursor = range.first; cursor < range.second;) {
-            if (cancel.stop_requested()) {
-                return result_t::failure(make_workspace_error(
-                    cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
-                                               : workspace_error_code_t::cancelled,
-                    "batch decompile provider capture was cancelled", "decompile_batch.capture"));
-            }
-            const std::uint64_t amount = (std::min)(k_snapshot_read_quantum, range.second - cursor);
-            const address_t start{address_space_id_t::relative_virtual, cursor,
-                image->architecture, image->architecture_mode};
-            auto read = load_image.value()->read(start, amount, cancel);
-            if (!read)
-                return result_t::failure(read.error());
-            if (read.value().bytes.size() != amount) {
-                return result_t::failure(make_workspace_error(workspace_error_code_t::integrity_failure,
-                    "batch decompile generation snapshot is truncated",
-                    "decompile_batch.capture"));
-            }
-            captured.bytes.insert(captured.bytes.end(),
-                read.value().bytes.begin(), read.value().bytes.end());
+            const std::uint64_t amount = (std::min)(k_snapshot_capture_shard_bytes,
+                range.second - cursor);
+            shards.push_back(capture_shard_t{cursor, amount, staging_total});
+            staging_total += amount;
             cursor += amount;
         }
-        snapshot.ranges.push_back(std::move(captured));
     }
+    std::vector<std::uint8_t> staging;
+    try {
+        staging.resize(static_cast<std::size_t>(staging_total));
+    } catch (const std::bad_alloc&) {
+        return result_t::failure(make_workspace_error(workspace_error_code_t::limit_exceeded,
+            "batch decompile generation snapshot staging allocation failed",
+            "decompile_batch.capture"));
+    }
+    struct capture_error_state_t {
+        std::mutex mutex;
+        std::optional<workspace_error_t> first_error;
+    };
+    auto error_state = std::make_shared<capture_error_state_t>();
+    std::atomic<std::uint64_t> shard_cursor{0};
+    const auto note_capture_cancelled = [&error_state, &cancel] {
+        std::lock_guard lock(error_state->mutex);
+        if (!error_state->first_error)
+            error_state->first_error = make_workspace_error(
+                cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
+                                           : workspace_error_code_t::cancelled,
+                "batch decompile provider capture was cancelled", "decompile_batch.capture");
+    };
+    auto capture_body = [&]() {
+        while (true) {
+            if (cancel.stop_requested()) {
+                note_capture_cancelled();
+                return;
+            }
+            {
+                std::lock_guard lock(error_state->mutex);
+                if (error_state->first_error)
+                    return;
+            }
+            const std::uint64_t index = shard_cursor.fetch_add(1, std::memory_order_acq_rel);
+            if (index >= shards.size())
+                return;
+            const auto& shard = shards[static_cast<std::size_t>(index)];
+            std::uint64_t consumed = 0;
+            while (consumed < shard.size) {
+                if (cancel.stop_requested()) {
+                    note_capture_cancelled();
+                    return;
+                }
+                const std::uint64_t amount = (std::min)(k_snapshot_read_quantum,
+                    shard.size - consumed);
+                const address_t start{address_space_id_t::relative_virtual,
+                    shard.relative_virtual_address + consumed, image->architecture,
+                    image->architecture_mode};
+                auto read = load_image.value()->read(start, amount, cancel);
+                if (!read) {
+                    std::lock_guard lock(error_state->mutex);
+                    if (!error_state->first_error)
+                        error_state->first_error = read.error();
+                    return;
+                }
+                if (read.value().bytes.size() != amount) {
+                    std::lock_guard lock(error_state->mutex);
+                    if (!error_state->first_error)
+                        error_state->first_error = make_workspace_error(
+                            workspace_error_code_t::integrity_failure,
+                            "batch decompile generation snapshot is truncated",
+                            "decompile_batch.capture");
+                    return;
+                }
+                std::memcpy(staging.data() + shard.staging_offset + consumed,
+                    read.value().bytes.data(), static_cast<std::size_t>(amount));
+                consumed += amount;
+            }
+        }
+    };
+    const std::size_t task_count = (std::min)({k_snapshot_capture_max_tasks,
+        (std::max<std::size_t>)(2, static_cast<std::size_t>(
+            aida::infra::taskflow_runtime::analysis_compute_capacity()) / 2),
+        shards.size()});
+    std::vector<aida::infra::taskflow_runtime::job_handle_t> capture_jobs;
+    capture_jobs.reserve(task_count);
+    std::size_t submitted = 0;
+    for (std::size_t index = 0; index < task_count; ++index) {
+        aida::infra::taskflow_runtime::task_descriptor_t desc;
+        desc.owner_subsystem = "decompiler";
+        desc.label = "decompile.snapshot_capture";
+        desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+        desc.priority = 3;
+        desc.shutdown_policy = "cancel_pending";
+        desc.cancel_hook = [&error_state] {
+            try {
+                std::lock_guard lock(error_state->mutex);
+                if (!error_state->first_error)
+                    error_state->first_error = make_workspace_error(
+                        workspace_error_code_t::cancelled,
+                        "batch decompile provider capture was cancelled", "decompile_batch.capture");
+            } catch (...) {
+            }
+        };
+        desc.cancellable_body = [&capture_body](const aida::infra::taskflow_runtime::cancellation_token_t&) {
+            capture_body();
+        };
+        auto submitted_result = aida::infra::taskflow_runtime::submit(std::move(desc));
+        if (!submitted_result.submitted || !submitted_result.handle.valid()) {
+            diag::log_tagged_fmt("dec_batch", "snapshot_capture_task_rejected index=%zu", index);
+            continue;
+        }
+        capture_jobs.push_back(submitted_result.handle);
+        ++submitted;
+    }
+    if (submitted == 0) {
+        capture_body();
+    } else {
+        for (auto& handle : capture_jobs) {
+            const auto waited = aida::infra::taskflow_runtime::wait_for(handle, 0xFFFFFFFFu);
+            if (!waited.completed)
+                (void)aida::infra::taskflow_runtime::cancel(handle);
+        }
+    }
+    if (error_state->first_error)
+        return result_t::failure(std::move(*error_state->first_error));
     namespace sidecar_ns = native_worker::snapshot_sidecar;
     sidecar_ns::sidecar_t sidecar;
     sidecar.is_64bit = image->address_width_bits >= 64;
@@ -1955,22 +2314,28 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
             }
             return false;
         };
-        const auto read_captured = [&snapshot](std::uint64_t rva, std::uint64_t size,
-                                                std::uint64_t& value) {
-            for (const auto& range : snapshot.ranges) {
-                if (rva < range.relative_virtual_address ||
-                    rva - range.relative_virtual_address >= range.bytes.size())
-                    continue;
-                const std::uint64_t offset = rva - range.relative_virtual_address;
-                if (size > range.bytes.size() - offset)
-                    continue;
-                std::uint64_t parsed = 0;
-                std::memcpy(&parsed, range.bytes.data() + offset,
-                    static_cast<std::size_t>(size));
-                value = parsed;
-                return true;
-            }
-            return false;
+        const auto read_captured = [&merged, &range_staging_offsets, &staging](
+            std::uint64_t rva, std::uint64_t size, std::uint64_t& value) {
+            const auto found = std::upper_bound(merged.begin(), merged.end(), rva,
+                [](std::uint64_t target, const std::pair<std::uint64_t, std::uint64_t>& range) {
+                    return target < range.first;
+                });
+            if (found == merged.begin())
+                return false;
+            const auto previous = found - 1;
+            const std::size_t range_index = static_cast<std::size_t>(previous - merged.begin());
+            if (rva < previous->first || rva >= previous->second ||
+                size > previous->second - rva)
+                return false;
+            const std::uint64_t staging_offset =
+                range_staging_offsets[range_index] + (rva - previous->first);
+            if (staging_offset > staging.size() || size > staging.size() - staging_offset)
+                return false;
+            std::uint64_t parsed = 0;
+            std::memcpy(&parsed, staging.data() + staging_offset,
+                static_cast<std::size_t>(size));
+            value = parsed;
+            return true;
         };
         for (const auto& candidate : analysis_snapshot->rich_facts.data_candidates) {
             if (sidecar.global_scalars.size() >= sidecar_ns::k_max_global_scalar_records)
@@ -2226,6 +2591,36 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
             sidecar_charge(charge);
             sidecar.prototypes.push_back(std::move(out));
         }
+        {
+            std::set<std::pair<std::uint64_t, std::uint64_t>> occupied_slots;
+            for (const auto& record : sidecar.vtables)
+                occupied_slots.emplace(record.vtable_rva, record.slot_index);
+            for (const auto& record : recognition->vtable_slots) {
+                if (sidecar.vtables.size() >= sidecar_ns::k_max_vtable_records)
+                    break;
+                if (record.vtable_rva == 0 || record.vtable_rva >= image->image_size)
+                    continue;
+                std::string method_name = record.method_name;
+                if (method_name.empty() && !record.class_name.empty())
+                    method_name = record.class_name + "::method_" + std::to_string(record.slot_index);
+                if (method_name.empty())
+                    continue;
+                if (method_name.size() > sidecar_ns::k_max_name_bytes)
+                    method_name.resize(sidecar_ns::k_max_name_bytes);
+                if (!occupied_slots.emplace(record.vtable_rva, record.slot_index).second)
+                    continue;
+                const std::uint64_t charge = 24 + method_name.size();
+                if (charge > sidecar_budget_remaining())
+                    break;
+                sidecar_ns::vtable_record_t out;
+                out.vtable_rva = record.vtable_rva;
+                out.slot_index = record.slot_index;
+                out.method_name = std::move(method_name);
+                out.confidence = record.confidence;
+                sidecar_charge(charge);
+                sidecar.vtables.push_back(std::move(out));
+            }
+        }
     }
     const auto sidecar_bytes = sidecar_ns::encode(sidecar);
     if (sidecar_bytes.empty()) {
@@ -2241,16 +2636,92 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
             "batch decompile generation snapshot exceeds its absolute memory bound",
             "decompile_batch.capture"));
     }
-    const auto serialized = native_worker::serialize_native_provider_snapshot_v3(
-        snapshot, sidecar_bytes);
-    if (serialized.empty()) {
+    const std::uint64_t total = 40 + static_cast<std::uint64_t>(merged.size()) * 16 +
+        staging_total + static_cast<std::uint64_t>(sidecar_bytes.size());
+    if (total == 0 || total > native_worker::k_native_provider_snapshot_max_bytes ||
+        merged.empty() || merged.size() > 65536) {
+        return result_t::failure(make_workspace_error(workspace_error_code_t::limit_exceeded,
+            "batch decompile generation snapshot serialization failed",
+            "decompile_batch.capture"));
+    }
+    std::string serialized;
+    try {
+        serialized.reserve(static_cast<std::size_t>(total));
+    } catch (...) {
+        return result_t::failure(make_workspace_error(workspace_error_code_t::limit_exceeded,
+            "batch decompile generation snapshot serialization failed",
+            "decompile_batch.capture"));
+    }
+    native_worker::native_worker_detail::le_u32(serialized,
+        native_worker::k_native_provider_snapshot_v3_magic);
+    native_worker::native_worker_detail::le_u32(serialized,
+        native_worker::k_native_provider_snapshot_v3_version);
+    native_worker::native_worker_detail::le_u64(serialized, image->image_base);
+    native_worker::native_worker_detail::le_u64(serialized, image->image_size);
+    native_worker::native_worker_detail::le_u32(serialized,
+        static_cast<std::uint32_t>(merged.size()));
+    native_worker::native_worker_detail::le_u32(serialized,
+        static_cast<std::uint32_t>(sidecar_bytes.size()));
+    native_worker::native_worker_detail::le_u64(serialized, 0);
+    for (const auto& range : merged) {
+        native_worker::native_worker_detail::le_u64(serialized, range.first);
+        native_worker::native_worker_detail::le_u64(serialized, range.second - range.first);
+    }
+    const std::size_t payload_base = serialized.size();
+    serialized.resize(static_cast<std::size_t>(total - sidecar_bytes.size()));
+    const std::size_t copy_tasks = (std::min<std::size_t>)(4, task_count);
+    std::vector<aida::infra::taskflow_runtime::job_handle_t> copy_jobs;
+    copy_jobs.reserve(copy_tasks);
+    std::uint64_t submitted_mask = 0;
+    for (std::size_t chunk = 0; chunk < copy_tasks; ++chunk) {
+        const std::uint64_t chunk_begin = staging_total * chunk / copy_tasks;
+        const std::uint64_t chunk_end = staging_total * (chunk + 1) / copy_tasks;
+        if (chunk_end <= chunk_begin)
+            continue;
+        aida::infra::taskflow_runtime::task_descriptor_t desc;
+        desc.owner_subsystem = "decompiler";
+        desc.label = "decompile.snapshot_assemble";
+        desc.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+        desc.priority = 3;
+        desc.shutdown_policy = "cancel_pending";
+        desc.body = [&serialized, &staging, payload_base, chunk_begin, chunk_end] {
+            std::memcpy(reinterpret_cast<std::uint8_t*>(serialized.data()) + payload_base +
+                chunk_begin, staging.data() + chunk_begin,
+                static_cast<std::size_t>(chunk_end - chunk_begin));
+        };
+        auto submitted_result = aida::infra::taskflow_runtime::submit(std::move(desc));
+        if (!submitted_result.submitted || !submitted_result.handle.valid()) {
+            diag::log_tagged_fmt("dec_batch", "snapshot_assemble_task_rejected index=%zu", chunk);
+            continue;
+        }
+        copy_jobs.push_back(submitted_result.handle);
+        submitted_mask |= 1ULL << chunk;
+    }
+    for (auto& handle : copy_jobs) {
+        const auto waited = aida::infra::taskflow_runtime::wait_for(handle, 0xFFFFFFFFu);
+        if (!waited.completed)
+            (void)aida::infra::taskflow_runtime::cancel(handle);
+    }
+    for (std::size_t chunk = 0; chunk < copy_tasks; ++chunk) {
+        if ((submitted_mask & (1ULL << chunk)) != 0)
+            continue;
+        const std::uint64_t chunk_begin = staging_total * chunk / copy_tasks;
+        const std::uint64_t chunk_end = staging_total * (chunk + 1) / copy_tasks;
+        if (chunk_end <= chunk_begin)
+            continue;
+        std::memcpy(reinterpret_cast<std::uint8_t*>(serialized.data()) + payload_base +
+            chunk_begin, staging.data() + chunk_begin,
+            static_cast<std::size_t>(chunk_end - chunk_begin));
+    }
+    serialized.append(sidecar_bytes.data(), sidecar_bytes.size());
+    if (serialized.size() != total) {
         return result_t::failure(make_workspace_error(workspace_error_code_t::limit_exceeded,
             "batch decompile generation snapshot serialization failed",
             "decompile_batch.capture"));
     }
     diag::log_tagged_fmt("dec_batch",
         "snapshot_serialized version=3 snapshot_bytes=%llu ranges=%zu sidecar_bytes=%llu sidecar_names=%zu sidecar_imports=%zu sidecar_prototypes=%zu sidecar_noreturn=%zu sidecar_strings=%zu sidecar_scalars=%zu sidecar_members=%zu sidecar_vtables=%zu sidecar_comments=%zu",
-        static_cast<unsigned long long>(serialized.size()), snapshot.ranges.size(),
+        static_cast<unsigned long long>(serialized.size()), merged.size(),
         static_cast<unsigned long long>(sidecar_bytes.size()),
         sidecar.names.size(), sidecar.imports.size(), sidecar.prototypes.size(),
         sidecar.noreturn.size(), sidecar.strings.size(), sidecar.global_scalars.size(),
@@ -2259,8 +2730,13 @@ decompile_batch_orchestrator_t::capture_generation_provider_context(
     auto shared_snapshot = std::make_shared<const std::vector<std::uint8_t>>(
         std::move(serialized_bytes));
     const auto snapshot_hash = stable_serialization_hash(serialized);
-    const auto published = generation_snapshot_store_t::instance().publish(
-        publication->generation, snapshot_hash, shared_snapshot);
+    const auto published = snapshot_pin_out
+        ? generation_snapshot_store_t::instance().publish_pinned(
+            publication->generation, snapshot_hash, shared_snapshot)
+        : generation_snapshot_store_t::instance().publish(
+            publication->generation, snapshot_hash, shared_snapshot);
+    if (snapshot_pin_out && published)
+        *snapshot_pin_out = published;
     diag::log_tagged_fmt("dec_batch",
         "generation_snapshot_store_publish generation=%llu snapshot_bytes=%llu published=%d",
         static_cast<unsigned long long>(publication->generation),

@@ -161,7 +161,7 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/decode_frontier.cpp"
     "${STANDALONE_ROOT}/core/analysis/decode_worker_pool.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompile_batch_orchestrator.cpp"
-    "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_cache_v9.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_cache.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_contracts.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_provider_registry.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_service.cpp"
@@ -175,11 +175,11 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/decompiler/providers/ghidra_ir_adapter.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/providers/jvm_ssa.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_readability.cpp"
-    "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer_v2.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/semantic_refiner.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/triton_z3_adapter.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/type_graph_builder.cpp"
-    "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast_v2.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast.cpp"
     "${STANDALONE_ROOT}/core/analysis/image_layout_index.cpp"
     "${STANDALONE_ROOT}/core/analysis/incremental_reanalysis.cpp"
     "${STANDALONE_ROOT}/core/analysis/live_request_budget.cpp"
@@ -428,8 +428,8 @@ set(AIDA_C03_COMPILER_MATRIX_CM_08
     "${STANDALONE_ROOT}/core/analysis/decompiler/type_graph_builder.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/semantic_refiner.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/triton_z3_adapter.cpp"
-    "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast_v2.cpp"
-    "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer_v2.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_readability.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/managed_entity_binding.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/metadata_provenance.cpp"
@@ -438,7 +438,7 @@ set(AIDA_C03_COMPILER_MATRIX_CM_08
     "${STANDALONE_ROOT}/core/analysis/workspace/type_recovery.cpp")
 set(AIDA_C03_COMPILER_MATRIX_CM_09
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompile_batch_orchestrator.cpp"
-    "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_cache_v9.cpp"
+    "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_cache.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_provider_registry.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_service.cpp"
     "${STANDALONE_ROOT}/core/analysis/decompiler/decompiler_ui_integration.cpp"
@@ -710,7 +710,8 @@ function(aida_c03_configure_native_target target)
         "${OPENSSL_INCLUDE_DIR}"
         "${Z3_INCLUDE_DIRS}"
     )
-    target_include_directories(${target} SYSTEM PRIVATE "${DEPS_DIR}/taskflow")
+    target_include_directories(${target} SYSTEM PRIVATE "${DEPS_DIR}/taskflow"
+        "${parallel_hashmap_SOURCE_DIR}" "${concurrentqueue_SOURCE_DIR}")
     target_compile_definitions(${target} PRIVATE
         __NT__ _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE AIDA_STANDALONE
         LZMA_API_STATIC
@@ -987,8 +988,8 @@ function(aida_c03_register_worker_targets application_target)
         "${STANDALONE_ROOT}/core/analysis/decompiler/providers/ghidra_ir_adapter.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/providers/jvm_ssa.cpp"
         "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_readability.cpp"
-        "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer_v2.cpp"
-        "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast_v2.cpp"
+        "${STANDALONE_ROOT}/core/analysis/decompiler/pseudocode_renderer.cpp"
+        "${STANDALONE_ROOT}/core/analysis/decompiler/typed_ast.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_pretty_xml_encode.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_function_db.cpp"
         "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_load_image.cpp"
@@ -1640,6 +1641,11 @@ function(aida_c03_register_safe_headless_targets application_target)
         SOURCES
             "${AIDA_C03_TEST_ROOT}/flirt_db_builder_main.cpp"
             "${STANDALONE_ROOT}/core/analysis/flirt/flirt_db_builder.cpp")
+    file(READ "${STANDALONE_ROOT}/core/analysis/flirt/flirt_signature_db_seed.hpp" _aida_flirt_seed_header)
+    string(REGEX MATCH "k_afdb_seed_entry_count = ([0-9]+)u" _aida_flirt_seed_match "${_aida_flirt_seed_header}")
+    if(NOT _aida_flirt_seed_match OR CMAKE_MATCH_1 EQUAL 0)
+        message(WARNING "AiDA FLIRT embedded seed database is unpopulated (k_afdb_seed_entry_count=0); CRT/library recognition and batch decompile library exclusion are disabled. Regenerate via the aida_c03_srec_flirt_db_builder tool (plans/PLAN_A_flirt_libcode.md section 6.10).")
+    endif()
 
     get_property(_aida_manifest_targets GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGETS)
     get_property(_aida_manifest_records GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGET_RECORDS)
@@ -2008,6 +2014,36 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
             "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         ARGUMENTS "synthetic" "256" "0xA1DA0004"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_real_harness PACKAGE A06 TIMEOUT 1800
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "real" "${AIDA_BENCHMARK_REAL_PE}"
+        LINK_LIBRARIES bcrypt)
+    if(NOT AIDA_BENCHMARK_REAL_PE)
+        set_tests_properties(aida_c03_benchmark_real_harness PROPERTIES DISABLED TRUE)
+    endif()
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_synthetic_320mb_harness PACKAGE A06 TIMEOUT 3000
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "synthetic" "320" "0xA1DA0007"
+        LINK_LIBRARIES bcrypt)
+    aida_c03_register_direct_test(
+        TARGET aida_c03_benchmark_synthetic_320mb_compare_harness PACKAGE A06 TIMEOUT 3000
+        SOURCES
+            "${AIDA_C03_WORKSPACE_TEST_ROOT}/analysis_benchmark_harness.cpp"
+            "${AIDA_C03_TEST_ROOT}/benchmark_sla_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/decompiler_quality_schema.cpp"
+            "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
+        ARGUMENTS "synthetic_compare" "320" "0xA1DA0008" "${AIDA_C03_WORKSPACE_TEST_ROOT}/baselines/synthetic_320mb_baseline.json"
         LINK_LIBRARIES bcrypt)
     aida_c03_register_direct_test(
         TARGET aida_c03_benchmark_synthetic_compare_harness PACKAGE A06 TIMEOUT 1200

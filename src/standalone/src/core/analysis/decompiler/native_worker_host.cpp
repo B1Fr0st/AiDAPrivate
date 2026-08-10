@@ -8,6 +8,7 @@
 #include "providers/ghidra_ir_adapter.hpp"
 #include "providers/jvm_ssa.hpp"
 #include "../workspace/workspace_identity.hpp"
+#include "../../infra/executor.hpp"
 #include "../../../helpers/diag_log.hpp"
 
 #include "../../../../workers/native_decompiler/native_worker_protocol.hpp"
@@ -1132,6 +1133,13 @@ public:
                 error = ERROR_INVALID_SID;
             return false;
         }
+        try {
+            sid_string_ = sid_string;
+        } catch (...) {
+            LocalFree(sid_string);
+            error = ERROR_NOT_ENOUGH_MEMORY;
+            return false;
+        }
         PWSTR profile_path = nullptr;
         status = GetAppContainerFolderPath(sid_string, &profile_path);
         LocalFree(sid_string);
@@ -1151,9 +1159,11 @@ public:
     }
 
     PSID sid() const noexcept { return sid_; }
+    const std::wstring& sid_string() const noexcept { return sid_string_; }
 
 private:
     PSID sid_ = nullptr;
+    std::wstring sid_string_;
 };
 
 constexpr ACCESS_MASK k_app_container_runtime_read_execute =
@@ -1169,6 +1179,12 @@ std::mutex& app_container_runtime_acl_mutex()
 {
     static std::mutex mutex;
     return mutex;
+}
+
+std::unordered_set<std::wstring>& app_container_acl_completed()
+{
+    static std::unordered_set<std::wstring> completed;
+    return completed;
 }
 
 bool app_container_runtime_acl_satisfied(PACL acl, PSID app_container_sid,
@@ -1459,6 +1475,34 @@ bool ensure_app_container_runtime_access(const native_worker_verified_package_t&
     return true;
 }
 
+bool ensure_app_container_runtime_access_cached(
+    const native_worker_verified_package_t& verified, app_container_t& container, DWORD& error)
+{
+    bool known = false;
+    {
+        std::lock_guard lock(app_container_runtime_acl_mutex());
+        known = app_container_acl_completed().count(container.sid_string()) != 0;
+    }
+    if (known) {
+        bool satisfied = false;
+        if (query_app_container_runtime_acl(verified.worker_file.get(), container.sid(),
+                k_app_container_runtime_read_execute, satisfied, error) && satisfied)
+            return true;
+        {
+            std::lock_guard lock(app_container_runtime_acl_mutex());
+            app_container_acl_completed().erase(container.sid_string());
+        }
+    }
+    if (!ensure_app_container_runtime_access(verified, container.sid(), error))
+        return false;
+    {
+        std::lock_guard lock(app_container_runtime_acl_mutex());
+        app_container_acl_completed().insert(container.sid_string());
+    }
+    error = ERROR_SUCCESS;
+    return true;
+}
+
 class restricted_pipe_security_t final {
 public:
     bool create(PSID app_container_sid, DWORD& error)
@@ -1724,7 +1768,7 @@ bool launch_worker(const native_worker_verified_package_t& verified,
         append_diagnostic(result, native_worker_diagnostic_code_t::app_container_unavailable, "native_worker.app_container", "networkless AppContainer could not be established", error);
         return false;
     }
-    if (!ensure_app_container_runtime_access(verified, container.sid(), error)) {
+    if (!ensure_app_container_runtime_access_cached(verified, container, error)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected,
             "native_worker.runtime_acl",
             "verified worker runtime could not be restricted to manifest-bound AppContainer read and execute access",
@@ -2090,6 +2134,9 @@ terminal_wait_t wait_for_message(worker_instance_t& worker, const native_worker_
 {
     worker.wait_observation = {};
     worker.wait_observation.native_protocol = worker.native_protocol;
+    DWORD backoff_ms = 1;
+    const DWORD backoff_cap = static_cast<DWORD>((std::max)(std::int64_t{1},
+        (std::min)(limits.poll_interval.count(), static_cast<std::int64_t>(2))));
     while (true) {
         if (std::chrono::steady_clock::now() >= deadline)
             return terminal_wait_t::deadline;
@@ -2138,7 +2185,12 @@ terminal_wait_t wait_for_message(worker_instance_t& worker, const native_worker_
             error = worker.wait_observation.process_error;
             return terminal_wait_t::protocol_failure;
         }
-        Sleep(static_cast<DWORD>((std::max)(std::int64_t{1}, limits.poll_interval.count())));
+        const bool progressing = worker.reader.has_partial_frame();
+        Sleep(progressing ? 1 : backoff_ms);
+        if (!progressing)
+            backoff_ms = (std::min<DWORD>)(backoff_cap, backoff_ms * 2);
+        else
+            backoff_ms = 1;
     }
 }
 
@@ -3011,6 +3063,54 @@ native_worker_host_t::~native_worker_host_t()
     stop();
 }
 
+bool native_worker_host_t::verify_snapshot_hash(
+    const std::shared_ptr<const std::vector<std::uint8_t>>& bytes,
+    const sha256_digest_t& expected, sha256_digest_t& out)
+{
+    {
+        std::lock_guard lock(snapshot_verify_mutex_);
+        if (snapshot_verify_ptr_ == bytes->data() && snapshot_verify_size_ == bytes->size() &&
+            !snapshot_verify_hash_.empty() && snapshot_verify_hash_ == expected) {
+            out = snapshot_verify_hash_;
+            return true;
+        }
+    }
+    sha256_digest_t computed;
+    if (!wire::sha256(bytes->data(), bytes->size(), computed) || computed != expected)
+        return false;
+    {
+        std::lock_guard lock(snapshot_verify_mutex_);
+        snapshot_verify_ptr_ = bytes->data();
+        snapshot_verify_size_ = bytes->size();
+        snapshot_verify_hash_ = computed;
+    }
+    out = computed;
+    return true;
+}
+
+bool native_worker_host_t::prime_appcontainer_acl() noexcept
+{
+    try {
+        const auto verified = verified_package_;
+        if (!verified)
+            return false;
+        app_container_t container;
+        DWORD error = ERROR_SUCCESS;
+        if (!container.create(verified->manifest_hash, error)) {
+            diag::log_tagged_fmt("dec_batch", "pool_acl_warmup result=%d gle=%lu",
+                0, static_cast<unsigned long>(error));
+            return false;
+        }
+        const bool granted = ensure_app_container_runtime_access_cached(
+            *verified, container, error);
+        diag::log_tagged_fmt("dec_batch", "pool_acl_warmup result=%d gle=%lu",
+            granted ? 1 : 0, static_cast<unsigned long>(error));
+        return granted;
+    } catch (...) {
+        return false;
+    }
+}
+
 native_worker_execution_result_t native_worker_host_t::execute(const native_worker_execution_request_t& input)
 {
     native_worker_execution_result_t result;
@@ -3072,7 +3172,7 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
                (external_cancel && external_cancel());
     };
     sha256_digest_t verified_snapshot_hash;
-    if (!wire::sha256(request.snapshot.bytes->data(), request.snapshot.bytes->size(), verified_snapshot_hash) || verified_snapshot_hash != request.snapshot.hash) {
+    if (!verify_snapshot_hash(request.snapshot.bytes, request.snapshot.hash, verified_snapshot_hash)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::snapshot_invalid, "native_worker.snapshot", "snapshot hash is invalid", ERROR_CRC);
         return result;
     }
@@ -3927,7 +4027,7 @@ bool native_worker_host_t::session_launch(const native_worker_execution_request_
                (external_cancel && external_cancel());
     };
     sha256_digest_t verified_snapshot_hash;
-    if (!wire::sha256(request.snapshot.bytes->data(), request.snapshot.bytes->size(), verified_snapshot_hash) || verified_snapshot_hash != request.snapshot.hash) {
+    if (!verify_snapshot_hash(request.snapshot.bytes, request.snapshot.hash, verified_snapshot_hash)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::snapshot_invalid, "native_worker.snapshot", "snapshot hash is invalid", ERROR_CRC);
         release_slot();
         return false;
@@ -4046,13 +4146,15 @@ bool native_worker_host_t::session_launch(const native_worker_execution_request_
     session.slot_released = false;
     slot_held = false;
     diag::log_tagged_fmt("dec_batch",
-        "pool_spawn worker_gen=%llu pid=%lu jobs_bound=%u cpu_backstop_ms=%llu snapshot_shared=%d snapshot_bytes=%llu",
+        "pool_spawn worker_gen=%llu pid=%lu jobs_bound=%u cpu_backstop_ms=%llu snapshot_shared=%d snapshot_bytes=%llu snapshot_size=%llu envelope=%llu",
         static_cast<unsigned long long>(session.worker_generation),
         static_cast<unsigned long>(session.worker.process_id),
         static_cast<unsigned int>(max_jobs_per_session),
         static_cast<unsigned long long>(backstop),
         request.snapshot.shared_mapping_handle != nullptr ? 1 : 0,
-        static_cast<unsigned long long>(request.snapshot.bytes->size()));
+        static_cast<unsigned long long>(request.snapshot.bytes->size()),
+        static_cast<unsigned long long>(request.snapshot.bytes->size()),
+        static_cast<unsigned long long>(session_envelope_max_memory_bytes));
     return true;
 }
 
@@ -4380,6 +4482,7 @@ struct pooled_native_worker_provider_host_t::state_t {
     std::shared_ptr<native_worker_host_t> host;
     native_worker_session_pool_config_t config;
     std::uint64_t session_envelope_max_memory_bytes = 0;
+    std::uint64_t thorough_max_memory_bytes = 0;
     mutable std::mutex mutex;
     std::condition_variable wake;
     std::map<worker_pool_key_t, std::deque<std::shared_ptr<worker_session_record_t>>> idle;
@@ -4435,7 +4538,8 @@ struct pooled_native_worker_provider_host_t::state_t {
                               const cancellation_token_t& cancel,
                               const decompiler_provider_route_t& route,
                               const decompiler_provider_request_t& provider_request,
-                              std::chrono::steady_clock::time_point started)
+                              std::chrono::steady_clock::time_point started,
+                              std::uint64_t session_envelope_max_memory_bytes)
     {
         acquire_outcome_t outcome;
         const auto preempt_started = std::chrono::steady_clock::now();
@@ -4709,10 +4813,11 @@ pooled_native_worker_provider_host_t::pooled_native_worker_provider_host_t(
     if (state_->config.batch_slots == 0)
         state_->config.batch_slots = 1;
     if (state_->config.max_jobs_per_session == 0)
-        state_->config.max_jobs_per_session = 8192;
+        state_->config.max_jobs_per_session = 65536;
     const auto policy = default_decompiler_profile_policy();
     state_->session_envelope_max_memory_bytes = (std::max)({policy.fast.max_memory_bytes,
         policy.balanced.max_memory_bytes, policy.thorough.max_memory_bytes});
+    state_->thorough_max_memory_bytes = policy.thorough.max_memory_bytes;
     diag::log_tagged_fmt("dec_batch",
         "pool_session_envelope memory_bytes=%llu cpu_backstop_ms=%llu",
         static_cast<unsigned long long>(state_->session_envelope_max_memory_bytes),
@@ -4809,8 +4914,16 @@ decompiler_provider_result_t pooled_native_worker_provider_host_t::execute(
         return cancel.stop_requested();
     };
     const auto key = make_worker_pool_key(request, context->snapshot_hash());
+    const std::uint64_t snapshot_size = context->snapshot()->size();
+    const std::uint64_t thorough_half = state_->thorough_max_memory_bytes / 2;
+    std::uint64_t envelope = state_->session_envelope_max_memory_bytes;
+    if (snapshot_size > thorough_half) {
+        const std::uint64_t bumped = state_->session_envelope_max_memory_bytes +
+            (snapshot_size - thorough_half);
+        envelope = (std::min)(bumped, k_decompiler_profile_max_memory_bytes);
+    }
     auto acquired = state_->acquire(key, request.interactive, worker_request, cancel,
-        route, request, started);
+        route, request, started, envelope);
     if (!acquired.record) {
         if (acquired.failure)
             return std::move(*acquired.failure);
@@ -4867,8 +4980,25 @@ std::shared_ptr<decompiler_isolated_provider_host_t> create_pooled_native_worker
         config.interactive_reserved_slots,
         static_cast<unsigned int>(config.max_jobs_per_session),
         static_cast<long long>(config.max_session_lifetime.count()));
-    return std::make_shared<pooled_native_worker_provider_host_t>(
+    std::weak_ptr<native_worker_host_t> warmup_host = session_host;
+    auto pooled = std::make_shared<pooled_native_worker_provider_host_t>(
         runtime.provider_host, std::move(session_host), config);
+    aida::infra::executor::submission_t warmup;
+    warmup.owner_subsystem = "decompiler";
+    warmup.label = "decompile.pool_acl_warmup";
+    warmup.thread_class = "long_running";
+    warmup.domain = aida::infra::executor::domain_t::long_running;
+    warmup.priority = 5;
+    warmup.shutdown_policy = "cancel_pending";
+    warmup.body = [warmup_host] {
+        try {
+            if (auto host = warmup_host.lock())
+                (void)host->prime_appcontainer_acl();
+        } catch (...) {
+        }
+    };
+    (void)aida::infra::executor::submit(std::move(warmup));
+    return pooled;
 }
 
 std::uint64_t native_worker_measured_private_bytes() noexcept

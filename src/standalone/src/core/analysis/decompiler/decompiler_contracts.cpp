@@ -1,5 +1,7 @@
 #include "decompiler_contracts.hpp"
 
+#include "../../crypto/sha256_cng.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -68,6 +70,103 @@ public:
 
 private:
     std::string bytes_;
+};
+
+class measured_writer_t final {
+public:
+    measured_writer_t() : hash_(aida::crypto::sha256_cng_t::create()) {}
+
+    measured_writer_t(const measured_writer_t&) = delete;
+    measured_writer_t& operator=(const measured_writer_t&) = delete;
+
+    void u8(std::uint8_t value)
+    {
+        bytes_.push_back(static_cast<char>(value));
+        pending_.push_back(value);
+        if (pending_.size() >= k_hash_chunk_bytes)
+            flush_pending();
+    }
+
+    void u16(std::uint16_t value)
+    {
+        for (std::size_t index = 0; index < sizeof(value); ++index)
+            u8(static_cast<std::uint8_t>(value >> (index * 8U)));
+    }
+
+    void u32(std::uint32_t value)
+    {
+        for (std::size_t index = 0; index < sizeof(value); ++index)
+            u8(static_cast<std::uint8_t>(value >> (index * 8U)));
+    }
+
+    void u64(std::uint64_t value)
+    {
+        for (std::size_t index = 0; index < sizeof(value); ++index)
+            u8(static_cast<std::uint8_t>(value >> (index * 8U)));
+    }
+
+    void boolean(bool value) { u8(value ? 1U : 0U); }
+
+    void string(const std::string& value)
+    {
+        if (value.size() > k_max_string_bytes)
+            throw std::invalid_argument("contract string exceeds serialization limit");
+        u32(static_cast<std::uint32_t>(value.size()));
+        bytes_.append(value);
+        feed(value.data(), value.size());
+    }
+
+    void digest(const sha256_digest_t& value)
+    {
+        bytes_.append(reinterpret_cast<const char*>(value.bytes.data()), value.bytes.size());
+        feed(reinterpret_cast<const char*>(value.bytes.data()), value.bytes.size());
+    }
+
+    std::string take() { return std::move(bytes_); }
+
+    bool finish_digest(std::array<std::uint8_t, 32>& out) noexcept
+    {
+        flush_pending();
+        if (!hash_ok_ || !hash_.is_valid())
+            return false;
+        return hash_.finish(out);
+    }
+
+private:
+    static constexpr std::size_t k_hash_chunk_bytes = 64U * 1024U;
+
+    void feed(const char* data, std::size_t size)
+    {
+        if (size == 0)
+            return;
+        if (!pending_.empty() && pending_.size() + size <= k_hash_chunk_bytes) {
+            pending_.append(data, size);
+            if (pending_.size() >= k_hash_chunk_bytes)
+                flush_pending();
+            return;
+        }
+        flush_pending();
+        if (size <= k_hash_chunk_bytes) {
+            pending_.append(data, size);
+            return;
+        }
+        hash_ok_ = hash_ok_ && hash_.update(reinterpret_cast<const std::uint8_t*>(data), size);
+    }
+
+    void flush_pending()
+    {
+        if (pending_.empty())
+            return;
+        const bool updated = hash_.update(reinterpret_cast<const std::uint8_t*>(pending_.data()),
+                                          pending_.size());
+        hash_ok_ = hash_ok_ && updated;
+        pending_.clear();
+    }
+
+    aida::crypto::sha256_cng_t hash_;
+    bool hash_ok_ = true;
+    std::string bytes_;
+    std::string pending_;
 };
 
 class canonical_reader_t final {
@@ -149,8 +248,8 @@ private:
     std::size_t offset_ = 0;
 };
 
-template <typename T>
-void write_optional(canonical_writer_t& writer, const std::optional<T>& value, void (*write_value)(canonical_writer_t&, const T&))
+template <typename T, typename Writer, typename Write>
+void write_optional(Writer& writer, const std::optional<T>& value, Write&& write_value)
 {
     writer.boolean(value.has_value());
     if (value)
@@ -174,8 +273,8 @@ bool read_optional(canonical_reader_t& reader, std::optional<T>& value, bool (*r
     return true;
 }
 
-template <typename T, typename Write>
-void write_vector(canonical_writer_t& writer, const std::vector<T>& value, Write&& write_value)
+template <typename T, typename Writer, typename Write>
+void write_vector(Writer& writer, const std::vector<T>& value, Write&& write_value)
 {
     if (value.size() > k_max_collection_entries)
         throw std::invalid_argument("contract collection exceeds serialization limit");
@@ -201,8 +300,8 @@ bool read_vector(canonical_reader_t& reader, std::vector<T>& value, Read&& read_
     return true;
 }
 
-template <typename Enum>
-void write_enum(canonical_writer_t& writer, Enum value)
+template <typename Enum, typename Writer>
+void write_enum(Writer& writer, Enum value)
 {
     using raw_t = std::underlying_type_t<Enum>;
     if constexpr (sizeof(raw_t) == 1)
@@ -238,7 +337,8 @@ bool read_enum(canonical_reader_t& reader, Enum& value)
     return true;
 }
 
-void write_address(canonical_writer_t& writer, const address_t& value)
+template <typename Writer>
+void write_address(Writer& writer, const address_t& value)
 {
     write_enum(writer, value.space);
     writer.u64(value.value);
@@ -252,7 +352,8 @@ bool read_address(canonical_reader_t& reader, address_t& value)
         read_enum(reader, value.architecture) && read_enum(reader, value.mode);
 }
 
-void write_address_range(canonical_writer_t& writer, const decompiler_address_range_t& value)
+template <typename Writer>
+void write_address_range(Writer& writer, const decompiler_address_range_t& value)
 {
     write_address(writer, value.begin);
     write_address(writer, value.end);
@@ -263,7 +364,8 @@ bool read_address_range(canonical_reader_t& reader, decompiler_address_range_t& 
     return read_address(reader, value.begin) && read_address(reader, value.end);
 }
 
-void write_token_range(canonical_writer_t& writer, const decompiler_token_range_t& value)
+template <typename Writer>
+void write_token_range(Writer& writer, const decompiler_token_range_t& value)
 {
     writer.u32(value.begin);
     writer.u32(value.end);
@@ -274,7 +376,8 @@ bool read_token_range(canonical_reader_t& reader, decompiler_token_range_t& valu
     return reader.u32(value.begin) && reader.u32(value.end);
 }
 
-void write_instruction_range(canonical_writer_t& writer, const decompiler_instruction_range_t& value)
+template <typename Writer>
+void write_instruction_range(Writer& writer, const decompiler_instruction_range_t& value)
 {
     writer.u64(value.first_instruction_id);
     writer.u64(value.last_instruction_id);
@@ -285,7 +388,8 @@ bool read_instruction_range(canonical_reader_t& reader, decompiler_instruction_r
     return reader.u64(value.first_instruction_id) && reader.u64(value.last_instruction_id);
 }
 
-void write_source_origin(canonical_writer_t& writer, const decompiler_source_origin_t& value)
+template <typename Writer>
+void write_source_origin(Writer& writer, const decompiler_source_origin_t& value)
 {
     writer.digest(value.source_artifact_hash);
     writer.string(value.source_path);
@@ -302,7 +406,8 @@ bool read_source_origin(canonical_reader_t& reader, decompiler_source_origin_t& 
         reader.u32(value.last_line) && reader.u32(value.last_column);
 }
 
-void write_entity(canonical_writer_t& writer, const decompiler_entity_key_t& value)
+template <typename Writer>
+void write_entity(Writer& writer, const decompiler_entity_key_t& value)
 {
     writer.u32(value.schema_version);
     write_enum(writer, value.kind);
@@ -398,16 +503,17 @@ bool read_entity(canonical_reader_t& reader, decompiler_entity_key_t& value)
     }
 }
 
-void write_coordinate(canonical_writer_t& writer, const source_coordinate_t& value)
+template <typename Writer>
+void write_coordinate(Writer& writer, const source_coordinate_t& value)
 {
     write_enum(writer, value.layer);
     writer.u64(value.workspace_generation);
     write_entity(writer, value.entity);
-    write_optional(writer, value.address_range, write_address_range);
-    write_optional(writer, value.token_range, write_token_range);
-    write_optional(writer, value.instruction_range, write_instruction_range);
-    write_optional(writer, value.document_range, write_token_range);
-    write_optional(writer, value.source_origin, write_source_origin);
+    write_optional(writer, value.address_range, write_address_range<Writer>);
+    write_optional(writer, value.token_range, write_token_range<Writer>);
+    write_optional(writer, value.instruction_range, write_instruction_range<Writer>);
+    write_optional(writer, value.document_range, write_token_range<Writer>);
+    write_optional(writer, value.source_origin, write_source_origin<Writer>);
 }
 
 bool read_coordinate(canonical_reader_t& reader, source_coordinate_t& value)
@@ -420,15 +526,16 @@ bool read_coordinate(canonical_reader_t& reader, source_coordinate_t& value)
         read_optional(reader, value.source_origin, read_source_origin);
 }
 
-void write_diagnostic(canonical_writer_t& writer, const decompiler_diagnostic_t& value)
+template <typename Writer>
+void write_diagnostic(Writer& writer, const decompiler_diagnostic_t& value)
 {
     write_enum(writer, value.severity);
     write_enum(writer, value.code);
     writer.string(value.localization_key);
-    write_vector(writer, value.localization_arguments, [](canonical_writer_t& nested, const std::string& argument) {
+    write_vector(writer, value.localization_arguments, [](auto& nested, const std::string& argument) {
         nested.string(argument);
     });
-    write_optional(writer, value.coordinate, write_coordinate);
+    write_optional(writer, value.coordinate, write_coordinate<Writer>);
     writer.u8(value.confidence);
     writer.boolean(value.retryable);
     writer.u32(value.ordinal);
@@ -445,7 +552,8 @@ bool read_diagnostic(canonical_reader_t& reader, decompiler_diagnostic_t& value)
         reader.boolean(value.retryable) && reader.u32(value.ordinal);
 }
 
-void write_unknown(canonical_writer_t& writer, const decompiler_unknown_t& value)
+template <typename Writer>
+void write_unknown(Writer& writer, const decompiler_unknown_t& value)
 {
     write_enum(writer, value.reason);
     writer.string(value.stable_token);
@@ -461,7 +569,8 @@ bool read_unknown(canonical_reader_t& reader, decompiler_unknown_t& value)
         read_enum(reader, value.provenance);
 }
 
-void write_provider(canonical_writer_t& writer, const decompiler_provider_identity_t& value)
+template <typename Writer>
+void write_provider(Writer& writer, const decompiler_provider_identity_t& value)
 {
     write_enum(writer, value.provider);
     writer.string(value.provider_name);
@@ -478,7 +587,8 @@ bool read_provider(canonical_reader_t& reader, decompiler_provider_identity_t& v
         reader.string(value.worker_build_id) && reader.digest(value.worker_build_hash);
 }
 
-void write_language(canonical_writer_t& writer, const decompiler_language_identity_t& value)
+template <typename Writer>
+void write_language(Writer& writer, const decompiler_language_identity_t& value)
 {
     writer.string(value.language_id);
     writer.string(value.language_version);
@@ -497,12 +607,13 @@ bool read_language(canonical_reader_t& reader, decompiler_language_identity_t& v
         read_enum(reader, value.endian);
 }
 
-void write_provider_value(canonical_writer_t& writer, const provider_ir_value_t& value)
+template <typename Writer>
+void write_provider_value(Writer& writer, const provider_ir_value_t& value)
 {
     writer.u64(value.id);
     write_enum(writer, value.opcode);
     writer.u64(value.type_id);
-    write_vector(writer, value.operand_ids, [](canonical_writer_t& nested, std::uint64_t id) { nested.u64(id); });
+    write_vector(writer, value.operand_ids, [](auto& nested, std::uint64_t id) { nested.u64(id); });
     writer.string(value.stable_immediate);
     writer.string(value.stable_symbol);
     write_coordinate(writer, value.coordinate);
@@ -521,14 +632,15 @@ bool read_provider_value(canonical_reader_t& reader, provider_ir_value_t& value)
         read_enum(reader, value.provenance);
 }
 
-void write_provider_block(canonical_writer_t& writer, const provider_ir_block_t& value)
+template <typename Writer>
+void write_provider_block(Writer& writer, const provider_ir_block_t& value)
 {
     writer.u64(value.id);
-    const auto write_id = [](canonical_writer_t& nested, std::uint64_t id) { nested.u64(id); };
+    const auto write_id = [](auto& nested, std::uint64_t id) { nested.u64(id); };
     write_vector(writer, value.predecessor_ids, write_id);
     write_vector(writer, value.successor_ids, write_id);
     write_vector(writer, value.exception_successor_ids, write_id);
-    write_vector(writer, value.values, write_provider_value);
+    write_vector(writer, value.values, write_provider_value<Writer>);
     write_coordinate(writer, value.coordinate);
 }
 
@@ -541,12 +653,13 @@ bool read_provider_block(canonical_reader_t& reader, provider_ir_block_t& value)
         read_vector(reader, value.values, read_provider_value) && read_coordinate(reader, value.coordinate);
 }
 
-void write_hir_value(canonical_writer_t& writer, const hir_value_t& value)
+template <typename Writer>
+void write_hir_value(Writer& writer, const hir_value_t& value)
 {
     writer.u64(value.id);
     write_enum(writer, value.kind);
     writer.u64(value.type_id);
-    write_vector(writer, value.operand_ids, [](canonical_writer_t& nested, std::uint64_t id) { nested.u64(id); });
+    write_vector(writer, value.operand_ids, [](auto& nested, std::uint64_t id) { nested.u64(id); });
     writer.string(value.stable_value);
     write_coordinate(writer, value.coordinate);
     writer.u8(value.confidence);
@@ -563,14 +676,15 @@ bool read_hir_value(canonical_reader_t& reader, hir_value_t& value)
         reader.u8(value.confidence) && read_enum(reader, value.provenance);
 }
 
-void write_hir_block(canonical_writer_t& writer, const hir_block_t& value)
+template <typename Writer>
+void write_hir_block(Writer& writer, const hir_block_t& value)
 {
     writer.u64(value.id);
-    const auto write_id = [](canonical_writer_t& nested, std::uint64_t id) { nested.u64(id); };
+    const auto write_id = [](auto& nested, std::uint64_t id) { nested.u64(id); };
     write_vector(writer, value.predecessor_ids, write_id);
     write_vector(writer, value.successor_ids, write_id);
     write_vector(writer, value.exception_successor_ids, write_id);
-    write_vector(writer, value.values, write_hir_value);
+    write_vector(writer, value.values, write_hir_value<Writer>);
     write_coordinate(writer, value.coordinate);
 }
 
@@ -583,7 +697,8 @@ bool read_hir_block(canonical_reader_t& reader, hir_block_t& value)
         read_vector(reader, value.values, read_hir_value) && read_coordinate(reader, value.coordinate);
 }
 
-void write_hir_variable(canonical_writer_t& writer, const hir_variable_t& value)
+template <typename Writer>
+void write_hir_variable(Writer& writer, const hir_variable_t& value)
 {
     writer.u64(value.id);
     writer.string(value.stable_name);
@@ -600,7 +715,8 @@ bool read_hir_variable(canonical_reader_t& reader, hir_variable_t& value)
         read_enum(reader, value.provenance);
 }
 
-void write_type_node(canonical_writer_t& writer, const decompiler_type_node_t& value)
+template <typename Writer>
+void write_type_node(Writer& writer, const decompiler_type_node_t& value)
 {
     writer.u64(value.id);
     write_enum(writer, value.kind);
@@ -613,7 +729,7 @@ void write_type_node(canonical_writer_t& writer, const decompiler_type_node_t& v
     writer.boolean(value.is_signed);
     writer.u8(value.confidence);
     write_enum(writer, value.provenance);
-    write_vector(writer, value.coordinates, write_coordinate);
+    write_vector(writer, value.coordinates, write_coordinate<Writer>);
 }
 
 bool read_type_node(canonical_reader_t& reader, decompiler_type_node_t& value)
@@ -634,7 +750,8 @@ bool read_type_node(canonical_reader_t& reader, decompiler_type_node_t& value)
         read_enum(reader, value.provenance) && read_vector(reader, value.coordinates, read_coordinate);
 }
 
-void write_type_edge(canonical_writer_t& writer, const decompiler_type_edge_t& value)
+template <typename Writer>
+void write_type_edge(Writer& writer, const decompiler_type_edge_t& value)
 {
     writer.u64(value.source_type_id);
     writer.u64(value.target_type_id);
@@ -665,12 +782,13 @@ bool read_type_edge(canonical_reader_t& reader, decompiler_type_edge_t& value)
     return reader.u32(value.ordinal) && reader.u8(value.confidence) && read_enum(reader, value.provenance);
 }
 
-void write_ast_node(canonical_writer_t& writer, const typed_pseudocode_ast_node_t& value)
+template <typename Writer>
+void write_ast_node(Writer& writer, const typed_pseudocode_ast_node_t& value)
 {
     writer.u64(value.id);
     write_enum(writer, value.kind);
     writer.u64(value.type_id);
-    write_vector(writer, value.child_ids, [](canonical_writer_t& nested, std::uint64_t id) { nested.u64(id); });
+    write_vector(writer, value.child_ids, [](auto& nested, std::uint64_t id) { nested.u64(id); });
     writer.string(value.stable_text);
     write_coordinate(writer, value.coordinate);
     writer.u8(value.confidence);
@@ -687,7 +805,8 @@ bool read_ast_node(canonical_reader_t& reader, typed_pseudocode_ast_node_t& valu
         reader.u8(value.confidence) && read_enum(reader, value.provenance);
 }
 
-void write_document_token(canonical_writer_t& writer, const decompiler_document_token_t& value)
+template <typename Writer>
+void write_document_token(Writer& writer, const decompiler_document_token_t& value)
 {
     write_enum(writer, value.kind);
     write_token_range(writer, value.range);
@@ -699,10 +818,11 @@ bool read_document_token(canonical_reader_t& reader, decompiler_document_token_t
     return read_enum(reader, value.kind) && read_token_range(reader, value.range) && reader.u64(value.ast_node_id);
 }
 
-void write_document_source_map(canonical_writer_t& writer, const decompiler_document_source_map_t& value)
+template <typename Writer>
+void write_document_source_map(Writer& writer, const decompiler_document_source_map_t& value)
 {
     write_token_range(writer, value.document_range);
-    write_vector(writer, value.coordinates, write_coordinate);
+    write_vector(writer, value.coordinates, write_coordinate<Writer>);
 }
 
 bool read_document_source_map(canonical_reader_t& reader, decompiler_document_source_map_t& value)
@@ -710,14 +830,16 @@ bool read_document_source_map(canonical_reader_t& reader, decompiler_document_so
     return read_token_range(reader, value.document_range) && read_vector(reader, value.coordinates, read_coordinate);
 }
 
-void write_u32_clamped(canonical_writer_t& writer, const std::size_t value)
+template <typename Writer>
+void write_u32_clamped(Writer& writer, const std::size_t value)
 {
     writer.u32(value > (std::numeric_limits<std::uint32_t>::max)()
         ? (std::numeric_limits<std::uint32_t>::max)()
         : static_cast<std::uint32_t>(value));
 }
 
-void write_readability_settings(canonical_writer_t& writer, const readability_transform_settings_t& value,
+template <typename Writer>
+void write_readability_settings(Writer& writer, const readability_transform_settings_t& value,
                                 const std::uint32_t schema_version)
 {
     writer.boolean(value.enable_variable_renaming);
@@ -750,6 +872,13 @@ void write_readability_settings(canonical_writer_t& writer, const readability_tr
         writer.boolean(value.enable_bit_operation_idioms);
         writer.boolean(value.enable_loop_intrinsic_idioms);
         writer.boolean(value.enable_magic_division_recognition);
+    }
+    if (schema_version >= 5) {
+        writer.boolean(value.enable_semantic_fact_application);
+        writer.boolean(value.enable_array_index_recognition);
+        writer.boolean(value.enable_method_call_restructuring);
+        writer.boolean(value.enable_ternary_formation);
+        writer.boolean(value.enable_cast_agreement_insertion);
     }
     write_u32_clamped(writer, value.max_transform_iterations);
     write_u32_clamped(writer, value.max_expression_depth);
@@ -800,6 +929,13 @@ bool read_readability_settings(canonical_reader_t& reader, readability_transform
           reader.boolean(value.enable_loop_intrinsic_idioms) &&
           reader.boolean(value.enable_magic_division_recognition)))
         return false;
+    if (schema_version >= 5 &&
+        !(reader.boolean(value.enable_semantic_fact_application) &&
+          reader.boolean(value.enable_array_index_recognition) &&
+          reader.boolean(value.enable_method_call_restructuring) &&
+          reader.boolean(value.enable_ternary_formation) &&
+          reader.boolean(value.enable_cast_agreement_insertion)))
+        return false;
     if (!reader.u32(iterations) || !reader.u32(depth))
         return false;
     value.max_transform_iterations = iterations;
@@ -823,7 +959,8 @@ bool read_readability_settings(canonical_reader_t& reader, readability_transform
     return true;
 }
 
-void write_renderer(canonical_writer_t& writer, const decompiler_renderer_settings_t& value)
+template <typename Writer>
+void write_renderer(Writer& writer, const decompiler_renderer_settings_t& value)
 {
     writer.u32(value.schema_version);
     writer.string(value.style_id);
@@ -836,6 +973,9 @@ void write_renderer(canonical_writer_t& writer, const decompiler_renderer_settin
         writer.boolean(value.emit_resolved_symbols);
         writer.boolean(value.emit_enum_case_names);
     }
+    if (value.schema_version >= 5) {
+        writer.boolean(value.emit_calling_convention_annotations);
+    }
     write_readability_settings(writer, value.readability, value.schema_version);
 }
 
@@ -845,16 +985,20 @@ bool read_renderer(canonical_reader_t& reader, decompiler_renderer_settings_t& v
         reader.u32(value.indentation_spaces) && reader.boolean(value.emit_type_annotations) &&
         reader.boolean(value.emit_provenance_annotations) && reader.boolean(value.emit_unknown_tokens)))
         return false;
-    if (value.schema_version != 2 && value.schema_version != 3 && value.schema_version != 4)
+    if (value.schema_version != 2 && value.schema_version != 3 && value.schema_version != 4 &&
+        value.schema_version != 5)
         return false;
     if (value.schema_version >= 3 &&
         !(reader.boolean(value.emit_comments) && reader.boolean(value.emit_resolved_symbols) &&
           reader.boolean(value.emit_enum_case_names)))
         return false;
+    if (value.schema_version >= 5 && !reader.boolean(value.emit_calling_convention_annotations))
+        return false;
     return read_readability_settings(reader, value.readability, value.schema_version);
 }
 
-void write_profile(canonical_writer_t& writer, const decompiler_profile_budget_t& value)
+template <typename Writer>
+void write_profile(Writer& writer, const decompiler_profile_budget_t& value)
 {
     write_enum(writer, value.profile);
     writer.u32(value.schema_version);
@@ -877,7 +1021,8 @@ bool read_profile(canonical_reader_t& reader, decompiler_profile_budget_t& value
         reader.u32(value.max_semantic_queries) && reader.boolean(value.semantic_proofs_enabled);
 }
 
-void write_chunk_fingerprint(canonical_writer_t& writer, const decompiler_chunk_fingerprint_t& value)
+template <typename Writer>
+void write_chunk_fingerprint(Writer& writer, const decompiler_chunk_fingerprint_t& value)
 {
     write_address(writer, value.begin);
     write_address(writer, value.end);
@@ -889,7 +1034,8 @@ bool read_chunk_fingerprint(canonical_reader_t& reader, decompiler_chunk_fingerp
     return read_address(reader, value.begin) && read_address(reader, value.end) && reader.digest(value.bytes_hash);
 }
 
-void write_dependency(canonical_writer_t& writer, const decompiler_dependency_version_t& value)
+template <typename Writer>
+void write_dependency(Writer& writer, const decompiler_dependency_version_t& value)
 {
     writer.string(value.name);
     writer.string(value.version);
@@ -901,7 +1047,8 @@ bool read_dependency(canonical_reader_t& reader, decompiler_dependency_version_t
     return reader.string(value.name) && reader.string(value.version) && reader.digest(value.content_hash);
 }
 
-void write_cache_key(canonical_writer_t& writer, const decompiler_pipeline_cache_key_t& value)
+template <typename Writer>
+void write_cache_key(Writer& writer, const decompiler_pipeline_cache_key_t& value)
 {
     writer.u32(value.schema_version);
     write_enum(writer, value.stage);
@@ -915,7 +1062,7 @@ void write_cache_key(canonical_writer_t& writer, const decompiler_pipeline_cache
     write_language(writer, value.language);
     writer.digest(value.loader_layout_hash);
     writer.digest(value.function_bytes_hash);
-    write_vector(writer, value.chunk_fingerprints, write_chunk_fingerprint);
+    write_vector(writer, value.chunk_fingerprints, write_chunk_fingerprint<Writer>);
     writer.u64(value.metadata_revision);
     writer.u64(value.type_graph_revision);
     writer.u64(value.overlay_revision);
@@ -926,7 +1073,7 @@ void write_cache_key(canonical_writer_t& writer, const decompiler_pipeline_cache
     writer.u32(value.ast_schema_version);
     writer.u32(value.document_schema_version);
     write_renderer(writer, value.renderer);
-    write_vector(writer, value.dependencies, write_dependency);
+    write_vector(writer, value.dependencies, write_dependency<Writer>);
 }
 
 bool read_cache_key(canonical_reader_t& reader, decompiler_pipeline_cache_key_t& value)
@@ -946,7 +1093,8 @@ bool read_cache_key(canonical_reader_t& reader, decompiler_pipeline_cache_key_t&
         read_vector(reader, value.dependencies, read_dependency);
 }
 
-void write_symbol_evidence(canonical_writer_t& writer, const decompiler_symbol_evidence_t& value)
+template <typename Writer>
+void write_symbol_evidence(Writer& writer, const decompiler_symbol_evidence_t& value)
 {
     writer.string(value.unresolved_text);
     writer.string(value.resolved_name);
@@ -964,22 +1112,25 @@ bool read_symbol_evidence(canonical_reader_t& reader, decompiler_symbol_evidence
         reader.boolean(value.is_import) && reader.boolean(value.is_noreturn) && reader.u8(value.confidence);
 }
 
-void write_prototype_evidence(canonical_writer_t& writer, const decompiler_prototype_evidence_t& value)
+template <typename Writer>
+void write_prototype_evidence(Writer& writer, const decompiler_prototype_evidence_t& value)
 {
     writer.string(value.api_name);
     writer.string(value.return_type_display);
-    write_vector(writer, value.argument_names, [](canonical_writer_t& nested, const std::string& entry) {
+    write_vector(writer, value.argument_names, [](auto& nested, const std::string& entry) {
         nested.string(entry);
     });
-    write_vector(writer, value.argument_type_displays, [](canonical_writer_t& nested, const std::string& entry) {
+    write_vector(writer, value.argument_type_displays, [](auto& nested, const std::string& entry) {
         nested.string(entry);
     });
     writer.boolean(value.is_variadic);
     writer.boolean(value.is_noreturn);
     writer.u8(value.confidence);
+    writer.string(value.calling_convention);
+    writer.string(value.class_qualifier);
 }
 
-bool read_prototype_evidence(canonical_reader_t& reader, decompiler_prototype_evidence_t& value)
+bool read_prototype_evidence_v2(canonical_reader_t& reader, decompiler_prototype_evidence_t& value)
 {
     return reader.string(value.api_name) && reader.string(value.return_type_display) &&
         read_vector(reader, value.argument_names, [](canonical_reader_t& nested, std::string& entry) {
@@ -991,7 +1142,14 @@ bool read_prototype_evidence(canonical_reader_t& reader, decompiler_prototype_ev
         reader.boolean(value.is_variadic) && reader.boolean(value.is_noreturn) && reader.u8(value.confidence);
 }
 
-void write_string_evidence(canonical_writer_t& writer, const decompiler_string_evidence_t& value)
+bool read_prototype_evidence(canonical_reader_t& reader, decompiler_prototype_evidence_t& value)
+{
+    return read_prototype_evidence_v2(reader, value) && reader.string(value.calling_convention) &&
+        reader.string(value.class_qualifier);
+}
+
+template <typename Writer>
+void write_string_evidence(Writer& writer, const decompiler_string_evidence_t& value)
 {
     writer.string(value.reference_text);
     writer.string(value.utf8_content);
@@ -1016,7 +1174,8 @@ bool read_string_evidence_v2(canonical_reader_t& reader, decompiler_string_evide
         reader.u32(value.original_byte_length);
 }
 
-void write_member_evidence(canonical_writer_t& writer, const decompiler_member_evidence_t& value)
+template <typename Writer>
+void write_member_evidence(Writer& writer, const decompiler_member_evidence_t& value)
 {
     writer.string(value.object_type_canonical);
     writer.u64(value.byte_offset);
@@ -1031,7 +1190,8 @@ bool read_member_evidence(canonical_reader_t& reader, decompiler_member_evidence
         reader.string(value.field_name) && reader.string(value.selector_hint) && reader.u8(value.confidence);
 }
 
-void write_vtable_slot_evidence(canonical_writer_t& writer, const decompiler_vtable_slot_evidence_t& value)
+template <typename Writer>
+void write_vtable_slot_evidence(Writer& writer, const decompiler_vtable_slot_evidence_t& value)
 {
     writer.string(value.vtable_selector);
     writer.u64(value.slot_index);
@@ -1053,7 +1213,8 @@ bool read_vtable_slot_evidence_v2(canonical_reader_t& reader, decompiler_vtable_
         reader.u64(value.vtable_rva);
 }
 
-void write_user_comment_evidence(canonical_writer_t& writer, const decompiler_user_comment_evidence_t& value)
+template <typename Writer>
+void write_user_comment_evidence(Writer& writer, const decompiler_user_comment_evidence_t& value)
 {
     writer.string(value.anchor_text);
     writer.string(value.comment_text);
@@ -1076,7 +1237,8 @@ bool read_user_comment_evidence_v2(canonical_reader_t& reader, decompiler_user_c
         reader.u64(value.rva) && reader.u64(value.function_rva);
 }
 
-void write_global_scalar_evidence(canonical_writer_t& writer, const decompiler_global_scalar_evidence_t& value)
+template <typename Writer>
+void write_global_scalar_evidence(Writer& writer, const decompiler_global_scalar_evidence_t& value)
 {
     writer.u64(value.absolute_address);
     writer.u64(value.value);
@@ -1088,16 +1250,17 @@ bool read_global_scalar_evidence(canonical_reader_t& reader, decompiler_global_s
     return reader.u64(value.absolute_address) && reader.u64(value.value) && reader.u8(value.size_log2);
 }
 
-void write_render_evidence(canonical_writer_t& writer, const decompiler_render_evidence_t& value)
+template <typename Writer>
+void write_render_evidence(Writer& writer, const decompiler_render_evidence_t& value)
 {
     writer.u32(k_decompiler_render_evidence_schema_version);
-    write_vector(writer, value.symbols, write_symbol_evidence);
-    write_vector(writer, value.prototypes, write_prototype_evidence);
-    write_vector(writer, value.strings, write_string_evidence);
-    write_vector(writer, value.members, write_member_evidence);
-    write_vector(writer, value.vtable_slots, write_vtable_slot_evidence);
-    write_vector(writer, value.user_comments, write_user_comment_evidence);
-    write_vector(writer, value.global_scalars, write_global_scalar_evidence);
+    write_vector(writer, value.symbols, write_symbol_evidence<Writer>);
+    write_vector(writer, value.prototypes, write_prototype_evidence<Writer>);
+    write_vector(writer, value.strings, write_string_evidence<Writer>);
+    write_vector(writer, value.members, write_member_evidence<Writer>);
+    write_vector(writer, value.vtable_slots, write_vtable_slot_evidence<Writer>);
+    write_vector(writer, value.user_comments, write_user_comment_evidence<Writer>);
+    write_vector(writer, value.global_scalars, write_global_scalar_evidence<Writer>);
 }
 
 bool read_render_evidence(canonical_reader_t& reader, decompiler_render_evidence_t& value)
@@ -1107,11 +1270,23 @@ bool read_render_evidence(canonical_reader_t& reader, decompiler_render_evidence
         return false;
     if (schema_version == 1U) {
         if (!read_vector(reader, value.symbols, read_symbol_evidence) ||
-            !read_vector(reader, value.prototypes, read_prototype_evidence) ||
+            !read_vector(reader, value.prototypes, read_prototype_evidence_v2) ||
             !read_vector(reader, value.strings, read_string_evidence_v1) ||
             !read_vector(reader, value.members, read_member_evidence) ||
             !read_vector(reader, value.vtable_slots, read_vtable_slot_evidence_v1) ||
             !read_vector(reader, value.user_comments, read_user_comment_evidence_v1))
+            return false;
+        value.schema_version = k_decompiler_render_evidence_schema_version;
+        return true;
+    }
+    if (schema_version == 2U) {
+        if (!read_vector(reader, value.symbols, read_symbol_evidence) ||
+            !read_vector(reader, value.prototypes, read_prototype_evidence_v2) ||
+            !read_vector(reader, value.strings, read_string_evidence_v2) ||
+            !read_vector(reader, value.members, read_member_evidence) ||
+            !read_vector(reader, value.vtable_slots, read_vtable_slot_evidence_v2) ||
+            !read_vector(reader, value.user_comments, read_user_comment_evidence_v2) ||
+            !read_vector(reader, value.global_scalars, read_global_scalar_evidence))
             return false;
         value.schema_version = k_decompiler_render_evidence_schema_version;
         return true;
@@ -1127,7 +1302,8 @@ bool read_render_evidence(canonical_reader_t& reader, decompiler_render_evidence
         read_vector(reader, value.global_scalars, read_global_scalar_evidence);
 }
 
-void write_envelope(canonical_writer_t& writer, const decompiler_worker_envelope_t& value)
+template <typename Writer>
+void write_envelope(Writer& writer, const decompiler_worker_envelope_t& value)
 {
     writer.u32(value.protocol_version);
     write_enum(writer, value.kind);
@@ -1229,7 +1405,8 @@ bool language_matches_entity(const decompiler_language_identity_t& language, con
 
 bool valid_renderer(const decompiler_renderer_settings_t& value) noexcept
 {
-    return (value.schema_version == 2 || value.schema_version == 3 || value.schema_version == 4) &&
+    return (value.schema_version == 2 || value.schema_version == 3 || value.schema_version == 4 ||
+            value.schema_version == 5) &&
         !value.style_id.empty() &&
         value.indentation_spaces >= 1 && value.indentation_spaces <= 16 &&
         value.readability.max_transform_iterations >= 1 && value.readability.max_transform_iterations <= 16 &&
@@ -1263,6 +1440,38 @@ bool valid_diagnostic(const decompiler_diagnostic_t& value)
         !value.localization_key.empty() && value.confidence <= 100;
 }
 
+decompiler_contract_validation_t validate_source_coordinate_impl(
+    const source_coordinate_t& value,
+    const decompiler_entity_key_t* prevalidated_entity)
+{
+    decompiler_contract_validation_t result;
+    if (value.layer != decompiler_coordinate_layer_t::provider_ir && value.layer != decompiler_coordinate_layer_t::hir &&
+        value.layer != decompiler_coordinate_layer_t::typed_ast && value.layer != decompiler_coordinate_layer_t::document)
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::invalid_contract, "decompiler.coordinate.layer"));
+    if (value.workspace_generation == 0)
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::invalid_contract, "decompiler.coordinate.generation"));
+    if (prevalidated_entity == nullptr || !same_entity(value.entity, *prevalidated_entity))
+        append(result, validate_decompiler_entity_key(value.entity));
+    if (value.address_range && !valid_range(*value.address_range))
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.address_range"));
+    if (value.token_range && !valid_range(*value.token_range))
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.token_range"));
+    if (value.instruction_range && !valid_range(*value.instruction_range))
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.instruction_range"));
+    if (value.document_range && !valid_range(*value.document_range))
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.document_range"));
+    if (value.source_origin && (value.source_origin->source_artifact_hash.empty() || value.source_origin->source_path.empty() ||
+        value.source_origin->first_line == 0 || value.source_origin->last_line < value.source_origin->first_line ||
+        (value.source_origin->last_line == value.source_origin->first_line &&
+         value.source_origin->last_column < value.source_origin->first_column)))
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.source_origin"));
+    if (!value.address_range && !value.token_range && !value.instruction_range && !value.document_range && !value.source_origin)
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.anchor"));
+    if (value.layer == decompiler_coordinate_layer_t::document && !value.document_range)
+        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.document_anchor"));
+    return result;
+}
+
 void append_diagnostic_validation(
     decompiler_contract_validation_t& result,
     const std::vector<decompiler_diagnostic_t>& diagnostics,
@@ -1280,16 +1489,17 @@ void append_diagnostic_validation(
             result.diagnostics.push_back(contract_error(malformed_code, diagnostic_key));
         if (!diagnostic.coordinate)
             continue;
-        append(result, validate_source_coordinate(*diagnostic.coordinate));
+        append(result, validate_source_coordinate_impl(*diagnostic.coordinate, entity));
         if ((entity && !same_entity(diagnostic.coordinate->entity, *entity)) ||
             (expected_layer && diagnostic.coordinate->layer != *expected_layer))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, coordinate_key));
     }
 }
 
-bool valid_unknown(const decompiler_unknown_t& value) noexcept
+bool valid_unknown(const decompiler_unknown_t& value, const decompiler_entity_key_t* prevalidated_entity) noexcept
 {
-    return !value.stable_token.empty() && value.confidence <= 100 && validate_source_coordinate(value.coordinate).valid();
+    return !value.stable_token.empty() && value.confidence <= 100 &&
+        validate_source_coordinate_impl(value.coordinate, prevalidated_entity).valid();
 }
 
 bool is_managed_provider(decompiler_provider_id_t provider, decompiler_entity_kind_t kind) noexcept
@@ -1608,31 +1818,7 @@ decompiler_contract_validation_t validate_decompiler_entity_key(const decompiler
 
 decompiler_contract_validation_t validate_source_coordinate(const source_coordinate_t& value)
 {
-    decompiler_contract_validation_t result;
-    if (value.layer != decompiler_coordinate_layer_t::provider_ir && value.layer != decompiler_coordinate_layer_t::hir &&
-        value.layer != decompiler_coordinate_layer_t::typed_ast && value.layer != decompiler_coordinate_layer_t::document)
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::invalid_contract, "decompiler.coordinate.layer"));
-    if (value.workspace_generation == 0)
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::invalid_contract, "decompiler.coordinate.generation"));
-    append(result, validate_decompiler_entity_key(value.entity));
-    if (value.address_range && !valid_range(*value.address_range))
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.address_range"));
-    if (value.token_range && !valid_range(*value.token_range))
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.token_range"));
-    if (value.instruction_range && !valid_range(*value.instruction_range))
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.instruction_range"));
-    if (value.document_range && !valid_range(*value.document_range))
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.document_range"));
-    if (value.source_origin && (value.source_origin->source_artifact_hash.empty() || value.source_origin->source_path.empty() ||
-        value.source_origin->first_line == 0 || value.source_origin->last_line < value.source_origin->first_line ||
-        (value.source_origin->last_line == value.source_origin->first_line &&
-         value.source_origin->last_column < value.source_origin->first_column)))
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.source_origin"));
-    if (!value.address_range && !value.token_range && !value.instruction_range && !value.document_range && !value.source_origin)
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.anchor"));
-    if (value.layer == decompiler_coordinate_layer_t::document && !value.document_range)
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.coordinate.document_anchor"));
-    return result;
+    return validate_source_coordinate_impl(value, nullptr);
 }
 
 decompiler_contract_validation_t validate_provider_ir(const provider_ir_t& value)
@@ -1658,7 +1844,7 @@ decompiler_contract_validation_t validate_provider_ir(const provider_ir_t& value
         result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_provider_ir, "decompiler.provider_ir.entry_block"));
     std::uint64_t previous_value_id = 0;
     for (const auto& block : value.blocks) {
-        append(result, validate_source_coordinate(block.coordinate));
+        append(result, validate_source_coordinate_impl(block.coordinate, &value.entity));
         if (block.coordinate.layer != decompiler_coordinate_layer_t::provider_ir ||
             !same_entity(block.coordinate.entity, value.entity) || block.values.empty() ||
             !strictly_increasing_ids(block.values, [](const provider_ir_value_t& node) { return node.id; }))
@@ -1677,16 +1863,16 @@ decompiler_contract_validation_t validate_provider_ir(const provider_ir_t& value
             if (node.id <= previous_value_id)
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_provider_ir, "decompiler.provider_ir.value_order"));
             previous_value_id = node.id;
-            append(result, validate_source_coordinate(node.coordinate));
+            append(result, validate_source_coordinate_impl(node.coordinate, &value.entity));
         }
     }
     for (const auto& coordinate : value.source_coordinates) {
-        append(result, validate_source_coordinate(coordinate));
+        append(result, validate_source_coordinate_impl(coordinate, &value.entity));
         if (coordinate.layer != decompiler_coordinate_layer_t::provider_ir || !same_entity(coordinate.entity, value.entity))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.provider_ir.source_entity"));
     }
     for (const auto& unknown : value.unknowns) {
-        if (!valid_unknown(unknown) || !same_entity(unknown.coordinate.entity, value.entity))
+        if (!valid_unknown(unknown, &value.entity) || !same_entity(unknown.coordinate.entity, value.entity))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_provider_ir, "decompiler.provider_ir.unknown"));
     }
     append_diagnostic_validation(result, value.diagnostics, decompiler_diagnostic_code_t::malformed_provider_ir,
@@ -1710,7 +1896,7 @@ decompiler_contract_validation_t validate_hir_function(const hir_function_t& val
                 variable.coordinate.layer != decompiler_coordinate_layer_t::hir ||
                 !same_entity(variable.coordinate.entity, value.entity))
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_hir, key));
-            append(result, validate_source_coordinate(variable.coordinate));
+            append(result, validate_source_coordinate_impl(variable.coordinate, &value.entity));
         }
     };
     validate_variables(value.parameters, "decompiler.hir.parameters");
@@ -1727,7 +1913,7 @@ decompiler_contract_validation_t validate_hir_function(const hir_function_t& val
     };
     std::uint64_t previous_value_id = 0;
     for (const auto& block : value.blocks) {
-        append(result, validate_source_coordinate(block.coordinate));
+        append(result, validate_source_coordinate_impl(block.coordinate, &value.entity));
         if (block.coordinate.layer != decompiler_coordinate_layer_t::hir ||
             !same_entity(block.coordinate.entity, value.entity) || block.values.empty() ||
             !strictly_increasing_ids(block.values, [](const hir_value_t& node) { return node.id; }))
@@ -1746,16 +1932,16 @@ decompiler_contract_validation_t validate_hir_function(const hir_function_t& val
             if (node.id <= previous_value_id)
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_hir, "decompiler.hir.value_order"));
             previous_value_id = node.id;
-            append(result, validate_source_coordinate(node.coordinate));
+            append(result, validate_source_coordinate_impl(node.coordinate, &value.entity));
         }
     }
     for (const auto& coordinate : value.source_coordinates) {
-        append(result, validate_source_coordinate(coordinate));
+        append(result, validate_source_coordinate_impl(coordinate, &value.entity));
         if (coordinate.layer != decompiler_coordinate_layer_t::hir || !same_entity(coordinate.entity, value.entity))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.hir.source_entity"));
     }
     for (const auto& unknown : value.unknowns) {
-        if (!valid_unknown(unknown) || !same_entity(unknown.coordinate.entity, value.entity))
+        if (!valid_unknown(unknown, &value.entity) || !same_entity(unknown.coordinate.entity, value.entity))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_hir, "decompiler.hir.unknown"));
     }
     append_diagnostic_validation(result, value.diagnostics, decompiler_diagnostic_code_t::malformed_hir,
@@ -1785,7 +1971,7 @@ decompiler_contract_validation_t validate_type_graph(const type_graph_t& value)
             (node.byte_size && *node.byte_size == 0))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_type_graph, "decompiler.type_graph.node"));
         for (const auto& coordinate : node.coordinates) {
-            append(result, validate_source_coordinate(coordinate));
+            append(result, validate_source_coordinate_impl(coordinate, &value.entity));
             if (!same_entity(coordinate.entity, value.entity))
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.type_graph.node_entity"));
         }
@@ -1798,7 +1984,7 @@ decompiler_contract_validation_t validate_type_graph(const type_graph_t& value)
         previous_ordinal = edge.ordinal;
     }
     for (const auto& unknown : value.unknowns) {
-        if (!valid_unknown(unknown) || !same_entity(unknown.coordinate.entity, value.entity))
+        if (!valid_unknown(unknown, &value.entity) || !same_entity(unknown.coordinate.entity, value.entity))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_type_graph, "decompiler.type_graph.unknown"));
     }
     append_diagnostic_validation(result, value.diagnostics, decompiler_diagnostic_code_t::malformed_type_graph,
@@ -1840,19 +2026,19 @@ decompiler_contract_validation_t validate_typed_pseudocode_ast(const typed_pseud
         if (std::any_of(node.child_ids.begin(), node.child_ids.end(), [&has_node](std::uint64_t id) { return !has_node(id); }) ||
             duplicate_child)
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.child"));
-        append(result, validate_source_coordinate(node.coordinate));
+        append(result, validate_source_coordinate_impl(node.coordinate, &value.entity));
     }
     if (!root || !body || root->kind != typed_pseudocode_ast_node_kind_t::function_definition ||
         body->kind != typed_pseudocode_ast_node_kind_t::compound_statement || body->child_ids.empty() ||
         std::find(root->child_ids.begin(), root->child_ids.end(), value.body_node_id) == root->child_ids.end())
         result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.nonempty_body"));
     for (const auto& coordinate : value.source_coordinates) {
-        append(result, validate_source_coordinate(coordinate));
+        append(result, validate_source_coordinate_impl(coordinate, &value.entity));
         if (coordinate.layer != decompiler_coordinate_layer_t::typed_ast || !same_entity(coordinate.entity, value.entity))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.ast.source_entity"));
     }
     for (const auto& unknown : value.unknowns) {
-        if (!valid_unknown(unknown) || !same_entity(unknown.coordinate.entity, value.entity))
+        if (!valid_unknown(unknown, &value.entity) || !same_entity(unknown.coordinate.entity, value.entity))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_ast, "decompiler.ast.unknown"));
     }
     append_diagnostic_validation(result, value.diagnostics, decompiler_diagnostic_code_t::malformed_ast,
@@ -1861,7 +2047,8 @@ decompiler_contract_validation_t validate_typed_pseudocode_ast(const typed_pseud
     return result;
 }
 
-decompiler_contract_validation_t validate_decompiler_document(const decompiler_document_t& value)
+decompiler_contract_validation_t validate_decompiler_document(const decompiler_document_t& value,
+                                                              document_validation_session_t& session)
 {
     decompiler_contract_validation_t result;
     if (value.schema_version != k_decompiler_document_schema_version || value.rendered_text.empty() ||
@@ -1871,8 +2058,18 @@ decompiler_contract_validation_t validate_decompiler_document(const decompiler_d
     append(result, validate_decompiler_entity_key(value.entity));
     const auto ast_validation = validate_typed_pseudocode_ast(value.ast);
     append(result, ast_validation);
-    if (ast_validation.valid() && !value.ast_hash.empty() && value.ast_hash != stable_serialization_hash(value.ast))
-        result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_document, "decompiler.document.ast_hash"));
+    if (ast_validation.valid() && !value.ast_hash.empty()) {
+        if (session.ast_identity != &value.ast || !session.ast_measured) {
+            measured_serialization_t measured;
+            measured.bytes = serialize_typed_pseudocode_ast(value.ast);
+            measured.size = static_cast<std::uint64_t>(measured.bytes.size());
+            measured.digest = stable_serialization_hash(measured.bytes);
+            session.ast_measured = std::move(measured);
+            session.ast_identity = &value.ast;
+        }
+        if (value.ast_hash != session.ast_measured->digest)
+            result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_document, "decompiler.document.ast_hash"));
+    }
     if (value.type_graph_hash != value.ast.type_graph_hash)
         result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_document, "decompiler.document.type_graph_hash"));
     std::uint32_t expected_begin = 0;
@@ -1899,7 +2096,7 @@ decompiler_contract_validation_t validate_decompiler_document(const decompiler_d
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::source_map_rejected, "decompiler.document.source_map"));
         previous_end = map.document_range.end;
         for (const auto& coordinate : map.coordinates) {
-            append(result, validate_source_coordinate(coordinate));
+            append(result, validate_source_coordinate_impl(coordinate, &value.entity));
             if (coordinate.layer != decompiler_coordinate_layer_t::document || !coordinate.document_range ||
                 coordinate.document_range->begin != map.document_range.begin ||
                 coordinate.document_range->end != map.document_range.end || !same_entity(coordinate.entity, value.entity))
@@ -1907,13 +2104,19 @@ decompiler_contract_validation_t validate_decompiler_document(const decompiler_d
         }
     }
     for (const auto& unknown : value.unknowns) {
-        if (!valid_unknown(unknown) || !same_entity(unknown.coordinate.entity, value.entity))
+        if (!valid_unknown(unknown, &value.entity) || !same_entity(unknown.coordinate.entity, value.entity))
             result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::malformed_document, "decompiler.document.unknown"));
     }
     append_diagnostic_validation(result, value.diagnostics, decompiler_diagnostic_code_t::malformed_document,
         "decompiler.document.diagnostics", "decompiler.document.diagnostic",
         "decompiler.document.diagnostic_coordinate", &value.entity, decompiler_coordinate_layer_t::document);
     return result;
+}
+
+decompiler_contract_validation_t validate_decompiler_document(const decompiler_document_t& value)
+{
+    document_validation_session_t session;
+    return validate_decompiler_document(value, session);
 }
 
 decompiler_contract_validation_t validate_decompiler_profile(const decompiler_profile_budget_t& value)
@@ -2061,6 +2264,16 @@ decompiler_contract_validation_t validate_decompiler_render_evidence(const decom
     const auto text_ok = [](const std::string& text, const bool required) {
         return text.size() <= k_decompiler_render_evidence_max_text_bytes && (!required || !text.empty());
     };
+    const auto identifier_ok = [](const std::string& text) {
+        if (text.empty())
+            return true;
+        if (text.size() > 32)
+            return false;
+        return std::all_of(text.begin(), text.end(), [](const char character) {
+            return (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') ||
+                character == '_';
+        });
+    };
     for (const auto& entry : value.symbols) {
         if (!text_ok(entry.unresolved_text, true) || !text_ok(entry.resolved_name, true) ||
             !text_ok(entry.module_name, false) || entry.confidence > 100)
@@ -2069,7 +2282,8 @@ decompiler_contract_validation_t validate_decompiler_render_evidence(const decom
     for (const auto& entry : value.prototypes) {
         if (!text_ok(entry.api_name, true) || !text_ok(entry.return_type_display, false) ||
             entry.argument_names.size() > 64 || entry.argument_type_displays.size() > 64 ||
-            entry.confidence > 100)
+            entry.confidence > 100 || !identifier_ok(entry.calling_convention) ||
+            !identifier_ok(entry.class_qualifier))
             error("decompiler.render_evidence.prototype");
         for (const auto& name : entry.argument_names) {
             if (!text_ok(name, true))
@@ -2225,61 +2439,70 @@ std::string serialize_source_coordinate(const source_coordinate_t& value)
     return writer.take();
 }
 
-std::string serialize_provider_ir(const provider_ir_t& value)
+namespace {
+
+measured_serialization_t finish_measured(measured_writer_t& writer)
+{
+    measured_serialization_t result;
+    result.bytes = writer.take();
+    result.size = static_cast<std::uint64_t>(result.bytes.size());
+    if (!writer.finish_digest(result.digest.bytes))
+        throw std::invalid_argument("measured serialization digest unavailable");
+    return result;
+}
+
+template <typename Writer>
+void serialize_provider_ir_body(Writer& writer, const provider_ir_t& value)
 {
     require_valid(validate_provider_ir(value));
-    canonical_writer_t writer;
     writer.u32(k_magic_provider_ir);
     writer.u32(value.schema_version);
     write_provider(writer, value.provider);
     write_language(writer, value.language);
     write_entity(writer, value.entity);
     writer.u64(value.entry_block_id);
-    write_vector(writer, value.blocks, write_provider_block);
-    write_vector(writer, value.source_coordinates, write_coordinate);
-    write_vector(writer, value.unknowns, write_unknown);
-    write_vector(writer, value.diagnostics, write_diagnostic);
-    return writer.take();
+    write_vector(writer, value.blocks, write_provider_block<Writer>);
+    write_vector(writer, value.source_coordinates, write_coordinate<Writer>);
+    write_vector(writer, value.unknowns, write_unknown<Writer>);
+    write_vector(writer, value.diagnostics, write_diagnostic<Writer>);
 }
 
-std::string serialize_hir_function(const hir_function_t& value)
+template <typename Writer>
+void serialize_hir_function_body(Writer& writer, const hir_function_t& value)
 {
     require_valid(validate_hir_function(value));
-    canonical_writer_t writer;
     writer.u32(k_magic_hir);
     writer.u32(value.schema_version);
     write_entity(writer, value.entity);
     writer.digest(value.provider_ir_hash);
     writer.u64(value.type_graph_revision);
     writer.u64(value.return_type_id);
-    write_vector(writer, value.parameters, write_hir_variable);
-    write_vector(writer, value.locals, write_hir_variable);
-    write_vector(writer, value.blocks, write_hir_block);
-    write_vector(writer, value.source_coordinates, write_coordinate);
-    write_vector(writer, value.unknowns, write_unknown);
-    write_vector(writer, value.diagnostics, write_diagnostic);
-    return writer.take();
+    write_vector(writer, value.parameters, write_hir_variable<Writer>);
+    write_vector(writer, value.locals, write_hir_variable<Writer>);
+    write_vector(writer, value.blocks, write_hir_block<Writer>);
+    write_vector(writer, value.source_coordinates, write_coordinate<Writer>);
+    write_vector(writer, value.unknowns, write_unknown<Writer>);
+    write_vector(writer, value.diagnostics, write_diagnostic<Writer>);
 }
 
-std::string serialize_type_graph(const type_graph_t& value)
+template <typename Writer>
+void serialize_type_graph_body(Writer& writer, const type_graph_t& value)
 {
     require_valid(validate_type_graph(value));
-    canonical_writer_t writer;
     writer.u32(k_magic_type_graph);
     writer.u32(value.schema_version);
     write_entity(writer, value.entity);
     writer.u64(value.revision);
-    write_vector(writer, value.nodes, write_type_node);
-    write_vector(writer, value.edges, write_type_edge);
-    write_vector(writer, value.unknowns, write_unknown);
-    write_vector(writer, value.diagnostics, write_diagnostic);
-    return writer.take();
+    write_vector(writer, value.nodes, write_type_node<Writer>);
+    write_vector(writer, value.edges, write_type_edge<Writer>);
+    write_vector(writer, value.unknowns, write_unknown<Writer>);
+    write_vector(writer, value.diagnostics, write_diagnostic<Writer>);
 }
 
-std::string serialize_typed_pseudocode_ast(const typed_pseudocode_ast_v2_t& value)
+template <typename Writer>
+void serialize_typed_pseudocode_ast_body(Writer& writer, const typed_pseudocode_ast_v2_t& value)
 {
     require_valid(validate_typed_pseudocode_ast(value));
-    canonical_writer_t writer;
     writer.u32(k_magic_ast);
     writer.u32(value.schema_version);
     write_entity(writer, value.entity);
@@ -2287,17 +2510,16 @@ std::string serialize_typed_pseudocode_ast(const typed_pseudocode_ast_v2_t& valu
     writer.digest(value.type_graph_hash);
     writer.u64(value.root_node_id);
     writer.u64(value.body_node_id);
-    write_vector(writer, value.nodes, write_ast_node);
-    write_vector(writer, value.source_coordinates, write_coordinate);
-    write_vector(writer, value.unknowns, write_unknown);
-    write_vector(writer, value.diagnostics, write_diagnostic);
-    return writer.take();
+    write_vector(writer, value.nodes, write_ast_node<Writer>);
+    write_vector(writer, value.source_coordinates, write_coordinate<Writer>);
+    write_vector(writer, value.unknowns, write_unknown<Writer>);
+    write_vector(writer, value.diagnostics, write_diagnostic<Writer>);
 }
 
-std::string serialize_decompiler_document(const decompiler_document_t& value)
+template <typename Writer>
+void serialize_decompiler_document_body(Writer& writer, const decompiler_document_t& value)
 {
     require_valid(validate_decompiler_document(value));
-    canonical_writer_t writer;
     writer.u32(k_magic_document);
     writer.u32(value.schema_version);
     write_entity(writer, value.entity);
@@ -2307,30 +2529,135 @@ std::string serialize_decompiler_document(const decompiler_document_t& value)
     write_enum(writer, value.profile);
     write_renderer(writer, value.renderer);
     writer.string(value.rendered_text);
-    write_vector(writer, value.tokens, write_document_token);
-    write_vector(writer, value.source_maps, write_document_source_map);
-    write_vector(writer, value.unknowns, write_unknown);
-    write_vector(writer, value.diagnostics, write_diagnostic);
+    write_vector(writer, value.tokens, write_document_token<Writer>);
+    write_vector(writer, value.source_maps, write_document_source_map<Writer>);
+    write_vector(writer, value.unknowns, write_unknown<Writer>);
+    write_vector(writer, value.diagnostics, write_diagnostic<Writer>);
+}
+
+template <typename Writer>
+void serialize_decompiler_diagnostic_body(Writer& writer, const decompiler_diagnostic_t& value)
+{
+    if (!valid_diagnostic(value) || (value.coordinate && !validate_source_coordinate(*value.coordinate).valid()))
+        throw std::invalid_argument("invalid decompiler diagnostic");
+    writer.u32(k_magic_diagnostic);
+    write_diagnostic(writer, value);
+}
+
+template <typename Writer>
+void serialize_decompiler_pipeline_cache_key_body(Writer& writer, const decompiler_pipeline_cache_key_t& value)
+{
+    require_valid(validate_decompiler_pipeline_cache_key(value));
+    writer.u32(k_magic_cache);
+    write_cache_key(writer, value);
+}
+
+template <typename Writer>
+void serialize_decompiler_render_evidence_body(Writer& writer, const decompiler_render_evidence_t& value)
+{
+    require_valid(validate_decompiler_render_evidence(value));
+    writer.u32(k_magic_render_evidence);
+    write_render_evidence(writer, value);
+}
+
+}
+
+std::string serialize_provider_ir(const provider_ir_t& value)
+{
+    canonical_writer_t writer;
+    serialize_provider_ir_body(writer, value);
     return writer.take();
+}
+
+measured_serialization_t serialize_provider_ir_measured(const provider_ir_t& value)
+{
+    measured_writer_t writer;
+    serialize_provider_ir_body(writer, value);
+    return finish_measured(writer);
+}
+
+std::string serialize_hir_function(const hir_function_t& value)
+{
+    canonical_writer_t writer;
+    serialize_hir_function_body(writer, value);
+    return writer.take();
+}
+
+measured_serialization_t serialize_hir_function_measured(const hir_function_t& value)
+{
+    measured_writer_t writer;
+    serialize_hir_function_body(writer, value);
+    return finish_measured(writer);
+}
+
+std::string serialize_type_graph(const type_graph_t& value)
+{
+    canonical_writer_t writer;
+    serialize_type_graph_body(writer, value);
+    return writer.take();
+}
+
+measured_serialization_t serialize_type_graph_measured(const type_graph_t& value)
+{
+    measured_writer_t writer;
+    serialize_type_graph_body(writer, value);
+    return finish_measured(writer);
+}
+
+std::string serialize_typed_pseudocode_ast(const typed_pseudocode_ast_v2_t& value)
+{
+    canonical_writer_t writer;
+    serialize_typed_pseudocode_ast_body(writer, value);
+    return writer.take();
+}
+
+measured_serialization_t serialize_typed_pseudocode_ast_measured(const typed_pseudocode_ast_v2_t& value)
+{
+    measured_writer_t writer;
+    serialize_typed_pseudocode_ast_body(writer, value);
+    return finish_measured(writer);
+}
+
+std::string serialize_decompiler_document(const decompiler_document_t& value)
+{
+    canonical_writer_t writer;
+    serialize_decompiler_document_body(writer, value);
+    return writer.take();
+}
+
+measured_serialization_t serialize_decompiler_document_measured(const decompiler_document_t& value)
+{
+    measured_writer_t writer;
+    serialize_decompiler_document_body(writer, value);
+    return finish_measured(writer);
 }
 
 std::string serialize_decompiler_diagnostic(const decompiler_diagnostic_t& value)
 {
-    if (!valid_diagnostic(value) || (value.coordinate && !validate_source_coordinate(*value.coordinate).valid()))
-        throw std::invalid_argument("invalid decompiler diagnostic");
     canonical_writer_t writer;
-    writer.u32(k_magic_diagnostic);
-    write_diagnostic(writer, value);
+    serialize_decompiler_diagnostic_body(writer, value);
     return writer.take();
+}
+
+measured_serialization_t serialize_decompiler_diagnostic_measured(const decompiler_diagnostic_t& value)
+{
+    measured_writer_t writer;
+    serialize_decompiler_diagnostic_body(writer, value);
+    return finish_measured(writer);
 }
 
 std::string serialize_decompiler_pipeline_cache_key(const decompiler_pipeline_cache_key_t& value)
 {
-    require_valid(validate_decompiler_pipeline_cache_key(value));
     canonical_writer_t writer;
-    writer.u32(k_magic_cache);
-    write_cache_key(writer, value);
+    serialize_decompiler_pipeline_cache_key_body(writer, value);
     return writer.take();
+}
+
+measured_serialization_t serialize_decompiler_pipeline_cache_key_measured(const decompiler_pipeline_cache_key_t& value)
+{
+    measured_writer_t writer;
+    serialize_decompiler_pipeline_cache_key_body(writer, value);
+    return finish_measured(writer);
 }
 
 std::string serialize_decompiler_worker_message(const decompiler_worker_message_t& value)
@@ -2365,7 +2692,7 @@ std::string serialize_decompiler_worker_message(const decompiler_worker_message_
             writer.string(serialize_decompiler_document(message.document));
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_failure_message_t>) {
             writer.u64(message.job_id);
-            write_vector(writer, message.diagnostics, write_diagnostic);
+            write_vector(writer, message.diagnostics, write_diagnostic<canonical_writer_t>);
         } else {
             writer.u64(message.active_job_id);
         }
@@ -2375,11 +2702,16 @@ std::string serialize_decompiler_worker_message(const decompiler_worker_message_
 
 std::string serialize_decompiler_render_evidence(const decompiler_render_evidence_t& value)
 {
-    require_valid(validate_decompiler_render_evidence(value));
     canonical_writer_t writer;
-    writer.u32(k_magic_render_evidence);
-    write_render_evidence(writer, value);
+    serialize_decompiler_render_evidence_body(writer, value);
     return writer.take();
+}
+
+measured_serialization_t serialize_decompiler_render_evidence_measured(const decompiler_render_evidence_t& value)
+{
+    measured_writer_t writer;
+    serialize_decompiler_render_evidence_body(writer, value);
+    return finish_measured(writer);
 }
 
 decompiler_contract_decode_result_t<decompiler_entity_key_t> deserialize_decompiler_entity_key(const std::string& value)
@@ -2553,8 +2885,26 @@ decompiler_contract_decode_result_t<decompiler_render_evidence_t> deserialize_de
         validate_decompiler_render_evidence);
 }
 
+namespace {
+
+bool sha256_software_reference(const std::uint8_t* data, std::size_t size,
+                               std::array<std::uint8_t, 32>& out) noexcept
+{
+    sha256_t hash;
+    hash.update(data, size);
+    out = hash.finish().bytes;
+    return true;
+}
+
+}
+
 sha256_digest_t stable_serialization_hash(const std::string& bytes)
 {
+    if (aida::crypto::sha256_cng_available(&sha256_software_reference)) {
+        sha256_digest_t digest;
+        if (aida::crypto::sha256_cng_digest(bytes.data(), bytes.size(), digest.bytes))
+            return digest;
+    }
     sha256_t hash;
     hash.update(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size());
     return hash.finish();
@@ -2571,5 +2921,31 @@ sha256_digest_t stable_serialization_hash(const decompiler_diagnostic_t& value) 
 sha256_digest_t stable_serialization_hash(const decompiler_pipeline_cache_key_t& value) { return stable_serialization_hash(serialize_decompiler_pipeline_cache_key(value)); }
 sha256_digest_t stable_serialization_hash(const decompiler_worker_message_t& value) { return stable_serialization_hash(serialize_decompiler_worker_message(value)); }
 sha256_digest_t stable_serialization_hash(const decompiler_render_evidence_t& value) { return stable_serialization_hash(serialize_decompiler_render_evidence(value)); }
+
+sha256_digest_t attestation_equivalence_digest(const decompiler_document_t& value)
+{
+    constexpr std::uint32_t k_magic_attestation = 0x31584b44U;
+    constexpr std::uint32_t k_attestation_domain_version = 1;
+    measured_writer_t writer;
+    writer.u32(k_magic_attestation);
+    writer.u32(k_attestation_domain_version);
+    writer.u32(k_magic_document);
+    writer.u32(value.schema_version);
+    write_entity(writer, value.entity);
+    writer.string(serialize_typed_pseudocode_ast(value.ast));
+    writer.digest(value.ast_hash);
+    writer.digest(value.type_graph_hash);
+    write_enum(writer, value.profile);
+    write_renderer(writer, value.renderer);
+    writer.string(value.rendered_text);
+    write_vector(writer, value.tokens, write_document_token<measured_writer_t>);
+    write_vector(writer, value.source_maps, write_document_source_map<measured_writer_t>);
+    write_vector(writer, value.unknowns, write_unknown<measured_writer_t>);
+    writer.u32(0);
+    sha256_digest_t digest;
+    if (!writer.finish_digest(digest.bytes))
+        throw std::invalid_argument("attestation equivalence digest unavailable");
+    return digest;
+}
 
 }

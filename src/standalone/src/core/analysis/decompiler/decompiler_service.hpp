@@ -1,9 +1,9 @@
 #pragma once
 
-#include "decompiler_cache_v9.hpp"
+#include "decompiler_cache.hpp"
 #include "decompiler_provider_registry.hpp"
 #include "pseudocode_readability.hpp"
-#include "pseudocode_renderer_v2.hpp"
+#include "pseudocode_renderer.hpp"
 #include "type_graph_builder.hpp"
 
 #include <chrono>
@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace aida::analysis {
@@ -135,8 +136,8 @@ struct decompiler_pipeline_service_config_t {
     std::size_t max_diagnostics = 65536;
     std::uint64_t max_provider_payload_bytes = 64ULL << 20;
     std::uint64_t max_normalized_payload_bytes = 128ULL << 20;
-    typed_ast_v2_build_limits_t ast_limits;
-    pseudocode_renderer_v2_limits_t renderer_limits;
+    typed_ast_build_limits_t ast_limits;
+    pseudocode_renderer_limits_t renderer_limits;
     decompiler_profile_policy_t profiles = default_decompiler_profile_policy();
     std::shared_ptr<decompiler_isolated_provider_host_t> isolated_provider_host;
     pseudocode_readability_limits_t readability_limits;
@@ -144,6 +145,8 @@ struct decompiler_pipeline_service_config_t {
     bool batch_rendered_only_memory_cache = true;
     bool batch_attestation_enabled = true;
     std::uint32_t batch_attestation_sample_rate = 8;
+    std::size_t persistent_prefetch_max_tasks = 4;
+    std::uint64_t persistent_prefetch_await_cap_ms = 250;
     std::shared_ptr<workspace_database_t> database;
     std::shared_ptr<analysis_metrics_t> metrics_sink;
 };
@@ -183,7 +186,7 @@ public:
 
     static workspace_result_t<std::shared_ptr<decompiler_pipeline_service_t>> create(
         std::shared_ptr<decompiler_provider_registry_t> providers,
-        std::shared_ptr<decompiler_cache_v9_t> cache,
+        std::shared_ptr<decompiler_cache_t> cache,
         std::shared_ptr<semantic_refiner_t> semantic_refiner = {},
         decompiler_pipeline_service_config_t config = {});
 
@@ -207,6 +210,8 @@ public:
         const std::string& workspace_id,
         std::uint64_t generation,
         const std::vector<decompiler_entity_key_t>& entities);
+    void prefetch_persistent_rendered(std::string_view workspace_id, std::uint64_t generation,
+                                      std::vector<decompiler_pipeline_cache_key_t> rendered_keys);
     decompiler_pipeline_service_snapshot_t snapshot() const;
     void request_stop() noexcept;
 

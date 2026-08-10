@@ -10,6 +10,7 @@
 #include "../ui/metrics.hpp"
 #include "../ui/theme.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
+#include "../../helpers/diag_log.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/disasm_preview_adapter.hpp"
 #include "../../preview/studio_semantics.hpp"
@@ -57,9 +58,19 @@ struct tab_t {
     std::string error;
     bool error_acknowledged = false;
     std::uint64_t renames_applied_job_id = 0;
+    std::uint64_t resolve_ticket = 0;
+    bool resolve_force_refresh = false;
 };
 
 using local_rename_map_t = std::map<std::string, std::string>;
+
+struct ast_index_cache_t {
+    const void* document = nullptr;
+    std::unordered_map<std::uint64_t,
+        const aida::analysis::typed_pseudocode_ast_node_t*> by_id;
+    std::unordered_map<std::uint64_t,
+        const aida::analysis::typed_pseudocode_ast_node_t*> parents;
+};
 
 struct state_t {
     std::mutex mutex;
@@ -72,6 +83,7 @@ struct state_t {
     bool renames_loaded = false;
     aida::analysis::binary_id_t binary_id;
     std::map<std::string, local_rename_map_t> local_renames;
+    ast_index_cache_t ast_index;
 };
 
 std::filesystem::path local_rename_store_path(
@@ -311,12 +323,17 @@ void synchronize_tabs(
         tab.label = has_native_address
             ? label_for(context, tab.address) : tab.entity_locator;
         if (generation_changed) {
+            if (tab.resolve_ticket != 0 && workbench.pseudocode_document)
+                static_cast<void>(workbench.pseudocode_document->cancel_resolution(
+                    tab.resolve_ticket));
             tab.request = {};
             tab.has_request = false;
             tab.job_id = 0;
             tab.state = pseudocode_cache_state_t::empty;
             tab.error.clear();
             tab.error_acknowledged = false;
+            tab.resolve_ticket = 0;
+            tab.resolve_force_refresh = false;
         }
         if (document.id == workbench.persistence.active_document)
             active = static_cast<int>(synchronized.size());
@@ -354,10 +371,65 @@ std::string first_diagnostic(
     return diagnostics.front().localization_key;
 }
 
+void apply_resolution_outcomes(
+    aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
+    const std::shared_ptr<state_t>& state,
+    const std::vector<aida::workbench::pseudocode_document::
+        pseudocode_document_model_t::resolution_outcome_t>& outcomes)
+{
+    if (outcomes.empty())
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    for (const auto& outcome : outcomes) {
+        for (auto& tab : state->tabs) {
+            if (tab.resolve_ticket == 0 || tab.resolve_ticket != outcome.ticket)
+                continue;
+            tab.resolve_ticket = 0;
+            tab.resolve_force_refresh = false;
+            if (outcome.submitted_request &&
+                (outcome.error ||
+                 outcome.error.code == aida::workbench::pseudocode_document::
+                     pseudocode_error_code_t::request_in_progress)) {
+                tab.request = outcome.request;
+                tab.has_request = true;
+                tab.error.clear();
+                if (const auto* cached = model.cached_document(outcome.request)) {
+                    tab.job_id = cached->job_id;
+                    tab.state = cached->state;
+                }
+                diag::log_tagged_fmt("workbench",
+                    "workbench.pseudocode.resolve completed ticket=%llu job_id=%llu",
+                    static_cast<unsigned long long>(outcome.ticket),
+                    static_cast<unsigned long long>(tab.job_id));
+            } else {
+                tab.has_request = false;
+                tab.state = pseudocode_cache_state_t::failed;
+                tab.error = pseudocode_error_text(outcome.error);
+                const bool stale = outcome.error.code ==
+                    aida::workbench::pseudocode_document::
+                        pseudocode_error_code_t::stale_generation;
+                if (stale) {
+                    diag::log_tagged_fmt("workbench",
+                        "workbench.pseudocode.resolve stale ticket=%llu generation=%llu",
+                        static_cast<unsigned long long>(outcome.ticket),
+                        static_cast<unsigned long long>(outcome.error.subject));
+                } else {
+                    diag::log_tagged_fmt("workbench",
+                        "workbench.pseudocode.resolve failed ticket=%llu code=%u",
+                        static_cast<unsigned long long>(outcome.ticket),
+                        static_cast<unsigned>(outcome.error.code));
+                }
+            }
+            break;
+        }
+    }
+}
+
 void refresh_tab_states(
     aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
     const std::shared_ptr<state_t>& state)
 {
+    apply_resolution_outcomes(model, state, model.drain_resolutions());
     const auto binary_id = state->binary_id;
     std::lock_guard<std::mutex> lock(state->mutex);
     for (auto& tab : state->tabs) {
@@ -549,7 +621,8 @@ bool local_rename_identifier_text(const std::string& value)
 std::string local_rename_candidate(
     const aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
     const aida::workbench::pseudocode_document::pseudocode_page_t& page,
-    std::uint32_t token_begin)
+    std::uint32_t token_begin,
+    const std::shared_ptr<state_t>& state)
 {
     const auto* cached = model.cached_document();
     if (!cached || !cached->document)
@@ -566,24 +639,28 @@ std::string local_rename_candidate(
         !local_rename_identifier_text(token->text))
         return {};
     const auto& ast = cached->document->ast;
-    std::unordered_map<std::uint64_t, const aida::analysis::typed_pseudocode_ast_node_t*> by_id;
-    by_id.reserve(ast.nodes.size());
-    for (const auto& node : ast.nodes)
-        by_id.emplace(node.id, &node);
+    auto& index = state->ast_index;
+    if (index.document != static_cast<const void*>(cached->document.get())) {
+        index.document = cached->document.get();
+        index.by_id.clear();
+        index.parents.clear();
+        index.by_id.reserve(ast.nodes.size());
+        for (const auto& node : ast.nodes)
+            index.by_id.emplace(node.id, &node);
+        index.parents.reserve(ast.nodes.size());
+        for (const auto& node : ast.nodes) {
+            for (const auto child_id : node.child_ids)
+                index.parents.emplace(child_id, &node);
+        }
+    }
     const aida::analysis::typed_pseudocode_ast_node_t* ast_node = nullptr;
     const aida::analysis::typed_pseudocode_ast_node_t* root = nullptr;
-    const auto node_it = by_id.find(token->ast_node_id);
-    if (node_it != by_id.end())
+    const auto node_it = index.by_id.find(token->ast_node_id);
+    if (node_it != index.by_id.end())
         ast_node = node_it->second;
-    const auto root_it = by_id.find(ast.root_node_id);
-    if (root_it != by_id.end())
+    const auto root_it = index.by_id.find(ast.root_node_id);
+    if (root_it != index.by_id.end())
         root = root_it->second;
-    std::unordered_map<std::uint64_t, const aida::analysis::typed_pseudocode_ast_node_t*> parents;
-    parents.reserve(ast.nodes.size());
-    for (const auto& node : ast.nodes) {
-        for (const auto child_id : node.child_ids)
-            parents.emplace(child_id, &node);
-    }
     if (ast_node == nullptr ||
         (ast_node->kind != aida::analysis::typed_pseudocode_ast_node_kind_t::declaration &&
          ast_node->kind != aida::analysis::typed_pseudocode_ast_node_kind_t::identifier) ||
@@ -591,8 +668,8 @@ std::string local_rename_candidate(
         return {};
     if (root != nullptr && root->stable_text == token->text)
         return {};
-    const auto parent = parents.find(ast_node->id);
-    if (parent != parents.end() &&
+    const auto parent = index.parents.find(ast_node->id);
+    if (parent != index.parents.end() &&
         parent->second->kind == aida::analysis::typed_pseudocode_ast_node_kind_t::call_expression &&
         !parent->second->child_ids.empty() &&
         parent->second->child_ids.front() == ast_node->id)
@@ -981,22 +1058,14 @@ void request_decompile(const disasm_view::workspace_context_t& context,
         return;
     synchronize_tabs(context, workbench, state);
 
-    pseudocode_request_t request;
-    const auto resolved = workbench.pseudocode_document->resolve_request(
-        typed->value, aida::analysis::decompiler_profile_id_t::balanced,
+    aida::analysis::decompiler_entity_locator_t locator;
+    locator.address = typed->value;
+    std::uint64_t ticket = 0;
+    const auto submitted = workbench.pseudocode_document->request_async(
+        locator, aida::analysis::decompiler_profile_id_t::balanced,
         aida::workbench::pseudocode_document::
             k_pseudocode_document_default_timeout_ms,
-        request);
-    aida::workbench::pseudocode_document::pseudocode_error_t requested;
-    if (resolved)
-        requested = workbench.pseudocode_document->request(request, force_refresh);
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    if (resolved && requested) {
-        settle_preview_request(*workbench.pseudocode_document, request);
-        aida::preview::disasm::record("decompile_function", canonical_address,
-            force_refresh ? "refresh" : "open");
-    }
-#endif
+        force_refresh, ticket);
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         const auto index = find_tab(*state, canonical_address);
@@ -1004,29 +1073,38 @@ void request_decompile(const disasm_view::workspace_context_t& context,
             return;
         auto& tab = state->tabs[*index];
         tab.error_acknowledged = false;
-        if (!resolved) {
+        if (!submitted) {
+            tab.request = {};
             tab.has_request = false;
+            tab.job_id = 0;
+            tab.resolve_ticket = 0;
+            tab.resolve_force_refresh = false;
             tab.state = pseudocode_cache_state_t::failed;
-            tab.error = pseudocode_error_text(resolved);
+            tab.error = pseudocode_error_text(submitted);
             return;
         }
-        tab.request = request;
-        tab.has_request = true;
-        if (!requested && requested.code !=
-                aida::workbench::pseudocode_document::
-                    pseudocode_error_code_t::request_in_progress) {
-            tab.state = pseudocode_cache_state_t::failed;
-            tab.error = pseudocode_error_text(requested);
-            return;
-        }
-        static_cast<void>(workbench.pseudocode_document->activate(request));
-        if (const auto* cached =
-                workbench.pseudocode_document->cached_document(request)) {
-            tab.job_id = cached->job_id;
-            tab.state = cached->state;
-        }
+        tab.request = {};
+        tab.has_request = false;
+        tab.job_id = 0;
+        tab.resolve_ticket = ticket;
+        tab.resolve_force_refresh = force_refresh;
+        tab.state = pseudocode_cache_state_t::requesting;
         tab.error.clear();
     }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (submitted) {
+        const auto outcomes = workbench.pseudocode_document->drain_resolutions();
+        apply_resolution_outcomes(*workbench.pseudocode_document, state, outcomes);
+        for (const auto& outcome : outcomes) {
+            if (outcome.ticket != ticket || !outcome.submitted_request ||
+                !outcome.error)
+                continue;
+            settle_preview_request(*workbench.pseudocode_document, outcome.request);
+            aida::preview::disasm::record("decompile_function", canonical_address,
+                force_refresh ? "refresh" : "open");
+        }
+    }
+#endif
 }
 
 void request_decompile(
@@ -1061,50 +1139,50 @@ void request_decompile(
         return;
     synchronize_tabs(context, workbench, state);
 
-    pseudocode_request_t request;
-    const auto resolved = workbench.pseudocode_document->resolve_request(
+    std::uint64_t ticket = 0;
+    const auto submitted = workbench.pseudocode_document->request_async(
         locator, aida::analysis::decompiler_profile_id_t::balanced,
         aida::workbench::pseudocode_document::
             k_pseudocode_document_default_timeout_ms,
-        request);
-    aida::workbench::pseudocode_document::pseudocode_error_t requested;
-    if (resolved)
-        requested = workbench.pseudocode_document->request(
-            request, force_refresh);
+        force_refresh, ticket);
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const auto index = find_tab(*state, *canonical);
+        if (!index)
+            return;
+        auto& tab = state->tabs[*index];
+        tab.error_acknowledged = false;
+        if (!submitted) {
+            tab.request = {};
+            tab.has_request = false;
+            tab.job_id = 0;
+            tab.resolve_ticket = 0;
+            tab.resolve_force_refresh = false;
+            tab.state = pseudocode_cache_state_t::failed;
+            tab.error = pseudocode_error_text(submitted);
+            return;
+        }
+        tab.request = {};
+        tab.has_request = false;
+        tab.job_id = 0;
+        tab.resolve_ticket = ticket;
+        tab.resolve_force_refresh = force_refresh;
+        tab.state = pseudocode_cache_state_t::requesting;
+        tab.error.clear();
+    }
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    if (resolved && requested) {
-        settle_preview_request(*workbench.pseudocode_document, request);
-        aida::preview::disasm::record("decompile_entity", 0, *canonical);
+    if (submitted) {
+        const auto outcomes = workbench.pseudocode_document->drain_resolutions();
+        apply_resolution_outcomes(*workbench.pseudocode_document, state, outcomes);
+        for (const auto& outcome : outcomes) {
+            if (outcome.ticket != ticket || !outcome.submitted_request ||
+                !outcome.error)
+                continue;
+            settle_preview_request(*workbench.pseudocode_document, outcome.request);
+            aida::preview::disasm::record("decompile_entity", 0, *canonical);
+        }
     }
 #endif
-    std::lock_guard<std::mutex> lock(state->mutex);
-    const auto index = find_tab(*state, *canonical);
-    if (!index)
-        return;
-    auto& tab = state->tabs[*index];
-    tab.error_acknowledged = false;
-    if (!resolved) {
-        tab.has_request = false;
-        tab.state = pseudocode_cache_state_t::failed;
-        tab.error = pseudocode_error_text(resolved);
-        return;
-    }
-    tab.request = request;
-    tab.has_request = true;
-    if (!requested && requested.code !=
-            aida::workbench::pseudocode_document::
-                pseudocode_error_code_t::request_in_progress) {
-        tab.state = pseudocode_cache_state_t::failed;
-        tab.error = pseudocode_error_text(requested);
-        return;
-    }
-    static_cast<void>(workbench.pseudocode_document->activate(request));
-    if (const auto* cached =
-            workbench.pseudocode_document->cached_document(request)) {
-        tab.job_id = cached->job_id;
-        tab.state = cached->state;
-    }
-    tab.error.clear();
 }
 
 void request_decompile(std::uint64_t address, const DisasmFile*, bool force_refresh)
@@ -1127,10 +1205,15 @@ void close_tab_by_addr(const disasm_view::workspace_context_t& context,
         if (state) {
             std::lock_guard<std::mutex> lock(state->mutex);
             const auto index = find_tab(*state, canonical_address);
-            if (index && state->tabs[*index].has_request &&
-                state->tabs[*index].state == pseudocode_cache_state_t::requesting)
-                static_cast<void>(workbench.pseudocode_document->cancel(
-                    state->tabs[*index].job_id));
+            if (index) {
+                if (state->tabs[*index].resolve_ticket != 0)
+                    static_cast<void>(workbench.pseudocode_document->cancel_resolution(
+                        state->tabs[*index].resolve_ticket));
+                if (state->tabs[*index].has_request &&
+                    state->tabs[*index].state == pseudocode_cache_state_t::requesting)
+                    static_cast<void>(workbench.pseudocode_document->cancel(
+                        state->tabs[*index].job_id));
+            }
         }
     }
     static_cast<void>(
@@ -1162,10 +1245,15 @@ void close_tab_by_entity(const disasm_view::workspace_context_t& context,
         if (state) {
             std::lock_guard<std::mutex> lock(state->mutex);
             const auto index = find_tab(*state, *canonical);
-            if (index && state->tabs[*index].has_request &&
-                state->tabs[*index].state == pseudocode_cache_state_t::requesting)
-                static_cast<void>(workbench.pseudocode_document->cancel(
-                    state->tabs[*index].job_id));
+            if (index) {
+                if (state->tabs[*index].resolve_ticket != 0)
+                    static_cast<void>(workbench.pseudocode_document->cancel_resolution(
+                        state->tabs[*index].resolve_ticket));
+                if (state->tabs[*index].has_request &&
+                    state->tabs[*index].state == pseudocode_cache_state_t::requesting)
+                    static_cast<void>(workbench.pseudocode_document->cancel(
+                        state->tabs[*index].job_id));
+            }
         }
     }
     static_cast<void>(
@@ -1280,6 +1368,14 @@ void cancel_active_decompile(const disasm_view::workspace_context_t& context)
         static_cast<std::size_t>(state->active) >= state->tabs.size())
         return;
     auto& tab = state->tabs[static_cast<std::size_t>(state->active)];
+    if (tab.resolve_ticket != 0) {
+        static_cast<void>(workbench.pseudocode_document->cancel_resolution(
+            tab.resolve_ticket));
+        tab.resolve_ticket = 0;
+        tab.resolve_force_refresh = false;
+        tab.state = pseudocode_cache_state_t::cancelled;
+        return;
+    }
     if (!tab.has_request || tab.state != pseudocode_cache_state_t::requesting)
         return;
     static_cast<void>(workbench.pseudocode_document->activate(tab.request));
@@ -1432,7 +1528,6 @@ void render(float, float, float width, float height,
         return;
     }
     synchronize_tabs(context, workbench, state);
-    refresh_tab_states(*workbench.pseudocode_document, state);
 
     const std::string id = context.workspace->identity().binary_id().to_hex();
     ImGui::PushID(id.c_str());
@@ -1676,10 +1771,10 @@ void render(float, float, float width, float height,
         ImGuiListClipper clipper;
         clipper.Begin(line_count, row_height);
         std::optional<std::uint64_t> selected_source_address;
+        std::optional<aida::workbench::pseudocode_document::pseudocode_line_view_t>
+            selected_line_view;
         std::string selected_token_text;
         std::string selected_rename_candidate;
-        std::optional<aida::ui::analysis_context_menu::context_t>
-            selected_shortcut_context;
         while (clipper.Step()) {
             auto first = static_cast<std::uint32_t>(clipper.DisplayStart);
             const auto end = static_cast<std::uint32_t>(clipper.DisplayEnd);
@@ -1810,6 +1905,7 @@ void render(float, float, float width, float height,
                             line_origin.y + row_height * 0.5f), 1.75f,
                             theme.accent_u32);
                     if (selected_line == line_index) {
+                        selected_line_view = line;
                         selected_source_address = token_source_address(
                             *workbench.pseudocode_document,
                             token_for_position(page, selected_token_begin),
@@ -1822,12 +1918,8 @@ void render(float, float, float width, float height,
                                 selected_token_end - selected_token_begin);
                         }
                         selected_rename_candidate = local_rename_candidate(
-                            *workbench.pseudocode_document, page, selected_token_begin);
-                        selected_shortcut_context = make_line_context_menu(
-                            context, line, selected_source_address,
-                            selected_token_text, state, line_index,
-                            selected_token_begin, selected_token_end,
-                            selected_rename_candidate);
+                            *workbench.pseudocode_document, page,
+                            selected_token_begin, state);
                     }
                     if (hovered_token && hovered && source_address) {
                         ImGui::SetTooltip("%s\nMapped address  0x%s\nEnter: disassembly   Space: graph",
@@ -1889,7 +1981,7 @@ void render(float, float, float width, float height,
                             ? hovered_token->text : selected_token_text;
                         const auto rename_candidate = right_clicked && hovered_token
                             ? local_rename_candidate(*workbench.pseudocode_document, page,
-                                hovered_token->range.begin)
+                                hovered_token->range.begin, state)
                             : selected_rename_candidate;
                         open_line_context_menu(context, line, menu_source,
                             token_text, state, static_cast<int>(line_index),
@@ -1906,13 +1998,17 @@ void render(float, float, float width, float height,
         ImGui::PopStyleVar();
         const bool code_focused =
             ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-        if (code_focused && selected_source_address) {
+        if (code_focused && selected_source_address && selected_line_view) {
             const auto& io = ImGui::GetIO();
-			if (io.KeyCtrl && selected_shortcut_context &&
+			if (io.KeyCtrl &&
                 (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
 				 ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
                 aida::ui::analysis_context_menu::execute_shortcut(
-                    std::move(*selected_shortcut_context), "analysis.copy.text");
+                    make_line_context_menu(context, *selected_line_view,
+                        selected_source_address, selected_token_text, state,
+                        selected_line, selected_token_begin, selected_token_end,
+                        selected_rename_candidate),
+                    "analysis.copy.text");
         }
         if (code_focused && !selected_rename_candidate.empty()) {
             const auto& io = ImGui::GetIO();

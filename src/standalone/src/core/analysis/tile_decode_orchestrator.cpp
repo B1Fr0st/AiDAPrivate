@@ -3,6 +3,8 @@
 #include "decode_worker_pool.hpp"
 #include "workspace/parallel_pass.hpp"
 
+#include "../infra/fast_containers.hpp"
+
 #include "../../helpers/diag_log.hpp"
 
 #include <algorithm>
@@ -1445,8 +1447,8 @@ struct decode_shard_context_t final {
     std::vector<std::uint64_t> mint_low;
     std::vector<decode_frontier_claim_t> mint_watermark_claim;
     std::atomic<std::uint32_t> in_flight{0};
-    std::mutex inbound_mutex;
-    std::vector<seed_envelope_t> inbound;
+    aida::infra::fast_queue<seed_envelope_t> inbound_queue;
+    std::atomic<std::int64_t> inbound_pending{0};
     std::uint64_t emitted_ordinal_counter = 0;
     std::uint64_t wave_index = 0;
     std::size_t next_gap_tile = 0;
@@ -1483,6 +1485,7 @@ struct decode_run_context_t final {
     tile_decode_executor_t* executor = nullptr;
     decode_worker_pool_t* pool = nullptr;
     decode_lane_seed_exchange_t* lane_exchange = nullptr;
+    decode_build_progress_t* build_progress = nullptr;
     std::uint32_t lane_id = 0;
     std::uint64_t image_base = 0;
     std::uint64_t image_size = 0;
@@ -1590,8 +1593,8 @@ workspace_result_t<void> shard_emit_seed(decode_run_context_t& ctx,
         envelope.seed = seed;
         envelope.source_tile = source_tile;
         auto& target = *ctx.shards[target_shard];
-        std::lock_guard<std::mutex> lock(target.inbound_mutex);
-        target.inbound.push_back(std::move(envelope));
+        target.inbound_pending.fetch_add(1, std::memory_order_acq_rel);
+        target.inbound_queue.enqueue(std::move(envelope));
         return workspace_result_t<void>::success();
     }
     if (ctx.lane_exchange != nullptr) {
@@ -2420,6 +2423,14 @@ workspace_result_t<void> shard_build_tile(decode_run_context_t& ctx,
     if (instruction_count != 0)
         ++shard.stats.accepted_tiles;
 
+    if (ctx.build_progress != nullptr) {
+        auto ready = ctx.build_progress->packed_tile_ready(
+            static_cast<std::size_t>(shard.tile_begin) + tile_local,
+            *shard.built_shards[tile_local]);
+        if (!ready)
+            return workspace_result_t<void>::failure(ready.error());
+    }
+
     ++shard.next_build_tile;
     return workspace_result_t<void>::success();
 }
@@ -2777,8 +2788,7 @@ workspace_result_t<bool> shard_lease_build_step(
 
 bool shard_inbound_empty(decode_shard_context_t& shard)
 {
-    std::lock_guard<std::mutex> lock(shard.inbound_mutex);
-    return shard.inbound.empty();
+    return shard.inbound_pending.load(std::memory_order_acquire) == 0;
 }
 
 workspace_result_t<bool> shard_lease_step(decode_run_context_t& ctx,
@@ -2821,13 +2831,37 @@ workspace_result_t<bool> shard_lease_step(decode_run_context_t& ctx,
             auto& order =
                 shard.apply_order[static_cast<std::size_t>(request_tile -
                     shard.tile_begin)];
-            if (order.empty() || order.front() != seq) {
+            const bool gap_pass =
+                request_it->second.pass == tile_decode_pass_t::gap;
+            if (order.empty()) {
                 ++it;
                 continue;
             }
+            bool out_of_order_gap = false;
+            if (order.front() == seq) {
+                order.pop_front();
+            } else {
+                if (!gap_pass) {
+                    ++it;
+                    continue;
+                }
+                bool erased = false;
+                for (auto order_it = order.begin(); order_it != order.end();
+                     ++order_it) {
+                    if (*order_it == seq) {
+                        order.erase(order_it);
+                        erased = true;
+                        break;
+                    }
+                }
+                if (!erased) {
+                    ++it;
+                    continue;
+                }
+                out_of_order_gap = true;
+            }
             auto completion = std::move(it->second);
             it = shard.incoming.erase(it);
-            order.pop_front();
             const auto request = request_it->second;
             shard.requests_in_flight.erase(request_it);
             if (!completion.succeeded()) {
@@ -2843,20 +2877,30 @@ workspace_result_t<bool> shard_lease_step(decode_run_context_t& ctx,
             if (!processed)
                 return workspace_result_t<bool>::failure(processed.error());
             shard.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            if (out_of_order_gap)
+                ++shard.stats.gap_out_of_order_apply_count;
             did_work = true;
             applied_any = true;
         }
         if (!applied_any)
             break;
     }
-    if (!shard.incoming.empty())
+    if (std::any_of(shard.incoming.begin(), shard.incoming.end(),
+            [&](const auto& entry) {
+                const auto request_it = shard.requests_in_flight.find(entry.first);
+                return request_it != shard.requests_in_flight.end() &&
+                    request_it->second.pass == tile_decode_pass_t::recursive;
+            }))
         ++shard.stats.apply_stall_count;
 
     std::vector<seed_envelope_t> envelopes;
     {
-        std::lock_guard<std::mutex> lock(shard.inbound_mutex);
-        if (!shard.inbound.empty())
-            envelopes.swap(shard.inbound);
+        seed_envelope_t envelope;
+        while (shard.inbound_queue.try_dequeue(envelope))
+            envelopes.push_back(std::move(envelope));
+        if (!envelopes.empty())
+            shard.inbound_pending.fetch_sub(static_cast<std::int64_t>(envelopes.size()),
+                std::memory_order_acq_rel);
     }
     if (ctx.lane_exchange != nullptr) {
         std::vector<decode_lane_seed_envelope_t> lane_envelopes;
@@ -3260,82 +3304,111 @@ workspace_result_t<void> drive_phase(decode_run_context_t& ctx,
         batch_cancel_message);
 }
 
-workspace_result_t<void> reconcile_boundary_fixup(decode_run_context_t& ctx)
+struct reconcile_fixup_outcome_t final {
+    std::optional<workspace_error_t> error;
+    std::uint64_t overlap_candidates = 0;
+};
+
+void reconcile_boundary_pair(decode_run_context_t& ctx, std::uint32_t left,
+    std::uint32_t right, reconcile_fixup_outcome_t& outcome)
 {
+    auto& left_shard = *ctx.shards[left];
+    auto& right_shard = *ctx.shards[right];
+    if (!left_shard.cursor_valid)
+        return;
     retained_cursor_t cursor;
+    cursor.valid = true;
+    cursor.shard = left;
+    cursor.tile_local = left_shard.cursor_tile_local;
+    cursor.slot = left_shard.cursor_slot;
+    cursor.rva = left_shard.cursor_rva;
+    cursor.end = left_shard.cursor_end;
+    bool closed = false;
     std::uint64_t visits = 0;
-    for (std::uint32_t shard_index = 0;
-         shard_index < static_cast<std::uint32_t>(ctx.shards.size());
-         ++shard_index) {
-        auto& shard = *ctx.shards[shard_index];
-        if (!cursor.valid) {
-            if (shard.cursor_valid) {
-                cursor.valid = true;
-                cursor.shard = shard_index;
-                cursor.tile_local = shard.cursor_tile_local;
-                cursor.slot = shard.cursor_slot;
-                cursor.rva = shard.cursor_rva;
-                cursor.end = shard.cursor_end;
-            }
+    for (std::size_t tile_local = 0;
+         tile_local < right_shard.accumulators.size() && !closed;
+         ++tile_local) {
+        auto& accumulator = right_shard.accumulators[tile_local];
+        if (accumulator.tile == nullptr)
             continue;
-        }
-        bool closed = false;
-        for (std::size_t tile_local = 0;
-             tile_local < shard.accumulators.size() && !closed; ++tile_local) {
-            auto& accumulator = shard.accumulators[tile_local];
-            if (accumulator.tile == nullptr)
+        for (std::uint32_t slot = 0;
+             slot < static_cast<std::uint32_t>(accumulator.entries.size());
+             ++slot) {
+            auto& entry = accumulator.entries[slot];
+            if (entry.evicted)
                 continue;
-            for (std::uint32_t slot = 0;
-                 slot < static_cast<std::uint32_t>(accumulator.entries.size());
-                 ++slot) {
-                auto& entry = accumulator.entries[slot];
-                if (entry.evicted)
-                    continue;
-                if ((visits++ & 255ULL) == 0 &&
-                    ctx.cancellation->stop_requested()) {
-                    return workspace_result_t<void>::failure(
-                        cancellation_error(*ctx.cancellation,
-                            "cross-tile instruction reconciliation cancelled"));
-                }
-                const auto rva = entry.record.address.value;
-                std::uint64_t entry_end = 0;
-                if (!checked_add(rva, entry.record.length, entry_end)) {
-                    return workspace_result_t<void>::failure(
-                        orchestrator_error(workspace_error_code_t::integrity_failure,
-                            "cross-tile instruction order is invalid", rva));
-                }
-                if (rva < cursor.rva) {
-                    return workspace_result_t<void>::failure(
-                        orchestrator_error(workspace_error_code_t::integrity_failure,
-                            "cross-tile instruction order is invalid", rva));
-                }
-                if (rva >= cursor.end) {
-                    closed = true;
-                    break;
-                }
-                ++ctx.stats.overlap_instruction_candidates;
-                if (instruction_stronger(entry.record,
-                        cursor_entry(ctx, cursor).record)) {
-                    shard_evict_entry(ctx, *ctx.shards[cursor.shard],
-                        cursor.tile_local, cursor.slot);
-                    cursor.shard = shard_index;
-                    cursor.tile_local = tile_local;
-                    cursor.slot = slot;
-                    cursor.rva = rva;
-                    cursor.end = entry_end;
-                } else {
-                    shard_evict_entry(ctx, shard, tile_local, slot);
-                }
+            if ((visits++ & 255ULL) == 0 &&
+                ctx.cancellation->stop_requested()) {
+                outcome.error = cancellation_error(*ctx.cancellation,
+                    "cross-tile instruction reconciliation cancelled");
+                return;
             }
-        }
-        if (closed && shard.cursor_valid) {
-            cursor.shard = shard_index;
-            cursor.tile_local = shard.cursor_tile_local;
-            cursor.slot = shard.cursor_slot;
-            cursor.rva = shard.cursor_rva;
-            cursor.end = shard.cursor_end;
+            const auto rva = entry.record.address.value;
+            std::uint64_t entry_end = 0;
+            if (!checked_add(rva, entry.record.length, entry_end)) {
+                outcome.error = orchestrator_error(
+                    workspace_error_code_t::integrity_failure,
+                    "cross-tile instruction order is invalid", rva);
+                return;
+            }
+            if (rva < cursor.rva) {
+                outcome.error = orchestrator_error(
+                    workspace_error_code_t::integrity_failure,
+                    "cross-tile instruction order is invalid", rva);
+                return;
+            }
+            if (rva >= cursor.end) {
+                closed = true;
+                break;
+            }
+            ++outcome.overlap_candidates;
+            if (instruction_stronger(entry.record,
+                    cursor_entry(ctx, cursor).record)) {
+                shard_evict_entry(ctx, *ctx.shards[cursor.shard],
+                    cursor.tile_local, cursor.slot);
+                cursor.shard = right;
+                cursor.tile_local = tile_local;
+                cursor.slot = slot;
+                cursor.rva = rva;
+                cursor.end = entry_end;
+            } else {
+                shard_evict_entry(ctx, right_shard, tile_local, slot);
+            }
         }
     }
+}
+
+workspace_result_t<void> reconcile_boundary_fixup(decode_run_context_t& ctx)
+{
+    const auto shard_count = static_cast<std::uint32_t>(ctx.shards.size());
+    if (shard_count < 2)
+        return workspace_result_t<void>::success();
+    const std::size_t boundary_count =
+        static_cast<std::size_t>(shard_count) - 1;
+    std::vector<reconcile_fixup_outcome_t> outcomes(boundary_count);
+    for (std::uint32_t wave = 0; wave < 2; ++wave) {
+        const std::size_t wave_pairs = wave == 0
+            ? (boundary_count + 1) / 2
+            : boundary_count / 2;
+        if (wave_pairs == 0)
+            continue;
+        parallel_executor_t::run(wave_pairs, ctx.caps->worker_count,
+            "analysis.decode_reconcile_fixup", [&](std::size_t index) {
+                const auto left =
+                    static_cast<std::uint32_t>(index * 2 + wave);
+                reconcile_boundary_pair(ctx, left, left + 1, outcomes[left]);
+            });
+    }
+    std::optional<workspace_error_t> first_error;
+    std::uint64_t overlap_candidates = 0;
+    for (auto& outcome : outcomes) {
+        if (outcome.error && !first_error)
+            first_error = std::move(outcome.error);
+        overlap_candidates += outcome.overlap_candidates;
+    }
+    ctx.stats.overlap_instruction_candidates += overlap_candidates;
+    if (first_error)
+        return workspace_result_t<void>::failure(std::move(*first_error));
     return workspace_result_t<void>::success();
 }
 
@@ -3538,6 +3611,78 @@ workspace_result_t<void> parallel_coverage_union(
     return workspace_result_t<void>::success();
 }
 
+workspace_result_t<std::vector<decode_accepted_tile_counts_t>>
+compute_accepted_tile_counts(decode_run_context_t& ctx)
+{
+    std::vector<decode_accepted_tile_counts_t> tile_counts(
+        static_cast<std::size_t>(ctx.range_end - ctx.range_begin));
+    if (tile_counts.empty())
+        return workspace_result_t<
+            std::vector<decode_accepted_tile_counts_t>>::success(
+            std::move(tile_counts));
+    const auto shard_ranges = parallel_shards(ctx.shards.size(),
+        ctx.caps->worker_count);
+    auto counted = parallel_run_shards(shard_ranges,
+        [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
+            std::uint64_t visits = 0;
+            for (std::size_t shard_index = range.begin;
+                 shard_index < range.end; ++shard_index) {
+                auto& shard = *ctx.shards[shard_index];
+                for (std::size_t tile_local = 0;
+                     tile_local < shard.accumulators.size(); ++tile_local) {
+                    if ((visits++ & 255ULL) == 0 &&
+                        ctx.cancellation->stop_requested()) {
+                        return workspace_result_t<void>::failure(
+                            cancellation_error(*ctx.cancellation,
+                                "accepted decode count scan cancelled"));
+                    }
+                    auto& acc = shard.accumulators[tile_local];
+                    if (acc.tile == nullptr)
+                        continue;
+                    auto& counts = tile_counts[static_cast<std::size_t>(
+                        acc.tile->tile_id - ctx.range_begin)];
+                    for (const auto& entry : acc.entries) {
+                        if (entry.evicted)
+                            continue;
+                        ++counts.instruction_count;
+                        counts.operand_count += entry.operand_count;
+                        counts.target_count += entry.target_count;
+                        const auto* operands = acc.operands_of(entry);
+                        inline_id_map_t<entity_id_t> expression_ids;
+                        for (std::uint32_t operand_index = 0;
+                             operand_index < entry.operand_count;
+                             ++operand_index) {
+                            const auto& op = operands[operand_index];
+                            if (op.address_expression_id != 0 &&
+                                expression_ids.find(
+                                    op.address_expression_id) != nullptr)
+                                continue;
+                            if (op.address_expression_id != 0 ||
+                                op.address_expression !=
+                                    address_expression_kind_t::none ||
+                                op.address_components !=
+                                    address_component_none) {
+                                ++counts.expression_count;
+                                if (op.address_expression_id != 0)
+                                    expression_ids.emplace(
+                                        op.address_expression_id,
+                                        counts.expression_count);
+                            }
+                        }
+                    }
+                }
+            }
+            return workspace_result_t<void>::success();
+        }, *ctx.cancellation);
+    if (!counted)
+        return workspace_result_t<
+            std::vector<decode_accepted_tile_counts_t>>::failure(
+            counted.error());
+    return workspace_result_t<
+        std::vector<decode_accepted_tile_counts_t>>::success(
+        std::move(tile_counts));
+}
+
 }
 
 workspace_result_t<tile_decode_orchestration_result_t>
@@ -3553,7 +3698,8 @@ tile_decode_orchestrator_t::run_impl(
     std::uint32_t lane_id,
     decode_worker_pool_t* shared_pool,
     bool tile_only_shard_formula,
-    bool publish_unmerged_shards) const
+    bool publish_unmerged_shards,
+    decode_build_progress_t* build_progress) const
 {
     const auto run_start = std::chrono::steady_clock::now();
     const auto& caps = executor.capabilities();
@@ -3618,6 +3764,7 @@ tile_decode_orchestrator_t::run_impl(
     ctx.executor = &executor;
     ctx.lane_exchange = lane_exchange;
     ctx.lane_id = lane_id;
+    ctx.build_progress = build_progress;
     ctx.image_base = layout.identity().image_base;
     ctx.batch_request_limit = batch_request_limit;
     ctx.range_begin = range_begin;
@@ -3922,6 +4069,49 @@ tile_decode_orchestrator_t::run_impl(
 
     ctx.fixup_done.store(true, std::memory_order_release);
 
+    if (ctx.build_progress != nullptr) {
+        auto counts = compute_accepted_tile_counts(ctx);
+        if (!counts)
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                counts.error());
+        auto tile_counts = counts.take_value();
+        std::uint64_t total_instructions = 0;
+        std::uint64_t total_operands = 0;
+        std::uint64_t total_targets = 0;
+        std::uint64_t total_expressions = 0;
+        for (const auto& tile : tile_counts) {
+            if (!checked_add(total_instructions,
+                    static_cast<std::uint64_t>(tile.instruction_count),
+                    total_instructions) ||
+                !checked_add(total_operands,
+                    static_cast<std::uint64_t>(tile.operand_count),
+                    total_operands) ||
+                !checked_add(total_targets,
+                    static_cast<std::uint64_t>(tile.target_count),
+                    total_targets) ||
+                !checked_add(total_expressions,
+                    static_cast<std::uint64_t>(tile.expression_count),
+                    total_expressions)) {
+                return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                    orchestrator_error(workspace_error_code_t::range_overflow,
+                        "accepted decode count totals overflowed"));
+            }
+        }
+        if (total_instructions !=
+                ctx.ledger.instructions.load(std::memory_order_acquire) ||
+            total_operands !=
+                ctx.ledger.operand_facts.load(std::memory_order_acquire) ||
+            total_targets !=
+                ctx.ledger.target_facts.load(std::memory_order_acquire)) {
+            return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+                orchestrator_error(workspace_error_code_t::integrity_failure,
+                    "accepted decode counts disagree with the decode ledger"));
+        }
+        ctx.build_progress->accepted_counts_final(tile_counts,
+            total_instructions, total_operands, total_targets,
+            total_expressions, total_instructions);
+    }
+
     if (pipelined) {
         const auto edges_build_begin_ns = steady_now_ns();
         driven = drive(edges_build_phase_done,
@@ -3994,27 +4184,29 @@ tile_decode_orchestrator_t::run_impl(
     std::vector<coverage_span_t> merged_coverage;
     std::vector<coverage_span_t> zero_fill_coverage;
     std::vector<std::uint8_t> merged_delay_slot_counts;
-    merged_delay_slot_counts.reserve(static_cast<std::size_t>(
-        ctx.ledger.instructions.load(std::memory_order_acquire)));
 
     std::vector<std::vector<decoded_edge_key_t>> edge_sources;
     std::vector<std::vector<tile_decode_cross_tile_edge_t>> cross_edge_sources;
 
-    for (auto& shard_ptr : ctx.shards) {
-        auto& shard = *shard_ptr;
-        for (auto& built : shard.built_shards) {
-            if (built.has_value())
-                shards.push_back(std::move(*built));
-        }
-        shard_summaries.insert(shard_summaries.end(),
-            shard.built_summaries.begin(), shard.built_summaries.end());
-        merged_coverage.insert(merged_coverage.end(),
-            shard.built_coverage.begin(), shard.built_coverage.end());
-        merged_delay_slot_counts.insert(merged_delay_slot_counts.end(),
-            shard.built_delay_slots.begin(), shard.built_delay_slots.end());
-        edge_sources.emplace_back(shard.edges.begin(), shard.edges.end());
-        cross_edge_sources.emplace_back(shard.cross_edges.begin(),
-            shard.cross_edges.end());
+    const auto shard_total = ctx.shards.size();
+    std::vector<std::size_t> packed_offsets(shard_total + 1, 0);
+    std::vector<std::size_t> summary_offsets(shard_total + 1, 0);
+    std::vector<std::size_t> coverage_offsets(shard_total + 1, 0);
+    std::vector<std::size_t> delay_offsets(shard_total + 1, 0);
+    for (std::size_t shard_index = 0; shard_index < shard_total;
+         ++shard_index) {
+        auto& shard = *ctx.shards[shard_index];
+        std::size_t built_count = 0;
+        for (const auto& built : shard.built_shards)
+            built_count += built.has_value() ? 1U : 0U;
+        packed_offsets[shard_index + 1] =
+            packed_offsets[shard_index] + built_count;
+        summary_offsets[shard_index + 1] =
+            summary_offsets[shard_index] + shard.built_summaries.size();
+        coverage_offsets[shard_index + 1] =
+            coverage_offsets[shard_index] + shard.built_coverage.size();
+        delay_offsets[shard_index + 1] =
+            delay_offsets[shard_index] + shard.built_delay_slots.size();
 
         stats.recursive_requests += shard.stats.recursive_requests;
         stats.gap_requests += shard.stats.gap_requests;
@@ -4032,6 +4224,8 @@ tile_decode_orchestrator_t::run_impl(
         stats.accepted_tiles += shard.stats.accepted_tiles;
         stats.duplicate_edges += shard.stats.duplicate_edges;
         stats.apply_stall_count += shard.stats.apply_stall_count;
+        stats.gap_out_of_order_apply_count +=
+            shard.stats.gap_out_of_order_apply_count;
         const auto snapshot_of = shard.frontier.snapshot();
         stats.frontier.unique_seed_count += snapshot_of.unique_seed_count;
         stats.frontier.pending_seed_count += snapshot_of.pending_seed_count;
@@ -4043,6 +4237,45 @@ tile_decode_orchestrator_t::run_impl(
         stats.frontier.cross_tile_route_count +=
             snapshot_of.cross_tile_route_count;
     }
+
+    shards.resize(packed_offsets[shard_total]);
+    shard_summaries.resize(summary_offsets[shard_total]);
+    merged_coverage.resize(coverage_offsets[shard_total]);
+    merged_delay_slot_counts.resize(delay_offsets[shard_total]);
+    edge_sources.resize(shard_total);
+    cross_edge_sources.resize(shard_total);
+    const auto tail_ranges = parallel_shards(shard_total, caps.worker_count);
+    auto concatenated = parallel_run_shards(tail_ranges,
+        [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
+            for (std::size_t shard_index = range.begin;
+                 shard_index < range.end; ++shard_index) {
+                auto& shard = *ctx.shards[shard_index];
+                std::size_t packed_cursor = packed_offsets[shard_index];
+                for (auto& built : shard.built_shards) {
+                    if (built.has_value())
+                        shards[packed_cursor++] = std::move(*built);
+                }
+                std::move(shard.built_summaries.begin(),
+                    shard.built_summaries.end(),
+                    shard_summaries.begin() + static_cast<std::ptrdiff_t>(
+                        summary_offsets[shard_index]));
+                std::move(shard.built_coverage.begin(),
+                    shard.built_coverage.end(),
+                    merged_coverage.begin() + static_cast<std::ptrdiff_t>(
+                        coverage_offsets[shard_index]));
+                std::move(shard.built_delay_slots.begin(),
+                    shard.built_delay_slots.end(),
+                    merged_delay_slot_counts.begin() +
+                        static_cast<std::ptrdiff_t>(
+                            delay_offsets[shard_index]));
+                edge_sources[shard_index] = std::move(shard.edges);
+                cross_edge_sources[shard_index] = std::move(shard.cross_edges);
+            }
+            return workspace_result_t<void>::success();
+        }, cancellation);
+    if (!concatenated)
+        return workspace_result_t<tile_decode_orchestration_result_t>::failure(
+            concatenated.error());
     stats.overlap_instruction_candidates +=
         ctx.stats.overlap_instruction_candidates;
 
@@ -4155,7 +4388,7 @@ tile_decode_orchestrator_t::run_impl(
             std::chrono::steady_clock::now() - run_start).count());
 
     ::diag::log_tagged_fmt("tile_decode",
-        "run done wall_us=%llu tiles=%llu shards=%u workers=%u requests=%llu instructions=%llu steals=%llu apply_stalls=%llu backpressure_waits=%llu max_queue_depth=%llu coalesced=%llu mode=%s",
+        "run done wall_us=%llu tiles=%llu shards=%u workers=%u requests=%llu instructions=%llu steals=%llu apply_stalls=%llu gap_ooo_applies=%llu backpressure_waits=%llu max_queue_depth=%llu coalesced=%llu mode=%s",
         static_cast<unsigned long long>(stats.lane_wall_ns / 1000ULL),
         static_cast<unsigned long long>(range_tile_count),
         shard_count,
@@ -4165,6 +4398,7 @@ tile_decode_orchestrator_t::run_impl(
         static_cast<unsigned long long>(stats.accepted_instructions),
         static_cast<unsigned long long>(stats.worker_steal_count),
         static_cast<unsigned long long>(stats.apply_stall_count),
+        static_cast<unsigned long long>(stats.gap_out_of_order_apply_count),
         static_cast<unsigned long long>(stats.worker_backpressure_wait_count),
         static_cast<unsigned long long>(stats.worker_max_queue_depth),
         static_cast<unsigned long long>(stats.wave_seeds_coalesced),
@@ -4198,7 +4432,7 @@ tile_decode_orchestrator_t::run(
 {
     return run_impl(snapshot, layout, nullptr, std::move(seeds), executor,
         cancellation, tile_range, lane_exchange, lane_id, nullptr, false,
-        false);
+        false, nullptr);
 }
 
 workspace_result_t<tile_decode_orchestration_result_t>
@@ -4209,7 +4443,8 @@ tile_decode_orchestrator_t::run_shared(
     std::vector<tile_decode_seed_t> seeds,
     tile_decode_executor_t& executor,
     const cancellation_token_t& cancellation,
-    decode_worker_pool_t* shared_pool) const
+    decode_worker_pool_t* shared_pool,
+    decode_build_progress_t* build_progress) const
 {
     if (static_cast<std::uint64_t>(partition.tiles.size()) >
         limits_.maximum_tiles) {
@@ -4227,7 +4462,8 @@ tile_decode_orchestrator_t::run_shared(
         }
     }
     return run_impl(snapshot, layout, &partition, std::move(seeds), executor,
-        cancellation, nullptr, nullptr, 0, shared_pool, true, true);
+        cancellation, nullptr, nullptr, 0, shared_pool, true, true,
+        build_progress);
 }
 
 }

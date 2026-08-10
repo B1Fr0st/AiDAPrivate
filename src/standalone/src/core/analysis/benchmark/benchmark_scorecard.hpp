@@ -325,9 +325,11 @@ inline nlohmann::json evaluate_phase_budgets(const nlohmann::json& phases,
         {"analysis_wall_ms_target", nullptr,
             "informational target for the full analysis wall", true}};
     json verdicts = json::array();
+    json watchdog_tripped = json::array();
     bool any_fail = false;
     bool all_pass_or_warn = true;
     const double scale = wall_scale > 0.0 ? wall_scale : 1.0;
+    constexpr double watchdog_multiplier = 2.0;
     for (const auto& binding : bindings) {
         const double target = thresholds[binding.key].get<double>() * scale;
         json actual = nullptr;
@@ -356,12 +358,20 @@ inline nlohmann::json evaluate_phase_budgets(const nlohmann::json& phases,
             any_fail = true;
             all_pass_or_warn = false;
         }
+        if (actual.is_number() && actual.get<double>() > watchdog_multiplier * target) {
+            entry["watchdog"] = true;
+            watchdog_tripped.push_back(binding.key);
+        }
         verdicts.push_back(std::move(entry));
     }
+    const bool watchdog_any = !watchdog_tripped.empty();
     return json{{"schema", phase_budget_gate_schema_v1},
         {"schema_version", 1},
         {"informational_only", true},
         {"targets_scaled_by", scale},
+        {"watchdog", json{{"multiplier", watchdog_multiplier},
+            {"tripped", std::move(watchdog_tripped)},
+            {"verdict", watchdog_any ? "TRIPPED" : "CLEAR"}}},
         {"thresholds", thresholds},
         {"verdicts", std::move(verdicts)},
         {"overall", any_fail ? "FAIL" : (all_pass_or_warn ? "PASS" : "NOT_MEASURED")}};

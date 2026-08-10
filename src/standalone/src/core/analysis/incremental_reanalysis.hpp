@@ -118,6 +118,7 @@ struct incremental_reanalysis_executor_result_t final {
     bool ok = false;
     bool fallback_to_full = false;
     std::shared_ptr<const analysis_snapshot_t> merged_snapshot;
+    std::vector<switch_record_t> switches;
     std::shared_ptr<analysis_metrics_t> metrics;
     std::string detail;
 
@@ -133,6 +134,18 @@ public:
         std::shared_ptr<const byte_provider_t> projected_provider,
         incremental_reanalysis_executor_settings_t settings,
         const cancellation_token_t& cancel = {});
+};
+
+class incremental_reanalysis_scheduler_t final {
+public:
+    static constexpr std::uint64_t kMaxPatchedBytes = 1ULL << 20;
+    static constexpr std::size_t kMaxRanges = 64;
+
+    static void maybe_schedule(
+        std::shared_ptr<analysis_workspace_t> workspace,
+        const reanalysis_scope_t& scope,
+        const projection_invalidation_set_t& invalidation,
+        std::shared_ptr<const byte_provider_t> projected_provider);
 };
 
 }

@@ -8,6 +8,7 @@
 #include "../analysis/integrity_hunter.hpp"
 #include "../analysis/binary_map.hpp"
 #include "../analysis/benchmark/benchmark_runner.hpp"
+#include "../analysis/benchmark/benchmark_sla.hpp"
 #include "../analysis/source_reconstructor.hpp"
 #include "../analysis/xref_engine.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
@@ -33,11 +34,13 @@
 #include "../disasm/xref_index.hpp"
 #include "../editor/expression_eval.hpp"
 #include "../infra/taskflow_runtime.hpp"
+#include "../infra/fast_containers.hpp"
 #include "../../helpers/diag_log.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <Windows.h>
+#include <psapi.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -52,8 +55,12 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#pragma comment(lib, "psapi.lib")
 
 namespace test_all_features {
 
@@ -4941,17 +4948,41 @@ static void test_stale_revisions_and_decompiler_errors(HANDLE hf, std::atomic<in
     passed.fetch_add(1);
 }
 
+enum class benchmark_real_state_t {
+    not_run_no_fixture,
+    measured,
+    failed
+};
+
+static benchmark_real_state_t g_benchmark_real_state = benchmark_real_state_t::not_run_no_fixture;
+static std::string g_benchmark_real_detail = "not_run";
+
+static const char* benchmark_real_state_name(benchmark_real_state_t state) noexcept {
+    switch (state) {
+    case benchmark_real_state_t::measured:
+        return "MEASURED";
+    case benchmark_real_state_t::failed:
+        return "FAILED";
+    default:
+        return "SKIPPED_NO_FIXTURE";
+    }
+}
+
 static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
     char path_buffer[MAX_PATH]{};
     const DWORD path_length = GetEnvironmentVariableA("AIDA_BENCHMARK_REAL_PE", path_buffer, MAX_PATH);
     if (path_length == 0 || path_length >= MAX_PATH) {
-        log_msg(hf, "analysis", "SKIP -- AIDA_BENCHMARK_REAL_PE not set; real 300MB benchmark not run");
+        g_benchmark_real_state = benchmark_real_state_t::not_run_no_fixture;
+        g_benchmark_real_detail = "AIDA_BENCHMARK_REAL_PE_unset";
+        log_msg(hf, "analysis", "SKIP-LOUD -- analysis_benchmark_real_300mb state=SKIPPED_NO_FIXTURE evidence=AIDA_BENCHMARK_REAL_PE_unset action=set AIDA_BENCHMARK_REAL_PE=<300-500MB PE> to arm the release gate");
         passed.fetch_add(1);
         return;
     }
     std::error_code path_error;
     const auto fixture_path = std::filesystem::u8path(path_buffer);
     if (!std::filesystem::is_regular_file(fixture_path, path_error)) {
+        g_benchmark_real_state = benchmark_real_state_t::failed;
+        g_benchmark_real_detail = std::string("fixture_not_regular_file path=") + path_buffer;
         log_msg(hf, "analysis", "FAIL -- AIDA_BENCHMARK_REAL_PE is not a regular file path=%s", path_buffer);
         failed.fetch_add(1);
         return;
@@ -4959,6 +4990,9 @@ static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& pass
     std::error_code size_error;
     const auto fixture_size = std::filesystem::file_size(fixture_path, size_error);
     if (size_error || fixture_size < 300000000ULL || fixture_size > 500000000ULL) {
+        g_benchmark_real_state = benchmark_real_state_t::failed;
+        g_benchmark_real_detail = "fixture_outside_300000000..500000000_window size=" +
+            std::to_string(static_cast<unsigned long long>(fixture_size));
         log_msg(hf, "analysis", "FAIL -- real benchmark fixture outside the 300000000..500000000 byte window path=%s size=%llu error=%d",
             path_buffer, static_cast<unsigned long long>(fixture_size),
             size_error ? size_error.value() : 0);
@@ -4968,13 +5002,17 @@ static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& pass
     char relax_buffer[8]{};
     const DWORD relax_length = GetEnvironmentVariableA("AIDA_BENCHMARK_REAL_SLA_RELAX", relax_buffer, sizeof(relax_buffer));
     const bool sla_relaxed = relax_length != 0 && relax_length < sizeof(relax_buffer) && relax_buffer[0] == '1';
-    log_msg(hf, "analysis", "benchmark run_begin mode=%s path=%s size=%llu relaxed=%d",
-        "real", path_buffer, static_cast<unsigned long long>(fixture_size), sla_relaxed ? 1 : 0);
+    const double wall_scale = aida::analysis::benchmark::program_sla_wall_scale(fixture_size);
+    log_msg(hf, "analysis", "benchmark run_begin mode=%s path=%s size=%llu relaxed=%d wall_scale=%.4f wall_gate_ms=%.0f",
+        "real", path_buffer, static_cast<unsigned long long>(fixture_size), sla_relaxed ? 1 : 0,
+        wall_scale, 300000.0 * wall_scale);
 
     aida::analysis::benchmark::benchmark_run_request_t request;
     request.mode = aida::analysis::benchmark::benchmark_mode_t::real;
     request.real_path = path_buffer;
     request.sla_relaxed = sla_relaxed;
+    request.run_cancellation_stage = true;
+    request.cancellation_samples = 3;
     const auto run_begin = GetTickCount64();
     auto result = aida::analysis::benchmark::run_benchmark(request, {});
     const auto run_wall_ms = GetTickCount64() - run_begin;
@@ -5071,6 +5109,15 @@ static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& pass
                     !scorecard["decompile"]["funcs_per_s"].is_number() ||
                     scorecard["decompile"]["funcs_per_s"].get<double>() <= 0.0))
                 v2_fail("decompile.funcs_per_s");
+            if (functions_present &&
+                (!scorecard.contains("decompile") || !scorecard["decompile"].is_object() ||
+                    !scorecard["decompile"].contains("slots") ||
+                    !scorecard["decompile"]["slots"].is_number() ||
+                    scorecard["decompile"]["slots"].get<std::uint64_t>() < 1 ||
+                    !scorecard["decompile"].contains("slots_effective_peak") ||
+                    !scorecard["decompile"]["slots_effective_peak"].is_number() ||
+                    scorecard["decompile"]["slots_effective_peak"].get<std::uint64_t>() < 1))
+                v2_fail("decompile.slots");
             if (!v2_failures.empty()) {
                 v2_complete = false;
                 log_msg(hf, "analysis", "benchmark scorecard_v2_incomplete failures=%s",
@@ -5086,16 +5133,238 @@ static void test_analysis_benchmark_real_300mb(HANDLE hf, std::atomic<int>& pass
         result.report_json_path.empty() ? result.error.c_str() : result.report_json_path.c_str());
 
     if (result.ok && result.verdict == "PASS" && v2_complete) {
+        g_benchmark_real_state = benchmark_real_state_t::measured;
+        g_benchmark_real_detail = "verdict=PASS sla_overall=" + result.sla_overall +
+            " wall_ms=" + std::to_string(static_cast<unsigned long long>(run_wall_ms));
         log_msg(hf, "analysis", "PASS -- analysis_benchmark_real_300mb sla_overall=%s parse_ok=%d v2_complete=%d relaxed=%d",
             result.sla_overall.c_str(), parse_ok ? 1 : 0, v2_complete ? 1 : 0, sla_relaxed ? 1 : 0);
         passed.fetch_add(1);
         return;
     }
+    g_benchmark_real_state = benchmark_real_state_t::failed;
+    g_benchmark_real_detail = "verdict=" + result.verdict + " sla_overall=" + result.sla_overall +
+        " failing_keys=" + (failing_keys.empty() ? std::string("<none>") : failing_keys);
     log_msg(hf, "analysis", "FAIL -- analysis_benchmark_real_300mb verdict=%s sla_overall=%s failing_keys=%s v2_complete=%d error=%s",
         result.verdict.c_str(), result.sla_overall.c_str(),
         failing_keys.empty() ? "<none>" : failing_keys.c_str(),
         v2_complete ? 1 : 0,
         result.error.empty() ? "<none>" : result.error.c_str());
+    failed.fetch_add(1);
+}
+
+static void test_analysis_fast_containers_bench(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed) {
+    constexpr std::size_t k_map_key_count = 4000000;
+    std::vector<std::uint64_t> keys;
+    keys.reserve(k_map_key_count);
+    std::uint64_t key_state = 0xA1DAF457C0FFEE99ULL;
+    for (std::size_t index = 0; index < k_map_key_count; ++index) {
+        key_state += 0x9E3779B97F4A7C15ULL;
+        std::uint64_t mixed = key_state;
+        mixed = (mixed ^ (mixed >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+        mixed = (mixed ^ (mixed >> 27U)) * 0x94D049BB133111EBULL;
+        keys.push_back(mixed ^ (mixed >> 31U));
+    }
+    const auto private_bytes_now = []() -> std::uint64_t {
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))) {
+            return static_cast<std::uint64_t>(counters.PrivateUsage);
+        }
+        return 0;
+    };
+
+    double unordered_insert_ns_per_op = 0.0;
+    double unordered_lookup_ns_per_op = 0.0;
+    std::uint64_t unordered_private_delta = 0;
+    std::uint64_t unordered_checksum = 0;
+    std::size_t unordered_found = 0;
+    {
+        const std::uint64_t memory_before = private_bytes_now();
+        std::unordered_map<std::uint64_t, std::uint64_t> reference_map;
+        reference_map.reserve(k_map_key_count);
+        const auto insert_begin = std::chrono::steady_clock::now();
+        for (const std::uint64_t key : keys) {
+            reference_map.emplace(key, key ^ 0x5A5A5A5A5A5A5A5AULL);
+        }
+        const auto insert_end = std::chrono::steady_clock::now();
+        unordered_insert_ns_per_op =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(insert_end - insert_begin).count()) /
+            static_cast<double>(k_map_key_count);
+        const auto lookup_begin = std::chrono::steady_clock::now();
+        for (const std::uint64_t key : keys) {
+            const auto found = reference_map.find(key);
+            if (found != reference_map.end()) {
+                unordered_checksum += found->second;
+                ++unordered_found;
+            }
+        }
+        const auto lookup_end = std::chrono::steady_clock::now();
+        unordered_lookup_ns_per_op =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(lookup_end - lookup_begin).count()) /
+            static_cast<double>(k_map_key_count);
+        const std::uint64_t memory_after = private_bytes_now();
+        unordered_private_delta = memory_after >= memory_before ? memory_after - memory_before : 0;
+    }
+
+    double flat_insert_ns_per_op = 0.0;
+    double flat_lookup_ns_per_op = 0.0;
+    std::uint64_t flat_private_delta = 0;
+    std::uint64_t flat_checksum = 0;
+    std::size_t flat_found = 0;
+    {
+        const std::uint64_t memory_before = private_bytes_now();
+        aida::infra::fast_u64_map<std::uint64_t> flat_map;
+        flat_map.reserve(k_map_key_count);
+        const auto insert_begin = std::chrono::steady_clock::now();
+        for (const std::uint64_t key : keys) {
+            flat_map.emplace(key, key ^ 0x5A5A5A5A5A5A5A5AULL);
+        }
+        const auto insert_end = std::chrono::steady_clock::now();
+        flat_insert_ns_per_op =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(insert_end - insert_begin).count()) /
+            static_cast<double>(k_map_key_count);
+        const auto lookup_begin = std::chrono::steady_clock::now();
+        for (const std::uint64_t key : keys) {
+            const auto found = flat_map.find(key);
+            if (found != flat_map.end()) {
+                flat_checksum += found->second;
+                ++flat_found;
+            }
+        }
+        const auto lookup_end = std::chrono::steady_clock::now();
+        flat_lookup_ns_per_op =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(lookup_end - lookup_begin).count()) /
+            static_cast<double>(k_map_key_count);
+        const std::uint64_t memory_after = private_bytes_now();
+        flat_private_delta = memory_after >= memory_before ? memory_after - memory_before : 0;
+    }
+
+    const double insert_speedup = flat_insert_ns_per_op > 0.0
+        ? unordered_insert_ns_per_op / flat_insert_ns_per_op : 0.0;
+    const double lookup_speedup = flat_lookup_ns_per_op > 0.0
+        ? unordered_lookup_ns_per_op / flat_lookup_ns_per_op : 0.0;
+    log_msg(hf, "analysis",
+        "fast_containers bench map keys=%llu unordered_insert_ns=%.2f flat_insert_ns=%.2f insert_speedup=%.3f unordered_lookup_ns=%.2f flat_lookup_ns=%.2f lookup_speedup=%.3f unordered_private_delta=%llu flat_private_delta=%llu unordered_found=%llu flat_found=%llu checksum_match=%d",
+        static_cast<unsigned long long>(k_map_key_count),
+        unordered_insert_ns_per_op, flat_insert_ns_per_op, insert_speedup,
+        unordered_lookup_ns_per_op, flat_lookup_ns_per_op, lookup_speedup,
+        static_cast<unsigned long long>(unordered_private_delta),
+        static_cast<unsigned long long>(flat_private_delta),
+        static_cast<unsigned long long>(unordered_found),
+        static_cast<unsigned long long>(flat_found),
+        (unordered_checksum == flat_checksum) ? 1 : 0);
+
+    const bool map_ok = unordered_found == k_map_key_count &&
+        flat_found == k_map_key_count &&
+        unordered_checksum == flat_checksum &&
+        flat_insert_ns_per_op > 0.0 &&
+        insert_speedup >= 1.5;
+    if (!map_ok) {
+        log_msg(hf, "analysis",
+            "FAIL -- analysis_fast_containers_bench map stage unordered_found=%llu flat_found=%llu checksum_match=%d insert_speedup=%.3f required=1.500",
+            static_cast<unsigned long long>(unordered_found),
+            static_cast<unsigned long long>(flat_found),
+            (unordered_checksum == flat_checksum) ? 1 : 0,
+            insert_speedup);
+    }
+
+    constexpr std::uint32_t k_producer_count = 16;
+    constexpr std::uint32_t k_items_per_producer = 18750;
+    constexpr std::uint64_t k_expected_total =
+        static_cast<std::uint64_t>(k_producer_count) * static_cast<std::uint64_t>(k_items_per_producer);
+    struct queue_item_t {
+        std::uint32_t producer;
+        std::uint32_t sequence;
+    };
+    aida::infra::fast_blocking_queue<queue_item_t> queue;
+    std::atomic<std::uint64_t> enqueued{0};
+    std::vector<std::thread> producers;
+    producers.reserve(k_producer_count);
+    for (std::uint32_t producer_index = 0; producer_index < k_producer_count; ++producer_index) {
+        producers.emplace_back([&queue, &enqueued, producer_index]() {
+            for (std::uint32_t sequence = 0; sequence < k_items_per_producer; ++sequence) {
+                queue.enqueue(queue_item_t{producer_index, sequence});
+                enqueued.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    std::vector<std::uint32_t> expected_next(k_producer_count, 0);
+    std::uint64_t dequeued = 0;
+    std::uint64_t fifo_violations = 0;
+    bool consumer_stalled = false;
+    while (dequeued < k_expected_total) {
+        queue_item_t item{};
+        if (!queue.wait_dequeue_timed(item, std::chrono::milliseconds(30000))) {
+            consumer_stalled = true;
+            log_msg(hf, "analysis",
+                "FAIL -- analysis_fast_containers_bench queue stage consumer stall enqueued=%llu dequeued=%llu expected=%llu",
+                static_cast<unsigned long long>(enqueued.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(dequeued),
+                static_cast<unsigned long long>(k_expected_total));
+            break;
+        }
+        if (item.producer >= k_producer_count) {
+            ++fifo_violations;
+        } else if (item.sequence != expected_next[item.producer]) {
+            ++fifo_violations;
+            expected_next[item.producer] = item.sequence + 1;
+        } else {
+            ++expected_next[item.producer];
+        }
+        ++dequeued;
+    }
+    for (std::thread& producer : producers) {
+        producer.join();
+    }
+    std::uint64_t drained_extra = 0;
+    {
+        queue_item_t item{};
+        while (queue.try_dequeue(item)) {
+            ++drained_extra;
+        }
+    }
+    std::uint64_t per_producer_deficits = 0;
+    for (std::uint32_t producer_index = 0; producer_index < k_producer_count; ++producer_index) {
+        if (expected_next[producer_index] != k_items_per_producer) {
+            ++per_producer_deficits;
+        }
+    }
+    log_msg(hf, "analysis",
+        "fast_containers bench queue producers=%lu items_per_producer=%lu enqueued=%llu dequeued=%llu fifo_violations=%llu drained_extra=%llu per_producer_deficits=%llu stalled=%d",
+        static_cast<unsigned long>(k_producer_count),
+        static_cast<unsigned long>(k_items_per_producer),
+        static_cast<unsigned long long>(enqueued.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(dequeued),
+        static_cast<unsigned long long>(fifo_violations),
+        static_cast<unsigned long long>(drained_extra),
+        static_cast<unsigned long long>(per_producer_deficits),
+        consumer_stalled ? 1 : 0);
+
+    const bool queue_ok = !consumer_stalled &&
+        dequeued == k_expected_total &&
+        enqueued.load(std::memory_order_acquire) == k_expected_total &&
+        fifo_violations == 0 &&
+        drained_extra == 0 &&
+        per_producer_deficits == 0;
+    if (!queue_ok) {
+        log_msg(hf, "analysis",
+            "FAIL -- analysis_fast_containers_bench queue stage dequeued=%llu expected=%llu fifo_violations=%llu drained_extra=%llu per_producer_deficits=%llu stalled=%d",
+            static_cast<unsigned long long>(dequeued),
+            static_cast<unsigned long long>(k_expected_total),
+            static_cast<unsigned long long>(fifo_violations),
+            static_cast<unsigned long long>(drained_extra),
+            static_cast<unsigned long long>(per_producer_deficits),
+            consumer_stalled ? 1 : 0);
+    }
+
+    if (map_ok && queue_ok) {
+        log_msg(hf, "analysis",
+            "PASS -- analysis_fast_containers_bench insert_speedup=%.3f lookup_speedup=%.3f queue_fifo=1 queue_count=%llu",
+            insert_speedup, lookup_speedup,
+            static_cast<unsigned long long>(dequeued));
+        passed.fetch_add(1);
+        return;
+    }
     failed.fetch_add(1);
 }
 
@@ -5602,7 +5871,8 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
         { "symbolic_inner_expression",   test_symbolic_inner_expression   },
         { "protection_inner_scan",       test_protection_inner_scan       },
         { "protection_inner_controls",   test_protection_inner_controls   },
-        { "analysis_benchmark_real_300mb", test_analysis_benchmark_real_300mb, 600000 },
+        { "analysis_benchmark_real_300mb", test_analysis_benchmark_real_300mb, 1200000 },
+        { "analysis_fast_containers_bench", test_analysis_fast_containers_bench, 120000 },
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));
@@ -5631,6 +5901,8 @@ void phase_analysis_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>&
             failed.load(std::memory_order_acquire) - fail_before);
     }
 
+    log_msg(hf, "analysis", "analysis phase benchmark coverage: real_300mb=%s detail=%s",
+        benchmark_real_state_name(g_benchmark_real_state), g_benchmark_real_detail.c_str());
     log_msg(hf, "analysis", "=== END analysis tests ===");
 }
 

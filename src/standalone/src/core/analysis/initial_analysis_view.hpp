@@ -19,6 +19,9 @@
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "initial_analysis.hpp"
 #include "symbol_store.hpp"
+#include "decompiler/decompile_batch_orchestrator.hpp"
+#include "../ui/task_center.hpp"
+#include "../../helpers/diag_log.hpp"
 #endif
 #include "../disasm/disasm_view.hpp"
 #include "../session/analysis_session.hpp"
@@ -75,6 +78,14 @@ struct view_state_t {
 	std::string analysis_error;
 	std::string pdb_error;
 	pdb_prompt_state_t pdb_prompt;
+	std::uint64_t batch_last_update_ms = 0;
+	bool batch_task_registered = false;
+	std::string batch_task_id;
+	std::uint64_t batch_generation = 0;
+	bool batch_cancel_requested = false;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::analysis::decompile_batch_orchestrator_t::run_snapshot_t batch_snapshot{};
+#endif
 };
 
 inline std::mutex& states_mutex()
@@ -573,6 +584,232 @@ inline void render_pdb_status(const disasm_view::workspace_context_t& context,
 	ImGui::PopStyleColor(2);
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline void terminal_batch_task(
+	const std::shared_ptr<view_state_t>& state,
+	aida::ui::task_center::task_state_t terminal,
+	const aida::analysis::decompile_batch_orchestrator_t::run_snapshot_t& snap,
+	const char* stage)
+{
+	const auto processed = snap.completed + snap.failed + snap.cancelled;
+	const float fraction = snap.total != 0
+		? static_cast<float>((std::min)(1.0,
+			static_cast<double>(processed) / static_cast<double>(snap.total)))
+		: 1.0f;
+	char summary[192]{};
+	std::snprintf(summary, sizeof(summary),
+		"%llu/%llu decompiled · %llu failed · %llu cancelled",
+		static_cast<unsigned long long>(snap.completed),
+		static_cast<unsigned long long>(snap.total),
+		static_cast<unsigned long long>(snap.failed),
+		static_cast<unsigned long long>(snap.cancelled));
+	static_cast<void>(aida::ui::task_center::update_task(state->batch_task_id,
+		terminal, fraction, stage, summary));
+	diag::log_tagged_fmt("dec_batch",
+		"progress_task_terminal id=%s terminal=%d completed=%llu failed=%llu cancelled=%llu total=%llu",
+		state->batch_task_id.c_str(), static_cast<int>(terminal),
+		static_cast<unsigned long long>(snap.completed),
+		static_cast<unsigned long long>(snap.failed),
+		static_cast<unsigned long long>(snap.cancelled),
+		static_cast<unsigned long long>(snap.total));
+	state->batch_task_registered = false;
+	state->batch_task_id.clear();
+	state->batch_generation = 0;
+}
+
+inline void sync_batch_task(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<view_state_t>& state)
+{
+	if (!context.workspace || !state) return;
+	const auto orchestrator = context.workspace->background_decompile();
+	if (!orchestrator) {
+		if (state->batch_task_registered)
+			terminal_batch_task(state, aida::ui::task_center::task_state_t::cancelled,
+				state->batch_snapshot, "Workspace closed");
+		state->batch_cancel_requested = false;
+		return;
+	}
+	const auto now_ms = static_cast<std::uint64_t>(::GetTickCount64());
+	if (state->batch_task_registered &&
+		now_ms - state->batch_last_update_ms < 500)
+		return;
+	const auto snap = orchestrator->run_snapshot();
+	if (snap.active) {
+		if (state->batch_task_registered &&
+			snap.generation != state->batch_generation)
+			terminal_batch_task(state, aida::ui::task_center::task_state_t::partial,
+				state->batch_snapshot, "Superseded by a new run");
+		state->batch_snapshot = snap;
+		if (!state->batch_task_registered &&
+			state->batch_generation == snap.generation) {
+			state->batch_last_update_ms = now_ms;
+			return;
+		}
+		if (!state->batch_task_registered) {
+			const std::string binary_hex =
+				context.workspace->identity().binary_id().to_hex();
+			const std::string task_id = "decompile.batch." + binary_hex + "." +
+				std::to_string(snap.generation);
+			aida::ui::task_center::task_registration_t registration;
+			registration.id = task_id;
+			registration.source = "decompiler";
+			registration.owner = "Decompiler";
+			registration.owner_view = "document.pseudocode";
+			registration.target = context.workspace->identity().bin_name();
+			registration.label = "Background decompilation";
+			registration.stage = "Starting background decompilation";
+			registration.cancellation_is_safe = true;
+			std::weak_ptr<aida::analysis::decompile_batch_orchestrator_t> weak =
+				orchestrator;
+			registration.callbacks.cancel = [weak]() {
+				const auto strong = weak.lock();
+				if (!strong) return false;
+				strong->request_cancel();
+				return true;
+			};
+			bool registered =
+				aida::ui::task_center::register_task(std::move(registration));
+			if (!registered)
+				registered = aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::running, 0.0f,
+					"Restarting background decompilation");
+			diag::log_tagged_fmt("dec_batch",
+				"progress_task_register id=%s ok=%d total=%llu",
+				task_id.c_str(), registered ? 1 : 0,
+				static_cast<unsigned long long>(snap.total));
+			if (registered) {
+				state->batch_task_registered = true;
+				state->batch_task_id = task_id;
+				state->batch_cancel_requested = false;
+			}
+			state->batch_generation = snap.generation;
+		} else {
+			const auto processed = snap.completed + snap.failed + snap.cancelled;
+			const float fraction = snap.total != 0
+				? static_cast<float>((std::min)(1.0,
+					static_cast<double>(processed) / static_cast<double>(snap.total)))
+				: -1.0f;
+			const auto eta_total_s = static_cast<unsigned>(
+				snap.eta_s > 0.0 ? snap.eta_s + 0.5 : 0.0);
+			char stage[192]{};
+			std::snprintf(stage, sizeof(stage),
+				"Decompiling functions %llu/%llu · %.1f funcs/s · ETA %02u:%02u",
+				static_cast<unsigned long long>(processed),
+				static_cast<unsigned long long>(snap.total),
+				snap.rate_funcs_s, eta_total_s / 60, eta_total_s % 60);
+			static_cast<void>(aida::ui::task_center::update_task(state->batch_task_id,
+				aida::ui::task_center::task_state_t::running, fraction, stage));
+			diag::log_tagged_fmt("dec_batch",
+				"progress_task_update id=%s processed=%llu total=%llu rate=%.1f eta_s=%u",
+				state->batch_task_id.c_str(),
+				static_cast<unsigned long long>(processed),
+				static_cast<unsigned long long>(snap.total),
+				snap.rate_funcs_s, eta_total_s);
+		}
+		state->batch_last_update_ms = now_ms;
+		return;
+	}
+	if (state->batch_task_registered) {
+		const auto processed = snap.completed + snap.failed + snap.cancelled;
+		auto terminal = aida::ui::task_center::task_state_t::completed;
+		if (snap.cancelled != 0)
+			terminal = aida::ui::task_center::task_state_t::cancelled;
+		else if (snap.failed != 0 || processed < snap.total)
+			terminal = aida::ui::task_center::task_state_t::partial;
+		terminal_batch_task(state, terminal, snap, "Background decompilation finished");
+		state->batch_cancel_requested = false;
+		state->batch_last_update_ms = now_ms;
+	}
+	state->batch_snapshot = snap;
+}
+
+inline void render_batch_progress(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<view_state_t>& state)
+{
+	if (!context.workspace || !state) return;
+	const auto orchestrator = context.workspace->background_decompile();
+	if (!orchestrator) return;
+	const auto snap = orchestrator->run_snapshot();
+	if (!snap.active) return;
+	const auto& text_snap = state->batch_snapshot.active
+		? state->batch_snapshot : snap;
+	const auto& theme = aida::ui::resolved();
+	const ImVec2 size(430.0f, 150.0f);
+#if defined(IMGUI_HAS_DOCK)
+	const ImGuiID bottom_node = aida::ui::workspace_layout::node_id(
+		aida::ui::workspace_layout::dock_role_t::bottom);
+	const ImGuiID target_node = bottom_node != 0
+		? bottom_node : aida::ui::ide_shell::root_dockspace_id();
+	if (target_node != 0)
+		ImGui::SetNextWindowDockID(target_node, ImGuiCond_Appearing);
+#else
+	const ImGuiViewport* viewport = ImGui::GetMainViewport();
+	const ImVec2 position(viewport->WorkPos.x + (viewport->WorkSize.x - size.x) * 0.5f,
+		viewport->WorkPos.y + aida::ui::ide_shell::reserved_chrome_height() + 20.0f);
+	ImGui::SetNextWindowPos(position, ImGuiCond_Appearing);
+#endif
+	ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(theme.bg_elevated, 0.98f));
+	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(theme.border_strong, 1.0f));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 16.0f));
+	const bool window_visible = ImGui::Begin(
+		"Background Decompilation###aida.decompile.batch.progress", nullptr,
+		ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+	if (!window_visible) {
+		ImGui::End();
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor(2);
+		return;
+	}
+	ImGui::PushFont(aida::ui::fonts::body_em());
+	ImGui::TextUnformatted("Background decompilation");
+	ImGui::PopFont();
+	ImGui::SameLine();
+	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.text_dim), "%s",
+		context.workspace->identity().bin_name().c_str());
+	const auto processed = snap.completed + snap.failed + snap.cancelled;
+	const float fraction = snap.total != 0
+		? static_cast<float>((std::min)(1.0,
+			static_cast<double>(processed) / static_cast<double>(snap.total)))
+		: 0.0f;
+	ImGui::ProgressBar(fraction, ImVec2(-1.0f, 8.0f), "");
+	const auto text_processed =
+		text_snap.completed + text_snap.failed + text_snap.cancelled;
+	const auto eta_total_s = static_cast<unsigned>(
+		text_snap.eta_s > 0.0 ? text_snap.eta_s + 0.5 : 0.0);
+	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.text_secondary),
+		"%llu / %llu functions · %.1f funcs/s · ETA %02u:%02u",
+		static_cast<unsigned long long>(text_processed),
+		static_cast<unsigned long long>(text_snap.total),
+		text_snap.rate_funcs_s, eta_total_s / 60, eta_total_s % 60);
+	if (text_snap.failed != 0)
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.warning),
+			"%llu failed", static_cast<unsigned long long>(text_snap.failed));
+	if (aida::ui::button(state->batch_cancel_requested ? "Cancelling" : "Cancel",
+		aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm, ImVec2(),
+		state->batch_cancel_requested)) {
+		state->batch_cancel_requested = true;
+		orchestrator->request_cancel();
+		if (state->batch_task_registered)
+			static_cast<void>(aida::ui::task_center::request_cancel(state->batch_task_id));
+	}
+	ImGui::End();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+}
+#else
+inline void sync_batch_task(const disasm_view::workspace_context_t&,
+	const std::shared_ptr<view_state_t>&)
+{
+}
+
+inline void render_batch_progress(const disasm_view::workspace_context_t&,
+	const std::shared_ptr<view_state_t>&)
+{
+}
+#endif
+
 }
 
 inline void render_frame(const disasm_view::workspace_context_t& context)
@@ -581,6 +818,8 @@ inline void render_frame(const disasm_view::workspace_context_t& context)
 	if (!state) return;
 	detail::sync_pdb_prompt_state(context, state);
 	detail::render_progress(context, state);
+	detail::sync_batch_task(context, state);
+	detail::render_batch_progress(context, state);
 	detail::render_remote_pdb(context, state);
 	detail::render_local_pdb(context, state);
 	detail::render_pdb_status(context, state);

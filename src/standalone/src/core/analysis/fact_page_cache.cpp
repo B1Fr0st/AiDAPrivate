@@ -3,6 +3,7 @@
 #include "analysis_budget.hpp"
 #include "mapped_window_cache.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../infra/fast_containers.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -10,7 +11,6 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -53,7 +53,7 @@ struct fact_page_entry_t {
 
 struct fact_page_shard_t {
     std::mutex mutex;
-    std::unordered_map<fact_page_key_t, fact_page_entry_t, fact_page_key_hash_t> entries;
+    aida::infra::fast_flat_map<fact_page_key_t, fact_page_entry_t, fact_page_key_hash_t> entries;
 };
 
 bool ranges_overlap(std::uint64_t entry_min, std::uint64_t entry_max,

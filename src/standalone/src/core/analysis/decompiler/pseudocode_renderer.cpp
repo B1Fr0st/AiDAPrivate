@@ -1,4 +1,4 @@
-#include "pseudocode_renderer_v2.hpp"
+#include "pseudocode_renderer.hpp"
 
 #include "pseudocode_readability.hpp"
 
@@ -51,18 +51,41 @@ bool unary_operator(const std::string& value) noexcept
            value == "++" || value == "--";
 }
 
+bool qualified_identifier_text(const std::string& value) noexcept
+{
+    if (value.empty() || value.size() > 128)
+        return false;
+    std::size_t segments = 1;
+    std::size_t segment_begin = 0;
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] == ':' && index + 1 < value.size() && value[index + 1] == ':') {
+            if (!identifier_text(value.substr(segment_begin, index - segment_begin)))
+                return false;
+            ++segments;
+            if (segments > 8)
+                return false;
+            ++index;
+            segment_begin = index + 1;
+            continue;
+        }
+        if (value[index] == ':')
+            return false;
+    }
+    return identifier_text(value.substr(segment_begin));
+}
+
 int binary_precedence(const std::string& value) noexcept
 {
-    if (value == "||") return 2;
-    if (value == "&&") return 3;
-    if (value == "|") return 4;
-    if (value == "^") return 5;
-    if (value == "&") return 6;
-    if (value == "==" || value == "!=") return 7;
-    if (value == "<" || value == "<=" || value == ">" || value == ">=") return 8;
-    if (value == "<<" || value == ">>") return 9;
-    if (value == "+" || value == "-") return 10;
-    if (value == "*" || value == "/" || value == "%") return 11;
+    if (value == "||") return 3;
+    if (value == "&&") return 4;
+    if (value == "|") return 5;
+    if (value == "^") return 6;
+    if (value == "&") return 7;
+    if (value == "==" || value == "!=") return 8;
+    if (value == "<" || value == "<=" || value == ">" || value == ">=") return 9;
+    if (value == "<<" || value == ">>") return 10;
+    if (value == "+" || value == "-") return 11;
+    if (value == "*" || value == "/" || value == "%") return 12;
     return 0;
 }
 
@@ -130,14 +153,14 @@ public:
     renderer_t(
         const typed_pseudocode_ast_v2_t& ast,
         const type_graph_t& type_graph,
-        const pseudocode_renderer_v2_request_t& request)
+        const pseudocode_renderer_request_t& request)
         : ast_(ast), type_graph_(type_graph), request_(request), settings_(request.settings.style_id.empty()
-              ? pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced)
+              ? pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced)
               : request.settings)
     {
     }
 
-    pseudocode_renderer_v2_result_t run()
+    pseudocode_renderer_result_t run()
     {
         if (!prepare())
             return result_;
@@ -171,7 +194,8 @@ private:
         if (request_.limits.max_ast_nodes == 0 || request_.limits.max_output_bytes == 0 || request_.limits.max_tokens == 0 ||
             request_.limits.max_source_maps == 0 || request_.limits.max_nesting == 0 ||
             request_.limits.max_output_bytes > std::numeric_limits<std::uint32_t>::max() ||
-            (settings_.schema_version != 2 && settings_.schema_version != 3 && settings_.schema_version != 4) ||
+            (settings_.schema_version != 2 && settings_.schema_version != 3 && settings_.schema_version != 4 &&
+             settings_.schema_version != 5) ||
             settings_.style_id.empty() ||
             settings_.indentation_spaces == 0 || settings_.indentation_spaces > 16) {
             fail(decompiler_diagnostic_code_t::invalid_contract, "decompiler.renderer.v2.request", nullptr);
@@ -181,7 +205,7 @@ private:
             fail(decompiler_diagnostic_code_t::resource_limit, "decompiler.renderer.v2.ast_node_limit", nullptr);
             return false;
         }
-        const auto semantic_validation = validate_typed_ast_v2_semantics(ast_, type_graph_);
+        const auto semantic_validation = validate_typed_ast_semantics(ast_, type_graph_);
         if (!semantic_validation.valid()) {
             result_.diagnostics.insert(result_.diagnostics.end(), semantic_validation.diagnostics.begin(), semantic_validation.diagnostics.end());
             return false;
@@ -216,6 +240,12 @@ private:
             if (!entry.vtable_selector.empty() && !entry.method_name.empty() &&
                 identifier_text(entry.method_name))
                 vtable_slots_.emplace(vtable_slot_key(entry.vtable_selector, entry.slot_index), entry.method_name);
+        }
+        for (const auto& entry : request_.evidence->prototypes) {
+            if (prototype_cc_.size() >= k_max_evidence_map_entries)
+                break;
+            if (!entry.api_name.empty() && !entry.calling_convention.empty())
+                prototype_cc_.emplace(entry.api_name, entry.calling_convention);
         }
     }
 
@@ -354,14 +384,54 @@ private:
     {
         switch (value.kind) {
         case typed_pseudocode_ast_node_kind_t::assignment_expression: return 1;
+        case typed_pseudocode_ast_node_kind_t::conditional_expression: return 2;
         case typed_pseudocode_ast_node_kind_t::binary_expression: return binary_precedence(value.stable_text);
         case typed_pseudocode_ast_node_kind_t::cast_expression:
-        case typed_pseudocode_ast_node_kind_t::unary_expression: return 12;
+        case typed_pseudocode_ast_node_kind_t::unary_expression: return 13;
         case typed_pseudocode_ast_node_kind_t::call_expression:
         case typed_pseudocode_ast_node_kind_t::member_expression:
-        case typed_pseudocode_ast_node_kind_t::index_expression: return 13;
-        default: return 14;
+        case typed_pseudocode_ast_node_kind_t::index_expression: return 14;
+        default: return 15;
         }
+    }
+
+    std::string resolved_function_name(const typed_pseudocode_ast_node_t& value) const
+    {
+        if (settings_.emit_resolved_symbols && !resolved_symbols_.empty()) {
+            const auto resolved = resolved_symbols_.find(value.stable_text);
+            if (resolved != resolved_symbols_.end())
+                return resolved->second;
+        }
+        return value.stable_text;
+    }
+
+    std::string function_calling_convention(const typed_pseudocode_ast_node_t& value,
+                                            const std::string& display_name) const
+    {
+        if (!prototype_cc_.empty()) {
+            const auto explicit_cc = prototype_cc_.find(display_name);
+            if (explicit_cc != prototype_cc_.end())
+                return explicit_cc->second;
+        }
+        if (value.child_ids.size() < 2)
+            return {};
+        const auto first = nodes_.find(value.child_ids.front());
+        if (first == nodes_.end() || first->second->stable_text != "this")
+            return {};
+        const auto type = types_.find(first->second->type_id);
+        if (type == types_.end() || type->second->kind != decompiler_type_kind_t::pointer)
+            return {};
+        for (const auto& edge : type_graph_.edges) {
+            if (edge.source_type_id != type->second->id ||
+                edge.kind != decompiler_type_edge_kind_t::pointee)
+                continue;
+            const auto pointee = types_.find(edge.target_type_id);
+            if (pointee != types_.end() &&
+                (pointee->second->kind == decompiler_type_kind_t::structure ||
+                 pointee->second->kind == decompiler_type_kind_t::class_type))
+                return "__thiscall";
+        }
+        return {};
     }
 
     bool render_function(const std::uint64_t id)
@@ -377,11 +447,18 @@ private:
         } else if (!emit("function", decompiler_document_token_kind_t::keyword, *value) || !emit_space(*value)) {
             return false;
         }
-        if (!identifier_text(value->stable_text)) {
+        const std::string display_name = resolved_function_name(*value);
+        if (!qualified_identifier_text(display_name)) {
             fail(decompiler_diagnostic_code_t::unresolved_symbol, "decompiler.renderer.v2.function_identifier", value);
             return false;
         }
-        if (!emit(value->stable_text, decompiler_document_token_kind_t::identifier, *value) ||
+        if (settings_.emit_calling_convention_annotations) {
+            const std::string convention = function_calling_convention(*value, display_name);
+            if (!convention.empty() &&
+                (!emit(convention, decompiler_document_token_kind_t::keyword, *value) || !emit_space(*value)))
+                return false;
+        }
+        if (!emit(display_name, decompiler_document_token_kind_t::identifier, *value) ||
             !emit("(", decompiler_document_token_kind_t::punctuation, *value))
             return false;
         for (std::size_t index = 0; index + 1 < value->child_ids.size(); ++index) {
@@ -798,6 +875,13 @@ private:
                        emit("=", decompiler_document_token_kind_t::operator_token, *value) && emit_space(*value) &&
                        render_expression(value->child_ids[1], current_precedence);
             break;
+        case typed_pseudocode_ast_node_kind_t::conditional_expression:
+            rendered = render_expression(value->child_ids[0], 13) && emit_space(*value) &&
+                       emit("?", decompiler_document_token_kind_t::operator_token, *value) && emit_space(*value) &&
+                       render_expression(value->child_ids[1], current_precedence + 1) && emit_space(*value) &&
+                       emit(":", decompiler_document_token_kind_t::punctuation, *value) && emit_space(*value) &&
+                       render_expression(value->child_ids[2], current_precedence);
+            break;
         case typed_pseudocode_ast_node_kind_t::unary_expression:
             rendered = unary_operator(value->stable_text) &&
                        emit(value->stable_text, decompiler_document_token_kind_t::operator_token, *value) &&
@@ -1001,14 +1085,15 @@ private:
 
     const typed_pseudocode_ast_v2_t& ast_;
     const type_graph_t& type_graph_;
-    const pseudocode_renderer_v2_request_t& request_;
+    const pseudocode_renderer_request_t& request_;
     const decompiler_renderer_settings_t settings_;
-    pseudocode_renderer_v2_result_t result_;
+    pseudocode_renderer_result_t result_;
     decompiler_document_t document_;
     std::map<std::uint64_t, const typed_pseudocode_ast_node_t*> nodes_;
     std::map<std::uint64_t, const decompiler_type_node_t*> types_;
     std::map<std::string, std::string> resolved_symbols_;
     std::map<std::string, std::string> vtable_slots_;
+    std::map<std::string, std::string> prototype_cc_;
     std::uint64_t switch_selector_type_id_ = 0;
     std::size_t indent_ = 0;
     std::size_t nesting_ = 0;
@@ -1018,17 +1103,17 @@ private:
 
 }
 
-bool pseudocode_renderer_v2_result_t::succeeded() const noexcept
+bool pseudocode_renderer_result_t::succeeded() const noexcept
 {
     return document.has_value();
 }
 
-decompiler_renderer_settings_t pseudocode_renderer_v2_style_settings(
-    const pseudocode_renderer_v2_style_profile_t profile)
+decompiler_renderer_settings_t pseudocode_renderer_style_settings(
+    const pseudocode_renderer_style_profile_t profile)
 {
     decompiler_renderer_settings_t result;
     switch (profile) {
-    case pseudocode_renderer_v2_style_profile_t::compact:
+    case pseudocode_renderer_style_profile_t::compact:
         result.style_id = "aida.pseudocode.v2.compact";
         result.indentation_spaces = 2;
         result.emit_type_annotations = true;
@@ -1046,40 +1131,41 @@ decompiler_renderer_settings_t pseudocode_renderer_v2_style_settings(
         result.readability.enable_copy_propagation = false;
         result.readability.enable_dead_store_elimination = false;
         break;
-    case pseudocode_renderer_v2_style_profile_t::balanced:
+    case pseudocode_renderer_style_profile_t::balanced:
         result.style_id = "aida.pseudocode.v2.balanced";
         result.indentation_spaces = 4;
         result.emit_type_annotations = true;
         result.emit_provenance_annotations = false;
         result.emit_unknown_tokens = true;
         break;
-    case pseudocode_renderer_v2_style_profile_t::audit:
+    case pseudocode_renderer_style_profile_t::audit:
         result.style_id = "aida.pseudocode.v2.audit";
         result.indentation_spaces = 4;
         result.emit_type_annotations = true;
         result.emit_provenance_annotations = true;
         result.emit_unknown_tokens = true;
+        result.emit_calling_convention_annotations = true;
         result.readability.max_transform_iterations = 8;
         break;
     }
     return result;
 }
 
-pseudocode_renderer_v2_result_t render_pseudocode_v2(
+pseudocode_renderer_result_t render_pseudocode(
     const typed_pseudocode_ast_v2_t& ast,
     const type_graph_t& type_graph,
-    const pseudocode_renderer_v2_request_t& request)
+    const pseudocode_renderer_request_t& request)
 {
     return renderer_t(ast, type_graph, request).run();
 }
 
-pseudocode_renderer_v2_result_t rerender_document_with_local_renames(
+pseudocode_renderer_result_t rerender_document_with_local_renames(
     const decompiler_document_t& source,
     const type_graph_t& type_graph,
-    const pseudocode_renderer_v2_request_t& request,
+    const pseudocode_renderer_request_t& request,
     const std::vector<std::pair<std::string, std::string>>& renames)
 {
-    pseudocode_renderer_v2_result_t result;
+    pseudocode_renderer_result_t result;
     auto ast = source.ast;
     std::uint32_t ordinal = 1;
     for (const auto& [old_name, new_name] : renames) {
@@ -1103,7 +1189,7 @@ pseudocode_renderer_v2_result_t rerender_document_with_local_renames(
             ast_validation.diagnostics.begin(), ast_validation.diagnostics.end());
         return result;
     }
-    result = render_pseudocode_v2(ast, type_graph, request);
+    result = render_pseudocode(ast, type_graph, request);
     if (!result.succeeded() || !result.document)
         return result;
     const auto document_validation = validate_decompiler_document(*result.document);

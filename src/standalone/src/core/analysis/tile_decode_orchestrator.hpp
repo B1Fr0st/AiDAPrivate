@@ -8,6 +8,7 @@
 #include "packed_analysis_store.hpp"
 #include "provider_snapshot.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -211,6 +212,7 @@ struct tile_decode_orchestrator_statistics_t final {
     std::uint64_t edges_phase_wall_ns = 0;
     std::uint64_t build_phase_wall_ns = 0;
     std::uint64_t apply_stall_count = 0;
+    std::uint64_t gap_out_of_order_apply_count = 0;
     std::uint64_t worker_completion_push_count = 0;
     std::uint64_t worker_steal_count = 0;
     std::uint64_t worker_backpressure_wait_count = 0;
@@ -227,6 +229,26 @@ struct tile_decode_orchestration_result_t final {
     std::vector<tile_decode_cross_tile_edge_t> cross_tile_edges;
     std::vector<tile_decode_shard_summary_t> shards;
     tile_decode_orchestrator_statistics_t statistics;
+};
+
+struct decode_accepted_tile_counts_t final {
+    std::uint32_t instruction_count = 0;
+    std::uint32_t operand_count = 0;
+    std::uint32_t target_count = 0;
+    std::uint32_t expression_count = 0;
+};
+
+class decode_build_progress_t {
+public:
+    virtual ~decode_build_progress_t() = default;
+
+    virtual void accepted_counts_final(
+        const std::vector<decode_accepted_tile_counts_t>& tile_counts,
+        std::uint64_t instructions, std::uint64_t operands,
+        std::uint64_t targets, std::uint64_t expressions,
+        std::uint64_t delay_slots) = 0;
+    virtual workspace_result_t<void> packed_tile_ready(
+        std::size_t tile_ordinal, packed_analysis_shard_t& tile) = 0;
 };
 
 struct decode_tile_range_t final {
@@ -276,7 +298,8 @@ public:
         std::vector<tile_decode_seed_t> seeds,
         tile_decode_executor_t& executor,
         const cancellation_token_t& cancellation = {},
-        decode_worker_pool_t* shared_pool = nullptr) const;
+        decode_worker_pool_t* shared_pool = nullptr,
+        decode_build_progress_t* build_progress = nullptr) const;
 
     const tile_decode_orchestrator_limits_t& limits() const noexcept { return limits_; }
 
@@ -295,7 +318,8 @@ private:
         std::uint32_t lane_id,
         decode_worker_pool_t* shared_pool,
         bool tile_only_shard_formula,
-        bool publish_unmerged_shards) const;
+        bool publish_unmerged_shards,
+        decode_build_progress_t* build_progress = nullptr) const;
 
     tile_decode_orchestrator_limits_t limits_;
 };

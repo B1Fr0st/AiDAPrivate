@@ -87,7 +87,6 @@ namespace functions_panel {
 
 		char                           filter_buf[160] = {};
 		std::string                    last_filter_lower;
-		std::vector<int>               filtered_indices;
 		bool                           filter_dirty = true;
 
 		int                            selected_row = -1;
@@ -99,6 +98,9 @@ namespace functions_panel {
 		int                            sort_column = 0;
 		bool                           sort_ascending = true;
 		bool                           sort_dirty = false;
+
+		std::atomic<std::uint64_t>     filter_sort_serial{0};
+		std::atomic<bool>              filter_sort_building{false};
 	};
 
 	inline std::mutex& workspace_states_mutex() {
@@ -128,15 +130,6 @@ namespace functions_panel {
 		auto& slot = workspace_states()[id];
 		if (!slot) slot = std::make_shared<view_state_t>();
 		return slot;
-	}
-
-	inline view_state_t& state_for(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
-		return *state_handle_for(workspace);
-	}
-
-	inline view_state_t& state() {
-		return state_for(render_workspace());
 	}
 
 	namespace detail {
@@ -208,7 +201,6 @@ namespace functions_panel {
 						std::make_shared<const std::vector<function_entry_t>>();
 					state_handle->presentation =
 						std::make_shared<const presentation_snapshot_t>();
-					state_handle->filtered_indices.clear();
 					state_handle->cached_module_base = workspace->identity().image_base();
 					state_handle->cached_module_size = workspace->identity().module()
 						? static_cast<uint32_t>((std::min<std::uint64_t>)(
@@ -440,7 +432,6 @@ namespace functions_panel {
 						std::make_shared<const std::vector<function_entry_t>>(std::move(entries));
 					state_handle->presentation =
 						std::make_shared<const presentation_snapshot_t>();
-					state_handle->filtered_indices.clear();
 					state_handle->cached_module_base = workspace->identity().image_base();
 					state_handle->cached_module_size = image ? image->image_size() : 0;
 					state_handle->cached_module_name = workspace->identity().bin_name();
@@ -474,127 +465,156 @@ namespace functions_panel {
 			refresh_from_workspace(render_workspace());
 		}
 
-		inline void rebuild_filter(view_state_t& s) {
+		inline void submit_filter_sort(const std::shared_ptr<view_state_t>& state_handle) {
+			auto& s = *state_handle;
 			std::string current = to_lower_copy(s.filter_buf);
 			std::shared_ptr<const std::vector<function_entry_t>> entries;
-			{
-				std::lock_guard<std::mutex> lock(s.mtx);
-				if (!s.filter_dirty && current == s.last_filter_lower) return;
-				s.last_filter_lower = current;
-				s.filter_dirty = false;
-				entries = s.entries;
-			}
-			std::vector<int> filtered;
-			filtered.reserve(entries ? entries->size() : 0);
-			if (current.empty()) {
-				for (int index = 0; entries && index < static_cast<int>(entries->size()); ++index)
-					filtered.push_back(index);
-			} else {
-				std::string addr_query = current;
-				if (addr_query.size() > 2 && addr_query[0] == '0' && addr_query[1] == 'x')
-					addr_query = addr_query.substr(2);
-				char addr_buf[32];
-				for (int index = 0; entries && index < static_cast<int>(entries->size()); ++index) {
-					const auto& entry = (*entries)[static_cast<std::size_t>(index)];
-					std::snprintf(addr_buf, sizeof(addr_buf), "%llx",
-						static_cast<unsigned long long>(entry.address));
-					bool matched = std::strstr(addr_buf, addr_query.c_str()) != nullptr;
-					if (!matched)
-						matched = to_lower_copy(entry.name).find(current) != std::string::npos;
-					if (!matched && !entry.section.empty())
-						matched = to_lower_copy(entry.section).find(current) != std::string::npos;
-					if (matched) filtered.push_back(index);
-				}
-			}
-			{
-				std::lock_guard<std::mutex> lock(s.mtx);
-				if (s.entries != entries) {
-					s.filter_dirty = true;
-					return;
-				}
-				s.filtered_indices = std::move(filtered);
-				s.sort_dirty = true;
-			}
-		}
-
-		inline void apply_sort(view_state_t& s) {
-			std::shared_ptr<const std::vector<function_entry_t>> entries;
-			std::vector<int> sorted;
 			int column = 0;
 			bool ascending = true;
+			std::uint64_t serial = 0;
 			{
 				std::lock_guard<std::mutex> lock(s.mtx);
-				if (!s.sort_dirty) return;
+				if (!s.filter_dirty && !s.sort_dirty && current == s.last_filter_lower)
+					return;
+				s.last_filter_lower = current;
+				s.filter_dirty = false;
 				s.sort_dirty = false;
 				entries = s.entries;
-				sorted = s.filtered_indices;
 				column = s.sort_column;
 				ascending = s.sort_ascending;
+				serial = s.filter_sort_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
 			}
-			auto compare = [column, ascending, &entries](int left, int right) {
-				const auto& a = (*entries)[static_cast<std::size_t>(left)];
-				const auto& b = (*entries)[static_cast<std::size_t>(right)];
-				int c = 0;
-				switch (column) {
-					case 0:
-						c = compare_case_insensitive(a.name, b.name);
-						break;
-					case 1:
-						if (a.size < b.size) c = -1;
-						else if (a.size > b.size) c = 1;
-						break;
-					case 2:
-						c = compare_case_insensitive(a.section, b.section);
-						break;
-					case 3: {
-						uint64_t ax = static_cast<uint64_t>(a.calls_in)
-							+ static_cast<uint64_t>(a.calls_out);
-						uint64_t bx = static_cast<uint64_t>(b.calls_in)
-							+ static_cast<uint64_t>(b.calls_out);
-						if (ax < bx) c = -1;
-						else if (ax > bx) c = 1;
-						break;
+			s.filter_sort_building.store(true, std::memory_order_release);
+			aida::infra::executor::submission_t submission;
+			submission.owner_subsystem = "analysis";
+			submission.label = "analysis.functions_panel.filter_sort";
+			submission.thread_class = "bounded_task";
+			submission.domain = aida::infra::executor::domain_t::feature_worker;
+			submission.priority = 2;
+			submission.body = [state_handle, entries, current, column, ascending, serial]() {
+				auto& state = *state_handle;
+				std::vector<int> filtered;
+				filtered.reserve(entries ? entries->size() : 0);
+				if (current.empty()) {
+					for (int index = 0; entries && index < static_cast<int>(entries->size()); ++index)
+						filtered.push_back(index);
+				} else {
+					std::string addr_query = current;
+					if (addr_query.size() > 2 && addr_query[0] == '0' && addr_query[1] == 'x')
+						addr_query = addr_query.substr(2);
+					char addr_buf[32];
+					for (int index = 0; entries && index < static_cast<int>(entries->size()); ++index) {
+						const auto& entry = (*entries)[static_cast<std::size_t>(index)];
+						std::snprintf(addr_buf, sizeof(addr_buf), "%llx",
+							static_cast<unsigned long long>(entry.address));
+						bool matched = std::strstr(addr_buf, addr_query.c_str()) != nullptr;
+						if (!matched)
+							matched = to_lower_copy(entry.name).find(current) != std::string::npos;
+						if (!matched && !entry.section.empty())
+							matched = to_lower_copy(entry.section).find(current) != std::string::npos;
+						if (matched) filtered.push_back(index);
 					}
-					default:
-						c = compare_case_insensitive(a.name, b.name);
-						break;
 				}
-				if (c == 0) {
-					if (a.address < b.address) c = -1;
-					else if (a.address > b.address) c = 1;
+				auto compare = [column, ascending, &entries](int left, int right) {
+					const auto& a = (*entries)[static_cast<std::size_t>(left)];
+					const auto& b = (*entries)[static_cast<std::size_t>(right)];
+					int c = 0;
+					switch (column) {
+						case 0:
+							c = compare_case_insensitive(a.name, b.name);
+							break;
+						case 1:
+							if (a.size < b.size) c = -1;
+							else if (a.size > b.size) c = 1;
+							break;
+						case 2:
+							c = compare_case_insensitive(a.section, b.section);
+							break;
+						case 3: {
+							uint64_t ax = static_cast<uint64_t>(a.calls_in)
+								+ static_cast<uint64_t>(a.calls_out);
+							uint64_t bx = static_cast<uint64_t>(b.calls_in)
+								+ static_cast<uint64_t>(b.calls_out);
+							if (ax < bx) c = -1;
+							else if (ax > bx) c = 1;
+							break;
+						}
+						default:
+							c = compare_case_insensitive(a.name, b.name);
+							break;
+					}
+					if (c == 0) {
+						if (a.address < b.address) c = -1;
+						else if (a.address > b.address) c = 1;
+					}
+					return ascending ? (c < 0) : (c > 0);
+				};
+				if (entries)
+					std::sort(filtered.begin(), filtered.end(), compare);
+				auto presentation = std::make_shared<presentation_snapshot_t>();
+				presentation->entries = entries;
+				presentation->sorted_indices = std::move(filtered);
+				presentation->row_by_address.reserve(presentation->sorted_indices.size());
+				for (std::size_t row = 0; row < presentation->sorted_indices.size(); ++row) {
+					const int source = presentation->sorted_indices[row];
+					if (entries && source >= 0 && source < static_cast<int>(entries->size()))
+						presentation->row_by_address.emplace(
+							(*entries)[static_cast<std::size_t>(source)].address, row);
 				}
-				return ascending ? (c < 0) : (c > 0);
-			};
-			if (entries)
-				std::sort(sorted.begin(), sorted.end(), compare);
-			auto presentation = std::make_shared<presentation_snapshot_t>();
-			presentation->entries = entries;
-			presentation->sorted_indices = std::move(sorted);
-			presentation->row_by_address.reserve(presentation->sorted_indices.size());
-			for (std::size_t row = 0; row < presentation->sorted_indices.size(); ++row) {
-				const int source = presentation->sorted_indices[row];
-				if (entries && source >= 0 && source < static_cast<int>(entries->size()))
-					presentation->row_by_address.emplace(
-						(*entries)[static_cast<std::size_t>(source)].address, row);
-			}
-			{
-				std::lock_guard<std::mutex> lock(s.mtx);
-				if (s.entries != entries || s.sort_column != column ||
-					s.sort_ascending != ascending) {
-					s.sort_dirty = true;
-					return;
-				}
-				if (s.selected_addr != 0) {
-					const auto selected = presentation->row_by_address.find(s.selected_addr);
-					if (selected == presentation->row_by_address.end()) {
-						s.selected_row = -1;
-						s.selected_addr = 0;
+				const char* drop_reason = nullptr;
+				{
+					std::lock_guard<std::mutex> lock(state.mtx);
+					if (state.entries != entries) {
+						state.filter_dirty = true;
+						state.sort_dirty = true;
+						drop_reason = "entries_replaced";
+					} else if (state.filter_sort_serial.load(std::memory_order_acquire) != serial) {
+						drop_reason = "superseded";
 					} else {
-						s.selected_row = static_cast<int>(selected->second);
+						if (state.selected_addr != 0) {
+							const auto selected = presentation->row_by_address.find(state.selected_addr);
+							if (selected == presentation->row_by_address.end()) {
+								state.selected_row = -1;
+								state.selected_addr = 0;
+							} else {
+								state.selected_row = static_cast<int>(selected->second);
+							}
+						}
+						state.presentation = std::move(presentation);
 					}
 				}
-				s.presentation = std::move(presentation);
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				if (drop_reason != nullptr)
+					diag::log_tagged_fmt("functions_panel",
+						"filter_sort_stale_drop serial=%llu reason=%s",
+						static_cast<unsigned long long>(serial), drop_reason);
+#endif
+				if (state_handle->filter_sort_serial.load(std::memory_order_acquire) == serial)
+					state_handle->filter_sort_building.store(false, std::memory_order_release);
+			};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			auto preview_body = std::move(submission.body);
+			preview_body();
+#else
+			const auto submitted = aida::infra::executor::submit(std::move(submission));
+			if (!submitted.submitted) {
+				s.filter_sort_building.store(false, std::memory_order_release);
+				{
+					std::lock_guard<std::mutex> lock(s.mtx);
+					s.filter_dirty = true;
+					s.sort_dirty = true;
+				}
+				diag::log_tagged_fmt("functions_panel",
+					"filter_sort_submit_failed serial=%llu reason=%s",
+					static_cast<unsigned long long>(serial),
+					submitted.reject_reason.c_str());
+			} else {
+				diag::log_tagged_fmt("functions_panel",
+					"filter_sort_submit serial=%llu column=%d ascending=%d filter=%s",
+					static_cast<unsigned long long>(serial), column, ascending ? 1 : 0,
+					current.c_str());
 			}
+#endif
 		}
 
 		inline void jump_to_disasm(uint64_t addr) {
@@ -700,7 +720,8 @@ namespace functions_panel {
 	}
 
 	inline void render_impl(float, float, float w, float h) {
-		auto& s = state();
+		const auto state_handle = state_handle_for(render_workspace());
+		auto& s = *state_handle;
 		const auto& th = aida::ui::resolved();
 		const float dt = aida::ui::clock::dt();
 		s.row_anim_time += dt;
@@ -900,8 +921,7 @@ namespace functions_panel {
 			return;
 		}
 
-		detail::rebuild_filter(s);
-		detail::apply_sort(s);
+		detail::submit_filter_sort(state_handle);
 
 		std::shared_ptr<const presentation_snapshot_t> row_view;
 		{
@@ -1120,7 +1140,7 @@ namespace functions_panel {
 							s.sort_ascending = asc;
 							s.sort_dirty = true;
 						}
-						detail::apply_sort(s);
+						detail::submit_filter_sort(state_handle);
 						std::lock_guard<std::mutex> lock(s.mtx);
 						row_view = s.presentation;
 						shown_count = row_view ? row_view->sorted_indices.size() : 0;

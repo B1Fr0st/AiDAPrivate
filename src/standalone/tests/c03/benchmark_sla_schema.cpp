@@ -1,6 +1,8 @@
 #include "benchmark_sla_schema.hpp"
 #include "evidence_hash.hpp"
 
+#include "../../src/core/analysis/benchmark/benchmark_sla.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -299,22 +301,26 @@ void validate_matrix(contract_validation_result_t& result, const json& matrix, s
 
 const json& benchmark_sla_thresholds()
 {
+    const auto& program = aida::analysis::benchmark::program_sla_thresholds();
     static const json thresholds = {
         {"threshold_schema", "aida.c03.benchmark-sla-thresholds"},
         {"threshold_schema_version", 2},
-        {"release_min_artifact_bytes", 300000000ULL},
-        {"release_max_artifact_bytes", 500000000ULL},
+        {"release_min_artifact_bytes", aida::analysis::benchmark::real_fixture_min_bytes},
+        {"release_max_artifact_bytes", aida::analysis::benchmark::real_fixture_max_bytes},
         {"required_min_samples", 5},
-        {"cancellation_p95_ms_max", 250.0},
-        {"metadata_ready_ms_max", 3000.0},
-        {"warm_reopen_ms_max", 10000.0},
-        {"indexed_query_p95_ms_max", 50.0},
+        {"cancellation_p95_ms_max", program["cancellation_p95_ms_max"].get<double>()},
+        {"metadata_ready_ms_max", program["metadata_ready_ms_max"].get<double>()},
+        {"warm_reopen_ms_max", program["warm_reopen_ms_max"].get<double>()},
+        {"indexed_query_p95_ms_max", program["indexed_query_p95_ms_max"].get<double>()},
         {"warm_analysis_p50_ms_max", 60000.0},
         {"warm_analysis_max_ms_max", 75000.0},
-        {"incremental_private_bytes_max", 8589934592ULL},
+        {"incremental_private_bytes_max",
+            program["incremental_private_bytes_max"].get<std::uint64_t>()},
         {"resident_bytes_max", 8589934592ULL},
-        {"workspace_mapped_bytes_max", 1073741824ULL},
-        {"global_mapped_bytes_max", 2147483648ULL},
+        {"workspace_mapped_bytes_max",
+            program["workspace_mapped_bytes_max"].get<std::uint64_t>()},
+        {"global_mapped_bytes_max",
+            program["global_mapped_bytes_max"].get<std::uint64_t>()},
         {"cache_bytes_max", 1073741824ULL},
         {"spill_bytes_max", 1073741824ULL},
         {"spill_written_total_bytes_max", 4294967296ULL},

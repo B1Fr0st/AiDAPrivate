@@ -70,6 +70,8 @@ option(AIDA_FAST_LINK   "Use /DEBUG (default) instead of /DEBUG:FULL for faster 
 option(AIDA_ARC_ENCRYPT_IMPORTS "Enable --encrypt-imports for ARC (requires api-set resolver in payload.c — W1c-payload)" OFF)
 option(AIDA_HARDEN_RELEASE "Enable MSVC compiler/linker hardening (/GS /guard:cf /guard:ehcont /guard:xfg /Qspectre /sdl /CETCOMPAT /HIGHENTROPYVA /NXCOMPAT /DYNAMICBASE)" ON)
 option(AIDA_HARDEN_XFG "Enable /guard:xfg (Extended Control Flow Guard, requires Win11 22H2+ runtime)" ON)
+set(AIDA_BENCHMARK_REAL_PE "" CACHE FILEPATH
+    "300-500MB PE fixture that enables the aida_c03_benchmark_real_harness ctest target (mirrors Test Lab AIDA_BENCHMARK_REAL_PE)")
 
 set(AIDA_BUILD_SEED_FILE "${CMAKE_BINARY_DIR}/build_seed.txt")
 set(AIDA_BUILD_SEED "")
@@ -565,6 +567,12 @@ set(AIDA_LIBLZMA_LICENSE_FILE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/liblzma-COPYING.txt")
 set(AIDA_PCRE2_LICENSE_FILE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/PCRE2-LICENCE.txt")
+set(AIDA_PARALLEL_HASHMAP_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/parallel-hashmap-LICENSE.txt")
+set(AIDA_CONCURRENTQUEUE_LICENSE_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/third_party_notices/concurrentqueue-LICENSE.txt")
+set(parallel_hashmap_SOURCE_DIR "${DEPS_DIR}/parallel-hashmap-2.0.0/parallel-hashmap-2.0.0")
+set(concurrentqueue_SOURCE_DIR "${DEPS_DIR}/concurrentqueue-1.0.5/concurrentqueue-1.0.5")
 foreach(_aida_required_analysis_dependency IN ITEMS
         "${zydis_SOURCE_DIR}/CMakeLists.txt"
         "${zydis_SOURCE_DIR}/include/Zydis/Zydis.h"
@@ -586,6 +594,14 @@ foreach(_aida_required_analysis_dependency IN ITEMS
         "${DEPS_DIR}/zstd-1.5.7/LICENSE"
         "${DEPS_DIR}/xz-5.8.3/COPYING"
         "${DEPS_DIR}/pcre2-10.47/LICENCE.md"
+        "${parallel_hashmap_SOURCE_DIR}/parallel_hashmap/phmap.h"
+        "${parallel_hashmap_SOURCE_DIR}/LICENSE"
+        "${concurrentqueue_SOURCE_DIR}/concurrentqueue.h"
+        "${concurrentqueue_SOURCE_DIR}/blockingconcurrentqueue.h"
+        "${concurrentqueue_SOURCE_DIR}/lightweightsemaphore.h"
+        "${concurrentqueue_SOURCE_DIR}/LICENSE.md"
+        "${AIDA_PARALLEL_HASHMAP_LICENSE_FILE}"
+        "${AIDA_CONCURRENTQUEUE_LICENSE_FILE}"
         "${AIDA_ANALYSIS_NOTICE_LEDGER_FILE}")
     if(NOT EXISTS "${_aida_required_analysis_dependency}")
         message(FATAL_ERROR "AiDA: required pinned analysis dependency or notice is missing: ${_aida_required_analysis_dependency}")
@@ -676,6 +692,30 @@ aida_require_analysis_file_sha256(
 aida_require_analysis_text_sha256(
     "${AIDA_PCRE2_LICENSE_FILE}"
     "197d8a73ffee0d6b09adba2f9c677b5f5aede24edf89258a68e48248d010d811")
+aida_require_analysis_file_sha256(
+    "${parallel_hashmap_SOURCE_DIR}/parallel_hashmap/phmap.h"
+    "1ee9253539dbc1c06cd9879aa8d362bd4e2e77f5a3201b0cb966c36667f975fd")
+aida_require_analysis_file_sha256(
+    "${parallel_hashmap_SOURCE_DIR}/LICENSE"
+    "aac73b3148f6d1d7111dbca32099f68d26c644c6813ae1e4f05f6579aa2663fe")
+aida_require_analysis_file_sha256(
+    "${concurrentqueue_SOURCE_DIR}/concurrentqueue.h"
+    "f352dd5924ad6f23e9e09d62aa564713eadccf4cb29dc08c07d64e1c11050ecf")
+aida_require_analysis_file_sha256(
+    "${concurrentqueue_SOURCE_DIR}/blockingconcurrentqueue.h"
+    "d3a1354968f09b5dd13254618b45ce549c772a7b7a4be9acf8fc3c847f779f73")
+aida_require_analysis_file_sha256(
+    "${concurrentqueue_SOURCE_DIR}/lightweightsemaphore.h"
+    "44644ccd1b8d3d39459b15a036c5330d1d0161092c705d483b3dbb76c8066442")
+aida_require_analysis_file_sha256(
+    "${concurrentqueue_SOURCE_DIR}/LICENSE.md"
+    "22331571e5e3dbe4c79ad715e23127bdf3beabd75052c953ddabf191ef799e14")
+aida_require_analysis_text_sha256(
+    "${AIDA_PARALLEL_HASHMAP_LICENSE_FILE}"
+    "aac73b3148f6d1d7111dbca32099f68d26c644c6813ae1e4f05f6579aa2663fe")
+aida_require_analysis_text_sha256(
+    "${AIDA_CONCURRENTQUEUE_LICENSE_FILE}"
+    "22331571e5e3dbe4c79ad715e23127bdf3beabd75052c953ddabf191ef799e14")
 add_subdirectory("${zydis_SOURCE_DIR}" "${zydis_BINARY_DIR}")
 
 if(MSVC AND TARGET Zycore)
@@ -2265,6 +2305,8 @@ if(WIN32)
 
         target_include_directories(AiDAStandalone SYSTEM PRIVATE
             "${DEPS_DIR}/taskflow"
+            "${parallel_hashmap_SOURCE_DIR}"
+            "${concurrentqueue_SOURCE_DIR}"
         )
 
         target_compile_definitions(AiDAStandalone PRIVATE
@@ -2619,6 +2661,12 @@ if(WIN32)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${AIDA_MIMALLOC_LICENSE_FILE}"
                 "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/mimalloc-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_PARALLEL_HASHMAP_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/parallel-hashmap-LICENSE.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${AIDA_CONCURRENTQUEUE_LICENSE_FILE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/notices/analysis/concurrentqueue-LICENSE.txt"
             COMMENT "Staging pinned analysis dependency notices beside AiDAStandalone..."
             VERBATIM
         )

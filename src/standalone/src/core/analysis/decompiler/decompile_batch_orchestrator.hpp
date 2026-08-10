@@ -4,6 +4,7 @@
 #include "../workspace/analysis_metrics.hpp"
 #include "decompiler_contracts.hpp"
 #include "decompiler_provider_registry.hpp"
+#include "generation_snapshot_store.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -45,7 +46,8 @@ public:
         capture_generation_provider_context(
             const std::shared_ptr<analysis_workspace_t>& workspace,
             const std::shared_ptr<const analysis_publication_t>& publication,
-            const cancellation_token_t& cancel);
+            const cancellation_token_t& cancel,
+            std::shared_ptr<const generation_snapshot_store_t::entry_t>* snapshot_pin_out = nullptr);
 
     struct run_snapshot_t {
         bool active = false;

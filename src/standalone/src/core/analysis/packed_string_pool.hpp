@@ -1,11 +1,12 @@
 #pragma once
 
+#include "../infra/fast_containers.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -167,7 +168,7 @@ public:
 
 private:
     std::vector<std::string> values_;
-    std::unordered_map<std::string, packed_string_id_t> index_;
+    aida::infra::fast_flat_map<std::string, packed_string_id_t> index_;
 };
 
 static_assert(sizeof(packed_string_id_t) == sizeof(std::uint32_t),

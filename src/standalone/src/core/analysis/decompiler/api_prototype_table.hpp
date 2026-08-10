@@ -15,6 +15,7 @@ struct api_prototype_entry_t {
     const char* signature;
     bool is_noreturn;
     bool is_crt;
+    const char* format_attribute = nullptr;
 };
 
 inline constexpr api_prototype_entry_t k_entries[] = {
@@ -470,6 +471,8 @@ inline constexpr api_prototype_entry_t k_entries[] = {
     { "user32.dll", "GetClipboardData", "HANDLE __stdcall GetClipboardData(UINT uFormat)", false, false },
     { "user32.dll", "SetClipboardData", "HANDLE __stdcall SetClipboardData(UINT uFormat, HANDLE hMem)", false, false },
     { "user32.dll", "EmptyClipboard", "BOOL __stdcall EmptyClipboard(void)", false, false },
+    { "user32.dll", "wsprintfA", "int __cdecl wsprintfA(LPSTR buffer, LPCSTR format, ...)", false, false, "printf:2" },
+    { "user32.dll", "wsprintfW", "int __cdecl wsprintfW(LPWSTR buffer, LPCWSTR format, ...)", false, false, "printf:2" },
     { "dwmapi.dll", "DwmExtendFrameIntoClientArea", "HRESULT __stdcall DwmExtendFrameIntoClientArea(HWND hWnd, LPVOID pMarInset)", false, false },
     { "dwmapi.dll", "DwmSetWindowAttribute", "HRESULT __stdcall DwmSetWindowAttribute(HWND hwnd, DWORD dwAttribute, LPCVOID pvAttribute, DWORD cbAttribute)", false, false },
     { "dwmapi.dll", "DwmGetWindowAttribute", "HRESULT __stdcall DwmGetWindowAttribute(HWND hwnd, DWORD dwAttribute, LPVOID pvAttribute, DWORD cbAttribute)", false, false },
@@ -550,13 +553,13 @@ inline constexpr api_prototype_entry_t k_entries[] = {
     { "crt", "strcpy_s", "int __cdecl strcpy_s(LPSTR dest, SIZE_T destsz, LPCSTR src)", false, true },
     { "crt", "strncpy_s", "int __cdecl strncpy_s(LPSTR dest, SIZE_T destsz, LPCSTR src, SIZE_T count)", false, true },
     { "crt", "strcat_s", "int __cdecl strcat_s(LPSTR dest, SIZE_T destsz, LPCSTR src)", false, true },
-    { "crt", "sprintf_s", "int __cdecl sprintf_s(LPSTR buffer, SIZE_T sizeOfBuffer, LPCSTR format, ...)", false, true },
-    { "crt", "snprintf", "int __cdecl snprintf(LPSTR buffer, SIZE_T sizeOfBuffer, LPCSTR format, ...)", false, true },
+    { "crt", "sprintf_s", "int __cdecl sprintf_s(LPSTR buffer, SIZE_T sizeOfBuffer, LPCSTR format, ...)", false, true, "printf:2" },
+    { "crt", "snprintf", "int __cdecl snprintf(LPSTR buffer, SIZE_T sizeOfBuffer, LPCSTR format, ...)", false, true, "printf:2" },
     { "crt", "_snprintf_s", "int __cdecl _snprintf_s(LPSTR buffer, SIZE_T sizeOfBuffer, SIZE_T count, LPCSTR format, ...)", false, true },
     { "crt", "vsnprintf", "int __cdecl vsnprintf(LPSTR buffer, SIZE_T sizeOfBuffer, LPCSTR format, ULONG_PTR va)", false, true },
-    { "crt", "printf", "int __cdecl printf(LPCSTR format, ...)", false, true },
+    { "crt", "printf", "int __cdecl printf(LPCSTR format, ...)", false, true, "printf:1" },
     { "crt", "fprintf", "int __cdecl fprintf(LPVOID stream, LPCSTR format, ...)", false, true },
-    { "crt", "sprintf", "int __cdecl sprintf(LPSTR buffer, LPCSTR format, ...)", false, true },
+    { "crt", "sprintf", "int __cdecl sprintf(LPSTR buffer, LPCSTR format, ...)", false, true, "printf:2" },
     { "crt", "sscanf", "int __cdecl sscanf(LPCSTR buffer, LPCSTR format, ...)", false, true },
     { "crt", "puts", "int __cdecl puts(LPCSTR str)", false, true },
     { "crt", "putchar", "int __cdecl putchar(int ch)", false, true },
@@ -577,9 +580,9 @@ inline constexpr api_prototype_entry_t k_entries[] = {
     { "crt", "wcscpy_s", "int __cdecl wcscpy_s(LPWSTR dest, SIZE_T destsz, LPCWSTR src)", false, true },
     { "crt", "wcsncpy_s", "int __cdecl wcsncpy_s(LPWSTR dest, SIZE_T destsz, LPCWSTR src, SIZE_T count)", false, true },
     { "crt", "wcscat_s", "int __cdecl wcscat_s(LPWSTR dest, SIZE_T destsz, LPCWSTR src)", false, true },
-    { "crt", "swprintf_s", "int __cdecl swprintf_s(LPWSTR buffer, SIZE_T sizeOfBuffer, LPCWSTR format, ...)", false, true },
+    { "crt", "swprintf_s", "int __cdecl swprintf_s(LPWSTR buffer, SIZE_T sizeOfBuffer, LPCWSTR format, ...)", false, true, "printf:2" },
     { "crt", "_snwprintf_s", "int __cdecl _snwprintf_s(LPWSTR buffer, SIZE_T sizeOfBuffer, SIZE_T count, LPCWSTR format, ...)", false, true },
-    { "crt", "wprintf", "int __cdecl wprintf(LPCWSTR format, ...)", false, true },
+    { "crt", "wprintf", "int __cdecl wprintf(LPCWSTR format, ...)", false, true, "printf:1" },
     { "crt", "fwprintf", "int __cdecl fwprintf(LPVOID stream, LPCWSTR format, ...)", false, true },
     { "crt", "fopen", "LPVOID __cdecl fopen(LPCSTR filename, LPCSTR mode)", false, true },
     { "crt", "_wfopen", "LPVOID __cdecl _wfopen(LPCWSTR filename, LPCWSTR mode)", false, true },

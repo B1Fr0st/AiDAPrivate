@@ -4,6 +4,8 @@
 #include "calling_convention.hpp"
 #include "semantic_fusion.hpp"
 #include "type_recovery.hpp"
+#include "../flirt/static_recognition_service.hpp"
+#include "../flirt/type_seed_exporter.hpp"
 #include "../decompiler/pseudocode_readability.hpp"
 #include "../../disasm/ghidra_adapters/aida_arch_map.hpp"
 #include "../../disasm/ghidra_adapters/aida_function_db.hpp"
@@ -1229,7 +1231,7 @@ decompiler_service_v2_result_t decompiler_service_t::render_typed_pseudocode_v2(
     const type_graph_t& type_graph,
     const decompiler_service_v2_request_t& request) {
     decompiler_service_v2_result_t result;
-    auto ast_build = build_typed_ast_v2(hir, type_graph, request.ast);
+    auto ast_build = build_typed_ast(hir, type_graph, request.ast);
     append_v2_diagnostics(result, ast_build.diagnostics);
     if (!ast_build.succeeded() || !ast_build.ast)
         return result;
@@ -1250,7 +1252,7 @@ decompiler_service_v2_result_t decompiler_service_t::render_typed_pseudocode_v2(
         }
     }
     result.ast = std::move(*ast_build.ast);
-    result.rendering = render_pseudocode_v2(*result.ast, type_graph, request.renderer);
+    result.rendering = render_pseudocode(*result.ast, type_graph, request.renderer);
     append_v2_diagnostics(result, result.rendering->diagnostics);
     return result;
 }
@@ -1932,6 +1934,15 @@ workspace_result_t<decompiler_quality_result_t> run_decompiler_quality(
     type_request.cfg_result = quality.cfg ? &*quality.cfg : nullptr;
     type_request.calling_convention_result = quality.calling_convention
         ? &*quality.calling_convention : nullptr;
+    if (const auto recognition = static_recognition::records_for(workspace)) {
+        if (!recognition->rtti.types.empty() || !recognition->vtables.slots.empty()) {
+            if (const auto normalized = workspace->normalized_image()) {
+                type_request.injected_evidence =
+                    static_recognition::make_static_rtti_evidence(*recognition,
+                                                                  normalized->image_base);
+            }
+        }
+    }
     auto types = recover_types(*workspace, type_request, quality_cancel);
     if (!types) {
         if (quality_error_requires_abort(types.error()))
@@ -1939,7 +1950,10 @@ workspace_result_t<decompiler_quality_result_t> run_decompiler_quality(
         append_quality_error(quality, function, type_revision, "type-recovery",
             decompiler_feedback_error_class_t::type_recovery, types.error().message);
     } else {
+        auto recovered_shared = std::make_shared<const type_recovery_result_t>(types.value());
         quality.types = types.take_value();
+        static_recognition::note_recovered_types(workspace,
+            function.function.start.value, function.generation, recovered_shared);
         const std::size_t facts_before = quality.feedback_facts.size();
         append_validated_type_facts(quality, function, type_revision, *quality.types,
             caller, workspace_cancel, deadline);

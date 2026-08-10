@@ -4,6 +4,7 @@
 #include "../../infra/taskflow_runtime.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -28,7 +29,8 @@
 namespace aida::analysis {
 
 struct semantic_refiner_execution_state_t {
-    std::atomic<bool> adapter_busy{false};
+    static constexpr std::size_t k_proof_slots = 4;
+    std::array<std::atomic<bool>, k_proof_slots> slot_busy{};
 };
 
 namespace {
@@ -281,9 +283,16 @@ proof_worker_result_t bounded_prove(
     const cancellation_token_t& caller_cancel)
 {
     proof_worker_result_t result;
-    bool expected = false;
-    if (!execution_state->adapter_busy.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    std::size_t slot = semantic_refiner_execution_state_t::k_proof_slots;
+    for (std::size_t index = 0; index < semantic_refiner_execution_state_t::k_proof_slots; ++index) {
+        bool expected = false;
+        if (execution_state->slot_busy[index].compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            slot = index;
+            break;
+        }
+    }
+    if (slot == semantic_refiner_execution_state_t::k_proof_slots) {
         result.terminal = proof_worker_terminal_t::adapter_busy;
         return result;
     }
@@ -311,7 +320,7 @@ proof_worker_result_t bounded_prove(
             static_cast<std::uint64_t>(deadline_gap > 0 ? deadline_gap : 0);
     }
 #endif
-    worker_desc.cancellable_body = [adapter, execution_state, request, state, worker_token](
+    worker_desc.cancellable_body = [adapter, execution_state, request, state, worker_token, slot](
         const infra::taskflow_runtime::cancellation_token_t&) {
 #if defined(_WIN32)
         const HANDLE self_handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
@@ -340,7 +349,7 @@ proof_worker_result_t bounded_prove(
             state->cpu_ms = cpu_ms;
             state->complete = true;
         }
-        execution_state->adapter_busy.store(false, std::memory_order_release);
+        execution_state->slot_busy[slot].store(false, std::memory_order_release);
         state->condition.notify_all();
 #if defined(_WIN32)
         if (state->caller_abandoned.load(std::memory_order_acquire)) {
@@ -356,7 +365,7 @@ proof_worker_result_t bounded_prove(
     };
     auto worker_submission = infra::taskflow_runtime::submit(std::move(worker_desc));
     if (!worker_submission.submitted) {
-        execution_state->adapter_busy.store(false, std::memory_order_release);
+        execution_state->slot_busy[slot].store(false, std::memory_order_release);
         result.terminal = proof_worker_terminal_t::launch_failure;
         return result;
     }

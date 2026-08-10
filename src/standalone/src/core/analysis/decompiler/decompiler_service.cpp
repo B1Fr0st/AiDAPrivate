@@ -46,9 +46,75 @@ struct render_evidence_cache_entry_t {
     std::uint64_t touch = 0;
 };
 
+class readability_verdict_cache_t {
+public:
+    std::optional<pseudocode_readability_report_t> lookup(const sha256_digest_t& digest) {
+        auto& shard = shards_[shard_index(digest)];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        const auto found = shard.entries.find(digest);
+        if (found == shard.entries.end())
+            return std::nullopt;
+        found->second.touch = ++clock_;
+        return found->second.report;
+    }
+
+    void store(const sha256_digest_t& digest, const pseudocode_readability_report_t& report) {
+        auto& shard = shards_[shard_index(digest)];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        const auto existing = shard.entries.find(digest);
+        if (existing != shard.entries.end()) {
+            existing->second.report = report;
+            existing->second.touch = ++clock_;
+            return;
+        }
+        while (shard.entries.size() >= k_shard_capacity) {
+            const auto oldest = std::min_element(
+                shard.entries.begin(), shard.entries.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.touch < right.second.touch;
+                });
+            if (oldest == shard.entries.end())
+                break;
+            shard.entries.erase(oldest);
+        }
+        verdict_entry_t entry;
+        entry.report = report;
+        entry.touch = ++clock_;
+        shard.entries.emplace(digest, std::move(entry));
+    }
+
+private:
+    struct verdict_entry_t {
+        pseudocode_readability_report_t report;
+        std::uint64_t touch = 0;
+    };
+
+    struct verdict_shard_t {
+        std::mutex mutex;
+        std::unordered_map<sha256_digest_t, verdict_entry_t, binary_id_hash_t> entries;
+    };
+
+    static constexpr std::size_t k_shards = 8;
+    static constexpr std::size_t k_max_entries = 1024;
+    static constexpr std::size_t k_shard_capacity = k_max_entries / k_shards;
+
+    static std::size_t shard_index(const sha256_digest_t& digest) noexcept {
+        return static_cast<std::size_t>(digest.bytes[0]) & (k_shards - 1);
+    }
+
+    std::array<verdict_shard_t, k_shards> shards_;
+    std::atomic<std::uint64_t> clock_{0};
+};
+
+struct persistent_prefetch_task_t {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> done{false};
+};
+
 struct service_state_data_t {
     std::shared_ptr<decompiler_provider_registry_t> providers;
-    std::shared_ptr<decompiler_cache_v9_t> cache;
+    std::shared_ptr<decompiler_cache_t> cache;
     std::shared_ptr<semantic_refiner_t> semantic_refiner;
     decompiler_pipeline_service_config_t config;
     mutable std::mutex gate_mutex;
@@ -75,6 +141,9 @@ struct service_state_data_t {
     mutable std::mutex evidence_mutex;
     std::unordered_map<std::string, render_evidence_cache_entry_t> evidence_cache;
     std::uint64_t evidence_clock = 0;
+    readability_verdict_cache_t verdicts;
+    std::mutex persistent_mutex;
+    std::unordered_map<std::string, std::shared_ptr<persistent_prefetch_task_t>> persistent_inflight;
 };
 
 decompiler_diagnostic_t pipeline_diagnostic(
@@ -580,17 +649,21 @@ bool equal_provider(
 
 bool equivalent_attested_document(
     const decompiler_document_t& attested,
-    const decompiler_document_t& rendered)
+    const decompiler_document_t& rendered,
+    const sha256_digest_t* attested_digest = nullptr,
+    const sha256_digest_t* rendered_digest = nullptr)
 {
-    if (!validate_decompiler_document(attested).valid() ||
-        !validate_decompiler_document(rendered).valid())
+    try {
+        const sha256_digest_t left = attested_digest != nullptr
+            ? *attested_digest
+            : attestation_equivalence_digest(attested);
+        const sha256_digest_t right = rendered_digest != nullptr
+            ? *rendered_digest
+            : attestation_equivalence_digest(rendered);
+        return left.constant_time_equal(right);
+    } catch (...) {
         return false;
-    auto canonical_attested = attested;
-    auto canonical_rendered = rendered;
-    canonical_attested.diagnostics.clear();
-    canonical_rendered.diagnostics.clear();
-    return serialize_decompiler_document(canonical_attested) ==
-           serialize_decompiler_document(canonical_rendered);
+    }
 }
 
 constexpr std::size_t k_semantic_condition_max_ir_nodes = 24;
@@ -940,6 +1013,40 @@ workspace_result_t<pseudocode_readability_report_t> readability_report(
         std::move(*analyzed.report));
 }
 
+bool rendered_integrity_matches(
+    const decompiler_rendered_cache_value_t& value,
+    const sha256_digest_t& content_hash) noexcept
+{
+    try {
+        return stable_serialization_hash(serialize_decompiler_rendered_cache_value(value)) == content_hash;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::optional<pseudocode_readability_report_t> trusted_readability_verdict(
+    service_state_data_t& state,
+    const decompiler_rendered_cache_value_t& value)
+{
+    if (value.readability)
+        return *value.readability;
+    sha256_digest_t document_digest;
+    try {
+        document_digest = serialize_decompiler_document_measured(value.document).digest;
+    } catch (...) {
+        return std::nullopt;
+    }
+    auto memoized = state.verdicts.lookup(document_digest);
+    if (memoized)
+        return memoized;
+    auto readability = readability_report(value.document, state.config);
+    if (!readability)
+        return std::nullopt;
+    auto report = readability.take_value();
+    state.verdicts.store(document_digest, report);
+    return report;
+}
+
 bool equal_language(
     const decompiler_language_identity_t& left,
     const decompiler_language_identity_t& right) noexcept
@@ -957,11 +1064,11 @@ decompiler_renderer_settings_t renderer_settings(const decompiler_pipeline_reque
         return *request.renderer;
     switch (request.profile) {
     case decompiler_profile_id_t::fast:
-        return pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::compact);
+        return pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::compact);
     case decompiler_profile_id_t::balanced:
-        return pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::balanced);
+        return pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
     case decompiler_profile_id_t::thorough:
-        return pseudocode_renderer_v2_style_settings(pseudocode_renderer_v2_style_profile_t::audit);
+        return pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::audit);
     }
     return {};
 }
@@ -1209,7 +1316,7 @@ std::shared_ptr<const decompiler_render_evidence_t> resolve_render_evidence(
             found->second.touch = ++state.evidence_clock;
             return found->second.evidence;
         }
-        while (state.evidence_cache.size() >= 4) {
+        while (state.evidence_cache.size() >= 6) {
             const auto oldest = std::min_element(
                 state.evidence_cache.begin(), state.evidence_cache.end(),
                 [](const auto& left, const auto& right) {
@@ -1484,23 +1591,42 @@ bool provider_generation_matches(
     return true;
 }
 
+struct measured_provider_stage_t {
+    measured_serialization_t provider_ir;
+    std::optional<measured_serialization_t> provider_hir;
+    measured_serialization_t type_graph;
+};
+
+struct measured_normalized_stage_t {
+    measured_serialization_t hir;
+    measured_serialization_t type_graph;
+    measured_serialization_t ast;
+};
+
 std::optional<std::uint64_t> provider_payload_size(
-    const decompiler_provider_ir_cache_value_t& value)
+    const decompiler_provider_ir_cache_value_t& value,
+    measured_provider_stage_t& measured)
 {
     try {
-        std::uint64_t size = serialize_provider_ir(value.provider_ir).size();
-        const auto add = [&size](const std::size_t bytes) {
+        if (measured.provider_ir.bytes.empty())
+            measured.provider_ir = serialize_provider_ir_measured(value.provider_ir);
+        if (value.provider_hir && !measured.provider_hir)
+            measured.provider_hir = serialize_hir_function_measured(*value.provider_hir);
+        if (measured.type_graph.bytes.empty())
+            measured.type_graph = serialize_type_graph_measured(value.provider_type_graph);
+        std::uint64_t size = measured.provider_ir.size;
+        const auto add = [&size](const std::uint64_t bytes) {
             if (bytes > std::numeric_limits<std::uint64_t>::max() - size)
                 return false;
             size += bytes;
             return true;
         };
-        if (value.provider_hir && !add(serialize_hir_function(*value.provider_hir).size()))
+        if (measured.provider_hir && !add(measured.provider_hir->size))
             return std::nullopt;
-        if (!add(serialize_type_graph(value.provider_type_graph).size()))
+        if (!add(measured.type_graph.size))
             return std::nullopt;
         for (const auto& diagnostic : value.diagnostics) {
-            if (!add(serialize_decompiler_diagnostic(diagnostic).size()))
+            if (!add(serialize_decompiler_diagnostic_measured(diagnostic).size))
                 return std::nullopt;
         }
         return size;
@@ -1510,21 +1636,27 @@ std::optional<std::uint64_t> provider_payload_size(
 }
 
 std::optional<std::uint64_t> normalized_payload_size(
-    const decompiler_normalized_cache_value_t& value)
+    const decompiler_normalized_cache_value_t& value,
+    measured_normalized_stage_t& measured)
 {
     try {
-        std::uint64_t size = serialize_hir_function(value.hir).size();
-        const auto add = [&size](const std::size_t bytes) {
+        if (measured.hir.bytes.empty())
+            measured.hir = serialize_hir_function_measured(value.hir);
+        if (measured.type_graph.bytes.empty())
+            measured.type_graph = serialize_type_graph_measured(value.type_graph);
+        if (measured.ast.bytes.empty())
+            measured.ast = serialize_typed_pseudocode_ast_measured(value.ast);
+        std::uint64_t size = measured.hir.size;
+        const auto add = [&size](const std::uint64_t bytes) {
             if (bytes > std::numeric_limits<std::uint64_t>::max() - size)
                 return false;
             size += bytes;
             return true;
         };
-        if (!add(serialize_type_graph(value.type_graph).size()) ||
-            !add(serialize_typed_pseudocode_ast(value.ast).size()))
+        if (!add(measured.type_graph.size) || !add(measured.ast.size))
             return std::nullopt;
         for (const auto& diagnostic : value.diagnostics) {
-            if (!add(serialize_decompiler_diagnostic(diagnostic).size()))
+            if (!add(serialize_decompiler_diagnostic_measured(diagnostic).size))
                 return std::nullopt;
         }
         return size;
@@ -1712,6 +1844,7 @@ void discard_persistent_rendered(
 
 struct persistent_rendered_load_t {
     std::shared_ptr<const decompiler_rendered_cache_value_t> value;
+    std::optional<pseudocode_readability_report_t> readability;
 };
 
 persistent_rendered_load_t load_persistent_rendered(
@@ -1764,8 +1897,27 @@ persistent_rendered_load_t load_persistent_rendered(
         }
         corrupt = !parsed.has_value();
     }
-    if (!corrupt && !readability_report(parsed->document, state.config))
-        corrupt = true;
+    std::optional<measured_serialization_t> measured_document;
+    if (!corrupt) {
+        try {
+            measured_document = serialize_decompiler_document_measured(parsed->document);
+        } catch (...) {
+            measured_document.reset();
+        }
+        corrupt = !measured_document.has_value();
+    }
+    std::optional<pseudocode_readability_report_t> verdict;
+    if (!corrupt) {
+        verdict = state.verdicts.lookup(measured_document->digest);
+        if (!verdict) {
+            auto readability = readability_report(parsed->document, state.config);
+            if (readability) {
+                verdict = readability.take_value();
+                state.verdicts.store(measured_document->digest, *verdict);
+            }
+        }
+        corrupt = !verdict.has_value() || verdict->document_hash != measured_document->digest;
+    }
     if (corrupt) {
         discard_persistent_rendered(state, function_rva, "validation");
         return result;
@@ -1779,16 +1931,20 @@ persistent_rendered_load_t load_persistent_rendered(
         request.workspace_id, request.workspace_generation);
     if (!generation)
         return result;
-    auto stored = state.cache->store_rendered(rendered_key, *parsed);
+    decompiler_cache_component_blobs_t blobs;
+    blobs.primary_blob = std::move(measured_document->bytes);
+    auto stored = state.cache->store_rendered_preserialized(
+        rendered_key, *parsed, std::move(blobs), measured_document->digest, verdict, canonical);
     if (!stored) {
         if (stored.error().code == workspace_error_code_t::integrity_failure)
             discard_persistent_rendered(state, function_rva, "integrity");
         return result;
     }
-    auto hydrated = state.cache->lookup_rendered(rendered_key);
+    auto hydrated = state.cache->lookup_rendered(rendered_key, canonical);
     if (!hydrated || !hydrated.value().hit())
         return result;
     result.value = hydrated.value().value;
+    result.readability = std::move(verdict);
     return result;
 }
 
@@ -2271,7 +2427,7 @@ bool decompiler_pipeline_result_t::succeeded() const noexcept
 
 workspace_result_t<std::shared_ptr<decompiler_pipeline_service_t>> decompiler_pipeline_service_t::create(
     std::shared_ptr<decompiler_provider_registry_t> providers,
-    std::shared_ptr<decompiler_cache_v9_t> cache,
+    std::shared_ptr<decompiler_cache_t> cache,
     std::shared_ptr<semantic_refiner_t> semantic_refiner,
     decompiler_pipeline_service_config_t config)
 {
@@ -2335,6 +2491,14 @@ struct pipeline_operation_t {
     decompiler_pipeline_cache_key_t provider_key;
     decompiler_pipeline_cache_key_t normalized_key;
     decompiler_pipeline_cache_key_t rendered_key;
+    std::string canonical_provider_key;
+    std::string canonical_normalized_key;
+    std::string canonical_rendered_key;
+    measured_provider_stage_t measured_provider;
+    measured_normalized_stage_t measured_normalized;
+    std::optional<sha256_digest_t> provider_ir_digest;
+    std::optional<sha256_digest_t> attested_document_digest;
+    std::optional<sha256_digest_t> rendered_document_digest;
     std::optional<decompiler_document_t> attested_document;
     bool deferred_intermediate_cache_writes = false;
     bool attestation_sampled = false;
@@ -2343,6 +2507,92 @@ struct pipeline_operation_t {
     std::uint64_t dispatch_stage_ms = 0;
     decompiler_pipeline_service_t::decompiler_completion_t completion;
 };
+
+sha256_digest_t provider_ir_digest_for(
+    pipeline_operation_t& op,
+    const decompiler_provider_ir_cache_value_t& provider_stage)
+{
+    if (op.provider_ir_digest)
+        return *op.provider_ir_digest;
+    const auto digest = stable_serialization_hash(provider_stage.provider_ir);
+    op.provider_ir_digest = digest;
+    return digest;
+}
+
+std::optional<decompiler_pipeline_status_t> accept_rendered_hit(
+    service_state_data_t& state,
+    pipeline_operation_t& op,
+    std::shared_ptr<const decompiler_rendered_cache_value_t> cached,
+    const sha256_digest_t& content_hash)
+{
+    auto& result = op.result;
+    if (!rendered_integrity_matches(*cached, content_hash)) {
+        const auto integrity_error = service_error(
+            workspace_error_code_t::integrity_failure,
+            "decompiler rendered cache payload failed post-store integrity verification");
+        result.diagnostics.push_back(cache_failure_diagnostic(integrity_error));
+        return decompiler_pipeline_status_t::cache_integrity_failure;
+    }
+    auto verdict = trusted_readability_verdict(state, *cached);
+    if (!verdict) {
+        result.diagnostics = cached->diagnostics;
+        result.diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::malformed_document,
+            "decompiler.pipeline.readability.rejected"));
+        return decompiler_pipeline_status_t::rendering_failed;
+    }
+    result.rendered_stage = std::move(cached);
+    result.cache_hit_stage = decompiler_cache_stage_t::rendered_document;
+    result.diagnostics = result.rendered_stage->diagnostics;
+    result.readability = std::move(*verdict);
+    {
+        std::lock_guard lock(state.metrics_mutex);
+        ++state.metrics.rendered_cache_hits;
+    }
+    return std::nullopt;
+}
+
+std::shared_ptr<persistent_prefetch_task_t> find_persistent_inflight(
+    service_state_data_t& state,
+    const std::string& canonical_rendered_key)
+{
+    if (canonical_rendered_key.empty())
+        return nullptr;
+    std::lock_guard lock(state.persistent_mutex);
+    const auto found = state.persistent_inflight.find(canonical_rendered_key);
+    return found != state.persistent_inflight.end() ? found->second : nullptr;
+}
+
+void await_persistent_inflight(
+    service_state_data_t& state,
+    persistent_prefetch_task_t& task,
+    pipeline_operation_t& op)
+{
+    const auto cap = std::chrono::milliseconds(
+        static_cast<std::chrono::milliseconds::rep>(state.config.persistent_prefetch_await_cap_ms));
+    const auto started = std::chrono::steady_clock::now();
+    auto budget = cap;
+    if (op.operation_deadline != std::chrono::steady_clock::time_point::max()) {
+        if (op.operation_deadline <= started)
+            return;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            op.operation_deadline - started);
+        budget = (std::min)(cap, remaining);
+    }
+    std::unique_lock lock(task.mutex);
+    while (!task.done) {
+        if (op.operation_cancel.stop_requested() || budget <= std::chrono::milliseconds(0))
+            return;
+        const auto slice = (std::min)(budget, std::chrono::milliseconds(25));
+        if (task.cv.wait_for(lock, slice, [&task] { return task.done; }))
+            return;
+        budget -= slice;
+        if (op.operation_deadline != std::chrono::steady_clock::time_point::max() &&
+            std::chrono::steady_clock::now() >= op.operation_deadline)
+            return;
+    }
+}
 
 decompiler_pipeline_result_t pipeline_finish(
     pipeline_operation_t& op,
@@ -2478,31 +2728,29 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
             "decompiler.pipeline.cache_key.invalid"));
         return decompiler_pipeline_status_t::invalid_request;
     }
+    try {
+        op.canonical_provider_key = serialize_decompiler_pipeline_cache_key(op.provider_key);
+        op.canonical_normalized_key = serialize_decompiler_pipeline_cache_key(op.normalized_key);
+        op.canonical_rendered_key = serialize_decompiler_pipeline_cache_key(op.rendered_key);
+    } catch (...) {
+        op.canonical_provider_key.clear();
+        op.canonical_normalized_key.clear();
+        op.canonical_rendered_key.clear();
+    }
 
     if (cache_reads_enabled(request.cache_mode)) {
-        auto rendered_lookup = state.cache->lookup_rendered(op.rendered_key);
+        auto rendered_lookup = !op.canonical_rendered_key.empty()
+            ? state.cache->lookup_rendered_verified(op.rendered_key, op.canonical_rendered_key)
+            : state.cache->lookup_rendered_verified(op.rendered_key);
         if (!rendered_lookup) {
             result.diagnostics.push_back(cache_failure_diagnostic(rendered_lookup.error()));
             return cache_error_status(rendered_lookup.error());
         }
         if (rendered_lookup.value().hit()) {
-            result.rendered_stage = rendered_lookup.value().value;
-            result.cache_hit_stage = decompiler_cache_stage_t::rendered_document;
-            result.diagnostics = result.rendered_stage->diagnostics;
-            auto readability = readability_report(
-                result.rendered_stage->document, state.config);
-            if (!readability) {
-                result.diagnostics.push_back(pipeline_diagnostic(
-                    decompiler_diagnostic_severity_t::error,
-                    decompiler_diagnostic_code_t::malformed_document,
-                    "decompiler.pipeline.readability.rejected"));
-                return decompiler_pipeline_status_t::rendering_failed;
-            }
-            result.readability = readability.take_value();
-            {
-                std::lock_guard lock(state.metrics_mutex);
-                ++state.metrics.rendered_cache_hits;
-            }
+            const auto accepted = accept_rendered_hit(
+                state, op, rendered_lookup.value().value, rendered_lookup.value().content_hash);
+            if (accepted)
+                return *accepted;
             if (request.invocation == decompiler_pipeline_invocation_t::background_batch)
                 metrics_add(state.config.metrics_sink,
                     analysis_metric_t::decompile_memory_cache_hits);
@@ -2511,21 +2759,43 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
 
         if (state.config.database &&
             request.entity.kind == decompiler_entity_kind_t::native_function) {
+            const auto inflight = find_persistent_inflight(state, op.canonical_rendered_key);
+            if (inflight) {
+                await_persistent_inflight(state, *inflight, op);
+                auto hydrated_lookup = !op.canonical_rendered_key.empty()
+                    ? state.cache->lookup_rendered_verified(op.rendered_key, op.canonical_rendered_key)
+                    : state.cache->lookup_rendered_verified(op.rendered_key);
+                if (hydrated_lookup && hydrated_lookup.value().hit()) {
+                    const auto accepted = accept_rendered_hit(
+                        state, op, hydrated_lookup.value().value,
+                        hydrated_lookup.value().content_hash);
+                    if (accepted)
+                        return *accepted;
+                    if (request.invocation == decompiler_pipeline_invocation_t::background_batch)
+                        metrics_add(state.config.metrics_sink,
+                            analysis_metric_t::decompile_persistent_cache_hits);
+                    return decompiler_pipeline_status_t::completed;
+                }
+            }
             auto persistent = load_persistent_rendered(state, request, op.rendered_key);
             if (persistent.value) {
                 result.rendered_stage = std::move(persistent.value);
                 result.cache_hit_stage = decompiler_cache_stage_t::rendered_document;
                 result.diagnostics = result.rendered_stage->diagnostics;
-                auto readability = readability_report(
-                    result.rendered_stage->document, state.config);
-                if (!readability) {
-                    result.diagnostics.push_back(pipeline_diagnostic(
-                        decompiler_diagnostic_severity_t::error,
-                        decompiler_diagnostic_code_t::malformed_document,
-                        "decompiler.pipeline.readability.rejected"));
-                    return decompiler_pipeline_status_t::rendering_failed;
+                if (persistent.readability) {
+                    result.readability = std::move(*persistent.readability);
+                } else {
+                    auto readability = readability_report(
+                        result.rendered_stage->document, state.config);
+                    if (!readability) {
+                        result.diagnostics.push_back(pipeline_diagnostic(
+                            decompiler_diagnostic_severity_t::error,
+                            decompiler_diagnostic_code_t::malformed_document,
+                            "decompiler.pipeline.readability.rejected"));
+                        return decompiler_pipeline_status_t::rendering_failed;
+                    }
+                    result.readability = readability.take_value();
                 }
-                result.readability = readability.take_value();
                 {
                     std::lock_guard lock(state.metrics_mutex);
                     ++state.metrics.rendered_cache_hits;
@@ -2537,7 +2807,9 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
             }
         }
 
-        auto normalized_lookup = state.cache->lookup_normalized(op.normalized_key);
+        auto normalized_lookup = !op.canonical_normalized_key.empty()
+            ? state.cache->lookup_normalized(op.normalized_key, op.canonical_normalized_key)
+            : state.cache->lookup_normalized(op.normalized_key);
         if (!normalized_lookup) {
             result.diagnostics.push_back(cache_failure_diagnostic(normalized_lookup.error()));
             return cache_error_status(normalized_lookup.error());
@@ -2556,7 +2828,9 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
     }
 
     if (!result.normalized_stage && cache_reads_enabled(request.cache_mode)) {
-        auto provider_lookup = state.cache->lookup_provider_ir(op.provider_key);
+        auto provider_lookup = !op.canonical_provider_key.empty()
+            ? state.cache->lookup_provider_ir(op.provider_key, op.canonical_provider_key)
+            : state.cache->lookup_provider_ir(op.provider_key);
         if (!provider_lookup) {
             result.diagnostics.push_back(cache_failure_diagnostic(provider_lookup.error()));
             return cache_error_status(provider_lookup.error());
@@ -2741,7 +3015,17 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
             provider_stage.provider_type_graph = merged_types.take_value();
         }
 
-        if (!validate_provider_ir(provider_stage.provider_ir).valid() ||
+        const bool provider_ir_valid = validate_provider_ir(provider_stage.provider_ir).valid();
+        if (provider_ir_valid && provider_stage.provider_hir) {
+            try {
+                op.measured_provider.provider_ir = serialize_provider_ir_measured(provider_stage.provider_ir);
+                op.provider_ir_digest = op.measured_provider.provider_ir.digest;
+            } catch (...) {
+                op.measured_provider.provider_ir = measured_serialization_t{};
+                op.provider_ir_digest.reset();
+            }
+        }
+        if (!provider_ir_valid ||
             !validate_type_graph(provider_stage.provider_type_graph).valid() ||
             provider_stage.provider_ir.entity != request.entity ||
             provider_stage.provider_type_graph.entity != request.entity ||
@@ -2753,7 +3037,7 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
             !provider_generation_matches(provider_stage, request) ||
             (provider_stage.provider_hir &&
                 (!validate_hir_function(*provider_stage.provider_hir).valid() ||
-                 provider_stage.provider_hir->provider_ir_hash != stable_serialization_hash(provider_stage.provider_ir)))) {
+                 provider_stage.provider_hir->provider_ir_hash != provider_ir_digest_for(op, provider_stage)))) {
             result.diagnostics = std::move(provider_stage.diagnostics);
             result.diagnostics.push_back(pipeline_diagnostic(
                 decompiler_diagnostic_severity_t::error,
@@ -2761,7 +3045,7 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
                 "decompiler.pipeline.provider.contract_rejected"));
             return decompiler_pipeline_status_t::provider_failed;
         }
-        const auto payload_size = provider_payload_size(provider_stage);
+        const auto payload_size = provider_payload_size(provider_stage, op.measured_provider);
         if (!payload_size || *payload_size > state.config.max_provider_payload_bytes ||
             provider_ir_nodes(provider_stage.provider_ir) > budget->max_provider_ir_nodes) {
             result.diagnostics = std::move(provider_stage.diagnostics);
@@ -2771,10 +3055,34 @@ std::optional<decompiler_pipeline_status_t> pipeline_front(pipeline_operation_t&
                 "decompiler.pipeline.provider.payload_limit"));
             return decompiler_pipeline_status_t::resource_limit;
         }
+        op.provider_ir_digest = op.measured_provider.provider_ir.digest;
         result.provider_stage = std::make_shared<const decompiler_provider_ir_cache_value_t>(provider_stage);
         if (cache_writes_enabled(request.cache_mode) && !op.deferred_intermediate_cache_writes &&
             !batch_intermediate_stores_skipped(state.config, request)) {
-            auto stored = state.cache->store_provider_ir(op.provider_key, std::move(provider_stage));
+            const bool preserialized_ready =
+                !op.measured_provider.provider_ir.bytes.empty() &&
+                !op.measured_provider.type_graph.bytes.empty() &&
+                (!provider_stage.provider_hir ||
+                 (op.measured_provider.provider_hir.has_value() &&
+                  !op.measured_provider.provider_hir->bytes.empty()));
+            workspace_result_t<void> stored = [&]() -> workspace_result_t<void> {
+                if (preserialized_ready) {
+                    decompiler_cache_component_blobs_t blobs;
+                    blobs.primary_blob = std::move(op.measured_provider.provider_ir.bytes);
+                    if (op.measured_provider.provider_hir)
+                        blobs.secondary_blob = std::move(op.measured_provider.provider_hir->bytes);
+                    blobs.type_graph_blob = std::move(op.measured_provider.type_graph.bytes);
+                    return !op.canonical_provider_key.empty()
+                        ? state.cache->store_provider_ir_preserialized(
+                              op.provider_key, std::move(provider_stage), std::move(blobs),
+                              op.measured_provider.provider_ir.digest, std::nullopt,
+                              op.canonical_provider_key)
+                        : state.cache->store_provider_ir_preserialized(
+                              op.provider_key, std::move(provider_stage), std::move(blobs),
+                              op.measured_provider.provider_ir.digest, std::nullopt);
+                }
+                return state.cache->store_provider_ir(op.provider_key, std::move(provider_stage));
+            }();
             if (!stored) {
                 result.diagnostics = result.provider_stage->diagnostics;
                 result.diagnostics.push_back(cache_failure_diagnostic(stored.error()));
@@ -2804,6 +3112,7 @@ bool renderer_settings_equal(
            left.emit_comments == right.emit_comments &&
            left.emit_resolved_symbols == right.emit_resolved_symbols &&
            left.emit_enum_case_names == right.emit_enum_case_names &&
+           left.emit_calling_convention_annotations == right.emit_calling_convention_annotations &&
            left.readability == right.readability;
 }
 
@@ -2898,8 +3207,29 @@ decompiler_pipeline_status_t pipeline_back_attestation_validated(
     result.rendered_stage = std::make_shared<const decompiler_rendered_cache_value_t>(rendered);
     result.diagnostics = result.rendered_stage->diagnostics;
     if (cache_writes_enabled(request.cache_mode)) {
+        std::optional<measured_serialization_t> measured_document;
+        try {
+            measured_document = serialize_decompiler_document_measured(rendered.document);
+        } catch (...) {
+            measured_document.reset();
+        }
         std::string serialized;
-        auto stored = state.cache->store_rendered(op.rendered_key, std::move(rendered), &serialized);
+        workspace_result_t<void> stored = [&]() -> workspace_result_t<void> {
+            if (measured_document && result.readability &&
+                result.readability->document_hash == measured_document->digest) {
+                decompiler_cache_component_blobs_t blobs;
+                blobs.primary_blob = std::move(measured_document->bytes);
+                return !op.canonical_rendered_key.empty()
+                    ? state.cache->store_rendered_preserialized(
+                          op.rendered_key, std::move(rendered), std::move(blobs),
+                          measured_document->digest, result.readability, op.canonical_rendered_key,
+                          &serialized)
+                    : state.cache->store_rendered_preserialized(
+                          op.rendered_key, std::move(rendered), std::move(blobs),
+                          measured_document->digest, result.readability, &serialized);
+            }
+            return state.cache->store_rendered(op.rendered_key, std::move(rendered), &serialized);
+        }();
         if (!stored) {
             result.diagnostics.push_back(cache_failure_diagnostic(stored.error()));
             if (stored.error().code == workspace_error_code_t::stale_generation ||
@@ -2959,7 +3289,7 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
 
         if (!validate_hir_function(hir).valid() || !validate_type_graph(type_graph).valid() ||
             hir.entity != request.entity || type_graph.entity != request.entity ||
-            hir.provider_ir_hash != stable_serialization_hash(result.provider_stage->provider_ir) ||
+            hir.provider_ir_hash != provider_ir_digest_for(op, *result.provider_stage) ||
             hir.type_graph_revision != request.cache_identity.type_graph_revision ||
             type_graph.revision != request.cache_identity.type_graph_revision ||
             hir_nodes(hir) > budget.max_hir_nodes) {
@@ -3036,13 +3366,13 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
             attestation_diagnostics = std::move(diagnostics);
         }
         if (!batch_validated_attestation) {
-        typed_ast_v2_build_request_t ast_request;
+        typed_ast_build_request_t ast_request;
         ast_request.limits = state.config.ast_limits;
         ast_request.limits.max_hir_values = static_cast<std::size_t>(
             std::min<std::uint64_t>(ast_request.limits.max_hir_values, budget.max_hir_nodes));
         ast_request.limits.max_ast_nodes = static_cast<std::size_t>(
             std::min<std::uint64_t>(ast_request.limits.max_ast_nodes, budget.max_ast_nodes));
-        auto ast_build = build_typed_ast_v2(hir, type_graph, ast_request);
+        auto ast_build = build_typed_ast(hir, type_graph, ast_request);
         append_diagnostics(diagnostics, ast_build.diagnostics);
         if (!ast_build.succeeded() || !ast_build.ast ||
             ast_build.ast->nodes.size() > budget.max_ast_nodes) {
@@ -3059,15 +3389,18 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
         }
         if (hir.entity.kind == decompiler_entity_kind_t::native_function &&
             readability_transforms_enabled(renderer.readability)) {
-            auto readability_result = transform_evidence
-                ? apply_readability_transforms(
-                      *ast_build.ast, type_graph, to_rt_settings(renderer.readability),
-                      *transform_evidence)
-                : apply_readability_transforms(
-                      *ast_build.ast, type_graph, to_rt_settings(renderer.readability));
+            std::vector<rt_semantic_fact_view_t> semantic_fact_views;
+            semantic_fact_views.reserve(semantic_facts.size());
+            for (const auto& fact : semantic_facts)
+                semantic_fact_views.push_back(rt_semantic_fact_view_t{fact.refinement_key, fact.confidence});
+            static const decompiler_render_evidence_t k_empty_transform_evidence{};
+            auto readability_result = apply_readability_transforms(
+                *ast_build.ast, type_graph, to_rt_settings(renderer.readability),
+                transform_evidence ? *transform_evidence : k_empty_transform_evidence,
+                semantic_fact_views, ast_build.branch_bridge);
             append_diagnostics(diagnostics, readability_result.diagnostics);
             if (readability_result.succeeded()) {
-                ::diag::log_tagged_fmt("decompiler", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u string_literals=%u cast_masks=%u bit_ops=%u loop_intrinsics=%u magic_divisions=%u evidence=%d",
+                ::diag::log_tagged_fmt("decompiler", "readability_transforms applied renamed=%u folded=%u simplified=%u inlined=%u dead_stores=%u string_literals=%u cast_masks=%u bit_ops=%u loop_intrinsics=%u magic_divisions=%u ternaries=%u array_indexes=%u method_calls=%u dead_branches=%u evidence=%d",
                     static_cast<unsigned int>(readability_result.metrics.variables_renamed),
                     static_cast<unsigned int>(readability_result.metrics.constants_folded),
                     static_cast<unsigned int>(readability_result.metrics.identities_simplified),
@@ -3078,6 +3411,10 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
                     static_cast<unsigned int>(readability_result.metrics.bit_operation_idioms_rewritten),
                     static_cast<unsigned int>(readability_result.metrics.loop_intrinsics_rewritten),
                     static_cast<unsigned int>(readability_result.metrics.magic_divisions_recognized),
+                    static_cast<unsigned int>(readability_result.metrics.ternaries_formed),
+                    static_cast<unsigned int>(readability_result.metrics.array_indexes_formed),
+                    static_cast<unsigned int>(readability_result.metrics.method_calls_restructured),
+                    static_cast<unsigned int>(readability_result.metrics.dead_branches_eliminated),
                     transform_evidence ? 1 : 0);
             } else {
                 ::diag::log_tagged_fmt("decompiler", "readability_transforms status=warning_no_transform continuing_with_unmodified_ast");
@@ -3085,7 +3422,7 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
         }
 
         decompiler_normalized_cache_value_t normalized;
-        normalized.provider_ir_hash = stable_serialization_hash(result.provider_stage->provider_ir);
+        normalized.provider_ir_hash = provider_ir_digest_for(op, *result.provider_stage);
         normalized.hir = std::move(hir);
         normalized.type_graph = std::move(type_graph);
         normalized.ast = std::move(*ast_build.ast);
@@ -3096,7 +3433,7 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
         normalized.provider_wall_clock_ms = result.provider_stage->provider_wall_clock_ms;
         normalized.provider_cpu_ms = result.provider_stage->provider_cpu_ms;
         normalized.provider_peak_memory_bytes = result.provider_stage->provider_peak_memory_bytes;
-        const auto payload_size = normalized_payload_size(normalized);
+        const auto payload_size = normalized_payload_size(normalized, op.measured_normalized);
         if (!payload_size || *payload_size > state.config.max_normalized_payload_bytes) {
             result.diagnostics = std::move(normalized.diagnostics);
             result.diagnostics.push_back(pipeline_diagnostic(
@@ -3108,7 +3445,27 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
         result.normalized_stage = std::make_shared<const decompiler_normalized_cache_value_t>(normalized);
         if (cache_writes_enabled(request.cache_mode) && !op.deferred_intermediate_cache_writes &&
             !batch_intermediate_stores_skipped(state.config, request)) {
-            auto stored = state.cache->store_normalized(op.normalized_key, std::move(normalized));
+            const bool preserialized_ready =
+                !op.measured_normalized.hir.bytes.empty() &&
+                !op.measured_normalized.type_graph.bytes.empty() &&
+                !op.measured_normalized.ast.bytes.empty();
+            workspace_result_t<void> stored = [&]() -> workspace_result_t<void> {
+                if (preserialized_ready) {
+                    decompiler_cache_component_blobs_t blobs;
+                    blobs.primary_blob = std::move(op.measured_normalized.hir.bytes);
+                    blobs.type_graph_blob = std::move(op.measured_normalized.type_graph.bytes);
+                    blobs.ast_blob = std::move(op.measured_normalized.ast.bytes);
+                    return !op.canonical_normalized_key.empty()
+                        ? state.cache->store_normalized_preserialized(
+                              op.normalized_key, std::move(normalized), std::move(blobs),
+                              op.measured_normalized.hir.digest, std::nullopt,
+                              op.canonical_normalized_key)
+                        : state.cache->store_normalized_preserialized(
+                              op.normalized_key, std::move(normalized), std::move(blobs),
+                              op.measured_normalized.hir.digest, std::nullopt);
+                }
+                return state.cache->store_normalized(op.normalized_key, std::move(normalized));
+            }();
             if (!stored) {
                 result.diagnostics = result.normalized_stage->diagnostics;
                 result.diagnostics.push_back(cache_failure_diagnostic(stored.error()));
@@ -3146,7 +3503,7 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
             : decompiler_pipeline_status_t::cancelled;
     }
 
-    pseudocode_renderer_v2_request_t render_request;
+    pseudocode_renderer_request_t render_request;
     render_request.profile = budget.profile;
     render_request.settings = renderer;
     render_request.limits = state.config.renderer_limits;
@@ -3155,7 +3512,7 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
     render_request.require_complete_source_map = state.config.require_complete_source_map;
     render_request.evidence = result.normalized_stage->evidence
         ? result.normalized_stage->evidence : op.evidence;
-    auto rendering = render_pseudocode_v2(
+    auto rendering = render_pseudocode(
         result.normalized_stage->ast, result.normalized_stage->type_graph, render_request);
     std::vector<decompiler_diagnostic_t> diagnostics = result.normalized_stage->diagnostics;
     append_diagnostics(diagnostics, rendering.diagnostics);
@@ -3179,20 +3536,56 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
     }
     result.readability = readability.take_value();
     if (op.attested_document && request.type_evidence.empty() &&
-        result.normalized_stage->semantic_facts.empty() &&
-        !equivalent_attested_document(*op.attested_document, *rendering.document)) {
-        diagnostics.push_back(pipeline_diagnostic(
-            decompiler_diagnostic_severity_t::error,
-            decompiler_diagnostic_code_t::worker_protocol_failure,
-            "decompiler.pipeline.provider.attested_document_mismatch"));
-        result.diagnostics = std::move(diagnostics);
-        record_attestation_mismatch(state, request, op);
-        return decompiler_pipeline_status_t::provider_failed;
+        result.normalized_stage->semantic_facts.empty()) {
+        try {
+            if (!op.attested_document_digest)
+                op.attested_document_digest = attestation_equivalence_digest(*op.attested_document);
+        } catch (...) {
+            op.attested_document_digest.reset();
+        }
+        try {
+            if (!op.rendered_document_digest)
+                op.rendered_document_digest = attestation_equivalence_digest(*rendering.document);
+        } catch (...) {
+            op.rendered_document_digest.reset();
+        }
+        if (!equivalent_attested_document(
+                *op.attested_document, *rendering.document,
+                op.attested_document_digest ? &*op.attested_document_digest : nullptr,
+                op.rendered_document_digest ? &*op.rendered_document_digest : nullptr)) {
+            diagnostics.push_back(pipeline_diagnostic(
+                decompiler_diagnostic_severity_t::error,
+                decompiler_diagnostic_code_t::worker_protocol_failure,
+                "decompiler.pipeline.provider.attested_document_mismatch"));
+            result.diagnostics = std::move(diagnostics);
+            record_attestation_mismatch(state, request, op);
+            return decompiler_pipeline_status_t::provider_failed;
+        }
     }
     if (op.deferred_intermediate_cache_writes && cache_writes_enabled(request.cache_mode) &&
         !batch_intermediate_stores_skipped(state.config, request)) {
-        auto provider_stored = state.cache->store_provider_ir(
-            op.provider_key, *result.provider_stage);
+        workspace_result_t<void> provider_stored = [&]() -> workspace_result_t<void> {
+            if (!op.measured_provider.provider_ir.bytes.empty() &&
+                !op.measured_provider.type_graph.bytes.empty() &&
+                (!result.provider_stage->provider_hir ||
+                 (op.measured_provider.provider_hir.has_value() &&
+                  !op.measured_provider.provider_hir->bytes.empty()))) {
+                decompiler_cache_component_blobs_t blobs;
+                blobs.primary_blob = std::move(op.measured_provider.provider_ir.bytes);
+                if (op.measured_provider.provider_hir)
+                    blobs.secondary_blob = std::move(op.measured_provider.provider_hir->bytes);
+                blobs.type_graph_blob = std::move(op.measured_provider.type_graph.bytes);
+                return !op.canonical_provider_key.empty()
+                    ? state.cache->store_provider_ir_preserialized(
+                          op.provider_key, *result.provider_stage, std::move(blobs),
+                          op.measured_provider.provider_ir.digest, std::nullopt,
+                          op.canonical_provider_key)
+                    : state.cache->store_provider_ir_preserialized(
+                          op.provider_key, *result.provider_stage, std::move(blobs),
+                          op.measured_provider.provider_ir.digest, std::nullopt);
+            }
+            return state.cache->store_provider_ir(op.provider_key, *result.provider_stage);
+        }();
         if (!provider_stored) {
             diagnostics.push_back(cache_failure_diagnostic(provider_stored.error()));
             if (provider_stored.error().code == workspace_error_code_t::stale_generation ||
@@ -3201,8 +3594,25 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
                 return cache_error_status(provider_stored.error());
             }
         }
-        auto normalized_stored = state.cache->store_normalized(
-            op.normalized_key, *result.normalized_stage);
+        workspace_result_t<void> normalized_stored = [&]() -> workspace_result_t<void> {
+            if (!op.measured_normalized.hir.bytes.empty() &&
+                !op.measured_normalized.type_graph.bytes.empty() &&
+                !op.measured_normalized.ast.bytes.empty()) {
+                decompiler_cache_component_blobs_t blobs;
+                blobs.primary_blob = std::move(op.measured_normalized.hir.bytes);
+                blobs.type_graph_blob = std::move(op.measured_normalized.type_graph.bytes);
+                blobs.ast_blob = std::move(op.measured_normalized.ast.bytes);
+                return !op.canonical_normalized_key.empty()
+                    ? state.cache->store_normalized_preserialized(
+                          op.normalized_key, *result.normalized_stage, std::move(blobs),
+                          op.measured_normalized.hir.digest, std::nullopt,
+                          op.canonical_normalized_key)
+                    : state.cache->store_normalized_preserialized(
+                          op.normalized_key, *result.normalized_stage, std::move(blobs),
+                          op.measured_normalized.hir.digest, std::nullopt);
+            }
+            return state.cache->store_normalized(op.normalized_key, *result.normalized_stage);
+        }();
         if (!normalized_stored) {
             diagnostics.push_back(cache_failure_diagnostic(normalized_stored.error()));
             if (normalized_stored.error().code == workspace_error_code_t::stale_generation ||
@@ -3224,8 +3634,29 @@ decompiler_pipeline_status_t pipeline_back_impl(pipeline_operation_t& op)
     result.rendered_stage = std::make_shared<const decompiler_rendered_cache_value_t>(rendered);
     result.diagnostics = result.rendered_stage->diagnostics;
     if (cache_writes_enabled(request.cache_mode)) {
+        std::optional<measured_serialization_t> measured_document;
+        try {
+            measured_document = serialize_decompiler_document_measured(rendered.document);
+        } catch (...) {
+            measured_document.reset();
+        }
         std::string serialized;
-        auto stored = state.cache->store_rendered(op.rendered_key, std::move(rendered), &serialized);
+        workspace_result_t<void> stored = [&]() -> workspace_result_t<void> {
+            if (measured_document && result.readability &&
+                result.readability->document_hash == measured_document->digest) {
+                decompiler_cache_component_blobs_t blobs;
+                blobs.primary_blob = std::move(measured_document->bytes);
+                return !op.canonical_rendered_key.empty()
+                    ? state.cache->store_rendered_preserialized(
+                          op.rendered_key, std::move(rendered), std::move(blobs),
+                          measured_document->digest, result.readability, op.canonical_rendered_key,
+                          &serialized)
+                    : state.cache->store_rendered_preserialized(
+                          op.rendered_key, std::move(rendered), std::move(blobs),
+                          measured_document->digest, result.readability, &serialized);
+            }
+            return state.cache->store_rendered(op.rendered_key, std::move(rendered), &serialized);
+        }();
         if (!stored) {
             result.diagnostics.push_back(cache_failure_diagnostic(stored.error()));
             if (stored.error().code == workspace_error_code_t::stale_generation ||
@@ -3395,6 +3826,112 @@ void decompiler_pipeline_service_t::decompile_async(
     }
 }
 
+void decompiler_pipeline_service_t::prefetch_persistent_rendered(
+    std::string_view workspace_id,
+    std::uint64_t generation,
+    std::vector<decompiler_pipeline_cache_key_t> rendered_keys)
+{
+    auto& state = *state_;
+    if (!state.accepting.load(std::memory_order_acquire) || !state.config.database)
+        return;
+    std::vector<std::pair<std::string, decompiler_pipeline_cache_key_t>> accepted;
+    accepted.reserve(rendered_keys.size());
+    {
+        std::lock_guard lock(state.persistent_mutex);
+        for (auto& key : rendered_keys) {
+            if (key.stage != decompiler_cache_stage_t::rendered_document ||
+                key.workspace_id != workspace_id ||
+                key.workspace_generation != generation ||
+                !validate_decompiler_pipeline_cache_key(key).valid())
+                continue;
+            std::string canonical;
+            try {
+                canonical = serialize_decompiler_pipeline_cache_key(key);
+            } catch (...) {
+                continue;
+            }
+            if (canonical.empty() ||
+                state.persistent_inflight.find(canonical) != state.persistent_inflight.end())
+                continue;
+            accepted.emplace_back(std::move(canonical), std::move(key));
+        }
+    }
+    constexpr std::size_t k_chunk_size = 64;
+    for (std::size_t begin = 0; begin < accepted.size(); begin += k_chunk_size) {
+        const auto amount = (std::min)(k_chunk_size, accepted.size() - begin);
+        auto task = std::make_shared<persistent_prefetch_task_t>();
+        std::vector<std::pair<std::string, decompiler_pipeline_cache_key_t>> chunk;
+        chunk.reserve(amount);
+        {
+            std::lock_guard lock(state.persistent_mutex);
+            std::unordered_set<persistent_prefetch_task_t*> live;
+            for (const auto& entry : state.persistent_inflight) {
+                if (!entry.second->done.load(std::memory_order_acquire))
+                    live.insert(entry.second.get());
+            }
+            if (live.size() >= state.config.persistent_prefetch_max_tasks)
+                return;
+            for (std::size_t index = begin; index < begin + amount; ++index) {
+                if (state.persistent_inflight.emplace(accepted[index].first, task).second)
+                    chunk.push_back(std::move(accepted[index]));
+            }
+        }
+        if (chunk.empty())
+            continue;
+        auto state_ref = state_;
+        infra::taskflow_runtime::task_descriptor_t descriptor;
+        descriptor.domain = infra::taskflow_runtime::executor_domain_t::general;
+        descriptor.owner_subsystem = "decompiler";
+        descriptor.label = "decompiler.persistent_prefetch";
+        descriptor.priority = 1;
+        descriptor.shutdown_policy = "drain";
+        descriptor.cancellable_body =
+            [state_ref, task, chunk = std::move(chunk)](
+                const infra::taskflow_runtime::cancellation_token_t&) mutable {
+                auto& shared = *state_ref;
+                for (const auto& item : chunk) {
+                    if (!shared.accepting.load(std::memory_order_acquire))
+                        break;
+                    decompiler_pipeline_request_t synthesized;
+                    synthesized.invocation = decompiler_pipeline_invocation_t::background_batch;
+                    synthesized.cache_mode = decompiler_pipeline_cache_mode_t::read_write;
+                    synthesized.workspace_id = item.second.workspace_id;
+                    synthesized.workspace_generation = item.second.workspace_generation;
+                    synthesized.analysis_revision = item.second.analysis_revision;
+                    synthesized.entity = item.second.entity;
+                    synthesized.profile = item.second.profile.profile;
+                    synthesized.cache_identity.overlay_revision = item.second.overlay_revision;
+                    load_persistent_rendered(shared, synthesized, item.second);
+                }
+                {
+                    std::lock_guard lock(task->mutex);
+                    task->done.store(true, std::memory_order_release);
+                }
+                task->cv.notify_all();
+                std::lock_guard lock(shared.persistent_mutex);
+                for (const auto& item : chunk)
+                    shared.persistent_inflight.erase(item.first);
+            };
+        auto submitted = infra::taskflow_runtime::submit(std::move(descriptor));
+        if (!submitted.submitted) {
+            ::diag::log_tagged_fmt("decompiler",
+                "persistent_prefetch_submit_rejected reason=%s",
+                submitted.reject_reason.c_str());
+            {
+                std::lock_guard lock(state.persistent_mutex);
+                for (const auto& item : chunk)
+                    state.persistent_inflight.erase(item.first);
+            }
+            {
+                std::lock_guard task_lock(task->mutex);
+                task->done.store(true, std::memory_order_release);
+            }
+            task->cv.notify_all();
+            return;
+        }
+    }
+}
+
 decompiler_rendered_probe_result_t decompiler_pipeline_service_t::probe_rendered_cache(
     const decompiler_pipeline_request_t& request)
 {
@@ -3417,9 +3954,18 @@ decompiler_rendered_probe_result_t decompiler_pipeline_service_t::probe_rendered
         resolve_render_evidence(*state_, request));
     if (!validate_decompiler_pipeline_cache_key(rendered_key).valid())
         return result;
-    auto lookup = state_->cache->lookup_rendered(rendered_key);
+    std::string canonical;
+    try {
+        canonical = serialize_decompiler_pipeline_cache_key(rendered_key);
+    } catch (...) {
+        canonical.clear();
+    }
+    auto lookup = !canonical.empty()
+        ? state_->cache->lookup_rendered_verified(rendered_key, canonical)
+        : state_->cache->lookup_rendered_verified(rendered_key);
     if (lookup && lookup.value().hit()) {
-        if (readability_report(lookup.value().value->document, state_->config)) {
+        if (rendered_integrity_matches(*lookup.value().value, lookup.value().content_hash) &&
+            trusted_readability_verdict(*state_, *lookup.value().value)) {
             result.hit_stage = decompiler_rendered_probe_stage_t::memory_rendered;
             result.rendered = lookup.value().value;
         }

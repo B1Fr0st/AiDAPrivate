@@ -2,6 +2,7 @@
 
 #include "workspace/analysis_workspace.hpp"
 #include "workspace/analysis_metrics.hpp"
+#include "workspace/baseline_pipeline.hpp"
 #include "workspace/decompiler_service.hpp"
 #include "workspace/byte_provider.hpp"
 #include "workspace/compact_ir.hpp"
@@ -12,12 +13,14 @@
 #include "workspace/search_index.hpp"
 #include "workspace/string_discovery.hpp"
 #include "workspace/symbol_type_candidates.hpp"
+#include "workspace/workspace_database.hpp"
 #include "workspace/workspace_types.hpp"
 #include "workspace/xref_builder.hpp"
 #include "workspace/arch_decoder.hpp"
 #include "call_graph_builder.hpp"
 #include "image_layout_index.hpp"
 #include "tile_decode_orchestrator.hpp"
+#include "working_set_governor.hpp"
 
 #include "../infra/taskflow_runtime.hpp"
 
@@ -1156,7 +1159,7 @@ incremental_reanalysis_executor_t::execute(
             static_cast<std::uint32_t>(fabric_stats.pool_size);
     }
     const auto decode_lanes =
-        (std::min)(8U, (std::max)(2U, fabric_lane_lease / 4U));
+        (std::min)(16U, (std::max)(4U, fabric_lane_lease / 2U));
 
     production_tile_decode_executor_options_t executor_options;
     executor_options.decoder_key = decoder_key;
@@ -1246,6 +1249,44 @@ incremental_reanalysis_executor_t::execute(
             "execute fallback reason=validation_failed generation=%llu",
             static_cast<unsigned long long>(scope.generation));
         return result;
+    }
+    struct decode_transient_guard_t {
+        ~decode_transient_guard_t() {
+            if (charged == 0)
+                return;
+            working_set_governor_t::instance().charge(
+                working_set_metrics::subsystem_t::decode_transient,
+                -static_cast<std::int64_t>(charged));
+            working_set_governor_t::instance().refresh();
+        }
+        std::uint64_t charged = 0;
+    } decode_transient_guard;
+    {
+        std::uint64_t transient_bytes = sizeof(tile_result);
+        const auto store_accounting = tile_result.packed_store->size_accounting();
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(transient_bytes, store_accounting.reserved_bytes, updated) ||
+            !checked_add_u64(updated,
+                static_cast<std::uint64_t>(tile_result.delay_slot_counts.capacity()),
+                updated) ||
+            !checked_add_u64(updated,
+                static_cast<std::uint64_t>(tile_result.coverage.capacity()) *
+                    sizeof(coverage_span_t), updated) ||
+            !checked_add_u64(updated,
+                static_cast<std::uint64_t>(tile_result.cross_tile_edges.capacity()) *
+                    sizeof(tile_decode_cross_tile_edge_t), updated) ||
+            !checked_add_u64(updated,
+                static_cast<std::uint64_t>(tile_result.shards.capacity()) *
+                    sizeof(tile_decode_shard_summary_t), updated)) {
+            updated = (std::numeric_limits<std::uint64_t>::max)();
+        }
+        if (updated != 0) {
+            working_set_governor_t::instance().charge(
+                working_set_metrics::subsystem_t::decode_transient,
+                static_cast<std::int64_t>(updated));
+            working_set_governor_t::instance().refresh();
+            decode_transient_guard.charged = updated;
+        }
     }
 
     const auto packed_view = tile_result.packed_store->compatibility_view();
@@ -1391,6 +1432,7 @@ incremental_reanalysis_executor_t::execute(
     merged->function_block_memberships =
         std::move(function_result.function_block_memberships);
     merged->edges = std::move(function_result.edges);
+    result.switches = std::move(function_result.switches);
 
     ::diag::log_tagged_fmt("incremental",
         "stage=basic_blocks functions=%zu blocks=%zu generation=%llu",
@@ -1616,6 +1658,219 @@ incremental_reanalysis_executor_t::execute(
     result.merged_snapshot = std::const_pointer_cast<
         const analysis_snapshot_t>(merged);
     return result;
+}
+
+namespace {
+
+constexpr std::uint64_t kIncrementalTypeEntityTag = 10ULL << 56;
+
+fact_provenance_t incremental_legacy_type_provenance(
+    metadata_provenance_t provenance) noexcept {
+    switch (provenance) {
+        case metadata_provenance_t::decoded:
+            return fact_provenance_t::recursive_decode;
+        case metadata_provenance_t::relocation:
+        case metadata_provenance_t::import_metadata:
+            return fact_provenance_t::relocation;
+        case metadata_provenance_t::export_metadata:
+            return fact_provenance_t::export_entry;
+        case metadata_provenance_t::loader_symbol:
+        case metadata_provenance_t::debug_metadata:
+            return fact_provenance_t::debug_symbol;
+        case metadata_provenance_t::rtti:
+        case metadata_provenance_t::vtable_validation:
+        case metadata_provenance_t::objective_c_metadata:
+        case metadata_provenance_t::swift_metadata:
+        case metadata_provenance_t::managed_metadata:
+            return fact_provenance_t::linear_validation;
+        case metadata_provenance_t::unknown:
+            return fact_provenance_t::unknown;
+    }
+    return fact_provenance_t::unknown;
+}
+
+std::vector<type_candidate_record_t> incremental_legacy_types(
+    const std::vector<symbol_type_candidate_record_t>& candidates) {
+    std::vector<type_candidate_record_t> legacy;
+    legacy.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        if (!candidate.address)
+            continue;
+        type_candidate_record_t record;
+        switch (candidate.kind) {
+            case symbol_type_candidate_kind_t::function_prototype:
+                record.kind = type_candidate_kind_t::function_prototype;
+                break;
+            case symbol_type_candidate_kind_t::import_prototype:
+                record.kind = type_candidate_kind_t::import_prototype;
+                break;
+            case symbol_type_candidate_kind_t::global_object:
+                record.kind = type_candidate_kind_t::global_object;
+                break;
+            case symbol_type_candidate_kind_t::pointer_object:
+                record.kind = type_candidate_kind_t::pointer_object;
+                break;
+            default:
+                continue;
+        }
+        record.address = *candidate.address;
+        record.display_name = candidate.display_name;
+        record.canonical_type = candidate.canonical_type;
+        record.provenance =
+            incremental_legacy_type_provenance(candidate.provenance);
+        record.confidence = candidate.confidence;
+        record.explicitly_unknown = candidate.explicitly_unknown;
+        legacy.push_back(std::move(record));
+    }
+    for (std::size_t index = 0; index < legacy.size(); ++index) {
+        legacy[index].id = kIncrementalTypeEntityTag |
+            static_cast<std::uint64_t>(index + 1);
+    }
+    return legacy;
+}
+
+void run_incremental_reanalysis(
+    std::shared_ptr<analysis_workspace_t> workspace,
+    reanalysis_scope_t scope,
+    projection_invalidation_set_t invalidation,
+    std::shared_ptr<const byte_provider_t> projected_provider)
+{
+    const auto cancel = workspace->cancellation_token();
+    const auto schedule_full = [&workspace, &scope](const char* reason) {
+        ::diag::log_tagged_fmt("incremental",
+            "incremental_fallback reason=%s generation=%llu", reason,
+            static_cast<unsigned long long>(scope.generation));
+        auto started = baseline_analysis_service_t::start(workspace,
+            baseline_analysis_settings_t{});
+        if (!started) {
+            ::diag::log_tagged_fmt("incremental",
+                "incremental_fallback full baseline rejected generation=%llu",
+                static_cast<unsigned long long>(scope.generation));
+        }
+    };
+    const auto publication = workspace->analysis_publication();
+    if (!publication || !publication->snapshot || !publication->provider ||
+        publication->generation != scope.generation)
+        return;
+    const auto source_analysis_revision = publication->analysis_revision;
+    const auto code_invalidated =
+        stage_test(scope.stage_flags, projection_stage_flag_t::disassembler) ||
+        stage_test(scope.stage_flags, projection_stage_flag_t::basic_block_table) ||
+        stage_test(scope.stage_flags, projection_stage_flag_t::function_table);
+    incremental_reanalysis_executor_settings_t settings;
+    settings.deadline = cancel.deadline();
+    auto result = incremental_reanalysis_executor_t::execute(workspace, scope,
+        invalidation, projected_provider, std::move(settings), cancel);
+    if (!result.ok || result.fallback_to_full || !result.merged_snapshot) {
+        schedule_full(result.fallback_to_full ? "fallback_to_full" : "execute_failed");
+        return;
+    }
+    auto merged = result.merged_snapshot;
+    auto validated = validate_analysis_snapshot(*merged, false, cancel);
+    if (!validated) {
+        schedule_full("validate_failed");
+        return;
+    }
+    std::vector<data_candidate_record_t> data_candidates;
+    std::vector<switch_record_t> switches;
+    std::vector<type_candidate_record_t> types;
+    if (code_invalidated) {
+        data_candidates = merged->rich_facts.data_candidates;
+        switches = std::move(result.switches);
+        types = incremental_legacy_types(merged->rich_facts.type_candidates);
+    } else if (publication->search_index) {
+        data_candidates = publication->search_index->data_candidates();
+        switches = publication->search_index->switches();
+        types = publication->search_index->types();
+    }
+    const auto search_limits = publication->search_index
+        ? publication->search_index->limits()
+        : search_index_limits_t{};
+    auto index = search_index_t::build(merged, std::move(data_candidates),
+        std::move(switches), std::move(types), result.metrics, search_limits,
+        cancel);
+    if (!index) {
+        schedule_full("search_build_failed");
+        return;
+    }
+    auto search = index.take_value();
+    const auto& identity = workspace->identity();
+    if (!search->matches(merged) ||
+        !search->matches(identity.binary_id(), identity.load_profile_hash(),
+            merged->generation, merged->analysis_revision,
+            merged->overlay_revision)) {
+        schedule_full("search_mismatch");
+        return;
+    }
+    const auto database = workspace->database();
+    if (!database) {
+        schedule_full("database_unavailable");
+        return;
+    }
+    baseline_analysis_settings_t baseline_settings;
+    auto ticket = database->persist_snapshot(merged,
+        baseline_settings.canonical_json(), result.metrics->snapshot().to_json(),
+        cancel);
+    if (!ticket.accepted || !ticket.completion.valid() ||
+        !ticket.snapshot_candidate) {
+        schedule_full("persist_rejected");
+        return;
+    }
+    ticket.completion.wait();
+    const auto& completed = ticket.completion.get();
+    if (!completed) {
+        schedule_full("persist_failed");
+        return;
+    }
+    auto finalized = ticket.snapshot_candidate->finalize(cancel);
+    if (!finalized) {
+        schedule_full("finalize_failed");
+        return;
+    }
+    auto published = workspace->publish_analysis_bundle(scope.generation,
+        source_analysis_revision, merged, search, false);
+    if (!published) {
+        schedule_full("publish_failed");
+        return;
+    }
+    ::diag::log_tagged_fmt("incremental",
+        "incremental_publish ok generation=%llu analysis_revision=%llu",
+        static_cast<unsigned long long>(scope.generation),
+        static_cast<unsigned long long>(merged->analysis_revision));
+}
+
+}
+
+void incremental_reanalysis_scheduler_t::maybe_schedule(
+    std::shared_ptr<analysis_workspace_t> workspace,
+    const reanalysis_scope_t& scope,
+    const projection_invalidation_set_t& invalidation,
+    std::shared_ptr<const byte_provider_t> projected_provider)
+{
+    if (!workspace || !projected_provider)
+        return;
+    if (scope.requires_full_reanalysis || scope.generation_conflict ||
+        scope.total_patched_bytes > kMaxPatchedBytes ||
+        scope.ranges.size() > kMaxRanges)
+        return;
+    const auto publication = workspace->analysis_publication();
+    if (!publication || !publication->snapshot || !publication->provider)
+        return;
+    auto scheduled_scope = scope;
+    scheduled_scope.generation = publication->generation;
+    namespace taskflow = aida::infra::taskflow_runtime;
+    taskflow::task_descriptor_t desc;
+    desc.domain = taskflow::executor_domain_t::feature_worker;
+    desc.owner_subsystem = "analysis_workspace";
+    desc.label = "analysis.incremental_reanalysis";
+    desc.priority = 2;
+    desc.generation = scheduled_scope.generation;
+    desc.body = [workspace, scope = std::move(scheduled_scope), invalidation,
+                 projected_provider]() {
+        run_incremental_reanalysis(std::move(workspace), std::move(scope),
+            std::move(invalidation), std::move(projected_provider));
+    };
+    static_cast<void>(taskflow::submit(std::move(desc)));
 }
 
 }

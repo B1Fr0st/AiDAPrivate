@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -691,6 +692,170 @@ void verify_production_semantic_fixtures()
     }
 }
 
+class gated_slot_adapter_t final : public triton_z3_adapter_t {
+public:
+    triton_z3_adapter_capabilities_t capabilities() const override
+    {
+        return ready_capabilities();
+    }
+
+    triton_z3_proof_response_t prove(
+        const triton_z3_proof_request_t& request_value,
+        const cancellation_token_t&) override
+    {
+        entered.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            entered_keys_.push_back(request_value.refinement_key);
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [&] { return released_.load(std::memory_order_acquire); });
+        triton_z3_proof_response_t result;
+        result.status = triton_z3_proof_status_t::proved;
+        result.unknown_reason = triton_z3_unknown_reason_t::none;
+        result.refinement_key = request_value.refinement_key;
+        result.peak_memory_bytes = 1024;
+        return result;
+    }
+
+    std::vector<std::string> entered_keys() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return entered_keys_;
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_.store(true, std::memory_order_release);
+        }
+        condition_.notify_all();
+    }
+
+    std::atomic<std::uint32_t> entered{0};
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::atomic<bool> released_{false};
+    std::vector<std::string> entered_keys_;
+};
+
+void verify_concurrent_refine_completion()
+{
+    auto adapter = std::make_shared<gated_slot_adapter_t>();
+    semantic_refiner_t refiner(adapter);
+    auto first_request = request(1);
+    auto second_request = request(1);
+    first_request.profile.max_wall_clock_ms = 30000;
+    first_request.profile.max_cpu_ms = 30000;
+    second_request.profile.max_wall_clock_ms = 30000;
+    second_request.profile.max_cpu_ms = 30000;
+    std::vector<semantic_refinement_result_t> results(2);
+    std::vector<std::thread> workers;
+    workers.emplace_back([&] { results[0] = refiner.refine(first_request); });
+    workers.emplace_back([&] { results[1] = refiner.refine(second_request); });
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        adapter->release();
+    });
+    for (auto& worker : workers)
+        worker.join();
+    releaser.join();
+    require(adapter->entered.load(std::memory_order_acquire) == 2,
+        "concurrent refine calls did not both reach the adapter");
+    for (const auto& result : results) {
+        require(result.status == semantic_refinement_status_t::completed,
+            "concurrent refine call was denied by the single-flight adapter gate");
+        require(result.facts.size() == 1 &&
+                result.facts.front().refinement_key == "refinement.1",
+            "concurrent refine call lost its proof fact");
+    }
+}
+
+void verify_slot_pool_exhaustion_denial()
+{
+    auto adapter = std::make_shared<gated_slot_adapter_t>();
+    semantic_refiner_t refiner(adapter);
+    constexpr std::size_t k_pool_slots = 4;
+    std::vector<std::thread> workers;
+    std::vector<semantic_refinement_result_t> results(k_pool_slots);
+    for (std::size_t index = 0; index < k_pool_slots; ++index) {
+        workers.emplace_back([&, index] {
+            auto value = request(1);
+            value.profile.max_wall_clock_ms = 30000;
+            value.profile.max_cpu_ms = 30000;
+            results[index] = refiner.refine(value);
+        });
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(30000);
+    while (adapter->entered.load(std::memory_order_acquire) < k_pool_slots &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(adapter->entered.load(std::memory_order_acquire) == k_pool_slots,
+        "pool slots were not all occupied before the fifth refine");
+    auto denied_request = request(1);
+    denied_request.profile.max_wall_clock_ms = 30000;
+    denied_request.profile.max_cpu_ms = 30000;
+    const auto denied = refiner.refine(denied_request);
+    require(denied.status == semantic_refinement_status_t::adapter_denied,
+        "slot exhaustion did not deny the fifth concurrent refine");
+    require(denied.adapter_invocations == 0 && denied.facts.empty(),
+        "slot-exhaustion denial invoked the adapter or produced facts");
+    require(contains_unknown(denied.unknowns, "semantic_adapter_denied:proof.1"),
+        "slot-exhaustion denial lost the pending query as unknown");
+    require(contains_diagnostic(denied.diagnostics, "semantic_refiner.adapter.worker_busy"),
+        "slot-exhaustion denial diagnostic missing");
+    adapter->release();
+    for (auto& worker : workers)
+        worker.join();
+    for (const auto& result : results) {
+        require(result.status == semantic_refinement_status_t::completed &&
+                result.facts.size() == 1,
+            "a pooled refine call did not complete after slot release");
+    }
+}
+
+void verify_per_query_isolation_under_concurrency()
+{
+    auto adapter = std::make_shared<gated_slot_adapter_t>();
+    semantic_refiner_t refiner(adapter);
+    auto first_request = request(1);
+    auto second_request = request(2);
+    first_request.profile.max_wall_clock_ms = 30000;
+    first_request.profile.max_cpu_ms = 30000;
+    second_request.profile.max_wall_clock_ms = 30000;
+    second_request.profile.max_cpu_ms = 30000;
+    first_request.queries[0].static_ir = constant_ir(11);
+    first_request.queries[0].refinement_key = "isolation.alpha";
+    second_request.queries[0].static_ir = constant_ir(22);
+    second_request.queries[0].refinement_key = "isolation.beta";
+    second_request.queries[1].static_ir = constant_ir(33);
+    second_request.queries[1].refinement_key = "isolation.gamma";
+    std::vector<semantic_refinement_result_t> results(2);
+    std::vector<std::thread> workers;
+    workers.emplace_back([&] { results[0] = refiner.refine(first_request); });
+    workers.emplace_back([&] { results[1] = refiner.refine(second_request); });
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        adapter->release();
+    });
+    for (auto& worker : workers)
+        worker.join();
+    releaser.join();
+    require(results[0].facts.size() == 1 &&
+            results[0].facts.front().refinement_key == "isolation.alpha",
+        "first concurrent refine lost its isolation.alpha fact");
+    require(results[1].facts.size() == 2 &&
+            results[1].facts[0].refinement_key == "isolation.beta" &&
+            results[1].facts[1].refinement_key == "isolation.gamma",
+        "second concurrent refine lost or reordered its isolation facts");
+    require(std::none_of(results[0].facts.begin(), results[0].facts.end(),
+        [](const semantic_refinement_fact_t& fact) {
+            return fact.refinement_key.find("isolation.beta") != std::string::npos ||
+                fact.refinement_key.find("isolation.gamma") != std::string::npos;
+        }), "per-query isolation leaked facts across concurrent refine calls");
 }
 
 void run_semantic_refiner_harness()
@@ -707,6 +872,11 @@ void run_semantic_refiner_harness()
     verify_host_timing_authority();
     verify_repeated_run_determinism();
     verify_production_semantic_fixtures();
+    verify_concurrent_refine_completion();
+    verify_slot_pool_exhaustion_denial();
+    verify_per_query_isolation_under_concurrency();
+}
+
 }
 
 }

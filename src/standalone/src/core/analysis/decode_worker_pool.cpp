@@ -1,5 +1,6 @@
 #include "decode_worker_pool.hpp"
 
+#include "../infra/fast_containers.hpp"
 #include "../infra/taskflow_runtime.hpp"
 
 #include "../../helpers/diag_log.hpp"
@@ -13,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -47,9 +49,7 @@ workspace_error_t pool_cancelled_error()
 }
 
 struct decode_completion_slot_t final {
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::deque<tile_decode_completion_t> completions;
+    aida::infra::fast_blocking_queue<std::optional<tile_decode_completion_t>> queue;
 };
 
 thread_local void* tls_worker_state = nullptr;
@@ -143,11 +143,7 @@ void push_completion(decode_worker_pool_t::impl_t& impl, std::uint32_t shard_ind
     const auto slot_index = static_cast<std::size_t>(
         shard_index % static_cast<std::uint32_t>(impl.slots.size()));
     auto& slot = *impl.slots[slot_index];
-    {
-        std::lock_guard<std::mutex> lock(slot.mutex);
-        slot.completions.push_back(std::move(completion));
-    }
-    slot.cv.notify_one();
+    slot.queue.enqueue(std::optional<tile_decode_completion_t>(std::move(completion)));
     impl.active_items.fetch_sub(1, std::memory_order_acq_rel);
     impl.completion_push_count.fetch_add(1, std::memory_order_relaxed);
     invoke_completion_signal(impl);
@@ -326,7 +322,7 @@ void record_worker_fatal(decode_worker_pool_t::impl_t& impl, std::uint32_t code)
             worker->space_cv.notify_all();
         }
         for (auto& slot : impl.slots)
-            slot->cv.notify_all();
+            slot->queue.enqueue(std::optional<tile_decode_completion_t>(std::nullopt));
         invoke_completion_signal(impl);
     }
 }
@@ -513,7 +509,7 @@ decode_worker_pool_t::create(std::uint32_t worker_count,
                 entry->space_cv.notify_all();
             }
             for (auto& slot : impl->slots)
-                slot->cv.notify_all();
+                slot->queue.enqueue(std::optional<tile_decode_completion_t>(std::nullopt));
             for (auto& entry : impl->workers) {
                 if (entry->lane_handle.valid())
                     rt::cancel(entry->lane_handle);
@@ -635,11 +631,10 @@ bool decode_worker_pool_t::pop_completion(std::uint32_t shard_slot,
 {
     auto& slot = *impl_->slots[
         static_cast<std::size_t>(shard_slot % maximum_shard_slots)];
-    std::lock_guard<std::mutex> lock(slot.mutex);
-    if (slot.completions.empty())
+    std::optional<tile_decode_completion_t> item;
+    if (!slot.queue.try_dequeue(item) || !item.has_value())
         return false;
-    out = std::move(slot.completions.front());
-    slot.completions.pop_front();
+    out = std::move(*item);
     return true;
 }
 
@@ -648,16 +643,21 @@ bool decode_worker_pool_t::wait_completion(std::uint32_t shard_slot,
 {
     auto& slot = *impl_->slots[
         static_cast<std::size_t>(shard_slot % maximum_shard_slots)];
-    std::unique_lock<std::mutex> lock(slot.mutex);
-    slot.cv.wait_for(lock, kCompletionWakeBackstop, [&] {
-        return !slot.completions.empty() ||
-            impl_->stop.load(std::memory_order_acquire) ||
-            impl_->seh_fatal.load(std::memory_order_acquire);
-    });
-    if (slot.completions.empty())
+    std::optional<tile_decode_completion_t> item;
+    if (slot.queue.try_dequeue(item)) {
+        if (!item.has_value())
+            return false;
+        out = std::move(*item);
+        return true;
+    }
+    if (impl_->stop.load(std::memory_order_acquire) ||
+        impl_->seh_fatal.load(std::memory_order_acquire))
         return false;
-    out = std::move(slot.completions.front());
-    slot.completions.pop_front();
+    if (!slot.queue.wait_dequeue_timed(item, kCompletionWakeBackstop))
+        return false;
+    if (!item.has_value())
+        return false;
+    out = std::move(*item);
     return true;
 }
 
@@ -669,7 +669,7 @@ void decode_worker_pool_t::request_stop() noexcept
         worker->space_cv.notify_all();
     }
     for (auto& slot : impl_->slots)
-        slot->cv.notify_all();
+        slot->queue.enqueue(std::optional<tile_decode_completion_t>(std::nullopt));
     invoke_completion_signal(*impl_);
 }
 

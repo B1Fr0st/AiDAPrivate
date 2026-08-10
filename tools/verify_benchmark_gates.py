@@ -12,6 +12,11 @@ BENCHMARK_ROOT = os.path.join(
 RUNNER_CPP = os.path.join(BENCHMARK_ROOT, "benchmark_runner.cpp")
 RUNNER_HPP = os.path.join(BENCHMARK_ROOT, "benchmark_runner.hpp")
 SCORECARD_HPP = os.path.join(BENCHMARK_ROOT, "benchmark_scorecard.hpp")
+SLA_HPP = os.path.join(BENCHMARK_ROOT, "benchmark_sla.hpp")
+SLA_SCHEMA_CPP = os.path.join(
+    REPO_ROOT, "src", "standalone", "tests", "c03",
+    "benchmark_sla_schema.cpp")
+ROOT_CMAKELISTS = os.path.join(REPO_ROOT, "CMakeLists.txt")
 TOOLS_CPP = os.path.join(
     REPO_ROOT, "src", "standalone", "src", "core", "analysis",
     "analysis_tools_standalone.cpp")
@@ -316,6 +321,64 @@ def main():
             "ctest synthetic_compare target")
     require(CMAKE_MANIFEST, r"baselines/synthetic_32mb_baseline\.json",
             "ctest synthetic_compare baseline argument")
+
+    require(SLA_HPP, r"program_sla_thresholds",
+            "canonical SLA header: thresholds function")
+    require(SLA_HPP, r"program_sla_reference_bytes",
+            "canonical SLA header: reference bytes")
+    require(SLA_HPP, r"real_fixture_min_bytes",
+            "canonical SLA header: real fixture minimum")
+    require(SLA_HPP, r"synthetic_code_bytes_max",
+            "canonical SLA header: synthetic maximum")
+
+    forbid(HARNESS_CPP, r"const json& program_sla_thresholds",
+            "divergent harness threshold copy cannot return")
+    forbid(HARNESS_CPP, r"decompile_all_funcs_per_s_min\", 5\.0",
+            "lowered harness decompile gate cannot return")
+
+    require(RUNNER_CPP, r"benchmark_sla\.hpp",
+            "runner consumes the canonical SLA header")
+    require(RUNNER_CPP, r"synthetic_code_bytes_max",
+            "runner synthetic cap uses canonical constants")
+    require(RUNNER_CPP, r"program_sla_wall_scale\(fixture_size\)",
+            "runner real wall scaling cannot silently revert")
+    require(RUNNER_CPP, r"program_sla_reference_bytes",
+            "runner emits the SLA reference bytes")
+    require(RUNNER_CPP, r"run_cancellation_stage_measurement",
+            "runner cancellation p95 measurement stage")
+    forbid(RUNNER_CPP,
+            r"verdict_entry\(\s*\"cancellation_p95_ms_max\"[\s\S]{0,120}nullptr\s*,\s*\"NOT_MEASURED\"\s*\)\s*\)",
+            "hardcoded cancellation NOT_MEASURED cannot return")
+
+    require(HARNESS_CPP, r"benchmark_sla\.hpp",
+            "harness consumes the canonical SLA header")
+    require(HARNESS_CPP, r"synthetic_code_bytes_max",
+            "harness synthetic cap uses canonical constants")
+    require(HARNESS_CPP, r"real_fixture_min_bytes",
+            "harness real window uses canonical constants")
+    require(HARNESS_CPP, r"program_sla_wall_scale",
+            "harness real wall scaling uses the canonical helper")
+
+    require(SLA_SCHEMA_CPP, r"benchmark_sla\.hpp",
+            "c03 schema consumes the canonical SLA header")
+    require(SLA_SCHEMA_CPP, r"real_fixture_min_bytes",
+            "c03 schema artifact floor uses canonical constants")
+    require(SLA_SCHEMA_CPP, r"real_fixture_max_bytes",
+            "c03 schema artifact ceiling uses canonical constants")
+    require(SLA_SCHEMA_CPP, r"benchmark::program_sla_thresholds",
+            "c03 schema shared numeric keys read from the canonical table")
+
+    require(TESTLAB_CPP, r"SKIP-LOUD",
+            "test lab loud skip evidence")
+    require(TESTLAB_CPP, r"benchmark coverage: real_300mb=",
+            "test lab phase-end benchmark coverage line")
+
+    require(CMAKE_MANIFEST, r"aida_c03_benchmark_synthetic_320mb_harness",
+            "ctest synthetic 320mb target")
+    require(CMAKE_MANIFEST, r"aida_c03_benchmark_real_harness",
+            "ctest real-mode target")
+    require(ROOT_CMAKELISTS, r"AIDA_BENCHMARK_REAL_PE",
+            "root cache var arming the real-mode ctest")
 
     if check_file(BASELINE_JSON, "committed structural baseline"):
         try:

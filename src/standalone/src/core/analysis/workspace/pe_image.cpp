@@ -132,14 +132,18 @@ const pe_section_t* pe_image_t::section_for_file_offset(std::uint64_t offset,
 
 #include "checked_range.hpp"
 #include "compact_ir.hpp"
+#include "parallel_pass.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <new>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <unordered_set>
@@ -316,8 +320,10 @@ workspace_result_t<void> validate_pe_parser_profile(const pe_parser_profile_t& p
 class pe_parser_t {
 public:
     pe_parser_t(const byte_provider_t& provider, const pe_parse_limits_t& limits,
-                const cancellation_token_t& cancel)
+                const cancellation_token_t& cancel,
+                std::atomic<std::uint64_t>* shared_metadata_bytes = nullptr)
         : provider_(provider), limits_(limits), cancel_(cancel),
+          shared_metadata_bytes_(shared_metadata_bytes),
           image_(std::make_shared<pe_image_t>()) {
         image_->parser_profile_ = make_pe_parser_profile(limits);
     }
@@ -326,33 +332,72 @@ public:
         auto result = parse_headers();
         if (!result)
             return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_import_directory(false);
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_import_directory(true);
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_exports();
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_relocations();
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_tls();
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_exception_directory();
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_load_config();
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_debug_directory();
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
-        result = parse_resources();
-        if (!result)
-            return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(result.error());
+        std::atomic<std::uint64_t> metadata_envelope{metadata_bytes_};
+        struct directory_task_t {
+            std::shared_ptr<pe_image_t> image;
+            std::optional<workspace_error_t> error;
+        };
+        std::array<directory_task_t, 6> directory_tasks;
+        const auto run_group = [&](std::size_t group) {
+            pe_parser_t worker(provider_, limits_, cancel_, &metadata_envelope);
+            worker.adopt_headers(*image_);
+            auto group_result = workspace_result_t<void>::success();
+            switch (group) {
+                case 0:
+                    group_result = worker.parse_import_directory(false);
+                    if (group_result)
+                        group_result = worker.parse_import_directory(true);
+                    break;
+                case 1:
+                    group_result = worker.parse_exports();
+                    break;
+                case 2:
+                    group_result = worker.parse_relocations();
+                    break;
+                case 3:
+                    group_result = worker.parse_tls();
+                    break;
+                case 4:
+                    group_result = worker.parse_exception_directory();
+                    break;
+                default:
+                    group_result = worker.parse_load_config();
+                    if (group_result)
+                        group_result = worker.parse_debug_directory();
+                    if (group_result)
+                        group_result = worker.parse_resources();
+                    break;
+            }
+            directory_tasks[group].image = std::move(worker.image_);
+            if (!group_result)
+                directory_tasks[group].error = std::move(group_result.error());
+        };
+        parallel_executor_t::run(directory_tasks.size(),
+            static_cast<std::uint32_t>(directory_tasks.size()),
+            "analysis.pe_parse_directories", run_group);
+        for (auto& task : directory_tasks) {
+            if (task.error)
+                return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(
+                    std::move(*task.error));
+        }
+        metadata_bytes_ = metadata_envelope.load(std::memory_order_acquire);
+        image_->imports_ = std::move(directory_tasks[0].image->imports_);
+        image_->exports_ = std::move(directory_tasks[1].image->exports_);
+        image_->relocations_ = std::move(directory_tasks[2].image->relocations_);
+        image_->tls_callbacks_ = std::move(directory_tasks[3].image->tls_callbacks_);
+        image_->runtime_functions_ =
+            std::move(directory_tasks[4].image->runtime_functions_);
+        image_->unwind_records_ =
+            std::move(directory_tasks[4].image->unwind_records_);
+        image_->load_config_ = std::move(directory_tasks[5].image->load_config_);
+        image_->codeview_records_ =
+            std::move(directory_tasks[5].image->codeview_records_);
+        image_->resources_ = std::move(directory_tasks[5].image->resources_);
+        for (auto& task : directory_tasks) {
+            image_->entry_points_.insert(image_->entry_points_.end(),
+                std::make_move_iterator(task.image->entry_points_.begin()),
+                std::make_move_iterator(task.image->entry_points_.end()));
+        }
         if (cancel_.stop_requested())
             return workspace_result_t<std::shared_ptr<const pe_image_t>>::failure(
                 stop_error(cancel_));
@@ -365,6 +410,26 @@ public:
     }
 
 private:
+    void adopt_headers(const pe_image_t& source) {
+        image_->format_ = source.format_;
+        image_->architecture_ = source.architecture_;
+        image_->mode_ = source.mode_;
+        image_->abi_ = source.abi_;
+        image_->artifact_kind_ = source.artifact_kind_;
+        image_->image_base_ = source.image_base_;
+        image_->image_size_ = source.image_size_;
+        image_->headers_size_ = source.headers_size_;
+        image_->entry_rva_ = source.entry_rva_;
+        image_->machine_ = source.machine_;
+        image_->subsystem_ = source.subsystem_;
+        image_->characteristics_ = source.characteristics_;
+        image_->dll_characteristics_ = source.dll_characteristics_;
+        image_->timestamp_ = source.timestamp_;
+        image_->parser_profile_ = source.parser_profile_;
+        image_->directories_ = source.directories_;
+        image_->sections_ = source.sections_;
+    }
+
     workspace_result_t<const std::uint8_t*> cached_data(
         std::uint64_t offset, std::uint64_t size_value) const {
         if (cancel_.stop_requested())
@@ -404,6 +469,26 @@ private:
     }
 
     workspace_result_t<void> consume_metadata_bytes(std::uint64_t amount) {
+        if (shared_metadata_bytes_ != nullptr) {
+            const auto prior = shared_metadata_bytes_->fetch_add(amount,
+                std::memory_order_acq_rel);
+            std::uint64_t next = 0;
+            if (!checked_add_u64(prior, amount, next)) {
+                shared_metadata_bytes_->fetch_sub(amount,
+                    std::memory_order_acq_rel);
+                return workspace_result_t<void>::failure(
+                    pe_error("PE metadata byte accounting overflowed"));
+            }
+            if (next > limits_.max_total_metadata_bytes) {
+                shared_metadata_bytes_->fetch_sub(amount,
+                    std::memory_order_acq_rel);
+                return workspace_result_t<void>::failure(
+                    limit_error("PE metadata exceeds its aggregate byte limit",
+                                next, limits_.max_total_metadata_bytes));
+            }
+            metadata_bytes_ = next;
+            return workspace_result_t<void>::success();
+        }
         std::uint64_t next = 0;
         if (!checked_add_u64(metadata_bytes_, amount, next))
             return workspace_result_t<void>::failure(
@@ -414,6 +499,12 @@ private:
                             limits_.max_total_metadata_bytes));
         metadata_bytes_ = next;
         return workspace_result_t<void>::success();
+    }
+
+    std::uint64_t current_metadata_bytes() const noexcept {
+        return shared_metadata_bytes_ != nullptr
+            ? shared_metadata_bytes_->load(std::memory_order_acquire)
+            : metadata_bytes_;
     }
 
     workspace_result_t<void> add_entry_point(std::uint32_t rva,
@@ -1168,7 +1259,7 @@ private:
         if (!checked_mul_u64(count, sizeof(pe_unwind_scope_t), record_bytes) ||
             !checked_add_u64(sizeof(std::uint32_t), record_bytes, table_bytes) ||
             table_bytes > std::numeric_limits<std::uint32_t>::max() ||
-            table_bytes > limits_.max_total_metadata_bytes - metadata_bytes_ ||
+            table_bytes > limits_.max_total_metadata_bytes - current_metadata_bytes() ||
             !image_->rva_to_file_offset(*record.language_data_rva, table_bytes))
             return workspace_result_t<void>::success();
         std::vector<pe_unwind_scope_t> scopes;
@@ -2308,6 +2399,7 @@ private:
     const byte_provider_t& provider_;
     const pe_parse_limits_t& limits_;
     const cancellation_token_t& cancel_;
+    std::atomic<std::uint64_t>* shared_metadata_bytes_ = nullptr;
     std::shared_ptr<pe_image_t> image_;
     mutable byte_view_t read_cache_;
     mutable std::uint64_t read_cache_offset_ = 0;

@@ -1,12 +1,16 @@
 #pragma once
 
 #include "legacy_document_adapter.hpp"
+#include "typed_ast.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace aida::analysis {
@@ -42,6 +46,38 @@ struct readability_transform_metrics_t {
     std::uint64_t bit_operation_idioms_rewritten = 0;
     std::uint64_t loop_intrinsics_rewritten = 0;
     std::uint64_t magic_divisions_recognized = 0;
+    std::uint64_t ternaries_formed = 0;
+    std::uint64_t array_indexes_formed = 0;
+    std::uint64_t method_calls_restructured = 0;
+    std::uint64_t semantic_facts_applied = 0;
+    std::uint64_t dead_branches_eliminated = 0;
+    std::uint64_t casts_inserted = 0;
+    std::uint64_t vararg_format_comments_injected = 0;
+    std::uint64_t unsigned_folds = 0;
+    std::uint64_t overflow_guards_hit = 0;
+};
+
+struct rt_semantic_fact_view_t {
+    std::string refinement_key;
+    std::uint8_t confidence = 0;
+};
+
+using rt_binding_id = std::uint32_t;
+
+struct rt_binding_t {
+    rt_binding_id id = 0;
+    std::string name;
+    std::uint64_t scope_node_id = 0;
+    std::uint64_t declaration_node_id = 0;
+    std::uint64_t type_id = 0;
+    bool is_parameter = false;
+};
+
+struct rt_binding_table_t {
+    std::vector<rt_binding_t> bindings;
+    std::map<std::pair<std::uint64_t, std::string>, rt_binding_id> scope_name;
+    std::unordered_map<std::uint64_t, rt_binding_id> by_declaration;
+    std::unordered_map<std::uint64_t, rt_binding_id> by_identifier;
 };
 
 struct readability_transform_result_t {
@@ -75,6 +111,14 @@ readability_transform_result_t apply_readability_transforms(
     const readability_transform_settings_t& settings,
     const decompiler_render_evidence_t& evidence);
 
+readability_transform_result_t apply_readability_transforms(
+    typed_pseudocode_ast_v2_t& ast,
+    const type_graph_t& type_graph,
+    const readability_transform_settings_t& settings,
+    const decompiler_render_evidence_t& evidence,
+    const std::vector<rt_semantic_fact_view_t>& semantic_facts,
+    const std::vector<typed_ast_branch_bridge_entry_t>& branch_bridge);
+
 bool readability_transforms_enabled(const readability_transform_settings_t& settings) noexcept;
 
 readability_transform_settings_t to_rt_settings(const readability_transform_settings_t& settings) noexcept;
@@ -105,6 +149,9 @@ struct pseudocode_readability_metrics_t {
     std::uint64_t dead_placeholder_count = 0;
     std::uint64_t cast_count = 0;
     std::uint64_t fabricated_body_count = 0;
+    std::uint64_t ternary_count = 0;
+    std::uint64_t array_index_count = 0;
+    std::uint64_t method_call_count = 0;
 };
 
 struct pseudocode_baseline_capture_request_t {
@@ -180,5 +227,18 @@ pseudocode_readability_result_t analyze_pseudocode_readability(
     const typed_pseudocode_ast_v2_t& ast,
     const decompiler_document_t& document,
     const pseudocode_readability_request_t& request = {});
+
+struct pseudocode_readability_precomputed_t {
+    std::optional<sha256_digest_t> ast_digest;
+    std::optional<sha256_digest_t> document_digest;
+    bool ast_validated = false;
+    bool document_validated = false;
+};
+
+pseudocode_readability_result_t analyze_pseudocode_readability(
+    const typed_pseudocode_ast_v2_t& ast,
+    const decompiler_document_t& document,
+    const pseudocode_readability_request_t& request,
+    const pseudocode_readability_precomputed_t& precomputed);
 
 }

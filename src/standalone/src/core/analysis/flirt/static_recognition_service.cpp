@@ -15,6 +15,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 
 namespace aida::analysis::static_recognition {
 namespace {
@@ -25,6 +26,7 @@ constexpr std::size_t k_max_prototype_records = 128000;
 constexpr std::size_t k_max_vtable_slot_records = 1000000;
 constexpr std::uint64_t k_max_record_payload_bytes = 32ull << 20;
 constexpr std::size_t k_max_store_entries = 16;
+constexpr std::size_t k_max_recovered_entries = 64;
 
 struct store_entry_t {
     binary_id_t binary_id;
@@ -35,6 +37,7 @@ struct store_entry_t {
     std::atomic<bool> in_flight{false};
     std::atomic<std::uint64_t> job_id{0};
     std::uint64_t touch = 0;
+    std::unordered_map<std::uint64_t, std::pair<std::shared_ptr<const type_recovery_result_t>, std::uint64_t>> recovered_by_rva;
 };
 
 struct service_state_t {
@@ -210,6 +213,19 @@ std::shared_ptr<store_entry_t> ensure_entry(const std::shared_ptr<analysis_works
     return entry;
 }
 
+std::shared_ptr<const type_recovery_result_t> recovered_types_for(
+    const std::shared_ptr<store_entry_t>& entry, std::uint64_t rva)
+{
+    if (!entry)
+        return {};
+    std::lock_guard lock(state().mutex);
+    const auto found = entry->recovered_by_rva.find(rva);
+    if (found == entry->recovered_by_rva.end())
+        return {};
+    found->second.second = ++state().clock;
+    return found->second.first;
+}
+
 void publish_records(const std::shared_ptr<store_entry_t>& entry,
                      std::shared_ptr<recognition_records_t> records)
 {
@@ -241,14 +257,8 @@ void run_scan(const std::shared_ptr<analysis_workspace_t>& workspace,
         return;
     }
     if (settings.enable_flirt && !cancelled()) {
-        std::shared_ptr<const flirt::flirt_signature_db_t> db;
-        if (settings.db_path.empty()) {
-            db = flirt::flirt_signature_db_t::load_embedded();
-        } else {
-            auto loaded = flirt::flirt_signature_db_t::load_from_file(settings.db_path);
-            if (loaded)
-                db = loaded.take_value();
-        }
+        std::shared_ptr<const flirt::flirt_signature_db_t> db =
+            flirt::flirt_signature_db_t::load_embedded();
         const bool pe_x64 = image->format == format_id_t::pe32_plus &&
             image->architecture == architecture_id_t::x86_64;
         if (db && !db->empty() && pe_x64) {
@@ -578,12 +588,112 @@ type_seed_batches_for(const std::shared_ptr<analysis_workspace_t>& workspace,
     const auto records = records_for(workspace);
     if (!records || records->status == k_status_pending || records->status == k_status_running)
         return {};
+    std::shared_ptr<const type_recovery_result_t> recovered;
+    if (entity.kind == decompiler_entity_kind_t::native_function) {
+        const auto* native = std::get_if<native_decompiler_entity_identity_t>(&entity.identity);
+        if (native && native->entry.space == address_space_id_t::relative_virtual &&
+            native->entry.value != 0) {
+            std::shared_ptr<store_entry_t> entry;
+            {
+                std::lock_guard lock(state().mutex);
+                entry = find_entry(workspace->identity().binary_id(), generation);
+            }
+            recovered = recovered_types_for(entry, native->entry.value);
+        }
+    }
     type_seed_export_options_t options;
     options.min_confidence = min_confidence;
-    auto batches = make_recognition_seed_batches(*records, entity, generation, options);
+    auto batches = make_recognition_seed_batches(*records, entity, generation, options,
+                                                 recovered.get());
     if (!batches)
         return {};
     return batches.take_value();
+}
+
+recognition_wait_result_t wait_for_records(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    std::chrono::milliseconds timeout)
+{
+    recognition_wait_result_t out;
+    if (!workspace)
+        return out;
+    ensure_attached(workspace);
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + timeout;
+    for (;;) {
+        auto records = records_for(workspace);
+        if (records && records->status != k_status_pending &&
+            records->status != k_status_running) {
+            out.records = std::move(records);
+            out.ready = true;
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            out.records = std::move(records);
+            out.timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for((std::min)(std::chrono::milliseconds(10), timeout));
+    }
+    out.waited_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    return out;
+}
+
+library_exclusion_set_t build_library_exclusion(
+    const recognition_records_t& records,
+    const analysis_snapshot_t& snapshot)
+{
+    library_exclusion_set_t exclusion;
+    if (records.flirt.empty())
+        return exclusion;
+    std::unordered_set<std::uint64_t> snapshot_named;
+    snapshot_named.reserve(snapshot.symbols.size());
+    for (const auto& symbol : snapshot.symbols)
+        if (!symbol.name.empty())
+            snapshot_named.insert(symbol.address.value);
+    exclusion.rvas.reserve(records.flirt.size() * 2);
+    for (const auto& match : records.flirt) {
+        if (match.tier > flirt::k_flirt_tier_exact_crc)
+            continue;
+        ++exclusion.tier_candidates;
+        if (snapshot_named.find(match.rva) != snapshot_named.end()) {
+            ++exclusion.suppressed_named;
+            continue;
+        }
+        exclusion.rvas.insert(match.rva);
+    }
+    return exclusion;
+}
+
+bool is_library_function(const library_exclusion_set_t& exclusion,
+                         std::uint64_t rva) noexcept
+{
+    return exclusion.rvas.find(rva) != exclusion.rvas.end();
+}
+
+void note_recovered_types(
+    const std::shared_ptr<analysis_workspace_t>& workspace,
+    std::uint64_t function_rva,
+    std::uint64_t generation,
+    std::shared_ptr<const type_recovery_result_t> recovered)
+{
+    if (!workspace || !recovered)
+        return;
+    ensure_attached(workspace);
+    auto& service = state();
+    std::lock_guard lock(service.mutex);
+    auto entry = ensure_entry(workspace, generation);
+    auto& slot = entry->recovered_by_rva[function_rva];
+    slot.first = std::move(recovered);
+    slot.second = ++service.clock;
+    while (entry->recovered_by_rva.size() > k_max_recovered_entries) {
+        auto oldest = entry->recovered_by_rva.begin();
+        for (auto it = entry->recovered_by_rva.begin(); it != entry->recovered_by_rva.end(); ++it)
+            if (it->second.second < oldest->second.second)
+                oldest = it;
+        entry->recovered_by_rva.erase(oldest);
+    }
 }
 
 }

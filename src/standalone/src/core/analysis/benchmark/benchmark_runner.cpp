@@ -1,6 +1,7 @@
 #include "benchmark_runner.hpp"
 
 #include "benchmark_scorecard.hpp"
+#include "benchmark_sla.hpp"
 
 #include "../../../../tests/analysis_workspace/large_pe_fixture_builder.hpp"
 
@@ -1224,35 +1225,6 @@ parallel_decompile_stage_t run_parallel_decompile_stage(
 }
 
 
-const json& program_sla_thresholds()
-{
-    static const json thresholds = {
-        {"threshold_schema", "aida.hyperperf.program-sla-thresholds"},
-        {"threshold_schema_version", 2},
-        {"total_wall_ms_max_300mb", 300000.0},
-        {"total_wall_ms_stretch_300mb", 180000.0},
-        {"decode_throughput_bytes_per_s_min", 26214400.0},
-        {"file_throughput_bytes_per_s_min", 1048576.0},
-        {"instructions_per_s_min", 2000000.0},
-        {"publish_ready_ms_max", 50.0},
-        {"indexed_query_p95_ms_max", 50.0},
-        {"metadata_ready_ms_max", 3000.0},
-        {"warm_reopen_ms_max", 10000.0},
-        {"cancellation_p95_ms_max", 250.0},
-        {"incremental_private_bytes_max", 8589934592ULL},
-        {"workspace_mapped_bytes_max", 1073741824ULL},
-        {"global_mapped_bytes_max", 2147483648ULL},
-        {"decompile_all_funcs_per_s_min", 12.0},
-        {"decompile_all_funcs_per_s_stretch", 16.0},
-        {"decompile_all_funcs_wall_per_s_min", 100.0},
-        {"decompile_all_funcs_wall_per_s_stretch", 140.0},
-        {"scaling_wall16_over_wall1_max", 0.20},
-        {"scaling_efficiency_16_min", 0.5},
-        {"determinism_hash_match", true}
-    };
-    return thresholds;
-}
-
 json verdict_entry(const char* key, const json& target, const json& actual,
                    const char* verdict)
 {
@@ -1269,6 +1241,71 @@ std::uint64_t percentile_value(std::vector<std::uint64_t> values, double rank)
     return values[index];
 }
 
+json run_cancellation_stage_measurement(
+    const open_static_workspace_request_t& open_request,
+    std::uint32_t samples,
+    const cancellation_token_t& cancel)
+{
+    json sample_rows = json::array();
+    std::vector<std::uint64_t> latencies;
+    for (std::uint32_t sample = 0; sample < samples; ++sample) {
+        if (cancel.stop_requested())
+            throw std::runtime_error("benchmark cancellation stage cancelled");
+        auto opened = workspace_registry().open_static(open_request, cancel);
+        if (!opened)
+            throw std::runtime_error("benchmark cancellation stage workspace open failed: " +
+                opened.error().stable_code() + ":" + opened.error().message);
+        auto workspace = opened.take_value();
+        json sample_row;
+        std::uint64_t latency_ns = 0;
+        bool completed_before_request = true;
+        try {
+            baseline_analysis_settings_t settings;
+            settings.decode_worker_lanes = 1;
+            auto started = baseline_analysis_service_t::start(workspace, settings);
+            if (!started)
+                throw std::runtime_error("benchmark cancellation stage submission failed: " +
+                    started.error().stable_code() + ":" + started.error().message);
+            const auto observation_deadline =
+                steady_clock_t::now() + std::chrono::milliseconds(250);
+            aida::infra::taskflow_runtime::wait_result_t state;
+            while (steady_clock_t::now() < observation_deadline) {
+                state = aida::infra::taskflow_runtime::wait_for(started.value(), 0);
+                if (!state.timed_out || workspace->progress().completed_bytes != 0)
+                    break;
+                std::this_thread::yield();
+            }
+            completed_before_request = state.completed || state.failed || state.cancelled;
+            const auto requested = steady_clock_t::now();
+            const bool cancellation_signalled = completed_before_request
+                ? false : baseline_analysis_service_t::cancel(started.value());
+            (void)aida::infra::taskflow_runtime::wait_for(started.value(), 60000);
+            latency_ns = nanoseconds_since(requested);
+            const auto progress = workspace->progress();
+            sample_row = json{
+                {"latency_ns", completed_before_request ? json(nullptr) : json(latency_ns)},
+                {"completed_before_request", completed_before_request},
+                {"cancellation_signalled", cancellation_signalled},
+                {"final_readiness", static_cast<unsigned>(progress.readiness)}};
+        } catch (...) {
+            try { close_benchmark_workspace(workspace, true); } catch (...) {}
+            throw;
+        }
+        close_benchmark_workspace(workspace, true);
+        sample_rows.push_back(std::move(sample_row));
+        if (!completed_before_request)
+            latencies.push_back(latency_ns);
+    }
+    const bool measured = latencies.size() >= 2;
+    return json{
+        {"samples", std::move(sample_rows)},
+        {"measured_count", latencies.size()},
+        {"p50_ns", measured ? json(percentile_value(latencies, 0.50)) : json(nullptr)},
+        {"p95_ns", measured ? json(percentile_value(latencies, 0.95)) : json(nullptr)},
+        {"unavailable_reason", measured
+            ? json(nullptr) : json("insufficient_valid_cancellation_samples")}};
+}
+
 std::string json_value_text(const json& value)
 {
     return value.is_null() ? std::string("null") : value.dump();
@@ -1281,7 +1318,9 @@ struct benchmark_async_state_t {
     std::atomic<std::uint64_t> job_id{0};
     std::atomic<bool> run_scaling_stage{false};
     std::atomic<bool> run_determinism_stage{false};
+    std::atomic<bool> run_cancellation_stage{false};
     std::atomic<std::uint32_t> determinism_runs{2};
+    std::atomic<std::uint32_t> cancellation_samples{3};
     mutable std::mutex mutex;
     std::string mode;
     std::string verdict;
@@ -1478,10 +1517,9 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         test_fixture::large_pe_manifest_t synthetic_manifest;
         std::optional<synthetic_fixture_root_t> synthetic_root;
         if (request.mode == benchmark_mode_t::synthetic) {
-            constexpr std::uint64_t mib = 1024ULL * 1024ULL;
-            if (request.synthetic_code_bytes < 8ULL * mib ||
-                request.synthetic_code_bytes > 256ULL * mib)
-                throw std::runtime_error("synthetic benchmark code_bytes must be within 8..256 MiB");
+            if (request.synthetic_code_bytes < synthetic_code_bytes_min ||
+                request.synthetic_code_bytes > synthetic_code_bytes_max)
+                throw std::runtime_error("synthetic benchmark code_bytes must be within 8..320 MiB");
             synthetic_params.code_bytes = request.synthetic_code_bytes;
             synthetic_params.seed = request.synthetic_seed;
             synthetic_params = test_fixture::validated_large_pe_params(synthetic_params);
@@ -1644,6 +1682,53 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         }
         remove_database_artifacts(cold_database_path);
         database_path.clear();
+
+        json cancellation_block = nullptr;
+        bool cancellation_measured = false;
+        double cancellation_p95_ms = 0.0;
+        const bool cancellation_stage_runs = request.run_cancellation_stage &&
+            request.mode == benchmark_mode_t::real;
+        const std::uint32_t cancellation_samples =
+            (std::max)(1U, (std::min)(8U, request.cancellation_samples));
+        if (cancellation_stage_runs) {
+            const auto stage_begin = steady_clock_t::now();
+            json stage = run_cancellation_stage_measurement(
+                open_request, cancellation_samples, cancel);
+            const auto measured_count = stage["measured_count"].get<std::uint64_t>();
+            cancellation_measured = measured_count >= 2;
+            if (cancellation_measured)
+                cancellation_p95_ms = static_cast<double>(
+                    stage["p95_ns"].get<std::uint64_t>()) / 1000000.0;
+            cancellation_block = json{
+                {"status", cancellation_measured ? "measured" : "not_measured"},
+                {"samples_requested", cancellation_samples},
+                {"samples", std::move(stage["samples"])},
+                {"measured_count", measured_count},
+                {"p50_ns", std::move(stage["p50_ns"])},
+                {"p95_ns", std::move(stage["p95_ns"])},
+                {"p95_ms", cancellation_measured ? json(cancellation_p95_ms) : json(nullptr)},
+                {"unavailable_reason", std::move(stage["unavailable_reason"])}};
+            const std::string cancellation_p95_text = cancellation_measured
+                ? std::to_string(cancellation_p95_ms) : std::string("null");
+            diag::log_tagged_fmt("benchmark",
+                "cancellation samples=%u measured=%llu p95_ms=%s stage_wall_ms=%llu",
+                static_cast<unsigned>(cancellation_samples),
+                static_cast<unsigned long long>(measured_count),
+                cancellation_p95_text.c_str(),
+                static_cast<unsigned long long>(nanoseconds_since(stage_begin) / 1000000ULL));
+        } else {
+            cancellation_block = json{
+                {"status", "not_measured"},
+                {"reason", request.run_cancellation_stage
+                    ? "cancellation_stage_runs_on_real_mode_only"
+                    : "cancellation_stage_disabled_by_request"},
+                {"samples", json::array()},
+                {"measured_count", 0},
+                {"p50_ns", nullptr},
+                {"p95_ns", nullptr},
+                {"p95_ms", nullptr},
+                {"unavailable_reason", "cancellation_stage_off"}};
+        }
 
         json scaling_block = nullptr;
         json determinism_block = nullptr;
@@ -1829,8 +1914,8 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
         const double wall_ms = static_cast<double>(analysis_wall_ns) / 1000000.0;
         const auto& thresholds = program_sla_thresholds();
         const double wall_scale = request.mode == benchmark_mode_t::synthetic
-            ? static_cast<double>(request.synthetic_code_bytes) / (300.0 * 1024.0 * 1024.0)
-            : 1.0;
+            ? program_sla_wall_scale(request.synthetic_code_bytes)
+            : program_sla_wall_scale(fixture_size);
         const std::uint64_t harvested_decode_wall_ns = harvested_available
             ? harvested->phases[static_cast<std::size_t>(baseline_phase_t::decode)].wall_ns +
                 harvested->phases[static_cast<std::size_t>(baseline_phase_t::decode_merge)].wall_ns
@@ -1921,8 +2006,9 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             thresholds["metadata_ready_ms_max"].get<double>(), metadata_ready_ms);
         push_max("warm_reopen_ms_max", thresholds["warm_reopen_ms_max"].get<double>(),
             warm_reopen_measured ? json(warm_reopen_ms) : json(nullptr));
-        verdicts.push_back(verdict_entry("cancellation_p95_ms_max",
-            thresholds["cancellation_p95_ms_max"], nullptr, "NOT_MEASURED"));
+        push_max("cancellation_p95_ms_max",
+            thresholds["cancellation_p95_ms_max"].get<double>(),
+            cancellation_measured ? json(cancellation_p95_ms) : json(nullptr));
         push_max_u64("incremental_private_bytes_max",
             thresholds["incremental_private_bytes_max"].get<std::uint64_t>(),
             metrics_snapshot.value(analysis_metric_t::peak_private_bytes), true);
@@ -1995,7 +2081,9 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             any_fail ? "FAIL" : (all_pass_or_warn ? "PASS" : "NOT_MEASURED");
         json sla = json{{"thresholds", thresholds},
             {"verdicts", std::move(verdicts)},
-            {"overall", sla_overall}};
+            {"overall", sla_overall},
+            {"wall_scale", wall_scale},
+            {"reference_bytes", program_sla_reference_bytes}};
 
         diag::log_tagged_fmt("benchmark",
             "phase name=%s wall_ms=%llu cpu_ms=%llu bytes_in=%llu work_items=%llu",
@@ -2150,6 +2238,48 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"decode_window_ns", decode_window_ns},
                 {"merge_window_ns", windows.merge_wall_ns()}};
 
+        const json harvested_publication = harvested_available
+            ? json::parse(harvested->to_json(), nullptr, false) : json(nullptr);
+        const auto harvested_counter = [](const json& metrics, const char* name) -> json {
+            if (!metrics.is_object())
+                return nullptr;
+            const auto counters = metrics.find("counters");
+            if (counters == metrics.end() || !counters->is_object())
+                return nullptr;
+            const auto entry = counters->find(name);
+            if (entry == counters.end() || !entry->is_number())
+                return nullptr;
+            return *entry;
+        };
+        const json memory_admission_grants =
+            harvested_counter(harvested_publication, "memory_admission_grants");
+        const json memory_admission_denials =
+            harvested_counter(harvested_publication, "memory_admission_denials");
+        const json memory_admission_wait_ns_max =
+            harvested_counter(harvested_publication, "memory_admission_wait_ns_max");
+        const bool memory_admission_measured = !memory_admission_grants.is_null() &&
+            !memory_admission_denials.is_null() && !memory_admission_wait_ns_max.is_null();
+        const json memory_admission_block = memory_admission_measured
+            ? json{{"status", "measured"}, {"grants", memory_admission_grants},
+                {"denials", memory_admission_denials},
+                {"wait_ns_max", memory_admission_wait_ns_max}}
+            : json{{"status", "not_applicable"}, {"grants", nullptr}, {"denials", nullptr},
+                {"wait_ns_max", nullptr}};
+        const json decompile_slots_requested =
+            harvested_counter(harvested_publication, "decompile_slots_requested");
+        const json decompile_slots_admitted =
+            harvested_counter(harvested_publication, "decompile_slots_admitted");
+        const json decompile_slots_denied =
+            harvested_counter(harvested_publication, "decompile_slots_denied");
+        const bool decompile_admission_measured = !decompile_slots_requested.is_null() &&
+            !decompile_slots_admitted.is_null() && !decompile_slots_denied.is_null();
+        const json decompile_admission_block = decompile_admission_measured
+            ? json{{"status", "measured"}, {"slots_requested", decompile_slots_requested},
+                {"slots_admitted", decompile_slots_admitted},
+                {"slots_denied", decompile_slots_denied}}
+            : json{{"status", "not_applicable"}, {"slots_requested", nullptr},
+                {"slots_admitted", nullptr}, {"slots_denied", nullptr}};
+
         const json memory_block = json{
             {"status", harvested_available ? "measured" : "partial"},
             {"peak_private_bytes",
@@ -2181,7 +2311,8 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 : json(nullptr)},
             {"pressure_events", harvested_available
                 ? json(harvested->value(analysis_metric_t::memory_pressure_events))
-                : json(nullptr)}};
+                : json(nullptr)},
+            {"admission", memory_admission_block}};
 
         const std::uint64_t persist_logical_bytes = harvested_available
             ? harvested->value(analysis_metric_t::database_logical_bytes)
@@ -2257,9 +2388,27 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"funcs_per_s", nullptr},
                 {"wall_per_s", nullptr}};
         }
+        decompile_block["admission"] = decompile_admission_block;
 
         const json phase_budgets_block = evaluate_phase_budgets(
             phases_block, wall_ms, wall_scale);
+        if (phase_budgets_block.contains("watchdog") &&
+            phase_budgets_block["watchdog"].contains("tripped") &&
+            phase_budgets_block["watchdog"]["tripped"].is_array()) {
+            for (const auto& tripped_key : phase_budgets_block["watchdog"]["tripped"]) {
+                const auto key_text = tripped_key.get<std::string>();
+                for (const auto& entry : phase_budgets_block["verdicts"]) {
+                    if (entry.value("key", std::string()) == key_text) {
+                        diag::log_tagged_fmt("benchmark",
+                            "phase_watchdog key=%s target_ms=%s actual_ms=%s",
+                            key_text.c_str(),
+                            json_value_text(entry["target_ms"]).c_str(),
+                            json_value_text(entry["actual_ms"]).c_str());
+                        break;
+                    }
+                }
+            }
+        }
 
         json scorecard = json{
             {"scorecard_schema", scorecard_schema_v2},
@@ -2270,7 +2419,7 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
             {"claim", json{
                 {"tracks", json::array({
                     json{{"id", "auto_analysis_wall"},
-                        {"definition", "total_wall_ms open-to-baseline_ready at or below total_wall_ms_max_300mb on a 300..500MB real binary"}},
+                        {"definition", "total_wall_ms open-to-baseline_ready at or below the size-scaled total_wall_ms_max_300mb gate (reference 300 MiB)"}},
                     json{{"id", "batch_decompile_throughput"},
                         {"definition", "decompile_all_funcs_per_s on the parallel production batch engine; a throughput claim, never a minutes claim"}}})},
                 {"real_mode_invocation",
@@ -2291,6 +2440,8 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"run_scaling_stage", request.run_scaling_stage},
                 {"run_determinism_stage", request.run_determinism_stage},
                 {"determinism_runs", request.determinism_runs},
+                {"run_cancellation_stage", request.run_cancellation_stage},
+                {"cancellation_samples", request.cancellation_samples},
                 {"scaling_worker_budgets", request.scaling_worker_budgets},
                 {"decompile_batch_lanes", request.decompile_batch_lanes},
                 {"decompile_batch_max_functions", request.decompile_batch_max_functions},
@@ -2335,7 +2486,9 @@ benchmark_run_result_t run_benchmark(const benchmark_run_request_t& request,
                 {"metadata_ready_ms", metadata_ready_ms},
                 {"indexed_query_p95_ms", query_p95_ms},
                 {"decompile_p95_ms", decompile_p95_ms},
-                {"cancellation_request_to_completion_ms", nullptr}}},
+                {"cancellation_request_to_completion_ms",
+                    cancellation_measured ? json(cancellation_p95_ms) : json(nullptr)}}},
+            {"cancellation", std::move(cancellation_block)},
             {"counts", json{{"instructions", instruction_count},
                 {"blocks", snapshot->blocks.size()},
                 {"functions", snapshot->functions.size()},
@@ -2523,7 +2676,11 @@ bool start_benchmark_async(const benchmark_run_request_t& request)
         std::memory_order_release);
     g_async_state.run_determinism_stage.store(request.run_determinism_stage,
         std::memory_order_release);
+    g_async_state.run_cancellation_stage.store(request.run_cancellation_stage,
+        std::memory_order_release);
     g_async_state.determinism_runs.store(request.determinism_runs, std::memory_order_release);
+    g_async_state.cancellation_samples.store(request.cancellation_samples,
+        std::memory_order_release);
     g_async_state.started_ms.store(GetTickCount64(), std::memory_order_release);
     g_async_state.finished_ms.store(0, std::memory_order_release);
     g_async_state.job_id.store(submitted.handle.id, std::memory_order_release);
@@ -2558,7 +2715,11 @@ nlohmann::json benchmark_run_status()
         {"run_scaling_stage", g_async_state.run_scaling_stage.load(std::memory_order_acquire)},
         {"run_determinism_stage",
             g_async_state.run_determinism_stage.load(std::memory_order_acquire)},
+        {"run_cancellation_stage",
+            g_async_state.run_cancellation_stage.load(std::memory_order_acquire)},
         {"determinism_runs", g_async_state.determinism_runs.load(std::memory_order_acquire)},
+        {"cancellation_samples",
+            g_async_state.cancellation_samples.load(std::memory_order_acquire)},
         {"verdict", verdict}, {"error", error},
         {"report_json", report_path}};
 }

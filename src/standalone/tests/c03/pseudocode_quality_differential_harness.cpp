@@ -3,9 +3,9 @@
 #include "../../src/core/analysis/builtin_typelib.hpp"
 #include "../../src/core/analysis/decompiler/decompiler_service.hpp"
 #include "../../src/core/analysis/decompiler/pseudocode_readability.hpp"
-#include "../../src/core/analysis/decompiler/pseudocode_renderer_v2.hpp"
+#include "../../src/core/analysis/decompiler/pseudocode_renderer.hpp"
 #include "../../src/core/analysis/decompiler/type_graph_builder.hpp"
-#include "../../src/core/analysis/decompiler/typed_ast_v2.hpp"
+#include "../../src/core/analysis/decompiler/typed_ast.hpp"
 #include "../../src/core/workbench/adapters/pseudocode_document.hpp"
 #include "../../workers/native_decompiler/snapshot_sidecar.hpp"
 
@@ -257,16 +257,16 @@ render_result_t render_checked(const typed_pseudocode_ast_v2_t& ast_value,
                                const type_graph_t& types,
                                const decompiler_render_evidence_t* evidence = nullptr)
 {
-    pseudocode_renderer_v2_request_t request;
+    pseudocode_renderer_request_t request;
     request.profile = decompiler_profile_id_t::balanced;
-    request.settings = pseudocode_renderer_v2_style_settings(
-        pseudocode_renderer_v2_style_profile_t::balanced);
+    request.settings = pseudocode_renderer_style_settings(
+        pseudocode_renderer_style_profile_t::balanced);
     if (evidence != nullptr) {
         static std::shared_ptr<const decompiler_render_evidence_t> shared_evidence;
         shared_evidence = std::make_shared<const decompiler_render_evidence_t>(*evidence);
         request.evidence = shared_evidence;
     }
-    auto rendered = render_pseudocode_v2(ast_value, types, request);
+    auto rendered = render_pseudocode(ast_value, types, request);
     require(rendered.succeeded() && rendered.document.has_value(),
         "quality fixture renderer rejected a valid typed AST");
     render_result_t result;
@@ -1091,7 +1091,7 @@ void verify_switch_case_naming(const decompiler_entity_key_t& entity_value,
     hir.blocks.push_back(make_return_block(2, 3, "10"));
     hir.blocks.push_back(make_return_block(3, 5, "20"));
     hir.blocks.push_back(make_return_block(4, 7, "30"));
-    auto ast_build = build_typed_ast_v2(hir, types);
+    auto ast_build = build_typed_ast(hir, types);
     require(ast_build.succeeded() && ast_build.ast.has_value(),
         "switch_win32_error AST build failed");
     const auto rendered = render_checked(*ast_build.ast, types);

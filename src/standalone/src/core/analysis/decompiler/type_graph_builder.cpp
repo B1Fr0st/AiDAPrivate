@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <new>
 #include <set>
 #include <sstream>
@@ -442,7 +443,7 @@ void type_graph_builder_t::merge_edges(merged_node_t& merged, const type_candida
     }
 }
 
-void type_graph_builder_t::detect_recursive_types(std::unordered_map<std::string, merged_node_t>& merged_nodes)
+void type_graph_builder_t::detect_recursive_types(type_graph_builder_t::merged_node_map_t& merged_nodes)
 {
     for (auto& [name, node] : merged_nodes) {
         std::unordered_set<std::string> visited;
@@ -477,7 +478,7 @@ void type_graph_builder_t::detect_recursive_types(std::unordered_map<std::string
 }
 
 void type_graph_builder_t::assign_stable_ids(
-    std::unordered_map<std::string, merged_node_t>& merged_nodes,
+    type_graph_builder_t::merged_node_map_t& merged_nodes,
     std::vector<std::string>& sorted_names) const
 {
     sorted_names.clear();
@@ -509,11 +510,16 @@ void type_graph_builder_t::assign_stable_ids(
 }
 
 void type_graph_builder_t::resolve_edges(
-    const std::unordered_map<std::string, merged_node_t>& merged_nodes,
+    const type_graph_builder_t::merged_node_map_t& merged_nodes,
+    const std::vector<std::string>& sorted_names,
     std::vector<merged_edge_t>& resolved_edges,
     std::vector<decompiler_unknown_t>& unknowns)
 {
-    for (const auto& [name, node] : merged_nodes) {
+    for (const auto& name : sorted_names) {
+        const auto node_it = merged_nodes.find(name);
+        if (node_it == merged_nodes.end())
+            continue;
+        const auto& node = node_it->second;
         if (node.assigned_id == 0)
             continue;
 
@@ -718,7 +724,7 @@ void type_graph_builder_t::emit_diagnostics(type_graph_t& graph, std::uint32_t& 
 
 type_graph_t type_graph_builder_t::build()
 {
-    std::unordered_map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> name_to_candidates;
+    aida::infra::fast_flat_map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> name_to_candidates;
     for (std::size_t batch_idx = 0; batch_idx < batches_.size(); ++batch_idx) {
         for (std::size_t cand_idx = 0; cand_idx < batches_[batch_idx].candidates.size(); ++cand_idx) {
             const auto& candidate = batches_[batch_idx].candidates[cand_idx];
@@ -728,7 +734,7 @@ type_graph_t type_graph_builder_t::build()
         }
     }
 
-    std::unordered_map<std::string, merged_node_t> merged_nodes;
+    merged_node_map_t merged_nodes;
     for (const auto& [name, indices] : name_to_candidates) {
         std::vector<type_candidate_t> candidates;
         candidates.reserve(indices.size());
@@ -772,7 +778,7 @@ type_graph_t type_graph_builder_t::build()
 
     std::vector<merged_edge_t> resolved_edges;
     std::vector<decompiler_unknown_t> unknowns;
-    resolve_edges(merged_nodes, resolved_edges, unknowns);
+    resolve_edges(merged_nodes, sorted_names, resolved_edges, unknowns);
 
     std::vector<merged_node_t> node_list;
     for (const auto& name : sorted_names) {
@@ -912,6 +918,10 @@ workspace_result_t<type_graph_t> merge_type_evidence_impl(
         source_nodes.reserve(provider_graph.nodes.size());
         for (const auto& node : provider_graph.nodes)
             source_nodes.emplace(node.id, &node);
+        std::unordered_map<std::uint64_t, std::vector<const decompiler_type_edge_t*>> edges_by_source;
+        edges_by_source.reserve(provider_graph.edges.size());
+        for (const auto& edge : provider_graph.edges)
+            edges_by_source[edge.source_type_id].push_back(&edge);
         type_seed_batch_t provider_seed;
         provider_seed.source = decompiler_fact_provenance_t::provider_semantics;
         provider_seed.source_label = "provider_type_graph";
@@ -929,22 +939,23 @@ workspace_result_t<type_graph_t> merge_type_evidence_impl(
             candidate.source_detail = "provider_type_graph";
             if (!node.coordinates.empty())
                 candidate.coordinate = node.coordinates.front();
-            for (const auto& edge : provider_graph.edges) {
-                if (edge.source_type_id != node.id)
-                    continue;
-                const auto target = source_nodes.find(edge.target_type_id);
-                if (target == source_nodes.end())
-                    return invalid("provider type graph edge target is absent");
-                type_edge_candidate_t converted;
-                converted.kind = edge.kind;
-                converted.target_canonical_name = target->second->canonical_name;
-                converted.stable_name = edge.stable_name;
-                converted.byte_offset = edge.byte_offset;
-                converted.local_ordinal = edge.ordinal;
-                converted.confidence = edge.confidence;
-                converted.provenance = edge.provenance;
-                converted.source_detail = "provider_type_graph";
-                candidate.edges.push_back(std::move(converted));
+            const auto outgoing = edges_by_source.find(node.id);
+            if (outgoing != edges_by_source.end()) {
+                for (const auto* edge : outgoing->second) {
+                    const auto target = source_nodes.find(edge->target_type_id);
+                    if (target == source_nodes.end())
+                        return invalid("provider type graph edge target is absent");
+                    type_edge_candidate_t converted;
+                    converted.kind = edge->kind;
+                    converted.target_canonical_name = target->second->canonical_name;
+                    converted.stable_name = edge->stable_name;
+                    converted.byte_offset = edge->byte_offset;
+                    converted.local_ordinal = edge->ordinal;
+                    converted.confidence = edge->confidence;
+                    converted.provenance = edge->provenance;
+                    converted.source_detail = "provider_type_graph";
+                    candidate.edges.push_back(std::move(converted));
+                }
             }
             provider_seed.candidates.push_back(std::move(candidate));
         }
@@ -1040,11 +1051,12 @@ workspace_result_t<type_graph_t> merge_type_evidence(
 
 const decompiler_type_node_t* find_type_node(const type_graph_t& graph, const std::uint64_t type_id) noexcept
 {
-    for (const auto& node : graph.nodes) {
-        if (node.id == type_id)
-            return &node;
-    }
-    return nullptr;
+    const auto iterator = std::lower_bound(
+        graph.nodes.begin(), graph.nodes.end(), type_id,
+        [](const decompiler_type_node_t& node, const std::uint64_t candidate) {
+            return node.id < candidate;
+        });
+    return iterator != graph.nodes.end() && iterator->id == type_id ? &*iterator : nullptr;
 }
 
 const decompiler_type_edge_t* find_member_edge_by_offset(
@@ -1099,6 +1111,135 @@ const decompiler_type_edge_t* find_enumerator_edge(
             result = &edge;
     }
     return result;
+}
+
+struct type_graph_index_t::state_t {
+    struct member_key_t {
+        std::uint64_t source = 0;
+        std::uint64_t offset = 0;
+
+        bool operator==(const member_key_t& other) const noexcept {
+            return source == other.source && offset == other.offset;
+        }
+    };
+
+    struct member_key_hash_t {
+        std::size_t operator()(const member_key_t& key) const noexcept {
+            std::uint64_t value = key.source * 0x9E3779B97F4A7C15ULL;
+            value ^= key.offset + 0x9E3779B97F4A7C15ULL + (value << 6U) + (value >> 2U);
+            value ^= value >> 33U;
+            value *= 0xFF51AFD7ED558CCDULL;
+            value ^= value >> 33U;
+            return static_cast<std::size_t>(value);
+        }
+    };
+
+    const type_graph_t* graph = nullptr;
+    aida::infra::fast_u64_map<std::uint32_t> nodes_by_id;
+    aida::infra::fast_u64_map<std::vector<std::uint32_t>> edges_by_source;
+    aida::infra::fast_flat_map<member_key_t, std::uint32_t, member_key_hash_t> member_by_offset;
+    aida::infra::fast_u64_map<std::uint32_t> pointee_by_source;
+};
+
+type_graph_index_t::type_graph_index_t() = default;
+type_graph_index_t::~type_graph_index_t() = default;
+type_graph_index_t::type_graph_index_t(type_graph_index_t&&) noexcept = default;
+type_graph_index_t& type_graph_index_t::operator=(type_graph_index_t&&) noexcept = default;
+
+bool type_graph_index_t::empty() const noexcept
+{
+    return !state_ || state_->nodes_by_id.empty();
+}
+
+const decompiler_type_node_t* type_graph_index_t::node(const std::uint64_t type_id) const noexcept
+{
+    if (!state_)
+        return nullptr;
+    const auto found = state_->nodes_by_id.find(type_id);
+    return found != state_->nodes_by_id.end() ? &state_->graph->nodes[found->second] : nullptr;
+}
+
+const decompiler_type_edge_t* type_graph_index_t::members_at(
+    const std::uint64_t struct_type_id, const std::uint64_t byte_offset) const noexcept
+{
+    if (!state_)
+        return nullptr;
+    const state_t::member_key_t key{struct_type_id, byte_offset};
+    const auto found = state_->member_by_offset.find(key);
+    return found != state_->member_by_offset.end() ? &state_->graph->edges[found->second] : nullptr;
+}
+
+const decompiler_type_edge_t* type_graph_index_t::member_named(
+    const std::uint64_t struct_type_id, const std::string& member_name) const noexcept
+{
+    if (!state_)
+        return nullptr;
+    const auto bucket = state_->edges_by_source.find(struct_type_id);
+    if (bucket == state_->edges_by_source.end())
+        return nullptr;
+    const decompiler_type_edge_t* result = nullptr;
+    for (const auto edge_index : bucket->second) {
+        const auto& edge = state_->graph->edges[edge_index];
+        if (edge.kind != decompiler_type_edge_kind_t::member || edge.stable_name != member_name)
+            continue;
+        if (result == nullptr || edge.confidence > result->confidence)
+            result = &edge;
+    }
+    return result;
+}
+
+const decompiler_type_edge_t* type_graph_index_t::pointee(const std::uint64_t pointer_type_id) const noexcept
+{
+    if (!state_)
+        return nullptr;
+    const auto found = state_->pointee_by_source.find(pointer_type_id);
+    return found != state_->pointee_by_source.end() ? &state_->graph->edges[found->second] : nullptr;
+}
+
+const decompiler_type_edge_t* type_graph_index_t::enumerator(
+    const std::uint64_t enum_type_id, const std::uint64_t enumerator_value) const noexcept
+{
+    if (!state_)
+        return nullptr;
+    const state_t::member_key_t key{enum_type_id, enumerator_value};
+    const auto found = state_->member_by_offset.find(key);
+    return found != state_->member_by_offset.end() ? &state_->graph->edges[found->second] : nullptr;
+}
+
+type_graph_index_t build_type_graph_index(const type_graph_t& graph)
+{
+    type_graph_index_t index;
+    index.state_ = std::make_unique<type_graph_index_t::state_t>();
+    auto& state = *index.state_;
+    state.graph = &graph;
+    state.nodes_by_id.reserve(graph.nodes.size());
+    for (std::uint32_t node_index = 0; node_index < graph.nodes.size(); ++node_index)
+        state.nodes_by_id.emplace(graph.nodes[node_index].id, node_index);
+    state.edges_by_source.reserve(graph.edges.size());
+    for (std::uint32_t edge_index = 0; edge_index < graph.edges.size(); ++edge_index)
+        state.edges_by_source[graph.edges[edge_index].source_type_id].push_back(edge_index);
+    state.member_by_offset.reserve(graph.edges.size());
+    state.pointee_by_source.reserve(graph.edges.size());
+    for (std::uint32_t edge_index = 0; edge_index < graph.edges.size(); ++edge_index) {
+        const auto& edge = graph.edges[edge_index];
+        if (edge.kind == decompiler_type_edge_kind_t::member && edge.byte_offset.has_value()) {
+            const state_t::member_key_t key{edge.source_type_id, *edge.byte_offset};
+            const auto found = state.member_by_offset.find(key);
+            if (found == state.member_by_offset.end()) {
+                state.member_by_offset.emplace(key, edge_index);
+            } else if (edge.confidence > graph.edges[found->second].confidence) {
+                found->second = edge_index;
+            }
+        } else if (edge.kind == decompiler_type_edge_kind_t::pointee) {
+            const auto found = state.pointee_by_source.find(edge.source_type_id);
+            if (found == state.pointee_by_source.end()) {
+                state.pointee_by_source.emplace(edge.source_type_id, edge_index);
+            } else if (edge.confidence > graph.edges[found->second].confidence) {
+                found->second = edge_index;
+            }
+        }
+    }
+    return index;
 }
 
 }

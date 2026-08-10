@@ -3292,26 +3292,21 @@ void helpers::render_title()
 				if (!opened || !activated.pseudocode_document)
 					return aida::ui::action_handler_result_t::failed(
 						"The Pseudocode document could not be activated");
-				aida::workbench::pseudocode_document::pseudocode_request_t request;
-				aida::workbench::pseudocode_document::pseudocode_error_t resolved;
+				aida::analysis::decompiler_entity_locator_t locator;
 				if (managed_locator) {
-					resolved = activated.pseudocode_document->resolve_request(*managed_locator,
-						aida::analysis::decompiler_profile_id_t::balanced,
-						aida::workbench::pseudocode_document::k_pseudocode_document_default_timeout_ms,
-						request);
+					locator = *managed_locator;
 				} else {
-					resolved = activated.pseudocode_document->resolve_request(address,
-						aida::analysis::decompiler_profile_id_t::balanced,
-						aida::workbench::pseudocode_document::k_pseudocode_document_default_timeout_ms,
-						request);
+					locator.address = address;
 				}
-				const auto requested = resolved ? activated.pseudocode_document->request(request) : resolved;
-				if (requested || requested.code == aida::workbench::pseudocode_document::
-					pseudocode_error_code_t::request_in_progress) {
-					static_cast<void>(activated.pseudocode_document->activate(request));
-					diag::log_tagged_fmt("ui", "workbench_f5 address=0x%llX managed=%d ok=%d code=%u",
+				std::uint64_t ticket = 0;
+				const auto submitted = activated.pseudocode_document->request_async(
+					locator, aida::analysis::decompiler_profile_id_t::balanced,
+					aida::workbench::pseudocode_document::k_pseudocode_document_default_timeout_ms,
+					false, ticket);
+				if (submitted) {
+					diag::log_tagged_fmt("ui", "workbench_f5 address=0x%llX managed=%d async=1 ticket=%llu",
 						static_cast<unsigned long long>(address), managed_locator ? 1 : 0,
-						requested ? 1 : 0, static_cast<unsigned>(requested.code));
+						static_cast<unsigned long long>(ticket));
 					return aida::ui::action_handler_result_t::completed();
 				}
 				return aida::ui::action_handler_result_t::failed(

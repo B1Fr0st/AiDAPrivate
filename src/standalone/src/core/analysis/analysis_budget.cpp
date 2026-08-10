@@ -129,8 +129,8 @@ constexpr std::uint64_t kGovernorSearchFloorBytes = 2ULL * analysis_gibibyte;
 constexpr std::uint64_t kGovernorSearchCeilingBytes = 8ULL * analysis_gibibyte;
 constexpr std::uint64_t kGovernorDecompilerFloorBytes = 128ULL * analysis_mebibyte;
 constexpr std::uint64_t kGovernorDecompilerCeilingBytes = 512ULL * analysis_mebibyte;
-constexpr std::uint64_t kGovernorWorkerFloorBytes = 256ULL * analysis_mebibyte;
-constexpr std::uint64_t kGovernorWorkerCeilingBytes = analysis_gibibyte;
+constexpr std::uint64_t kGovernorWorkerFloorBytes = analysis_gibibyte;
+constexpr std::uint64_t kGovernorWorkerCeilingBytes = 32ULL * analysis_gibibyte;
 constexpr std::uint64_t kGovernorXrefFloorBytes = 256ULL * analysis_mebibyte;
 constexpr std::uint64_t kGovernorXrefCeilingBytes = analysis_gibibyte;
 constexpr std::uint64_t kGovernorSqliteCachesBytes = 512ULL * analysis_mebibyte;
@@ -449,7 +449,7 @@ governor_subsystem_budget_fields_t governor_subsystem_budget_fields(
                                           kGovernorSearchCeilingBytes);
     fields.decompiler_memory_bytes = clamp_u64(usable / 64ULL, kGovernorDecompilerFloorBytes,
                                                kGovernorDecompilerCeilingBytes);
-    fields.worker_snapshots_bytes = clamp_u64(usable / 32ULL, kGovernorWorkerFloorBytes,
+    fields.worker_snapshots_bytes = clamp_u64(usable / 2ULL, kGovernorWorkerFloorBytes,
                                               kGovernorWorkerCeilingBytes);
     fields.xref_arenas_bytes = clamp_u64(usable / 48ULL, kGovernorXrefFloorBytes,
                                          kGovernorXrefCeilingBytes);

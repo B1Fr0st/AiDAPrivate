@@ -34,6 +34,7 @@
 #include "../../helpers/diag_log.hpp"
 #include "../anti-tamper/webhook.hpp"
 #include "../infra/executor.hpp"
+#include "../infra/fast_containers.hpp"
 
 namespace function_index {
 
@@ -924,15 +925,16 @@ namespace function_index {
 
 		struct cache_t {
 			std::shared_mutex                                              mutex;
-			std::unordered_map<uint64_t, func_record_t>                    by_start;
-			std::unordered_map<uint64_t, std::shared_ptr<func_status_t>>   status_by_start;
-			std::unordered_map<uint64_t, uint64_t>                         addr_to_func_start;
+			aida::infra::fast_flat_map<uint64_t, func_record_t,
+				aida::infra::fast_u64_hash_t>                          by_start;
+			aida::infra::fast_u64_map<std::shared_ptr<func_status_t>>    status_by_start;
+			aida::infra::fast_u64_map<uint64_t>                          addr_to_func_start;
 			std::vector<uint64_t>                                          sorted_starts;
-			std::unordered_map<uint64_t, std::string>                      synthetic_names;
-			std::unordered_map<uint64_t, align_run_t>                      align_runs_by_start;
+			aida::infra::fast_u64_map<std::string>                       synthetic_names;
+			aida::infra::fast_u64_map<align_run_t>                       align_runs_by_start;
 			std::vector<uint64_t>                                          align_run_starts;
-			std::unordered_map<uint64_t, iat_entry_t>                      iat_lookup;
-			std::unordered_map<uint64_t, data_symbol_entry_t>              data_symbol_lookup;
+			aida::infra::fast_u64_map<iat_entry_t>                       iat_lookup;
+			aida::infra::fast_u64_map<data_symbol_entry_t>               data_symbol_lookup;
 			std::vector<uint8_t>                                           text_blob;
 			uint64_t                                                       text_blob_va = 0;
 			uint64_t                                                       cached_module_base = 0;
@@ -1754,7 +1756,7 @@ namespace function_index {
 				module->pdb.symbols[symbol->second].is_function;
 		}
 
-		inline void populate_pdb_symbols_into(std::unordered_map<uint64_t, data_symbol_entry_t>& out,
+		inline void populate_pdb_symbols_into(aida::infra::fast_u64_map<data_symbol_entry_t>& out,
 			const std::string& module_name)
 		{
 			auto module = legacy_live_module_symbols(module_name);
@@ -1900,9 +1902,10 @@ namespace function_index {
 			candidates.erase(std::unique(candidates.begin(), candidates.end()),
 				candidates.end());
 
-			std::unordered_map<uint64_t, func_record_t>                  by_start;
-			std::unordered_map<uint64_t, std::shared_ptr<func_status_t>> status_by_start;
-			std::unordered_map<uint64_t, std::string>                    synthetic_names;
+			aida::infra::fast_flat_map<uint64_t, func_record_t,
+				aida::infra::fast_u64_hash_t>                        by_start;
+			aida::infra::fast_u64_map<std::shared_ptr<func_status_t>>  status_by_start;
+			aida::infra::fast_u64_map<std::string>                     synthetic_names;
 			std::vector<uint64_t>                                        sorted_starts;
 			by_start.reserve(candidates.size());
 			status_by_start.reserve(candidates.size());
@@ -1938,7 +1941,7 @@ namespace function_index {
 				sorted_starts.push_back(start);
 			}
 
-			std::unordered_map<uint64_t, uint64_t> addr_to_func_start;
+			aida::infra::fast_u64_map<uint64_t> addr_to_func_start;
 			addr_to_func_start.reserve(by_start.size());
 			for (const auto& kv : by_start) {
 				addr_to_func_start.emplace(kv.first, kv.first);

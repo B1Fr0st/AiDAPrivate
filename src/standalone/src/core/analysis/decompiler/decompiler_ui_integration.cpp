@@ -9,8 +9,8 @@
 #include "providers/jvm_ssa.hpp"
 
 #include "decompiler_contracts.hpp"
-#include "pseudocode_renderer_v2.hpp"
-#include "typed_ast_v2.hpp"
+#include "pseudocode_renderer.hpp"
+#include "typed_ast.hpp"
 
 #include "../flirt/static_recognition_service.hpp"
 #include "../workspace/decompiler_feedback.hpp"
@@ -63,6 +63,21 @@ struct managed_module_snapshot_cache_entry_t final {
     std::uint64_t touch = 0;
 };
 
+struct native_identity_cache_entry_t {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::vector<decompiler_chunk_fingerprint_t> fingerprints;
+    sha256_digest_t function_bytes_hash{};
+    decompiler_entity_key_t entity{};
+    std::string canonical_symbol;
+    std::uint64_t function_id = 0;
+    std::uint64_t generation = 0, analysis_revision = 0, overlay_revision = 0;
+    sha256_digest_t load_profile_hash{};
+    sha256_digest_t worker_protocol_hash{};
+    std::uint64_t touch = 0;
+};
+
+inline constexpr std::size_t k_native_identity_cache_max_entries = 256;
+
 struct ui_state_t final {
     ui_state_t(std::shared_ptr<analysis_workspace_t> workspace_value,
                std::shared_ptr<decompiler_pipeline_service_t> service_value,
@@ -102,6 +117,10 @@ struct ui_state_t final {
     std::uint64_t managed_module_snapshot_reserved_bytes = 0;
     std::uint64_t managed_capture_clock = 0;
     std::uint64_t managed_cache_epoch = 0;
+    mutable std::mutex native_identity_mutex;
+    std::unordered_map<std::uint64_t, native_identity_cache_entry_t>
+        native_identity_cache;
+    std::uint64_t native_identity_clock = 0;
 };
 
 struct production_cache_entry_t {
@@ -1662,7 +1681,7 @@ decompiler_ui_integration_t::create_production(
             return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
                 registered.error());
         }
-        auto cache = decompiler_cache_v9_t::create();
+        auto cache = decompiler_cache_t::create();
         if (!cache) {
             return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
                 cache.error());
@@ -1671,7 +1690,7 @@ decompiler_ui_integration_t::create_production(
         const unsigned int logical_cores = (std::max)(2u, std::thread::hardware_concurrency());
         pool_config.batch_slots = (std::min<std::size_t>)(
             native_worker::native_worker_session_pool_config_t{}.batch_slots,
-            (std::max<std::size_t>)(2, logical_cores - 2));
+            (std::max<std::size_t>)(2, logical_cores - 1));
         pool_config.interactive_reserved_slots = (std::min<std::size_t>)(
             native_worker::native_worker_session_pool_config_t{}.interactive_reserved_slots,
             static_cast<std::size_t>(logical_cores - 2));
@@ -2000,6 +2019,39 @@ decompiler_ui_integration_t::build_pipeline_request(
                 "decompiler_ui.identity.function"));
     }
 
+    if (auto integration = find_production_for_workspace(
+            std::const_pointer_cast<analysis_workspace_t>(
+                workspace.shared_from_this()))) {
+        auto& identity_state = integration.value()->impl_->state;
+        native_identity_cache_entry_t identity_entry;
+        identity_entry.spans = spans;
+        identity_entry.fingerprints = fingerprints;
+        identity_entry.function_bytes_hash = function_hash.value();
+        identity_entry.entity = entity;
+        identity_entry.canonical_symbol = canonical_symbol;
+        identity_entry.function_id = function->id;
+        identity_entry.generation = snapshot->generation;
+        identity_entry.analysis_revision = snapshot->analysis_revision;
+        identity_entry.overlay_revision = snapshot->overlay_revision;
+        identity_entry.load_profile_hash = publication->load_profile_hash;
+        identity_entry.worker_protocol_hash = request.worker_protocol_hash;
+        std::lock_guard<std::mutex> identity_lock(identity_state.native_identity_mutex);
+        identity_entry.touch = ++identity_state.native_identity_clock;
+        if (identity_state.native_identity_cache.size() >=
+            k_native_identity_cache_max_entries) {
+            const auto oldest = std::min_element(
+                identity_state.native_identity_cache.begin(),
+                identity_state.native_identity_cache.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.touch < right.second.touch;
+                });
+            if (oldest != identity_state.native_identity_cache.end())
+                identity_state.native_identity_cache.erase(oldest);
+        }
+        identity_state.native_identity_cache.insert_or_assign(
+            function->id, std::move(identity_entry));
+    }
+
     decompiler_pipeline_request_t pipeline_request;
     pipeline_request.invocation = map_invocation_source(request.source);
     pipeline_request.cache_mode = request.cache_mode;
@@ -2118,12 +2170,49 @@ workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
     if (!dependencies)
         return workspace_result_t<decompiler_pipeline_request_t>::failure(
             dependencies.error());
+    auto& identity_state = integration.value()->impl_->state;
+    native_identity_cache_entry_t identity_hit_entry;
+    bool identity_hit = false;
+    {
+        std::lock_guard<std::mutex> identity_lock(identity_state.native_identity_mutex);
+        const auto found = identity_state.native_identity_cache.find(function.id);
+        if (found != identity_state.native_identity_cache.end()) {
+            if (found->second.generation != snapshot->generation ||
+                found->second.analysis_revision != snapshot->analysis_revision ||
+                found->second.overlay_revision != snapshot->overlay_revision) {
+                identity_state.native_identity_cache.clear();
+            } else if (found->second.load_profile_hash != publication->load_profile_hash ||
+                       found->second.worker_protocol_hash !=
+                           state.native_worker_protocol_hash) {
+                identity_state.native_identity_cache.erase(found);
+            } else {
+                found->second.touch = ++identity_state.native_identity_clock;
+                identity_hit_entry = found->second;
+                identity_hit = true;
+            }
+        }
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::vector<decompiler_chunk_fingerprint_t> fingerprints;
+    sha256_digest_t function_bytes_hash{};
+    decompiler_entity_key_t entity;
+    if (identity_hit) {
+        spans = std::move(identity_hit_entry.spans);
+        fingerprints = std::move(identity_hit_entry.fingerprints);
+        function_bytes_hash = identity_hit_entry.function_bytes_hash;
+        entity = std::move(identity_hit_entry.entity);
+        integration.value()->impl_->increment_metric(
+            &decompiler_ui_integration_metrics_t::native_identity_cache_hits);
+        ::diag::log_tagged_fmt("decompiler",
+            "native_identity_cache hit=1 function_id=%llu",
+            static_cast<unsigned long long>(function.id));
+    } else {
     auto spans_result = function_spans(
         *snapshot, function, image->image_base, max_function_chunks);
     if (!spans_result)
         return workspace_result_t<decompiler_pipeline_request_t>::failure(
             spans_result.error());
-    auto spans = std::move(spans_result.value());
+    spans = std::move(spans_result.value());
     std::uint64_t total_bytes = 0;
     for (const auto& span : spans) {
         const auto span_size = span.second - span.first;
@@ -2142,7 +2231,6 @@ workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
                 "decompiler_ui.identity.bytes"));
     }
     std::vector<std::uint8_t> aggregate;
-    std::vector<decompiler_chunk_fingerprint_t> fingerprints;
     try {
         aggregate.reserve(static_cast<std::size_t>(total_bytes));
         fingerprints.reserve(spans.size());
@@ -2202,8 +2290,8 @@ workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
     native_identity.end = address_t{address_space_id_t::relative_virtual,
         *end, image->architecture, image->architecture_mode};
     native_identity.function_bytes_hash = function_hash.value();
-    native_identity.canonical_symbol = resolve_function_symbol(*snapshot, function);
-    decompiler_entity_key_t entity;
+    const auto canonical_symbol = resolve_function_symbol(*snapshot, function);
+    native_identity.canonical_symbol = canonical_symbol;
     entity.kind = decompiler_entity_kind_t::native_function;
     entity.format = image->format;
     entity.architecture = image->architecture;
@@ -2215,6 +2303,42 @@ workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
             ui_request_error(workspace_error_code_t::invalid_argument,
                 "decompiler pipeline function identity failed contract validation",
                 "decompiler_ui.identity.function"));
+    }
+    function_bytes_hash = function_hash.value();
+    {
+        native_identity_cache_entry_t identity_entry;
+        identity_entry.spans = spans;
+        identity_entry.fingerprints = fingerprints;
+        identity_entry.function_bytes_hash = function_bytes_hash;
+        identity_entry.entity = entity;
+        identity_entry.canonical_symbol = canonical_symbol;
+        identity_entry.function_id = function.id;
+        identity_entry.generation = snapshot->generation;
+        identity_entry.analysis_revision = snapshot->analysis_revision;
+        identity_entry.overlay_revision = snapshot->overlay_revision;
+        identity_entry.load_profile_hash = publication->load_profile_hash;
+        identity_entry.worker_protocol_hash = state.native_worker_protocol_hash;
+        std::lock_guard<std::mutex> identity_lock(identity_state.native_identity_mutex);
+        identity_entry.touch = ++identity_state.native_identity_clock;
+        if (identity_state.native_identity_cache.size() >=
+            k_native_identity_cache_max_entries) {
+            const auto oldest = std::min_element(
+                identity_state.native_identity_cache.begin(),
+                identity_state.native_identity_cache.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.touch < right.second.touch;
+                });
+            if (oldest != identity_state.native_identity_cache.end())
+                identity_state.native_identity_cache.erase(oldest);
+        }
+        identity_state.native_identity_cache.insert_or_assign(
+            function.id, std::move(identity_entry));
+    }
+    integration.value()->impl_->increment_metric(
+        &decompiler_ui_integration_metrics_t::native_identity_cache_misses);
+    ::diag::log_tagged_fmt("decompiler",
+        "native_identity_cache hit=0 function_id=%llu",
+        static_cast<unsigned long long>(function.id));
     }
     decompiler_pipeline_request_t pipeline_request;
     pipeline_request.invocation = invocation;
@@ -2241,7 +2365,7 @@ workspace_result_t<decompiler_pipeline_request_t> make_native_pipeline_request(
     pipeline_request.cache_identity.worker_protocol_hash =
         state.native_worker_protocol_hash;
     pipeline_request.cache_identity.loader_layout_hash = publication->load_profile_hash;
-    pipeline_request.cache_identity.function_bytes_hash = function_hash.value();
+    pipeline_request.cache_identity.function_bytes_hash = function_bytes_hash;
     pipeline_request.cache_identity.chunk_fingerprints = std::move(fingerprints);
     pipeline_request.cache_identity.metadata_revision = publication->analysis_revision;
     pipeline_request.cache_identity.type_graph_revision = publication->analysis_revision;

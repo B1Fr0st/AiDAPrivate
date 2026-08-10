@@ -56,8 +56,6 @@ class flirt_signature_db_t {
 public:
     static std::shared_ptr<const flirt_signature_db_t> load_embedded();
     static workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>
-        load_from_file(const std::string& utf8_path);
-    static workspace_result_t<std::shared_ptr<const flirt_signature_db_t>>
         load_from_blob(const std::uint8_t* data, std::size_t size,
                        std::string_view source_label);
 

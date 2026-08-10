@@ -3,6 +3,7 @@
 
 #include "../../src/core/analysis/flirt/flirt_engine.hpp"
 #include "../../src/core/analysis/flirt/flirt_signature_db.hpp"
+#include "../../src/core/analysis/flirt/static_recognition_service.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -93,6 +94,51 @@ std::shared_ptr<const flirt::flirt_signature_db_t> build_fixture_db()
     require(db.has_value(), "fixture FLIRT database failed validation");
     require(db.value()->entry_count() == 8, "fixture FLIRT database must hold 8 entries");
     return db.take_value();
+}
+
+void verify_library_exclusion()
+{
+    analysis_snapshot_t snapshot;
+    snapshot.baseline_complete = true;
+    symbol_record_t named;
+    named.address = rva(0x1300);
+    named.name = "user_supplied_name";
+    named.kind = symbol_kind_t::function;
+    snapshot.symbols.push_back(named);
+
+    static_recognition::recognition_records_t records;
+    const auto plant = [&records](std::uint64_t at, std::uint8_t tier) {
+        flirt::flirt_match_t match;
+        match.rva = at;
+        match.name = "crt_fn_" + std::to_string(at);
+        match.tier = tier;
+        match.confidence = tier == flirt::k_flirt_tier_exact_size ? 230 :
+            tier == flirt::k_flirt_tier_exact_crc ? 200 : 170;
+        records.flirt.push_back(std::move(match));
+    };
+    plant(0x1000, flirt::k_flirt_tier_exact_size);
+    plant(0x1100, flirt::k_flirt_tier_exact_crc);
+    plant(0x1200, flirt::k_flirt_tier_pattern_only);
+    plant(0x1300, flirt::k_flirt_tier_exact_size);
+
+    const auto exclusion = static_recognition::build_library_exclusion(records, snapshot);
+    require(exclusion.tier_candidates == 3,
+            "exclusion must consider exact_size and exact_crc tiers only");
+    require(exclusion.suppressed_named == 1,
+            "snapshot-named function must suppress exclusion");
+    require(static_recognition::is_library_function(exclusion, 0x1000),
+            "exact_size match must be excluded");
+    require(static_recognition::is_library_function(exclusion, 0x1100),
+            "exact_crc match must be excluded");
+    require(!static_recognition::is_library_function(exclusion, 0x1200),
+            "pattern_only match must never be excluded");
+    require(!static_recognition::is_library_function(exclusion, 0x1300),
+            "named override must never be excluded");
+
+    static_recognition::recognition_records_t empty_records;
+    const auto empty_exclusion = static_recognition::build_library_exclusion(empty_records, snapshot);
+    require(empty_exclusion.rvas.empty() && empty_exclusion.tier_candidates == 0,
+            "empty recognition must produce an empty exclusion set");
 }
 
 }
@@ -225,6 +271,8 @@ void run_flirt_engine_harness()
     require(absent.has_value() && absent.value().status == flirt::k_flirt_status_db_absent,
             "missing database must degrade to db_absent");
     require(absent.value().matches.empty(), "missing database must emit no matches");
+
+    verify_library_exclusion();
 }
 
 }

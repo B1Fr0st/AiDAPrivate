@@ -380,7 +380,7 @@ baseline_analysis_service_t::start(
     };
     auto graph_schedule = std::make_shared<baseline_graph_schedule_t>();
     std::vector<std::string> labels;
-    labels.reserve(18);
+    labels.reserve(21);
     auto add_node = [&](std::uint64_t id, std::string label,
                         std::vector<std::uint64_t> dependencies,
                         std::function<void(
@@ -449,6 +449,18 @@ baseline_analysis_service_t::start(
             [](auto& value, const auto& cancel) {
                 return value.search_index_entities_phase(cancel);
             }, {graph_schedule, 270, {265, 260}}));
+        add_node(278, "baseline.persistence_stage_decode", {200}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.persistence_stage_decode_phase(cancel);
+            }, {graph_schedule, 278, {200}}));
+        add_node(279, "baseline.persistence_stage_functions", {240}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.persistence_stage_functions_phase(cancel);
+            }, {graph_schedule, 279, {240}}));
+        add_node(281, "baseline.persistence_stage_metadata", {260, 3}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.persistence_stage_metadata_phase(cancel);
+            }, {graph_schedule, 281, {260, 3}}));
     } else {
         add_node(210, "baseline.data_discovery", {200}, phase_body(state,
             [](auto& value, const auto& cancel) {
@@ -480,10 +492,18 @@ baseline_analysis_service_t::start(
                 return value.search_index_phase(cancel);
             }, {graph_schedule, 270, {260}}));
     }
-    add_node(280, "baseline.persistence_submit", {270}, phase_body(state,
-        [](auto& value, const auto& cancel) {
-            return value.persistence_submit_phase(cancel);
-        }, {graph_schedule, 280, {270}}));
+    if (enable_parallel_fact_passes) {
+        add_node(280, "baseline.persistence_submit", {270, 278, 279, 281},
+            phase_body(state,
+                [](auto& value, const auto& cancel) {
+                    return value.persistence_submit_phase(cancel);
+                }, {graph_schedule, 280, {270, 278, 279, 281}}));
+    } else {
+        add_node(280, "baseline.persistence_submit", {270}, phase_body(state,
+            [](auto& value, const auto& cancel) {
+                return value.persistence_submit_phase(cancel);
+            }, {graph_schedule, 280, {270}}));
+    }
     add_node(290, "baseline.persistence_commit", {280}, phase_body(state,
         [](auto& value, const auto& cancel) {
             return value.persistence_commit_phase(cancel);

@@ -4,7 +4,7 @@
 #include "decompiler_feedback.hpp"
 #include "type_recovery.hpp"
 #include "workspace_database.hpp"
-#include "../decompiler/pseudocode_renderer_v2.hpp"
+#include "../decompiler/pseudocode_renderer.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -112,13 +112,13 @@ struct decompiler_service_snapshot_t {
 };
 
 struct decompiler_service_v2_request_t {
-    typed_ast_v2_build_request_t ast;
-    pseudocode_renderer_v2_request_t renderer;
+    typed_ast_build_request_t ast;
+    pseudocode_renderer_request_t renderer;
 };
 
 struct decompiler_service_v2_result_t {
     std::optional<typed_pseudocode_ast_v2_t> ast;
-    std::optional<pseudocode_renderer_v2_result_t> rendering;
+    std::optional<pseudocode_renderer_result_t> rendering;
     std::vector<decompiler_diagnostic_t> diagnostics;
 
     bool succeeded() const noexcept;

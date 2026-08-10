@@ -12,6 +12,7 @@
 #include "workspace/workspace_identity.hpp"
 #include "working_set_governor.hpp"
 #include "../../helpers/diag_log.hpp"
+#include "../infra/fast_containers.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -21,7 +22,6 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -256,7 +256,7 @@ struct mapped_window_t {
 
 struct window_shard_t {
     std::mutex mutex;
-    std::unordered_map<std::uint64_t, std::shared_ptr<mapped_window_t>> windows;
+    aida::infra::fast_u64_map<std::shared_ptr<mapped_window_t>> windows;
 };
 
 }
@@ -329,8 +329,7 @@ struct mapped_window_cache_t::state_t {
     std::atomic<std::uint64_t> map_calls{0};
     std::atomic<std::uint64_t> prefetch_warm_issued{0};
     mutable std::mutex pin_mutex;
-    mutable std::unordered_map<std::uint64_t,
-                               std::vector<std::shared_ptr<mapped_window_t>>>
+    mutable aida::infra::fast_u64_map<std::vector<std::shared_ptr<mapped_window_t>>>
         pins;
     mutable std::atomic<std::uint64_t> next_pin_token{1};
 

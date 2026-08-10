@@ -15,7 +15,6 @@
 #include "../../helpers/diag_log.hpp"
 #endif
 #include <vector>
-#include <map>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +28,8 @@
 #include <utility>
 #include <set>
 #include <tuple>
+
+#include "../infra/fast_containers.hpp"
 
 
 namespace code_index {
@@ -111,7 +112,7 @@ struct document_t
     std::string file_path;
     int         line_number = 0;
     std::string content;
-    std::map<std::string, double> tf;
+    aida::infra::fast_flat_map<std::string, double> tf;
     double dl = 0.0;
 };
 
@@ -139,7 +140,7 @@ public:
         auto tokens = tokenize(content);
         if (tokens.empty()) return;
 
-        std::map<std::string, int> freq;
+        aida::infra::fast_flat_map<std::string, int> freq;
         for (const auto& t : tokens) freq[t]++;
 
         doc.dl = static_cast<double>(tokens.size());
@@ -155,7 +156,7 @@ public:
         if (_docs.empty()) return;
 
         double total_dl = 0.0;
-        std::map<std::string, int> df;
+        aida::infra::fast_flat_map<std::string, int> df;
 
         for (const auto& doc : _docs) {
             total_dl += doc.dl;
@@ -300,7 +301,7 @@ public:
 
 private:
     std::vector<document_t> _docs;
-    std::map<std::string, double> _idf;
+    aida::infra::fast_flat_map<std::string, double> _idf;
     double _avg_dl = 0.0;
 };
 

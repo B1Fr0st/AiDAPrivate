@@ -332,8 +332,13 @@ void verify_workspace_ladder()
             value.status == static_recognition::k_status_partial,
             "static recognition must complete on the RTTI fixture");
     require(value.rtti.types.size() == 3, "service RTTI scan must recover 3 classes");
-    require(value.flirt_status == flirt::k_flirt_status_db_absent,
-            "empty seed DB must degrade FLIRT to db_absent");
+    const auto embedded_db = flirt::flirt_signature_db_t::load_embedded();
+    require(embedded_db && !embedded_db->empty(),
+            "embedded FLIRT seed DB must be populated on this host");
+    require(embedded_db->entry_count() >= 1000,
+            "embedded FLIRT seed DB must carry at least 1000 CRT signatures");
+    require(value.flirt_status == flirt::k_flirt_status_completed,
+            "populated seed DB must drive FLIRT to completion on the x64 fixture");
     require(value.vtable_slots.size() == 9, "service must publish 9 vtable slots");
     std::size_t leaf_named = 0;
     std::size_t base_named = 0;

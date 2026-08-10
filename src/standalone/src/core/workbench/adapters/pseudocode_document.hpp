@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace aida {
@@ -168,6 +169,11 @@ struct pseudocode_render_evidence_bundle_t {
     std::shared_ptr<const aida::analysis::type_graph_t> type_graph;
 };
 
+struct pseudocode_resolve_result_t {
+    workbench_error_t error{};
+    pseudocode_request_t request{};
+};
+
 class pseudocode_source_adapter_t {
 public:
     virtual ~pseudocode_source_adapter_t() = default;
@@ -208,6 +214,30 @@ public:
             return {workbench_error_code_t::adapter_rejected, 0};
         }
         return resolve_request(*locator.address, profile, timeout_ms, output);
+    }
+    virtual bool resolve_request_async_supported() const noexcept { return false; }
+    virtual workbench_error_t submit_resolve_request(
+        aida::analysis::decompiler_entity_locator_t locator,
+        aida::analysis::decompiler_profile_id_t profile,
+        std::uint64_t timeout_ms, std::uint64_t resolve_ticket,
+        bool force_refresh)
+    {
+        static_cast<void>(locator);
+        static_cast<void>(profile);
+        static_cast<void>(timeout_ms);
+        static_cast<void>(force_refresh);
+        return {workbench_error_code_t::adapter_rejected, resolve_ticket};
+    }
+    virtual bool poll_resolve_request(std::uint64_t resolve_ticket,
+                                      pseudocode_resolve_result_t& output)
+    {
+        static_cast<void>(resolve_ticket);
+        static_cast<void>(output);
+        return false;
+    }
+    virtual void cancel_resolve_request(std::uint64_t resolve_ticket) noexcept
+    {
+        static_cast<void>(resolve_ticket);
     }
     virtual workbench_error_t request_decompilation(
         const pseudocode_request_t& request,
@@ -287,9 +317,35 @@ struct pseudocode_command_result_t {
 
 class pseudocode_document_model_t final {
 public:
+    struct pending_resolution_t {
+        std::uint64_t ticket = 0;
+        aida::analysis::decompiler_entity_locator_t locator;
+        aida::analysis::decompiler_profile_id_t profile =
+            aida::analysis::decompiler_profile_id_t::balanced;
+        std::uint64_t timeout_ms = 0;
+        std::uint64_t workspace_generation = 0;
+        bool force_refresh = false;
+    };
+
+    struct resolution_outcome_t {
+        std::uint64_t ticket = 0;
+        bool submitted_request = false;
+        pseudocode_error_t error{};
+        pseudocode_request_t request{};
+    };
+
     explicit pseudocode_document_model_t(
         pseudocode_source_adapter_t& source,
         const pseudocode_navigation_adapter_t* navigation = nullptr) noexcept;
+
+    pseudocode_error_t request_async(
+        const aida::analysis::decompiler_entity_locator_t& locator,
+        aida::analysis::decompiler_profile_id_t profile,
+        std::uint64_t timeout_ms, bool force_refresh,
+        std::uint64_t& ticket_out);
+    std::vector<resolution_outcome_t> drain_resolutions();
+    bool resolution_pending(std::uint64_t ticket) const noexcept;
+    pseudocode_error_t cancel_resolution(std::uint64_t ticket);
 
     pseudocode_error_t resolve_request(
         std::uint64_t function_address,
@@ -355,6 +411,9 @@ private:
         const pseudocode_cached_document_t& cache_entry) const;
     void rebuild_address_map();
     void split_lines();
+    void ensure_active_views_current();
+    void invalidate_line_views() noexcept;
+    void bump_diagnostics_revision() noexcept;
     pseudocode_cached_document_t* find_cached(
         const aida::analysis::decompiler_entity_key_t& entity);
     const pseudocode_cached_document_t* find_cached(
@@ -373,6 +432,21 @@ private:
     pseudocode_cached_document_t* active_;
     pseudocode_selection_t selection_;
     std::vector<pseudocode_line_view_t> line_views_;
+    const void* line_views_key_ = nullptr;
+    const pseudocode_cached_document_t* line_views_owner_ = nullptr;
+    std::uint64_t diagnostics_revision_ = 0;
+    struct diagnostics_cache_key_t {
+        const pseudocode_cached_document_t* owner = nullptr;
+        pseudocode_cache_state_t state = pseudocode_cache_state_t::empty;
+        const void* document = nullptr;
+        std::uint64_t revision = 0;
+    };
+    mutable diagnostics_cache_key_t diagnostics_key_{};
+    mutable std::vector<pseudocode_diagnostic_view_t> diagnostics_cache_;
+    std::vector<pending_resolution_t> pending_resolutions_;
+    std::unordered_map<std::uint64_t, pseudocode_resolve_result_t> completed_resolutions_;
+    std::uint64_t next_resolve_ticket_ = 1;
+    bool has_pending_resolutions_ = false;
 };
 
 bool pseudocode_page_request_valid(const pseudocode_page_request_t& request) noexcept;

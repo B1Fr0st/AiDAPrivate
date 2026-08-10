@@ -5,8 +5,8 @@
 #include "../../src/core/analysis/decompiler/providers/ghidra_ir_adapter.hpp"
 #include "../../src/core/analysis/decompiler/providers/jvm_ssa.hpp"
 #include "../../src/core/analysis/decompiler/pseudocode_readability.hpp"
-#include "../../src/core/analysis/decompiler/pseudocode_renderer_v2.hpp"
-#include "../../src/core/analysis/decompiler/typed_ast_v2.hpp"
+#include "../../src/core/analysis/decompiler/pseudocode_renderer.hpp"
+#include "../../src/core/analysis/decompiler/typed_ast.hpp"
 #include "../../src/core/disasm/ghidra_decompiler.hpp"
 
 #include <windows.h>
@@ -493,12 +493,12 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
                 "decompiler.isolated_worker.provider_output_binding"));
         return result;
     }
-    typed_ast_v2_build_request_t ast_request;
+    typed_ast_build_request_t ast_request;
     ast_request.limits.max_hir_values = static_cast<std::size_t>((std::min<std::uint64_t>)(
         job.profile.max_hir_nodes, (std::numeric_limits<std::size_t>::max)()));
     ast_request.limits.max_ast_nodes = static_cast<std::size_t>((std::min<std::uint64_t>)(
         job.profile.max_ast_nodes, (std::numeric_limits<std::size_t>::max)()));
-    auto ast = build_typed_ast_v2(output->hir, output->type_graph, ast_request);
+    auto ast = build_typed_ast(output->hir, output->type_graph, ast_request);
     if (!ast.succeeded() || !ast.ast) {
         result.diagnostics = ast.diagnostics;
         if (result.diagnostics.empty())
@@ -529,11 +529,11 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
             diag::log_tagged_fmt("dec", "readability_transforms status=warning_no_transform continuing_with_unmodified_ast");
         }
     }
-    pseudocode_renderer_v2_request_t render_request;
+    pseudocode_renderer_request_t render_request;
     render_request.profile = job.profile.profile;
     render_request.settings = job.cache_key.renderer;
     render_request.limits.max_ast_nodes = ast_request.limits.max_ast_nodes;
-    const auto rendered = render_pseudocode_v2(*ast.ast, output->type_graph, render_request);
+    const auto rendered = render_pseudocode(*ast.ast, output->type_graph, render_request);
     if (!rendered.succeeded() || !rendered.document) {
         result.diagnostics = rendered.diagnostics;
         if (result.diagnostics.empty())

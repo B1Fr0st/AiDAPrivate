@@ -26,6 +26,34 @@ namespace {
 constexpr std::uint64_t kInstructionEntityTag = 1ULL << 56;
 constexpr std::uint64_t kTypeEntityTag = 10ULL << 56;
 
+constexpr std::uint32_t packed_domain_bit(packed_page_type_t domain) noexcept {
+    return 1U << static_cast<std::uint32_t>(domain);
+}
+
+constexpr std::uint32_t kPersistenceStageDecodeMask =
+    packed_domain_bit(packed_page_type_t::instructions) |
+    packed_domain_bit(packed_page_type_t::operands) |
+    packed_domain_bit(packed_page_type_t::target_facts) |
+    packed_domain_bit(packed_page_type_t::address_expressions) |
+    packed_domain_bit(packed_page_type_t::coverage);
+constexpr std::uint32_t kPersistenceStageFunctionsMask =
+    packed_domain_bit(packed_page_type_t::basic_blocks) |
+    packed_domain_bit(packed_page_type_t::edges) |
+    packed_domain_bit(packed_page_type_t::call_graph);
+constexpr std::uint32_t kPersistenceStageMetadataMask =
+    packed_domain_bit(packed_page_type_t::functions) |
+    packed_domain_bit(packed_page_type_t::function_chunks) |
+    packed_domain_bit(packed_page_type_t::xrefs) |
+    packed_domain_bit(packed_page_type_t::strings) |
+    packed_domain_bit(packed_page_type_t::symbols) |
+    packed_domain_bit(packed_page_type_t::pointer_facts) |
+    packed_domain_bit(packed_page_type_t::type_references) |
+    packed_domain_bit(packed_page_type_t::metadata_conflicts) |
+    packed_domain_bit(packed_page_type_t::symbol_type_candidates);
+constexpr std::uint32_t kPersistenceStageAllMask =
+    kPersistenceStageDecodeMask | kPersistenceStageFunctionsMask |
+    kPersistenceStageMetadataMask;
+
 class phase_completion_guard_t final {
 public:
     phase_completion_guard_t(analysis_metrics_t& metrics, phase_measurement_t& measurement) noexcept
@@ -900,6 +928,9 @@ enum class baseline_progress_slot_t : std::size_t {
     metadata,
     search_instructions,
     search,
+    persistence_stage_decode,
+    persistence_stage_functions,
+    persistence_stage_metadata,
     persistence_submit,
     persistence_commit,
     publish,
@@ -910,24 +941,26 @@ constexpr std::size_t kProgressSlotCount =
     static_cast<std::size_t>(baseline_progress_slot_t::count);
 
 constexpr std::uint64_t kProgressSlotWeights[kProgressSlotCount] = {
-    2, 2, 4, 45, 3, 2, 5, 10, 6, 2, 6, 1, 4, 3, 2, 1, 1, 1};
+    2, 2, 4, 45, 3, 2, 5, 10, 6, 2, 6, 1, 4, 3, 2, 3, 1, 1, 1, 1, 1};
 
 constexpr const char* kProgressSlotNames[kProgressSlotCount] = {
     "parse", "seed", "strings_data", "decode", "decode_merge", "data_image_scan",
     "data_discovery", "function_recovery", "functions", "cfg_calls", "xrefs",
     "publish_xrefs", "metadata_symbols_types", "search_index_instructions",
-    "search_index", "persistence", "persistence", "publish_ready"};
+    "search_index", "persistence", "persistence", "persistence", "persistence",
+    "persistence", "publish_ready"};
 
 constexpr const char* kNodeWindowNames[kProgressSlotCount] = {
     "parse", "seed", "strings_data", "decode", "decode_merge", "data_image_scan",
     "data_discovery", "function_recovery", "functions", "cfg_calls", "xrefs",
     "publish_xrefs", "metadata_symbols_types", "search_index_instructions",
-    "search_index_entities", "persistence_submit", "persistence_commit",
-    "publish_ready"};
+    "search_index_entities", "persistence_stage_decode",
+    "persistence_stage_functions", "persistence_stage_metadata",
+    "persistence_submit", "persistence_commit", "publish_ready"};
 
 constexpr std::uint64_t kNodeSoftBudgetMs[kProgressSlotCount] = {
     5000, 5000, 30000, 135000, 10000, 8000, 20000, 30000, 20000, 5000, 25000,
-    5000, 15000, 15000, 15000, 5000, 25000, 2000};
+    5000, 15000, 15000, 15000, 30000, 5000, 10000, 5000, 25000, 2000};
 
 struct progress_slot_state_t {
     std::atomic<std::uint64_t> complete{0};
@@ -1210,6 +1243,10 @@ struct pe_baseline_analyzer_t::impl_t {
     std::shared_ptr<search_index_t> instruction_search;
     std::shared_ptr<search_index_t> search;
     persistence_ticket_t persistence_ticket;
+    std::shared_ptr<decode_materializer::materialize_plan_t> materialize_plan;
+    std::shared_ptr<workspace_snapshot_staging_t> persistence_staging;
+    std::uint32_t persistence_staged_mask = 0;
+    std::mutex persistence_staging_mutex;
     std::uint64_t persistence_submit_ns = 0;
     std::uint64_t merge_snapshot_bytes = 0;
     std::uint64_t decode_transient_charged = 0;
@@ -1380,12 +1417,102 @@ struct pe_baseline_analyzer_t::impl_t {
 
     void discard_persistence_candidate() noexcept {
         const auto candidate = persistence_ticket.snapshot_candidate;
-        if (!candidate)
-            return;
-        try {
-            (void)candidate->discard();
-        } catch (...) {
+        if (candidate) {
+            try {
+                (void)candidate->discard();
+            } catch (...) {
+            }
         }
+        std::shared_ptr<workspace_snapshot_staging_t> staging;
+        {
+            std::lock_guard<std::mutex> lock(persistence_staging_mutex);
+            staging = std::move(persistence_staging);
+            persistence_staged_mask = 0;
+        }
+        if (staging) {
+            try {
+                staging->discard(make_workspace_error(
+                    workspace_error_code_t::persistence_failure,
+                    "baseline persistence staging was discarded",
+                    "persistence"));
+            } catch (...) {
+            }
+        }
+    }
+
+    workspace_result_t<void> persistence_stage_begin_locked() {
+        if (persistence_staging)
+            return workspace_result_t<void>::success();
+        const auto database = workspace->database();
+        std::shared_ptr<const analysis_snapshot_t> staged_snapshot = draft;
+        if (!staged_snapshot)
+            staged_snapshot = final_snapshot;
+        if (!database || !staged_snapshot) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::persistence_failure,
+                "baseline persistence staging prerequisites are unavailable",
+                "persistence"));
+        }
+        auto ticket = database->begin_snapshot_staging(
+            std::move(staged_snapshot), settings.canonical_json(), "{}",
+            cancellation.token());
+        if (!ticket.accepted || !ticket.staging || !ticket.snapshot_candidate) {
+            if (ticket.completion.valid()) {
+                const auto& completed = ticket.completion.get();
+                if (!completed)
+                    return workspace_result_t<void>::failure(completed.error());
+            }
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::persistence_failure,
+                "workspace persistence staging was rejected", "persistence"));
+        }
+        ticket.staging->expect_complete_baseline();
+        persistence_staging = std::move(ticket.staging);
+        return workspace_result_t<void>::success();
+    }
+
+    workspace_result_t<void> persistence_stage_domains(std::uint32_t domain_mask) {
+        if (domain_mask == 0 ||
+            (domain_mask & kPersistenceStageAllMask) != domain_mask) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "baseline persistence stage mask is invalid", "persistence"));
+        }
+        const auto database = workspace->database();
+        if (!database) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::persistence_failure,
+                "baseline persistence database is unavailable", "persistence"));
+        }
+        std::unique_lock<std::mutex> lock(persistence_staging_mutex);
+        auto begun = persistence_stage_begin_locked();
+        if (!begun)
+            return begun;
+        if ((persistence_staged_mask & domain_mask) != 0) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "baseline persistence stage domains overlap", "persistence"));
+        }
+        auto stage_ticket = database->stage_snapshot_domains(
+            persistence_staging, domain_mask, cancellation.token());
+        if (!stage_ticket.accepted || !stage_ticket.completion.valid()) {
+            if (stage_ticket.completion.valid()) {
+                const auto& completed = stage_ticket.completion.get();
+                if (!completed)
+                    return workspace_result_t<void>::failure(completed.error());
+            }
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::persistence_failure,
+                "workspace persistence staging rejected a domain mask",
+                "persistence"));
+        }
+        persistence_staged_mask |= domain_mask;
+        lock.unlock();
+        stage_ticket.completion.wait();
+        const auto& completed = stage_ticket.completion.get();
+        if (!completed)
+            return workspace_result_t<void>::failure(completed.error());
+        return workspace_result_t<void>::success();
     }
 
     std::uint64_t executable_bytes() const noexcept {
@@ -1463,6 +1590,74 @@ struct pe_baseline_analyzer_t::impl_t {
     }
 
     std::mutex governor_mutex;
+};
+
+class progressive_materialize_bridge_t final : public decode_build_progress_t {
+public:
+    explicit progressive_materialize_bridge_t(pe_baseline_analyzer_t::impl_t& impl)
+        : impl_(impl) {}
+
+    void accepted_counts_final(
+        const std::vector<decode_accepted_tile_counts_t>& tile_counts,
+        std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+        std::uint64_t) override {
+        auto current = snapshot_memory_accounted_bytes(*impl_.draft);
+        if (!current) {
+            record_failure(current.error());
+            return;
+        }
+        const auto r0 = current.value() >= impl_.settings.max_analysis_memory_bytes
+            ? 0ULL
+            : impl_.settings.max_analysis_memory_bytes - current.value();
+        auto plan = decode_materializer::materialize_begin(tile_counts,
+            *impl_.draft, r0);
+        if (!plan) {
+            record_failure(plan.error());
+            return;
+        }
+        impl_.materialize_plan = plan.take_value();
+        auto accounted = snapshot_memory_accounted_bytes(*impl_.draft);
+        if (accounted)
+            impl_.governor_charge_resident(accounted.value());
+    }
+
+    workspace_result_t<void> packed_tile_ready(std::size_t tile_ordinal,
+        packed_analysis_shard_t& tile) override {
+        {
+            std::lock_guard<std::mutex> lock(failure_mutex_);
+            if (failure_)
+                return workspace_result_t<void>::failure(*failure_);
+        }
+        if (!impl_.materialize_plan) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "tile decode materialization plan is unavailable", "decode"));
+        }
+        auto materialized = decode_materializer::materialize_tile(
+            *impl_.materialize_plan, tile_ordinal, tile, *impl_.draft,
+            impl_.cancellation.token());
+        if (!materialized) {
+            record_failure(materialized.error());
+            return workspace_result_t<void>::failure(materialized.error());
+        }
+        return workspace_result_t<void>::success();
+    }
+
+    std::optional<workspace_error_t> failure() const {
+        std::lock_guard<std::mutex> lock(failure_mutex_);
+        return failure_;
+    }
+
+private:
+    void record_failure(workspace_error_t error) {
+        std::lock_guard<std::mutex> lock(failure_mutex_);
+        if (!failure_)
+            failure_ = std::move(error);
+    }
+
+    pe_baseline_analyzer_t::impl_t& impl_;
+    mutable std::mutex failure_mutex_;
+    std::optional<workspace_error_t> failure_;
 };
 
 pe_baseline_analyzer_t::pe_baseline_analyzer_t(std::unique_ptr<impl_t> impl) : impl_(std::move(impl)) {
@@ -2020,11 +2215,15 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_phase(const std::atomic<
         decode_seeds.push_back(
             {seed.address, seed.provenance, seed.confidence, seed.stable_source_id});
     }
+    progressive_materialize_bridge_t materialize_bridge(*impl_);
     auto decoded = orchestrator.value().run_shared(*impl_->provider_snapshot,
         *impl_->image_layout, *impl_->decode_partition, std::move(decode_seeds),
-        *executor.value(), impl_->cancellation.token());
+        *executor.value(), impl_->cancellation.token(), nullptr,
+        &materialize_bridge);
     if (!decoded)
         return workspace_result_t<void>::failure(decoded.error());
+    if (const auto bridge_failure = materialize_bridge.failure())
+        return workspace_result_t<void>::failure(*bridge_failure);
     auto result = decoded.take_value();
     if (result.packed_shards.empty() && result.statistics.accepted_instructions != 0) {
         return workspace_result_t<void>::failure(make_workspace_error(
@@ -2070,15 +2269,15 @@ workspace_result_t<void> pe_baseline_analyzer_t::decode_merge_phase(
                 workspace_error_code_t::integrity_failure,
                 "tile decode merge publication is unavailable", "decode_merge"));
         }
-        auto current = snapshot_memory_accounted_bytes(*impl_->draft);
-        if (!current)
-            return workspace_result_t<void>::failure(current.error());
-        const auto r0 = current.value() >= impl_->settings.max_analysis_memory_bytes
-            ? 0ULL
-            : impl_->settings.max_analysis_memory_bytes - current.value();
-        auto materialized = decode_materializer::materialize(*impl_->tile_result,
-            *impl_->draft, r0, impl_->settings.fact_pass_worker_budget,
-            impl_->cancellation.token());
+        if (!impl_->materialize_plan) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "tile decode merge plan is unavailable", "decode_merge"));
+        }
+        auto materialized = decode_materializer::materialize_finish(
+            *impl_->materialize_plan, *impl_->tile_result, *impl_->draft,
+            impl_->settings.fact_pass_worker_budget, impl_->cancellation.token());
+        impl_->materialize_plan.reset();
         if (!materialized)
             return materialized;
         auto coverage = build_canonical_decode_coverage(*impl_->image,
@@ -2890,8 +3089,11 @@ workspace_result_t<void> pe_baseline_analyzer_t::search_index_entities_phase(
     auto validated = validate_analysis_snapshot(*impl_->draft, true, impl_->cancellation.token());
     if (!validated)
         return validated;
-    impl_->final_snapshot = impl_->draft;
-    impl_->draft.reset();
+    {
+        std::lock_guard<std::mutex> staging_lock(impl_->persistence_staging_mutex);
+        impl_->final_snapshot = impl_->draft;
+        impl_->draft.reset();
+    }
     auto bytes = snapshot_memory_accounted_bytes(*impl_->final_snapshot);
     if (!bytes || bytes.value() >= impl_->settings.max_analysis_memory_bytes) {
         return workspace_result_t<void>::failure(bytes ? make_workspace_error(
@@ -2945,6 +3147,78 @@ workspace_result_t<void> pe_baseline_analyzer_t::search_index_phase(
     return search_index_entities_phase(runtime_cancel);
 }
 
+workspace_result_t<void> pe_baseline_analyzer_t::persistence_stage_decode_phase(
+    const std::atomic<bool>& runtime_cancel) {
+    auto measurement = impl_->metrics->begin_phase(baseline_phase_t::persistence);
+    phase_completion_guard_t guard(*impl_->metrics, measurement);
+    auto node_window = impl_->node_guard(
+        baseline_progress_slot_t::persistence_stage_decode);
+    auto active = impl_->ensure_active(runtime_cancel, "persistence");
+    if (!active)
+        return active;
+    if (!impl_->draft && !impl_->final_snapshot) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "decode persistence staging requires the analysis snapshot",
+            "persistence"));
+    }
+    auto staged = impl_->persistence_stage_domains(kPersistenceStageDecodeMask);
+    if (!staged)
+        return staged;
+    impl_->metrics->end_phase(measurement, 0, 0, 1, 1, false);
+    return impl_->update_progress_slot(
+        baseline_progress_slot_t::persistence_stage_decode, "persistence", 1, 1,
+        0, 0);
+}
+
+workspace_result_t<void> pe_baseline_analyzer_t::persistence_stage_functions_phase(
+    const std::atomic<bool>& runtime_cancel) {
+    auto measurement = impl_->metrics->begin_phase(baseline_phase_t::persistence);
+    phase_completion_guard_t guard(*impl_->metrics, measurement);
+    auto node_window = impl_->node_guard(
+        baseline_progress_slot_t::persistence_stage_functions);
+    auto active = impl_->ensure_active(runtime_cancel, "persistence");
+    if (!active)
+        return active;
+    if (!impl_->draft && !impl_->final_snapshot) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "function persistence staging requires the analysis snapshot",
+            "persistence"));
+    }
+    auto staged = impl_->persistence_stage_domains(kPersistenceStageFunctionsMask);
+    if (!staged)
+        return staged;
+    impl_->metrics->end_phase(measurement, 0, 0, 1, 1, false);
+    return impl_->update_progress_slot(
+        baseline_progress_slot_t::persistence_stage_functions, "persistence", 1,
+        1, 0, 0);
+}
+
+workspace_result_t<void> pe_baseline_analyzer_t::persistence_stage_metadata_phase(
+    const std::atomic<bool>& runtime_cancel) {
+    auto measurement = impl_->metrics->begin_phase(baseline_phase_t::persistence);
+    phase_completion_guard_t guard(*impl_->metrics, measurement);
+    auto node_window = impl_->node_guard(
+        baseline_progress_slot_t::persistence_stage_metadata);
+    auto active = impl_->ensure_active(runtime_cancel, "persistence");
+    if (!active)
+        return active;
+    if (!impl_->draft && !impl_->final_snapshot) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "metadata persistence staging requires the analysis snapshot",
+            "persistence"));
+    }
+    auto staged = impl_->persistence_stage_domains(kPersistenceStageMetadataMask);
+    if (!staged)
+        return staged;
+    impl_->metrics->end_phase(measurement, 0, 0, 1, 1, false);
+    return impl_->update_progress_slot(
+        baseline_progress_slot_t::persistence_stage_metadata, "persistence", 1,
+        1, 0, 0);
+}
+
 workspace_result_t<void> pe_baseline_analyzer_t::persistence_submit_phase(
     const std::atomic<bool>& runtime_cancel) {
     auto measurement = impl_->metrics->begin_phase(baseline_phase_t::persistence);
@@ -2987,9 +3261,42 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_submit_phase(
             return workspace_result_t<void>::failure(rebound.error());
         managed_publication = rebound.take_value();
     }
-    impl_->persistence_ticket = database->persist_snapshot(
-        impl_->final_snapshot, std::move(products), std::move(managed_publication),
-        impl_->settings.canonical_json(), impl_->metrics->snapshot().to_json(), cancel);
+    if (impl_->settings.enable_parallel_fact_passes) {
+        auto validated = validate_analysis_snapshot(*impl_->final_snapshot,
+            true, cancel);
+        if (!validated) {
+            impl_->discard_persistence_candidate();
+            return validated;
+        }
+        std::shared_ptr<workspace_snapshot_staging_t> staging;
+        std::optional<workspace_error_t> staging_error;
+        {
+            std::lock_guard<std::mutex> lock(impl_->persistence_staging_mutex);
+            auto begun = impl_->persistence_stage_begin_locked();
+            if (!begun) {
+                staging_error = begun.error();
+            } else {
+                auto metrics_applied =
+                    impl_->persistence_staging->set_metrics_json(
+                        impl_->metrics->snapshot().to_json());
+                if (!metrics_applied)
+                    staging_error = metrics_applied.error();
+                else
+                    staging = impl_->persistence_staging;
+            }
+        }
+        if (staging_error) {
+            impl_->discard_persistence_candidate();
+            return workspace_result_t<void>::failure(std::move(*staging_error));
+        }
+        impl_->persistence_ticket = database->finalize_snapshot_staging(
+            std::move(staging), std::move(products),
+            std::move(managed_publication), cancel);
+    } else {
+        impl_->persistence_ticket = database->persist_snapshot(
+            impl_->final_snapshot, std::move(products), std::move(managed_publication),
+            impl_->settings.canonical_json(), impl_->metrics->snapshot().to_json(), cancel);
+    }
     if (!impl_->persistence_ticket.accepted || !impl_->persistence_ticket.completion.valid() ||
         !impl_->persistence_ticket.snapshot_candidate) {
         impl_->discard_persistence_candidate();
@@ -3079,6 +3386,11 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_commit_phase(
     if (!finalized) {
         impl_->discard_persistence_candidate();
         return workspace_result_t<void>::failure(finalized.error());
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl_->persistence_staging_mutex);
+        impl_->persistence_staging.reset();
+        impl_->persistence_staged_mask = 0;
     }
     if (impl_->persistence_submit_ns != 0) {
         const auto completed_ns = analysis_metrics_t::steady_now_ns();

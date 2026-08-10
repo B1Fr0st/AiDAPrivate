@@ -1,6 +1,6 @@
 #include "pseudocode_document.hpp"
 
-#include "../../analysis/decompiler/pseudocode_renderer_v2.hpp"
+#include "../../analysis/decompiler/pseudocode_renderer.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -511,11 +511,36 @@ bool pseudocode_document_model_t::evict_oldest()
         return false;
     if (active_ == &(*oldest)) {
         active_ = nullptr;
-        line_views_.clear();
+        invalidate_line_views();
         selection_ = {};
     }
     cache_.erase(oldest);
     return true;
+}
+
+void pseudocode_document_model_t::ensure_active_views_current()
+{
+    if (!active_ || active_->state != pseudocode_cache_state_t::cached ||
+        !active_->document)
+        return;
+    if (line_views_owner_ == active_ && line_views_key_ == active_->document.get())
+        return;
+    split_lines();
+    rebuild_address_map();
+    line_views_owner_ = active_;
+    line_views_key_ = active_->document.get();
+}
+
+void pseudocode_document_model_t::invalidate_line_views() noexcept
+{
+    line_views_.clear();
+    line_views_owner_ = nullptr;
+    line_views_key_ = nullptr;
+}
+
+void pseudocode_document_model_t::bump_diagnostics_revision() noexcept
+{
+    ++diagnostics_revision_;
 }
 
 void pseudocode_document_model_t::split_lines()
@@ -648,6 +673,116 @@ pseudocode_error_t pseudocode_document_model_t::resolve_request(
     return {};
 }
 
+pseudocode_error_t pseudocode_document_model_t::request_async(
+    const aida::analysis::decompiler_entity_locator_t& locator,
+    aida::analysis::decompiler_profile_id_t profile,
+    std::uint64_t timeout_ms, bool force_refresh,
+    std::uint64_t& ticket_out)
+{
+    ticket_out = 0;
+    if (timeout_ms == 0 || (locator.address.has_value() == locator.token.has_value()))
+        return fail(pseudocode_error_code_t::invalid_argument);
+    if (next_resolve_ticket_ == 0)
+        return fail(pseudocode_error_code_t::resource_exhausted);
+    if (!source_->resolve_request_async_supported()) {
+        pseudocode_request_t resolved;
+        const auto error = resolve_request(locator, profile, timeout_ms, resolved);
+        if (!error)
+            return error;
+        const auto ticket = next_resolve_ticket_++;
+        pseudocode_resolve_result_t result;
+        result.request = std::move(resolved);
+        pending_resolutions_.push_back(pending_resolution_t{
+            ticket, locator, profile, timeout_ms, bound_generation_, force_refresh});
+        completed_resolutions_.emplace(ticket, std::move(result));
+        has_pending_resolutions_ = true;
+        ticket_out = ticket;
+        return {};
+    }
+    const auto ticket = next_resolve_ticket_++;
+    const auto submitted = source_->submit_resolve_request(
+        locator, profile, timeout_ms, ticket, force_refresh);
+    if (!submitted) {
+        return fail(pseudocode_error_code_t::adapter_rejected,
+                    static_cast<std::uint64_t>(submitted.code));
+    }
+    pending_resolutions_.push_back(pending_resolution_t{
+        ticket, locator, profile, timeout_ms, bound_generation_, force_refresh});
+    has_pending_resolutions_ = true;
+    ticket_out = ticket;
+    return {};
+}
+
+std::vector<pseudocode_document_model_t::resolution_outcome_t>
+pseudocode_document_model_t::drain_resolutions()
+{
+    std::vector<resolution_outcome_t> outcomes;
+    if (pending_resolutions_.empty())
+        return outcomes;
+    std::vector<pending_resolution_t> remaining;
+    remaining.reserve(pending_resolutions_.size());
+    for (auto& pending : pending_resolutions_) {
+        pseudocode_resolve_result_t result;
+        bool ready = false;
+        const auto completed = completed_resolutions_.find(pending.ticket);
+        if (completed != completed_resolutions_.end()) {
+            result = std::move(completed->second);
+            completed_resolutions_.erase(completed);
+            ready = true;
+        } else if (source_->poll_resolve_request(pending.ticket, result)) {
+            ready = true;
+        }
+        if (!ready) {
+            remaining.push_back(std::move(pending));
+            continue;
+        }
+        resolution_outcome_t outcome;
+        outcome.ticket = pending.ticket;
+        if (!lease_current(pending.workspace_generation)) {
+            outcome.error = stale();
+        } else if (!result.error) {
+            outcome.error = fail(pseudocode_error_code_t::adapter_rejected,
+                                 static_cast<std::uint64_t>(result.error.code));
+        } else if (!pseudocode_request_valid(result.request)) {
+            outcome.error = fail(pseudocode_error_code_t::invalid_argument);
+        } else {
+            outcome.request = result.request;
+            outcome.error = request(result.request, pending.force_refresh);
+            outcome.submitted_request = true;
+        }
+        outcomes.push_back(std::move(outcome));
+    }
+    pending_resolutions_ = std::move(remaining);
+    has_pending_resolutions_ = !pending_resolutions_.empty();
+    return outcomes;
+}
+
+bool pseudocode_document_model_t::resolution_pending(
+    std::uint64_t ticket) const noexcept
+{
+    return std::any_of(pending_resolutions_.begin(), pending_resolutions_.end(),
+        [ticket](const pending_resolution_t& pending) {
+            return pending.ticket == ticket;
+        });
+}
+
+pseudocode_error_t pseudocode_document_model_t::cancel_resolution(std::uint64_t ticket)
+{
+    for (auto iterator = pending_resolutions_.begin();
+         iterator != pending_resolutions_.end(); ++iterator) {
+        if (iterator->ticket != ticket)
+            continue;
+        source_->cancel_resolve_request(ticket);
+        pseudocode_resolve_result_t ignored;
+        static_cast<void>(source_->poll_resolve_request(ticket, ignored));
+        pending_resolutions_.erase(iterator);
+        completed_resolutions_.erase(ticket);
+        has_pending_resolutions_ = !pending_resolutions_.empty();
+        return {};
+    }
+    return fail(pseudocode_error_code_t::no_active_request, ticket);
+}
+
 pseudocode_error_t pseudocode_document_model_t::request(
     const pseudocode_request_t& request)
 {
@@ -677,7 +812,7 @@ pseudocode_error_t pseudocode_document_model_t::request(
     auto* existing = find_cached(request);
     if (existing && existing->state == pseudocode_cache_state_t::requesting) {
         active_ = existing;
-        line_views_.clear();
+        invalidate_line_views();
         selection_ = {};
         if (!force_refresh && entry_current(*existing) &&
             same_binding(existing->binding, request.binding))
@@ -694,8 +829,7 @@ pseudocode_error_t pseudocode_document_model_t::request(
         existing->profile_info.profile == request.profile &&
         same_binding(existing->binding, request.binding)) {
         active_ = existing;
-        split_lines();
-        rebuild_address_map();
+        ensure_active_views_current();
         if (!source_->generation_current(bound_generation_))
             return stale();
         return {};
@@ -750,7 +884,7 @@ pseudocode_error_t pseudocode_document_model_t::request(
         cache_.push_back(std::move(entry));
         active_ = &cache_.back();
     }
-    line_views_.clear();
+    invalidate_line_views();
     selection_ = {};
     return {};
 }
@@ -758,6 +892,8 @@ pseudocode_error_t pseudocode_document_model_t::request(
 pseudocode_error_t pseudocode_document_model_t::activate(
     const aida::analysis::decompiler_entity_key_t& entity)
 {
+    if (has_pending_resolutions_)
+        static_cast<void>(drain_resolutions());
     if (!aida::analysis::validate_decompiler_entity_key(entity).valid())
         return fail(pseudocode_error_code_t::invalid_argument);
     auto* existing = find_cached(entity);
@@ -768,14 +904,13 @@ pseudocode_error_t pseudocode_document_model_t::activate(
     if (changed)
         selection_ = {};
     if (!entry_current(*existing)) {
-        line_views_.clear();
+        invalidate_line_views();
         return stale();
     }
     if (existing->state == pseudocode_cache_state_t::cached) {
-        split_lines();
-        rebuild_address_map();
+        ensure_active_views_current();
     } else {
-        line_views_.clear();
+        invalidate_line_views();
     }
     return {};
 }
@@ -783,6 +918,8 @@ pseudocode_error_t pseudocode_document_model_t::activate(
 pseudocode_error_t pseudocode_document_model_t::activate(
     const pseudocode_request_t& request)
 {
+    if (has_pending_resolutions_)
+        static_cast<void>(drain_resolutions());
     if (!pseudocode_request_valid(request))
         return fail(pseudocode_error_code_t::invalid_argument);
     auto* existing = find_cached(request);
@@ -793,14 +930,13 @@ pseudocode_error_t pseudocode_document_model_t::activate(
     if (changed)
         selection_ = {};
     if (!entry_current(*existing)) {
-        line_views_.clear();
+        invalidate_line_views();
         return stale();
     }
     if (existing->state == pseudocode_cache_state_t::cached) {
-        split_lines();
-        rebuild_address_map();
+        ensure_active_views_current();
     } else {
-        line_views_.clear();
+        invalidate_line_views();
     }
     return {};
 }
@@ -818,7 +954,7 @@ pseudocode_error_t pseudocode_document_model_t::cancel(std::uint64_t job_id)
                         static_cast<std::uint64_t>(adapter_error.code));
         entry.state = pseudocode_cache_state_t::cancelled;
         if (active_ == &entry) {
-            line_views_.clear();
+            invalidate_line_views();
             selection_ = {};
         }
         return {};
@@ -828,6 +964,8 @@ pseudocode_error_t pseudocode_document_model_t::cancel(std::uint64_t job_id)
 
 pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
 {
+    if (has_pending_resolutions_)
+        static_cast<void>(drain_resolutions());
     for (auto& entry : cache_) {
         if (entry.job_id != job_id)
             continue;
@@ -840,9 +978,10 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
             entry.failure_diagnostics.clear();
             entry.failure_diagnostics.push_back(stale_result_diagnostic(
                 job_id, entry.workspace_generation, source_->current_generation()));
+            bump_diagnostics_revision();
             entry.profile_info.elapsed_ms = now_ms() - entry.cached_at_ms;
             if (entry_active) {
-                line_views_.clear();
+                invalidate_line_views();
                 selection_ = {};
             }
             return fail(pseudocode_error_code_t::stale_result, job_id);
@@ -879,9 +1018,10 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
                         ? "decompiler.document.resource_limit"
                         : "decompiler.document.rejected",
                     job_id));
+                bump_diagnostics_revision();
                 entry.profile_info.elapsed_ms = now_ms() - entry.cached_at_ms;
                 if (entry_active) {
-                    line_views_.clear();
+                    invalidate_line_views();
                     selection_ = {};
                 }
                 return error;
@@ -892,11 +1032,11 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
             entry.document = std::make_shared<aida::analysis::decompiler_document_t>(
                 std::move(document));
             entry.failure_diagnostics.clear();
+            bump_diagnostics_revision();
             entry.state = pseudocode_cache_state_t::cached;
             entry.profile_info.elapsed_ms = now_ms() - entry.cached_at_ms;
             if (entry_active) {
-                split_lines();
-                rebuild_address_map();
+                ensure_active_views_current();
             }
             if (!entry_current(entry))
                 return reject_stale_result();
@@ -924,11 +1064,12 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
         if (!entry_current(entry))
             return reject_stale_result();
         entry.failure_diagnostics = std::move(diagnostics);
+        bump_diagnostics_revision();
         entry.document.reset();
         entry.state = pseudocode_cache_state_t::failed;
         entry.profile_info.elapsed_ms = now_ms() - entry.cached_at_ms;
         if (entry_active) {
-            line_views_.clear();
+            invalidate_line_views();
             selection_ = {};
         }
         return fail(pseudocode_error_code_t::worker_failure, job_id);
@@ -940,6 +1081,9 @@ pseudocode_error_t pseudocode_document_model_t::page(
     const pseudocode_page_request_t& request,
     pseudocode_page_t& output) const
 {
+    if (has_pending_resolutions_)
+        static_cast<void>(const_cast<pseudocode_document_model_t*>(this)->
+            drain_resolutions());
     output = {};
     if (!pseudocode_page_request_valid(request))
         return fail(pseudocode_error_code_t::invalid_argument, request.line_count);
@@ -1004,21 +1148,29 @@ pseudocode_error_t pseudocode_document_model_t::page(
         }
     }
 
-    for (std::size_t token_index = 0;
-         token_index < active_->document->tokens.size(); ++token_index) {
-        const auto& token = active_->document->tokens[token_index];
-        if (token.range.end <= page_text_begin)
-            continue;
-        if (token.range.begin >= page_text_end)
-            break;
-        pseudocode_token_view_t view;
-        view.kind = token.kind;
-        view.token_index = static_cast<std::uint32_t>(token_index);
-        view.range = token.range;
-        view.ast_node_id = token.ast_node_id;
-        view.text = active_->document->rendered_text.substr(
-            token.range.begin, token.range.end - token.range.begin);
-        output.tokens.push_back(std::move(view));
+    {
+        const auto& tokens = active_->document->tokens;
+        auto iterator = std::lower_bound(tokens.begin(), tokens.end(), page_text_begin,
+            [](const aida::analysis::decompiler_document_token_t& token,
+               std::uint32_t value) {
+                return token.range.begin < value;
+            });
+        while (iterator != tokens.begin() && (iterator - 1)->range.end > page_text_begin)
+            --iterator;
+        for (; iterator != tokens.end() && iterator->range.begin < page_text_end;
+             ++iterator) {
+            if (iterator->range.end <= page_text_begin)
+                continue;
+            pseudocode_token_view_t view;
+            view.kind = iterator->kind;
+            view.token_index = static_cast<std::uint32_t>(
+                std::distance(tokens.begin(), iterator));
+            view.range = iterator->range;
+            view.ast_node_id = iterator->ast_node_id;
+            view.text = active_->document->rendered_text.substr(
+                iterator->range.begin, iterator->range.end - iterator->range.begin);
+            output.tokens.push_back(std::move(view));
+        }
     }
 
     for (const auto& source_map : active_->document->source_maps) {
@@ -1180,6 +1332,12 @@ pseudocode_error_t pseudocode_document_model_t::resolve_token(
 
 void pseudocode_document_model_t::refresh() noexcept
 {
+    if (has_pending_resolutions_) {
+        try {
+            static_cast<void>(drain_resolutions());
+        } catch (...) {
+        }
+    }
     const auto generation = source_->current_generation();
     if (generation != bound_generation_)
         bound_generation_ = generation;
@@ -1189,7 +1347,7 @@ void pseudocode_document_model_t::refresh() noexcept
             entry.state = pseudocode_cache_state_t::stale;
     }
     if (active_ && !entry_current(*active_)) {
-        line_views_.clear();
+        invalidate_line_views();
         selection_ = {};
     }
 }
@@ -1217,7 +1375,7 @@ pseudocode_error_t pseudocode_document_model_t::apply_local_rename(
     const auto bundle = source_->render_evidence(request);
     if (!bundle.type_graph)
         return fail(pseudocode_error_code_t::adapter_rejected, active_->job_id);
-    aida::analysis::pseudocode_renderer_v2_request_t render_request;
+    aida::analysis::pseudocode_renderer_request_t render_request;
     render_request.profile = active_->profile_info.profile;
     render_request.settings = active_->document->renderer;
     render_request.evidence = bundle.evidence;
@@ -1244,8 +1402,8 @@ pseudocode_error_t pseudocode_document_model_t::apply_local_rename(
     if (!validation)
         return validation;
     active_->document = std::move(replacement);
-    split_lines();
-    rebuild_address_map();
+    bump_diagnostics_revision();
+    ensure_active_views_current();
     if (!entry_current(*active_))
         return stale();
     nodes_renamed = renamed;
@@ -1407,25 +1565,41 @@ pseudocode_document_model_t::profile_info() const noexcept
 std::vector<pseudocode_diagnostic_view_t>
 pseudocode_document_model_t::diagnostics() const
 {
+    diagnostics_cache_key_t key;
+    key.owner = active_;
+    key.state = active_ ? active_->state : pseudocode_cache_state_t::empty;
+    key.document = active_ && active_->document
+        ? static_cast<const void*>(active_->document.get()) : nullptr;
+    key.revision = diagnostics_revision_;
+    if (diagnostics_key_.owner == key.owner &&
+        diagnostics_key_.state == key.state &&
+        diagnostics_key_.document == key.document &&
+        diagnostics_key_.revision == key.revision)
+        return diagnostics_cache_;
     std::vector<pseudocode_diagnostic_view_t> result;
-    if (!active_)
+    if (!active_) {
+        diagnostics_key_ = key;
+        diagnostics_cache_.clear();
         return result;
+    }
     const bool retained_stale_result = active_->state == pseudocode_cache_state_t::stale &&
         !active_->failure_diagnostics.empty() &&
         active_->failure_diagnostics.front().localization_key ==
             "decompiler.worker.stale_result";
-    if (!entry_current(*active_) && !retained_stale_result)
-        return result;
-    const auto* source = &active_->failure_diagnostics;
-    if (active_->state != pseudocode_cache_state_t::failed && active_->document)
-        source = &active_->document->diagnostics;
-    const auto count = (std::min)(source->size(),
-                                  static_cast<std::size_t>(k_pseudocode_document_max_diagnostics));
-    result.reserve(count);
-    for (std::size_t index = 0; index < count; ++index)
-        result.push_back(diagnostic_view((*source)[index]));
-    if (!entry_current(*active_) && !retained_stale_result)
-        result.clear();
+    if (entry_current(*active_) || retained_stale_result) {
+        const auto* source = &active_->failure_diagnostics;
+        if (active_->state != pseudocode_cache_state_t::failed && active_->document)
+            source = &active_->document->diagnostics;
+        const auto count = (std::min)(source->size(),
+                                      static_cast<std::size_t>(k_pseudocode_document_max_diagnostics));
+        result.reserve(count);
+        for (std::size_t index = 0; index < count; ++index)
+            result.push_back(diagnostic_view((*source)[index]));
+        if (!entry_current(*active_) && !retained_stale_result)
+            result.clear();
+    }
+    diagnostics_key_ = key;
+    diagnostics_cache_ = result;
     return result;
 }
 

@@ -16,10 +16,10 @@ constexpr std::uint32_t k_decompiler_contract_schema_version = 2;
 constexpr std::uint32_t k_provider_ir_schema_version = 1;
 constexpr std::uint32_t k_hir_schema_version = 1;
 constexpr std::uint32_t k_type_graph_schema_version = 1;
-constexpr std::uint32_t k_typed_pseudocode_ast_schema_version = 2;
+constexpr std::uint32_t k_typed_pseudocode_ast_schema_version = 3;
 constexpr std::uint32_t k_decompiler_document_schema_version = 1;
 constexpr std::uint32_t k_decompiler_cache_key_schema_version = 2;
-constexpr std::uint32_t k_decompiler_render_evidence_schema_version = 2;
+constexpr std::uint32_t k_decompiler_render_evidence_schema_version = 3;
 constexpr std::size_t k_decompiler_render_evidence_max_entries = 1U << 20;
 constexpr std::size_t k_decompiler_render_evidence_max_text_bytes = 4096;
 constexpr std::uint32_t k_decompiler_worker_protocol_version = 3;
@@ -228,7 +228,8 @@ enum class typed_pseudocode_ast_node_kind_t : std::uint16_t {
     unknown_expression = 28,
     goto_statement = 29,
     label_statement = 30,
-    comment_statement = 31
+    comment_statement = 31,
+    conditional_expression = 32
 };
 
 enum class decompiler_document_token_kind_t : std::uint8_t {
@@ -577,6 +578,11 @@ struct readability_transform_settings_t {
     bool enable_bit_operation_idioms = true;
     bool enable_loop_intrinsic_idioms = true;
     bool enable_magic_division_recognition = true;
+    bool enable_semantic_fact_application = true;
+    bool enable_array_index_recognition = true;
+    bool enable_method_call_restructuring = true;
+    bool enable_ternary_formation = true;
+    bool enable_cast_agreement_insertion = false;
     std::size_t max_transform_iterations = 4;
     std::size_t max_expression_depth = 256;
     std::size_t max_comment_bytes = 96;
@@ -613,6 +619,11 @@ struct readability_transform_settings_t {
             enable_bit_operation_idioms == other.enable_bit_operation_idioms &&
             enable_loop_intrinsic_idioms == other.enable_loop_intrinsic_idioms &&
             enable_magic_division_recognition == other.enable_magic_division_recognition &&
+            enable_semantic_fact_application == other.enable_semantic_fact_application &&
+            enable_array_index_recognition == other.enable_array_index_recognition &&
+            enable_method_call_restructuring == other.enable_method_call_restructuring &&
+            enable_ternary_formation == other.enable_ternary_formation &&
+            enable_cast_agreement_insertion == other.enable_cast_agreement_insertion &&
             max_transform_iterations == other.max_transform_iterations &&
             max_expression_depth == other.max_expression_depth &&
             max_comment_bytes == other.max_comment_bytes &&
@@ -624,7 +635,7 @@ struct readability_transform_settings_t {
 };
 
 struct decompiler_renderer_settings_t {
-    std::uint32_t schema_version = 4;
+    std::uint32_t schema_version = 5;
     std::string style_id;
     std::uint32_t indentation_spaces = 4;
     bool emit_type_annotations = true;
@@ -633,6 +644,7 @@ struct decompiler_renderer_settings_t {
     bool emit_comments = true;
     bool emit_resolved_symbols = true;
     bool emit_enum_case_names = true;
+    bool emit_calling_convention_annotations = false;
     readability_transform_settings_t readability;
 };
 
@@ -778,6 +790,8 @@ struct decompiler_prototype_evidence_t {
     bool is_variadic = false;
     bool is_noreturn = false;
     std::uint8_t confidence = 0;
+    std::string calling_convention;
+    std::string class_qualifier;
 };
 
 struct decompiler_string_evidence_t {
@@ -849,7 +863,12 @@ enum class decompiler_render_pass_id_t : std::uint8_t {
     cast_idiom_folding = 12,
     bit_operation_idioms = 13,
     loop_intrinsic_idioms = 14,
-    magic_division_recognition = 15
+    magic_division_recognition = 15,
+    ternary_formation = 16,
+    array_index_recognition = 17,
+    method_call_restructuring = 18,
+    semantic_fact_elimination = 19,
+    cast_agreement_insertion = 20
 };
 
 constexpr std::uint32_t k_decompiler_render_pass_revision_readability_transforms = 1;
@@ -889,6 +908,17 @@ struct decompiler_contract_decode_result_t {
     bool valid() const noexcept { return value.has_value() && error.empty(); }
 };
 
+struct measured_serialization_t {
+    std::string bytes;
+    std::uint64_t size = 0;
+    sha256_digest_t digest;
+};
+
+struct document_validation_session_t {
+    const typed_pseudocode_ast_v2_t* ast_identity = nullptr;
+    std::optional<measured_serialization_t> ast_measured;
+};
+
 decompiler_contract_validation_t validate_decompiler_entity_key(const decompiler_entity_key_t& value);
 decompiler_contract_validation_t validate_source_coordinate(const source_coordinate_t& value);
 decompiler_contract_validation_t validate_provider_ir(const provider_ir_t& value);
@@ -896,6 +926,8 @@ decompiler_contract_validation_t validate_hir_function(const hir_function_t& val
 decompiler_contract_validation_t validate_type_graph(const type_graph_t& value);
 decompiler_contract_validation_t validate_typed_pseudocode_ast(const typed_pseudocode_ast_v2_t& value);
 decompiler_contract_validation_t validate_decompiler_document(const decompiler_document_t& value);
+decompiler_contract_validation_t validate_decompiler_document(const decompiler_document_t& value,
+                                                              document_validation_session_t& session);
 decompiler_contract_validation_t validate_decompiler_profile(const decompiler_profile_budget_t& value);
 decompiler_contract_validation_t validate_decompiler_pipeline_cache_key(const decompiler_pipeline_cache_key_t& value);
 decompiler_contract_validation_t validate_decompiler_worker_message(const decompiler_worker_message_t& value);
@@ -921,6 +953,15 @@ std::string serialize_decompiler_pipeline_cache_key(const decompiler_pipeline_ca
 std::string serialize_decompiler_worker_message(const decompiler_worker_message_t& value);
 std::string serialize_decompiler_render_evidence(const decompiler_render_evidence_t& value);
 
+measured_serialization_t serialize_provider_ir_measured(const provider_ir_t& value);
+measured_serialization_t serialize_hir_function_measured(const hir_function_t& value);
+measured_serialization_t serialize_type_graph_measured(const type_graph_t& value);
+measured_serialization_t serialize_typed_pseudocode_ast_measured(const typed_pseudocode_ast_v2_t& value);
+measured_serialization_t serialize_decompiler_document_measured(const decompiler_document_t& value);
+measured_serialization_t serialize_decompiler_diagnostic_measured(const decompiler_diagnostic_t& value);
+measured_serialization_t serialize_decompiler_pipeline_cache_key_measured(const decompiler_pipeline_cache_key_t& value);
+measured_serialization_t serialize_decompiler_render_evidence_measured(const decompiler_render_evidence_t& value);
+
 decompiler_contract_decode_result_t<decompiler_entity_key_t> deserialize_decompiler_entity_key(const std::string& value);
 decompiler_contract_decode_result_t<source_coordinate_t> deserialize_source_coordinate(const std::string& value);
 decompiler_contract_decode_result_t<provider_ir_t> deserialize_provider_ir(const std::string& value);
@@ -945,5 +986,7 @@ sha256_digest_t stable_serialization_hash(const decompiler_diagnostic_t& value);
 sha256_digest_t stable_serialization_hash(const decompiler_pipeline_cache_key_t& value);
 sha256_digest_t stable_serialization_hash(const decompiler_worker_message_t& value);
 sha256_digest_t stable_serialization_hash(const decompiler_render_evidence_t& value);
+
+sha256_digest_t attestation_equivalence_digest(const decompiler_document_t& value);
 
 }

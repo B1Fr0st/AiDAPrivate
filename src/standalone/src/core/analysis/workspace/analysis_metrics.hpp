@@ -136,6 +136,13 @@ enum class analysis_metric_t : std::uint8_t {
     decompile_batch_queue_depth_peak,
     decompile_memory_cache_hits,
     decompile_persistent_cache_hits,
+    decompile_batch_library_excluded,
+    memory_admission_grants,
+    memory_admission_denials,
+    memory_admission_wait_ns_max,
+    decompile_slots_requested,
+    decompile_slots_admitted,
+    decompile_slots_denied,
     count
 };
 

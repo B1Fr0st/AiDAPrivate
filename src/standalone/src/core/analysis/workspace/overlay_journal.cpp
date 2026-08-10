@@ -3963,6 +3963,9 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     if (!finalized)
         return workspace_result_t<overlay_transaction_result_t>::failure(
             projection_finalize_error(finalized, "overlay_journal.transact"));
+    incremental_reanalysis_scheduler_t::maybe_schedule(
+        workspace, reanalysis.scope, prepared.invalidation,
+        projected_provider.value());
     return workspace_result_t<overlay_transaction_result_t>::success(
         std::move(*result_holder));
 }
@@ -4497,6 +4500,9 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
     if (!finalized)
         return workspace_result_t<overlay_transaction_result_t>::failure(
             projection_finalize_error(finalized, "overlay_journal.history"));
+    incremental_reanalysis_scheduler_t::maybe_schedule(
+        workspace, reanalysis.scope, prepared.invalidation,
+        projected_provider.value());
     return workspace_result_t<overlay_transaction_result_t>::success(
         std::move(*result_holder));
 }

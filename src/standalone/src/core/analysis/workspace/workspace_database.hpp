@@ -237,6 +237,9 @@ public:
     workspace_snapshot_staging_t& operator=(const workspace_snapshot_staging_t&) = delete;
 
     std::uint32_t staged_domain_mask() const noexcept;
+    workspace_result_t<void> set_metrics_json(std::string metrics_json);
+    void expect_complete_baseline() noexcept;
+    void discard(workspace_error_t error) noexcept;
 
 private:
     struct state_t;

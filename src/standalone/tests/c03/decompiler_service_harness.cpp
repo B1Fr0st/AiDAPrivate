@@ -3,15 +3,21 @@
 
 #include "../../src/core/analysis/decompiler/decompiler_service.hpp"
 #include "../../src/core/analysis/decompiler/legacy_document_adapter.hpp"
+#include "../../src/core/analysis/workspace/workspace_database.hpp"
+#include "../../src/core/analysis/workspace/workspace_identity.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <variant>
 
@@ -371,7 +377,7 @@ public:
         auto result = route.provider->decompile(request, cancel);
         if (!result.succeeded() || !result.artifacts->hir)
             return result;
-        const auto ast = build_typed_ast_v2(
+        const auto ast = build_typed_ast(
             *result.artifacts->hir, result.artifacts->type_graph);
         if (!ast.succeeded() || !ast.ast) {
             result.status = decompiler_provider_execution_status_t::failed;
@@ -379,10 +385,10 @@ public:
                 ast.diagnostics.begin(), ast.diagnostics.end());
             return result;
         }
-        pseudocode_renderer_v2_request_t render_request;
+        pseudocode_renderer_request_t render_request;
         render_request.profile = request.cache_key.profile.profile;
         render_request.settings = request.cache_key.renderer;
-        auto rendered = render_pseudocode_v2(
+        auto rendered = render_pseudocode(
             *ast.ast, result.artifacts->type_graph, render_request);
         if (!rendered.succeeded() || !rendered.document) {
             result.status = decompiler_provider_execution_status_t::failed;
@@ -456,7 +462,7 @@ decompiler_pipeline_request_t request(
 struct service_fixture_t {
     std::shared_ptr<fake_native_provider_t> provider;
     std::shared_ptr<fake_isolated_host_t> host;
-    std::shared_ptr<decompiler_cache_v9_t> cache;
+    std::shared_ptr<decompiler_cache_t> cache;
     std::shared_ptr<decompiler_pipeline_service_t> service;
 };
 
@@ -468,7 +474,7 @@ service_fixture_t service_fixture()
         decompiler_provider_id_t::ghidra_native, "c03.fake.native"));
     require(static_cast<bool>(registry->register_provider(result.provider)),
         "failed to register the isolated service fixture provider");
-    auto cache = decompiler_cache_v9_t::create();
+    auto cache = decompiler_cache_t::create();
     require(static_cast<bool>(cache), "failed to create the decompiler cache fixture");
     result.cache = cache.value();
     result.host = std::make_shared<fake_isolated_host_t>();
@@ -582,7 +588,7 @@ void verify_isolated_host_is_required()
         decompiler_provider_id_t::ghidra_native, "c03.fake.native"));
     require(static_cast<bool>(registry->register_provider(provider)),
         "failed to register the host-rejection provider fixture");
-    auto cache = decompiler_cache_v9_t::create();
+    auto cache = decompiler_cache_t::create();
     require(static_cast<bool>(cache), "failed to create the host-rejection cache fixture");
     auto service = decompiler_pipeline_service_t::create(registry, cache.value());
     require(static_cast<bool>(service), "failed to create the host-rejection service fixture");
@@ -738,6 +744,375 @@ void verify_concurrent_workspace_isolation(service_fixture_t& fixture)
         "concurrent workspaces did not retain isolated cache entries");
 }
 
+void verify_verdict_cache_equivalence(service_fixture_t& fixture)
+{
+    const auto base = request("c03-verdict-cache");
+    const auto before_provider = fixture.provider->invocations();
+    const auto before_host = fixture.host->invocations();
+    const auto first = fixture.service->decompile(base);
+    require(first.succeeded() && first.readability.has_value() &&
+            !first.cache_hit_stage.has_value(),
+        "verdict-cache fixture failed the miss-path decompile");
+    const auto second = fixture.service->decompile(base);
+    require(second.succeeded() &&
+            second.cache_hit_stage == decompiler_cache_stage_t::rendered_document &&
+            second.readability.has_value(),
+        "verdict-cache fixture failed the hit-path decompile");
+    require(fixture.provider->invocations() == before_provider + 1 &&
+            fixture.host->invocations() == before_host + 1,
+        "verdict hit invoked the provider again");
+    require(second.readability->document_hash == first.readability->document_hash &&
+            second.readability->ast_hash == first.readability->ast_hash &&
+            second.readability->source_map_hash == first.readability->source_map_hash &&
+            second.readability->ast_node_count == first.readability->ast_node_count &&
+            second.readability->document_bytes == first.readability->document_bytes &&
+            second.readability->source_mapped_bytes == first.readability->source_mapped_bytes &&
+            second.readability->metrics.declaration_count == first.readability->metrics.declaration_count,
+        "verdict hit returned a report that diverged from the full analysis");
+
+    pseudocode_readability_request_t analysis_request;
+    const auto reanalyzed = analyze_pseudocode_readability(
+        first.rendered_stage->document.ast, first.rendered_stage->document, analysis_request);
+    require(reanalyzed.succeeded() && reanalyzed.report.has_value(),
+        "independent reanalysis of the cached document failed");
+    require(reanalyzed.report->document_hash == first.readability->document_hash &&
+            reanalyzed.report->ast_hash == first.readability->ast_hash &&
+            reanalyzed.report->source_map_hash == first.readability->source_map_hash &&
+            reanalyzed.report->ast_node_count == first.readability->ast_node_count &&
+            reanalyzed.report->document_bytes == first.readability->document_bytes,
+        "stored verdict diverged from an independent full analysis");
+
+    auto mutated = first.rendered_stage->document;
+    mutated.rendered_text.push_back(' ');
+    const auto original_digest = serialize_decompiler_document_measured(
+        first.rendered_stage->document).digest;
+    const auto mutated_digest = serialize_decompiler_document_measured(mutated).digest;
+    require(!(mutated_digest == original_digest),
+        "one-byte document mutation did not change the verdict cache key digest");
+}
+
+void verify_nondeterminism_rejection()
+{
+    auto cache = decompiler_cache_t::create();
+    require(static_cast<bool>(cache), "failed to create the nondeterminism cache fixture");
+    const auto entity = native_entity();
+    decompiler_pipeline_cache_key_t key;
+    key.stage = decompiler_cache_stage_t::rendered_document;
+    key.workspace_id = "c03-nondeterminism";
+    key.workspace_generation = 1;
+    key.analysis_revision = 11;
+    key.entity = entity;
+    key.provider = provider_identity(decompiler_provider_id_t::ghidra_native, "c03.fake.native");
+    key.worker_protocol_hash = digest("c03-service-worker-protocol");
+    key.language = native_language();
+    key.loader_layout_hash = digest("c03-service-loader-layout");
+    key.function_bytes_hash =
+        std::get<native_decompiler_entity_identity_t>(entity.identity).function_bytes_hash;
+    key.chunk_fingerprints.push_back({
+        native_address(0x3000), native_address(0x3040), digest("c03-service-function-chunk")});
+    key.metadata_revision = 13;
+    key.type_graph_revision = 17;
+    key.overlay_revision = 19;
+    key.profile = default_decompiler_profile_policy().balanced;
+    key.renderer = pseudocode_renderer_style_settings(pseudocode_renderer_style_profile_t::balanced);
+    key.dependencies.push_back({
+        "c03.fixture.provider", "1", digest("c03-service-provider-dependency")});
+    require(validate_decompiler_pipeline_cache_key(key).valid(),
+        "nondeterminism fixture cache key is invalid");
+    require(static_cast<bool>(cache.value()->activate_workspace_generation(key.workspace_id, 1)),
+        "nondeterminism fixture failed to activate the workspace generation");
+
+    const auto rendered_value = [&](const std::string& text_seed) {
+        typed_pseudocode_ast_node_t root;
+        root.id = 1;
+        root.kind = typed_pseudocode_ast_node_kind_t::function_definition;
+        root.type_id = 1;
+        root.child_ids = {2};
+        root.stable_text = "fixture";
+        root.coordinate = coordinate(key, decompiler_coordinate_layer_t::typed_ast);
+        root.confidence = 100;
+        root.provenance = decompiler_fact_provenance_t::provider_semantics;
+        typed_pseudocode_ast_node_t body;
+        body.id = 2;
+        body.kind = typed_pseudocode_ast_node_kind_t::compound_statement;
+        body.type_id = 1;
+        body.child_ids = {3};
+        body.coordinate = coordinate(key, decompiler_coordinate_layer_t::typed_ast);
+        body.confidence = 100;
+        body.provenance = decompiler_fact_provenance_t::provider_semantics;
+        typed_pseudocode_ast_node_t statement;
+        statement.id = 3;
+        statement.kind = typed_pseudocode_ast_node_kind_t::return_statement;
+        statement.type_id = 1;
+        statement.child_ids = {4};
+        statement.coordinate = coordinate(key, decompiler_coordinate_layer_t::typed_ast);
+        statement.confidence = 100;
+        statement.provenance = decompiler_fact_provenance_t::provider_semantics;
+        typed_pseudocode_ast_node_t literal;
+        literal.id = 4;
+        literal.kind = typed_pseudocode_ast_node_kind_t::literal;
+        literal.type_id = 1;
+        literal.stable_text = "7";
+        literal.coordinate = coordinate(key, decompiler_coordinate_layer_t::typed_ast);
+        literal.confidence = 100;
+        literal.provenance = decompiler_fact_provenance_t::provider_semantics;
+        typed_pseudocode_ast_v2_t ast;
+        ast.entity = entity;
+        ast.hir_hash = digest("c03-nondeterminism-hir");
+        ast.type_graph_hash = digest("c03-nondeterminism-types");
+        ast.root_node_id = 1;
+        ast.body_node_id = 2;
+        ast.nodes = {std::move(root), std::move(body), std::move(statement), std::move(literal)};
+        decompiler_document_t document;
+        document.entity = entity;
+        document.ast = ast;
+        document.ast_hash = stable_serialization_hash(ast);
+        document.type_graph_hash = ast.type_graph_hash;
+        document.profile = key.profile.profile;
+        document.renderer = key.renderer;
+        document.rendered_text = "int fixture() { return " + text_seed + "; }";
+        document.tokens.push_back({decompiler_document_token_kind_t::identifier,
+            {0, static_cast<std::uint32_t>(document.rendered_text.size())}, 1});
+        decompiler_document_source_map_t map;
+        map.document_range = {0, static_cast<std::uint32_t>(document.rendered_text.size())};
+        source_coordinate_t document_coordinate;
+        document_coordinate.layer = decompiler_coordinate_layer_t::document;
+        document_coordinate.workspace_generation = key.workspace_generation;
+        document_coordinate.entity = entity;
+        document_coordinate.document_range = map.document_range;
+        map.coordinates.push_back(document_coordinate);
+        document.source_maps.push_back(std::move(map));
+        decompiler_rendered_cache_value_t value;
+        value.document = std::move(document);
+        return value;
+    };
+
+    const auto first = cache.value()->store_rendered(key, rendered_value("7"));
+    require(static_cast<bool>(first), "nondeterminism fixture rejected the baseline store");
+    const auto repeat = cache.value()->store_rendered(key, rendered_value("7"));
+    require(static_cast<bool>(repeat),
+        "nondeterminism fixture rejected an identical repeat store");
+    const auto diverged = cache.value()->store_rendered(key, rendered_value("8"));
+    require(!static_cast<bool>(diverged) &&
+            diverged.error().code == workspace_error_code_t::integrity_failure,
+        "preserialized-era cache accepted two differing artifacts under one key");
+
+    decompiler_pipeline_cache_key_t second_key = key;
+    second_key.workspace_id = "c03-nondeterminism-preserialized";
+    require(static_cast<bool>(cache.value()->activate_workspace_generation(second_key.workspace_id, 1)),
+        "nondeterminism fixture failed to activate the preserialized workspace generation");
+    const auto second_value = rendered_value("7");
+    decompiler_cache_component_blobs_t blobs;
+    blobs.primary_blob = serialize_decompiler_document(second_value.document);
+    const auto measured_digest = stable_serialization_hash(blobs.primary_blob);
+    const auto preserialized = cache.value()->store_rendered_preserialized(
+        second_key, second_value, std::move(blobs), measured_digest, std::nullopt);
+    require(static_cast<bool>(preserialized),
+        "preserialized store rejected the baseline artifact");
+    const auto diverged_value = rendered_value("8");
+    decompiler_cache_component_blobs_t diverged_blobs;
+    diverged_blobs.primary_blob = serialize_decompiler_document(diverged_value.document);
+    const auto diverged_digest = stable_serialization_hash(diverged_blobs.primary_blob);
+    const auto preserialized_diverged = cache.value()->store_rendered_preserialized(
+        second_key, diverged_value, std::move(diverged_blobs), diverged_digest, std::nullopt);
+    require(!static_cast<bool>(preserialized_diverged) &&
+            preserialized_diverged.error().code == workspace_error_code_t::integrity_failure,
+        "preserialized store accepted two differing artifacts under one key");
+}
+
+struct persistent_fixture_t {
+    std::shared_ptr<workspace_database_t> database;
+    std::string database_path;
+    std::string source_path;
+    decompiler_pipeline_cache_key_t rendered_key;
+    std::string canonical_key;
+    decompiler_pipeline_request_t base_request;
+    decompiler_pipeline_result_t first_result;
+};
+
+persistent_fixture_t persistent_fixture()
+{
+    persistent_fixture_t fixture;
+    fixture.source_path = (std::filesystem::temp_directory_path() /
+        ("aida-c03-prefetch-source-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin")).string();
+    {
+        std::ofstream source(fixture.source_path, std::ios::binary | std::ios::trunc);
+        source << "AiDA c03 persistent prefetch fixture";
+    }
+    workspace_identity_input_t identity_input;
+    identity_input.bin_name = "c03-prefetch.bin";
+    identity_input.source_path = fixture.source_path;
+    identity_input.content_hash = digest("c03-prefetch-content");
+    identity_input.load_profile_hash = digest("c03-prefetch-profile");
+    identity_input.target_kind = target_kind_t::static_file;
+    identity_input.format = format_id_t::pe32_plus;
+    identity_input.architecture = architecture_id_t::x86_64;
+    identity_input.architecture_mode = architecture_mode_t::x86_64;
+    identity_input.abi = abi_id_t::windows_x64;
+    identity_input.endian = endian_t::little;
+    identity_input.image_base = 0x140000000ULL;
+    auto identity = make_workspace_identity(std::move(identity_input));
+    require(static_cast<bool>(identity), "failed to create the prefetch workspace identity");
+    workspace_database_options_t options;
+    options.identity = identity.take_value();
+    options.versions.engine_version = "c03-service-harness";
+    options.versions.specification_version = "c03";
+    options.versions.analysis_settings_hash = "c03-prefetch-settings";
+    auto opened = workspace_database_t::open(std::move(options));
+    require(static_cast<bool>(opened), "failed to open the prefetch workspace database");
+    fixture.database = opened.take_value();
+    fixture.database_path = fixture.database->path();
+
+    auto registry = std::make_shared<decompiler_provider_registry_t>();
+    auto provider = std::make_shared<fake_native_provider_t>(provider_identity(
+        decompiler_provider_id_t::ghidra_native, "c03.fake.native"));
+    require(static_cast<bool>(registry->register_provider(provider)),
+        "failed to register the prefetch provider");
+    auto cache = decompiler_cache_t::create();
+    require(static_cast<bool>(cache), "failed to create the prefetch cache");
+    auto host = std::make_shared<fake_isolated_host_t>();
+    decompiler_pipeline_service_config_t config;
+    config.isolated_provider_host = host;
+    config.database = fixture.database;
+    auto service = decompiler_pipeline_service_t::create(
+        std::move(registry), cache.value(), {}, std::move(config));
+    require(static_cast<bool>(service), "failed to create the prefetch service");
+
+    fixture.base_request = request("c03-prefetch-workspace", 1);
+    std::optional<decompiler_pipeline_cache_key_t> captured_provider_key;
+    fixture.base_request.provider_context_factory =
+        [&captured_provider_key](
+            const decompiler_provider_request_t& provider_request,
+            const cancellation_token_t&) {
+            captured_provider_key = provider_request.cache_key;
+            std::shared_ptr<const decompiler_provider_context_t> context =
+                std::make_shared<fake_provider_context_t>();
+            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::success(
+                std::move(context));
+        };
+    fixture.first_result = service.value()->decompile(fixture.base_request);
+    require(fixture.first_result.succeeded() && fixture.first_result.rendered_stage &&
+            captured_provider_key.has_value(),
+        "prefetch fixture failed the initial decompile");
+    require(provider->invocations() == 1, "prefetch fixture provider accounting drifted");
+    fixture.base_request.provider_context_factory = {};
+
+    fixture.rendered_key = *captured_provider_key;
+    fixture.rendered_key.stage = decompiler_cache_stage_t::rendered_document;
+    const auto pass_chain = decompiler_render_pass_chain(
+        fixture.rendered_key.renderer.readability, fixture.rendered_key.renderer, nullptr);
+    decompiler_dependency_version_t pass_dependency;
+    pass_dependency.name = "aida.render.pass_chain";
+    pass_dependency.version = "1";
+    pass_dependency.content_hash = decompiler_render_pass_chain_hash(pass_chain);
+    fixture.rendered_key.dependencies.push_back(std::move(pass_dependency));
+    std::sort(fixture.rendered_key.dependencies.begin(),
+        fixture.rendered_key.dependencies.end(),
+        [](const decompiler_dependency_version_t& left,
+           const decompiler_dependency_version_t& right) {
+            return left.name < right.name;
+        });
+    require(validate_decompiler_pipeline_cache_key(fixture.rendered_key).valid(),
+        "prefetch fixture reconstructed an invalid rendered key");
+    fixture.canonical_key = serialize_decompiler_pipeline_cache_key(fixture.rendered_key);
+
+    decompiler_pipeline_cache_v1_row_t row;
+    const auto* key_begin = reinterpret_cast<const std::uint8_t*>(fixture.canonical_key.data());
+    row.cache_key.assign(key_begin, key_begin + fixture.canonical_key.size());
+    row.stage = static_cast<std::int64_t>(decompiler_cache_stage_t::rendered_document);
+    row.workspace_id = fixture.base_request.workspace_id;
+    row.generation = fixture.base_request.workspace_generation;
+    row.analysis_revision = fixture.base_request.analysis_revision;
+    row.overlay_revision = fixture.base_request.cache_identity.overlay_revision;
+    row.function_rva = 0x3000;
+    const auto serialized = serialize_decompiler_rendered_cache_value(
+        *fixture.first_result.rendered_stage);
+    row.value.assign(reinterpret_cast<const std::uint8_t*>(serialized.data()),
+        reinterpret_cast<const std::uint8_t*>(serialized.data()) + serialized.size());
+    auto ticket = fixture.database->store_pipeline_cache(std::move(row), {});
+    require(ticket.accepted, "prefetch fixture row write was not accepted");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(30000);
+    while (ticket.completion.wait_for(std::chrono::milliseconds(10)) !=
+               std::future_status::ready &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    require(ticket.completion.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready,
+        "prefetch fixture row write did not complete");
+    require(static_cast<bool>(ticket.completion.get()),
+        "prefetch fixture row write failed");
+    return fixture;
+}
+
+void verify_persistent_prefetch_integration()
+{
+    auto fixture = persistent_fixture();
+
+    auto make_service = [](std::shared_ptr<workspace_database_t> database,
+                           std::shared_ptr<fake_native_provider_t>& provider_out,
+                           std::shared_ptr<fake_isolated_host_t>& host_out) {
+        auto registry = std::make_shared<decompiler_provider_registry_t>();
+        provider_out = std::make_shared<fake_native_provider_t>(provider_identity(
+            decompiler_provider_id_t::ghidra_native, "c03.fake.native"));
+        require(static_cast<bool>(registry->register_provider(provider_out)),
+            "failed to register the persistent-hit provider");
+        auto cache = decompiler_cache_t::create();
+        require(static_cast<bool>(cache), "failed to create the persistent-hit cache");
+        host_out = std::make_shared<fake_isolated_host_t>();
+        decompiler_pipeline_service_config_t config;
+        config.isolated_provider_host = host_out;
+        config.database = std::move(database);
+        auto service = decompiler_pipeline_service_t::create(
+            std::move(registry), cache.value(), {}, std::move(config));
+        require(static_cast<bool>(service), "failed to create the persistent-hit service");
+        return service.take_value();
+    };
+
+    std::shared_ptr<fake_native_provider_t> hit_provider;
+    std::shared_ptr<fake_isolated_host_t> hit_host;
+    auto hit_service = make_service(fixture.database, hit_provider, hit_host);
+    hit_service->prefetch_persistent_rendered(
+        fixture.base_request.workspace_id, fixture.base_request.workspace_generation,
+        {fixture.rendered_key});
+    const auto hydrated = hit_service->decompile(fixture.base_request);
+    require(hydrated.succeeded() &&
+            hydrated.cache_hit_stage == decompiler_cache_stage_t::rendered_document,
+        "prefetch-then-decompile did not produce a persistent rendered hit");
+    require(hit_provider->invocations() == 0 && hit_host->invocations() == 0,
+        "persistent prefetched hit invoked the provider");
+    require(hydrated.readability.has_value() &&
+            hydrated.readability->document_hash == fixture.first_result.readability->document_hash,
+        "persistent prefetched hit returned a divergent readability verdict");
+    require(serialize_decompiler_document(hydrated.rendered_stage->document) ==
+            serialize_decompiler_document(fixture.first_result.rendered_stage->document),
+        "persistent prefetched hit returned a divergent document");
+
+    std::shared_ptr<fake_native_provider_t> stale_provider;
+    std::shared_ptr<fake_isolated_host_t> stale_host;
+    auto stale_service = make_service(fixture.database, stale_provider, stale_host);
+    stale_service->prefetch_persistent_rendered(
+        fixture.base_request.workspace_id, fixture.base_request.workspace_generation,
+        {fixture.rendered_key});
+    auto stale_request = fixture.base_request;
+    stale_request.workspace_generation = 2;
+    const auto stale = stale_service->decompile(stale_request);
+    require(stale.succeeded() && !stale.cache_hit_stage.has_value() &&
+            stale_provider->invocations() == 1 && stale_host->invocations() == 1,
+        "stale-generation prefetch hydrated a rendered row");
+
+    hit_service->request_stop();
+    stale_service->request_stop();
+    hit_service.reset();
+    stale_service.reset();
+    fixture.database.reset();
+    std::error_code cleanup_error;
+    std::filesystem::remove(std::filesystem::u8path(fixture.database_path), cleanup_error);
+    std::filesystem::remove(std::filesystem::u8path(fixture.database_path + "-wal"), cleanup_error);
+    std::filesystem::remove(std::filesystem::u8path(fixture.database_path + "-shm"), cleanup_error);
+    std::filesystem::remove(std::filesystem::u8path(fixture.source_path), cleanup_error);
+}
+
 }
 
 void run_decompiler_service_harness()
@@ -751,6 +1126,9 @@ void run_decompiler_service_harness()
     verify_attestation_cache_transaction(fixture);
     verify_determinism_and_generations(fixture);
     verify_concurrent_workspace_isolation(fixture);
+    verify_verdict_cache_equivalence(fixture);
+    verify_nondeterminism_rejection();
+    verify_persistent_prefetch_integration();
 }
 
 }

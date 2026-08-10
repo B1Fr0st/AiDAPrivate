@@ -14,6 +14,7 @@
 #include "../../src/core/analysis/tile_decode_orchestrator.hpp"
 #include "../../src/core/analysis/benchmark/benchmark_runner.hpp"
 #include "../../src/core/analysis/benchmark/benchmark_scorecard.hpp"
+#include "../../src/core/analysis/benchmark/benchmark_sla.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1342,33 +1343,6 @@ json run_measurement(const std::filesystem::path& path, const measurement_option
     }
 }
 
-const json& program_sla_thresholds()
-{
-    static const json thresholds = {
-        {"threshold_schema", "aida.hyperperf.program-sla-thresholds"},
-        {"threshold_schema_version", 2},
-        {"total_wall_ms_max_300mb", 300000.0},
-        {"total_wall_ms_stretch_300mb", 180000.0},
-        {"decode_throughput_bytes_per_s_min", 26214400.0},
-        {"file_throughput_bytes_per_s_min", 1048576.0},
-        {"instructions_per_s_min", 2000000.0},
-        {"publish_ready_ms_max", 50.0},
-        {"indexed_query_p95_ms_max", 50.0},
-        {"metadata_ready_ms_max", 3000.0},
-        {"warm_reopen_ms_max", 10000.0},
-        {"cancellation_p95_ms_max", 250.0},
-        {"incremental_private_bytes_max", 8589934592ULL},
-        {"workspace_mapped_bytes_max", 1073741824ULL},
-        {"global_mapped_bytes_max", 2147483648ULL},
-        {"decompile_all_funcs_per_s_min", 5.0},
-        {"decompile_all_funcs_per_s_stretch", 10.0},
-        {"scaling_wall16_over_wall1_max", 0.20},
-        {"scaling_efficiency_16_min", 0.5},
-        {"determinism_hash_match", true}
-    };
-    return thresholds;
-}
-
 std::uint64_t metrics_counter(const json& metrics, const char* name)
 {
     if (!metrics.is_object())
@@ -1479,7 +1453,7 @@ json sla_verdict(const char* key, const json& target, const json& actual,
 
 json evaluate_program_sla(const sla_measurement_context_t& context)
 {
-    const auto& thresholds = program_sla_thresholds();
+    const auto& thresholds = benchmark::program_sla_thresholds();
     const auto& report = *context.report;
     const auto& metrics = *context.metrics;
     const auto& throughput = *context.throughput;
@@ -1582,6 +1556,10 @@ json evaluate_program_sla(const sla_measurement_context_t& context)
         verdicts.push_back(sla_verdict("decompile_all_funcs_per_s_stretch",
             thresholds["decompile_all_funcs_per_s_stretch"], nullptr, "NOT_MEASURED"));
     }
+    verdicts.push_back(sla_verdict("decompile_all_funcs_wall_per_s_min",
+        thresholds["decompile_all_funcs_wall_per_s_min"], nullptr, "NOT_MEASURED"));
+    verdicts.push_back(sla_verdict("decompile_all_funcs_wall_per_s_stretch",
+        thresholds["decompile_all_funcs_wall_per_s_stretch"], nullptr, "NOT_MEASURED"));
     if (context.scaling_gate_applicable) {
         verdicts.push_back(sla_verdict("scaling_wall16_over_wall1_max",
             thresholds["scaling_wall16_over_wall1_max"], context.scaling_wall16_over_wall1,
@@ -1617,7 +1595,9 @@ json evaluate_program_sla(const sla_measurement_context_t& context)
     }
     return json{{"thresholds", thresholds},
         {"verdicts", std::move(verdicts)},
-        {"overall", any_fail ? "FAIL" : (all_pass_or_warn ? "PASS" : "NOT_MEASURED")}};
+        {"overall", any_fail ? "FAIL" : (all_pass_or_warn ? "PASS" : "NOT_MEASURED")},
+        {"wall_scale", context.wall_scale},
+        {"reference_bytes", benchmark::program_sla_reference_bytes}};
 }
 
 std::string benchmark_run_id()
@@ -1730,7 +1710,7 @@ json build_scorecard(const scorecard_input_t& input)
         {"claim", json{
             {"tracks", json::array({
                 json{{"id", "auto_analysis_wall"},
-                    {"definition", "cold wall_ns open-to-baseline_ready at or below total_wall_ms_max_300mb on a 300..500MB real binary"}},
+                    {"definition", "cold wall_ns open-to-baseline_ready at or below the size-scaled total_wall_ms_max_300mb gate (reference 300 MiB)"}},
                 json{{"id", "batch_decompile_throughput"},
                     {"definition", "decompile_all_funcs_per_s on the parallel production batch engine; a throughput claim, never a minutes claim"}}})},
             {"real_mode_invocation",
@@ -1850,8 +1830,12 @@ std::uint32_t parse_code_mb(const std::string& text)
 {
     std::size_t consumed = 0;
     const unsigned long value = std::stoul(text, &consumed, 10);
-    if (consumed != text.size() || value < 8 || value > 256)
-        throw fixture_error_t("synthetic code size must be within 8..256 MiB");
+    constexpr unsigned long min_mb = static_cast<unsigned long>(
+        benchmark::synthetic_code_bytes_min / (1024ULL * 1024ULL));
+    constexpr unsigned long max_mb = static_cast<unsigned long>(
+        benchmark::synthetic_code_bytes_max / (1024ULL * 1024ULL));
+    if (consumed != text.size() || value < min_mb || value > max_mb)
+        throw fixture_error_t("synthetic code size must be within 8..320 MiB");
     return static_cast<std::uint32_t>(value);
 }
 
@@ -2354,6 +2338,17 @@ int run_determinism_hw_mode(std::uint32_t code_mb, std::uint64_t seed,
 int run_real_mode(const std::filesystem::path& path,
                   const std::optional<std::filesystem::path>& out)
 {
+    std::error_code fixture_path_error;
+    if (!std::filesystem::is_regular_file(path, fixture_path_error))
+        throw fixture_error_t("real fixture does not exist: " + path.u8string());
+    std::error_code fixture_size_error;
+    const auto fixture_file_size = std::filesystem::file_size(path, fixture_size_error);
+    if (fixture_size_error)
+        throw fixture_error_t("real fixture size query failed: " + path.u8string());
+    if (fixture_file_size < benchmark::real_fixture_min_bytes ||
+        fixture_file_size > benchmark::real_fixture_max_bytes)
+        throw fixture_error_t("real fixture size " + std::to_string(fixture_file_size) +
+            " is outside the program-gate 300000000..500000000 byte window");
     measurement_options_t options;
     options.benchmark_mode = "real";
     options.claim_status = "measurement_candidate";
@@ -2374,7 +2369,8 @@ int run_real_mode(const std::filesystem::path& path,
     sla_context.report = &report;
     sla_context.metrics = &metrics;
     sla_context.throughput = &throughput;
-    sla_context.wall_scale = 1.0;
+    sla_context.wall_scale = benchmark::program_sla_wall_scale(
+        report["fixture"]["size_bytes"].get<std::uint64_t>());
     sla_context.decompile_funcs_per_s = &background_batch["funcs_per_s"];
     auto program_sla = evaluate_program_sla(sla_context);
     report["program_sla"] = program_sla;
@@ -2589,7 +2585,7 @@ int run_compare_mode(const std::filesystem::path& baseline_path,
     json verdicts = json::array();
     json warnings = json::array();
     bool any_fail = false;
-    const auto& thresholds = program_sla_thresholds();
+    const auto& thresholds = benchmark::program_sla_thresholds();
     for (const auto& item : thresholds.items()) {
         const auto& key = item.key();
         if (key == "threshold_schema" || key == "threshold_schema_version")

@@ -1,0 +1,299 @@
+{
+ "schema": "aida.c03.typed-ast-hashes-pre-lt.v1",
+ "intent": "dominator/postdominator loop-header and NCPD equivalence corpus computed by an independent reference implementation of the legacy iterative dataflow",
+ "canonical_form": "case <id>\\nentry <e>\\nblock <id> <succ,csv> (id ascending)\\nloops <n>\\nloop header=<h> members=<csv> latches=<csv> (header ascending)\\nncpds <n>\\nncpd branch=<b> left=<l> right=<r> join=<j> (branch ascending); trailing newline; UTF-8",
+ "cases": [
+  {
+   "id": "chain_4",
+   "entry": 1,
+   "edges": {
+    "1": [
+     2
+    ],
+    "2": [
+     3
+    ],
+    "3": [
+     4
+    ],
+    "4": []
+   },
+   "expected_loops": [],
+   "expected_ncpds": [],
+   "expected_loop_statements": [],
+   "expectation_sha256": "d8ddced474405f3ff3b3291f883b8b4b04793cbc2bca4ec84f7e54ad561196c3"
+  },
+  {
+   "id": "diamond_4",
+   "entry": 1,
+   "edges": {
+    "1": [
+     2,
+     3
+    ],
+    "2": [
+     4
+    ],
+    "3": [
+     4
+    ],
+    "4": []
+   },
+   "expected_loops": [],
+   "expected_ncpds": [
+    {
+     "branch": 1,
+     "left": 2,
+     "right": 3,
+     "join": 4
+    }
+   ],
+   "expected_loop_statements": [],
+   "expectation_sha256": "2bc13a23f3a85cb518b22a2e648e3088141f4b6483ab55909b42be3263b365e3"
+  },
+  {
+   "id": "loop_while_4",
+   "entry": 1,
+   "edges": {
+    "1": [
+     2
+    ],
+    "2": [
+     3,
+     4
+    ],
+    "3": [
+     2
+    ],
+    "4": []
+   },
+   "expected_loops": [
+    {
+     "header": 2,
+     "members": [
+      2,
+      3
+     ],
+     "latches": [
+      3
+     ]
+    }
+   ],
+   "expected_ncpds": [
+    {
+     "branch": 2,
+     "left": 3,
+     "right": 4,
+     "join": 4
+    }
+   ],
+   "expected_loop_statements": [
+    {
+     "kind": "while_statement",
+     "header": 2
+    }
+   ],
+   "expectation_sha256": "9c91c981331c387c70cc03b38c2027c7f9bf63634661a3e2c93a69c6871c53e7"
+  },
+  {
+   "id": "loop_do_4",
+   "entry": 1,
+   "edges": {
+    "1": [
+     2
+    ],
+    "2": [
+     3
+    ],
+    "3": [
+     2,
+     4
+    ],
+    "4": []
+   },
+   "expected_loops": [
+    {
+     "header": 2,
+     "members": [
+      2,
+      3
+     ],
+     "latches": [
+      3
+     ]
+    }
+   ],
+   "expected_ncpds": [
+    {
+     "branch": 3,
+     "left": 2,
+     "right": 4,
+     "join": 4
+    }
+   ],
+   "expected_loop_statements": [
+    {
+     "kind": "do_while_statement",
+     "header": 2
+    }
+   ],
+   "expectation_sha256": "1c539866d9bd7f5a05b0135ff847bccac289b54f116f6d3ba9fc13f722a9684c"
+  },
+  {
+   "id": "nested_loops_7",
+   "entry": 1,
+   "edges": {
+    "1": [
+     2
+    ],
+    "2": [
+     3,
+     7
+    ],
+    "3": [
+     4
+    ],
+    "4": [
+     5
+    ],
+    "5": [
+     3,
+     6
+    ],
+    "6": [
+     2
+    ],
+    "7": []
+   },
+   "expected_loops": [
+    {
+     "header": 2,
+     "members": [
+      2,
+      3,
+      4,
+      5,
+      6
+     ],
+     "latches": [
+      6
+     ]
+    },
+    {
+     "header": 3,
+     "members": [
+      3,
+      4,
+      5
+     ],
+     "latches": [
+      5
+     ]
+    }
+   ],
+   "expected_ncpds": [
+    {
+     "branch": 2,
+     "left": 3,
+     "right": 7,
+     "join": 7
+    },
+    {
+     "branch": 5,
+     "left": 3,
+     "right": 6,
+     "join": 6
+    }
+   ],
+   "expected_loop_statements": [
+    {
+     "kind": "while_statement",
+     "header": 2
+    },
+    {
+     "kind": "do_while_statement",
+     "header": 3
+    }
+   ],
+   "expectation_sha256": "8d1b7fe765c923acda8d372ff990dff5c1cbba76f09cadd4169587833626b4fc"
+  },
+  {
+   "id": "multi_exit_loop_6",
+   "entry": 1,
+   "edges": {
+    "1": [
+     2
+    ],
+    "2": [
+     3,
+     6
+    ],
+    "3": [
+     4,
+     5
+    ],
+    "4": [
+     2
+    ],
+    "5": [
+     2
+    ],
+    "6": []
+   },
+   "expected_loops": [
+    {
+     "header": 2,
+     "members": [
+      2,
+      3,
+      4,
+      5
+     ],
+     "latches": [
+      4,
+      5
+     ]
+    }
+   ],
+   "expected_ncpds": [
+    {
+     "branch": 2,
+     "left": 3,
+     "right": 6,
+     "join": 6
+    },
+    {
+     "branch": 3,
+     "left": 4,
+     "right": 5,
+     "join": 2
+    }
+   ],
+   "expected_loop_statements": [
+    {
+     "kind": "while_statement",
+     "header": 2
+    }
+   ],
+   "expectation_sha256": "ba6dd6ee107f2b9956ede094d2c0b7749ea27a51b7a29bca8732d6fdef6c2b80"
+  },
+  {
+   "id": "stress_chain_5000",
+   "generator": "chain",
+   "entry": 1,
+   "expected_loop_count": 0,
+   "expected_ncpd_count": 0,
+   "expectation_sha256": "39a70eaac702df3f7b5f5d620b9301be63441c67e4b0945a04bfbdc084e42b2e",
+   "blocks": 5000
+  },
+  {
+   "id": "stress_diamonds_1200",
+   "generator": "diamond_chain",
+   "entry": 1,
+   "expected_loop_count": 0,
+   "expected_ncpd_count": 300,
+   "expectation_sha256": "3f9578be7bfa41b11000918c053391ebecf5d6a98a9719f7273afed3173f58e3",
+   "diamonds": 300
+  }
+ ]
+}

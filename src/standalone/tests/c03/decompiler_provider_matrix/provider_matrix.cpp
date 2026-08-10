@@ -1234,8 +1234,8 @@ decompiler_ui_request_t make_native_ui_request(
     request.profile = decompiler_profile_id_t::balanced;
     request.cache_mode = decompiler_pipeline_cache_mode_t::bypass;
     request.provider_registration_id = "aida.decompiler.native.ghidra";
-    request.renderer = pseudocode_renderer_v2_style_settings(
-        pseudocode_renderer_v2_style_profile_t::balanced);
+    request.renderer = pseudocode_renderer_style_settings(
+        pseudocode_renderer_style_profile_t::balanced);
     request.dependencies = {
         {"aida.native.provider",
             runtime.provider.provider_version + "|" + runtime.provider.worker_build_id,
@@ -1274,8 +1274,8 @@ decompiler_pipeline_cache_key_t make_provider_cache_key(
     key.type_graph_revision = request.cache_identity.type_graph_revision;
     key.overlay_revision = request.cache_identity.overlay_revision;
     key.profile = request.budget.value_or(default_decompiler_profile_policy().balanced);
-    key.renderer = request.renderer.value_or(pseudocode_renderer_v2_style_settings(
-        pseudocode_renderer_v2_style_profile_t::balanced));
+    key.renderer = request.renderer.value_or(pseudocode_renderer_style_settings(
+        pseudocode_renderer_style_profile_t::balanced));
     key.dependencies = request.cache_identity.dependencies;
     const auto validation = validate_decompiler_pipeline_cache_key(key);
     if (!validation.valid())

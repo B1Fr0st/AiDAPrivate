@@ -106,6 +106,12 @@ public:
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> search_index_phase(
         const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> persistence_stage_decode_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> persistence_stage_functions_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
+    workspace_result_t<void> persistence_stage_metadata_phase(
+        const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> persistence_submit_phase(
         const std::atomic<bool>& runtime_cancel_requested);
     workspace_result_t<void> persistence_commit_phase(

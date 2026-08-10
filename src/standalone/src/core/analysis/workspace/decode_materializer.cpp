@@ -111,28 +111,28 @@ struct shard_base_ordinals_t {
 };
 
 workspace_result_t<shard_base_ordinals_t> compute_shard_bases(
-    const std::vector<packed_analysis_shard_t>& shards) {
+    const std::vector<decode_accepted_tile_counts_t>& tile_counts) {
     shard_base_ordinals_t bases;
-    bases.instruction_bases.reserve(shards.size());
-    bases.operand_bases.reserve(shards.size());
-    bases.target_bases.reserve(shards.size());
-    bases.expression_bases.reserve(shards.size());
-    for (const auto& shard : shards) {
+    bases.instruction_bases.reserve(tile_counts.size());
+    bases.operand_bases.reserve(tile_counts.size());
+    bases.target_bases.reserve(tile_counts.size());
+    bases.expression_bases.reserve(tile_counts.size());
+    for (const auto& tile : tile_counts) {
         bases.instruction_bases.push_back(bases.instruction_total);
         bases.operand_bases.push_back(bases.operand_total);
         bases.target_bases.push_back(bases.target_total);
         bases.expression_bases.push_back(bases.expression_total);
         if (!checked_add_u64(bases.instruction_total,
-                static_cast<std::uint64_t>(shard.instruction_count()),
+                static_cast<std::uint64_t>(tile.instruction_count),
                 bases.instruction_total) ||
             !checked_add_u64(bases.operand_total,
-                static_cast<std::uint64_t>(shard.operand_count()),
+                static_cast<std::uint64_t>(tile.operand_count),
                 bases.operand_total) ||
             !checked_add_u64(bases.target_total,
-                static_cast<std::uint64_t>(shard.target_fact_count()),
+                static_cast<std::uint64_t>(tile.target_count),
                 bases.target_total) ||
             !checked_add_u64(bases.expression_total,
-                static_cast<std::uint64_t>(shard.address_expression_count()),
+                static_cast<std::uint64_t>(tile.expression_count),
                 bases.expression_total)) {
             return workspace_result_t<shard_base_ordinals_t>::failure(
                 make_workspace_error(workspace_error_code_t::range_overflow,
@@ -786,14 +786,30 @@ workspace_result_t<void> stream_target_pages(
 
 namespace decode_materializer {
 
-workspace_result_t<void> materialize(
-    tile_decode_orchestration_result_t& decoded, analysis_snapshot_t& snapshot,
-    std::uint64_t remaining_budget_bytes, std::uint32_t workers,
-    const cancellation_token_t& cancel) {
-    auto bases = compute_shard_bases(decoded.packed_shards);
+struct materialize_plan_t {
+    shard_base_ordinals_t ordinals;
+    fact_residency_plan_t residency_plan;
+    bool paged_instructions = false;
+    bool paged_operands = false;
+    bool paged_targets = false;
+    std::shared_ptr<paged_fact_staging_t> staging_handle;
+    shard_fill_options_t fill_options;
+    std::vector<instruction_grouping_t> grouping;
+    std::vector<std::vector<operand_fact_cold_t>> tile_colds;
+    std::uint64_t remaining_budget_bytes = 0;
+};
+
+workspace_result_t<std::shared_ptr<materialize_plan_t>> materialize_begin(
+    const std::vector<decode_accepted_tile_counts_t>& tile_counts,
+    analysis_snapshot_t& snapshot, std::uint64_t remaining_budget_bytes) {
+    auto bases = compute_shard_bases(tile_counts);
     if (!bases)
-        return workspace_result_t<void>::failure(bases.error());
-    auto ordinals = bases.take_value();
+        return workspace_result_t<std::shared_ptr<materialize_plan_t>>::failure(
+            bases.error());
+    auto plan = std::make_shared<materialize_plan_t>();
+    plan->ordinals = bases.take_value();
+    plan->remaining_budget_bytes = remaining_budget_bytes;
+    const auto& ordinals = plan->ordinals;
     std::array<fact_domain_projection_t, fact_domain_count> projections{};
     projections[static_cast<std::size_t>(fact_domain_t::instructions)] = {
         ordinals.instruction_total,
@@ -803,9 +819,9 @@ workspace_result_t<void> materialize(
     projections[static_cast<std::size_t>(fact_domain_t::target_facts)] = {
         ordinals.target_total,
         static_cast<std::uint64_t>(sizeof(target_fact_t))};
-    auto residency_plan = fact_residency_select(projections,
+    plan->residency_plan = fact_residency_select(projections,
         fact_resident_budget_bytes(host_memory_envelope()));
-    snapshot.residency_plan = residency_plan;
+    snapshot.residency_plan = plan->residency_plan;
     snapshot.paged_domain_counts = {};
     snapshot.paged_staging.reset();
     snapshot.persisted_page_source.source.reset();
@@ -813,76 +829,87 @@ workspace_result_t<void> materialize(
     snapshot.operand_facts.clear();
     snapshot.target_facts.clear();
     snapshot.address_expressions.clear();
-    const bool paged_instructions =
-        residency_plan.domains[static_cast<std::size_t>(
+    plan->paged_instructions =
+        plan->residency_plan.domains[static_cast<std::size_t>(
             fact_domain_t::instructions)].mode == fact_residency_mode_t::paged;
-    const bool paged_operands =
-        residency_plan.domains[static_cast<std::size_t>(
+    plan->paged_operands =
+        plan->residency_plan.domains[static_cast<std::size_t>(
             fact_domain_t::operand_facts)].mode == fact_residency_mode_t::paged;
-    const bool paged_targets =
-        residency_plan.domains[static_cast<std::size_t>(
+    plan->paged_targets =
+        plan->residency_plan.domains[static_cast<std::size_t>(
             fact_domain_t::target_facts)].mode == fact_residency_mode_t::paged;
-    std::shared_ptr<paged_fact_staging_t> staging_handle;
-    if (residency_plan.any_paged()) {
+    if (plan->residency_plan.any_paged()) {
         auto staging = paged_fact_staging_t::create(
             governor_subsystem_budget_fields(
                 host_memory_envelope()).persistence_staging_bytes,
             staging_page_encoder_t::content_capacity());
         if (!staging)
-            return workspace_result_t<void>::failure(staging.error());
-        staging_handle = staging.take_value();
+            return workspace_result_t<std::shared_ptr<materialize_plan_t>>::failure(
+                staging.error());
+        plan->staging_handle = staging.take_value();
     }
-    if (!paged_instructions) {
+    if (!plan->paged_instructions) {
         resize_uninitialized(snapshot.instructions,
             static_cast<std::size_t>(ordinals.instruction_total));
     }
-    if (!paged_operands) {
+    if (!plan->paged_operands) {
         resize_uninitialized(snapshot.operand_facts.hot,
             static_cast<std::size_t>(ordinals.operand_total));
     }
-    if (!paged_targets) {
+    if (!plan->paged_targets) {
         resize_uninitialized(snapshot.target_facts,
             static_cast<std::size_t>(ordinals.target_total));
     }
     resize_uninitialized(snapshot.address_expressions,
         static_cast<std::size_t>(ordinals.expression_total));
-    std::vector<instruction_grouping_t> grouping;
-    if (paged_instructions) {
-        grouping.resize(static_cast<std::size_t>(ordinals.instruction_total));
+    if (plan->paged_instructions) {
+        plan->grouping.resize(
+            static_cast<std::size_t>(ordinals.instruction_total));
     }
-    shard_fill_options_t fill_options;
-    fill_options.fill_instructions = !paged_instructions;
-    fill_options.fill_operands = !paged_operands;
-    fill_options.fill_targets = !paged_targets;
-    const auto shard_ranges =
-        parallel_shards(decoded.packed_shards.size(), workers);
-    std::vector<std::vector<operand_fact_cold_t>> shard_colds(
-        decoded.packed_shards.size());
-    auto materialized = parallel_run_shards(shard_ranges,
-        [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
-            for (std::size_t shard_index = range.begin; shard_index < range.end;
-                 ++shard_index) {
-                if (cancel.stop_requested())
-                    return workspace_result_t<void>::failure(
-                        materialize_cancellation_error(cancel));
-                auto consumed = materialize_shard_rows(
-                    decoded.packed_shards[shard_index], snapshot,
-                    ordinals.instruction_bases[shard_index],
-                    ordinals.operand_bases[shard_index],
-                    ordinals.target_bases[shard_index],
-                    ordinals.expression_bases[shard_index],
-                    grouping.empty() ? nullptr : grouping.data(),
-                    shard_colds[shard_index], fill_options, cancel);
-                if (!consumed)
-                    return consumed;
-            }
-            return workspace_result_t<void>::success();
-        }, cancel);
-    if (!materialized)
-        return materialized;
-    if (!paged_operands) {
+    plan->fill_options.fill_instructions = !plan->paged_instructions;
+    plan->fill_options.fill_operands = !plan->paged_operands;
+    plan->fill_options.fill_targets = !plan->paged_targets;
+    plan->tile_colds.resize(tile_counts.size());
+    return workspace_result_t<std::shared_ptr<materialize_plan_t>>::success(
+        std::move(plan));
+}
+
+workspace_result_t<void> materialize_tile(
+    materialize_plan_t& plan, std::size_t tile_ordinal,
+    packed_analysis_shard_t& tile, analysis_snapshot_t& snapshot,
+    const cancellation_token_t& cancel) {
+    if (tile_ordinal >= plan.ordinals.instruction_bases.size()) {
+        return workspace_result_t<void>::failure(materialize_integrity_error(
+            "tile decode materialization tile ordinal is out of range"));
+    }
+    return materialize_shard_rows(tile, snapshot,
+        plan.ordinals.instruction_bases[tile_ordinal],
+        plan.ordinals.operand_bases[tile_ordinal],
+        plan.ordinals.target_bases[tile_ordinal],
+        plan.ordinals.expression_bases[tile_ordinal],
+        plan.grouping.empty() ? nullptr : plan.grouping.data(),
+        plan.tile_colds[tile_ordinal], plan.fill_options, cancel);
+}
+
+workspace_result_t<void> materialize_finish(
+    materialize_plan_t& plan, tile_decode_orchestration_result_t& decoded,
+    analysis_snapshot_t& snapshot, std::uint32_t workers,
+    const cancellation_token_t& cancel) {
+    const auto& ordinals = plan.ordinals;
+    const auto resolve_tile_ordinal = [](const packed_analysis_shard_t& shard,
+        std::size_t plan_size, std::size_t& tile_ordinal)
+        -> workspace_result_t<void> {
+        tile_ordinal = static_cast<std::size_t>(shard.shard_id());
+        if (tile_ordinal >= plan_size) {
+            return workspace_result_t<void>::failure(
+                materialize_integrity_error(
+                    "tile decode packed shard identifier is out of range"));
+        }
+        return workspace_result_t<void>::success();
+    };
+    if (!plan.paged_operands) {
         std::uint64_t cold_total = 0;
-        for (const auto& cold : shard_colds) {
+        for (const auto& cold : plan.tile_colds) {
             if (!checked_add_u64(cold_total,
                     static_cast<std::uint64_t>(cold.size()), cold_total)) {
                 return workspace_result_t<void>::failure(make_workspace_error(
@@ -892,34 +919,57 @@ workspace_result_t<void> materialize(
         }
         resize_uninitialized(snapshot.operand_facts.cold,
             static_cast<std::size_t>(cold_total));
-        std::vector<std::uint64_t> cold_bases(decoded.packed_shards.size(), 0);
+        std::vector<std::uint64_t> cold_bases(plan.tile_colds.size(), 0);
         std::uint64_t cold_base = 0;
-        for (std::size_t shard_index = 0;
-             shard_index < decoded.packed_shards.size(); ++shard_index) {
-            cold_bases[shard_index] = cold_base;
-            auto& cold = shard_colds[shard_index];
-            if (!cold.empty()) {
-                std::memcpy(snapshot.operand_facts.cold.data() + cold_base,
-                            cold.data(), cold.size() * sizeof(operand_fact_cold_t));
-                cold_base += cold.size();
-            }
-            std::vector<operand_fact_cold_t>().swap(cold);
+        for (std::size_t tile_ordinal = 0;
+             tile_ordinal < plan.tile_colds.size(); ++tile_ordinal) {
+            cold_bases[tile_ordinal] = cold_base;
+            cold_base += plan.tile_colds[tile_ordinal].size();
         }
-        auto remapped = parallel_run_shards(shard_ranges,
+        const auto tile_ranges =
+            parallel_shards(plan.tile_colds.size(), workers);
+        auto copied = parallel_run_shards(tile_ranges,
             [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
-                for (std::size_t shard_index = range.begin; shard_index < range.end;
-                     ++shard_index) {
+                for (std::size_t tile_ordinal = range.begin;
+                     tile_ordinal < range.end; ++tile_ordinal) {
+                    if (cancel.stop_requested())
+                        return workspace_result_t<void>::failure(
+                            materialize_cancellation_error(cancel));
+                    auto& cold = plan.tile_colds[tile_ordinal];
+                    if (!cold.empty()) {
+                        std::memcpy(snapshot.operand_facts.cold.data() +
+                            cold_bases[tile_ordinal], cold.data(),
+                            cold.size() * sizeof(operand_fact_cold_t));
+                    }
+                    std::vector<operand_fact_cold_t>().swap(cold);
+                }
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!copied)
+            return copied;
+        const auto packed_ranges =
+            parallel_shards(decoded.packed_shards.size(), workers);
+        auto remapped = parallel_run_shards(packed_ranges,
+            [&](std::size_t, parallel_shard_t range) -> workspace_result_t<void> {
+                for (std::size_t shard_index = range.begin;
+                     shard_index < range.end; ++shard_index) {
+                    std::size_t tile_ordinal = 0;
+                    auto resolved = resolve_tile_ordinal(
+                        decoded.packed_shards[shard_index],
+                        ordinals.operand_bases.size(), tile_ordinal);
+                    if (!resolved)
+                        return resolved;
                     const auto operand_begin = static_cast<std::size_t>(
-                        ordinals.operand_bases[shard_index]);
+                        ordinals.operand_bases[tile_ordinal]);
                     const auto operand_end = static_cast<std::size_t>(
-                        ordinals.operand_bases[shard_index] +
+                        ordinals.operand_bases[tile_ordinal] +
                         decoded.packed_shards[shard_index].operand_count());
                     for (std::size_t index = operand_begin; index < operand_end;
                          ++index) {
                         auto& hot = snapshot.operand_facts.hot[index];
                         if (hot.cold_index != 0) {
                             hot.cold_index = static_cast<std::uint32_t>(
-                                cold_bases[shard_index] + hot.cold_index);
+                                cold_bases[tile_ordinal] + hot.cold_index);
                         }
                     }
                 }
@@ -941,13 +991,13 @@ workspace_result_t<void> materialize(
         shard_expression_counts[shard_index] =
             decoded.packed_shards[shard_index].address_expression_count();
     }
-    if (residency_plan.any_paged()) {
+    if (plan.residency_plan.any_paged()) {
         for (const auto domain : fact_domain_page_priority) {
             if (cancel.stop_requested())
                 return workspace_result_t<void>::failure(
                     materialize_cancellation_error(cancel));
             const auto mode =
-                residency_plan.domains[static_cast<std::size_t>(domain)].mode;
+                plan.residency_plan.domains[static_cast<std::size_t>(domain)].mode;
             if (mode != fact_residency_mode_t::paged)
                 continue;
             if (domain != fact_domain_t::instructions &&
@@ -967,35 +1017,41 @@ workspace_result_t<void> materialize(
                 page_type = packed_page_type_t::target_facts;
             }
             staging_page_encoder_t encoder(domain, page_type, record_total,
-                                           staging_handle, cancel);
+                                           plan.staging_handle, cancel);
             for (std::size_t shard_index = 0;
                  shard_index < decoded.packed_shards.size(); ++shard_index) {
                 if (cancel.stop_requested())
                     return workspace_result_t<void>::failure(
                         materialize_cancellation_error(cancel));
                 auto& shard = decoded.packed_shards[shard_index];
+                std::size_t tile_ordinal = 0;
+                auto resolved = resolve_tile_ordinal(shard,
+                    ordinals.instruction_bases.size(), tile_ordinal);
+                if (!resolved)
+                    return resolved;
                 workspace_result_t<void> streamed =
                     workspace_result_t<void>::success();
                 if (domain == fact_domain_t::instructions) {
                     streamed = stream_instruction_pages(
-                        shard, encoder, ordinals.instruction_bases[shard_index],
-                        shard_instruction_counts[shard_index], grouping.data(), cancel);
+                        shard, encoder, ordinals.instruction_bases[tile_ordinal],
+                        shard_instruction_counts[shard_index],
+                        plan.grouping.data(), cancel);
                 } else if (domain == fact_domain_t::operand_facts) {
                     streamed = stream_operand_pages(
-                        shard, encoder, ordinals.instruction_bases[shard_index],
+                        shard, encoder, ordinals.instruction_bases[tile_ordinal],
                         shard_instruction_counts[shard_index],
-                        ordinals.operand_bases[shard_index],
+                        ordinals.operand_bases[tile_ordinal],
                         shard_operand_counts[shard_index],
-                        ordinals.expression_bases[shard_index],
+                        ordinals.expression_bases[tile_ordinal],
                         shard_expression_counts[shard_index], cancel);
                 } else {
                     streamed = stream_target_pages(
-                        shard, encoder, ordinals.instruction_bases[shard_index],
+                        shard, encoder, ordinals.instruction_bases[tile_ordinal],
                         shard_instruction_counts[shard_index],
-                        ordinals.operand_bases[shard_index],
+                        ordinals.operand_bases[tile_ordinal],
                         shard_operand_counts[shard_index],
                         static_cast<std::uint64_t>(shard.target_fact_count()),
-                        ordinals.expression_bases[shard_index],
+                        ordinals.expression_bases[tile_ordinal],
                         shard_expression_counts[shard_index], cancel);
                 }
                 if (!streamed)
@@ -1028,34 +1084,34 @@ workspace_result_t<void> materialize(
             auto finished = encoder.finish();
             if (!finished)
                 return finished;
-            auto contiguous = staging_handle->validate_contiguous(domain);
+            auto contiguous = plan.staging_handle->validate_contiguous(domain);
             if (!contiguous)
                 return contiguous;
         }
         snapshot.paged_domain_counts[static_cast<std::size_t>(
-            fact_domain_t::instructions)] = paged_instructions
+            fact_domain_t::instructions)] = plan.paged_instructions
             ? ordinals.instruction_total : 0;
         snapshot.paged_domain_counts[static_cast<std::size_t>(
-            fact_domain_t::operand_facts)] = paged_operands
+            fact_domain_t::operand_facts)] = plan.paged_operands
             ? ordinals.operand_total : 0;
         snapshot.paged_domain_counts[static_cast<std::size_t>(
-            fact_domain_t::target_facts)] = paged_targets
+            fact_domain_t::target_facts)] = plan.paged_targets
             ? ordinals.target_total : 0;
-        if (paged_instructions &&
-            staging_handle->record_count(fact_domain_t::instructions) !=
+        if (plan.paged_instructions &&
+            plan.staging_handle->record_count(fact_domain_t::instructions) !=
                 ordinals.instruction_total +
                     static_cast<std::uint64_t>(decoded.delay_slot_counts.size())) {
             return workspace_result_t<void>::failure(materialize_integrity_error(
                 "tile decode staged instruction count does not match the decode"));
         }
-        if (paged_operands &&
-            staging_handle->record_count(fact_domain_t::operand_facts) !=
+        if (plan.paged_operands &&
+            plan.staging_handle->record_count(fact_domain_t::operand_facts) !=
                 ordinals.operand_total) {
             return workspace_result_t<void>::failure(materialize_integrity_error(
                 "tile decode staged operand count does not match the decode"));
         }
-        if (paged_targets &&
-            staging_handle->record_count(fact_domain_t::target_facts) !=
+        if (plan.paged_targets &&
+            plan.staging_handle->record_count(fact_domain_t::target_facts) !=
                 ordinals.target_total) {
             return workspace_result_t<void>::failure(materialize_integrity_error(
                 "tile decode staged target count does not match the decode"));
@@ -1063,7 +1119,7 @@ workspace_result_t<void> materialize(
     }
     std::uint64_t resident_required = 0;
     std::uint64_t term = 0;
-    if (!paged_instructions &&
+    if (!plan.paged_instructions &&
         (!checked_mul_u64(ordinals.instruction_total,
              static_cast<std::uint64_t>(sizeof(instruction_record_t)), term) ||
          !checked_add_u64(resident_required, term, resident_required))) {
@@ -1071,7 +1127,7 @@ workspace_result_t<void> materialize(
             workspace_error_code_t::range_overflow,
             "tile decode memory accounting overflows", "memory_budget"));
     }
-    if (!paged_operands &&
+    if (!plan.paged_operands &&
         (!checked_mul_u64(static_cast<std::uint64_t>(snapshot.operand_facts.hot.size()),
              static_cast<std::uint64_t>(sizeof(operand_fact_hot_t)), term) ||
          !checked_add_u64(resident_required, term, resident_required) ||
@@ -1082,7 +1138,7 @@ workspace_result_t<void> materialize(
             workspace_error_code_t::range_overflow,
             "tile decode memory accounting overflows", "memory_budget"));
     }
-    if (!paged_targets &&
+    if (!plan.paged_targets &&
         (!checked_mul_u64(ordinals.target_total,
              static_cast<std::uint64_t>(sizeof(target_fact_t)), term) ||
          !checked_add_u64(resident_required, term, resident_required))) {
@@ -1101,16 +1157,16 @@ workspace_result_t<void> materialize(
             static_cast<std::uint64_t>(sizeof(address_expression_record_t)), term) ||
         !checked_add_u64(resident_required, term, resident_required) ||
         !checked_add_u64(resident_required,
-            static_cast<std::uint64_t>(grouping.size() * sizeof(instruction_grouping_t)),
+            static_cast<std::uint64_t>(plan.grouping.size() * sizeof(instruction_grouping_t)),
             resident_required) ||
         !checked_add_u64(resident_required,
-            staging_handle ? staging_handle->resident_bytes() : 0,
+            plan.staging_handle ? plan.staging_handle->resident_bytes() : 0,
             resident_required)) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::range_overflow,
             "tile decode memory accounting overflows", "memory_budget"));
     }
-    if (resident_required > remaining_budget_bytes) {
+    if (resident_required > plan.remaining_budget_bytes) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::limit_exceeded,
             "decoded snapshot exceeds analysis memory budget even with paged residency",
@@ -1123,7 +1179,7 @@ workspace_result_t<void> materialize(
             "decoded snapshot exceeds the working-set governor resident-facts budget",
             "decode_merge"));
     }
-    const std::uint64_t expected_delay_slots = paged_instructions
+    const std::uint64_t expected_delay_slots = plan.paged_instructions
         ? ordinals.instruction_total
         : static_cast<std::uint64_t>(snapshot.instructions.size());
     if (static_cast<std::uint64_t>(decoded.delay_slot_counts.size()) !=
@@ -1134,7 +1190,7 @@ workspace_result_t<void> materialize(
             "decode_merge"));
     }
     snapshot.delay_slot_counts = std::move(decoded.delay_slot_counts);
-    snapshot.paged_staging = std::move(staging_handle);
+    snapshot.paged_staging = std::move(plan.staging_handle);
     decoded.packed_shards.clear();
     return workspace_result_t<void>::success();
 }

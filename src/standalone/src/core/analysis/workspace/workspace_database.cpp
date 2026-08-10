@@ -9637,6 +9637,31 @@ std::uint32_t workspace_snapshot_staging_t::staged_domain_mask() const noexcept 
     return state_->staged_mask.load(std::memory_order_acquire);
 }
 
+workspace_result_t<void> workspace_snapshot_staging_t::set_metrics_json(
+    std::string metrics_json) {
+    if (state_->finalized.load(std::memory_order_acquire)) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "snapshot staging is already finalized",
+            "workspace_database.persist"));
+    }
+    if (state_->failed.load(std::memory_order_acquire))
+        return workspace_result_t<void>::failure(state_->current_failure());
+    state_->metrics_json = std::move(metrics_json);
+    return workspace_result_t<void>::success();
+}
+
+void workspace_snapshot_staging_t::expect_complete_baseline() noexcept {
+    state_->baseline_complete = true;
+}
+
+void workspace_snapshot_staging_t::discard(workspace_error_t error) noexcept {
+    try {
+        state_->record_failure(std::move(error));
+    } catch (...) {
+    }
+}
+
 std::string decompiler_cache_key_t::canonical() const {
     std::ostringstream output;
     const bool legacy_pe = endian == endian_t::little &&

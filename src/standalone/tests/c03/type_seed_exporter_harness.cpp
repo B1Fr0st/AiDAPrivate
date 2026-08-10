@@ -508,17 +508,17 @@ public:
         auto result = route.provider->decompile(request, cancel);
         if (!result.succeeded() || !result.artifacts->hir)
             return result;
-        const auto ast = build_typed_ast_v2(*result.artifacts->hir, result.artifacts->type_graph);
+        const auto ast = build_typed_ast(*result.artifacts->hir, result.artifacts->type_graph);
         if (!ast.succeeded() || !ast.ast) {
             result.status = decompiler_provider_execution_status_t::failed;
             result.diagnostics.insert(result.diagnostics.end(),
                 ast.diagnostics.begin(), ast.diagnostics.end());
             return result;
         }
-        pseudocode_renderer_v2_request_t render_request;
+        pseudocode_renderer_request_t render_request;
         render_request.profile = request.cache_key.profile.profile;
         render_request.settings = request.cache_key.renderer;
-        auto rendered = render_pseudocode_v2(*ast.ast, result.artifacts->type_graph, render_request);
+        auto rendered = render_pseudocode(*ast.ast, result.artifacts->type_graph, render_request);
         if (!rendered.succeeded() || !rendered.document) {
             result.status = decompiler_provider_execution_status_t::failed;
             result.diagnostics.insert(result.diagnostics.end(),
@@ -539,7 +539,7 @@ decompiler_pipeline_result_t run_semantic_fixture(semantic_fixture_kind_t fixtur
         provider_identity(std::to_string(function_id)), fixture);
     require(static_cast<bool>(registry->register_provider(provider)),
             "failed to register the semantic fixture provider");
-    auto cache = decompiler_cache_v9_t::create();
+    auto cache = decompiler_cache_t::create();
     require(static_cast<bool>(cache), "failed to create the semantic fixture cache");
     decompiler_pipeline_service_config_t config;
     config.isolated_provider_host = std::make_shared<passthrough_isolated_host_t>();

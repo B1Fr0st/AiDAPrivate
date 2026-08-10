@@ -39,6 +39,23 @@ struct xref_popup_entry_t {
     std::string function_name;
 };
 
+enum class operand_color_role_t : std::uint8_t {
+    reg = 0,
+    imm = 1,
+    keyword = 2,
+    name_candidate = 3,
+    sub_label = 4,
+    string_ref = 5,
+    reg_ptr = 6,
+    plain = 7
+};
+
+struct operand_token_t {
+    std::uint32_t offset = 0;
+    std::uint32_t length = 0;
+    std::uint8_t color_role = 0;
+};
+
 struct formatted_instruction_t {
     aida::analysis::entity_id_t instruction_id = 0;
     std::uint64_t generation = 0;
@@ -48,6 +65,8 @@ struct formatted_instruction_t {
     std::string bytes;
     std::string text;
     std::string error;
+    std::size_t mnemonic_end = 0;
+    std::vector<operand_token_t> tokens;
 };
 
 struct mutation_state_t {
@@ -110,6 +129,30 @@ struct state_t {
     std::atomic<bool> xref_scanning{false};
     std::vector<bookmark_t> bookmarks;
     std::unordered_map<aida::analysis::entity_id_t, formatted_instruction_t> formatted;
+    std::atomic<std::uint64_t> formatted_revision{0};
+    struct bookmark_cache_t {
+        std::shared_ptr<const std::vector<bookmark_t>> rows;
+        const void* publication = nullptr;
+        std::uint64_t overlay_revision = 0;
+    };
+    bookmark_cache_t bookmark_cache;
+    struct nav_band_cache_t {
+        std::vector<std::uint32_t> colors;
+        const void* instructions = nullptr;
+        std::size_t range_first = 0;
+        std::size_t range_second = 0;
+        std::size_t marker_step = 0;
+        std::uint64_t formatted_revision = 0;
+    };
+    nav_band_cache_t nav_band_cache;
+    struct prefix_width_cache_t {
+        float width = 0.0f;
+        int addr_format = -1;
+        const void* font = nullptr;
+        std::uint64_t sections_revision = 0;
+        bool valid = false;
+    };
+    prefix_width_cache_t prefix_width_cache;
     std::unordered_set<std::uint64_t> pending_format_pages;
     std::uint64_t cached_generation = 0;
     std::uint64_t cached_analysis_revision = 0;
@@ -182,6 +225,10 @@ std::optional<aida::analysis::address_t> typed_address(
     const workspace_context_t& context, std::uint64_t runtime_address);
 std::optional<std::uint64_t> runtime_address(
     const workspace_context_t& context, const aida::analysis::address_t& address);
+std::optional<std::uint64_t> display_base_override(const workspace_context_t& context);
+std::optional<std::uint64_t> runtime_address_with_base(
+    const workspace_context_t& context, const aida::analysis::address_t& address,
+    const std::optional<std::uint64_t>& base_override);
 std::optional<std::uint64_t> provider_offset(
     const workspace_context_t& context, const aida::analysis::address_t& address);
 aida::analysis::workspace_result_t<std::vector<std::uint8_t>> read_bytes(
