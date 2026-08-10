@@ -16422,10 +16422,7 @@ void server_t::server_thread_func(int port)
         proof["mcp_port"] = static_cast<uint32_t>(_port);
         proof["issued_tick_ms"] = now_tick;
         proof["expires_tick_ms"] = now_tick + 15000ull;
-        proof["validated"] = true;
-        proof["arc_loaded"] = true;
         proof["lifecycle_ready"] = g_ide_lifecycle_ready.load(std::memory_order_acquire);
-        proof["exports_verified"] = true;
         const std::string proof_json = proof.dump();
 
         res.status = 200;
@@ -16479,10 +16476,7 @@ void server_t::server_thread_func(int port)
         health["pid"]         = static_cast<std::uint32_t>(GetCurrentProcessId());
         health["port"]        = _port;
         health["authenticated"] = lifecycle_ready;
-        health["validated"] = true;
-        health["arc_loaded"] = true;
         health["lifecycle_ready"] = lifecycle_ready;
-        health["exports_verified"] = true;
         health["tools_count"] = g_cached_external_tool_count.load(std::memory_order_acquire);
         health["cache_ready"] = g_cached_health_ready.load(std::memory_order_acquire);
         health["active_requests"] = g_active_http_requests.load(std::memory_order_acquire);

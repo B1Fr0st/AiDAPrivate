@@ -7,7 +7,6 @@
 #include <function/CoreSecurity.h>
 #include <function/DebugEvents.h>
 #include <function/MalwareSafe.h>
-#include <core/HardwareId.h>
 
 namespace ioctl_codes {
     constexpr ULONG kFunctionBase = 0x800;
@@ -170,15 +169,6 @@ namespace dispatcher {
             irp->IoStatus.Information = 0;
             _IofCompleteRequest(irp, IO_NO_INCREMENT);
             return STATUS_INVALID_PARAMETER;
-        }
-
-        if (code == IOCTL_AIDA_GET_HWID) {
-            NTSTATUS hwid_status = HardwareIdHandleIoctl(irp, stack);
-            ULONG hwid_bytes = static_cast<ULONG>(irp->IoStatus.Information);
-            irp->IoStatus.Status = hwid_status;
-            irp->IoStatus.Information = hwid_bytes;
-            _IofCompleteRequest(irp, IO_NO_INCREMENT);
-            return hwid_status;
         }
 
         if (malware_safe::any_sandboxed()) {

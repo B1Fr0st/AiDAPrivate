@@ -147,18 +147,10 @@
     <ClCompile Include="src\function\impl\Debugger.cpp" />
     <ClCompile Include="src\function\impl\Network.cpp" />
     <ClCompile Include="src\function\KernelDebugCapture.cpp" />
-    <ClCompile Include="src\core\HardwareId.cpp" />
   </ItemGroup>
-  <!-- 
-    ntoskernel_base.asm has been replaced with a safe C++ implementation in Defs.h
-    The assembly version caused PAGE_FAULT_IN_NONPAGED_AREA (0x50) when loading
-    multiple drivers due to unsafe memory scanning without MmIsAddressValid checks.
-  -->
   <ItemGroup>
     <ClInclude Include="src\function\KernelDebugCapture.h" />
-    <ClInclude Include="src\core\HardwareId.h" />
     <ClInclude Include="src\function\CoreSecurity.h" />
-    <ClInclude Include="src\function\KernelCrypto.h" />
     <ClInclude Include="src\function\KernelLayout.h" />
     <ClInclude Include="src\function\Dispatcher.h" />
     <ClInclude Include="src\function\Functions.h" />

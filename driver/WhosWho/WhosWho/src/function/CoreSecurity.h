@@ -2,7 +2,6 @@
 #include <ntifs.h>
 #include <intrin.h>
 #include "../imports/Defs.h"
-#include "KernelCrypto.h"
 
 #ifndef YieldProcessor
 #define YieldProcessor() _mm_pause()

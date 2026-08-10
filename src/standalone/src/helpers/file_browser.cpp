@@ -1307,7 +1307,7 @@ void open_path(const std::string& path)
         || extension == ".hpp" || extension == ".asm" || extension == ".md"
         || extension == ".txt" || extension == ".json") {
         const std::string content = extension == ".md"
-            ? "# Reverse Engineering Notes\n\n- Entrypoint mapped\n- Import resolver identified\n- License gate cross-references indexed\n"
+            ? "# Reverse Engineering Notes\n\n- Entrypoint mapped\n- Import resolver identified\n"
             : "int analyze_target(const char* path) {\n    return path != nullptr ? 0 : -1;\n}\n";
         file_tabs::open_or_focus(path, filename, content);
         aida::ui::application_views::open_or_focus(

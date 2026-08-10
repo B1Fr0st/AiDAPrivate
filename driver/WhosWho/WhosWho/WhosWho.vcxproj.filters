@@ -43,14 +43,6 @@
     <ClCompile Include="src\function\KernelDebugCapture.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\core\HardwareId.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <MASM Include="src\imports\ntoskernel_base.asm">
-      <Filter>Source Files</Filter>
-    </MASM>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\imports\Defs.h">
@@ -69,9 +61,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\function\CoreSecurity.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\function\KernelCrypto.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\function\KernelLayout.h">
@@ -93,9 +82,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\function\impl\driver\za.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\core\HardwareId.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

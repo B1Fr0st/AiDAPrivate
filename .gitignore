@@ -6,7 +6,6 @@
 
 # Allow the specific root directories you want
 !/src/
-!/server/
 !/tools/
 !/cmake/
 !/docs/
@@ -27,9 +26,6 @@
 # ==========================================
 # 2. EXCLUSIONS (These override the allows)
 # ==========================================
-
-# Build-generated embedded headers (regenerated from AiDA.dll; >100MB so exceeds GitHub per-file limit)
-/src/aida_plugin_encrypted.h
 
 # Images and Media
 *.png
@@ -76,13 +72,9 @@ compile_commands.json
 .env
 *.pem
 *.p12
-server/keys/
-server/bootstrap_artifacts/
-firebase/functions/.local-secrets/
 
 # Aider and local cache
 models.json
-license-validation-response.json
 
 # Massive Third-Party Headers/Directories
 **/freetype/

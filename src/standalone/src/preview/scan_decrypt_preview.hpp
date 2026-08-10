@@ -67,7 +67,7 @@ inline void scan_and_decrypt(std::uint64_t address, std::uint64_t size,
 	g_state.total_xrefs.store(4);
 	std::vector<decrypted_string_t> results{
 		{address + 0x140, address + 0x2A8, address + 0x20, address + 0x918,
-			"license/session/validate", 24, .97f, false, 86, 3},
+			"modules/updater/sync.dll", 24, .97f, false, 86, 3},
 		{address + 0x3D0, address + 0x458, address + 0x1C0, address + 0xA40,
 			"Runtime integrity verified", 26, .93f, false, 114, 5},
 		{address + 0x720, address + 0x7C8, address + 0x2E0, address + 0xB10,

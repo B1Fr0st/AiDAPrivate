@@ -209,7 +209,7 @@ namespace aida::preview
 		globals::ui::bg_init_step.store(globals::ui::bg_init_total.load(std::memory_order_acquire), std::memory_order_release);
 		globals::ui::window_w = display_size.x > 0.f ? display_size.x : 1280.f;
 		globals::ui::window_h = display_size.y > 0.f ? display_size.y : 760.f;
-		globals::ui::welcome_done = active_phase == shell_phase_t::ide || active_phase == shell_phase_t::license;
+		globals::ui::welcome_done = active_phase == shell_phase_t::ide;
 		globals::ui::ui_alpha = active_phase == shell_phase_t::ide ? 1.f : 0.f;
 		if (initialized.exchange(true, std::memory_order_acq_rel)) {
 			if (!desktop_focus_applied.exchange(true, std::memory_order_acq_rel)) {
@@ -388,7 +388,7 @@ namespace aida::preview
 
 	bool welcome_done()
 	{
-		return active_phase == shell_phase_t::ide || active_phase == shell_phase_t::license;
+		return active_phase == shell_phase_t::ide;
 	}
 
 	bool mouse_button_down(ImGuiMouseButton button)

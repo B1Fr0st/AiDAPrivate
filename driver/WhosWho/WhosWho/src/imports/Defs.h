@@ -79,27 +79,6 @@ extern "C" NTSTATUS NTAPI ZwQuerySystemInformation(
     _Out_opt_ PULONG ReturnLength
 );
 
-namespace func_obfuscate {
-    constexpr std::uintptr_t compute_key() {
-        std::uintptr_t h = 0xDEADBEEFCAFEBABEULL;
-        const char* t = __TIME__ __DATE__;
-        while (*t) { h = h * 31 + *t++; }
-        return h ^ 0x5A5A5A5A5A5A5A5AULL;
-    }
-
-    constexpr std::uintptr_t KEY = compute_key();
-
-    template<typename T>
-    __forceinline T decode(T encoded) {
-        return (T)((std::uintptr_t)encoded ^ KEY);
-    }
-
-    template<typename T>
-    __forceinline T encode(T raw) {
-        return (T)((std::uintptr_t)raw ^ KEY);
-    }
-}
-
 inline PVOID GetProcAddress(PVOID ModBase, CHAR Name[]) {
     if (!ModBase || !Name)
         return nullptr;
@@ -252,11 +231,9 @@ inline BOOLEAN             (NTAPI* _ObReferenceObjectSafe)(PVOID) = nullptr;
 
 inline NTSTATUS           (NTAPI* _ZwOpenKey)                      (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
 inline NTSTATUS           (NTAPI* _ZwQueryValueKey)                (HANDLE, PUNICODE_STRING, KEY_VALUE_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-inline NTSTATUS           (NTAPI* _ZwDeleteFile)                    (POBJECT_ATTRIBUTES);
 inline NTSTATUS           (NTAPI* _ZwSetInformationFile)           (HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
 inline NTSTATUS           (NTAPI* _IoCreateFileEx)                 (PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG, CREATE_FILE_TYPE, PVOID, ULONG, PIO_DRIVER_CREATE_CONTEXT);
 
-inline VOID               (NTAPI* _KeBugCheckEx)                   (ULONG, ULONG_PTR, ULONG_PTR, ULONG_PTR, ULONG_PTR);
 inline BOOLEAN            (NTAPI* _KdRefreshDebuggerNotPresent)    (VOID) = nullptr;
 inline VOID               (NTAPI* _KeInitializeDpc)                (PRKDPC, PKDEFERRED_ROUTINE, PVOID);
 inline VOID               (NTAPI* _KeInitializeTimerEx)            (PKTIMER, TIMER_TYPE);
@@ -1666,11 +1643,9 @@ inline bool SetupFunctions() {
 
     *(PVOID*)&_ZwOpenKey = GetProcAddress(kernelBase, (PCHAR)"ZwOpenKey");
     *(PVOID*)&_ZwQueryValueKey = GetProcAddress(kernelBase, (PCHAR)"ZwQueryValueKey");
-    *(PVOID*)&_ZwDeleteFile = GetProcAddress(kernelBase, (PCHAR)"ZwDeleteFile");
     *(PVOID*)&_ZwSetInformationFile = GetProcAddress(kernelBase, (PCHAR)"ZwSetInformationFile");
     *(PVOID*)&_IoCreateFileEx = GetProcAddress(kernelBase, (PCHAR)"IoCreateFileEx");
 
-    *(PVOID*)&_KeBugCheckEx = GetProcAddress(kernelBase, (PCHAR)"KeBugCheckEx");
     *(PVOID*)&_KdRefreshDebuggerNotPresent = GetProcAddress(kernelBase, (PCHAR)"KdRefreshDebuggerNotPresent");
     *(PVOID*)&_KeInitializeDpc = GetProcAddress(kernelBase, (PCHAR)"KeInitializeDpc");
     *(PVOID*)&_KeInitializeTimerEx = GetProcAddress(kernelBase, (PCHAR)"KeInitializeTimerEx");
@@ -1710,8 +1685,8 @@ inline bool SetupFunctions() {
     WW_LOG("SetupFunctions: _PsGetProcessPeb=%p _ZwQueryVirtualMemory=%p _ZwProtectVirtualMemory=%p", _PsGetProcessPeb, _ZwQueryVirtualMemory, _ZwProtectVirtualMemory);
     WW_LOG("SetupFunctions: _ObOpenObjectByPointer=%p _ZwSuspendThread=%p _ZwResumeThread=%p _ZwQueryInformationThread=%p _ZwTerminateThread=%p _ZwSetInformationThread=%p", _ObOpenObjectByPointer, _ZwSuspendThread, _ZwResumeThread, _ZwQueryInformationThread, _ZwTerminateThread, _ZwSetInformationThread);
     WW_LOG("SetupFunctions: _IoFileObjectType=%p _ObGetObjectType=%p _ObReferenceObjectSafe=%p", _IoFileObjectType, _ObGetObjectType, _ObReferenceObjectSafe);
-    WW_LOG("SetupFunctions: _ZwOpenKey=%p _ZwQueryValueKey=%p _ZwDeleteFile=%p _ZwSetInformationFile=%p", _ZwOpenKey, _ZwQueryValueKey, _ZwDeleteFile, _ZwSetInformationFile);
-    WW_LOG("SetupFunctions: _IoCreateFileEx=%p _KeBugCheckEx=%p _KdRefreshDebuggerNotPresent=%p", _IoCreateFileEx, _KeBugCheckEx, _KdRefreshDebuggerNotPresent);
+    WW_LOG("SetupFunctions: _ZwOpenKey=%p _ZwQueryValueKey=%p _ZwSetInformationFile=%p", _ZwOpenKey, _ZwQueryValueKey, _ZwSetInformationFile);
+    WW_LOG("SetupFunctions: _IoCreateFileEx=%p _KdRefreshDebuggerNotPresent=%p", _IoCreateFileEx, _KdRefreshDebuggerNotPresent);
     WW_LOG("SetupFunctions: _KeInitializeDpc=%p _KeInitializeTimerEx=%p _KeSetTimerEx=%p _KeCancelTimer=%p _KeFlushQueuedDpcs=%p", _KeInitializeDpc, _KeInitializeTimerEx, _KeSetTimerEx, _KeCancelTimer, _KeFlushQueuedDpcs);
     WW_LOG("SetupFunctions: _ExQueueWorkItem=%p", _ExQueueWorkItem);
     WW_LOG("SetupFunctions: _ObRegisterCallbacks=%p _ObUnRegisterCallbacks=%p _PsSetCreateProcessNotifyRoutineEx=%p", _ObRegisterCallbacks, _ObUnRegisterCallbacks, _PsSetCreateProcessNotifyRoutineEx);
@@ -1734,7 +1709,7 @@ inline bool SetupFunctions() {
             _KeStackAttachProcess && _KeUnstackDetachProcess &&
             _ZwAllocateVirtualMemory && _ZwFreeVirtualMemory &&
             _IoDeleteDevice && _IoDeleteSymbolicLink &&
-            _KeBugCheckEx && _KeInitializeDpc && _KeInitializeTimerEx &&
+            _KeInitializeDpc && _KeInitializeTimerEx &&
             _KeSetTimerEx && _KeCancelTimer && _KeFlushQueuedDpcs &&
             _ExQueueWorkItem) ? TRUE : FALSE),
         _RtlInitUnicodeString,
@@ -1757,7 +1732,7 @@ inline bool SetupFunctions() {
             _KeStackAttachProcess && _KeUnstackDetachProcess &&
             _ZwAllocateVirtualMemory && _ZwFreeVirtualMemory &&
             _IoDeleteDevice && _IoDeleteSymbolicLink &&
-            _KeBugCheckEx && _KeInitializeDpc && _KeInitializeTimerEx &&
+            _KeInitializeDpc && _KeInitializeTimerEx &&
             _KeSetTimerEx && _KeCancelTimer && _KeFlushQueuedDpcs &&
             _ExQueueWorkItem) ? "none" : "critical_export_missing");
 
@@ -1800,7 +1775,7 @@ inline bool SetupFunctions() {
         !_KeStackAttachProcess || !_KeUnstackDetachProcess ||
         !_ZwAllocateVirtualMemory || !_ZwFreeVirtualMemory ||
         !_IoDeleteDevice || !_IoDeleteSymbolicLink ||
-        !_KeBugCheckEx || !_KeInitializeDpc || !_KeInitializeTimerEx ||
+        !_KeInitializeDpc || !_KeInitializeTimerEx ||
         !_KeSetTimerEx || !_KeCancelTimer || !_KeFlushQueuedDpcs ||
         !_ExQueueWorkItem) {
         WW_LOG("SetupFunctions: CRITICAL FUNCTION MISSING - returning false");

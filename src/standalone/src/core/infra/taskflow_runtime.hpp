@@ -736,7 +736,7 @@ inline bool sample_thread_cpu_100ns(DWORD tid, std::uint64_t& cpu_100ns, DWORD& 
 inline const char* classify_worker_label(const std::string& label, const char* default_class) {
     if (label.find("full_test") != std::string::npos || label.find("test_all") != std::string::npos)
         return "full_test";
-    if (label.find("heartbeat") != std::string::npos || label.find("session_health") != std::string::npos)
+    if (label.find("heartbeat") != std::string::npos)
         return "heartbeat";
     if (label.find("mcp") != std::string::npos || label.find("http") != std::string::npos || label.find("sse") != std::string::npos)
         return "mcp_or_http";

@@ -83,32 +83,6 @@ namespace ioctl_codes {
     __forceinline DWORD TQIF() { return make(60); }
     __forceinline DWORD TTERM(){ return make(61); }
     __forceinline DWORD HCLS() { return make(62); }
-
-    __forceinline DWORD HWID() {
-        return static_cast<DWORD>(CTL_CODE(FILE_DEVICE_UNKNOWN, 0xA1D0, METHOD_BUFFERED, FILE_READ_DATA));
-    }
-}
-
-namespace hwid_kernel_proto {
-    constexpr std::uint32_t kReplyMagic       = 0x48574944u;
-    constexpr std::uint32_t kReplyVersion     = 2u;
-    constexpr std::uint32_t kFactorCount      = 9u;
-
-#pragma pack(push, 8)
-    struct reply_t {
-        std::uint32_t  magic;
-        std::uint32_t  version;
-        std::uint8_t   hwid_hash[32];
-        std::uint8_t   factor_hashes[kFactorCount][32];
-        std::uint8_t   hmac_signature[32];
-        std::uint32_t  factor_present_mask;
-        std::uint32_t  reserved0;
-        std::int64_t   timestamp_qpc;
-        std::int64_t   nonce_tsc;
-    };
-#pragma pack(pop)
-    static_assert(sizeof(reply_t) == 8 + 32 + (32 * kFactorCount) + 32 + 4 + 4 + 8 + 8,
-        "hwid_kernel_proto::reply_t size mismatch with kernel AIDA_HWID_REPLY");
 }
 
 namespace voyager {

@@ -14,8 +14,7 @@ namespace aida::preview
 	{
 		ide,
 		loading,
-		welcome,
-		license
+		welcome
 	};
 
 	enum class shell_action_t : int
@@ -35,8 +34,7 @@ namespace aida::preview
 		chat_send,
 		chat_cancel,
 		copy_text,
-		source_reconstruct,
-		license_activate
+		source_reconstruct
 	};
 
 	struct shell_receipt_t

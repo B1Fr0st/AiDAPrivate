@@ -5,27 +5,6 @@
 
 #include <imports/Strings.h>
 
-namespace func_obfuscate {
-    constexpr std::uintptr_t compute_key() {
-        std::uintptr_t h = 0xDEADBEEFCAFEBABEULL;
-        const char* t = __TIME__ __DATE__;
-        while (*t) { h = h * 31 + *t++; }
-        return h ^ 0x5A5A5A5A5A5A5A5AULL;
-    }
-
-    constexpr std::uintptr_t KEY = compute_key();
-
-    template<typename T>
-    __forceinline T decode(T encoded) {
-        return (T)((std::uintptr_t)encoded ^ KEY);
-    }
-
-    template<typename T>
-    __forceinline T encode(T raw) {
-        return (T)((std::uintptr_t)raw ^ KEY);
-    }
-}
-
 inline PVOID GetProcAddress(PVOID ModBase, CHAR Name[]) {
     if (!ModBase || !Name)
         return nullptr;

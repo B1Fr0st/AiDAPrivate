@@ -4722,10 +4722,9 @@ tool_result_t driver_detect_integrity_checks(const json& params)
     for (int idx = 0; critical_exports[idx]; ++idx)
         ++critical_export_count_entry;
     diag::log_tagged_critical_fmt("drv_tools",
-        "INTEGRITY_SCAN_ENTER ntoskrnl_base=0x%llX critical_export_count=%d session_key_present=%d device_pid=%u kernel_dtb=0x%llX",
+        "INTEGRITY_SCAN_ENTER ntoskrnl_base=0x%llX critical_export_count=%d device_pid=%u kernel_dtb=0x%llX",
         static_cast<unsigned long long>(ntos_base),
         critical_export_count_entry,
-        device->has_server_seed() ? 1 : 0,
         device->get_process_id(),
         static_cast<unsigned long long>(device->get_kernel_dtb()));
 

@@ -185,7 +185,7 @@ inline void initialize_fixture() {
 	state.strings = {
 		{0x00007FF7A4C9A310, "Debugger detected", "sample.exe", 0x9A310, false},
 		{0x00007FF7A4C9A350, "VirtualProtect", "sample.exe", 0x9A350, false},
-		{0x00007FF7A4C9A388, "license/heartbeat", "sample.exe", 0x9A388, false},
+		{0x00007FF7A4C9A388, "modules/updater.dll", "sample.exe", 0x9A388, false},
 		{0x00007FF7A4C9A3D0, "AES-256-GCM", "sample.exe", 0x9A3D0, false}
 	};
 	state.bookmarks = {0x00007FF7A4C16A32, 0x00007FF7A4C1B420, 0x00007FF7A4C208F0};

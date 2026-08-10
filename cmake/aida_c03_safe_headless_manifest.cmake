@@ -650,7 +650,6 @@ function(aida_c03_configure_native_target target)
     target_include_directories(${target} PRIVATE
         "${CMAKE_CURRENT_BINARY_DIR}/generated"
         "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}"
-        "${CMAKE_SOURCE_DIR}/src/shared"
         "${STANDALONE_ROOT}"
         "${STANDALONE_ROOT}/core"
         "${STANDALONE_ROOT}/core/analysis"
