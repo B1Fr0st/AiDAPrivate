@@ -22,7 +22,6 @@
 #include "intercept/diagnostics.hpp"
 #include "intercept/instrumentation_provider.hpp"
 #include "executor_status.hpp"
-#include "obfuscation.hpp"
 #include "pro.h"
 #include "helpers/diag_log.hpp"
 
@@ -2336,7 +2335,7 @@ tool_result_t tls_extract_keys(const json& params) {
         config.hint_only ? 1 : 0);
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "tls_extract_keys driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected"));
+        return tool_result_t::error(std::string("Driver not connected"));
     }
     if (driver_bridge::attached_pid() == 0) {
         json r;
@@ -2345,7 +2344,7 @@ tool_result_t tls_extract_keys(const json& params) {
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
         diag::log_tagged("net_sec", "tls_extract_keys no process attached");
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     auto keys = net_security::TlsKeyExtractor::instance().extract_keys(config);
@@ -2384,10 +2383,10 @@ tool_result_t tls_extract_keys(const json& params) {
     }
     result["keys"] = arr;
     if (config.hint_only && (!scan_diag.hint_used || scan_diag.early_exit_reason == "hint_missing"))
-        return tool_result_t::error(OBFSTR("TLS key extraction hint range was not available"), result);
+        return tool_result_t::error(std::string("TLS key extraction hint range was not available"), result);
     if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
-        return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("TLS key extraction exceeded scan deadline") : OBFSTR("TLS key extraction cancelled"), result);
-    return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" TLS session keys"), result);
+        return tool_result_t::error(scan_diag.deadline_expired ? std::string("TLS key extraction exceeded scan deadline") : std::string("TLS key extraction cancelled"), result);
+    return tool_result_t::ok(std::string("Extracted ") + std::to_string(keys.size()) + std::string(" TLS session keys"), result);
 }
 
 tool_result_t tls_start_keylog(const json& params) {
@@ -2505,7 +2504,7 @@ tool_result_t tls_start_keylog(const json& params) {
             static_cast<unsigned long long>(elapsed_ms),
             seen_before.size(),
             seen_after.size());
-        return tool_result_t::ok(OBFSTR("TLS keylogging started -> ") + config.output_file, r);
+        return tool_result_t::ok(std::string("TLS keylogging started -> ") + config.output_file, r);
     }
 
     const std::string early_reason = ledger_active_before ? "mcp_session_already_active" :
@@ -2526,7 +2525,7 @@ tool_result_t tls_start_keylog(const json& params) {
         static_cast<unsigned long>(gle),
         config.output_file.c_str(),
         static_cast<unsigned long long>(elapsed_ms));
-    return tool_result_t::error(OBFSTR("Keylogging already active or failed to start"), r);
+    return tool_result_t::error(std::string("Keylogging already active or failed to start"), r);
 }
 
 tool_result_t tls_stop_keylog(const json& params) {
@@ -2603,10 +2602,10 @@ tool_result_t tls_stop_keylog(const json& params) {
     };
 
     if (requested_session_id != 0 && (!ledger_active_before || requested_session_id != ledger_session_before))
-        return finish_error("session_id_mismatch", OBFSTR("Requested TLS keylog session is not active"));
+        return finish_error("session_id_mismatch", std::string("Requested TLS keylog session is not active"));
 
     if (!extractor_active_before && !ledger_active_before)
-        return finish_error("no_active_keylog_session", OBFSTR("No active keylogging session"));
+        return finish_error("no_active_keylog_session", std::string("No active keylogging session"));
 
     if (!extractor_active_before && ledger_active_before) {
         {
@@ -2619,7 +2618,7 @@ tool_result_t tls_stop_keylog(const json& params) {
                 r["ledger_stale_clear_skipped_newer_session"] = true;
             }
         }
-        return finish_error("mcp_session_stale_inactive_extractor", OBFSTR("TLS keylog session was stale; extractor was inactive"));
+        return finish_error("mcp_session_stale_inactive_extractor", std::string("TLS keylog session was stale; extractor was inactive"));
     }
 
     const auto file_before = ns_probe_keylog_file(ledger_output_file);
@@ -2679,8 +2678,8 @@ tool_result_t tls_stop_keylog(const json& params) {
         ledger_output_file.c_str(),
         static_cast<unsigned long>(gle));
     if (stop_accepted)
-        return tool_result_t::ok(stopped ? OBFSTR("TLS keylogging stopped") : OBFSTR("TLS keylogging stop accepted; worker is unwinding"), r);
-    return tool_result_t::error(OBFSTR("TLS keylogging stop failed"), r);
+        return tool_result_t::ok(stopped ? std::string("TLS keylogging stopped") : std::string("TLS keylogging stop accepted; worker is unwinding"), r);
+    return tool_result_t::error(std::string("TLS keylogging stop failed"), r);
 }
 
 tool_result_t tls_get_extracted_keys(const json&) {
@@ -2702,7 +2701,7 @@ tool_result_t tls_get_extracted_keys(const json&) {
         arr.push_back(kj);
     }
     result["keys"] = arr;
-    return tool_result_t::ok(OBFSTR("Retrieved ") + std::to_string(seen.size()) + OBFSTR(" cached TLS keys"), result);
+    return tool_result_t::ok(std::string("Retrieved ") + std::to_string(seen.size()) + std::string(" cached TLS keys"), result);
 }
 
 tool_result_t cert_inject(const json& params) {
@@ -2723,7 +2722,7 @@ tool_result_t cert_inject(const json& params) {
     if (params.contains("cert_der_hex") && params["cert_der_hex"].is_string()) {
         auto hex = params["cert_der_hex"].get<std::string>();
         if (!ns_hex_to_bytes_strict(hex, config.cert_der))
-            return tool_result_t::error(OBFSTR("cert_der_hex is not valid hex DER data"));
+            return tool_result_t::error(std::string("cert_der_hex is not valid hex DER data"));
         diag::log_tagged_fmt("net_sec", "cert_inject der_hex len=%zu bytes=%zu", hex.size(), config.cert_der.size());
     }
 
@@ -2732,22 +2731,22 @@ tool_result_t cert_inject(const json& params) {
         std::string format;
         if (params.contains("cert_der_hex")) {
             if (!params["cert_der_hex"].is_string())
-                return tool_result_t::error(OBFSTR("cert_der_hex must be a string"));
+                return tool_result_t::error(std::string("cert_der_hex must be a string"));
             if (!ns_hex_to_bytes_strict(params["cert_der_hex"].get<std::string>(), der))
-                return tool_result_t::error(OBFSTR("cert_der_hex is not valid hex DER data"));
-            format = OBFSTR("der_hex");
+                return tool_result_t::error(std::string("cert_der_hex is not valid hex DER data"));
+            format = std::string("der_hex");
         } else if (params.contains("cert_pem")) {
             if (!params["cert_pem"].is_string())
-                return tool_result_t::error(OBFSTR("cert_pem must be a string"));
+                return tool_result_t::error(std::string("cert_pem must be a string"));
             if (!ns_decode_pem_certificate_der(params["cert_pem"].get<std::string>(), der))
-                return tool_result_t::error(OBFSTR("cert_pem is not a valid PEM certificate"));
-            format = OBFSTR("pem");
+                return tool_result_t::error(std::string("cert_pem is not a valid PEM certificate"));
+            format = std::string("pem");
         } else {
-            return tool_result_t::error(OBFSTR("cert_pem or cert_der_hex is required"));
+            return tool_result_t::error(std::string("cert_pem or cert_der_hex is required"));
         }
         std::string subject;
         if (!ns_is_valid_certificate_der(der, subject))
-            return tool_result_t::error(OBFSTR("certificate data is not a valid X.509 certificate"));
+            return tool_result_t::error(std::string("certificate data is not a valid X.509 certificate"));
         json r;
         r["success"] = true;
         r["validate_only"] = true;
@@ -2756,7 +2755,7 @@ tool_result_t cert_inject(const json& params) {
         r["subject_cn"] = subject;
         r["store_name"] = config.store_name;
         r["system_wide"] = config.system_wide;
-        return tool_result_t::ok(OBFSTR("Validated certificate injection request without modifying the certificate store."), r);
+        return tool_result_t::ok(std::string("Validated certificate injection request without modifying the certificate store."), r);
     }
 
     auto result = net_security::CertificateInjector::instance().inject_certificate(config);
@@ -2769,8 +2768,8 @@ tool_result_t cert_inject(const json& params) {
     r["store_name"] = result.store_name;
     r["method"] = result.method;
     if (result.success)
-        return tool_result_t::ok(OBFSTR("Certificate injected: ") + result.subject_cn, r);
-    return tool_result_t::error(OBFSTR("Certificate injection failed"), r);
+        return tool_result_t::ok(std::string("Certificate injected: ") + result.subject_cn, r);
+    return tool_result_t::error(std::string("Certificate injection failed"), r);
 }
 
 tool_result_t cert_remove(const json& params) {
@@ -2782,18 +2781,18 @@ tool_result_t cert_remove(const json& params) {
     diag::log_tagged_fmt("net_sec", "cert_remove entry thumbprint=%s store_name=%s validate_only=%d", thumbprint.c_str(), store_name.c_str(), validate_only ? 1 : 0);
     if (thumbprint.empty()) {
         diag::log_tagged("net_sec", "cert_remove thumbprint empty -> error");
-        return tool_result_t::error(OBFSTR("thumbprint is required"));
+        return tool_result_t::error(std::string("thumbprint is required"));
     }
 
     if (validate_only) {
         if (!ns_valid_sha1_thumbprint_text(thumbprint))
-            return tool_result_t::error(OBFSTR("thumbprint must be a 40-hex-character SHA-1 certificate thumbprint"));
+            return tool_result_t::error(std::string("thumbprint must be a 40-hex-character SHA-1 certificate thumbprint"));
         json r;
         r["removed"] = false;
         r["validate_only"] = true;
         r["thumbprint"] = thumbprint;
         r["store_name"] = store_name;
-        return tool_result_t::ok(OBFSTR("Validated certificate removal request without modifying the certificate store."), r);
+        return tool_result_t::ok(std::string("Validated certificate removal request without modifying the certificate store."), r);
     }
 
     bool removed = net_security::CertificateInjector::instance().remove_certificate(thumbprint, store_name);
@@ -2802,9 +2801,9 @@ tool_result_t cert_remove(const json& params) {
         json r;
         r["removed"] = true;
         r["thumbprint"] = thumbprint;
-        return tool_result_t::ok(OBFSTR("Certificate removed"), r);
+        return tool_result_t::ok(std::string("Certificate removed"), r);
     }
-    return tool_result_t::error(OBFSTR("Failed to remove certificate"));
+    return tool_result_t::error(std::string("Failed to remove certificate"));
 }
 
 tool_result_t cert_generate_ca(const json& params) {
@@ -2817,13 +2816,13 @@ tool_result_t cert_generate_ca(const json& params) {
 
     if (validate_only) {
         if (!cert_generator::is_ready() && !cert_generator::initialize())
-            return tool_result_t::error(OBFSTR("AiDA CA is not ready"));
+            return tool_result_t::error(std::string("AiDA CA is not ready"));
         std::vector<std::uint8_t> cert_der;
         if (!cert_generator::export_ca_certificate_der(cert_generator::get_root_ca(), cert_der) || cert_der.empty())
-            return tool_result_t::error(OBFSTR("Failed to export AiDA public CA certificate"));
+            return tool_result_t::error(std::string("Failed to export AiDA public CA certificate"));
         std::string subject;
         if (!ns_is_valid_certificate_der(cert_der, subject))
-            return tool_result_t::error(OBFSTR("Generated CA certificate did not validate as X.509"));
+            return tool_result_t::error(std::string("Generated CA certificate did not validate as X.509"));
         json r;
         r["success"] = true;
         r["validate_only"] = true;
@@ -2831,7 +2830,7 @@ tool_result_t cert_generate_ca(const json& params) {
         r["cert_size"] = cert_der.size();
         r["subject_cn"] = subject.empty() ? cn : subject;
         r["validity_days"] = days;
-        return tool_result_t::ok(OBFSTR("Validated public CA certificate generation path without exporting private key material"), r);
+        return tool_result_t::ok(std::string("Validated public CA certificate generation path without exporting private key material"), r);
     }
 
     std::vector<std::uint8_t> cert_der;
@@ -2848,9 +2847,9 @@ tool_result_t cert_generate_ca(const json& params) {
     r["validity_days"] = days;
     if (ok) {
         r["cert_der_hex"] = ns_bytes_to_hex(cert_der.data(), cert_der.size());
-        return tool_result_t::ok(OBFSTR("Generated public CA certificate: ") + cn, r);
+        return tool_result_t::ok(std::string("Generated public CA certificate: ") + cn, r);
     }
-    return tool_result_t::error(OBFSTR("Failed to generate CA certificate"), r);
+    return tool_result_t::error(std::string("Failed to generate CA certificate"), r);
 }
 
 tool_result_t cert_list(const json& params) {
@@ -2874,7 +2873,7 @@ tool_result_t cert_list(const json& params) {
         arr.push_back(cj);
     }
     result["certificates"] = arr;
-    return tool_result_t::ok(OBFSTR("Listed ") + std::to_string(certs.size()) + OBFSTR(" certificates"), result);
+    return tool_result_t::ok(std::string("Listed ") + std::to_string(certs.size()) + std::string(" certificates"), result);
 }
 
 tool_result_t pin_bypass(const json& params) {
@@ -2889,7 +2888,7 @@ tool_result_t pin_bypass(const json& params) {
         r["camoufox_only"] = true;
         r["supported_browser"] = "camoufox";
         r["unsupported_method"] = method;
-        return tool_result_t::error(OBFSTR("Unsupported certificate diagnostic method; Camoufox is the only AiDA browser"), r);
+        return tool_result_t::error(std::string("Unsupported certificate diagnostic method; Camoufox is the only AiDA browser"), r);
     }
     if (pid == 0 && device && device->is_connected()) pid = device->get_process_id();
 
@@ -2917,7 +2916,7 @@ tool_result_t pin_bypass(const json& params) {
     r["diagnostics"] = ns_diagnostics_to_json(diagnostics);
     r["providers"] = json::array();
     for (const auto& provider : providers) r["providers"].push_back(ns_provider_to_json(provider));
-    return tool_result_t::ok(OBFSTR("Certificate interception diagnostics completed without process modification"), r);
+    return tool_result_t::ok(std::string("Certificate interception diagnostics completed without process modification"), r);
 }
 
 tool_result_t quic_detect_connections(const json& params) {
@@ -2931,7 +2930,7 @@ tool_result_t quic_detect_connections(const json& params) {
             r["backend"] = "provided_payload";
             r["deterministic_input"] = true;
             r["parser_rejection_reason"] = hex.empty() ? "empty_payload_hex" : "invalid_payload_hex";
-            return tool_result_t::error(OBFSTR("Invalid QUIC payload_hex"), r);
+            return tool_result_t::error(std::string("Invalid QUIC payload_hex"), r);
         }
         net_security::QuicAnalyzer::quic_header_t hdr;
         std::size_t offset = 0;
@@ -3003,8 +3002,8 @@ tool_result_t quic_detect_connections(const json& params) {
             parsed ? hdr.scid.size() : 0u,
             rejection.empty() ? "<none>" : rejection.c_str());
         if (!parsed)
-            return tool_result_t::error(OBFSTR("QUIC payload did not parse as a connection"), result);
-        return tool_result_t::ok(OBFSTR("Parsed 1 QUIC payload as parser-only evidence"), result);
+            return tool_result_t::error(std::string("QUIC payload did not parse as a connection"), result);
+        return tool_result_t::ok(std::string("Parsed 1 QUIC payload as parser-only evidence"), result);
     }
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "quic_detect_connections driver not connected");
@@ -3017,7 +3016,7 @@ tool_result_t quic_detect_connections(const json& params) {
         r["udp_live_stimulus_status"] = ns_udp_live_stimulus_status_json("quic");
         r["live_stimulus_owned_by"] = "testlab_harness";
         r["implementation_udp_stimulus_executor_available"] = false;
-        return tool_result_t::error(OBFSTR("Driver not connected"), r);
+        return tool_result_t::error(std::string("Driver not connected"), r);
     }
 
     bool cap_active_before = false;
@@ -3124,8 +3123,8 @@ tool_result_t quic_detect_connections(const json& params) {
     result["captured_connections"] = arr;
     result["connections"] = functional ? arr : json::array();
     const std::string message = functional
-        ? OBFSTR("Detected ") + std::to_string(conns.size()) + OBFSTR(" correlated QUIC connections")
-        : OBFSTR("Parsed QUIC capture candidates without functional correlation");
+        ? std::string("Detected ") + std::to_string(conns.size()) + std::string(" correlated QUIC connections")
+        : std::string("Parsed QUIC capture candidates without functional correlation");
     return tool_result_t::ok(message, result);
 }
 
@@ -3133,7 +3132,7 @@ tool_result_t quic_decrypt_initial(const json& params) {
     diag::log_tagged("net_sec", "quic_decrypt_initial entry");
     if (!params.contains("packet_hex")) {
         diag::log_tagged("net_sec", "quic_decrypt_initial missing packet_hex");
-        return tool_result_t::error(OBFSTR("packet_hex is required"));
+        return tool_result_t::error(std::string("packet_hex is required"));
     }
 
     std::vector<std::uint8_t> pkt_bytes;
@@ -3141,7 +3140,7 @@ tool_result_t quic_decrypt_initial(const json& params) {
     diag::log_tagged_fmt("net_sec", "quic_decrypt_initial packet_bytes=%zu", pkt_bytes.size());
     if (!packet_hex_valid) {
         diag::log_tagged("net_sec", "quic_decrypt_initial invalid packet hex data");
-        return tool_result_t::error(OBFSTR("Invalid packet hex data"));
+        return tool_result_t::error(std::string("Invalid packet hex data"));
     }
 
     auto result = net_security::QuicAnalyzer::instance().decrypt_initial_packet(pkt_bytes.data(), pkt_bytes.size());
@@ -3153,8 +3152,8 @@ tool_result_t quic_decrypt_initial(const json& params) {
     r["dcid"] = ns_bytes_to_hex(result.dcid.data(), result.dcid.size());
     r["scid"] = ns_bytes_to_hex(result.scid.data(), result.scid.size());
     if (result.success)
-        return tool_result_t::ok(OBFSTR("QUIC Initial packet decoded"), r);
-    return tool_result_t::error(OBFSTR("Failed to decode QUIC Initial packet"));
+        return tool_result_t::ok(std::string("QUIC Initial packet decoded"), r);
+    return tool_result_t::error(std::string("Failed to decode QUIC Initial packet"));
 }
 
 tool_result_t quic_extract_keys(const json& params) {
@@ -3171,7 +3170,7 @@ tool_result_t quic_extract_keys(const json& params) {
         config.hint_only ? 1 : 0);
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "quic_extract_keys driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected"));
+        return tool_result_t::error(std::string("Driver not connected"));
     }
 
     auto keys = net_security::TlsKeyExtractor::instance().extract_quic_keys(config);
@@ -3208,10 +3207,10 @@ tool_result_t quic_extract_keys(const json& params) {
     }
     result["keys"] = arr;
     if (config.hint_only && (!scan_diag.hint_used || scan_diag.early_exit_reason == "hint_missing"))
-        return tool_result_t::error(OBFSTR("QUIC key extraction hint range was not available"), result);
+        return tool_result_t::error(std::string("QUIC key extraction hint range was not available"), result);
     if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
-        return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("QUIC key extraction exceeded scan deadline") : OBFSTR("QUIC key extraction cancelled"), result);
-    return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" QUIC keys"), result);
+        return tool_result_t::error(scan_diag.deadline_expired ? std::string("QUIC key extraction exceeded scan deadline") : std::string("QUIC key extraction cancelled"), result);
+    return tool_result_t::ok(std::string("Extracted ") + std::to_string(keys.size()) + std::string(" QUIC keys"), result);
 }
 
 json quic_observer_stats_json(const mitm_proxy::quic_proxy::quic_proxy_stats& stats) {
@@ -3282,7 +3281,7 @@ json quic_observation_json(const mitm_proxy::quic_proxy::quic_observation& obs) 
 tool_result_t quic_observer_start(const json& params) {
     mitm_proxy::quic_proxy::quic_proxy_config cfg;
     if (params.contains("bind_addr") && !params["bind_addr"].is_string())
-        return tool_result_t::error(OBFSTR("bind_addr must be a string"));
+        return tool_result_t::error(std::string("bind_addr must be a string"));
     cfg.bind_addr = params.value("bind_addr", std::string("127.0.0.1"));
     std::string bind_lower = cfg.bind_addr;
     std::transform(bind_lower.begin(), bind_lower.end(), bind_lower.begin(), [](unsigned char c) {
@@ -3293,33 +3292,33 @@ tool_result_t quic_observer_start(const json& params) {
     } else if (bind_lower == "127.0.0.1") {
         cfg.bind_addr = "127.0.0.1";
     } else {
-        return tool_result_t::error(OBFSTR("QUIC observer bind address must be loopback"));
+        return tool_result_t::error(std::string("QUIC observer bind address must be loopback"));
     }
     std::uint16_t bind_port = 8443;
     std::uint16_t origin_port = 443;
     if (!ns_json_u16_param(params, "bind_port", bind_port, 8443) ||
         !ns_json_u16_param(params, "expected_origin_port", origin_port, 443))
-        return tool_result_t::error(OBFSTR("Invalid QUIC observer port"));
+        return tool_result_t::error(std::string("Invalid QUIC observer port"));
     cfg.bind_port = bind_port;
     cfg.expected_origin_port = origin_port;
     int max_observations = 512;
     if (params.contains("max_observations")) {
         if (!params["max_observations"].is_number_integer() && !params["max_observations"].is_number_unsigned())
-            return tool_result_t::error(OBFSTR("max_observations must be numeric"));
+            return tool_result_t::error(std::string("max_observations must be numeric"));
         if (params["max_observations"].is_number_unsigned()) {
             const auto raw = params["max_observations"].get<uint64_t>();
             max_observations = raw > 8192 ? 8192 : static_cast<int>(raw);
         } else {
             const auto raw = params["max_observations"].get<int64_t>();
             if (raw <= 0)
-                return tool_result_t::error(OBFSTR("max_observations must be positive"));
+                return tool_result_t::error(std::string("max_observations must be positive"));
             max_observations = raw > 8192 ? 8192 : static_cast<int>(raw);
         }
     }
     if (params.contains("fail_closed_without_tls_keys") && !params["fail_closed_without_tls_keys"].is_boolean())
-        return tool_result_t::error(OBFSTR("fail_closed_without_tls_keys must be boolean"));
+        return tool_result_t::error(std::string("fail_closed_without_tls_keys must be boolean"));
     if (params.contains("observation_only") && !params["observation_only"].is_boolean())
-        return tool_result_t::error(OBFSTR("observation_only must be boolean"));
+        return tool_result_t::error(std::string("observation_only must be boolean"));
     cfg.max_observations = static_cast<size_t>(max_observations);
     cfg.fail_closed_without_tls_keys = params.value("fail_closed_without_tls_keys", true);
     cfg.observation_only = params.value("observation_only", true);
@@ -3329,48 +3328,48 @@ tool_result_t quic_observer_start(const json& params) {
     r["listener_id"] = listener_id;
     r["requested_observation_only"] = cfg.observation_only;
     if (!ok)
-        return tool_result_t::error(OBFSTR("QUIC observer start failed"), r);
-    return tool_result_t::ok(OBFSTR("QUIC observer started"), r);
+        return tool_result_t::error(std::string("QUIC observer start failed"), r);
+    return tool_result_t::ok(std::string("QUIC observer started"), r);
 }
 
 tool_result_t quic_observer_stop(const json& params) {
     if (params.contains("listener_id")) {
         if (!params["listener_id"].is_number_unsigned() && !params["listener_id"].is_number_integer())
-            return tool_result_t::error(OBFSTR("listener_id must be numeric"));
+            return tool_result_t::error(std::string("listener_id must be numeric"));
         uint64_t id = 0;
         if (params["listener_id"].is_number_unsigned()) {
             id = params["listener_id"].get<uint64_t>();
         } else {
             const int64_t signed_id = params["listener_id"].get<int64_t>();
             if (signed_id <= 0)
-                return tool_result_t::error(OBFSTR("listener_id must be non-zero"));
+                return tool_result_t::error(std::string("listener_id must be non-zero"));
             id = static_cast<uint64_t>(signed_id);
         }
         if (id == 0)
-            return tool_result_t::error(OBFSTR("listener_id must be non-zero"));
+            return tool_result_t::error(std::string("listener_id must be non-zero"));
         if (!mitm_proxy::quic_proxy::stop(id))
-            return tool_result_t::error(OBFSTR("QUIC observer listener not found"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
+            return tool_result_t::error(std::string("QUIC observer listener not found"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
     } else {
         mitm_proxy::quic_proxy::stop_all();
     }
-    return tool_result_t::ok(OBFSTR("QUIC observer stopped"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
+    return tool_result_t::ok(std::string("QUIC observer stopped"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
 }
 
 tool_result_t quic_observer_stats(const json&) {
-    return tool_result_t::ok(OBFSTR("QUIC observer stats"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
+    return tool_result_t::ok(std::string("QUIC observer stats"), quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats()));
 }
 
 tool_result_t quic_observer_observations(const json& params) {
     size_t limit = 0;
     if (params.contains("limit")) {
         if (!params["limit"].is_number_integer() && !params["limit"].is_number_unsigned())
-            return tool_result_t::error(OBFSTR("limit must be numeric"));
+            return tool_result_t::error(std::string("limit must be numeric"));
         if (params["limit"].is_number_unsigned()) {
             limit = static_cast<size_t>(std::min<uint64_t>(params["limit"].get<uint64_t>(), 8192));
         } else {
             const int64_t v = params["limit"].get<int64_t>();
             if (v < 0)
-                return tool_result_t::error(OBFSTR("limit must be non-negative"));
+                return tool_result_t::error(std::string("limit must be non-negative"));
             limit = static_cast<size_t>(std::min<int64_t>(v, 8192));
         }
     }
@@ -3381,7 +3380,7 @@ tool_result_t quic_observer_observations(const json& params) {
     json r = quic_observer_stats_json(mitm_proxy::quic_proxy::get_stats());
     r["observations"] = std::move(arr);
     r["count"] = observations.size();
-    return tool_result_t::ok(OBFSTR("QUIC observer observations"), r);
+    return tool_result_t::ok(std::string("QUIC observer observations"), r);
 }
 
 tool_result_t dtls_detect_sessions(const json& params) {
@@ -3395,7 +3394,7 @@ tool_result_t dtls_detect_sessions(const json& params) {
             r["backend"] = "provided_payload";
             r["deterministic_input"] = true;
             r["parser_rejection_reason"] = hex.empty() ? "empty_payload_hex" : "invalid_payload_hex";
-            return tool_result_t::error(OBFSTR("Invalid DTLS payload_hex"), r);
+            return tool_result_t::error(std::string("Invalid DTLS payload_hex"), r);
         }
         net_security::DtlsAnalyzer::dtls_record_t rec;
         std::size_t offset = 0;
@@ -3463,8 +3462,8 @@ tool_result_t dtls_detect_sessions(const json& params) {
             parsed ? rec.epoch : 0u,
             rejection.empty() ? "<none>" : rejection.c_str());
         if (!parsed)
-            return tool_result_t::error(OBFSTR("DTLS payload did not parse as a session"), result);
-        return tool_result_t::ok(OBFSTR("Parsed 1 DTLS payload as parser-only evidence"), result);
+            return tool_result_t::error(std::string("DTLS payload did not parse as a session"), result);
+        return tool_result_t::ok(std::string("Parsed 1 DTLS payload as parser-only evidence"), result);
     }
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "dtls_detect_sessions driver not connected");
@@ -3477,7 +3476,7 @@ tool_result_t dtls_detect_sessions(const json& params) {
         r["udp_live_stimulus_status"] = ns_udp_live_stimulus_status_json("dtls");
         r["live_stimulus_owned_by"] = "testlab_harness";
         r["implementation_udp_stimulus_executor_available"] = false;
-        return tool_result_t::error(OBFSTR("Driver not connected"), r);
+        return tool_result_t::error(std::string("Driver not connected"), r);
     }
 
     bool cap_active_before = false;
@@ -3579,8 +3578,8 @@ tool_result_t dtls_detect_sessions(const json& params) {
     result["captured_sessions"] = arr;
     result["sessions"] = functional ? arr : json::array();
     const std::string message = functional
-        ? OBFSTR("Detected ") + std::to_string(sessions.size()) + OBFSTR(" correlated DTLS sessions")
-        : OBFSTR("Parsed DTLS capture candidates without functional correlation");
+        ? std::string("Detected ") + std::to_string(sessions.size()) + std::string(" correlated DTLS sessions")
+        : std::string("Parsed DTLS capture candidates without functional correlation");
     return tool_result_t::ok(message, result);
 }
 
@@ -3598,7 +3597,7 @@ tool_result_t dtls_extract_keys(const json& params) {
         config.hint_only ? 1 : 0);
     if (!device || !device->is_connected()) {
         diag::log_tagged("net_sec", "dtls_extract_keys driver not connected");
-        return tool_result_t::error(OBFSTR("Driver not connected"));
+        return tool_result_t::error(std::string("Driver not connected"));
     }
     if (driver_bridge::attached_pid() == 0) {
         json r;
@@ -3607,7 +3606,7 @@ tool_result_t dtls_extract_keys(const json& params) {
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
         diag::log_tagged("net_sec", "dtls_extract_keys no process attached");
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     auto keys = net_security::TlsKeyExtractor::instance().extract_dtls_keys(config);
@@ -3644,10 +3643,10 @@ tool_result_t dtls_extract_keys(const json& params) {
     }
     result["keys"] = arr;
     if (config.hint_only && (!scan_diag.hint_used || scan_diag.early_exit_reason == "hint_missing"))
-        return tool_result_t::error(OBFSTR("DTLS key extraction hint range was not available"), result);
+        return tool_result_t::error(std::string("DTLS key extraction hint range was not available"), result);
     if (keys.empty() && (scan_diag.deadline_expired || scan_diag.cancelled))
-        return tool_result_t::error(scan_diag.deadline_expired ? OBFSTR("DTLS key extraction exceeded scan deadline") : OBFSTR("DTLS key extraction cancelled"), result);
-    return tool_result_t::ok(OBFSTR("Extracted ") + std::to_string(keys.size()) + OBFSTR(" DTLS keys"), result);
+        return tool_result_t::error(scan_diag.deadline_expired ? std::string("DTLS key extraction exceeded scan deadline") : std::string("DTLS key extraction cancelled"), result);
+    return tool_result_t::ok(std::string("Extracted ") + std::to_string(keys.size()) + std::string(" DTLS keys"), result);
 }
 
 tool_result_t network_decrypt_capture(const json& params) {
@@ -3658,7 +3657,7 @@ tool_result_t network_decrypt_capture(const json& params) {
         r["success"] = false;
         r["input_valid"] = false;
         r["error"] = "pcap_path, keylog_path, and display_filter must be strings";
-        return tool_result_t::error(OBFSTR("pcap_path, keylog_path, and display_filter must be strings"), r);
+        return tool_result_t::error(std::string("pcap_path, keylog_path, and display_filter must be strings"), r);
     }
     std::string pcap_path = params.value("pcap_path", "");
     std::string keylog_path = params.value("keylog_path", "");
@@ -3669,14 +3668,14 @@ tool_result_t network_decrypt_capture(const json& params) {
 
     if (pcap_path.empty()) {
         diag::log_tagged("net_sec", "network_decrypt_capture pcap_path empty -> error");
-        return tool_result_t::error(OBFSTR("pcap_path is required"));
+        return tool_result_t::error(std::string("pcap_path is required"));
     }
     if (pcap_path.find('\0') != std::string::npos || keylog_path.find('\0') != std::string::npos || display_filter.find('\0') != std::string::npos) {
         json r;
         r["success"] = false;
         r["input_valid"] = false;
         r["error"] = "network_decrypt_capture inputs must not contain embedded NUL characters";
-        return tool_result_t::error(OBFSTR("network_decrypt_capture inputs must not contain embedded NUL characters"), r);
+        return tool_result_t::error(std::string("network_decrypt_capture inputs must not contain embedded NUL characters"), r);
     }
     std::string display_filter_reason;
     if (!net_security::validate_tshark_display_filter(display_filter, &display_filter_reason)) {
@@ -3689,7 +3688,7 @@ tool_result_t network_decrypt_capture(const json& params) {
         r["requires_http2_frames"] = true;
         diag::log_tagged_fmt("net_sec", "network_decrypt_capture display_filter_invalid filter=%s reason=%s",
             display_filter.c_str(), display_filter_reason.c_str());
-        return tool_result_t::error(OBFSTR("Invalid tshark display_filter"), r);
+        return tool_result_t::error(std::string("Invalid tshark display_filter"), r);
     }
 
 
@@ -3701,7 +3700,7 @@ tool_result_t network_decrypt_capture(const json& params) {
     }
     if (keylog_path.empty()) {
         diag::log_tagged("net_sec", "network_decrypt_capture keylog_path empty -> error");
-        return tool_result_t::error(OBFSTR("keylog_path is required (or set SSLKEYLOGFILE environment variable)"));
+        return tool_result_t::error(std::string("keylog_path is required (or set SSLKEYLOGFILE environment variable)"));
     }
 
     auto searched_paths = ns_tshark_search_paths();
@@ -3747,7 +3746,7 @@ tool_result_t network_decrypt_capture(const json& params) {
             diag::log_tagged_fmt("net_sec", "network_decrypt_capture empty_fixture backend=builtin pcap=%s keylog=%s filter=%s packets=%u keylog_entries=%u searched_paths=%zu",
                 pcap_path.c_str(), keylog_path.c_str(), display_filter.c_str(),
                 pcap_probe.packet_count, keylog_probe.entry_count, searched_paths.size());
-            return tool_result_t::ok(OBFSTR("Validated empty TLS capture fixture without tshark"), r);
+            return tool_result_t::ok(std::string("Validated empty TLS capture fixture without tshark"), r);
         }
         r["reason"] = pcap_probe.valid && pcap_probe.packet_count != 0
             ? "non-empty capture requires tshark for decryption"
@@ -3759,7 +3758,7 @@ tool_result_t network_decrypt_capture(const json& params) {
             pcap_probe.valid ? 1 : 0, pcap_probe.packet_count,
             keylog_probe.valid ? 1 : 0, keylog_probe.entry_count,
             r["reason"].get<std::string>().c_str(), searched_paths.size());
-        return tool_result_t::error(OBFSTR("tshark not found. Install Wireshark to enable PCAP decryption."), r);
+        return tool_result_t::error(std::string("tshark not found. Install Wireshark to enable PCAP decryption."), r);
     }
     ns_add_unique_path(searched_paths, tshark_path);
 
@@ -3930,15 +3929,15 @@ tool_result_t network_decrypt_capture(const json& params) {
 
     if (decrypt_result.success)
         return tool_result_t::ok(
-            OBFSTR("Decrypted ") + std::to_string(decrypt_result.decrypted_packets) +
-            OBFSTR(" packets, found ") + std::to_string(decrypt_result.http2_frames.size()) +
-            OBFSTR(" HTTP/2 frames"), r);
+            std::string("Decrypted ") + std::to_string(decrypt_result.decrypted_packets) +
+            std::string(" packets, found ") + std::to_string(decrypt_result.http2_frames.size()) +
+            std::string(" HTTP/2 frames"), r);
 
     if (decrypt_result.dependency_slow)
-        return tool_result_t::error(OBFSTR("tshark dependency exceeded decrypt deadline"), r);
+        return tool_result_t::error(std::string("tshark dependency exceeded decrypt deadline"), r);
 
     return tool_result_t::error(decrypt_result.error_message.empty() ?
-        OBFSTR("Decryption failed - no matching packets found") : decrypt_result.error_message, r);
+        std::string("Decryption failed - no matching packets found") : decrypt_result.error_message, r);
 }
 
 tool_result_t autoresponder_add_rule(const json& params) {
@@ -3977,7 +3976,7 @@ tool_result_t autoresponder_add_rule(const json& params) {
     diag::log_tagged_fmt("net_sec", "autoresponder_add_rule rule_id=%u match_type=%s match_pattern=%s", id, mt.c_str(), match_pattern.c_str());
     json r;
     r["rule_id"] = id;
-    return tool_result_t::ok(OBFSTR("AutoResponder rule added with ID ") + std::to_string(id), r);
+    return tool_result_t::ok(std::string("AutoResponder rule added with ID ") + std::to_string(id), r);
 }
 
 tool_result_t autoresponder_remove_rule(const json& params) {
@@ -3989,9 +3988,9 @@ tool_result_t autoresponder_remove_rule(const json& params) {
         json r;
         r["removed"] = true;
         r["rule_id"] = rule_id;
-        return tool_result_t::ok(OBFSTR("Rule removed"), r);
+        return tool_result_t::ok(std::string("Rule removed"), r);
     }
-    return tool_result_t::error(OBFSTR("Rule not found"));
+    return tool_result_t::error(std::string("Rule not found"));
 }
 
 tool_result_t autoresponder_list_rules(const json&) {
@@ -4015,7 +4014,7 @@ tool_result_t autoresponder_list_rules(const json&) {
         arr.push_back(rj);
     }
     result["rules"] = arr;
-    return tool_result_t::ok(OBFSTR("Listed ") + std::to_string(rules.size()) + OBFSTR(" autoresponder rules"), result);
+    return tool_result_t::ok(std::string("Listed ") + std::to_string(rules.size()) + std::string(" autoresponder rules"), result);
 }
 
 tool_result_t autoresponder_match_request(const json& params) {
@@ -4032,7 +4031,7 @@ tool_result_t autoresponder_match_request(const json& params) {
     diag::log_tagged_fmt("net_sec", "autoresponder_match_request entry method=%s url=%s headers=%zu body_len=%zu",
         method.c_str(), url.c_str(), headers.size(), body.size());
     if (url.empty())
-        return tool_result_t::error(OBFSTR("url is required"));
+        return tool_result_t::error(std::string("url is required"));
 
     auto match = net_security::AutoResponder::instance().match_request(method, url, headers, body);
     auto rules = net_security::AutoResponder::instance().list_rules();
@@ -4058,8 +4057,8 @@ tool_result_t autoresponder_match_request(const json& params) {
         match.response_status_line.c_str(),
         match.response_body.size());
     if (match.matched)
-        return tool_result_t::ok(OBFSTR("AutoResponder matched request"), r);
-    return tool_result_t::error(OBFSTR("No AutoResponder rule matched request"), r);
+        return tool_result_t::ok(std::string("AutoResponder matched request"), r);
+    return tool_result_t::error(std::string("No AutoResponder rule matched request"), r);
 }
 
 tool_result_t autoresponder_start(const json&) {
@@ -4069,9 +4068,9 @@ tool_result_t autoresponder_start(const json&) {
     if (started) {
         json r;
         r["status"] = "started";
-        return tool_result_t::ok(OBFSTR("AutoResponder started"), r);
+        return tool_result_t::ok(std::string("AutoResponder started"), r);
     }
-    return tool_result_t::error(OBFSTR("AutoResponder already running or failed"));
+    return tool_result_t::error(std::string("AutoResponder already running or failed"));
 }
 
 tool_result_t autoresponder_stop(const json&) {
@@ -4081,9 +4080,9 @@ tool_result_t autoresponder_stop(const json&) {
     if (stopped) {
         json r;
         r["status"] = "stopped";
-        return tool_result_t::ok(OBFSTR("AutoResponder stopped"), r);
+        return tool_result_t::ok(std::string("AutoResponder stopped"), r);
     }
-    return tool_result_t::error(OBFSTR("AutoResponder is not running"));
+    return tool_result_t::error(std::string("AutoResponder is not running"));
 }
 
 tool_result_t autoresponder_import_rules(const json& params) {
@@ -4091,7 +4090,7 @@ tool_result_t autoresponder_import_rules(const json& params) {
     diag::log_tagged_fmt("net_sec", "autoresponder_import_rules entry rules_json_len=%zu", rules_json.size());
     if (rules_json.empty()) {
         diag::log_tagged("net_sec", "autoresponder_import_rules rules_json empty -> error");
-        return tool_result_t::error(OBFSTR("rules_json is required"));
+        return tool_result_t::error(std::string("rules_json is required"));
     }
 
     bool imported = net_security::AutoResponder::instance().import_rules(rules_json);
@@ -4102,9 +4101,9 @@ tool_result_t autoresponder_import_rules(const json& params) {
         json r;
         r["imported"] = true;
         r["total_rules"] = count;
-        return tool_result_t::ok(OBFSTR("Rules imported, total: ") + std::to_string(count), r);
+        return tool_result_t::ok(std::string("Rules imported, total: ") + std::to_string(count), r);
     }
-    return tool_result_t::error(OBFSTR("Failed to import rules - invalid JSON"));
+    return tool_result_t::error(std::string("Failed to import rules - invalid JSON"));
 }
 
 tool_result_t autoresponder_export_rules(const json& params) {
@@ -4148,9 +4147,9 @@ tool_result_t autoresponder_export_rules(const json& params) {
         diag::log_tagged_fmt("net_sec", "autoresponder_export_rules write_failed path=%s wrote=%d file_size=%llu ec=%lu",
             path.c_str(), wrote_file ? 1 : 0,
             static_cast<unsigned long long>(file_size), static_cast<unsigned long>(fs_ec.value()));
-        return tool_result_t::error(OBFSTR("AutoResponder rules export file write failed"), r);
+        return tool_result_t::error(std::string("AutoResponder rules export file write failed"), r);
     }
-    return tool_result_t::ok(OBFSTR("AutoResponder rules exported"), r);
+    return tool_result_t::ok(std::string("AutoResponder rules exported"), r);
 }
 
 #else
@@ -4192,31 +4191,31 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
     diag::log_tagged("net_sec", "register_net_security_tools entry");
 
     register_compat(srv, {
-        OBFSTR("tls_manage"), OBFSTR("network_security"),
-        OBFSTR("Manage TLS key extraction and keylog capture. Actions: extract_keys, start_keylog, stop_keylog, get_extracted_keys."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("extract_keys|start_keylog|stop_keylog|get_extracted_keys"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID; 0 resolves to the attached driver target."), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded memory scan deadline in milliseconds."), false},
-         {OBFSTR("scan_timeout_ms"), OBFSTR("number"), OBFSTR("Per-worker bounded key scan deadline for start_keylog."), false},
-         {OBFSTR("stop_wait_ms"), OBFSTR("number"), OBFSTR("Bounded wait for keylog worker shutdown."), false},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum keys to return."), false},
-         {OBFSTR("max_keys"), OBFSTR("number"), OBFSTR("Alias for max_results."), false},
-         {OBFSTR("max_regions"), OBFSTR("number"), OBFSTR("Maximum memory regions to scan; 0 means unrestricted diagnostic scan."), false},
-         {OBFSTR("max_read_attempts"), OBFSTR("number"), OBFSTR("Maximum process memory reads; 0 means unrestricted diagnostic scan."), false},
-         {OBFSTR("max_read_bytes"), OBFSTR("number"), OBFSTR("Maximum bytes to read from target memory; 0 means unrestricted diagnostic scan."), false},
-         {OBFSTR("scan_schannel"), OBFSTR("boolean"), OBFSTR("Enable SChannel key scanner."), false},
-         {OBFSTR("scan_openssl"), OBFSTR("boolean"), OBFSTR("Enable OpenSSL key scanner."), false},
-         {OBFSTR("scan_nss"), OBFSTR("boolean"), OBFSTR("Enable NSS key scanner."), false},
-         {OBFSTR("scan_boringssl"), OBFSTR("boolean"), OBFSTR("Enable BoringSSL key scanner."), false},
-         {OBFSTR("scan_generic"), OBFSTR("boolean"), OBFSTR("Enable generic keylog-pattern scanner."), false},
-         {OBFSTR("scan_tls13_structures"), OBFSTR("boolean"), OBFSTR("Enable TLS 1.3 structure scanner."), false},
-         {OBFSTR("hint_address"), OBFSTR("string"), OBFSTR("Optional target memory address hint for bounded fixture/key scans."), false},
-         {OBFSTR("memory_hint_address"), OBFSTR("string"), OBFSTR("Alias for hint_address."), false},
-         {OBFSTR("hint_size"), OBFSTR("number"), OBFSTR("Size of the hinted target memory range."), false},
-         {OBFSTR("memory_hint_size"), OBFSTR("number"), OBFSTR("Alias for hint_size."), false},
-         {OBFSTR("hint_only"), OBFSTR("boolean"), OBFSTR("Restrict extraction to the hinted range instead of broad process scanning."), false},
-         {OBFSTR("memory_hint_only"), OBFSTR("boolean"), OBFSTR("Alias for hint_only."), false}},
+        std::string("tls_manage"), std::string("network_security"),
+        std::string("Manage TLS key extraction and keylog capture. Actions: extract_keys, start_keylog, stop_keylog, get_extracted_keys."),
+        {{std::string("action"), std::string("string"), std::string("extract_keys|start_keylog|stop_keylog|get_extracted_keys"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false},
+         {std::string("pid"), std::string("number"), std::string("Target process ID; 0 resolves to the attached driver target."), false},
+         {std::string("timeout_ms"), std::string("number"), std::string("Bounded memory scan deadline in milliseconds."), false},
+         {std::string("scan_timeout_ms"), std::string("number"), std::string("Per-worker bounded key scan deadline for start_keylog."), false},
+         {std::string("stop_wait_ms"), std::string("number"), std::string("Bounded wait for keylog worker shutdown."), false},
+         {std::string("max_results"), std::string("number"), std::string("Maximum keys to return."), false},
+         {std::string("max_keys"), std::string("number"), std::string("Alias for max_results."), false},
+         {std::string("max_regions"), std::string("number"), std::string("Maximum memory regions to scan; 0 means unrestricted diagnostic scan."), false},
+         {std::string("max_read_attempts"), std::string("number"), std::string("Maximum process memory reads; 0 means unrestricted diagnostic scan."), false},
+         {std::string("max_read_bytes"), std::string("number"), std::string("Maximum bytes to read from target memory; 0 means unrestricted diagnostic scan."), false},
+         {std::string("scan_schannel"), std::string("boolean"), std::string("Enable SChannel key scanner."), false},
+         {std::string("scan_openssl"), std::string("boolean"), std::string("Enable OpenSSL key scanner."), false},
+         {std::string("scan_nss"), std::string("boolean"), std::string("Enable NSS key scanner."), false},
+         {std::string("scan_boringssl"), std::string("boolean"), std::string("Enable BoringSSL key scanner."), false},
+         {std::string("scan_generic"), std::string("boolean"), std::string("Enable generic keylog-pattern scanner."), false},
+         {std::string("scan_tls13_structures"), std::string("boolean"), std::string("Enable TLS 1.3 structure scanner."), false},
+         {std::string("hint_address"), std::string("string"), std::string("Optional target memory address hint for bounded fixture/key scans."), false},
+         {std::string("memory_hint_address"), std::string("string"), std::string("Alias for hint_address."), false},
+         {std::string("hint_size"), std::string("number"), std::string("Size of the hinted target memory range."), false},
+         {std::string("memory_hint_size"), std::string("number"), std::string("Alias for hint_size."), false},
+         {std::string("hint_only"), std::string("boolean"), std::string("Restrict extraction to the hinted range instead of broad process scanning."), false},
+         {std::string("memory_hint_only"), std::string("boolean"), std::string("Alias for hint_only."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -4271,10 +4270,10 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
     });
 
     register_compat(srv, {
-        OBFSTR("cert_manage"), OBFSTR("network_security"),
-        OBFSTR("Manage certificate generation and Windows certificate store operations. Actions: inject, remove, generate_ca, list."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("inject|remove|generate_ca|list"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("cert_manage"), std::string("network_security"),
+        std::string("Manage certificate generation and Windows certificate store operations. Actions: inject, remove, generate_ca, list."),
+        {{std::string("action"), std::string("string"), std::string("inject|remove|generate_ca|list"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -4287,42 +4286,42 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("pin_bypass"), OBFSTR("network_security"),
-        OBFSTR("Run read-only certificate interception diagnostics for a target process. Reports proxy, CA trust, "
+        std::string("pin_bypass"), std::string("network_security"),
+        std::string("Run read-only certificate interception diagnostics for a target process. Reports proxy, CA trust, "
                "Camoufox, provider, and handoff readiness; normal builds do not modify target process code."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (0 = current attached)"), false},
-         {OBFSTR("method"), OBFSTR("string"), OBFSTR("Diagnostic focus: 'all', 'wintrust', 'crypt32', 'schannel', 'dotnet' (default: all)"), false},
-         {OBFSTR("proxy_running"), OBFSTR("boolean"), OBFSTR("Override proxy route readiness"), false},
-         {OBFSTR("ca_trusted"), OBFSTR("boolean"), OBFSTR("Override AiDA CA trust readiness"), false},
-         {OBFSTR("interception_still_failing"), OBFSTR("boolean"), OBFSTR("Set when proxy and trust are present but interception still fails"), false}},
+        {{std::string("pid"), std::string("number"), std::string("Target process ID (0 = current attached)"), false},
+         {std::string("method"), std::string("string"), std::string("Diagnostic focus: 'all', 'wintrust', 'crypt32', 'schannel', 'dotnet' (default: all)"), false},
+         {std::string("proxy_running"), std::string("boolean"), std::string("Override proxy route readiness"), false},
+         {std::string("ca_trusted"), std::string("boolean"), std::string("Override AiDA CA trust readiness"), false},
+         {std::string("interception_still_failing"), std::string("boolean"), std::string("Set when proxy and trust are present but interception still fails"), false}},
         pin_bypass, true});
 
     register_compat(srv, {
-        OBFSTR("quic_manage"), OBFSTR("network_security"),
-        OBFSTR("Manage QUIC analysis and observation-only UDP listener state. Actions: detect_connections, decrypt_initial, extract_keys, start_observer, stop_observer, observer_stats, observer_observations."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("detect_connections|decrypt_initial|extract_keys|start_observer|stop_observer|observer_stats|observer_observations"), true},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for live detection or deterministic payload attribution."), false},
-         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Optional QUIC UDP payload bytes for deterministic detection without live capture."), false},
-         {OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Optional QUIC packet bytes for decrypt_initial or deterministic detection."), false},
-         {OBFSTR("bind_addr"), OBFSTR("string"), OBFSTR("Loopback bind address for start_observer."), false},
-         {OBFSTR("bind_port"), OBFSTR("number"), OBFSTR("UDP bind port for start_observer."), false},
-         {OBFSTR("expected_origin_port"), OBFSTR("number"), OBFSTR("Expected original QUIC server port for observation."), false},
-         {OBFSTR("max_observations"), OBFSTR("number"), OBFSTR("Maximum retained observer observations, capped at 8192."), false},
-         {OBFSTR("fail_closed_without_tls_keys"), OBFSTR("boolean"), OBFSTR("Mark encrypted QUIC payloads unsupported when TLS keys are unavailable."), false},
-         {OBFSTR("observation_only"), OBFSTR("boolean"), OBFSTR("Must remain true; full QUIC MITM is not claimed by this observer."), false},
-         {OBFSTR("listener_id"), OBFSTR("number"), OBFSTR("Listener id for stop_observer."), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum observer observations to return."), false},
-         {OBFSTR("local_port"), OBFSTR("number"), OBFSTR("Synthetic source port for deterministic payload detection."), false},
-         {OBFSTR("remote_port"), OBFSTR("number"), OBFSTR("Synthetic destination port for deterministic payload detection."), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded key extraction scan deadline in milliseconds."), false},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum keys to return for extract_keys."), false},
-         {OBFSTR("max_regions"), OBFSTR("number"), OBFSTR("Maximum memory regions to scan for extract_keys."), false},
-         {OBFSTR("max_read_attempts"), OBFSTR("number"), OBFSTR("Maximum process memory reads for extract_keys."), false},
-         {OBFSTR("max_read_bytes"), OBFSTR("number"), OBFSTR("Maximum target memory bytes to read for extract_keys."), false},
-         {OBFSTR("hint_address"), OBFSTR("string"), OBFSTR("Optional target memory address hint for bounded key scans."), false},
-         {OBFSTR("hint_size"), OBFSTR("number"), OBFSTR("Size of the hinted target memory range."), false},
-         {OBFSTR("hint_only"), OBFSTR("boolean"), OBFSTR("Restrict extract_keys to the hinted range."), false},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("quic_manage"), std::string("network_security"),
+        std::string("Manage QUIC analysis and observation-only UDP listener state. Actions: detect_connections, decrypt_initial, extract_keys, start_observer, stop_observer, observer_stats, observer_observations."),
+        {{std::string("action"), std::string("string"), std::string("detect_connections|decrypt_initial|extract_keys|start_observer|stop_observer|observer_stats|observer_observations"), true},
+         {std::string("pid"), std::string("number"), std::string("Target process ID for live detection or deterministic payload attribution."), false},
+         {std::string("payload_hex"), std::string("string"), std::string("Optional QUIC UDP payload bytes for deterministic detection without live capture."), false},
+         {std::string("packet_hex"), std::string("string"), std::string("Optional QUIC packet bytes for decrypt_initial or deterministic detection."), false},
+         {std::string("bind_addr"), std::string("string"), std::string("Loopback bind address for start_observer."), false},
+         {std::string("bind_port"), std::string("number"), std::string("UDP bind port for start_observer."), false},
+         {std::string("expected_origin_port"), std::string("number"), std::string("Expected original QUIC server port for observation."), false},
+         {std::string("max_observations"), std::string("number"), std::string("Maximum retained observer observations, capped at 8192."), false},
+         {std::string("fail_closed_without_tls_keys"), std::string("boolean"), std::string("Mark encrypted QUIC payloads unsupported when TLS keys are unavailable."), false},
+         {std::string("observation_only"), std::string("boolean"), std::string("Must remain true; full QUIC MITM is not claimed by this observer."), false},
+         {std::string("listener_id"), std::string("number"), std::string("Listener id for stop_observer."), false},
+         {std::string("limit"), std::string("number"), std::string("Maximum observer observations to return."), false},
+         {std::string("local_port"), std::string("number"), std::string("Synthetic source port for deterministic payload detection."), false},
+         {std::string("remote_port"), std::string("number"), std::string("Synthetic destination port for deterministic payload detection."), false},
+         {std::string("timeout_ms"), std::string("number"), std::string("Bounded key extraction scan deadline in milliseconds."), false},
+         {std::string("max_results"), std::string("number"), std::string("Maximum keys to return for extract_keys."), false},
+         {std::string("max_regions"), std::string("number"), std::string("Maximum memory regions to scan for extract_keys."), false},
+         {std::string("max_read_attempts"), std::string("number"), std::string("Maximum process memory reads for extract_keys."), false},
+         {std::string("max_read_bytes"), std::string("number"), std::string("Maximum target memory bytes to read for extract_keys."), false},
+         {std::string("hint_address"), std::string("string"), std::string("Optional target memory address hint for bounded key scans."), false},
+         {std::string("hint_size"), std::string("number"), std::string("Size of the hinted target memory range."), false},
+         {std::string("hint_only"), std::string("boolean"), std::string("Restrict extract_keys to the hinted range."), false},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -4338,23 +4337,23 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("dtls_manage"), OBFSTR("network_security"),
-        OBFSTR("Manage DTLS analysis. Actions: detect_sessions, extract_keys."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("detect_sessions|extract_keys"), true},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for live detection or deterministic payload attribution."), false},
-         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Optional DTLS UDP payload bytes for deterministic detection without live capture."), false},
-         {OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Optional DTLS packet bytes for deterministic detection."), false},
-         {OBFSTR("local_port"), OBFSTR("number"), OBFSTR("Synthetic source port for deterministic payload detection."), false},
-         {OBFSTR("remote_port"), OBFSTR("number"), OBFSTR("Synthetic destination port for deterministic payload detection."), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded key extraction scan deadline in milliseconds."), false},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum keys to return for extract_keys."), false},
-         {OBFSTR("max_regions"), OBFSTR("number"), OBFSTR("Maximum memory regions to scan for extract_keys."), false},
-         {OBFSTR("max_read_attempts"), OBFSTR("number"), OBFSTR("Maximum process memory reads for extract_keys."), false},
-         {OBFSTR("max_read_bytes"), OBFSTR("number"), OBFSTR("Maximum target memory bytes to read for extract_keys."), false},
-         {OBFSTR("hint_address"), OBFSTR("string"), OBFSTR("Optional target memory address hint for bounded key scans."), false},
-         {OBFSTR("hint_size"), OBFSTR("number"), OBFSTR("Size of the hinted target memory range."), false},
-         {OBFSTR("hint_only"), OBFSTR("boolean"), OBFSTR("Restrict extract_keys to the hinted range."), false},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("dtls_manage"), std::string("network_security"),
+        std::string("Manage DTLS analysis. Actions: detect_sessions, extract_keys."),
+        {{std::string("action"), std::string("string"), std::string("detect_sessions|extract_keys"), true},
+         {std::string("pid"), std::string("number"), std::string("Target process ID for live detection or deterministic payload attribution."), false},
+         {std::string("payload_hex"), std::string("string"), std::string("Optional DTLS UDP payload bytes for deterministic detection without live capture."), false},
+         {std::string("packet_hex"), std::string("string"), std::string("Optional DTLS packet bytes for deterministic detection."), false},
+         {std::string("local_port"), std::string("number"), std::string("Synthetic source port for deterministic payload detection."), false},
+         {std::string("remote_port"), std::string("number"), std::string("Synthetic destination port for deterministic payload detection."), false},
+         {std::string("timeout_ms"), std::string("number"), std::string("Bounded key extraction scan deadline in milliseconds."), false},
+         {std::string("max_results"), std::string("number"), std::string("Maximum keys to return for extract_keys."), false},
+         {std::string("max_regions"), std::string("number"), std::string("Maximum memory regions to scan for extract_keys."), false},
+         {std::string("max_read_attempts"), std::string("number"), std::string("Maximum process memory reads for extract_keys."), false},
+         {std::string("max_read_bytes"), std::string("number"), std::string("Maximum target memory bytes to read for extract_keys."), false},
+         {std::string("hint_address"), std::string("string"), std::string("Optional target memory address hint for bounded key scans."), false},
+         {std::string("hint_size"), std::string("number"), std::string("Size of the hinted target memory range."), false},
+         {std::string("hint_only"), std::string("boolean"), std::string("Restrict extract_keys to the hinted range."), false},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -4365,10 +4364,10 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("autoresponder_manage"), OBFSTR("network_security"),
-        OBFSTR("Manage AutoResponder rules and runtime state. Actions: add_rule, remove_rule, list_rules, match_request, start, stop, import_rules, export_rules."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add_rule|remove_rule|list_rules|match_request|start|stop|import_rules|export_rules"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("autoresponder_manage"), std::string("network_security"),
+        std::string("Manage AutoResponder rules and runtime state. Actions: add_rule, remove_rule, list_rules, match_request, start, stop, import_rules, export_rules."),
+        {{std::string("action"), std::string("string"), std::string("add_rule|remove_rule|list_rules|match_request|start|stop|import_rules|export_rules"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -4385,16 +4384,16 @@ void register_net_security_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("network_decrypt_capture"), OBFSTR("network_security"),
-        OBFSTR("Decrypt a captured PCAP file using TLS session keys and return the decrypted HTTP/2 frames. "
+        std::string("network_decrypt_capture"), std::string("network_security"),
+        std::string("Decrypt a captured PCAP file using TLS session keys and return the decrypted HTTP/2 frames. "
                "Uses tshark (Wireshark CLI) with an SSLKEYLOGFILE to decrypt TLS traffic. "
                "Automatically reads the SSLKEYLOGFILE path from the environment if keylog_path is not specified. "
                "Returns decrypted HTTP/2 request/response headers, methods, URLs, and bodies. "
                "The target process must have been started with SSLKEYLOGFILE set for key logging to work."),
-        {{OBFSTR("pcap_path"), OBFSTR("string"), OBFSTR("Path to the PCAP file to decrypt"), true},
-         {OBFSTR("keylog_path"), OBFSTR("string"), OBFSTR("Path to the SSLKEYLOGFILE (auto-detected from env if empty)"), false},
-         {OBFSTR("display_filter"), OBFSTR("string"), OBFSTR("Strict HTTP/2 Wireshark display filter (default: 'http2')"), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Bounded TShark decrypt deadline in milliseconds."), false}},
+        {{std::string("pcap_path"), std::string("string"), std::string("Path to the PCAP file to decrypt"), true},
+         {std::string("keylog_path"), std::string("string"), std::string("Path to the SSLKEYLOGFILE (auto-detected from env if empty)"), false},
+         {std::string("display_filter"), std::string("string"), std::string("Strict HTTP/2 Wireshark display filter (default: 'http2')"), false},
+         {std::string("timeout_ms"), std::string("number"), std::string("Bounded TShark decrypt deadline in milliseconds."), false}},
         network_decrypt_capture, true});
 
     diag::log_tagged("net_sec", "register_net_security_tools complete");

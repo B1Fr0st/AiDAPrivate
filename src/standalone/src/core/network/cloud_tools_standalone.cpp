@@ -7,7 +7,6 @@
 
 #include "cloud_tools_standalone.hpp"
 #include "standalone_compat.hpp"
-#include "obfuscation.hpp"
 #include "pro.h"
 #include "helpers/diag_log.hpp"
 
@@ -557,38 +556,38 @@ tool_result_t discover_azure_blob(const json& params) {
 void register_cloud_tools(mcp_standalone::server_t& srv) {
     diag::log_tagged("cloud_tools", "register_cloud_tools entry");
     register_compat(srv, {
-        OBFSTR("aida.cloud.discover_s3"), OBFSTR("network"),
-        OBFSTR("Probe public AWS S3 bucket endpoints with bounded HEAD/metadata checks and optional explicit list/read/write marker checks."),
-        {{OBFSTR("bucket_names"), OBFSTR("array"), OBFSTR("Bucket names to probe, capped at 64."), true},
-         {OBFSTR("region"), OBFSTR("string"), OBFSTR("Optional AWS region for regional S3 hostname."), false},
-         {OBFSTR("check_list"), OBFSTR("boolean"), OBFSTR("Explicitly perform a limited list check with max-keys=0."), false},
-         {OBFSTR("check_read"), OBFSTR("boolean"), OBFSTR("Explicitly HEAD object_key when supplied."), false},
-         {OBFSTR("object_key"), OBFSTR("string"), OBFSTR("Object key for explicit read check."), false},
-         {OBFSTR("allow_write_check"), OBFSTR("boolean"), OBFSTR("Explicit permission to PUT a marker object and attempt cleanup."), false},
-         {OBFSTR("marker_name"), OBFSTR("string"), OBFSTR("Marker object name for explicit write check."), false}},
+        std::string("aida.cloud.discover_s3"), std::string("network"),
+        std::string("Probe public AWS S3 bucket endpoints with bounded HEAD/metadata checks and optional explicit list/read/write marker checks."),
+        {{std::string("bucket_names"), std::string("array"), std::string("Bucket names to probe, capped at 64."), true},
+         {std::string("region"), std::string("string"), std::string("Optional AWS region for regional S3 hostname."), false},
+         {std::string("check_list"), std::string("boolean"), std::string("Explicitly perform a limited list check with max-keys=0."), false},
+         {std::string("check_read"), std::string("boolean"), std::string("Explicitly HEAD object_key when supplied."), false},
+         {std::string("object_key"), std::string("string"), std::string("Object key for explicit read check."), false},
+         {std::string("allow_write_check"), std::string("boolean"), std::string("Explicit permission to PUT a marker object and attempt cleanup."), false},
+         {std::string("marker_name"), std::string("string"), std::string("Marker object name for explicit write check."), false}},
         discover_s3, false});
 
     register_compat(srv, {
-        OBFSTR("aida.cloud.discover_gcs"), OBFSTR("network"),
-        OBFSTR("Probe public Google Cloud Storage buckets with bounded metadata checks and optional explicit list/read/write marker checks."),
-        {{OBFSTR("bucket_names"), OBFSTR("array"), OBFSTR("Bucket names to probe, capped at 64."), true},
-         {OBFSTR("check_list"), OBFSTR("boolean"), OBFSTR("Explicitly perform a limited object list check."), false},
-         {OBFSTR("check_read"), OBFSTR("boolean"), OBFSTR("Explicitly HEAD object_name when supplied."), false},
-         {OBFSTR("object_name"), OBFSTR("string"), OBFSTR("Object name for explicit read check."), false},
-         {OBFSTR("allow_write_check"), OBFSTR("boolean"), OBFSTR("Explicit permission to PUT a marker object and attempt cleanup."), false},
-         {OBFSTR("marker_name"), OBFSTR("string"), OBFSTR("Marker object name for explicit write check."), false}},
+        std::string("aida.cloud.discover_gcs"), std::string("network"),
+        std::string("Probe public Google Cloud Storage buckets with bounded metadata checks and optional explicit list/read/write marker checks."),
+        {{std::string("bucket_names"), std::string("array"), std::string("Bucket names to probe, capped at 64."), true},
+         {std::string("check_list"), std::string("boolean"), std::string("Explicitly perform a limited object list check."), false},
+         {std::string("check_read"), std::string("boolean"), std::string("Explicitly HEAD object_name when supplied."), false},
+         {std::string("object_name"), std::string("string"), std::string("Object name for explicit read check."), false},
+         {std::string("allow_write_check"), std::string("boolean"), std::string("Explicit permission to PUT a marker object and attempt cleanup."), false},
+         {std::string("marker_name"), std::string("string"), std::string("Marker object name for explicit write check."), false}},
         discover_gcs, false});
 
     register_compat(srv, {
-        OBFSTR("aida.cloud.discover_azure_blob"), OBFSTR("network"),
-        OBFSTR("Probe public Azure Blob accounts and specified containers with bounded metadata checks and optional explicit list/read/write marker checks."),
-        {{OBFSTR("account_names"), OBFSTR("array"), OBFSTR("Storage account names to probe, capped at 64."), true},
-         {OBFSTR("container_names"), OBFSTR("array"), OBFSTR("Optional container names to probe, capped at 128."), false},
-         {OBFSTR("check_list"), OBFSTR("boolean"), OBFSTR("Explicitly perform limited account/container list checks."), false},
-         {OBFSTR("check_read"), OBFSTR("boolean"), OBFSTR("Explicitly HEAD blob_name when supplied."), false},
-         {OBFSTR("blob_name"), OBFSTR("string"), OBFSTR("Blob name for explicit read check."), false},
-         {OBFSTR("allow_write_check"), OBFSTR("boolean"), OBFSTR("Explicit permission to PUT a marker blob and attempt cleanup."), false},
-         {OBFSTR("marker_name"), OBFSTR("string"), OBFSTR("Marker blob name for explicit write check."), false}},
+        std::string("aida.cloud.discover_azure_blob"), std::string("network"),
+        std::string("Probe public Azure Blob accounts and specified containers with bounded metadata checks and optional explicit list/read/write marker checks."),
+        {{std::string("account_names"), std::string("array"), std::string("Storage account names to probe, capped at 64."), true},
+         {std::string("container_names"), std::string("array"), std::string("Optional container names to probe, capped at 128."), false},
+         {std::string("check_list"), std::string("boolean"), std::string("Explicitly perform limited account/container list checks."), false},
+         {std::string("check_read"), std::string("boolean"), std::string("Explicitly HEAD blob_name when supplied."), false},
+         {std::string("blob_name"), std::string("string"), std::string("Blob name for explicit read check."), false},
+         {std::string("allow_write_check"), std::string("boolean"), std::string("Explicit permission to PUT a marker blob and attempt cleanup."), false},
+         {std::string("marker_name"), std::string("string"), std::string("Marker blob name for explicit write check."), false}},
         discover_azure_blob, false});
     diag::log_tagged("cloud_tools", "register_cloud_tools complete");
 }

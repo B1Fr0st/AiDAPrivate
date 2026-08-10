@@ -68,8 +68,6 @@ struct hung_context_t {
     const char* downstream_pressure = nullptr;
     const char* testlab_step = nullptr;
     std::uint64_t testlab_step_elapsed_ms = 0;
-    std::uint64_t license_liveness_ms = 0;
-    std::uint64_t arc_liveness_ms = 0;
     std::uint64_t driver_watchdog_ms = 0;
     const char* mcp_snapshot = nullptr;
     const char* queue_snapshot = nullptr;
@@ -89,7 +87,7 @@ inline void log_window_hung_snapshot(const hung_context_t& ctx) {
     utc_val.HighPart = system_time.dwHighDateTime;
 
     diag::log_tagged_critical_fmt("tracer",
-        "WINDOW-HUNG-SNAPSHOT pid=%lu tid=%lu utc_100ns=%llu tick_ms=%llu elapsed_ms=%llu qpc_present=1 hwnd=0x%llX hwnd_valid=%d hwnd_pid_check=1 ui_owner_tid=%lu current_tid=%lu render_tid=%lu is_hung=%d send_wm_null_ok=%d send_wm_null_gle=%lu send_wm_null_lresult=0x%llX send_timeout_ms=%u send_flags=0x%08X queue_status=0x%08lX current_queue_status=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX peek_calls=%llu peek_returns=%llu send_only_defers=%llu send_only_flushes=%llu stall_streak=%llu frame=%llu heartbeat_tick_ms=%llu heartbeat_age_ms=%llu last_input_event_ms=%llu last_pump_return_ms=%llu phase=%s section=%s phase_id=%llu dispatch_stage=%s dispatch_msg=%s(0x%04X) dispatch_hwnd=0x%llX wndproc_stage=%s wndproc_msg=%s(0x%04X) wndproc_hwnd=0x%llX ui_dispatch_qd=%zu ui_dispatch_oldest_age_ms=%llu ui_dispatch_wake_pending=%d ui_dispatch_rejected=%llu ui_dispatch_drained=%llu ui_dispatch_budget_hits=%llu ui_dispatch_time_budget_hits=%llu ui_dispatch_affinity_violations=%llu ui_dispatch_top_labels=%s mcp_active_requests=%zu mcp_active_leases=%zu mcp_oldest_owner=%s mcp_pending_cancellations=%zu capacity_pressure=%s downstream_pressure=%s testlab_step=%s testlab_step_elapsed_ms=%llu license_liveness_ms=%llu arc_liveness_ms=%llu driver_watchdog_ms=%llu mcp={%.1300s} queues={%.2800s} ui_dispatch={%.1300s}",
+        "WINDOW-HUNG-SNAPSHOT pid=%lu tid=%lu utc_100ns=%llu tick_ms=%llu elapsed_ms=%llu qpc_present=1 hwnd=0x%llX hwnd_valid=%d hwnd_pid_check=1 ui_owner_tid=%lu current_tid=%lu render_tid=%lu is_hung=%d send_wm_null_ok=%d send_wm_null_gle=%lu send_wm_null_lresult=0x%llX send_timeout_ms=%u send_flags=0x%08X queue_status=0x%08lX current_queue_status=0x%08lX peek_gle=%lu peek_flags=0x%08X peek_filter=0x%llX peek_calls=%llu peek_returns=%llu send_only_defers=%llu send_only_flushes=%llu stall_streak=%llu frame=%llu heartbeat_tick_ms=%llu heartbeat_age_ms=%llu last_input_event_ms=%llu last_pump_return_ms=%llu phase=%s section=%s phase_id=%llu dispatch_stage=%s dispatch_msg=%s(0x%04X) dispatch_hwnd=0x%llX wndproc_stage=%s wndproc_msg=%s(0x%04X) wndproc_hwnd=0x%llX ui_dispatch_qd=%zu ui_dispatch_oldest_age_ms=%llu ui_dispatch_wake_pending=%d ui_dispatch_rejected=%llu ui_dispatch_drained=%llu ui_dispatch_budget_hits=%llu ui_dispatch_time_budget_hits=%llu ui_dispatch_affinity_violations=%llu ui_dispatch_top_labels=%s mcp_active_requests=%zu mcp_active_leases=%zu mcp_oldest_owner=%s mcp_pending_cancellations=%zu capacity_pressure=%s downstream_pressure=%s testlab_step=%s testlab_step_elapsed_ms=%llu driver_watchdog_ms=%llu mcp={%.1300s} queues={%.2800s} ui_dispatch={%.1300s}",
         static_cast<unsigned long>(pid),
         static_cast<unsigned long>(tid),
         static_cast<unsigned long long>(utc_val.QuadPart),
@@ -149,8 +147,6 @@ inline void log_window_hung_snapshot(const hung_context_t& ctx) {
         ctx.downstream_pressure ? ctx.downstream_pressure : "<null>",
         ctx.testlab_step ? ctx.testlab_step : "<null>",
         static_cast<unsigned long long>(ctx.testlab_step_elapsed_ms),
-        static_cast<unsigned long long>(ctx.license_liveness_ms),
-        static_cast<unsigned long long>(ctx.arc_liveness_ms),
         static_cast<unsigned long long>(ctx.driver_watchdog_ms),
         ctx.mcp_snapshot && ctx.mcp_snapshot[0] ? ctx.mcp_snapshot : "empty=1",
         ctx.queue_snapshot && ctx.queue_snapshot[0] ? ctx.queue_snapshot : "empty=1",

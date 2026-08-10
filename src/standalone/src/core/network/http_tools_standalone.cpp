@@ -7,7 +7,6 @@
 #include <windows.h>
 
 #include "standalone_compat.hpp"
-#include "obfuscation.hpp"
 #include "helpers/diag_log.hpp"
 #include "../mcp/mcp_standalone.hpp"
 #include "burp/audit_http.hpp"

@@ -8,7 +8,6 @@
 #include "standalone_compat.hpp"
 #include "debugger_engine.hpp"
 #include "comm.h"
-#include "obfuscation.hpp"
 #include "pro.h"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/standalone_driver_identity.hpp"
@@ -183,7 +182,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
     diag::log_tagged_fmt("dbg_tools", "ensure_attached: entry");
     if (!device->is_connected()) {
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: driver not connected");
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     }
     std::string kernel_reason;
     const bool kernel_ready = driver_bridge::using_kernel_driver() &&
@@ -198,7 +197,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
         std::string detail = kernel_reason.empty() ? driver_bridge::last_error() : kernel_reason;
         if (detail.empty())
             detail = "kernel_driver_unavailable";
-        return tool_result_t::error(OBFSTR("Kernel driver path is unavailable for debugger target operations: ") +
+        return tool_result_t::error(std::string("Kernel driver path is unavailable for debugger target operations: ") +
             detail);
     }
 
@@ -227,7 +226,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: switching active pid from %u to %u", current_pid, requested_pid);
         if (!is_process_alive(requested_pid)) {
             diag::log_tagged_fmt("dbg_tools", "ensure_attached: target_pid %u not alive", requested_pid);
-            return tool_result_t::error(OBFSTR("target_pid ") + std::to_string(requested_pid) + OBFSTR(" is not alive."));
+            return tool_result_t::error(std::string("target_pid ") + std::to_string(requested_pid) + std::string(" is not alive."));
         }
 
         const auto attached = driver_bridge::attached_pids();
@@ -240,8 +239,8 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
             {
                 diag::log_tagged_fmt("dbg_tools", "ensure_attached: attach_additional failed for pid %u", requested_pid);
                 return tool_result_t::error(
-                    OBFSTR("attach_additional failed for target_pid ") + std::to_string(requested_pid) +
-                    OBFSTR(": ") + driver_bridge::last_error());
+                    std::string("attach_additional failed for target_pid ") + std::to_string(requested_pid) +
+                    std::string(": ") + driver_bridge::last_error());
             }
         }
 
@@ -253,8 +252,8 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
                 (void)stealth_engine::ensure_default_enabled(current_pid, "debugger_tools.ensure_attached.restore_failed_switch");
             diag::log_tagged_fmt("dbg_tools", "ensure_attached: set_active_pid failed for pid %u", requested_pid);
             return tool_result_t::error(
-                OBFSTR("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
-                OBFSTR(": ") + driver_bridge::last_error());
+                std::string("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
+                std::string(": ") + driver_bridge::last_error());
         }
 
         (void)stealth_engine::ensure_default_enabled(requested_pid, "debugger_tools.ensure_attached");
@@ -265,8 +264,8 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
             if (device->get_dtb() == 0) {
                 diag::log_tagged_fmt("dbg_tools", "ensure_attached: DTB solve failed for pid %u", requested_pid);
                 return tool_result_t::error(
-                    OBFSTR("Failed to solve DTB for target_pid ") +
-                    std::to_string(requested_pid) + OBFSTR("."));
+                    std::string("Failed to solve DTB for target_pid ") +
+                    std::to_string(requested_pid) + std::string("."));
             }
         }
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: switched to pid %u ok", requested_pid);
@@ -274,7 +273,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
 
     if (driver_bridge::attached_pid() == 0) {
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: not attached");
-        return tool_result_t::error(OBFSTR("Not attached. Use sessions_manage action=attach_pid or pass target_pid."));
+        return tool_result_t::error(std::string("Not attached. Use sessions_manage action=attach_pid or pass target_pid."));
     }
 
     if (!is_process_alive(driver_bridge::attached_pid()))
@@ -283,8 +282,8 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
         diag::log_tagged_fmt("dbg_tools", "ensure_attached: attached pid %u is dead", dead_pid);
         device->clear_process_context();
         return tool_result_t::error(
-            OBFSTR("Attached process PID ") + std::to_string(dead_pid) +
-            OBFSTR(" is no longer alive. Reattach with sessions_manage action=attach_pid."));
+            std::string("Attached process PID ") + std::to_string(dead_pid) +
+            std::string(" is no longer alive. Reattach with sessions_manage action=attach_pid."));
     }
 
     if (device->get_dtb() == 0)
@@ -292,7 +291,7 @@ static std::optional<tool_result_t> ensure_attached(const json& params)
         device->solve_dtb();
         if (device->get_dtb() == 0) {
             diag::log_tagged_fmt("dbg_tools", "ensure_attached: DTB solve failed for attached pid");
-            return tool_result_t::error(OBFSTR("Failed to solve DTB for the attached process."));
+            return tool_result_t::error(std::string("Failed to solve DTB for the attached process."));
         }
     }
     diag::log_tagged_fmt("dbg_tools", "ensure_attached: ok pid=%u", driver_bridge::attached_pid());
@@ -1113,7 +1112,7 @@ static std::optional<tool_result_t> reject_full_test_system_mutation(std::uint64
         module_name.c_str(),
         module_path.c_str());
     return tool_result_t::error(
-        OBFSTR("Full Test Lab refuses to mutate system module memory. Use a private target fixture address instead."));
+        std::string("Full Test Lab refuses to mutate system module memory. Use a private target fixture address instead."));
 }
 
 static bool is_hardware_breakpoint(debugger_engine::bp_type_t type)
@@ -1334,7 +1333,7 @@ static std::string bytes_to_hex(const std::uint8_t* bytes, std::size_t size)
 static bool parse_protection_value(const json& params, std::uint32_t& protect, std::string& normalized, std::string& error)
 {
     protect = PAGE_EXECUTE_READWRITE;
-    normalized = OBFSTR("PAGE_EXECUTE_READWRITE");
+    normalized = std::string("PAGE_EXECUTE_READWRITE");
 
     if (!params.contains("protection"))
         return true;
@@ -1342,7 +1341,7 @@ static bool parse_protection_value(const json& params, std::uint32_t& protect, s
     const auto& value = params["protection"];
     if (auto numeric = parse_u64_json(value)) {
         if (*numeric == 0 || *numeric > 0xFFFFFFFFULL) {
-            error = OBFSTR("Invalid PAGE_* protection value.");
+            error = std::string("Invalid PAGE_* protection value.");
             return false;
         }
         protect = static_cast<std::uint32_t>(*numeric);
@@ -1351,13 +1350,13 @@ static bool parse_protection_value(const json& params, std::uint32_t& protect, s
     }
 
     if (!value.is_string()) {
-        error = OBFSTR("'protection' must be a PAGE_* string or numeric Win32 constant.");
+        error = std::string("'protection' must be a PAGE_* string or numeric Win32 constant.");
         return false;
     }
 
     std::string text = lower_ascii(trim_ascii(value.get<std::string>()));
     if (text.empty()) {
-        error = OBFSTR("'protection' cannot be empty.");
+        error = std::string("'protection' cannot be empty.");
         return false;
     }
 
@@ -1389,7 +1388,7 @@ static bool parse_protection_value(const json& params, std::uint32_t& protect, s
         else if (token == "writecombine") { token_value = PAGE_WRITECOMBINE; is_modifier = true; }
         else if (auto parsed = sa_parse_address(token)) token_value = static_cast<std::uint32_t>(*parsed);
         else {
-            error = OBFSTR("Unsupported protection token: ") + token;
+            error = std::string("Unsupported protection token: ") + token;
             return false;
         }
 
@@ -1397,7 +1396,7 @@ static bool parse_protection_value(const json& params, std::uint32_t& protect, s
             modifiers |= token_value;
         else {
             if (base != 0 && token_value != base) {
-                error = OBFSTR("Specify only one base PAGE_* protection.");
+                error = std::string("Specify only one base PAGE_* protection.");
                 return false;
             }
             base = token_value;
@@ -1405,7 +1404,7 @@ static bool parse_protection_value(const json& params, std::uint32_t& protect, s
     }
 
     if (base == 0) {
-        error = OBFSTR("Missing base PAGE_* protection.");
+        error = std::string("Missing base PAGE_* protection.");
         return false;
     }
 
@@ -1723,9 +1722,9 @@ static tool_result_t handle_debugger_set_register(const json& params, bool allow
 
     auto tid = parse_tid(params);
     if (!tid)
-        return tool_result_t::error(OBFSTR("'tid' is required."));
+        return tool_result_t::error(std::string("'tid' is required."));
     if (!params.contains("register") || !params["register"].is_string())
-        return tool_result_t::error(OBFSTR("'register' is required."));
+        return tool_result_t::error(std::string("'register' is required."));
 
     const char* value_key = nullptr;
     if (params.contains("hex_value"))
@@ -1733,15 +1732,15 @@ static tool_result_t handle_debugger_set_register(const json& params, bool allow
     else if (allow_value_alias && params.contains("value"))
         value_key = "value";
     if (!value_key)
-        return tool_result_t::error(allow_value_alias ? OBFSTR("'hex_value' or 'value' is required.") : OBFSTR("'hex_value' is required."));
+        return tool_result_t::error(allow_value_alias ? std::string("'hex_value' or 'value' is required.") : std::string("'hex_value' is required."));
 
     auto value = parse_u64_json(params[value_key]);
     if (!value)
-        return tool_result_t::error(OBFSTR("Invalid register value."));
+        return tool_result_t::error(std::string("Invalid register value."));
 
     auto reg = canonical_mutable_register(params["register"].get<std::string>());
     if (!reg)
-        return tool_result_t::error(OBFSTR("Unsupported register. Use a 64-bit general register, RIP, RSP, RBP, or RFLAGS."));
+        return tool_result_t::error(std::string("Unsupported register. Use a 64-bit general register, RIP, RSP, RBP, or RFLAGS."));
 
     debugger_engine::g_state.active_tid = *tid;
     auto before_regs = debugger_engine::get_registers();
@@ -1752,7 +1751,7 @@ static tool_result_t handle_debugger_set_register(const json& params, bool allow
         *tid, reg->c_str(), static_cast<unsigned long long>(*value));
     if (!debugger_engine::set_register(*reg, *value)) {
         const std::string detail = debugger_engine::last_error().empty()
-            ? OBFSTR("debugger_engine::set_register failed.")
+            ? std::string("debugger_engine::set_register failed.")
             : debugger_engine::last_error();
         diag::log_tagged_fmt("dbg_tools", "debugger_set_register: failed tid=%u reg=%s detail=%s",
             *tid, reg->c_str(), detail.c_str());
@@ -1770,7 +1769,7 @@ static tool_result_t handle_debugger_set_register(const json& params, bool allow
     result["after"] = sa_format_address(after_value);
     result["requested"] = sa_format_address(*value);
     result["registers"] = registers_to_json(after_regs);
-    return tool_result_t::ok(OBFSTR("Register updated."), result);
+    return tool_result_t::ok(std::string("Register updated."), result);
 }
 
 
@@ -1789,7 +1788,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
 
     auto tid = parse_tid(params);
     if (!tid)
-        return tool_result_t::error(OBFSTR("'tid' is required."));
+        return tool_result_t::error(std::string("'tid' is required."));
 
     int max_instructions = int_param_clamped(params, "max_instructions", 256, 1, 4096);
     if (!params.contains("max_instructions") && params.contains("max_records"))
@@ -1800,10 +1799,10 @@ static tool_result_t handle_debugger_start_trace(const json& params)
     std::string condition;
     if (params.contains("condition")) {
         if (!params["condition"].is_string())
-            return tool_result_t::error(OBFSTR("'condition' must be a string expression."));
+            return tool_result_t::error(std::string("'condition' must be a string expression."));
         condition = trim_ascii(params["condition"].get<std::string>());
         if (condition.size() > 512)
-            return tool_result_t::error(OBFSTR("'condition' is too long."));
+            return tool_result_t::error(std::string("'condition' is too long."));
     }
 
     debugger_engine::g_state.active_tid = *tid;
@@ -1819,11 +1818,11 @@ static tool_result_t handle_debugger_start_trace(const json& params)
     if (!condition.empty()) {
         auto initial_regs = debugger_engine::get_registers();
         if (!evaluate_trace_condition(condition, initial_regs, initial_matched, condition_error))
-            return tool_result_t::error(OBFSTR("Invalid trace condition: ") + condition_error);
+            return tool_result_t::error(std::string("Invalid trace condition: ") + condition_error);
     }
 
     if (!debugger_engine::start_trace(max_instructions))
-        return tool_result_t::error(OBFSTR("Trace is already active."));
+        return tool_result_t::error(std::string("Trace is already active."));
 
     trace_session_t session;
     session.pid = driver_bridge::attached_pid();
@@ -1831,7 +1830,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
     session.condition = condition;
     session.max_instructions = max_instructions;
     session.timeout_ms = timeout_ms;
-    session.stop_reason = OBFSTR("max_instructions");
+    session.stop_reason = std::string("max_instructions");
 
     const auto started = std::chrono::steady_clock::now();
     const auto deadline = started + std::chrono::milliseconds(timeout_ms);
@@ -1839,7 +1838,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
     if (initial_matched) {
         session.completed = true;
         session.condition_met = true;
-        session.stop_reason = OBFSTR("condition");
+        session.stop_reason = std::string("condition");
         diag::log_tagged_fmt("dbg_tools",
             "debugger_start_trace: initial_condition_matched tid=%u",
             static_cast<unsigned>(*tid));
@@ -1847,7 +1846,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
         for (int i = 0; i < max_instructions; ++i) {
             if (mcp_standalone::current_call_cancelled()) {
                 session.cancelled = true;
-                session.stop_reason = OBFSTR("cancelled");
+                session.stop_reason = std::string("cancelled");
                 diag::log_tagged_fmt("dbg_tools",
                     "debugger_start_trace: cancelled tid=%u step=%d executed=%d",
                     static_cast<unsigned>(*tid), i, session.executed_instructions);
@@ -1855,7 +1854,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 session.timed_out = true;
-                session.stop_reason = OBFSTR("timeout");
+                session.stop_reason = std::string("timeout");
                 diag::log_tagged_fmt("dbg_tools",
                     "debugger_start_trace: timeout_before_step tid=%u step=%d executed=%d",
                     static_cast<unsigned>(*tid), i, session.executed_instructions);
@@ -1868,9 +1867,9 @@ static tool_result_t handle_debugger_start_trace(const json& params)
                 static_cast<unsigned>(*tid), i + 1, max_instructions, session.executed_instructions);
             if (!debugger_engine::step_into()) {
                 session.error = debugger_engine::last_error().empty()
-                    ? OBFSTR("step_into failed.")
+                    ? std::string("step_into failed.")
                     : debugger_engine::last_error();
-                session.stop_reason = OBFSTR("step_failed");
+                session.stop_reason = std::string("step_failed");
                 const auto step_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - step_started).count();
                 diag::log_tagged_fmt("dbg_tools",
@@ -1890,7 +1889,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
 
             if (std::chrono::steady_clock::now() >= deadline) {
                 session.timed_out = true;
-                session.stop_reason = OBFSTR("timeout");
+                session.stop_reason = std::string("timeout");
                 diag::log_tagged_fmt("dbg_tools",
                     "debugger_start_trace: timeout_after_step tid=%u step=%d executed=%d",
                     static_cast<unsigned>(*tid), i + 1, session.executed_instructions);
@@ -1901,8 +1900,8 @@ static tool_result_t handle_debugger_start_trace(const json& params)
                 bool matched = false;
                 auto regs = debugger_engine::get_registers();
                 if (!evaluate_trace_condition(condition, regs, matched, condition_error)) {
-                    session.error = OBFSTR("Trace condition evaluation failed: ") + condition_error;
-                    session.stop_reason = OBFSTR("condition_error");
+                    session.error = std::string("Trace condition evaluation failed: ") + condition_error;
+                    session.stop_reason = std::string("condition_error");
                     diag::log_tagged_fmt("dbg_tools",
                         "debugger_start_trace: condition_error tid=%u step=%d error=%s",
                         static_cast<unsigned>(*tid), i + 1, session.error.c_str());
@@ -1911,7 +1910,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
                 if (matched) {
                     session.condition_met = true;
                     session.completed = true;
-                    session.stop_reason = OBFSTR("condition");
+                    session.stop_reason = std::string("condition");
                     diag::log_tagged_fmt("dbg_tools",
                         "debugger_start_trace: condition_matched tid=%u step=%d executed=%d",
                         static_cast<unsigned>(*tid), i + 1, session.executed_instructions);
@@ -1922,7 +1921,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
 
         if (session.executed_instructions >= max_instructions) {
             session.completed = true;
-            session.stop_reason = OBFSTR("max_instructions");
+            session.stop_reason = std::string("max_instructions");
         }
     }
 
@@ -1965,7 +1964,7 @@ static tool_result_t handle_debugger_start_trace(const json& params)
     const bool failed = !stored.error.empty() || stored.timed_out || stored.cancelled || !stored.completed;
     if (failed) {
         std::string detail = stored.error.empty()
-            ? (OBFSTR("Trace stopped before completion: ") + stored.stop_reason)
+            ? (std::string("Trace stopped before completion: ") + stored.stop_reason)
             : stored.error;
         diag::log_tagged_fmt("dbg_tools",
             "debugger_start_trace: failed id=%s tid=%u reason=%s entries=%zu executed=%d completed=%d timed_out=%d cancelled=%d",
@@ -1979,19 +1978,19 @@ static tool_result_t handle_debugger_start_trace(const json& params)
             stored.cancelled ? 1 : 0);
         return tool_result_t{false, detail, result};
     }
-    return tool_result_t::ok(OBFSTR("Trace recorded."), result);
+    return tool_result_t::ok(std::string("Trace recorded."), result);
 }
 
 static tool_result_t handle_debugger_get_trace(const json& params)
 {
     diag::log_tagged_fmt("dbg_tools", "debugger_get_trace: entry");
     if (!params.contains("trace_id") || !params["trace_id"].is_string())
-        return tool_result_t::error(OBFSTR("'trace_id' is required."));
+        return tool_result_t::error(std::string("'trace_id' is required."));
 
     const std::string trace_id = params["trace_id"].get<std::string>();
     trace_session_t session;
     if (!load_trace_session(trace_id, session))
-        return tool_result_t::error(OBFSTR("Trace ID not found."));
+        return tool_result_t::error(std::string("Trace ID not found."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("debugger_get_trace", driver_bridge::attached_pid(), quota_guard))
@@ -2028,7 +2027,7 @@ static tool_result_t handle_debugger_get_trace(const json& params)
     result["entries"] = std::move(entries);
     diag::log_tagged_fmt("dbg_tools", "debugger_get_trace: id=%s total=%zu returned=%zu",
         trace_id.c_str(), session.entries.size(), result["returned"].get<std::size_t>());
-    return tool_result_t::ok(OBFSTR("Trace returned."), result);
+    return tool_result_t::ok(std::string("Trace returned."), result);
 }
 
 static bool callstack_source_contains(const std::string& source, const char* needle)
@@ -2145,11 +2144,11 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
             driver_bridge::attached_pid(),
             0,
             "missing_tid",
-            OBFSTR("'tid' (thread ID) is required."),
+            std::string("'tid' (thread ID) is required."),
             ERROR_INVALID_PARAMETER,
             false);
         return tool_result_t::error(
-            OBFSTR("'tid' (thread ID) is required."),
+            std::string("'tid' (thread ID) is required."),
             "callstack_missing_tid",
             details);
     }
@@ -2182,11 +2181,11 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
             driver_bridge::attached_pid(),
             tid,
             "thread_context_unavailable",
-            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid),
+            std::string("Failed to get thread context for TID ") + std::to_string(tid),
             gle,
             did_suspend);
         return tool_result_t::error(
-            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid),
+            std::string("Failed to get thread context for TID ") + std::to_string(tid),
             "callstack_thread_context_unavailable",
             details);
     }
@@ -2399,14 +2398,14 @@ static tool_result_t handle_debugger_get_callstack_impl(const json& params)
             ERROR_NOT_FOUND,
             did_suspend);
         return tool_result_t::error(
-            OBFSTR("Call stack evidence is unavailable for TID ") + std::to_string(tid),
+            std::string("Call stack evidence is unavailable for TID ") + std::to_string(tid),
             "callstack_evidence_unavailable",
             result);
     }
     result["failure"] = nullptr;
     return tool_result_t::ok(
-        OBFSTR("Call stack for TID ") + std::to_string(tid) +
-        OBFSTR(": ") + std::to_string(frames.size()) + OBFSTR(" frame(s)"),
+        std::string("Call stack for TID ") + std::to_string(tid) +
+        std::string(": ") + std::to_string(frames.size()) + std::string(" frame(s)"),
         result);
 }
 
@@ -2442,7 +2441,7 @@ static tool_result_t dbg_snapshot_state(const json& params)
     auto tid_opt = parse_tid(params);
     if (!tid_opt) {
         diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: missing tid param");
-        return tool_result_t::error(OBFSTR("'tid' (thread ID) is required."));
+        return tool_result_t::error(std::string("'tid' (thread ID) is required."));
     }
     const std::uint32_t tid = *tid_opt;
 
@@ -2451,7 +2450,7 @@ static tool_result_t dbg_snapshot_state(const json& params)
         snap_name = params["name"].get<std::string>();
     if (snap_name.empty()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: empty snapshot name");
-        return tool_result_t::error(OBFSTR("Snapshot name cannot be empty."));
+        return tool_result_t::error(std::string("Snapshot name cannot be empty."));
     }
     diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: capturing snapshot '%s' tid=%u", snap_name.c_str(), tid);
 
@@ -2473,7 +2472,7 @@ static tool_result_t dbg_snapshot_state(const json& params)
         if (did_suspend) device->resume_thread(tid);
         SetLastError(gle);
         return tool_result_t::error(
-            OBFSTR("Failed to get thread context for TID ") + std::to_string(tid));
+            std::string("Failed to get thread context for TID ") + std::to_string(tid));
     }
 
     execution_snapshot snap;
@@ -2526,7 +2525,7 @@ static tool_result_t dbg_snapshot_state(const json& params)
 
     diag::log_tagged_fmt("dbg_tools", "dbg_snapshot_state: snapshot '%s' captured tid=%u RIP=0x%llX memory_regions=%zu", snap_name.c_str(), tid, (unsigned long long)ctx.rip, snap.memory.size());
     return tool_result_t::ok(
-        OBFSTR("Snapshot '") + snap_name + OBFSTR("' captured"), result);
+        std::string("Snapshot '") + snap_name + std::string("' captured"), result);
 }
 
 static tool_result_t dbg_compare_snapshots(const json& params)
@@ -2534,11 +2533,11 @@ static tool_result_t dbg_compare_snapshots(const json& params)
     diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: entry");
     if (!params.contains("snapshot_a") || !params["snapshot_a"].is_string()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: missing snapshot_a");
-        return tool_result_t::error(OBFSTR("'snapshot_a' name is required."));
+        return tool_result_t::error(std::string("'snapshot_a' name is required."));
     }
     if (!params.contains("snapshot_b") || !params["snapshot_b"].is_string()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: missing snapshot_b");
-        return tool_result_t::error(OBFSTR("'snapshot_b' name is required."));
+        return tool_result_t::error(std::string("'snapshot_b' name is required."));
     }
 
     const std::string name_a = params["snapshot_a"].get<std::string>();
@@ -2551,11 +2550,11 @@ static tool_result_t dbg_compare_snapshots(const json& params)
     auto it_b = s_snapshots.find(name_b);
     if (it_a == s_snapshots.end()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: snapshot '%s' not found", name_a.c_str());
-        return tool_result_t::error(OBFSTR("Snapshot '") + name_a + OBFSTR("' not found."));
+        return tool_result_t::error(std::string("Snapshot '") + name_a + std::string("' not found."));
     }
     if (it_b == s_snapshots.end()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: snapshot '%s' not found", name_b.c_str());
-        return tool_result_t::error(OBFSTR("Snapshot '") + name_b + OBFSTR("' not found."));
+        return tool_result_t::error(std::string("Snapshot '") + name_b + std::string("' not found."));
     }
 
     const auto& a = it_a->second;
@@ -2662,9 +2661,9 @@ static tool_result_t dbg_compare_snapshots(const json& params)
 
     diag::log_tagged_fmt("dbg_tools", "dbg_compare_snapshots: '%s' vs '%s' => %zu reg diffs, %zu mem diffs, elapsed_ms=%lld", name_a.c_str(), name_b.c_str(), reg_diffs.size(), mem_diffs.size(), (long long)elapsed_ms);
     return tool_result_t::ok(
-        OBFSTR("Diff: ") + std::to_string(reg_diffs.size()) +
-        OBFSTR(" register(s), ") + std::to_string(mem_diffs.size()) +
-        OBFSTR(" memory region(s) changed"),
+        std::string("Diff: ") + std::to_string(reg_diffs.size()) +
+        std::string(" register(s), ") + std::to_string(mem_diffs.size()) +
+        std::string(" memory region(s) changed"),
         result);
 }
 
@@ -2681,13 +2680,13 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
 
     if (!params.contains("address") || !params["address"].is_string()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: missing address param");
-        return tool_result_t::error(OBFSTR("'address' (hex string) is required."));
+        return tool_result_t::error(std::string("'address' (hex string) is required."));
     }
 
     auto addr_opt = sa_parse_address(params["address"].get<std::string>());
     if (!addr_opt || *addr_opt == 0) {
         diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: invalid address");
-        return tool_result_t::error(OBFSTR("Invalid address."));
+        return tool_result_t::error(std::string("Invalid address."));
     }
     const std::uint64_t addr = *addr_opt;
 
@@ -2702,7 +2701,7 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
     if (read < 16) {
         diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: only %zu bytes read at 0x%llX", read, (unsigned long long)addr);
         return tool_result_t::error(
-            OBFSTR("Insufficient bytes read at ") + sa_format_address(addr));
+            std::string("Insufficient bytes read at ") + sa_format_address(addr));
     }
     diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: read %zu bytes", read);
     code.resize(read);
@@ -2846,8 +2845,8 @@ static tool_result_t dbg_detect_vm_handler(const json& params)
 
     diag::log_tagged_fmt("dbg_tools", "dbg_detect_vm_handler: addr=0x%llX score=%d verdict=%s indirect_jmps=%d scaled_jmps=%d", (unsigned long long)addr, (int)score, verdict.c_str(), indirect_jumps, scaled_jumps);
     return tool_result_t::ok(
-        OBFSTR("VM analysis at ") + sa_format_address(addr) +
-        OBFSTR(": ") + verdict, result);
+        std::string("VM analysis at ") + sa_format_address(addr) +
+        std::string(": ") + verdict, result);
 }
 
 static tool_result_t dbg_map_vm_handlers(const json& params)
@@ -2863,14 +2862,14 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
     if (!params.contains("table_address") || !params["table_address"].is_string()) {
         diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: missing table_address param");
         return tool_result_t::error(
-            OBFSTR("'table_address' (hex string of handler table base) is required."));
+            std::string("'table_address' (hex string of handler table base) is required."));
     }
 
     auto table_addr_opt = sa_parse_address(
         params["table_address"].get<std::string>());
     if (!table_addr_opt || *table_addr_opt == 0) {
         diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: invalid table_address");
-        return tool_result_t::error(OBFSTR("Invalid table_address."));
+        return tool_result_t::error(std::string("Invalid table_address."));
     }
     const std::uint64_t table_base = *table_addr_opt;
 
@@ -2916,7 +2915,7 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
     if (table_read < static_cast<std::size_t>(entry_size)) {
         diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: failed to read table at 0x%llX read=%zu", (unsigned long long)table_base, table_read);
         return tool_result_t::error(
-            OBFSTR("Failed to read handler table at ") +
+            std::string("Failed to read handler table at ") +
             sa_format_address(table_base));
     }
     diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: read %zu bytes from table", table_read);
@@ -3013,8 +3012,8 @@ static tool_result_t dbg_map_vm_handlers(const json& params)
 
     diag::log_tagged_fmt("dbg_tools", "dbg_map_vm_handlers: table=0x%llX valid=%d null=%d", (unsigned long long)table_base, valid_count, null_count);
     return tool_result_t::ok(
-        OBFSTR("Mapped ") + std::to_string(valid_count) +
-        OBFSTR(" handlers from table at ") + sa_format_address(table_base),
+        std::string("Mapped ") + std::to_string(valid_count) +
+        std::string(" handlers from table at ") + sa_format_address(table_base),
         result);
 }
 
@@ -3030,60 +3029,60 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("dbg_snapshot_state"), OBFSTR("debugger"),
-        OBFSTR("Capture the full execution state (all registers + optional memory regions) of a "
+        std::string("dbg_snapshot_state"), std::string("debugger"),
+        std::string("Capture the full execution state (all registers + optional memory regions) of a "
                "thread into a named snapshot. Snapshots can be compared with dbg_compare_snapshots "
                "to see exactly which registers and bytes changed between two points in execution."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
-         {OBFSTR("name"), OBFSTR("string"), OBFSTR("Snapshot name (default 'default'). Use descriptive names like 'before_call', 'after_decrypt'."), false},
-         {OBFSTR("memory_regions"), OBFSTR("array"),
-          OBFSTR("Optional array of {address, size} objects specifying memory regions to capture."), false, {},
+        {{std::string("tid"), std::string("string"), std::string("Thread ID"), true},
+         {std::string("name"), std::string("string"), std::string("Snapshot name (default 'default'). Use descriptive names like 'before_call', 'after_decrypt'."), false},
+         {std::string("memory_regions"), std::string("array"),
+          std::string("Optional array of {address, size} objects specifying memory regions to capture."), false, {},
           json::object({{"type", "object"},
                         {"properties", json::object({
                             {"address", json::object({{"type", "string"}})},
                             {"size", json::object({{"type", "number"}})}
                         })}
           })},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_snapshot_state, false});
 
     register_compat(srv, {
-        OBFSTR("dbg_compare_snapshots"), OBFSTR("debugger"),
-        OBFSTR("Compare two previously captured execution snapshots. Shows all register "
+        std::string("dbg_compare_snapshots"), std::string("debugger"),
+        std::string("Compare two previously captured execution snapshots. Shows all register "
                "differences and byte-level memory diffs. Useful for tracing exactly what a "
                "function call modified, detecting encryption/decryption state changes, or "
                "verifying that a code patch had the expected effect."),
-        {{OBFSTR("snapshot_a"), OBFSTR("string"), OBFSTR("Name of the 'before' snapshot"), true},
-         {OBFSTR("snapshot_b"), OBFSTR("string"), OBFSTR("Name of the 'after' snapshot"), true}},
+        {{std::string("snapshot_a"), std::string("string"), std::string("Name of the 'before' snapshot"), true},
+         {std::string("snapshot_b"), std::string("string"), std::string("Name of the 'after' snapshot"), true}},
         dbg_compare_snapshots, true});
 
 
     register_compat(srv, {
-        OBFSTR("dbg_detect_vm_handler"), OBFSTR("debugger"),
-        OBFSTR("Analyze code at an address to detect virtual machine (VM) obfuscation patterns. "
+        std::string("dbg_detect_vm_handler"), std::string("debugger"),
+        std::string("Analyze code at an address to detect virtual machine (VM) obfuscation patterns. "
                "Reads code bytes from the target process and uses Zydis disassembly to identify "
                "VM dispatcher indicators: indirect jumps through registers, scaled table dispatches "
                "(jmp [reg*8+table]), opcode fetch patterns (movzx/movsx from memory), and other "
                "common VM handler idioms. Returns a confidence score and detailed indicators."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to analyze (hex)"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to analyze (default 512, max 16384)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
+        {{std::string("address"), std::string("string"), std::string("Address to analyze (hex)"), true},
+         {std::string("size"), std::string("number"), std::string("Bytes to analyze (default 512, max 16384)"), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_detect_vm_handler, true});
 
     register_compat(srv, {
-        OBFSTR("dbg_map_vm_handlers"), OBFSTR("debugger"),
-        OBFSTR("Read a VM handler dispatch table from target memory and disassemble each handler entry. "
+        std::string("dbg_map_vm_handlers"), std::string("debugger"),
+        std::string("Read a VM handler dispatch table from target memory and disassemble each handler entry. "
                "Reads an array of handler pointers (or relative offsets) from a table address, resolves "
                "each to a handler address, and provides a Zydis disassembly preview of each handler. "
                "Use dbg_detect_vm_handler first to locate the dispatch table, then use this tool to "
                "map all handler entries."),
-        {{OBFSTR("table_address"), OBFSTR("string"), OBFSTR("Base address of the handler table (hex)"), true},
-         {OBFSTR("count"), OBFSTR("number"), OBFSTR("Number of entries to read (default 256, max 4096)"), false},
-         {OBFSTR("entry_size"), OBFSTR("number"), OBFSTR("Size of each table entry in bytes: 4 or 8 (default 8)"), false},
-         {OBFSTR("relative"), OBFSTR("boolean"), OBFSTR("If true, entries are relative offsets from image_base (default false = absolute pointers)"), false},
-         {OBFSTR("image_base"), OBFSTR("string"), OBFSTR("Base address for resolving relative offsets (default: attached process image base)"), false},
-         {OBFSTR("preview_instructions"), OBFSTR("number"), OBFSTR("Instructions to disassemble per handler (default 5, max 32)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
+        {{std::string("table_address"), std::string("string"), std::string("Base address of the handler table (hex)"), true},
+         {std::string("count"), std::string("number"), std::string("Number of entries to read (default 256, max 4096)"), false},
+         {std::string("entry_size"), std::string("number"), std::string("Size of each table entry in bytes: 4 or 8 (default 8)"), false},
+         {std::string("relative"), std::string("boolean"), std::string("If true, entries are relative offsets from image_base (default false = absolute pointers)"), false},
+         {std::string("image_base"), std::string("string"), std::string("Base address for resolving relative offsets (default: attached process image base)"), false},
+         {std::string("preview_instructions"), std::string("number"), std::string("Instructions to disassemble per handler (default 5, max 32)"), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         dbg_map_vm_handlers, true});
 
 
@@ -3093,12 +3092,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("dbg_run_to_address"), OBFSTR("debugger"),
-        OBFSTR("Run until execution reaches a specific address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address (hex)"), true},
-         {OBFSTR("wait_for_completion"), OBFSTR("boolean"), OBFSTR("Wait until the address is reached before returning."), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum wait time in milliseconds when wait_for_completion is true."), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
+        std::string("dbg_run_to_address"), std::string("debugger"),
+        std::string("Run until execution reaches a specific address."),
+        {{std::string("address"), std::string("string"), std::string("Target address (hex)"), true},
+         {std::string("wait_for_completion"), std::string("boolean"), std::string("Wait until the address is reached before returning."), false},
+         {std::string("timeout_ms"), std::string("number"), std::string("Maximum wait time in milliseconds when wait_for_completion is true."), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_run_to_address: entry");
             if (mcp_standalone::current_call_cancelled())
@@ -3110,9 +3109,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
+                return tool_result_t::error(std::string("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            if (!addr) return tool_result_t::error(std::string("Invalid address."));
 
             bool wait = false;
             if (params.contains("wait_for_completion") && params["wait_for_completion"].is_boolean())
@@ -3157,7 +3156,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 static_cast<unsigned>(debugger_engine::g_state.active_tid),
                 debugger_engine::last_error().empty() ? "(empty)" : debugger_engine::last_error().c_str());
             if (!ok)
-                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("run_to_address failed.") : debugger_engine::last_error());
+                return tool_result_t::error(debugger_engine::last_error().empty() ? std::string("run_to_address failed.") : debugger_engine::last_error());
             json result;
             result["pid"] = pid_after;
             result["pid_before"] = pid_before;
@@ -3185,7 +3184,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 static_cast<unsigned long long>(elapsed_ms),
                 static_cast<unsigned long long>(regs_before_valid ? regs_before.rip : 0),
                 static_cast<unsigned long long>(regs_after_valid ? regs_after.rip : 0));
-            return tool_result_t::ok(OBFSTR("Running to ") + sa_format_address(*addr), result);
+            return tool_result_t::ok(std::string("Running to ") + sa_format_address(*addr), result);
         }, false});
 
     srv.register_tool({
@@ -3257,11 +3256,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
     });
 
     register_compat(srv, {
-        OBFSTR("debugger_get_memory_map"), OBFSTR("debugger"),
-        OBFSTR("Enumerate the attached process memory map with base, end, size, protection, state, type, module, and region info."),
-        {{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum regions to return, default 2048, cap 4096"), false},
-         {OBFSTR("executable_only"), OBFSTR("boolean"), OBFSTR("Return only executable regions."), false},
-         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+        std::string("debugger_get_memory_map"), std::string("debugger"),
+        std::string("Enumerate the attached process memory map with base, end, size, protection, state, type, module, and region info."),
+        {{std::string("limit"), std::string("number"), std::string("Maximum regions to return, default 2048, cap 4096"), false},
+         {std::string("executable_only"), std::string("boolean"), std::string("Return only executable regions."), false},
+         {std::string("target_pid"), std::string("number"), std::string("Optional PID override. Switches the active attach context for this call."), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: entry");
             if (auto err = ensure_attached(params)) return *err;
@@ -3287,7 +3286,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     err["driver_last_error"] = driver_bridge::last_error();
                     diag::log_tagged_fmt("dbg_tools", "debugger_get_memory_map: 0 regions for live process pid=%u",
                         driver_bridge::attached_pid());
-                    return tool_result_t::error(OBFSTR("Memory map enumeration returned 0 regions for attached process"), err);
+                    return tool_result_t::error(std::string("Memory map enumeration returned 0 regions for attached process"), err);
                 }
             }
             json arr = json::array();
@@ -3334,10 +3333,10 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
         }, true});
 
     register_compat(srv, {
-        OBFSTR("debugger_execution_manage"), OBFSTR("debugger"),
-        OBFSTR("Manage debugger execution state. Actions: continue, pause, status."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("continue|pause|status"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("debugger_execution_manage"), std::string("debugger"),
+        std::string("Manage debugger execution state. Actions: continue, pause, status."),
+        {{std::string("action"), std::string("string"), std::string("continue|pause|status"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -3376,27 +3375,27 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 json result = make_status();
                 result["operation_ok"] = ok;
                 if (!ok)
-                    return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("continue failed.") : debugger_engine::last_error());
-                return tool_result_t::ok(OBFSTR("Target continued."), result);
+                    return tool_result_t::error(debugger_engine::last_error().empty() ? std::string("continue failed.") : debugger_engine::last_error());
+                return tool_result_t::ok(std::string("Target continued."), result);
             }
             if (action == "pause") {
                 const bool ok = debugger_engine::pause_target();
                 json result = make_status();
                 result["operation_ok"] = ok;
                 if (!ok)
-                    return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("pause failed.") : debugger_engine::last_error());
-                return tool_result_t::ok(OBFSTR("Target paused."), result);
+                    return tool_result_t::error(debugger_engine::last_error().empty() ? std::string("pause failed.") : debugger_engine::last_error());
+                return tool_result_t::ok(std::string("Target paused."), result);
             }
             return compat_unknown_action("debugger_execution_manage", action);
         }, false});
 
     register_compat(srv, {
-        OBFSTR("debugger_set_register"), OBFSTR("debugger"),
-        OBFSTR("Set a CPU register for a specific target thread. Accepts 64-bit GPR names, RIP, RSP, RBP, and RFLAGS."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
-         {OBFSTR("register"), OBFSTR("string"), OBFSTR("Register name such as RAX, RCX, RIP, RSP, or RFLAGS"), true},
-         {OBFSTR("hex_value"), OBFSTR("string"), OBFSTR("New register value as hex or decimal"), true},
-         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+        std::string("debugger_set_register"), std::string("debugger"),
+        std::string("Set a CPU register for a specific target thread. Accepts 64-bit GPR names, RIP, RSP, RBP, and RFLAGS."),
+        {{std::string("tid"), std::string("string"), std::string("Thread ID"), true},
+         {std::string("register"), std::string("string"), std::string("Register name such as RAX, RCX, RIP, RSP, or RFLAGS"), true},
+         {std::string("hex_value"), std::string("string"), std::string("New register value as hex or decimal"), true},
+         {std::string("target_pid"), std::string("number"), std::string("Optional PID override. Switches the active attach context for this call."), false}},
         [](const json& params) -> tool_result_t {
             return handle_debugger_set_register(params, false);
         }, false});
@@ -3404,21 +3403,21 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("debugger_start_trace"), OBFSTR("debugger"),
-        OBFSTR("Record a bounded synchronous single-step trace for a thread until max_instructions, timeout, cancellation, or a condition expression is reached."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
-         {OBFSTR("max_instructions"), OBFSTR("number"), OBFSTR("Maximum instructions to single-step, default 256, cap 4096"), false},
-         {OBFSTR("condition"), OBFSTR("string"), OBFSTR("Optional expression such as 'rip == 0x140001000' or 'rax == 0'"), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Overall trace timeout, default 30000, cap 120000"), false},
-         {OBFSTR("target_pid"), OBFSTR("number"), OBFSTR("Optional PID override. Switches the active attach context for this call."), false}},
+        std::string("debugger_start_trace"), std::string("debugger"),
+        std::string("Record a bounded synchronous single-step trace for a thread until max_instructions, timeout, cancellation, or a condition expression is reached."),
+        {{std::string("tid"), std::string("string"), std::string("Thread ID"), true},
+         {std::string("max_instructions"), std::string("number"), std::string("Maximum instructions to single-step, default 256, cap 4096"), false},
+         {std::string("condition"), std::string("string"), std::string("Optional expression such as 'rip == 0x140001000' or 'rax == 0'"), false},
+         {std::string("timeout_ms"), std::string("number"), std::string("Overall trace timeout, default 30000, cap 120000"), false},
+         {std::string("target_pid"), std::string("number"), std::string("Optional PID override. Switches the active attach context for this call."), false}},
         handle_debugger_start_trace, false});
 
     register_compat(srv, {
-        OBFSTR("debugger_get_trace"), OBFSTR("debugger"),
-        OBFSTR("Return a recorded debugger_start_trace log with registers, flags, disassembly, and practical memory operand metadata."),
-        {{OBFSTR("trace_id"), OBFSTR("string"), OBFSTR("Trace ID returned by debugger_start_trace"), true},
-         {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Start entry offset, default 0"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum entries to return, default 200, cap 1000"), false}},
+        std::string("debugger_get_trace"), std::string("debugger"),
+        std::string("Return a recorded debugger_start_trace log with registers, flags, disassembly, and practical memory operand metadata."),
+        {{std::string("trace_id"), std::string("string"), std::string("Trace ID returned by debugger_start_trace"), true},
+         {std::string("offset"), std::string("number"), std::string("Start entry offset, default 0"), false},
+         {std::string("limit"), std::string("number"), std::string("Maximum entries to return, default 200, cap 1000"), false}},
         handle_debugger_get_trace, true});
 
     srv.register_tool({
@@ -3441,7 +3440,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["count"]       = arr.size();
             result["breakpoints"] = std::move(arr);
             return tool_result_t::ok(
-                std::to_string(result["count"].get<std::size_t>()) + OBFSTR(" breakpoint(s)."), result);
+                std::to_string(result["count"].get<std::size_t>()) + std::string(" breakpoint(s)."), result);
         }
     });
 
@@ -3476,7 +3475,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 }
                 if (tid == 0) {
                     diag::log_tagged_fmt("dbg_tools", "debugger_get_callstack: no live thread");
-                    return tool_result_t::error(OBFSTR("No live target thread available."));
+                    return tool_result_t::error(std::string("No live target thread available."));
                 }
                 call_params["tid"] = std::to_string(tid);
             }
@@ -3697,7 +3696,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["active_count"] = active_count;
             result["patches"] = std::move(arr);
             return tool_result_t::ok(
-                std::to_string(result["count"].get<std::size_t>()) + OBFSTR(" patch(es)."), result);
+                std::to_string(result["count"].get<std::size_t>()) + std::string(" patch(es)."), result);
         }
     });
 
@@ -3775,7 +3774,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 result["breakpoint"] = std::move(entry);
             }
             return tool_result_t::ok(
-                OBFSTR("Breakpoint set at ") + sa_format_address(addr), result);
+                std::string("Breakpoint set at ") + sa_format_address(addr), result);
         }
     });
 
@@ -3835,7 +3834,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["breakpoint_count_after"] = breakpoint_count();
             result["removed"] = std::move(removed_entry);
             result["status"] = "removed";
-            return tool_result_t::ok(OBFSTR("Breakpoint removed."), result);
+            return tool_result_t::ok(std::string("Breakpoint removed."), result);
         }
     });
 
@@ -3853,12 +3852,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             auto tid = parse_tid(params);
-            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            if (!tid) return tool_result_t::error(std::string("'tid' is required."));
             debugger_engine::g_state.active_tid = *tid;
             bool ok = debugger_engine::step_over();
             diag::log_tagged_fmt("dbg_tools", "debugger_step_over: step_over returned ok=%d", (int)ok);
             if (!ok)
-                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_over failed.") : debugger_engine::last_error());
+                return tool_result_t::error(debugger_engine::last_error().empty() ? std::string("step_over failed.") : debugger_engine::last_error());
             json result;
             result["status"] = "stepped";
             return tool_result_t::ok(result);
@@ -3879,12 +3878,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             auto tid = parse_tid(params);
-            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            if (!tid) return tool_result_t::error(std::string("'tid' is required."));
             debugger_engine::g_state.active_tid = *tid;
             bool ok = debugger_engine::step_into();
             diag::log_tagged_fmt("dbg_tools", "debugger_step_into: step_into returned ok=%d", (int)ok);
             if (!ok)
-                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_into failed.") : debugger_engine::last_error());
+                return tool_result_t::error(debugger_engine::last_error().empty() ? std::string("step_into failed.") : debugger_engine::last_error());
             json result;
             result["status"] = "stepped";
             return tool_result_t::ok(result);
@@ -3905,12 +3904,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             auto tid = parse_tid(params);
-            if (!tid) return tool_result_t::error(OBFSTR("'tid' is required."));
+            if (!tid) return tool_result_t::error(std::string("'tid' is required."));
             debugger_engine::g_state.active_tid = *tid;
             bool ok = debugger_engine::step_out();
             diag::log_tagged_fmt("dbg_tools", "debugger_step_out: step_out returned ok=%d", (int)ok);
             if (!ok)
-                return tool_result_t::error(debugger_engine::last_error().empty() ? OBFSTR("step_out failed.") : debugger_engine::last_error());
+                return tool_result_t::error(debugger_engine::last_error().empty() ? std::string("step_out failed.") : debugger_engine::last_error());
             json result;
             result["status"] = "stepped";
             return tool_result_t::ok(result);
@@ -3928,13 +3927,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("dbg_add_watch"), OBFSTR("debugger"),
-        OBFSTR("Add a watch expression. Supports register names (rax, rsp, etc.) and hex addresses."),
-        {{OBFSTR("expression"), OBFSTR("string"), OBFSTR("Watch expression"), true}},
+        std::string("dbg_add_watch"), std::string("debugger"),
+        std::string("Add a watch expression. Supports register names (rax, rsp, etc.) and hex addresses."),
+        {{std::string("expression"), std::string("string"), std::string("Watch expression"), true}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_add_watch: entry");
             if (!params.contains("expression") || !params["expression"].is_string())
-                return tool_result_t::error(OBFSTR("'expression' is required."));
+                return tool_result_t::error(std::string("'expression' is required."));
             const std::string expr = params["expression"].get<std::string>();
             diag::log_tagged_fmt("dbg_tools", "dbg_add_watch: expr=%s", expr.c_str());
             const std::size_t before_count = watch_count();
@@ -3951,24 +3950,24 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             json entry;
             if (idx >= 0 && watch_entry_by_index(idx, entry))
                 result["watch"] = std::move(entry);
-            return tool_result_t::ok(OBFSTR("Watch added."), result);
+            return tool_result_t::ok(std::string("Watch added."), result);
         }, false});
 
     register_compat(srv, {
-        OBFSTR("dbg_remove_watch"), OBFSTR("debugger"),
-        OBFSTR("Remove a watch by index."),
-        {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Watch index"), true}},
+        std::string("dbg_remove_watch"), std::string("debugger"),
+        std::string("Remove a watch by index."),
+        {{std::string("index"), std::string("number"), std::string("Watch index"), true}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_watch: entry");
             if (!params.contains("index") || !params["index"].is_number())
-                return tool_result_t::error(OBFSTR("'index' required."));
+                return tool_result_t::error(std::string("'index' required."));
             int idx = params["index"].get<int>();
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_watch: removing watch idx=%d", idx);
             const std::size_t before_count = watch_count();
             json removed_entry;
             const bool had_entry = watch_entry_by_index(idx, removed_entry);
             if (!debugger_engine::remove_watch(idx))
-                return tool_result_t::error(OBFSTR("Watch index is out of range."));
+                return tool_result_t::error(std::string("Watch index is out of range."));
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_watch: removed");
             json result;
             add_debugger_action_context(result, "dbg_remove_watch");
@@ -3978,12 +3977,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["watch_count_after"] = watch_count();
             if (had_entry)
                 result["removed"] = std::move(removed_entry);
-            return tool_result_t::ok(OBFSTR("Watch removed."), result);
+            return tool_result_t::ok(std::string("Watch removed."), result);
         }, false});
 
     register_compat(srv, {
-        OBFSTR("dbg_get_watches"), OBFSTR("debugger"),
-        OBFSTR("Get all watch expressions and their current values."),
+        std::string("dbg_get_watches"), std::string("debugger"),
+        std::string("Get all watch expressions and their current values."),
         {},
         [](const json& ) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_get_watches: entry");
@@ -4002,7 +4001,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_get_watches: returning %zu watches", arr.size());
             return tool_result_t::ok(
-                std::to_string(arr.size()) + OBFSTR(" watches."), arr);
+                std::to_string(arr.size()) + std::string(" watches."), arr);
         }, true});
 
 
@@ -4011,15 +4010,15 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("dbg_toggle_bookmark"), OBFSTR("debugger"),
-        OBFSTR("Toggle a bookmark at an address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true}},
+        std::string("dbg_toggle_bookmark"), std::string("debugger"),
+        std::string("Toggle a bookmark at an address."),
+        {{std::string("address"), std::string("string"), std::string("Address (hex)"), true}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_toggle_bookmark: entry");
             if (!params.contains("address"))
-                return tool_result_t::error(OBFSTR("'address' is required."));
+                return tool_result_t::error(std::string("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            if (!addr) return tool_result_t::error(std::string("Invalid address."));
             diag::log_tagged_fmt("dbg_tools", "dbg_toggle_bookmark: addr=0x%llX", (unsigned long long)*addr);
             const std::size_t before_count = bookmark_count();
             const bool enabled_before = bookmark_present(*addr);
@@ -4034,15 +4033,15 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["enabled"] = enabled_after;
             result["bookmark_count_before"] = before_count;
             result["bookmark_count_after"] = bookmark_count();
-            return tool_result_t::ok(OBFSTR("Bookmark toggled at ") + sa_format_address(*addr), result);
+            return tool_result_t::ok(std::string("Bookmark toggled at ") + sa_format_address(*addr), result);
         }, false});
 
     register_compat(srv, {
-        OBFSTR("dbg_find_strings"), OBFSTR("debugger"),
-        OBFSTR("Find ASCII strings in the memory of the attached process. Results include address, "
+        std::string("dbg_find_strings"), std::string("debugger"),
+        std::string("Find ASCII strings in the memory of the attached process. Results include address, "
                "string value, and containing module."),
-        {{OBFSTR("min_length"), OBFSTR("number"), OBFSTR("Minimum string length (default 4)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
+        {{std::string("min_length"), std::string("number"), std::string("Minimum string length (default 4)"), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_find_strings: entry");
             if (mcp_standalone::current_call_cancelled())
@@ -4074,19 +4073,19 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["strings"] = arr;
             diag::log_tagged_fmt("dbg_tools", "dbg_find_strings: total=%zu returned=%d", st.strings.size(), count < 500 ? count : 500);
             return tool_result_t::ok(
-                std::to_string(st.strings.size()) + OBFSTR(" strings found."), result);
+                std::to_string(st.strings.size()) + std::string(" strings found."), result);
         }, true});
 
 
     register_compat(srv, {
-        OBFSTR("dbg_add_hw_breakpoint"), OBFSTR("debugger"),
-        OBFSTR("Set a hardware breakpoint using debug registers (DR0-DR3). "
+        std::string("dbg_add_hw_breakpoint"), std::string("debugger"),
+        std::string("Set a hardware breakpoint using debug registers (DR0-DR3). "
                "Does not modify code bytes, so it is transparent to anti-tamper. "
                "Limited to 4 active hardware breakpoints."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address (hex)"), true},
-         {OBFSTR("type"), OBFSTR("string"), OBFSTR("Type: 'execute', 'write', 'read' (default 'execute')"), false},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Watch granularity in bytes: 1, 2, 4, or 8 (default 1; ignored for 'execute')"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
+        {{std::string("address"), std::string("string"), std::string("Address (hex)"), true},
+         {std::string("type"), std::string("string"), std::string("Type: 'execute', 'write', 'read' (default 'execute')"), false},
+         {std::string("size"), std::string("number"), std::string("Watch granularity in bytes: 1, 2, 4, or 8 (default 1; ignored for 'execute')"), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). Switches the active attach context for the duration of this call."), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: entry");
             if (auto err = ensure_attached(params)) return *err;
@@ -4096,9 +4095,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' required."));
+                return tool_result_t::error(std::string("'address' required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            if (!addr) return tool_result_t::error(std::string("Invalid address."));
 
             std::string type_str = params.value("type", "execute");
             debugger_engine::bp_type_t bpt = debugger_engine::bp_type_t::hardware_execute;
@@ -4108,7 +4107,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (params.contains("size") && params["size"].is_number())
                 size = params["size"].get<int>();
             if (size != 1 && size != 2 && size != 4 && size != 8)
-                return tool_result_t::error(OBFSTR("'size' must be 1, 2, 4, or 8."));
+                return tool_result_t::error(std::string("'size' must be 1, 2, 4, or 8."));
             diag::log_tagged_fmt("dbg_tools", "dbg_add_hw_breakpoint: addr=0x%llX type=%s size=%d", (unsigned long long)*addr, type_str.c_str(), size);
             const std::size_t before_count = breakpoint_count();
             int idx = debugger_engine::add_breakpoint(*addr, bpt, "", "", size);
@@ -4135,13 +4134,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 result["hw_slot_active"] = entry.value("hw_slot_active", false);
                 result["breakpoint"] = std::move(entry);
             }
-            return tool_result_t::ok(OBFSTR("Hardware breakpoint set at ") + sa_format_address(*addr), result);
+            return tool_result_t::ok(std::string("Hardware breakpoint set at ") + sa_format_address(*addr), result);
         }, false});
 
 
     register_compat(srv, {
-        OBFSTR("dbg_clear_all_breakpoints"), OBFSTR("debugger"),
-        OBFSTR("Remove all breakpoints (software and hardware)."),
+        std::string("dbg_clear_all_breakpoints"), std::string("debugger"),
+        std::string("Remove all breakpoints (software and hardware)."),
         {},
         [](const json&) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: entry");
@@ -4156,25 +4155,25 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["engine_verified"] = cleared;
             if (!cleared || after_count != 0) {
                 const std::string detail = debugger_engine::last_error().empty()
-                    ? OBFSTR("Breakpoint restoration or removal did not verify completely.")
+                    ? std::string("Breakpoint restoration or removal did not verify completely.")
                     : debugger_engine::last_error();
                 result["diagnostic"] = detail;
                 diag::log_tagged_fmt("dbg_tools",
                     "dbg_clear_all_breakpoints: failed before=%zu after=%zu engine_verified=%d detail='%s'",
                     before_count, after_count, static_cast<int>(cleared), detail.c_str());
                 return tool_result_t::error(
-                    OBFSTR("Failed to clear every breakpoint without leaving target state uncertain."),
+                    std::string("Failed to clear every breakpoint without leaving target state uncertain."),
                     "debugger_breakpoint_clear_failed", result);
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_clear_all_breakpoints: all breakpoints cleared");
-            return tool_result_t::ok(OBFSTR("All breakpoints cleared."), result);
+            return tool_result_t::ok(std::string("All breakpoints cleared."), result);
         }, false});
 
 
 
     register_compat(srv, {
-        OBFSTR("dbg_get_bookmarks"), OBFSTR("debugger"),
-        OBFSTR("Get all bookmarked addresses."),
+        std::string("dbg_get_bookmarks"), std::string("debugger"),
+        std::string("Get all bookmarked addresses."),
         {},
         [](const json&) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_get_bookmarks: entry");
@@ -4188,16 +4187,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["bookmarks"] = arr;
             diag::log_tagged_fmt("dbg_tools", "dbg_get_bookmarks: returning %zu bookmarks", arr.size());
             return tool_result_t::ok(
-                std::to_string(arr.size()) + OBFSTR(" bookmark(s)."), result);
+                std::to_string(arr.size()) + std::string(" bookmark(s)."), result);
         }, true});
 
 
 
 
     register_compat(srv, {
-        OBFSTR("dbg_build_cfg"), OBFSTR("debugger"),
-        OBFSTR("Build a control flow graph starting from an address. Disassembles and splits into basic blocks with edges."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Entry address to build CFG from (hex)"), true}},
+        std::string("dbg_build_cfg"), std::string("debugger"),
+        std::string("Build a control flow graph starting from an address. Disassembles and splits into basic blocks with edges."),
+        {{std::string("address"), std::string("string"), std::string("Entry address to build CFG from (hex)"), true}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_build_cfg: entry");
             if (auto err = ensure_attached(params)) return *err;
@@ -4207,9 +4206,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
+                return tool_result_t::error(std::string("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            if (!addr) return tool_result_t::error(std::string("Invalid address."));
             std::lock_guard<std::mutex> request_lock(g_cfg_request_mutex);
             if (mcp_standalone::current_call_cancelled())
                 return tool_result_t::error("Tool cancelled before CFG build.");
@@ -4266,12 +4265,12 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 static_cast<unsigned long long>(model->generation),
                 target_identity.process.pid);
             return tool_result_t::ok(
-                OBFSTR("CFG built: ") + std::to_string(model->blocks.size()) + OBFSTR(" blocks."), result);
+                std::string("CFG built: ") + std::to_string(model->blocks.size()) + std::string(" blocks."), result);
         }, true});
 
     register_compat(srv, {
-        OBFSTR("dbg_get_cfg"), OBFSTR("debugger"),
-        OBFSTR("Get the current control flow graph state, including all basic blocks, instructions, and edges."),
+        std::string("dbg_get_cfg"), std::string("debugger"),
+        std::string("Get the current control flow graph state, including all basic blocks, instructions, and edges."),
         {},
         [](const json&) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_get_cfg: entry");
@@ -4304,7 +4303,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                     static_cast<unsigned long long>(model ? model->entry_addr : 0),
                     static_cast<unsigned long long>(binding.entry_addr),
                     binding.target.process.pid, driver_bridge::attached_pid());
-                return tool_result_t::error(OBFSTR("No CFG built. Call dbg_build_cfg first."));
+                return tool_result_t::error(std::string("No CFG built. Call dbg_build_cfg first."));
             }
             if (auto identity_error = validate_cfg_target_identity(
                 binding.target, "dbg_get_cfg.preflight"))
@@ -4349,22 +4348,22 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 static_cast<unsigned long long>(model->generation),
                 binding.target.process.pid);
             return tool_result_t::ok(
-                OBFSTR("CFG: ") + std::to_string(model->blocks.size()) + OBFSTR(" blocks."), result);
+                std::string("CFG: ") + std::to_string(model->blocks.size()) + std::string(" blocks."), result);
         }, true});
 
 
     register_compat(srv, {
-        OBFSTR("dbg_get_modules_detail"), OBFSTR("debugger"),
-        OBFSTR("Get detailed module information with PE analysis including exports and imports."),
-        {{OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Optional module name filter"), false},
-         {OBFSTR("module_filter"), OBFSTR("string"), OBFSTR("Alias for module_name"), false},
-         {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Alias for module_name"), false},
-         {OBFSTR("max_modules"), OBFSTR("number"), OBFSTR("Maximum modules to inspect deeply"), false},
-         {OBFSTR("include_pe"), OBFSTR("boolean"), OBFSTR("Parse PE headers/sections for broad requests; focused module requests include PE details by default"), false},
-         {OBFSTR("max_exports"), OBFSTR("number"), OBFSTR("Maximum exports per module"), false},
-         {OBFSTR("max_imports"), OBFSTR("number"), OBFSTR("Maximum imports per module"), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum elapsed time before returning partial results"), false},
-         {OBFSTR("allow_partial"), OBFSTR("boolean"), OBFSTR("Return partial results without marking the payload as timed out"), false}},
+        std::string("dbg_get_modules_detail"), std::string("debugger"),
+        std::string("Get detailed module information with PE analysis including exports and imports."),
+        {{std::string("module_name"), std::string("string"), std::string("Optional module name filter"), false},
+         {std::string("module_filter"), std::string("string"), std::string("Alias for module_name"), false},
+         {std::string("filter"), std::string("string"), std::string("Alias for module_name"), false},
+         {std::string("max_modules"), std::string("number"), std::string("Maximum modules to inspect deeply"), false},
+         {std::string("include_pe"), std::string("boolean"), std::string("Parse PE headers/sections for broad requests; focused module requests include PE details by default"), false},
+         {std::string("max_exports"), std::string("number"), std::string("Maximum exports per module"), false},
+         {std::string("max_imports"), std::string("number"), std::string("Maximum imports per module"), false},
+         {std::string("timeout_ms"), std::string("number"), std::string("Maximum elapsed time before returning partial results"), false},
+         {std::string("allow_partial"), std::string("boolean"), std::string("Return partial results without marking the payload as timed out"), false}},
         [](const json& params) -> tool_result_t {
             const auto handler_start = std::chrono::steady_clock::now();
             auto elapsed_ms = [&]() -> long long {
@@ -5078,17 +5077,17 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 allow_partial ? 1 : 0,
                 elapsed_ms());
             if (effective_timed_out && !allow_partial)
-                return tool_result_t{false, OBFSTR("Module detail collection did not complete within the timeout."), result};
+                return tool_result_t{false, std::string("Module detail collection did not complete within the timeout."), result};
             return tool_result_t::ok(
-                std::to_string(result["count"].get<size_t>()) + OBFSTR(" module(s)."), result);
+                std::to_string(result["count"].get<size_t>()) + std::string(" module(s)."), result);
         }, true});
 
     register_compat(srv, {
-        OBFSTR("dbg_add_patch"), OBFSTR("debugger"),
-        OBFSTR("Apply a code patch at an address. Overwrites bytes and saves original for reverting."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to patch (hex)"), true},
-         {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Hex bytes to write (e.g. '90 90 90')"), true},
-         {OBFSTR("label"), OBFSTR("string"), OBFSTR("Optional description for this patch"), false}},
+        std::string("dbg_add_patch"), std::string("debugger"),
+        std::string("Apply a code patch at an address. Overwrites bytes and saves original for reverting."),
+        {{std::string("address"), std::string("string"), std::string("Address to patch (hex)"), true},
+         {std::string("bytes"), std::string("string"), std::string("Hex bytes to write (e.g. '90 90 90')"), true},
+         {std::string("label"), std::string("string"), std::string("Optional description for this patch"), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: entry");
             if (auto err = ensure_attached(params)) return *err;
@@ -5098,16 +5097,16 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
+                return tool_result_t::error(std::string("'address' is required."));
             if (!params.contains("bytes") || !params["bytes"].is_string())
-                return tool_result_t::error(OBFSTR("'bytes' is required."));
+                return tool_result_t::error(std::string("'bytes' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            if (!addr) return tool_result_t::error(std::string("Invalid address."));
             auto patched = code_patcher::parse_bytes(params["bytes"].get<std::string>());
 
             if (patched.empty()) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: invalid hex bytes");
-                return tool_result_t::error(OBFSTR("Invalid hex bytes."));
+                return tool_result_t::error(std::string("Invalid hex bytes."));
             }
             std::string label;
             if (params.contains("label") && params["label"].is_string())
@@ -5120,11 +5119,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             int idx = code_patcher::create_patch(*addr, patched, label);
             if (idx < 0) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: create_patch failed");
-                return tool_result_t::error(OBFSTR("Failed to create patch."));
+                return tool_result_t::error(std::string("Failed to create patch."));
             }
             if (!code_patcher::apply_patch(idx)) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: apply_patch failed for idx=%d", idx);
-                return tool_result_t::error(OBFSTR("Patch created but failed to apply."));
+                return tool_result_t::error(std::string("Patch created but failed to apply."));
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_add_patch: patch applied at 0x%llX idx=%d", (unsigned long long)*addr, idx);
             std::vector<std::uint8_t> readback;
@@ -5153,20 +5152,20 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 result["active"] = entry.value("active", true);
                 result["patch"] = std::move(entry);
             }
-            const std::string summary = OBFSTR("Patch applied at ") + sa_format_address(*addr) + OBFSTR(" (") + std::to_string(patched.size()) + OBFSTR(" bytes).");
+            const std::string summary = std::string("Patch applied at ") + sa_format_address(*addr) + std::string(" (") + std::to_string(patched.size()) + std::string(" bytes).");
             if (readback_ok && !verified)
-                return tool_result_t{false, OBFSTR("Patch write verification failed."), result};
+                return tool_result_t{false, std::string("Patch write verification failed."), result};
             return tool_result_t::ok(summary, result);
         }, false});
 
     register_compat(srv, {
-        OBFSTR("dbg_remove_patch"), OBFSTR("debugger"),
-        OBFSTR("Remove a code patch by index. Reverts original bytes before removing."),
-        {{OBFSTR("index"), OBFSTR("number"), OBFSTR("Patch index to remove"), true}},
+        std::string("dbg_remove_patch"), std::string("debugger"),
+        std::string("Remove a code patch by index. Reverts original bytes before removing."),
+        {{std::string("index"), std::string("number"), std::string("Patch index to remove"), true}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: entry");
             if (!params.contains("index") || !params["index"].is_number())
-                return tool_result_t::error(OBFSTR("'index' is required."));
+                return tool_result_t::error(std::string("'index' is required."));
             int idx = params["index"].get<int>();
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: reverting and removing idx=%d", idx);
             const std::size_t before_count = patch_count();
@@ -5178,7 +5177,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             {
                 std::lock_guard<std::mutex> lk(code_patcher::g_state.mtx);
                 if (idx < 0 || idx >= static_cast<int>(code_patcher::g_state.patches.size()))
-                    return tool_result_t::error(OBFSTR("Patch index is out of range."));
+                    return tool_result_t::error(std::string("Patch index is out of range."));
                 const auto& p = code_patcher::g_state.patches[static_cast<std::size_t>(idx)];
                 patch_address = p.address;
                 original_bytes = p.original_bytes;
@@ -5198,7 +5197,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
 
             if (!code_patcher::revert_patch(idx)) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: revert_patch failed for idx=%d", idx);
-                return tool_result_t::error(OBFSTR("Failed to revert patch."));
+                return tool_result_t::error(std::string("Failed to revert patch."));
             }
             std::vector<std::uint8_t> readback;
             const bool readback_ok = !original_bytes.empty() &&
@@ -5223,11 +5222,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 result["active_patch_count_before"] = before_active_count;
                 result["active_patch_count_after"] = active_patch_count();
                 result["removed"] = std::move(removed_entry);
-                return tool_result_t{false, OBFSTR("Patch revert verification failed."), result};
+                return tool_result_t{false, std::string("Patch revert verification failed."), result};
             }
             if (!code_patcher::remove_patch(idx)) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: remove_patch failed for idx=%d", idx);
-                return tool_result_t::error(OBFSTR("Failed to remove patch."));
+                return tool_result_t::error(std::string("Failed to remove patch."));
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_remove_patch: patch removed idx=%d", idx);
             json result;
@@ -5246,15 +5245,15 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             if (readback_ok)
                 result["readback"] = code_patcher::format_bytes(readback);
             result["removed"] = std::move(removed_entry);
-            return tool_result_t::ok(OBFSTR("Patch removed."), result);
+            return tool_result_t::ok(std::string("Patch removed."), result);
         }, false});
 
 
     register_compat(srv, {
-        OBFSTR("dbg_nop_fill"), OBFSTR("debugger"),
-        OBFSTR("NOP-fill a range of bytes at the given address."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to start NOP fill (hex)"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Number of bytes to NOP"), true}},
+        std::string("dbg_nop_fill"), std::string("debugger"),
+        std::string("NOP-fill a range of bytes at the given address."),
+        {{std::string("address"), std::string("string"), std::string("Address to start NOP fill (hex)"), true},
+         {std::string("size"), std::string("number"), std::string("Number of bytes to NOP"), true}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: entry");
             if (auto err = ensure_attached(params)) return *err;
@@ -5264,14 +5263,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
+                return tool_result_t::error(std::string("'address' is required."));
             if (!params.contains("size") || !params["size"].is_number())
-                return tool_result_t::error(OBFSTR("'size' is required."));
+                return tool_result_t::error(std::string("'size' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            if (!addr) return tool_result_t::error(std::string("Invalid address."));
             int size = params["size"].get<int>();
             if (size <= 0 || size > 4096)
-                return tool_result_t::error(OBFSTR("Size must be between 1 and 4096."));
+                return tool_result_t::error(std::string("Size must be between 1 and 4096."));
 
             if (auto reject = reject_full_test_system_mutation(*addr, static_cast<std::uint64_t>(size), "dbg_nop_fill"))
                 return *reject;
@@ -5279,13 +5278,13 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             const std::size_t before_count = patch_count();
             const std::size_t before_active_count = active_patch_count();
             std::vector<std::uint8_t> nops(static_cast<std::size_t>(size), 0x90);
-            int idx = code_patcher::create_patch(*addr, nops, OBFSTR("NOP fill"));
+            int idx = code_patcher::create_patch(*addr, nops, std::string("NOP fill"));
             if (idx < 0) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: nop_region failed at 0x%llX", (unsigned long long)*addr);
-                return tool_result_t::error(OBFSTR("Failed to NOP-fill region."));
+                return tool_result_t::error(std::string("Failed to NOP-fill region."));
             }
             if (!code_patcher::apply_patch(idx))
-                return tool_result_t::error(OBFSTR("NOP patch created but failed to apply."));
+                return tool_result_t::error(std::string("NOP patch created but failed to apply."));
             std::vector<std::uint8_t> readback;
             const bool readback_ok = driver_bridge::read_memory(*addr, nops.size(), readback) && readback.size() >= nops.size();
             if (readback.size() > nops.size())
@@ -5313,18 +5312,18 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 result["patch"] = std::move(entry);
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_nop_fill: NOP-filled %d bytes at 0x%llX", size, (unsigned long long)*addr);
-            const std::string summary = OBFSTR("NOP-filled ") + std::to_string(size) + OBFSTR(" bytes at ") + sa_format_address(*addr);
+            const std::string summary = std::string("NOP-filled ") + std::to_string(size) + std::string(" bytes at ") + sa_format_address(*addr);
             if (readback_ok && !verified)
-                return tool_result_t{false, OBFSTR("NOP fill verification failed."), result};
+                return tool_result_t{false, std::string("NOP fill verification failed."), result};
             return tool_result_t::ok(summary, result);
         }, false});
 
     register_compat(srv, {
-        OBFSTR("dbg_find_code_caves"), OBFSTR("debugger"),
-        OBFSTR("Find regions of unused bytes (code caves) near a given address. Searches for consecutive 0x00 or 0xCC bytes."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Module base or search start address (hex)"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of region to scan (default 0x1000)"), false},
-         {OBFSTR("min_cave_size"), OBFSTR("number"), OBFSTR("Minimum cave size in bytes (default 16)"), false}},
+        std::string("dbg_find_code_caves"), std::string("debugger"),
+        std::string("Find regions of unused bytes (code caves) near a given address. Searches for consecutive 0x00 or 0xCC bytes."),
+        {{std::string("address"), std::string("string"), std::string("Module base or search start address (hex)"), true},
+         {std::string("size"), std::string("number"), std::string("Size of region to scan (default 0x1000)"), false},
+         {std::string("min_cave_size"), std::string("number"), std::string("Minimum cave size in bytes (default 16)"), false}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: entry");
             if (auto err = ensure_attached(params)) return *err;
@@ -5334,9 +5333,9 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
+                return tool_result_t::error(std::string("'address' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            if (!addr) return tool_result_t::error(std::string("Invalid address."));
             uint32_t size = static_cast<uint32_t>(params.value("size", 0x1000));
             bool inferred_size = false;
             if (!params.contains("size") || size == 0 || size == 0x1000) {
@@ -5368,14 +5367,14 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             result["caves"] = std::move(arr);
             diag::log_tagged_fmt("dbg_tools", "dbg_find_code_caves: found %zu caves", caves.size());
             return tool_result_t::ok(
-                std::to_string(count) + OBFSTR(" code cave(s) found."), result);
+                std::to_string(count) + std::string(" code cave(s) found."), result);
         }, true});
 
     register_compat(srv, {
-        OBFSTR("dbg_conditional_breakpoint"), OBFSTR("debugger"),
-        OBFSTR("Set a breakpoint with a condition expression. The breakpoint will only trigger when the condition is met."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address for breakpoint (hex)"), true},
-         {OBFSTR("condition"), OBFSTR("string"), OBFSTR("Condition expression (e.g. 'rax == 0x1234')"), true}},
+        std::string("dbg_conditional_breakpoint"), std::string("debugger"),
+        std::string("Set a breakpoint with a condition expression. The breakpoint will only trigger when the condition is met."),
+        {{std::string("address"), std::string("string"), std::string("Address for breakpoint (hex)"), true},
+         {std::string("condition"), std::string("string"), std::string("Condition expression (e.g. 'rax == 0x1234')"), true}},
         [](const json& params) -> tool_result_t {
             diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: entry");
             if (auto err = ensure_attached(params)) return *err;
@@ -5385,11 +5384,11 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
                 return *quota_err;
 
             if (!params.contains("address") || !params["address"].is_string())
-                return tool_result_t::error(OBFSTR("'address' is required."));
+                return tool_result_t::error(std::string("'address' is required."));
             if (!params.contains("condition") || !params["condition"].is_string())
-                return tool_result_t::error(OBFSTR("'condition' is required."));
+                return tool_result_t::error(std::string("'condition' is required."));
             auto addr = sa_parse_address(params["address"].get<std::string>());
-            if (!addr) return tool_result_t::error(OBFSTR("Invalid address."));
+            if (!addr) return tool_result_t::error(std::string("Invalid address."));
             std::string cond = params["condition"].get<std::string>();
 
             diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: addr=0x%llX cond=%s", (unsigned long long)*addr, cond.c_str());
@@ -5397,7 +5396,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             int bp_idx = debugger_engine::add_breakpoint(*addr, debugger_engine::bp_type_t::software, "", cond);
             if (bp_idx < 0) {
                 diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: add_breakpoint failed: %s", debugger_engine::last_error().c_str());
-                return tool_result_t::error(OBFSTR("Failed to add breakpoint."));
+                return tool_result_t::error(std::string("Failed to add breakpoint."));
             }
             json result;
             add_debugger_action_context(result, "dbg_conditional_breakpoint");
@@ -5419,7 +5418,7 @@ void register_debugger_tools(mcp_standalone::server_t& srv)
             }
             diag::log_tagged_fmt("dbg_tools", "dbg_conditional_breakpoint: BP set at 0x%llX idx=%d cond=%s", (unsigned long long)*addr, bp_idx, cond.c_str());
             return tool_result_t::ok(
-                OBFSTR("Conditional breakpoint set at ") + sa_format_address(*addr) + OBFSTR(" [condition: ") + cond + OBFSTR("]"), result);
+                std::string("Conditional breakpoint set at ") + sa_format_address(*addr) + std::string(" [condition: ") + cond + std::string("]"), result);
         }, false});
 
 }

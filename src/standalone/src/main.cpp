@@ -5133,8 +5133,6 @@ static void emit_window_hung_snapshot(
     hctx.downstream_pressure = bdiag.downstream_snapshot;
     hctx.testlab_step = testlab_step_buf;
     hctx.testlab_step_elapsed_ms = testlab_step_elapsed;
-    hctx.license_liveness_ms = 0;
-    hctx.arc_liveness_ms = 0;
     hctx.driver_watchdog_ms = driver_bridge::driver_watchdog_age_ms();
     hctx.mcp_snapshot = mcp_snapshot;
     hctx.queue_snapshot = queue_snapshot;
@@ -6480,9 +6478,7 @@ int main(int, char**)
             ctx.testlab_phase = testlab_phase_buf;
             ctx.testlab_step = testlab_step_buf;
             ctx.testlab_step_start_ms = testlab_step_start;
-            ctx.arc_liveness_ms = 0;
             ctx.driver_watchdog_ms = driver_bridge::driver_watchdog_age_ms();
-            ctx.license_liveness_ms = 0;
             char thread_classes_buf[320] = {};
             {
                 const auto exec_snap = aida::infra::executor::active_snapshot();

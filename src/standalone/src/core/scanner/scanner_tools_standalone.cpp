@@ -6,7 +6,6 @@
 
 #include "standalone_compat.hpp"
 #include "memory_scanner.hpp"
-#include "obfuscation.hpp"
 #include "struct_dissector.hpp"
 #include "../debugger/page_guard_engine.hpp"
 #include "../runtime/standalone_driver.hpp"
@@ -588,14 +587,14 @@ static bool parse_field_type(const std::string& text, struct_dissector::field_ty
 
 static bool parse_address_param(const json& params, const char* key, uint64_t& out, std::string& error) {
 	if (!params.contains(key)) {
-		error = OBFSTR("'") + std::string(key) + OBFSTR("' is required.");
+		error = std::string("'") + std::string(key) + std::string("' is required.");
 		return false;
 	}
 	const auto& v = params[key];
 	if (v.is_string()) {
 		auto parsed = sa_parse_address(v.get<std::string>());
 		if (!parsed) {
-			error = OBFSTR("Invalid ") + std::string(key) + OBFSTR(".");
+			error = std::string("Invalid ") + std::string(key) + std::string(".");
 			return false;
 		}
 		out = *parsed;
@@ -608,19 +607,19 @@ static bool parse_address_param(const json& params, const char* key, uint64_t& o
 	if (v.is_number_integer()) {
 		const int64_t s = v.get<int64_t>();
 		if (s < 0) {
-			error = OBFSTR("Negative ") + std::string(key) + OBFSTR(" is invalid.");
+			error = std::string("Negative ") + std::string(key) + std::string(" is invalid.");
 			return false;
 		}
 		out = static_cast<uint64_t>(s);
 		return true;
 	}
-	error = OBFSTR("'") + std::string(key) + OBFSTR("' must be a string or integer address.");
+	error = std::string("'") + std::string(key) + std::string("' must be a string or integer address.");
 	return false;
 }
 
 static bool parse_i64_param(const json& params, const char* key, int64_t& out, std::string& error) {
 	if (!params.contains(key)) {
-		error = OBFSTR("'") + std::string(key) + OBFSTR("' is required.");
+		error = std::string("'") + std::string(key) + std::string("' is required.");
 		return false;
 	}
 	const auto& v = params[key];
@@ -631,7 +630,7 @@ static bool parse_i64_param(const json& params, const char* key, int64_t& out, s
 	if (v.is_number_unsigned()) {
 		const uint64_t u = v.get<uint64_t>();
 		if (u > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-			error = OBFSTR("'") + std::string(key) + OBFSTR("' is too large.");
+			error = std::string("'") + std::string(key) + std::string("' is too large.");
 			return false;
 		}
 		out = static_cast<int64_t>(u);
@@ -647,7 +646,7 @@ static bool parse_i64_param(const json& params, const char* key, int64_t& out, s
 		} catch (...) {
 		}
 	}
-	error = OBFSTR("'") + std::string(key) + OBFSTR("' must be an integer offset.");
+	error = std::string("'") + std::string(key) + std::string("' must be an integer offset.");
 	return false;
 }
 
@@ -911,7 +910,7 @@ static tool_result_t handle_first_scan(const json& params) {
 			"FEATURE-WORKER-GROUP-REJECT scanner_first_scan reason=%s quota=%s observed=%zu limit=%zu",
 			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
 		return tool_result_t::error(
-			OBFSTR("Scanner capacity exhausted; work was not started."),
+			std::string("Scanner capacity exhausted; work was not started."),
 			"MCP_DOWNSTREAM_CAPACITY_REJECT",
 			mcp_standalone::downstream::rejection_json(rej, fs_id));
 	}
@@ -958,7 +957,7 @@ static tool_result_t handle_first_scan(const json& params) {
 				static_cast<unsigned long long>(fs_admission.token()));
 			fs_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("Scanner busy or not attached to a process."));
+		return tool_result_t::error(std::string("Scanner busy or not attached to a process."));
 	}
 
 
@@ -980,7 +979,7 @@ static tool_result_t handle_first_scan(const json& params) {
 					static_cast<unsigned long long>(fs_admission.token()));
 				fs_admission.release("completed");
 			}
-			return tool_result_t::error(OBFSTR("Memory scan cancelled."), "cancelled", result);
+			return tool_result_t::error(std::string("Memory scan cancelled."), "cancelled", result);
 		}
 		Sleep(100);
 	}
@@ -1003,7 +1002,7 @@ static tool_result_t handle_first_scan(const json& params) {
 				static_cast<unsigned long long>(fs_admission.token()));
 			fs_admission.release("completed");
 		}
-		return tool_result_t{false, OBFSTR("Memory scan did not complete within the wait budget."), result};
+		return tool_result_t{false, std::string("Memory scan did not complete within the wait budget."), result};
 	}
 
 	if (fs_admission.active()) {
@@ -1027,7 +1026,7 @@ static tool_result_t handle_next_scan(const json& params) {
 			"FEATURE-WORKER-GROUP-REJECT scanner_next_scan reason=%s quota=%s observed=%zu limit=%zu",
 			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
 		return tool_result_t::error(
-			OBFSTR("Scanner capacity exhausted; work was not started."),
+			std::string("Scanner capacity exhausted; work was not started."),
 			"MCP_DOWNSTREAM_CAPACITY_REJECT",
 			mcp_standalone::downstream::rejection_json(rej, ns_id));
 	}
@@ -1056,7 +1055,7 @@ static tool_result_t handle_next_scan(const json& params) {
 				static_cast<unsigned long long>(ns_admission.token()));
 			ns_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("Scanner busy or no initial scan performed."));
+		return tool_result_t::error(std::string("Scanner busy or no initial scan performed."));
 	}
 
 	for (int i = 0; i < 300; ++i) {
@@ -1077,7 +1076,7 @@ static tool_result_t handle_next_scan(const json& params) {
 					static_cast<unsigned long long>(ns_admission.token()));
 				ns_admission.release("completed");
 			}
-			return tool_result_t::error(OBFSTR("Next memory scan cancelled."), "cancelled", result);
+			return tool_result_t::error(std::string("Next memory scan cancelled."), "cancelled", result);
 		}
 		Sleep(100);
 	}
@@ -1098,7 +1097,7 @@ static tool_result_t handle_next_scan(const json& params) {
 				static_cast<unsigned long long>(ns_admission.token()));
 			ns_admission.release("completed");
 		}
-		return tool_result_t{false, OBFSTR("Next memory scan did not complete within the wait budget."), result};
+		return tool_result_t{false, std::string("Next memory scan did not complete within the wait budget."), result};
 	}
 
 	if (ns_admission.active()) {
@@ -1128,7 +1127,7 @@ static tool_result_t handle_get_results(const json& params) {
 
 static tool_result_t handle_reset_scan(const json&) {
 	memory_scanner::reset_scan();
-	return tool_result_t::ok(OBFSTR("Scanner reset."));
+	return tool_result_t::ok(std::string("Scanner reset."));
 }
 
 static tool_result_t handle_undo_scan(const json&) {
@@ -1193,24 +1192,24 @@ static tool_result_t handle_add_address(const json& params) {
 		}
 	}
 	const std::string text = added
-		? OBFSTR("Address ") + sa_format_address(addr) + OBFSTR(" added to list.")
-		: OBFSTR("Address ") + sa_format_address(addr) + OBFSTR(" already in list.");
+		? std::string("Address ") + sa_format_address(addr) + std::string(" added to list.")
+		: std::string("Address ") + sa_format_address(addr) + std::string(" already in list.");
 	return tool_result_t::ok(text, result);
 }
 
 static tool_result_t handle_remove_address(const json& params) {
 	if (!params.contains("index"))
-		return tool_result_t::error(OBFSTR("Missing 'index' parameter."));
+		return tool_result_t::error(std::string("Missing 'index' parameter."));
 	if (!params["index"].is_number_integer())
-		return tool_result_t::error(OBFSTR("'index' must be an integer."));
+		return tool_result_t::error(std::string("'index' must be an integer."));
 	const auto raw_index = params["index"].get<int64_t>();
 	if (raw_index < 0)
-		return tool_result_t::error(OBFSTR("'index' must be non-negative."));
+		return tool_result_t::error(std::string("'index' must be non-negative."));
 	size_t idx = static_cast<size_t>(raw_index);
 	const size_t before_count = address_list_count();
 	json removed_entry;
 	if (!address_entry_by_index(idx, removed_entry))
-		return tool_result_t::error(OBFSTR("Address index is out of range."));
+		return tool_result_t::error(std::string("Address index is out of range."));
 	memory_scanner::remove_address(idx);
 	const size_t after_count = address_list_count();
 	const bool removed = after_count < before_count;
@@ -1228,17 +1227,17 @@ static tool_result_t handle_remove_address(const json& params) {
 	result["readback_ok"] = false;
 	result["verified"] = removed;
 	result["removed"] = std::move(removed_entry);
-	return tool_result_t::ok(OBFSTR("Address removed."), result);
+	return tool_result_t::ok(std::string("Address removed."), result);
 }
 
 static tool_result_t handle_freeze_address(const json& params) {
 	if (!params.contains("index"))
-		return tool_result_t::error(OBFSTR("Missing 'index' parameter."));
+		return tool_result_t::error(std::string("Missing 'index' parameter."));
 	if (!params["index"].is_number_integer())
-		return tool_result_t::error(OBFSTR("'index' must be an integer."));
+		return tool_result_t::error(std::string("'index' must be an integer."));
 	const auto raw_index = params["index"].get<int64_t>();
 	if (raw_index < 0)
-		return tool_result_t::error(OBFSTR("'index' must be non-negative."));
+		return tool_result_t::error(std::string("'index' must be non-negative."));
 	size_t idx = static_cast<size_t>(raw_index);
 	bool enable = true;
 	if (params.contains("enable") && params["enable"].is_boolean())
@@ -1246,7 +1245,7 @@ static tool_result_t handle_freeze_address(const json& params) {
 	const size_t before_count = address_list_count();
 	json before_entry;
 	if (!address_entry_by_index(idx, before_entry))
-		return tool_result_t::error(OBFSTR("Address index is out of range."));
+		return tool_result_t::error(std::string("Address index is out of range."));
 	memory_scanner::freeze_address(idx, enable);
 	const size_t after_count = address_list_count();
 	json after_entry;
@@ -1270,7 +1269,7 @@ static tool_result_t handle_freeze_address(const json& params) {
 	result["before"] = std::move(before_entry);
 	if (have_after)
 		result["after"] = std::move(after_entry);
-	return tool_result_t::ok(enable ? OBFSTR("Address frozen.") : OBFSTR("Address unfrozen."), result);
+	return tool_result_t::ok(enable ? std::string("Address frozen.") : std::string("Address unfrozen."), result);
 }
 
 static tool_result_t handle_get_address_list(const json&) {
@@ -1289,7 +1288,7 @@ static tool_result_t handle_get_address_list(const json&) {
 	result["addresses"] = std::move(arr);
 	result["active_scan_state"] = scanner_activity_json();
 	return tool_result_t::ok(
-		std::to_string(result["count"].get<size_t>()) + OBFSTR(" address(es)."), result);
+		std::to_string(result["count"].get<size_t>()) + std::string(" address(es)."), result);
 }
 
 static tool_result_t handle_pointer_scan(const json& params) {
@@ -1304,7 +1303,7 @@ static tool_result_t handle_pointer_scan(const json& params) {
 			"FEATURE-WORKER-GROUP-REJECT scanner_pointer_scan reason=%s quota=%s observed=%zu limit=%zu",
 			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
 		return tool_result_t::error(
-			OBFSTR("Scanner capacity exhausted; work was not started."),
+			std::string("Scanner capacity exhausted; work was not started."),
 			"MCP_DOWNSTREAM_CAPACITY_REJECT",
 			mcp_standalone::downstream::rejection_json(rej, ps_id));
 	}
@@ -1319,7 +1318,7 @@ static tool_result_t handle_pointer_scan(const json& params) {
 				static_cast<unsigned long long>(ps_admission.token()));
 			ps_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("Missing 'address' parameter."));
+		return tool_result_t::error(std::string("Missing 'address' parameter."));
 	}
 
 	uint64_t addr = 0;
@@ -1333,7 +1332,7 @@ static tool_result_t handle_pointer_scan(const json& params) {
 					static_cast<unsigned long long>(ps_admission.token()));
 				ps_admission.release("completed");
 			}
-			return tool_result_t::error(OBFSTR("Invalid address format."));
+			return tool_result_t::error(std::string("Invalid address format."));
 		}
 		addr = *parsed;
 	} else if (v.is_number()) {
@@ -1370,7 +1369,7 @@ static tool_result_t handle_pointer_scan(const json& params) {
 				static_cast<unsigned long long>(ps_admission.token()));
 			ps_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("Pointer scan did not start. Ensure the driver is loaded and a process is attached."));
+		return tool_result_t::error(std::string("Pointer scan did not start. Ensure the driver is loaded and a process is attached."));
 	}
 	{
 		std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
@@ -1396,7 +1395,7 @@ static tool_result_t handle_pointer_scan(const json& params) {
 					static_cast<unsigned long long>(ps_admission.token()));
 				ps_admission.release("completed");
 			}
-			return tool_result_t::error(OBFSTR("Pointer scan cancelled."), "cancelled", result);
+			return tool_result_t::error(std::string("Pointer scan cancelled."), "cancelled", result);
 		}
 		if (i == 0 || ((i + 1) % 20) == 0) {
 			std::lock_guard<std::mutex> lk(memory_scanner::g_state.pointer_mutex);
@@ -1472,7 +1471,7 @@ static tool_result_t handle_pointer_scan(const json& params) {
 				static_cast<unsigned long long>(ps_admission.token()));
 			ps_admission.release("completed");
 		}
-		return tool_result_t{false, OBFSTR("Pointer scan did not complete within the timeout."), result};
+		return tool_result_t{false, std::string("Pointer scan did not complete within the timeout."), result};
 	}
 	if (ps_admission.active()) {
 		diag::log_tagged_fmt("scanner",
@@ -1497,7 +1496,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 			"FEATURE-WORKER-GROUP-REJECT find_what_accesses reason=%s quota=%s observed=%zu limit=%zu",
 			rej.reason.c_str(), rej.quota_name.c_str(), rej.observed, rej.limit);
 		return tool_result_t::error(
-			OBFSTR("Scanner capacity exhausted; work was not started."),
+			std::string("Scanner capacity exhausted; work was not started."),
 			"MCP_DOWNSTREAM_CAPACITY_REJECT",
 			mcp_standalone::downstream::rejection_json(rej, fwa_id));
 	}
@@ -1512,7 +1511,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(fwa_admission.token()));
 			fwa_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("'address' is required."));
+		return tool_result_t::error(std::string("'address' is required."));
 	}
 	auto address = sa_parse_address(params["address"].get<std::string>());
 	if (!address) {
@@ -1522,7 +1521,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(fwa_admission.token()));
 			fwa_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("Invalid address."));
+		return tool_result_t::error(std::string("Invalid address."));
 	}
 	uint64_t size = 4;
 	if (params.contains("size") && params["size"].is_number_integer()) {
@@ -1539,7 +1538,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 					static_cast<unsigned long long>(fwa_admission.token()));
 				fwa_admission.release("completed");
 			}
-			return tool_result_t::error(OBFSTR("'type' must be read, write, or execute."));
+			return tool_result_t::error(std::string("'type' must be read, write, or execute."));
 		}
 		type = params["type"].get<std::string>();
 	}
@@ -1551,7 +1550,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(fwa_admission.token()));
 			fwa_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("'type' must be read, write, or execute."));
+		return tool_result_t::error(std::string("'type' must be read, write, or execute."));
 	}
 	const int wait_ms = clamp_wait_ms(params, 5000);
 	const size_t limit = limit_param(params, 32, 256);
@@ -1562,7 +1561,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(fwa_admission.token()));
 			fwa_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("find_what_accesses requires the kernel driver page-guard backend."));
+		return tool_result_t::error(std::string("find_what_accesses requires the kernel driver page-guard backend."));
 	}
 	const uint32_t pid = driver_bridge::attached_pid();
 	if (pid == 0) {
@@ -1572,7 +1571,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(fwa_admission.token()));
 			fwa_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("No attached process."));
+		return tool_result_t::error(std::string("No attached process."));
 	}
 	SYSTEM_INFO si{};
 	GetSystemInfo(&si);
@@ -1584,7 +1583,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(fwa_admission.token()));
 			fwa_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("Watched address range overflows."));
+		return tool_result_t::error(std::string("Watched address range overflows."));
 	}
 	const uint64_t end = *address + size;
 	if (end > std::numeric_limits<uint64_t>::max() - (page_size - 1)) {
@@ -1594,7 +1593,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(fwa_admission.token()));
 			fwa_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("Guard address range overflows."));
+		return tool_result_t::error(std::string("Guard address range overflows."));
 	}
 	const uint64_t page_base = *address & ~(page_size - 1);
 	const uint64_t guard_end = (end + page_size - 1) & ~(page_size - 1);
@@ -1642,7 +1641,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 		result["cleanup_ok"] = cleanup_ok;
 		result["page_guard_captures"] = capture_count;
 		result["elapsed_ms"] = static_cast<unsigned long long>(GetTickCount64() - started_tick);
-		return tool_result_t::error(OBFSTR("find_what_accesses cancelled before completion."), "cancelled", result);
+		return tool_result_t::error(std::string("find_what_accesses cancelled before completion."), "cancelled", result);
 	};
 	diag::log_tagged_fmt("scanner",
 		"find_what_accesses entry pid=%u address=0x%llX size=0x%llX type=%s wait_ms=%d limit=%zu page_base=0x%llX guard_size=0x%llX attached=%u cancelled=%d deadline_ms=%llu diag_id=%s",
@@ -1757,7 +1756,7 @@ static tool_result_t handle_find_what_accesses(const json& params) {
 				static_cast<unsigned long long>(fwa_admission.token()));
 			fwa_admission.release("completed");
 		}
-		return tool_result_t::error(OBFSTR("find_what_accesses page-guard install failed."), "page_guard_install_failed", result);
+		return tool_result_t::error(std::string("find_what_accesses page-guard install failed."), "page_guard_install_failed", result);
 	}
 	diag::log_tagged_fmt("scanner",
 		"find_what_accesses install_done sid=%u pid=%u payloads=1 max_drain=%u elapsed_ms=%llu",
@@ -2034,20 +2033,20 @@ static tool_result_t handle_watch_memory_layout(const json& params) {
 		}
 	}
 	if (missing_struct)
-		return tool_result_t::error(OBFSTR("Struct definition not found. Available structs: ") + available_struct_names_text());
+		return tool_result_t::error(std::string("Struct definition not found. Available structs: ") + available_struct_names_text());
 
 	if (sd.total_size == 0)
-		return tool_result_t::error(OBFSTR("Struct definition has no fields."));
+		return tool_result_t::error(std::string("Struct definition has no fields."));
 	if (sd.total_size > 0x10000)
-		return tool_result_t::error(OBFSTR("Struct snapshot size exceeds 65536 bytes."));
+		return tool_result_t::error(std::string("Struct snapshot size exceeds 65536 bytes."));
 	if (address > std::numeric_limits<uint64_t>::max() - sd.total_size)
-		return tool_result_t::error(OBFSTR("Struct snapshot address range overflows."));
+		return tool_result_t::error(std::string("Struct snapshot address range overflows."));
 	if (!driver_bridge::can_read_memory())
-		return tool_result_t::error(OBFSTR("Memory reader is unavailable or no process is attached."));
+		return tool_result_t::error(std::string("Memory reader is unavailable or no process is attached."));
 
 	std::vector<uint8_t> block;
 	if (!driver_bridge::read_memory(address, sd.total_size, block) || block.size() < sd.total_size)
-		return tool_result_t::error(OBFSTR("Failed to read struct memory snapshot."));
+		return tool_result_t::error(std::string("Failed to read struct memory snapshot."));
 
 	json result = struct_snapshot_json(struct_index, sd, address, block);
 	result["watch_active"] = refresh_rate_ms > 0;
@@ -2065,24 +2064,24 @@ static tool_result_t handle_assert_memory_type(const json& params) {
 	if (!parse_i64_param(params, "offset", offset, error))
 		return tool_result_t::error(error);
 	if (!params.contains("expected_type") || !params["expected_type"].is_string())
-		return tool_result_t::error(OBFSTR("'expected_type' is required."));
+		return tool_result_t::error(std::string("'expected_type' is required."));
 	struct_dissector::field_type_t expected_type = struct_dissector::field_type_t::int32;
 	const std::string expected_text = params["expected_type"].get<std::string>();
 	if (!parse_field_type(expected_text, expected_type))
-		return tool_result_t::error(OBFSTR("Unsupported expected_type: ") + expected_text);
+		return tool_result_t::error(std::string("Unsupported expected_type: ") + expected_text);
 	if (expected_type == struct_dissector::field_type_t::nested_struct)
-		return tool_result_t::error(OBFSTR("nested_struct assertions require watch_memory_layout."));
+		return tool_result_t::error(std::string("nested_struct assertions require watch_memory_layout."));
 
 	bool offset_ok = false;
 	const uint64_t effective = add_signed_offset(address, offset, offset_ok);
 	if (!offset_ok)
-		return tool_result_t::error(OBFSTR("Effective address overflow or offset outside allowed range."));
+		return tool_result_t::error(std::string("Effective address overflow or offset outside allowed range."));
 	if (!driver_bridge::can_read_memory())
-		return tool_result_t::error(OBFSTR("Memory reader is unavailable or no process is attached."));
+		return tool_result_t::error(std::string("Memory reader is unavailable or no process is attached."));
 
 	const size_t read_size = assertion_read_size(expected_type, params);
 	if (effective > std::numeric_limits<uint64_t>::max() - read_size)
-		return tool_result_t::error(OBFSTR("Assertion read address range overflows."));
+		return tool_result_t::error(std::string("Assertion read address range overflows."));
 	int duration_ms = 5000;
 	if (params.contains("duration_ms") && params["duration_ms"].is_number_integer())
 		duration_ms = params["duration_ms"].get<int>();
@@ -2128,7 +2127,7 @@ static tool_result_t handle_assert_memory_type(const json& params) {
 
 	for (int i = 0; i < sample_count; ++i) {
 		if (mcp_standalone::current_call_cancelled())
-			return tool_result_t::error(OBFSTR("Memory type assertion cancelled during sampling."));
+			return tool_result_t::error(std::string("Memory type assertion cancelled during sampling."));
 		std::vector<uint8_t> bytes;
 		const bool read_ok = driver_bridge::read_memory(effective, read_size, bytes) && bytes.size() >= read_size;
 		json sample;
@@ -2210,12 +2209,12 @@ static tool_result_t handle_write_value(const json& params) {
 		driver_bridge::identity::validate_attached_target_identity(authorized_identity).matches;
 	if (!identity_captured)
 		return tool_result_t::error(identity_error.empty()
-			? OBFSTR("No verified live target is attached.") : identity_error);
+			? std::string("No verified live target is attached.") : identity_error);
 
 	if (!params.contains("address") || !params.contains("value"))
-		return tool_result_t::error(OBFSTR("Missing 'address' or 'value' parameter."));
+		return tool_result_t::error(std::string("Missing 'address' or 'value' parameter."));
 	if (!params["value"].is_string())
-		return tool_result_t::error(OBFSTR("'value' must be a string."));
+		return tool_result_t::error(std::string("'value' must be a string."));
 
 	uint64_t addr = 0;
 	std::string error;
@@ -2233,7 +2232,7 @@ static tool_result_t handle_write_value(const json& params) {
 	std::string val_str = params["value"].get<std::string>();
 	std::vector<uint8_t> bytes = memory_scanner::parse_value(val_str, vtype, hex);
 	if (bytes.empty())
-		return tool_result_t::error(OBFSTR("Failed to parse value for the requested value_type."));
+		return tool_result_t::error(std::string("Failed to parse value for the requested value_type."));
 
 	const size_t before_count = address_list_count();
 	const auto list_index = address_index_by_address(addr);
@@ -2293,75 +2292,75 @@ static tool_result_t handle_write_value(const json& params) {
 	}
 	if (!transaction.verified)
 		return tool_result_t{false, transaction.error.empty()
-			? OBFSTR("Value write verification failed.") : transaction.error, result};
-	return tool_result_t::ok(OBFSTR("Value written successfully."), result);
+			? std::string("Value write verification failed.") : transaction.error, result};
+	return tool_result_t::ok(std::string("Value written successfully."), result);
 }
 
 
 void register_scanner_tools(mcp_standalone::server_t& srv) {
 
-	register_compat(srv, {OBFSTR("find_what_accesses"), OBFSTR("memory_scanner"),
-		OBFSTR("Monitor reads, writes, or executes touching an address range using the page-guard backend. Returns access RIP, fault address, captured exception-context registers, and payload preview."),
-		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to monitor"), true},
-		 {OBFSTR("size"), OBFSTR("number"), OBFSTR("Watched byte count, default 4, capped at 4096"), false},
-		 {OBFSTR("type"), OBFSTR("string"), OBFSTR("Access type: read, write, execute"), false},
-		 {OBFSTR("wait_ms"), OBFSTR("number"), OBFSTR("Capture duration, default 5000, capped at 60000"), false},
-		 {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum matching access records to return, default 32"), false}},
+	register_compat(srv, {std::string("find_what_accesses"), std::string("memory_scanner"),
+		std::string("Monitor reads, writes, or executes touching an address range using the page-guard backend. Returns access RIP, fault address, captured exception-context registers, and payload preview."),
+		{{std::string("address"), std::string("string"), std::string("Address to monitor"), true},
+		 {std::string("size"), std::string("number"), std::string("Watched byte count, default 4, capped at 4096"), false},
+		 {std::string("type"), std::string("string"), std::string("Access type: read, write, execute"), false},
+		 {std::string("wait_ms"), std::string("number"), std::string("Capture duration, default 5000, capped at 60000"), false},
+		 {std::string("limit"), std::string("number"), std::string("Maximum matching access records to return, default 32"), false}},
 		handle_find_what_accesses, false});
 
-	register_compat(srv, {OBFSTR("watch_memory_layout"), OBFSTR("memory_scanner"),
-		OBFSTR("Read a live ReClass-style snapshot at an address using an existing struct_dissector definition by name, or the active struct when struct_name is omitted."),
-		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Base address to read"), true},
-		 {OBFSTR("struct_name"), OBFSTR("string"), OBFSTR("Struct definition name; omit to use the active struct"), false},
-		 {OBFSTR("refresh_rate_ms"), OBFSTR("number"), OBFSTR("Refresh interval to arm in the struct dissector state, 0 disables auto refresh"), false}},
+	register_compat(srv, {std::string("watch_memory_layout"), std::string("memory_scanner"),
+		std::string("Read a live ReClass-style snapshot at an address using an existing struct_dissector definition by name, or the active struct when struct_name is omitted."),
+		{{std::string("address"), std::string("string"), std::string("Base address to read"), true},
+		 {std::string("struct_name"), std::string("string"), std::string("Struct definition name; omit to use the active struct"), false},
+		 {std::string("refresh_rate_ms"), std::string("number"), std::string("Refresh interval to arm in the struct dissector state, 0 disables auto refresh"), false}},
 		handle_watch_memory_layout, false});
 
-	register_compat(srv, {OBFSTR("assert_memory_type"), OBFSTR("memory_scanner"),
-		OBFSTR("Sample address+offset for a bounded interval and report whether the observed bytes plausibly match an expected scalar, pointer, string, or byte-array type."),
-		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Base address to test"), true},
-		 {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Offset from base address"), true},
-		 {OBFSTR("expected_type"), OBFSTR("string"), OBFSTR("Type: int8/uint8/int16/uint16/int32/uint32/int64/uint64/float/double/pointer/string/utf16/aob"), true},
-		 {OBFSTR("duration_ms"), OBFSTR("number"), OBFSTR("Sampling duration, default 5000, capped at 10000"), false},
-		 {OBFSTR("sample_interval_ms"), OBFSTR("number"), OBFSTR("Sampling interval, default 250, clamped 50-1000"), false},
-		 {OBFSTR("size"), OBFSTR("number"), OBFSTR("Read size for string or byte-array assertions, capped at 256"), false},
-		 {OBFSTR("min"), OBFSTR("number"), OBFSTR("Optional numeric lower bound"), false},
-		 {OBFSTR("max"), OBFSTR("number"), OBFSTR("Optional numeric upper bound"), false}},
+	register_compat(srv, {std::string("assert_memory_type"), std::string("memory_scanner"),
+		std::string("Sample address+offset for a bounded interval and report whether the observed bytes plausibly match an expected scalar, pointer, string, or byte-array type."),
+		{{std::string("address"), std::string("string"), std::string("Base address to test"), true},
+		 {std::string("offset"), std::string("number"), std::string("Offset from base address"), true},
+		 {std::string("expected_type"), std::string("string"), std::string("Type: int8/uint8/int16/uint16/int32/uint32/int64/uint64/float/double/pointer/string/utf16/aob"), true},
+		 {std::string("duration_ms"), std::string("number"), std::string("Sampling duration, default 5000, capped at 10000"), false},
+		 {std::string("sample_interval_ms"), std::string("number"), std::string("Sampling interval, default 250, clamped 50-1000"), false},
+		 {std::string("size"), std::string("number"), std::string("Read size for string or byte-array assertions, capped at 256"), false},
+		 {std::string("min"), std::string("number"), std::string("Optional numeric lower bound"), false},
+		 {std::string("max"), std::string("number"), std::string("Optional numeric upper bound"), false}},
 		handle_assert_memory_type, true});
 
-	register_compat(srv, {OBFSTR("scanner_first_scan"), OBFSTR("memory_scanner"),
-		OBFSTR("Start a new memory scan. Scans all committed memory of the attached process for values matching the criteria. Operates on the currently active binary_id session; pass binary_id explicitly in multi-target sessions."),
-		{{OBFSTR("value"), OBFSTR("string"), OBFSTR("Value to search for"), true},
-		 {OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Type: byte/int16/int32/int64/float/double/ascii/utf16/aob"), false},
-		 {OBFSTR("scan_mode"), OBFSTR("string"), OBFSTR("Mode: exact/bigger/smaller/between/unknown"), false},
-		 {OBFSTR("value2"), OBFSTR("string"), OBFSTR("Second value for 'between' mode"), false},
-		 {OBFSTR("hex"), OBFSTR("boolean"), OBFSTR("Interpret value as hexadecimal"), false},
-		 {OBFSTR("writable_only"), OBFSTR("boolean"), OBFSTR("Only scan writable pages (default true)"), false},
-		 {OBFSTR("executable_exclude"), OBFSTR("boolean"), OBFSTR("Exclude executable pages (default true)"), false},
-		 {OBFSTR("alignment"), OBFSTR("number"), OBFSTR("Scan alignment in bytes (default: type size)"), false},
-		 {OBFSTR("range_base"), OBFSTR("string"), OBFSTR("Optional scan range base address"), false},
-		 {OBFSTR("range_size"), OBFSTR("number"), OBFSTR("Optional scan range size in bytes"), false}},
+	register_compat(srv, {std::string("scanner_first_scan"), std::string("memory_scanner"),
+		std::string("Start a new memory scan. Scans all committed memory of the attached process for values matching the criteria. Operates on the currently active binary_id session; pass binary_id explicitly in multi-target sessions."),
+		{{std::string("value"), std::string("string"), std::string("Value to search for"), true},
+		 {std::string("value_type"), std::string("string"), std::string("Type: byte/int16/int32/int64/float/double/ascii/utf16/aob"), false},
+		 {std::string("scan_mode"), std::string("string"), std::string("Mode: exact/bigger/smaller/between/unknown"), false},
+		 {std::string("value2"), std::string("string"), std::string("Second value for 'between' mode"), false},
+		 {std::string("hex"), std::string("boolean"), std::string("Interpret value as hexadecimal"), false},
+		 {std::string("writable_only"), std::string("boolean"), std::string("Only scan writable pages (default true)"), false},
+		 {std::string("executable_exclude"), std::string("boolean"), std::string("Exclude executable pages (default true)"), false},
+		 {std::string("alignment"), std::string("number"), std::string("Scan alignment in bytes (default: type size)"), false},
+		 {std::string("range_base"), std::string("string"), std::string("Optional scan range base address"), false},
+		 {std::string("range_size"), std::string("number"), std::string("Optional scan range size in bytes"), false}},
 		handle_first_scan, false});
 
-	register_compat(srv, {OBFSTR("scanner_next_scan"), OBFSTR("memory_scanner"),
-		OBFSTR("Refine previous scan results by applying a new comparison. Narrows down results from the last scan."),
-		{{OBFSTR("scan_mode"), OBFSTR("string"), OBFSTR("Mode: exact/bigger/smaller/between/changed/unchanged/increased/decreased"), true},
-		 {OBFSTR("value"), OBFSTR("string"), OBFSTR("Value for comparison (not needed for changed/unchanged/increased/decreased)"), false},
-		 {OBFSTR("value2"), OBFSTR("string"), OBFSTR("Second value for 'between' mode"), false}},
+	register_compat(srv, {std::string("scanner_next_scan"), std::string("memory_scanner"),
+		std::string("Refine previous scan results by applying a new comparison. Narrows down results from the last scan."),
+		{{std::string("scan_mode"), std::string("string"), std::string("Mode: exact/bigger/smaller/between/changed/unchanged/increased/decreased"), true},
+		 {std::string("value"), std::string("string"), std::string("Value for comparison (not needed for changed/unchanged/increased/decreased)"), false},
+		 {std::string("value2"), std::string("string"), std::string("Second value for 'between' mode"), false}},
 		handle_next_scan, false});
 
-	register_compat(srv, {OBFSTR("scanner_get_results"), OBFSTR("memory_scanner"),
-		OBFSTR("Get current scan results. Returns addresses, values, and module info."),
-		{{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum results to return (default 100)"), false}},
+	register_compat(srv, {std::string("scanner_get_results"), std::string("memory_scanner"),
+		std::string("Get current scan results. Returns addresses, values, and module info."),
+		{{std::string("limit"), std::string("number"), std::string("Maximum results to return (default 100)"), false}},
 		handle_get_results, true});
 
-	register_compat(srv, {OBFSTR("scanner_undo"), OBFSTR("memory_scanner"),
-		OBFSTR("Undo the last scan refinement, restoring previous results."),
+	register_compat(srv, {std::string("scanner_undo"), std::string("memory_scanner"),
+		std::string("Undo the last scan refinement, restoring previous results."),
 		{}, handle_undo_scan, false});
 
-	register_compat(srv, {OBFSTR("scanner_address_list_manage"), OBFSTR("memory_scanner"),
-		OBFSTR("Manage the scanner address watch list. Actions: add, remove, freeze, list."),
-		{{OBFSTR("action"), OBFSTR("string"), OBFSTR("add|remove|freeze|list"), true},
-		 {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+	register_compat(srv, {std::string("scanner_address_list_manage"), std::string("memory_scanner"),
+		std::string("Manage the scanner address watch list. Actions: add, remove, freeze, list."),
+		{{std::string("action"), std::string("string"), std::string("add|remove|freeze|list"), true},
+		 {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
 		[](const json& params) -> tool_result_t {
 			const std::string action = compat_action_name(params);
 			const json p = compat_action_payload(params);
@@ -2372,27 +2371,27 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			return compat_unknown_action("scanner_address_list_manage", action);
 		}, false});
 
-	register_compat(srv, {OBFSTR("scanner_write_value"), OBFSTR("memory_scanner"),
-		OBFSTR("Write a value to a memory address in the attached process."),
-		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Memory address (hex)"), true},
-		 {OBFSTR("value"), OBFSTR("string"), OBFSTR("Value to write"), true},
-		 {OBFSTR("value_type"), OBFSTR("string"), OBFSTR("Type: byte/int16/int32/int64/float/double"), false},
-		 {OBFSTR("hex"), OBFSTR("boolean"), OBFSTR("Interpret value as hex"), false}},
+	register_compat(srv, {std::string("scanner_write_value"), std::string("memory_scanner"),
+		std::string("Write a value to a memory address in the attached process."),
+		{{std::string("address"), std::string("string"), std::string("Memory address (hex)"), true},
+		 {std::string("value"), std::string("string"), std::string("Value to write"), true},
+		 {std::string("value_type"), std::string("string"), std::string("Type: byte/int16/int32/int64/float/double"), false},
+		 {std::string("hex"), std::string("boolean"), std::string("Interpret value as hex"), false}},
 		handle_write_value, false});
 
-	register_compat(srv, {OBFSTR("scanner_pointer_scan"), OBFSTR("memory_scanner"),
-		OBFSTR("Perform a pointer scan to find pointer chains that lead to the target address. Useful for finding stable pointers. Operates on the currently active binary_id session; pass binary_id explicitly in multi-target sessions."),
-		{{OBFSTR("address"), OBFSTR("string"), OBFSTR("Target address to find pointers to"), true},
-		 {OBFSTR("max_depth"), OBFSTR("number"), OBFSTR("Maximum pointer chain depth (1-7, default 4)"), false},
-		 {OBFSTR("max_offset"), OBFSTR("number"), OBFSTR("Maximum offset from pointer base (default 0x1000)"), false},
-		 {OBFSTR("range_base"), OBFSTR("string"), OBFSTR("Optional pointer-slot scan range base address"), false},
-		 {OBFSTR("range_size"), OBFSTR("number"), OBFSTR("Optional pointer-slot scan range size in bytes"), false},
-		 {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Maximum wait time, capped at 30000 ms"), false},
-		 {OBFSTR("allow_partial"), OBFSTR("boolean"), OBFSTR("Return partial results without marking the payload as timed out"), false}},
+	register_compat(srv, {std::string("scanner_pointer_scan"), std::string("memory_scanner"),
+		std::string("Perform a pointer scan to find pointer chains that lead to the target address. Useful for finding stable pointers. Operates on the currently active binary_id session; pass binary_id explicitly in multi-target sessions."),
+		{{std::string("address"), std::string("string"), std::string("Target address to find pointers to"), true},
+		 {std::string("max_depth"), std::string("number"), std::string("Maximum pointer chain depth (1-7, default 4)"), false},
+		 {std::string("max_offset"), std::string("number"), std::string("Maximum offset from pointer base (default 0x1000)"), false},
+		 {std::string("range_base"), std::string("string"), std::string("Optional pointer-slot scan range base address"), false},
+		 {std::string("range_size"), std::string("number"), std::string("Optional pointer-slot scan range size in bytes"), false},
+		 {std::string("timeout_ms"), std::string("number"), std::string("Maximum wait time, capped at 30000 ms"), false},
+		 {std::string("allow_partial"), std::string("boolean"), std::string("Return partial results without marking the payload as timed out"), false}},
 		handle_pointer_scan, true});
 
-	register_compat(srv, {OBFSTR("scanner_cancel_pointer_scan"), OBFSTR("memory_scanner"),
-		OBFSTR("Cancel a running pointer scan."),
+	register_compat(srv, {std::string("scanner_cancel_pointer_scan"), std::string("memory_scanner"),
+		std::string("Cancel a running pointer scan."),
 		{},
 		[](const json&) -> tool_result_t {
 			const size_t before_count = address_list_count();
@@ -2419,36 +2418,36 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			result["pointer_scanning_after"] = memory_scanner::g_state.pointer_scanning.load();
 			result["active_pointer_session"] = g_active_pointer_session.load(std::memory_order_relaxed);
 			result["before_state"] = std::move(before_state);
-			return tool_result_t::ok(OBFSTR("Pointer scan cancelled."), result);
+			return tool_result_t::ok(std::string("Pointer scan cancelled."), result);
 		}, false});
 
 	auto scanner_define_struct = [](const json& params) -> tool_result_t {
 			if (!params.contains("name") || !params["name"].is_string())
-				return tool_result_t::error(OBFSTR("'name' is required."));
+				return tool_result_t::error(std::string("'name' is required."));
 			if (!params.contains("base_address") || !params["base_address"].is_string())
-				return tool_result_t::error(OBFSTR("'base_address' is required."));
+				return tool_result_t::error(std::string("'base_address' is required."));
 			auto addr = sa_parse_address(params["base_address"].get<std::string>());
-			if (!addr) return tool_result_t::error(OBFSTR("Invalid base_address."));
+			if (!addr) return tool_result_t::error(std::string("Invalid base_address."));
 			int idx = struct_dissector::create_struct(params["name"].get<std::string>());
 			if (idx < 0)
-				return tool_result_t::error(OBFSTR("Failed to create struct."));
+				return tool_result_t::error(std::string("Failed to create struct."));
 			if (params.value("kind", std::string{"struct"}) == "union" &&
 				!struct_dissector::set_structure_kind(idx, struct_dissector::structure_kind_t::union_type)) {
 				std::string rollback_error;
 				struct_dissector::remove_structure(idx, rollback_error);
-				return tool_result_t::error(OBFSTR("Failed to configure union layout."));
+				return tool_result_t::error(std::string("Failed to configure union layout."));
 			}
 			if (params.contains("packing") && !struct_dissector::set_structure_packing(idx,
 				params["packing"].get<std::uint16_t>())) {
 				std::string rollback_error;
 				struct_dissector::remove_structure(idx, rollback_error);
-				return tool_result_t::error(OBFSTR("Invalid structure packing."));
+				return tool_result_t::error(std::string("Invalid structure packing."));
 			}
 			if (params.contains("alignment") && !struct_dissector::set_structure_alignment(idx,
 				params["alignment"].get<std::uint16_t>())) {
 				std::string rollback_error;
 				struct_dissector::remove_structure(idx, rollback_error);
-				return tool_result_t::error(OBFSTR("Invalid structure alignment."));
+				return tool_result_t::error(std::string("Invalid structure alignment."));
 			}
 			{
 				std::lock_guard<std::mutex> lk(struct_dissector::g_state.mtx);
@@ -2460,18 +2459,18 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			result["name"] = params["name"].get<std::string>();
 			result["base_address"] = sa_format_address(*addr);
 			return tool_result_t::ok(
-				OBFSTR("Structure '") + params["name"].get<std::string>() + OBFSTR("' created at index ") + std::to_string(idx), result);
+				std::string("Structure '") + params["name"].get<std::string>() + std::string("' created at index ") + std::to_string(idx), result);
 		};
 
 	auto scanner_add_struct_field = [](const json& params) -> tool_result_t {
 			if (!params.contains("struct_index") || !params["struct_index"].is_number())
-				return tool_result_t::error(OBFSTR("'struct_index' is required."));
+				return tool_result_t::error(std::string("'struct_index' is required."));
 			if (!params.contains("name") || !params["name"].is_string())
-				return tool_result_t::error(OBFSTR("'name' is required."));
+				return tool_result_t::error(std::string("'name' is required."));
 			if (!params.contains("offset") || !params["offset"].is_number())
-				return tool_result_t::error(OBFSTR("'offset' is required."));
+				return tool_result_t::error(std::string("'offset' is required."));
 			if (!params.contains("field_type") || !params["field_type"].is_string())
-				return tool_result_t::error(OBFSTR("'field_type' is required."));
+				return tool_result_t::error(std::string("'field_type' is required."));
 			int si = params["struct_index"].get<int>();
 			std::string type_str = params["field_type"].get<std::string>();
 			struct_dissector::field_type_t ft = struct_dissector::field_type_t::int32;
@@ -2491,10 +2490,10 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			else if (type_str == "byte_array") ft = struct_dissector::field_type_t::byte_array;
 			else if (type_str == "padding") ft = struct_dissector::field_type_t::padding;
 			else if (type_str == "nested_struct") ft = struct_dissector::field_type_t::nested_struct;
-			else return tool_result_t::error(OBFSTR("Unknown field_type: ") + type_str);
+			else return tool_result_t::error(std::string("Unknown field_type: ") + type_str);
 			if (ft == struct_dissector::field_type_t::nested_struct &&
 				(!params.contains("target_structure") || !params["target_structure"].is_string()))
-				return tool_result_t::error(OBFSTR("nested_struct requires 'target_structure'."));
+				return tool_result_t::error(std::string("nested_struct requires 'target_structure'."));
 			struct_dissector::field_def_t fld;
 			fld.name = params["name"].get<std::string>();
 			fld.type = ft == struct_dissector::field_type_t::nested_struct
@@ -2508,12 +2507,12 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			fld.description = params.value("description", std::string{});
 			int fi = struct_dissector::add_field(si, fld);
 			if (fi < 0)
-				return tool_result_t::error(OBFSTR("Failed to add field."));
+				return tool_result_t::error(std::string("Failed to add field."));
 			if (params.contains("target_structure") && params["target_structure"].is_string() &&
 				!struct_dissector::set_field_nested_target_by_name(si, fi,
 					params["target_structure"].get<std::string>(), ft == struct_dissector::field_type_t::pointer)) {
 				struct_dissector::remove_field(si, fi);
-				return tool_result_t::error(OBFSTR("Field was added, but its target structure was rejected."));
+				return tool_result_t::error(std::string("Field was added, but its target structure was rejected."));
 			}
 			json result;
 			result["field_index"] = fi;
@@ -2521,17 +2520,17 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			result["offset"] = fld.offset;
 			result["type"] = type_str;
 			return tool_result_t::ok(
-				OBFSTR("Field '") + fld.name + OBFSTR("' added at offset ") + std::to_string(fld.offset), result);
+				std::string("Field '") + fld.name + std::string("' added at offset ") + std::to_string(fld.offset), result);
 		};
 
 	auto scanner_get_struct = [](const json& params) -> tool_result_t {
 			if (!params.contains("struct_index") || !params["struct_index"].is_number())
-				return tool_result_t::error(OBFSTR("'struct_index' is required."));
+				return tool_result_t::error(std::string("'struct_index' is required."));
 			int si = params["struct_index"].get<int>();
 			{
 				std::lock_guard<std::mutex> lk(struct_dissector::g_state.mtx);
 				if (si < 0 || si >= static_cast<int>(struct_dissector::g_state.structs.size()))
-					return tool_result_t::error(OBFSTR("Invalid struct_index."));
+					return tool_result_t::error(std::string("Invalid struct_index."));
 				struct_dissector::g_state.active_struct = si;
 			}
 			struct_dissector::refresh_values();
@@ -2570,16 +2569,16 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			result["field_count"] = sd.fields.size();
 			result["fields"] = std::move(fields_arr);
 			return tool_result_t::ok(
-				OBFSTR("Struct '") + sd.name + OBFSTR("': ") + std::to_string(sd.fields.size()) + OBFSTR(" field(s)."), result);
+				std::string("Struct '") + sd.name + std::string("': ") + std::to_string(sd.fields.size()) + std::string(" field(s)."), result);
 		};
 
 	auto scanner_export_struct_c = [](const json& params) -> tool_result_t {
 			if (!params.contains("struct_index") || !params["struct_index"].is_number())
-				return tool_result_t::error(OBFSTR("'struct_index' is required."));
+				return tool_result_t::error(std::string("'struct_index' is required."));
 			int si = params["struct_index"].get<int>();
 			std::string code = struct_dissector::export_to_c(si);
 			if (code.empty())
-				return tool_result_t::error(OBFSTR("Invalid struct_index or empty struct."));
+				return tool_result_t::error(std::string("Invalid struct_index or empty struct."));
 			json result;
 			result["c_code"] = code;
 			return tool_result_t::ok(code, result);
@@ -2590,25 +2589,25 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 		json result;
 		result["schema_version"] = 3;
 		result["schema"] = schema;
-		return tool_result_t::ok(OBFSTR("Structure schema exported."), result);
+		return tool_result_t::ok(std::string("Structure schema exported."), result);
 	};
 
 	auto scanner_import_struct_schema = [](const json& params) -> tool_result_t {
 		if (!params.contains("schema") || !params["schema"].is_string())
-			return tool_result_t::error(OBFSTR("'schema' is required."));
+			return tool_result_t::error(std::string("'schema' is required."));
 		std::string error;
 		if (!struct_dissector::deserialize_schema(params["schema"].get<std::string>(), error))
-			return tool_result_t::error(OBFSTR("Structure schema import failed: ") + error);
+			return tool_result_t::error(std::string("Structure schema import failed: ") + error);
 		json result;
 		result["schema_version"] = 3;
 		result["schema"] = struct_dissector::serialize_schema();
-		return tool_result_t::ok(OBFSTR("Structure schema imported and validated."), result);
+		return tool_result_t::ok(std::string("Structure schema imported and validated."), result);
 	};
 
-	register_compat(srv, {OBFSTR("scanner_struct_manage"), OBFSTR("memory_scanner"),
-		OBFSTR("Manage scanner structure definitions. Actions: define, add_field, get, export_c, export_schema, import_schema."),
-		{{OBFSTR("action"), OBFSTR("string"), OBFSTR("define|add_field|get|export_c|export_schema|import_schema"), true},
-		 {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+	register_compat(srv, {std::string("scanner_struct_manage"), std::string("memory_scanner"),
+		std::string("Manage scanner structure definitions. Actions: define, add_field, get, export_c, export_schema, import_schema."),
+		{{std::string("action"), std::string("string"), std::string("define|add_field|get|export_c|export_schema|import_schema"), true},
+		 {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
 		[scanner_define_struct, scanner_add_struct_field, scanner_get_struct, scanner_export_struct_c,
 			scanner_export_struct_schema, scanner_import_struct_schema](const json& params) -> tool_result_t {
 			const std::string action = compat_action_name(params);

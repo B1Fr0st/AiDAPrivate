@@ -55,8 +55,6 @@ struct diagnostic_state_t {
     const char* testlab_state = nullptr;
     const char* camoufox_state = nullptr;
     const char* background_command_state = nullptr;
-    std::uint64_t license_liveness_ms = 0;
-    std::uint64_t arc_liveness_ms = 0;
     std::uint64_t driver_watchdog_ms = 0;
     const char* metadata_ring_summary = nullptr;
     const char* wer_correlation = nullptr;
@@ -133,9 +131,7 @@ inline std::string build_diagnostics_json(const diagnostic_state_t& state) {
     out += buf;
 
     _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-        "\"liveness\":{\"license_ms\":%llu,\"arc_ms\":%llu,\"driver_watchdog_ms\":%llu},",
-        static_cast<unsigned long long>(state.license_liveness_ms),
-        static_cast<unsigned long long>(state.arc_liveness_ms),
+        "\"liveness\":{\"driver_watchdog_ms\":%llu},",
         static_cast<unsigned long long>(state.driver_watchdog_ms));
     out += buf;
 

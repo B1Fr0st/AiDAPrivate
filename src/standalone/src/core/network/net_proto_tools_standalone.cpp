@@ -6,7 +6,6 @@
 #include "standalone_compat.hpp"
 #include "net_proto_analysis.hpp"
 #include "game_protocol.hpp"
-#include "obfuscation.hpp"
 #include "helpers/diag_log.hpp"
 #include "executor_status.hpp"
 #include "../runtime/standalone_driver.hpp"
@@ -270,7 +269,7 @@ tool_result_t handle_find_sendrecv(const json& raw_params)
             options.process_id,
             static_cast<unsigned long long>(elapsed),
             error.c_str());
-        return tool_result_t::error(error.empty() ? OBFSTR("send/recv scan failed") : error, result);
+        return tool_result_t::error(error.empty() ? std::string("send/recv scan failed") : error, result);
     }
     if (result.is_object() && !result.contains("handler_elapsed_ms"))
         result["handler_elapsed_ms"] = GetTickCount64() - started;
@@ -281,14 +280,14 @@ tool_result_t handle_find_sendrecv(const json& raw_params)
         result.value("result_count", 0u),
         result.value("deadline_hit", false) ? 1 : 0,
         result.value("stage", std::string()).c_str());
-    return tool_result_t::ok(OBFSTR("Socket send/recv callsite scan completed."), result);
+    return tool_result_t::ok(std::string("Socket send/recv callsite scan completed."), result);
 }
 
 tool_result_t handle_trace_serializer(const json& raw_params)
 {
     const json params = compat_action_payload(raw_params);
     if (!params.contains("serializer_va") && !params.contains("address"))
-        return tool_result_t::error(OBFSTR("'serializer_va' is required."));
+        return tool_result_t::error(std::string("'serializer_va' is required."));
 
     std::optional<std::uint64_t> va;
     if (params.contains("serializer_va") && params["serializer_va"].is_string())
@@ -309,7 +308,7 @@ tool_result_t handle_trace_serializer(const json& raw_params)
             va = static_cast<std::uint64_t>(v);
     }
     if (!va)
-        return tool_result_t::error(OBFSTR("Invalid serializer_va."));
+        return tool_result_t::error(std::string("Invalid serializer_va."));
 
     net_proto_analysis::serializer_trace_options_t options;
     options.process_id = process_id_from_params(params);
@@ -350,7 +349,7 @@ tool_result_t handle_trace_serializer(const json& raw_params)
         result["trace_runtime_status"] = net_proto_runtime_status(options.process_id, "net_proto_trace_serializer");
         attach_serializer_trace_contract(result, params, options, error);
         result["diagnostic_contract"] = "zero_capture_without_stimulus_is_not_functional_capture_evidence";
-        return tool_result_t::error(error.empty() ? OBFSTR("serializer trace failed") : error, result);
+        return tool_result_t::error(error.empty() ? std::string("serializer trace failed") : error, result);
     }
     diag::log_tagged_fmt("net_proto",
         "net_proto_trace_serializer handler_done pid=%u serializer_va=0x%llX sample_ms=%u capture_count=%u driver_sniff_started=%d backend=%s zero_capture=%d",
@@ -367,8 +366,8 @@ tool_result_t handle_trace_serializer(const json& raw_params)
     result["zero_capture_due_to_no_stimulus"] = result.value("capture_count", 0u) == 0 && result.value("stimulus_observed", false) == false;
     result["diagnostic_contract"] = "zero_capture_without_stimulus_is_not_functional_capture_evidence";
     if (result.value("capture_count", 0u) == 0)
-        return tool_result_t::error(OBFSTR("Serializer trace completed with zero captured serializer outputs."), result);
-    return tool_result_t::ok(OBFSTR("Serializer sampling completed with bounded captures."), result);
+        return tool_result_t::error(std::string("Serializer trace completed with zero captured serializer outputs."), result);
+    return tool_result_t::ok(std::string("Serializer sampling completed with bounded captures."), result);
 }
 
 tool_result_t handle_udp_reassemble(const json& raw_params)
@@ -405,12 +404,12 @@ tool_result_t handle_udp_reassemble(const json& raw_params)
             result["stimulus_observed"] = false;
             result["no_stimulus"] = true;
             result["diagnostic_contract"] = "empty_provided_payload_is_not_functional_udp_reassembly_evidence";
-            return tool_result_t::error(OBFSTR("payload_hex must contain at least one byte."), result);
+            return tool_result_t::error(std::string("payload_hex must contain at least one byte."), result);
         }
         std::string error;
         auto bytes = game_protocol::hex_to_bytes(hex, &error, options.max_payload);
         if (bytes.empty())
-            return tool_result_t::error(error.empty() ? OBFSTR("invalid payload_hex") : error);
+            return tool_result_t::error(error.empty() ? std::string("invalid payload_hex") : error);
         options.fixture_payloads.push_back(std::move(bytes));
     }
     if (params.contains("payloads_hex") && params["payloads_hex"].is_array()) {
@@ -429,12 +428,12 @@ tool_result_t handle_udp_reassemble(const json& raw_params)
                 result["stimulus_observed"] = false;
                 result["no_stimulus"] = true;
                 result["diagnostic_contract"] = "empty_provided_payload_is_not_functional_udp_reassembly_evidence";
-                return tool_result_t::error(OBFSTR("payloads_hex entries must contain at least one byte."), result);
+                return tool_result_t::error(std::string("payloads_hex entries must contain at least one byte."), result);
             }
             std::string error;
             auto bytes = game_protocol::hex_to_bytes(hex, &error, options.max_payload);
             if (bytes.empty())
-                return tool_result_t::error(error.empty() ? OBFSTR("invalid payloads_hex entry") : error);
+                return tool_result_t::error(error.empty() ? std::string("invalid payloads_hex entry") : error);
             options.fixture_payloads.push_back(std::move(bytes));
         }
     }
@@ -495,7 +494,7 @@ tool_result_t handle_udp_reassemble(const json& raw_params)
             result.value("packet_count", 0u),
             result.value("session_count", 0u),
             error.c_str());
-        return tool_result_t::error(error.empty() ? OBFSTR("UDP reassembly failed") : error, result);
+        return tool_result_t::error(error.empty() ? std::string("UDP reassembly failed") : error, result);
     }
     result["capture_sec_requested"] = capture_sec_requested;
     result["capture_sec_effective"] = capture_sec;
@@ -544,10 +543,10 @@ tool_result_t handle_udp_reassemble(const json& raw_params)
         result.value("zero_capture_due_to_no_stimulus", false) ? 1 : 0,
         first_session_id.empty() ? "<none>" : first_session_id.c_str());
     if (packet_count == 0)
-        return tool_result_t::error(OBFSTR("UDP reassembly completed with zero packets; no functional capture evidence was produced."), result);
+        return tool_result_t::error(std::string("UDP reassembly completed with zero packets; no functional capture evidence was produced."), result);
     if (session_count == 0)
-        return tool_result_t::error(OBFSTR("UDP reassembly completed with zero sessions; no functional protocol evidence was produced."), result);
-    return tool_result_t::ok(OBFSTR("UDP logical sessions reassembled with heuristic evidence."), result);
+        return tool_result_t::error(std::string("UDP reassembly completed with zero sessions; no functional protocol evidence was produced."), result);
+    return tool_result_t::ok(std::string("UDP logical sessions reassembled with heuristic evidence."), result);
 }
 
 tool_result_t handle_replay_mutate(const json& raw_params)
@@ -582,7 +581,7 @@ tool_result_t handle_replay_mutate(const json& raw_params)
             options.confirm_unsafe ? 1 : 0,
             options.target_ip.empty() ? "<empty>" : options.target_ip.c_str(),
             options.target_port);
-        return tool_result_t::error(OBFSTR("session_id is required."),
+        return tool_result_t::error(std::string("session_id is required."),
             json{{"tool", "net_replay_mutate"},
                  {"validation_code", "session_id_required"},
                  {"guard", "session_lookup"}});
@@ -599,8 +598,8 @@ tool_result_t handle_replay_mutate(const json& raw_params)
     json result;
     std::string error;
     if (!net_proto_analysis::replay_mutate(options, result, error))
-        return tool_result_t::error(error.empty() ? OBFSTR("mutation replay failed") : error, result);
-    return tool_result_t::ok(OBFSTR("Mutation replay attempted with bounded unsafe caps."), result);
+        return tool_result_t::error(error.empty() ? std::string("mutation replay failed") : error, result);
+    return tool_result_t::ok(std::string("Mutation replay attempted with bounded unsafe caps."), result);
 }
 
 }
@@ -610,56 +609,56 @@ void register_net_proto_tools(mcp_standalone::server_t& srv)
     diag::log_tagged("net_proto", "register_net_proto_tools entry");
 
     register_compat(srv, {
-        OBFSTR("net_proto_find_sendrecv"), OBFSTR("net_proto"),
-        OBFSTR("Locate probable send/recv handlers by scanning application modules for direct, thunked, IAT-indirect, and register-loaded Winsock API calls, returning ranked serializer/deserializer evidence."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Target process ID. Defaults to attached process."), false},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum findings, default 64, max 128."), false},
-         {OBFSTR("max_modules"), OBFSTR("number"), OBFSTR("Maximum non-system modules to scan."), false},
-         {OBFSTR("max_scan_bytes"), OBFSTR("number"), OBFSTR("Global byte scan cap."), false},
-         {OBFSTR("timeout_ms"), OBFSTR("number"), OBFSTR("Internal scan deadline in milliseconds, default 2500."), false},
-         {OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Optional deterministic module name/path filter."), false},
-         {OBFSTR("module_base"), OBFSTR("string"), OBFSTR("Optional deterministic module base filter."), false},
-         {OBFSTR("scan_base"), OBFSTR("string"), OBFSTR("Optional scan start VA constrained to the selected module."), false},
-         {OBFSTR("scan_size"), OBFSTR("number"), OBFSTR("Optional scan byte length constrained to the selected module."), false}},
+        std::string("net_proto_find_sendrecv"), std::string("net_proto"),
+        std::string("Locate probable send/recv handlers by scanning application modules for direct, thunked, IAT-indirect, and register-loaded Winsock API calls, returning ranked serializer/deserializer evidence."),
+        {{std::string("process_id"), std::string("number"), std::string("Target process ID. Defaults to attached process."), false},
+         {std::string("max_results"), std::string("number"), std::string("Maximum findings, default 64, max 128."), false},
+         {std::string("max_modules"), std::string("number"), std::string("Maximum non-system modules to scan."), false},
+         {std::string("max_scan_bytes"), std::string("number"), std::string("Global byte scan cap."), false},
+         {std::string("timeout_ms"), std::string("number"), std::string("Internal scan deadline in milliseconds, default 2500."), false},
+         {std::string("module_name"), std::string("string"), std::string("Optional deterministic module name/path filter."), false},
+         {std::string("module_base"), std::string("string"), std::string("Optional deterministic module base filter."), false},
+         {std::string("scan_base"), std::string("string"), std::string("Optional scan start VA constrained to the selected module."), false},
+         {std::string("scan_size"), std::string("number"), std::string("Optional scan byte length constrained to the selected module."), false}},
         handle_find_sendrecv, true});
 
     register_compat(srv, {
-        OBFSTR("net_proto_trace_serializer"), OBFSTR("net_proto"),
-        OBFSTR("Sample a serializer function through bounded register-derived hooks or network-buffer sniffing and infer output fields with explicit output-byte provenance."),
-        {{OBFSTR("serializer_va"), OBFSTR("string"), OBFSTR("Serializer function VA."), true},
-         {OBFSTR("buffer_reg"), OBFSTR("string"), OBFSTR("Buffer pointer register, default rdx."), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Target process ID. Defaults to attached process."), false},
-         {OBFSTR("size_reg"), OBFSTR("string"), OBFSTR("Size register, default r8."), false},
-         {OBFSTR("tid"), OBFSTR("number"), OBFSTR("Optional thread ID filter for kernel driver buffer sniffing."), false},
-         {OBFSTR("sample_ms"), OBFSTR("number"), OBFSTR("Bounded sampling window, default 2000, max 10000."), false},
-         {OBFSTR("max_captures"), OBFSTR("number"), OBFSTR("Capture cap, default 16, max 32."), false}},
+        std::string("net_proto_trace_serializer"), std::string("net_proto"),
+        std::string("Sample a serializer function through bounded register-derived hooks or network-buffer sniffing and infer output fields with explicit output-byte provenance."),
+        {{std::string("serializer_va"), std::string("string"), std::string("Serializer function VA."), true},
+         {std::string("buffer_reg"), std::string("string"), std::string("Buffer pointer register, default rdx."), true},
+         {std::string("process_id"), std::string("number"), std::string("Target process ID. Defaults to attached process."), false},
+         {std::string("size_reg"), std::string("string"), std::string("Size register, default r8."), false},
+         {std::string("tid"), std::string("number"), std::string("Optional thread ID filter for kernel driver buffer sniffing."), false},
+         {std::string("sample_ms"), std::string("number"), std::string("Bounded sampling window, default 2000, max 10000."), false},
+         {std::string("max_captures"), std::string("number"), std::string("Capture cap, default 16, max 32."), false}},
         handle_trace_serializer, false});
 
     register_compat(srv, {
-        OBFSTR("net_udp_session_reassemble"), OBFSTR("net_proto"),
-        OBFSTR("Capture bounded UDP traffic and group datagrams into logical sessions with endpoint fields, length-prefix framing, and multi-datagram fragment reassembly evidence for later analysis or guarded mutation."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Optional PID filter."), false},
-         {OBFSTR("capture_sec"), OBFSTR("number"), OBFSTR("Capture duration in seconds, default 10, max 15."), false},
-         {OBFSTR("max_packets"), OBFSTR("number"), OBFSTR("Packet cap, default 256, max 512."), false},
-         {OBFSTR("max_payload"), OBFSTR("number"), OBFSTR("Payload capture cap, default 1500, max 4096."), false},
-         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Optional single UDP payload for deterministic local reassembly analysis."), false},
-         {OBFSTR("payloads_hex"), OBFSTR("array"), OBFSTR("Optional UDP payload list for deterministic local reassembly analysis."), false}},
+        std::string("net_udp_session_reassemble"), std::string("net_proto"),
+        std::string("Capture bounded UDP traffic and group datagrams into logical sessions with endpoint fields, length-prefix framing, and multi-datagram fragment reassembly evidence for later analysis or guarded mutation."),
+        {{std::string("pid"), std::string("number"), std::string("Optional PID filter."), false},
+         {std::string("capture_sec"), std::string("number"), std::string("Capture duration in seconds, default 10, max 15."), false},
+         {std::string("max_packets"), std::string("number"), std::string("Packet cap, default 256, max 512."), false},
+         {std::string("max_payload"), std::string("number"), std::string("Payload capture cap, default 1500, max 4096."), false},
+         {std::string("payload_hex"), std::string("string"), std::string("Optional single UDP payload for deterministic local reassembly analysis."), false},
+         {std::string("payloads_hex"), std::string("array"), std::string("Optional UDP payload list for deterministic local reassembly analysis."), false}},
         handle_udp_reassemble, false});
 
     register_compat(srv, {
-        OBFSTR("net_replay_mutate"), OBFSTR("net_proto"),
-        OBFSTR("Replay a stored UDP session with bounded numeric field mutations. Requires allow_unsafe and confirm_unsafe; loopback-only by default and hard-capped mutation/payload counts."),
-        {{OBFSTR("session_id"), OBFSTR("string"), OBFSTR("Session ID returned by net_udp_session_reassemble."), true},
-         {OBFSTR("target_ip"), OBFSTR("string"), OBFSTR("IPv4 mutation target. Non-loopback requires allow_non_loopback."), true},
-         {OBFSTR("target_port"), OBFSTR("number"), OBFSTR("UDP target port."), true},
-         {OBFSTR("source_port"), OBFSTR("number"), OBFSTR("Optional UDP source port. Defaults to the recorded session local port."), false},
-         {OBFSTR("mutation_strategy"), OBFSTR("string"), OBFSTR("boundary|random|bitflip, default boundary."), false},
-         {OBFSTR("max_mutations"), OBFSTR("number"), OBFSTR("Mutation cap, default 64, max 256."), false},
-         {OBFSTR("payload_cap"), OBFSTR("number"), OBFSTR("Payload cap, default 1024, max 4096."), false},
-         {OBFSTR("response_wait_ms"), OBFSTR("number"), OBFSTR("Bounded response capture wait, default 500, max 5000."), false},
-         {OBFSTR("allow_unsafe"), OBFSTR("boolean"), OBFSTR("Required true."), false},
-         {OBFSTR("confirm_unsafe"), OBFSTR("boolean"), OBFSTR("Required true."), false},
-         {OBFSTR("allow_non_loopback"), OBFSTR("boolean"), OBFSTR("Allow non-loopback target."), false}},
+        std::string("net_replay_mutate"), std::string("net_proto"),
+        std::string("Replay a stored UDP session with bounded numeric field mutations. Requires allow_unsafe and confirm_unsafe; loopback-only by default and hard-capped mutation/payload counts."),
+        {{std::string("session_id"), std::string("string"), std::string("Session ID returned by net_udp_session_reassemble."), true},
+         {std::string("target_ip"), std::string("string"), std::string("IPv4 mutation target. Non-loopback requires allow_non_loopback."), true},
+         {std::string("target_port"), std::string("number"), std::string("UDP target port."), true},
+         {std::string("source_port"), std::string("number"), std::string("Optional UDP source port. Defaults to the recorded session local port."), false},
+         {std::string("mutation_strategy"), std::string("string"), std::string("boundary|random|bitflip, default boundary."), false},
+         {std::string("max_mutations"), std::string("number"), std::string("Mutation cap, default 64, max 256."), false},
+         {std::string("payload_cap"), std::string("number"), std::string("Payload cap, default 1024, max 4096."), false},
+         {std::string("response_wait_ms"), std::string("number"), std::string("Bounded response capture wait, default 500, max 5000."), false},
+         {std::string("allow_unsafe"), std::string("boolean"), std::string("Required true."), false},
+         {std::string("confirm_unsafe"), std::string("boolean"), std::string("Required true."), false},
+         {std::string("allow_non_loopback"), std::string("boolean"), std::string("Allow non-loopback target."), false}},
         handle_replay_mutate, false});
 }
 

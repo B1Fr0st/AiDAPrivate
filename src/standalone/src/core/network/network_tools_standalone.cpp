@@ -16,7 +16,6 @@
 
 #include "standalone_compat.hpp"
 #include "standalone_driver.hpp"
-#include "obfuscation.hpp"
 #include "pro.h"
 #include "decoder_pipeline.hpp"
 #include "script_engine.hpp"
@@ -1066,7 +1065,7 @@ static std::string extract_ascii(const std::uint8_t* data, std::size_t len, std:
 tool_result_t network_enumerate_connections(const json& params)
 {
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     std::uint32_t filter_pid = 0, filter_protocol = 0;
     if (params.contains("pid") && params["pid"].is_number())
@@ -1098,7 +1097,7 @@ tool_result_t network_enumerate_connections(const json& params)
     }
 
     return tool_result_t::ok(
-        std::to_string(conns.size()) + OBFSTR(" active connections found"), arr);
+        std::to_string(conns.size()) + std::string(" active connections found"), arr);
 }
 
 static std::uint64_t s_capture_start_ms = 0;
@@ -1111,7 +1110,7 @@ tool_result_t network_start_capture(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     std::uint32_t filter_pid = 0, filter_port = 0, filter_protocol = 0, max_payload = 1500;
     std::uint8_t filter_ip[16] = {};
@@ -1139,7 +1138,7 @@ tool_result_t network_start_capture(const json& params)
     diag::log_tagged_fmt("net_tools", "network_start_capture result=%d", (int)ok);
 
     if (!ok)
-        return tool_result_t::error(OBFSTR("Failed to start packet capture. Network subsystem may not be ready."));
+        return tool_result_t::error(std::string("Failed to start packet capture. Network subsystem may not be ready."));
 
     s_capture_start_ms = static_cast<std::uint64_t>(GetTickCount64());
 
@@ -1151,7 +1150,7 @@ tool_result_t network_start_capture(const json& params)
     if (params.contains("ip")) result["filter_ip"] = params["ip"];
     result["max_payload"] = max_payload;
 
-    return tool_result_t::ok(OBFSTR("Packet capture started via kernel WFP callouts"), result);
+    return tool_result_t::ok(std::string("Packet capture started via kernel WFP callouts"), result);
 }
 
 tool_result_t network_stop_capture(const json&)
@@ -1166,12 +1165,12 @@ tool_result_t network_stop_capture(const json&)
     }
 
     if (!driver_connected)
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     bool ok = driver_bridge::stop_capture();
     diag::log_tagged_fmt("net_tools", "network_stop_capture result=%d was_capturing=%d packets_captured=%u packets_dropped=%u", (int)ok, (int)was_capturing, packets_captured, packets_dropped);
     if (!ok)
-        return tool_result_t::error(OBFSTR("Failed to stop packet capture."));
+        return tool_result_t::error(std::string("Failed to stop packet capture."));
 
     const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
     const std::uint64_t duration_ms = (s_capture_start_ms != 0 && now_ms >= s_capture_start_ms) ? (now_ms - s_capture_start_ms) : 0;
@@ -1185,7 +1184,7 @@ tool_result_t network_stop_capture(const json&)
     result["packets_dropped"] = static_cast<std::uint64_t>(packets_dropped);
     result["capture_duration_ms"] = duration_ms;
 
-    return tool_result_t::ok(OBFSTR("Packet capture stopped"), result);
+    return tool_result_t::ok(std::string("Packet capture stopped"), result);
 }
 
 tool_result_t network_get_packets(const json& params)
@@ -1194,7 +1193,7 @@ tool_result_t network_get_packets(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     std::uint32_t max_packets = 32;
     if (params.contains("count") && params["count"].is_number())
@@ -1224,7 +1223,7 @@ tool_result_t network_get_packets(const json& params)
     }
 
     return tool_result_t::ok(
-        std::to_string(packets.size()) + OBFSTR(" packets retrieved"), arr);
+        std::to_string(packets.size()) + std::string(" packets retrieved"), arr);
 }
 
 tool_result_t network_analyze_packet(const json& params)
@@ -1233,7 +1232,7 @@ tool_result_t network_analyze_packet(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
 
     auto packets = driver_bridge::get_captured_packets(1);
@@ -1249,7 +1248,7 @@ tool_result_t network_analyze_packet(const json& params)
         result["functional_capture_evidence"] = false;
         result["evidence_contract"] = "packet_analysis_requires_same_run_captured_packet";
         result["message"] = "No packets are currently available for analysis.";
-        return tool_result_t::error(OBFSTR("No packets available"), result);
+        return tool_result_t::error(std::string("No packets available"), result);
     }
 
     const auto& p = packets[0];
@@ -1292,7 +1291,7 @@ tool_result_t network_analyze_packet(const json& params)
     }
 
     diag::log_tagged_fmt("net_tools", "network_analyze_packet complete payload_size=%u", (unsigned)p.payload_size);
-    return tool_result_t::ok(OBFSTR("Packet analysis complete"), result);
+    return tool_result_t::ok(std::string("Packet analysis complete"), result);
 }
 
 static constexpr std::uint16_t kDnsTypeA = 1;
@@ -2665,14 +2664,14 @@ tool_result_t network_dns_log(const json& params)
 {
     diag::log_tagged("net_tools", "network_dns_log entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (driver_bridge::attached_pid() == 0) {
         json r;
         r["driver_connected"] = true;
         r["driver_attached_pid"] = 0;
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     std::uint32_t filter_pid = 0;
@@ -2717,14 +2716,14 @@ tool_result_t network_dns_log(const json& params)
     }
 
     return tool_result_t::ok(
-        std::to_string(entries.size()) + OBFSTR(" DNS entries retrieved"), arr);
+        std::to_string(entries.size()) + std::string(" DNS entries retrieved"), arr);
 }
 
 tool_result_t network_add_filter(const json& params)
 {
     diag::log_tagged("net_tools", "network_add_filter entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     std::uint32_t action = 2;
     std::uint32_t direction = 2;
@@ -2785,17 +2784,17 @@ tool_result_t network_add_filter(const json& params)
     result["operation"] = "add";
     add_driver_request_fields(result, ok, gle);
 
-    return tool_result_t::ok(OBFSTR("Filter rule added (ID: ") + std::to_string(rule_id) + ")", result);
+    return tool_result_t::ok(std::string("Filter rule added (ID: ") + std::to_string(rule_id) + ")", result);
 }
 
 tool_result_t network_remove_filter(const json& params)
 {
     diag::log_tagged("net_tools", "network_remove_filter entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     if (!params.contains("rule_id") || !params["rule_id"].is_number())
-        return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
+        return tool_result_t::error(std::string("Missing required parameter: rule_id"));
 
     std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
     diag::log_tagged_fmt("net_tools", "network_remove_filter rule_id=%u", rule_id);
@@ -2816,14 +2815,14 @@ tool_result_t network_remove_filter(const json& params)
     result["remaining_count"] = after_ok ? after.active_filter_rules : 0;
     result["stats_after_ok"] = after_ok;
     add_driver_request_fields(result, ok, gle);
-    return tool_result_t::ok(OBFSTR("Filter rule ") + std::to_string(rule_id) + OBFSTR(" removed"), result);
+    return tool_result_t::ok(std::string("Filter rule ") + std::to_string(rule_id) + std::string(" removed"), result);
 }
 
 tool_result_t network_clear_filters(const json&)
 {
     diag::log_tagged("net_tools", "network_clear_filters entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     driver_bridge::network_stats_t before{};
     driver_bridge::network_stats_t after{};
@@ -2849,19 +2848,19 @@ tool_result_t network_clear_filters(const json&)
     result["operation"] = "clear";
     result["remaining_count"] = after_ok ? after.active_filter_rules : 0;
     add_driver_request_fields(result, ok, gle);
-    return tool_result_t::ok(OBFSTR("All filter rules cleared"), result);
+    return tool_result_t::ok(std::string("All filter rules cleared"), result);
 }
 
 tool_result_t network_stats(const json&)
 {
     diag::log_tagged("net_tools", "network_stats entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     driver_bridge::network_stats_t stats{};
     bool ok = driver_bridge::get_network_stats(stats);
     if (!ok)
-        return tool_result_t::error(OBFSTR("Failed to get network stats."));
+        return tool_result_t::error(std::string("Failed to get network stats."));
 
     std::uint32_t enumerated_active = 0;
     bool active_connections_degraded = false;
@@ -2889,7 +2888,7 @@ tool_result_t network_stats(const json&)
     result["total_dns_logged"] = stats.total_dns_logged;
     result["active_filter_rules"] = stats.active_filter_rules;
 
-    return tool_result_t::ok(OBFSTR("Network statistics"), result);
+    return tool_result_t::ok(std::string("Network statistics"), result);
 }
 
 tool_result_t network_capture_status(const json&)
@@ -2915,7 +2914,7 @@ tool_result_t network_capture_status(const json&)
             driver_bridge::attached_pid(),
             driver_bridge::status().c_str(),
             driver_bridge::last_error().size());
-        return tool_result_t::error(OBFSTR("Driver not connected."), result);
+        return tool_result_t::error(std::string("Driver not connected."), result);
     }
 
     bool active = false;
@@ -2930,7 +2929,7 @@ tool_result_t network_capture_status(const json&)
         static_cast<unsigned long long>(aida::network::executor_status::work_pending()),
         static_cast<unsigned long long>(aida::network::executor_status::critical_pending()));
     if (!ok)
-        return tool_result_t::error(OBFSTR("Failed to get capture status."));
+        return tool_result_t::error(std::string("Failed to get capture status."));
 
     json result;
     result["backend"] = "whoswho_driver_capture";
@@ -2951,7 +2950,7 @@ tool_result_t network_capture_status(const json&)
     aida::network::executor_status::attach_executor_snapshots(result);
     result["evidence_contract"] = "functional_capture_evidence_requires_active_capture_or_nonzero_packet_counters";
 
-    return tool_result_t::ok(active ? OBFSTR("Capture is active") : OBFSTR("Capture is stopped"), result);
+    return tool_result_t::ok(active ? std::string("Capture is active") : std::string("Capture is stopped"), result);
 }
 
 tool_result_t network_block_ip(const json& params)
@@ -2960,14 +2959,14 @@ tool_result_t network_block_ip(const json& params)
     if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_block_ip entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     if (!params.contains("ip") || !params["ip"].is_string())
-        return tool_result_t::error(OBFSTR("Missing required parameter: ip (e.g. '192.168.1.1')"));
+        return tool_result_t::error(std::string("Missing required parameter: ip (e.g. '192.168.1.1')"));
 
     std::uint8_t ip[16] = {}, mask[16] = {};
     if (!parse_ipv4(params["ip"].get<std::string>(), ip))
-        return tool_result_t::error(OBFSTR("Invalid IPv4 address"));
+        return tool_result_t::error(std::string("Invalid IPv4 address"));
 
     std::memset(mask, 0xFF, 4);
 
@@ -2994,7 +2993,7 @@ tool_result_t network_block_ip(const json& params)
     result["direction"] = (direction == 0) ? "inbound" : (direction == 1) ? "outbound" : "both";
     result["operation"] = "block_ip";
     add_driver_request_fields(result, block_ok, gle);
-    return tool_result_t::ok(OBFSTR("IP blocked: ") + params["ip"].get<std::string>(), result);
+    return tool_result_t::ok(std::string("IP blocked: ") + params["ip"].get<std::string>(), result);
 }
 
 tool_result_t network_block_port(const json& params)
@@ -3003,10 +3002,10 @@ tool_result_t network_block_port(const json& params)
     if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_block_port entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     if (!params.contains("port") || !params["port"].is_number())
-        return tool_result_t::error(OBFSTR("Missing required parameter: port"));
+        return tool_result_t::error(std::string("Missing required parameter: port"));
 
     std::uint32_t port = params["port"].get<std::uint32_t>();
     std::uint32_t protocol = 0;
@@ -3032,7 +3031,7 @@ tool_result_t network_block_port(const json& params)
     if (protocol) result["protocol"] = protocol_name(protocol);
     result["operation"] = "block_port";
     add_driver_request_fields(result, port_ok, gle);
-    return tool_result_t::ok(OBFSTR("Port blocked: ") + std::to_string(port), result);
+    return tool_result_t::ok(std::string("Port blocked: ") + std::to_string(port), result);
 }
 
 tool_result_t network_block_process(const json& params)
@@ -3041,16 +3040,16 @@ tool_result_t network_block_process(const json& params)
     if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_block_process entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     if (!params.contains("pid") || !params["pid"].is_number())
-        return tool_result_t::error(OBFSTR("Missing required parameter: pid"));
+        return tool_result_t::error(std::string("Missing required parameter: pid"));
 
     std::uint32_t pid = params["pid"].get<std::uint32_t>();
     diag::log_tagged_fmt("net_tools", "network_block_process pid=%u", pid);
     if (!process_exists(pid)) {
         diag::log_tagged_fmt("net_tools", "network_block_process rejected missing pid=%u", pid);
-        return tool_result_t::error(OBFSTR("Cannot block network traffic for a process that is not running."));
+        return tool_result_t::error(std::string("Cannot block network traffic for a process that is not running."));
     }
 
     std::uint32_t rule_id = 0;
@@ -3068,7 +3067,7 @@ tool_result_t network_block_process(const json& params)
     result["pid"] = pid;
     result["operation"] = "block_process";
     add_driver_request_fields(result, proc_ok, gle);
-    return tool_result_t::ok(OBFSTR("All network traffic blocked for PID ") + std::to_string(pid), result);
+    return tool_result_t::ok(std::string("All network traffic blocked for PID ") + std::to_string(pid), result);
 }
 
 
@@ -3350,7 +3349,7 @@ tool_result_t network_deep_inspect(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     std::uint32_t filter_pid = 0, filter_protocol = 0, filter_port = 0;
     if (params.contains("pid") && params["pid"].is_number()) filter_pid = params["pid"].get<std::uint32_t>();
@@ -3393,7 +3392,7 @@ tool_result_t network_deep_inspect(const json& params)
         if (d.is_dns) entry["app_protocol"] = "DNS";
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(results.size()) + OBFSTR(" DPI results"), arr);
+    return tool_result_t::ok(std::to_string(results.size()) + std::string(" DPI results"), arr);
 }
 
 tool_result_t network_follow_tcp_stream(const json& params)
@@ -3402,9 +3401,9 @@ tool_result_t network_follow_tcp_stream(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
-        return tool_result_t::error(OBFSTR("Missing required parameter: operation ('start', 'stop', or 'get')"));
+        return tool_result_t::error(std::string("Missing required parameter: operation ('start', 'stop', or 'get')"));
 
     std::string op = params["operation"].get<std::string>();
     std::uint32_t src_port = 0, dst_port = 0, pid = 0;
@@ -3416,14 +3415,14 @@ tool_result_t network_follow_tcp_stream(const json& params)
     if (op == "start") {
         bool ok = driver_bridge::stream_reassemble_op(0, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
         diag::log_tagged_fmt("net_tools", "network_follow_tcp_stream start result=%d", (int)ok);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to start stream reassembly. Max 1024 concurrent streams."));
+        if (!ok) return tool_result_t::error(std::string("Failed to start stream reassembly. Max 1024 concurrent streams."));
         json r; r["status"] = "started"; r["src_port"] = src_port; r["dst_port"] = dst_port;
-        return tool_result_t::ok(OBFSTR("TCP stream reassembly started"), r);
+        return tool_result_t::ok(std::string("TCP stream reassembly started"), r);
     } else if (op == "stop") {
         bool ok = driver_bridge::stream_reassemble_op(1, src_port, dst_port, pid, nullptr, nullptr, nullptr, nullptr, nullptr);
         diag::log_tagged_fmt("net_tools", "network_follow_tcp_stream stop result=%d", (int)ok);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to stop stream reassembly."));
-        return tool_result_t::ok(OBFSTR("TCP stream reassembly stopped"));
+        if (!ok) return tool_result_t::error(std::string("Failed to stop stream reassembly."));
+        return tool_result_t::ok(std::string("TCP stream reassembly stopped"));
     } else if (op == "get") {
         std::vector<std::uint8_t> stream_data;
         std::uint32_t total_packets = 0, truncated = 0;
@@ -3436,9 +3435,9 @@ tool_result_t network_follow_tcp_stream(const json& params)
             r["truncated"] = 0;
             r["stream_empty"] = true;
             r["message"] = "No stream selector was provided and no active reassembly data is available.";
-            return tool_result_t::ok(OBFSTR("0 bytes reassembled"), r);
+            return tool_result_t::ok(std::string("0 bytes reassembled"), r);
         }
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to get reassembled stream data."));
+        if (!ok) return tool_result_t::error(std::string("Failed to get reassembled stream data."));
         json r;
         r["total_bytes"] = stream_data.size();
         r["total_packets"] = total_packets;
@@ -3447,16 +3446,16 @@ tool_result_t network_follow_tcp_stream(const json& params)
             r["hex_dump"] = hex_dump(stream_data.data(), stream_data.size(), 1024);
             r["ascii"] = extract_ascii(stream_data.data(), stream_data.size(), 2048);
         }
-        return tool_result_t::ok(std::to_string(stream_data.size()) + OBFSTR(" bytes reassembled"), r);
+        return tool_result_t::ok(std::to_string(stream_data.size()) + std::string(" bytes reassembled"), r);
     }
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'start', 'stop', or 'get'."));
+    return tool_result_t::error(std::string("Invalid operation. Use 'start', 'stop', or 'get'."));
 }
 
 tool_result_t network_parse_http(const json& params)
 {
     diag::log_tagged("net_tools", "network_parse_http entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     std::uint32_t max_pkts = 32;
     if (params.contains("count") && params["count"].is_number())
@@ -3501,15 +3500,15 @@ tool_result_t network_parse_http(const json& params)
 
     diag::log_tagged_fmt("net_tools", "network_parse_http parsed=%zu", arr.size());
     if (arr.empty())
-        return tool_result_t::ok(OBFSTR("No HTTP messages found in captured packets. Ensure capture is active and HTTP traffic is flowing."), arr);
-    return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" HTTP messages parsed"), arr);
+        return tool_result_t::ok(std::string("No HTTP messages found in captured packets. Ensure capture is active and HTTP traffic is flowing."), arr);
+    return tool_result_t::ok(std::to_string(arr.size()) + std::string(" HTTP messages parsed"), arr);
 }
 
 tool_result_t network_parse_tls(const json& params)
 {
     diag::log_tagged("net_tools", "network_parse_tls entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     std::uint32_t max_pkts = 32;
     if (params.contains("count") && params["count"].is_number())
@@ -3555,8 +3554,8 @@ tool_result_t network_parse_tls(const json& params)
 
     diag::log_tagged_fmt("net_tools", "network_parse_tls parsed=%zu", arr.size());
     if (arr.empty())
-        return tool_result_t::ok(OBFSTR("No TLS records found in captured packets. Ensure capture is active and HTTPS traffic is flowing."), arr);
-    return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" TLS records parsed"), arr);
+        return tool_result_t::ok(std::string("No TLS records found in captured packets. Ensure capture is active and HTTPS traffic is flowing."), arr);
+    return tool_result_t::ok(std::to_string(arr.size()) + std::string(" TLS records parsed"), arr);
 }
 
 static const char* wfp_action_type_name(std::uint32_t action)
@@ -3608,14 +3607,14 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
 {
     diag::log_tagged("net_tools", "network_enumerate_wfp_callouts entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (driver_bridge::attached_pid() == 0) {
         json r;
         r["driver_connected"] = true;
         r["driver_attached_pid"] = 0;
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     std::string filter_module;
@@ -3702,7 +3701,7 @@ tool_result_t network_enumerate_wfp_callouts(const json& params)
     }
     diag::log_tagged_fmt("net_tools", "network_enumerate_wfp_callouts source_counts bfe=%zu runtime_registered_fallback=%zu",
                          bfe_count, runtime_fallback_count);
-    return tool_result_t::ok(std::to_string(callouts.size()) + OBFSTR(" WFP entries found"), arr);
+    return tool_result_t::ok(std::to_string(callouts.size()) + std::string(" WFP entries found"), arr);
 }
 
 tool_result_t network_get_socket_handles(const json& params)
@@ -3732,9 +3731,9 @@ tool_result_t network_get_socket_handles(const json& params)
             d["owner_rows"] = owner_rows.size();
             add_driver_request_fields(d, false, ERROR_INVALID_FUNCTION);
             d["diagnostic"] = "kernel driver is not connected and IP Helper returned no socket owners";
-            return tool_result_t::error(OBFSTR("No socket owner rows available without the kernel driver."), d);
+            return tool_result_t::error(std::string("No socket owner rows available without the kernel driver."), d);
         }
-        return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" socket entries found via IP Helper; handle values unavailable without the kernel driver"), arr);
+        return tool_result_t::ok(std::to_string(arr.size()) + std::string(" socket entries found via IP Helper; handle values unavailable without the kernel driver"), arr);
     }
 
     std::set<std::uint32_t> query_pids;
@@ -3799,21 +3798,21 @@ tool_result_t network_get_socket_handles(const json& params)
         arr.size(),
         socks.size(),
         fallback_count);
-    return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" socket entries found"), arr);
+    return tool_result_t::ok(std::to_string(arr.size()) + std::string(" socket entries found"), arr);
 }
 
 tool_result_t network_dump_tcpip(const json& params)
 {
     diag::log_tagged("net_tools", "network_dump_tcpip entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (driver_bridge::attached_pid() == 0) {
         json r;
         r["driver_connected"] = true;
         r["driver_attached_pid"] = 0;
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     std::uint32_t target_pid = 0, filter_protocol = 0;
@@ -3844,21 +3843,21 @@ tool_result_t network_dump_tcpip(const json& params)
         entry["create_time"] = c.create_time;
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(conns.size()) + OBFSTR(" TCPIP connections dumped"), arr);
+    return tool_result_t::ok(std::to_string(conns.size()) + std::string(" TCPIP connections dumped"), arr);
 }
 
 tool_result_t network_enumerate_interfaces(const json&)
 {
     diag::log_tagged("net_tools", "network_enumerate_interfaces entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (driver_bridge::attached_pid() == 0) {
         json r;
         r["driver_connected"] = true;
         r["driver_attached_pid"] = 0;
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     auto ifaces = driver_bridge::enumerate_interfaces();
@@ -3880,7 +3879,7 @@ tool_result_t network_enumerate_interfaces(const json&)
         entry["out_bytes"] = ifc.out_octets;
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(ifaces.size()) + OBFSTR(" network interfaces"), arr);
+    return tool_result_t::ok(std::to_string(ifaces.size()) + std::string(" network interfaces"), arr);
 }
 
 tool_result_t network_inject_packet(const json& params)
@@ -3891,7 +3890,7 @@ tool_result_t network_inject_packet(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     std::uint32_t direction = 1, protocol = 6, af = 2;
     std::uint32_t src_port = 0, dst_port = 0;
@@ -3922,7 +3921,7 @@ tool_result_t network_inject_packet(const json& params)
         payload.assign(text.begin(), text.end());
     }
     if (payload.empty())
-        return tool_result_t::error(OBFSTR("Payload required. Provide 'payload_hex' or 'payload_text'."));
+        return tool_result_t::error(std::string("Payload required. Provide 'payload_hex' or 'payload_text'."));
 
     diag::log_tagged_fmt("net_tools", "network_inject_packet direction=%u protocol=%u src_port=%u dst_port=%u payload=%zu", direction, protocol, src_port, dst_port, payload.size());
     bool ok = driver_bridge::inject_packet(direction, protocol, af, src_port, dst_port,
@@ -3939,7 +3938,7 @@ tool_result_t network_inject_packet(const json& params)
     r["direction"] = (direction == 0) ? "inbound" : "outbound";
     r["protocol"] = protocol_name(protocol);
     r["payload_size"] = payload.size();
-    return tool_result_t::ok(OBFSTR("Packet injected successfully"), r);
+    return tool_result_t::ok(std::string("Packet injected successfully"), r);
 }
 
 tool_result_t network_modify_packet_rule(const json& params)
@@ -3948,9 +3947,9 @@ tool_result_t network_modify_packet_rule(const json& params)
     if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_modify_packet_rule entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
-        return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
+        return tool_result_t::error(std::string("Missing required parameter: operation ('add', 'remove', or 'clear')"));
 
     std::string op = params["operation"].get<std::string>();
     diag::log_tagged_fmt("net_tools", "network_modify_packet_rule op=%s", op.c_str());
@@ -3983,7 +3982,7 @@ tool_result_t network_modify_packet_rule(const json& params)
             replacement.assign(t.begin(), t.end());
         }
         if (pattern.empty())
-            return tool_result_t::error(OBFSTR("Pattern required for 'add'. Provide 'pattern_hex' or 'pattern_text'."));
+            return tool_result_t::error(std::string("Pattern required for 'add'. Provide 'pattern_hex' or 'pattern_text'."));
 
         std::uint32_t rule_id = 0;
         diag::log_tagged_fmt("net_tools", "network_modify_packet_rule add direction=%u proto=%u port=%u pid=%u pattern=%zu replacement=%zu", direction, protocol, port, pid, pattern.size(), replacement.size());
@@ -4008,10 +4007,10 @@ tool_result_t network_modify_packet_rule(const json& params)
         r["port"] = port;
         r["pid"] = pid;
         add_driver_request_fields(r, ok, gle);
-        return tool_result_t::ok(OBFSTR("Packet modification rule added (ID: ") + std::to_string(rule_id) + ")", r);
+        return tool_result_t::ok(std::string("Packet modification rule added (ID: ") + std::to_string(rule_id) + ")", r);
     } else if (op == "remove") {
         if (!params.contains("rule_id") || !params["rule_id"].is_number())
-            return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
+            return tool_result_t::error(std::string("Missing required parameter: rule_id"));
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
         bool ok = driver_bridge::packet_mod_rule_op(1, rule_id);
         const DWORD gle = GetLastError();
@@ -4026,7 +4025,7 @@ tool_result_t network_modify_packet_rule(const json& params)
         r["rule_id"] = rule_id;
         r["remaining_count"] = remaining.size();
         add_driver_request_fields(r, ok, gle);
-        return tool_result_t::ok(OBFSTR("Modification rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
+        return tool_result_t::ok(std::string("Modification rule ") + std::to_string(rule_id) + std::string(" removed"), r);
     } else if (op == "clear") {
         auto before = driver_bridge::list_packet_mod_rules();
         bool ok = driver_bridge::packet_mod_rule_op(3);
@@ -4044,23 +4043,23 @@ tool_result_t network_modify_packet_rule(const json& params)
         r["remaining_count"] = remaining.size();
         r["cleared"] = remaining.empty();
         add_driver_request_fields(r, ok, gle);
-        return tool_result_t::ok(OBFSTR("All packet modification rules cleared"), r);
+        return tool_result_t::ok(std::string("All packet modification rules cleared"), r);
     }
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'add', 'remove', or 'clear'."));
+    return tool_result_t::error(std::string("Invalid operation. Use 'add', 'remove', or 'clear'."));
 }
 
 tool_result_t network_list_mod_rules(const json&)
 {
     diag::log_tagged("net_tools", "network_list_mod_rules entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (driver_bridge::attached_pid() == 0) {
         json r;
         r["driver_connected"] = true;
         r["driver_attached_pid"] = 0;
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     auto rules = driver_bridge::list_packet_mod_rules();
@@ -4077,7 +4076,7 @@ tool_result_t network_list_mod_rules(const json&)
         entry["active"] = r.active != 0;
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(rules.size()) + OBFSTR(" packet modification rules"), arr);
+    return tool_result_t::ok(std::to_string(rules.size()) + std::string(" packet modification rules"), arr);
 }
 
 static json redirect_rule_to_json(const driver_bridge::redirect_rule_info_t& rule) {
@@ -4192,10 +4191,10 @@ tool_result_t network_redirect_traffic(const json& params)
             {"driver_last_error", driver_bridge::last_error()},
             {"elapsed_ms", static_cast<std::uint64_t>(GetTickCount64() - start_ms)}
         };
-        return tool_result_t::error(OBFSTR("Driver not connected."), r);
+        return tool_result_t::error(std::string("Driver not connected."), r);
     }
     if (!params.contains("operation") || !params["operation"].is_string())
-        return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
+        return tool_result_t::error(std::string("Missing required parameter: operation ('add', 'remove', or 'clear')"));
 
     std::string op = params["operation"].get<std::string>();
     diag::log_tagged_fmt("net_tools", "network_redirect_traffic op=%s", op.c_str());
@@ -4217,9 +4216,9 @@ tool_result_t network_redirect_traffic(const json& params)
         const bool match_ip_ok = params.contains("match_ip") && params["match_ip"].is_string() ? parse_ipv4(params["match_ip"].get<std::string>(), match_addr) : true;
         const bool redirect_ip_ok = params.contains("redirect_ip") && params["redirect_ip"].is_string() ? parse_ipv4(params["redirect_ip"].get<std::string>(), redirect_addr) : true;
         if (!match_ip_ok)
-            return tool_result_t::error(OBFSTR("Invalid match_ip"));
+            return tool_result_t::error(std::string("Invalid match_ip"));
         if (!redirect_ip_ok)
-            return tool_result_t::error(OBFSTR("Invalid redirect_ip"));
+            return tool_result_t::error(std::string("Invalid redirect_ip"));
 
         auto before = driver_bridge::list_redirect_rules();
         std::uint32_t rule_id = 0;
@@ -4257,10 +4256,10 @@ tool_result_t network_redirect_traffic(const json& params)
             return tool_result_t::error(format_kernel_session_failure("Failed to add redirect rule", gle,
                 std::string("max 16 rules")), r);
         }
-        return tool_result_t::ok(OBFSTR("Traffic redirect rule added (ID: ") + std::to_string(rule_id) + ")", r);
+        return tool_result_t::ok(std::string("Traffic redirect rule added (ID: ") + std::to_string(rule_id) + ")", r);
     } else if (op == "remove") {
         if (!params.contains("rule_id"))
-            return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
+            return tool_result_t::error(std::string("Missing required parameter: rule_id"));
         std::uint32_t rule_id = 0;
         std::string parse_error;
         if (!parse_json_u32_param(params, "rule_id", rule_id, parse_error))
@@ -4293,7 +4292,7 @@ tool_result_t network_redirect_traffic(const json& params)
             return tool_result_t::error(format_kernel_session_failure("Failed to remove redirect rule", gle,
                 std::string("rule_id=") + std::to_string(rule_id)), r);
         }
-        return tool_result_t::ok(OBFSTR("Redirect rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
+        return tool_result_t::ok(std::string("Redirect rule ") + std::to_string(rule_id) + std::string(" removed"), r);
     } else if (op == "clear") {
         auto before = driver_bridge::list_redirect_rules();
         bool ok = driver_bridge::traffic_redirect_op(3);
@@ -4319,9 +4318,9 @@ tool_result_t network_redirect_traffic(const json& params)
             log_net_tools_failure("network_redirect_traffic_clear", gle);
             return tool_result_t::error(format_kernel_session_failure("Failed to clear redirect rules", gle), r);
         }
-        return tool_result_t::ok(OBFSTR("All traffic redirect rules cleared"), r);
+        return tool_result_t::ok(std::string("All traffic redirect rules cleared"), r);
     }
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'add', 'remove', or 'clear'."));
+    return tool_result_t::error(std::string("Invalid operation. Use 'add', 'remove', or 'clear'."));
 }
 
 tool_result_t network_list_redirect_rules(const json&)
@@ -4338,7 +4337,7 @@ tool_result_t network_list_redirect_rules(const json&)
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
         r["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64() - start_ms);
-        return tool_result_t::error(OBFSTR("Driver not connected."), r);
+        return tool_result_t::error(std::string("Driver not connected."), r);
     }
     if (driver_bridge::attached_pid() == 0) {
         json r;
@@ -4349,7 +4348,7 @@ tool_result_t network_list_redirect_rules(const json&)
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
         r["elapsed_ms"] = static_cast<std::uint64_t>(GetTickCount64() - start_ms);
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     auto rules = driver_bridge::list_redirect_rules();
@@ -4370,7 +4369,7 @@ tool_result_t network_list_redirect_rules(const json&)
         static_cast<unsigned long>(gle),
         wsa_error,
         static_cast<unsigned long long>(GetTickCount64() - start_ms));
-    return tool_result_t::ok(std::to_string(rules.size()) + OBFSTR(" traffic redirect rules"), out);
+    return tool_result_t::ok(std::to_string(rules.size()) + std::string(" traffic redirect rules"), out);
 }
 
 tool_result_t network_intercept(const json& params)
@@ -4381,7 +4380,7 @@ tool_result_t network_intercept(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!params.contains("operation") || !params["operation"].is_string())
-        return tool_result_t::error(OBFSTR("Missing required parameter: operation ('enable' or 'disable')"));
+        return tool_result_t::error(std::string("Missing required parameter: operation ('enable' or 'disable')"));
 
     std::string op = params["operation"].get<std::string>();
     diag::log_tagged_fmt("net_tools", "network_intercept op=%s", op.c_str());
@@ -4424,7 +4423,7 @@ tool_result_t network_intercept(const json& params)
                 filter_port,
                 filter_protocol,
                 static_cast<unsigned long>(ERROR_INVALID_PARAMETER));
-            return tool_result_t::error(OBFSTR("Packet interception enable requires at least one explicit filter."), r);
+            return tool_result_t::error(std::string("Packet interception enable requires at least one explicit filter."), r);
         }
         if (!driver_bridge::using_kernel_driver()) {
             json r;
@@ -4450,7 +4449,7 @@ tool_result_t network_intercept(const json& params)
                 filter_protocol,
                 driver_bridge::status().c_str(),
                 driver_bridge::last_error().c_str());
-            return tool_result_t::error(OBFSTR("Driver not connected."), r);
+            return tool_result_t::error(std::string("Driver not connected."), r);
         }
         std::uint32_t held_count = 0; bool active = false;
         diag::log_tagged_fmt("net_tools", "network_intercept enable pid=%u port=%u proto=%u", filter_pid, filter_port, filter_protocol);
@@ -4511,14 +4510,14 @@ tool_result_t network_intercept(const json& params)
                 (int)cleanup_active,
                 cleanup_held_count,
                 static_cast<unsigned long>(cleanup_gle));
-            return tool_result_t::error(OBFSTR("Failed to enable packet interception: Win32 error ") +
-                std::to_string(static_cast<unsigned long>(ok ? ERROR_GEN_FAILURE : gle)) + OBFSTR(" (") +
-                win32_error_message(ok ? ERROR_GEN_FAILURE : gle) + OBFSTR(")."), r);
+            return tool_result_t::error(std::string("Failed to enable packet interception: Win32 error ") +
+                std::to_string(static_cast<unsigned long>(ok ? ERROR_GEN_FAILURE : gle)) + std::string(" (") +
+                win32_error_message(ok ? ERROR_GEN_FAILURE : gle) + std::string(")."), r);
         }
         r["cleanup_attempted"] = false;
         r["cleanup_result"] = "not_needed";
         add_intercept_ntstatus_hint(r, ERROR_SUCCESS, "driver_request_success");
-        return tool_result_t::ok(OBFSTR("Packet interception enabled. Matching packets will be held for inspection."), r);
+        return tool_result_t::ok(std::string("Packet interception enabled. Matching packets will be held for inspection."), r);
     } else if (op == "disable") {
         if (!driver_bridge::using_kernel_driver()) {
             json r;
@@ -4533,7 +4532,7 @@ tool_result_t network_intercept(const json& params)
             r["cleanup_attempted"] = false;
             r["cleanup_result"] = "not_started_driver_not_connected";
             add_intercept_ntstatus_hint(r, ERROR_INVALID_HANDLE, "driver_not_connected");
-            return tool_result_t::error(OBFSTR("Driver not connected."), r);
+            return tool_result_t::error(std::string("Driver not connected."), r);
         }
         SetLastError(ERROR_SUCCESS);
         bool ok = driver_bridge::intercept_op(1, 0, 0, 0, 0, nullptr, 0, nullptr, nullptr);
@@ -4561,18 +4560,18 @@ tool_result_t network_intercept(const json& params)
             log_net_tools_failure("network_intercept_disable", gle);
             r["failure_phase"] = "driver_intercept_disable_ioctl";
             r["diagnostic"] = "driver rejected packet interception disable request";
-            return tool_result_t::error(OBFSTR("Failed to disable packet interception: ") + format_kernel_session_failure("intercept_disable", gle), r);
+            return tool_result_t::error(std::string("Failed to disable packet interception: ") + format_kernel_session_failure("intercept_disable", gle), r);
         }
-        return tool_result_t::ok(OBFSTR("Packet interception disabled. All held packets released."), r);
+        return tool_result_t::ok(std::string("Packet interception disabled. All held packets released."), r);
     }
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'enable' or 'disable'."));
+    return tool_result_t::error(std::string("Invalid operation. Use 'enable' or 'disable'."));
 }
 
 tool_result_t network_get_held_packets(const json&)
 {
     diag::log_tagged("net_tools", "network_get_held_packets entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     auto held = driver_bridge::get_held_packets();
     diag::log_tagged_fmt("net_tools", "network_get_held_packets count=%zu", held.size());
@@ -4593,16 +4592,16 @@ tool_result_t network_get_held_packets(const json&)
         }
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(held.size()) + OBFSTR(" packets held for inspection"), arr);
+    return tool_result_t::ok(std::to_string(held.size()) + std::string(" packets held for inspection"), arr);
 }
 
 tool_result_t network_release_packet(const json& params)
 {
     diag::log_tagged("net_tools", "network_release_packet entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (!params.contains("hold_id") || !params["hold_id"].is_number())
-        return tool_result_t::error(OBFSTR("Missing required parameter: hold_id"));
+        return tool_result_t::error(std::string("Missing required parameter: hold_id"));
 
     std::uint64_t hold_id = params["hold_id"].get<std::uint64_t>();
     diag::log_tagged_fmt("net_tools", "network_release_packet hold_id=%llu", static_cast<unsigned long long>(hold_id));
@@ -4612,7 +4611,7 @@ tool_result_t network_release_packet(const json& params)
     });
     diag::log_tagged_fmt("net_tools", "network_release_packet held_count=%zu hold_exists=%d", held.size(), hold_exists ? 1 : 0);
     if (!hold_exists)
-        return tool_result_t::error(OBFSTR("Held packet ID was not found."));
+        return tool_result_t::error(std::string("Held packet ID was not found."));
 
     std::vector<std::uint8_t> modify_payload;
     std::uint32_t operation = 3;
@@ -4653,7 +4652,7 @@ tool_result_t network_release_packet(const json& params)
     r["remaining_held_count"] = remaining.size();
     r["modified_payload_size"] = modify_payload.size();
     add_driver_request_fields(r, ok, gle);
-    return tool_result_t::ok(OBFSTR("Packet ") + action_str, r);
+    return tool_result_t::ok(std::string("Packet ") + action_str, r);
 }
 
 tool_result_t network_kill_connection(const json& params)
@@ -4662,7 +4661,7 @@ tool_result_t network_kill_connection(const json& params)
     if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_kill_connection entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     std::uint32_t protocol = 6, af = 2, src_port = 0, dst_port = 0, pid = 0;
     std::uint8_t src_addr[16] = {}, dst_addr[16] = {};
@@ -4683,10 +4682,10 @@ tool_result_t network_kill_connection(const json& params)
         return addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 0;
     };
     if (!has_src_ip || !has_dst_ip || addr_is_zero(src_addr) || addr_is_zero(dst_addr)) {
-        return tool_result_t::error(OBFSTR("Refusing to kill connection without explicit non-wildcard src_ip and dst_ip"));
+        return tool_result_t::error(std::string("Refusing to kill connection without explicit non-wildcard src_ip and dst_ip"));
     }
     if (src_port == 0 || dst_port == 0) {
-        return tool_result_t::error(OBFSTR("Refusing to kill connection without explicit non-zero src_port and dst_port"));
+        return tool_result_t::error(std::string("Refusing to kill connection without explicit non-zero src_port and dst_port"));
     }
 
     diag::log_tagged_fmt("net_tools", "network_kill_connection protocol=%u src_port=%u dst_port=%u pid=%u", protocol, src_port, dst_port, pid);
@@ -4709,7 +4708,7 @@ tool_result_t network_kill_connection(const json& params)
     r["tuple"] = r["src_ip"].get<std::string>() + ":" + std::to_string(src_port) + " -> " +
         r["dst_ip"].get<std::string>() + ":" + std::to_string(dst_port);
     add_driver_request_fields(r, ok, gle);
-    return tool_result_t::ok(OBFSTR("Connection killed successfully"), r);
+    return tool_result_t::ok(std::string("Connection killed successfully"), r);
 }
 
 tool_result_t network_spoof_dns(const json& params)
@@ -4718,17 +4717,17 @@ tool_result_t network_spoof_dns(const json& params)
     if (!adm.admitted) return admission_reject_result(adm);
     diag::log_tagged("net_tools", "network_spoof_dns entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
-        return tool_result_t::error(OBFSTR("Missing required parameter: operation ('add', 'remove', or 'clear')"));
+        return tool_result_t::error(std::string("Missing required parameter: operation ('add', 'remove', or 'clear')"));
 
     std::string op = params["operation"].get<std::string>();
     diag::log_tagged_fmt("net_tools", "network_spoof_dns op=%s", op.c_str());
     if (op == "add") {
         if (!params.contains("domain") || !params["domain"].is_string())
-            return tool_result_t::error(OBFSTR("Missing required parameter: domain"));
+            return tool_result_t::error(std::string("Missing required parameter: domain"));
         if (!params.contains("spoof_ip") || !params["spoof_ip"].is_string())
-            return tool_result_t::error(OBFSTR("Missing required parameter: spoof_ip"));
+            return tool_result_t::error(std::string("Missing required parameter: spoof_ip"));
 
         std::string domain = params["domain"].get<std::string>();
         std::uint8_t spoof_addr[16] = {};
@@ -4756,10 +4755,10 @@ tool_result_t network_spoof_dns(const json& params)
         r["ttl"] = ttl;
         r["remaining_count"] = remaining.size();
         add_driver_request_fields(r, ok, gle);
-        return tool_result_t::ok(OBFSTR("DNS spoof rule added: ") + domain + OBFSTR(" -> ") + params["spoof_ip"].get<std::string>(), r);
+        return tool_result_t::ok(std::string("DNS spoof rule added: ") + domain + std::string(" -> ") + params["spoof_ip"].get<std::string>(), r);
     } else if (op == "remove") {
         if (!params.contains("rule_id") || !params["rule_id"].is_number())
-            return tool_result_t::error(OBFSTR("Missing required parameter: rule_id"));
+            return tool_result_t::error(std::string("Missing required parameter: rule_id"));
         std::uint32_t rule_id = params["rule_id"].get<std::uint32_t>();
         bool ok = driver_bridge::dns_spoof_op(1, rule_id, nullptr, nullptr, 2, 0, nullptr);
         const DWORD gle = GetLastError();
@@ -4775,7 +4774,7 @@ tool_result_t network_spoof_dns(const json& params)
         r["rule_id"] = rule_id;
         r["remaining_count"] = remaining.size();
         add_driver_request_fields(r, ok, gle);
-        return tool_result_t::ok(OBFSTR("DNS spoof rule ") + std::to_string(rule_id) + OBFSTR(" removed"), r);
+        return tool_result_t::ok(std::string("DNS spoof rule ") + std::to_string(rule_id) + std::string(" removed"), r);
     } else if (op == "clear") {
         auto before = driver_bridge::list_dns_spoof_rules();
         bool ok = driver_bridge::dns_spoof_op(3, 0, nullptr, nullptr, 2, 0, nullptr);
@@ -4794,23 +4793,23 @@ tool_result_t network_spoof_dns(const json& params)
         r["remaining_count"] = remaining.size();
         r["cleared"] = remaining.empty();
         add_driver_request_fields(r, ok, gle);
-        return tool_result_t::ok(OBFSTR("All DNS spoof rules cleared"), r);
+        return tool_result_t::ok(std::string("All DNS spoof rules cleared"), r);
     }
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'add', 'remove', or 'clear'."));
+    return tool_result_t::error(std::string("Invalid operation. Use 'add', 'remove', or 'clear'."));
 }
 
 tool_result_t network_list_dns_spoof_rules(const json&)
 {
     diag::log_tagged("net_tools", "network_list_dns_spoof_rules entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (driver_bridge::attached_pid() == 0) {
         json r;
         r["driver_connected"] = true;
         r["driver_attached_pid"] = 0;
         r["driver_status"] = driver_bridge::status();
         r["driver_last_error"] = driver_bridge::last_error();
-        return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+        return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
     }
 
     auto rules = driver_bridge::list_dns_spoof_rules();
@@ -4825,16 +4824,16 @@ tool_result_t network_list_dns_spoof_rules(const json&)
         entry["active"] = r.active != 0;
         arr.push_back(entry);
     }
-    return tool_result_t::ok(std::to_string(rules.size()) + OBFSTR(" DNS spoof rules"), arr);
+    return tool_result_t::ok(std::to_string(rules.size()) + std::string(" DNS spoof rules"), arr);
 }
 
 tool_result_t network_bandwidth_monitor(const json& params)
 {
     diag::log_tagged("net_tools", "network_bandwidth_monitor entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
-        return tool_result_t::error(OBFSTR("Missing required parameter: operation ('start', 'stop', 'get', or 'reset')"));
+        return tool_result_t::error(std::string("Missing required parameter: operation ('start', 'stop', 'get', or 'reset')"));
 
     std::string op = params["operation"].get<std::string>();
     std::uint32_t filter_pid = 0;
@@ -4849,7 +4848,7 @@ tool_result_t network_bandwidth_monitor(const json& params)
             log_net_tools_failure("network_bandwidth_monitor_start", gle);
             return tool_result_t::error(format_kernel_session_failure("Failed to start bandwidth monitoring", gle));
         }
-        return tool_result_t::ok(OBFSTR("Bandwidth monitoring started"));
+        return tool_result_t::ok(std::string("Bandwidth monitoring started"));
     } else if (op == "stop") {
         bool ok = driver_bridge::bw_monitor_op(1, 0, nullptr);
         const DWORD gle = GetLastError();
@@ -4858,7 +4857,7 @@ tool_result_t network_bandwidth_monitor(const json& params)
             log_net_tools_failure("network_bandwidth_monitor_stop", gle);
             return tool_result_t::error(format_kernel_session_failure("Failed to stop bandwidth monitoring", gle));
         }
-        return tool_result_t::ok(OBFSTR("Bandwidth monitoring stopped"));
+        return tool_result_t::ok(std::string("Bandwidth monitoring stopped"));
     } else if (op == "get") {
         driver_bridge::bw_stats_t stats{};
         bool ok = driver_bridge::bw_monitor_op(2, filter_pid, &stats);
@@ -4876,7 +4875,7 @@ tool_result_t network_bandwidth_monitor(const json& params)
         r["total_packets_recv"] = stats.total_packets_recv;
         r["bps_in"] = stats.bps_in;
         r["bps_out"] = stats.bps_out;
-        return tool_result_t::ok(OBFSTR("Bandwidth statistics"), r);
+        return tool_result_t::ok(std::string("Bandwidth statistics"), r);
     } else if (op == "reset") {
         bool ok = driver_bridge::bw_monitor_op(3, 0, nullptr);
         const DWORD gle = GetLastError();
@@ -4884,9 +4883,9 @@ tool_result_t network_bandwidth_monitor(const json& params)
             log_net_tools_failure("network_bandwidth_monitor_reset", gle);
             return tool_result_t::error(format_kernel_session_failure("Failed to reset bandwidth counters", gle));
         }
-        return tool_result_t::ok(OBFSTR("Bandwidth counters reset"));
+        return tool_result_t::ok(std::string("Bandwidth counters reset"));
     }
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'start', 'stop', 'get', or 'reset'."));
+    return tool_result_t::error(std::string("Invalid operation. Use 'start', 'stop', 'get', or 'reset'."));
 }
 
 tool_result_t network_bandwidth_per_process(const json& params)
@@ -4948,9 +4947,9 @@ tool_result_t network_bandwidth_per_process(const json& params)
             d["owner_rows"] = owner_rows.size();
             add_driver_request_fields(d, false, ERROR_INVALID_FUNCTION);
             d["diagnostic"] = "kernel driver is not connected and IP Helper returned no active socket owners";
-            return tool_result_t::error(OBFSTR("No per-process bandwidth rows or socket owners were available."), d);
+            return tool_result_t::error(std::string("No per-process bandwidth rows or socket owners were available."), d);
         }
-        return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" processes with socket ownership data"), arr);
+        return tool_result_t::ok(std::to_string(arr.size()) + std::string(" processes with socket ownership data"), arr);
     }
 
     driver_bridge::bw_stats_t stats_before{};
@@ -5062,32 +5061,32 @@ tool_result_t network_bandwidth_per_process(const json& params)
         d["auto_stop_win32_error"] = static_cast<unsigned long>(auto_stop_gle);
         d["auto_stop_win32_message"] = win32_error_message(auto_stop_gle);
         add_driver_request_fields(d, stats_ok, stats_gle);
-        return tool_result_t::error(OBFSTR("No per-process bandwidth rows or active socket owners were available."), d);
+        return tool_result_t::error(std::string("No per-process bandwidth rows or active socket owners were available."), d);
     }
 
-    return tool_result_t::ok(std::to_string(arr.size()) + OBFSTR(" processes with bandwidth data"), arr);
+    return tool_result_t::ok(std::to_string(arr.size()) + std::string(" processes with bandwidth data"), arr);
 }
 
 tool_result_t network_os_fingerprint(const json& params)
 {
     diag::log_tagged("net_tools", "network_os_fingerprint entry");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
     if (!params.contains("operation") || !params["operation"].is_string())
-        return tool_result_t::error(OBFSTR("Missing required parameter: operation ('enable', 'disable', or 'get')"));
+        return tool_result_t::error(std::string("Missing required parameter: operation ('enable', 'disable', or 'get')"));
 
     std::string op = params["operation"].get<std::string>();
     diag::log_tagged_fmt("net_tools", "network_os_fingerprint op=%s", op.c_str());
     if (op == "enable") {
         bool ok = driver_bridge::fingerprint_op(0);
         diag::log_tagged_fmt("net_tools", "network_os_fingerprint enable result=%d", (int)ok);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to enable OS fingerprinting."));
-        return tool_result_t::ok(OBFSTR("Passive OS fingerprinting enabled. Analyzing TCP SYN packets."));
+        if (!ok) return tool_result_t::error(std::string("Failed to enable OS fingerprinting."));
+        return tool_result_t::ok(std::string("Passive OS fingerprinting enabled. Analyzing TCP SYN packets."));
     } else if (op == "disable") {
         bool ok = driver_bridge::fingerprint_op(1);
         diag::log_tagged_fmt("net_tools", "network_os_fingerprint disable result=%d", (int)ok);
-        if (!ok) return tool_result_t::error(OBFSTR("Failed to disable OS fingerprinting."));
-        return tool_result_t::ok(OBFSTR("OS fingerprinting disabled"));
+        if (!ok) return tool_result_t::error(std::string("Failed to disable OS fingerprinting."));
+        return tool_result_t::ok(std::string("OS fingerprinting disabled"));
     } else if (op == "get") {
         if (driver_bridge::attached_pid() == 0) {
             json r;
@@ -5095,7 +5094,7 @@ tool_result_t network_os_fingerprint(const json& params)
             r["driver_attached_pid"] = 0;
             r["driver_status"] = driver_bridge::status();
             r["driver_last_error"] = driver_bridge::last_error();
-            return tool_result_t::error(OBFSTR("No process attached to driver. DTB resolution may have failed."), r);
+            return tool_result_t::error(std::string("No process attached to driver. DTB resolution may have failed."), r);
         }
         auto fps = driver_bridge::get_fingerprints();
         diag::log_tagged_fmt("net_tools", "network_os_fingerprint get count=%zu", fps.size());
@@ -5112,9 +5111,9 @@ tool_result_t network_os_fingerprint(const json& params)
             entry["sack_permitted"] = f.sack_permitted != 0;
             arr.push_back(entry);
         }
-        return tool_result_t::ok(std::to_string(fps.size()) + OBFSTR(" OS fingerprints collected"), arr);
+        return tool_result_t::ok(std::to_string(fps.size()) + std::string(" OS fingerprints collected"), arr);
     }
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'enable', 'disable', or 'get'."));
+    return tool_result_t::error(std::string("Invalid operation. Use 'enable', 'disable', or 'get'."));
 }
 
 tool_result_t network_export_pcap(const json& params)
@@ -5123,7 +5122,7 @@ tool_result_t network_export_pcap(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!driver_bridge::using_kernel_driver())
-        return tool_result_t::error(OBFSTR("Driver not connected."));
+        return tool_result_t::error(std::string("Driver not connected."));
 
     std::uint32_t filter_pid = 0, filter_protocol = 0, max_packets = 256;
     if (params.contains("pid") && params["pid"].is_number()) filter_pid = params["pid"].get<std::uint32_t>();
@@ -5140,7 +5139,7 @@ tool_result_t network_export_pcap(const json& params)
     diag::log_tagged_fmt("net_tools", "network_export_pcap filter_pid=%u proto=%u max=%u", filter_pid, filter_protocol, max_packets);
     bool ok = driver_bridge::export_pcap(filter_pid, filter_protocol, max_packets, &pcap);
     diag::log_tagged_fmt("net_tools", "network_export_pcap driver_result=%d packets=%zu", (int)ok, pcap.packets.size());
-    if (!ok) return tool_result_t::error(OBFSTR("Failed to export PCAP data from driver."));
+    if (!ok) return tool_result_t::error(std::string("Failed to export PCAP data from driver."));
 
     std::string filename;
     if (params.contains("filename") && params["filename"].is_string())
@@ -5153,7 +5152,7 @@ tool_result_t network_export_pcap(const json& params)
 
     HANDLE hf = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hf == INVALID_HANDLE_VALUE)
-        return tool_result_t::error(OBFSTR("Failed to create PCAP file: ") + path);
+        return tool_result_t::error(std::string("Failed to create PCAP file: ") + path);
 
     DWORD written = 0;
     bool write_ok = true;
@@ -5174,13 +5173,13 @@ tool_result_t network_export_pcap(const json& params)
     }
     CloseHandle(hf);
 
-    if (!write_ok) return tool_result_t::error(OBFSTR("Failed to write PCAP file."));
+    if (!write_ok) return tool_result_t::error(std::string("Failed to write PCAP file."));
 
     json r;
     r["file_path"] = path;
     r["packet_count"] = pcap.packets.size();
     diag::log_tagged_fmt("net_tools", "network_export_pcap complete path=%s packets=%zu", path.c_str(), pcap.packets.size());
-    return tool_result_t::ok(std::to_string(pcap.packets.size()) + OBFSTR(" packets exported to ") + path, r);
+    return tool_result_t::ok(std::to_string(pcap.packets.size()) + std::string(" packets exported to ") + path, r);
 }
 
 tool_result_t api_monitor_start(const json& params)
@@ -5189,7 +5188,7 @@ tool_result_t api_monitor_start(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!params.contains("apis") || !params["apis"].is_array())
-        return tool_result_t::error(OBFSTR("Missing required parameter: apis"));
+        return tool_result_t::error(std::string("Missing required parameter: apis"));
 
     std::vector<api_monitor::api_request_t> apis;
     apis.reserve(params["apis"].size());
@@ -5197,7 +5196,7 @@ tool_result_t api_monitor_start(const json& params)
         api_monitor::api_request_t request;
         std::string error;
         if (!api_monitor::parse_request_json(item, request, error))
-            return tool_result_t::error(OBFSTR("Invalid apis entry: ") + error);
+            return tool_result_t::error(std::string("Invalid apis entry: ") + error);
         apis.push_back(std::move(request));
     }
 
@@ -5304,7 +5303,7 @@ tool_result_t api_monitor_start(const json& params)
     summary["status_after_start"] = status_after_start;
     summary["handler_elapsed_ms"] = GetTickCount64() - handler_start_ms;
     diag::log_tagged_fmt("net_tools", "api_monitor_start active resolved=%d", resolved_count);
-    return tool_result_t::ok(OBFSTR("API monitor started with ") + std::to_string(resolved_count) + OBFSTR(" resolved API target(s)"), summary);
+    return tool_result_t::ok(std::string("API monitor started with ") + std::to_string(resolved_count) + std::string(" resolved API target(s)"), summary);
 }
 
 tool_result_t api_monitor_results(const json& params)
@@ -5408,10 +5407,10 @@ tool_result_t api_monitor_results(const json& params)
             static_cast<unsigned long long>(total_hits_before),
             static_cast<unsigned long long>(total_hits_after));
         if (stop_after)
-            return tool_result_t::ok(OBFSTR("API monitor stopped with no captured events."), result);
-        return tool_result_t::error(OBFSTR("No API monitor events captured after setup/stimulus check."), result);
+            return tool_result_t::ok(std::string("API monitor stopped with no captured events."), result);
+        return tool_result_t::error(std::string("No API monitor events captured after setup/stimulus check."), result);
     }
-    return tool_result_t::ok(std::to_string(count) + OBFSTR(" API monitor event(s)"), result);
+    return tool_result_t::ok(std::to_string(count) + std::string(" API monitor event(s)"), result);
 }
 
 void register_network_tools(mcp_standalone::server_t& srv) {
@@ -5419,10 +5418,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
     aida::burp::register_all_tools(srv);
 
     register_compat(srv, {
-        OBFSTR("network_capture_manage"), OBFSTR("network"),
-        OBFSTR("Manage kernel packet capture. Actions: start, stop, get_packets, status, export_pcap."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("start|stop|get_packets|status|export_pcap"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("network_capture_manage"), std::string("network"),
+        std::string("Manage kernel packet capture. Actions: start, stop, get_packets, status, export_pcap."),
+        {{std::string("action"), std::string("string"), std::string("start|stop|get_packets|status|export_pcap"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -5436,18 +5435,18 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("network_analyze_packet"), OBFSTR("network"),
-        OBFSTR("Retrieve and deeply analyze a single captured packet. "
+        std::string("network_analyze_packet"), std::string("network"),
+        std::string("Retrieve and deeply analyze a single captured packet. "
                "Auto-detects application protocol (HTTP, TLS, DNS), extracts headers, "
                "provides full hex dump and ASCII render. Like Fiddler's packet inspector."),
         {},
         network_analyze_packet, true});
 
     register_compat(srv, {
-        OBFSTR("network_filter_manage"), OBFSTR("network"),
-        OBFSTR("Manage kernel-level network filter rules. Actions: add, remove, clear."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add|remove|clear"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("network_filter_manage"), std::string("network"),
+        std::string("Manage kernel-level network filter rules. Actions: add, remove, clear."),
+        {{std::string("action"), std::string("string"), std::string("add|remove|clear"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -5459,10 +5458,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("network_bandwidth_manage"), OBFSTR("network"),
-        OBFSTR("Manage network bandwidth monitoring and summary stats. Actions: monitor, per_process, stats."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("monitor|per_process|stats"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("network_bandwidth_manage"), std::string("network"),
+        std::string("Manage network bandwidth monitoring and summary stats. Actions: monitor, per_process, stats."),
+        {{std::string("action"), std::string("string"), std::string("monitor|per_process|stats"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             json p = params.is_object() ? params : json::object();
@@ -5500,10 +5499,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("network_firewall_manage"), OBFSTR("network"),
-        OBFSTR("Manage quick firewall actions. Actions: block_ip, block_port, block_process, kill_connection."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("block_ip|block_port|block_process|kill_connection"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("network_firewall_manage"), std::string("network"),
+        std::string("Manage quick firewall actions. Actions: block_ip, block_port, block_process, kill_connection."),
+        {{std::string("action"), std::string("string"), std::string("block_ip|block_port|block_process|kill_connection"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             const json p = compat_action_payload(params);
@@ -5516,84 +5515,84 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("network_deep_inspect"), OBFSTR("network"),
-        OBFSTR("Deep packet inspection of captured traffic. Returns protocol-level analysis: HTTP method/host/path, "
+        std::string("network_deep_inspect"), std::string("network"),
+        std::string("Deep packet inspection of captured traffic. Returns protocol-level analysis: HTTP method/host/path, "
                "TLS version/SNI/content type, DNS detection. Requires active capture (network_start_capture). "
                "Filter by pid, port, or protocol. Superior to basic packet view - identifies application-layer protocols."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID"), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Filter by port number"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Filter: 'tcp' or 'udp'"), false}},
+        {{std::string("pid"), std::string("number"), std::string("Filter by process ID"), false},
+         {std::string("port"), std::string("number"), std::string("Filter by port number"), false},
+         {std::string("protocol"), std::string("string"), std::string("Filter: 'tcp' or 'udp'"), false}},
         network_deep_inspect, true});
 
     register_compat(srv, {
-        OBFSTR("network_parse_http"), OBFSTR("network"),
-        OBFSTR("Parse HTTP request/response messages from captured packets. Extracts method, URI, status code, "
+        std::string("network_parse_http"), std::string("network"),
+        std::string("Parse HTTP request/response messages from captured packets. Extracts method, URI, status code, "
                "all headers (Host, Content-Type, User-Agent, Cookie, Authorization, etc.), and body preview. "
                "Equivalent to Wireshark HTTP dissector or HTTP Debugger request/response view. Requires active capture."),
-        {{OBFSTR("count"), OBFSTR("number"), OBFSTR("Max packets to scan (default 32, max 32)"), false}},
+        {{std::string("count"), std::string("number"), std::string("Max packets to scan (default 32, max 32)"), false}},
         network_parse_http, true});
 
     register_compat(srv, {
-        OBFSTR("network_parse_tls"), OBFSTR("network"),
-        OBFSTR("Parse TLS/SSL handshake details from captured packets. Extracts: record type, TLS version, "
+        std::string("network_parse_tls"), std::string("network"),
+        std::string("Parse TLS/SSL handshake details from captured packets. Extracts: record type, TLS version, "
                "handshake type (ClientHello/ServerHello), SNI (Server Name Indication), ALPN protocols (detects HTTP/2), "
                "cipher suites offered/selected. Equivalent to Wireshark TLS dissector. Requires active capture."),
-        {{OBFSTR("count"), OBFSTR("number"), OBFSTR("Max packets to scan (default 32, max 32)"), false}},
+        {{std::string("count"), std::string("number"), std::string("Max packets to scan (default 32, max 32)"), false}},
         network_parse_tls, true});
 
     register_compat(srv, {
-        OBFSTR("network_enumerate_wfp_callouts"), OBFSTR("network"),
-        OBFSTR("Enumerate registered WFP (Windows Filtering Platform) callouts and filters. Shows BFE inventory source, "
+        std::string("network_enumerate_wfp_callouts"), std::string("network"),
+        std::string("Enumerate registered WFP (Windows Filtering Platform) callouts and filters. Shows BFE inventory source, "
                "degraded runtime-fallback status, action/layer/sublayer/callout GUID labels, display/app-condition previews, "
                "and classify/notify addresses where available. Use to audit stale block filters or security products hooking network traffic."),
-        {{OBFSTR("module"), OBFSTR("string"), OBFSTR("Filter by owning module name (case-insensitive substring)"), false}},
+        {{std::string("module"), std::string("string"), std::string("Filter by owning module name (case-insensitive substring)"), false}},
         network_enumerate_wfp_callouts, true});
 
     register_compat(srv, {
-        OBFSTR("network_get_socket_handles"), OBFSTR("network"),
-        OBFSTR("Enumerate kernel socket handle objects for a process. Returns handle value, AFD endpoint address, "
+        std::string("network_get_socket_handles"), std::string("network"),
+        std::string("Enumerate kernel socket handle objects for a process. Returns handle value, AFD endpoint address, "
                "protocol, state, local/remote address:port. Lower-level than netstat - works from kernel object tables."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (0 = all processes)"), false}},
+        {{std::string("pid"), std::string("number"), std::string("Target process ID (0 = all processes)"), false}},
         network_get_socket_handles, true});
 
     register_compat(srv, {
-        OBFSTR("network_dump_tcpip"), OBFSTR("network"),
-        OBFSTR("Deep kernel TCPIP stack connection dump. Returns TCB address, owning module, bytes in/out, "
+        std::string("network_dump_tcpip"), std::string("network"),
+        std::string("Deep kernel TCPIP stack connection dump. Returns TCB address, owning module, bytes in/out, "
                "create time, and full connection tuple. More detailed than netstat - reads kernel TCPIP internal structures."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID (0 = all)"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Filter: 'tcp' or 'udp'"), false}},
+        {{std::string("pid"), std::string("number"), std::string("Filter by process ID (0 = all)"), false},
+         {std::string("protocol"), std::string("string"), std::string("Filter: 'tcp' or 'udp'"), false}},
         network_dump_tcpip, true});
 
     register_compat(srv, {
-        OBFSTR("network_enumerate_interfaces"), OBFSTR("network"),
-        OBFSTR("List all network interfaces with details: name, description, type, MTU, speed, operational status, "
+        std::string("network_enumerate_interfaces"), std::string("network"),
+        std::string("List all network interfaces with details: name, description, type, MTU, speed, operational status, "
                "MAC address, IPv4/IPv6 addresses, in/out byte counters. Equivalent to Wireshark's capture interface list."),
         {},
         network_enumerate_interfaces, true});
 
     register_compat(srv, {
-        OBFSTR("network_inject_packet"), OBFSTR("network"),
-        OBFSTR("Inject a crafted packet into the network stack at the WFP transport layer. Specify direction, "
+        std::string("network_inject_packet"), std::string("network"),
+        std::string("Inject a crafted packet into the network stack at the WFP transport layer. Specify direction, "
                "protocol, source/destination IP:port, payload (hex or text), and TCP flags/sequence numbers. "
                "Use for testing, replaying requests, or active response injection. Equivalent to Scapy packet crafting."),
-        {{OBFSTR("direction"), OBFSTR("string"), OBFSTR("'inbound' or 'outbound' (default: outbound)"), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("'tcp' or 'udp' (default: tcp)"), false},
-         {OBFSTR("src_ip"), OBFSTR("string"), OBFSTR("Source IP address"), false},
-         {OBFSTR("dst_ip"), OBFSTR("string"), OBFSTR("Destination IP address"), false},
-         {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source port"), false},
-         {OBFSTR("dst_port"), OBFSTR("number"), OBFSTR("Destination port"), false},
-         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Payload as hex string (e.g. '48656C6C6F')"), false},
-         {OBFSTR("payload_text"), OBFSTR("string"), OBFSTR("Payload as ASCII text"), false},
-         {OBFSTR("tcp_flags"), OBFSTR("number"), OBFSTR("TCP flags bitmask (SYN=2, ACK=16, RST=4, FIN=1, PSH=8)"), false},
-         {OBFSTR("tcp_seq"), OBFSTR("number"), OBFSTR("TCP sequence number"), false},
-         {OBFSTR("tcp_ack"), OBFSTR("number"), OBFSTR("TCP acknowledgment number"), false}},
+        {{std::string("direction"), std::string("string"), std::string("'inbound' or 'outbound' (default: outbound)"), false},
+         {std::string("protocol"), std::string("string"), std::string("'tcp' or 'udp' (default: tcp)"), false},
+         {std::string("src_ip"), std::string("string"), std::string("Source IP address"), false},
+         {std::string("dst_ip"), std::string("string"), std::string("Destination IP address"), false},
+         {std::string("src_port"), std::string("number"), std::string("Source port"), false},
+         {std::string("dst_port"), std::string("number"), std::string("Destination port"), false},
+         {std::string("payload_hex"), std::string("string"), std::string("Payload as hex string (e.g. '48656C6C6F')"), false},
+         {std::string("payload_text"), std::string("string"), std::string("Payload as ASCII text"), false},
+         {std::string("tcp_flags"), std::string("number"), std::string("TCP flags bitmask (SYN=2, ACK=16, RST=4, FIN=1, PSH=8)"), false},
+         {std::string("tcp_seq"), std::string("number"), std::string("TCP sequence number"), false},
+         {std::string("tcp_ack"), std::string("number"), std::string("TCP acknowledgment number"), false}},
         network_inject_packet, false});
 
     register_compat(srv, {
-        OBFSTR("network_packet_mod_manage"), OBFSTR("network"),
-        OBFSTR("Manage packet modification rules. Actions: add, remove, clear, list."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add|remove|clear|list"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("network_packet_mod_manage"), std::string("network"),
+        std::string("Manage packet modification rules. Actions: add, remove, clear, list."),
+        {{std::string("action"), std::string("string"), std::string("add|remove|clear|list"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             json p = compat_action_payload(params);
@@ -5607,10 +5606,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("network_redirect_manage"), OBFSTR("network"),
-        OBFSTR("Manage traffic redirect rules. Actions: add, remove, clear, list."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("add|remove|clear|list"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("network_redirect_manage"), std::string("network"),
+        std::string("Manage traffic redirect rules. Actions: add, remove, clear, list."),
+        {{std::string("action"), std::string("string"), std::string("add|remove|clear|list"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             json p = compat_action_payload(params);
@@ -5624,17 +5623,17 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("network_intercept_manage"), OBFSTR("network"),
-        OBFSTR("Manage packet interception and held-packet decisions. Actions: enable, disable, list, release, drop, modify. "
+        std::string("network_intercept_manage"), std::string("network"),
+        std::string("Manage packet interception and held-packet decisions. Actions: enable, disable, list, release, drop, modify. "
                "The enable action requires at least one explicit filter: pid, port, or protocol."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("enable|disable|list|release|drop|modify"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Enable filter: process ID. At least one of pid, port, or protocol is required for enable."), false},
-         {OBFSTR("port"), OBFSTR("number"), OBFSTR("Enable filter: local or remote port. At least one of pid, port, or protocol is required for enable."), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Enable filter: 'tcp' or 'udp'. At least one of pid, port, or protocol is required for enable."), false},
-         {OBFSTR("hold_id"), OBFSTR("number"), OBFSTR("Held packet ID for release, drop, or modify."), false},
-         {OBFSTR("payload_text"), OBFSTR("string"), OBFSTR("Replacement payload text for modify."), false},
-         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Replacement payload hex for modify."), false}},
+        {{std::string("action"), std::string("string"), std::string("enable|disable|list|release|drop|modify"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false},
+         {std::string("pid"), std::string("number"), std::string("Enable filter: process ID. At least one of pid, port, or protocol is required for enable."), false},
+         {std::string("port"), std::string("number"), std::string("Enable filter: local or remote port. At least one of pid, port, or protocol is required for enable."), false},
+         {std::string("protocol"), std::string("string"), std::string("Enable filter: 'tcp' or 'udp'. At least one of pid, port, or protocol is required for enable."), false},
+         {std::string("hold_id"), std::string("number"), std::string("Held packet ID for release, drop, or modify."), false},
+         {std::string("payload_text"), std::string("string"), std::string("Replacement payload text for modify."), false},
+         {std::string("payload_hex"), std::string("string"), std::string("Replacement payload hex for modify."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             json p = compat_action_payload(params);
@@ -5652,10 +5651,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         false});
 
     register_compat(srv, {
-        OBFSTR("network_dns_manage"), OBFSTR("network"),
-        OBFSTR("Manage DNS diagnostics and spoofing rules. Actions: log, add_spoof, remove_spoof, clear_spoof, list_spoof."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("log|add_spoof|remove_spoof|clear_spoof|list_spoof"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
+        std::string("network_dns_manage"), std::string("network"),
+        std::string("Manage DNS diagnostics and spoofing rules. Actions: log, add_spoof, remove_spoof, clear_spoof, list_spoof."),
+        {{std::string("action"), std::string("string"), std::string("log|add_spoof|remove_spoof|clear_spoof|list_spoof"), true},
+         {std::string("payload"), std::string("object"), std::string("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
         [](const json& params) -> tool_result_t {
             const std::string action = compat_action_name(params);
             json p = compat_action_payload(params);
@@ -5726,25 +5725,25 @@ void register_network_tools(mcp_standalone::server_t& srv) {
     });
 
     register_compat(srv, {
-        OBFSTR("network_os_fingerprint"), OBFSTR("network"),
-        OBFSTR("Passive OS fingerprinting via TCP SYN packet analysis (p0f-style). 'enable' starts collecting "
+        std::string("network_os_fingerprint"), std::string("network"),
+        std::string("Passive OS fingerprinting via TCP SYN packet analysis (p0f-style). 'enable' starts collecting "
                "fingerprints from incoming connections. 'get' returns results: remote IP, OS guess, TTL, window size, "
                "MSS, window scale, DF flag, SACK. 'disable' stops. Like p0f or Wireshark OS detection."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'enable', 'disable', or 'get'"), true}},
+        {{std::string("operation"), std::string("string"), std::string("'enable', 'disable', or 'get'"), true}},
         network_os_fingerprint, false});
 
     register_compat(srv, {
-        OBFSTR("network_decode_data"), OBFSTR("network"),
-        OBFSTR("Apply a sequence of data transformations to input data (CyberChef-style). "
+        std::string("network_decode_data"), std::string("network"),
+        std::string("Apply a sequence of data transformations to input data (CyberChef-style). "
                "Supports: base64_encode, base64_decode, hex_encode, hex_decode, url_encode, url_decode, "
                "html_entities_encode, html_entities_decode, gzip_compress, gzip_decompress, brotli_decompress, "
                "deflate_decompress, xor (needs 'key' param), aes_encrypt, aes_decrypt (needs 'key','iv','mode' params), "
                "md5, sha1, sha256, sha512, hmac (needs 'key','algorithm' params), json_beautify, json_minify, "
                "hex_dump, protobuf_decode, grpc_decode, upper, lower, reverse, byte_count, entropy. "
                "Input as text or hex. Pipeline steps applied in order."),
-        {{OBFSTR("input"), OBFSTR("string"), OBFSTR("Input data (text)"), false},
-         {OBFSTR("input_hex"), OBFSTR("string"), OBFSTR("Input data (hex encoded) - use instead of 'input' for binary"), false},
-         {OBFSTR("pipeline"), OBFSTR("array"), OBFSTR("Array of transform step objects: [{\"name\":\"base64_decode\"}, {\"transform\":\"xor\",\"params\":{\"key\":\"41\"}}]; transform is accepted as an alias for name"), true}},
+        {{std::string("input"), std::string("string"), std::string("Input data (text)"), false},
+         {std::string("input_hex"), std::string("string"), std::string("Input data (hex encoded) - use instead of 'input' for binary"), false},
+         {std::string("pipeline"), std::string("array"), std::string("Array of transform step objects: [{\"name\":\"base64_decode\"}, {\"transform\":\"xor\",\"params\":{\"key\":\"41\"}}]; transform is accepted as an alias for name"), true}},
         [](const json& args) -> tool_result_t {
             diag::log_tagged("net_tools", "network_decode_data entry");
             std::vector<uint8_t> data;
@@ -5842,8 +5841,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, false});
 
     register_compat(srv, {
-        OBFSTR("network_list_transforms"), OBFSTR("network"),
-        OBFSTR("List all available decoder pipeline transforms with categories and descriptions. "
+        std::string("network_list_transforms"), std::string("network"),
+        std::string("List all available decoder pipeline transforms with categories and descriptions. "
                "Use to discover available transforms for network_decode_data pipeline."),
         {},
         [](const json&) -> tool_result_t {
@@ -5867,14 +5866,14 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
 
     register_compat(srv, {
-        OBFSTR("network_script_load"), OBFSTR("network"),
-        OBFSTR("Load a Lua script into the proxy scripting engine. Script can register hooks for "
+        std::string("network_script_load"), std::string("network"),
+        std::string("Load a Lua script into the proxy scripting engine. Script can register hooks for "
                "on_request, on_response, on_websocket_frame, on_packet, on_dns, on_connection events. "
                "Provide either a file path or inline source code."),
-        {{OBFSTR("path"), OBFSTR("string"), OBFSTR("Path to .lua script file"), false},
-         {OBFSTR("source"), OBFSTR("string"), OBFSTR("Inline Lua source code"), false},
-         {OBFSTR("source_code"), OBFSTR("string"), OBFSTR("Alias for inline Lua source code"), false},
-         {OBFSTR("name"), OBFSTR("string"), OBFSTR("Script name (default: derived from path)"), false}},
+        {{std::string("path"), std::string("string"), std::string("Path to .lua script file"), false},
+         {std::string("source"), std::string("string"), std::string("Inline Lua source code"), false},
+         {std::string("source_code"), std::string("string"), std::string("Alias for inline Lua source code"), false},
+         {std::string("name"), std::string("string"), std::string("Script name (default: derived from path)"), false}},
         [](const json& args) -> tool_result_t {
             std::string name = args.value("name", "");
             diag::log_tagged_fmt("net_tools", "network_script_load entry name=%s", name.c_str());
@@ -5918,9 +5917,9 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, false});
 
     register_compat(srv, {
-        OBFSTR("network_script_unload"), OBFSTR("network"),
-        OBFSTR("Unload a previously loaded Lua script by name."),
-        {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Script name to unload"), true}},
+        std::string("network_script_unload"), std::string("network"),
+        std::string("Unload a previously loaded Lua script by name."),
+        {{std::string("name"), std::string("string"), std::string("Script name to unload"), true}},
         [](const json& args) -> tool_result_t {
             std::string name = args.value("name", "");
             diag::log_tagged_fmt("net_tools", "network_script_unload name=%s", name.c_str());
@@ -5953,10 +5952,10 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, false});
 
     register_compat(srv, {
-        OBFSTR("network_script_execute"), OBFSTR("network"),
-        OBFSTR("Execute Lua code in the script engine console. Returns the output/result. "
+        std::string("network_script_execute"), std::string("network"),
+        std::string("Execute Lua code in the script engine console. Returns the output/result. "
                "Useful for querying state, testing hooks, or running one-off transformations."),
-        {{OBFSTR("code"), OBFSTR("string"), OBFSTR("Lua code to execute"), true}},
+        {{std::string("code"), std::string("string"), std::string("Lua code to execute"), true}},
         [](const json& args) -> tool_result_t {
             std::string code = args.value("code", "");
             diag::log_tagged_fmt("net_tools", "network_script_execute code_len=%zu", code.size());
@@ -6011,8 +6010,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, false});
 
     register_compat(srv, {
-        OBFSTR("network_script_list"), OBFSTR("network"),
-        OBFSTR("List all loaded Lua scripts with their enabled/disabled status."),
+        std::string("network_script_list"), std::string("network"),
+        std::string("List all loaded Lua scripts with their enabled/disabled status."),
         {},
         [](const json&) -> tool_result_t {
             json init_diag;
@@ -6038,8 +6037,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, true});
 
     register_compat(srv, {
-        OBFSTR("network_script_api"), OBFSTR("network"),
-        OBFSTR("Get the complete Lua API reference for the AiDA scripting engine. Lists all available "
+        std::string("network_script_api"), std::string("network"),
+        std::string("Get the complete Lua API reference for the AiDA scripting engine. Lists all available "
                "functions, hook types, and data structures."),
         {},
         [](const json&) -> tool_result_t {
@@ -6067,18 +6066,18 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
 
     register_compat(srv, {
-        OBFSTR("network_stream_track"), OBFSTR("network"),
-        OBFSTR("Dynamic TCP stream tracker backed by the kernel driver. Operations: "
+        std::string("network_stream_track"), std::string("network"),
+        std::string("Dynamic TCP stream tracker backed by the kernel driver. Operations: "
                "'start' begins tracking (optional pid filter), 'stop' halts tracking, "
                "'get_all' returns all reassembled streams with hex+ASCII payloads, "
                "'get_stream' fetches a single stream by src_ip/src_port/dst_ip/dst_port, "
                "'clear' evicts all cached streams."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("start|stop|get_all|get_stream|clear"), true},
-         {OBFSTR("pid"),       OBFSTR("number"), OBFSTR("Process ID filter for 'start' (0 = all); numeric strings are accepted"), false},
-         {OBFSTR("src_ip"),    OBFSTR("string"), OBFSTR("Source IPv4 (dotted-quad) for get_stream"), false},
-         {OBFSTR("src_port"),  OBFSTR("number"), OBFSTR("Source port for get_stream"), false},
-         {OBFSTR("dst_ip"),    OBFSTR("string"), OBFSTR("Destination IPv4 (dotted-quad) for get_stream"), false},
-         {OBFSTR("dst_port"),  OBFSTR("number"), OBFSTR("Destination port for get_stream"), false}},
+        {{std::string("operation"), std::string("string"), std::string("start|stop|get_all|get_stream|clear"), true},
+         {std::string("pid"),       std::string("number"), std::string("Process ID filter for 'start' (0 = all); numeric strings are accepted"), false},
+         {std::string("src_ip"),    std::string("string"), std::string("Source IPv4 (dotted-quad) for get_stream"), false},
+         {std::string("src_port"),  std::string("number"), std::string("Source port for get_stream"), false},
+         {std::string("dst_ip"),    std::string("string"), std::string("Destination IPv4 (dotted-quad) for get_stream"), false},
+         {std::string("dst_port"),  std::string("number"), std::string("Destination port for get_stream"), false}},
         [](const json& params) -> tool_result_t {
             const std::string op = params.value("operation", "");
             diag::log_tagged_fmt("net_tools", "network_stream_track op=%s", op.c_str());
@@ -6190,15 +6189,15 @@ void register_network_tools(mcp_standalone::server_t& srv) {
 
 
     register_compat(srv, {
-        OBFSTR("network_pg_sniff"), OBFSTR("network"),
-        OBFSTR("Pre-encryption page guard sniffer. PAGE_GUARD capture requires a WhosWho driver-backed "
+        std::string("network_pg_sniff"), std::string("network"),
+        std::string("Pre-encryption page guard sniffer. PAGE_GUARD capture requires a WhosWho driver-backed "
                "capture backend; the legacy user-mode VEH backend is disabled."),
-        {{OBFSTR("operation"),  OBFSTR("string"), OBFSTR("install|get_captures|uninstall|list_sessions"), true},
-         {OBFSTR("pid"),        OBFSTR("number"), OBFSTR("Target process ID (install)"), false},
-         {OBFSTR("address"),    OBFSTR("string"), OBFSTR("Target memory address as hex string, e.g. '0x7FFE0000' (install)"), false},
-         {OBFSTR("size"),       OBFSTR("number"), OBFSTR("Region size in bytes (install, default 0x1000)"), false},
-         {OBFSTR("max_records_per_drain"), OBFSTR("number"), OBFSTR("Maximum page-guard ring records to drain per poll (install, default 32)"), false},
-         {OBFSTR("session_id"), OBFSTR("number"), OBFSTR("Session ID returned by install (get_captures/uninstall)"), false}},
+        {{std::string("operation"),  std::string("string"), std::string("install|get_captures|uninstall|list_sessions"), true},
+         {std::string("pid"),        std::string("number"), std::string("Target process ID (install)"), false},
+         {std::string("address"),    std::string("string"), std::string("Target memory address as hex string, e.g. '0x7FFE0000' (install)"), false},
+         {std::string("size"),       std::string("number"), std::string("Region size in bytes (install, default 0x1000)"), false},
+         {std::string("max_records_per_drain"), std::string("number"), std::string("Maximum page-guard ring records to drain per poll (install, default 32)"), false},
+         {std::string("session_id"), std::string("number"), std::string("Session ID returned by install (get_captures/uninstall)"), false}},
         [](const json& params) -> tool_result_t {
             const ULONGLONG op_started = GetTickCount64();
             const std::string op = params.value("operation", "");
@@ -6478,14 +6477,14 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, false});
 
     register_compat(srv, {
-        OBFSTR("network_packet_callstack"), OBFSTR("network"),
-        OBFSTR("Capture or retrieve the call stack associated with a network packet. "
+        std::string("network_packet_callstack"), std::string("network"),
+        std::string("Capture or retrieve the call stack associated with a network packet. "
                "When a packet is captured with a thread ID, this snapshots the thread's registers "
                "and walks the RBP chain to show exactly which code sent the packet. "
                "Operations: enable, disable, get (by packet_index), recent, clear."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: enable|disable|get|recent|clear"), true},
-         {OBFSTR("packet_index"), OBFSTR("number"), OBFSTR("Packet index for 'get' operation"), false},
-         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max entries for 'recent' operation (default 64)"), false}},
+        {{std::string("operation"), std::string("string"), std::string("Operation: enable|disable|get|recent|clear"), true},
+         {std::string("packet_index"), std::string("number"), std::string("Packet index for 'get' operation"), false},
+         {std::string("max_count"), std::string("number"), std::string("Max entries for 'recent' operation (default 64)"), false}},
         [](const json& args) -> tool_result_t {
             std::string op = args.value("operation", "");
             if (op.empty())
@@ -6553,8 +6552,8 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, false});
 
     register_compat(srv, {
-        OBFSTR("api_monitor_start"), OBFSTR("network"),
-        OBFSTR("Start a native dynamic API monitor for an attached x64 target process. "
+        std::string("api_monitor_start"), std::string("network"),
+        std::string("Start a native dynamic API monitor for an attached x64 target process. "
                "Resolves requested APIs such as ws2_32.dll!send, ws2_32.dll!WSASend, "
                "kernel32.dll!DeviceIoControl, or ntdll.dll!NtDeviceIoControlFile in the target, "
                "programs hardware execute breakpoints through the existing driver bridge, and "
@@ -6562,39 +6561,39 @@ void register_network_tools(mcp_standalone::server_t& srv) {
                "Captured events include API name, timestamp, thread, return address, caller module "
                "where resolvable, handle/socket/IOCTL metadata, and bounded hex buffers for outbound "
                "or input buffers where obtainable."),
-        {{OBFSTR("apis"), OBFSTR("array"), OBFSTR("Array of API specs like 'ws2_32.dll!send' or objects with api, buffer_kind, buffer_reg, size_reg"), true},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target PID. Defaults to the currently attached driver target"), false},
-         {OBFSTR("log_callstack"), OBFSTR("boolean"), OBFSTR("Capture a bounded callstack for each API hit"), false},
-         {OBFSTR("capture_buffer"), OBFSTR("boolean"), OBFSTR("Read bounded input/outbound buffers from the target process"), false},
-         {OBFSTR("max_capture_bytes"), OBFSTR("number"), OBFSTR("Maximum bytes captured per buffer, capped at 2048"), false},
-         {OBFSTR("max_events"), OBFSTR("number"), OBFSTR("Maximum buffered events, capped at 16384"), false}},
+        {{std::string("apis"), std::string("array"), std::string("Array of API specs like 'ws2_32.dll!send' or objects with api, buffer_kind, buffer_reg, size_reg"), true},
+         {std::string("pid"), std::string("number"), std::string("Target PID. Defaults to the currently attached driver target"), false},
+         {std::string("log_callstack"), std::string("boolean"), std::string("Capture a bounded callstack for each API hit"), false},
+         {std::string("capture_buffer"), std::string("boolean"), std::string("Read bounded input/outbound buffers from the target process"), false},
+         {std::string("max_capture_bytes"), std::string("number"), std::string("Maximum bytes captured per buffer, capped at 2048"), false},
+         {std::string("max_events"), std::string("number"), std::string("Maximum buffered events, capped at 16384"), false}},
         api_monitor_start, false});
 
     register_compat(srv, {
-        OBFSTR("api_monitor_results"), OBFSTR("network"),
-        OBFSTR("Return buffered native API monitor events. Results can be filtered by API name and "
+        std::string("api_monitor_results"), std::string("network"),
+        std::string("Return buffered native API monitor events. Results can be filtered by API name and "
                "include exact return addresses, caller address when direct-call decoding is possible, "
                "register snapshots, endpoint/handle/IOCTL metadata, and bounded hex buffer captures. "
                "Optional clear drains buffered events; optional stop tears down the active monitor."),
-        {{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Maximum events to return, capped at 512"), false},
-         {OBFSTR("filter_api"), OBFSTR("string"), OBFSTR("Case-insensitive substring filter for API name"), false},
-         {OBFSTR("clear"), OBFSTR("boolean"), OBFSTR("Clear buffered events after reading"), false},
-         {OBFSTR("stop"), OBFSTR("boolean"), OBFSTR("Stop the active monitor after reading results"), false}},
+        {{std::string("limit"), std::string("number"), std::string("Maximum events to return, capped at 512"), false},
+         {std::string("filter_api"), std::string("string"), std::string("Case-insensitive substring filter for API name"), false},
+         {std::string("clear"), std::string("boolean"), std::string("Clear buffered events after reading"), false},
+         {std::string("stop"), std::string("boolean"), std::string("Stop the active monitor after reading results"), false}},
         api_monitor_results, false});
 
     register_compat(srv, {
-        OBFSTR("network_pre_encrypt_hook"), OBFSTR("network"),
-        OBFSTR("Hook SSL/TLS encryption functions to capture plaintext data before encryption. "
+        std::string("network_pre_encrypt_hook"), std::string("network"),
+        std::string("Hook SSL/TLS encryption functions to capture plaintext data before encryption. "
                "Auto-detects SSL_write, PR_Write, EncryptMessage, send, WSASend across OpenSSL, NSS, Schannel, Winsock. "
                "Uses hardware breakpoints (DR0-DR3) with normal Windows debug-event delivery for authorized lab targets. "
                "Operations: auto_hook (auto-detect and hook), hook_address (manual), unhook_all, get_captures, clear, status."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: auto_hook|hook_address|unhook_all|get_captures|clear|status"), true},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID for auto_hook or hook_address"), false},
-         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Hex address for hook_address (e.g. '0x7FFA1234')"), false},
-         {OBFSTR("name"), OBFSTR("string"), OBFSTR("Function name label for hook_address"), false},
-         {OBFSTR("buffer_reg"), OBFSTR("number"), OBFSTR("Register index for buffer ptr: 0=RCX 1=RDX 2=R8 3=R9"), false},
-         {OBFSTR("size_reg"), OBFSTR("number"), OBFSTR("Register index for size param"), false},
-         {OBFSTR("max_count"), OBFSTR("number"), OBFSTR("Max captures to return (default 64)"), false}},
+        {{std::string("operation"), std::string("string"), std::string("Operation: auto_hook|hook_address|unhook_all|get_captures|clear|status"), true},
+         {std::string("pid"), std::string("number"), std::string("Target process ID for auto_hook or hook_address"), false},
+         {std::string("address"), std::string("string"), std::string("Hex address for hook_address (e.g. '0x7FFA1234')"), false},
+         {std::string("name"), std::string("string"), std::string("Function name label for hook_address"), false},
+         {std::string("buffer_reg"), std::string("number"), std::string("Register index for buffer ptr: 0=RCX 1=RDX 2=R8 3=R9"), false},
+         {std::string("size_reg"), std::string("number"), std::string("Register index for size param"), false},
+         {std::string("max_count"), std::string("number"), std::string("Max captures to return (default 64)"), false}},
         [](const json& args) -> tool_result_t {
             std::string op = args.value("operation", "");
             if (op.empty())
@@ -6783,15 +6782,15 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, false});
 
     register_compat(srv, {
-        OBFSTR("network_display_filter"), OBFSTR("network"),
-        OBFSTR("Compile and test BPF-style display filter expressions for packet filtering. "
+        std::string("network_display_filter"), std::string("network"),
+        std::string("Compile and test BPF-style display filter expressions for packet filtering. "
                "Supports fields: tcp.port, ip.src, ip.dst, http.method, http.status, dns.query, "
                "tcp.len, pid, protocol, direction, host, summary. "
                "Operators: ==, !=, >, <, >=, <=, contains. Boolean: && || !. Grouping: (). "
                "Operations: compile (validate expression), test (test against packet fields), validate."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: compile|test|validate"), true},
-         {OBFSTR("expression"), OBFSTR("string"), OBFSTR("Filter expression e.g. 'tcp.port == 443 && http.method == \"POST\"'"), true},
-         {OBFSTR("packet"), OBFSTR("object"), OBFSTR("Packet fields object for 'test' operation"), false}},
+        {{std::string("operation"), std::string("string"), std::string("Operation: compile|test|validate"), true},
+         {std::string("expression"), std::string("string"), std::string("Filter expression e.g. 'tcp.port == 443 && http.method == \"POST\"'"), true},
+         {std::string("packet"), std::string("object"), std::string("Packet fields object for 'test' operation"), false}},
         [](const json& args) -> tool_result_t {
             std::string op = args.value("operation", "compile");
             std::string expr = args.value("expression", "");
@@ -6850,17 +6849,17 @@ void register_network_tools(mcp_standalone::server_t& srv) {
         }, true});
 
     register_compat(srv, {
-        OBFSTR("network_protobuf_decode"), OBFSTR("network"),
-        OBFSTR("Decode, encode, and edit Protocol Buffer wire format data without .proto files. "
+        std::string("network_protobuf_decode"), std::string("network"),
+        std::string("Decode, encode, and edit Protocol Buffer wire format data without .proto files. "
                "Supports raw protobuf and gRPC length-prefixed frames. "
                "Operations: decode (binary to field tree), encode (field tree to binary), "
                "decode_grpc (gRPC frames), modify (edit field by path), auto_detect (heuristic type inference)."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("Operation: decode|encode|decode_grpc|modify|auto_detect"), true},
-         {OBFSTR("hex_data"), OBFSTR("string"), OBFSTR("Hex-encoded protobuf data for decode/decode_grpc"), false},
-         {OBFSTR("fields"), OBFSTR("array"), OBFSTR("Field tree array for encode operation"), false},
-         {OBFSTR("path"), OBFSTR("string"), OBFSTR("Dot-separated field path for modify (e.g. '1.3.2')"), false},
-         {OBFSTR("value"), OBFSTR("string"), OBFSTR("New value for modify operation"), false},
-         {OBFSTR("field_type"), OBFSTR("string"), OBFSTR("Type for modify: uint|sint|int|bool|float|double|string|bytes"), false}},
+        {{std::string("operation"), std::string("string"), std::string("Operation: decode|encode|decode_grpc|modify|auto_detect"), true},
+         {std::string("hex_data"), std::string("string"), std::string("Hex-encoded protobuf data for decode/decode_grpc"), false},
+         {std::string("fields"), std::string("array"), std::string("Field tree array for encode operation"), false},
+         {std::string("path"), std::string("string"), std::string("Dot-separated field path for modify (e.g. '1.3.2')"), false},
+         {std::string("value"), std::string("string"), std::string("New value for modify operation"), false},
+         {std::string("field_type"), std::string("string"), std::string("Type for modify: uint|sint|int|bool|float|double|string|bytes"), false}},
         [](const json& args) -> tool_result_t {
             std::string op = args.value("operation", "");
             if (op.empty())

@@ -11,7 +11,6 @@
 
 #include "standalone_compat.hpp"
 #include "comm.h"
-#include "obfuscation.hpp"
 #include "pro.h"
 #include "../infra/executor.hpp"
 #include "../infra/taskflow_runtime.hpp"
@@ -244,7 +243,7 @@ static std::optional<tool_result_t> reject_full_test_system_mutation(std::uint64
         module_name.c_str(),
         module_path.c_str());
     return tool_result_t::error(
-        OBFSTR("Full Test Lab refuses to mutate system module memory. Use a private target fixture address instead."));
+        std::string("Full Test Lab refuses to mutate system module memory. Use a private target fixture address instead."));
 }
 
 static bool is_ida_host_process_name(const std::string& process_name)
@@ -675,7 +674,7 @@ static bool validate_kernel_range(std::uint64_t address, std::uint64_t size, std
 static std::optional<tool_result_t> ensure_kernel_memory_context()
 {
     if (mcp_standalone::current_call_cancelled())
-        return tool_result_t::error(OBFSTR("Tool cancelled before the kernel operation started."));
+        return tool_result_t::error(std::string("Tool cancelled before the kernel operation started."));
     std::string reason;
     if (!driver_bridge::kernel_session_available(&reason))
     {
@@ -684,13 +683,13 @@ static std::optional<tool_result_t> ensure_kernel_memory_context()
         details["driver_status"] = driver_bridge::status();
         details["attached_pid"] = driver_bridge::attached_pid();
         return tool_result_t::error(
-            OBFSTR("Kernel driver session is unavailable: ") + reason,
-            OBFSTR("kernel_session_unavailable"), details);
+            std::string("Kernel driver session is unavailable: ") + reason,
+            std::string("kernel_session_unavailable"), details);
     }
     if (device == nullptr || !device->is_connected())
-        return tool_result_t::error(OBFSTR("Kernel device is not connected."));
+        return tool_result_t::error(std::string("Kernel device is not connected."));
     if (device->get_kernel_dtb() == 0 && device->get_dtb() == 0)
-        return tool_result_t::error(OBFSTR("No kernel-capable DTB is resolved. Attach a live process before accessing kernel memory."));
+        return tool_result_t::error(std::string("No kernel-capable DTB is resolved. Attach a live process before accessing kernel memory."));
     return std::nullopt;
 }
 
@@ -735,7 +734,7 @@ static bool is_process_alive(std::uint32_t pid)
 static std::optional<tool_result_t> ensure_attached_process_context(const json& params)
 {
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     std::uint32_t requested_pid = 0;
     for (const char* key : {"target_pid", "process_id", "pid"})
@@ -743,19 +742,19 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
         if (!params.contains(key))
             continue;
         if (!parse_u32_id_value(params[key], requested_pid))
-            return tool_result_t::error(std::string(OBFSTR("Invalid ")) + key + OBFSTR(". Expected a positive decimal PID or 0x-prefixed hex PID."));
+            return tool_result_t::error(std::string(std::string("Invalid ")) + key + std::string(". Expected a positive decimal PID or 0x-prefixed hex PID."));
         if (requested_pid != 0)
             break;
     }
 
     if (requested_pid != 0 && is_self_target_pid(requested_pid))
-        return tool_result_t::error(OBFSTR("Cannot target AiDA's own process."));
+        return tool_result_t::error(std::string("Cannot target AiDA's own process."));
 
     const std::uint32_t current_pid = driver_bridge::attached_pid();
     if (requested_pid != 0 && requested_pid != current_pid)
     {
         if (!is_process_alive(requested_pid))
-            return tool_result_t::error(OBFSTR("target_pid ") + std::to_string(requested_pid) + OBFSTR(" is not alive."));
+            return tool_result_t::error(std::string("target_pid ") + std::to_string(requested_pid) + std::string(" is not alive."));
 
         const auto attached = driver_bridge::attached_pids();
         bool in_map = false;
@@ -764,8 +763,8 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
         {
             if (!driver_bridge::attach_additional(requested_pid))
             {
-                return tool_result_t::error(OBFSTR("attach_additional failed for target_pid ") + std::to_string(requested_pid) +
-                                            OBFSTR(": ") + driver_bridge::last_error());
+                return tool_result_t::error(std::string("attach_additional failed for target_pid ") + std::to_string(requested_pid) +
+                                            std::string(": ") + driver_bridge::last_error());
             }
         }
 
@@ -776,8 +775,8 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
         {
             if (current_pid != 0 && driver_bridge::attached_pid() == current_pid)
                 (void)stealth_engine::ensure_default_enabled(current_pid, "driver_tools.ensure_attached_context.restore_failed_switch");
-            return tool_result_t::error(OBFSTR("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
-                                        OBFSTR(": ") + driver_bridge::last_error());
+            return tool_result_t::error(std::string("set_active_pid failed for target_pid ") + std::to_string(requested_pid) +
+                                        std::string(": ") + driver_bridge::last_error());
         }
 
         (void)stealth_engine::ensure_default_enabled(requested_pid, "driver_tools.ensure_attached_context");
@@ -786,25 +785,25 @@ static std::optional<tool_result_t> ensure_attached_process_context(const json& 
         {
             device->solve_dtb();
             if (device->get_dtb() == 0)
-                return tool_result_t::error(OBFSTR("Failed to solve DTB for target_pid ") + std::to_string(requested_pid) + OBFSTR("."));
+                return tool_result_t::error(std::string("Failed to solve DTB for target_pid ") + std::to_string(requested_pid) + std::string("."));
         }
     }
 
     if (driver_bridge::attached_pid() == 0)
-        return tool_result_t::error(OBFSTR("Not attached. Use sessions_manage action=attach_pid or pass target_pid."));
+        return tool_result_t::error(std::string("Not attached. Use sessions_manage action=attach_pid or pass target_pid."));
 
     if (!is_process_alive(driver_bridge::attached_pid()))
     {
         const std::uint32_t dead_pid = driver_bridge::attached_pid();
         device->clear_process_context();
-        return tool_result_t::error(OBFSTR("Attached process PID ") + std::to_string(dead_pid) + OBFSTR(" is no longer alive. Reattach with sessions_manage action=attach_pid."));
+        return tool_result_t::error(std::string("Attached process PID ") + std::to_string(dead_pid) + std::string(" is no longer alive. Reattach with sessions_manage action=attach_pid."));
     }
 
     if (device->get_dtb() == 0)
     {
         device->solve_dtb();
         if (device->get_dtb() == 0)
-            return tool_result_t::error(OBFSTR("Failed to solve DTB for the attached process."));
+            return tool_result_t::error(std::string("Failed to solve DTB for the attached process."));
     }
 
     return std::nullopt;
@@ -896,7 +895,7 @@ static bool resolve_teb_address_for_thread(std::uint32_t tid,
         if (diag.context_valid)
         {
             out_teb = diag.context_candidate;
-            source = OBFSTR("thread_context.kernel_gs_base");
+            source = std::string("thread_context.kernel_gs_base");
             diag.selected_source = source;
             diag::log_tagged_fmt("drv_tools",
                 "teb_resolve_selected pid=%u tid=%u source=%s address=0x%llX context_candidate=0x%llX tqif_candidate=0x%llX tqif_called=%d tqif_ok=%d tqif_status=0x%08X",
@@ -946,7 +945,7 @@ static bool resolve_teb_address_for_thread(std::uint32_t tid,
     if (diag.tqif_valid)
     {
         out_teb = diag.tqif_candidate;
-        source = OBFSTR("thread_query_information.teb_base");
+        source = std::string("thread_query_information.teb_base");
         diag.selected_source = source;
         diag::log_tagged_fmt("drv_tools",
             "teb_resolve_selected pid=%u tid=%u source=%s address=0x%llX context_candidate=0x%llX tqif_candidate=0x%llX tqif_called=%d tqif_ok=%d tqif_status=0x%08X",
@@ -964,21 +963,21 @@ static bool resolve_teb_address_for_thread(std::uint32_t tid,
 
     std::string context_error;
     if (!diag.context_available)
-        context_error = OBFSTR("driver thread context was unavailable for TID ") + std::to_string(tid);
+        context_error = std::string("driver thread context was unavailable for TID ") + std::to_string(tid);
     else if (diag.context_kernel)
-        context_error = OBFSTR("driver thread context reported a kernel GS base instead of a user TEB for TID ") + std::to_string(tid);
+        context_error = std::string("driver thread context reported a kernel GS base instead of a user TEB for TID ") + std::to_string(tid);
     else
-        context_error = OBFSTR("driver thread context did not include a valid user TEB for TID ") + std::to_string(tid);
+        context_error = std::string("driver thread context did not include a valid user TEB for TID ") + std::to_string(tid);
 
     std::string tqif_error;
     if (!diag.tqif_ok)
-        tqif_error = OBFSTR("TQIF failed with status ") + sa_format_address(static_cast<std::uint64_t>(diag.tqif_status));
+        tqif_error = std::string("TQIF failed with status ") + sa_format_address(static_cast<std::uint64_t>(diag.tqif_status));
     else if (diag.tqif_candidate == 0)
-        tqif_error = OBFSTR("TQIF returned a null TEB base");
+        tqif_error = std::string("TQIF returned a null TEB base");
     else
-        tqif_error = OBFSTR("TQIF returned a kernel address instead of a user TEB");
+        tqif_error = std::string("TQIF returned a kernel address instead of a user TEB");
 
-    error = context_error + OBFSTR("; ") + tqif_error;
+    error = context_error + std::string("; ") + tqif_error;
     diag.failure = error;
     diag::log_tagged_fmt("drv_tools",
         "teb_resolve_failed pid=%u tid=%u context_available=%d context_candidate=0x%llX context_valid=%d context_kernel=%d tqif_called=%d tqif_ok=%d tqif_status=0x%08X tqif_candidate=0x%llX tqif_valid=%d tqif_kernel=%d failure=%s",
@@ -1173,7 +1172,7 @@ tool_result_t driver_read_pointer_chain(const json& params)
 
     auto ea_opt = sa_parse_address(base_address);
     if (!ea_opt)
-        return tool_result_t::error(OBFSTR("Invalid address. Use address='0x...' (alias base_address is supported)."));
+        return tool_result_t::error(std::string("Invalid address. Use address='0x...' (alias base_address is supported)."));
 
     std::vector<std::int64_t> offsets;
     if (params.contains("offsets") && params["offsets"].is_array())
@@ -1222,7 +1221,7 @@ tool_result_t driver_read_pointer_chain(const json& params)
     result["final_value"]        = sa_format_address(final_val);
     result["final_value_decimal"] = final_val;
     result["chain"]              = chain;
-    return tool_result_t::ok(OBFSTR("Pointer chain traversed"), result);
+    return tool_result_t::ok(std::string("Pointer chain traversed"), result);
 }
 
 static std::string resolve_nt_path_to_win32(const std::string& nt_path)
@@ -1601,12 +1600,12 @@ static bool apply_readonly_kernel_module_base_fallback(
         diag_ref.fallback_reason = fallback.reason;
         const std::string token_json = diag_ref.token.dump();
         const std::string driver_json = diag_ref.driver.dump();
-        error_msg = OBFSTR("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
+        error_msg = std::string("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
             std::to_string(diag_ref.count) +
-            OBFSTR(" modules but every ImageBase is zero; read-only EnumDeviceDrivers fallback was rejected. sample_modules=") +
+            std::string(" modules but every ImageBase is zero; read-only EnumDeviceDrivers fallback was rejected. sample_modules=") +
             (primary_samples.empty() ? std::string("<none>") : primary_samples) +
-            OBFSTR(" strict_fallback=") + diag_ref.strict_fallback +
-            OBFSTR(" fallback_reason=") + diag_ref.fallback_reason;
+            std::string(" strict_fallback=") + diag_ref.strict_fallback +
+            std::string(" fallback_reason=") + diag_ref.fallback_reason;
         diag::log_tagged_fmt("drv_tools",
             "query_kernel_modules dependency_blocked reason=all_image_bases_zero fallback_status=rejected fallback_reason=%s primary_count=%lu fallback_raw=%lu fallback_named=%zu fallback_name_query_failed=%zu fallback_duplicate=%zu fallback_unmatched_psapi=%zu token=%s driver=%s strict_fallback=%s",
             diag_ref.fallback_reason.c_str(),
@@ -1670,11 +1669,11 @@ static bool apply_readonly_kernel_module_base_fallback(
         const std::string missing = module_sample_text(missing_samples);
         const std::string token_json = diag_ref.token.dump();
         const std::string driver_json = diag_ref.driver.dump();
-        error_msg = OBFSTR("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
+        error_msg = std::string("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
             std::to_string(diag_ref.count) +
-            OBFSTR(" modules but every ImageBase is zero; read-only EnumDeviceDrivers fallback did not match every primary module. missing_modules=") +
+            std::string(" modules but every ImageBase is zero; read-only EnumDeviceDrivers fallback did not match every primary module. missing_modules=") +
             (missing.empty() ? std::string("<none>") : missing) +
-            OBFSTR(" strict_fallback=") + diag_ref.strict_fallback;
+            std::string(" strict_fallback=") + diag_ref.strict_fallback;
         diag::log_tagged_fmt("drv_tools",
             "query_kernel_modules dependency_blocked reason=all_image_bases_zero fallback_status=rejected fallback_reason=%s primary_count=%lu primary_zero=%zu primary_nonzero=%zu fallback_raw=%lu fallback_named=%zu fallback_name_query_failed=%zu fallback_duplicate=%zu match_count=%zu unmatched_primary=%zu unmatched_psapi=%zu ambiguous_primary=%zu missing=%s token=%s driver=%s strict_fallback=%s base_source=%s",
             diag_ref.fallback_reason.c_str(),
@@ -1791,7 +1790,7 @@ static tool_result_t kernel_module_query_error_result(
 {
     const std::string message = prefix.empty() ? error : prefix + error;
     if (diag.dependency_blocked)
-        return tool_result_t::error(message, OBFSTR("dependency_blocked"), kernel_module_query_diagnostics_json(diag));
+        return tool_result_t::error(message, std::string("dependency_blocked"), kernel_module_query_diagnostics_json(diag));
     return tool_result_t::error(message);
 }
 
@@ -1827,7 +1826,7 @@ static bool query_kernel_modules(
     if (!ntdll)
     {
         diag_ref.win32_error = GetLastError();
-        error_msg = OBFSTR("Cannot resolve ntdll.dll");
+        error_msg = std::string("Cannot resolve ntdll.dll");
         diag::log_tagged_fmt("drv_tools",
             "query_kernel_modules failed stage=resolve_ntdll gle=%lu abi_header=%zu abi_entry=%zu",
             static_cast<unsigned long>(diag_ref.win32_error),
@@ -1841,7 +1840,7 @@ static bool query_kernel_modules(
     if (!pNtQuerySystemInformation)
     {
         diag_ref.win32_error = GetLastError();
-        error_msg = OBFSTR("Cannot resolve NtQuerySystemInformation");
+        error_msg = std::string("Cannot resolve NtQuerySystemInformation");
         diag::log_tagged_fmt("drv_tools",
             "query_kernel_modules failed stage=resolve_NtQuerySystemInformation gle=%lu abi_header=%zu abi_entry=%zu",
             static_cast<unsigned long>(diag_ref.win32_error),
@@ -1884,7 +1883,7 @@ static bool query_kernel_modules(
 
     if (status < 0)
     {
-        error_msg = OBFSTR("NtQuerySystemInformation(SystemModuleInformation) failed: NTSTATUS ")
+        error_msg = std::string("NtQuerySystemInformation(SystemModuleInformation) failed: NTSTATUS ")
             + sa_format_address(static_cast<uint64_t>(diag_ref.final_ntstatus));
         diag::log_tagged_fmt("drv_tools",
             "query_kernel_modules failed stage=SystemModuleInformation status=0x%08X bytes_returned=%lu buffer_size=%zu",
@@ -1897,7 +1896,7 @@ static bool query_kernel_modules(
     out_info = reinterpret_cast<sys_module_info_t*>(out_buffer.data());
     if (out_buffer.size() < sizeof(ULONG))
     {
-        error_msg = OBFSTR("System module buffer is too small");
+        error_msg = std::string("System module buffer is too small");
         diag::log_tagged_fmt("drv_tools",
             "query_kernel_modules failed stage=buffer_too_small buffer_size=%zu abi_header=%zu",
             out_buffer.size(),
@@ -1911,8 +1910,8 @@ static bool query_kernel_modules(
     diag_ref.abi_min_size = min_size;
     if (count > 4096 || min_size > out_buffer.size())
     {
-        error_msg = OBFSTR("System module buffer failed bounds validation: count=") +
-            std::to_string(count) + OBFSTR(" buffer=") + std::to_string(out_buffer.size());
+        error_msg = std::string("System module buffer failed bounds validation: count=") +
+            std::to_string(count) + std::string(" buffer=") + std::to_string(out_buffer.size());
         diag::log_tagged_fmt("drv_tools",
             "query_kernel_modules failed stage=bounds count=%lu min_size=%zu buffer_size=%zu bytes_returned=%zu abi_entry=%zu",
             static_cast<unsigned long>(count),
@@ -1982,13 +1981,13 @@ static bool query_kernel_modules(
             diag_ref.fallback_reason = "readonly_kernel_base_fallback_not_permitted_by_caller";
         }
         const std::string sample_value = samples.empty() ? std::string("<none>") : samples;
-        error_msg = OBFSTR("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
+        error_msg = std::string("dependency_blocked: NtQuerySystemInformation(SystemModuleInformation) returned ") +
             std::to_string(count) +
-            OBFSTR(" modules but every ImageBase is zero; kernel module base resolution is unavailable for this context. sample_modules=") +
+            std::string(" modules but every ImageBase is zero; kernel module base resolution is unavailable for this context. sample_modules=") +
             sample_value +
-            OBFSTR(" strict_fallback=") + diag_ref.strict_fallback +
-            OBFSTR(" fallback_status=") + diag_ref.fallback_status +
-            OBFSTR(" fallback_reason=") + diag_ref.fallback_reason;
+            std::string(" strict_fallback=") + diag_ref.strict_fallback +
+            std::string(" fallback_status=") + diag_ref.fallback_status +
+            std::string(" fallback_reason=") + diag_ref.fallback_reason;
         const std::string token_json = diag_ref.token.dump();
         const std::string driver_json = diag_ref.driver.dump();
         diag::log_tagged_fmt("drv_tools",
@@ -2020,7 +2019,7 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
             kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
     {
         if (query_diag.dependency_blocked)
-            return tool_result_t::error(err, OBFSTR("dependency_blocked"), kernel_module_query_diagnostics_json(query_diag));
+            return tool_result_t::error(err, std::string("dependency_blocked"), kernel_module_query_diagnostics_json(query_diag));
         return tool_result_t::error(err);
     }
 
@@ -2076,8 +2075,8 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
     result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
 
     return tool_result_t::ok(
-        OBFSTR("Enumerated ") + std::to_string(modules_arr.size()) + OBFSTR(" kernel modules") +
-        (filter.empty() ? "" : OBFSTR(" matching '") + filter + "'"), result);
+        std::string("Enumerated ") + std::to_string(modules_arr.size()) + std::string(" kernel modules") +
+        (filter.empty() ? "" : std::string(" matching '") + filter + "'"), result);
 }
 
 static bool parse_kernel_address_param(const json& params, const char* key, std::uint64_t& out)
@@ -2179,7 +2178,7 @@ tool_result_t driver_read_kernel_memory(const json& params)
     std::uint64_t address = 0;
     std::string address_error;
     if (!parse_kernel_address_or_symbol(params, "address", address, address_error))
-        return tool_result_t::error(OBFSTR("Missing or invalid kernel address: ") + address_error);
+        return tool_result_t::error(std::string("Missing or invalid kernel address: ") + address_error);
 
     const bool annotate = !params.contains("annotate") || !params["annotate"].is_boolean() ||
         params["annotate"].get<bool>();
@@ -2191,10 +2190,10 @@ tool_result_t driver_read_kernel_memory(const json& params)
 
     std::uint64_t size64 = 0;
     if (!parse_kernel_size(params, "size", size64))
-        return tool_result_t::error(OBFSTR("Missing or invalid size."));
+        return tool_result_t::error(std::string("Missing or invalid size."));
     constexpr std::uint64_t max_read_size = 1024ULL * 1024ULL;
     if (size64 > max_read_size)
-        return tool_result_t::error(OBFSTR("Kernel reads are capped at 1048576 bytes per call."));
+        return tool_result_t::error(std::string("Kernel reads are capped at 1048576 bytes per call."));
 
     std::string range_error;
     if (!validate_kernel_range(address, size64, range_error))
@@ -2214,7 +2213,7 @@ tool_result_t driver_read_kernel_memory(const json& params)
         details["requested_size"] = size64;
         details["driver_status"] = driver_bridge::status();
         details["driver_error"] = driver_bridge::last_error();
-        return tool_result_t::error(OBFSTR("Kernel memory read failed."), OBFSTR("kernel_read_failed"), details);
+        return tool_result_t::error(std::string("Kernel memory read failed."), std::string("kernel_read_failed"), details);
     }
 
     json result;
@@ -2315,9 +2314,9 @@ tool_result_t driver_read_kernel_memory(const json& params)
         bytes.size(), bytes.size() == size64 ? 1 : 0, annotate ? 1 : 0, struct_name.c_str());
     if (bytes.size() != size64)
         return tool_result_t::error(
-            OBFSTR("Kernel memory read was partial; exact-length reads are required."),
-            OBFSTR("kernel_read_partial"), result);
-    return tool_result_t::ok(OBFSTR("Read kernel memory."), result);
+            std::string("Kernel memory read was partial; exact-length reads are required."),
+            std::string("kernel_read_partial"), result);
+    return tool_result_t::ok(std::string("Read kernel memory."), result);
 }
 
 tool_result_t driver_write_kernel_memory(const json& params)
@@ -2326,10 +2325,10 @@ tool_result_t driver_write_kernel_memory(const json& params)
     std::uint64_t address = 0;
     std::string address_error;
     if (!parse_kernel_address_or_symbol(params, "address", address, address_error))
-        return tool_result_t::error(OBFSTR("Missing or invalid kernel address: ") + address_error);
+        return tool_result_t::error(std::string("Missing or invalid kernel address: ") + address_error);
 
     if (!params.contains("bytes"))
-        return tool_result_t::error(OBFSTR("Missing bytes payload."));
+        return tool_result_t::error(std::string("Missing bytes payload."));
 
     std::vector<std::uint8_t> bytes;
     std::string parse_error;
@@ -2337,7 +2336,7 @@ tool_result_t driver_write_kernel_memory(const json& params)
         return tool_result_t::error(parse_error);
     constexpr std::size_t max_write_size = 1024 * 1024;
     if (bytes.size() > max_write_size)
-        return tool_result_t::error(OBFSTR("Kernel writes are capped at 1048576 bytes per call."));
+        return tool_result_t::error(std::string("Kernel writes are capped at 1048576 bytes per call."));
 
     std::string range_error;
     if (!validate_kernel_range(address, bytes.size(), range_error))
@@ -2346,15 +2345,15 @@ tool_result_t driver_write_kernel_memory(const json& params)
     const bool dry_run = params.value("dry_run", false);
     if (!dry_run && !params.value("confirm_unsafe", false))
         return tool_result_t::error(
-            OBFSTR("driver_write_kernel_memory can corrupt kernel state or crash Windows. Re-run with confirm_unsafe=true, or use dry_run=true to validate the request without writing."));
+            std::string("driver_write_kernel_memory can corrupt kernel state or crash Windows. Re-run with confirm_unsafe=true, or use dry_run=true to validate the request without writing."));
 
     std::vector<std::uint8_t> expected;
     if (params.contains("expected_bytes"))
     {
         if (!parse_byte_sequence(params["expected_bytes"], expected, parse_error))
-            return tool_result_t::error(OBFSTR("Invalid expected_bytes: ") + parse_error);
+            return tool_result_t::error(std::string("Invalid expected_bytes: ") + parse_error);
         if (expected.size() != bytes.size())
-            return tool_result_t::error(OBFSTR("expected_bytes must have exactly the same length as bytes."));
+            return tool_result_t::error(std::string("expected_bytes must have exactly the same length as bytes."));
     }
 
     if (auto context_error = ensure_kernel_memory_context())
@@ -2372,8 +2371,8 @@ tool_result_t driver_write_kernel_memory(const json& params)
         details["requested_size"] = bytes.size();
         details["bytes_read"] = before.size();
         return tool_result_t::error(
-            OBFSTR("Pre-write kernel read failed or was partial; the write was not attempted."),
-            OBFSTR("kernel_prewrite_read_failed"), details);
+            std::string("Pre-write kernel read failed or was partial; the write was not attempted."),
+            std::string("kernel_prewrite_read_failed"), details);
     }
 
     if (!expected.empty() && !std::equal(expected.begin(), expected.end(), before.begin()))
@@ -2383,8 +2382,8 @@ tool_result_t driver_write_kernel_memory(const json& params)
         details["expected_hex"] = kernel_bytes_hex(expected);
         details["actual_hex"] = kernel_bytes_hex(before);
         return tool_result_t::error(
-            OBFSTR("Kernel memory no longer matches expected_bytes; the write was not attempted."),
-            OBFSTR("kernel_compare_exchange_mismatch"), details);
+            std::string("Kernel memory no longer matches expected_bytes; the write was not attempted."),
+            std::string("kernel_compare_exchange_mismatch"), details);
     }
 
     if (dry_run)
@@ -2396,7 +2395,7 @@ tool_result_t driver_write_kernel_memory(const json& params)
         preview["replacement_hex"] = kernel_bytes_hex(bytes);
         preview["expected_bytes_checked"] = !expected.empty();
         preview["written"] = false;
-        return tool_result_t::ok(OBFSTR("Validated kernel write dry-run; no memory was modified."), preview);
+        return tool_result_t::ok(std::string("Validated kernel write dry-run; no memory was modified."), preview);
     }
 
     if (!driver_bridge::write_kernel_memory(address, bytes))
@@ -2406,7 +2405,7 @@ tool_result_t driver_write_kernel_memory(const json& params)
         details["size"] = bytes.size();
         details["before_hex"] = kernel_bytes_hex(before);
         details["driver_error"] = driver_bridge::last_error();
-        return tool_result_t::error(OBFSTR("Kernel memory write failed or was partial."), OBFSTR("kernel_write_failed"), details);
+        return tool_result_t::error(std::string("Kernel memory write failed or was partial."), std::string("kernel_write_failed"), details);
     }
 
     std::vector<std::uint8_t> after;
@@ -2426,9 +2425,9 @@ tool_result_t driver_write_kernel_memory(const json& params)
         static_cast<unsigned long long>(address), bytes.size(), readback_ok ? 1 : 0, verified ? 1 : 0);
     if (!verified)
         return tool_result_t::error(
-            OBFSTR("Kernel write completed but exact readback verification failed; kernel state may have changed and must be inspected."),
-            OBFSTR("kernel_write_verification_failed"), result);
-    return tool_result_t::ok(OBFSTR("Wrote and verified kernel memory."), result);
+            std::string("Kernel write completed but exact readback verification failed; kernel state may have changed and must be inspected."),
+            std::string("kernel_write_verification_failed"), result);
+    return tool_result_t::ok(std::string("Wrote and verified kernel memory."), result);
 }
 
 tool_result_t search_kernel_memory(const json& params)
@@ -2438,7 +2437,7 @@ tool_result_t search_kernel_memory(const json& params)
         return *context_error;
 
     if (!params.contains("pattern"))
-        return tool_result_t::error(OBFSTR("Missing required pattern."));
+        return tool_result_t::error(std::string("Missing required pattern."));
     kernel_pattern_t pattern;
     std::string pattern_error;
     if (!parse_kernel_pattern(params["pattern"], pattern, pattern_error))
@@ -2452,7 +2451,7 @@ tool_result_t search_kernel_memory(const json& params)
         !trim_ascii_copy(params["module"].get<std::string>()).empty();
     const bool has_address = params.contains("address") || params.contains("start_address");
     if (has_module && has_address)
-        return tool_result_t::error(OBFSTR("Specify either module or address/start_address, not both."));
+        return tool_result_t::error(std::string("Specify either module or address/start_address, not both."));
 
     if (has_module)
     {
@@ -2463,7 +2462,7 @@ tool_result_t search_kernel_memory(const json& params)
         kernel_module_query_diagnostics_t query_diagnostics{};
         if (!query_kernel_modules(module_buffer, module_info, module_error, &query_diagnostics,
                 kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
-            return kernel_module_query_error_result(module_error, query_diagnostics, OBFSTR("Cannot resolve kernel module scan range: "));
+            return kernel_module_query_error_result(module_error, query_diagnostics, std::string("Cannot resolve kernel module scan range: "));
         module_diagnostics = kernel_module_query_diagnostics_json(query_diagnostics);
 
         std::vector<const sys_module_entry_t*> exact;
@@ -2480,27 +2479,27 @@ tool_result_t search_kernel_memory(const json& params)
         }
         const auto& candidates = exact.empty() ? partial : exact;
         if (candidates.empty())
-            return tool_result_t::error(OBFSTR("No loaded kernel module matches '") + query + "'.");
+            return tool_result_t::error(std::string("No loaded kernel module matches '") + query + "'.");
         if (candidates.size() != 1)
-            return tool_result_t::error(OBFSTR("Kernel module query is ambiguous; use the exact module filename."));
+            return tool_result_t::error(std::string("Kernel module query is ambiguous; use the exact module filename."));
 
         const auto& entry = *candidates.front();
         const std::uint64_t base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(entry.ImageBase));
         const std::uint64_t module_size = entry.ImageSize;
         std::uint64_t offset = 0;
         if (params.contains("offset") && !parse_kernel_size(params, "offset", offset))
-            return tool_result_t::error(OBFSTR("Invalid module offset."));
+            return tool_result_t::error(std::string("Invalid module offset."));
         if (offset >= module_size)
-            return tool_result_t::error(OBFSTR("Module offset is outside the loaded image."));
+            return tool_result_t::error(std::string("Module offset is outside the loaded image."));
         start = base + offset;
         span = module_size - offset;
         if (params.contains("size"))
         {
             std::uint64_t requested_span = 0;
             if (!parse_kernel_size(params, "size", requested_span) || requested_span == 0)
-                return tool_result_t::error(OBFSTR("Invalid scan size."));
+                return tool_result_t::error(std::string("Invalid scan size."));
             if (requested_span > span)
-                return tool_result_t::error(OBFSTR("Requested scan size extends beyond the selected kernel module."));
+                return tool_result_t::error(std::string("Requested scan size extends beyond the selected kernel module."));
             span = requested_span;
         }
         module_name = bounded_kernel_module_name(entry);
@@ -2510,33 +2509,33 @@ tool_result_t search_kernel_memory(const json& params)
         const char* address_key = params.contains("address") ? "address" : "start_address";
         std::string address_error;
         if (!parse_kernel_address_or_symbol(params, address_key, start, address_error))
-            return tool_result_t::error(OBFSTR("Missing or invalid address/start_address: ") + address_error);
+            return tool_result_t::error(std::string("Missing or invalid address/start_address: ") + address_error);
         if (!parse_kernel_size(params, "size", span))
-            return tool_result_t::error(OBFSTR("Missing or invalid scan size."));
+            return tool_result_t::error(std::string("Missing or invalid scan size."));
     }
 
     constexpr std::uint64_t max_scan_span = 4ULL * 1024ULL * 1024ULL * 1024ULL;
     if (span > max_scan_span)
-        return tool_result_t::error(OBFSTR("Kernel searches are capped at 4294967296 bytes per call."));
+        return tool_result_t::error(std::string("Kernel searches are capped at 4294967296 bytes per call."));
     std::string range_error;
     if (!validate_kernel_range(start, span, range_error))
         return tool_result_t::error(range_error);
     if (span > std::numeric_limits<std::uint64_t>::max() - start)
-        return tool_result_t::error(OBFSTR("Kernel search end-exclusive address overflows the 64-bit virtual address space."));
+        return tool_result_t::error(std::string("Kernel search end-exclusive address overflows the 64-bit virtual address space."));
     if (span < pattern.bytes.size())
-        return tool_result_t::error(OBFSTR("Scan range is smaller than the pattern."));
+        return tool_result_t::error(std::string("Scan range is smaller than the pattern."));
 
     std::uint64_t chunk_size64 = 64 * 1024;
     if (params.contains("chunk_size") && !parse_kernel_size(params, "chunk_size", chunk_size64))
-        return tool_result_t::error(OBFSTR("Invalid chunk_size."));
+        return tool_result_t::error(std::string("Invalid chunk_size."));
     if (chunk_size64 < 4096 || chunk_size64 > 1024 * 1024)
-        return tool_result_t::error(OBFSTR("chunk_size must be between 4096 and 1048576 bytes."));
+        return tool_result_t::error(std::string("chunk_size must be between 4096 and 1048576 bytes."));
 
     std::uint64_t max_results64 = 256;
     if (params.contains("max_results") && !parse_kernel_size(params, "max_results", max_results64))
-        return tool_result_t::error(OBFSTR("Invalid max_results."));
+        return tool_result_t::error(std::string("Invalid max_results."));
     if (max_results64 == 0 || max_results64 > 4096)
-        return tool_result_t::error(OBFSTR("max_results must be between 1 and 4096."));
+        return tool_result_t::error(std::string("max_results must be between 1 and 4096."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_error = acquire_driver_debugger_quota("search_kernel_memory", driver_bridge::attached_pid(), quota_guard))
@@ -2561,7 +2560,7 @@ tool_result_t search_kernel_memory(const json& params)
             details["bytes_scanned"] = bytes_scanned;
             details["bytes_unreadable"] = bytes_unreadable;
             details["matches"] = matches;
-            return tool_result_t::error(OBFSTR("Kernel memory search was cancelled."), OBFSTR("cancelled"), details);
+            return tool_result_t::error(std::string("Kernel memory search was cancelled."), std::string("cancelled"), details);
         }
 
         const std::uint64_t remaining = end - cursor;
@@ -2641,8 +2640,8 @@ tool_result_t search_kernel_memory(const json& params)
     }
     if (bytes_scanned == 0)
         return tool_result_t::error(
-            OBFSTR("No readable kernel memory was found in the requested range."),
-            OBFSTR("kernel_search_unreadable_range"), result);
+            std::string("No readable kernel memory was found in the requested range."),
+            std::string("kernel_search_unreadable_range"), result);
     diag::log_tagged_fmt("drv_tools",
         "search_kernel_memory exit start=0x%llX span=%llu scanned=%llu unreadable=%llu failures=%llu matches=%zu limit=%d complete=%d",
         static_cast<unsigned long long>(start),
@@ -2651,7 +2650,7 @@ tool_result_t search_kernel_memory(const json& params)
         static_cast<unsigned long long>(bytes_unreadable),
         static_cast<unsigned long long>(read_failures),
         matches.size(), result_limit_reached ? 1 : 0, cursor >= end ? 1 : 0);
-    return tool_result_t::ok(OBFSTR("Searched live kernel memory."), result);
+    return tool_result_t::ok(std::string("Searched live kernel memory."), result);
 }
 
 
@@ -2708,7 +2707,7 @@ tool_result_t driver_allocate_memory(const json& params)
             static_cast<unsigned long>(host_tid),
             size,
             static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_entry).count()));
-        return tool_result_t::error(OBFSTR("Invalid size. Must be 1 to 16777216 (16MB)."));
+        return tool_result_t::error(std::string("Invalid size. Must be 1 to 16777216 (16MB)."));
     }
 
     const std::uint32_t bridge_pid_after_ctx = driver_bridge::attached_pid();
@@ -2759,7 +2758,7 @@ tool_result_t driver_allocate_memory(const json& params)
             bridge_alive_after_call ? 1 : 0,
             driver_bridge::status().c_str(),
             driver_bridge::last_error().c_str());
-        return tool_result_t::error(OBFSTR("Failed to allocate memory in target process."));
+        return tool_result_t::error(std::string("Failed to allocate memory in target process."));
     }
 
     json result;
@@ -2776,7 +2775,7 @@ tool_result_t driver_allocate_memory(const json& params)
         kernel_us,
         static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_entry).count()));
     return tool_result_t::ok(
-        OBFSTR("Allocated ") + std::to_string(size) + OBFSTR(" bytes at ") +
+        std::string("Allocated ") + std::to_string(size) + std::string(" bytes at ") +
         sa_format_address(static_cast<uint64_t>(allocated)), result);
 }
 
@@ -2792,7 +2791,7 @@ tool_result_t driver_free_memory(const json& params)
 
     auto addr_opt = sa_parse_address(params["address"].get<std::string>());
     if (!addr_opt || *addr_opt == 0)
-        return tool_result_t::error(OBFSTR("Invalid address."));
+        return tool_result_t::error(std::string("Invalid address."));
 
     std::uint64_t address = static_cast<std::uint64_t>(*addr_opt);
 
@@ -2814,10 +2813,10 @@ tool_result_t driver_free_memory(const json& params)
     }
 
     if (ok)
-        return tool_result_t::ok(OBFSTR("Memory freed at ") + sa_format_address(*addr_opt), result);
+        return tool_result_t::ok(std::string("Memory freed at ") + sa_format_address(*addr_opt), result);
     else
-        return tool_result_t::error(OBFSTR("Failed to free memory at ") + sa_format_address(*addr_opt) +
-            OBFSTR(". If the region was modified through kernel-space writes, verify address space consistency and attached PID."));
+        return tool_result_t::error(std::string("Failed to free memory at ") + sa_format_address(*addr_opt) +
+            std::string(". If the region was modified through kernel-space writes, verify address space consistency and attached PID."));
 }
 
 tool_result_t driver_call_function(const json& params)
@@ -2830,7 +2829,7 @@ tool_result_t driver_call_function(const json& params)
 
     auto func_opt = sa_parse_address(params["address"].get<std::string>());
     if (!func_opt || *func_opt == 0)
-        return tool_result_t::error(OBFSTR("Invalid function address."));
+        return tool_result_t::error(std::string("Invalid function address."));
 
     std::uint64_t func_addr = static_cast<std::uint64_t>(*func_opt);
 
@@ -2846,13 +2845,13 @@ tool_result_t driver_call_function(const json& params)
         preview["function"] = sa_format_address(static_cast<uint64_t>(func_addr));
         preview["process_id"] = device->get_process_id();
         preview["note"] = "Dry-run only. No remote execution performed.";
-        return tool_result_t::ok(OBFSTR("driver_call_function dry-run completed."), preview);
+        return tool_result_t::ok(std::string("driver_call_function dry-run completed."), preview);
     }
 
     if (!unsafe_confirmed)
     {
         return tool_result_t::error(
-            OBFSTR("driver_call_function is high-risk and may crash the target process. "
+            std::string("driver_call_function is high-risk and may crash the target process. "
                    "Re-run with confirm_unsafe=true (or allow_unsafe=true) to execute, "
                    "or dry_run=true to preview only."));
     }
@@ -2884,8 +2883,8 @@ tool_result_t driver_call_function(const json& params)
     {
         const std::uint32_t crashed_pid = device->get_process_id();
         device->clear_process_context();
-        return tool_result_t::error(OBFSTR("Target process PID ") + std::to_string(crashed_pid) +
-            OBFSTR(" terminated during driver_call_function. Process context was detached for safety."));
+        return tool_result_t::error(std::string("Target process PID ") + std::to_string(crashed_pid) +
+            std::string(" terminated during driver_call_function. Process context was detached for safety."));
     }
 
     json result;
@@ -2898,8 +2897,8 @@ tool_result_t driver_call_function(const json& params)
     result["return_decimal"] = ret;
     result["process_id"] = device->get_process_id();
     return tool_result_t::ok(
-        OBFSTR("Function at ") + sa_format_address(static_cast<uint64_t>(func_addr)) +
-        OBFSTR(" returned ") + sa_format_address(static_cast<uint64_t>(ret)), result);
+        std::string("Function at ") + sa_format_address(static_cast<uint64_t>(func_addr)) +
+        std::string(" returned ") + sa_format_address(static_cast<uint64_t>(ret)), result);
 }
 
 
@@ -2921,7 +2920,7 @@ tool_result_t driver_protect_memory(const json& params)
     if (params.contains("address"))
         address = sa_parse_address(params["address"].get<std::string>()).value_or(0);
     if (address == 0)
-        return tool_result_t::error(OBFSTR("Address is required"));
+        return tool_result_t::error(std::string("Address is required"));
 
     std::uint64_t size = 0x1000;
     if (params.contains("size")) {
@@ -2931,7 +2930,7 @@ tool_result_t driver_protect_memory(const json& params)
             size = params["size"].get<std::uint64_t>();
     }
     if (size == 0)
-        return tool_result_t::error(OBFSTR("Size is required"));
+        return tool_result_t::error(std::string("Size is required"));
 
     std::uint32_t new_protect = 0x40;
     if (params.contains("protect")) {
@@ -2946,14 +2945,14 @@ tool_result_t driver_protect_memory(const json& params)
 
     std::uint32_t old_protect = 0;
     if (!device->protect_memory(address, size, new_protect, &old_protect))
-        return tool_result_t::error(OBFSTR("Failed to change protection at ") + sa_format_address(static_cast<uint64_t>(address)));
+        return tool_result_t::error(std::string("Failed to change protection at ") + sa_format_address(static_cast<uint64_t>(address)));
 
     json result;
     result["address"] = sa_format_address(static_cast<uint64_t>(address));
     result["size"] = sa_format_address(static_cast<uint64_t>(size));
     result["new_protect"] = new_protect;
     result["old_protect"] = old_protect;
-    return tool_result_t::ok(OBFSTR("Memory protection changed"), result);
+    return tool_result_t::ok(std::string("Memory protection changed"), result);
 }
 
 
@@ -2970,7 +2969,7 @@ tool_result_t driver_read_peb(const json& params)
 
     voyager::device_t::peb_info info{};
     if (!device->read_peb(info))
-        return tool_result_t::error(OBFSTR("Failed to read PEB"));
+        return tool_result_t::error(std::string("Failed to read PEB"));
 
     json result;
     result["peb_address"] = sa_format_address(static_cast<uint64_t>(info.peb_address));
@@ -2982,7 +2981,7 @@ tool_result_t driver_read_peb(const json& params)
     result["number_of_heaps"] = info.number_of_heaps;
     result["max_heaps"] = info.max_heaps;
     result["process_heaps"] = sa_format_address(static_cast<uint64_t>(info.process_heaps));
-    return tool_result_t::ok(OBFSTR("PEB info for PID ") + std::to_string(device->get_process_id()), result);
+    return tool_result_t::ok(std::string("PEB info for PID ") + std::to_string(device->get_process_id()), result);
 }
 
 
@@ -2998,13 +2997,13 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
 
     const auto tid_opt = parse_tid_param(params);
     if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
+        return tool_result_t::error(std::string("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
     const std::uint32_t tid = *tid_opt;
 
     std::uint64_t address = 0;
     if (params.contains("address"))
         address = sa_parse_address(params["address"].get<std::string>()).value_or(0);
-    if (address == 0) return tool_result_t::error(OBFSTR("Address is required"));
+    if (address == 0) return tool_result_t::error(std::string("Address is required"));
 
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
@@ -3027,14 +3026,14 @@ tool_result_t driver_set_hw_breakpoint(const json& params)
     }
 
     if (!device->set_hardware_breakpoint(tid, index, address, type, size))
-        return tool_result_t::error(OBFSTR("Failed to set hardware breakpoint"));
+        return tool_result_t::error(std::string("Failed to set hardware breakpoint"));
 
     json result;
     result["tid"] = tid;
     result["index"] = index;
     result["address"] = sa_format_address(static_cast<uint64_t>(address));
     result["type"] = (type == 0) ? "execute" : (type == 1) ? "write" : "readwrite";
-    return tool_result_t::ok(OBFSTR("Hardware breakpoint set on DR") + std::to_string(index), result);
+    return tool_result_t::ok(std::string("Hardware breakpoint set on DR") + std::to_string(index), result);
 }
 
 tool_result_t driver_clear_hw_breakpoint(const json& params)
@@ -3049,19 +3048,19 @@ tool_result_t driver_clear_hw_breakpoint(const json& params)
 
     const auto tid_opt = parse_tid_param(params);
     if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
+        return tool_result_t::error(std::string("Thread ID (tid) is required and must be a decimal integer or 0x-prefixed hex."));
     const std::uint32_t tid = *tid_opt;
 
     int index = 0;
     if (params.contains("index")) index = params["index"].get<int>();
 
     if (!device->clear_hardware_breakpoint(tid, index))
-        return tool_result_t::error(OBFSTR("Failed to clear hardware breakpoint"));
+        return tool_result_t::error(std::string("Failed to clear hardware breakpoint"));
 
     json result;
     result["tid"] = tid;
     result["index"] = index;
-    return tool_result_t::ok(OBFSTR("Hardware breakpoint cleared on DR") + std::to_string(index), result);
+    return tool_result_t::ok(std::string("Hardware breakpoint cleared on DR") + std::to_string(index), result);
 }
 
 tool_result_t driver_resolve_export(const json& params)
@@ -3081,7 +3080,7 @@ tool_result_t driver_resolve_export(const json& params)
         export_name = trim_ascii_copy(params["export_name"].get<std::string>());
 
     if (export_name.empty())
-        return tool_result_t::error(OBFSTR("Export name is required. Use name='GetTickCount' (alias export_name is supported)."));
+        return tool_result_t::error(std::string("Export name is required. Use name='GetTickCount' (alias export_name is supported)."));
 
     std::uint64_t module_base = 0;
     std::string resolved_module_name;
@@ -3112,23 +3111,23 @@ tool_result_t driver_resolve_export(const json& params)
         if (auto parsed = sa_parse_address(module_query))
             module_base = static_cast<std::uint64_t>(*parsed);
         else if (!resolve_loaded_module_base(module_query, module_base, resolved_module_name))
-            return tool_result_t::error(OBFSTR("Could not resolve module '") + module_query +
-                OBFSTR("'. Provide module_base='0x...' or a loaded module name/path."));
+            return tool_result_t::error(std::string("Could not resolve module '") + module_query +
+                std::string("'. Provide module_base='0x...' or a loaded module name/path."));
     }
 
     if (module_base == 0)
         module_base = device->get_base_address();
     if (module_base == 0)
-        return tool_result_t::error(OBFSTR("Module base required. Provide module_base or module/module_name."));
+        return tool_result_t::error(std::string("Module base required. Provide module_base or module/module_name."));
 
 
     std::uint64_t addr = device->resolve_export(module_base, export_name.c_str());
     if (addr == 0)
     {
-        std::string detail = OBFSTR("Export '") + export_name + OBFSTR("' not found in module ") +
+        std::string detail = std::string("Export '") + export_name + std::string("' not found in module ") +
             sa_format_address(static_cast<uint64_t>(module_base));
         if (!module_query.empty())
-            detail += OBFSTR(" (query: '") + module_query + OBFSTR("')");
+            detail += std::string(" (query: '") + module_query + std::string("')");
         return tool_result_t::error(detail);
     }
 
@@ -3141,14 +3140,14 @@ tool_result_t driver_resolve_export(const json& params)
         result["resolved_module_name"] = resolved_module_name;
     result["explicit_module_param"] = explicit_module_param;
     result["resolved_address"] = sa_format_address(static_cast<uint64_t>(addr));
-    return tool_result_t::ok(OBFSTR("Export resolved: ") + export_name + OBFSTR(" -> ") + sa_format_address(static_cast<uint64_t>(addr)), result);
+    return tool_result_t::ok(std::string("Export resolved: ") + export_name + std::string(" -> ") + sa_format_address(static_cast<uint64_t>(addr)), result);
 }
 
 tool_result_t driver_virtual_to_physical(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_virtual_to_physical entry");
     if (!device->is_connected() || device->get_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Driver not connected or DTB not solved"));
+        return tool_result_t::error(std::string("Driver not connected or DTB not solved"));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_virtual_to_physical", driver_bridge::attached_pid(), quota_guard))
@@ -3157,16 +3156,16 @@ tool_result_t driver_virtual_to_physical(const json& params)
     std::uint64_t vaddr = 0;
     if (params.contains("address"))
         vaddr = sa_parse_address(params["address"].get<std::string>()).value_or(0);
-    if (vaddr == 0) return tool_result_t::error(OBFSTR("Address is required"));
+    if (vaddr == 0) return tool_result_t::error(std::string("Address is required"));
 
     std::uint64_t paddr = device->virtual_to_physical(vaddr);
     if (paddr == 0)
-        return tool_result_t::error(OBFSTR("Translation failed for ") + sa_format_address(static_cast<uint64_t>(vaddr)));
+        return tool_result_t::error(std::string("Translation failed for ") + sa_format_address(static_cast<uint64_t>(vaddr)));
 
     json result;
     result["virtual_address"] = sa_format_address(static_cast<uint64_t>(vaddr));
     result["physical_address"] = sa_format_address(static_cast<uint64_t>(paddr));
-    return tool_result_t::ok(OBFSTR("Virtual -> Physical translation"), result);
+    return tool_result_t::ok(std::string("Virtual -> Physical translation"), result);
 }
 
 
@@ -3299,7 +3298,7 @@ static tool_result_t execute_deferred_tool(const std::string& name, const json& 
 {
     const auto* def = get_deferred_tool_def(name);
     if (!def)
-        return tool_result_t::error(OBFSTR("Unknown deferred tool: ") + name);
+        return tool_result_t::error(std::string("Unknown deferred tool: ") + name);
     return def->handler(params);
 }
 
@@ -3764,7 +3763,7 @@ void DeferredActionManager::watcher_thread_func(int action_id)
     auto timeout = std::chrono::seconds(action->timeout_seconds);
     auto poll_interval = std::chrono::milliseconds(action->poll_interval_ms);
 
-    msg(OBFSTR_C("AiDA: Deferred action #%d watching for %s '%s' (timeout: %ds, poll: %dms)\n"),
+    msg("AiDA: Deferred action #%d watching for %s '%s' (timeout: %ds, poll: %dms)\n",
         action->id, action->condition_type.c_str(), action->target_name.c_str(),
         action->timeout_seconds, action->poll_interval_ms);
 
@@ -3775,7 +3774,7 @@ void DeferredActionManager::watcher_thread_func(int action_id)
         auto st = action->status.load();
         if (st == deferred_status::cancelled)
         {
-            msg(OBFSTR_C("AiDA: Deferred action #%d cancelled\n"), action->id);
+            msg("AiDA: Deferred action #%d cancelled\n", action->id);
             return;
         }
 
@@ -3786,10 +3785,10 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             {
                 std::lock_guard<std::mutex> lock(_mutex);
                 action->status.store(deferred_status::timed_out);
-                action->error = OBFSTR("Timed out waiting for ") + action->condition_type +
-                    OBFSTR(": ") + action->target_name;
+                action->error = std::string("Timed out waiting for ") + action->condition_type +
+                    std::string(": ") + action->target_name;
             }
-            msg(OBFSTR_C("AiDA: Deferred action #%d timed out after %ds\n"),
+            msg("AiDA: Deferred action #%d timed out after %ds\n",
                 action->id, action->timeout_seconds);
             return;
         }
@@ -3828,7 +3827,7 @@ void DeferredActionManager::watcher_thread_func(int action_id)
                     std::lock_guard<std::mutex> lock(_mutex);
                     action->status.store(deferred_status::failed);
                     action->error = poll_error.empty()
-                        ? std::string(OBFSTR("dependency_blocked: kernel module base resolution unavailable"))
+                        ? std::string(std::string("dependency_blocked: kernel module base resolution unavailable"))
                         : poll_error;
                     action->trigger_info = poll_diagnostics.dump();
                 }
@@ -3881,8 +3880,8 @@ void DeferredActionManager::watcher_thread_func(int action_id)
 
             auto trigger_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 action->triggered_at - start_time).count();
-            msg(OBFSTR_C("AiDA: Deferred action #%d TRIGGERED! %s '%s' detected after %lldms. "
-                "Executing %zu queued tool call(s) IMMEDIATELY...\n"),
+            msg("AiDA: Deferred action #%d TRIGGERED! %s '%s' detected after %lldms. "
+                "Executing %zu queued tool call(s) IMMEDIATELY...\n",
                 action->id, action->condition_type.c_str(), action->target_name.c_str(),
                 trigger_elapsed, action->tool_calls.size());
 
@@ -3897,7 +3896,7 @@ void DeferredActionManager::watcher_thread_func(int action_id)
             }
             for (const auto& r : results_snapshot)
             {
-                msg(OBFSTR_C("AiDA: Deferred action #%d - %s: %s - %s\n"),
+                msg("AiDA: Deferred action #%d - %s: %s - %s\n",
                     action->id, r.action_type.c_str(),
                     r.success ? "OK" : "FAIL", r.message.c_str());
                 if (!r.success) any_failed = true;
@@ -3905,7 +3904,7 @@ void DeferredActionManager::watcher_thread_func(int action_id)
 
             action->status.store(any_failed ? deferred_status::failed : deferred_status::completed);
 
-            msg(OBFSTR_C("AiDA: Deferred action #%d %s. %zu/%zu actions succeeded.\n"),
+            msg("AiDA: Deferred action #%d %s. %zu/%zu actions succeeded.\n",
                 action->id,
                 any_failed ? "completed with failures" : "completed successfully",
                 std::count_if(results_snapshot.begin(), results_snapshot.end(),
@@ -3968,30 +3967,30 @@ tool_result_t driver_defer_action(const json& params)
     if (normalized.contains("wait_for"))
     {
         if (!normalized["wait_for"].is_string())
-            return tool_result_t::error(OBFSTR("'wait_for' must be a string enum: 'process_start' or 'kernel_module_load'."));
+            return tool_result_t::error(std::string("'wait_for' must be a string enum: 'process_start' or 'kernel_module_load'."));
         wait_for = normalized["wait_for"].get<std::string>();
     }
     if (wait_for.empty())
-        return tool_result_t::error(OBFSTR("'wait_for' is required: 'kernel_module_load' or 'process_start'."));
+        return tool_result_t::error(std::string("'wait_for' is required: 'kernel_module_load' or 'process_start'."));
 
     if (wait_for != "kernel_module_load" && wait_for != "process_start")
-        return tool_result_t::error(OBFSTR("Invalid 'wait_for'. Allowed values: 'kernel_module_load', 'process_start'."));
+        return tool_result_t::error(std::string("Invalid 'wait_for'. Allowed values: 'kernel_module_load', 'process_start'."));
 
     std::string target;
     if (normalized.contains("target"))
     {
         if (!normalized["target"].is_string())
-            return tool_result_t::error(OBFSTR("'target' must be a string (module or process name)."));
+            return tool_result_t::error(std::string("'target' must be a string (module or process name)."));
         target = normalized["target"].get<std::string>();
     }
     if (target.empty())
-        return tool_result_t::error(OBFSTR("'target' is required: module or process name to watch for"));
+        return tool_result_t::error(std::string("'target' is required: module or process name to watch for"));
 
     int timeout = normalized.value("timeout", 300);
     int poll_interval = normalized.value("poll_interval", 50);
 
     if (!normalized.contains("actions") || !normalized["actions"].is_array() || normalized["actions"].empty())
-        return tool_result_t::error(OBFSTR("'actions' array is required with at least one tool call. Format: [{\"tool\":\"read_memory\",\"params\":{...}}]."));
+        return tool_result_t::error(std::string("'actions' array is required with at least one tool call. Format: [{\"tool\":\"read_memory\",\"params\":{...}}]."));
 
     auto action = std::make_unique<deferred_action_t>();
     action->condition_type = wait_for;
@@ -4002,7 +4001,7 @@ tool_result_t driver_defer_action(const json& params)
     for (const auto& act : normalized["actions"])
     {
         if (!act.contains("tool") || !act["tool"].is_string())
-            return tool_result_t::error(OBFSTR("Each action must have a string 'tool' field (full tool name, e.g. 'read_memory')."));
+            return tool_result_t::error(std::string("Each action must have a string 'tool' field (full tool name, e.g. 'read_memory')."));
 
         deferred_action_t::queued_tool_call_t tc;
         tc.tool_name = act["tool"].get<std::string>();
@@ -4010,7 +4009,7 @@ tool_result_t driver_defer_action(const json& params)
 
 
         if (!get_deferred_tool_def(tc.tool_name))
-            return tool_result_t::error(OBFSTR("Unknown tool: ") + tc.tool_name);
+            return tool_result_t::error(std::string("Unknown tool: ") + tc.tool_name);
 
         action->tool_calls.push_back(std::move(tc));
     }
@@ -4032,9 +4031,9 @@ tool_result_t driver_defer_action(const json& params)
         else if (dependency_blocked)
         {
             const std::string error_text = poll_error.empty()
-                ? std::string(OBFSTR("dependency_blocked: kernel module base resolution unavailable"))
+                ? std::string(std::string("dependency_blocked: kernel module base resolution unavailable"))
                 : poll_error;
-            return tool_result_t::error(error_text, OBFSTR("dependency_blocked"), poll_diagnostics);
+            return tool_result_t::error(error_text, std::string("dependency_blocked"), poll_diagnostics);
         }
     }
     else if (wait_for == "process_start")
@@ -4071,20 +4070,20 @@ tool_result_t driver_defer_action(const json& params)
     {
         result["status"] = "failed";
         result["error"] = registered_action.error;
-        return tool_result_t::error(OBFSTR("Deferred action #") + std::to_string(action_id) +
-            OBFSTR(" watcher failed to start: ") + registered_action.error);
+        return tool_result_t::error(std::string("Deferred action #") + std::to_string(action_id) +
+            std::string(" watcher failed to start: ") + registered_action.error);
     }
     result["status"] = already_met ? "target_already_loaded_executing_now" : "watching";
     result["note"] = already_met
-        ? OBFSTR("Target '") + target + OBFSTR("' is ALREADY loaded! Actions are being executed immediately.")
-        : OBFSTR("Background watcher started. Actions will execute THE INSTANT '") + target +
-          OBFSTR("' loads. Use driver_get_deferred_results with action_id=") +
-          std::to_string(action_id) + OBFSTR(" to check results.");
+        ? std::string("Target '") + target + std::string("' is ALREADY loaded! Actions are being executed immediately.")
+        : std::string("Background watcher started. Actions will execute THE INSTANT '") + target +
+          std::string("' loads. Use driver_get_deferred_results with action_id=") +
+          std::to_string(action_id) + std::string(" to check results.");
 
     return tool_result_t::ok(
         already_met
-            ? OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(" - target already loaded, executing immediately!")
-            : OBFSTR("Deferred action #") + std::to_string(action_id) + OBFSTR(" registered - watching for '") + target + "'",
+            ? std::string("Deferred action #") + std::to_string(action_id) + std::string(" - target already loaded, executing immediately!")
+            : std::string("Deferred action #") + std::to_string(action_id) + std::string(" registered - watching for '") + target + "'",
         result);
 }
 
@@ -4127,7 +4126,7 @@ tool_result_t driver_list_deferred_actions(const json&)
     result["actions"] = arr;
     result["total"] = arr.size();
     return tool_result_t::ok(
-        OBFSTR("Found ") + std::to_string(arr.size()) + OBFSTR(" deferred action(s)"), result);
+        std::string("Found ") + std::to_string(arr.size()) + std::string(" deferred action(s)"), result);
 }
 
 tool_result_t driver_cancel_deferred_action(const json& params)
@@ -4142,18 +4141,18 @@ tool_result_t driver_cancel_deferred_action(const json& params)
             id = params["action_id"].get<int>();
     }
     if (id == 0)
-        return tool_result_t::error(OBFSTR("'action_id' is required"));
+        return tool_result_t::error(std::string("'action_id' is required"));
 
     if (DeferredActionManager::instance().cancel_action(id))
     {
         json result;
         result["action_id"] = id;
         result["status"] = "cancelled";
-        return tool_result_t::ok(OBFSTR("Deferred action #") + std::to_string(id) + OBFSTR(" cancelled"), result);
+        return tool_result_t::ok(std::string("Deferred action #") + std::to_string(id) + std::string(" cancelled"), result);
     }
 
-    return tool_result_t::error(OBFSTR("Cannot cancel action #") + std::to_string(id) +
-        OBFSTR(" - not found or already completed/triggered"));
+    return tool_result_t::error(std::string("Cannot cancel action #") + std::to_string(id) +
+        std::string(" - not found or already completed/triggered"));
 }
 
 tool_result_t driver_get_deferred_results(const json& params)
@@ -4168,11 +4167,11 @@ tool_result_t driver_get_deferred_results(const json& params)
             id = params["action_id"].get<int>();
     }
     if (id == 0)
-        return tool_result_t::error(OBFSTR("'action_id' is required"));
+        return tool_result_t::error(std::string("'action_id' is required"));
 
     deferred_action_snapshot_t action;
     if (!DeferredActionManager::instance().get_action_snapshot(id, action))
-        return tool_result_t::error(OBFSTR("Action #") + std::to_string(id) + OBFSTR(" not found"));
+        return tool_result_t::error(std::string("Action #") + std::to_string(id) + std::string(" not found"));
 
     json result;
     result["action_id"] = action.id;
@@ -4211,7 +4210,7 @@ tool_result_t driver_get_deferred_results(const json& params)
 
     std::string status_str = deferred_status_to_string(action.status);
     return tool_result_t::ok(
-        OBFSTR("Deferred action #") + std::to_string(id) + OBFSTR(": ") + status_str, result);
+        std::string("Deferred action #") + std::to_string(id) + std::string(": ") + status_str, result);
 }
 
 
@@ -4274,7 +4273,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
             bool active_before = false;
             auto captures = device->sniff_net_buffers_get(active_before);
             if (!device->sniff_net_buffers_stop())
-                return tool_result_t::error(OBFSTR("Failed to stop sniff session"));
+                return tool_result_t::error(std::string("Failed to stop sniff session"));
             bool active_after = false;
             (void)device->sniff_net_buffers_get(active_after);
             json result;
@@ -4285,7 +4284,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
             result["capture_count"] = captures.size();
             result["captures"] = sniff_captures_to_json(captures);
             result["driver_error"] = driver_bridge::last_error();
-            return tool_result_t::ok(OBFSTR("Sniff session stopped"), result);
+            return tool_result_t::ok(std::string("Sniff session stopped"), result);
         }
         if (op == "store") {
             const json* bytes_value = nullptr;
@@ -4293,11 +4292,11 @@ tool_result_t driver_sniff_network_buffers(const json& params)
             else if (params.contains("data")) bytes_value = &params["data"];
             else if (params.contains("hex")) bytes_value = &params["hex"];
             if (!bytes_value)
-                return tool_result_t::error(OBFSTR("'bytes', 'data', or 'hex' is required for store operation"));
+                return tool_result_t::error(std::string("'bytes', 'data', or 'hex' is required for store operation"));
             std::vector<std::uint8_t> bytes;
             std::string parse_error;
             if (!parse_byte_sequence(*bytes_value, bytes, parse_error))
-                return tool_result_t::error(OBFSTR("Invalid capture bytes: ") + parse_error);
+                return tool_result_t::error(std::string("Invalid capture bytes: ") + parse_error);
             std::uint64_t timestamp = GetTickCount64();
             if (params.contains("timestamp")) {
                 if (params["timestamp"].is_number_unsigned())
@@ -4317,7 +4316,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
                     thread_id = sa_parse_address(params["thread_id"].get<std::string>()).value_or(thread_id);
             }
             if (!device->sniff_net_buffers_store(timestamp, thread_id, bytes.data(), static_cast<std::uint32_t>(bytes.size())))
-                return tool_result_t::error(OBFSTR("Failed to store sniff capture"));
+                return tool_result_t::error(std::string("Failed to store sniff capture"));
             bool active = false;
             auto captures = device->sniff_net_buffers_get(active);
             json result;
@@ -4328,7 +4327,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
             result["stored_size"] = bytes.size();
             result["captures"] = sniff_captures_to_json(captures);
             result["driver_error"] = driver_bridge::last_error();
-            return tool_result_t::ok(OBFSTR("Sniff capture stored"), result);
+            return tool_result_t::ok(std::string("Sniff capture stored"), result);
         }
         if (op == "get" || op == "results") {
             bool active = false;
@@ -4342,7 +4341,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
             result["captures"] = sniff_captures_to_json(captures);
 
             return tool_result_t::ok(
-                std::to_string(captures.size()) + OBFSTR(" capture(s) retrieved"), result);
+                std::to_string(captures.size()) + std::string(" capture(s) retrieved"), result);
         }
     }
 
@@ -4351,7 +4350,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
     if (params.contains("address"))
         address = sa_parse_address(params["address"].get<std::string>()).value_or(0);
     if (address == 0)
-        return tool_result_t::error(OBFSTR("Address of send/recv/encrypt function required"));
+        return tool_result_t::error(std::string("Address of send/recv/encrypt function required"));
 
 
     auto reg_name_to_index = [](const std::string& name) -> std::uint32_t {
@@ -4388,7 +4387,7 @@ tool_result_t driver_sniff_network_buffers(const json& params)
     if (bp_index > 3) bp_index = 0;
 
     if (!device->sniff_net_buffers_start(address, buf_reg, size_reg, max_packets, tid, bp_index))
-        return tool_result_t::error(OBFSTR("Failed to start sniff session"));
+        return tool_result_t::error(std::string("Failed to start sniff session"));
     diag::log_tagged_fmt("drv_tools",
         "driver_sniff_network_buffers start address=0x%llX buf_reg=%u size_reg=%u max_packets=%u tid=%u bp_index=%u",
         static_cast<unsigned long long>(address), buf_reg, size_reg, max_packets, tid, bp_index);
@@ -4400,12 +4399,12 @@ tool_result_t driver_sniff_network_buffers(const json& params)
     result["size_register"] = reg_index_to_name(size_reg);
     result["max_captures"] = max_packets;
     result["bp_index"] = bp_index;
-    result["note"] = OBFSTR("Sniff session initialized. The HW breakpoint must be set separately via "
+    result["note"] = std::string("Sniff session initialized. The HW breakpoint must be set separately via "
         "driver_set_hw_breakpoint on the target address. Then poll with operation='get' to retrieve captures. "
         "After each BP hit, read the buffer from memory using read_memory at the register value, "
         "then call this tool with operation='store' to record it.");
 
-    return tool_result_t::ok(OBFSTR("Sniff session started"), result);
+    return tool_result_t::ok(std::string("Sniff session started"), result);
 }
 
 static bool parse_ip_string(const std::string& ip, std::uint8_t* out16, std::uint32_t* af) {
@@ -4442,7 +4441,7 @@ tool_result_t driver_reassemble_stream(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver not connected"));
+        return tool_result_t::error(std::string("Driver not connected"));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_reassemble_stream", driver_bridge::attached_pid(), quota_guard))
@@ -4477,7 +4476,7 @@ tool_result_t driver_reassemble_stream(const json& params)
     diag::log_tagged_fmt("drv_tools",
         "driver_reassemble_stream result ok=%d operation=%s bytes=%zu packets=%u truncated=%u",
         ok ? 1 : 0, operation.c_str(), data.size(), packets, truncated);
-    if (!ok) return tool_result_t::error(OBFSTR("Stream operation failed"));
+    if (!ok) return tool_result_t::error(std::string("Stream operation failed"));
 
     json result;
     result["operation"] = operation;
@@ -4501,17 +4500,17 @@ tool_result_t driver_reassemble_stream(const json& params)
         result["ascii_preview"] = ascii;
     }
 
-    return tool_result_t::ok(OBFSTR("Stream reassembly ") + operation + OBFSTR(": ") +
-        std::to_string(data.size()) + OBFSTR(" bytes, ") + std::to_string(packets) + OBFSTR(" packets"), result);
+    return tool_result_t::ok(std::string("Stream reassembly ") + operation + std::string(": ") +
+        std::to_string(data.size()) + std::string(" bytes, ") + std::to_string(packets) + std::string(" packets"), result);
 }
 
 tool_result_t driver_enum_kernel_callbacks(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enum_kernel_callbacks entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_enum_kernel_callbacks", driver_bridge::attached_pid(), quota_guard))
@@ -4543,7 +4542,7 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
     }
 
     if (ntos_base == 0)
-        return tool_result_t::error(OBFSTR("Could not locate ntoskrnl.exe base via NtQuerySystemInformation"));
+        return tool_result_t::error(std::string("Could not locate ntoskrnl.exe base via NtQuerySystemInformation"));
 
     json result;
     result["ntoskrnl_base"] = sa_format_address(static_cast<uint64_t>(ntos_base));
@@ -4663,9 +4662,9 @@ tool_result_t driver_enum_kernel_callbacks(const json& params)
     result["callback_array_refs_found"] = callback_array_refs_found;
     result["callbacks_observed"] = callbacks_observed;
     result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
-    result["note"] = OBFSTR("Kernel callbacks are used by anti-cheats (EAC/BattlEye/Vanguard) to monitor "
+    result["note"] = std::string("Kernel callbacks are used by anti-cheats (EAC/BattlEye/Vanguard) to monitor "
                             "process creation, thread creation, image loading, and registry access.");
-    return tool_result_t::ok(OBFSTR("Kernel callback enumeration complete"), result);
+    return tool_result_t::ok(std::string("Kernel callback enumeration complete"), result);
 }
 
 
@@ -4675,9 +4674,9 @@ tool_result_t driver_detect_integrity_checks(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_detect_integrity_checks", driver_bridge::attached_pid(), quota_guard))
@@ -4705,7 +4704,7 @@ tool_result_t driver_detect_integrity_checks(const json& params)
         }
     }
     if (ntos_base == 0)
-        return tool_result_t::error(OBFSTR("Could not locate ntoskrnl.exe base"));
+        return tool_result_t::error(std::string("Could not locate ntoskrnl.exe base"));
 
 
     static const char* critical_exports[] = {
@@ -4860,8 +4859,8 @@ tool_result_t driver_detect_integrity_checks(const json& params)
         failure["hooks_found"]              = hook_count;
         failure["scan_ran"]                 = false;
         failure["module_base_diagnostics"]  = kernel_module_query_diagnostics_json(query_diag);
-        failure["reason"]                   = OBFSTR("kernel_scanner_did_not_run: zero critical exports resolved");
-        return tool_result_t::error(OBFSTR("driver_detect_integrity_checks: kernel scanner returned 0 functions_scanned (scanner did not run)"), failure);
+        failure["reason"]                   = std::string("kernel_scanner_did_not_run: zero critical exports resolved");
+        return tool_result_t::error(std::string("driver_detect_integrity_checks: kernel scanner returned 0 functions_scanned (scanner did not run)"), failure);
     }
     json result;
     result["ntoskrnl_base"]     = sa_format_address(static_cast<uint64_t>(ntos_base));
@@ -4877,10 +4876,10 @@ tool_result_t driver_detect_integrity_checks(const json& params)
     result["hooked_functions"]  = std::move(hooks);
     result["clean_functions"]   = std::move(clean);
     result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
-    result["note"] = OBFSTR("Kernel function hooks indicate anti-cheat monitoring. Hooked functions route through "
+    result["note"] = std::string("Kernel function hooks indicate anti-cheat monitoring. Hooked functions route through "
                             "the anti-cheat driver, which can block, log, or alter calls from target processes.");
-    return tool_result_t::ok(OBFSTR("Kernel integrity: ") + std::to_string(hook_count) +
-                             OBFSTR(" hooks in ") + std::to_string(checked) + OBFSTR(" functions"), result);
+    return tool_result_t::ok(std::string("Kernel integrity: ") + std::to_string(hook_count) +
+                             std::string(" hooks in ") + std::to_string(checked) + std::string(" functions"), result);
 }
 
 
@@ -4890,9 +4889,9 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_detect_ssdt_hooks", driver_bridge::attached_pid(), quota_guard))
@@ -4905,7 +4904,7 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
     if (!query_kernel_modules(buf, info, err, &query_diag,
             kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence)) {
         diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks query_kernel_modules_failed err=%s", err.c_str());
-        return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
+        return kernel_module_query_error_result(err, query_diag, std::string("Failed to enumerate kernel modules: "));
     }
     diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks modules=%lu kernel_dtb=0x%llX",
         static_cast<unsigned long>(info ? info->NumberOfModules : 0),
@@ -4934,7 +4933,7 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
                 static_cast<unsigned long>(info->Modules[i].ImageSize),
                 reinterpret_cast<const char*>(info->Modules[i].FullPathName));
         }
-        return tool_result_t::error(OBFSTR("Could not find ntoskrnl base address"));
+        return tool_result_t::error(std::string("Could not find ntoskrnl base address"));
     }
     diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks ntos base=0x%llX size=0x%llX path=%s",
         static_cast<unsigned long long>(ntos_base),
@@ -4964,7 +4963,7 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
         if (ssdt_read < sizeof(ssdt)) {
             diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks read_ssdt_failed addr=0x%llX read=%zu need=%zu",
                 static_cast<unsigned long long>(ssdt_addr), ssdt_read, sizeof(ssdt));
-            return tool_result_t::error(OBFSTR("Failed to read SSDT structure"));
+            return tool_result_t::error(std::string("Failed to read SSDT structure"));
         }
     } else {
         std::uint64_t shadow_addr = device->resolve_export(ntos_base, "KeServiceDescriptorTableShadow");
@@ -4983,7 +4982,7 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
                 "driver_detect_ssdt_hooks ssdt_query_failed ntos=0x%llX kernel_dtb=0x%llX",
                 static_cast<unsigned long long>(ntos_base),
                 static_cast<unsigned long long>(device->get_kernel_dtb()));
-            return tool_result_t::error(OBFSTR("Could not resolve SSDT through export or syscall-entry fallback"));
+            return tool_result_t::error(std::string("Could not resolve SSDT through export or syscall-entry fallback"));
         }
 
         ssdt_addr = query.descriptor_address;
@@ -5013,12 +5012,12 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
 
     if (ssdt.num_services == 0 || ssdt.num_services > 2048) {
         diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks invalid_service_count=%u", ssdt.num_services);
-        return tool_result_t::error(OBFSTR("Invalid SSDT service count: ") + std::to_string(ssdt.num_services));
+        return tool_result_t::error(std::string("Invalid SSDT service count: ") + std::to_string(ssdt.num_services));
     }
     if (!is_probably_kernel_address(ssdt.service_table)) {
         diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks invalid_service_table=0x%llX",
             static_cast<unsigned long long>(ssdt.service_table));
-        return tool_result_t::error(OBFSTR("ServiceTableBase is not a valid kernel address"));
+        return tool_result_t::error(std::string("ServiceTableBase is not a valid kernel address"));
     }
 
 
@@ -5028,7 +5027,7 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
     if (entries_read < read_sz) {
         diag::log_tagged_fmt("drv_tools", "driver_detect_ssdt_hooks read_entries_failed table=0x%llX read=%zu need=%zu",
             static_cast<unsigned long long>(ssdt.service_table), entries_read, read_sz);
-        return tool_result_t::error(OBFSTR("Failed to read SSDT entries"));
+        return tool_result_t::error(std::string("Failed to read SSDT entries"));
     }
 
     json hooked = json::array();
@@ -5093,11 +5092,11 @@ tool_result_t driver_detect_ssdt_hooks(const json&)
                                   sa_format_address(static_cast<uint64_t>(ntos_end));
     result["hooked_entries"]    = std::move(hooked);
     result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
-    result["note"] = OBFSTR("SSDT hooks redirect syscalls to third-party kernel code. Anti-cheats commonly hook "
+    result["note"] = std::string("SSDT hooks redirect syscalls to third-party kernel code. Anti-cheats commonly hook "
                             "NtReadVirtualMemory, NtWriteVirtualMemory, NtOpenProcess to intercept memory access.");
 
-    return tool_result_t::ok(OBFSTR("SSDT: ") + std::to_string(hooks_found) + OBFSTR(" hooks in ") +
-                             std::to_string(ssdt.num_services) + OBFSTR(" services"), result);
+    return tool_result_t::ok(std::string("SSDT: ") + std::to_string(hooks_found) + std::string(" hooks in ") +
+                             std::to_string(ssdt.num_services) + std::string(" services"), result);
 }
 
 
@@ -5107,9 +5106,9 @@ tool_result_t driver_enum_minifilters(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_enum_minifilters", driver_bridge::attached_pid(), quota_guard))
@@ -5121,7 +5120,7 @@ tool_result_t driver_enum_minifilters(const json& params)
     kernel_module_query_diagnostics_t query_diag{};
     if (!query_kernel_modules(buf, info, err, &query_diag,
             kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
-        return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
+        return kernel_module_query_error_result(err, query_diag, std::string("Failed to enumerate kernel modules: "));
 
 
     std::uint64_t fltmgr_base = 0, fltmgr_size = 0;
@@ -5137,7 +5136,7 @@ tool_result_t driver_enum_minifilters(const json& params)
         }
     }
     if (fltmgr_base == 0)
-        return tool_result_t::error(OBFSTR("Filter Manager (fltmgr.sys) not found in loaded modules"));
+        return tool_result_t::error(std::string("Filter Manager (fltmgr.sys) not found in loaded modules"));
 
 
     uint8_t pe_hdr[0x1000];
@@ -5147,12 +5146,12 @@ tool_result_t driver_enum_minifilters(const json& params)
         r["fltmgr_base"] = sa_format_address(fltmgr_base);
         r["bytes_read"] = static_cast<std::uint64_t>(pe_hdr_read);
         r["bytes_requested"] = static_cast<std::uint64_t>(sizeof(pe_hdr));
-        return tool_result_t::error(OBFSTR("fltmgr kernel memory read failed"), r);
+        return tool_result_t::error(std::string("fltmgr kernel memory read failed"), r);
     }
 
     std::uint32_t pe_off = *reinterpret_cast<std::uint32_t*>(&pe_hdr[0x3C]);
     if (pe_off + 0x18 + 0x70 > sizeof(pe_hdr))
-        return tool_result_t::error(OBFSTR("Invalid fltmgr PE header"));
+        return tool_result_t::error(std::string("Invalid fltmgr PE header"));
 
     std::uint16_t num_sections = *reinterpret_cast<std::uint16_t*>(&pe_hdr[pe_off + 6]);
     std::uint16_t opt_hdr_sz   = *reinterpret_cast<std::uint16_t*>(&pe_hdr[pe_off + 20]);
@@ -5173,7 +5172,7 @@ tool_result_t driver_enum_minifilters(const json& params)
         }
     }
     if (data_rva == 0)
-        return tool_result_t::error(OBFSTR("Could not find fltmgr .data section"));
+        return tool_result_t::error(std::string("Could not find fltmgr .data section"));
 
 
     std::uint64_t data_addr = fltmgr_base + data_rva;
@@ -5312,11 +5311,11 @@ tool_result_t driver_enum_minifilters(const json& params)
     result["filter_count"]    = filters.size();
     result["filters"]         = std::move(filters);
     result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
-    result["note"] = OBFSTR("Minifilter drivers intercept filesystem I/O. Anti-cheats use minifilters to monitor file access, "
+    result["note"] = std::string("Minifilter drivers intercept filesystem I/O. Anti-cheats use minifilters to monitor file access, "
                             "prevent dumps, and detect injection DLLs. Altitude determines callback priority order.");
 
-    return tool_result_t::ok(OBFSTR("Minifilters: ") + std::to_string(result["filter_count"].get<std::size_t>()) +
-                             OBFSTR(" registered filter drivers"), result);
+    return tool_result_t::ok(std::string("Minifilters: ") + std::to_string(result["filter_count"].get<std::size_t>()) +
+                             std::string(" registered filter drivers"), result);
 }
 
 
@@ -5326,9 +5325,9 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_kernel_dtb() == 0)
-        return tool_result_t::error(OBFSTR("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Kernel DTB is not resolved. Attach with sessions_manage action=attach_pid first."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_detect_etw_monitors", driver_bridge::attached_pid(), quota_guard))
@@ -5340,7 +5339,7 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     kernel_module_query_diagnostics_t query_diag{};
     if (!query_kernel_modules(buf, info, err, &query_diag,
             kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
-        return kernel_module_query_error_result(err, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
+        return kernel_module_query_error_result(err, query_diag, std::string("Failed to enumerate kernel modules: "));
 
     std::uint64_t ntos_base = 0, ntos_size = 0;
     for (ULONG i = 0; i < info->NumberOfModules; ++i)
@@ -5356,7 +5355,7 @@ tool_result_t driver_detect_etw_monitors(const json& params)
         }
     }
     if (ntos_base == 0)
-        return tool_result_t::error(OBFSTR("Could not find ntoskrnl base address"));
+        return tool_result_t::error(std::string("Could not find ntoskrnl base address"));
 
 
     std::uint64_t etw_threat_intel = device->resolve_export(ntos_base, "EtwThreatIntProvRegHandle");
@@ -5379,7 +5378,7 @@ tool_result_t driver_detect_etw_monitors(const json& params)
         ti["name"]    = "Microsoft-Windows-Threat-Intelligence";
         ti["address"] = sa_format_address(static_cast<uint64_t>(etw_threat_intel));
         ti["status"]  = (reg_handle != 0) ? "active" : "inactive";
-        ti["note"]    = OBFSTR("ETW-TI monitors process injection, executable memory allocation, and other "
+        ti["note"]    = std::string("ETW-TI monitors process injection, executable memory allocation, and other "
                                "security-sensitive operations. Used by EDR and anti-cheat for real-time telemetry.");
         if (reg_handle != 0) {
             ti["reg_handle"] = sa_format_address(static_cast<uint64_t>(reg_handle));
@@ -5518,13 +5517,13 @@ tool_result_t driver_detect_etw_monitors(const json& params)
     result["providers"]         = std::move(providers);
     result["etw_consumer_modules"] = std::move(etw_modules);
     result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diag);
-    result["note"] = OBFSTR("ETW (Event Tracing for Windows) provides kernel-level telemetry. The Threat Intelligence "
+    result["note"] = std::string("ETW (Event Tracing for Windows) provides kernel-level telemetry. The Threat Intelligence "
                             "provider detects process injection, executable memory allocation, and suspicious API sequences. "
                             "Anti-cheats and EDRs subscribe to these events for real-time detection.");
 
-    return tool_result_t::ok(OBFSTR("ETW monitors: ") + std::to_string(provider_artifact_count) +
-                             OBFSTR(" providers, ") + std::to_string(consumer_module_count) +
-                             OBFSTR(" consumer modules"), result);
+    return tool_result_t::ok(std::string("ETW monitors: ") + std::to_string(provider_artifact_count) +
+                             std::string(" providers, ") + std::to_string(consumer_module_count) +
+                             std::string(" consumer modules"), result);
 }
 
 
@@ -5534,9 +5533,9 @@ tool_result_t driver_detect_hidden_modules(const json& params)
     if (mcp_standalone::current_call_cancelled())
         return tool_result_t::error("Tool cancelled before operation.");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
     if (device->get_process_id() == 0)
-        return tool_result_t::error(OBFSTR("No target process attached. Use sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("No target process attached. Use sessions_manage action=attach_pid first."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_detect_hidden_modules", driver_bridge::attached_pid(), quota_guard))
@@ -5554,7 +5553,7 @@ tool_result_t driver_detect_hidden_modules(const json& params)
 
         voyager::device_t::peb_info peb{};
         if (!device->read_peb(peb))
-            return tool_result_t::error(OBFSTR("Failed to read PEB"));
+            return tool_result_t::error(std::string("Failed to read PEB"));
 
 
         auto regions = device->enumerate_memory_regions(0, 0x7FFFFFFFFFFF, false);
@@ -5701,7 +5700,7 @@ tool_result_t driver_detect_hidden_modules(const json& params)
         kernel_module_query_diagnostics_t query_diag{};
         if (!query_kernel_modules(mod_buf, kinfo, kerr, &query_diag,
                 kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
-            return kernel_module_query_error_result(kerr, query_diag, OBFSTR("Failed to enumerate kernel modules: "));
+            return kernel_module_query_error_result(kerr, query_diag, std::string("Failed to enumerate kernel modules: "));
         module_base_diagnostics = kernel_module_query_diagnostics_json(query_diag);
 
         std::set<std::uint64_t> known_bases;
@@ -5784,12 +5783,12 @@ tool_result_t driver_detect_hidden_modules(const json& params)
     {
         result["module_base_diagnostics"] = std::move(module_base_diagnostics);
     }
-    result["note"] = OBFSTR("Hidden modules are PE images present in memory but not in the PEB module list (usermode) "
+    result["note"] = std::string("Hidden modules are PE images present in memory but not in the PEB module list (usermode) "
                             "or NtQuerySystemInformation module list (kernel). Common for manual-mapped DLLs, "
                             "anti-cheat drivers, and injected payloads.");
 
-    return tool_result_t::ok(OBFSTR("Hidden modules: ") + std::to_string(result["hidden_count"].get<std::size_t>()) +
-                             OBFSTR(" found"), result);
+    return tool_result_t::ok(std::string("Hidden modules: ") + std::to_string(result["hidden_count"].get<std::size_t>()) +
+                             std::string(" found"), result);
 }
 
 
@@ -5813,11 +5812,11 @@ tool_result_t driver_walk_heap(const json& params)
 
     voyager::device_t::peb_info peb{};
     if (!device->read_peb(peb))
-        return tool_result_t::error(OBFSTR("Failed to read PEB"));
+        return tool_result_t::error(std::string("Failed to read PEB"));
 
     const std::uint64_t peb_addr = peb.peb_address;
     if (peb_addr == 0)
-        return tool_result_t::error(OBFSTR("PEB address is null"));
+        return tool_result_t::error(std::string("PEB address is null"));
 
 
     const std::uint32_t num_heaps = device->read<std::uint32_t>(peb_addr + 0xE8);
@@ -5833,7 +5832,7 @@ tool_result_t driver_walk_heap(const json& params)
         free_only ? 1 : 0);
 
     if (num_heaps == 0 || num_heaps > 256 || heaps_ptr == 0)
-        return tool_result_t::error(OBFSTR("No heaps found or invalid PEB heap data"));
+        return tool_result_t::error(std::string("No heaps found or invalid PEB heap data"));
 
     json heaps_arr = json::array();
     int total_entries = 0;
@@ -5999,15 +5998,15 @@ tool_result_t driver_walk_heap(const json& params)
     result["heaps"] = std::move(heaps_arr);
     if (!fallback_regions.empty())
         result["fallback_regions"] = std::move(fallback_regions);
-    return tool_result_t::ok(OBFSTR("Walked ") + std::to_string(num_heaps) + OBFSTR(" heaps, ") +
-                             std::to_string(total_entries) + OBFSTR(" entries"), result);
+    return tool_result_t::ok(std::string("Walked ") + std::to_string(num_heaps) + std::string(" heaps, ") +
+                             std::to_string(total_entries) + std::string(" entries"), result);
 }
 
 tool_result_t driver_enumerate_handles(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_handles entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_enumerate_handles", driver_bridge::attached_pid(), quota_guard))
@@ -6059,7 +6058,7 @@ tool_result_t driver_enumerate_handles(const json& params)
         GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation"));
 
     if (!NtQuerySystemInformation)
-        return tool_result_t::error(OBFSTR("Failed to resolve NtQuerySystemInformation"));
+        return tool_result_t::error(std::string("Failed to resolve NtQuerySystemInformation"));
 
     ULONG returned_length = 0;
     for (int attempt = 0; attempt < 5; ++attempt)
@@ -6071,11 +6070,11 @@ tool_result_t driver_enumerate_handles(const json& params)
         {
             bufsize = returned_length + (1 << 20);
             if (bufsize > (1u << 28))
-                return tool_result_t::error(OBFSTR("Handle table too large"));
+                return tool_result_t::error(std::string("Handle table too large"));
             buffer.resize(bufsize);
             continue;
         }
-        return tool_result_t::error(OBFSTR("NtQuerySystemInformation failed: 0x") +
+        return tool_result_t::error(std::string("NtQuerySystemInformation failed: 0x") +
                                     sa_format_address(static_cast<uint64_t>(status)));
     }
 
@@ -6119,8 +6118,8 @@ tool_result_t driver_enumerate_handles(const json& params)
     if (filter_pid != 0) result["filter_pid"] = filter_pid;
     if (!filter_type.empty()) result["filter_type"] = filter_type;
     result["handles"] = std::move(handles_arr);
-    return tool_result_t::ok(std::to_string(matched) + OBFSTR(" handles returned (") +
-                             std::to_string(count) + OBFSTR(" total system-wide)"), result);
+    return tool_result_t::ok(std::to_string(matched) + std::string(" handles returned (") +
+                             std::to_string(count) + std::string(" total system-wide)"), result);
 }
 
 
@@ -6131,7 +6130,7 @@ tool_result_t driver_enumerate_windows(const json& params)
 {
     diag::log_tagged_fmt("drv_tools", "driver_enumerate_windows entry");
     if (!device->is_connected())
-        return tool_result_t::error(OBFSTR("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
+        return tool_result_t::error(std::string("Driver bridge is not connected. Attach with sessions_manage action=attach_pid first."));
 
     driver_debugger_quota_guard_t quota_guard;
     if (auto quota_err = acquire_driver_debugger_quota("driver_enumerate_windows", driver_bridge::attached_pid(), quota_guard))
@@ -6142,7 +6141,7 @@ tool_result_t driver_enumerate_windows(const json& params)
     const int limit = std::min(params.value("limit", 200), 2000);
 
     if (filter_pid == 0)
-        return tool_result_t::error(OBFSTR("No process attached and no pid specified."));
+        return tool_result_t::error(std::string("No process attached and no pid specified."));
 
     struct window_info_t {
         HWND hwnd;
@@ -6220,7 +6219,7 @@ tool_result_t driver_enumerate_windows(const json& params)
     result["pid"] = filter_pid;
     result["window_count"] = windows.size();
     result["windows"] = std::move(windows_arr);
-    return tool_result_t::ok(std::to_string(windows.size()) + OBFSTR(" windows found for PID ") +
+    return tool_result_t::ok(std::to_string(windows.size()) + std::string(" windows found for PID ") +
                              std::to_string(filter_pid), result);
 }
 
@@ -6230,7 +6229,7 @@ tool_result_t driver_assemble(const json& params)
     diag::log_tagged_fmt("drv_tools", "driver_assemble entry");
     const std::string assembly_text = params.value("assembly", "");
     if (assembly_text.empty())
-        return tool_result_t::error(OBFSTR("Missing required parameter: assembly"));
+        return tool_result_t::error(std::string("Missing required parameter: assembly"));
 
     const std::uint64_t address = [&]() -> std::uint64_t {
         if (params.contains("address"))
@@ -6503,7 +6502,7 @@ tool_result_t driver_assemble(const json& params)
         return tool_result_t::error(error_msg);
 
     if (output.empty())
-        return tool_result_t::error(OBFSTR("No instructions assembled"));
+        return tool_result_t::error(std::string("No instructions assembled"));
 
 
     std::ostringstream hex_ss;
@@ -6537,7 +6536,7 @@ tool_result_t driver_assemble(const json& params)
         }
     }
 
-    return tool_result_t::ok(std::to_string(output.size()) + OBFSTR(" bytes assembled"), result);
+    return tool_result_t::ok(std::to_string(output.size()) + std::string(" bytes assembled"), result);
 }
 
 
@@ -6559,10 +6558,10 @@ tool_result_t driver_find_references(const json& params)
 
     const std::string target_str = params.value("target_address", "");
     if (target_str.empty())
-        return tool_result_t::error(OBFSTR("Missing required parameter: target_address"));
+        return tool_result_t::error(std::string("Missing required parameter: target_address"));
 
     auto target_opt = sa_parse_address(target_str);
-    if (!target_opt) return tool_result_t::error(OBFSTR("Invalid target_address"));
+    if (!target_opt) return tool_result_t::error(std::string("Invalid target_address"));
 
     const std::uint64_t target = *target_opt;
     const int limit = std::min(params.value("limit", 100), 5000);
@@ -6656,7 +6655,7 @@ tool_result_t driver_find_references(const json& params)
     result["target_address"] = sa_format_address(static_cast<uint64_t>(target));
     result["references_found"] = found;
     result["references"] = std::move(refs);
-    return tool_result_t::ok(std::to_string(found) + OBFSTR(" references to ") +
+    return tool_result_t::ok(std::to_string(found) + std::string(" references to ") +
                              sa_format_address(static_cast<uint64_t>(target)), result);
 }
 
@@ -6672,7 +6671,7 @@ tool_result_t driver_read_teb(const json& params)
 
     auto tid_opt = parse_tid_param(params);
     if (!tid_opt)
-        return tool_result_t::error(OBFSTR("Missing or invalid tid parameter."));
+        return tool_result_t::error(std::string("Missing or invalid tid parameter."));
 
     const std::uint32_t tid = *tid_opt;
     const std::uint32_t pid = device ? device->get_process_id() : 0;
@@ -6697,8 +6696,8 @@ tool_result_t driver_read_teb(const json& params)
         failure["process_id"] = pid;
         failure["thread_id"] = tid;
         failure["teb_resolution"] = teb_resolution_diagnostics_to_json(resolution_diag);
-        return tool_result_t::error(OBFSTR("TEB address unavailable for TID ") +
-                                    std::to_string(tid) + OBFSTR(": ") + teb_error, failure);
+        return tool_result_t::error(std::string("TEB address unavailable for TID ") +
+                                    std::to_string(tid) + std::string(": ") + teb_error, failure);
     }
 
     constexpr std::size_t teb_read_size = 0x1680;
@@ -6734,9 +6733,9 @@ tool_result_t driver_read_teb(const json& params)
         failure["thread_id"] = tid;
         failure["teb_resolution"] = teb_resolution_diagnostics_to_json(resolution_diag);
         failure["teb_read"] = read_diag;
-        return tool_result_t::error(OBFSTR("Failed to read complete TEB at ") +
+        return tool_result_t::error(std::string("Failed to read complete TEB at ") +
                                     sa_format_address(static_cast<std::uint64_t>(teb_addr)) +
-                                    OBFSTR(" for TID ") + std::to_string(tid), failure);
+                                    std::string(" for TID ") + std::to_string(tid), failure);
     }
 
     auto read_u64 = [&](std::size_t offset) -> std::uint64_t
@@ -6807,7 +6806,7 @@ tool_result_t driver_read_teb(const json& params)
     result["teb_resolution"] = teb_resolution_diagnostics_to_json(resolution_diag);
     result["teb_read"] = read_diag;
     result["teb"] = std::move(teb);
-    return tool_result_t::ok(OBFSTR("TEB read for TID ") + std::to_string(tid), result);
+    return tool_result_t::ok(std::string("TEB read for TID ") + std::to_string(tid), result);
 }
 
 tool_result_t driver_map_peb_modules(const json& params)
@@ -6825,7 +6824,7 @@ tool_result_t driver_map_peb_modules(const json& params)
 
     voyager::device_t::peb_info peb{};
     if (!device->read_peb(peb) || peb.ldr_address == 0)
-        return tool_result_t::error(OBFSTR("Failed to read PEB or LDR address is null"));
+        return tool_result_t::error(std::string("Failed to read PEB or LDR address is null"));
 
 
     struct ldr_entry_offsets_t {
@@ -6942,7 +6941,7 @@ tool_result_t driver_map_peb_modules(const json& params)
     result["image_base"] = sa_format_address(static_cast<uint64_t>(peb.image_base));
     result["lists"] = std::move(all_lists);
     if (!filter.empty()) result["filter"] = filter;
-    return tool_result_t::ok(OBFSTR("PEB LDR module lists enumerated"), result);
+    return tool_result_t::ok(std::string("PEB LDR module lists enumerated"), result);
 }
 
 tool_result_t driver_set_page_guard(const json& params)
@@ -6958,10 +6957,10 @@ tool_result_t driver_set_page_guard(const json& params)
     const std::string operation = params.value("operation", "set");
 
     if (!params.contains("address"))
-        return tool_result_t::error(OBFSTR("Missing required parameter: address"));
+        return tool_result_t::error(std::string("Missing required parameter: address"));
 
     auto addr_opt = sa_parse_address(params["address"].get<std::string>());
-    if (!addr_opt) return tool_result_t::error(OBFSTR("Invalid address"));
+    if (!addr_opt) return tool_result_t::error(std::string("Invalid address"));
 
     const std::uint64_t target_addr = *addr_opt;
     const std::size_t size = params.value("size", 4096);
@@ -6971,7 +6970,7 @@ tool_result_t driver_set_page_guard(const json& params)
 
         voyager::device_t::memory_region_info region{};
         if (!device->query_memory(target_addr, region))
-            return tool_result_t::error(OBFSTR("Failed to query memory at ") +
+            return tool_result_t::error(std::string("Failed to query memory at ") +
                                         sa_format_address(static_cast<uint64_t>(target_addr)));
 
         std::uint32_t current_protect = region.protect;
@@ -6979,7 +6978,7 @@ tool_result_t driver_set_page_guard(const json& params)
 
         std::uint32_t old_protect = 0;
         if (!device->protect_memory(target_addr, size, new_protect, &old_protect))
-            return tool_result_t::error(OBFSTR("Failed to set PAGE_GUARD at ") +
+            return tool_result_t::error(std::string("Failed to set PAGE_GUARD at ") +
                                         sa_format_address(static_cast<uint64_t>(target_addr)));
 
         json result;
@@ -6988,35 +6987,35 @@ tool_result_t driver_set_page_guard(const json& params)
         result["size"] = size;
         result["old_protection"] = sa_format_address(static_cast<uint64_t>(old_protect));
         result["new_protection"] = sa_format_address(static_cast<uint64_t>(new_protect));
-        result["note"] = OBFSTR("PAGE_GUARD set. Next access triggers STATUS_GUARD_PAGE_VIOLATION (0x80000001). "
+        result["note"] = std::string("PAGE_GUARD set. Next access triggers STATUS_GUARD_PAGE_VIOLATION (0x80000001). "
                                 "Guard is automatically cleared after first hit. Re-apply as needed.");
-        return tool_result_t::ok(OBFSTR("PAGE_GUARD set at ") +
+        return tool_result_t::ok(std::string("PAGE_GUARD set at ") +
                                  sa_format_address(static_cast<uint64_t>(target_addr)), result);
     }
     else if (operation == "remove")
     {
         voyager::device_t::memory_region_info region{};
         if (!device->query_memory(target_addr, region))
-            return tool_result_t::error(OBFSTR("Failed to query memory"));
+            return tool_result_t::error(std::string("Failed to query memory"));
 
         std::uint32_t new_protect = region.protect & ~0x100u;
         std::uint32_t old_protect = 0;
         if (!device->protect_memory(target_addr, size, new_protect, &old_protect))
-            return tool_result_t::error(OBFSTR("Failed to remove PAGE_GUARD"));
+            return tool_result_t::error(std::string("Failed to remove PAGE_GUARD"));
 
         json result;
         result["operation"] = "remove";
         result["address"] = sa_format_address(static_cast<uint64_t>(target_addr));
         result["old_protection"] = sa_format_address(static_cast<uint64_t>(old_protect));
         result["new_protection"] = sa_format_address(static_cast<uint64_t>(new_protect));
-        return tool_result_t::ok(OBFSTR("PAGE_GUARD removed at ") +
+        return tool_result_t::ok(std::string("PAGE_GUARD removed at ") +
                                  sa_format_address(static_cast<uint64_t>(target_addr)), result);
     }
     else if (operation == "query")
     {
         voyager::device_t::memory_region_info region{};
         if (!device->query_memory(target_addr, region))
-            return tool_result_t::error(OBFSTR("Failed to query memory"));
+            return tool_result_t::error(std::string("Failed to query memory"));
 
         json result;
         result["address"] = sa_format_address(static_cast<uint64_t>(target_addr));
@@ -7026,11 +7025,11 @@ tool_result_t driver_set_page_guard(const json& params)
         result["has_guard"] = (region.protect & 0x100) != 0;
         result["state"] = sa_format_address(static_cast<uint64_t>(region.state));
         return tool_result_t::ok(
-            (region.protect & 0x100) ? OBFSTR("PAGE_GUARD is active") : OBFSTR("PAGE_GUARD is not set"),
+            (region.protect & 0x100) ? std::string("PAGE_GUARD is active") : std::string("PAGE_GUARD is not set"),
             result);
     }
 
-    return tool_result_t::error(OBFSTR("Invalid operation. Use 'set', 'remove', or 'query'."));
+    return tool_result_t::error(std::string("Invalid operation. Use 'set', 'remove', or 'query'."));
 }
 
 
@@ -7049,7 +7048,7 @@ tool_result_t driver_kernel_symbols(const json& params)
         json result;
         result["reloading"] = true;
         result["symbols"] = kernel_symbols_status_json();
-        return tool_result_t::ok(OBFSTR("Kernel symbol engine reload scheduled."), result);
+        return tool_result_t::ok(std::string("Kernel symbol engine reload scheduled."), result);
     }
 
     kernel_symbols::ensure_started();
@@ -7057,7 +7056,7 @@ tool_result_t driver_kernel_symbols(const json& params)
     if (action == "status")
     {
         json result = kernel_symbols_status_json();
-        return tool_result_t::ok(OBFSTR("Kernel symbol engine status."), result);
+        return tool_result_t::ok(std::string("Kernel symbol engine status."), result);
     }
 
     if (action == "resolve")
@@ -7066,7 +7065,7 @@ tool_result_t driver_kernel_symbols(const json& params)
         if (params.contains("expression") && params["expression"].is_string())
             expression = params["expression"].get<std::string>();
         if (expression.empty())
-            return tool_result_t::error(OBFSTR("Missing expression to resolve."));
+            return tool_result_t::error(std::string("Missing expression to resolve."));
         if (const auto value = kernel_symbols::resolve(expression))
         {
             json result;
@@ -7074,14 +7073,14 @@ tool_result_t driver_kernel_symbols(const json& params)
             result["address"] = sa_format_address(*value);
             result["pretty"] = kernel_symbols::format(*value);
             result["symbols"] = kernel_symbols_status_json();
-            return tool_result_t::ok(OBFSTR("Resolved kernel symbol expression."), result);
+            return tool_result_t::ok(std::string("Resolved kernel symbol expression."), result);
         }
         json details;
         details["expression"] = expression;
         details["symbols"] = kernel_symbols_status_json();
         return tool_result_t::error(
-            OBFSTR("Could not resolve the kernel symbol expression."),
-            OBFSTR("symbol_resolve_failed"), details);
+            std::string("Could not resolve the kernel symbol expression."),
+            std::string("symbol_resolve_failed"), details);
     }
 
     if (action == "lookup")
@@ -7089,7 +7088,7 @@ tool_result_t driver_kernel_symbols(const json& params)
         std::uint64_t address = 0;
         std::string address_error;
         if (!parse_kernel_address_or_symbol(params, "address", address, address_error))
-            return tool_result_t::error(OBFSTR("Missing or invalid address: ") + address_error);
+            return tool_result_t::error(std::string("Missing or invalid address: ") + address_error);
         json result;
         result["address"] = sa_format_address(address);
         result["pretty"] = kernel_symbols::format(address);
@@ -7110,7 +7109,7 @@ tool_result_t driver_kernel_symbols(const json& params)
             result["lookup"] = nullptr;
         }
         result["symbols"] = kernel_symbols_status_json();
-        return tool_result_t::ok(OBFSTR("Looked up kernel address."), result);
+        return tool_result_t::ok(std::string("Looked up kernel address."), result);
     }
 
     if (action == "struct")
@@ -7119,7 +7118,7 @@ tool_result_t driver_kernel_symbols(const json& params)
         if (params.contains("name") && params["name"].is_string())
             name = params["name"].get<std::string>();
         if (name.empty())
-            return tool_result_t::error(OBFSTR("Missing struct name."));
+            return tool_result_t::error(std::string("Missing struct name."));
         if (const auto desc = kernel_symbols::describe_struct(name))
         {
             json result;
@@ -7137,14 +7136,14 @@ tool_result_t driver_kernel_symbols(const json& params)
             }
             result["fields"] = std::move(fields);
             result["symbols"] = kernel_symbols_status_json();
-            return tool_result_t::ok(OBFSTR("Described kernel struct layout."), result);
+            return tool_result_t::ok(std::string("Described kernel struct layout."), result);
         }
         json details;
         details["struct"] = name;
         details["symbols"] = kernel_symbols_status_json();
         return tool_result_t::error(
-            OBFSTR("Struct was not found in the loaded kernel PDB."),
-            OBFSTR("struct_not_found"), details);
+            std::string("Struct was not found in the loaded kernel PDB."),
+            std::string("struct_not_found"), details);
     }
 
     if (action == "modules")
@@ -7175,12 +7174,12 @@ tool_result_t driver_kernel_symbols(const json& params)
         result["module_base_diagnostics"] = kernel_module_query_diagnostics_json(query_diagnostics);
         result["symbols"] = kernel_symbols_status_json();
         return tool_result_t::ok(
-            OBFSTR("Enumerated ") + std::to_string(info->NumberOfModules) + OBFSTR(" loaded kernel modules."),
+            std::string("Enumerated ") + std::to_string(info->NumberOfModules) + std::string(" loaded kernel modules."),
             result);
     }
 
     return tool_result_t::error(
-        OBFSTR("Invalid action. Use 'status', 'reload', 'resolve', 'lookup', 'struct', or 'modules'."));
+        std::string("Invalid action. Use 'status', 'reload', 'resolve', 'lookup', 'struct', or 'modules'."));
 }
 
 
@@ -7196,34 +7195,34 @@ void register_driver_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("driver_read_pointer_chain"), OBFSTR("driver"),
-        OBFSTR("Follow a chain of pointer dereferences through target process memory via kernel driver. "
+        std::string("driver_read_pointer_chain"), std::string("driver"),
+        std::string("Follow a chain of pointer dereferences through target process memory via kernel driver. "
                "Useful for traversing linked lists, object hierarchies, and obfuscated data structures."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Starting virtual address"), false},
-          {OBFSTR("base_address"), OBFSTR("string"), OBFSTR("Alias for address."), false},
-         {OBFSTR("offsets"), OBFSTR("array"),
-          OBFSTR("Array of byte offsets to apply after each dereference (e.g. [0, 48, 24])"), false, {},
+        {{std::string("address"), std::string("string"), std::string("Starting virtual address"), false},
+          {std::string("base_address"), std::string("string"), std::string("Alias for address."), false},
+         {std::string("offsets"), std::string("array"),
+          std::string("Array of byte offsets to apply after each dereference (e.g. [0, 48, 24])"), false, {},
            json::object({{"type", "number"}})},
-          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
+          {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_read_pointer_chain, false});
 
 
     register_compat(srv, {
-        OBFSTR("driver_enumerate_kernel_modules"), OBFSTR("driver"),
-        OBFSTR("Enumerate ALL loaded kernel drivers and modules via NtQuerySystemInformation. "
+        std::string("driver_enumerate_kernel_modules"), std::string("driver"),
+        std::string("Enumerate ALL loaded kernel drivers and modules via NtQuerySystemInformation. "
                "Returns each driver's name, NT path, resolved disk path, kernel base address, "
                "and image size. Does NOT require the kernel driver to be connected - works "
                "purely from usermode. Use filter to search for a specific driver "
                "(e.g. filter='EasyAntiCheat' or filter='eac')."),
-        {{OBFSTR("filter"), OBFSTR("string"),
-          OBFSTR("Case-insensitive substring filter applied to module name and path (e.g. 'eac', 'ntfs')"), false},
-         {OBFSTR("limit"), OBFSTR("number"),
-          OBFSTR("Maximum number of modules to return (default 500)"), false}},
+        {{std::string("filter"), std::string("string"),
+          std::string("Case-insensitive substring filter applied to module name and path (e.g. 'eac', 'ntfs')"), false},
+         {std::string("limit"), std::string("number"),
+          std::string("Maximum number of modules to return (default 500)"), false}},
         driver_enumerate_kernel_modules, false});
 
     register_compat(srv, {
-        OBFSTR("driver_read_kernel_memory"), OBFSTR("driver"),
-        OBFSTR("Read an arbitrary canonical kernel virtual-address range using the live kernel DTB. "
+        std::string("driver_read_kernel_memory"), std::string("driver"),
+        std::string("Read an arbitrary canonical kernel virtual-address range using the live kernel DTB. "
                "This is independent of the attached process address space and is intended for ntoskrnl globals, "
                "driver globals, executive objects, pool allocations, and other live kernel structures. "
                "The address accepts plain hex/decimal values and kernel symbol expressions such as "
@@ -7233,15 +7232,15 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "pointers are resolved to 'nt!Symbol+0xN' or '<module>+0xN'. "
                "Pass struct='<PDB struct name>' (for example '_EPROCESS' or 'EPROCESS') to decode the read buffer "
                "field-by-field from the live kernel PDB."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Canonical kernel virtual address (0x...) or symbol expression such as 'nt!NtCreateFile+0x10'"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to read, from 1 through 1048576"), true},
-         {OBFSTR("annotate"), OBFSTR("boolean"), OBFSTR("Attach symbolicated 16-byte annotated_lines with pointer resolution (default true)"), false},
-         {OBFSTR("struct"), OBFSTR("string"), OBFSTR("Optional PDB struct name used to decode the read buffer field-by-field"), false}},
+        {{std::string("address"), std::string("string"), std::string("Canonical kernel virtual address (0x...) or symbol expression such as 'nt!NtCreateFile+0x10'"), true},
+         {std::string("size"), std::string("number"), std::string("Bytes to read, from 1 through 1048576"), true},
+         {std::string("annotate"), std::string("boolean"), std::string("Attach symbolicated 16-byte annotated_lines with pointer resolution (default true)"), false},
+         {std::string("struct"), std::string("string"), std::string("Optional PDB struct name used to decode the read buffer field-by-field"), false}},
         driver_read_kernel_memory, true});
 
     register_compat(srv, {
-        OBFSTR("driver_kernel_symbols"), OBFSTR("driver"),
-        OBFSTR("Manage the in-memory kernel symbol engine (MemPDB over the live ntoskrnl debug directory, cached "
+        std::string("driver_kernel_symbols"), std::string("driver"),
+        std::string("Manage the in-memory kernel symbol engine (MemPDB over the live ntoskrnl debug directory, cached "
                "under the user profile, resolved through the Microsoft symbol server when missing). "
                "Actions: status (default) reports engine state, PDB name, cache path, symbol counts and ntoskrnl base; "
                "reload drops all state and re-downloads/re-parses after a driver reconnect; "
@@ -7249,70 +7248,70 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "lookup (address=0x... or symbol expression) maps an address to the nearest symbol or containing kernel module; "
                "struct (name='_EPROCESS') returns the PDB field layout; "
                "modules lists loaded kernel modules with base, size, and path."),
-        {{OBFSTR("action"), OBFSTR("string"), OBFSTR("status | reload | resolve | lookup | struct | modules"), false},
-         {OBFSTR("expression"), OBFSTR("string"), OBFSTR("Symbol expression for action=resolve, for example 'nt!NtCreateFile+0x10'"), false},
-         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Kernel address or symbol expression for action=lookup"), false},
-         {OBFSTR("name"), OBFSTR("string"), OBFSTR("PDB struct name for action=struct (leading underscore optional)"), false}},
+        {{std::string("action"), std::string("string"), std::string("status | reload | resolve | lookup | struct | modules"), false},
+         {std::string("expression"), std::string("string"), std::string("Symbol expression for action=resolve, for example 'nt!NtCreateFile+0x10'"), false},
+         {std::string("address"), std::string("string"), std::string("Kernel address or symbol expression for action=lookup"), false},
+         {std::string("name"), std::string("string"), std::string("PDB struct name for action=struct (leading underscore optional)"), false}},
         driver_kernel_symbols, true});
 
 
     register_compat(srv, {
-        OBFSTR("driver_write_kernel_memory"), OBFSTR("driver"),
-        OBFSTR("Write arbitrary canonical kernel virtual memory through the live kernel DTB. "
+        std::string("driver_write_kernel_memory"), std::string("driver"),
+        std::string("Write arbitrary canonical kernel virtual memory through the live kernel DTB. "
                "The operation fails closed unless the original range can be read completely, optionally compare-checks expected_bytes, "
                "requires confirm_unsafe=true for live mutation, and performs an exact readback verification. "
                "Use dry_run=true to validate the address, payload, and optional precondition without changing memory."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Canonical kernel virtual address to modify"), true},
-         {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Replacement bytes as packed hex or space/comma-separated hex bytes"), true},
-         {OBFSTR("expected_bytes"), OBFSTR("string"), OBFSTR("Optional exact current bytes required before the write is attempted"), false},
-         {OBFSTR("confirm_unsafe"), OBFSTR("boolean"), OBFSTR("Must be true for a live kernel write"), false},
-         {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Validate and pre-read without modifying kernel memory"), false}},
+        {{std::string("address"), std::string("string"), std::string("Canonical kernel virtual address to modify"), true},
+         {std::string("bytes"), std::string("string"), std::string("Replacement bytes as packed hex or space/comma-separated hex bytes"), true},
+         {std::string("expected_bytes"), std::string("string"), std::string("Optional exact current bytes required before the write is attempted"), false},
+         {std::string("confirm_unsafe"), std::string("boolean"), std::string("Must be true for a live kernel write"), false},
+         {std::string("dry_run"), std::string("boolean"), std::string("Validate and pre-read without modifying kernel memory"), false}},
         driver_write_kernel_memory, false});
 
     register_compat(srv, {
-        OBFSTR("search_kernel_memory"), OBFSTR("driver"),
-        OBFSTR("Search a bounded live kernel virtual-address range for a byte pattern with ?? wildcards. "
+        std::string("search_kernel_memory"), std::string("driver"),
+        std::string("Search a bounded live kernel virtual-address range for a byte pattern with ?? wildcards. "
                "Specify either address/start_address plus size, or a unique loaded kernel module name with optional offset and size. "
                "The scanner preserves overlap across partial and chunked reads, skips unreadable pages, honors cancellation, "
                "and reports scanned/unreadable byte counts and bounded match results."),
-        {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Hex byte pattern such as '48 8B ?? ?? 89' or '488B????89'"), true},
-         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Start of an explicit canonical kernel range; alias: start_address"), false},
-         {OBFSTR("start_address"), OBFSTR("string"), OBFSTR("Alias for address"), false},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Explicit range size, or optional module scan length; maximum 4294967296"), false},
-         {OBFSTR("module"), OBFSTR("string"), OBFSTR("Unique loaded kernel module filename or path used instead of address"), false},
-         {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Offset into module where scanning begins; default 0"), false},
-         {OBFSTR("chunk_size"), OBFSTR("number"), OBFSTR("Read chunk size from 4096 through 1048576; default 65536"), false},
-         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum matches to return from 1 through 4096; default 256"), false}},
+        {{std::string("pattern"), std::string("string"), std::string("Hex byte pattern such as '48 8B ?? ?? 89' or '488B????89'"), true},
+         {std::string("address"), std::string("string"), std::string("Start of an explicit canonical kernel range; alias: start_address"), false},
+         {std::string("start_address"), std::string("string"), std::string("Alias for address"), false},
+         {std::string("size"), std::string("number"), std::string("Explicit range size, or optional module scan length; maximum 4294967296"), false},
+         {std::string("module"), std::string("string"), std::string("Unique loaded kernel module filename or path used instead of address"), false},
+         {std::string("offset"), std::string("number"), std::string("Offset into module where scanning begins; default 0"), false},
+         {std::string("chunk_size"), std::string("number"), std::string("Read chunk size from 4096 through 1048576; default 65536"), false},
+         {std::string("max_results"), std::string("number"), std::string("Maximum matches to return from 1 through 4096; default 256"), false}},
         search_kernel_memory, true});
 
 
 
 
     register_compat(srv, {
-        OBFSTR("driver_allocate_memory"), OBFSTR("driver"),
-        OBFSTR("Allocate RWX memory in the attached target process. "
+        std::string("driver_allocate_memory"), std::string("driver"),
+        std::string("Allocate RWX memory in the attached target process. "
                "Uses kernel-level ZwAllocateVirtualMemory with PAGE_EXECUTE_READWRITE. "
                "Max 16MB per allocation. Useful for injecting shellcode, writing strings "
                "for function arguments, or setting up data structures remotely. "
                "Requires driver connected and process attached."),
-        {{OBFSTR("size"), OBFSTR("string"),
-                    OBFSTR("Number of bytes to allocate (max 16777216 = 16MB)"), true},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
+        {{std::string("size"), std::string("string"),
+                    std::string("Number of bytes to allocate (max 16777216 = 16MB)"), true},
+                 {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_allocate_memory, false});
 
     register_compat(srv, {
-        OBFSTR("driver_free_memory"), OBFSTR("driver"),
-        OBFSTR("Free previously allocated memory in the attached target process. "
+        std::string("driver_free_memory"), std::string("driver"),
+        std::string("Free previously allocated memory in the attached target process. "
                "Uses kernel-level ZwFreeVirtualMemory with MEM_RELEASE. "
                "Requires driver connected and process attached."),
-        {{OBFSTR("address"), OBFSTR("string"),
-                    OBFSTR("Address of the memory block to free (hex string like '0x...')"), true},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
+        {{std::string("address"), std::string("string"),
+                    std::string("Address of the memory block to free (hex string like '0x...')"), true},
+                 {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_free_memory, false});
 
     register_compat(srv, {
-        OBFSTR("driver_call_function"), OBFSTR("driver"),
-        OBFSTR("Execute ANY function inside the attached target process via thread hijack. "
+        std::string("driver_call_function"), std::string("driver"),
+        std::string("Execute ANY function inside the attached target process via thread hijack. "
                "Suspends a target thread, redirects execution to injected shellcode that calls "
                "the specified function with up to 4 arguments, polls for completion, restores "
                "original thread context. Call stack is spoofed via JMP-RBX gadget. "
@@ -7322,21 +7321,21 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "game/anticheat function to observe behavior. "
                              "Requires driver connected, process attached, DTB solved. "
                              "For safety, execution requires confirm_unsafe=true unless dry_run=true."),
-        {{OBFSTR("address"), OBFSTR("string"),
-          OBFSTR("Address of the function to call in the target process (hex)"), true},
-         {OBFSTR("arg1"), OBFSTR("string"),
-          OBFSTR("First argument (RCX). Hex address or integer. Default 0"), false},
-         {OBFSTR("arg2"), OBFSTR("string"),
-          OBFSTR("Second argument (RDX). Hex address or integer. Default 0"), false},
-         {OBFSTR("arg3"), OBFSTR("string"),
-          OBFSTR("Third argument (R8). Hex address or integer. Default 0"), false},
-         {OBFSTR("arg4"), OBFSTR("string"),
-                    OBFSTR("Fourth argument (R9). Hex address or integer. Default 0"), false},
-                 {OBFSTR("confirm_unsafe"), OBFSTR("boolean"), OBFSTR("Required for live execution. Must be true unless dry_run=true."), false},
-         {OBFSTR("allow_unsafe"), OBFSTR("boolean"), OBFSTR("Alias of confirm_unsafe."), false},
-         {OBFSTR("unsafe"), OBFSTR("boolean"), OBFSTR("Alias of confirm_unsafe."), false},
-                 {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Preview call metadata without executing."), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
+        {{std::string("address"), std::string("string"),
+          std::string("Address of the function to call in the target process (hex)"), true},
+         {std::string("arg1"), std::string("string"),
+          std::string("First argument (RCX). Hex address or integer. Default 0"), false},
+         {std::string("arg2"), std::string("string"),
+          std::string("Second argument (RDX). Hex address or integer. Default 0"), false},
+         {std::string("arg3"), std::string("string"),
+          std::string("Third argument (R8). Hex address or integer. Default 0"), false},
+         {std::string("arg4"), std::string("string"),
+                    std::string("Fourth argument (R9). Hex address or integer. Default 0"), false},
+                 {std::string("confirm_unsafe"), std::string("boolean"), std::string("Required for live execution. Must be true unless dry_run=true."), false},
+         {std::string("allow_unsafe"), std::string("boolean"), std::string("Alias of confirm_unsafe."), false},
+         {std::string("unsafe"), std::string("boolean"), std::string("Alias of confirm_unsafe."), false},
+                 {std::string("dry_run"), std::string("boolean"), std::string("Preview call metadata without executing."), false},
+                 {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_call_function, false});
 
 
@@ -7347,81 +7346,81 @@ void register_driver_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("driver_protect_memory"), OBFSTR("driver"),
-        OBFSTR("Change virtual memory protection in the attached process via kernel ZwProtectVirtualMemory. "
+        std::string("driver_protect_memory"), std::string("driver"),
+        std::string("Change virtual memory protection in the attached process via kernel ZwProtectVirtualMemory. "
                "Bypasses usermode hooks on VirtualProtect. Can set any protection including executable. "
                "Returns the old protection value."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address"), true},
-         {OBFSTR("size"), OBFSTR("string"), OBFSTR("Region size (default 0x1000)"), false},
-         {OBFSTR("protect"), OBFSTR("string"),
-          OBFSTR("New protection value: 0x40=PAGE_EXECUTE_READWRITE, 0x20=PAGE_EXECUTE_READ, "
+        {{std::string("address"), std::string("string"), std::string("Virtual address"), true},
+         {std::string("size"), std::string("string"), std::string("Region size (default 0x1000)"), false},
+         {std::string("protect"), std::string("string"),
+          std::string("New protection value: 0x40=PAGE_EXECUTE_READWRITE, 0x20=PAGE_EXECUTE_READ, "
              "0x04=PAGE_READWRITE, 0x02=PAGE_READONLY"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_protect_memory, false});
 
 
     register_compat(srv, {
-        OBFSTR("driver_read_peb"), OBFSTR("driver"),
-        OBFSTR("Read the Process Environment Block (PEB) of the attached process via kernel. "
+        std::string("driver_read_peb"), std::string("driver"),
+        std::string("Read the Process Environment Block (PEB) of the attached process via kernel. "
                "Returns PEB address, image base, BeingDebugged flag, NtGlobalFlag, "
                "loader data address, process heap, and heap info."),
-        {{OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}}, driver_read_peb, true});
+        {{std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}}, driver_read_peb, true});
 
 
     register_compat(srv, {
-        OBFSTR("driver_set_hw_breakpoint"), OBFSTR("driver"),
-        OBFSTR("Set a hardware breakpoint on a thread in the attached process using debug registers. "
+        std::string("driver_set_hw_breakpoint"), std::string("driver"),
+        std::string("Set a hardware breakpoint on a thread in the attached process using debug registers. "
                "Uses DR0-DR3 (4 breakpoints max per thread). Operates via kernel PsSetContextThread "
                "so it's invisible to usermode anti-debug. Types: execute (break on execution), "
                "write (break on memory write), readwrite (break on read or write). "
                "After setting, the thread will trigger a SINGLE_STEP exception when the breakpoint fires."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Address to break on"), true},
-         {OBFSTR("index"), OBFSTR("number"),
-          OBFSTR("Debug register index 0-3 (default 0). Each thread supports 4 HW breakpoints."), false},
-         {OBFSTR("type"), OBFSTR("string"),
-          OBFSTR("Breakpoint type: execute (default), write, readwrite"), false,
-          {OBFSTR("execute"), OBFSTR("write"), OBFSTR("readwrite")}},
-         {OBFSTR("size"), OBFSTR("number"),
-                    OBFSTR("Watched region size in bytes: 1 (default), 2, 4, or 8"), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
+        {{std::string("tid"), std::string("string"), std::string("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
+         {std::string("address"), std::string("string"), std::string("Address to break on"), true},
+         {std::string("index"), std::string("number"),
+          std::string("Debug register index 0-3 (default 0). Each thread supports 4 HW breakpoints."), false},
+         {std::string("type"), std::string("string"),
+          std::string("Breakpoint type: execute (default), write, readwrite"), false,
+          {std::string("execute"), std::string("write"), std::string("readwrite")}},
+         {std::string("size"), std::string("number"),
+                    std::string("Watched region size in bytes: 1 (default), 2, 4, or 8"), false},
+                 {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_set_hw_breakpoint, false});
 
     register_compat(srv, {
-        OBFSTR("driver_clear_hw_breakpoint"), OBFSTR("driver"),
-        OBFSTR("Clear a hardware breakpoint on a thread. Removes the address from the specified "
+        std::string("driver_clear_hw_breakpoint"), std::string("driver"),
+        std::string("Clear a hardware breakpoint on a thread. Removes the address from the specified "
                "debug register and disables it in DR7."),
-                {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
-         {OBFSTR("index"), OBFSTR("number"),
-                    OBFSTR("Debug register index 0-3 to clear (default 0)"), false},
-                 {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
+                {{std::string("tid"), std::string("string"), std::string("Thread ID. Decimal string recommended; 0x-prefixed hex supported."), true},
+         {std::string("index"), std::string("number"),
+                    std::string("Debug register index 0-3 to clear (default 0)"), false},
+                 {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_clear_hw_breakpoint, false});
 
     register_compat(srv, {
-        OBFSTR("driver_resolve_export"), OBFSTR("driver"),
-        OBFSTR("Resolve an export function address from a PE module in the attached process. "
+        std::string("driver_resolve_export"), std::string("driver"),
+        std::string("Resolve an export function address from a PE module in the attached process. "
                "Walks the PE export directory via physical memory reads. Useful for finding API "
                "addresses without relying on import tables (which may be obfuscated by packers)."),
-        {{OBFSTR("name"), OBFSTR("string"), OBFSTR("Export function name to resolve. Alias: export_name."), false},
-          {OBFSTR("export_name"), OBFSTR("string"), OBFSTR("Alias for name."), false},
-         {OBFSTR("module_base"), OBFSTR("string"),
-           OBFSTR("Module base address (default: attached process image base)"), false},
-          {OBFSTR("module"), OBFSTR("string"), OBFSTR("Module name/path or base address string. Alias: module_name."), false},
-          {OBFSTR("module_name"), OBFSTR("string"), OBFSTR("Alias for module."), false},
-          {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
+        {{std::string("name"), std::string("string"), std::string("Export function name to resolve. Alias: export_name."), false},
+          {std::string("export_name"), std::string("string"), std::string("Alias for name."), false},
+         {std::string("module_base"), std::string("string"),
+           std::string("Module base address (default: attached process image base)"), false},
+          {std::string("module"), std::string("string"), std::string("Module name/path or base address string. Alias: module_name."), false},
+          {std::string("module_name"), std::string("string"), std::string("Alias for module."), false},
+          {std::string("process_id"), std::string("number"), std::string("Optional PID override (alias: target_pid). When set, the bridge's active PID is swapped to this for the duration of the call. The PID must be alive; if it is not in the attached set the bridge will open a handle automatically."), false}},
         driver_resolve_export, true});
 
     register_compat(srv, {
-        OBFSTR("driver_virtual_to_physical"), OBFSTR("driver"),
-        OBFSTR("Translate a virtual address to its physical address using the process DTB. "
+        std::string("driver_virtual_to_physical"), std::string("driver"),
+        std::string("Translate a virtual address to its physical address using the process DTB. "
                "Performs a full 4-level page table walk (PML4->PDPT->PD->PT) in kernel."),
-        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Virtual address to translate"), true}},
+        {{std::string("address"), std::string("string"), std::string("Virtual address to translate"), true}},
         driver_virtual_to_physical, true});
 
 
     register_compat(srv, {
-        OBFSTR("driver_defer_action"), OBFSTR("driver"),
-        OBFSTR("PRE-SCHEDULE driver tool calls to execute THE INSTANT a kernel module loads "
+        std::string("driver_defer_action"), std::string("driver"),
+        std::string("PRE-SCHEDULE driver tool calls to execute THE INSTANT a kernel module loads "
                "or a process starts. This solves the critical timing problem: many drivers "
                "(EAC, BattlEye, Vanguard) wipe their IAT, decrypt code, or perform anti-RE "
                "operations during initialization. By the time you can manually react, the "
@@ -7438,14 +7437,14 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "\nExample: to capture EAC's IAT before it's wiped:\n"
                "  wait_for='kernel_module_load', target='EasyAntiCheat_EOS.sys',\n"
                "  actions=[{tool:'driver_read_kernel_memory', params:{address:'${module_base}+0x17C000', size:64}}]"),
-        {{OBFSTR("wait_for"), OBFSTR("string"),
-          OBFSTR("Condition type: 'kernel_module_load' or 'process_start'"), true, {},
-          {OBFSTR("kernel_module_load"), OBFSTR("process_start")}},
-         {OBFSTR("target"), OBFSTR("string"),
-          OBFSTR("Module or process name to watch for (case-insensitive substring match). "
+        {{std::string("wait_for"), std::string("string"),
+          std::string("Condition type: 'kernel_module_load' or 'process_start'"), true, {},
+          {std::string("kernel_module_load"), std::string("process_start")}},
+         {std::string("target"), std::string("string"),
+          std::string("Module or process name to watch for (case-insensitive substring match). "
                  "E.g. 'EasyAntiCheat_EOS.sys', 'BEService.exe'"), true},
-         {OBFSTR("actions"), OBFSTR("array"),
-          OBFSTR("Array of tool calls to execute when condition is met. "
+         {std::string("actions"), std::string("array"),
+          std::string("Array of tool calls to execute when condition is met. "
                  "Each entry: {\"tool\": \"tool_name\", \"params\": {...}}. "
                  "Compatibility aliases accepted: top-level {action, params} and per-entry {action, params}. "
              "Params may use ${module_base}, ${module_size}, ${pid}, ${base_address} templates."), false, {},
@@ -7456,45 +7455,45 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                             {"params", json::object({{"type", "object"}})}
                         })}
           })},
-         {OBFSTR("timeout"), OBFSTR("number"),
-          OBFSTR("Maximum seconds to wait for the condition (default 300 = 5 minutes)"), false},
-         {OBFSTR("poll_interval"), OBFSTR("number"),
-          OBFSTR("Milliseconds between condition checks (default 50ms). Lower = faster reaction "
+         {std::string("timeout"), std::string("number"),
+          std::string("Maximum seconds to wait for the condition (default 300 = 5 minutes)"), false},
+         {std::string("poll_interval"), std::string("number"),
+          std::string("Milliseconds between condition checks (default 50ms). Lower = faster reaction "
                  "but more CPU. For IAT capture, use 10-25ms."), false}},
         driver_defer_action, false});
 
     register_compat(srv, {
-        OBFSTR("driver_list_deferred_actions"), OBFSTR("driver"),
-        OBFSTR("List all registered deferred actions and their current status "
+        std::string("driver_list_deferred_actions"), std::string("driver"),
+        std::string("List all registered deferred actions and their current status "
                "(pending, watching, triggered, completed, failed, cancelled, timed_out). "
                "Shows condition, target, number of queued actions, trigger info, and result counts."),
         {},
         driver_list_deferred_actions, false});
 
     register_compat(srv, {
-        OBFSTR("driver_cancel_deferred_action"), OBFSTR("driver"),
-        OBFSTR("Cancel a pending/watching deferred action by its action_id. "
+        std::string("driver_cancel_deferred_action"), std::string("driver"),
+        std::string("Cancel a pending/watching deferred action by its action_id. "
                "Only works if the action hasn't been triggered yet."),
-        {{OBFSTR("action_id"), OBFSTR("number"),
-          OBFSTR("The action ID returned by driver_defer_action"), true}},
+        {{std::string("action_id"), std::string("number"),
+          std::string("The action ID returned by driver_defer_action"), true}},
         driver_cancel_deferred_action, false});
 
     register_compat(srv, {
-        OBFSTR("driver_get_deferred_results"), OBFSTR("driver"),
-        OBFSTR("Get the detailed results of a deferred action after it has been triggered. "
+        std::string("driver_get_deferred_results"), std::string("driver"),
+        std::string("Get the detailed results of a deferred action after it has been triggered. "
                "Returns the trigger context (module base, PID, etc.), the status of each "
                "queued tool call (success/failure, output data), and timing information. "
                "Use this to retrieve data captured by pre-scheduled actions."),
-        {{OBFSTR("action_id"), OBFSTR("number"),
-          OBFSTR("The action ID returned by driver_defer_action"), true}},
+        {{std::string("action_id"), std::string("number"),
+          std::string("The action ID returned by driver_defer_action"), true}},
         driver_get_deferred_results, false});
 
 
 
 
     register_compat(srv, {
-        OBFSTR("driver_sniff_network_buffers"), OBFSTR("driver"),
-        OBFSTR("Manage a kernel-level network buffer sniff session that works with hardware breakpoints to "
+        std::string("driver_sniff_network_buffers"), std::string("driver"),
+        std::string("Manage a kernel-level network buffer sniff session that works with hardware breakpoints to "
                "capture plaintext network buffers in memory BEFORE encryption. Wireshark only sees encrypted "
                "payloads; this tool captures the data before it reaches ws2_32.dll!send, "
                "afd.sys!AfdFastIoDeviceControl, or a custom game/malware encryption function.\n\n"
@@ -7505,31 +7504,31 @@ void register_driver_tools(mcp_standalone::server_t& srv)
                "4. Call with operation='get' to retrieve all captured buffers\n"
                "5. Call with operation='stop' when done\n\n"
                "This is a composite tool that coordinates with driver_set_hw_breakpoint and read_memory."),
-        {{OBFSTR("address"), OBFSTR("string"),
-          OBFSTR("Address of the send/recv/encrypt function (for 'start' operation)"), false},
-         {OBFSTR("buffer_register"), OBFSTR("string"),
-          OBFSTR("Register containing the buffer pointer (e.g., 'rcx', 'rdx', 'r8')"), false},
-         {OBFSTR("size_register"), OBFSTR("string"),
-          OBFSTR("Register containing the buffer size (e.g., 'rdx', 'r8', 'r9')"), false},
-         {OBFSTR("max_packets"), OBFSTR("number"),
-          OBFSTR("Max captures before auto-stop (default 1, max 16)"), false},
-         {OBFSTR("operation"), OBFSTR("string"),
-          OBFSTR("'start' (default), 'store', 'get'/'results', 'stop'"), false, {},
-          {OBFSTR("start"), OBFSTR("store"), OBFSTR("stop"), OBFSTR("get"), OBFSTR("results")}},
-         {OBFSTR("bytes"), OBFSTR("string"),
-          OBFSTR("Capture bytes for operation='store' as hex bytes, hex string, or text"), false},
-         {OBFSTR("data"), OBFSTR("string"),
-          OBFSTR("Alias for bytes when operation='store'"), false},
-         {OBFSTR("hex"), OBFSTR("string"),
-          OBFSTR("Alias for bytes when operation='store'"), false},
-         {OBFSTR("timestamp"), OBFSTR("number"),
-          OBFSTR("Capture timestamp for operation='store' (defaults to GetTickCount64)"), false},
-         {OBFSTR("thread_id"), OBFSTR("number"),
-          OBFSTR("Capture thread id for operation='store' (defaults to current thread)"), false},
-         {OBFSTR("tid"), OBFSTR("number"),
-          OBFSTR("Thread ID for breakpoint (default: 0 = first thread)"), false},
-         {OBFSTR("bp_index"), OBFSTR("number"),
-          OBFSTR("Debug register index 0-3 (default: 0)"), false}},
+        {{std::string("address"), std::string("string"),
+          std::string("Address of the send/recv/encrypt function (for 'start' operation)"), false},
+         {std::string("buffer_register"), std::string("string"),
+          std::string("Register containing the buffer pointer (e.g., 'rcx', 'rdx', 'r8')"), false},
+         {std::string("size_register"), std::string("string"),
+          std::string("Register containing the buffer size (e.g., 'rdx', 'r8', 'r9')"), false},
+         {std::string("max_packets"), std::string("number"),
+          std::string("Max captures before auto-stop (default 1, max 16)"), false},
+         {std::string("operation"), std::string("string"),
+          std::string("'start' (default), 'store', 'get'/'results', 'stop'"), false, {},
+          {std::string("start"), std::string("store"), std::string("stop"), std::string("get"), std::string("results")}},
+         {std::string("bytes"), std::string("string"),
+          std::string("Capture bytes for operation='store' as hex bytes, hex string, or text"), false},
+         {std::string("data"), std::string("string"),
+          std::string("Alias for bytes when operation='store'"), false},
+         {std::string("hex"), std::string("string"),
+          std::string("Alias for bytes when operation='store'"), false},
+         {std::string("timestamp"), std::string("number"),
+          std::string("Capture timestamp for operation='store' (defaults to GetTickCount64)"), false},
+         {std::string("thread_id"), std::string("number"),
+          std::string("Capture thread id for operation='store' (defaults to current thread)"), false},
+         {std::string("tid"), std::string("number"),
+          std::string("Thread ID for breakpoint (default: 0 = first thread)"), false},
+         {std::string("bp_index"), std::string("number"),
+          std::string("Debug register index 0-3 (default: 0)"), false}},
         driver_sniff_network_buffers, false});
 
 
@@ -7538,17 +7537,17 @@ void register_driver_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("driver_reassemble_stream"), OBFSTR("driver"),
-        OBFSTR("TCP stream reassembly engine. Like Wireshark's 'Follow TCP Stream' but from the kernel. "
+        std::string("driver_reassemble_stream"), std::string("driver"),
+        std::string("TCP stream reassembly engine. Like Wireshark's 'Follow TCP Stream' but from the kernel. "
                "Tracks TCP connections and reassembles the byte stream in order. Supports up to 8 "
                "concurrent streams, 64KB each. Operations: start, stop, get_data, list, clear."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'start', 'stop', 'get'/'get_data', 'list', 'clear'"), false,
-          {OBFSTR("start"), OBFSTR("stop"), OBFSTR("get"), OBFSTR("get_data"), OBFSTR("list"), OBFSTR("clear")}},
-         {OBFSTR("src_addr"), OBFSTR("string"), OBFSTR("Source IP of the connection to track"), false},
-         {OBFSTR("dst_addr"), OBFSTR("string"), OBFSTR("Destination IP"), false},
-         {OBFSTR("src_port"), OBFSTR("number"), OBFSTR("Source port"), false},
-         {OBFSTR("dst_port"), OBFSTR("number"), OBFSTR("Destination port"), false},
-         {OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by PID"), false}},
+        {{std::string("operation"), std::string("string"), std::string("'start', 'stop', 'get'/'get_data', 'list', 'clear'"), false,
+          {std::string("start"), std::string("stop"), std::string("get"), std::string("get_data"), std::string("list"), std::string("clear")}},
+         {std::string("src_addr"), std::string("string"), std::string("Source IP of the connection to track"), false},
+         {std::string("dst_addr"), std::string("string"), std::string("Destination IP"), false},
+         {std::string("src_port"), std::string("number"), std::string("Source port"), false},
+         {std::string("dst_port"), std::string("number"), std::string("Destination port"), false},
+         {std::string("pid"), std::string("number"), std::string("Filter by PID"), false}},
         driver_reassemble_stream, false});
 
 
@@ -7560,8 +7559,8 @@ void register_driver_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("driver_enum_kernel_callbacks"), OBFSTR("driver"),
-        OBFSTR("Enumerate kernel notification callbacks: process creation (PsSetCreateProcessNotifyRoutine), "
+        std::string("driver_enum_kernel_callbacks"), std::string("driver"),
+        std::string("Enumerate kernel notification callbacks: process creation (PsSetCreateProcessNotifyRoutine), "
                "thread creation (PsSetCreateThreadNotifyRoutine), image load (PsSetLoadImageNotifyRoutine), "
                "registry (CmRegisterCallbackEx), object (ObRegisterCallbacks). Identifies which driver module "
                "registered each callback. Essential for understanding anti-cheat monitoring."),
@@ -7569,8 +7568,8 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         driver_enum_kernel_callbacks, true});
 
     register_compat(srv, {
-        OBFSTR("driver_detect_integrity_checks"), OBFSTR("driver"),
-        OBFSTR("Check critical ntoskrnl exports for inline hooks (jmp, mov rax + jmp, int3). "
+        std::string("driver_detect_integrity_checks"), std::string("driver"),
+        std::string("Check critical ntoskrnl exports for inline hooks (jmp, mov rax + jmp, int3). "
                "Scans NtReadVirtualMemory, NtWriteVirtualMemory, NtOpenProcess, MmCopyVirtualMemory, "
                "KeStackAttachProcess, and 14 other critical functions. Identifies hook owner module. "
                "Reveals which kernel functions anti-cheats are monitoring."),
@@ -7578,8 +7577,8 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         driver_detect_integrity_checks, true});
 
     register_compat(srv, {
-        OBFSTR("driver_detect_ssdt_hooks"), OBFSTR("driver"),
-        OBFSTR("Detect SSDT (System Service Descriptor Table) hooks. Reads KeServiceDescriptorTable, "
+        std::string("driver_detect_ssdt_hooks"), std::string("driver"),
+        std::string("Detect SSDT (System Service Descriptor Table) hooks. Reads KeServiceDescriptorTable, "
                "resolves all syscall function pointers, and identifies entries redirected outside ntoskrnl. "
                "Anti-cheats hook SSDT to intercept NtReadVirtualMemory, NtOpenProcess, etc. "
                "Returns hooked syscall IDs, target addresses, and hook owner modules."),
@@ -7587,53 +7586,53 @@ void register_driver_tools(mcp_standalone::server_t& srv)
         driver_detect_ssdt_hooks, true});
 
     register_compat(srv, {
-        OBFSTR("driver_enum_minifilters"), OBFSTR("driver"),
-        OBFSTR("Enumerate registered filesystem minifilter drivers via Filter Manager (fltmgr.sys). "
+        std::string("driver_enum_minifilters"), std::string("driver"),
+        std::string("Enumerate registered filesystem minifilter drivers via Filter Manager (fltmgr.sys). "
                "Minifilters intercept file I/O - anti-cheats use them to monitor file access, "
                "prevent memory dumps, and detect injection DLLs. Returns filter names, altitudes, and owner modules."),
         {},
         driver_enum_minifilters, true});
 
     register_compat(srv, {
-        OBFSTR("driver_detect_etw_monitors"), OBFSTR("driver"),
-        OBFSTR("Detect active ETW (Event Tracing for Windows) monitoring. Checks if the Threat Intelligence "
+        std::string("driver_detect_etw_monitors"), std::string("driver"),
+        std::string("Detect active ETW (Event Tracing for Windows) monitoring. Checks if the Threat Intelligence "
                "provider is active (monitors process injection, executable memory allocation). "
                "Scans for known security ETW provider GUIDs and identifies kernel modules that import EtwRegister/EtwWrite."),
         {},
         driver_detect_etw_monitors, true});
 
     register_compat(srv, {
-        OBFSTR("driver_detect_hidden_modules"), OBFSTR("driver"),
-        OBFSTR("Detect manually mapped or hidden PE modules not in the PEB module list (usermode) or "
+        std::string("driver_detect_hidden_modules"), std::string("driver"),
+        std::string("Detect manually mapped or hidden PE modules not in the PEB module list (usermode) or "
                "NtQuerySystemInformation list (kernel). Scans memory for PE headers at non-listed addresses. "
                "Finds injected DLLs, manual-mapped anti-cheat drivers, and stealth payloads. "
                "Returns hidden module addresses, sizes, and export names when available."),
-        {{OBFSTR("kernel"), OBFSTR("boolean"), OBFSTR("Scan kernel space instead of attached process (default: false)"), false}},
+        {{std::string("kernel"), std::string("boolean"), std::string("Scan kernel space instead of attached process (default: false)"), false}},
         driver_detect_hidden_modules, true});
 
 
     register_compat(srv, {
-        OBFSTR("driver_walk_heap"), OBFSTR("driver"),
-        OBFSTR("Walk the NT heap structures of the attached process via kernel memory reads. "
+        std::string("driver_walk_heap"), std::string("driver"),
+        std::string("Walk the NT heap structures of the attached process via kernel memory reads. "
                "Enumerates all process heaps from PEB.ProcessHeaps, walks segment chains, and lists "
                "heap entries with their addresses, sizes, and busy/free flags. Equivalent to Cheat Engine's "
                "dissect data/structures and x64dbg's heap view. Filter by min/max block size or free-only."),
-        {{OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max heap entries to return (default 500, max 5000)"), false},
-         {OBFSTR("min_size"), OBFSTR("number"), OBFSTR("Only return entries >= this size in bytes"), false},
-         {OBFSTR("max_size"), OBFSTR("number"), OBFSTR("Only return entries <= this size in bytes"), false},
-         {OBFSTR("free_only"), OBFSTR("boolean"), OBFSTR("Only return free (non-busy) blocks (default false)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{std::string("limit"), std::string("number"), std::string("Max heap entries to return (default 500, max 5000)"), false},
+         {std::string("min_size"), std::string("number"), std::string("Only return entries >= this size in bytes"), false},
+         {std::string("max_size"), std::string("number"), std::string("Only return entries <= this size in bytes"), false},
+         {std::string("free_only"), std::string("boolean"), std::string("Only return free (non-busy) blocks (default false)"), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override"), false}},
         driver_walk_heap, true});
 
     register_compat(srv, {
-        OBFSTR("driver_enumerate_handles"), OBFSTR("driver"),
-        OBFSTR("Enumerate kernel object handles system-wide or for a specific process via NtQuerySystemInformation. "
+        std::string("driver_enumerate_handles"), std::string("driver"),
+        std::string("Enumerate kernel object handles system-wide or for a specific process via NtQuerySystemInformation. "
                "Returns handle values, types (Process, Thread, File, Section, Key, Event, Mutant, etc.), "
                "kernel object addresses, and granted access masks. Equivalent to x64dbg's Handles tab "
                "and Process Hacker's handle list. Filter by PID or object type name."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Filter by process ID (0 = all processes)"), false},
-         {OBFSTR("type_filter"), OBFSTR("string"), OBFSTR("Filter by type name substring (e.g. 'Process', 'File')"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max handles to return (default 500, max 10000)"), false}},
+        {{std::string("pid"), std::string("number"), std::string("Filter by process ID (0 = all processes)"), false},
+         {std::string("type_filter"), std::string("string"), std::string("Filter by type name substring (e.g. 'Process', 'File')"), false},
+         {std::string("limit"), std::string("number"), std::string("Max handles to return (default 500, max 10000)"), false}},
         driver_enumerate_handles, true});
 
 
@@ -7641,78 +7640,78 @@ void register_driver_tools(mcp_standalone::server_t& srv)
 
 
     register_compat(srv, {
-        OBFSTR("driver_enumerate_windows"), OBFSTR("driver"),
-        OBFSTR("List all windows (HWND) owned by a process. Returns window handle, parent, class name, "
+        std::string("driver_enumerate_windows"), std::string("driver"),
+        std::string("List all windows (HWND) owned by a process. Returns window handle, parent, class name, "
                "title text, visibility, position/size rect, and style flags. Equivalent to x64dbg's "
                "Window tab and Spy++ functionality. Useful for finding game overlay windows, "
                "anti-cheat UI, hidden dialogs, and message-only windows."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID (default: attached PID)"), false},
-         {OBFSTR("include_children"), OBFSTR("boolean"), OBFSTR("Include child windows (default true)"), false},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max windows (default 200, max 2000)"), false}},
+        {{std::string("pid"), std::string("number"), std::string("Target process ID (default: attached PID)"), false},
+         {std::string("include_children"), std::string("boolean"), std::string("Include child windows (default true)"), false},
+         {std::string("limit"), std::string("number"), std::string("Max windows (default 200, max 2000)"), false}},
         driver_enumerate_windows, true});
 
 
     register_compat(srv, {
-        OBFSTR("driver_assemble"), OBFSTR("driver"),
-        OBFSTR("Assemble x86-64 instructions to machine code bytes. Supports common instructions: "
+        std::string("driver_assemble"), std::string("driver"),
+        std::string("Assemble x86-64 instructions to machine code bytes. Supports common instructions: "
                "NOP, RET, INT3, PUSH/POP reg, MOV reg/imm64, XOR reg/reg, JMP/CALL (reg or address), "
                "SUB RSP/imm, ADD RSP/imm. Multi-line input (one instruction per line). "
                "Optionally writes assembled bytes to target process memory. "
                "Equivalent to x64dbg's built-in assembler and Cheat Engine's auto-assembler."),
-        {{OBFSTR("assembly"), OBFSTR("string"), OBFSTR("Assembly text (one instruction per line)"), true},
-         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Base address for relative calculations (default 0x140000000)"), false},
-         {OBFSTR("write_to"), OBFSTR("string"), OBFSTR("If specified, write assembled bytes to this address in the attached process"), false}},
+        {{std::string("assembly"), std::string("string"), std::string("Assembly text (one instruction per line)"), true},
+         {std::string("address"), std::string("string"), std::string("Base address for relative calculations (default 0x140000000)"), false},
+         {std::string("write_to"), std::string("string"), std::string("If specified, write assembled bytes to this address in the attached process"), false}},
         driver_assemble, false});
 
 
     register_compat(srv, {
-        OBFSTR("driver_find_references"), OBFSTR("driver"),
-        OBFSTR("Find all memory locations that reference a target address. Scans for both direct "
+        std::string("driver_find_references"), std::string("driver"),
+        std::string("Find all memory locations that reference a target address. Scans for both direct "
                "64-bit pointer matches and RIP-relative (rel32) references in code sections. "
                "Equivalent to x64dbg's 'Find References' and IDA's xrefs but in live runtime memory. "
                "Useful for finding vtable entries, function pointer tables, and cross-references "
                "that only exist at runtime."),
-        {{OBFSTR("target_address"), OBFSTR("string"), OBFSTR("Address to find references to (hex)"), true},
-         {OBFSTR("limit"), OBFSTR("number"), OBFSTR("Max references (default 100, max 5000)"), false},
-         {OBFSTR("scan_code"), OBFSTR("boolean"), OBFSTR("Scan executable regions (default true)"), false},
-         {OBFSTR("scan_data"), OBFSTR("boolean"), OBFSTR("Scan data regions (default true)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{std::string("target_address"), std::string("string"), std::string("Address to find references to (hex)"), true},
+         {std::string("limit"), std::string("number"), std::string("Max references (default 100, max 5000)"), false},
+         {std::string("scan_code"), std::string("boolean"), std::string("Scan executable regions (default true)"), false},
+         {std::string("scan_data"), std::string("boolean"), std::string("Scan data regions (default true)"), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override"), false}},
         driver_find_references, true});
 
     register_compat(srv, {
-        OBFSTR("driver_read_teb"), OBFSTR("driver"),
-        OBFSTR("Read the Thread Environment Block (TEB) for a thread via kernel driver. "
+        std::string("driver_read_teb"), std::string("driver"),
+        std::string("Read the Thread Environment Block (TEB) for a thread via kernel driver. "
                "Extracts: NT_TIB (exception list, stack base/limit), TLS slots with values, "
                "PEB address, client ID, last error, critical section count, stack size. "
                "Equivalent to x64dbg's TEB view. Requires tid of the target thread."),
-        {{OBFSTR("tid"), OBFSTR("string"), OBFSTR("Thread ID"), true},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{std::string("tid"), std::string("string"), std::string("Thread ID"), true},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override"), false}},
         driver_read_teb, true});
 
     register_compat(srv, {
-        OBFSTR("driver_map_peb_modules"), OBFSTR("driver"),
-        OBFSTR("Walk ALL three PEB LDR linked lists: InLoadOrder, InMemoryOrder, InInitializationOrder. "
+        std::string("driver_map_peb_modules"), std::string("driver"),
+        std::string("Walk ALL three PEB LDR linked lists: InLoadOrder, InMemoryOrder, InInitializationOrder. "
                "Returns complete module details: base, entry point, size, name, full path, flags "
                "(static import, entry processed, process attach called, etc.), load count, TLS index. "
                "Order differences reveal manually mapped modules and load-order anomalies. "
                "More detailed than basic module enumeration - shows all three orderings and decoded flags."),
-        {{OBFSTR("order"), OBFSTR("string"), OBFSTR("Which list: load, memory, init, or all (default all)"), false,
-          {OBFSTR("load"), OBFSTR("memory"), OBFSTR("init"), OBFSTR("all")}},
-         {OBFSTR("filter"), OBFSTR("string"), OBFSTR("Module name/path substring filter (case-insensitive)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{std::string("order"), std::string("string"), std::string("Which list: load, memory, init, or all (default all)"), false,
+          {std::string("load"), std::string("memory"), std::string("init"), std::string("all")}},
+         {std::string("filter"), std::string("string"), std::string("Module name/path substring filter (case-insensitive)"), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override"), false}},
         driver_map_peb_modules, true});
 
     register_compat(srv, {
-        OBFSTR("driver_set_page_guard"), OBFSTR("driver"),
-        OBFSTR("Set, remove, or query PAGE_GUARD protection on memory in the attached process. "
+        std::string("driver_set_page_guard"), std::string("driver"),
+        std::string("Set, remove, or query PAGE_GUARD protection on memory in the attached process. "
                "PAGE_GUARD triggers STATUS_GUARD_PAGE_VIOLATION exception on first access - "
                "equivalent to Cheat Engine's memory breakpoint / 'Break on Access'. "
                "The guard auto-clears after first hit. Operations: set, remove, query."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("'set', 'remove', or 'query'"), true,
-          {OBFSTR("set"), OBFSTR("remove"), OBFSTR("query")}},
-         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Target memory address (hex)"), true},
-         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Size of the guarded region in bytes (default 4096)"), false},
-         {OBFSTR("process_id"), OBFSTR("number"), OBFSTR("Optional PID override"), false}},
+        {{std::string("operation"), std::string("string"), std::string("'set', 'remove', or 'query'"), true,
+          {std::string("set"), std::string("remove"), std::string("query")}},
+         {std::string("address"), std::string("string"), std::string("Target memory address (hex)"), true},
+         {std::string("size"), std::string("number"), std::string("Size of the guarded region in bytes (default 4096)"), false},
+         {std::string("process_id"), std::string("number"), std::string("Optional PID override"), false}},
         driver_set_page_guard, false});
     diag::log_tagged_fmt("drv_tools", "register_driver_tools done");
 }

@@ -51,7 +51,6 @@
 #include "../network/burp/audit_http.hpp"
 #include "../network/burp/headless_view.hpp"
 #include "../network/network_view.hpp"
-#include "../runtime/manual_map_tls.hpp"
 #include "../ui/ui_thread_dispatcher.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "test_lab_bounded_runner.hpp"
@@ -1068,10 +1067,8 @@ namespace {
                 static_cast<unsigned long>(tid),
                 static_cast<unsigned>(st->port.load(std::memory_order_acquire)),
                 static_cast<unsigned long long>(st->listen_socket.load(std::memory_order_acquire)));
-            const bool tls_ready = aida::manual_map_tls::ensure_current_thread();
-            diag::log_tagged_fmt("testlab_burp", "loopback_worker_tls_exit mode=%s tls_ready=%d state=%p tid=%lu elapsed_ms=%llu",
+            diag::log_tagged_fmt("testlab_burp", "loopback_worker_tls_exit mode=%s state=%p tid=%lu elapsed_ms=%llu",
                 mode ? mode : "",
-                tls_ready ? 1 : 0,
                 st,
                 static_cast<unsigned long>(tid),
                 static_cast<unsigned long long>(GetTickCount64() - t0));

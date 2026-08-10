@@ -37,8 +37,6 @@ struct crash_context_t {
     const char* testlab_step = nullptr;
     std::uint64_t testlab_step_start_ms = 0;
     const char* camoufox_longop = nullptr;
-    std::uint64_t license_liveness_ms = 0;
-    std::uint64_t arc_liveness_ms = 0;
     std::uint64_t driver_watchdog_ms = 0;
     const char* thread_runtime_active_classes = nullptr;
     const char* mcp_snapshot = nullptr;
@@ -108,7 +106,7 @@ inline void log_crash_snapshot(const crash_context_t& ctx) {
     module_info_t mod = resolve_faulting_module(ctx.exception_address);
 
     diag::log_tagged_critical_fmt("diag",
-        "CRASH-SNAPSHOT pid=%lu tid=%lu exception_code=0x%08lX exception_flags=0x%08lX exception_addr=0x%llX exception_records=%llu label=%s boundary=%s utc_100ns=%llu tick_ms=%llu elapsed_ms=%llu ui_owner_tid=%lu fault_module=%s module_base=0x%llX module_end=0x%llX module_size=%llu rva=0x%llX module_gle=%lu render_phase=%s render_tick_ms=%llu render_heartbeat_age_ms=%llu wndproc_stage=%s dispatch_stage=%s pump_phase=%s last_pump_return_ms=%llu last_input_event_ms=%llu testlab_phase=%s testlab_step=%s testlab_step_start_ms=%llu camoufox_longop=%s license_liveness_ms=%llu arc_liveness_ms=%llu driver_watchdog_ms=%llu thread_runtime_classes=%s mcp={%.1300s} queues={%.2800s} ui_dispatch={%.1300s} capacity={%.1300s} lease_registry={%.1300s} downstream={%.1300s}",
+        "CRASH-SNAPSHOT pid=%lu tid=%lu exception_code=0x%08lX exception_flags=0x%08lX exception_addr=0x%llX exception_records=%llu label=%s boundary=%s utc_100ns=%llu tick_ms=%llu elapsed_ms=%llu ui_owner_tid=%lu fault_module=%s module_base=0x%llX module_end=0x%llX module_size=%llu rva=0x%llX module_gle=%lu render_phase=%s render_tick_ms=%llu render_heartbeat_age_ms=%llu wndproc_stage=%s dispatch_stage=%s pump_phase=%s last_pump_return_ms=%llu last_input_event_ms=%llu testlab_phase=%s testlab_step=%s testlab_step_start_ms=%llu camoufox_longop=%s driver_watchdog_ms=%llu thread_runtime_classes=%s mcp={%.1300s} queues={%.2800s} ui_dispatch={%.1300s} capacity={%.1300s} lease_registry={%.1300s} downstream={%.1300s}",
         static_cast<unsigned long>(pid),
         static_cast<unsigned long>(tid),
         static_cast<unsigned long>(ctx.exception_code),
@@ -139,8 +137,6 @@ inline void log_crash_snapshot(const crash_context_t& ctx) {
         ctx.testlab_step ? ctx.testlab_step : "<null>",
         static_cast<unsigned long long>(ctx.testlab_step_start_ms),
         ctx.camoufox_longop ? ctx.camoufox_longop : "<null>",
-        static_cast<unsigned long long>(ctx.license_liveness_ms),
-        static_cast<unsigned long long>(ctx.arc_liveness_ms),
         static_cast<unsigned long long>(ctx.driver_watchdog_ms),
         ctx.thread_runtime_active_classes ? ctx.thread_runtime_active_classes : "<null>",
         ctx.mcp_snapshot && ctx.mcp_snapshot[0] ? ctx.mcp_snapshot : "empty=1",

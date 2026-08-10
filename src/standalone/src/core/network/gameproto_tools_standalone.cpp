@@ -5,7 +5,6 @@
 
 #include "standalone_compat.hpp"
 #include "game_protocol.hpp"
-#include "obfuscation.hpp"
 #include "helpers/diag_log.hpp"
 #include "executor_status.hpp"
 #include "../runtime/standalone_driver.hpp"
@@ -280,12 +279,12 @@ tool_result_t handle_gameproto_detect(const json& raw_params)
             result["stimulus_observed"] = false;
             result["no_stimulus"] = true;
             result["diagnostic_contract"] = "empty_provided_payload_is_not_functional_protocol_evidence";
-            return tool_result_t::error(OBFSTR("payload_hex must contain at least one byte."), result);
+            return tool_result_t::error(std::string("payload_hex must contain at least one byte."), result);
         }
         std::string error;
         auto bytes = game_protocol::hex_to_bytes(hex, &error, options.max_payload);
         if (bytes.empty())
-            return tool_result_t::error(error.empty() ? OBFSTR("invalid payload_hex") : error);
+            return tool_result_t::error(error.empty() ? std::string("invalid payload_hex") : error);
         driver_bridge::captured_packet_t pkt{};
         pkt.pid = options.pid;
         pkt.protocol = options.protocol == 0 ? 17 : options.protocol;
@@ -312,15 +311,15 @@ tool_result_t handle_gameproto_detect(const json& raw_params)
         result["payload_bytes"] = packets.front().payload.size();
         diag::log_tagged_fmt("gameproto", "detect provided_payload bytes=%zu protocol=%u pid=%u confidence=%.3f",
             packets.front().payload.size(), packets.front().protocol, packets.front().pid, result.value("confidence", 0.0));
-        return tool_result_t::ok(OBFSTR("Game protocol detection completed from provided payload."), result);
+        return tool_result_t::ok(std::string("Game protocol detection completed from provided payload."), result);
     }
     if (options.pid == 0)
-        return tool_result_t::error(OBFSTR("'pid' is required for live protocol detection."));
+        return tool_result_t::error(std::string("'pid' is required for live protocol detection."));
 
     std::vector<driver_bridge::captured_packet_t> packets;
     std::string error;
     if (!game_protocol::capture_packets_bounded(options, packets, error))
-        return tool_result_t::error(error.empty() ? OBFSTR("capture failed") : error);
+        return tool_result_t::error(error.empty() ? std::string("capture failed") : error);
 
     json result = game_protocol::detect_protocols(packets, 32);
     result["backend"] = "driver_capture";
@@ -335,19 +334,19 @@ tool_result_t handle_gameproto_detect(const json& raw_params)
     diag::log_tagged_fmt("gameproto", "detect live pid=%u protocol=%u packets=%zu confidence=%.3f",
         options.pid, options.protocol, packets.size(), result.value("confidence", 0.0));
     if (packets.empty())
-        return tool_result_t::error(OBFSTR("Game protocol detection completed with zero captured packets."), result);
-    return tool_result_t::ok(OBFSTR("Game protocol detection completed."), result);
+        return tool_result_t::error(std::string("Game protocol detection completed with zero captured packets."), result);
+    return tool_result_t::ok(std::string("Game protocol detection completed."), result);
 }
 
 tool_result_t handle_gameproto_enet_decode(const json& raw_params)
 {
     const json params = compat_action_payload(raw_params);
     if (!params.contains("packet_hex") || !params["packet_hex"].is_string())
-        return tool_result_t::error(OBFSTR("'packet_hex' is required."));
+        return tool_result_t::error(std::string("'packet_hex' is required."));
     std::string error;
     auto bytes = game_protocol::hex_to_bytes(params["packet_hex"].get<std::string>(), &error, 65536);
     if (bytes.empty() && !params["packet_hex"].get<std::string>().empty())
-        return tool_result_t::error(error.empty() ? OBFSTR("invalid packet_hex") : error);
+        return tool_result_t::error(error.empty() ? std::string("invalid packet_hex") : error);
 
     std::optional<std::uint32_t> channel;
     if (params.contains("channel_id") && params["channel_id"].is_number()) {
@@ -357,23 +356,23 @@ tool_result_t handle_gameproto_enet_decode(const json& raw_params)
     }
 
     json result = game_protocol::decode_enet_packet(bytes, channel);
-    return tool_result_t::ok(OBFSTR("ENet packet decoded with heuristic confidence."), result);
+    return tool_result_t::ok(std::string("ENet packet decoded with heuristic confidence."), result);
 }
 
 tool_result_t handle_gameproto_decode_heuristic(const json& raw_params)
 {
     const json params = compat_action_payload(raw_params);
     if (!params.contains("payload_hex") || !params["payload_hex"].is_string())
-        return tool_result_t::error(OBFSTR("'payload_hex' is required."));
+        return tool_result_t::error(std::string("'payload_hex' is required."));
 
     std::string error;
     auto bytes = game_protocol::hex_to_bytes(params["payload_hex"].get<std::string>(), &error, 65536);
     if (bytes.empty() && !params["payload_hex"].get<std::string>().empty())
-        return tool_result_t::error(error.empty() ? OBFSTR("invalid payload_hex") : error);
+        return tool_result_t::error(error.empty() ? std::string("invalid payload_hex") : error);
 
     const std::string hint = params.value("context_hint", std::string());
     json result = game_protocol::decode_payload_heuristic(bytes, hint);
-    return tool_result_t::ok(OBFSTR("Payload heuristic decode completed."), result);
+    return tool_result_t::ok(std::string("Payload heuristic decode completed."), result);
 }
 
 tool_result_t handle_gameproto_replay(const json& raw_params)
@@ -402,8 +401,8 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
         if (!error.empty())
             return tool_result_t::error(error, result);
         if (result.value("packet_count", 0u) == 0)
-            return tool_result_t::error(OBFSTR("Game protocol replay record completed with zero captured packets."), result);
-        return tool_result_t::ok(OBFSTR("Game protocol replay session recorded."), result);
+            return tool_result_t::error(std::string("Game protocol replay record completed with zero captured packets."), result);
+        return tool_result_t::ok(std::string("Game protocol replay session recorded."), result);
     }
 
     if (op == "stop") {
@@ -421,8 +420,8 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
         if (!error.empty())
             return tool_result_t::error(error, result);
         if (result.value("packet_count", 0u) == 0)
-            return tool_result_t::error(OBFSTR("Game protocol replay recording stopped with zero captured packets."), result);
-        return tool_result_t::ok(OBFSTR("Game protocol replay recording stopped."), result);
+            return tool_result_t::error(std::string("Game protocol replay recording stopped with zero captured packets."), result);
+        return tool_result_t::ok(std::string("Game protocol replay recording stopped."), result);
     }
 
     if (op == "list") {
@@ -432,7 +431,7 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
         result["record_operation"] = "gameproto_replay operation=record";
         result["replay_requires_existing_session"] = true;
         diag::log_tagged_fmt("gameproto", "replay list sessions=%u", result.value("count", 0u));
-        return tool_result_t::ok(OBFSTR("Game protocol replay sessions listed."), result);
+        return tool_result_t::ok(std::string("Game protocol replay sessions listed."), result);
     }
 
     if (op == "replay") {
@@ -459,12 +458,12 @@ tool_result_t handle_gameproto_replay(const json& raw_params)
         contract_options.max_packets = options.max_packets;
         if (!game_protocol::replay_session(options, result, error)) {
             attach_protocol_reemit_contract(result, params, contract_options, "gameproto_replay.replay");
-            return tool_result_t::error(error.empty() ? OBFSTR("replay failed") : error, result);
+            return tool_result_t::error(error.empty() ? std::string("replay failed") : error, result);
         }
         attach_protocol_reemit_contract(result, params, contract_options, "gameproto_replay.replay");
         if (result.value("sent_packet_count", 0u) == 0)
-            return tool_result_t::error(OBFSTR("Game protocol replay completed without sending a packet."), result);
-        return tool_result_t::ok(OBFSTR("Game protocol replay attempted with bounded packet caps."), result);
+            return tool_result_t::error(std::string("Game protocol replay completed without sending a packet."), result);
+        return tool_result_t::ok(std::string("Game protocol replay attempted with bounded packet caps."), result);
     }
 
     return compat_unknown_action("gameproto_replay", op);
@@ -477,43 +476,43 @@ void register_gameproto_tools(mcp_standalone::server_t& srv)
     diag::log_tagged("gameproto", "register_gameproto_tools entry");
 
     register_compat(srv, {
-        OBFSTR("gameproto_detect"), OBFSTR("gameproto"),
-        OBFSTR("Capture a bounded live traffic sample for a PID and return protocol confidence and packet evidence for ENet, Photon, RakNet, protobuf, gzip, and custom binary formats."),
-        {{OBFSTR("pid"), OBFSTR("number"), OBFSTR("Target process ID."), true},
-         {OBFSTR("capture_sec"), OBFSTR("number"), OBFSTR("Capture duration in seconds, default 5, max 15."), false},
-         {OBFSTR("max_packets"), OBFSTR("number"), OBFSTR("Maximum packets to inspect, default 64, max 512."), false},
-         {OBFSTR("protocol"), OBFSTR("string"), OBFSTR("Optional tcp or udp capture filter."), false},
-         {OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Optional payload for deterministic local protocol detection without live capture."), false},
-         {OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Alias for payload_hex."), false}},
+        std::string("gameproto_detect"), std::string("gameproto"),
+        std::string("Capture a bounded live traffic sample for a PID and return protocol confidence and packet evidence for ENet, Photon, RakNet, protobuf, gzip, and custom binary formats."),
+        {{std::string("pid"), std::string("number"), std::string("Target process ID."), true},
+         {std::string("capture_sec"), std::string("number"), std::string("Capture duration in seconds, default 5, max 15."), false},
+         {std::string("max_packets"), std::string("number"), std::string("Maximum packets to inspect, default 64, max 512."), false},
+         {std::string("protocol"), std::string("string"), std::string("Optional tcp or udp capture filter."), false},
+         {std::string("payload_hex"), std::string("string"), std::string("Optional payload for deterministic local protocol detection without live capture."), false},
+         {std::string("packet_hex"), std::string("string"), std::string("Alias for payload_hex."), false}},
         handle_gameproto_detect, false});
 
     register_compat(srv, {
-        OBFSTR("gameproto_enet_decode"), OBFSTR("gameproto"),
-        OBFSTR("Decode ENet packet bytes into header and command components with channel, sequence, length, payload preview, confidence, and parse-stop evidence."),
-        {{OBFSTR("packet_hex"), OBFSTR("string"), OBFSTR("Hex-encoded ENet packet bytes."), true},
-         {OBFSTR("channel_id"), OBFSTR("number"), OBFSTR("Optional channel filter."), false}},
+        std::string("gameproto_enet_decode"), std::string("gameproto"),
+        std::string("Decode ENet packet bytes into header and command components with channel, sequence, length, payload preview, confidence, and parse-stop evidence."),
+        {{std::string("packet_hex"), std::string("string"), std::string("Hex-encoded ENet packet bytes."), true},
+         {std::string("channel_id"), std::string("number"), std::string("Optional channel filter."), false}},
         handle_gameproto_enet_decode, true});
 
     register_compat(srv, {
-        OBFSTR("gameproto_decode_heuristic"), OBFSTR("gameproto"),
-        OBFSTR("Heuristically classify fields in an unknown binary protocol payload using entropy, strings, length prefixes, protobuf wire format, numeric values, and repeated records."),
-        {{OBFSTR("payload_hex"), OBFSTR("string"), OBFSTR("Hex-encoded payload bytes."), true},
-         {OBFSTR("context_hint"), OBFSTR("string"), OBFSTR("Optional hint such as entity_update, position, or damage."), false}},
+        std::string("gameproto_decode_heuristic"), std::string("gameproto"),
+        std::string("Heuristically classify fields in an unknown binary protocol payload using entropy, strings, length prefixes, protobuf wire format, numeric values, and repeated records."),
+        {{std::string("payload_hex"), std::string("string"), std::string("Hex-encoded payload bytes."), true},
+         {std::string("context_hint"), std::string("string"), std::string("Optional hint such as entity_update, position, or damage."), false}},
         handle_gameproto_decode_heuristic, true});
 
     register_compat(srv, {
-        OBFSTR("gameproto_replay"), OBFSTR("gameproto"),
-        OBFSTR("Record, stop, list, or replay bounded captured packets. Replay requires allow_unsafe and confirm_unsafe, payload caps, packet caps, and loopback-safe targeting by default."),
-        {{OBFSTR("operation"), OBFSTR("string"), OBFSTR("record|stop|replay|list"), true},
-         {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Operation-specific parameters; top-level fields are also accepted."), false},
-         {OBFSTR("session_id"), OBFSTR("string"), OBFSTR("Replay session ID for stop or replay."), false},
-         {OBFSTR("filter_pid"), OBFSTR("number"), OBFSTR("PID filter for record."), false},
-         {OBFSTR("target_ip"), OBFSTR("string"), OBFSTR("IPv4 replay target. Non-loopback requires allow_non_loopback."), false},
-         {OBFSTR("target_port"), OBFSTR("number"), OBFSTR("Replay target port."), false},
-         {OBFSTR("max_packets"), OBFSTR("number"), OBFSTR("Replay or capture packet cap."), false},
-         {OBFSTR("payload_cap"), OBFSTR("number"), OBFSTR("Maximum replay payload bytes, hard-capped at 4096."), false},
-         {OBFSTR("allow_unsafe"), OBFSTR("boolean"), OBFSTR("Required true for replay."), false},
-         {OBFSTR("confirm_unsafe"), OBFSTR("boolean"), OBFSTR("Required true for replay."), false}},
+        std::string("gameproto_replay"), std::string("gameproto"),
+        std::string("Record, stop, list, or replay bounded captured packets. Replay requires allow_unsafe and confirm_unsafe, payload caps, packet caps, and loopback-safe targeting by default."),
+        {{std::string("operation"), std::string("string"), std::string("record|stop|replay|list"), true},
+         {std::string("payload"), std::string("object"), std::string("Operation-specific parameters; top-level fields are also accepted."), false},
+         {std::string("session_id"), std::string("string"), std::string("Replay session ID for stop or replay."), false},
+         {std::string("filter_pid"), std::string("number"), std::string("PID filter for record."), false},
+         {std::string("target_ip"), std::string("string"), std::string("IPv4 replay target. Non-loopback requires allow_non_loopback."), false},
+         {std::string("target_port"), std::string("number"), std::string("Replay target port."), false},
+         {std::string("max_packets"), std::string("number"), std::string("Replay or capture packet cap."), false},
+         {std::string("payload_cap"), std::string("number"), std::string("Maximum replay payload bytes, hard-capped at 4096."), false},
+         {std::string("allow_unsafe"), std::string("boolean"), std::string("Required true for replay."), false},
+         {std::string("confirm_unsafe"), std::string("boolean"), std::string("Required true for replay."), false}},
         handle_gameproto_replay, false});
 }
 
